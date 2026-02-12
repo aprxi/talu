@@ -1,0 +1,37 @@
+/* =============================================================================
+   Docs Base (docs-specific overrides on top of shared base.css)
+   ============================================================================= */
+
+:root {
+  --bg-hover: #27272a;
+  --border-dark: #3f3f46;
+
+  --sidebar-width: 250px;
+  --topbar-height: 40px;
+}
+
+html {
+  font-size: 16px;
+  line-height: 1.5;
+}
+
+body {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* Selection */
+::selection {
+  background: #b3d4fc;
+}
+
+/* Responsive */
+@media (max-width: 700px) {
+  body {
+    flex-direction: column;
+  }
+
+  :root {
+    --sidebar-width: 100%;
+  }
+}

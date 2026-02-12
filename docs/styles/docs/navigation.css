@@ -1,0 +1,271 @@
+/* =============================================================================
+   RUSTDOC THEME - Navigation
+   Compact, scannable navigation like Cargo docs
+   ============================================================================= */
+
+/* Sidebar Navigation */
+.sidebar nav {
+  padding: 0.5rem 0;
+}
+
+.sidebar nav ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.sidebar nav > ul > li {
+  margin-bottom: 0;
+}
+
+.sidebar nav li {
+  position: relative;
+}
+
+/* Top-level nav links */
+.sidebar nav a {
+  display: block;
+  padding: 0.3rem 0.75rem 0.3rem 1rem;
+  color: var(--text-secondary);
+  text-decoration: none;
+  font-size: 0.9375rem;
+  font-weight: 500;
+  font-family: var(--font-sans);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Selected item — accent border on leaf items only */
+.sidebar nav li.current > a {
+  color: var(--primary);
+  font-weight: 600;
+}
+
+.sidebar nav a:hover {
+  color: var(--primary);
+}
+
+/* Accent border only on top-level leaf current items */
+.sidebar nav > ul > li.current:not(.has-children) > a {
+  border-left: 3px solid var(--accent);
+  padding-left: calc(1rem - 3px);
+}
+
+/* Accent border on nested current items — subtle left indicator */
+.sidebar nav ul ul li.current > a {
+  color: var(--primary);
+  font-weight: 500;
+}
+
+/* Nested navigation - always visible (rustdoc style) */
+.sidebar nav ul ul {
+  display: block;
+  background: transparent;
+  margin-top: 0.1rem;
+}
+
+/* Sublinks — neutral, never theme-colored */
+.sidebar nav ul ul a {
+  padding-left: 1.5rem;
+  font-size: 0.875rem;
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+.sidebar nav ul ul a:hover {
+  color: var(--primary);
+}
+
+/* Third level (reference modules under Reference) */
+.sidebar nav ul ul ul {
+  margin-left: 0;
+}
+
+.sidebar nav ul ul ul a {
+  padding-left: 2.25rem;
+  font-size: 0.8125rem;
+}
+
+/* Nav separator */
+.nav-separator {
+  margin: 0.15rem 1.5rem 0.15rem 1rem;
+  padding: 0;
+}
+
+.nav-separator hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0;
+  opacity: 0.4;
+}
+
+/* No toggle arrows - rustdoc style */
+.nav-toggle {
+  display: none;
+}
+
+/* Current module in reference mode */
+.sidebar nav li.current-module > a {
+  color: var(--text);
+  font-weight: 600;
+}
+
+/* Back link - return to parent */
+.sidebar nav li.is-back {
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.sidebar nav li.is-back > a {
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
+
+.sidebar nav li.is-back > a:hover {
+  color: var(--primary);
+}
+
+/* Comment labels from __all__ - section headers */
+.sidebar nav li.is-label {
+  margin-top: 1rem;
+}
+
+.sidebar nav li.is-label:first-child {
+  margin-top: 0.25rem;
+}
+
+.sidebar nav li.is-label > .nav-label {
+  display: block;
+  padding: 0.5rem 0.75rem 0.25rem 1rem;
+  color: var(--text-secondary);
+  font-size: 0.9375rem;
+  font-weight: 500;
+}
+
+/* Reference sidebar section — monospace, compact, visually distinct */
+nav.sidebar-ref {
+  padding: 0.125rem 0 0.5rem;
+}
+
+
+nav.sidebar-ref li.is-label {
+  margin-top: 0.5rem;
+}
+
+nav.sidebar-ref li.is-label:first-child {
+  margin-top: 0;
+}
+
+nav.sidebar-ref li.is-label > .nav-label {
+  font-size: 0.65rem;
+  padding: 0.2rem 0.75rem 0.1rem;
+  color: var(--text-muted);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  opacity: 0.6;
+}
+
+nav.sidebar-ref a {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  padding: 0.15rem 0.75rem;
+  color: var(--text-secondary);
+}
+
+nav.sidebar-ref a:hover {
+  color: var(--text);
+}
+
+/* Prev/Next navigation */
+.page-nav {
+  display: flex;
+  justify-content: space-between;
+  margin-top: 2rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+  font-size: 0.875rem;
+}
+
+.page-nav a {
+  display: flex;
+  flex-direction: column;
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  max-width: 45%;
+  text-decoration: none;
+}
+
+.page-nav a:hover {
+  border-color: var(--primary);
+  background: var(--bg-code);
+}
+
+.page-nav-label {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-bottom: 0.15rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.page-nav-title {
+  color: var(--secondary);
+  font-family: var(--font-sans);
+  font-size: 0.875rem;
+}
+
+.page-nav-prev {
+  align-items: flex-start;
+}
+
+.page-nav-next {
+  align-items: flex-end;
+  margin-left: auto;
+}
+
+/* Table of contents */
+.toc {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.75rem 1rem;
+  margin-bottom: 1.5rem;
+}
+.toc > ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+.toc > ul > li {
+  margin-bottom: 0.3rem;
+  font-size: 0.95rem;
+  color: var(--text-muted);
+}
+.toc > ul > li > a {
+  color: var(--text);
+  text-decoration: none;
+  font-weight: 500;
+}
+.toc > ul > li > a:hover {
+  color: var(--primary);
+}
+.toc ul ul {
+  list-style: none;
+  padding-left: 1rem;
+  margin: 0.15rem 0 0.25rem;
+}
+.toc ul ul li {
+  font-size: 0.875rem;
+  margin-bottom: 0.1rem;
+}
+.toc ul ul li a {
+  color: var(--text-muted);
+  text-decoration: none;
+}
+.toc ul ul li a:hover {
+  color: var(--primary);
+}

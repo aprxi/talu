@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Talu Console</title>
+  <link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+  <div class="app-layout" data-mode="chat">
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         TOPBAR - Brand + theme
+         ═══════════════════════════════════════════════════════════════════════ -->
+    <header class="topbar">
+      <a href="#" class="topbar-logo">TALU</a>
+      <span class="topbar-separator">/</span>
+      <span id="topbar-title" class="topbar-title" contenteditable="true" spellcheck="false"></span>
+      <div class="flex-1"></div>
+      <nav class="topbar-nav">
+        <!-- Dark/Light toggle -->
+        <div id="theme-selector" class="theme-selector">
+          <button class="theme-toggle-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme">
+            <svg class="theme-icon theme-icon-sun" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="5"></circle>
+              <line x1="12" y1="1" x2="12" y2="3"></line>
+              <line x1="12" y1="21" x2="12" y2="23"></line>
+              <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"></line>
+              <line x1="18.36" y1="18.36" x2="19.78" y2="19.78"></line>
+              <line x1="1" y1="12" x2="3" y2="12"></line>
+              <line x1="21" y1="12" x2="23" y2="12"></line>
+              <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"></line>
+              <line x1="18.36" y1="5.64" x2="19.78" y2="4.22"></line>
+            </svg>
+            <svg class="theme-icon theme-icon-moon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+            </svg>
+            </button>
+        </div>
+      </nav>
+    </header>
+
+    <!-- ═══════════════════════════════════════════════════════════════════════
+         MAIN AREA - Activity bar + content
+         ═══════════════════════════════════════════════════════════════════════ -->
+    <div class="app-main">
+      <!-- Activity bar (VS Code style) -->
+      <aside id="activity-bar" class="activity-bar">
+        <button class="activity-btn active" data-mode="chat" title="Chat">
+          <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+        </button>
+        <button class="activity-btn" data-mode="conversations" title="Conversations">
+          <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
+        </button>
+        <button class="activity-btn" data-mode="prompts" title="Prompts">
+          <svg xmlns="http://www.w3.org/2000/svg" width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>
+        </button>
+      </aside>
+
+      <!-- Content area -->
+      <div class="app-content">
+
+      <!-- ═══ CHAT MODE (chat plugin builds its own DOM) ═══ -->
+      <div id="chat-mode" class="mode-view"></div>
+
+      <!-- ═══ CONVERSATIONS MODE (browser plugin builds its own DOM) ═══ -->
+      <div id="conversations-mode" class="mode-view hidden"></div>
+
+      <!-- ═══ PROMPTS MODE (prompts plugin builds its own DOM) ═══ -->
+      <div id="prompts-mode" class="mode-view hidden"></div>
+
+      <!-- ═══ SETTINGS MODE (settings plugin builds its own DOM) ═══ -->
+      <div id="settings-mode" class="mode-view hidden"></div>
+
+      </div><!-- /app-content -->
+    </div><!-- /app-main -->
+
+    <!-- Status bar -->
+    <footer id="status-bar" class="status-bar" role="status" aria-label="Status bar"></footer>
+  </div><!-- /app-layout -->
+
+  <!-- Toast container -->
+  <div id="toast-container" class="toast-container" role="log" aria-live="polite" aria-label="Notifications"></div>
+
+  <!-- Pre-JS safe mode button — visible during loading, hidden after boot -->
+  <div id="safe-mode-fallback" style="position:fixed;bottom:1rem;right:1rem;z-index:9999;">
+    <a href="?safe=true" style="font-size:11px;color:#6c7086;text-decoration:underline;padding:0.25rem 0.5rem;background:rgba(0,0,0,0.5);border-radius:4px;">Safe mode</a>
+  </div>
+
+  <script src="/assets/main.js"></script>
+</body>
+</html>

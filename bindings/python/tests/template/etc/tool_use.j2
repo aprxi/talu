@@ -1,0 +1,14 @@
+You have access to the following tools:
+
+{% for tool in tools %}
+## {{ tool.name }}
+{{ tool.description }}
+Parameters: {{ tool.parameters | join(', ') }}
+
+{% endfor %}
+User request: {{ user_request }}
+
+To use a tool, respond with:
+<tool_call>
+{"name": "tool_name", "arguments": {...}}
+</tool_call>

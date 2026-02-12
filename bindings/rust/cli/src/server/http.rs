@@ -1,0 +1,499 @@
+use std::collections::HashSet;
+use std::convert::Infallible;
+use std::future::Future;
+use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::task::{Context, Poll};
+
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full};
+use hyper::body::Incoming;
+use hyper::{Method, Request, Response, StatusCode};
+use once_cell::sync::Lazy;
+use serde_json::Value;
+use tower_service::Service;
+
+use crate::server::auth_gateway::AuthContext;
+use crate::server::conversations;
+use crate::server::documents;
+use crate::server::handlers;
+use crate::server::plugins;
+use crate::server::proxy;
+use crate::server::search;
+use crate::server::settings;
+use crate::server::state::AppState;
+use crate::server::tags;
+
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+const OPENAPI_JSON: &[u8] = include_bytes!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/server/openapi.json"
+));
+
+// Console UI assets — only compiled in when `make ui` has been run.
+// build.rs sets cfg(bundled_ui) when ui/dist/ contains the required files.
+#[cfg(bundled_ui)]
+const CONSOLE_HTML: &[u8] = include_bytes!("../../../../../ui/dist/index.html");
+#[cfg(bundled_ui)]
+const CONSOLE_CSS: &[u8] = include_bytes!("../../../../../ui/dist/style.css");
+#[cfg(bundled_ui)]
+const CONSOLE_JS: &[u8] = include_bytes!("../../../../../ui/dist/main.js");
+
+static KNOWN_PATHS: Lazy<HashSet<String>> = Lazy::new(|| {
+    let mut paths = HashSet::new();
+    let parsed: Value = serde_json::from_slice(OPENAPI_JSON).unwrap_or(Value::Null);
+    if let Some(obj) = parsed.get("paths").and_then(|val| val.as_object()) {
+        for key in obj.keys() {
+            paths.insert(key.to_string());
+        }
+    }
+    paths
+});
+
+#[derive(Clone)]
+pub struct Router {
+    state: Arc<AppState>,
+}
+
+impl Router {
+    pub fn new(state: Arc<AppState>) -> Self {
+        Self { state }
+    }
+}
+
+impl Service<Request<Incoming>> for Router {
+    type Response = Response<BoxBody>;
+    type Error = Infallible;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Incoming>) -> Self::Future {
+        let state = self.state.clone();
+        Box::pin(async move {
+            let method = req.method().clone();
+            let method_log = method.clone();
+            let path = req.uri().path().to_string();
+            let path_log = path.clone();
+
+            log::info!("{} {}", method, path);
+
+            // Auth-exempt routes.
+            let response = match (method.clone(), path.as_str()) {
+                (Method::GET, "/health") => {
+                    Response::new(Full::new(Bytes::from_static(b"ok")).boxed())
+                }
+                (Method::GET, "/openapi.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from_static(OPENAPI_JSON)).boxed())
+                    .unwrap(),
+                // Console UI (auth-exempt)
+                (Method::GET, "/") => {
+                    let mut resp = serve_ui_asset(&state, "index.html", "text/html; charset=utf-8");
+                    if resp.status() == StatusCode::OK {
+                        resp.headers_mut().insert(
+                            "content-security-policy",
+                            hyper::header::HeaderValue::from_static(
+                                "default-src 'self'; \
+                                 script-src 'self' 'unsafe-inline'; \
+                                 style-src 'self' 'unsafe-inline'; \
+                                 connect-src 'self'; \
+                                 img-src 'self' data: blob:; \
+                                 font-src 'self'; \
+                                 media-src 'self' blob:; \
+                                 object-src 'none'; \
+                                 frame-src 'none'",
+                            ),
+                        );
+                        resp.headers_mut().insert(
+                            "referrer-policy",
+                            hyper::header::HeaderValue::from_static("no-referrer"),
+                        );
+                    }
+                    resp
+                }
+                (Method::GET, "/assets/style.css") => {
+                    serve_ui_asset(&state, "style.css", "text/css")
+                }
+                (Method::GET, "/assets/main.js") => {
+                    serve_ui_asset(&state, "main.js", "application/javascript")
+                }
+                // Plugin assets (auth-exempt — JS loads before auth context exists)
+                (Method::GET, p)
+                    if (p.starts_with("/v1/plugins/") || p.starts_with("/plugins/"))
+                        && p.matches('/').count() >= 3 =>
+                {
+                    plugins::handle_asset(state, req, None).await
+                }
+                _ => {
+                    // Authenticate all other routes.
+                    let auth = match authenticate(&state, req.headers()) {
+                        Ok(ctx) => ctx,
+                        Err(resp) => {
+                            let status = resp.status();
+                            if status.is_client_error() {
+                                log::warn!("{} {} -> {}", method_log, path_log, status);
+                            }
+                            return Ok(resp);
+                        }
+                    };
+
+                    // Resolve plugin Bearer token for document/proxy routes.
+                    let plugin_owner = plugins::resolve_bearer_token(&state, req.headers()).await;
+
+                    match (method, path.as_str()) {
+                        (Method::GET, "/v1/models") | (Method::GET, "/models") => {
+                            handlers::handle_models(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/responses") | (Method::POST, "/responses") => {
+                            handlers::handle_responses(state, req, auth).await
+                        }
+                        // Settings endpoints
+                        (Method::GET, "/v1/settings") | (Method::GET, "/settings") => {
+                            settings::handle_get(state, req, auth).await
+                        }
+                        (Method::PATCH, "/v1/settings") | (Method::PATCH, "/settings") => {
+                            settings::handle_patch(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/settings/models/")
+                                || p.starts_with("/settings/models/") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/settings/models/"
+                            } else {
+                                "/settings/models/"
+                            };
+                            let model_id = &p[prefix.len()..];
+                            settings::handle_reset_model(state, req, auth, model_id).await
+                        }
+                        // Conversation management endpoints
+                        (Method::GET, "/v1/conversations") | (Method::GET, "/conversations") => {
+                            conversations::handle_list(state, req, auth).await
+                        }
+                        // Batch operations (must be before single-conversation routes)
+                        (Method::POST, "/v1/conversations/batch")
+                        | (Method::POST, "/conversations/batch") => {
+                            conversations::handle_batch(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/conversations/")
+                                || p.starts_with("/conversations/"))
+                                && !p.ends_with("/fork") =>
+                        {
+                            conversations::handle_get(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if (p.starts_with("/v1/conversations/")
+                                || p.starts_with("/conversations/"))
+                                && !p.ends_with("/tags") =>
+                        {
+                            conversations::handle_delete(state, req, auth).await
+                        }
+                        (Method::PATCH, p)
+                            if p.starts_with("/v1/conversations/")
+                                || p.starts_with("/conversations/") =>
+                        {
+                            conversations::handle_patch(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.ends_with("/fork")
+                                && (p.starts_with("/v1/conversations/")
+                                    || p.starts_with("/conversations/")) =>
+                        {
+                            conversations::handle_fork(state, req, auth).await
+                        }
+                        // Search endpoint
+                        (Method::POST, "/v1/search") | (Method::POST, "/search") => {
+                            search::handle_search(state, req, auth).await
+                        }
+                        // Tag management endpoints
+                        (Method::GET, "/v1/tags") | (Method::GET, "/tags") => {
+                            tags::handle_list(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/tags") | (Method::POST, "/tags") => {
+                            tags::handle_create(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/tags/") || p.starts_with("/tags/") =>
+                        {
+                            tags::handle_get(state, req, auth).await
+                        }
+                        (Method::PATCH, p)
+                            if p.starts_with("/v1/tags/") || p.starts_with("/tags/") =>
+                        {
+                            tags::handle_patch(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/tags/") || p.starts_with("/tags/") =>
+                        {
+                            tags::handle_delete(state, req, auth).await
+                        }
+                        // Conversation tag endpoints
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/conversations/")
+                                || p.starts_with("/conversations/"))
+                                && p.ends_with("/tags") =>
+                        {
+                            conversations::handle_get_tags(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if (p.starts_with("/v1/conversations/")
+                                || p.starts_with("/conversations/"))
+                                && p.ends_with("/tags") =>
+                        {
+                            conversations::handle_add_tags(state, req, auth).await
+                        }
+                        (Method::PUT, p)
+                            if (p.starts_with("/v1/conversations/")
+                                || p.starts_with("/conversations/"))
+                                && p.ends_with("/tags") =>
+                        {
+                            conversations::handle_set_tags(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if (p.starts_with("/v1/conversations/")
+                                || p.starts_with("/conversations/"))
+                                && p.ends_with("/tags") =>
+                        {
+                            conversations::handle_remove_tags(state, req, auth).await
+                        }
+                        // Document management endpoints
+                        (Method::GET, "/v1/documents") | (Method::GET, "/documents") => {
+                            documents::handle_list(state, req, auth, plugin_owner).await
+                        }
+                        (Method::POST, "/v1/documents") | (Method::POST, "/documents") => {
+                            documents::handle_create(state, req, auth, plugin_owner).await
+                        }
+                        (Method::POST, "/v1/documents/search")
+                        | (Method::POST, "/documents/search") => {
+                            documents::handle_search(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/documents/")
+                                || p.starts_with("/documents/"))
+                                && !p.ends_with("/tags") =>
+                        {
+                            documents::handle_get(state, req, auth).await
+                        }
+                        (Method::PATCH, p)
+                            if (p.starts_with("/v1/documents/")
+                                || p.starts_with("/documents/"))
+                                && !p.ends_with("/tags") =>
+                        {
+                            documents::handle_update(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if (p.starts_with("/v1/documents/")
+                                || p.starts_with("/documents/"))
+                                && !p.ends_with("/tags") =>
+                        {
+                            documents::handle_delete(state, req, auth).await
+                        }
+                        // Document tag endpoints
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/documents/")
+                                || p.starts_with("/documents/"))
+                                && p.ends_with("/tags") =>
+                        {
+                            documents::handle_get_tags(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if (p.starts_with("/v1/documents/")
+                                || p.starts_with("/documents/"))
+                                && p.ends_with("/tags") =>
+                        {
+                            documents::handle_add_tags(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if (p.starts_with("/v1/documents/")
+                                || p.starts_with("/documents/"))
+                                && p.ends_with("/tags") =>
+                        {
+                            documents::handle_remove_tags(state, req, auth).await
+                        }
+                        // Plugin discovery
+                        (Method::GET, "/v1/plugins") | (Method::GET, "/plugins") => {
+                            plugins::handle_list(state, req, auth).await
+                        }
+                        // Proxy endpoint (plugin outbound HTTP)
+                        (Method::POST, "/v1/proxy") | (Method::POST, "/proxy") => {
+                            proxy::handle_proxy(state, req, auth).await
+                        }
+                        _ => {
+                            if is_known_path(&path) {
+                                log::warn!("unimplemented endpoint: {} {}", method_log, path_log);
+                                json_error(
+                                    StatusCode::NOT_IMPLEMENTED,
+                                    "not_implemented",
+                                    "Not implemented",
+                                )
+                            } else {
+                                Response::builder()
+                                    .status(StatusCode::NOT_FOUND)
+                                    .body(Full::new(Bytes::from_static(b"not found")).boxed())
+                                    .unwrap()
+                            }
+                        }
+                    }
+                }
+            };
+
+            let status = response.status();
+            if status.is_client_error() {
+                log::warn!("{} {} -> {}", method_log, path_log, status);
+            } else if status.is_server_error() {
+                log::error!("{} {} -> {}", method_log, path_log, status);
+            }
+
+            Ok(response)
+        })
+    }
+}
+
+/// Authenticate the request using gateway auth (if configured).
+///
+/// Returns `Ok(None)` when gateway auth is not enabled (no secret configured).
+/// Returns `Ok(Some(ctx))` on successful authentication.
+/// Returns `Err(response)` on auth failure.
+fn authenticate(
+    state: &AppState,
+    headers: &hyper::HeaderMap,
+) -> Result<Option<AuthContext>, Response<BoxBody>> {
+    use crate::server::auth_gateway::{self, AuthError};
+
+    let secret = match state.gateway_secret.as_deref() {
+        Some(secret) => secret,
+        None => return Ok(None),
+    };
+    let registry = match state.tenant_registry.as_ref() {
+        Some(registry) => registry,
+        None => {
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "server_error",
+                "Gateway auth enabled but tenant registry is missing",
+            ))
+        }
+    };
+
+    match auth_gateway::validate_request(headers, secret, registry) {
+        Ok(ctx) => Ok(Some(ctx)),
+        Err(AuthError::MissingSecret) => Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Missing gateway secret",
+        )),
+        Err(AuthError::InvalidSecret) => Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "unauthorized",
+            "Invalid gateway secret",
+        )),
+        Err(AuthError::MissingTenant) => Err(json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Missing tenant id",
+        )),
+        Err(AuthError::UnknownTenant) => Err(json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "Unknown tenant id",
+        )),
+    }
+}
+
+fn is_known_path(path: &str) -> bool {
+    if KNOWN_PATHS.contains(path) {
+        return true;
+    }
+    if let Some(stripped) = path.strip_prefix("/v1") {
+        return KNOWN_PATHS.contains(stripped);
+    }
+    false
+}
+
+/// Serve a console UI asset.
+///
+/// Resolution order:
+/// 1. `--html-dir <dir>` → read `<dir>/<filename>` from disk
+/// 2. Bundled assets (when built with `make ui` / `cfg(bundled_ui)`)
+/// 3. 404 with a helpful message
+fn serve_ui_asset(state: &AppState, filename: &str, content_type: &str) -> Response<BoxBody> {
+    // --html-dir takes precedence over bundled assets.
+    if let Some(ref dir) = state.html_dir {
+        return serve_file(dir, filename, content_type);
+    }
+
+    // Fall back to bundled assets (compiled in when ui/dist/ exists).
+    #[cfg(bundled_ui)]
+    {
+        if let Some(data) = bundled_asset(filename) {
+            return static_response(content_type, data);
+        }
+    }
+
+    json_error(
+        StatusCode::NOT_FOUND,
+        "ui_not_available",
+        "No UI bundled. Run 'make ui' or use --html-dir",
+    )
+}
+
+/// Return bundled asset bytes by filename.
+#[cfg(bundled_ui)]
+fn bundled_asset(filename: &str) -> Option<&'static [u8]> {
+    match filename {
+        "index.html" => Some(CONSOLE_HTML),
+        "style.css" => Some(CONSOLE_CSS),
+        "main.js" => Some(CONSOLE_JS),
+        _ => None,
+    }
+}
+
+/// Serve a file from a directory on disk.
+fn serve_file(dir: &Path, filename: &str, content_type: &str) -> Response<BoxBody> {
+    let path = dir.join(filename);
+    match std::fs::read(&path) {
+        Ok(data) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", content_type)
+            .header("referrer-policy", "no-referrer")
+            .body(Full::new(Bytes::from(data)).boxed())
+            .unwrap(),
+        Err(_) => json_error(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            &format!("Asset not found: {}", filename),
+        ),
+    }
+}
+
+#[cfg(bundled_ui)]
+fn static_response(content_type: &str, body: &'static [u8]) -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", content_type)
+        .header("referrer-policy", "no-referrer")
+        .body(Full::new(Bytes::from_static(body)).boxed())
+        .unwrap()
+}
+
+fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody> {
+    let payload = serde_json::json!({
+        "error": {
+            "code": code,
+            "message": message
+        }
+    });
+    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap()
+}

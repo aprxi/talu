@@ -1,0 +1,315 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'python'
+        type: choice
+        options:
+          - python
+          - binary
+
+permissions:
+  contents: write
+
+env:
+  NAME: talu
+
+jobs:
+  prebuild:
+    runs-on: ubuntu-latest
+    outputs:
+      version_python: ${{ steps.get_version.outputs.version_python }}
+      version_semver: ${{ steps.get_version.outputs.version_semver }}
+      release_tag: ${{ steps.get_version.outputs.release_tag }}
+      release_type: ${{ steps.set_release_type.outputs.release_type }}
+      is_versioned_release: ${{ steps.get_version.outputs.is_versioned_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Need full history to check tags
+
+      - name: Get version from VERSION or generate dev version
+        id: get_version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          FILE_VERSION=$(cat VERSION)
+          RELEASE_TAG="v$FILE_VERSION"
+
+          # Check if GitHub release exists (not just tag)
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            # Release exists - generate post-release version
+            TIMESTAMP=$(date +"%Y%m%d%H%M")
+            # Python (PEP 440): 0.0.3.post202601211430
+            # Rust/Zig (SemVer): 0.0.3-post.202601211430
+            echo "Release $RELEASE_TAG already exists - using post version with timestamp: $TIMESTAMP"
+            echo "version_python=${FILE_VERSION}.post${TIMESTAMP}" >> $GITHUB_OUTPUT
+            echo "version_semver=${FILE_VERSION}-post.${TIMESTAMP}" >> $GITHUB_OUTPUT
+            echo "release_tag=v${FILE_VERSION}-post.${TIMESTAMP}" >> $GITHUB_OUTPUT
+            echo "is_versioned_release=false" >> $GITHUB_OUTPUT
+          else
+            # New version - use VERSION file
+            echo "Release $RELEASE_TAG does not exist - creating versioned release"
+            echo "version_python=$FILE_VERSION" >> $GITHUB_OUTPUT
+            echo "version_semver=$FILE_VERSION" >> $GITHUB_OUTPUT
+            echo "release_tag=$RELEASE_TAG" >> $GITHUB_OUTPUT
+            echo "is_versioned_release=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Set release type
+        id: set_release_type
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "release_type=${{ github.event.inputs.release_type }}" >> $GITHUB_OUTPUT
+          else
+            echo "release_type=python" >> $GITHUB_OUTPUT
+          fi
+
+  build:
+    needs: prebuild
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-linux
+            os: ubuntu-latest
+            zig_arch: x86_64-linux
+            python_platform: manylinux_2_17_x86_64
+          # - target: x86_64-macos
+          #   os: macos-13
+          #   zig_arch: x86_64-macos
+          #   python_platform: macosx_10_9_x86_64
+          - target: aarch64-macos
+            os: macos-latest
+            zig_arch: aarch64-macos
+            python_platform: macosx_11_0_arm64
+    env:
+      TARGET: ${{ matrix.target }}
+      OS: ${{ matrix.os }}
+      RELEASE_TYPE: ${{ needs.prebuild.outputs.release_type }}
+      VERSION_PYTHON: ${{ needs.prebuild.outputs.version_python }}
+      VERSION_SEMVER: ${{ needs.prebuild.outputs.version_semver }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Zig
+        run: |
+          ZIG_VERSION="0.15.2"
+          ZIG_ARCH="${{ matrix.zig_arch }}"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/zig-${ZIG_ARCH}-${ZIG_VERSION}.tar.xz" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/zig-${ZIG_ARCH}-${ZIG_VERSION}" >> $GITHUB_PATH
+
+      - name: Install dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -qq cmake bc unzip
+          RUST_VERSION="1.92.0"
+          curl -fsSL "https://static.rust-lang.org/dist/rust-${RUST_VERSION}-x86_64-unknown-linux-gnu.tar.xz" \
+            | sudo tar -xJ -C /opt
+          sudo ln -s "/opt/rust-${RUST_VERSION}-x86_64-unknown-linux-gnu/bin/cargo" /usr/local/bin/cargo
+          sudo ln -s "/opt/rust-${RUST_VERSION}-x86_64-unknown-linux-gnu/bin/rustc" /usr/local/bin/rustc
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake
+          RUST_VERSION="1.92.0"
+          # Determine Rust target based on runner architecture
+          if [ "$(uname -m)" = "arm64" ]; then
+            RUST_TARGET="aarch64-apple-darwin"
+          else
+            RUST_TARGET="x86_64-apple-darwin"
+          fi
+          curl -fsSL "https://static.rust-lang.org/dist/rust-${RUST_VERSION}-${RUST_TARGET}.tar.xz" \
+            | tar -xJ -C /tmp
+          sudo /tmp/rust-${RUST_VERSION}-${RUST_TARGET}/install.sh --prefix=/usr/local --disable-ldconfig
+
+      - name: Install bun
+        uses: oven-sh/setup-bun@v2
+
+      - name: Build UI
+        run: make ui
+
+      # Python wheel build
+      - name: Install uv
+        if: env.RELEASE_TYPE == 'python'
+        uses: astral-sh/setup-uv@v4
+
+      - name: Build Python packages
+        if: env.RELEASE_TYPE == 'python'
+        run: |
+          echo "Building Python with version: $VERSION_PYTHON"
+          echo "Building Rust/Zig with version: $VERSION_SEMVER"
+
+          # Generate Python ctypes bindings from Zig C API
+          zig build gen-bindings
+
+          # Sync version to Python _version.py (PEP 440 format)
+          cat > bindings/python/talu/_version.py << EOF
+          """Version is set at build time."""
+          __version__ = "$VERSION_PYTHON"
+          EOF
+
+          # Sync version to Rust Cargo.toml (use temp file for cross-platform compatibility)
+          sed "s/^version = \"0.0.0\"/version = \"$VERSION_SEMVER\"/" bindings/rust/Cargo.toml > bindings/rust/Cargo.toml.tmp
+          mv bindings/rust/Cargo.toml.tmp bindings/rust/Cargo.toml
+
+          # Update VERSION file for Zig CLI (SemVer format)
+          echo "$VERSION_SEMVER" > VERSION
+
+          # Prepare vendor/talu with source files for sdist
+          mkdir -p bindings/python/vendor/talu/bindings
+          cp -r core build.zig VERSION Makefile bindings/python/vendor/talu/
+          cp -r bindings/rust bindings/python/vendor/talu/bindings/
+          mkdir -p bindings/python/vendor/talu/tools/archs
+          cp -r tools/archs/_graphs bindings/python/vendor/talu/tools/archs/
+          # Include pre-built UI assets so wheel build bundles the console UI
+          mkdir -p bindings/python/vendor/talu/ui
+          cp -r ui/dist bindings/python/vendor/talu/ui/
+
+          # Update vendor VERSION files with correct formats
+          # VERSION (SemVer) - used by Zig build.zig
+          # VERSION_PYTHON (PEP 440) - used by Python build hook
+          echo "$VERSION_SEMVER" > bindings/python/vendor/talu/VERSION
+          echo "$VERSION_PYTHON" > bindings/python/vendor/talu/VERSION_PYTHON
+          mkdir -p bindings/python/vendor/talu/bindings/rust/vendor
+          echo "$VERSION_SEMVER" > bindings/python/vendor/talu/bindings/rust/vendor/VERSION
+
+          # Build sdist (packages source in vendor/talu, no compile)
+          cd bindings/python
+          rm -f talu/libtalu.so
+          uv build --sdist --out-dir dist
+
+          # Build wheel FROM sdist (does make cli via build hook)
+          mkdir -p /tmp/sdist-build
+          cp dist/*.tar.gz /tmp/sdist-build/
+          cd /tmp/sdist-build
+          tar -xzf *.tar.gz
+          cd talu-*/
+          uv build --wheel --out-dir dist
+
+          # Copy wheel back, keep both sdist and wheel
+          cp dist/*.whl $GITHUB_WORKSPACE/bindings/python/dist/
+
+          # Verify wheel contains CLI binary in scripts
+          echo "Verifying wheel contents..."
+          unzip -l $GITHUB_WORKSPACE/bindings/python/dist/*.whl | grep -E "scripts|\.data"
+
+          ls -la $GITHUB_WORKSPACE/bindings/python/dist/
+
+      - name: Rename wheel with platform tag
+        if: env.RELEASE_TYPE == 'python'
+        run: |
+          cd bindings/python/dist
+          # Rename the wheel to include proper platform tag
+          for whl in *.whl; do
+            # Replace py3-none-any with py3-none-<platform>
+            newname=$(echo "$whl" | sed "s/py3-none-any/py3-none-${{ matrix.python_platform }}/")
+            if [ "$whl" != "$newname" ]; then
+              mv "$whl" "$newname"
+            fi
+          done
+          ls -la
+
+      - name: Archive Python artifacts
+        if: env.RELEASE_TYPE == 'python'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-python-${{ matrix.target }}
+          path: bindings/python/dist/*
+
+      # Binary build
+      - name: Build native binary
+        if: env.RELEASE_TYPE == 'binary'
+        run: |
+          make build
+          strip zig-out/bin/talu
+          # Verify binary is statically linked (no libtalu.so/dylib dependency)
+          echo "Checking binary dependencies..."
+          if [ "$(uname)" = "Darwin" ]; then
+            otool -L zig-out/bin/talu
+          else
+            ldd zig-out/bin/talu
+          fi
+          ls -lh zig-out/bin/
+
+      - name: Package binary
+        if: env.RELEASE_TYPE == 'binary'
+        run: |
+          [ -e ./build ] && rm -rf ./build
+          [ -e ./artifacts ] && rm -rf ./artifacts
+          mkdir -p ./artifacts ./build/bin
+          TAG=${{ needs.prebuild.outputs.release_tag }}
+          cp zig-out/bin/$NAME ./build/bin/$NAME
+          # Copy mlx.metallib next to binary for macOS Metal support
+          if [ "$(uname)" = "Darwin" ]; then
+            METALLIB="deps/mlx-src/build/mlx/backend/metal/kernels/mlx.metallib"
+            if [ -f "$METALLIB" ]; then
+              cp "$METALLIB" ./build/bin/
+              echo "Copied mlx.metallib ($(du -h "$METALLIB" | cut -f1))"
+            else
+              echo "Warning: mlx.metallib not found at $METALLIB"
+            fi
+          fi
+          OUTFILE=./artifacts/${NAME}-${TARGET}-${TAG}.tar.gz
+          tar -czf $OUTFILE -C ./build .
+          shasum -a 256 $OUTFILE > $OUTFILE.sha256
+
+      - name: Archive binary artifacts
+        if: env.RELEASE_TYPE == 'binary'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-binary-${{ matrix.target }}
+          path: ./artifacts
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: [prebuild, build]
+    env:
+      RELEASE_TYPE: ${{ needs.prebuild.outputs.release_type }}
+      IS_VERSIONED: ${{ needs.prebuild.outputs.is_versioned_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ./artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: find ./artifacts
+
+      - name: Create git tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag ${{ needs.prebuild.outputs.release_tag }}
+          git push origin ${{ needs.prebuild.outputs.release_tag }}
+
+      - name: Release to GitHub
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          files: |
+            ./artifacts/**/*
+          tag_name: ${{ needs.prebuild.outputs.release_tag }}
+          name: ${{ needs.prebuild.outputs.release_tag }}
+          prerelease: ${{ env.IS_VERSIONED != 'true' }}
+          body: |
+            ${{ env.IS_VERSIONED == 'true' && format('Release {0}
+
+            To publish to PyPI, run the "Publish to PyPI" workflow manually with tag `{0}`.', needs.prebuild.outputs.release_tag) || format('Dev build from {0}', github.sha) }}

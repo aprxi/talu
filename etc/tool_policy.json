@@ -1,0 +1,9 @@
+{
+  "default": "deny",
+  "mode": "enforce",
+  "statements": [
+    {"effect": "allow", "action": "ls *"},
+    {"effect": "allow", "action": "git show *"},
+    {"effect": "deny",  "action": "git push *"}
+  ]
+}

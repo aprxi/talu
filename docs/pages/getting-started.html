@@ -1,0 +1,229 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Getting Started - talu</title>
+</head>
+<body>
+  <aside class="sidebar">
+    <header class="sidebar-header">
+      <a href="index.html" class="logo"><span class="logo-t">▀█▀</span><span class="logo-name">talu</span></a>
+    </header>
+    <nav><ul></ul></nav>
+  </aside>
+  <main class="content">
+    <article class="markdown-body">
+      <h1>Getting Started</h1>
+      <p class="tagline">High-performance LLM inference with zero dependencies</p>
+
+      <section class="install-section">
+        <div class="install-header">
+          <h2>Install</h2>
+        </div>
+
+        <div class="platform-tabs">
+          <button class="platform-tab active" data-platform="mac">macOS</button>
+          <button class="platform-tab" data-platform="linux">Linux</button>
+        </div>
+
+        <div class="install-box">
+          <div class="install-command">
+            <span class="prompt">$</span>
+            <span class="command-text" id="install-command">pip install talu</span>
+            <div class="pkg-toggle">
+              <button class="active" data-pkg="pip">pip</button>
+              <button data-pkg="uv">uv</button>
+            </div>
+            <button class="copy-btn" title="Copy">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <p class="install-alt">
+          Python 3.10+
+          · <a href="https://pypi.org/project/talu/">PyPI</a>
+          · <a href="https://github.com/aprxi/talu/releases">Releases</a>
+          · <a href="install.html">Build from source</a>
+        </p>
+      </section>
+
+      <h2>Quick Examples</h2>
+      <p class="text-muted muted-intro">
+        From the command line. <a href="cli.html">CLI Guide →</a>
+      </p>
+
+      <p>Download a model and ask it a question.</p>
+
+      <div class="code-block">
+        <div class="cmd-body">
+          <div class="cmd-lines">
+            <div class="cmd-line"><span class="prompt">$</span> <span class="command-text">talu get LiquidAI/LFM2-350M</span></div>
+            <div class="cmd-line"><span class="prompt">$</span> <span class="command-text">talu ask -m LiquidAI/LFM2-350M "What is 2+2?"</span></div>
+          </div>
+          <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+        </div>
+      </div>
+
+      <p>Set a default model, then use it without <code>-m</code>.</p>
+
+      <div class="code-block">
+        <div class="cmd-body">
+          <div class="cmd-lines">
+            <div class="cmd-line"><span class="prompt">$</span> <span class="command-text">talu set LiquidAI/LFM2-350M</span></div>
+            <div class="cmd-line"><span class="prompt">$</span> <span class="command-text">talu ask "Tell me a joke"</span></div>
+          </div>
+          <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+        </div>
+      </div>
+
+      <p>Quantize a model to 4-bit for faster inference.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu convert -m LiquidAI/LFM2-350M --scheme gaf4_32</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <h2>Python</h2>
+      <p class="text-muted muted-intro">
+        Same models, from Python. <a href="examples/python.html">Python Examples →</a>
+      </p>
+
+      <p>Chat.</p>
+
+      <div class="code-block">
+        <div class="code-body">
+<pre><code><span class="kw">from</span> talu <span class="kw">import</span> Chat
+
+chat = Chat(<span class="str">"LiquidAI/LFM2-350M"</span>)
+response = chat(<span class="str">"What is the capital of France?"</span>)
+print(response)</code></pre>
+        </div>
+        <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+      </div>
+
+      <p>Multi-turn conversation.</p>
+
+      <div class="code-block">
+        <div class="code-body">
+<pre><code><span class="kw">from</span> talu <span class="kw">import</span> Chat
+
+chat = Chat(<span class="str">"LiquidAI/LFM2-350M"</span>, system=<span class="str">"Be concise."</span>)
+response = chat(<span class="str">"What is the largest planet?"</span>)
+response = response.append(<span class="str">"How far is it from the Sun?"</span>)
+print(response)</code></pre>
+        </div>
+        <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button>
+      </div>
+
+      <h2>Supported Models</h2>
+      <p>Models are downloaded from HuggingFace on first use. The models below have been verified. Other sizes and variants based on the same architecture are expected to work as well. This list is updated as coverage expands.</p>
+
+      <h3>Qwen</h3>
+      <ul>
+        <li><code>Qwen/Qwen3-0.6B</code></li>
+        <li><code>Qwen/Qwen3-1.7B</code></li>
+        <li><code>Qwen/Qwen3-4B</code></li>
+      </ul>
+
+      <h3>LLaMA</h3>
+      <ul>
+        <li><code>meta-llama/Llama-3.2-1B</code></li>
+        <li><code>meta-llama/Llama-3.2-1B-Instruct</code></li>
+      </ul>
+
+      <h3>Mistral</h3>
+      <ul>
+        <li><code>mistralai/Ministral-3B-Instruct</code></li>
+      </ul>
+
+      <h3>Gemma</h3>
+      <ul>
+        <li><code>google/gemma-3-270m-it</code></li>
+        <li><code>google/gemma-3-1b-it</code></li>
+      </ul>
+
+      <h3>Phi</h3>
+      <ul>
+        <li><code>microsoft/Phi-3-mini-128k-instruct</code></li>
+        <li><code>microsoft/Phi-3.5-mini-instruct</code></li>
+        <li><code>microsoft/Phi-4-mini-instruct</code></li>
+        <li><code>microsoft/Phi-4-mini-reasoning</code></li>
+      </ul>
+
+      <h3>Granite</h3>
+      <ul>
+        <li><code>ibm-granite/granite-4.0-h-350m</code></li>
+        <li><code>ibm-granite/granite-4.0-micro</code></li>
+      </ul>
+
+      <h3>LFM</h3>
+      <ul>
+        <li><code>LiquidAI/LFM2-350M</code></li>
+        <li><code>LiquidAI/LFM2-1.2B</code></li>
+        <li><code>LiquidAI/LFM2-2.6B</code></li>
+        <li><code>LiquidAI/LFM2.5-1.2B-Instruct</code></li>
+        <li><code>LiquidAI/LFM2.5-1.2B-Thinking</code></li>
+      </ul>
+    </article>
+  </main>
+
+  <script>
+    document.querySelectorAll('.platform-tabs').forEach(function(tabBar) {
+      var tabs = tabBar.querySelectorAll('.platform-tab');
+      tabs.forEach(function(tab) {
+        tab.addEventListener('click', function() {
+          if (tab.classList.contains('disabled')) return;
+          tabs.forEach(function(t) { t.classList.remove('active'); });
+          tab.classList.add('active');
+          var target = tab.dataset.target;
+          if (target) {
+            Array.from(tabs).forEach(function(t) {
+              var id = t.dataset.target;
+              if (id) { var el = document.getElementById(id); if (el) el.classList.remove('active'); }
+            });
+            var panel = document.getElementById(target);
+            if (panel) panel.classList.add('active');
+          }
+        });
+      });
+    });
+
+    var pkgBtns = document.querySelectorAll('.pkg-toggle button');
+    var installCmd = document.getElementById('install-command');
+    var currentPkg = 'pip';
+    pkgBtns.forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        pkgBtns.forEach(function(b) { b.classList.remove('active'); });
+        btn.classList.add('active');
+        currentPkg = btn.dataset.pkg;
+        installCmd.textContent = currentPkg === 'uv' ? 'uv pip install talu' : 'pip install talu';
+      });
+    });
+
+    document.querySelectorAll('.copy-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var text = '';
+        var cmdBody = btn.closest('.cmd-body');
+        var codeBlock = btn.closest('.code-block');
+        var installCmd = btn.closest('.install-command');
+        var guideHeader = btn.closest('.guide-header');
+        if (installCmd) {
+          text = installCmd.querySelector('.command-text').textContent;
+        } else if (cmdBody) {
+          var cmds = cmdBody.querySelectorAll('.command-text');
+          text = Array.from(cmds).map(function(c) { return c.textContent; }).join('\n');
+        } else if (codeBlock) {
+          text = codeBlock.querySelector('pre').textContent;
+        } else if (guideHeader) {
+          var lines = guideHeader.nextElementSibling.querySelectorAll('.cmd');
+          text = Array.from(lines).map(function(l) { return l.textContent.trim(); }).join('\n');
+        }
+        if (text) navigator.clipboard.writeText(text).then(function() { showCopied(btn); });
+      });
+    });
+  </script>
+</body>
+</html>

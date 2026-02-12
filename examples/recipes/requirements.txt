@@ -1,0 +1,6 @@
+fastapi
+uvicorn
+sse-starlette
+rich
+prompt_toolkit
+aiofiles

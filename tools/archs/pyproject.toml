@@ -1,0 +1,11 @@
+[project]
+name = "talu-models"
+version = "0.0.1"
+description = "PyTorch model definitions for talu graph generation"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0.0",
+    "transformers>=4.40.0",
+    "accelerate>=0.30.0",
+    "safetensors>=0.4.0",
+]

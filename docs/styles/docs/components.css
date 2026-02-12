@@ -1,0 +1,309 @@
+/* =============================================================================
+   Docs Components (docs-specific)
+   Tables, API reference, theme selector overrides
+   ============================================================================= */
+
+/* Tables — shared markdown.css provides .markdown-body table base styles.
+   Docs-specific table overrides (td color) are in docs/typography.css. */
+
+/* =============================================================================
+   Dark/Light Mode Toggle
+   ============================================================================= */
+
+.mode-toggle {
+  background: none;
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.3rem 0.4rem;
+  cursor: pointer;
+  color: var(--text-muted);
+  display: flex;
+  align-items: center;
+  transition: color 0.15s, border-color 0.15s;
+}
+
+.mode-toggle:hover {
+  color: var(--primary);
+  border-color: var(--primary);
+}
+
+/* Show sun in dark mode, moon in light mode */
+#mode-icon-moon { display: none; }
+:root[class*="light-"] #mode-icon-sun { display: none; }
+:root[class*="light-"] #mode-icon-moon { display: block; }
+
+/* =============================================================================
+   API Reference Block
+   ============================================================================= */
+
+.api-ref {
+  margin: 1rem 0;
+  padding: 0;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.5;
+}
+
+.api-sig {
+  color: var(--text);
+  white-space: pre;
+  background: var(--bg-code);
+  padding: 0.5rem 0.75rem;
+  border-left: 3px solid var(--accent);
+  display: block;
+  overflow-x: auto;
+}
+
+.api-sig .api-keyword {
+  color: var(--syntax-keyword);
+  font-weight: 500;
+}
+
+.api-sig .api-name {
+  color: var(--syntax-function);
+  font-weight: 600;
+}
+
+.api-sig .api-param {
+  color: var(--text);
+}
+
+.api-sig .api-type {
+  color: var(--syntax-keyword);
+}
+
+.api-type-link {
+  color: var(--secondary);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+.api-type-link:hover {
+  text-decoration-style: solid;
+}
+
+.api-sig .api-default {
+  color: var(--text-muted);
+}
+
+.api-sig .api-comment {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+
+.api-more {
+  cursor: pointer;
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  position: relative;
+}
+
+.api-more:focus {
+  outline: none;
+}
+
+.api-more:focus::after {
+  content: attr(title);
+  position: absolute;
+  left: 0;
+  top: 1.4em;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0.35rem 0.5rem;
+  color: var(--text);
+  white-space: normal;
+  width: max-content;
+  max-width: 35ch;
+  z-index: 100;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.api-sig .api-ret {
+  color: var(--text-muted);
+}
+
+.api-sig .api-ret .api-type {
+  color: var(--syntax-keyword);
+}
+
+.api-desc {
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+  font-family: var(--font-sans);
+  margin: 0.5rem 0 0 0;
+  padding-left: 0.75rem;
+  border-left: 1px solid var(--border);
+}
+
+.api-desc .api-quotes {
+  display: none;
+}
+
+.api-desc p {
+  margin: 0 0 0.35rem 0;
+}
+
+.api-returns {
+  color: var(--text-muted);
+  font-size: 0.8125rem;
+  margin-top: 0.25rem;
+  padding-left: 0.75rem;
+}
+
+.api-returns .api-type {
+  color: var(--syntax-keyword);
+}
+
+.api-returns .api-type a {
+  color: var(--secondary);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+}
+
+/* =============================================================================
+   Auto-linked Symbols in Code Blocks
+   ============================================================================= */
+
+.highlight a.api-link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.highlight a.api-link:hover {
+  text-decoration: underline dotted;
+  text-underline-offset: 2px;
+}
+
+/* =============================================================================
+   Search
+   ============================================================================= */
+
+.topbar-search {
+  position: relative;
+  flex: 1;
+  max-width: 260px;
+  margin: 0 1rem;
+}
+
+#search-input {
+  width: 100%;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0.3rem 0.6rem;
+  color: var(--text);
+  font-family: var(--font-sans);
+  font-size: 0.8125rem;
+  outline: none;
+}
+
+#search-input::placeholder {
+  color: var(--text-secondary);
+  opacity: 0.6;
+}
+
+#search-input:focus {
+  border-color: var(--accent);
+}
+
+.search-results {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  right: 0;
+  margin-top: 0.25rem;
+  background: var(--bg-sidebar);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  max-height: 320px;
+  overflow-y: auto;
+  z-index: 1000;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+}
+
+.search-results.hidden {
+  display: none;
+}
+
+.search-result-item {
+  display: block;
+  padding: 0.4rem 0.75rem;
+  color: var(--text);
+  text-decoration: none;
+  font-size: 0.8125rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.search-result-item:last-child {
+  border-bottom: none;
+}
+
+.search-result-item:hover,
+.search-result-item.active {
+  background: var(--bg-code);
+  text-decoration: none;
+}
+
+.search-result-name {
+  font-weight: 600;
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+}
+
+.search-result-type {
+  color: var(--text-secondary);
+  font-size: 0.6875rem;
+  margin-left: 0.4rem;
+}
+
+.search-result-doc {
+  color: var(--text-secondary);
+  font-size: 0.75rem;
+  margin-top: 0.1rem;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.search-no-results {
+  padding: 0.6rem 0.75rem;
+  color: var(--text-secondary);
+  font-size: 0.8125rem;
+}
+
+/* =============================================================================
+   Code Block Overrides (docs-specific)
+   Use --bg-code consistently for all code surfaces
+   ============================================================================= */
+
+pre {
+  background: var(--bg-code);
+  border-color: var(--border);
+}
+
+.highlight {
+  background: var(--bg-code);
+}
+
+code {
+  background: var(--bg-code);
+  color: var(--tertiary);
+}
+
+/* =============================================================================
+   Copy Button Overrides (docs-specific)
+   Base .copy-btn in syntax.css uses position:absolute for .highlight blocks.
+   In docs, reset to static by default; re-apply absolute only for .highlight.
+   ============================================================================= */
+
+.copy-btn {
+  position: static;
+}
+
+.highlight .copy-btn {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.35rem;
+}

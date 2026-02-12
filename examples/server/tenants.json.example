@@ -1,0 +1,12 @@
+[
+  {
+    "id": "acme",
+    "storage_prefix": "acme-prod",
+    "allowed_models": ["openai::gpt-4o", "openai::gpt-4o-mini"]
+  },
+  {
+    "id": "globex",
+    "storage_prefix": "globex",
+    "allowed_models": []
+  }
+]

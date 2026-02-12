@@ -1,0 +1,9 @@
+Answer the question based on these documents:
+
+{% for doc in documents %}
+[{{ doc.source }}]
+{{ doc.content }}
+
+{% endfor %}
+Question: {{ question }}
+Answer:

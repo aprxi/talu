@@ -1,0 +1,176 @@
+/* =============================================================================
+   RUSTDOC THEME - Layout
+   Dense, utilitarian layout like Cargo docs
+   ============================================================================= */
+
+/* Top bar */
+.topbar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--topbar-height);
+  background: var(--bg-sidebar);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 1rem;
+  z-index: 200;
+}
+
+.topbar-logo {
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  text-decoration: none;
+  letter-spacing: 0.05em;
+}
+
+.topbar-logo:hover {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.topbar-utils {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.topbar-github {
+  display: flex;
+  align-items: center;
+  color: var(--text-muted);
+}
+
+.topbar-github:hover {
+  color: var(--text);
+}
+
+/* Sidebar - always visible, split into main nav + reference nav */
+.sidebar {
+  width: var(--sidebar-width);
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  position: fixed;
+  top: var(--topbar-height);
+  left: 0;
+  bottom: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  font-size: 0.875rem;
+}
+
+.sidebar-main {
+  flex-shrink: 0;
+}
+
+.sidebar-ref {
+  flex: 1;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+}
+
+/* Hide ref section when empty */
+.sidebar-ref:empty,
+.sidebar-ref:has(ul:empty) {
+  display: none;
+}
+
+/* Main content */
+.content {
+  margin-left: var(--sidebar-width);
+  margin-top: var(--topbar-height);
+  flex: 1;
+  min-width: 0;
+  background: var(--bg);
+  position: relative;
+}
+
+.content::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: 200px;
+  background: linear-gradient(180deg, color-mix(in srgb, var(--primary) 6%, var(--bg)), var(--bg));
+  pointer-events: none;
+  z-index: 0;
+}
+
+.content > * {
+  position: relative;
+  z-index: 1;
+}
+
+article {
+  position: relative;
+  max-width: 100ch;
+  margin: 0 auto;
+  padding: 1.5rem 2rem;
+  font-size: 0.9375rem;
+}
+
+/* Article actions - subtle, top right */
+.article-actions {
+  position: absolute;
+  top: 1.5rem;
+  right: 2rem;
+  display: flex;
+  gap: 0.75rem;
+  align-items: center;
+}
+
+.article-actions .examples-link,
+.article-actions .copy-btn {
+  position: static;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  font-size: 0.8rem;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0;
+  font-family: var(--font-sans);
+}
+
+.article-actions .examples-link:hover,
+.article-actions .copy-btn:hover {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.article-actions svg {
+  vertical-align: middle;
+}
+
+/* Responsive */
+@media (max-width: 900px) {
+  article {
+    padding: 1rem 1.5rem;
+  }
+}
+
+@media (max-width: 700px) {
+  .sidebar {
+    position: static;
+    width: 100%;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+    max-height: 50vh;
+  }
+
+  .content {
+    margin-left: 0;
+  }
+
+  article {
+    padding: 1rem;
+  }
+}

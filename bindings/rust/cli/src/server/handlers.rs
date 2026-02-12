@@ -1,0 +1,1598 @@
+use std::collections::HashSet;
+use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use anyhow::{anyhow, Context, Result};
+use bytes::Bytes;
+use http_body_util::{BodyExt, Full, StreamBody};
+use hyper::body::Frame;
+use hyper::body::Incoming;
+use hyper::{Request, Response, StatusCode};
+use serde_json::json;
+use tokio_stream::wrappers::UnboundedReceiverStream;
+use tokio_stream::StreamExt;
+
+use crate::bucket_settings;
+use crate::provider;
+use crate::server::auth_gateway::AuthContext;
+use crate::server::generated;
+use crate::server::state::{AppState, StoredResponse};
+use talu::documents::{DocumentError, DocumentsHandle};
+use talu::responses::{ContentType, ItemType};
+use talu::{ChatHandle, FinishReason};
+
+type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+/// Error type for response generation with HTTP status code information.
+#[derive(Debug)]
+pub enum ResponseError {
+    /// Bad request (400) - user error like invalid prompt_id
+    BadRequest { code: &'static str, message: String },
+    /// Internal server error (500) - system error
+    Internal { code: &'static str, message: String },
+}
+
+impl ResponseError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self::BadRequest {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn internal(code: &'static str, message: impl Into<String>) -> Self {
+        Self::Internal {
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn status_code(&self) -> StatusCode {
+        match self {
+            Self::BadRequest { .. } => StatusCode::BAD_REQUEST,
+            Self::Internal { .. } => StatusCode::INTERNAL_SERVER_ERROR,
+        }
+    }
+
+    fn error_code(&self) -> &'static str {
+        match self {
+            Self::BadRequest { code, .. } => code,
+            Self::Internal { code, .. } => code,
+        }
+    }
+
+    fn error_message(&self) -> &str {
+        match self {
+            Self::BadRequest { message, .. } => message,
+            Self::Internal { message, .. } => message,
+        }
+    }
+}
+
+impl From<anyhow::Error> for ResponseError {
+    fn from(err: anyhow::Error) -> Self {
+        Self::Internal {
+            code: "inference_error",
+            message: err.to_string(),
+        }
+    }
+}
+
+pub async fn handle_responses(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth_ctx: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let (_parts, body) = req.into_parts();
+    if let Some(ctx) = auth_ctx.as_ref() {
+        log::info!(
+            "Authenticated tenant: {}, prefix: {}",
+            ctx.tenant_id,
+            ctx.storage_prefix
+        );
+    }
+
+    let body_bytes = match body.collect().await {
+        Ok(body) => body.to_bytes(),
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Invalid body"),
+    };
+
+    let request: generated::CreateResponseBody = match serde_json::from_slice(&body_bytes) {
+        Ok(val) => val,
+        Err(err) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &format!("Invalid JSON: {err}"),
+            )
+        }
+    };
+
+    let request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
+        Ok(val) => val,
+        Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Invalid JSON"),
+    };
+
+    let stream = request_value
+        .get("stream")
+        .and_then(|val| val.as_bool())
+        .unwrap_or(false);
+
+    let tools_json = request_value.get("tools").cloned();
+    let tool_choice_json = request_value.get("tool_choice").cloned();
+    let previous_response_id = request_value
+        .get("previous_response_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let input_value = request_value.get("input").cloned();
+    let store = request_value
+        .get("store")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let request_session_id = request_value
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let prompt_id = request_value
+        .get("prompt_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Validate that input is present (string, array, or null with previous_response_id).
+    if input_value.is_none() && previous_response_id.is_none() {
+        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Missing input");
+    }
+
+    if stream {
+        return stream_response(
+            state,
+            request,
+            input_value,
+            tools_json,
+            tool_choice_json,
+            previous_response_id,
+            store,
+            request_session_id,
+            prompt_id,
+            auth_ctx,
+        )
+        .await;
+    }
+
+    let response_json = match generate_response(
+        state,
+        request,
+        input_value,
+        tools_json,
+        tool_choice_json,
+        previous_response_id,
+        store,
+        request_session_id,
+        prompt_id,
+        auth_ctx.as_ref(),
+    )
+    .await
+    {
+        Ok(val) => val,
+        Err(err) => return json_error(err.status_code(), err.error_code(), err.error_message()),
+    };
+    if let Some(ctx) = auth_ctx.as_ref() {
+        log_generation_completed(ctx);
+    }
+
+    let response_body = match serde_json::to_vec(&response_json) {
+        Ok(body) => body,
+        Err(_) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "serialization_error",
+                "Failed to serialize response",
+            )
+        }
+    };
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(response_body)).boxed())
+        .unwrap()
+}
+
+pub async fn handle_models(
+    state: Arc<AppState>,
+    _req: Request<Incoming>,
+    auth_ctx: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let allowed_models = auth_ctx
+        .as_ref()
+        .and_then(|ctx| {
+            state
+                .tenant_registry
+                .as_ref()
+                .and_then(|registry| registry.get(&ctx.tenant_id))
+                .map(|tenant| tenant.allowed_models.clone())
+        })
+        .unwrap_or_default();
+
+    let mut models = match list_backend_models(state.clone()).await {
+        Ok(items) if !items.is_empty() => items,
+        _ => {
+            let fallback = state
+                .backend
+                .lock()
+                .await
+                .current_model
+                .clone()
+                .or_else(|| state.configured_model.clone());
+            if let Some(model_id) = fallback {
+                vec![talu::RemoteModelInfo {
+                    id: model_id,
+                    object: "model".to_string(),
+                    created: 0,
+                    owned_by: "talu".to_string(),
+                }]
+            } else {
+                Vec::new()
+            }
+        }
+    };
+
+    if !allowed_models.is_empty() {
+        let allowed: HashSet<String> = allowed_models.into_iter().collect();
+        models.retain(|model| allowed.contains(&model.id));
+    }
+
+    let models = models
+        .into_iter()
+        .map(|model| {
+            json!({
+                "id": model.id,
+                "object": model.object,
+                "created": model.created,
+                "owned_by": model.owned_by
+            })
+        })
+        .collect::<Vec<_>>();
+
+    let payload = json!({
+        "object": "list",
+        "data": models
+    });
+
+    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap()
+}
+
+async fn generate_response(
+    state: Arc<AppState>,
+    request: generated::CreateResponseBody,
+    input_value: Option<serde_json::Value>,
+    tools_json: Option<serde_json::Value>,
+    tool_choice_json: Option<serde_json::Value>,
+    previous_response_id: Option<String>,
+    store: bool,
+    request_session_id: Option<String>,
+    prompt_id: Option<String>,
+    auth_ctx: Option<&AuthContext>,
+) -> Result<serde_json::Value, ResponseError> {
+    let request_max_output_tokens = request.max_output_tokens;
+    let temperature = request.temperature;
+    let top_p = request.top_p;
+
+    let model_id = select_model_id(state.clone(), request.model.clone()).await?;
+
+    // Load previous conversation state if chaining.
+    let prev_state = if let Some(ref prev_id) = previous_response_id {
+        let store = state.response_store.lock().await;
+        store.get(prev_id).map(|s| {
+            (
+                s.responses_json.clone(),
+                s.tools_json.clone(),
+                s.tool_choice_json.clone(),
+                s.session_id.clone(),
+            )
+        })
+    } else {
+        None
+    };
+
+    // Merge: previous conversation's tools/tool_choice are used as defaults
+    // if the new request doesn't specify them.
+    let effective_tools = tools_json.or_else(|| prev_state.as_ref().and_then(|s| s.1.clone()));
+    let effective_tool_choice =
+        tool_choice_json.or_else(|| prev_state.as_ref().and_then(|s| s.2.clone()));
+
+    // Resolve session ID: explicit request > previous response chain > new UUID.
+    let session_id = request_session_id
+        .or_else(|| prev_state.as_ref().and_then(|s| s.3.clone()))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
+
+    // Resolve bucket path for persistence (only when store=true).
+    let bucket_path = if store {
+        state.bucket_path.as_ref().map(|base| match auth_ctx {
+            Some(ctx) => base.join(&ctx.storage_prefix),
+            None => base.to_path_buf(),
+        })
+    } else {
+        None
+    };
+
+    // Ensure storage directory exists.
+    if let Some(ref bp) = bucket_path {
+        std::fs::create_dir_all(bp)
+            .map_err(|e| anyhow!("failed to create storage directory: {}", e))?;
+    }
+
+    // Apply bucket settings fallback for max_output_tokens if request doesn't specify it.
+    // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
+    let max_output_tokens = request_max_output_tokens.or_else(|| {
+        let settings_bucket = state.bucket_path.as_ref().map(|base| match auth_ctx {
+            Some(ctx) => base.join(&ctx.storage_prefix),
+            None => base.to_path_buf(),
+        });
+        settings_bucket.and_then(|bp| {
+            bucket_settings::load_bucket_settings(&bp)
+                .ok()
+                .and_then(|s| s.max_output_tokens.map(|v| v as i64))
+        })
+    });
+
+    // If prompt_id is provided, fetch the document and extract system prompt.
+    let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
+        if let Some(ref bp) = bucket_path {
+            match DocumentsHandle::open(bp) {
+                Ok(docs) => match docs.get(pid) {
+                    Ok(Some(doc)) => {
+                        // Parse doc_json to extract system prompt
+                        // Try direct fields first (current UI format), then nested under "data" (legacy)
+                        if let Ok(envelope) =
+                            serde_json::from_str::<serde_json::Value>(&doc.doc_json)
+                        {
+                            envelope
+                                .get("system")
+                                .or_else(|| envelope.get("system_prompt"))
+                                .or_else(|| envelope.get("data").and_then(|d| d.get("system")))
+                                .or_else(|| {
+                                    envelope.get("data").and_then(|d| d.get("system_prompt"))
+                                })
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    Ok(None) => {
+                        return Err(ResponseError::bad_request(
+                            "invalid_request",
+                            format!("prompt_id '{}' not found", pid),
+                        ));
+                    }
+                    Err(DocumentError::DocumentNotFound(_)) => {
+                        return Err(ResponseError::bad_request(
+                            "invalid_request",
+                            format!("prompt_id '{}' not found", pid),
+                        ));
+                    }
+                    Err(e) => {
+                        return Err(ResponseError::internal(
+                            "storage_error",
+                            format!("failed to fetch prompt document: {}", e),
+                        ));
+                    }
+                },
+                Err(e) => {
+                    return Err(ResponseError::internal(
+                        "storage_error",
+                        format!("failed to open documents store: {}", e),
+                    ));
+                }
+            }
+        } else {
+            return Err(ResponseError::bad_request(
+                "invalid_request",
+                "prompt_id requires storage to be configured",
+            ));
+        }
+    } else {
+        None
+    };
+
+    let response_id = format!("resp_{}", random_id());
+    let created_at = now_unix_seconds();
+
+    let backend = state.backend.clone();
+    // Only pass prev_json for in-memory chaining when storage is NOT active.
+    // When storage is active, set_storage_db auto-loads existing items.
+    let prev_json = if bucket_path.is_none() {
+        prev_state.map(|s| s.0)
+    } else {
+        let _ = prev_state; // consumed
+        None
+    };
+
+    // Build serialized input for the blocking task.
+    let input_json = input_value
+        .as_ref()
+        .filter(|v| v.is_array())
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let input_string = input_value
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let session_id_for_task = session_id.clone();
+    let bucket_for_task = bucket_path.clone();
+    let model_id_for_task = model_id.clone();
+    let system_prompt_for_task = system_prompt_from_doc.clone();
+    let prompt_id_for_task = prompt_id.clone();
+    let (output_items, prompt_tokens, completion_tokens, responses_json) =
+        tokio::task::spawn_blocking(move || {
+            let mut backend = backend.blocking_lock();
+            let backend = backend
+                .backend
+                .as_mut()
+                .ok_or_else(|| anyhow!("no backend available"))?;
+            // Create ChatHandle with system prompt if prompt_id was provided
+            let chat = ChatHandle::new(system_prompt_for_task.as_deref())?;
+
+            // Enable storage persistence if store=true and bucket is configured.
+            // set_storage_db auto-loads any existing items for this session.
+            if let Some(ref bp) = bucket_for_task {
+                if let Some(bp_str) = bp.to_str() {
+                    chat.set_storage_db(bp_str, &session_id_for_task)
+                        .map_err(|e| anyhow!("failed to set storage: {}", e))?;
+                }
+            }
+
+            // Restore previous conversation from in-memory JSON (only when
+            // storage is not active — set_storage_db already loaded items).
+            if let Some(ref prev) = prev_json {
+                chat.load_responses_json(prev)
+                    .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
+            }
+
+            // Load input items into the conversation.
+            if let Some(ref json) = input_json {
+                chat.load_responses_json(json)
+                    .map_err(|e| anyhow!("failed to load input: {}", e))?;
+            } else if let Some(ref text) = input_string {
+                chat.append_user_message(text)
+                    .map_err(|e| anyhow!("failed to append user message: {}", e))?;
+            }
+
+            // Record item count before generation to extract only new output items.
+            let pre_gen_count = chat.item_count();
+
+            let mut cfg = talu::router::GenerateConfig::default();
+            if let Some(max_tokens) = max_output_tokens {
+                cfg.max_tokens = max_tokens as usize;
+            }
+            if let Some(temp) = temperature {
+                cfg.temperature = temp as f32;
+            }
+            if let Some(top_p) = top_p {
+                cfg.top_p = top_p as f32;
+            }
+
+            // Generate with empty content — conversation already has the input.
+            let result = talu::router::generate(&chat, &[], backend, &cfg)
+                .map_err(|e| anyhow!("generation failed: {}", e))?;
+
+            let prompt_tokens = result.prompt_tokens();
+            let completion_tokens = result.completion_tokens();
+
+            // Persist session metadata so the conversation appears in list_sessions.
+            // A brand-new chat has at most 2 items before generation: an optional
+            // system message (from prompt_id) + the user message.  Chained requests
+            // have more items and must skip this to avoid overwriting the title.
+            if bucket_for_task.is_some() && pre_gen_count <= 2 {
+                let t = input_string.as_deref().unwrap_or("Untitled");
+                let title: String = t.chars().take(47).collect();
+                // Use extended update with source_doc_id for lineage tracking
+                let _ = chat.notify_session_update_ex(
+                    Some(&model_id_for_task),
+                    Some(&title),
+                    Some("active"),
+                    prompt_id_for_task.as_deref(),
+                );
+            }
+
+            // Serialize ALL items (response direction), then slice to output only.
+            let all_json = chat
+                .to_responses_json(1)
+                .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
+            let all_items: serde_json::Value =
+                serde_json::from_str(&all_json).unwrap_or_else(|_| json!([]));
+            let output_items = if let Some(arr) = all_items.as_array() {
+                serde_json::Value::Array(arr[pre_gen_count..].to_vec())
+            } else {
+                json!([])
+            };
+
+            // Store full conversation for chaining.
+            let responses_json = all_json;
+
+            Ok::<_, anyhow::Error>((
+                output_items,
+                prompt_tokens,
+                completion_tokens,
+                responses_json,
+            ))
+        })
+        .await
+        .context("Generation task failed")??;
+
+    // Store conversation for future `previous_response_id` lookups.
+    let session_id_for_response = session_id.clone();
+    {
+        let mut store = state.response_store.lock().await;
+        store.insert(
+            response_id.clone(),
+            StoredResponse {
+                responses_json,
+                tools_json: effective_tools.clone(),
+                tool_choice_json: effective_tool_choice.clone(),
+                session_id: Some(session_id),
+            },
+        );
+    }
+
+    let usage = UsageStats {
+        input_tokens: prompt_tokens,
+        output_tokens: completion_tokens,
+    };
+    let mut response_value = build_response_resource_value(
+        &response_id,
+        &model_id,
+        created_at,
+        Some(now_unix_seconds()),
+        output_items,
+        max_output_tokens,
+        temperature.unwrap_or(0.0),
+        top_p.unwrap_or(1.0),
+        "completed",
+        Some(&usage),
+        effective_tools.as_ref(),
+        effective_tool_choice.as_ref(),
+    );
+
+    // Set previous_response_id on the response resource.
+    if let Some(ref prev_id) = previous_response_id {
+        response_value["previous_response_id"] = json!(prev_id);
+    }
+
+    // Include session_id in metadata so the UI can adopt it for follow-ups.
+    response_value["metadata"] = json!({ "session_id": session_id_for_response });
+
+    Ok(normalize_response_value(response_value))
+}
+
+async fn stream_response(
+    state: Arc<AppState>,
+    request: generated::CreateResponseBody,
+    input_value: Option<serde_json::Value>,
+    tools_json: Option<serde_json::Value>,
+    tool_choice_json: Option<serde_json::Value>,
+    previous_response_id: Option<String>,
+    store: bool,
+    request_session_id: Option<String>,
+    prompt_id: Option<String>,
+    auth_ctx: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let response_id = format!("resp_{}", random_id());
+    let message_id = format!("msg_{}", random_id());
+    let created_at = now_unix_seconds();
+
+    let request_max_output_tokens = request.max_output_tokens;
+    let temperature = request.temperature;
+    let top_p = request.top_p;
+    let model_id = match select_model_id(state.clone(), request.model.clone()).await {
+        Ok(val) => val,
+        Err(err) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "model_error",
+                &format!("{err}"),
+            )
+        }
+    };
+
+    // Load previous conversation state if chaining.
+    let prev_state = if let Some(ref prev_id) = previous_response_id {
+        let rstore = state.response_store.lock().await;
+        rstore.get(prev_id).map(|s| {
+            (
+                s.responses_json.clone(),
+                s.tools_json.clone(),
+                s.tool_choice_json.clone(),
+                s.session_id.clone(),
+            )
+        })
+    } else {
+        None
+    };
+
+    // Merge tools from previous if not specified in this request.
+    let effective_tools = tools_json.or_else(|| prev_state.as_ref().and_then(|s| s.1.clone()));
+    let effective_tool_choice =
+        tool_choice_json.or_else(|| prev_state.as_ref().and_then(|s| s.2.clone()));
+
+    // Resolve session ID: explicit request > previous response chain > new UUID.
+    let session_id = request_session_id
+        .or_else(|| prev_state.as_ref().and_then(|s| s.3.clone()))
+        .unwrap_or_else(|| uuid::Uuid::new_v4().hyphenated().to_string());
+
+    // Resolve bucket path for persistence (only when store=true).
+    let bucket_path = if store {
+        state
+            .bucket_path
+            .as_ref()
+            .map(|base| match auth_ctx.as_ref() {
+                Some(ctx) => base.join(&ctx.storage_prefix),
+                None => base.to_path_buf(),
+            })
+    } else {
+        None
+    };
+
+    // Ensure storage directory exists.
+    if let Some(ref bp) = bucket_path {
+        if let Err(e) = std::fs::create_dir_all(bp) {
+            log::warn!("failed to create storage directory: {}", e);
+        }
+    }
+
+    // Apply bucket settings fallback for max_output_tokens if request doesn't specify it.
+    // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
+    let max_output_tokens = request_max_output_tokens.or_else(|| {
+        let settings_bucket = state
+            .bucket_path
+            .as_ref()
+            .map(|base| match auth_ctx.as_ref() {
+                Some(ctx) => base.join(&ctx.storage_prefix),
+                None => base.to_path_buf(),
+            });
+        settings_bucket.and_then(|bp| {
+            bucket_settings::load_bucket_settings(&bp)
+                .ok()
+                .and_then(|s| s.max_output_tokens.map(|v| v as i64))
+        })
+    });
+
+    // If prompt_id is provided, fetch the document and extract system prompt.
+    let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
+        if let Some(ref bp) = bucket_path {
+            match DocumentsHandle::open(bp) {
+                Ok(docs) => match docs.get(pid) {
+                    Ok(Some(doc)) => {
+                        // Parse doc_json to extract system prompt
+                        // Try direct fields first (current UI format), then nested under "data" (legacy)
+                        if let Ok(envelope) =
+                            serde_json::from_str::<serde_json::Value>(&doc.doc_json)
+                        {
+                            envelope
+                                .get("system")
+                                .or_else(|| envelope.get("system_prompt"))
+                                .or_else(|| envelope.get("data").and_then(|d| d.get("system")))
+                                .or_else(|| {
+                                    envelope.get("data").and_then(|d| d.get("system_prompt"))
+                                })
+                                .and_then(|s| s.as_str())
+                                .map(|s| s.to_string())
+                        } else {
+                            None
+                        }
+                    }
+                    Ok(None) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            &format!("prompt_id '{}' not found", pid),
+                        );
+                    }
+                    Err(DocumentError::DocumentNotFound(_)) => {
+                        return json_error(
+                            StatusCode::BAD_REQUEST,
+                            "invalid_request",
+                            &format!("prompt_id '{}' not found", pid),
+                        );
+                    }
+                    Err(e) => {
+                        return json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "storage_error",
+                            &format!("failed to fetch prompt document: {}", e),
+                        );
+                    }
+                },
+                Err(e) => {
+                    return json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "storage_error",
+                        &format!("failed to open documents store: {}", e),
+                    );
+                }
+            }
+        } else {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "prompt_id requires storage to be configured",
+            );
+        }
+    } else {
+        None
+    };
+
+    // Only pass prev_json for in-memory chaining when storage is NOT active.
+    // When storage is active, set_storage_db auto-loads existing items.
+    let prev_json = if bucket_path.is_none() {
+        prev_state.map(|s| s.0)
+    } else {
+        let _ = prev_state; // consumed
+        None
+    };
+
+    // Create a stop flag for cancellation on client disconnect.
+    let stop_flag = Arc::new(AtomicBool::new(false));
+    let stop_flag_for_gen = stop_flag.clone();
+
+    // Prepare input for the blocking task.
+    let input_json = input_value
+        .as_ref()
+        .filter(|v| v.is_array())
+        .map(|v| serde_json::to_string(v).unwrap_or_default());
+    let input_string = input_value
+        .as_ref()
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Clones for the blocking task to store response after completion.
+    let state_for_store = state.clone();
+    let session_id_for_store = session_id.clone();
+    let store_tools = effective_tools.clone();
+    let store_tool_choice = effective_tool_choice.clone();
+    let response_id_for_store = response_id.clone();
+
+    let backend = state.backend.clone();
+    let tools_for_events = effective_tools.clone();
+    let tool_choice_for_events = effective_tool_choice.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut seq = 0u64;
+        let created_response = normalize_response_value(build_response_resource_value(
+            &response_id,
+            &model_id,
+            created_at,
+            None,
+            json!([]),
+            max_output_tokens,
+            temperature.unwrap_or(0.0),
+            top_p.unwrap_or(1.0),
+            "in_progress",
+            None,
+            tools_for_events.as_ref(),
+            tool_choice_for_events.as_ref(),
+        ));
+        let _ = send_event(
+            &tx,
+            "response.created",
+            json!({
+                "type": "response.created",
+                "sequence_number": seq,
+                "response": &created_response
+            }),
+        );
+        seq += 1;
+
+        let _ = send_event(
+            &tx,
+            "response.in_progress",
+            json!({
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "response": created_response
+            }),
+        );
+        seq += 1;
+
+        let ctx = Arc::new(std::sync::Mutex::new(StreamCtx {
+            tx,
+            seq,
+            response_id,
+            stop_flag: stop_flag_for_gen.clone(),
+            output_index: 0,
+            content_index: 0,
+            cur_item_type: None,
+            cur_content_type: None,
+            accumulated_text: String::new(),
+            cur_item_id: message_id,
+            tools_json: tools_for_events,
+            tool_choice_json: tool_choice_for_events,
+            tenant_id: auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone()),
+            user_id: auth_ctx.and_then(|ctx| ctx.user_id),
+            session_id: session_id.clone(),
+        }));
+        let ctx_for_complete = ctx.clone();
+
+        let gen_result = run_streaming_generation(
+            backend,
+            input_json,
+            input_string,
+            prev_json,
+            bucket_path,
+            session_id,
+            model_id.clone(),
+            max_output_tokens,
+            temperature,
+            top_p,
+            system_prompt_from_doc,
+            prompt_id,
+            ctx,
+            stop_flag_for_gen,
+        );
+
+        // Store conversation for chaining after streaming completes.
+        if let Ok(ref r) = gen_result {
+            let mut store = state_for_store.response_store.blocking_lock();
+            store.insert(
+                response_id_for_store.clone(),
+                StoredResponse {
+                    responses_json: r.responses_json.clone(),
+                    tools_json: store_tools,
+                    tool_choice_json: store_tool_choice,
+                    session_id: Some(session_id_for_store),
+                },
+            );
+        }
+
+        if let Ok(mut guard) = ctx_for_complete.lock() {
+            let _ = guard.flush_completion(
+                model_id,
+                created_at,
+                max_output_tokens,
+                temperature.unwrap_or(0.0),
+                top_p.unwrap_or(1.0),
+                gen_result,
+            );
+        };
+    });
+
+    let stream =
+        UnboundedReceiverStream::new(rx).map(|chunk| Ok::<_, Infallible>(Frame::data(chunk)));
+    let body = StreamBody::new(stream).boxed();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(body)
+        .unwrap()
+}
+
+fn run_streaming_generation(
+    backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
+    input_json: Option<String>,
+    input_string: Option<String>,
+    prev_json: Option<String>,
+    bucket_path: Option<std::path::PathBuf>,
+    session_id: String,
+    model_id: String,
+    max_output_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    system_prompt: Option<String>,
+    prompt_id: Option<String>,
+    ctx: Arc<std::sync::Mutex<StreamCtx>>,
+    stop_flag: Arc<AtomicBool>,
+) -> Result<StreamGenResult> {
+    let mut backend = backend.blocking_lock();
+    let backend = backend
+        .backend
+        .as_mut()
+        .ok_or_else(|| anyhow!("no backend available"))?;
+    // Create ChatHandle with system prompt if prompt_id was provided
+    let chat = ChatHandle::new(system_prompt.as_deref())?;
+
+    // Enable storage persistence if store=true and bucket is configured.
+    // set_storage_db auto-loads any existing items for this session.
+    if let Some(ref bp) = bucket_path {
+        if let Some(bp_str) = bp.to_str() {
+            chat.set_storage_db(bp_str, &session_id)
+                .map_err(|e| anyhow!("failed to set storage: {}", e))?;
+        }
+    }
+
+    // Restore previous conversation from in-memory JSON (only when
+    // storage is not active — set_storage_db already loaded items).
+    if let Some(ref prev) = prev_json {
+        chat.load_responses_json(prev)
+            .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
+    }
+
+    // Load input items into the conversation.
+    if let Some(ref json) = input_json {
+        chat.load_responses_json(json)
+            .map_err(|e| anyhow!("failed to load input: {}", e))?;
+    } else if let Some(ref text) = input_string {
+        chat.append_user_message(text)
+            .map_err(|e| anyhow!("failed to append user message: {}", e))?;
+    }
+
+    let mut cfg = talu::router::GenerateConfig::default();
+    if let Some(max_tokens) = max_output_tokens {
+        cfg.max_tokens = max_tokens as usize;
+    }
+    if let Some(temp) = temperature {
+        cfg.temperature = temp as f32;
+    }
+    if let Some(top_p) = top_p {
+        cfg.top_p = top_p as f32;
+    }
+
+    // Pass the stop flag for cooperative cancellation.
+    cfg.stop_flag = Some(stop_flag);
+
+    let ctx_clone = ctx.clone();
+    let callback: talu::router::StreamCallback = Box::new(move |token| {
+        if let Ok(mut guard) = ctx_clone.lock() {
+            let _ = guard.send_delta(token);
+        }
+        true
+    });
+
+    // Record item count before generation to extract only new output items.
+    let pre_gen_count = chat.item_count();
+
+    // Generate with empty content — conversation already has the input.
+    let stream_result = talu::router::generate_stream(&chat, &[], backend, &cfg, callback)
+        .map_err(|e| anyhow!("generation failed: {}", e))?;
+
+    // Persist session metadata so the conversation appears in list_sessions.
+    // A brand-new chat has at most 2 items before generation: an optional
+    // system message (from prompt_id) + the user message.  Chained requests
+    // have more items and must skip this to avoid overwriting the title.
+    if bucket_path.is_some() && pre_gen_count <= 2 {
+        let t = input_string.as_deref().unwrap_or("Untitled");
+        let title: String = t.chars().take(47).collect();
+        // Use extended update with source_doc_id for lineage tracking
+        let _ = chat.notify_session_update_ex(
+            Some(&model_id),
+            Some(&title),
+            Some("active"),
+            prompt_id.as_deref(),
+        );
+    }
+
+    // Serialize all items and full conversation for storage/chaining.
+    let all_json = chat
+        .to_responses_json(1)
+        .map_err(|e| anyhow!("failed to serialize output: {}", e))?;
+    let output_items = serde_json::from_str::<serde_json::Value>(&all_json)
+        .ok()
+        .and_then(|v| v.as_array().map(|arr| arr[pre_gen_count..].to_vec()))
+        .map(serde_json::Value::Array)
+        .unwrap_or_else(|| json!([]));
+
+    Ok(StreamGenResult {
+        output_items,
+        usage: UsageStats {
+            input_tokens: stream_result.prompt_tokens,
+            output_tokens: stream_result.completion_tokens,
+        },
+        finish_reason: stream_result.finish_reason,
+        responses_json: all_json,
+    })
+}
+
+/// Result from streaming generation, carrying output items and usage stats.
+struct StreamGenResult {
+    output_items: serde_json::Value,
+    usage: UsageStats,
+    finish_reason: FinishReason,
+    /// Full conversation JSON for chaining via response_store.
+    responses_json: String,
+}
+
+struct StreamCtx {
+    tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    seq: u64,
+    response_id: String,
+    /// Stop flag for cancellation. Signaled when client disconnects.
+    stop_flag: Arc<AtomicBool>,
+
+    // -- Item/content transition tracking for SSE event completeness --
+    /// Current output item index (incremented on item_type transitions).
+    output_index: u32,
+    /// Content part index within the current output item.
+    content_index: u32,
+    /// Item type of the currently active output item (None before first token).
+    cur_item_type: Option<ItemType>,
+    /// Content type of the currently active content part.
+    cur_content_type: Option<ContentType>,
+    /// Accumulated text for the current content part (for .done events).
+    accumulated_text: String,
+    /// Item ID for the current output item (may differ from message_id for
+    /// multi-item responses, e.g. reasoning + message).
+    cur_item_id: String,
+    /// Tool definitions from the request (for response resource round-tripping).
+    tools_json: Option<serde_json::Value>,
+    /// Tool choice from the request (for response resource round-tripping).
+    tool_choice_json: Option<serde_json::Value>,
+    /// Tenant identifier for audit logging.
+    tenant_id: Option<String>,
+    /// Optional user identifier from the gateway.
+    user_id: Option<String>,
+    /// TaluDB session ID (returned in metadata so the UI can chain follow-ups).
+    session_id: String,
+}
+
+impl StreamCtx {
+    fn send_delta(&mut self, token: &talu::router::StreamToken) -> Result<()> {
+        let item_changed = self.cur_item_type != Some(token.item_type);
+        let content_changed = item_changed || self.cur_content_type != Some(token.content_type);
+
+        // Close the previous content part and output item on transition.
+        if content_changed && self.cur_content_type.is_some() {
+            self.emit_content_done()?;
+        }
+        if item_changed && self.cur_item_type.is_some() {
+            self.emit_item_done()?;
+        }
+
+        // Open a new output item and content part on transition.
+        if item_changed {
+            // Assign a new item_id for each output item beyond the first.
+            if self.cur_item_type.is_some() {
+                self.output_index += 1;
+                self.content_index = 0;
+                self.cur_item_id = format!("msg_{}", random_id());
+            }
+            self.cur_item_type = Some(token.item_type);
+            self.emit_item_added(token.item_type)?;
+        }
+        if content_changed {
+            if !item_changed && self.cur_content_type.is_some() {
+                self.content_index += 1;
+            }
+            self.cur_content_type = Some(token.content_type);
+            self.accumulated_text.clear();
+            self.emit_content_part_added(token.content_type)?;
+        }
+
+        self.accumulated_text.push_str(token.text);
+
+        // Emit the delta event.
+        let event_name = delta_event_name(token.item_type, token.content_type);
+        let payload = json!({
+            "type": event_name,
+            "sequence_number": self.seq,
+            "item_id": self.cur_item_id,
+            "output_index": self.output_index,
+            "content_index": self.content_index,
+            "delta": token.text,
+            "logprobs": []
+        });
+        self.seq += 1;
+
+        // Detect client disconnect: if send fails, the client has disconnected.
+        // Signal the stop flag to halt generation gracefully.
+        if send_event(&self.tx, event_name, payload).is_err() {
+            self.stop_flag.store(true, Ordering::Release);
+            return Err(anyhow!("client disconnected"));
+        }
+        Ok(())
+    }
+
+    /// Emit `response.output_item.added` for a new output item.
+    fn emit_item_added(&mut self, item_type: ItemType) -> Result<()> {
+        let item_object = match item_type {
+            ItemType::Reasoning => json!({
+                "type": "reasoning",
+                "id": self.cur_item_id,
+                "summary": [],
+                "status": "in_progress"
+            }),
+            ItemType::FunctionCall => json!({
+                "type": "function_call",
+                "id": self.cur_item_id,
+                "call_id": "",
+                "name": "",
+                "arguments": "",
+                "status": "in_progress"
+            }),
+            _ => json!({
+                "type": "message",
+                "id": self.cur_item_id,
+                "role": "assistant",
+                "status": "in_progress",
+                "content": []
+            }),
+        };
+
+        let payload = json!({
+            "type": "response.output_item.added",
+            "sequence_number": self.seq,
+            "output_index": self.output_index,
+            "item": item_object
+        });
+        self.seq += 1;
+        self.try_send("response.output_item.added", payload)
+    }
+
+    /// Emit `response.content_part.added` for a new content part.
+    fn emit_content_part_added(&mut self, content_type: ContentType) -> Result<()> {
+        let part_type = content_part_type(content_type);
+        let payload = json!({
+            "type": "response.content_part.added",
+            "sequence_number": self.seq,
+            "item_id": self.cur_item_id,
+            "output_index": self.output_index,
+            "content_index": self.content_index,
+            "part": {
+                "type": part_type,
+                "text": "",
+                "annotations": [],
+                "logprobs": []
+            }
+        });
+        self.seq += 1;
+        self.try_send("response.content_part.added", payload)
+    }
+
+    /// Emit the type-specific `.done` event and `response.content_part.done`
+    /// for the current content part.
+    fn emit_content_done(&mut self) -> Result<()> {
+        let (item_type, content_type) = match (self.cur_item_type, self.cur_content_type) {
+            (Some(it), Some(ct)) => (it, ct),
+            _ => return Ok(()),
+        };
+
+        // Type-specific done event (e.g. response.output_text.done).
+        let done_event = done_event_name(item_type, content_type);
+        let done_payload = json!({
+            "type": done_event,
+            "sequence_number": self.seq,
+            "item_id": self.cur_item_id,
+            "output_index": self.output_index,
+            "content_index": self.content_index,
+            "text": self.accumulated_text,
+            "logprobs": []
+        });
+        self.seq += 1;
+        self.try_send(done_event, done_payload)?;
+
+        // content_part.done
+        let part_type = content_part_type(content_type);
+        let part_payload = json!({
+            "type": "response.content_part.done",
+            "sequence_number": self.seq,
+            "item_id": self.cur_item_id,
+            "output_index": self.output_index,
+            "content_index": self.content_index,
+            "part": {
+                "type": part_type,
+                "text": self.accumulated_text,
+                "annotations": [],
+                "logprobs": []
+            }
+        });
+        self.seq += 1;
+        self.try_send("response.content_part.done", part_payload)
+    }
+
+    /// Emit `response.output_item.done` for the current output item.
+    fn emit_item_done(&mut self) -> Result<()> {
+        let item_type = match self.cur_item_type {
+            Some(it) => it,
+            None => return Ok(()),
+        };
+
+        let item_object = match item_type {
+            ItemType::Reasoning => json!({
+                "type": "reasoning",
+                "id": self.cur_item_id,
+                "summary": [],
+                "status": "completed"
+            }),
+            ItemType::FunctionCall => json!({
+                "type": "function_call",
+                "id": self.cur_item_id,
+                "call_id": "",
+                "name": "",
+                "arguments": self.accumulated_text,
+                "status": "completed"
+            }),
+            _ => json!({
+                "type": "message",
+                "id": self.cur_item_id,
+                "role": "assistant",
+                "status": "completed",
+                "content": [{
+                    "type": "output_text",
+                    "text": self.accumulated_text,
+                    "annotations": [],
+                    "logprobs": []
+                }]
+            }),
+        };
+
+        let payload = json!({
+            "type": "response.output_item.done",
+            "sequence_number": self.seq,
+            "output_index": self.output_index,
+            "item": item_object
+        });
+        self.seq += 1;
+        self.try_send("response.output_item.done", payload)
+    }
+
+    /// Send an event, signaling the stop flag on client disconnect.
+    fn try_send(&self, event: &str, payload: serde_json::Value) -> Result<()> {
+        if send_event(&self.tx, event, payload).is_err() {
+            self.stop_flag.store(true, Ordering::Release);
+            return Err(anyhow!("client disconnected"));
+        }
+        Ok(())
+    }
+
+    fn flush_completion(
+        &mut self,
+        model_id: String,
+        created_at: i64,
+        max_output_tokens: Option<i64>,
+        temperature: f64,
+        top_p: f64,
+        result: Result<StreamGenResult>,
+    ) -> Result<()> {
+        // Close the last content part and output item (if any tokens were emitted).
+        let _ = self.emit_content_done();
+        let _ = self.emit_item_done();
+
+        match result {
+            Ok(r) => {
+                let (status, event_type) = match r.finish_reason {
+                    FinishReason::Length => ("incomplete", "response.incomplete"),
+                    FinishReason::Cancelled => ("incomplete", "response.incomplete"),
+                    _ => ("completed", "response.completed"),
+                };
+                // Build output items from streaming accumulated state.
+                // For streaming, output items are already sent as individual events.
+                // The terminal response resource needs the output array for completeness.
+                let output_items = r.output_items;
+                let mut response = build_response_resource_value(
+                    &self.response_id,
+                    &model_id,
+                    created_at,
+                    Some(now_unix_seconds()),
+                    output_items,
+                    max_output_tokens,
+                    temperature,
+                    top_p,
+                    status,
+                    Some(&r.usage),
+                    self.tools_json.as_ref(),
+                    self.tool_choice_json.as_ref(),
+                );
+                if status == "incomplete" {
+                    let reason = match r.finish_reason {
+                        FinishReason::Cancelled => "cancelled",
+                        _ => "max_output_tokens",
+                    };
+                    response["incomplete_details"] = json!({
+                        "reason": reason
+                    });
+                }
+                response["metadata"] = json!({ "session_id": self.session_id });
+                let response = normalize_response_value(response);
+                let payload = json!({
+                    "type": event_type,
+                    "sequence_number": self.seq,
+                    "response": response
+                });
+                self.seq += 1;
+                send_event(&self.tx, event_type, payload)?;
+                self.log_generation_completed();
+            }
+            Err(err) => {
+                let mut response = build_response_resource_value(
+                    &self.response_id,
+                    &model_id,
+                    created_at,
+                    Some(now_unix_seconds()),
+                    json!([]),
+                    max_output_tokens,
+                    temperature,
+                    top_p,
+                    "failed",
+                    None,
+                    self.tools_json.as_ref(),
+                    self.tool_choice_json.as_ref(),
+                );
+                response["error"] = json!({
+                    "code": "server_error",
+                    "message": format!("{err}")
+                });
+                let response = normalize_response_value(response);
+                let payload = json!({
+                    "type": "response.failed",
+                    "sequence_number": self.seq,
+                    "response": response
+                });
+                self.seq += 1;
+                send_event(&self.tx, "response.failed", payload)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn log_generation_completed(&self) {
+        if let Some(tenant_id) = self.tenant_id.as_deref() {
+            if let Some(user_id) = self.user_id.as_deref() {
+                log::info!(
+                    "[tenant={}] [user={}] Generation completed",
+                    tenant_id,
+                    user_id
+                );
+            } else {
+                log::info!("[tenant={}] Generation completed", tenant_id);
+            }
+        }
+    }
+}
+
+fn send_event(
+    tx: &tokio::sync::mpsc::UnboundedSender<Bytes>,
+    event: &str,
+    payload: serde_json::Value,
+) -> Result<()> {
+    let data = serde_json::to_string(&payload)?;
+    let formatted = format!("event: {}\ndata: {}\n\n", event, data);
+    tx.send(Bytes::from(formatted))
+        .map_err(|_| anyhow!("stream closed"))?;
+    Ok(())
+}
+
+/// Returns the SSE event name for a streaming delta token.
+fn delta_event_name(item_type: ItemType, content_type: ContentType) -> &'static str {
+    match content_type {
+        ContentType::ReasoningText => "response.reasoning.delta",
+        _ if item_type == ItemType::FunctionCall => "response.function_call_arguments.delta",
+        _ => "response.output_text.delta",
+    }
+}
+
+/// Returns the SSE event name for a content-part done event.
+fn done_event_name(item_type: ItemType, content_type: ContentType) -> &'static str {
+    match content_type {
+        ContentType::ReasoningText => "response.reasoning.done",
+        _ if item_type == ItemType::FunctionCall => "response.function_call_arguments.done",
+        _ => "response.output_text.done",
+    }
+}
+
+/// Maps a content type to the OpenResponses content part type string.
+fn content_part_type(content_type: ContentType) -> &'static str {
+    match content_type {
+        ContentType::ReasoningText => "reasoning",
+        ContentType::OutputText => "output_text",
+        ContentType::Refusal => "refusal",
+        ContentType::SummaryText => "summary_text",
+        _ => "output_text",
+    }
+}
+
+/// Token usage statistics for the response resource.
+struct UsageStats {
+    input_tokens: usize,
+    output_tokens: usize,
+}
+
+fn build_response_resource_value(
+    response_id: &str,
+    model_id: &str,
+    created_at: i64,
+    completed_at: Option<i64>,
+    output_items: serde_json::Value,
+    max_output_tokens: Option<i64>,
+    temperature: f64,
+    top_p: f64,
+    status: &str,
+    usage: Option<&UsageStats>,
+    tools: Option<&serde_json::Value>,
+    tool_choice: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let usage_value = match usage {
+        Some(u) => json!({
+            "input_tokens": u.input_tokens,
+            "output_tokens": u.output_tokens,
+            "total_tokens": u.input_tokens + u.output_tokens,
+            "input_tokens_details": {
+                "cached_tokens": 0
+            },
+            "output_tokens_details": {
+                "reasoning_tokens": 0
+            }
+        }),
+        None => serde_json::Value::Null,
+    };
+
+    let tools_value = tools.cloned().unwrap_or_else(|| json!([]));
+    let tool_choice_value = tool_choice.cloned().unwrap_or_else(|| json!("none"));
+
+    json!({
+        "id": response_id,
+        "object": "response",
+        "created_at": created_at,
+        "completed_at": completed_at,
+        "status": status,
+        "incomplete_details": null,
+        "model": model_id,
+        "previous_response_id": null,
+        "instructions": null,
+        "output": output_items,
+        "error": null,
+        "tools": tools_value,
+        "tool_choice": tool_choice_value,
+        "truncation": "auto",
+        "parallel_tool_calls": false,
+        "text": { "format": { "type": "text" } },
+        "top_p": top_p,
+        "presence_penalty": 0.0,
+        "frequency_penalty": 0.0,
+        "top_logprobs": 0,
+        "temperature": temperature,
+        "reasoning": { "effort": null, "summary": null },
+        "usage": usage_value,
+        "max_output_tokens": max_output_tokens,
+        "max_tool_calls": null,
+        "store": false,
+        "background": false,
+        "service_tier": "default",
+        "metadata": {},
+        "safety_identifier": null,
+        "prompt_cache_key": null
+    })
+}
+
+fn normalize_response_value(value: serde_json::Value) -> serde_json::Value {
+    match serde_json::from_value::<generated::ResponseResource>(value.clone()) {
+        Ok(val) => serde_json::to_value(val).unwrap_or(value),
+        Err(_) => value,
+    }
+}
+
+async fn select_model_id(state: Arc<AppState>, request_model: Option<String>) -> Result<String> {
+    if let Some(configured) = state.configured_model.clone() {
+        if let Some(requested) = request_model {
+            // Accept exact match or suffix match (short ID vs full path).
+            // The settings endpoint returns short IDs like "Org/Model" while
+            // configured_model may be a full filesystem path.
+            if requested == configured || configured.ends_with(&format!("/{}", requested)) {
+                return Ok(configured);
+            }
+
+            // Check remote backend models (e.g. OpenAI-compatible providers).
+            let models = list_backend_models(state.clone()).await.unwrap_or_default();
+            if models.iter().any(|model| model.id == requested) {
+                return Ok(requested);
+            }
+
+            // Check managed local models and hot-swap if found.
+            let requested_clone = requested.clone();
+            let found = tokio::task::spawn_blocking(move || {
+                talu::repo::repo_list_models(false)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .find(|m| m.id == requested_clone)
+            })
+            .await
+            .unwrap_or(None);
+
+            if found.is_some() {
+                ensure_backend_for_model(state.clone(), &requested).await?;
+                return Ok(requested);
+            }
+
+            return Err(anyhow!("model not available: {}", requested));
+        }
+
+        let models = list_backend_models(state.clone()).await.unwrap_or_default();
+        if let Some(first) = models.first() {
+            if !first.id.is_empty() {
+                return Ok(first.id.clone());
+            }
+        }
+
+        return Ok(configured);
+    }
+
+    let requested = request_model.ok_or_else(|| anyhow!("model is required"))?;
+    ensure_backend_for_model(state.clone(), &requested).await?;
+    Ok(requested)
+}
+
+async fn list_backend_models(state: Arc<AppState>) -> Result<Vec<talu::RemoteModelInfo>> {
+    let mut guard = state.backend.lock().await;
+    let backend = guard
+        .backend
+        .as_mut()
+        .ok_or_else(|| anyhow!("no backend available"))?;
+    backend
+        .list_models()
+        .map_err(|err| anyhow!("model listing failed: {err}"))
+}
+
+async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Result<()> {
+    {
+        let guard = state.backend.lock().await;
+        if guard
+            .current_model
+            .as_deref()
+            .map(|current| current == model_id)
+            .unwrap_or(false)
+            && guard.backend.is_some()
+        {
+            return Ok(());
+        }
+    }
+
+    log::info!("loading backend for model {}", model_id);
+    let model = model_id.to_string();
+    let backend =
+        tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model)).await??;
+
+    let mut guard = state.backend.lock().await;
+    guard.backend = Some(backend);
+    guard.current_model = Some(model_id.to_string());
+    Ok(())
+}
+
+fn log_generation_completed(ctx: &AuthContext) {
+    if let Some(user_id) = ctx.user_id.as_deref() {
+        log::info!(
+            "[tenant={}] [user={}] Generation completed",
+            ctx.tenant_id,
+            user_id
+        );
+    } else {
+        log::info!("[tenant={}] Generation completed", ctx.tenant_id);
+    }
+}
+
+fn random_id() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{:x}", nanos)
+}
+
+fn now_unix_seconds() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
+}
+
+fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody> {
+    let payload = json!({
+        "error": {
+            "code": code,
+            "message": message
+        }
+    });
+    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap()
+}

@@ -1,0 +1,13 @@
+[workspace]
+members = ["talu-sys", "talu", "cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/aprxi/talu"
+
+[workspace.dependencies]
+anyhow = "1.0"
+thiserror = "2.0"

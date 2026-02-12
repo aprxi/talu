@@ -1,0 +1,101 @@
+/* =============================================================================
+   Shared Components (shared between UI and docs)
+   Source of truth: ui/src/styles/components.css
+   ============================================================================= */
+
+/* =============================================================================
+   Theme Toggle
+   ============================================================================= */
+
+.theme-selector {
+  position: relative;
+}
+
+.theme-toggle-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.25rem;
+  width: 2rem;
+  height: 2rem;
+  border-radius: 6px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.theme-toggle-btn:hover {
+  color: var(--text);
+}
+
+.theme-icon {
+  width: 14px;
+  height: 14px;
+}
+
+.theme-icon-sun {
+  display: none;
+}
+
+.theme-icon-moon {
+  display: block;
+}
+
+:root.light-talu .theme-icon-sun {
+  display: block;
+}
+
+:root.light-talu .theme-icon-moon {
+  display: none;
+}
+
+/* =============================================================================
+   Card Grid
+   Base card pattern for grid layouts (browser cards, quickstart cards, etc.)
+   ============================================================================= */
+
+.card-grid {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.card {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 0.75rem;
+}
+
+.card:hover {
+  border-color: var(--primary);
+}
+
+/* =============================================================================
+   Note / Callout
+   Contextual callouts for notes, warnings, and other highlighted information
+   ============================================================================= */
+
+.note {
+  background: var(--bg-code);
+  border-left: 3px solid var(--primary);
+  padding: 0.5rem 0.75rem;
+  margin: 0.75rem 0;
+  font-size: 0.8rem;
+}
+
+.note.warning {
+  border-left-color: #e0a500;
+}
+
+.note-label {
+  font-weight: 600;
+  margin-bottom: 0.2rem;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.note.warning .note-label {
+  color: #e0a500;
+}

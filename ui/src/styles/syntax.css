@@ -1,0 +1,213 @@
+/* =============================================================================
+   Syntax Highlighting (shared between UI and docs)
+   Source of truth: ui/src/styles/syntax.css
+
+   Unified hl-* classes used by:
+   - Docs: Pygments with UnifiedHtmlFormatter (build-time)
+   - UI:   tree-sitter via Zig core API (runtime)
+   ============================================================================= */
+
+/* -----------------------------------------------------------------------------
+   Base Code Styling
+   ----------------------------------------------------------------------------- */
+
+/* Inline code */
+code {
+  font-family: var(--font-mono);
+  font-size: 0.875em;
+  background: var(--bg-code);
+  color: var(--text);
+  padding: 0.1em 0.3em;
+  border-radius: 3px;
+}
+
+/* Code blocks */
+pre {
+  background: var(--bg-code);
+  padding: 0.75rem 1rem;
+  border-radius: 3px;
+  overflow-x: auto;
+  margin-bottom: 0.75rem;
+  border: 1px solid var(--border);
+}
+
+pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  color: var(--text);
+}
+
+/* -----------------------------------------------------------------------------
+   Pygments wrapper (docs)
+   ----------------------------------------------------------------------------- */
+
+.highlight {
+  position: relative;
+  margin-bottom: 0.75rem;
+  background: var(--bg-code);
+}
+
+.highlight pre {
+  margin: 0;
+}
+
+.highlight pre > span:first-child:empty {
+  display: none;
+}
+
+/* -----------------------------------------------------------------------------
+   Unified Syntax Token Classes (hl-*)
+   ----------------------------------------------------------------------------- */
+
+/* Comments */
+.hl-comment {
+  color: var(--syntax-comment);
+  font-style: italic;
+}
+
+/* Keywords */
+.hl-keyword {
+  color: var(--syntax-keyword);
+  font-weight: 500;
+}
+
+/* Contextual keyword groups */
+.hl-keyword-type {
+  color: var(--syntax-keyword-type, var(--syntax-keyword));
+  font-weight: 600;
+}
+
+.hl-keyword-declaration {
+  color: var(--syntax-keyword-declaration, var(--syntax-keyword));
+  font-weight: 600;
+}
+
+.hl-keyword-namespace {
+  color: var(--syntax-keyword-namespace, var(--syntax-keyword));
+}
+
+/* Explicit declaration keywords by symbol kind */
+.hl-class-keyword {
+  color: var(--syntax-class-keyword, var(--syntax-keyword-declaration, var(--syntax-keyword)));
+  font-weight: 600;
+}
+
+.hl-enum-keyword {
+  color: var(--syntax-enum-keyword, var(--syntax-keyword-type, var(--syntax-keyword)));
+  font-weight: 600;
+}
+
+.hl-type-keyword {
+  color: var(--syntax-type-keyword, var(--syntax-keyword-type, var(--syntax-keyword)));
+  font-weight: 600;
+}
+
+/* Strings */
+.hl-string {
+  color: var(--syntax-string);
+}
+
+/* Numbers */
+.hl-number {
+  color: var(--syntax-number, var(--syntax-function));
+}
+
+/* Symbol names */
+.hl-function {
+  color: var(--syntax-function);
+}
+
+.hl-function-name {
+  color: var(--syntax-function);
+}
+
+.hl-class-name {
+  color: var(--syntax-class-name, var(--syntax-class, var(--syntax-type, var(--syntax-function))));
+}
+
+.hl-enum-name {
+  color: var(--syntax-enum-name, var(--syntax-enum, var(--syntax-class, var(--syntax-type, var(--syntax-function)))));
+}
+
+.hl-type-name {
+  color: var(--syntax-type-name, var(--syntax-type, var(--syntax-class, var(--syntax-function))));
+}
+
+.hl-namespace-name {
+  color: var(--syntax-namespace, var(--syntax-type, var(--syntax-keyword)));
+}
+
+.hl-property-name {
+  color: var(--syntax-property, var(--text));
+}
+
+.hl-constant-name {
+  color: var(--syntax-constant, var(--syntax-number, var(--syntax-function)));
+  font-weight: 500;
+}
+
+.hl-builtin-name {
+  color: var(--syntax-builtin, var(--syntax-function));
+}
+
+.hl-decorator-name {
+  color: var(--syntax-decorator, var(--syntax-keyword));
+}
+
+/* Operators and punctuation */
+.hl-operator {
+  color: var(--syntax-operator, var(--text));
+}
+
+.hl-punctuation {
+  color: var(--syntax-punctuation, var(--text));
+}
+
+/* Error tokens */
+.hl-error {
+  color: var(--danger);
+}
+
+/* -----------------------------------------------------------------------------
+   Copy Button (docs style)
+   ----------------------------------------------------------------------------- */
+
+.copy-btn {
+  position: absolute;
+  top: 0.35rem;
+  right: 0.35rem;
+  padding: 0.15rem;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  opacity: 0.3;
+}
+
+.copy-btn svg {
+  width: 14px;
+  height: 14px;
+  display: block;
+}
+
+.copy-btn:hover {
+  opacity: 0.7;
+}
+
+/* -----------------------------------------------------------------------------
+   API Links in Code (docs)
+   ----------------------------------------------------------------------------- */
+
+.api-link {
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-style: dotted;
+  text-underline-offset: 2px;
+}
+
+.api-link:hover {
+  text-decoration-style: solid;
+}

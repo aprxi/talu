@@ -1,0 +1,26 @@
+{
+  "name": "talu-console",
+  "module": "src/main.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "build": "bun run build:js && bun run build:css && cp src/index.html dist/",
+    "build:js": "bun build ./src/main.ts --outdir ./dist --minify",
+    "build:css": "cat ./src/styles/colors.css ./src/styles/syntax.css ./src/styles/base.css ./src/styles/ui/base.css ./src/styles/components.css ./src/styles/ui/components.css ./src/styles/markdown.css ./src/styles/ui/layout.css ./src/styles/ui/chat.css ./src/styles/ui/browser.css > ./dist/style.css",
+    "dev": "bun build ./src/main.ts --outdir ./dist --watch",
+    "test": "bun test --preload ./tests/setup.ts"
+  },
+  "devDependencies": {
+    "@happy-dom/global-registrator": "^20.5.0",
+    "@types/bun": "latest",
+    "@types/dompurify": "^3.2.0",
+    "happy-dom": "^20.5.0"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "dompurify": "^3.3.1",
+    "marked": "^17.0.1"
+  }
+}

@@ -1,0 +1,29 @@
+name: Check Version Bump
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check version status
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PR_VERSION=$(cat VERSION)
+          echo "VERSION: $PR_VERSION"
+
+          # Check if GitHub release for this version exists
+          if gh release view "v$PR_VERSION" >/dev/null 2>&1; then
+            echo "Release v$PR_VERSION exists - dev build will be created on merge"
+          else
+            echo "Release v$PR_VERSION does not exist - versioned release will be created on merge"
+          fi

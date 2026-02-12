@@ -1,0 +1,189 @@
+/* =============================================================================
+   Docs Typography (docs-specific overrides)
+   Base typography comes from shared markdown.css (.markdown-body)
+   ============================================================================= */
+
+/* Docs body copy is driven by --text-muted so theme editor changes
+   to muted text are reflected directly in guide prose. */
+
+.markdown-body {
+  line-height: 1.5;
+}
+
+.markdown-body h1 {
+  margin-bottom: 0.75rem;
+  line-height: 1.2;
+}
+
+/* Headings use primary color for visual hierarchy */
+.markdown-body h1,
+.markdown-body h2,
+.markdown-body h3 {
+  color: var(--primary);
+}
+
+.markdown-body h2, .markdown-body h3, .markdown-body h4,
+.markdown-body .api-method {
+  scroll-margin-top: calc(var(--topbar-height) + 1rem);
+}
+
+.markdown-body h2 {
+  margin-top: 1.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.markdown-body h4 {
+  color: var(--text-muted);
+  margin-top: 1rem;
+  margin-bottom: 0.25rem;
+}
+
+.api-method {
+  padding: 0.5rem 0;
+}
+
+.api-method + .api-method {
+  margin-top: 1.5rem;
+}
+
+.api-method h4 {
+  margin: 0;
+}
+
+.api-method > p {
+  margin: 0.25rem 0 0 1.5rem;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+.markdown-body h4 > code {
+  background: none;
+  padding: 0;
+  font-size: 0.9em;
+}
+
+/* Structured docstring sections */
+.ds-section {
+  margin: 0.5rem 0 0 1.5rem;
+  font-size: 0.8125rem;
+  color: var(--text-muted);
+}
+
+.ds-label {
+  font-size: 0.7rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  margin: 0.5rem 0 0.15rem;
+}
+
+.ds-section p {
+  margin: 0 0 0.25rem;
+}
+
+.ds-section dl {
+  margin: 0;
+}
+
+.ds-section dt {
+  margin-top: 0.2rem;
+}
+
+.ds-section dt code {
+  background: none;
+  padding: 0;
+  color: var(--text);
+}
+
+.ds-section dd {
+  margin: 0.1rem 0 0 1rem;
+}
+
+.ds-section dd ul {
+  margin: 0.25rem 0;
+  padding-left: 1.25rem;
+}
+
+.ds-section .highlight {
+  margin: 0.25rem 0;
+}
+
+.ds-section .highlight pre {
+  padding: 0.5rem 0.75rem;
+}
+
+.markdown-body p {
+  color: var(--text-muted);
+}
+
+.markdown-body li {
+  margin-bottom: 0.15rem;
+  color: var(--text-muted);
+}
+
+.markdown-body li::marker {
+  color: var(--text-muted);
+}
+
+.markdown-body li > ul, .markdown-body li > ol {
+  margin-top: 0.15rem;
+  margin-bottom: 0.15rem;
+}
+
+.markdown-body blockquote {
+  border-left-color: var(--border-dark);
+}
+
+.markdown-body td {
+  color: var(--text-muted);
+}
+
+/* Anchor links */
+.anchor-link {
+  margin-left: 0.35rem;
+  opacity: 0;
+  color: var(--text-muted);
+  text-decoration: none;
+  font-weight: normal;
+  font-size: 0.9em;
+}
+
+h2:hover .anchor-link,
+h3:hover .anchor-link,
+h4:hover .anchor-link {
+  opacity: 0.6;
+}
+
+.anchor-link:hover {
+  opacity: 1;
+  color: var(--primary);
+}
+
+/* Content h3 - normal section header */
+.content h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 1.25rem 0 0.5rem;
+}
+
+/* Reference label style (Quick Reference, Properties, Methods) */
+.content h3.ref-label {
+  font-family: var(--font-mono);
+  font-size: 0.875rem;
+  margin: 1rem 0 0.25rem;
+  padding: 0.35rem 0.5rem;
+  background: var(--bg-code);
+  border-left: 3px solid var(--accent);
+  border-radius: 0 3px 3px 0;
+}
+
+/* Section labels */
+.content p > strong:only-child {
+  display: block;
+  color: var(--text-muted);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  margin-bottom: 0.25rem;
+}

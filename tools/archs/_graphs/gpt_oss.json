@@ -1,0 +1,569 @@
+{
+  "name": "gpt_oss",
+  "model_types": [
+    "gpt_oss"
+  ],
+  "weight_prefixes": [
+    "model.layers.{d}.",
+    "layers.{d}.",
+    "transformer.h.{d}.",
+    "backbone.layers.{d}.",
+    "language_model.model.layers.{d}."
+  ],
+  "block_variants": {
+    "sliding_attention": {
+      "ops": [
+        {
+          "op": "norm",
+          "inputs": [
+            {
+              "tensor": "x"
+            },
+            {
+              "tensor": "input_layernorm.weight"
+            }
+          ],
+          "outputs": [
+            "_t0"
+          ],
+          "eps": 1e-05,
+          "name": "input_layernorm"
+        },
+        {
+          "op": "multihead_attention",
+          "inputs": [
+            {
+              "tensor": "_t0"
+            }
+          ],
+          "outputs": [
+            "_t1"
+          ],
+          "qk_norm": false,
+          "fused_qkv": false,
+          "sliding_window": 128
+        },
+        {
+          "op": "add",
+          "inputs": [
+            {
+              "tensor": "x"
+            },
+            {
+              "tensor": "_t1"
+            }
+          ],
+          "outputs": [
+            "_t2"
+          ]
+        },
+        {
+          "op": "norm",
+          "inputs": [
+            {
+              "tensor": "_t2"
+            },
+            {
+              "tensor": "post_attention_layernorm.weight"
+            }
+          ],
+          "outputs": [
+            "_t3"
+          ],
+          "eps": 1e-05,
+          "name": "post_attention_layernorm"
+        },
+        {
+          "op": "moe",
+          "inputs": [
+            {
+              "tensor": "_t3"
+            }
+          ],
+          "outputs": [
+            "_t4"
+          ],
+          "num_experts": 32,
+          "experts_per_token": 4,
+          "activation": "swiglu_oss"
+        },
+        {
+          "op": "add",
+          "inputs": [
+            {
+              "tensor": "_t2"
+            },
+            {
+              "tensor": "_t4"
+            }
+          ],
+          "outputs": [
+            "_t5"
+          ]
+        }
+      ],
+      "weights": [
+        {
+          "id": "input_layernorm.weight",
+          "module_type": "RMSNorm",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.sinks",
+          "module_type": "Attention",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.q_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.q_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.k_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.k_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.v_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.v_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.o_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.o_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "post_attention_layernorm.weight",
+          "module_type": "RMSNorm",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.router.weight",
+          "module_type": "_TopKRouter",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.router.bias",
+          "module_type": "_TopKRouter",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.gate_up_proj_blocks",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "mxfp4",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.gate_up_proj_scales",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "uint8",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.gate_up_proj_bias",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.down_proj_blocks",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "mxfp4",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.down_proj_scales",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "uint8",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.down_proj_bias",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        }
+      ]
+    },
+    "full_attention": {
+      "ops": [
+        {
+          "op": "norm",
+          "inputs": [
+            {
+              "tensor": "x"
+            },
+            {
+              "tensor": "input_layernorm.weight"
+            }
+          ],
+          "outputs": [
+            "_t0"
+          ],
+          "eps": 1e-05,
+          "name": "input_layernorm"
+        },
+        {
+          "op": "multihead_attention",
+          "inputs": [
+            {
+              "tensor": "_t0"
+            }
+          ],
+          "outputs": [
+            "_t1"
+          ],
+          "qk_norm": false,
+          "fused_qkv": false
+        },
+        {
+          "op": "add",
+          "inputs": [
+            {
+              "tensor": "x"
+            },
+            {
+              "tensor": "_t1"
+            }
+          ],
+          "outputs": [
+            "_t2"
+          ]
+        },
+        {
+          "op": "norm",
+          "inputs": [
+            {
+              "tensor": "_t2"
+            },
+            {
+              "tensor": "post_attention_layernorm.weight"
+            }
+          ],
+          "outputs": [
+            "_t3"
+          ],
+          "eps": 1e-05,
+          "name": "post_attention_layernorm"
+        },
+        {
+          "op": "moe",
+          "inputs": [
+            {
+              "tensor": "_t3"
+            }
+          ],
+          "outputs": [
+            "_t4"
+          ],
+          "num_experts": 32,
+          "experts_per_token": 4,
+          "activation": "swiglu_oss"
+        },
+        {
+          "op": "add",
+          "inputs": [
+            {
+              "tensor": "_t2"
+            },
+            {
+              "tensor": "_t4"
+            }
+          ],
+          "outputs": [
+            "_t5"
+          ]
+        }
+      ],
+      "weights": [
+        {
+          "id": "input_layernorm.weight",
+          "module_type": "RMSNorm",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.sinks",
+          "module_type": "Attention",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.q_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.q_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.k_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.k_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.v_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.v_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.o_proj.weight",
+          "module_type": "Linear",
+          "layout": "linear",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "self_attn.o_proj.bias",
+          "module_type": "Linear",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "post_attention_layernorm.weight",
+          "module_type": "RMSNorm",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.router.weight",
+          "module_type": "_TopKRouter",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.router.bias",
+          "module_type": "_TopKRouter",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.gate_up_proj_blocks",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "mxfp4",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.gate_up_proj_scales",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "uint8",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.gate_up_proj_bias",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.down_proj_blocks",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "mxfp4",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.down_proj_scales",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "uint8",
+          "required": true
+        },
+        {
+          "id": "mlp.experts.down_proj_bias",
+          "module_type": "_Experts",
+          "layout": "none",
+          "dtype": "float32",
+          "required": true
+        }
+      ]
+    }
+  },
+  "variant_names": [
+    "sliding_attention",
+    "full_attention"
+  ],
+  "layer_map": [
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1,
+    0,
+    1
+  ],
+  "pre_block": [
+    {
+      "op": "embedding",
+      "inputs": [
+        {
+          "tensor": "input_ids"
+        }
+      ],
+      "outputs": [
+        "_t0"
+      ]
+    }
+  ],
+  "post_block": [
+    {
+      "op": "norm",
+      "inputs": [
+        {
+          "tensor": "_t_last"
+        }
+      ],
+      "outputs": [
+        "_t_out"
+      ],
+      "eps": 1e-05
+    }
+  ],
+  "global_weights": [
+    {
+      "id": "token_embeddings",
+      "candidates": [
+        "model.embed_tokens.weight",
+        "embed_tokens.weight",
+        "transformer.wte.weight",
+        "backbone.embedding.weight",
+        "language_model.model.embed_tokens.weight"
+      ],
+      "module_type": "Embedding",
+      "layout": "embedding",
+      "dtype": "float32",
+      "required": true
+    },
+    {
+      "id": "ln_final",
+      "candidates": [
+        "model.norm.weight",
+        "norm.weight",
+        "transformer.ln_f.weight",
+        "backbone.norm.weight",
+        "language_model.model.norm.weight",
+        "model.embedding_norm.weight"
+      ],
+      "module_type": "RMSNorm",
+      "layout": "none",
+      "dtype": "float32",
+      "required": true
+    },
+    {
+      "id": "lm_head",
+      "candidates": [
+        "lm_head.weight",
+        "output.weight",
+        "transformer.lm_head.weight",
+        "language_model.lm_head.weight"
+      ],
+      "module_type": "Linear",
+      "layout": "linear",
+      "dtype": "float32",
+      "required": false
+    }
+  ]
+}

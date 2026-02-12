@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>talu - High-Performance LLM Inference</title>
+  <!-- Styles are in docs/css/pages.css -->
+</head>
+<body>
+  <aside class="sidebar">
+    <header class="sidebar-header">
+      <a href="index.html" class="logo"><span class="logo-t">▀█▀</span><span class="logo-name">talu</span></a>
+    </header>
+    <nav>
+      <ul>
+        <!-- nav will be injected by build -->
+      </ul>
+    </nav>
+  </aside>
+  <main class="content">
+    <article class="markdown-body">
+      <h1>talu</h1>
+      <p class="tagline">High-performance LLM inference with zero dependencies</p>
+
+      <section class="install-section">
+        <div class="install-header">
+          <h2>Install</h2>
+          <span class="version-badge" id="version">v0.0.3</span>
+        </div>
+
+        <div class="platform-tabs">
+          <button class="platform-tab active" data-platform="mac">macOS</button>
+          <button class="platform-tab" data-platform="linux">Linux</button>
+        </div>
+
+        <div class="install-box">
+          <div class="install-command">
+            <span class="prompt">$</span>
+            <span class="command-text" id="install-command">pip install talu</span>
+            <div class="pkg-toggle">
+              <button class="active" data-pkg="pip">pip</button>
+              <button data-pkg="uv">uv</button>
+            </div>
+            <button class="copy-btn" title="Copy">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2"/>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
+              </svg>
+            </button>
+          </div>
+        </div>
+        <p class="install-alt">
+          <a href="https://pypi.org/project/talu/">PyPI</a> · <a href="https://github.com/aprxi/talu/releases">GitHub Releases</a>
+        </p>
+      </section>
+
+      <section class="examples-section">
+        <h2>Quick Examples</h2>
+        <p class="text-muted muted-intro">
+          Run from the command line. <a href="cli.html">See full CLI documentation →</a>
+        </p>
+
+        <p>Download a model and ask it a question.</p>
+
+        <div class="code-block">
+          <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask -m Qwen/Qwen3-0.6B "What is 2+2?"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+        </div>
+
+        <p>Use environment variables for quick iteration.</p>
+
+        <div class="code-block">
+          <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">TOKENS=100 TEMPERATURE=0.7 talu ask -m Qwen/Qwen3-0.6B "Tell me a joke"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+        </div>
+
+        <p>Quantize a model for faster inference.</p>
+
+        <div class="code-block">
+          <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu convert -m Qwen/Qwen3-0.6B --scheme gaf4_32</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+        </div>
+      </section>
+
+      <section class="quickstart-section">
+        <h2>Getting Started</h2>
+        <div class="card-grid quickstart-cards">
+          <a href="cli.html" class="card quickstart-card">
+            <h3>Command Line</h3>
+            <p>Run inference directly from your terminal. Download models, generate text, and convert formats.</p>
+            <span class="arrow">→ CLI Guide</span>
+          </a>
+          <a href="examples/python.html" class="card quickstart-card">
+            <h3>Python Library</h3>
+            <p>Integrate talu into your Python applications. Streaming, chat sessions, and custom pipelines.</p>
+            <span class="arrow">→ Python Examples</span>
+          </a>
+        </div>
+      </section>
+
+      <section class="quickstart-section">
+        <h2>Supported Models</h2>
+        <p class="text-muted muted-support">
+          Qwen2/3, LLaMA 2/3, Gemma 2/3, Phi-3/4, Mistral, Granite 3, and more.
+          <a href="getting-started/supported-models.html">See full list →</a>
+        </p>
+      </section>
+    </article>
+  </main>
+
+  <script>
+    const platformTabs = document.querySelectorAll('.platform-tab');
+    const pkgBtns = document.querySelectorAll('.pkg-toggle button');
+    const installCmd = document.getElementById('install-command');
+
+    let currentPkg = 'pip';
+
+    function updateInstallCommand() {
+      const commands = { pip: 'pip install talu', uv: 'uv pip install talu' };
+      installCmd.textContent = commands[currentPkg];
+    }
+
+    platformTabs.forEach(tab => {
+      tab.addEventListener('click', () => {
+        platformTabs.forEach(t => t.classList.remove('active'));
+        tab.classList.add('active');
+      });
+    });
+
+    pkgBtns.forEach(btn => {
+      btn.addEventListener('click', () => {
+        pkgBtns.forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentPkg = btn.dataset.pkg;
+        updateInstallCommand();
+      });
+    });
+
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        var cmdBody = btn.closest('.cmd-body');
+        var installCmd = btn.closest('.install-command');
+        var text = '';
+        if (installCmd) {
+          text = installCmd.querySelector('.command-text').textContent;
+        } else if (cmdBody) {
+          text = cmdBody.querySelector('.command-text').textContent;
+        }
+        if (text) navigator.clipboard.writeText(text).then(() => showCopied(btn));
+      });
+    });
+  </script>
+</body>
+</html>

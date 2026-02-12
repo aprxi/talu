@@ -1,0 +1,136 @@
+/** Build the full chat DOM into the plugin's shadow root container. */
+export function buildChatDOM(container: HTMLElement): void {
+  // Apply mode-view layout directly on the container since the
+  // .mode-view class is on the host element outside the shadow root.
+  container.style.display = "flex";
+  container.style.height = "100%";
+  container.style.overflow = "hidden";
+
+  container.innerHTML = `
+    <aside class="sidebar">
+      <div class="sidebar-header">
+        <button id="new-conversation" class="btn btn-primary btn-full" title="New conversation">
+          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
+          New Chat
+        </button>
+      </div>
+      <div class="sidebar-content scroll-thin">
+        <div class="sidebar-section-label">Recent</div>
+        <div id="sidebar-list">
+          <div id="loader-sentinel" class="empty-state hidden">
+            <div class="spinner"></div>
+            <a href="?safe=true" style="display:block;margin-top:0.75rem;font-size:12px;color:var(--text-muted,#6c7086);text-decoration:underline;">Safe mode</a>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <div class="chat-column">
+      <div class="content-area">
+        <div id="transcript" class="transcript scroll-thin"></div>
+
+        <div id="welcome-state" class="welcome-state">
+          <h2 class="welcome-title">Ask anything</h2>
+          <div class="input-container">
+            <textarea id="welcome-input" rows="1" placeholder="Send a message..." class="input-textarea"></textarea>
+            <div class="input-footer">
+              <select id="welcome-model" class="form-select form-select-inline">
+                <option value="">Loading...</option>
+              </select>
+              <select id="welcome-prompt" class="form-select form-select-inline" title="System prompt">
+                <option value="">No prompt</option>
+              </select>
+              <div class="flex-1"></div>
+              <button id="welcome-send" class="btn btn-primary btn-send">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div id="input-bar" class="input-bar hidden">
+          <div class="input-container">
+            <textarea id="input-text" rows="1" placeholder="Send a message..." class="input-textarea"></textarea>
+            <div class="input-footer">
+              <div class="flex-1"></div>
+              <button id="input-send" class="btn btn-primary btn-send">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <aside id="right-panel" class="right-panel hidden scroll-thin">
+      <div class="panel-section" data-panel-settings>
+        <div style="display: flex; justify-content: flex-end; margin-bottom: 0.5rem;">
+          <button id="close-right-panel" class="btn btn-ghost btn-icon" title="Close panel">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-model" class="form-label form-label-sm">Model</label>
+          <select id="panel-model" class="form-select form-select-sm">
+            <option value="">Loading...</option>
+          </select>
+        </div>
+
+        <div class="panel-divider"></div>
+        <h3 class="panel-heading">Sampling</h3>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-temperature" class="form-label form-label-sm">Temperature</label>
+          <input id="panel-temperature" type="number" step="0.1" min="0" max="2" placeholder="1.0" class="form-input form-input-sm">
+          <div id="panel-temperature-default" class="form-hint"></div>
+        </div>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-top-p" class="form-label form-label-sm">Top P</label>
+          <input id="panel-top-p" type="number" step="0.05" min="0" max="1" placeholder="1.0" class="form-input form-input-sm">
+          <div id="panel-top-p-default" class="form-hint"></div>
+        </div>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-top-k" class="form-label form-label-sm">Top K</label>
+          <input id="panel-top-k" type="number" step="1" min="0" placeholder="50" class="form-input form-input-sm">
+          <div id="panel-top-k-default" class="form-hint"></div>
+        </div>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-min-p" class="form-label form-label-sm">Min P</label>
+          <input id="panel-min-p" type="number" step="0.01" min="0" max="1" placeholder="0.0" class="form-input form-input-sm">
+        </div>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-max-output-tokens" class="form-label form-label-sm">Max Output Tokens</label>
+          <input id="panel-max-output-tokens" type="number" step="1" min="1" placeholder="2048" class="form-input form-input-sm">
+        </div>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-repetition-penalty" class="form-label form-label-sm">Repetition Penalty</label>
+          <input id="panel-repetition-penalty" type="number" step="0.05" min="1" placeholder="1.0" class="form-input form-input-sm">
+        </div>
+
+        <div style="margin-bottom: 0.75rem;">
+          <label for="panel-seed" class="form-label form-label-sm">Seed</label>
+          <input id="panel-seed" type="number" step="1" min="0" placeholder="Random" class="form-input form-input-sm">
+        </div>
+
+        <div class="panel-divider"></div>
+
+        <h3 class="panel-heading">Info</h3>
+        <div id="panel-chat-info">
+          <div class="info-row">
+            <span class="info-label">Created</span>
+            <span id="panel-info-created" class="info-value">-</span>
+          </div>
+          <div id="panel-info-forked-row" class="info-row hidden">
+            <span class="info-label">Forked from</span>
+            <span id="panel-info-forked" class="info-value mono">-</span>
+          </div>
+        </div>
+      </div>
+    </aside>`;
+}

@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Supported Models - talu</title>
+</head>
+<body>
+  <aside class="sidebar">
+    <header class="sidebar-header">
+      <a href="index.html" class="logo"><span class="logo-t">▀█▀</span><span class="logo-name">talu</span></a>
+    </header>
+    <nav><ul></ul></nav>
+  </aside>
+  <main class="content">
+    <article class="markdown-body">
+      <h1>Supported Models</h1>
+      <p>talu supports many popular LLM architectures. Models are downloaded automatically from HuggingFace Hub.</p>
+
+      <h2>Model Families</h2>
+      <table>
+        <thead>
+          <tr><th>Family</th><th>Architectures</th><th>Example</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><strong>Qwen</strong></td><td>Qwen2, Qwen2.5, Qwen3</td><td><code>Qwen/Qwen3-0.6B</code></td></tr>
+          <tr><td><strong>LLaMA</strong></td><td>LLaMA 2, 3, 3.1, 3.2</td><td><code>meta-llama/Llama-3.2-1B</code></td></tr>
+          <tr><td><strong>Mistral</strong></td><td>Mistral, Ministral</td><td><code>mistralai/Ministral-3B-Instruct</code></td></tr>
+          <tr><td><strong>Gemma</strong></td><td>Gemma 2, Gemma 3</td><td><code>google/gemma-3-1b-it</code></td></tr>
+          <tr><td><strong>Phi</strong></td><td>Phi-3, Phi-4</td><td><code>microsoft/Phi-4-mini-instruct</code></td></tr>
+          <tr><td><strong>Granite</strong></td><td>IBM Granite 3</td><td><code>ibm-granite/granite-3.3-2b-instruct</code></td></tr>
+        </tbody>
+      </table>
+      <p>Plus: Yi, Vicuna, TinyLlama, and more.</p>
+
+      <h2>Usage</h2>
+
+      <h3>From HuggingFace Hub</h3>
+<pre><code>import talu
+
+# Downloaded automatically on first use
+response = talu.generate("Qwen/Qwen3-0.6B", "Hello!")</code></pre>
+
+      <h3>From Local Path</h3>
+<pre><code>response = talu.generate("/path/to/model", "Hello!")</code></pre>
+
+      <h3>Private Models</h3>
+      <p>Set the <code>HF_TOKEN</code> environment variable:</p>
+<pre><code>export HF_TOKEN=your_token_here</code></pre>
+<pre><code>response = talu.generate("your-org/private-model", "Hello!")</code></pre>
+    </article>
+  </main>
+</body>
+</html>

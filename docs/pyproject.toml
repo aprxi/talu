@@ -1,0 +1,13 @@
+[project]
+name = "talu-docs"
+version = "0.0.0"
+description = "Documentation builder for talu"
+requires-python = ">=3.10"
+dependencies = [
+    "talu",
+    "markdown>=3.10",
+    "pygments>=2.19.2",
+]
+
+[tool.uv.sources]
+talu = { path = "../bindings/python", editable = true }

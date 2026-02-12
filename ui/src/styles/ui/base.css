@@ -1,0 +1,50 @@
+/* =============================================================================
+   UI Base (UI-specific overrides on top of shared base.css)
+   ============================================================================= */
+
+:root {
+  --sidebar-width: 280px;
+
+  color-scheme: dark;
+}
+
+html, body {
+  height: 100%;
+  overflow: hidden;
+}
+
+body {
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+/* Disable all browser View Transitions */
+@view-transition {
+  navigation: none;
+}
+
+::view-transition-old(*),
+::view-transition-new(*),
+::view-transition-group(*),
+::view-transition-image-pair(*) {
+  animation: none !important;
+}
+
+/* Firefox scrollbars */
+.scroll-thin {
+  scrollbar-width: thin;
+  scrollbar-color: var(--border) transparent;
+}
+
+/* =============================================================================
+   Utilities
+   ============================================================================= */
+
+.hidden { display: none !important; }
+.flex-1 { flex: 1; }
+.truncate { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.shrink-0 { flex-shrink: 0; }
+
+/* Utility classes for danger styling */
+.text-danger { color: var(--danger) !important; }
+.bg-danger\/10 { background: color-mix(in srgb, var(--danger) 10%, transparent) !important; }

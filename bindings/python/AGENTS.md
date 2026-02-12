@@ -1,0 +1,1 @@
+Before working in `bindings/python/`, open and follow `POLICY.md` in this directory.

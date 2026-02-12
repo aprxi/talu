@@ -1,0 +1,25 @@
+/* =============================================================================
+   Docs Shared Overrides
+   Adjustments layered on top of ui/src/styles/{markdown,syntax}.css
+   ============================================================================= */
+
+details summary {
+  color: var(--secondary);
+}
+
+.markdown-body a {
+  color: var(--secondary);
+}
+
+.markdown-body table {
+  table-layout: fixed;
+}
+
+.markdown-body table th:first-child,
+.markdown-body table td:first-child {
+  width: 35%;
+}
+
+.api-link {
+  color: var(--secondary);
+}

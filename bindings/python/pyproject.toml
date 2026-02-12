@@ -1,0 +1,201 @@
+[project]
+name = "talu"
+dynamic = ["version"]
+description = "High-performance LLM inference with zero dependencies"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# For tests/ (except reference/) - Python 3.10+
+# NO numpy/torch/transformers allowed here
+test = [
+    "pytest>=9.0",
+    "pytest-xdist>=3.8",
+    "pytest-asyncio>=1.3",
+    "pytest-cov>=7.0",
+]
+
+# For tests/reference/ only - requires numpy/torch/transformers (Python 3.11+)
+# Use .python-version file to enforce Python 3.14 for development
+test-validation = [
+    "pytest>=9.0",
+    "pytest-xdist>=3.8",
+    "pytest-asyncio>=1.3",
+    "pytest-cov>=7.0",
+    "pydantic>=2.0",
+    "numpy>=2.4.0; python_version >= '3.11'",
+    "torch>=2.9.1; python_version >= '3.11'",
+    "transformers>=4.57.3; python_version >= '3.11'",
+    "accelerate>=1.12.0; python_version >= '3.11'",
+]
+
+# Dev dependencies - installed by default with `uv sync`
+# Python 3.14 enforced via .python-version file
+[dependency-groups]
+dev = [
+    "talu[test-validation]",
+    "mistral-common>=1.8.8; python_version >= '3.11'",
+    "markdown>=3.10",
+    "pygments>=2.19.2",
+    "ruff>=0.14.10",
+    "pyright>=1.1.400",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+path = "talu/_version.py"
+
+[tool.hatch.build]
+artifacts = ["talu/*.so", "talu/*.dylib", "talu/*.dll", "talu/*.metallib", "vendor/talu/ui/dist/"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["talu"]
+
+[tool.hatch.build.targets.wheel.hooks.custom]
+path = "ci/build_hook.py"
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "talu/",
+    "ci/build_hook.py",
+    "README.md",
+    "LICENSE",
+    "vendor/",
+]
+exclude = [
+    "*.so",
+    "*.dylib",
+    "*.dll",
+    "__pycache__/",
+    ".git/",
+    "zig-out/",
+    ".zig-cache/",
+    "deps/",
+    "/dist/",
+    ".venv/",
+    "cache/",
+    "models/.venv/",
+]
+
+# =============================================================================
+# Pytest Configuration
+# =============================================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+# Ignore archived tests (legacy format)
+norecursedirs = ["archive", "__pycache__", ".git"]
+
+# Markers for filtering tests
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "stress: marks stress tests (subset of slow, high-volume leak detection)",
+    "gpu: marks tests requiring GPU",
+    "requires_model: marks tests requiring a model",
+    "memory: marks memory/leak detection tests",
+    "asyncio: marks tests as async",
+]
+
+# Default options
+# --import-mode=importlib avoids conftest.py name conflicts between
+# tests/ and tests/reference/ subdirectories (e.g., tokenizer/conftest.py
+# vs reference/tokenizer/conftest.py)
+# --dist=loadfile groups tests by file to avoid import race conditions
+# when pytest-xdist workers compile .pyc files after a fresh build
+addopts = [
+    "-v",
+    "--tb=short",
+    "-ra",  # Show summary of all non-passed tests
+    "--import-mode=importlib",
+    "--dist=loadfile",
+]
+
+# Filter warnings
+filterwarnings = [
+    "ignore::DeprecationWarning",
+    "ignore::PendingDeprecationWarning",
+]
+
+# Minimum pytest version
+minversion = "7.0"
+
+# =============================================================================
+# Coverage Configuration (optional, if pytest-cov is installed)
+# =============================================================================
+
+[tool.coverage.run]
+source = ["talu"]
+data_file = "~/.cache/pytest/.coverage"
+omit = [
+    "tests/*",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+
+# =============================================================================
+# Ruff Configuration
+# =============================================================================
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = [
+    "E",      # pycodestyle errors
+    "W",      # pycodestyle warnings
+    "F",      # pyflakes
+    "I",      # isort
+    "B",      # flake8-bugbear
+    "C4",     # flake8-comprehensions
+    "UP",     # pyupgrade
+    "D",      # pydocstyle (docstring checks)
+]
+ignore = [
+    "D100",   # Missing docstring in public module
+    "D104",   # Missing docstring in public package
+    "D105",   # Missing docstring in magic method (__repr__, __len__, etc.)
+    "D107",   # Missing docstring in __init__
+    "D203",   # 1 blank line required before class docstring (conflicts with D211)
+    "D213",   # Multi-line docstring summary should start at the second line (conflicts with D212)
+    "E501",   # Line too long (handled by formatter)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]  # Don't require docstrings in tests
+"docs/*" = ["D"]   # Don't require docstrings in docs scripts
+"talu/_native.py" = ["I001", "F401", "D202"]  # Auto-generated: import order, unused imports, docstring blank line
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+# =============================================================================
+# Pyright Configuration
+# =============================================================================
+
+[tool.pyright]
+include = ["talu"]
+exclude = ["**/__pycache__", ".venv", "tests", "talu/__main__.py"]
+pythonVersion = "3.10"
+typeCheckingMode = "standard"
+reportMissingImports = true
+reportMissingTypeStubs = false
+reportOptionalMemberAccess = true
+reportOptionalSubscript = true
+reportArgumentType = true
+reportReturnType = true

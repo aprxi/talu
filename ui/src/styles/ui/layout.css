@@ -1,0 +1,402 @@
+/* =============================================================================
+   App Layout (UI-only)
+   App shell, topbar, activity bar, sidebar, panels, modes
+   ============================================================================= */
+
+/* =============================================================================
+   Layout
+   ============================================================================= */
+
+.app-layout {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  overflow: hidden;
+}
+
+.app-content {
+  flex: 1;
+  overflow: hidden;
+  position: relative;
+}
+
+.mode-view {
+  display: flex;
+  height: 100%;
+  overflow: hidden;
+  contain: layout style;
+}
+
+.mode-view.hidden {
+  display: none;
+}
+
+.sidebar {
+  width: var(--sidebar-width);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  position: relative;
+  z-index: 900;
+  isolation: isolate;
+}
+
+.sidebar-header {
+  padding: 1rem 0.75rem 0.75rem;
+}
+
+.sidebar-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 0 0.5rem 0.5rem;
+}
+
+.sidebar-section-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  padding: 0.25rem 0.75rem;
+}
+
+.chat-column {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+
+/* =============================================================================
+   Topbar
+   ============================================================================= */
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 48px;
+  padding: 0 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+  position: relative;
+  z-index: 900;
+  isolation: isolate;
+}
+
+.topbar-logo {
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text);
+  letter-spacing: 0.05em;
+  text-decoration: none;
+}
+
+.topbar-logo:hover {
+  color: var(--primary);
+}
+
+.topbar-separator {
+  color: var(--text-muted);
+  opacity: 0.5;
+  margin: 0 0.5rem;
+  font-weight: 300;
+}
+
+.topbar-title {
+  font-size: 14px;
+  color: var(--text-secondary);
+  outline: none;
+  border-bottom: 1px solid transparent;
+  padding: 0.125rem 0.25rem;
+  margin: -0.125rem -0.25rem;
+  border-radius: 4px;
+  max-width: 300px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.topbar-title:hover {
+  color: var(--text);
+  border-bottom-color: var(--border);
+}
+
+.topbar-title:focus {
+  color: var(--text);
+  background: var(--bg-code);
+  border-bottom-color: var(--accent);
+}
+
+.topbar-title:empty {
+  display: none;
+}
+
+/* Hide separator when title is empty (separator comes before title) */
+.topbar-separator:has(+ .topbar-title:empty) {
+  display: none;
+}
+
+.topbar-nav {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+/* =============================================================================
+   App Main (activity bar + content)
+   ============================================================================= */
+
+.app-main {
+  display: flex;
+  flex: 1;
+  overflow: hidden;
+}
+
+/* =============================================================================
+   Activity Bar (VS Code style)
+   ============================================================================= */
+
+.activity-bar {
+  width: 48px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 0.5rem 0;
+  gap: 0.25rem;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  position: relative;
+  z-index: 900;
+  isolation: isolate;
+}
+
+.activity-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 40px;
+  height: 40px;
+  border-radius: 8px;
+  background: transparent;
+  border: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  position: relative;
+  transition: background 0.15s, color 0.15s;
+}
+
+.activity-btn:hover {
+  background: var(--bg-code);
+  color: var(--text);
+}
+
+.activity-btn.active {
+  color: var(--primary);
+}
+
+/* Active indicator bar on left edge */
+.activity-btn.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 3px;
+  border-radius: 0 2px 2px 0;
+  background: var(--primary);
+}
+
+/* Third-party plugin badge */
+.activity-btn-badge {
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  font-size: 7px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  padding: 0 3px;
+  line-height: 12px;
+  background: var(--accent, #6366f1);
+  color: var(--bg, #09090b);
+  border-radius: 2px;
+  pointer-events: none;
+}
+
+.content-area {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow: hidden;
+  contain: layout style;
+}
+
+.transcript {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  overflow-y: auto;
+}
+
+/* =============================================================================
+   Right Panel
+   ============================================================================= */
+
+.right-panel {
+  width: 256px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  border-left: 1px solid var(--border);
+  background: var(--bg-sidebar);
+  overflow-y: auto;
+}
+
+.right-panel.hidden { display: none; }
+
+/* Read-only mode for right panel */
+.right-panel.read-only .form-input,
+.right-panel.read-only .form-select {
+  opacity: 0.7;
+  cursor: not-allowed;
+  background: var(--bg);
+}
+
+.panel-section {
+  padding: 1rem;
+}
+
+.panel-divider {
+  border-top: 1px solid var(--border);
+  margin: 0.75rem 0;
+}
+
+.panel-heading {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  margin-bottom: 0.5rem;
+}
+
+/* =============================================================================
+   Browser Layout (Conversations & Prompts modes)
+   ============================================================================= */
+
+.browser-sidebar {
+  width: var(--sidebar-width);
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-sidebar);
+  border-right: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.browser-main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  overflow: hidden;
+}
+
+.browser-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  background: var(--bg);
+  flex-shrink: 0;
+}
+
+/* =============================================================================
+   Prompts Editor
+   ============================================================================= */
+
+.prompts-editor {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1.5rem 2rem;
+}
+
+.prompts-editor-content {
+  max-width: 720px;
+}
+
+.prompts-editor-header {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-bottom: 1rem;
+}
+
+.prompts-editor-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 1.5rem;
+  padding-top: 1rem;
+  border-top: 1px solid var(--border);
+}
+
+/* =============================================================================
+   Settings Content
+   ============================================================================= */
+
+.settings-content {
+  flex: 1;
+  overflow-y: auto;
+}
+
+/* =============================================================================
+   Status Bar
+   ============================================================================= */
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  height: 22px;
+  padding: 0 0.5rem;
+  font-size: 0.6875rem;
+  color: var(--text-muted);
+  background: var(--bg-sidebar);
+  border-top: 1px solid var(--border);
+  flex-shrink: 0;
+  position: relative;
+  z-index: 900;
+  isolation: isolate;
+}
+
+.status-bar:empty {
+  display: none;
+}
+
+.status-bar-left {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  flex: 1;
+}
+
+.status-bar-right {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+}
+
+.status-bar-item {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}

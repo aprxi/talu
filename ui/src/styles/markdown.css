@@ -1,0 +1,223 @@
+/* =============================================================================
+   Shared Markdown (shared between UI and docs)
+   Source of truth: ui/src/styles/markdown.css
+   Code blocks, collapsible details, search highlight, scoped typography
+   ============================================================================= */
+
+/* =============================================================================
+   Code Block with Header
+   ============================================================================= */
+
+.code-block {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  margin: 0.75rem 0;
+  overflow: hidden;
+}
+
+.code-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.35rem 0.75rem;
+  background: var(--bg-code);
+  border-bottom: 1px solid var(--border);
+}
+
+.code-lang {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.code-copy {
+  margin-left: auto;
+  padding: 0.15rem;
+  border-radius: 3px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0.4;
+}
+
+.code-copy:hover {
+  opacity: 0.8;
+  color: var(--primary);
+}
+
+.code-copy.copied {
+  color: var(--success);
+  opacity: 1;
+}
+
+.code-block pre {
+  margin: 0;
+  padding: 0.75rem 1rem;
+  border: none;
+  border-radius: 0;
+}
+
+/* =============================================================================
+   Collapsible Details
+   ============================================================================= */
+
+details {
+  margin: 0.35rem 0 0.75rem;
+}
+
+details summary {
+  cursor: pointer;
+  color: var(--primary);
+  font-size: 13px;
+  padding: 0.2rem 0;
+  list-style: none;
+  user-select: none;
+}
+
+details summary:hover {
+  text-decoration: underline;
+}
+
+details summary::before {
+  content: "\25B6\FE0E ";
+  font-size: 8px;
+  display: inline-block;
+  margin-right: 0.25rem;
+}
+
+details[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+details[open] summary {
+  margin-bottom: 0.35rem;
+}
+
+/* =============================================================================
+   Search Highlight
+   ============================================================================= */
+
+mark {
+  background: color-mix(in srgb, var(--primary) 40%, transparent);
+  color: var(--text);
+  padding: 0 0.125rem;
+  border-radius: 2px;
+}
+
+/* =============================================================================
+   Markdown Body - Scoped Typography
+   Base typography for rendered markdown content (.markdown-body container)
+   ============================================================================= */
+
+.markdown-body {
+  font-size: 15px;
+  line-height: 1.6;
+  white-space: normal;
+}
+
+.markdown-body p {
+  margin: 0 0 0.75rem;
+  color: var(--text);
+}
+
+.markdown-body p:last-child {
+  margin-bottom: 0;
+}
+
+.markdown-body h1, .markdown-body h2, .markdown-body h3, .markdown-body h4 {
+  margin-top: 1.25rem;
+  margin-bottom: 0.35rem;
+  font-weight: 500;
+  color: var(--text);
+}
+
+.markdown-body h1 {
+  font-size: 1.5rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.5rem;
+}
+
+.markdown-body h2 {
+  font-size: 1.25rem;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.25rem;
+}
+
+.markdown-body h3 { font-size: 1rem; font-weight: 600; }
+.markdown-body h4 { font-size: 0.9rem; font-weight: 600; color: var(--text); }
+
+.markdown-body strong {
+  font-weight: 600;
+  color: var(--text);
+}
+
+.markdown-body a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.markdown-body a:hover {
+  text-decoration: underline;
+}
+
+.markdown-body ul, .markdown-body ol {
+  padding-left: 1.25rem;
+  margin: 0.75rem 0;
+}
+
+.markdown-body li {
+  margin: 0.15rem 0;
+  color: var(--text);
+}
+
+.markdown-body blockquote {
+  border-left: 3px solid var(--border);
+  padding-left: 0.75rem;
+  margin: 0.75rem 0;
+  color: var(--text);
+  font-style: italic;
+}
+
+.markdown-body hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 1.25rem 0;
+}
+
+.markdown-body table {
+  border-collapse: collapse;
+  margin: 0.75rem 0;
+  width: 100%;
+  font-size: 13px;
+}
+
+.markdown-body th, .markdown-body td {
+  border-bottom: 1px solid var(--border);
+  padding: 0.4rem 0.5rem;
+  text-align: left;
+}
+
+.markdown-body th {
+  font-weight: 600;
+  color: var(--text);
+  background: var(--bg-code);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.markdown-body td {
+  color: var(--text);
+}
+
+.markdown-body tr:hover {
+  background: var(--bg-code);
+}
+
+.markdown-body pre {
+  margin: 0.75rem 0;
+}

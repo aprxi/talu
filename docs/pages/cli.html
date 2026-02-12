@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Command Line - talu</title>
+</head>
+<body>
+  <aside class="sidebar">
+    <header class="sidebar-header">
+      <a href="index.html" class="logo"><span class="logo-t">▀█▀</span><span class="logo-name">talu</span></a>
+    </header>
+    <nav><ul></ul></nav>
+  </aside>
+  <main class="content">
+    <article class="markdown-body">
+      <h1>Command Line</h1>
+
+      <nav class="toc">
+        <ul>
+          <li>
+            <a href="#overview">Overview</a>
+            <ul>
+              <li><a href="#quickstart">Quickstart</a></li>
+              <li><a href="#working-with-models">Working with models</a></li>
+              <li><a href="#profiles">Profiles</a></li>
+              <li><a href="#conversations">Conversations</a></li>
+              <li><a href="#quantization">Quantization</a></li>
+              <li><a href="#tokenization">Tokenization</a></li>
+            </ul>
+          </li>
+          <li>
+            <a href="#scripting">Scripting and CI</a>
+            <ul>
+              <li><a href="#stdout-contracts">Stdout contracts</a></li>
+              <li><a href="#model-uri-flows">Model URI flows</a></li>
+              <li><a href="#session-flows">Session flows</a></li>
+              <li><a href="#output-controls">Output controls</a></li>
+            </ul>
+          </li>
+          <li>
+            <a href="#reference">Reference</a>
+            <ul>
+              <li><a href="#env-vars">Environment variables</a></li>
+              <li><a href="#global-flags">Global flags</a></li>
+              <li><a href="#common-commands">Common commands</a></li>
+            </ul>
+          </li>
+        </ul>
+      </nav>
+
+      <!-- ═══════════════════════════════════════════════════ -->
+      <h2 id="overview">Overview</h2>
+
+      <p>This page focuses on the core CLI workflow for everyday use, with reference details at the end.</p>
+
+      <h3 id="quickstart">Quickstart</h3>
+
+      <p><code>talu get</code> downloads a model from HuggingFace and stores it locally. The weights stay in their original safetensors format, alongside the tokenizer and chat template — nothing is converted at this stage. Once cached, the model is available offline.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu get LiquidAI/LFM2-350M</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p><code>talu ask</code> sends a prompt to a model and streams the response to the terminal. The model's chat template is detected and applied automatically, so the prompt is wrapped in the correct format for that architecture.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask -m LiquidAI/LFM2-350M "What is the capital of France?"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>The <code>-S</code> flag sets a system prompt that controls the model's behavior and tone. When omitted, the default system prompt is "You are a helpful assistant."</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask -m LiquidAI/LFM2-350M -S "You are a helpful math tutor." "What is 2+2?"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <!-- ─────────────────────────────────────────────── -->
+      <h3 id="working-with-models">Working with models</h3>
+
+      <p><code>talu ls</code> shows all cached models in a table with columns for <code>SIZE</code>, <code>DATE</code>, <code>TYPE</code> (architecture), <code>QUANT</code> (quantization format), and <code>MODEL</code> (the HuggingFace identifier). Passing an organization name filters the list to that org; passing a full model name shows the individual weight files.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ls</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>When <code>talu get</code> is called without a model name, it opens an interactive browser. This lets you search HuggingFace by keyword, see parameter counts and architecture details, and then select a model to download — useful when you're exploring what's available rather than fetching a specific model.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu get</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p><code>talu rm</code> removes a model from the local cache and frees the associated disk space.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu rm LiquidAI/LFM2-350M</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <!-- ─────────────────────────────────────────────── -->
+      <h3 id="profiles">Profiles</h3>
+
+      <p>A profile stores a default model, conversation history, and other settings in <code>~/.talu/</code>, persisted across terminal sessions. By default, talu uses a profile named <code>default</code>. The active profile can be changed with the <code>TALU_PROFILE</code> environment variable, which makes it straightforward to maintain separate configurations for different projects or use cases.</p>
+
+      <p><code>talu set</code> assigns a default model to the current profile, which means <code>-m</code> no longer needs to be passed on every command.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu set LiquidAI/LFM2-350M</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>Once a default is set, every command that needs a model uses it automatically.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask "What is the capital of France?"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>Piping also works with a default model. Text from stdin is treated as the prompt for <code>ask</code>.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">echo "Summarize this" | talu</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>The <code>-m</code> flag overrides the default for a single command without changing the profile. <code>talu set show</code> displays the current profile configuration, and <code>talu set</code> without arguments opens an interactive picker that lists all cached models.</p>
+
+      <!-- ─────────────────────────────────────────────── -->
+      <h3 id="conversations">Conversations</h3>
+
+      <p>By default, each call to <code>talu ask</code> creates a new conversation. Conversations are persisted automatically — the full transcript is stored, so it can be reviewed, continued with follow-up prompts, or resumed at a later time.</p>
+
+      <p><code>talu ask</code> without a prompt lists all stored conversations, showing their session IDs and first messages.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>Passing a session ID with <code>--session</code> displays the full transcript of that conversation.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --session &lt;session_id&gt;</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>Adding a prompt along with <code>--session</code> continues the conversation. The model receives the full history as context, so it remembers earlier exchanges.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --session &lt;session_id&gt; "Tell me more about that"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>The <code>--delete</code> flag removes a conversation and its transcript permanently.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --session &lt;session_id&gt; --delete</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p><code>--no-bucket</code> creates an ephemeral conversation that is not persisted. This is useful for one-off questions where saving the transcript is unnecessary.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --no-bucket "Quick check — what year was Python released?"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <!-- ─────────────────────────────────────────────── -->
+      <h3 id="quantization">Quantization</h3>
+
+      <p>Models from HuggingFace are typically in full-precision (F16) safetensors format. Quantization compresses the weights to a smaller representation, reducing memory usage and increasing inference speed with minimal quality loss.</p>
+
+      <p><code>talu convert</code> quantizes a model using Grouped Affine (GAF) quantization. The model is positional (<code>talu convert &lt;model&gt;</code>). When <code>--scheme</code> is not specified, the default scheme is <code>gaf4_64</code>.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu convert LiquidAI/LFM2-350M</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>A different scheme can be selected with <code>--scheme</code>.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu convert LiquidAI/LFM2-350M --scheme gaf4_32</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>Smaller group sizes produce higher accuracy at the cost of slightly larger files. <code>talu convert --scheme help</code> prints this table in the terminal.</p>
+
+      <table class="options-table">
+        <tr><th>Scheme</th><th>Bits</th><th>Group size</th><th>Notes</th></tr>
+        <tr><td>gaf4_32</td><td>4</td><td>32</td><td>Highest accuracy</td></tr>
+        <tr><td>gaf4_64</td><td>4</td><td>64</td><td>Default — balanced quality and size</td></tr>
+        <tr><td>gaf4_128</td><td>4</td><td>128</td><td>Smallest file size</td></tr>
+        <tr><td>gaf8_32</td><td>8</td><td>32</td><td>Near-lossless</td></tr>
+        <tr><td>gaf8_64</td><td>8</td><td>64</td><td></td></tr>
+        <tr><td>gaf8_128</td><td>8</td><td>128</td><td></td></tr>
+      </table>
+
+      <p>Converted models are saved under <code>$TALU_HOME/models/</code> with the scheme as a suffix (e.g. <code>Qwen/Qwen3-0.6B-GAF4</code>). The <code>--output</code> flag writes to a different directory instead. The original model is never modified — both versions remain available and <code>talu set</code> can switch between them.</p>
+
+      <!-- ─────────────────────────────────────────────── -->
+      <h3 id="tokenization">Tokenization</h3>
+
+      <p><code>talu tokenize</code> shows how a model splits text into tokens. Each token is displayed alongside its numeric ID, which is useful for understanding context window usage or debugging prompt formatting.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu tokenize LiquidAI/LFM2-350M "Hello world"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <!-- ═══════════════════════════════════════════════════ -->
+      <h2 id="scripting">Scripting and CI</h2>
+
+      <p>Most commands work in scripts and CI pipelines. The CLI separates human-readable formatting from machine-parseable output: a set of flags control what goes to stdout, while logs always go to stderr. Interactive modes still require a TTY.</p>
+
+      <h3 id="stdout-contracts">Stdout contracts</h3>
+      <table class="options-table">
+        <tr><th>Flag</th><th>Stdout behavior</th></tr>
+        <tr><td>--model-uri</td><td>Prints only the model URI</td></tr>
+        <tr><td>--session-id</td><td>Prints only the session ID</td></tr>
+        <tr><td>-q</td><td>Prints response text only, no formatting</td></tr>
+        <tr><td>--format json</td><td>Prints OpenResponses JSON</td></tr>
+        <tr><td>-s</td><td>Prints nothing (exit code only)</td></tr>
+      </table>
+
+      <h3 id="model-uri-flows">Model URI flows</h3>
+
+      <p>The <code>--model-uri</code> flag changes stdout to print only the model URI, making it easy to capture in a shell variable and pass to subsequent commands. This is the typical pattern for chaining download, convert, and set operations in a script.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">MODEL_URI=$(talu get --model-uri LiquidAI/LFM2-350M)</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>The same flag works with <code>talu convert</code>, outputting the URI of the newly quantized model.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">CONVERTED_URI=$(talu convert --model-uri "$MODEL_URI")</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>And with <code>talu set</code>, it confirms the URI that was actually assigned to the profile.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">SET_URI=$(talu set --model-uri "$CONVERTED_URI")</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <h3 id="session-flows">Session flows</h3>
+
+      <p>The <code>--session-id</code> flag prints only the session ID to stdout, allowing scripts to capture it and reference the conversation in later steps.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">SESSION_ID=$(talu ask --session-id "Start incident analysis")</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>That session ID can then be passed back with <code>--session</code> to continue the same conversation, building up context across multiple script steps.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --session "$SESSION_ID" "List likely causes"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <h3 id="output-controls">Output controls</h3>
+
+      <p>Response text only.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">ANSWER=$(talu ask -q "What is 2+2?")</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>OpenResponses JSON.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --format json "Summarize this log block"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>Write to file.</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask --output /tmp/answer.txt "Write one sentence"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <p>Silent (exit code only).</p>
+
+      <div class="code-block">
+        <div class="cmd-body"><span class="prompt">$</span> <span class="command-text">talu ask -s "Run background check"</span> <button class="copy-btn" title="Copy"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></svg></button></div>
+      </div>
+
+      <!-- ═══════════════════════════════════════════════════ -->
+      <h2 id="reference">Reference</h2>
+
+      <h3 id="env-vars">Environment variables</h3>
+      <p>Environment variables provide an alternative to flags, useful in CI or when setting parameters for an entire shell session. Flags take precedence when both are specified.</p>
+      <table class="options-table">
+        <tr><th>Variable</th><th>Description</th><th>Example</th></tr>
+        <tr><td>MODEL_URI</td><td>Per-command model override</td><td><code>LiquidAI/LFM2-350M</code></td></tr>
+        <tr><td>SESSION_ID</td><td>Target a session without <code>--session</code></td><td>UUID</td></tr>
+        <tr><td>TOKENS</td><td>Max output tokens (default: 1024)</td><td><code>100</code></td></tr>
+        <tr><td>TEMPERATURE</td><td>Sampling temperature</td><td><code>0.7</code></td></tr>
+        <tr><td>TOP_K</td><td>Top-k sampling limit</td><td><code>40</code></td></tr>
+        <tr><td>TOP_P</td><td>Nucleus sampling cutoff (0.0 to 1.0)</td><td><code>0.95</code></td></tr>
+        <tr><td>SEED</td><td>Deterministic seed</td><td><code>42</code></td></tr>
+        <tr><td>TALU_PROFILE</td><td>Active profile name</td><td><code>default</code></td></tr>
+        <tr><td>TALU_BUCKET</td><td>Storage bucket path override</td><td><code>/path/to/db</code></td></tr>
+        <tr><td>HF_TOKEN</td><td>Auth token for private HuggingFace models</td><td><code>hf_xxx...</code></td></tr>
+        <tr><td>HF_ENDPOINT</td><td>HuggingFace endpoint override</td><td><code>https://huggingface.co</code></td></tr>
+      </table>
+
+      <h3 id="global-flags">Global flags</h3>
+      <p>These apply to all commands. Logs are always written to stderr.</p>
+      <table class="options-table">
+        <tr><th>Flag</th><th>Description</th></tr>
+        <tr><td>-v</td><td>INFO-level logs</td></tr>
+        <tr><td>-vv</td><td>DEBUG-level logs</td></tr>
+        <tr><td>-vvv</td><td>TRACE-level logs</td></tr>
+        <tr><td>--log-format</td><td><code>human</code> (default for TTY) or <code>json</code> (default for pipes)</td></tr>
+      </table>
+
+      <h3 id="common-commands">Common commands</h3>
+      <p>This table focuses on everyday CLI workflows, plus a few advanced commands for completeness.</p>
+      <table class="options-table">
+        <tr><th>Command</th><th>Purpose</th><th>Mode</th></tr>
+        <tr><td>talu get</td><td>Browse HuggingFace interactively</td><td>Interactive</td></tr>
+        <tr><td>talu get &lt;model&gt;</td><td>Download model to cache</td><td>Both</td></tr>
+        <tr><td>talu get --model-uri &lt;model&gt;</td><td>Download and print URI only</td><td>Script</td></tr>
+        <tr><td>talu ls</td><td>List models</td><td>Both</td></tr>
+        <tr><td>talu ls &lt;model&gt;</td><td>List files in a model</td><td>Both</td></tr>
+        <tr><td>talu rm &lt;model&gt;</td><td>Remove model from cache</td><td>Both</td></tr>
+        <tr><td>talu convert &lt;model&gt;</td><td>Quantize model (default: gaf4_64)</td><td>Both</td></tr>
+        <tr><td>talu convert &lt;model&gt; --scheme &lt;s&gt;</td><td>Quantize with specific scheme</td><td>Both</td></tr>
+        <tr><td>talu convert --model-uri &lt;model&gt;</td><td>Quantize and print URI only</td><td>Script</td></tr>
+        <tr><td>talu set</td><td>Set default model (interactive picker)</td><td>Interactive</td></tr>
+        <tr><td>talu set &lt;model&gt;</td><td>Set default model</td><td>Both</td></tr>
+        <tr><td>talu set show</td><td>Show profile configuration</td><td>Both</td></tr>
+        <tr><td>talu ask "prompt"</td><td>Ask model (creates new conversation)</td><td>Both</td></tr>
+        <tr><td>talu ask</td><td>List conversations</td><td>Both</td></tr>
+        <tr><td>talu ask --session &lt;id&gt;</td><td>View conversation transcript</td><td>Both</td></tr>
+        <tr><td>talu ask --session &lt;id&gt; "prompt"</td><td>Continue conversation</td><td>Both</td></tr>
+        <tr><td>talu ask --session &lt;id&gt; --delete</td><td>Delete conversation</td><td>Both</td></tr>
+        <tr><td>talu ask --session-id ["prompt"]</td><td>Create conversation and print session ID</td><td>Script</td></tr>
+        <tr><td>talu ask -q "prompt"</td><td>Response text only</td><td>Script</td></tr>
+        <tr><td>talu ask -s "prompt"</td><td>Silent (exit code only)</td><td>Script</td></tr>
+        <tr><td>talu ask --format json "prompt"</td><td>OpenResponses JSON output</td><td>Script</td></tr>
+        <tr><td>talu ask --output &lt;path&gt; "prompt"</td><td>Write response to file</td><td>Script</td></tr>
+        <tr><td>talu ask --no-bucket "prompt"</td><td>Ephemeral query (not persisted)</td><td>Both</td></tr>
+        <tr><td>talu tokenize &lt;model&gt; "text"</td><td>Show token breakdown</td><td>Both</td></tr>
+        <tr><td>talu describe &lt;model&gt;</td><td>Inspect model architecture/plan</td><td>Both</td></tr>
+        <tr><td>talu shell</td><td>Interactive tool-calling shell</td><td>Interactive</td></tr>
+        <tr><td>talu xray &lt;model&gt;</td><td>Kernel profiling for debugging</td><td>Both</td></tr>
+        <tr><td>talu serve</td><td>Start HTTP server</td><td>Both</td></tr>
+      </table>
+
+    </article>
+  </main>
+
+  <script>
+    document.querySelectorAll('.cmd-body .copy-btn').forEach(function(btn) {
+      btn.addEventListener('click', function() {
+        var text = btn.closest('.cmd-body').querySelector('.command-text').textContent;
+        navigator.clipboard.writeText(text).then(function() { showCopied(btn); });
+      });
+    });
+  </script>
+</body>
+</html>

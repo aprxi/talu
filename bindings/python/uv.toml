@@ -1,0 +1,10 @@
+# UV Configuration
+# https://docs.astral.sh/uv/reference/settings/
+#
+# The Makefile configures all tools to store caches outside the project:
+#   - UV_PROJECT_ENVIRONMENT → ~/.cache/uv/venvs/talu-python
+#   - RUFF_CACHE_DIR → ~/.cache/ruff
+#   - pytest cache_dir → ~/.cache/pytest (via --override-ini)
+#
+# This keeps the repo clean and allows read-only mounts.
+# Always use `make lint`, `make test`, etc. rather than raw `uv run` commands.

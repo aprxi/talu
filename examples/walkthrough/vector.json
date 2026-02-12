@@ -1,0 +1,38 @@
+{
+  "session_id": "demo-session",
+  "items": [
+    {
+      "item_id": 1,
+      "created_at_ms": 1700000001000,
+      "status": "completed",
+      "hidden": false,
+      "pinned": false,
+      "json_valid": false,
+      "schema_valid": false,
+      "repaired": false,
+      "parent_item_id": null,
+      "origin_session_id": null,
+      "origin_item_id": null,
+      "finish_reason": null,
+      "prefill_ns": 0,
+      "generation_ns": 0,
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "ttl_ts": 0,
+      "item_type": "message",
+      "variant": {
+        "role": "assistant",
+        "status": "completed",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Embeddings are stored separately in StoreFS."
+          }
+        ]
+      },
+      "metadata": {
+        "vector_note": "Embeddings are stored separately in VectorStore."
+      }
+    }
+  ]
+}

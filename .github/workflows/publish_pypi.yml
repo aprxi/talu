@@ -1,0 +1,79 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g., v0.0.1)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run (validate but do not upload)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+            echo "::error::Invalid tag format '$TAG'. Expected format: v0.0.1, v1.2.3-beta, etc."
+            exit 1
+          fi
+          echo "Tag format valid: $TAG"
+
+      - name: Check release exists
+        run: |
+          if ! gh release view "${{ inputs.tag }}" --repo ${{ github.repository }} > /dev/null 2>&1; then
+            echo "::error::Release '${{ inputs.tag }}' not found."
+            echo ""
+            echo "Available releases:"
+            gh release list --repo ${{ github.repository }} --limit 10
+            exit 1
+          fi
+          echo "Release found: ${{ inputs.tag }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Download release artifacts
+        run: |
+          mkdir -p artifacts
+          gh release download ${{ inputs.tag }} --dir artifacts --repo ${{ github.repository }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Validate Python packages exist
+        run: |
+          echo "Downloaded artifacts:"
+          ls -la artifacts/
+
+          WHEELS=$(ls artifacts/*.whl 2>/dev/null | wc -l)
+          SDIST=$(ls artifacts/*.tar.gz 2>/dev/null | wc -l)
+
+          if [ "$WHEELS" -eq 0 ] && [ "$SDIST" -eq 0 ]; then
+            echo "::error::No Python packages (.whl or .tar.gz) found in release ${{ inputs.tag }}"
+            echo "This release may be a binary-only release."
+            exit 1
+          fi
+
+          echo "Found $WHEELS wheel(s) and $SDIST sdist(s)"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Publish to PyPI
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN ==="
+            echo "Would publish the following packages to PyPI:"
+            ls -la artifacts/*.whl artifacts/*.tar.gz 2>/dev/null
+            echo ""
+            echo "To publish for real, run this workflow again with 'Dry run' unchecked."
+          else
+            uv publish artifacts/*.whl artifacts/*.tar.gz --token ${{ secrets.PYPI_TOKEN }}
+            echo "Successfully published to PyPI!"
+          fi

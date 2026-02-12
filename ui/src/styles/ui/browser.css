@@ -1,0 +1,522 @@
+/* =============================================================================
+   Browser (UI-only)
+   Cards, tabs, filters, sidebar items, prompts list
+   ============================================================================= */
+
+/* =============================================================================
+   Browser Tabs
+   ============================================================================= */
+
+.browser-tab {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.625rem;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text-muted);
+  cursor: pointer;
+
+  text-align: left;
+  background: transparent;
+  border: none;
+  width: 100%;
+}
+
+.browser-tab:hover {
+  background: var(--bg-code);
+  color: var(--text);
+}
+
+.browser-tab.active {
+  background: var(--bg);
+  color: var(--text);
+}
+
+.browser-bulk-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  opacity: 0.4;
+  pointer-events: none;
+
+}
+
+.browser-bulk-actions.active {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+.browser-clear-btn {
+  position: absolute;
+  right: 0.5rem;
+  top: 50%;
+  transform: translateY(-50%);
+  padding: 0.25rem;
+  color: var(--text-muted);
+  background: none;
+  border: none;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.browser-clear-btn:hover {
+  color: var(--text);
+}
+
+.browser-clear-btn.hidden {
+  display: none;
+}
+
+/* =============================================================================
+   Sidebar Items (Enhanced)
+   ============================================================================= */
+
+.sidebar-item {
+  display: flex;
+  align-items: center;
+  gap: 0.625rem;
+  padding: 0.625rem 0.75rem;
+  margin: 0.125rem 0.25rem;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  cursor: pointer;
+
+}
+
+.sidebar-item:hover {
+  background: color-mix(in srgb, white 5%, transparent);
+  color: var(--text);
+}
+
+.sidebar-item.active {
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  color: var(--primary);
+}
+
+.sidebar-item.forked {
+  border-left: 2px solid #a855f7;
+  padding-left: calc(0.75rem - 2px);
+}
+
+.sidebar-item-content {
+  flex: 1;
+  min-width: 0;
+}
+
+.sidebar-item-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.375rem;
+}
+
+.sidebar-item-title {
+  font-size: 14px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.sidebar-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.125rem;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.sidebar-item-tags {
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  margin-top: 0.25rem;
+  overflow: hidden;
+}
+
+.sidebar-item-tag {
+  padding: 0.125rem 0.375rem;
+  border-radius: 4px;
+  background: var(--bg-code);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+
+.pin-btn {
+  padding: 0.25rem;
+  border-radius: 4px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+
+}
+
+.sidebar-item:hover .pin-btn {
+  opacity: 1;
+}
+
+.pin-btn:hover {
+  color: var(--primary);
+}
+
+.pin-btn.pinned {
+  color: var(--primary);
+  opacity: 1;
+}
+
+/* Icons */
+.icon-pin,
+.icon-fork {
+  flex-shrink: 0;
+}
+
+.icon-pin { color: var(--primary); }
+.icon-fork { color: #a855f7; }
+
+/* =============================================================================
+   Browser Cards (extends shared .card-grid / .card)
+   ============================================================================= */
+
+.browser-cards {
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  padding: 0 1rem 2rem;
+  align-content: start;
+}
+
+.browser-card {
+  position: relative;
+  cursor: pointer;
+}
+
+.browser-card.selected {
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 50%, transparent);
+}
+
+.browser-card.forked {
+  border-color: color-mix(in srgb, #a855f7 40%, transparent);
+}
+
+.browser-card.archived {
+  opacity: 0.7;
+}
+
+.browser-card-top {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.75rem;
+}
+
+.browser-checkbox {
+  width: 1rem;
+  height: 1rem;
+  margin-top: 0.125rem;
+  flex-shrink: 0;
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+
+.browser-card-title-area {
+  flex: 1;
+  min-width: 0;
+}
+
+.browser-card-title-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.browser-card-title {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.browser-card-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+  margin-top: 0.375rem;
+}
+
+.browser-card-badge {
+  display: inline-block;
+  padding: 0.125rem 0.5rem;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--primary);
+}
+
+.browser-card-badge.archived {
+  background: color-mix(in srgb, var(--text-muted) 20%, transparent);
+  color: var(--text-muted);
+}
+
+.browser-card-action {
+  padding: 0.375rem;
+  border-radius: 6px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  opacity: 0;
+
+}
+
+.browser-card:hover .browser-card-action {
+  opacity: 1;
+}
+
+.browser-card-action:hover {
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  color: var(--primary);
+}
+
+.browser-card-preview {
+  margin-top: 0.5rem;
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.browser-card-preview.full {
+  display: block;
+  -webkit-line-clamp: unset;
+}
+
+.browser-card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+}
+
+.browser-card-meta {
+  display: flex;
+  align-items: center;
+  gap: 0.75rem;
+  margin-top: 0.5rem;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.browser-card-meta-separator {
+  color: color-mix(in srgb, var(--text-secondary) 65%, transparent);
+}
+
+/* Browser card tags */
+.tag-chip {
+  padding: 0.25rem 0.625rem;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--primary) 15%, transparent);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--primary);
+  cursor: pointer;
+
+}
+
+.tag-chip:hover {
+  background: color-mix(in srgb, var(--primary) 25%, transparent);
+}
+
+.tag-chip.active {
+  background: color-mix(in srgb, var(--primary) 30%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--primary) 50%, transparent);
+}
+
+.tag-chip.dimmed {
+  background: var(--bg-code);
+  color: var(--text-muted);
+}
+
+/* Load more container */
+.load-more-container {
+  display: flex;
+  justify-content: center;
+  padding: 1rem 0;
+  grid-column: 1 / -1;
+}
+
+/* =============================================================================
+   Filter Indicator
+   ============================================================================= */
+
+.filter-indicator {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+  margin-top: 0.75rem;
+  padding: 0.75rem;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border: 1px solid color-mix(in srgb, var(--primary) 20%, transparent);
+  grid-column: 1 / -1;
+}
+
+.filter-icon {
+  color: var(--primary);
+  flex-shrink: 0;
+}
+
+.filter-label {
+  font-size: 14px;
+  color: var(--text);
+}
+
+.filter-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.filter-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  padding: 0.25rem 0.75rem;
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--primary) 20%, transparent);
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--primary);
+}
+
+.filter-chip-remove {
+  background: none;
+  border: none;
+  padding: 0;
+  color: inherit;
+  cursor: pointer;
+  opacity: 0.7;
+
+}
+
+.filter-chip-remove:hover {
+  opacity: 1;
+  color: var(--danger);
+}
+
+.filter-clear-btn {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 0.25rem;
+  padding: 0.25rem 0.5rem;
+  border-radius: 6px;
+  font-size: 14px;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+
+}
+
+.filter-clear-btn:hover {
+  background: var(--bg-code);
+  color: var(--text);
+}
+
+/* Search indicator */
+.search-indicator {
+  grid-column: 1 / -1;
+  text-align: center;
+  font-size: 12px;
+  color: var(--text-muted);
+  margin-bottom: 0.75rem;
+}
+
+.search-indicator strong {
+  color: var(--text);
+}
+
+/* =============================================================================
+   Prompts List
+   ============================================================================= */
+
+.prompts-empty-hint {
+  padding: 1rem 0.5rem;
+  text-align: center;
+  font-size: 14px;
+  color: var(--text-muted);
+}
+
+.prompt-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  font-size: 14px;
+  text-align: left;
+  color: var(--text-muted);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+}
+
+.prompt-item:hover {
+  background: var(--bg-code);
+}
+
+.prompt-item.active {
+  color: var(--text);
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
+
+.prompt-item-name {
+  flex: 1;
+}
+
+.prompt-default-btn {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  opacity: 0;
+  cursor: pointer;
+}
+
+.prompt-item:hover .prompt-default-btn {
+  opacity: 1;
+}
+
+.prompt-default-btn:hover {
+  color: var(--success, #22c55e);
+}
+
+.prompt-default-btn.active {
+  opacity: 1;
+  color: var(--success, #22c55e);
+}
+
+.prompts-list-separator {
+  height: 1px;
+  margin: 0.5rem 0;
+  background: var(--border);
+}

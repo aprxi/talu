@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Quickstart - talu</title>
+</head>
+<body>
+  <aside class="sidebar">
+    <header class="sidebar-header">
+      <a href="index.html" class="logo"><span class="logo-t">▀█▀</span><span class="logo-name">talu</span></a>
+    </header>
+    <nav><ul></ul></nav>
+  </aside>
+  <main class="content">
+    <article class="markdown-body">
+      <h1>Quickstart</h1>
+      <p>Get up and running in 5 minutes.</p>
+
+      <h2>Generate Text</h2>
+      <p>The simplest way to generate text:</p>
+<pre><code>import talu
+
+response = talu.generate("Qwen/Qwen3-0.6B", "What is 2+2?")
+print(response)</code></pre>
+
+      <h2>Stream Responses</h2>
+      <p>Display text as it's generated:</p>
+<pre><code>for chunk in talu.stream("Qwen/Qwen3-0.6B", "Tell me a story"):
+    print(chunk, end="", flush=True)
+print()</code></pre>
+
+      <h2>Count Tokens</h2>
+      <p>Check token counts for context window limits:</p>
+<pre><code>tokens = talu.encode("Qwen/Qwen3-0.6B", "Hello, world!")
+print(f"Token count: {len(tokens)}")  # 4</code></pre>
+
+      <h2>Use a Chat (Faster for Multiple Calls)</h2>
+      <p>Load the model once for repeated use:</p>
+<pre><code>session = talu.Chat("Qwen/Qwen3-0.6B")
+
+# Generate multiple times without reloading
+response1 = session("What is Python?").collect().text
+response2 = session("What is JavaScript?").collect().text
+
+# Stream responses
+for chunk in session.send("Tell me a story"):
+    print(chunk, end="")</code></pre>
+
+      <h2>Multi-Turn Chat</h2>
+      <p>Have conversations with history:</p>
+<pre><code>session = talu.Chat("Qwen/Qwen3-0.6B")
+
+session.system("You are a math tutor.")
+session.send("What is 2+2?").collect()   # "4"
+session.send("And 3+3?")       # "6" (remembers context)
+
+# Start a new conversation
+session.new_chat()
+session.send("New topic!")</code></pre>
+
+      <h2>Custom Parameters</h2>
+      <p>Control creativity and length:</p>
+<pre><code># Creative writing
+response = talu.generate(
+    "Qwen/Qwen3-0.6B",
+    "Write a poem about the ocean",
+    temperature=1.2,   # More creative
+    max_tokens=200,
+)
+
+# Factual answer
+response = talu.generate(
+    "Qwen/Qwen3-0.6B",
+    "What is the capital of France?",
+    temperature=0,     # Deterministic
+)</code></pre>
+
+      <h2>Next Steps</h2>
+      <ul>
+        <li><a href="../examples/python.html">Examples</a> &mdash; Runnable code examples</li>
+        <li><a href="../reference/index.html">API Reference</a> &mdash; Full API documentation</li>
+        <li><a href="supported-models.html">Supported Models</a> &mdash; All compatible models</li>
+      </ul>
+    </article>
+  </main>
+</body>
+</html>

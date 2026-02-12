@@ -1,0 +1,289 @@
+/* =============================================================================
+   RUSTDOC THEME - Pages
+   Page-specific styles
+   ============================================================================= */
+
+/* -----------------------------------------------------------------------------
+   Home Page
+   ----------------------------------------------------------------------------- */
+
+.tagline {
+  color: var(--text-muted);
+  font-size: 0.9rem;
+  margin-bottom: 1.5rem;
+}
+
+/* Install section */
+.install-section { margin: 1.5rem 0; }
+.install-header { display: flex; align-items: center; justify-content: space-between; margin-bottom: 0.75rem; }
+.install-header h2 { margin: 0; border: none; padding: 0; }
+.version-badge { background: var(--bg-code); border: 1px solid var(--border); color: var(--accent); border-radius: 3px; padding: 0.15rem 0.5rem; font-size: 0.7rem; font-family: var(--font-mono); }
+
+/* Platform tabs */
+.platform-tabs { display: flex; gap: 0; margin-bottom: 0; border-bottom: 1px solid var(--border); }
+.platform-tab { background: none; border: none; border-bottom: 2px solid transparent; padding: 0.4rem 0.75rem; margin-bottom: -1px; color: var(--text-muted); font-family: var(--font-mono); font-size: 0.75rem; cursor: pointer; transition: color 0.15s; }
+.platform-tab:hover { color: var(--text); }
+.platform-tab.active { color: var(--text); border-bottom-color: var(--accent); }
+
+/* Install command box */
+.install-box { background: var(--bg-code); border: 1px solid var(--border); border-top: none; border-radius: 0 0 5px 5px; }
+.platform-tab.disabled { color: var(--text-muted); opacity: 0.35; cursor: default; }
+.install-command { padding: 0.6rem 0.75rem; display: flex; align-items: center; gap: 0.5rem; }
+.prompt { color: var(--text-muted); user-select: none; font-family: var(--font-mono); }
+.command-text { color: var(--text-neutral); flex: 1; font-size: 0.8rem; font-family: var(--font-mono); }
+
+/* Package toggle */
+.pkg-toggle { display: flex; background: var(--border); border-radius: 4px; padding: 2px; gap: 2px; }
+.pkg-toggle button { background: none; border: none; padding: 0.2rem 0.5rem; color: var(--text-muted); font-family: var(--font-mono); font-size: 0.7rem; cursor: pointer; border-radius: 3px; transition: color 0.15s, background 0.15s; }
+.pkg-toggle button:hover { color: var(--text); }
+.pkg-toggle button.active { background: color-mix(in srgb, var(--accent) 15%, var(--bg)); color: var(--text); }
+
+.install-alt { margin-top: 0.5rem; font-size: 0.75rem; color: var(--text-muted); }
+.muted-intro { font-size: 0.9rem; margin-bottom: 1rem; }
+.muted-support { font-size: 0.9rem; }
+.build-note-top { font-size: 0.85rem; margin-top: -0.25rem; }
+.build-note-bottom { font-size: 0.85rem; margin-bottom: 0.75rem; }
+.install-section-spacious { margin-bottom: 3rem; }
+.build-guide-top { margin-top: 1rem; }
+.guide-header-spaced { margin-top: 0.75rem; }
+.guide-detail-spaced { margin-top: 0.5rem; }
+
+/* Quickstart cards (extends shared .card-grid / .card) */
+.quickstart-section { margin-top: 2rem; }
+.quickstart-cards { grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); margin-top: 0.75rem; }
+.quickstart-card { padding: 0.75rem 1rem; text-decoration: none; }
+.quickstart-card h3 { color: var(--primary); font-size: 0.9rem; margin-bottom: 0.35rem; font-weight: 500; }
+.quickstart-card p { color: var(--text-muted); font-size: 0.8rem; margin: 0; }
+.quickstart-card .arrow { color: var(--text-muted); font-size: 0.8rem; margin-top: 0.5rem; display: block; }
+.quickstart-card:hover .arrow { color: var(--primary); }
+
+/* -----------------------------------------------------------------------------
+   CLI Page
+   ----------------------------------------------------------------------------- */
+
+.cmd-body { padding: 0.5rem 0.75rem; display: flex; align-items: center; gap: 0.4rem; }
+.cmd-lines { flex: 1; }
+.cmd-line { display: flex; align-items: flex-start; gap: 0.4rem; margin-bottom: 0.2rem; }
+.cmd-line:last-child { margin-bottom: 0; }
+.cmd { color: var(--text); font-size: 0.8rem; font-family: var(--font-mono); }
+.cmd .comment { color: var(--syntax-comment); }
+
+.options-table { width: 100%; border-collapse: collapse; margin: 0.75rem 0; font-size: 0.8rem; }
+.options-table th, .options-table td { text-align: left; padding: 0.35rem 0.5rem; border-bottom: 1px solid var(--border); }
+.options-table th { color: var(--text-muted); font-weight: 600; font-size: 0.7rem; text-transform: uppercase; }
+.options-table td:first-child { color: var(--text); font-family: var(--font-mono); white-space: nowrap; }
+.options-table td:last-child { color: var(--text-muted); }
+
+/* Terminal mock for interactive demos */
+.terminal-mock { background: var(--bg-code); border: 1px solid var(--border); border-radius: 6px; margin-bottom: 1rem; overflow: hidden; font-family: var(--font-mono); font-size: 0.8rem; }
+.terminal-bar { background: color-mix(in srgb, var(--bg-code) 70%, var(--bg)); border-bottom: 1px solid var(--border); padding: 0.4rem 0.75rem; display: flex; align-items: center; gap: 0.4rem; }
+.terminal-dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+.terminal-dot.red { background: var(--danger); }
+.terminal-dot.yellow { background: var(--secondary); }
+.terminal-dot.green { background: var(--success); }
+.terminal-title { color: var(--text-muted); font-size: 0.7rem; margin-left: 0.5rem; }
+.terminal-body { padding: 0.75rem; white-space: pre; line-height: 1.5; color: var(--text); }
+.terminal-body .t-muted { color: var(--text-muted); }
+.terminal-body .t-highlight { color: var(--primary); font-weight: 500; }
+.terminal-body .t-cursor { color: var(--text); border-bottom: 2px solid var(--primary); }
+
+/* -----------------------------------------------------------------------------
+   Python Page
+   ----------------------------------------------------------------------------- */
+
+.code-block { background: var(--bg-code); border: 1px solid var(--border); border-radius: 5px; margin-bottom: 0.75rem; position: relative; }
+.code-block > .copy-btn { position: absolute; top: 0.35rem; right: 0.35rem; }
+.code-body { padding: 0.75rem 1rem; overflow-x: auto; }
+.code-body pre { margin: 0; padding: 0; background: none; border: none; }
+
+/* Python syntax */
+.kw { color: var(--syntax-keyword); }
+.fn { color: var(--syntax-function); }
+.str { color: var(--syntax-string); }
+.cm { color: var(--syntax-comment); font-style: italic; }
+.op { color: var(--text); }
+
+/* -----------------------------------------------------------------------------
+   Building Page
+   ----------------------------------------------------------------------------- */
+
+.subtitle { color: var(--text-muted); margin-bottom: 1.5rem; font-size: 0.9rem; }
+
+/* .note/.note-label styles are in shared components.css */
+
+/* Build panels (toggled by .platform-tabs) */
+.build-panel { display: none; margin-top: 0.75rem; }
+.build-panel.active { display: block; }
+
+/* Build guide — soft docstring-style container */
+.build-guide {
+  background: var(--bg-code);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 0.75rem 1rem;
+}
+
+.guide-desc {
+  font-size: 0.85rem;
+  color: var(--text-muted);
+  margin: 0 0 0.75rem;
+}
+
+.guide-header {
+  font-size: 0.7rem;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-top: 0.75rem;
+  padding-bottom: 0.3rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.guide-header:first-child,
+.guide-desc + .guide-header {
+  margin-top: 0;
+}
+
+.guide-detail {
+  font-size: 0.8rem;
+  color: var(--text-muted);
+  margin: 0.35rem 0 0;
+}
+
+.guide-detail code {
+  font-size: 0.75em;
+}
+
+.guide-cmds {
+  padding: 0.35rem 0 0;
+}
+
+.guide-cmds .cmd-line {
+  margin-bottom: 0.15rem;
+}
+
+.guide-cmds .cmd-line:last-child {
+  margin-bottom: 0;
+}
+
+/* -----------------------------------------------------------------------------
+   Examples Pages
+   ----------------------------------------------------------------------------- */
+
+/* Examples index - 2-column grid (extends shared .card-grid / .card) */
+.examples-grid {
+  grid-template-columns: repeat(2, 1fr);
+  gap: 1.25rem;
+  margin-top: 1.5rem;
+}
+
+.examples-block {
+  padding: 1rem;
+}
+
+.examples-block h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  margin: 0 0 0.75rem 0;
+  padding: 0;
+  border: none;
+}
+
+.examples-block h2 a {
+  color: var(--text);
+  text-decoration: none;
+}
+
+.examples-block h2 a:hover {
+  color: var(--primary);
+}
+
+.examples-block ul {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+}
+
+.examples-block li {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 0.5rem;
+  padding-bottom: 0.5rem;
+  border-bottom: 1px solid var(--border);
+}
+
+.examples-block li:last-child {
+  margin-bottom: 0;
+  padding-bottom: 0;
+  border-bottom: none;
+}
+
+.examples-block li a {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.examples-block li a:hover {
+  text-decoration: underline;
+}
+
+.examples-block li span {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  margin-top: 0.15rem;
+}
+
+.examples-block li.more {
+  border-bottom: none;
+  margin-top: 0.25rem;
+}
+
+.examples-block li.more a {
+  font-family: var(--font-sans);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+}
+
+.examples-block li.more a:hover {
+  color: var(--primary);
+}
+
+@media (max-width: 700px) {
+  .examples-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* Override h3 styling for examples category pages */
+.examples-mode .content h3 {
+  font-family: var(--font-mono);
+  font-size: 0.9rem;
+  font-weight: 500;
+  margin: 1.25rem 0 0.25rem;
+  padding: 0;
+  background: none;
+  border-left: none;
+  border-radius: 0;
+}
+
+.examples-mode .content h3 a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+.examples-mode .content h3 a:hover {
+  text-decoration: underline;
+}
+
+/* Description text under the filename link */
+.examples-mode .content h3 + p {
+  margin: 0 0 0.75rem 0;
+  padding-left: 0;
+  color: var(--text-muted);
+  font-size: 0.85rem;
+}
