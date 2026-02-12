@@ -4,10 +4,12 @@
     "llama",
     "llama3",
     "llama3.1",
-    "llama3.2"
+    "llama3.2",
+    "idefics3"
   ],
   "weight_prefixes": [
     "model.layers.{d}.",
+    "model.text_model.layers.{d}.",
     "layers.{d}.",
     "transformer.h.{d}.",
     "backbone.layers.{d}.",
@@ -198,6 +200,7 @@
       "id": "token_embeddings",
       "candidates": [
         "model.embed_tokens.weight",
+        "model.text_model.embed_tokens.weight",
         "embed_tokens.weight",
         "transformer.wte.weight",
         "backbone.embedding.weight",
@@ -212,6 +215,7 @@
       "id": "ln_final",
       "candidates": [
         "model.norm.weight",
+        "model.text_model.norm.weight",
         "norm.weight",
         "transformer.ln_f.weight",
         "backbone.norm.weight",
@@ -227,6 +231,7 @@
       "id": "lm_head",
       "candidates": [
         "lm_head.weight",
+        "model.text_model.lm_head.weight",
         "output.weight",
         "transformer.lm_head.weight",
         "language_model.lm_head.weight"
