@@ -83,14 +83,17 @@ jobs:
             os: ubuntu-latest
             zig_arch: x86_64-linux
             python_platform: manylinux_2_17_x86_64
+            rust_target: x86_64-unknown-linux-gnu
           # - target: x86_64-macos
           #   os: macos-13
           #   zig_arch: x86_64-macos
           #   python_platform: macosx_10_9_x86_64
+          #   rust_target: x86_64-apple-darwin
           - target: aarch64-macos
             os: macos-latest
             zig_arch: aarch64-macos
             python_platform: macosx_11_0_arm64
+            rust_target: aarch64-apple-darwin
     env:
       TARGET: ${{ matrix.target }}
       OS: ${{ matrix.os }}
@@ -272,6 +275,34 @@ jobs:
         with:
           name: ${{ env.NAME }}-binary-${{ matrix.target }}
           path: ./artifacts
+
+      # Standalone library archive (for talu-sys crate on crates.io)
+      - name: Package library for talu-sys
+        run: |
+          # Binary release already ran make build; Python release built
+          # inside the sdist, so rebuild at repo root if needed.
+          if [ ! -f zig-out/lib/libtalu.so ] && [ ! -f zig-out/lib/libtalu.dylib ]; then
+            make build
+          fi
+
+          mkdir -p lib-artifacts
+          if [ "$(uname)" = "Darwin" ]; then
+            LIB_NAME="libtalu.dylib"
+          else
+            LIB_NAME="libtalu.so"
+          fi
+
+          strip zig-out/lib/$LIB_NAME
+          tar -czf lib-artifacts/libtalu-${{ matrix.rust_target }}.tar.gz \
+            -C zig-out/lib $LIB_NAME
+          shasum -a 256 lib-artifacts/libtalu-${{ matrix.rust_target }}.tar.gz \
+            > lib-artifacts/libtalu-${{ matrix.rust_target }}.tar.gz.sha256
+
+      - name: Archive library artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.NAME }}-lib-${{ matrix.target }}
+          path: lib-artifacts/*
 
   deploy:
     runs-on: ubuntu-latest
