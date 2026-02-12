@@ -1,13 +1,14 @@
 //! Input format variant tests over real HTTP.
 
-use crate::server::common::{model_config, model_path, post_json, ServerTestContext};
+use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
 
 /// Plain string input is accepted and produces output.
 #[test]
 fn string_input() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 5,
     });
@@ -20,9 +21,10 @@ fn string_input() {
 /// Structured array input with a user message item.
 #[test]
 fn structured_user_message() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": [{"type": "message", "role": "user", "content": "Say hello"}],
         "max_output_tokens": 200,
     });
@@ -36,9 +38,10 @@ fn structured_user_message() {
 /// System + user messages in structured input.
 #[test]
 fn system_and_user_messages() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": [
             {"type": "message", "role": "system", "content": "You are a helpful assistant."},
             {"type": "message", "role": "user", "content": "Hello"}
@@ -55,9 +58,10 @@ fn system_and_user_messages() {
 /// Developer message (alias for system) is accepted.
 #[test]
 fn developer_message() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": [
             {"type": "message", "role": "developer", "content": "Be brief."},
             {"type": "message", "role": "user", "content": "Hi"}
@@ -71,9 +75,10 @@ fn developer_message() {
 /// Message array input (legacy format without "type" discriminator).
 #[test]
 fn message_array_input() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": [{"type": "message", "role": "user", "content": "Hi"}],
         "max_output_tokens": 5,
     });

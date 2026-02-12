@@ -1,11 +1,11 @@
 //! Request parameter passthrough and enforcement tests.
 
-use crate::server::common::{get, model_config, model_path, post_json, ServerTestContext};
+use crate::server::common::{get, model_config, post_json, require_model, ServerTestContext};
 
 /// Helper: generate with custom parameters.
-fn generate_with(ctx: &ServerTestContext, extra: serde_json::Value) -> serde_json::Value {
+fn generate_with(ctx: &ServerTestContext, model: &str, extra: serde_json::Value) -> serde_json::Value {
     let mut body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 10,
     });
@@ -22,8 +22,9 @@ fn generate_with(ctx: &ServerTestContext, extra: serde_json::Value) -> serde_jso
 /// Temperature is reflected in the response resource.
 #[test]
 fn temperature_passthrough() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate_with(&ctx, serde_json::json!({"temperature": 0.7}));
+    let json = generate_with(&ctx, &model, serde_json::json!({"temperature": 0.7}));
     let temp = json["temperature"].as_f64().expect("temperature field");
     assert!(
         (temp - 0.7).abs() < 0.01,
@@ -34,8 +35,9 @@ fn temperature_passthrough() {
 /// top_p is reflected in the response resource.
 #[test]
 fn top_p_passthrough() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate_with(&ctx, serde_json::json!({"top_p": 0.9}));
+    let json = generate_with(&ctx, &model, serde_json::json!({"top_p": 0.9}));
     let top_p = json["top_p"].as_f64().expect("top_p field");
     assert!(
         (top_p - 0.9).abs() < 0.01,
@@ -46,8 +48,9 @@ fn top_p_passthrough() {
 /// max_output_tokens is echoed back in the response resource.
 #[test]
 fn max_output_tokens_echo() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate_with(&ctx, serde_json::json!({"max_output_tokens": 5}));
+    let json = generate_with(&ctx, &model, serde_json::json!({"max_output_tokens": 5}));
     assert_eq!(
         json["max_output_tokens"].as_i64(),
         Some(5),
@@ -59,10 +62,12 @@ fn max_output_tokens_echo() {
 /// max_output_tokens limits actual output length.
 #[test]
 fn max_output_tokens_limits_output() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     // Request with very few tokens.
     let json = generate_with(
         &ctx,
+        &model,
         serde_json::json!({
             "max_output_tokens": 3,
             "input": "Write a very long story about dragons"
@@ -81,8 +86,9 @@ fn max_output_tokens_limits_output() {
 /// Default temperature (when not specified) is 0.0.
 #[test]
 fn default_temperature() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate_with(&ctx, serde_json::json!({}));
+    let json = generate_with(&ctx, &model, serde_json::json!({}));
     assert_eq!(
         json["temperature"].as_f64(),
         Some(0.0),
@@ -93,8 +99,9 @@ fn default_temperature() {
 /// Default top_p (when not specified) is 1.0.
 #[test]
 fn default_top_p() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate_with(&ctx, serde_json::json!({}));
+    let json = generate_with(&ctx, &model, serde_json::json!({}));
     assert_eq!(
         json["top_p"].as_f64(),
         Some(1.0),
@@ -105,9 +112,10 @@ fn default_top_p() {
 /// Bare /responses path (without /v1 prefix) works.
 #[test]
 fn bare_responses_path() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 5,
     });
@@ -124,6 +132,7 @@ fn bare_responses_path() {
 /// /models path (without /v1 prefix) works like /v1/models.
 #[test]
 fn bare_models_path() {
+    let _ = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let v1 = get(ctx.addr(), "/v1/models").json();
     let bare = get(ctx.addr(), "/models").json();
@@ -136,9 +145,10 @@ fn bare_models_path() {
 /// Streaming with bare /responses path works.
 #[test]
 fn bare_responses_streaming() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hi",
         "stream": true,
         "max_output_tokens": 10,

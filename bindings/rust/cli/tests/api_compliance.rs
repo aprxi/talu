@@ -28,12 +28,25 @@ use talu_cli::server::http::Router;
 use talu_cli::server::state::{AppState, BackendState};
 
 // ---------------------------------------------------------------------------
-// Test model path (from TALU_TEST_MODEL env or default)
+// Test model path (from TALU_TEST_MODEL env var)
 // ---------------------------------------------------------------------------
 
-fn model_path() -> String {
-    std::env::var("TALU_TEST_MODEL")
-        .unwrap_or_else(|_| "models/LiquidAI/LFM2-350M-GAF4".to_string())
+/// Return the model path if TALU_TEST_MODEL is set, or None.
+fn try_model_path() -> Option<String> {
+    std::env::var("TALU_TEST_MODEL").ok()
+}
+
+/// Skip-guard for async tests: returns early if TALU_TEST_MODEL is unset.
+macro_rules! require_model {
+    () => {
+        match try_model_path() {
+            Some(path) => path,
+            None => {
+                eprintln!("Skipped: TALU_TEST_MODEL not set");
+                return;
+            }
+        }
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -88,17 +101,16 @@ async fn body_json(resp: Response<Incoming>) -> (StatusCode, Value) {
 }
 
 /// Build a Router with a real backend loaded (model inference enabled).
-fn build_app_with_model() -> Router {
-    let path = model_path();
+fn build_app_with_model(model: &str) -> Router {
     let backend =
-        InferenceBackend::new(&path).unwrap_or_else(|e| panic!("failed to load model {path}: {e}"));
+        InferenceBackend::new(model).unwrap_or_else(|e| panic!("failed to load model {model}: {e}"));
 
     let state = AppState {
         backend: Arc::new(Mutex::new(BackendState {
             backend: Some(backend),
-            current_model: Some(path.clone()),
+            current_model: Some(model.to_string()),
         })),
-        configured_model: Some(path),
+        configured_model: Some(model.to_string()),
         response_store: Mutex::new(HashMap::new()),
         gateway_secret: None,
         tenant_registry: None,
@@ -194,7 +206,8 @@ async fn test_openapi_json() {
 
 #[tokio::test]
 async fn test_models_list_format() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp = send_request(&app, get("/v1/models")).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::OK);
@@ -216,7 +229,8 @@ async fn test_models_list_format() {
 
 #[tokio::test]
 async fn test_models_with_v1_prefix() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp_v1 = send_request(&app, get("/v1/models")).await;
     let resp_bare = send_request(&app, get("/models")).await;
     let (s1, j1) = body_json(resp_v1).await;
@@ -288,9 +302,10 @@ async fn test_missing_input_400() {
 
 #[tokio::test]
 async fn test_string_input_accepted() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello",
         "max_output_tokens": 5,
     });
@@ -305,9 +320,10 @@ async fn test_string_input_accepted() {
 
 #[tokio::test]
 async fn test_message_array_input_accepted() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": [{"type": "message", "role": "user", "content": "Hi"}],
         "max_output_tokens": 5,
     });
@@ -326,9 +342,10 @@ async fn test_message_array_input_accepted() {
 
 #[tokio::test]
 async fn test_response_envelope() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Say hello",
         "max_output_tokens": 10,
     });
@@ -357,27 +374,28 @@ async fn test_response_envelope() {
 
 #[tokio::test]
 async fn test_response_model_matches() {
-    let app = build_app_with_model();
-    let path = model_path();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": &path,
+        "model": &model,
         "input": "Hi",
         "max_output_tokens": 5,
     });
     let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (_, json) = body_json(resp).await;
-    let model = json
+    let resp_model = json
         .get("model")
         .and_then(|v| v.as_str())
         .expect("should have model");
-    assert_eq!(model, path);
+    assert_eq!(resp_model, model);
 }
 
 #[tokio::test]
 async fn test_response_output_shape() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello",
         "max_output_tokens": 200,
     });
@@ -412,9 +430,10 @@ async fn test_response_output_shape() {
 
 #[tokio::test]
 async fn test_response_content_shape() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Say hi",
         "max_output_tokens": 200,
     });
@@ -444,9 +463,10 @@ async fn test_response_content_shape() {
 
 #[tokio::test]
 async fn test_response_usage() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Count to three",
         "max_output_tokens": 20,
     });
@@ -473,9 +493,10 @@ async fn test_response_usage() {
 
 #[tokio::test]
 async fn test_response_content_type_header() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hi",
         "max_output_tokens": 5,
     });
@@ -521,9 +542,9 @@ async fn collect_sse_events(resp: Response<Incoming>) -> Vec<(String, Value)> {
     events
 }
 
-fn streaming_request(input: &str) -> Value {
+fn streaming_request(model: &str, input: &str) -> Value {
     serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": input,
         "stream": true,
         "max_output_tokens": 50,
@@ -532,8 +553,9 @@ fn streaming_request(input: &str) -> Value {
 
 #[tokio::test]
 async fn test_streaming_content_type() {
-    let app = build_app_with_model();
-    let resp = send_request(&app, post_json("/v1/responses", &streaming_request("Hi"))).await;
+    let model = require_model!();
+    let app = build_app_with_model(&model);
+    let resp = send_request(&app, post_json("/v1/responses", &streaming_request(&model, "Hi"))).await;
     let ct = resp
         .headers()
         .get("content-type")
@@ -548,8 +570,9 @@ async fn test_streaming_content_type() {
 
 #[tokio::test]
 async fn test_streaming_cache_headers() {
-    let app = build_app_with_model();
-    let resp = send_request(&app, post_json("/v1/responses", &streaming_request("Hi"))).await;
+    let model = require_model!();
+    let app = build_app_with_model(&model);
+    let resp = send_request(&app, post_json("/v1/responses", &streaming_request(&model, "Hi"))).await;
     let cc = resp
         .headers()
         .get("cache-control")
@@ -563,10 +586,11 @@ async fn test_streaming_cache_headers() {
 
 #[tokio::test]
 async fn test_streaming_sequence() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/responses", &streaming_request("Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -592,10 +616,11 @@ async fn test_streaming_sequence() {
 
 #[tokio::test]
 async fn test_streaming_created_event() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/responses", &streaming_request("Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -613,10 +638,11 @@ async fn test_streaming_created_event() {
 
 #[tokio::test]
 async fn test_streaming_delta_events() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/responses", &streaming_request("Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -636,10 +662,11 @@ async fn test_streaming_delta_events() {
 
 #[tokio::test]
 async fn test_streaming_done_event() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/responses", &streaming_request("Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -657,10 +684,11 @@ async fn test_streaming_done_event() {
 
 #[tokio::test]
 async fn test_streaming_completed_event() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/responses", &streaming_request("Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -704,10 +732,11 @@ async fn test_streaming_completed_event() {
 
 #[tokio::test]
 async fn test_streaming_sequence_numbers() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/responses", &streaming_request("Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -784,9 +813,10 @@ async fn test_400_invalid_body() {
 
 #[tokio::test]
 async fn test_structured_user_message_input() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": [{"type": "message", "role": "user", "content": "Say hello"}],
         "max_output_tokens": 200,
     });
@@ -806,9 +836,10 @@ async fn test_structured_user_message_input() {
 
 #[tokio::test]
 async fn test_system_and_user_message_input() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": [
             {"type": "message", "role": "system", "content": "You are a helpful assistant."},
             {"type": "message", "role": "user", "content": "Hello"}
@@ -827,9 +858,10 @@ async fn test_system_and_user_message_input() {
 
 #[tokio::test]
 async fn test_developer_message_input() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": [
             {"type": "message", "role": "developer", "content": "Be brief."},
             {"type": "message", "role": "user", "content": "Hi"}
@@ -851,11 +883,12 @@ async fn test_developer_message_input() {
 
 #[tokio::test]
 async fn test_conversation_chaining() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
 
     // First request.
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello, my name is Alice.",
         "max_output_tokens": 50,
     });
@@ -869,7 +902,7 @@ async fn test_conversation_chaining() {
 
     // Chained request referencing the first.
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "What is my name?",
         "previous_response_id": response_id,
         "max_output_tokens": 50,
@@ -890,9 +923,10 @@ async fn test_conversation_chaining() {
 
 #[tokio::test]
 async fn test_multi_item_output() {
-    let app = build_app_with_model();
+    let model = require_model!();
+    let app = build_app_with_model(&model);
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "What is 2+2?",
         "max_output_tokens": 200,
     });

@@ -3,12 +3,12 @@
 //! Validates that the response resource contains all fields required by the
 //! OpenAPI spec, and that their types are correct.
 
-use crate::server::common::{get, model_config, model_path, post_json, ServerTestContext};
+use crate::server::common::{get, model_config, post_json, require_model, ServerTestContext};
 
 /// Helper: make a non-streaming request and return the parsed JSON response.
-fn generate(ctx: &ServerTestContext) -> serde_json::Value {
+fn generate(ctx: &ServerTestContext, model: &str) -> serde_json::Value {
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 10,
     });
@@ -20,8 +20,9 @@ fn generate(ctx: &ServerTestContext) -> serde_json::Value {
 /// All 31 required response resource fields are present.
 #[test]
 fn response_has_all_required_fields() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate(&ctx);
+    let json = generate(&ctx, &model);
 
     let required_fields = [
         "id",
@@ -68,8 +69,9 @@ fn response_has_all_required_fields() {
 /// Field types match the OpenAPI schema.
 #[test]
 fn response_field_types() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate(&ctx);
+    let json = generate(&ctx, &model);
 
     // String fields
     assert!(json["id"].is_string(), "id should be string");
@@ -133,8 +135,9 @@ fn response_field_types() {
 /// Usage object has all required sub-fields including details.
 #[test]
 fn usage_sub_fields() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate(&ctx);
+    let json = generate(&ctx, &model);
     let usage = &json["usage"];
 
     assert!(usage["input_tokens"].is_number(), "usage.input_tokens");
@@ -163,8 +166,9 @@ fn usage_sub_fields() {
 /// The text field has the expected format sub-object.
 #[test]
 fn text_format_field() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate(&ctx);
+    let json = generate(&ctx, &model);
     let text = &json["text"];
     assert!(text["format"].is_object(), "text.format should be object");
     assert_eq!(text["format"]["type"].as_str(), Some("text"));
@@ -173,8 +177,9 @@ fn text_format_field() {
 /// The reasoning field has effort and summary keys.
 #[test]
 fn reasoning_field() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate(&ctx);
+    let json = generate(&ctx, &model);
     let reasoning = &json["reasoning"];
     assert!(
         reasoning.get("effort").is_some(),
@@ -189,8 +194,9 @@ fn reasoning_field() {
 /// Default values for hardcoded fields.
 #[test]
 fn default_field_values() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate(&ctx);
+    let json = generate(&ctx, &model);
 
     assert_eq!(json["object"].as_str(), Some("response"));
     assert_eq!(json["truncation"].as_str(), Some("auto"));
@@ -229,8 +235,9 @@ fn default_field_values() {
 /// completed_at is present and >= created_at.
 #[test]
 fn completed_at_after_created_at() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let json = generate(&ctx);
+    let json = generate(&ctx, &model);
     let created = json["created_at"].as_f64().expect("created_at");
     let completed = json["completed_at"].as_f64().expect("completed_at");
     assert!(
@@ -242,6 +249,7 @@ fn completed_at_after_created_at() {
 /// Models list items have all required fields.
 #[test]
 fn model_object_schema() {
+    let _ = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let resp = get(ctx.addr(), "/v1/models");
     assert_eq!(resp.status, 200);
@@ -258,6 +266,7 @@ fn model_object_schema() {
 /// GET /openapi.json returns a valid OpenAPI spec.
 #[test]
 fn openapi_json_endpoint() {
+    let _ = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let resp = get(ctx.addr(), "/openapi.json");
     assert_eq!(resp.status, 200);

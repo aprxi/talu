@@ -368,6 +368,7 @@ fn get_manual_items_have_no_generation() {
 
 #[test]
 fn get_generated_item_has_generation_metadata() {
+    let _ = require_model!();
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
 
@@ -443,6 +444,7 @@ fn get_generated_item_has_generation_metadata() {
 
 #[test]
 fn get_generation_metadata_has_sampling_params() {
+    let _ = require_model!();
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
 

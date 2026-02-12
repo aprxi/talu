@@ -1,7 +1,7 @@
 //! Error response tests over real HTTP.
 
 use crate::server::common::{
-    model_config, model_path, post_json, send_request, ServerConfig, ServerTestContext,
+    model_config, post_json, require_model, send_request, ServerConfig, ServerTestContext,
 };
 
 /// Invalid JSON body returns 400 with error object.
@@ -43,7 +43,7 @@ fn error_content_type() {
 /// Missing input field returns 400.
 #[test]
 fn missing_input_400() {
-    let ctx = ServerTestContext::new(model_config());
+    let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({"model": "test"});
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 400, "body: {}", resp.body);
@@ -70,6 +70,7 @@ fn unimplemented_method_501() {
 /// Requesting an unavailable model returns 500 with inference_error.
 #[test]
 fn model_not_available_500() {
+    let _ = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
         "model": "nonexistent-model-that-does-not-exist",
@@ -89,6 +90,7 @@ fn model_not_available_500() {
 /// Streaming with unavailable model returns error (not SSE stream).
 #[test]
 fn streaming_model_not_available() {
+    let _ = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
         "model": "nonexistent-model-that-does-not-exist",
@@ -122,6 +124,7 @@ fn empty_body_400() {
 /// Input present with no model (when server has configured model) still works.
 #[test]
 fn no_model_field_uses_default() {
+    let _ = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
         "input": "Hello",
@@ -202,10 +205,11 @@ fn post_models_not_supported() {
 /// (previous_response_id satisfies input requirement).
 #[test]
 fn previous_response_id_without_input() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     // First: create a response to chain from.
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Remember: the answer is 42.",
         "max_output_tokens": 20,
     });
@@ -215,13 +219,11 @@ fn previous_response_id_without_input() {
 
     // Second: chain with previous_response_id but no input field at all.
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "previous_response_id": response_id,
         "max_output_tokens": 20,
     });
     let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
-    // The handler validates: input_value.is_none() && previous_response_id.is_none()
-    // Since previous_response_id is present, this should not return 400.
     assert_eq!(
         resp2.status, 200,
         "should succeed with just previous_response_id: {}",

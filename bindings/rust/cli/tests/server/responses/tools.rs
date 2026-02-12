@@ -1,6 +1,6 @@
 //! Tool calling passthrough and round-trip tests.
 
-use crate::server::common::{model_config, model_path, post_json, ServerTestContext};
+use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
 
 fn tool_definition() -> serde_json::Value {
     serde_json::json!([{
@@ -20,10 +20,11 @@ fn tool_definition() -> serde_json::Value {
 /// Tools array is echoed back in the response resource.
 #[test]
 fn tools_echo_in_response() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let tools = tool_definition();
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 10,
         "tools": tools,
@@ -39,9 +40,10 @@ fn tools_echo_in_response() {
 /// tool_choice is echoed back in the response resource.
 #[test]
 fn tool_choice_echo_in_response() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 10,
         "tools": tool_definition(),
@@ -56,9 +58,10 @@ fn tool_choice_echo_in_response() {
 /// Default tool_choice (when not specified) is "none".
 #[test]
 fn default_tool_choice() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 10,
     });
@@ -71,9 +74,10 @@ fn default_tool_choice() {
 /// Default tools (when not specified) is an empty array.
 #[test]
 fn default_tools_empty() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 10,
     });
@@ -87,11 +91,12 @@ fn default_tools_empty() {
 /// Tools are round-tripped through conversation chaining.
 #[test]
 fn tools_chaining_merge() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
 
     // First request with tools.
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello",
         "max_output_tokens": 10,
         "tools": tool_definition(),
@@ -104,7 +109,7 @@ fn tools_chaining_merge() {
 
     // Chained request WITHOUT tools — should inherit from previous.
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "What tools do you have?",
         "max_output_tokens": 10,
         "previous_response_id": response_id,
@@ -125,11 +130,12 @@ fn tools_chaining_merge() {
 /// Chained request can override tools from previous response.
 #[test]
 fn tools_chaining_override() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
 
     // First request with tools.
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello",
         "max_output_tokens": 10,
         "tools": tool_definition(),
@@ -147,7 +153,7 @@ fn tools_chaining_override() {
         "parameters": { "type": "object", "properties": {} }
     }]);
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Search for something",
         "max_output_tokens": 10,
         "previous_response_id": response_id,
@@ -174,9 +180,10 @@ fn tools_chaining_override() {
 /// Streaming with tools echoes them in the terminal response resource.
 #[test]
 fn streaming_tools_echo() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "stream": true,
         "max_output_tokens": 10,
@@ -203,9 +210,10 @@ fn streaming_tools_echo() {
 /// Streaming created event includes tools in the response resource.
 #[test]
 fn streaming_created_includes_tools() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "stream": true,
         "max_output_tokens": 10,

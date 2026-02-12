@@ -1,10 +1,10 @@
 //! Streaming (SSE) tests over real HTTP.
 
-use crate::server::common::{model_config, model_path, post_json, ServerTestContext};
+use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
 
-fn streaming_body(input: &str) -> serde_json::Value {
+fn streaming_body(model: &str, input: &str) -> serde_json::Value {
     serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": input,
         "stream": true,
         "max_output_tokens": 50,
@@ -32,8 +32,9 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
 /// Streaming response has text/event-stream Content-Type.
 #[test]
 fn streaming_content_type() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hi"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hi"));
     assert_eq!(resp.status, 200);
     let ct = resp
         .header("content-type")
@@ -44,8 +45,9 @@ fn streaming_content_type() {
 /// Streaming response has Cache-Control: no-cache.
 #[test]
 fn streaming_cache_headers() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hi"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hi"));
     assert_eq!(resp.status, 200);
     let cc = resp.header("cache-control");
     assert_eq!(cc, Some("no-cache"), "Cache-Control: {cc:?}");
@@ -54,8 +56,9 @@ fn streaming_cache_headers() {
 /// SSE stream starts with response.created and ends with a terminal event.
 #[test]
 fn streaming_event_sequence() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     assert_eq!(resp.status, 200);
     let events = parse_sse_events(&resp.body);
     assert!(!events.is_empty(), "should have SSE events");
@@ -77,8 +80,9 @@ fn streaming_event_sequence() {
 /// Created event has response with status=in_progress.
 #[test]
 fn streaming_created_event() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
     let (_, data) = &events[0];
     assert_eq!(data["type"].as_str(), Some("response.created"));
@@ -89,8 +93,9 @@ fn streaming_created_event() {
 /// Stream contains delta events with a delta field.
 #[test]
 fn streaming_delta_events() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let deltas: Vec<_> = events
@@ -109,8 +114,9 @@ fn streaming_delta_events() {
 /// Stream contains a done event with text.
 #[test]
 fn streaming_done_event() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let done = events
@@ -127,8 +133,9 @@ fn streaming_done_event() {
 /// Terminal event has a response with usage stats.
 #[test]
 fn streaming_terminal_has_usage() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let terminal = events
@@ -145,8 +152,9 @@ fn streaming_terminal_has_usage() {
 /// Sequence numbers are monotonically increasing.
 #[test]
 fn streaming_sequence_numbers() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let seq_nums: Vec<u64> = events
@@ -167,8 +175,9 @@ fn streaming_sequence_numbers() {
 /// Stream contains response.in_progress event after response.created.
 #[test]
 fn streaming_in_progress_event() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
     assert!(events.len() >= 2, "should have at least 2 events");
 
@@ -185,8 +194,9 @@ fn streaming_in_progress_event() {
 /// Stream contains response.output_item.added event with an item object.
 #[test]
 fn streaming_output_item_added() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let added = events
@@ -216,8 +226,9 @@ fn streaming_output_item_added() {
 /// Stream contains response.content_part.added event.
 #[test]
 fn streaming_content_part_added() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let added = events
@@ -242,8 +253,9 @@ fn streaming_content_part_added() {
 /// Stream contains response.content_part.done event with completed part.
 #[test]
 fn streaming_content_part_done() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let done = events
@@ -265,8 +277,9 @@ fn streaming_content_part_done() {
 /// Stream contains response.output_item.done event with completed item.
 #[test]
 fn streaming_output_item_done() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let done = events
@@ -291,8 +304,9 @@ fn streaming_output_item_done() {
 /// Terminal response resource in streaming has all 31 required fields.
 #[test]
 fn streaming_terminal_response_schema() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let terminal = events
@@ -355,8 +369,9 @@ fn streaming_terminal_response_schema() {
 /// content_part.added -> deltas -> done -> content_part.done -> item.done -> terminal.
 #[test]
 fn streaming_full_lifecycle_order() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let types: Vec<&str> = events.iter().map(|(t, _)| t.as_str()).collect();
@@ -425,8 +440,9 @@ fn streaming_full_lifecycle_order() {
 /// Delta events have item_id, output_index, content_index fields.
 #[test]
 fn streaming_delta_event_fields() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body("Hello"));
+    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
     let events = parse_sse_events(&resp.body);
 
     let delta = events.iter().find(|(t, _)| t.ends_with(".delta"));
@@ -455,9 +471,10 @@ fn streaming_delta_event_fields() {
 /// incomplete_details indicating max_output_tokens.
 #[test]
 fn streaming_incomplete_on_max_tokens() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Write a very long story about dragons and wizards",
         "stream": true,
         "max_output_tokens": 1,
@@ -487,9 +504,10 @@ fn streaming_incomplete_on_max_tokens() {
 /// Non-streaming with max_output_tokens=1 produces status=incomplete.
 #[test]
 fn non_streaming_incomplete_on_max_tokens() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Write a very long story about dragons and wizards",
         "max_output_tokens": 1,
     });

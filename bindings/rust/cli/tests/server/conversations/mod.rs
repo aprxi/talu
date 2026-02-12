@@ -60,6 +60,7 @@ pub fn seed_session_with_messages(
 ///
 /// Calls the C API directly since `ChatHandle::notify_session_update`
 /// doesn't expose the `system_prompt` parameter.
+#[allow(dead_code)]
 pub fn seed_session_with_system_prompt(
     db_path: &Path,
     session_id: &str,

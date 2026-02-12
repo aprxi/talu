@@ -1,6 +1,6 @@
 //! Conversation chaining (previous_response_id) tests over real HTTP.
 
-use crate::server::common::{model_config, model_path, post_json, ServerTestContext};
+use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
 
 /// Parse SSE events from a raw body string (same helper as streaming.rs).
 fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
@@ -22,11 +22,12 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
 /// Chained request references first response and succeeds.
 #[test]
 fn conversation_chaining() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
 
     // First request.
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello, my name is Alice.",
         "max_output_tokens": 50,
     });
@@ -37,7 +38,7 @@ fn conversation_chaining() {
 
     // Chained request.
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "What is my name?",
         "previous_response_id": response_id,
         "max_output_tokens": 50,
@@ -56,9 +57,10 @@ fn conversation_chaining() {
 /// (server treats missing context as a fresh conversation).
 #[test]
 fn chaining_unknown_id_succeeds() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello",
         "previous_response_id": "resp_nonexistent_00000000",
         "max_output_tokens": 10,
@@ -72,11 +74,12 @@ fn chaining_unknown_id_succeeds() {
 /// Streaming chained request works.
 #[test]
 fn streaming_chaining() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
 
     // First request (non-streaming).
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Remember: the secret word is banana.",
         "max_output_tokens": 50,
     });
@@ -87,7 +90,7 @@ fn streaming_chaining() {
 
     // Chained streaming request.
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "What is the secret word?",
         "previous_response_id": response_id,
         "stream": true,
@@ -110,11 +113,12 @@ fn streaming_chaining() {
 /// terminal event (response.completed or response.incomplete).
 #[test]
 fn streaming_continue_no_input() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
 
     // Initial stored request.
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Tell me about the weather.",
         "stream": true,
         "store": true,
@@ -133,7 +137,7 @@ fn streaming_continue_no_input() {
 
     // Continue request — no input, just previous_response_id.
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "previous_response_id": response_id,
         "stream": true,
         "store": true,
@@ -183,11 +187,12 @@ fn streaming_continue_no_input() {
 /// Continue request's terminal event carries session metadata.
 #[test]
 fn streaming_continue_has_session_metadata() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
 
     // Initial stored streaming request.
     let body1 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "input": "Hello",
         "stream": true,
         "store": true,
@@ -209,7 +214,7 @@ fn streaming_continue_has_session_metadata() {
 
     // Continue.
     let body2 = serde_json::json!({
-        "model": model_path(),
+        "model": &model,
         "previous_response_id": response_id,
         "stream": true,
         "store": true,

@@ -1,13 +1,16 @@
 //! Non-streaming response envelope tests over real HTTP.
 
-use crate::server::common::{get, model_config, model_path, post_json, ServerTestContext};
+use crate::server::common::{
+    get, model_config, post_json, require_model, ServerConfig, ServerTestContext,
+};
 
 /// Response has correct envelope fields (object, id, status, model, created_at).
 #[test]
 fn response_envelope() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Say hello",
         "max_output_tokens": 10,
     });
@@ -22,15 +25,16 @@ fn response_envelope() {
         "should have created_at"
     );
     assert_eq!(json["status"].as_str(), Some("completed"));
-    assert_eq!(json["model"].as_str(), Some(model_path().as_str()));
+    assert_eq!(json["model"].as_str(), Some(model.as_str()));
 }
 
 /// Response Content-Type is application/json.
 #[test]
 fn response_content_type() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hi",
         "max_output_tokens": 5,
     });
@@ -45,9 +49,10 @@ fn response_content_type() {
 /// Output is an array with at least one typed item containing a message.
 #[test]
 fn response_output_shape() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Hello",
         "max_output_tokens": 200,
     });
@@ -78,9 +83,10 @@ fn response_output_shape() {
 /// Message item has role=assistant and content array with output_text.
 #[test]
 fn response_content_shape() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Say hi",
         "max_output_tokens": 200,
     });
@@ -104,9 +110,10 @@ fn response_content_shape() {
 /// Usage has input_tokens, output_tokens, total_tokens.
 #[test]
 fn response_usage() {
+    let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
-        "model": model_path(),
+        "model": model,
         "input": "Count to three",
         "max_output_tokens": 20,
     });
@@ -125,6 +132,7 @@ fn response_usage() {
 /// GET /v1/models returns a list with the configured model.
 #[test]
 fn models_list() {
+    let _ = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let resp = get(ctx.addr(), "/v1/models");
     assert_eq!(resp.status, 200);
@@ -138,7 +146,7 @@ fn models_list() {
 /// GET /health returns 200 "ok".
 #[test]
 fn health_check() {
-    let ctx = ServerTestContext::new(model_config());
+    let ctx = ServerTestContext::new(ServerConfig::new());
     let resp = get(ctx.addr(), "/health");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body.trim(), "ok");

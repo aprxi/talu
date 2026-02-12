@@ -161,17 +161,39 @@ impl HttpResponse {
     }
 }
 
+/// Return the model path if TALU_TEST_MODEL is set, or None.
+pub fn try_model_path() -> Option<String> {
+    std::env::var("TALU_TEST_MODEL").ok()
+}
+
 /// Return the model path from TALU_TEST_MODEL env var.
+/// Panics if not set — prefer `require_model!()` in tests.
 pub fn model_path() -> String {
-    std::env::var("TALU_TEST_MODEL").expect("TALU_TEST_MODEL must be set to an absolute model path")
+    try_model_path().expect("TALU_TEST_MODEL must be set to an absolute model path")
 }
 
 /// Build a ServerConfig with the test model pre-loaded.
+/// Panics if TALU_TEST_MODEL is not set — prefer `require_model!()` first.
 pub fn model_config() -> ServerConfig {
     let mut config = ServerConfig::new();
     config.model = Some(model_path());
     config
 }
+
+/// Skip the current test if TALU_TEST_MODEL is not set.
+/// Returns the model path string if available.
+macro_rules! require_model {
+    () => {
+        match $crate::server::common::try_model_path() {
+            Some(path) => path,
+            None => {
+                eprintln!("Skipped: TALU_TEST_MODEL not set");
+                return;
+            }
+        }
+    };
+}
+pub(crate) use require_model;
 
 /// POST JSON to a path on the server. Convenience wrapper around send_request.
 pub fn post_json(addr: SocketAddr, path: &str, body: &serde_json::Value) -> HttpResponse {
