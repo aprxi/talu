@@ -31,6 +31,8 @@ export RUFF_CACHE_DIR := $(HOME)/.cache/ruff
 # Pytest cache dir (passed via --override-ini, no env var support)
 PYTEST_CACHE := --override-ini="cache_dir=$(HOME)/.cache/pytest"
 
+all: build
+
 # =============================================================================
 # Lint (Static Quality)
 # =============================================================================
