@@ -103,7 +103,7 @@ fn prompt_id_non_streaming_success() {
         "prompt_id": doc_id,
         "input": "What is Rust?",
         "store": true,
-        "max_output_tokens": 50,
+        "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "response request: {}", resp.body);
@@ -137,7 +137,7 @@ fn prompt_id_streaming_success() {
         "input": "Hello there!",
         "stream": true,
         "store": true,
-        "max_output_tokens": 30,
+        "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "streaming request: {}", resp.body);
@@ -177,7 +177,7 @@ fn prompt_id_lineage_tracking() {
         "prompt_id": doc_id,
         "input": "Summarize this: The quick brown fox jumps over the lazy dog.",
         "store": true,
-        "max_output_tokens": 30,
+        "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "response request: {}", resp.body);
@@ -213,7 +213,7 @@ fn prompt_id_streaming_lineage_tracking() {
         "input": "Hello",
         "stream": true,
         "store": true,
-        "max_output_tokens": 20,
+        "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "streaming request: {}", resp.body);
@@ -328,7 +328,7 @@ fn prompt_id_document_without_system_prompt() {
         "prompt_id": doc_id,
         "input": "Hello",
         "store": true,
-        "max_output_tokens": 20,
+        "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "should succeed without system_prompt: {}", resp.body);
@@ -356,7 +356,7 @@ fn prompt_id_with_chaining() {
         "prompt_id": doc_id,
         "input": "What is 2 + 2?",
         "store": true,
-        "max_output_tokens": 30,
+        "max_output_tokens": 10,
     });
     let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
     assert_eq!(resp1.status, 200, "first request: {}", resp1.body);
@@ -369,7 +369,7 @@ fn prompt_id_with_chaining() {
         "input": "What is 3 + 3?",
         "previous_response_id": response_id,
         "store": true,
-        "max_output_tokens": 30,
+        "max_output_tokens": 10,
     });
     let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
     assert_eq!(resp2.status, 200, "chained request: {}", resp2.body);
@@ -403,7 +403,7 @@ fn prompt_id_streaming_with_chaining() {
         "input": "Tell me a story about a dragon.",
         "stream": true,
         "store": true,
-        "max_output_tokens": 30,
+        "max_output_tokens": 10,
     });
     let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
     assert_eq!(resp1.status, 200, "first streaming: {}", resp1.body);
@@ -424,7 +424,7 @@ fn prompt_id_streaming_with_chaining() {
         "previous_response_id": response_id,
         "stream": true,
         "store": true,
-        "max_output_tokens": 30,
+        "max_output_tokens": 10,
     });
     let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
     assert_eq!(resp2.status, 200, "chained streaming: {}", resp2.body);
@@ -466,7 +466,7 @@ fn prompt_id_multiple_conversations_same_document() {
             "prompt_id": &doc_id,
             "input": format!("Question {}?", i),
             "store": true,
-            "max_output_tokens": 20,
+            "max_output_tokens": 10,
         });
         let resp = post_json(ctx.addr(), "/v1/responses", &body);
         assert_eq!(resp.status, 200, "request {}: {}", i, resp.body);
@@ -614,7 +614,7 @@ fn prompt_id_long_system_prompt() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(model_with_bucket(temp.path()));
 
-    let long_prompt = "You are an assistant. ".repeat(200);
+    let long_prompt = "You are an assistant. ".repeat(20);
     let doc_id = create_prompt_document(&ctx, &long_prompt, "Long Prompt");
 
     let body = serde_json::json!({

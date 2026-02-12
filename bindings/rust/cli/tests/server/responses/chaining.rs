@@ -52,7 +52,7 @@ fn streaming_chaining() {
     let body1 = serde_json::json!({
         "model": &model,
         "input": "Remember: the secret word is banana.",
-        "max_output_tokens": 50,
+        "max_output_tokens": 10,
     });
     let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
     assert_eq!(resp1.status, 200);
@@ -65,7 +65,7 @@ fn streaming_chaining() {
         "input": "What is the secret word?",
         "previous_response_id": response_id,
         "stream": true,
-        "max_output_tokens": 50,
+        "max_output_tokens": 10,
     });
     let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
     assert_eq!(resp2.status, 200, "streaming chained: {}", resp2.body);
@@ -93,7 +93,7 @@ fn streaming_continue_no_input() {
         "input": "Tell me about the weather.",
         "stream": true,
         "store": true,
-        "max_output_tokens": 20,
+        "max_output_tokens": 10,
     });
     let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
     assert_eq!(resp1.status, 200, "initial: {}", resp1.body);
@@ -112,7 +112,7 @@ fn streaming_continue_no_input() {
         "previous_response_id": response_id,
         "stream": true,
         "store": true,
-        "max_output_tokens": 20,
+        "max_output_tokens": 10,
     });
     let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
     assert_eq!(resp2.status, 200, "continue: {}", resp2.body);

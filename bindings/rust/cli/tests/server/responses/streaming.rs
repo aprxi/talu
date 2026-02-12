@@ -12,7 +12,7 @@ fn streaming_body(model: &str, input: &str) -> serde_json::Value {
         "model": model,
         "input": input,
         "stream": true,
-        "max_output_tokens": 50,
+        "max_output_tokens": 10,
     })
 }
 

@@ -131,7 +131,7 @@ fn previous_response_id_without_input() {
     let body1 = serde_json::json!({
         "model": &model,
         "input": "Remember: the answer is 42.",
-        "max_output_tokens": 20,
+        "max_output_tokens": 10,
     });
     let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
     assert_eq!(resp1.status, 200);
@@ -141,7 +141,7 @@ fn previous_response_id_without_input() {
     let body2 = serde_json::json!({
         "model": &model,
         "previous_response_id": response_id,
-        "max_output_tokens": 20,
+        "max_output_tokens": 10,
     });
     let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
     assert_eq!(

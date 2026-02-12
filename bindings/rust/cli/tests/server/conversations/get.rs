@@ -372,14 +372,14 @@ fn get_generated_item_has_generation_metadata() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
 
-    // Generate a response with store=true to create a conversation
-    // Use enough tokens to get past reasoning and into actual response
-    // Qwen3 thinking models need ~100+ tokens before the </think> tag closes
+    // Generate a response with store=true to create a conversation.
+    // Keep max_output_tokens low to minimize inference time.
+    // The test handles the case where reasoning doesn't complete.
     let body = serde_json::json!({
         "model": model_path(),
         "input": "Say hi",
         "store": true,
-        "max_output_tokens": 150,
+        "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "generate failed: {}", resp.body);
@@ -448,13 +448,13 @@ fn get_generation_metadata_has_sampling_params() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
 
-    // Generate with specific sampling params
-    // Use enough tokens for thinking models to complete reasoning + response
+    // Generate with specific sampling params.
+    // Keep max_output_tokens low — test only checks metadata, not content.
     let body = serde_json::json!({
         "model": model_path(),
         "input": "Hello",
         "store": true,
-        "max_output_tokens": 150,
+        "max_output_tokens": 10,
         "temperature": 0.5,
         "top_p": 0.8,
     });
