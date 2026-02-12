@@ -1,4 +1,9 @@
-//! Streaming (SSE) tests over real HTTP.
+//! Streaming (SSE) lifecycle tests over real HTTP.
+//!
+//! Basic streaming conformance (content-type, cache headers, event sequence,
+//! delta/done/terminal events, sequence numbers) is covered by the in-process
+//! `api_compliance` test suite. This module tests advanced lifecycle events
+//! and edge cases that only the subprocess harness exercises.
 
 use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
 
@@ -27,149 +32,6 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
         }
     }
     events
-}
-
-/// Streaming response has text/event-stream Content-Type.
-#[test]
-fn streaming_content_type() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hi"));
-    assert_eq!(resp.status, 200);
-    let ct = resp
-        .header("content-type")
-        .expect("should have Content-Type");
-    assert!(ct.contains("text/event-stream"), "Content-Type: {ct}");
-}
-
-/// Streaming response has Cache-Control: no-cache.
-#[test]
-fn streaming_cache_headers() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hi"));
-    assert_eq!(resp.status, 200);
-    let cc = resp.header("cache-control");
-    assert_eq!(cc, Some("no-cache"), "Cache-Control: {cc:?}");
-}
-
-/// SSE stream starts with response.created and ends with a terminal event.
-#[test]
-fn streaming_event_sequence() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
-    assert_eq!(resp.status, 200);
-    let events = parse_sse_events(&resp.body);
-    assert!(!events.is_empty(), "should have SSE events");
-
-    // First event: response.created
-    assert_eq!(
-        events[0].0, "response.created",
-        "first event should be response.created"
-    );
-
-    // Last event: terminal (completed or incomplete)
-    let last = &events.last().unwrap().0;
-    assert!(
-        last == "response.completed" || last == "response.incomplete",
-        "last event should be terminal: {last}",
-    );
-}
-
-/// Created event has response with status=in_progress.
-#[test]
-fn streaming_created_event() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
-    let events = parse_sse_events(&resp.body);
-    let (_, data) = &events[0];
-    assert_eq!(data["type"].as_str(), Some("response.created"));
-    let response = &data["response"];
-    assert_eq!(response["status"].as_str(), Some("in_progress"));
-}
-
-/// Stream contains delta events with a delta field.
-#[test]
-fn streaming_delta_events() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
-    let events = parse_sse_events(&resp.body);
-
-    let deltas: Vec<_> = events
-        .iter()
-        .filter(|(t, _)| t.ends_with(".delta"))
-        .collect();
-    assert!(!deltas.is_empty(), "should have delta events");
-    for (_, data) in &deltas {
-        assert!(
-            data.get("delta").is_some(),
-            "delta event should have delta field"
-        );
-    }
-}
-
-/// Stream contains a done event with text.
-#[test]
-fn streaming_done_event() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
-    let events = parse_sse_events(&resp.body);
-
-    let done = events
-        .iter()
-        .find(|(t, _)| t.ends_with(".done") && t.starts_with("response."));
-    assert!(done.is_some(), "should have a done event");
-    let (_, data) = done.unwrap();
-    assert!(
-        data.get("text").is_some(),
-        "done event should have text field"
-    );
-}
-
-/// Terminal event has a response with usage stats.
-#[test]
-fn streaming_terminal_has_usage() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
-    let events = parse_sse_events(&resp.body);
-
-    let terminal = events
-        .iter()
-        .find(|(t, _)| t == "response.completed" || t == "response.incomplete");
-    assert!(terminal.is_some(), "should have terminal event");
-    let (_, data) = terminal.unwrap();
-    let response = &data["response"];
-    let usage = &response["usage"];
-    assert!(usage["input_tokens"].as_u64().unwrap_or(0) > 0);
-    assert!(usage["output_tokens"].as_u64().unwrap_or(0) > 0);
-}
-
-/// Sequence numbers are monotonically increasing.
-#[test]
-fn streaming_sequence_numbers() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-    let resp = post_json(ctx.addr(), "/v1/responses", &streaming_body(&model, "Hello"));
-    let events = parse_sse_events(&resp.body);
-
-    let seq_nums: Vec<u64> = events
-        .iter()
-        .filter_map(|(_, data)| data["sequence_number"].as_u64())
-        .collect();
-    assert!(!seq_nums.is_empty(), "should have sequence numbers");
-    for window in seq_nums.windows(2) {
-        assert!(
-            window[1] > window[0],
-            "sequence numbers should increase: {} -> {}",
-            window[0],
-            window[1],
-        );
-    }
 }
 
 /// Stream contains response.in_progress event after response.created.

@@ -286,9 +286,6 @@ pub fn send_request(
     stream.flush().expect("flush");
     eprintln!("[DEBUG] Request sent to {addr}");
 
-    // Give server more time to process
-    std::thread::sleep(Duration::from_millis(100));
-
     let mut raw = Vec::new();
     loop {
         let mut buf = [0u8; 8192];
@@ -305,7 +302,14 @@ pub fn send_request(
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                eprintln!("[DEBUG] Read timeout/wouldblock: {e:?}");
+                if raw.is_empty() {
+                    panic!(
+                        "Read timeout waiting for response to {method} {path} \
+                         (no data received within 30s)"
+                    );
+                }
+                // Partial response received, server stopped sending — done.
+                eprintln!("[DEBUG] Read timeout after {} bytes", raw.len());
                 break;
             }
             Err(e) => panic!("read error: {e}"),

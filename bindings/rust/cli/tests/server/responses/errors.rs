@@ -1,71 +1,13 @@
 //! Error response tests over real HTTP.
+//!
+//! Basic error handling (invalid JSON, missing input, unknown path, unimplemented
+//! method, error shape, error content-type) is covered by the in-process
+//! `api_compliance` test suite. This module tests error scenarios that require
+//! a loaded model or subprocess-specific behavior.
 
 use crate::server::common::{
     model_config, post_json, require_model, send_request, ServerConfig, ServerTestContext,
 };
-
-/// Invalid JSON body returns 400 with error object.
-#[test]
-fn invalid_json_400() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
-    let resp = send_request(
-        ctx.addr(),
-        "POST",
-        "/v1/responses",
-        &[("Content-Type", "application/json")],
-        Some("{not json"),
-    );
-    assert_eq!(resp.status, 400);
-    let json = resp.json();
-    let error = &json["error"];
-    assert_eq!(error["code"].as_str(), Some("invalid_request"));
-    assert!(error["message"].as_str().is_some());
-}
-
-/// Error responses have application/json Content-Type.
-#[test]
-fn error_content_type() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
-    let resp = send_request(
-        ctx.addr(),
-        "POST",
-        "/v1/responses",
-        &[("Content-Type", "application/json")],
-        Some("invalid"),
-    );
-    assert!(resp.status >= 400);
-    let ct = resp
-        .header("content-type")
-        .expect("should have Content-Type");
-    assert!(ct.contains("application/json"), "error Content-Type: {ct}");
-}
-
-/// Missing input field returns 400.
-#[test]
-fn missing_input_400() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
-    let body = serde_json::json!({"model": "test"});
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "body: {}", resp.body);
-}
-
-/// Unknown path returns 404.
-#[test]
-fn unknown_path_404() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
-    let resp = send_request(ctx.addr(), "GET", "/v1/nonexistent", &[], None);
-    assert_eq!(resp.status, 404);
-}
-
-/// GET on /v1/responses (only POST implemented) returns 501.
-#[test]
-fn unimplemented_method_501() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
-    let resp = send_request(ctx.addr(), "GET", "/v1/responses", &[], None);
-    assert_eq!(resp.status, 501);
-    let json = resp.json();
-    assert_eq!(json["error"]["code"].as_str(), Some("not_implemented"));
-}
 
 /// Requesting an unavailable model returns 500 with inference_error.
 #[test]
@@ -140,28 +82,6 @@ fn no_model_field_uses_default() {
     assert!(
         json["model"].as_str().is_some(),
         "should have model in response"
-    );
-}
-
-/// Error response always has the standard error object shape.
-#[test]
-fn error_response_shape() {
-    let ctx = ServerTestContext::new(ServerConfig::new());
-    let resp = send_request(
-        ctx.addr(),
-        "POST",
-        "/v1/responses",
-        &[("Content-Type", "application/json")],
-        Some("{}"),
-    );
-    assert!(resp.status >= 400);
-    let json = resp.json();
-    assert!(json.get("error").is_some(), "should have error key");
-    let error = &json["error"];
-    assert!(error["code"].is_string(), "error.code should be string");
-    assert!(
-        error["message"].is_string(),
-        "error.message should be string"
     );
 }
 

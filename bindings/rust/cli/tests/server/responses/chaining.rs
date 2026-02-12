@@ -1,4 +1,9 @@
 //! Conversation chaining (previous_response_id) tests over real HTTP.
+//!
+//! Basic chaining (previous_response_id round-trip) is covered by the
+//! in-process `api_compliance` test suite. This module tests advanced
+//! chaining scenarios: unknown IDs, streaming chains, continue-generating,
+//! and session metadata preservation.
 
 use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
 
@@ -17,40 +22,6 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
         }
     }
     events
-}
-
-/// Chained request references first response and succeeds.
-#[test]
-fn conversation_chaining() {
-    let model = require_model!();
-    let ctx = ServerTestContext::new(model_config());
-
-    // First request.
-    let body1 = serde_json::json!({
-        "model": &model,
-        "input": "Hello, my name is Alice.",
-        "max_output_tokens": 50,
-    });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
-    assert_eq!(resp1.status, 200, "first request: {}", resp1.body);
-    let json1 = resp1.json();
-    let response_id = json1["id"].as_str().expect("should have id");
-
-    // Chained request.
-    let body2 = serde_json::json!({
-        "model": &model,
-        "input": "What is my name?",
-        "previous_response_id": response_id,
-        "max_output_tokens": 50,
-    });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
-    assert_eq!(resp2.status, 200, "chained request: {}", resp2.body);
-    let json2 = resp2.json();
-    assert_eq!(
-        json2["previous_response_id"].as_str(),
-        Some(response_id),
-        "should reference previous response",
-    );
 }
 
 /// Chaining with a nonexistent previous_response_id still succeeds
