@@ -184,7 +184,7 @@ def extract_mamba_config(submod: nn.Module, node: fx.Node) -> dict:
 ARCHITECTURES = {
     "qwen3": {
         "name": "qwen3",
-        "model_types": ["qwen3", "qwen2.5", "qwen2", "qwen"],
+        "model_types": ["qwen3", "qwen3_vl", "qwen2.5", "qwen2", "qwen"],
         "module": "qwen.qwen3",
         "block_class": "Block",
         "model_ids": ["Qwen/Qwen3-0.6B"],
@@ -1048,6 +1048,7 @@ def generate_weight_candidates(param_name: str) -> List[str]:
 # These are stored once at the graph root level; block weights only need the suffix.
 WEIGHT_PREFIXES = [
     "model.layers.{d}.",
+    "model.language_model.layers.{d}.",
     "layers.{d}.",
     "transformer.h.{d}.",
     "backbone.layers.{d}.",
@@ -1066,6 +1067,7 @@ def generate_global_weight_specs() -> List[Dict[str, Any]]:
             "id": "token_embeddings",
             "candidates": [
                 "model.embed_tokens.weight",
+                "model.language_model.embed_tokens.weight",
                 "embed_tokens.weight",
                 "transformer.wte.weight",
                 "backbone.embedding.weight",
@@ -1080,6 +1082,7 @@ def generate_global_weight_specs() -> List[Dict[str, Any]]:
             "id": "ln_final",
             "candidates": [
                 "model.norm.weight",
+                "model.language_model.norm.weight",
                 "norm.weight",
                 "transformer.ln_f.weight",
                 "backbone.norm.weight",

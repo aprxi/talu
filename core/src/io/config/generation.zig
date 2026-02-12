@@ -114,19 +114,46 @@ fn fillTokenIdsFromModelConfig(allocator: std.mem.Allocator, model_dir: []const 
     defer parsed_config.deinit();
 
     const config_fields = parsed_config.value.object;
+    const text_config_fields: ?std.json.ObjectMap = if (config_fields.get("text_config")) |v|
+        switch (v) {
+            .object => |o| o,
+            else => null,
+        }
+    else
+        null;
 
     if (cfg.eos_token_ids.len == 0) {
         cfg.eos_token_ids = try getIntArray(u32, allocator, config_fields, "eos_token_id");
+        if (cfg.eos_token_ids.len == 0) {
+            if (text_config_fields) |text_fields| {
+                cfg.eos_token_ids = try getIntArray(u32, allocator, text_fields, "eos_token_id");
+            }
+        }
     }
     if (cfg.bos_token_id == null) {
         cfg.bos_token_id = getOptionalInt(u32, config_fields, "bos_token_id");
+        if (cfg.bos_token_id == null) {
+            if (text_config_fields) |text_fields| {
+                cfg.bos_token_id = getOptionalInt(u32, text_fields, "bos_token_id");
+            }
+        }
     }
     if (cfg.pad_token_id == null) {
         cfg.pad_token_id = getOptionalInt(u32, config_fields, "pad_token_id");
+        if (cfg.pad_token_id == null) {
+            if (text_config_fields) |text_fields| {
+                cfg.pad_token_id = getOptionalInt(u32, text_fields, "pad_token_id");
+            }
+        }
     }
     // Fallback context length from config.json; loadTokenizerConfig may override
     // with model_max_length from tokenizer_config.json.
     cfg.model_max_length = getOptionalU64(config_fields, "max_position_embeddings");
+    if (cfg.model_max_length == null) {
+        if (text_config_fields) |text_fields| {
+            cfg.model_max_length = getOptionalU64(text_fields, "max_position_embeddings");
+        }
+    }
 }
 
 /// Load BOS-related config from tokenizer_config.json into GenerationConfig.
@@ -923,6 +950,39 @@ test "loadGenerationConfig merges config.json when generation_config.json missin
     try std.testing.expectEqual(@as(u32, 7), config.pad_token_id.?);
     try std.testing.expectEqual(@as(usize, 1), config.eos_token_ids.len);
     try std.testing.expectEqual(@as(u32, 6), config.eos_token_ids[0]);
+}
+
+test "loadGenerationConfig reads token IDs from config.json text_config fallback" {
+    const allocator = std.testing.allocator;
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_vl",
+        \\  "text_config": {
+        \\    "bos_token_id": 151643,
+        \\    "eos_token_id": 151645,
+        \\    "pad_token_id": 151643,
+        \\    "max_position_embeddings": 262144
+        \\  }
+        \\}
+    ;
+
+    try tmp_dir.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+
+    const tmp_path = try tmp_dir.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(tmp_path);
+
+    var config = try loadGenerationConfig(allocator, tmp_path);
+    defer config.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u32, 151643), config.bos_token_id.?);
+    try std.testing.expectEqual(@as(u32, 151643), config.pad_token_id.?);
+    try std.testing.expectEqual(@as(usize, 1), config.eos_token_ids.len);
+    try std.testing.expectEqual(@as(u32, 151645), config.eos_token_ids[0]);
+    try std.testing.expectEqual(@as(?u64, 262144), config.model_max_length);
 }
 
 test "loadGenerationConfig loads bos_token_str from tokenizer_config.json" {

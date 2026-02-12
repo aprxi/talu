@@ -442,7 +442,7 @@ for model runs.
 |---|---|---|---|
 | `llama/llama2.py` | llama2 | llama2, mistral, yi, vicuna, tinyllama | No |
 | `llama/llama3.py` | llama3 | llama, llama3, llama3.1, llama3.2 | No |
-| `qwen/qwen3.py` | qwen3 | qwen3, qwen2.5, qwen2, qwen | No |
+| `qwen/qwen3.py` | qwen3 | qwen3, qwen3_vl, qwen2.5, qwen2, qwen | No |
 | `qwen/qwen3_moe.py` | qwen3_moe | qwen3_moe | No |
 | `qwen/qwen3_next.py` | qwen3_next | qwen3_next | Yes (linear_attention + full_attention) |
 | `gemma/gemma3.py` | gemma3 | gemma3, gemma3_text, gemma2, gemma | No |
