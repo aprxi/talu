@@ -268,3 +268,71 @@ fn decode_backslash_sequence_in_context() {
     let decoded = ctx.decode(&[5, 7, 5]);
     assert_eq!(decoded, "n\\nn", "backslash tokens must stay literal in sequence");
 }
+
+// ===========================================================================
+// Bug D: JSON \b and \f escapes not decoded to control characters
+// ===========================================================================
+//
+// Tokens in tokenizer.json vocab can contain JSON escape sequences \b
+// (backspace U+0008) and \f (form feed U+000C). The JSON parser must
+// unescape these to their control character values during loading.
+//
+// Bug: json_utils.unescapeJsonString doesn't handle \b and \f — they
+// fall through to the else branch which keeps the literal backslash.
+// Result: token "\\b" in JSON → stored as two chars (\, b) → decoded
+// as literal "\b" instead of backspace character.
+// Affects: Gemma, Mistral, e5-mistral, phi-1.5, phi-2 (~1530 failures).
+
+/// Minimal SentencePiece BPE with tokens containing \b and \f JSON escapes.
+///
+/// Token 4 = backspace character (U+0008, from JSON \b escape)
+/// Token 5 = form feed character (U+000C, from JSON \f escape)
+/// Token 6 = tab character (U+0009, from JSON \t escape — should already work)
+const CONTROL_CHAR_TOKENIZER_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "\b": 4, "\f": 5, "\t": 6,
+      "\u2581Hello": 7, "H": 8, "e": 9, "l": 10, "o": 11
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+}"####;
+
+/// JSON \b escape in vocab must decode to backspace (U+0008).
+///
+/// Bug: unescapeJsonString keeps \b as literal backslash + b.
+#[test]
+fn decode_json_backspace_escape() {
+    let ctx = TokenizerTestContext::from_json(CONTROL_CHAR_TOKENIZER_JSON);
+    let decoded = ctx.decode(&[4]);
+    assert_eq!(
+        decoded, "\u{8}",
+        "JSON \\b in vocab must decode to backspace (U+0008), got: {decoded:?}"
+    );
+}
+
+/// JSON \f escape in vocab must decode to form feed (U+000C).
+///
+/// Bug: unescapeJsonString keeps \f as literal backslash + f.
+#[test]
+fn decode_json_formfeed_escape() {
+    let ctx = TokenizerTestContext::from_json(CONTROL_CHAR_TOKENIZER_JSON);
+    let decoded = ctx.decode(&[5]);
+    assert_eq!(
+        decoded, "\u{c}",
+        "JSON \\f in vocab must decode to form feed (U+000C), got: {decoded:?}"
+    );
+}

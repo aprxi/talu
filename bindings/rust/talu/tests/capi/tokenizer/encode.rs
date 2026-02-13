@@ -428,3 +428,266 @@ fn encode_metaspace_multi_word() {
         "Metaspace encode 'Hello, world!' → [▁Hello, comma, ▁world, !], got: {tokens:?}"
     );
 }
+
+// ===========================================================================
+// Bug A: Sequence-wrapped TemplateProcessing (Llama-3 pattern)
+// ===========================================================================
+//
+// Llama-3 and ~30 other models wrap TemplateProcessing inside a
+// "Sequence" post_processor:
+//   "post_processor": {
+//     "type": "Sequence",
+//     "processors": [ {"type":"ByteLevel",...}, {"type":"TemplateProcessing",...} ]
+//   }
+//
+// Bug: applyPostProcessorFromJson only checks the top-level "type" field.
+// When it sees "Sequence", it doesn't recognize it and returns without
+// parsing the inner TemplateProcessing. Result: BOS never added.
+// Affects: Llama-3, LiquidAI, Schematron (~30 models, 630 encode_special failures).
+
+/// Minimal BPE tokenizer with Sequence-wrapped TemplateProcessing.
+///
+/// Mimics Llama-3 pattern: post_processor is Sequence containing
+/// ByteLevel + TemplateProcessing. BOS token is `<|begin_of_text|>` (ID 1).
+const SEQUENCE_POSTPROC_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "H": 4, "i": 5, "e": 6, "l": 7, "o": 8
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<|begin_of_text|>", "special": true},
+    {"id": 2, "content": "<|end_of_text|>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "Sequence",
+    "processors": [
+      {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": false},
+      {
+        "type": "TemplateProcessing",
+        "single": [
+          {"SpecialToken": {"id": "<|begin_of_text|>", "type_id": 0}},
+          {"Sequence": {"id": "A", "type_id": 0}}
+        ],
+        "pair": [
+          {"SpecialToken": {"id": "<|begin_of_text|>", "type_id": 0}},
+          {"Sequence": {"id": "A", "type_id": 0}},
+          {"Sequence": {"id": "B", "type_id": 0}}
+        ],
+        "special_tokens": {
+          "<|begin_of_text|>": {"id": "<|begin_of_text|>", "ids": [1], "tokens": ["<|begin_of_text|>"]}
+        }
+      }
+    ]
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+
+/// Sequence-wrapped TemplateProcessing must prepend BOS.
+///
+/// Bug: "Sequence" type not unwrapped → inner TemplateProcessing ignored → no BOS.
+#[test]
+fn encode_sequence_wrapped_template_adds_bos() {
+    let ctx = TokenizerTestContext::from_json(SEQUENCE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    // "Hi" → [H=4, i=5], with BOS → [<|begin_of_text|>=1, H=4, i=5]
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens, vec![1, 4, 5],
+        "Sequence-wrapped TemplateProcessing must add BOS=1, got: {tokens:?}"
+    );
+}
+
+/// Sequence-wrapped TemplateProcessing: BOS-only template must NOT add EOS.
+///
+/// The single template is [BOS, A] — no EOS entry. Must not append any token.
+#[test]
+fn encode_sequence_wrapped_template_no_eos() {
+    let ctx = TokenizerTestContext::from_json(SEQUENCE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    // Empty string with BOS-only template → [BOS] only, no EOS
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(
+        tokens, vec![1],
+        "BOS-only template must produce [BOS] for empty string, got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// Bug B: BOS-only template adds unwanted SEP token at end
+// ===========================================================================
+//
+// Models like TinyLlama have TemplateProcessing with only BOS in the
+// single template: [<s>, A]. No EOS/SEP.
+//
+// Bug: applyPostProcessorFromJson defaults sep_str = cls_str when the
+// special_tokens map has only one entry. The encode post_processor then
+// appends sep_id (which equals cls_id) at the end.
+// Result: [BOS, tokens..., BOS] instead of [BOS, tokens...].
+// Affects: TinyLlama, Gemma, Mistral, ~15 models, 315 encode_special failures.
+
+/// Minimal BPE with BOS-only TemplateProcessing (no EOS in template).
+///
+/// The special_tokens map has ONLY `<s>` — no `</s>`.
+/// The single template is `[<s>, A]` — BOS prepended, nothing appended.
+const BOS_ONLY_TEMPLATE_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "H": 4, "i": 5, "e": 6, "l": 7, "o": 8
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "<s>", "type_id": 1}},
+      {"Sequence": {"id": "B", "type_id": 1}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+
+/// BOS-only template must NOT append any token at end.
+///
+/// Bug: sep_str defaults to cls_str → sep_id=1 (BOS) appended at end.
+#[test]
+fn encode_bos_only_template_no_trailing_token() {
+    let ctx = TokenizerTestContext::from_json(BOS_ONLY_TEMPLATE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    // "Hi" → [H=4, i=5], with BOS only → [<s>=1, H=4, i=5]
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens, vec![1, 4, 5],
+        "BOS-only template must not append extra token, got: {tokens:?}"
+    );
+}
+
+/// BOS-only template: empty string produces [BOS] only.
+#[test]
+fn encode_bos_only_template_empty_string() {
+    let ctx = TokenizerTestContext::from_json(BOS_ONLY_TEMPLATE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(
+        tokens, vec![1],
+        "BOS-only template empty string → [BOS] only, got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// Bug C: Metaspace prepend_scheme:"first" not handled
+// ===========================================================================
+//
+// Mistral models use `prepend_scheme: "first"` instead of `add_prefix_space: true`.
+// This is the newer HuggingFace Metaspace config format.
+//
+// Bug: applyPreTokenizerFromJson only checks for `add_prefix_space`, missing
+// the `prepend_scheme` field. Result: ▁ not prepended → wrong first token.
+// Also: whitespace-only input produces empty output instead of space tokens.
+// Affects: Mistral v0.1, v0.3 (4 models, 80 encode failures).
+
+/// Minimal SentencePiece BPE with Metaspace using prepend_scheme:"first".
+///
+/// Uses the newer HuggingFace Metaspace config with prepend_scheme
+/// instead of add_prefix_space.
+const METASPACE_PREPEND_SCHEME_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581Hello": 3, ",": 4, "\u2581world": 5, "!": 6,
+      "\u2581": 7, "H": 8, "e": 9, "l": 10, "o": 11,
+      "w": 12, "r": 13, "d": 14,
+      "He": 15, "Hel": 16, "Hell": 17, "Hello": 18,
+      "wo": 19, "wor": 20, "worl": 21, "world": 22,
+      "\u2581\u2581\u2581": 23
+    },
+    "merges": [
+      "H e", "He l", "Hel l", "Hell o", "\u2581 Hello",
+      "w o", "wo r", "wor l", "worl d", "\u2581 world",
+      "\u2581 \u2581\u2581"
+    ]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "prepend_scheme": "first"},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "prepend_scheme": "first"}
+}"####;
+
+/// Metaspace with prepend_scheme:"first" must prepend ▁ to first word.
+///
+/// Bug: Only add_prefix_space is checked; prepend_scheme is ignored.
+#[test]
+fn encode_metaspace_prepend_scheme_first() {
+    let ctx = TokenizerTestContext::from_json(METASPACE_PREPEND_SCHEME_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("Hello", &opts);
+    assert_eq!(
+        tokens, vec![3],
+        "Metaspace prepend_scheme:'first' must prepend ▁: 'Hello' → [▁Hello=3], got: {tokens:?}"
+    );
+}
+
+/// Metaspace with prepend_scheme:"first": whitespace-only must not be empty.
+///
+/// Bug: whitespace-only input "   " produces [] instead of a space token.
+#[test]
+fn encode_metaspace_whitespace_only() {
+    let ctx = TokenizerTestContext::from_json(METASPACE_PREPEND_SCHEME_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("   ", &opts);
+    assert_eq!(
+        tokens, vec![23],
+        "Metaspace whitespace '   ' → [▁▁▁=23], got: {tokens:?}"
+    );
+}
