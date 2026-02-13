@@ -222,3 +222,169 @@ fn encode_decode_roundtrip() {
         assert_eq!(decoded, input, "roundtrip failed for {input:?}");
     }
 }
+
+// ===========================================================================
+// TemplateProcessing post_processor: BOS/EOS insertion during encode
+// ===========================================================================
+//
+// When a tokenizer has a TemplateProcessing post_processor, encode with
+// add_bos=1 must prepend the BOS token and append the EOS token.
+//
+// Bug: `build_tokenizer_from_root` copies the cls_token/sep_token strings
+// from the post_processor spec but never resolves their IDs from the vocab.
+// cls_id/sep_id stay at -1, so the wrong token ID (-1 / 4294967295) is
+// inserted, or no token is inserted at all.
+// Affects: Llama-3, Gemma, LiquidAI, TinyLlama, Mistral (~52 models).
+
+/// Minimal BPE tokenizer with TemplateProcessing post_processor.
+///
+/// Special tokens (only in added_tokens, not model.vocab):
+///   1: `<s>` (BOS/CLS), 2: `</s>` (EOS/SEP)
+///
+/// The TemplateProcessing post_processor should:
+/// - Prepend `<s>` (ID 1) to the encoded output
+/// - Append `</s>` (ID 2) to the encoded output
+const TEMPLATE_POSTPROC_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "H": 4, "i": 5, "e": 6, "l": 7, "o": 8
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "<s>", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "</s>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<s>": {"id": "<s>", "ids": [1], "tokens": ["<s>"]},
+      "</s>": {"id": "</s>", "ids": [2], "tokens": ["</s>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+
+/// TemplateProcessing post_processor must prepend BOS and append EOS.
+///
+/// Bug: cls_id/sep_id never resolved from vocab → wrong or missing BOS/EOS.
+#[test]
+fn encode_template_postproc_adds_bos_and_eos() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    // "Hi" → [H=4, i=5], with BOS/EOS → [<s>=1, H=4, i=5, </s>=2]
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens, vec![1, 4, 5, 2],
+        "TemplateProcessing must add BOS=1 and EOS=2, got: {tokens:?}"
+    );
+}
+
+/// Empty string with BOS/EOS should produce [BOS, EOS].
+#[test]
+fn encode_template_postproc_empty_string() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(
+        tokens, vec![1, 2],
+        "empty string with TemplateProcessing should produce [BOS, EOS], got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// Metaspace pretokenizer: encode must add ▁ prefix and replace spaces
+// ===========================================================================
+//
+// SentencePiece BPE models (Mistral, TinyLlama, Phi-3, etc.) use a Metaspace
+// pretokenizer that:
+// 1. Prepends ▁ to the input when add_prefix_space is true
+// 2. Replaces internal spaces with ▁
+//
+// Bug: spaces are tokenized as individual characters instead of being
+// converted to ▁ and merged with adjacent text.
+// Affects: Mistral-7B (all versions), ~80 encode failures.
+
+/// Minimal SentencePiece BPE with Metaspace pretokenizer.
+const METASPACE_ENCODE_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581Hello": 3, ",": 4, "\u2581world": 5, "!": 6,
+      "\u2581": 7
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+}"####;
+
+/// Metaspace pretokenizer: encode must prepend ▁ and tokenize correctly.
+///
+/// "Hello" with add_prefix_space=true → "▁Hello" → token [3] (▁Hello)
+///
+/// Bug: Metaspace pretokenizer may not prepend ▁ during encode, causing
+/// "Hello" to be tokenized character-by-character.
+#[test]
+fn encode_metaspace_single_word() {
+    let ctx = TokenizerTestContext::from_json(METASPACE_ENCODE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("Hello", &opts);
+    assert_eq!(
+        tokens, vec![3],
+        "Metaspace encode 'Hello' → [▁Hello=3], got: {tokens:?}"
+    );
+}
+
+/// Metaspace pretokenizer: encode multi-word replaces spaces with ▁.
+///
+/// "Hello, world!" → "▁Hello" + "," + "▁world" + "!" → [3, 4, 5, 6]
+#[test]
+fn encode_metaspace_multi_word() {
+    let ctx = TokenizerTestContext::from_json(METASPACE_ENCODE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("Hello, world!", &opts);
+    assert_eq!(
+        tokens, vec![3, 4, 5, 6],
+        "Metaspace encode 'Hello, world!' → [▁Hello, comma, ▁world, !], got: {tokens:?}"
+    );
+}

@@ -216,3 +216,69 @@ fn skip_special_all_special_produces_empty() {
     let skip = talu_sys::DecodeOptionsC { skip_special_tokens: 1 };
     assert_eq!(ctx.decode_with(&[1, 2], &skip), "");
 }
+
+// ---------------------------------------------------------------------------
+// Encode: WordPiece tokenizer with BertProcessing post_processor
+// ---------------------------------------------------------------------------
+//
+// BERT-family models use a BertProcessing post_processor that adds [CLS] at
+// the start and [SEP] at the end of encoded output. The post_processor must
+// resolve the token strings "[CLS]" and "[SEP]" to their vocab IDs.
+//
+// Bug: `encode_special("")` should produce [101, 102] ([CLS] + [SEP]) for
+// BERT models, but produces [] (empty). The post_processor's cls_id/sep_id
+// are not resolved, or the BertProcessing path is not activated.
+// Affects: BAAI/bge, sentence-transformers, google-bert (~10 models).
+
+/// WordPiece tokenizer with BertProcessing post_processor.
+const BERT_POSTPROC_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2, "[PAD]": 3,
+      "hello": 4, "world": 5, ",": 6, "!": 7
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true},
+    {"id": 3, "content": "[PAD]", "special": true}
+  ],
+  "normalizer": {"type": "BertNormalizer", "lowercase": true},
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": {
+    "type": "BertProcessing",
+    "cls": ["[CLS]", 1],
+    "sep": ["[SEP]", 2]
+  },
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+
+/// BertProcessing adds [CLS] and [SEP] to encode output.
+///
+/// Bug: WordPiece encode with BertProcessing post_processor should
+/// wrap output with [CLS]=1 and [SEP]=2.
+#[test]
+fn encode_bert_postproc_adds_cls_sep() {
+    let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
+    // "hello" → [hello=4], with CLS/SEP → [CLS=1, hello=4, SEP=2]
+    assert_eq!(
+        ctx.encode("hello"), vec![1, 4, 2],
+        "BertProcessing must add [CLS]=1 and [SEP]=2"
+    );
+}
+
+/// BertProcessing: empty input produces [CLS, SEP].
+#[test]
+fn encode_bert_postproc_empty_produces_cls_sep() {
+    let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
+    assert_eq!(
+        ctx.encode(""), vec![1, 2],
+        "BertProcessing: empty input must produce [CLS, SEP]"
+    );
+}
