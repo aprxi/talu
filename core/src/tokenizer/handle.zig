@@ -59,15 +59,16 @@ pub const TokenizerHandle = struct {
     /// Caller owns the returned handle and must call deinit() when done.
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8) !*TokenizerHandle {
         // Resolve model path (handles HuggingFace cache format)
-        const resolved_path = try repository.resolveModelPath(allocator, model_path, .{});
+        // Tokenizer loading does not require weight files.
+        const resolved_path = try repository.resolveModelPath(allocator, model_path, .{ .require_weights = false });
         errdefer allocator.free(resolved_path);
 
         // Load generation config (for EOS tokens, BOS handling)
         var gen_config = gen_config_mod.loadGenerationConfig(allocator, resolved_path) catch GenerationConfig{};
         errdefer gen_config.deinit(allocator);
 
-        // Resolve model assets
-        var assets = try repository.resolve(allocator, resolved_path);
+        // Resolve model assets (weight-optional for tokenizer use)
+        var assets = try repository.resolve(allocator, resolved_path, .{ .require_weights = false });
         defer assets.deinit();
 
         // Load tokenizer from JSON or binary path

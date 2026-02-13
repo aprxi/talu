@@ -75,7 +75,7 @@ def _call_repo_resolve_path(
 ) -> tuple[int, str | None]:
     """Resolve model URI to local path."""
     out_ptr = ctypes.c_void_p()
-    code = _lib.talu_repo_resolve_path(uri, offline, token, endpoint_url, ctypes.byref(out_ptr))
+    code = _lib.talu_repo_resolve_path(uri, offline, token, endpoint_url, True, ctypes.byref(out_ptr))
     if code != 0 or not out_ptr.value:
         return (code, None)
 
@@ -150,7 +150,7 @@ def _call_repo_list_files(model_path: bytes, token: bytes | None) -> Iterator[st
 def _call_repo_get_cached_path(model_id: bytes) -> str | None:
     """Get local cache path for a model."""
     out_ptr = ctypes.c_void_p()
-    code = _lib.talu_repo_get_cached_path(model_id, ctypes.byref(out_ptr))
+    code = _lib.talu_repo_get_cached_path(model_id, True, ctypes.byref(out_ptr))
     if code != 0 or not out_ptr.value:
         return None
     path_bytes = ctypes.cast(out_ptr.value, ctypes.c_char_p).value

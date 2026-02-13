@@ -233,10 +233,19 @@ pub const DownloadConfig = struct {
     /// Custom HF endpoint URL (optional, overrides HF_ENDPOINT env var)
     /// Precedence: endpoint_url > HF_ENDPOINT env > DEFAULT_HF_ENDPOINT
     endpoint_url: ?[]const u8 = null,
+    /// Skip downloading weight files (.safetensors).
+    /// Used for tokenizer-only caching and --no-weights sync.
+    skip_weights: bool = false,
 };
 
 /// Get the effective HF API base URL.
 /// Precedence: config.endpoint_url > HF_ENDPOINT env > DEFAULT_HF_ENDPOINT
+/// Check if a filename is a weight file (.safetensors or .safetensors.index.json).
+fn isWeightFile(filename: []const u8) bool {
+    return std.mem.endsWith(u8, filename, ".safetensors") or
+        std.mem.endsWith(u8, filename, ".safetensors.index.json");
+}
+
 fn getEffectiveEndpoint(config_endpoint: ?[]const u8) []const u8 {
     // 1. Explicit config takes highest priority
     if (config_endpoint) |endpoint| {
@@ -337,7 +346,7 @@ pub fn fetchModel(
 
     // Check if already cached (unless force download)
     if (!download_config.force) {
-        if (cache.getCachedPath(allocator, model_id) catch null) |cached_path| {
+        if (cache.getCachedPath(allocator, model_id, !download_config.skip_weights) catch null) |cached_path| {
             log.info("fetch", "Model already cached", .{ .path = cached_path });
             return cached_path;
         }
@@ -407,6 +416,9 @@ pub fn fetchModel(
     };
 
     for (repo_file_names) |filename| {
+        // Skip weight files when skip_weights is set
+        if (download_config.skip_weights and isWeightFile(filename)) continue;
+
         const file_url = std.fmt.allocPrint(allocator, "{s}/{s}/resolve/main/{s}", .{ base_url, model_id, filename }) catch continue;
         defer allocator.free(file_url);
 

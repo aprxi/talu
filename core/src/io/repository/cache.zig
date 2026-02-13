@@ -343,10 +343,11 @@ pub fn getModelCacheDir(allocator: std.mem.Allocator, model_id: []const u8) ![]c
     return cache_dir_path;
 }
 
-/// Get the path to a cached model if it exists and has weights.
-/// Returns null if not cached or missing weights.
-/// Returns error for permission/access issues (not silently treated as "not cached").
-pub fn getCachedPath(allocator: std.mem.Allocator, model_id: []const u8) !?[]const u8 {
+/// Get the path to a cached model if it exists.
+/// When `require_weights` is true, only returns snapshots that contain weight files.
+/// When false, returns any valid snapshot directory.
+/// Returns null if not cached. Returns error for permission/access issues.
+pub fn getCachedPath(allocator: std.mem.Allocator, model_id: []const u8, require_weights: bool) !?[]const u8 {
     const cache_dir = try getModelCacheDir(allocator, model_id);
     defer allocator.free(cache_dir);
 
@@ -362,13 +363,15 @@ pub fn getCachedPath(allocator: std.mem.Allocator, model_id: []const u8) !?[]con
     };
     defer snapshots_dir.close();
 
-    // Check all snapshots for one with weights
+    // Check all snapshots for a valid one
     var snapshot_iter = snapshots_dir.iterate();
     while (try snapshot_iter.next()) |entry| {
         if (entry.kind != .directory) continue;
 
         const snapshot_path = try std.fs.path.join(allocator, &.{ snapshots_path, entry.name });
         errdefer allocator.free(snapshot_path);
+
+        if (!require_weights) return snapshot_path;
 
         // Check if this snapshot has weights
         const weights = resolver.findWeightsFile(allocator, snapshot_path) catch |err| return err;
@@ -385,7 +388,7 @@ pub fn getCachedPath(allocator: std.mem.Allocator, model_id: []const u8) !?[]con
 
 /// Check if a model is already cached with valid weights.
 pub fn isCached(allocator: std.mem.Allocator, model_id: []const u8) !bool {
-    const path = try getCachedPath(allocator, model_id);
+    const path = try getCachedPath(allocator, model_id, true);
     if (path) |p| {
         allocator.free(p);
         return true;
@@ -458,7 +461,7 @@ pub fn listCachedModels(allocator: std.mem.Allocator, options: ListOptions) Cach
 
         if (options.require_weights) {
             // Only include models with at least one snapshot containing weights.
-            if (getCachedPath(allocator, model_id) catch null) |cached_path| {
+            if (getCachedPath(allocator, model_id, true) catch null) |cached_path| {
                 allocator.free(cached_path);
             } else {
                 allocator.free(model_id);
@@ -733,7 +736,7 @@ test "getHfHome defaults to HOME/.cache/huggingface" {
 test "getCachedPath returns null for non-existent model" {
     const allocator = std.testing.allocator;
 
-    const cached_path = try getCachedPath(allocator, "NonExistent/Model");
+    const cached_path = try getCachedPath(allocator, "NonExistent/Model", true);
     try std.testing.expect(cached_path == null);
 }
 
@@ -801,7 +804,7 @@ test "getCachedPath returns path for cached model with weights" {
         try file.writeAll("");
     }
 
-    const cached_path = try getCachedPath(allocator, model_id);
+    const cached_path = try getCachedPath(allocator, model_id, true);
     try std.testing.expect(cached_path != null);
     defer allocator.free(cached_path.?);
 

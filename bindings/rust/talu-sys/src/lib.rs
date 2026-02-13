@@ -1727,6 +1727,7 @@ pub struct DownloadOptions {
     pub user_data: *mut c_void,
     pub force: bool,
     pub endpoint_url: *const c_char,
+    pub skip_weights: bool,
 }
 
 impl Default for DownloadOptions {
@@ -1737,6 +1738,7 @@ impl Default for DownloadOptions {
             user_data: std::ptr::null_mut(),
             force: false,
             endpoint_url: std::ptr::null(),
+            skip_weights: false,
         }
     }
 }
@@ -2599,7 +2601,7 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_get_cache_dir(model_id: *const c_char, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
-    pub fn talu_repo_get_cached_path(model_id: *const c_char, out: *mut c_void) -> c_int;
+    pub fn talu_repo_get_cached_path(model_id: *const c_char, require_weights: bool, out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_get_hf_home(out: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
@@ -2625,7 +2627,7 @@ extern "C" {
     // core/src/capi/repository.zig
     pub fn talu_repo_mtime(model_id: *const c_char) -> i64;
     // core/src/capi/repository.zig
-    pub fn talu_repo_resolve_path(uri: *const c_char, offline: bool, token: *const c_char, endpoint_url: *const c_char, out_path: *mut c_void) -> c_int;
+    pub fn talu_repo_resolve_path(uri: *const c_char, offline: bool, token: *const c_char, endpoint_url: *const c_char, require_weights: bool, out_path: *mut c_void) -> c_int;
     // core/src/capi/repository.zig
     pub fn talu_repo_search(query: *const c_char, limit: usize, token: *const c_char, endpoint_url: *const c_char, out: *mut *mut c_void) -> c_int;
     // core/src/capi/repository.zig

@@ -479,11 +479,11 @@ pub fn estimateDryRun(
     options: ConvertOptions,
 ) ![]u8 {
     // 1. Resolve model bundle (offline option not currently used)
-    var model_bundle = try repository.resolve(allocator, model_path);
+    var model_bundle = try repository.resolve(allocator, model_path, .{});
     defer model_bundle.deinit();
 
     // 2. Load SafeTensors to count parameters (supports sharded models)
-    var source_tensors = try safetensors.UnifiedSafeTensors.load(allocator, model_bundle.weights_path());
+    var source_tensors = try safetensors.UnifiedSafeTensors.load(allocator, model_bundle.weights_path() orelse return error.WeightsNotFound);
     defer source_tensors.deinit();
 
     // 3. Count total parameters via tensor names

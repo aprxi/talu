@@ -44,12 +44,14 @@ pub const Bundle = struct {
         json: []const u8,
     };
 
-    /// Weights source - single file or sharded
+    /// Weights source - single file, sharded, or absent
     pub const WeightsSource = union(enum) {
         /// Single weights file (model.safetensors)
         single: []const u8,
         /// Sharded weights (model.safetensors.index.json + shards)
         sharded: ShardedInfo,
+        /// No weights available (tokenizer-only resolution)
+        none,
     };
 
     /// Information for sharded weight files
@@ -78,11 +80,13 @@ pub const Bundle = struct {
         };
     }
 
-    /// Get weights path (for ModelLocation consumers)
-    pub fn weights_path(self: Bundle) []const u8 {
+    /// Get weights path (for ModelLocation consumers).
+    /// Returns null when weights are absent (tokenizer-only resolution).
+    pub fn weights_path(self: Bundle) ?[]const u8 {
         return switch (self.weights) {
             .single => |p| p,
             .sharded => |s| s.index_path,
+            .none => null,
         };
     }
 
@@ -107,7 +111,7 @@ pub const Bundle = struct {
     pub fn isSharded(self: Bundle) bool {
         return switch (self.weights) {
             .sharded => true,
-            else => false,
+            .single, .none => false,
         };
     }
 
@@ -131,6 +135,7 @@ pub const Bundle = struct {
                 self.allocator.free(s.index_path);
                 self.allocator.free(s.shard_dir);
             },
+            .none => {},
         }
 
         // Free tokenizer source
@@ -162,7 +167,7 @@ test "Bundle accessors" {
     defer model_bundle.deinit();
 
     try std.testing.expectEqualStrings("/models/test/config.json", model_bundle.config_path());
-    try std.testing.expectEqualStrings("/models/test/model.safetensors", model_bundle.weights_path());
+    try std.testing.expectEqualStrings("/models/test/model.safetensors", model_bundle.weights_path().?);
     try std.testing.expectEqualStrings("/models/test/tokenizer.json", model_bundle.tokenizer_path());
     try std.testing.expect(!model_bundle.isSharded());
 }
@@ -233,7 +238,7 @@ test "Bundle weights_path returns single file path" {
     };
     defer model_bundle.deinit();
 
-    try std.testing.expectEqualStrings("/test/model.safetensors", model_bundle.weights_path());
+    try std.testing.expectEqualStrings("/test/model.safetensors", model_bundle.weights_path().?);
 }
 
 test "Bundle weights_path returns index path for sharded weights" {
@@ -252,7 +257,7 @@ test "Bundle weights_path returns index path for sharded weights" {
     };
     defer model_bundle.deinit();
 
-    try std.testing.expectEqualStrings("/test/model.safetensors.index.json", model_bundle.weights_path());
+    try std.testing.expectEqualStrings("/test/model.safetensors.index.json", model_bundle.weights_path().?);
 }
 
 test "Bundle tokenizer_path returns path when tokenizer is path-based" {

@@ -9,6 +9,10 @@ const Bundle = @import("bundle.zig").Bundle;
 const cache = @import("cache.zig");
 
 
+pub const ResolveOptions = struct {
+    require_weights: bool = true,
+};
+
 pub const ResolveError = error{
     ConfigNotFound,
     WeightsNotFound,
@@ -20,7 +24,9 @@ pub const ResolveError = error{
 /// Resolve any model path to a Bundle.
 ///
 /// Handles: direct paths, HF cache format.
-pub fn resolve(allocator: std.mem.Allocator, input_path: []const u8) ResolveError!Bundle {
+/// When `options.require_weights` is false, returns a Bundle with `.none` weights
+/// instead of failing when no weight files are found.
+pub fn resolve(allocator: std.mem.Allocator, input_path: []const u8, options: ResolveOptions) ResolveError!Bundle {
     // Resolve HF cache format (has snapshots/) or direct directory
     const resolved_dir_path = resolveSnapshot(allocator, input_path) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
@@ -29,12 +35,12 @@ pub fn resolve(allocator: std.mem.Allocator, input_path: []const u8) ResolveErro
         else => return error.WeightsNotFound,
     };
 
-    // Find and validate weights file
-    const weights_path = findWeightsFile(allocator, resolved_dir_path) catch |err| {
+    // Find weights file (best-effort when not required)
+    const weights_path_result = findWeightsFile(allocator, resolved_dir_path) catch |err| {
         allocator.free(resolved_dir_path);
         return err;
     };
-    if (weights_path) |path| {
+    if (weights_path_result) |path| {
         return buildBundleFromDir(allocator, resolved_dir_path, path) catch |err| {
             allocator.free(resolved_dir_path);
             allocator.free(path);
@@ -42,8 +48,17 @@ pub fn resolve(allocator: std.mem.Allocator, input_path: []const u8) ResolveErro
         };
     }
 
-    allocator.free(resolved_dir_path);
-    return error.WeightsNotFound;
+    // No weights found
+    if (options.require_weights) {
+        allocator.free(resolved_dir_path);
+        return error.WeightsNotFound;
+    }
+
+    // Weight-optional: build bundle without weights
+    return buildBundleFromDirNoWeights(allocator, resolved_dir_path) catch |err| {
+        allocator.free(resolved_dir_path);
+        return err;
+    };
 }
 
 /// Resolve a directory with SafeTensors model.
@@ -82,6 +97,40 @@ fn buildBundleFromDir(allocator: std.mem.Allocator, dir: []const u8, weights_pat
         .dir = dir,
         .config = .{ .path = config_path },
         .weights = weights,
+        .tokenizer = tokenizer,
+        .format = format,
+    };
+}
+
+/// Build a Bundle from a directory without requiring weights or config.
+/// Used for tokenizer-only resolution. Takes ownership of `dir`.
+fn buildBundleFromDirNoWeights(allocator: std.mem.Allocator, dir: []const u8) ResolveError!Bundle {
+    const tokenizer_path = std.fs.path.join(allocator, &.{ dir, "tokenizer.json" }) catch return error.OutOfMemory;
+    errdefer allocator.free(tokenizer_path);
+
+    const tokenizer: Bundle.TokenizerSource = if (std.fs.cwd().access(tokenizer_path, .{})) |_|
+        .{ .path = tokenizer_path }
+    else |_| blk: {
+        allocator.free(tokenizer_path);
+        break :blk .{ .none = {} };
+    };
+
+    // Config is best-effort: present if exists, placeholder if absent
+    const config_path = std.fs.path.join(allocator, &.{ dir, "config.json" }) catch return error.OutOfMemory;
+    const config: Bundle.ConfigSource = if (std.fs.cwd().access(config_path, .{})) |_|
+        .{ .path = config_path }
+    else |_| blk: {
+        allocator.free(config_path);
+        break :blk .{ .json = allocator.dupe(u8, "{}") catch return error.OutOfMemory };
+    };
+
+    const format = detectModelFormat(dir);
+
+    return Bundle{
+        .allocator = allocator,
+        .dir = dir,
+        .config = config,
+        .weights = .{ .none = {} },
         .tokenizer = tokenizer,
         .format = format,
     };
@@ -572,7 +621,7 @@ test "resolve creates Bundle from direct model directory" {
         try file.writeAll("{}");
     }
 
-    var bundle = try resolve(allocator, temp_dir_path);
+    var bundle = try resolve(allocator, temp_dir_path, .{});
     defer bundle.deinit();
 
     try std.testing.expect(std.mem.endsWith(u8, bundle.dir, std.fs.path.basename(temp_dir_path)));
@@ -611,7 +660,7 @@ test "resolve creates Bundle from HF cache format" {
         try file.writeAll("");
     }
 
-    var bundle = try resolve(allocator, temp_dir_path);
+    var bundle = try resolve(allocator, temp_dir_path, .{});
     defer bundle.deinit();
 
     try std.testing.expect(std.mem.indexOf(u8, bundle.dir, "snapshots") != null);
@@ -636,7 +685,7 @@ test "resolve returns error for directory without config" {
         try file.writeAll("");
     }
 
-    const result = resolve(allocator, temp_dir_path);
+    const result = resolve(allocator, temp_dir_path, .{});
     try std.testing.expectError(error.ConfigNotFound, result);
 }
 
@@ -658,7 +707,7 @@ test "resolve returns error for directory without weights" {
         try file.writeAll("{}");
     }
 
-    const result = resolve(allocator, temp_dir_path);
+    const result = resolve(allocator, temp_dir_path, .{});
     try std.testing.expectError(error.WeightsNotFound, result);
 }
 
@@ -692,7 +741,7 @@ test "resolve handles MLX format detection" {
         try file.writeAll("");
     }
 
-    var bundle = try resolve(allocator, mlx_dir_path);
+    var bundle = try resolve(allocator, mlx_dir_path, .{});
     defer bundle.deinit();
 
     try std.testing.expectEqual(Bundle.Format.mlx, bundle.format);
@@ -724,7 +773,7 @@ test "resolve handles sharded weights with index.json" {
         try file.writeAll("{}");
     }
 
-    var bundle = try resolve(allocator, temp_dir_path);
+    var bundle = try resolve(allocator, temp_dir_path, .{});
     defer bundle.deinit();
 
     try std.testing.expect(bundle.isSharded());

@@ -79,7 +79,7 @@ pub fn convertToGroupedAffine(
     options: ConvertOptions,
 ) ![]const u8 {
     // 1. Resolve input model files
-    var model_bundle = try repository.resolve(allocator, input_path);
+    var model_bundle = try repository.resolve(allocator, input_path, .{});
     defer model_bundle.deinit();
 
     // 2. Load source model config
@@ -118,7 +118,7 @@ pub fn convertToGroupedAffine(
     }
 
     // 5. Load source weights and validate (supports both single and sharded models)
-    var source_tensors = try safetensors.UnifiedSafeTensors.load(allocator, model_bundle.weights_path());
+    var source_tensors = try safetensors.UnifiedSafeTensors.load(allocator, model_bundle.weights_path() orelse return error.WeightsNotFound);
     defer source_tensors.deinit();
 
     // 6. Check if model is already quantized

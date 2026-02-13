@@ -34,6 +34,8 @@ pub struct DownloadOptions {
     pub force: bool,
     /// Custom endpoint URL.
     pub endpoint_url: Option<String>,
+    /// Skip downloading weight files (.safetensors).
+    pub skip_weights: bool,
 }
 
 /// Progress action type.
@@ -179,12 +181,21 @@ pub fn is_model_id(value: &str) -> bool {
 
 /// Gets the cached local path for a model, if it exists.
 pub fn repo_get_cached_path(model_id: &str) -> Result<String> {
+    repo_get_cached_path_ex(model_id, true)
+}
+
+/// Returns the cached path for a model, optionally requiring weights.
+pub fn repo_get_cached_path_ex(model_id: &str, require_weights: bool) -> Result<String> {
     let c_str = CString::new(model_id)?;
     let mut out: *mut c_char = std::ptr::null_mut();
 
     // SAFETY: c_str is valid, out is a valid mutable pointer.
     let rc = unsafe {
-        talu_sys::talu_repo_get_cached_path(c_str.as_ptr(), &mut out as *mut _ as *mut c_void)
+        talu_sys::talu_repo_get_cached_path(
+            c_str.as_ptr(),
+            require_weights,
+            &mut out as *mut _ as *mut c_void,
+        )
     };
 
     if rc != 0 || out.is_null() {
@@ -210,6 +221,15 @@ pub fn resolve_model_path(path: &str) -> Result<String> {
 
 /// Resolves a model path, optionally in offline mode (cache-only, no downloads).
 pub fn resolve_model_path_ex(path: &str, offline: bool) -> Result<String> {
+    resolve_model_path_full(path, offline, true)
+}
+
+/// Resolves a model path with full control over offline mode and weight requirements.
+pub fn resolve_model_path_full(
+    path: &str,
+    offline: bool,
+    require_weights: bool,
+) -> Result<String> {
     let c_str = CString::new(path)?;
     let mut out: *mut c_char = std::ptr::null_mut();
 
@@ -220,6 +240,7 @@ pub fn resolve_model_path_ex(path: &str, offline: bool) -> Result<String> {
             offline,
             std::ptr::null(),
             std::ptr::null(),
+            require_weights,
             &mut out as *mut _ as *mut c_void,
         )
     };
@@ -483,6 +504,7 @@ pub fn repo_fetch(
             .as_ref()
             .map(|e| e.as_ptr())
             .unwrap_or(std::ptr::null()),
+        skip_weights: options.skip_weights,
     };
 
     let mut out: *mut c_char = std::ptr::null_mut();

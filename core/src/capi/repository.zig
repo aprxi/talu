@@ -64,6 +64,8 @@ pub const DownloadOptions = extern struct {
     force: bool = false,
     /// Custom HF endpoint URL (optional, overrides HF_ENDPOINT env var)
     endpoint_url: ?[*:0]const u8 = null,
+    /// Skip downloading weight files (.safetensors).
+    skip_weights: bool = false,
 
     /// Get a ProgressContext from the options.
     pub fn progressContext(self: DownloadOptions) progress_api.ProgressContext {
@@ -139,6 +141,7 @@ pub export fn talu_repo_resolve_path(
     offline: bool,
     token: ?[*:0]const u8,
     endpoint_url: ?[*:0]const u8,
+    require_weights: bool,
     out_path: *?[*:0]u8,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -149,7 +152,7 @@ pub export fn talu_repo_resolve_path(
     const resolved_path = repository.resolveModelPath(
         allocator,
         std.mem.span(uri),
-        .{ .token = tok, .offline = offline, .endpoint_url = endpoint },
+        .{ .token = tok, .offline = offline, .endpoint_url = endpoint, .require_weights = require_weights },
     ) catch |e| {
         setErr("resolve_path", e);
         return @intFromEnum(error_codes.errorToCode(e));
@@ -170,10 +173,10 @@ pub export fn talu_repo_resolve_path(
 ///   out: Output pointer for path (caller must free with talu_free_string)
 ///
 /// Returns 0 on success (even if not cached), error code on failure.
-pub export fn talu_repo_get_cached_path(model_id: [*:0]const u8, out: *?[*:0]u8) callconv(.c) i32 {
+pub export fn talu_repo_get_cached_path(model_id: [*:0]const u8, require_weights: bool, out: *?[*:0]u8) callconv(.c) i32 {
     capi_error.clearError();
     out.* = null;
-    const path = repository.cache.getCachedPath(allocator, std.mem.span(model_id)) catch |e| {
+    const path = repository.cache.getCachedPath(allocator, std.mem.span(model_id), require_weights) catch |e| {
         setErr("get_cached_path", e);
         return @intFromEnum(error_codes.errorToCode(e));
     };
@@ -491,6 +494,7 @@ fn buildDownloadConfig(options: ?*const DownloadOptions) repository.hf.DownloadC
         .progress = progress,
         .force = if (options) |o| o.force else false,
         .endpoint_url = endpoint,
+        .skip_weights = if (options) |o| o.skip_weights else false,
     };
 }
 

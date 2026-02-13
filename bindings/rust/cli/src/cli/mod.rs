@@ -425,6 +425,10 @@ pub(super) struct GetArgs {
     /// Disable dry-run for --sync-pins and perform downloads
     #[arg(long, requires = "sync_pins")]
     pub no_dry_run: bool,
+
+    /// Skip weight files when syncing pins (download only metadata/tokenizer)
+    #[arg(long, requires = "sync_pins")]
+    pub no_weights: bool,
 }
 
 #[derive(Args)]

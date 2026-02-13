@@ -65,6 +65,7 @@ const progress_api = @import("../../capi/progress.zig");
 // Re-export core types
 pub const Bundle = @import("bundle.zig").Bundle;
 pub const resolver = @import("resolver.zig");
+pub const ResolveOptions = resolver.ResolveOptions;
 pub const cache = @import("cache.zig");
 pub const talu_cache = @import("talu_cache.zig");
 pub const scheme = @import("scheme.zig");
@@ -114,6 +115,9 @@ pub const ResolutionConfig = struct {
     endpoint_url: ?[]const u8 = null,
     /// Progress context for download progress reporting.
     progress: ProgressContext = ProgressContext.NONE,
+    /// If false, weight files are not required for resolution.
+    /// Used for tokenizer-only loading and --no-weights sync.
+    require_weights: bool = true,
 };
 
 // Re-export cache size utilities
@@ -155,8 +159,8 @@ pub const SearchResultListC = cache.SearchResultListC;
 /// - HF cache format (models--org--name/snapshots/...)
 ///
 /// Returns error.NotFound if the path doesn't exist or is missing required files.
-pub fn resolve(allocator: std.mem.Allocator, path: []const u8) !Bundle {
-    return resolver.resolve(allocator, path);
+pub fn resolve(allocator: std.mem.Allocator, path: []const u8, options: resolver.ResolveOptions) !Bundle {
+    return resolver.resolve(allocator, path, options);
 }
 
 /// Fetch a model from HF Hub (downloads if not cached).
@@ -181,8 +185,8 @@ pub fn isModelId(path: []const u8) bool {
 /// Get the local cache path for a model ID, or null if not cached.
 /// Checks Talu managed cache first, then HuggingFace cache.
 pub fn getCachedPath(allocator: std.mem.Allocator, model_id: []const u8) !?[]const u8 {
-    if (try talu_cache.getTaluCachedPath(allocator, model_id)) |path| return path;
-    return cache.getCachedPath(allocator, model_id);
+    if (try talu_cache.getTaluCachedPath(allocator, model_id, true)) |path| return path;
+    return cache.getCachedPath(allocator, model_id, true);
 }
 
 /// List cached models from both Talu managed cache and HuggingFace cache.
@@ -342,7 +346,7 @@ pub fn exists(
 /// Returns true if the model is cached locally with valid weights.
 pub fn isCached(allocator: std.mem.Allocator, model_id: []const u8) !bool {
     if (try cache.isCached(allocator, model_id)) return true;
-    if (try talu_cache.getTaluCachedPath(allocator, model_id) != null) return true;
+    if (try talu_cache.getTaluCachedPath(allocator, model_id, true) != null) return true;
     return false;
 }
 
@@ -376,7 +380,7 @@ pub fn listFiles(
         },
         .hub => {
             // HuggingFace Hub - check cache first, then list from API
-            if (cache.getCachedPath(allocator, uri.path) catch null) |cached_path| {
+            if (cache.getCachedPath(allocator, uri.path, true) catch null) |cached_path| {
                 defer allocator.free(cached_path);
                 return listLocalFiles(allocator, cached_path);
             }
@@ -463,13 +467,13 @@ pub fn resolveModelPath(allocator: std.mem.Allocator, uri: []const u8, config: R
         .hub => {
             if (!config.force_download) {
                 // Check Talu local cache first ($TALU_HOME/models/org/model)
-                if (try talu_cache.getTaluCachedPath(allocator, parsed.path)) |talu_path| {
+                if (try talu_cache.getTaluCachedPath(allocator, parsed.path, config.require_weights)) |talu_path| {
                     log.info("load", "Using local model", .{ .model_id = parsed.path });
                     return talu_path;
                 }
 
                 // Then check HuggingFace cache
-                if (try cache.getCachedPath(allocator, parsed.path)) |cached_path| {
+                if (try cache.getCachedPath(allocator, parsed.path, config.require_weights)) |cached_path| {
                     log.info("load", "Using cached model", .{ .model_id = parsed.path });
                     return cached_path;
                 }
@@ -488,6 +492,7 @@ pub fn resolveModelPath(allocator: std.mem.Allocator, uri: []const u8, config: R
                 .force = config.force_download,
                 .endpoint_url = config.endpoint_url,
                 .progress = config.progress,
+                .skip_weights = !config.require_weights,
             });
         },
     }

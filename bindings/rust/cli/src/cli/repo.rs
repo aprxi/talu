@@ -224,7 +224,7 @@ pub(super) fn cmd_get(args: GetArgs) -> Result<()> {
         let store = pin_store
             .as_ref()
             .ok_or_else(|| anyhow!("internal error: pin store unavailable"))?;
-        return cmd_sync_pins(store, args.endpoint_url.as_deref(), dry_run);
+        return cmd_sync_pins(store, args.endpoint_url.as_deref(), dry_run, args.no_weights);
     }
 
     let target = match args.target {
@@ -313,7 +313,7 @@ fn cmd_remove_pin(pin_store: &PinStore, model_uri: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool) -> Result<()> {
+fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool, no_weights: bool) -> Result<()> {
     let entries = pin_store.list_pinned_entries()?;
     if entries.is_empty() {
         println!("No pinned models for this profile.");
@@ -341,7 +341,7 @@ fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool
             }
         }
 
-        match repo_get_cached_path_result(&model_id) {
+        match repo_get_cached_path_result_ex(&model_id, !no_weights) {
             CachePathResult::Cached(_) => {
                 cached.push(model_id.clone());
                 let local_size = talu::repo::repo_size(&model_id);
@@ -355,53 +355,68 @@ fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool
         }
     }
 
-    let missing_size: Vec<String> = missing
-        .iter()
-        .filter(|model_id| !size_by_model.contains_key(*model_id))
-        .cloned()
-        .collect();
-    let (_, size_errors) = hydrate_pin_sizes(
-        pin_store,
-        &missing_size,
-        endpoint_url,
-        "Resolving missing pin sizes",
-        true,
-        &mut size_by_model,
-    );
+    // Skip size hydration when --no-weights: metadata sizes are negligible.
+    let size_errors = if no_weights {
+        Vec::new()
+    } else {
+        let missing_size: Vec<String> = missing
+            .iter()
+            .filter(|model_id| !size_by_model.contains_key(*model_id))
+            .cloned()
+            .collect();
+        let (_, errors) = hydrate_pin_sizes(
+            pin_store,
+            &missing_size,
+            endpoint_url,
+            "Resolving missing pin sizes",
+            true,
+            false,
+            &mut size_by_model,
+        );
+        errors
+    };
 
     let total = cached.len() + missing.len() + invalid.len() + cache_errors.len();
     let cached_known_size: u64 = cached
         .iter()
         .filter_map(|model_id| size_by_model.get(model_id).copied())
         .sum();
-    let download_known_size: u64 = missing
-        .iter()
-        .filter_map(|model_id| size_by_model.get(model_id).copied())
-        .sum();
-    let download_unknown_count = missing
-        .iter()
-        .filter(|model_id| !size_by_model.contains_key(*model_id))
-        .count();
 
-    println!("Pinned models: {}", total);
+    if no_weights {
+        println!("Pinned models: {} (metadata only, skipping weights)", total);
+    } else {
+        println!("Pinned models: {}", total);
+    }
     println!(
         "Already cached: {} ({})",
         cached.len(),
         format_size(cached_known_size)
     );
-    if download_unknown_count == 0 {
-        println!(
-            "Need download: {} ({})",
-            missing.len(),
-            format_size(download_known_size)
-        );
+    if no_weights {
+        println!("Need download: {} (metadata only)", missing.len());
     } else {
-        println!(
-            "Need download: {} ({} + {} unknown)",
-            missing.len(),
-            format_size(download_known_size),
-            download_unknown_count
-        );
+        let download_known_size: u64 = missing
+            .iter()
+            .filter_map(|model_id| size_by_model.get(model_id).copied())
+            .sum();
+        let download_unknown_count = missing
+            .iter()
+            .filter(|model_id| !size_by_model.contains_key(*model_id))
+            .count();
+        if download_unknown_count == 0 {
+            println!(
+                "Need download: {} ({})",
+                missing.len(),
+                format_size(download_known_size)
+            );
+        } else {
+            println!(
+                "Need download: {} ({} + {} unknown)",
+                missing.len(),
+                format_size(download_known_size),
+                download_unknown_count
+            );
+        }
     }
     if !invalid.is_empty() {
         println!("Invalid pins: {}", invalid.len());
@@ -416,10 +431,18 @@ fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool
     if dry_run {
         println!("\nDry run: no downloads were started.");
         if !missing.is_empty() {
-            println!("Would download:");
+            if no_weights {
+                println!("Would download (metadata only, no weights):");
+            } else {
+                println!("Would download:");
+            }
             for model_id in &missing {
-                let size_text = format_size_cell(size_by_model.get(model_id).copied());
-                println!("  {:>10}  {}", size_text, model_id);
+                if no_weights {
+                    println!("          -  {}", model_id);
+                } else {
+                    let size_text = format_size_cell(size_by_model.get(model_id).copied());
+                    println!("  {:>10}  {}", size_text, model_id);
+                }
             }
         }
         if !invalid.is_empty() {
@@ -440,7 +463,11 @@ fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool
                 println!("  {}: {}", model_id, err);
             }
         }
-        println!("\nRun with --no-dry-run to download missing pinned models.");
+        if no_weights {
+            println!("\nRun with --no-dry-run to download metadata for missing pinned models.");
+        } else {
+            println!("\nRun with --no-dry-run to download missing pinned models.");
+        }
         return Ok(());
     }
 
@@ -523,6 +550,7 @@ fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool
             false,
             endpoint_url,
             sync_bars.as_ref().map(|bars| &bars.file),
+            no_weights,
         ) {
             Ok(_) => {
                 downloaded += 1;
@@ -825,6 +853,7 @@ fn hydrate_pin_sizes(
     endpoint_url: Option<&str>,
     activity: &str,
     show_status: bool,
+    skip_weights: bool,
     size_by_model: &mut std::collections::HashMap<String, u64>,
 ) -> (usize, Vec<(String, String)>) {
     let mut deduped: Vec<String> = Vec::new();
@@ -910,6 +939,7 @@ fn hydrate_pin_sizes(
             &endpoint,
             &model_id,
             token.as_deref(),
+            skip_weights,
         ));
         match fetch_result {
             Ok(size_bytes) if size_bytes > 0 => {
@@ -949,20 +979,21 @@ async fn fetch_hf_model_size(
     endpoint: &str,
     model_id: &str,
     token: Option<&str>,
+    skip_weights: bool,
 ) -> Result<u64> {
     let info_url = format!(
         "{}/api/models/{}?blobs=true&files_metadata=true",
         endpoint, model_id
     );
     if let Ok(body) = hf_get_text(client, &info_url, token).await {
-        if let Ok(size) = parse_hf_model_size_bytes(&body) {
+        if let Ok(size) = parse_hf_model_size_bytes(&body, skip_weights) {
             return Ok(size);
         }
     }
 
     let tree_url = format!("{}/api/models/{}/tree/main?recursive=0", endpoint, model_id);
     let body = hf_get_text(client, &tree_url, token).await?;
-    parse_hf_tree_size_bytes(&body)
+    parse_hf_tree_size_bytes(&body, skip_weights)
 }
 
 async fn hf_get_text(client: &reqwest::Client, url: &str, token: Option<&str>) -> Result<String> {
@@ -986,7 +1017,7 @@ async fn hf_get_text(client: &reqwest::Client, url: &str, token: Option<&str>) -
         .map_err(|e| anyhow!("failed to read response body: {}", e))
 }
 
-fn parse_hf_model_size_bytes(body: &str) -> Result<u64> {
+fn parse_hf_model_size_bytes(body: &str, skip_weights: bool) -> Result<u64> {
     let value: Value =
         serde_json::from_str(body).map_err(|e| anyhow!("invalid model metadata JSON: {}", e))?;
     let siblings = value
@@ -1001,6 +1032,9 @@ fn parse_hf_model_size_bytes(body: &str) -> Result<u64> {
             .and_then(Value::as_str)
             .unwrap_or_default();
         if filename.starts_with('.') || filename.contains('/') {
+            continue;
+        }
+        if skip_weights && is_weight_filename(filename) {
             continue;
         }
         let size = sibling
@@ -1023,7 +1057,7 @@ fn parse_hf_model_size_bytes(body: &str) -> Result<u64> {
     }
 }
 
-fn parse_hf_tree_size_bytes(body: &str) -> Result<u64> {
+fn parse_hf_tree_size_bytes(body: &str, skip_weights: bool) -> Result<u64> {
     let value: Value =
         serde_json::from_str(body).map_err(|e| anyhow!("invalid tree metadata JSON: {}", e))?;
     let entries = value
@@ -1045,6 +1079,9 @@ fn parse_hf_tree_size_bytes(body: &str) -> Result<u64> {
                 continue;
             }
         }
+        if skip_weights && is_weight_filename(filename) {
+            continue;
+        }
         let size = entry
             .get("size")
             .and_then(value_as_u64)
@@ -1063,6 +1100,10 @@ fn parse_hf_tree_size_bytes(body: &str) -> Result<u64> {
     } else {
         Ok(total_size)
     }
+}
+
+fn is_weight_filename(filename: &str) -> bool {
+    filename.ends_with(".safetensors") || filename.ends_with(".safetensors.index.json")
 }
 
 fn value_as_u64(value: &Value) -> Option<u64> {
@@ -1261,7 +1302,11 @@ enum CachePathResult {
 }
 
 fn repo_get_cached_path_result(model_id: &str) -> CachePathResult {
-    match talu::repo::repo_get_cached_path(model_id) {
+    repo_get_cached_path_result_ex(model_id, true)
+}
+
+fn repo_get_cached_path_result_ex(model_id: &str, require_weights: bool) -> CachePathResult {
+    match talu::repo::repo_get_cached_path_ex(model_id, require_weights) {
         Ok(path) => CachePathResult::Cached(path),
         Err(e) => {
             // Check if this is a "not cached" vs actual error
@@ -1297,6 +1342,7 @@ pub(super) fn repo_fetch_with_progress(
         token,
         force,
         endpoint_url: endpoint_url.map(|s| s.to_string()),
+        ..Default::default()
     };
 
     let callback: talu::repo::ProgressCallback = Box::new(move |update| {
@@ -1325,6 +1371,7 @@ pub(super) fn repo_fetch_no_progress(
         token,
         force,
         endpoint_url: endpoint_url.map(|s| s.to_string()),
+        ..Default::default()
     };
     talu::repo::repo_fetch(model_id, options, None).map_err(|e| anyhow!("{}", e))
 }
@@ -1334,12 +1381,14 @@ pub(super) fn repo_fetch_with_sync_progress(
     force: bool,
     endpoint_url: Option<&str>,
     file_bar: Option<&ProgressBar>,
+    skip_weights: bool,
 ) -> Result<String> {
     let token = env::var("HF_TOKEN").ok();
     let options = talu::DownloadOptions {
         token,
         force,
         endpoint_url: endpoint_url.map(|s| s.to_string()),
+        skip_weights,
     };
 
     let callback = file_bar.map(|bar| {
@@ -1413,14 +1462,30 @@ mod tests {
                 {"rfilename":"subdir/file.txt","size":456}
             ]
         }"#;
-        let size = parse_hf_model_size_bytes(json).expect("size parse");
+        let size = parse_hf_model_size_bytes(json, false).expect("size parse");
         assert_eq!(size, 1024 + 3221225472 + 3221225472);
+    }
+
+    #[test]
+    fn parse_hf_model_size_skip_weights_excludes_safetensors() {
+        let json = r#"{
+            "siblings": [
+                {"rfilename":"README.md","size":1024},
+                {"rfilename":"config.json","size":2048},
+                {"rfilename":"tokenizer.json","size":4096},
+                {"rfilename":"model-00001-of-00002.safetensors","lfs":{"size":3221225472}},
+                {"rfilename":"model-00002-of-00002.safetensors","size":3221225472},
+                {"rfilename":"model.safetensors.index.json","size":512}
+            ]
+        }"#;
+        let size = parse_hf_model_size_bytes(json, true).expect("size parse");
+        assert_eq!(size, 1024 + 2048 + 4096);
     }
 
     #[test]
     fn parse_hf_model_size_missing_siblings_errors() {
         let json = r#"{"id":"Qwen/Qwen3-0.6B"}"#;
-        let err = parse_hf_model_size_bytes(json).expect_err("should fail");
+        let err = parse_hf_model_size_bytes(json, false).expect_err("should fail");
         assert!(err.to_string().contains("siblings"));
     }
 
@@ -1433,7 +1498,7 @@ mod tests {
                 {"rfilename":"README.md"}
             ]
         }"#;
-        let err = parse_hf_model_size_bytes(json).expect_err("should fail");
+        let err = parse_hf_model_size_bytes(json, false).expect_err("should fail");
         assert!(err.to_string().contains("size metadata unavailable"));
     }
 
@@ -1446,8 +1511,20 @@ mod tests {
             {"path":".gitattributes","type":"file","size":50},
             {"path":"subdir","type":"directory"}
         ]"#;
-        let size = parse_hf_tree_size_bytes(json).expect("size parse");
+        let size = parse_hf_tree_size_bytes(json, false).expect("size parse");
         assert_eq!(size, 1024 + 3221225472);
+    }
+
+    #[test]
+    fn parse_hf_tree_size_skip_weights_excludes_safetensors() {
+        let json = r#"[
+            {"path":"config.json","type":"file","size":1024},
+            {"path":"tokenizer.json","type":"file","size":4096},
+            {"path":"model-00001-of-00002.safetensors","type":"file","lfs":{"size":3221225472}},
+            {"path":"model.safetensors.index.json","type":"file","size":512}
+        ]"#;
+        let size = parse_hf_tree_size_bytes(json, true).expect("size parse");
+        assert_eq!(size, 1024 + 4096);
     }
 
     #[test]

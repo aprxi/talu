@@ -32,9 +32,10 @@ pub fn getTaluModelsDir(allocator: std.mem.Allocator) CacheError![]const u8 {
 
 /// Look up a single model in the Talu local cache by model ID.
 ///
-/// Given "Org/Model", checks if $TALU_HOME/models/Org/Model exists and has weights.
+/// Given "Org/Model", checks if $TALU_HOME/models/Org/Model exists.
+/// When `require_weights` is true, also checks for weight files.
 /// Returns the directory path if found, null otherwise. Caller owns returned memory.
-pub fn getTaluCachedPath(allocator: std.mem.Allocator, model_id: []const u8) !?[]const u8 {
+pub fn getTaluCachedPath(allocator: std.mem.Allocator, model_id: []const u8, require_weights: bool) !?[]const u8 {
     const models_dir = getTaluModelsDir(allocator) catch |err| switch (err) {
         CacheError.NoHomeDir, CacheError.OutOfMemory => return @as(?[]const u8, null),
         else => return @as(?[]const u8, null),
@@ -46,6 +47,8 @@ pub fn getTaluCachedPath(allocator: std.mem.Allocator, model_id: []const u8) !?[
 
     // Check directory exists
     std.fs.cwd().access(model_path, .{}) catch return null;
+
+    if (!require_weights) return model_path;
 
     // Check for weight files
     const weights = resolver.findWeightsFile(allocator, model_path) catch return null;
@@ -322,7 +325,7 @@ test "getTaluCachedPath returns path when model exists with weights" {
         try file.writeAll("fake weights");
     }
 
-    const cached_path = try getTaluCachedPath(allocator, "TestOrg/TestModel");
+    const cached_path = try getTaluCachedPath(allocator, "TestOrg/TestModel", true);
     try std.testing.expect(cached_path != null);
     defer allocator.free(cached_path.?);
     try std.testing.expectEqualStrings(model_dir, cached_path.?);
@@ -353,7 +356,7 @@ test "getTaluCachedPath returns null when model doesn't exist" {
     defer allocator.free(models_dir);
     try std.fs.cwd().makePath(models_dir);
 
-    const cached_path = try getTaluCachedPath(allocator, "NonExistent/Model");
+    const cached_path = try getTaluCachedPath(allocator, "NonExistent/Model", true);
     try std.testing.expect(cached_path == null);
 }
 
@@ -390,7 +393,7 @@ test "getTaluCachedPath returns null when model exists but has no weights" {
         try file.writeAll("{}");
     }
 
-    const cached_path = try getTaluCachedPath(allocator, "TestOrg/NoWeights");
+    const cached_path = try getTaluCachedPath(allocator, "TestOrg/NoWeights", true);
     try std.testing.expect(cached_path == null);
 }
 

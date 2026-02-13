@@ -288,7 +288,7 @@ pub const LocalEngine = struct {
         errdefer allocator.free(resolved_model_path);
 
         // Find model files
-        var model_bundle = try io.repository.resolve(allocator, resolved_model_path);
+        var model_bundle = try io.repository.resolve(allocator, resolved_model_path, .{});
         defer model_bundle.deinit();
 
         // Validate files exist
@@ -296,7 +296,8 @@ pub const LocalEngine = struct {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
-        std.fs.cwd().access(model_bundle.weights_path(), .{}) catch |err| switch (err) {
+        const wp = model_bundle.weights_path() orelse return error.FileNotFound;
+        std.fs.cwd().access(wp, .{}) catch |err| switch (err) {
             error.FileNotFound => return error.FileNotFound,
             else => return err,
         };
@@ -325,7 +326,7 @@ pub const LocalEngine = struct {
         var loader_thread_state = ModelLoaderThread{
             .alloc = allocator,
             .config_path = model_bundle.config_path(),
-            .weights_path = model_bundle.weights_path(),
+            .weights_path = wp,
             .prog = progress,
         };
 
@@ -351,7 +352,7 @@ pub const LocalEngine = struct {
             thread.join();
         } else {
             // Thread spawn failed - load synchronously
-            loader_thread_state.loaded_model = try io.loadModel(allocator, model_bundle.config_path(), model_bundle.weights_path(), progress);
+            loader_thread_state.loaded_model = try io.loadModel(allocator, model_bundle.config_path(), wp, progress);
         }
 
         if (loader_thread_state.err) |e| return e;

@@ -226,10 +226,10 @@ pub fn main() !void {
     std.debug.print("Loading model...\n", .{});
 
     // Resolve model bundle (handles HuggingFace paths, local dirs, etc.)
-    var model_bundle = try io.repository.resolve(allocator, args.model_path);
+    var model_bundle = try io.repository.resolve(allocator, args.model_path, .{});
     defer model_bundle.deinit();
 
-    var loaded = try io.loadModel(allocator, model_bundle.config_path(), model_bundle.weights_path(), progress_mod.ProgressContext.NONE);
+    var loaded = try io.loadModel(allocator, model_bundle.config_path(), model_bundle.weights_path() orelse return error.WeightsNotFound, progress_mod.ProgressContext.NONE);
     defer loaded.deinit();
 
     // Initialize tokenizer

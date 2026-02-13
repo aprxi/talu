@@ -91,8 +91,9 @@ pub export fn talu_resolve_model_path(
     out_path.* = null;
     const model_path_slice = std.mem.span(model_path);
 
-    // Use centralized resolution logic from repository
-    const resolved_path = repository.resolveModelPath(allocator, model_path_slice, .{}) catch |err| {
+    // Use centralized resolution logic from repository.
+    // Tokenizer loading does not require weight files.
+    const resolved_path = repository.resolveModelPath(allocator, model_path_slice, .{ .require_weights = false }) catch |err| {
         capi_error.setError(err, "Model path resolution failed: {s}", .{@errorName(err)});
         return @intFromEnum(error_codes.errorToCode(err));
     };
