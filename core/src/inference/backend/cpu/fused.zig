@@ -485,6 +485,11 @@ pub const FusedCpuBackend = struct {
 
     /// Warmup: do a dummy forward pass to pull weights into CPU cache.
     pub fn warmup(self: *FusedCpuBackend) !void {
+        // Suppress trace during warmup so xray doesn't capture warmup records
+        const saved_handler = trace.getHandler();
+        trace.setHandler(null);
+        defer trace.setHandler(saved_handler);
+
         // Full single-token forward pass to warm up all layer weights.
         // This forces mmap pages to load, so the user doesn't wait during
         // the first real inference with no progress feedback.
