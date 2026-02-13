@@ -411,11 +411,10 @@ fn encodeWordGreedy(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []cons
     return EncodedWord{ .ids = ids_owned, .tokens = toks_owned };
 }
 
-fn unigram_encode(tokenizer: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncoding) c_int {
+fn unigram_encode(tokenizer: *ct.Tokenizer, text: []const u8, enc: *ct.TokenizerEncoding) c_int {
     if (tokenizer.model == null) return -1;
     const model = @as(*UnigramModel, @ptrCast(@alignCast(tokenizer.model.?)));
     const allocator = model.allocator;
-    const text = std.mem.sliceTo(input, 0);
 
     var ids = std.ArrayListUnmanaged(i32){};
     var toks = std.ArrayListUnmanaged([*:0]u8){};
@@ -619,7 +618,7 @@ pub fn tokenizer_unigram_create_from_spec(spec: ?*const ct.UnigramModelSpec) ?*c
 // Native Zig Dispatch Entry Points
 // =============================================================================
 
-pub fn unigramEncode(tokenizer: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncoding) c_int {
+pub fn unigramEncode(tokenizer: *ct.Tokenizer, input: []const u8, enc: *ct.TokenizerEncoding) c_int {
     return unigram_encode(tokenizer, input, enc);
 }
 

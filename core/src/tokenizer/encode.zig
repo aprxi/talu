@@ -541,6 +541,8 @@ fn encodeWord(tokenizer: *ct.Tokenizer, word_bytes: []const u8, add_sentencepiec
 }
 
 fn encodeCombined(tokenizer: *ct.Tokenizer, token_items: []Token, accumulator: *EncodeAccum) !void {
+    if (token_items.len == 0) return;
+
     var token_bytes = std.ArrayListUnmanaged(u8){};
     defer token_bytes.deinit(Allocator);
 

@@ -149,11 +149,10 @@ fn encodeWord(model: *WordPieceModel, tokenizer: *ct.Tokenizer, word: []const u8
     };
 }
 
-fn wordpiece_encode(tokenizer: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncoding) c_int {
+fn wordpiece_encode(tokenizer: *ct.Tokenizer, text: []const u8, enc: *ct.TokenizerEncoding) c_int {
     if (tokenizer.model == null) return -1;
     const model = @as(*WordPieceModel, @ptrCast(@alignCast(tokenizer.model.?)));
     const allocator = model.allocator;
-    const text = std.mem.sliceTo(input, 0);
 
     var ids = std.ArrayList(i32).empty;
     defer ids.deinit(allocator);
@@ -385,7 +384,7 @@ pub fn tokenizer_wordpiece_create_from_spec(spec: ?*const ct.WordPieceModelSpec)
 // Native Zig Dispatch Entry Points
 // =============================================================================
 
-pub fn wordpieceEncode(tokenizer: *ct.Tokenizer, input: [*c]const u8, enc: *ct.TokenizerEncoding) c_int {
+pub fn wordpieceEncode(tokenizer: *ct.Tokenizer, input: []const u8, enc: *ct.TokenizerEncoding) c_int {
     return wordpiece_encode(tokenizer, input, enc);
 }
 

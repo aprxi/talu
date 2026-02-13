@@ -167,13 +167,14 @@ pub const Tokenizer = extern struct {
 
     /// Encode with explicit length (supports text with embedded null bytes)
     pub fn encodeSlice(self: *Tokenizer, input: []const u8, enc: *TokenizerEncoding) c_int {
+        if (input.len == 0) return 0;
         return switch (self.type) {
             .bpe => blk: {
                 const model: *bpe.BpeModel = @ptrCast(@alignCast(self.model.?));
                 break :blk model.encodeSlice(self, input, enc);
             },
-            .wordpiece => wordpiece.wordpieceEncode(self, @ptrCast(input.ptr), enc),
-            .unigram => unigram.unigramEncode(self, @ptrCast(input.ptr), enc),
+            .wordpiece => wordpiece.wordpieceEncode(self, input, enc),
+            .unigram => unigram.unigramEncode(self, input, enc),
         };
     }
 
