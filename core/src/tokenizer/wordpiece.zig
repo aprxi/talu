@@ -213,27 +213,76 @@ fn wordpiece_encode(tokenizer: *ct.Tokenizer, text: []const u8, enc: *ct.Tokeniz
     return 0;
 }
 
-fn wordpiece_decode(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
+fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
     if (tokenizer.model == null) return -1;
     const model = @as(*WordPieceModel, @ptrCast(@alignCast(tokenizer.model.?)));
     const allocator = model.allocator;
     const unk_ptr: [*:0]const u8 = @ptrCast(&model.unk_token);
 
-    const token_ptrs = allocator.alloc([*:0]const u8, ids_len) catch return -1;
-    defer allocator.free(token_ptrs);
+    var result = std.ArrayListUnmanaged(u8){};
+    defer result.deinit(allocator);
 
-    for (token_ptrs, 0..) |*slot, id_idx| {
+    var first = true;
+    for (0..ids_len) |id_idx| {
         const id = ids[id_idx];
-        if (id >= 0 and @as(usize, @intCast(id)) < model.id_to_token.len) {
-            if (model.id_to_token[@as(usize, @intCast(id))]) |ptr| {
-                slot.* = ptr;
-                continue;
-            }
+
+        // Check if this is a special token (skip if requested)
+        if (options.skip_special_tokens) {
+            if (isSpecialToken(tokenizer, id)) continue;
         }
-        slot.* = unk_ptr;
+
+        const token_slice = blk: {
+            if (id >= 0 and @as(usize, @intCast(id)) < model.id_to_token.len) {
+                if (model.id_to_token[@as(usize, @intCast(id))]) |ptr| {
+                    break :blk std.mem.sliceTo(ptr, 0);
+                }
+            }
+            break :blk std.mem.sliceTo(unk_ptr, 0);
+        };
+
+        const is_subword = token_slice.len >= 2 and token_slice[0] == '#' and token_slice[1] == '#';
+        const content = if (is_subword) token_slice[2..] else token_slice;
+
+        if (!is_subword and !first) {
+            result.append(allocator, ' ') catch return -1;
+        }
+        result.appendSlice(allocator, content) catch return -1;
+        first = false;
     }
 
-    return decoders.decoder_wordpiece(token_ptrs.ptr, ids_len, out, out_len);
+    // Cleanup: remove space before certain punctuation characters
+    var write_pos: usize = 0;
+    for (result.items, 0..) |ch, read_pos| {
+        if (ch == ' ' and read_pos + 1 < result.items.len and isCleanupPunct(result.items[read_pos + 1])) {
+            continue; // skip the space
+        }
+        result.items[write_pos] = ch;
+        write_pos += 1;
+    }
+    result.items.len = write_pos;
+
+    // Null-terminate and return
+    result.append(allocator, 0) catch return -1;
+    out_len.* = result.items.len - 1; // exclude null terminator
+    const owned = result.toOwnedSlice(allocator) catch return -1;
+    out.* = @ptrCast(owned.ptr);
+    return 0;
+}
+
+fn isCleanupPunct(ch: u8) bool {
+    return switch (ch) {
+        '!', '"', '\'', ')', ',', '-', '.', ':', ';', '?', ']', '}' => true,
+        else => false,
+    };
+}
+
+fn isSpecialToken(tokenizer: *ct.Tokenizer, id: i32) bool {
+    var cur = tokenizer.added;
+    while (cur) |node| {
+        if (node.id == id and node.special != 0) return true;
+        cur = node.next;
+    }
+    return false;
 }
 
 fn wordpiece_destroy(tokenizer: *ct.Tokenizer) void {
@@ -389,7 +438,11 @@ pub fn wordpieceEncode(tokenizer: *ct.Tokenizer, input: []const u8, enc: *ct.Tok
 }
 
 pub fn wordpieceDecode(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-    return wordpiece_decode(tokenizer, ids, ids_len, out, out_len);
+    return wordpiece_decode_impl(tokenizer, ids, ids_len, out, out_len, .{});
+}
+
+pub fn wordpieceDecodeWithOptions(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
+    return wordpiece_decode_impl(tokenizer, ids, ids_len, out, out_len, options);
 }
 
 pub fn wordpieceDestroy(tokenizer: *ct.Tokenizer) void {

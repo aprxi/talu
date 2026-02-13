@@ -203,6 +203,16 @@ fn batch_encode_unicode_roundtrip() {
     }
 }
 
+/// Text with spaces roundtrips: "Pachelbel's Canon in D".
+#[test]
+fn text_with_spaces_roundtrip() {
+    let ctx = TokenizerTestContext::with_byte_level();
+    let input = "Pachelbel's Canon in D";
+    let tokens = ctx.encode_with(input, &no_bos());
+    let decoded = ctx.decode(&tokens);
+    assert_eq!(decoded, input);
+}
+
 /// Mixed script text roundtrips: "Testing 123 日本語".
 #[test]
 fn mixed_script_roundtrip() {

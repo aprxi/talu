@@ -790,24 +790,6 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
 
             var idx: usize = 0;
             while (idx < token.slice.len) {
-                // Handle JSON escape sequences (vocab may contain escaped chars like \n, \t)
-                if (token.slice[idx] == '\\' and idx + 1 < token.slice.len) {
-                    const escaped = token.slice[idx + 1];
-                    const replacement: ?u8 = switch (escaped) {
-                        'n' => '\n',
-                        't' => '\t',
-                        'r' => '\r',
-                        '\\' => '\\',
-                        '"' => '"',
-                        else => null,
-                    };
-                    if (replacement) |ch| {
-                        result.append(allocator, ch) catch return -1;
-                        idx += 2;
-                        continue;
-                    }
-                }
-
                 const codepoint = utf8Decode(token.slice, &idx);
                 // SentencePiece: U+2581 (▁) represents word boundary, convert to space
                 if (codepoint == 0x2581) {
@@ -837,6 +819,11 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
     while (strip_stop_count > 0 and result.items.len > 0 and result.items[result.items.len - 1] == ' ') {
         _ = result.pop();
         strip_stop_count -= 1;
+    }
+
+    // Strip leading space added by add_prefix_space pretokenizer
+    if (tok.pretokenizer.add_prefix_space != 0 and result.items.len > 0 and result.items[0] == ' ') {
+        _ = result.orderedRemove(0);
     }
 
     // Return actual length (before null terminator)

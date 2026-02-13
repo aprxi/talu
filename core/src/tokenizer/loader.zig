@@ -40,6 +40,42 @@ pub fn load_from_slice_streaming(allocator: std.mem.Allocator, json_content: []c
             // Find matching closing brace
             const vocab_end = findMatchingBrace(vocab_section, '{', '}') orelse vocab_section.len;
             try parseVocabFastSection(arena_allocator, vocab_section[0..vocab_end], &vocab_entries);
+        } else if (vocab_section.len > 0 and vocab_section[0] == '[') {
+            // Unigram array format: [["token", score], ...]
+            // Use std.json Scanner for correctness (this path is rare)
+            const vocab_end = findMatchingBrace(vocab_section, '[', ']') orelse vocab_section.len;
+            const vocab_json = vocab_section[0 .. vocab_end + 1];
+            var scanner = std.json.Scanner.initCompleteInput(arena_allocator, vocab_json);
+            if ((try scanner.next()) == .array_begin) {
+                var next_id: i32 = 0;
+                while (true) {
+                    const tok = try scanner.next();
+                    if (tok == .array_end) break;
+                    if (tok != .array_begin) {
+                        try scanner.skipValue();
+                        continue;
+                    }
+                    // Inner array: ["token", score]
+                    const token_tok = try scanner.nextAlloc(arena_allocator, .alloc_if_needed);
+                    const token_str: []const u8 = switch (token_tok) {
+                        .string => |s| s,
+                        .allocated_string => |s| s,
+                        else => {
+                            try scanner.skipValue();
+                            _ = try scanner.next(); // closing ]
+                            continue;
+                        },
+                    };
+                    const score_tok = try scanner.next();
+                    const score: f32 = switch (score_tok) {
+                        .number => |n| std.fmt.parseFloat(f32, n) catch 0.0,
+                        else => 0.0,
+                    };
+                    _ = try scanner.next(); // closing ]
+                    try vocab_entries.append(.{ .token = token_str, .id = next_id, .score = score });
+                    next_id += 1;
+                }
+            }
         }
     }
 
@@ -54,6 +90,41 @@ pub fn load_from_slice_streaming(allocator: std.mem.Allocator, json_content: []c
     // Find model type using the same method as detectModelType
     // Look within the "model" section for robustness
     model_type_name = detectModelType(json_content);
+
+    // Extract unk_token from model section
+    var unk_token_str: ?[]const u8 = null;
+    if (findSection(json_content, "\"model\"")) |model_section| {
+        const search_len = @min(500, model_section.len);
+        const search_region = model_section[0..search_len];
+        // Try "unk_token" (string value) — used by WordPiece
+        if (std.mem.indexOf(u8, search_region, "\"unk_token\"")) |unk_pos| {
+            const after_key = model_section[unk_pos + "\"unk_token\"".len ..];
+            if (findQuotedString(after_key)) |val| {
+                unk_token_str = val;
+            }
+        }
+        // Try "unk_id" (integer index into vocab) — used by Unigram
+        if (unk_token_str == null) {
+            if (std.mem.indexOf(u8, search_region, "\"unk_id\"")) |unk_pos| {
+                const after_key = model_section[unk_pos + "\"unk_id\"".len ..];
+                // Skip colon and whitespace to find the integer
+                var skip: usize = 0;
+                while (skip < after_key.len and (after_key[skip] == ':' or after_key[skip] == ' ' or after_key[skip] == '\t')) : (skip += 1) {}
+                if (skip < after_key.len) {
+                    const num_start = skip;
+                    while (skip < after_key.len and after_key[skip] >= '0' and after_key[skip] <= '9') : (skip += 1) {}
+                    if (skip > num_start) {
+                        const unk_id = std.fmt.parseInt(usize, after_key[num_start..skip], 10) catch null;
+                        if (unk_id) |id| {
+                            if (id < vocab_entries.items.len) {
+                                unk_token_str = vocab_entries.items[id].token;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     // Parse small sections with std.json (added_tokens, normalizer, etc.)
     var added_token_entries = ManagedArrayList(schema.AddedToken).init(arena_allocator);
@@ -83,7 +154,7 @@ pub fn load_from_slice_streaming(allocator: std.mem.Allocator, json_content: []c
             .type = model_type_name,
             .vocab = try vocab_entries.toOwnedSlice(),
             .merges = if (merge_entries.items.len > 0) try merge_entries.toOwnedSlice() else null,
-            .unk_token = null,
+            .unk_token = unk_token_str,
             .bos_token = null,
             .eos_token = null,
         },

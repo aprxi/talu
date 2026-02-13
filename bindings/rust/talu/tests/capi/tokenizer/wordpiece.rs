@@ -93,25 +93,20 @@ fn encode_empty() {
 // Decode: ## prefix handling
 // ---------------------------------------------------------------------------
 
-/// Single-token decode of a `##` subword preserves the prefix.
-/// HuggingFace returns "##lab" for `decode([11])`, not "lab".
+/// Single-token decode of a `##` subword strips the prefix.
+/// WordPiece decoder always strips `##` — the prefix is a tokenization
+/// artifact, not content.
 #[test]
-fn decode_single_subword_preserves_prefix() {
+fn decode_single_subword_strips_prefix() {
     let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
-    assert_eq!(
-        ctx.decode(&[11]), "##lab",
-        "single-token decode must preserve ## prefix"
-    );
+    assert_eq!(ctx.decode(&[11]), "lab");
 }
 
-/// Single-token decode of `##ing` preserves the prefix.
+/// Single-token decode of `##ing` strips the prefix.
 #[test]
-fn decode_single_subword_ing_preserves_prefix() {
+fn decode_single_subword_ing_strips_prefix() {
     let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
-    assert_eq!(
-        ctx.decode(&[9]), "##ing",
-        "single-token decode must preserve ## prefix"
-    );
+    assert_eq!(ctx.decode(&[9]), "ing");
 }
 
 /// In multi-token context, ## prefix is stripped and tokens are joined.

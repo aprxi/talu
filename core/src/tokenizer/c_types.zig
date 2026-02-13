@@ -195,8 +195,8 @@ pub const Tokenizer = extern struct {
                 const model: *bpe.BpeModel = @ptrCast(@alignCast(self.model.?));
                 break :blk model.decodeWithOptions(self, ids, ids_len, out, out_len, .{ .skip_special_tokens = options.skip_special_tokens });
             },
-            .wordpiece => wordpiece.wordpieceDecode(self, ids, ids_len, out, out_len),
-            .unigram => unigram.unigramDecode(self, ids, ids_len, out, out_len),
+            .wordpiece => wordpiece.wordpieceDecodeWithOptions(self, ids, ids_len, out, out_len, options),
+            .unigram => unigram.unigramDecodeWithOptions(self, ids, ids_len, out, out_len, options),
         };
     }
 

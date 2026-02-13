@@ -282,15 +282,11 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
     const len = word.len;
     const inf: f32 = 1e9;
     var best = try allocator.alloc(f32, len + 1);
-    errdefer allocator.free(best);
+    defer allocator.free(best);
     var best_len = try allocator.alloc(usize, len + 1);
-    errdefer allocator.free(best_len);
+    defer allocator.free(best_len);
     var best_entry = try allocator.alloc(?*UniEntry, len + 1);
-    defer {
-        allocator.free(best);
-        allocator.free(best_len);
-        allocator.free(best_entry);
-    }
+    defer allocator.free(best_entry);
     for (best, 0..) |*best_score, idx| {
         best_score.* = inf;
         best_len[idx] = 0;
@@ -484,43 +480,69 @@ fn unigram_encode(tokenizer: *ct.Tokenizer, text: []const u8, enc: *ct.Tokenizer
     return 0;
 }
 
-fn unigram_decode(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
+fn unigram_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
     if (tokenizer.model == null) return -1;
     const model = @as(*UnigramModel, @ptrCast(@alignCast(tokenizer.model.?)));
     const allocator = model.allocator;
 
-    var cap: usize = 1;
+    // U+2581 "▁" is encoded as 3 bytes in UTF-8: 0xE2 0x96 0x81
+    const SPIECE_UNDERLINE = "\xe2\x96\x81";
+
+    var result = std.ArrayListUnmanaged(u8){};
+    defer result.deinit(allocator);
+
     for (0..ids_len) |id_idx| {
         const id = ids[id_idx];
-        const token_slice = if (id >= 0 and @as(usize, @intCast(id)) < model.id_to_token.len and model.id_to_token[@as(usize, @intCast(id))] != null)
-            std.mem.sliceTo(model.id_to_token[@as(usize, @intCast(id))].?, 0)
-        else
-            unkSlice(model);
-        cap += token_slice.len + 1;
-    }
-    const output_buf = allocator.alloc(u8, cap) catch return -1;
-    output_buf[0] = 0;
-    var first = true;
-    var pos: usize = 0;
-    for (0..ids_len) |id_idx| {
-        const id = ids[id_idx];
-        const token_slice = if (id >= 0 and @as(usize, @intCast(id)) < model.id_to_token.len and model.id_to_token[@as(usize, @intCast(id))] != null)
-            std.mem.sliceTo(model.id_to_token[@as(usize, @intCast(id))].?, 0)
-        else
-            unkSlice(model);
-        if (!first) {
-            output_buf[pos] = ' ';
-            pos += 1;
+
+        // Check if this is a special token (skip if requested)
+        if (options.skip_special_tokens) {
+            if (isSpecialToken(tokenizer, id)) continue;
         }
-        std.mem.copyForwards(u8, output_buf[pos .. pos + token_slice.len], token_slice);
-        pos += token_slice.len;
-        first = false;
+
+        const token_slice = if (id >= 0 and @as(usize, @intCast(id)) < model.id_to_token.len and model.id_to_token[@as(usize, @intCast(id))] != null)
+            std.mem.sliceTo(model.id_to_token[@as(usize, @intCast(id))].?, 0)
+        else
+            unkSlice(model);
+
+        // Replace ▁ (U+2581) with space, copy everything else as-is
+        var i: usize = 0;
+        while (i < token_slice.len) {
+            if (i + 2 < token_slice.len and
+                token_slice[i] == SPIECE_UNDERLINE[0] and
+                token_slice[i + 1] == SPIECE_UNDERLINE[1] and
+                token_slice[i + 2] == SPIECE_UNDERLINE[2])
+            {
+                result.append(allocator, ' ') catch return -1;
+                i += 3;
+            } else {
+                result.append(allocator, token_slice[i]) catch return -1;
+                i += 1;
+            }
+        }
     }
-    // Return actual length before null terminator
-    out_len.* = pos;
-    output_buf[pos] = 0;
-    out.* = @ptrCast(output_buf.ptr);
+
+    // Apply strip_start: remove leading spaces
+    var strip_start = @as(usize, @intCast(@max(0, tokenizer.decoder.strip_start)));
+    while (strip_start > 0 and result.items.len > 0 and result.items[0] == ' ') {
+        _ = result.orderedRemove(0);
+        strip_start -= 1;
+    }
+
+    // Null-terminate and return
+    result.append(allocator, 0) catch return -1;
+    out_len.* = result.items.len - 1; // exclude null terminator
+    const owned = result.toOwnedSlice(allocator) catch return -1;
+    out.* = @ptrCast(owned.ptr);
     return 0;
+}
+
+fn isSpecialToken(tokenizer: *ct.Tokenizer, id: i32) bool {
+    var cur = tokenizer.added;
+    while (cur) |node| {
+        if (node.id == id and node.special != 0) return true;
+        cur = node.next;
+    }
+    return false;
 }
 
 fn unigram_destroy(tokenizer: *ct.Tokenizer) void {
@@ -623,7 +645,11 @@ pub fn unigramEncode(tokenizer: *ct.Tokenizer, input: []const u8, enc: *ct.Token
 }
 
 pub fn unigramDecode(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize) c_int {
-    return unigram_decode(tokenizer, ids, ids_len, out, out_len);
+    return unigram_decode_impl(tokenizer, ids, ids_len, out, out_len, .{});
+}
+
+pub fn unigramDecodeWithOptions(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: usize, out: *[*c]u8, out_len: *usize, options: ct.DecodeOptions) c_int {
+    return unigram_decode_impl(tokenizer, ids, ids_len, out, out_len, options);
 }
 
 pub fn unigramDestroy(tokenizer: *ct.Tokenizer) void {
