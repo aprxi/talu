@@ -13,7 +13,6 @@
 
 use crate::error::error_from_last_or;
 use crate::Result;
-use serde_json;
 use std::ffi::{CStr, CString};
 use std::marker::PhantomData;
 use std::os::raw::{c_char, c_void};
@@ -96,7 +95,7 @@ pub trait ResponsesView {
     }
 
     /// Gets the generation JSON for an item (if present).
-    fn get_item_generation_json(&self, index: usize) -> Option<serde_json::Value> {
+    fn get_item_generation_json(&self, index: usize) -> Option<String> {
         let mut ptr: *const u8 = std::ptr::null();
         let mut len: usize = 0;
         // SAFETY: self.as_ptr() is a valid handle; ptr/len are valid out-params.
@@ -113,7 +112,7 @@ pub trait ResponsesView {
         }
         // SAFETY: ptr is valid for len bytes (C API contract).
         let slice = unsafe { std::slice::from_raw_parts(ptr, len) };
-        serde_json::from_slice(slice).ok()
+        Some(String::from_utf8_lossy(slice).into_owned())
     }
 
     /// Returns concatenated text content for a message item.
@@ -923,13 +922,13 @@ pub struct Item {
     pub generation_ns: u64,
     /// Finish reason (e.g. "stop", "length"). None if not set.
     pub finish_reason: Option<String>,
-    /// Generation parameters (model, temperature, etc.) as JSON.
+    /// Generation parameters (model, temperature, etc.) as raw JSON string.
     /// Only populated for assistant messages. None for other roles.
-    pub generation: Option<serde_json::Value>,
+    pub generation: Option<String>,
 }
 
 /// Convert a C API `CItem` to the safe `Item` struct.
-fn item_from_c(c: &talu_sys::CItem, generation: Option<serde_json::Value>) -> Item {
+fn item_from_c(c: &talu_sys::CItem, generation: Option<String>) -> Item {
     let finish_reason = if c.finish_reason_ptr.is_null() {
         None
     } else {
@@ -1170,7 +1169,7 @@ impl<'a> ExactSizeIterator for ItemIterator<'a> {}
 fn get_item_generation_json_raw(
     ptr: *mut talu_sys::ResponsesHandle,
     index: usize,
-) -> Option<serde_json::Value> {
+) -> Option<String> {
     let mut data_ptr: *const u8 = std::ptr::null();
     let mut len: usize = 0;
     // SAFETY: ptr is a valid handle; data_ptr/len are valid out-params.
@@ -1187,7 +1186,7 @@ fn get_item_generation_json_raw(
     }
     // SAFETY: data_ptr is valid for len bytes (C API contract).
     let slice = unsafe { std::slice::from_raw_parts(data_ptr, len) };
-    serde_json::from_slice(slice).ok()
+    Some(String::from_utf8_lossy(slice).into_owned())
 }
 
 fn is_text_content(content_type: ContentType) -> bool {
