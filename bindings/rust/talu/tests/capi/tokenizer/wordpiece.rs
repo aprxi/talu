@@ -266,9 +266,13 @@ const BERT_POSTPROC_JSON: &str = r####"{
 #[test]
 fn encode_bert_postproc_adds_cls_sep() {
     let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
     // "hello" → [hello=4], with CLS/SEP → [CLS=1, hello=4, SEP=2]
     assert_eq!(
-        ctx.encode("hello"), vec![1, 4, 2],
+        ctx.encode_with("hello", &opts), vec![1, 4, 2],
         "BertProcessing must add [CLS]=1 and [SEP]=2"
     );
 }
@@ -277,8 +281,12 @@ fn encode_bert_postproc_adds_cls_sep() {
 #[test]
 fn encode_bert_postproc_empty_produces_cls_sep() {
     let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
     assert_eq!(
-        ctx.encode(""), vec![1, 2],
+        ctx.encode_with("", &opts), vec![1, 2],
         "BertProcessing: empty input must produce [CLS, SEP]"
     );
 }

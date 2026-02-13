@@ -316,6 +316,37 @@ fn encode_template_postproc_empty_string() {
     );
 }
 
+/// TemplateProcessing with add_bos=0 must NOT add BOS/EOS.
+///
+/// Regression: tri-state add_bos mapped 0 to "model default" instead of
+/// "skip post_processor", causing BOS/EOS insertion even when disabled.
+#[test]
+fn encode_template_postproc_skip_when_add_bos_zero() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "Hi" → [H=4, i=5] only, no BOS/EOS
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens, vec![4, 5],
+        "add_bos=0 must skip post_processor, got: {tokens:?}"
+    );
+}
+
+/// Default encode (EncodeOptions::default() has add_bos=0) must skip
+/// post_processor — consistent with HF encode(text, add_special_tokens=False).
+#[test]
+fn encode_template_postproc_default_opts_no_special() {
+    let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
+    let tokens = ctx.encode("Hi");
+    assert_eq!(
+        tokens, vec![4, 5],
+        "default encode must not add BOS/EOS, got: {tokens:?}"
+    );
+}
+
 // ===========================================================================
 // Metaspace pretokenizer: encode must add ▁ prefix and replace spaces
 // ===========================================================================
@@ -330,6 +361,9 @@ fn encode_template_postproc_empty_string() {
 // Affects: Mistral-7B (all versions), ~80 encode failures.
 
 /// Minimal SentencePiece BPE with Metaspace pretokenizer.
+///
+/// Vocab includes intermediate merge tokens so BPE can combine characters
+/// into whole-word tokens (e.g. ▁ + H + e + l + l + o → ▁Hello).
 const METASPACE_ENCODE_JSON: &str = r####"{
   "version": "1.0",
   "model": {
@@ -337,9 +371,15 @@ const METASPACE_ENCODE_JSON: &str = r####"{
     "vocab": {
       "<unk>": 0, "<s>": 1, "</s>": 2,
       "\u2581Hello": 3, ",": 4, "\u2581world": 5, "!": 6,
-      "\u2581": 7
+      "\u2581": 7, "H": 8, "e": 9, "l": 10, "o": 11,
+      "w": 12, "r": 13, "d": 14,
+      "He": 15, "Hel": 16, "Hell": 17, "Hello": 18,
+      "wo": 19, "wor": 20, "worl": 21, "world": 22
     },
-    "merges": []
+    "merges": [
+      "H e", "He l", "Hel l", "Hell o", "\u2581 Hello",
+      "w o", "wo r", "wor l", "worl d", "\u2581 world"
+    ]
   },
   "added_tokens": [
     {"id": 0, "content": "<unk>", "special": true},

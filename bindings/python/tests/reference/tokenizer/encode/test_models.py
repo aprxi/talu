@@ -110,7 +110,7 @@ class TestAllModelsEncodeBasic:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -145,7 +145,7 @@ class TestAllModelsEncodeNumbers:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -180,7 +180,7 @@ class TestAllModelsEncodePunctuation:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -215,7 +215,7 @@ class TestAllModelsEncodeContractions:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -250,7 +250,7 @@ class TestAllModelsEncodeWhitespace:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -285,7 +285,7 @@ class TestAllModelsEncodeUnicode:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -321,7 +321,7 @@ class TestAllModelsEncodeMultilingual:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -356,7 +356,7 @@ class TestAllModelsEncodeCode:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -391,8 +391,8 @@ class TestAllModelsRoundtrip:
         tok = load_tokenizer(model_path, tokenizer_cache, talu)
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
-        # Roundtrip with talu
-        talu_tokens = tok.encode(text)
+        # Roundtrip with talu (no special tokens — tests raw tokenization)
+        talu_tokens = tok.encode(text, special_tokens=False)
         talu_decoded = tok.decode(talu_tokens)
 
         # Roundtrip with HF

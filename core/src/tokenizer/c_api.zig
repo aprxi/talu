@@ -110,7 +110,9 @@ fn tokenizer_encode(tokenizer_handle: ?*ct.Tokenizer, input: [*:0]const u8) ?*ct
 
 /// Encode text to tokens using a slice (supports text with null bytes).
 fn tokenizer_encode_slice(tokenizer_handle: ?*ct.Tokenizer, input: []const u8) ?*ct.TokenizerEncoding {
-    return tokenizer_encode_slice_with_options(tokenizer_handle, input, .{});
+    // tokenize() is raw tokenization — never add special tokens.
+    // Callers wanting special tokens use tokenizer_encode_slice_with_options.
+    return tokenizer_encode_slice_with_options(tokenizer_handle, input, .{ .add_special_tokens = false });
 }
 
 /// Encode text to tokens with options (thread-safe).

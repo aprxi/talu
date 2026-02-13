@@ -390,12 +390,15 @@ fn encode_internal(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.Tokeniz
 
 fn encode_internal_impl(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.TokenizerEncoding, apply_postprocess: bool) !c_int {
     // Check if input exactly matches an added token - if so, skip normalization
-    // Empty input returns empty output (no tokens)
+    // Empty input returns empty output (no tokens), but still apply post-processor
+    // so that models with BOS/EOS (BERT, Llama) produce [CLS]+[SEP] or <s>+</s>.
     if (input.len == 0) {
-        out.ids = null;
-        out.tokens = null;
-        out.ids_len = 0;
-        out.tokens_len = 0;
+        out.* = std.mem.zeroes(ct.TokenizerEncoding);
+        if (apply_postprocess and tokenizer.postproc.add_special != 0) {
+            if (postprocess.postprocess_single(&tokenizer.postproc, out) != 0) {
+                return error.OutOfMemory;
+            }
+        }
         return 0;
     }
 
@@ -412,8 +415,9 @@ fn encode_internal_impl(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.To
     var normalized = try normalize.normalize_text(&tokenizer.normalizer, input);
     defer normalized.deinit();
 
-    // Add prefix space if needed
-    if (tokenizer.pretokenizer.add_prefix_space != 0 and (normalized.text.len == 0 or normalized.text[0] != ' ')) {
+    // Add prefix space if needed.
+    // Skip for Metaspace pretokenizer — Metaspace adds ▁ (not space) in encodeSegment.
+    if (tokenizer.pretokenizer.add_prefix_space != 0 and tokenizer.pretokenizer.metaspace == 0 and (normalized.text.len == 0 or normalized.text[0] != ' ')) {
         try normalize.addPrefixSpace(&normalized);
     }
 
@@ -511,11 +515,19 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
 
     const is_sentencepiece_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.regex_split != 0 and tokenizer.pretokenizer.byte_level == 0;
     const is_byte_level_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.byte_level != 0;
+    const is_metaspace_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.metaspace != 0;
 
-    if (is_sentencepiece_bpe or is_byte_level_bpe) {
+    if (is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace_bpe) {
         // Encode words separately
         for (pretokenized.tokens.items, 0..) |token_item, token_index| {
-            try encodeWord(tokenizer, token_item.sliceConst(), is_sentencepiece_bpe and token_index > 0, accumulator);
+            // SentencePiece: ▁ prefix on non-first words (first gets it from normalizer prepend).
+            // Metaspace: ▁ prefix on ALL words when add_prefix_space is set,
+            // otherwise on non-first words only.
+            const add_sp_prefix = if (is_metaspace_bpe)
+                (tokenizer.pretokenizer.add_prefix_space != 0 or token_index > 0)
+            else
+                (is_sentencepiece_bpe and token_index > 0);
+            try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator);
         }
     } else {
         // Combine and encode together

@@ -258,7 +258,7 @@ class TestAllModelsTokenProperties:
         common_words = ["the", "and", "is", "a", "to", "of"]
 
         for word in common_words:
-            talu_tokens = tok.encode(word).tolist()
+            talu_tokens = tok.encode(word, special_tokens=False).tolist()
             hf_tokens = hf_tok.encode(word, add_special_tokens=False)
 
             assert talu_tokens == hf_tokens, (
@@ -285,7 +285,7 @@ class TestAllModelsTokenProperties:
         chars = list("abcdefghijklmnopqrstuvwxyz0123456789")
 
         for char in chars:
-            talu_tokens = tok.encode(char).tolist()
+            talu_tokens = tok.encode(char, special_tokens=False).tolist()
             hf_tokens = hf_tok.encode(char, add_special_tokens=False)
 
             assert talu_tokens == hf_tokens, (

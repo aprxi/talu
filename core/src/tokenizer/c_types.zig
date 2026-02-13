@@ -93,6 +93,7 @@ pub const PreTokenizer = extern struct {
     is_sequence: c_int,
     seq: ?*PreTokenizer,
     seq_count: usize,
+    metaspace: c_int, // Metaspace pretokenizer: replace spaces with ▁ during encode
 };
 
 pub const PostProcessorEntry = extern struct {
@@ -383,6 +384,7 @@ pub const PreTokenizerSpec = extern struct {
     pattern: [*c]const u8,
     regex_split: c_int,
     regex_invert: c_int, // For Split with invert=true
+    metaspace: c_int, // Metaspace pretokenizer: replace spaces with ▁
 };
 
 pub const PostProcessorSpec = extern struct {

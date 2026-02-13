@@ -310,8 +310,8 @@ pub export fn talu_tokenizer_encode(
         return err;
     }));
 
-    const add_bos = if (options) |o| o.add_bos != 0 else true;
-    var rich = tok_offsets.encode(allocator, tok.tok.tokenizer_handle, text[0..text_len], add_bos) catch |e| {
+    const add_special = if (options) |o| o.add_bos != 0 else true;
+    var rich = tok_offsets.encode(allocator, tok.tok.tokenizer_handle, text[0..text_len], add_special) catch |e| {
         capi_error.setError(e, "Encode failed", .{});
         var err = std.mem.zeroes(EncodeResult);
         err.error_msg = "Encode failed";

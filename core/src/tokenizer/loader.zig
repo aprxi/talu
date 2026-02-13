@@ -805,6 +805,9 @@ fn parsePreTokenizer(arena_allocator: std.mem.Allocator, json_scanner: *std.json
     } else if (std.mem.eql(u8, pretokenizer.type, "BertPreTokenizer")) {
         pretokenizer.whitespace = true;
         pretokenizer.punctuation = true;
+    } else if (std.mem.eql(u8, pretokenizer.type, "Metaspace")) {
+        pretokenizer.metaspace = true;
+        pretokenizer.whitespace = true; // Split on spaces before ▁ replacement
     } else if (std.mem.eql(u8, pretokenizer.type, "Split")) {
         // For Split type, behavior determines whether we emit matches or split on pattern
         // "Isolated" = emit matches (regex_split = false)
@@ -1227,6 +1230,14 @@ fn applyConfigFromJson(tokenizer_any: anytype, json_bytes: []const u8) !void {
         }
     }
 
+    // Parse post_processor
+    if (findSection(json_bytes, "\"post_processor\"")) |section| {
+        if (section.len > 0 and section[0] == '{') {
+            const end = findMatchingBrace(section, '{', '}') orelse section.len;
+            applyPostProcessorFromJson(tokenizer, section[0..end]);
+        }
+    }
+
     // Parse decoder
     if (findSection(json_bytes, "\"decoder\"")) |section| {
         if (section.len > 0 and section[0] == '{') {
@@ -1459,6 +1470,11 @@ fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, a
         } else if (std.mem.eql(u8, type_str, "BertPreTokenizer")) {
             tokenizer.*.pretokenizer.whitespace = 1;
             tokenizer.*.pretokenizer.punctuation = 1;
+        } else if (std.mem.eql(u8, type_str, "Metaspace")) {
+            // Clear BPE default regex — Metaspace uses whitespace splitting, not regex
+            _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, null);
+            tokenizer.*.pretokenizer.metaspace = 1;
+            tokenizer.*.pretokenizer.whitespace = 1;
         } else if (std.mem.eql(u8, type_str, "Split")) {
             // Split type - parse pattern, behavior, and invert
             // Behavior: "Isolated" = emit matches, "Removed" = pattern describes what to keep (with invert)
@@ -1509,6 +1525,116 @@ fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, a
 }
 
 /// Apply decoder settings from JSON (fast path)
+/// Apply post_processor settings from JSON for the fast-path BPE loader.
+/// Parses type, cls/sep tokens (BertProcessing format), and resolves IDs
+/// from the added_tokens list.
+fn applyPostProcessorFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) void {
+    const type_str = findJsonFieldString(json_bytes, "\"type\"") orelse return;
+
+    // Set add_special for known post-processor types
+    if (std.mem.eql(u8, type_str, "BertProcessing") or
+        std.mem.eql(u8, type_str, "TemplateProcessing"))
+    {
+        tokenizer.postproc.add_special = 1;
+    } else if (std.mem.eql(u8, type_str, "RobertaProcessing")) {
+        tokenizer.postproc.add_special = 1;
+        tokenizer.postproc.pair = 1;
+    } else {
+        return;
+    }
+
+    // For BertProcessing: parse cls/sep from ["[CLS]", 1] arrays
+    // For TemplateProcessing: parse from special_tokens map
+    // In both cases, try to extract token strings
+    var cls_str: ?[]const u8 = null;
+    var sep_str: ?[]const u8 = null;
+
+    if (std.mem.eql(u8, type_str, "BertProcessing")) {
+        cls_str = findJsonFieldString(json_bytes, "\"cls\"");
+        sep_str = findJsonFieldString(json_bytes, "\"sep\"");
+    }
+
+    // For TemplateProcessing: extract from special_tokens section
+    if (std.mem.eql(u8, type_str, "TemplateProcessing")) {
+        if (findSection(json_bytes, "\"special_tokens\"")) |st_section| {
+            // Find token strings by looking for "id" fields
+            // The special_tokens map has entries like: "<s>": {"id": "<s>", "ids": [1], ...}
+            // We extract the keys (which are the token strings)
+            var cursor: usize = 0;
+            var found_first = false;
+            while (cursor < st_section.len) {
+                if (st_section[cursor] == '"') {
+                    const str_start = cursor + 1;
+                    cursor += 1;
+                    while (cursor < st_section.len and st_section[cursor] != '"') {
+                        if (st_section[cursor] == '\\') cursor += 2 else cursor += 1;
+                    }
+                    const str_end = cursor;
+                    if (cursor < st_section.len) cursor += 1;
+                    // Check if this is followed by ':' (a key, not a value)
+                    var peek = cursor;
+                    while (peek < st_section.len and (st_section[peek] == ' ' or st_section[peek] == '\n' or st_section[peek] == '\t')) : (peek += 1) {}
+                    if (peek < st_section.len and st_section[peek] == ':') {
+                        const key = st_section[str_start..str_end];
+                        if (!found_first) {
+                            cls_str = key;
+                            found_first = true;
+                        } else if (sep_str == null) {
+                            sep_str = key;
+                        }
+                        cursor = peek + 1;
+                        // Skip past the value object to avoid picking up nested keys
+                        while (cursor < st_section.len and st_section[cursor] != '{') : (cursor += 1) {}
+                        if (cursor < st_section.len) {
+                            cursor = cursor + (findMatchingBrace(st_section[cursor..], '{', '}') orelse (st_section.len - cursor));
+                        }
+                    }
+                } else {
+                    cursor += 1;
+                }
+            }
+        }
+    }
+
+    // Default token strings
+    if (cls_str == null) {
+        if (std.mem.eql(u8, type_str, "RobertaProcessing")) {
+            cls_str = "<s>";
+            sep_str = if (sep_str == null) "</s>" else sep_str;
+        } else {
+            cls_str = "[CLS]";
+            sep_str = if (sep_str == null) "[SEP]" else sep_str;
+        }
+    }
+    if (sep_str == null) sep_str = cls_str;
+
+    // Copy token strings into postproc
+    if (cls_str) |cls| {
+        const copy_len = @min(cls.len, tokenizer.postproc.cls_token.len - 1);
+        @memcpy(tokenizer.postproc.cls_token[0..copy_len], cls[0..copy_len]);
+        tokenizer.postproc.cls_token[copy_len] = 0;
+    }
+    if (sep_str) |sep| {
+        const copy_len = @min(sep.len, tokenizer.postproc.sep_token.len - 1);
+        @memcpy(tokenizer.postproc.sep_token[0..copy_len], sep[0..copy_len]);
+        tokenizer.postproc.sep_token[copy_len] = 0;
+    }
+
+    // Resolve cls_id/sep_id from added tokens
+    if (tokenizer.postproc.cls_id == -1) {
+        const cls_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.cls_token);
+        if (tok_fns.tokenizer_added_token_find(tokenizer, cls_z)) |added| {
+            tokenizer.postproc.cls_id = added.id;
+        }
+    }
+    if (tokenizer.postproc.sep_id == -1) {
+        const sep_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.sep_token);
+        if (tok_fns.tokenizer_added_token_find(tokenizer, sep_z)) |added| {
+            tokenizer.postproc.sep_id = added.id;
+        }
+    }
+}
+
 fn applyDecoderFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) void {
     // Look for Strip decoder by finding "type": "Strip" pattern
     const strip_pattern = "\"type\": \"Strip\"";
@@ -1577,11 +1703,15 @@ fn build_tokenizer_from_root(arena: *std.heap.ArenaAllocator, root: schema.Token
         .pattern = if (root.pre_tokenizer.pattern) |p| (arena.allocator().dupeZ(u8, p) catch return error.BuildFailed).ptr else null,
         .regex_split = if (root.pre_tokenizer.regex_split) 1 else 0,
         .regex_invert = if (root.pre_tokenizer.regex_invert) 1 else 0,
+        .metaspace = if (root.pre_tokenizer.metaspace) 1 else 0,
     };
     tok_fns.tokenizer_apply_pretokenizer_spec(tokenizer, &pretokenizer_spec);
 
-    // Apply post_processor settings only if explicitly specified in JSON
-    // This preserves model-specific defaults (e.g., WordPiece sets add_special=1)
+    // Apply post_processor settings from JSON.
+    // When JSON explicitly specifies a post_processor, use those settings.
+    // When JSON has no post_processor (null), clear any model default (e.g.,
+    // WordPiece init sets add_special=1 for BERT-like behavior, but we must
+    // respect the JSON configuration as authoritative).
     if (root.post_processor.type.len > 0 or root.post_processor.add_special or root.post_processor.pair or root.post_processor.cls_token != null or root.post_processor.sep_token != null) {
         const postprocessor_spec = ct.PostProcessorSpec{
             .type = if (root.post_processor.type.len > 0) (arena.allocator().dupeZ(u8, root.post_processor.type) catch return error.BuildFailed).ptr else null,
@@ -1591,6 +1721,24 @@ fn build_tokenizer_from_root(arena: *std.heap.ArenaAllocator, root: schema.Token
             .sep_token = if (root.post_processor.sep_token) |sep| (arena.allocator().dupeZ(u8, sep) catch return error.BuildFailed).ptr else null,
         };
         tok_fns.tokenizer_apply_postprocessor_spec(tokenizer, &postprocessor_spec);
+    }
+
+    // Resolve cls_id/sep_id from added tokens when post_processor is active.
+    // BPE/Unigram init sets cls_id/sep_id to -1; WordPiece resolves from its own
+    // vocab. For TemplateProcessing/BertProcessing on BPE models, the token
+    // strings (cls_token/sep_token) are set above but the IDs are never resolved.
+    // Look up the token strings in the added_tokens list to find the correct IDs.
+    if (tokenizer.postproc.add_special != 0 and tokenizer.postproc.cls_id == -1) {
+        const cls_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.cls_token);
+        if (tok_fns.tokenizer_added_token_find(tokenizer, cls_z)) |added| {
+            tokenizer.postproc.cls_id = added.id;
+        }
+    }
+    if (tokenizer.postproc.add_special != 0 and tokenizer.postproc.sep_id == -1) {
+        const sep_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.sep_token);
+        if (tok_fns.tokenizer_added_token_find(tokenizer, sep_z)) |added| {
+            tokenizer.postproc.sep_id = added.id;
+        }
     }
 
     // Apply decoder settings (e.g., Strip decoder for SentencePiece)

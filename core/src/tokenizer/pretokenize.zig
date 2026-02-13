@@ -144,6 +144,7 @@ pub fn tokenizer_apply_pretokenizer_spec(tok: ?*ct.Tokenizer, spec: ?*const ct.P
     tokenizer.pretokenizer.punctuation = pretokenizer_spec.punctuation;
     tokenizer.pretokenizer.regex_split = pretokenizer_spec.regex_split;
     tokenizer.pretokenizer.regex_invert = pretokenizer_spec.regex_invert;
+    tokenizer.pretokenizer.metaspace = pretokenizer_spec.metaspace;
     if (pretokenizer_spec.pattern) |pat| {
         _ = tokenizer_pretokenizer_set(&tokenizer.pretokenizer, @ptrCast(pat));
     }
@@ -427,6 +428,7 @@ test "tokenizer_apply_pretokenizer_spec sets options" {
         .pattern = null,
         .regex_split = 0,
         .regex_invert = 0,
+        .metaspace = 0,
     };
 
     tokenizer_apply_pretokenizer_spec(&tok, &spec);

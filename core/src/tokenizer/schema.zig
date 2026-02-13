@@ -59,6 +59,8 @@ pub const PreTokenizer = struct {
     pattern: ?[]const u8 = null,
     regex_split: bool = false,
     regex_invert: bool = false,
+    // Metaspace: replace spaces with ▁ (U+2581)
+    metaspace: bool = false,
 };
 
 pub const PostProcessor = struct {

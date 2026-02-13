@@ -211,7 +211,7 @@ class TestAllModelsStress:
         # 500 words
         text = " ".join(["testing"] * 500)
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -243,7 +243,7 @@ class TestAllModelsStress:
         # All printable ASCII
         text = string.printable
 
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, f"[{model_name}] Token mismatch for ASCII printable"
@@ -280,7 +280,7 @@ class TestAllModelsStress:
         ]
 
         for sample in samples:
-            talu_tokens = tok.encode(sample).tolist()
+            talu_tokens = tok.encode(sample, special_tokens=False).tolist()
             hf_tokens = hf_tok.encode(sample, add_special_tokens=False)
 
             assert talu_tokens == hf_tokens, (
@@ -363,7 +363,7 @@ class TestNullBytes:
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
         text = "\x00"
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -387,7 +387,7 @@ class TestNullBytes:
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
         text = "Hello\x00World"
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -413,7 +413,7 @@ class TestNullBytes:
         hf_tok = load_hf_tokenizer(model_path, hf_tokenizer_cache, transformers)
 
         text = "\x00\x00\x00"
-        talu_tokens = tok.encode(text).tolist()
+        talu_tokens = tok.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tok.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
