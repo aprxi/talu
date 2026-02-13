@@ -414,24 +414,12 @@ def call_list_concat_with_tokens(token_list: list[int], ptr2: "Any", len2: int) 
     )
 
 
-def call_tokenizer_compute_offsets(
-    ptr: int, text_bytes: bytes
-) -> tuple[list[tuple[int, int]], str | None]:
-    """Compute token offsets for text.
+def call_encode_result_free(result: "Any") -> None:
+    """Free an EncodeResult.
 
-    Returns
-    -------
-        Tuple of (offsets_list, error_msg). offsets_list is list of (start, end) tuples.
+    Null out result.ids first if ownership was transferred to a SharedBuffer.
     """
-    text_array = (ctypes.c_char * len(text_bytes)).from_buffer_copy(text_bytes)
-    result = _lib.talu_tokenizer_compute_offsets(ptr, text_array, len(text_bytes))
-
-    if result.error_msg:
-        return ([], result.error_msg.decode("utf-8"))
-
-    offsets = [(result.offsets[i].start, result.offsets[i].end) for i in range(result.len)]
-    _lib.talu_offsets_free(result)
-    return (offsets, None)
+    _lib.talu_encode_result_free(result)
 
 
 def get_ptr_address(ptr: "Any") -> int:

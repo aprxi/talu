@@ -69,27 +69,23 @@ fn decode_1mb_roundtrip() {
     assert_eq!(decoded, input);
 }
 
-/// compute_offsets on 100K chars produces contiguous single-byte spans.
+/// Encoding 100K chars produces offsets with contiguous single-byte spans.
 #[test]
-fn compute_offsets_100k_chars() {
+fn encode_offsets_100k_chars() {
     let ctx = TokenizerTestContext::new();
     let input = ascii_string(100_000);
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            input.as_bytes().as_ptr(),
-            input.len(),
-        )
+        super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 100_000);
+    assert_eq!(result.num_tokens, 100_000);
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets[0].end, 1);
     assert_eq!(offsets.last().unwrap().end as usize, 100_000);
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// tokenize_bytes on 100K chars produces 100K tokens.
@@ -187,24 +183,21 @@ fn rapid_tokenizer_create_free_100_cycles() {
     }
 }
 
-/// 100 compute_offsets→free cycles.
+/// 100 encode→free cycles checking offsets.
 #[test]
-fn rapid_offsets_free_100_cycles() {
+fn rapid_encode_offsets_free_100_cycles() {
     let ctx = TokenizerTestContext::new();
+    let opts = no_bos();
     let texts = ["Hello", "abc", "!@#$%"];
 
     for i in 0..100 {
         let text = texts[i % texts.len()];
         let result = unsafe {
-            talu_sys::talu_tokenizer_compute_offsets(
-                ctx.handle(),
-                text.as_bytes().as_ptr(),
-                text.len(),
-            )
+            super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
         };
         assert!(result.error_msg.is_null(), "cycle {i}: should succeed");
-        assert_eq!(result.len, text.len());
-        unsafe { talu_sys::talu_offsets_free(result) };
+        assert_eq!(result.num_tokens, text.len());
+        unsafe { talu_sys::talu_encode_result_free(result) };
     }
 }
 
@@ -248,13 +241,13 @@ fn concurrent_encode_8_threads() {
                     "thread {thread_id} iter {i}: encode failed"
                 );
                 let tokens = unsafe {
-                    std::slice::from_raw_parts(result.tokens, result.num_tokens)
+                    std::slice::from_raw_parts(result.ids, result.num_tokens)
                 };
                 assert_eq!(
                     tokens, expected[idx],
                     "thread {thread_id} iter {i}: wrong tokens"
                 );
-                unsafe { talu_sys::talu_tokens_free(result.tokens, result.num_tokens) };
+                unsafe { talu_sys::talu_encode_result_free(result) };
             }
         });
         handles.push(handle);
@@ -354,7 +347,7 @@ fn concurrent_roundtrip_8_threads() {
                 let dec = unsafe {
                     super::common::decode_raw(
                         shared.ptr(),
-                        std::slice::from_raw_parts(enc.tokens, enc.num_tokens),
+                        std::slice::from_raw_parts(enc.ids, enc.num_tokens),
                         &decode_opts,
                     )
                 };
@@ -370,7 +363,7 @@ fn concurrent_roundtrip_8_threads() {
                 );
 
                 unsafe {
-                    talu_sys::talu_tokens_free(enc.tokens, enc.num_tokens);
+                    talu_sys::talu_encode_result_free(enc);
                     talu_sys::talu_decode_result_free(dec.text, dec.text_len);
                 };
             }
@@ -532,7 +525,7 @@ fn concurrent_tokenizer_creation_8_threads() {
                 };
                 assert!(result.error_msg.is_null());
                 let tokens = unsafe {
-                    std::slice::from_raw_parts(result.tokens, result.num_tokens)
+                    std::slice::from_raw_parts(result.ids, result.num_tokens)
                 };
                 assert_eq!(
                     tokens, &[44, 77],
@@ -540,7 +533,7 @@ fn concurrent_tokenizer_creation_8_threads() {
                 );
 
                 unsafe {
-                    talu_sys::talu_tokens_free(result.tokens, result.num_tokens);
+                    talu_sys::talu_encode_result_free(result);
                     talu_sys::talu_tokenizer_free(h);
                 };
             }
@@ -617,10 +610,10 @@ fn concurrent_byte_level_encode_8_threads() {
                     };
                     assert!(result.error_msg.is_null());
                     let tokens = unsafe {
-                        std::slice::from_raw_parts(result.tokens, result.num_tokens)
+                        std::slice::from_raw_parts(result.ids, result.num_tokens)
                     };
                     assert_eq!(tokens, expected.as_slice(), "byte-level encode mismatch");
-                    unsafe { talu_sys::talu_tokens_free(result.tokens, result.num_tokens) };
+                    unsafe { talu_sys::talu_encode_result_free(result) };
                 }
             })
         })
@@ -654,7 +647,7 @@ fn concurrent_byte_level_roundtrip_8_threads() {
                     };
                     assert!(result.error_msg.is_null());
                     let tokens = unsafe {
-                        std::slice::from_raw_parts(result.tokens, result.num_tokens)
+                        std::slice::from_raw_parts(result.ids, result.num_tokens)
                     };
 
                     let dec_result = unsafe {
@@ -675,7 +668,7 @@ fn concurrent_byte_level_roundtrip_8_threads() {
 
                     unsafe {
                         talu_sys::talu_text_free(dec_result.text as *const i8);
-                        talu_sys::talu_tokens_free(result.tokens, result.num_tokens);
+                        talu_sys::talu_encode_result_free(result);
                     };
                 }
             })

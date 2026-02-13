@@ -1,7 +1,8 @@
-//! Token Offset Computation
+//! Token Offset Computation & Rich Encoding
 //!
-//! Utilities for computing byte offsets that map tokens back to source text.
-//! Used by the C API for token-to-text alignment.
+//! Utilities for computing byte offsets that map tokens back to source text,
+//! and the combined "rich encode" operation that produces IDs, offsets, and masks
+//! in a single pass through the encoding pipeline.
 
 const std = @import("std");
 const ct = @import("c_types.zig");
@@ -13,47 +14,25 @@ pub const TokenOffset = extern struct {
     end: u32,
 };
 
-/// Result of offset computation.
-pub const OffsetsResult = struct {
-    offsets: []TokenOffset,
-    allocator: std.mem.Allocator,
-
-    pub fn deinit(self: *OffsetsResult) void {
-        if (self.offsets.len > 0) {
-            self.allocator.free(self.offsets);
-        }
-        self.* = undefined;
-    }
-};
-
-/// Compute byte offsets for tokens in the source text.
-/// Returns offsets mapping each token to its position in the original text.
-pub fn computeOffsets(
-    allocator: std.mem.Allocator,
+/// Compute byte offsets from an already-computed encoding's token strings.
+/// Matches each token's decoded byte representation against the source text.
+/// Caller owns the returned slice.
+pub fn computeOffsetsFromEncoding(
+    alloc: std.mem.Allocator,
+    encoding: *const ct.TokenizerEncoding,
     tokenizer_handle: *ct.Tokenizer,
     text: []const u8,
-) !OffsetsResult {
-    var token_encoding = std.mem.zeroes(ct.TokenizerEncoding);
-    if (tok_encode.tokenizer_encode_struct(tokenizer_handle, text, &token_encoding) != 0) {
-        return error.TokenizationFailed;
-    }
-    defer tok_encode.tokenizer_encoding_free_struct(&token_encoding);
+) ![]TokenOffset {
+    const token_count = encoding.ids_len;
+    if (token_count == 0) return &.{};
 
-    const token_count = token_encoding.ids_len;
-    if (token_count == 0) {
-        return OffsetsResult{
-            .offsets = &.{},
-            .allocator = allocator,
-        };
-    }
-
-    const offsets = try allocator.alloc(TokenOffset, token_count);
-    errdefer allocator.free(offsets);
+    const offsets = try alloc.alloc(TokenOffset, token_count);
+    errdefer alloc.free(offsets);
 
     var text_offset: u32 = 0;
 
     for (0..token_count) |token_idx| {
-        const token_cstrs: [*][*c]u8 = if (token_encoding.tokens) |toks|
+        const token_cstrs: [*][*c]u8 = if (encoding.tokens) |toks|
             @ptrCast(toks)
         else {
             offsets[token_idx] = .{ .start = 0, .end = 0 };
@@ -67,11 +46,11 @@ pub fn computeOffsets(
         }
 
         const token_text = std.mem.sliceTo(token_ptr, 0);
-        const token_byte_sequence = decodeTokenToBytes(allocator, token_text, tokenizer_handle) catch {
+        const token_byte_sequence = decodeTokenToBytes(alloc, token_text, tokenizer_handle) catch {
             offsets[token_idx] = .{ .start = 0, .end = 0 };
             continue;
         };
-        defer if (token_byte_sequence.ptr != token_text.ptr) allocator.free(token_byte_sequence);
+        defer if (token_byte_sequence.ptr != token_text.ptr) alloc.free(token_byte_sequence);
 
         const remaining_text = text[text_offset..];
         if (findSubsequence(remaining_text, token_byte_sequence)) |match_offset| {
@@ -84,9 +63,88 @@ pub fn computeOffsets(
         }
     }
 
-    return OffsetsResult{
+    return offsets;
+}
+
+/// Combined encoding result with IDs, offsets, and masks.
+/// Produced by encode(). Caller owns all slices; call deinit() to free.
+pub const Encoding = struct {
+    ids: []u32,
+    offsets: []TokenOffset,
+    attention_mask: []u32,
+    special_tokens_mask: []u32,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Encoding) void {
+        if (self.ids.len > 0) self.allocator.free(self.ids);
+        if (self.offsets.len > 0) self.allocator.free(self.offsets);
+        if (self.attention_mask.len > 0) self.allocator.free(self.attention_mask);
+        if (self.special_tokens_mask.len > 0) self.allocator.free(self.special_tokens_mask);
+        self.* = undefined;
+    }
+};
+
+/// Single-pass encode producing IDs, offsets, attention mask, and special tokens mask.
+///
+/// Runs the encoding pipeline once and computes source-text byte offsets from the
+/// resulting token strings. This avoids the O(2N) cost of calling encode() and
+/// computeOffsets() separately (each of which runs the full pipeline independently).
+/// Caller owns the result; call deinit() to free all buffers.
+pub fn encode(
+    alloc: std.mem.Allocator,
+    tokenizer_handle: *ct.Tokenizer,
+    text: []const u8,
+    add_special_tokens: bool,
+) !Encoding {
+    // Full encode to get IDs, token strings, attention mask, and special tokens mask.
+    var encoding = std.mem.zeroes(ct.TokenizerEncoding);
+    const options = tok_encode.EncodeOptions{ .add_special_tokens = add_special_tokens };
+    if (tok_encode.tokenizer_encode_struct_with_options(tokenizer_handle, text, &encoding, options) != 0) {
+        return error.TokenizationFailed;
+    }
+    defer tok_encode.tokenizer_encoding_free_struct(&encoding);
+
+    const token_count = encoding.ids_len;
+    if (token_count == 0) {
+        return Encoding{
+            .ids = &.{},
+            .offsets = &.{},
+            .attention_mask = &.{},
+            .special_tokens_mask = &.{},
+            .allocator = alloc,
+        };
+    }
+
+    // Compute source-text byte offsets from the encoding's token strings.
+    const offsets = try computeOffsetsFromEncoding(alloc, &encoding, tokenizer_handle, text);
+    errdefer alloc.free(offsets);
+
+    // Convert i32 arrays from the encoding to u32 for the C-API contract.
+    const ids = try alloc.alloc(u32, token_count);
+    errdefer alloc.free(ids);
+
+    const attention_mask = try alloc.alloc(u32, token_count);
+    errdefer alloc.free(attention_mask);
+
+    const special_tokens_mask = try alloc.alloc(u32, token_count);
+    errdefer alloc.free(special_tokens_mask);
+
+    const enc_ids: [*]i32 = @ptrCast(encoding.ids orelse return error.TokenizationFailed);
+    const enc_mask: ?[*]i32 = if (encoding.attention_mask) |m| @ptrCast(m) else null;
+    const enc_special: ?[*]i32 = if (encoding.special_tokens_mask) |s| @ptrCast(s) else null;
+
+    for (0..token_count) |i| {
+        ids[i] = @intCast(enc_ids[i]);
+        attention_mask[i] = if (enc_mask) |m| @intCast(m[i]) else 1;
+        special_tokens_mask[i] = if (enc_special) |s| @intCast(s[i]) else 0;
+    }
+
+    return Encoding{
+        .ids = ids,
         .offsets = offsets,
-        .allocator = allocator,
+        .attention_mask = attention_mask,
+        .special_tokens_mask = special_tokens_mask,
+        .allocator = alloc,
     };
 }
 
@@ -282,4 +340,14 @@ test "findSubsequence finds single character" {
     const result = findSubsequence("hello", "l");
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(usize, 2), result.?);
+}
+
+test "computeOffsetsFromEncoding requires integration testing" {
+    // Requires fully initialized tokenizer with vocab, model, normalizer.
+    // Integration tests: tests/tokenizer/test_*.py
+}
+
+test "encode requires integration testing" {
+    // Requires fully initialized tokenizer with vocab, model, normalizer.
+    // Integration tests: tests/tokenizer/test_*.py
 }

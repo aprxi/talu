@@ -225,25 +225,21 @@ fn tokenize_strings_emoji() {
 }
 
 // ===========================================================================
-// Compute offsets with multi-byte input
+// Encode offsets with multi-byte input
 // ===========================================================================
 
 /// Offsets for "café" (5 bytes): 5 contiguous single-byte spans.
 #[test]
-fn compute_offsets_multibyte() {
+fn encode_offsets_multibyte() {
     let ctx = TokenizerTestContext::new();
     let text = "café";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 5); // 5 bytes = 5 tokens = 5 offsets
+    assert_eq!(result.num_tokens, 5); // 5 bytes = 5 tokens = 5 offsets
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets.last().unwrap().end as usize, text.len());
 
@@ -252,47 +248,39 @@ fn compute_offsets_multibyte() {
         assert_eq!(w[0].end, w[1].start, "offsets should be contiguous");
     }
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// Offsets for "🎉" (4 bytes): 4 spans covering [0,4).
 #[test]
-fn compute_offsets_emoji() {
+fn encode_offsets_emoji() {
     let ctx = TokenizerTestContext::new();
     let text = "🎉";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 4);
+    assert_eq!(result.num_tokens, 4);
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets[3].end as usize, 4);
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// Offsets for "Hi🎉bye" (9 bytes): 9 contiguous spans covering [0,9).
 #[test]
-fn compute_offsets_mixed_ascii_emoji() {
+fn encode_offsets_mixed_ascii_emoji() {
     let ctx = TokenizerTestContext::new();
     let text = "Hi🎉bye";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, text.len());
+    assert_eq!(result.num_tokens, text.len());
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets.last().unwrap().end as usize, text.len());
 
@@ -300,7 +288,7 @@ fn compute_offsets_mixed_ascii_emoji() {
         assert_eq!(w[0].end, w[1].start);
     }
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 // ===========================================================================
@@ -309,20 +297,16 @@ fn compute_offsets_mixed_ascii_emoji() {
 
 /// Offsets for CJK text "日本" (6 UTF-8 bytes): 6 contiguous single-byte spans.
 #[test]
-fn compute_offsets_cjk() {
+fn encode_offsets_cjk() {
     let ctx = TokenizerTestContext::new();
     let text = "日本";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 6); // 6 bytes = 6 tokens = 6 offsets
+    assert_eq!(result.num_tokens, 6); // 6 bytes = 6 tokens = 6 offsets
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets.last().unwrap().end as usize, 6);
 
@@ -330,7 +314,7 @@ fn compute_offsets_cjk() {
         assert_eq!(w[0].end, w[1].start, "offsets should be contiguous");
     }
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// "hello🎉": "hello" merges to one token, emoji bytes → unk.

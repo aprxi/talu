@@ -16,6 +16,7 @@ from ._bindings import (
     call_apply_chat_template_string,
     call_buffer_create_from_owned,
     call_buffer_get_data_ptr,
+    call_encode_result_free,
     call_resolve_model_path,
     call_tokenizer_create,
     call_tokenizer_create_from_json,
@@ -32,14 +33,13 @@ from ._bindings import (
     call_tokenizer_token_to_id,
     call_tokenizer_tokenize,
     call_tokenizer_tokenize_bytes,
-    call_tokens_free,
     free_tokenize_bytes_result,
     free_tokenize_result,
 )
 from .batch import BatchEncoding
 from .special_tokens import SpecialTokensMixin
 from .template import ChatTemplate
-from .token_array import TokenArray
+from .token_array import TokenArray, TokenOffset
 
 logger = scoped_logger("tokenizer")
 
@@ -539,32 +539,34 @@ class Tokenizer(SpecialTokensMixin):
         if result.error_msg:
             raise TokenizerError(f"Encode failed: {result.error_msg.decode('utf-8')}")
 
-        # Handle empty result - create a TokenArray with no buffer
+        # Handle empty result
         if result.num_tokens == 0:
-            return TokenArray(
-                None,
-                0,
-                source_text=text_bytes,
-                tokenizer=self,
-                _buffer_handle=None,
-            )
+            return TokenArray(None, 0, _offsets=[])
 
-        # Wrap the token data in a SharedBuffer for refcounted memory management
-        # talu_buffer_create_from_owned takes ownership of the pointer
-        buffer_handle = call_buffer_create_from_owned(result.tokens, result.num_tokens)
+        num_tokens = result.num_tokens
+
+        # Extract offsets into Python objects
+        offsets = [
+            TokenOffset(result.offsets[i].start, result.offsets[i].end)
+            for i in range(num_tokens)
+        ]
+
+        # Transfer ids ownership to SharedBuffer
+        buffer_handle = call_buffer_create_from_owned(result.ids, num_tokens)
         if not buffer_handle:
-            # Clean up the tokens if buffer creation fails
-            call_tokens_free(result.tokens, result.num_tokens)
+            call_encode_result_free(result)
             raise MemoryError("Failed to create SharedBuffer for TokenArray")
 
-        # Get the data pointer from the buffer
         data_ptr = call_buffer_get_data_ptr(buffer_handle)
+
+        # Null out ids (now owned by SharedBuffer), free remaining arrays
+        result.ids = None
+        call_encode_result_free(result)
 
         return TokenArray(
             data_ptr,
-            result.num_tokens,
-            source_text=text_bytes,
-            tokenizer=self,
+            num_tokens,
+            _offsets=offsets,
             _buffer_handle=buffer_handle,
         )
 

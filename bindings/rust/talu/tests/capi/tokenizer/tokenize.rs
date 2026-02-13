@@ -277,77 +277,65 @@ fn tokenize_bytes_partial_merge() {
 }
 
 // ===========================================================================
-// compute_offsets with merged tokens
+// Encode offsets with merged tokens
 // ===========================================================================
 
-/// compute_offsets for "hello" with merges: 1 token spanning [0, 5).
+/// Encoding "hello" with merges: 1 token spanning [0, 5).
 #[test]
-fn compute_offsets_merged_hello() {
+fn encode_offsets_merged_hello() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hello";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 1);
+    assert_eq!(result.num_tokens, 1);
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets[0].end, 5);
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
-/// compute_offsets for "helo" with merges: 2 tokens at [0,3) and [3,4).
+/// Encoding "helo" with merges: 2 tokens at [0,3) and [3,4).
 #[test]
-fn compute_offsets_partial_merge() {
+fn encode_offsets_partial_merge() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "helo";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 2);
+    assert_eq!(result.num_tokens, 2);
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets[0].end, 3);
     assert_eq!(offsets[1].start, 3);
     assert_eq!(offsets[1].end, 4);
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
-/// compute_offsets for "hellohello" with merges: 2 tokens each spanning 5 bytes.
+/// Encoding "hellohello" with merges: 2 tokens each spanning 5 bytes.
 #[test]
-fn compute_offsets_repeated_merge() {
+fn encode_offsets_repeated_merge() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hellohello";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 2);
+    assert_eq!(result.num_tokens, 2);
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets[0].end, 5);
     assert_eq!(offsets[1].start, 5);
     assert_eq!(offsets[1].end, 10);
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 // ===========================================================================

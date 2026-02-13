@@ -195,20 +195,16 @@ fn count_tokens_matches_encode_length() {
             )
         };
 
-        // compute_offsets should also agree.
-        let offsets_result = unsafe {
-            talu_sys::talu_tokenizer_compute_offsets(
-                ctx.handle(),
-                text.as_bytes().as_ptr(),
-                text.len(),
-            )
+        // Encode result offsets count should also agree.
+        let encode_result = unsafe {
+            super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
         };
-        assert!(offsets_result.error_msg.is_null());
+        assert!(encode_result.error_msg.is_null());
         assert_eq!(
-            offsets_result.len, encode_len,
-            "offsets count mismatch for {text:?}"
+            encode_result.num_tokens, encode_len,
+            "encode offsets count mismatch for {text:?}"
         );
-        unsafe { talu_sys::talu_offsets_free(offsets_result) };
+        unsafe { talu_sys::talu_encode_result_free(encode_result) };
     }
 }
 

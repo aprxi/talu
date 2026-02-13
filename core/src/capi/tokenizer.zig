@@ -40,7 +40,10 @@ fn allocZFromSlice(bytes: []const u8) ?[*:0]u8 {
 pub const OpaqueTokenizerHandle = opaque {};
 
 pub const EncodeResult = extern struct {
-    tokens: ?[*]u32,
+    ids: ?[*]u32,
+    offsets: ?[*]TokenOffset,
+    attention_mask: ?[*]u32,
+    special_tokens_mask: ?[*]u32,
     num_tokens: usize,
     error_msg: ?[*:0]const u8,
 };
@@ -77,12 +80,6 @@ pub const TokenizeBytesResult = extern struct {
 pub const TokenOffset = extern struct {
     start: u32,
     end: u32,
-};
-
-pub const OffsetsResult = extern struct {
-    offsets: ?[*]TokenOffset,
-    len: usize,
-    error_msg: ?[*:0]const u8,
 };
 
 pub const EosTokenResult = extern struct {
@@ -295,21 +292,11 @@ fn computeTruncation(ids_len: usize, options: ?*const EncodeOptions) TruncationP
     return .{ .start = start, .count = count };
 }
 
-/// Copy token IDs to output buffer. Returns null on allocation failure.
-fn copyTokensToOutput(ids: []const u32, params: TruncationParams) ?EncodeResult {
-    const out = allocator.alloc(u32, params.count) catch return null;
-    @memcpy(out, ids[params.start..][0..params.count]);
-    var result = std.mem.zeroes(EncodeResult);
-    result.tokens = out.ptr;
-    result.num_tokens = params.count;
-    return result;
-}
-
-/// Encodes text to token IDs.
+/// Encodes text to token IDs, byte offsets, attention mask, and special tokens mask.
 ///
-/// Options control BOS/EOS token handling, truncation, and max length.
-/// Pass null for options to use defaults.
-/// Caller must free tokens via talu_tokens_free().
+/// Runs the full encoding pipeline once and computes all metadata simultaneously.
+/// Options control BOS/EOS handling and truncation.
+/// Caller must free via talu_encode_result_free().
 pub export fn talu_tokenizer_encode(
     handle: ?*OpaqueTokenizerHandle,
     text: [*]const u8,
@@ -318,21 +305,93 @@ pub export fn talu_tokenizer_encode(
 ) callconv(.c) EncodeResult {
     const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
         capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
-        return .{ .tokens = null, .num_tokens = 0, .error_msg = "Invalid handle" };
+        var err = std.mem.zeroes(EncodeResult);
+        err.error_msg = "Invalid handle";
+        return err;
     }));
 
     const add_bos = if (options) |o| o.add_bos != 0 else true;
-    const ids = tok.tok.encodeSliceWithOptions(text[0..text_len], .{ .add_special_tokens = add_bos }) catch |e| {
+    var rich = tok_offsets.encode(allocator, tok.tok.tokenizer_handle, text[0..text_len], add_bos) catch |e| {
         capi_error.setError(e, "Encode failed", .{});
-        return .{ .tokens = null, .num_tokens = 0, .error_msg = "Encode failed" };
+        var err = std.mem.zeroes(EncodeResult);
+        err.error_msg = "Encode failed";
+        return err;
     };
-    defer tok.tok.allocator.free(ids);
 
-    const params = computeTruncation(ids.len, options);
-    return copyTokensToOutput(ids, params) orelse {
-        capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
-        return .{ .tokens = null, .num_tokens = 0, .error_msg = "OutOfMemory" };
-    };
+    const params = computeTruncation(rich.ids.len, options);
+
+    var ret = std.mem.zeroes(EncodeResult);
+    if (params.count == 0) {
+        rich.deinit();
+        return ret;
+    }
+
+    if (params.start == 0 and params.count == rich.ids.len) {
+        // No truncation — transfer ownership directly.
+        ret.ids = rich.ids.ptr;
+        ret.offsets = @ptrCast(rich.offsets.ptr);
+        ret.attention_mask = rich.attention_mask.ptr;
+        ret.special_tokens_mask = rich.special_tokens_mask.ptr;
+        ret.num_tokens = rich.ids.len;
+    } else {
+        // Truncation: copy the requested window, free originals.
+        const out_ids = allocator.alloc(u32, params.count) catch {
+            rich.deinit();
+            capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
+            var err = std.mem.zeroes(EncodeResult);
+            err.error_msg = "OutOfMemory";
+            return err;
+        };
+        const out_offsets = allocator.alloc(TokenOffset, params.count) catch {
+            allocator.free(out_ids);
+            rich.deinit();
+            var err = std.mem.zeroes(EncodeResult);
+            err.error_msg = "OutOfMemory";
+            return err;
+        };
+        const out_mask = allocator.alloc(u32, params.count) catch {
+            allocator.free(out_ids);
+            allocator.free(out_offsets);
+            rich.deinit();
+            var err = std.mem.zeroes(EncodeResult);
+            err.error_msg = "OutOfMemory";
+            return err;
+        };
+        const out_special = allocator.alloc(u32, params.count) catch {
+            allocator.free(out_ids);
+            allocator.free(out_offsets);
+            allocator.free(out_mask);
+            rich.deinit();
+            var err = std.mem.zeroes(EncodeResult);
+            err.error_msg = "OutOfMemory";
+            return err;
+        };
+
+        @memcpy(out_ids, rich.ids[params.start..][0..params.count]);
+        const src_offsets: [*]const TokenOffset = @ptrCast(rich.offsets[params.start..].ptr);
+        @memcpy(out_offsets, src_offsets[0..params.count]);
+        @memcpy(out_mask, rich.attention_mask[params.start..][0..params.count]);
+        @memcpy(out_special, rich.special_tokens_mask[params.start..][0..params.count]);
+        rich.deinit();
+
+        ret.ids = out_ids.ptr;
+        ret.offsets = @ptrCast(out_offsets.ptr);
+        ret.attention_mask = out_mask.ptr;
+        ret.special_tokens_mask = out_special.ptr;
+        ret.num_tokens = params.count;
+    }
+    return ret;
+}
+
+/// Frees all buffers in an EncodeResult.
+/// Safe to call with null fields (no-op for each null pointer).
+pub export fn talu_encode_result_free(result: EncodeResult) callconv(.c) void {
+    const n = result.num_tokens;
+    if (n == 0) return;
+    if (result.ids) |p| allocator.free(p[0..n]);
+    if (result.offsets) |p| allocator.free(p[0..n]);
+    if (result.attention_mask) |p| allocator.free(p[0..n]);
+    if (result.special_tokens_mask) |p| allocator.free(p[0..n]);
 }
 
 // =============================================================================
@@ -449,49 +508,6 @@ pub export fn talu_tokenize_bytes_result_free(
 ) callconv(.c) void {
     if (data) |d| if (data_len > 0) allocator.free(d[0..data_len]);
     if (offsets) |o| allocator.free(o[0 .. num_tokens + 1]);
-}
-
-// =============================================================================
-// Token Offset Mapping
-// =============================================================================
-
-/// Computes character offsets mapping tokens back to source text positions.
-///
-/// Returns start/end byte offsets for each token in the original text.
-/// Caller must free via talu_offsets_free().
-pub export fn talu_tokenizer_compute_offsets(
-    handle: ?*OpaqueTokenizerHandle,
-    text: [*]const u8,
-    text_len: usize,
-) callconv(.c) OffsetsResult {
-    // Cast opaque handle to TokenizerHandle
-    const tok: *TokenizerHandle = @ptrCast(@alignCast(handle orelse {
-        capi_error.setError(error.InvalidHandle, "Invalid handle", .{});
-        var err_result = std.mem.zeroes(OffsetsResult);
-        err_result.error_msg = "Invalid handle";
-        return err_result;
-    }));
-
-    var result = tok_offsets.computeOffsets(allocator, tok.tok.tokenizer_handle, text[0..text_len]) catch |e| {
-        capi_error.setError(e, "Offset computation failed", .{});
-        var err_result = std.mem.zeroes(OffsetsResult);
-        err_result.error_msg = "Computation failed";
-        return err_result;
-    };
-
-    const ptr = if (result.offsets.len > 0) result.offsets.ptr else null;
-    const len = result.offsets.len;
-    result.offsets = &.{};
-
-    var ret = std.mem.zeroes(OffsetsResult);
-    ret.offsets = @ptrCast(ptr);
-    ret.len = len;
-    return ret;
-}
-
-/// Frees offset result returned by talu_tokenizer_compute_offsets().
-pub export fn talu_offsets_free(result: OffsetsResult) callconv(.c) void {
-    if (result.offsets) |p| if (result.len > 0) allocator.free(p[0..result.len]);
 }
 
 // =============================================================================

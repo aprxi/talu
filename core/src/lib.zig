@@ -149,8 +149,7 @@ comptime {
     _ = &capi.talu_tokenize_result_free;
     _ = &capi.talu_tokenizer_tokenize_bytes;
     _ = &capi.talu_tokenize_bytes_result_free;
-    _ = &capi.talu_tokenizer_compute_offsets;
-    _ = &capi.talu_offsets_free;
+    _ = &capi.talu_encode_result_free;
     _ = &capi.talu_tokenizer_encode_batch;
     _ = &capi.talu_batch_encode_result_free;
     _ = &capi.talu_batch_to_padded_tensor;

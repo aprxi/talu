@@ -31,11 +31,12 @@ pub const getVocab = api_mod.getVocab;
 pub const TokenizeBytesResult = api_mod.TokenizeBytesResult;
 pub const tokenizeToBytes = api_mod.tokenizeToBytes;
 
-/// Token offset computation.
+/// Token offset computation and encoding.
 pub const offsets = offsets_mod;
 pub const TokenOffset = offsets_mod.TokenOffset;
-pub const OffsetsResult = offsets_mod.OffsetsResult;
-pub const computeOffsets = offsets_mod.computeOffsets;
+pub const computeOffsetsFromEncoding = offsets_mod.computeOffsetsFromEncoding;
+pub const Encoding = offsets_mod.Encoding;
+pub const encode = offsets_mod.encode;
 
 /// Batch operations.
 pub const batch = batch_mod;

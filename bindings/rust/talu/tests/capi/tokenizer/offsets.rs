@@ -1,26 +1,29 @@
 //! Offset computation and tokenize (string representation) tests.
 //!
-//! Validates compute_offsets, tokenize, and tokenize_bytes with exact assertions.
+//! Validates encode offsets, tokenize, and tokenize_bytes with exact assertions.
 
 use crate::capi::tokenizer::common::TokenizerTestContext;
 
-/// compute_offsets for "Hello" returns per-character byte spans [0,1)...[4,5).
+fn no_bos() -> talu_sys::EncodeOptions {
+    talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    }
+}
+
+/// Encoding "Hello" returns per-character byte spans [0,1)...[4,5).
 #[test]
-fn compute_offsets_hello() {
+fn encode_offsets_hello() {
     let ctx = TokenizerTestContext::new();
     let text = "Hello";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 5);
+    assert_eq!(result.num_tokens, 5);
 
     let offsets =
-        unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+        unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
 
     // Each character occupies exactly one byte.
     for (i, off) in offsets.iter().enumerate() {
@@ -28,36 +31,32 @@ fn compute_offsets_hello() {
         assert_eq!(off.end as usize, i + 1, "offset[{i}].end");
     }
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
-/// compute_offsets on empty string returns zero offsets.
+/// Encoding empty string returns zero tokens.
 #[test]
-fn compute_offsets_empty() {
+fn encode_offsets_empty() {
     let ctx = TokenizerTestContext::new();
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(ctx.handle(), [].as_ptr(), 0)
+        super::common::encode_raw(ctx.handle(), &[], &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 0);
-    unsafe { talu_sys::talu_offsets_free(result) };
+    assert_eq!(result.num_tokens, 0);
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
-/// compute_offsets produces non-overlapping, contiguous spans.
+/// Encoding produces non-overlapping, contiguous offset spans.
 #[test]
-fn compute_offsets_contiguous() {
+fn encode_offsets_contiguous() {
     let ctx = TokenizerTestContext::new();
     let text = "abc";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
     let offsets =
-        unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+        unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
 
     // Verify contiguous: each offset.start == previous offset.end.
     assert_eq!(offsets[0].start, 0);
@@ -66,7 +65,7 @@ fn compute_offsets_contiguous() {
     }
     assert_eq!(offsets.last().unwrap().end as usize, text.len());
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// tokenize "Hi" returns string representations ["H", "i"].
@@ -150,27 +149,23 @@ fn tokenize_bytes_hi() {
     };
 }
 
-/// compute_offsets for single character "A" returns one offset [0, 1).
+/// Encoding single character "A" returns one offset [0, 1).
 #[test]
-fn compute_offsets_single_char() {
+fn encode_offsets_single_char() {
     let ctx = TokenizerTestContext::new();
     let text = "A";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, 1);
+    assert_eq!(result.num_tokens, 1);
 
     let offsets =
-        unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+        unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets[0].end, 1);
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// tokenize_bytes on empty input returns zero tokens.

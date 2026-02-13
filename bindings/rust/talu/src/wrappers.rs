@@ -417,25 +417,22 @@ impl TokenizerHandle {
         }
 
         // Copy tokens to a Vec for safe ownership
-        let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
+        let tokens = if result.ids.is_null() || result.num_tokens == 0 {
             Vec::new()
         } else {
-            // SAFETY: tokens is a valid pointer with num_tokens elements.
-            let slice = unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) };
+            // SAFETY: ids is a valid pointer with num_tokens elements.
+            let slice = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
             slice.to_vec()
         };
 
-        // Free the C-allocated tokens
-        if !result.tokens.is_null() && result.num_tokens > 0 {
-            // SAFETY: tokens was allocated by talu and must be freed.
-            unsafe { talu_sys::talu_tokens_free(result.tokens, result.num_tokens) };
-        }
+        // Free the C-allocated result (ids, offsets, masks)
+        unsafe { talu_sys::talu_encode_result_free(result) };
 
         Ok(EncodeResult { tokens })
     }
 
     /// Encodes text and returns the raw result (for internal use).
-    /// Caller is responsible for freeing the tokens.
+    /// Caller is responsible for freeing the result via `talu_encode_result_free`.
     pub fn encode_raw(&self, text: &str) -> Result<talu_sys::EncodeResult> {
         let options = talu_sys::EncodeOptions::default();
         // SAFETY: self.ptr is valid, text is valid UTF-8.

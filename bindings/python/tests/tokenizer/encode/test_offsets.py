@@ -101,19 +101,14 @@ class TestOffsetUnicode:
 class TestOffsetCaching:
     """Lazy evaluation and caching tests."""
 
-    def test_lazy_evaluation(self, test_model_path):
-        """Offsets are computed lazily on first access."""
+    def test_eager_evaluation(self, test_model_path):
+        """Offsets are computed eagerly during encoding."""
         tokenizer = Tokenizer(test_model_path)
         tokens = tokenizer.encode("Hello", special_tokens=False)
 
-        # Before access, _offsets should be None
-        assert tokens._offsets is None
-
-        # Access offsets
-        _ = tokens.offsets
-
-        # After access, _offsets should be populated
+        # Offsets are pre-calculated at encode time
         assert tokens._offsets is not None
+        assert len(tokens._offsets) == len(tokens)
 
     def test_cached_result(self, test_model_path):
         """Second access returns same cached object."""

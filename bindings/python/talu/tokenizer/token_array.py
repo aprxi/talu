@@ -25,7 +25,6 @@ from ._bindings import (
     call_buffer_release,
     call_buffer_to_dlpack,
     call_list_concat_with_tokens,
-    call_tokenizer_compute_offsets,
     call_tokens_concat,
     call_tokens_concat_with_list,
     create_dlpack_capsule,
@@ -35,7 +34,6 @@ from ._bindings import (
 
 if TYPE_CHECKING:
     from .batch import BatchEncoding
-    from .tokenizer import Tokenizer
 
 
 class TokenOffset:
@@ -238,8 +236,7 @@ class TokenArray(Sequence[int]):
         tokens_ptr: Any,
         num_tokens: int,
         *,
-        source_text: bytes | None = None,
-        tokenizer: "Tokenizer | None" = None,
+        _offsets: list[TokenOffset] | None = None,
         _buffer_handle: Any = None,
     ) -> None:
         """
@@ -251,16 +248,13 @@ class TokenArray(Sequence[int]):
         Args:
             tokens_ptr: Pointer to uint32 token IDs (from buffer or legacy).
             num_tokens: Number of tokens in the array.
-            source_text: UTF-8 encoded source text (for offset computation).
-            tokenizer: Reference to parent tokenizer (for offset computation).
+            _offsets: Pre-calculated token offsets (from encode).
             _buffer_handle: SharedBuffer handle (if using refcounted buffer).
         """
         self._ptr = tokens_ptr
         self._num_tokens = num_tokens
         self._buffer_handle = _buffer_handle  # SharedBuffer for refcounting
-        self._source_text = source_text
-        self._tokenizer = tokenizer
-        self._offsets: list[TokenOffset] | None = None
+        self._offsets = _offsets
         # Future-proofing for views: offset into buffer (always 0 for now)
         self._offset_elems = 0
 
@@ -517,11 +511,10 @@ class TokenArray(Sequence[int]):
     @property
     def offsets(self) -> list[TokenOffset]:
         """
-        Lazy byte offsets mapping tokens back to source text.
+        Byte offsets mapping tokens back to source text.
 
         Each offset is a (start, end) pair of UTF-8 byte indices into the
-        original text. The first access triggers computation via the Zig
-        runtime; subsequent accesses return the cached result.
+        original text. Computed during encoding and returned directly.
 
         Special tokens (BOS, EOS, PAD) that don't correspond to source text
         are assigned (0, 0).
@@ -532,8 +525,8 @@ class TokenArray(Sequence[int]):
 
         Raises
         ------
-            RuntimeError: If source text was not preserved during encoding,
-                or if offset computation fails.
+            StateError: If the TokenArray was not created via Tokenizer.encode()
+                (e.g., created from a list or slice).
 
         Example:
             >>> text = "Hello 🎉 world"
@@ -551,32 +544,11 @@ class TokenArray(Sequence[int]):
         if self._offsets is not None:
             return self._offsets
 
-        if self._source_text is None or self._tokenizer is None:
-            raise StateError(
-                "Offset mapping requires source text. "
-                "Ensure the TokenArray was created via Tokenizer.encode().",
-                code="STATE_MISSING_SOURCE",
-            )
-
-        if self._num_tokens == 0:
-            self._offsets = []
-            return self._offsets
-
-        offsets_list, error = call_tokenizer_compute_offsets(
-            self._tokenizer._handle, self._source_text
+        raise StateError(
+            "Offset mapping requires source text. "
+            "Ensure the TokenArray was created via Tokenizer.encode().",
+            code="STATE_MISSING_SOURCE",
         )
-
-        if error:
-            from ..exceptions import TokenizerError
-
-            raise TokenizerError(
-                f"Offset computation failed: {error}",
-                code="TOKENIZER_OFFSET_FAILED",
-            )
-
-        # Convert to TokenOffset objects
-        self._offsets = [TokenOffset(start, end) for start, end in offsets_list]
-        return self._offsets
 
     @property
     def __array_interface__(self) -> dict:

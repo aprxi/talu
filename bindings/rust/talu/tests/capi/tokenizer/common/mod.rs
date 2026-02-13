@@ -232,15 +232,15 @@ impl TokenizerTestContext {
             result.error_msg.is_null(),
             "encode failed: error_msg is non-null"
         );
-        let tokens = if result.tokens.is_null() || result.num_tokens == 0 {
+        let tokens = if result.ids.is_null() || result.num_tokens == 0 {
             Vec::new()
         } else {
             let slice =
-                unsafe { std::slice::from_raw_parts(result.tokens, result.num_tokens) };
+                unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
             let v = slice.to_vec();
-            unsafe { talu_sys::talu_tokens_free(result.tokens, result.num_tokens) };
             v
         };
+        unsafe { talu_sys::talu_encode_result_free(result) };
         tokens
     }
 

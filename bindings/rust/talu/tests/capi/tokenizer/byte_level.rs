@@ -164,16 +164,12 @@ fn offsets_cover_full_emoji_span() {
     let ctx = TokenizerTestContext::with_byte_level();
     let text = "Hi😊bye";
     let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
     };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.len, text.len()); // 2 + 4 + 3 = 9 bytes
+    assert_eq!(result.num_tokens, text.len()); // 2 + 4 + 3 = 9 bytes
 
-    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.len) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets.last().unwrap().end as usize, text.len());
 
@@ -181,7 +177,7 @@ fn offsets_cover_full_emoji_span() {
         assert_eq!(w[0].end, w[1].start, "offsets should be contiguous");
     }
 
-    unsafe { talu_sys::talu_offsets_free(result) };
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 // ===========================================================================

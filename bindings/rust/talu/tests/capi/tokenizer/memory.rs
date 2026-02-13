@@ -89,7 +89,7 @@ fn encode_null_handle_returns_error() {
         !result.error_msg.is_null(),
         "encode with null handle should set error_msg"
     );
-    assert!(result.tokens.is_null(), "tokens should be null on error");
+    assert!(result.ids.is_null(), "ids should be null on error");
     assert_eq!(result.num_tokens, 0);
 }
 
@@ -163,22 +163,6 @@ fn tokenize_bytes_null_handle_returns_error() {
         "tokenize_bytes with null handle should set error_msg"
     );
     assert_eq!(result.num_tokens, 0);
-}
-
-// ---- Offsets with null handle ----
-
-/// Compute offsets with null handle returns error result, not crash.
-#[test]
-fn compute_offsets_null_handle_returns_error() {
-    let text = b"Hello";
-    let result = unsafe {
-        talu_sys::talu_tokenizer_compute_offsets(ptr::null_mut(), text.as_ptr(), text.len())
-    };
-    assert!(
-        !result.error_msg.is_null(),
-        "compute_offsets with null handle should set error_msg"
-    );
-    assert_eq!(result.len, 0);
 }
 
 // ---- Vocabulary with null handle ----
@@ -276,11 +260,11 @@ fn batch_encode_result_free_null_is_noop() {
     };
 }
 
-/// Freeing zeroed offsets result is a no-op.
+/// Freeing zeroed encode result is a no-op.
 #[test]
-fn offsets_free_zeroed_is_noop() {
-    let result = talu_sys::OffsetsResult::default();
-    unsafe { talu_sys::talu_offsets_free(result) };
+fn encode_result_free_zeroed_is_noop() {
+    let result = talu_sys::EncodeResult::default();
+    unsafe { talu_sys::talu_encode_result_free(result) };
 }
 
 /// Freeing null padded tensor result is a no-op.
