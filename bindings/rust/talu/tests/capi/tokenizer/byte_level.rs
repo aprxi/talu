@@ -6,7 +6,7 @@
 //!
 //! Token ID layout: byte b → ID b + 4.
 
-use crate::capi::tokenizer::common::{byte_token_id, TokenizerTestContext};
+use crate::capi::tokenizer::common::{build_byte_level_tokenizer_json, byte_token_id, TokenizerTestContext};
 
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
@@ -231,4 +231,26 @@ fn byte_level_vocab_size() {
     let ctx = TokenizerTestContext::with_byte_level();
     let size = unsafe { talu_sys::talu_tokenizer_get_vocab_size(ctx.handle()) };
     assert_eq!(size, 260);
+}
+
+// ===========================================================================
+// add_prefix_space roundtrip
+// ===========================================================================
+
+/// Encode→decode with `add_prefix_space: true` should roundtrip exactly.
+///
+/// The ByteLevel pretokenizer adds a space (→ Ġ) before the first token.
+/// The decoder must strip this added prefix so "Hello" roundtrips to "Hello",
+/// not " Hello".
+///
+/// Bug: the decode path does not track or reverse `add_prefix_space`, so the
+/// leading space leaks into the output.
+#[test]
+fn add_prefix_space_roundtrip() {
+    let json = build_byte_level_tokenizer_json()
+        .replace("\"add_prefix_space\": false", "\"add_prefix_space\": true");
+    let ctx = TokenizerTestContext::from_json(&json);
+    let tokens = ctx.encode_with("Hello", &no_bos());
+    let decoded = ctx.decode(&tokens);
+    assert_eq!(decoded, "Hello", "add_prefix_space roundtrip must not leak leading space");
 }

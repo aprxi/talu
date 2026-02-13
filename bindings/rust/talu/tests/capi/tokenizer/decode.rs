@@ -121,3 +121,80 @@ fn skip_special_strips_sandwiched_bos() {
     // [H=44, BOS=1, i=77]
     assert_eq!(ctx.decode_with(&[44, 1, 77], &skip), "Hi");
 }
+
+// ===========================================================================
+// Backslash escape handling in ByteLevel BPE decoder
+// ===========================================================================
+//
+// BPE merged tokens can contain literal backslash sequences (e.g. `\n`, `\"`,
+// `\\`). The decoder must return these as literal characters — NOT interpret
+// them as C-style escape sequences.
+//
+// Bug: our decoder turns `\n` → newline, `\"` → `"`, `\\` → `\`.
+// Affects: Qwen, Llama-3, OpenAI, Mistral, GLM (~70 models).
+
+/// Minimal ByteLevel BPE tokenizer with merged tokens containing backslashes.
+///
+/// Token 7 = `\n` (literal backslash + n)
+/// Token 8 = `\"` (literal backslash + quote)
+/// Token 9 = `\\` (two literal backslashes)
+/// Token 10 = `\t` (literal backslash + t)
+const BACKSLASH_TOKENIZER_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2, "<pad>": 3,
+      "\\": 4, "n": 5, "\"": 6,
+      "\\n": 7, "\\\"": 8, "\\\\": 9,
+      "t": 10, "\\t": 11
+    },
+    "merges": ["\\ n", "\\ \"", "\\ \\", "\\ t"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true},
+    {"id": 3, "content": "<pad>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+
+#[test]
+fn decode_backslash_n_literal() {
+    let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
+    let decoded = ctx.decode(&[7]);
+    assert_eq!(decoded, "\\n", "\\n must decode as two literal chars, not newline");
+}
+
+#[test]
+fn decode_backslash_quote_literal() {
+    let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
+    let decoded = ctx.decode(&[8]);
+    assert_eq!(decoded, "\\\"", "\\\" must decode as backslash + quote");
+}
+
+#[test]
+fn decode_double_backslash_literal() {
+    let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
+    let decoded = ctx.decode(&[9]);
+    assert_eq!(decoded, "\\\\", "\\\\ must decode as two backslashes");
+}
+
+#[test]
+fn decode_backslash_t_literal() {
+    let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
+    let decoded = ctx.decode(&[11]);
+    assert_eq!(decoded, "\\t", "\\t must decode as two literal chars, not tab");
+}
+
+#[test]
+fn decode_backslash_sequence_in_context() {
+    let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
+    // "n" + "\n" + "n" — the middle token is a merged backslash-n
+    let decoded = ctx.decode(&[5, 7, 5]);
+    assert_eq!(decoded, "n\\nn", "backslash tokens must stay literal in sequence");
+}
