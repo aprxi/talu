@@ -412,3 +412,181 @@ fn normalizer_plus_pretokenizer() {
     let decoded = ctx.decode(&upper_tokens);
     assert_eq!(decoded, "hello world");
 }
+
+// ===========================================================================
+// Type-based normalizer dispatch (check for fast-path missing type branches)
+// ===========================================================================
+
+/// {"type": "Lowercase"} normalizes uppercase to lowercase.
+///
+/// The HuggingFace format uses only the "type" field with no explicit boolean
+/// flags. This tests the fast-path type dispatch in applyNormalizerFromJson.
+#[test]
+fn normalizer_type_lowercase() {
+    let json = byte_level_with_normalizer(r#"{"type": "Lowercase"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let opts = no_bos();
+
+    let upper = ctx.encode_with("HELLO", &opts);
+    let lower = ctx.encode_with("hello", &opts);
+    assert_eq!(upper, lower, "type Lowercase should normalize uppercase to lowercase");
+}
+
+/// {"type": "Lowercase"} roundtrip: encode("HELLO") decodes to "hello".
+#[test]
+fn normalizer_type_lowercase_roundtrip() {
+    let json = byte_level_with_normalizer(r#"{"type": "Lowercase"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let opts = no_bos();
+
+    let tokens = ctx.encode_with("HELLO", &opts);
+    let decoded = ctx.decode(&tokens);
+    assert_eq!(decoded, "hello");
+}
+
+/// {"type": "StripAccents"} removes accents from composed characters.
+#[test]
+fn normalizer_type_strip_accents() {
+    let json = byte_level_with_normalizer(r#"{"type": "StripAccents"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // Composed é (C3 A9) stripped to e (65)
+    let stripped = ctx.encode_with("café", &opts);
+    let plain = ctx_raw.encode_with("cafe", &opts);
+    assert_eq!(stripped, plain, "type StripAccents should remove accent from é");
+}
+
+/// {"type": "BertNormalizer"} lowercases AND strips accents.
+#[test]
+fn normalizer_type_bert_normalizer() {
+    let json = byte_level_with_normalizer(r#"{"type": "BertNormalizer"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // Should lowercase "CAFÉ" and strip the accent on É
+    let tokens = ctx.encode_with("CAFÉ", &opts);
+    let expected = ctx_raw.encode_with("cafe", &opts);
+    assert_eq!(tokens, expected, "BertNormalizer should lowercase + strip accents");
+}
+
+/// {"type": "BertNormalizer"} adds spaces around CJK characters.
+#[test]
+fn normalizer_type_bert_cjk_spacing() {
+    let json = byte_level_with_normalizer(r#"{"type": "BertNormalizer"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // "日" is 3 UTF-8 bytes → 3 tokens without normalizer
+    let raw_tokens = ctx_raw.encode_with("日", &opts);
+    assert_eq!(raw_tokens.len(), 3);
+
+    // With BertNormalizer, CJK gets surrounding spaces: " 日 " = space + 3 bytes + space
+    let bert_tokens = ctx.encode_with("日", &opts);
+    assert!(
+        bert_tokens.len() > raw_tokens.len(),
+        "BertNormalizer should add spaces around CJK, got {} tokens (expected > {})",
+        bert_tokens.len(),
+        raw_tokens.len()
+    );
+}
+
+/// Sequence containing {"type": "Lowercase"} works correctly.
+#[test]
+fn normalizer_sequence_with_type_lowercase() {
+    let json = byte_level_with_normalizer(
+        r#"{"type": "Sequence", "normalizers": [{"type": "Lowercase"}, {"type": "NFC"}]}"#,
+    );
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // "CAFÉ" with decomposed É → Lowercase("cafe\u{0301}") → NFC("café")
+    let input = "CAFE\u{0301}";
+    let tokens = ctx.encode_with(input, &opts);
+    let expected = ctx_raw.encode_with("café", &opts);
+    assert_eq!(tokens, expected, "Sequence(type:Lowercase, type:NFC) should produce 'café'");
+}
+
+// ===========================================================================
+// Unicode normalization flags (check if NFD/NFKC/NFKD is parsed and applied)
+// ===========================================================================
+
+/// NFKC normalizes fullwidth Ａ (U+FF21, 3 bytes) to ASCII A (1 byte).
+#[test]
+fn normalizer_nfkc_fullwidth_to_ascii() {
+    let json = byte_level_with_normalizer(r#"{"type": "NFKC"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // Fullwidth Ａ is 3 UTF-8 bytes (EF BC A1) → 3 tokens raw
+    let fullwidth = "\u{FF21}";
+    assert_eq!(fullwidth.len(), 3);
+    let raw_tokens = ctx_raw.encode_with(fullwidth, &opts);
+    assert_eq!(raw_tokens.len(), 3);
+
+    // NFKC normalizes to ASCII A (1 byte) → 1 token
+    let nfkc_tokens = ctx.encode_with(fullwidth, &opts);
+    let ascii_tokens = ctx_raw.encode_with("A", &opts);
+    assert_eq!(nfkc_tokens, ascii_tokens, "NFKC should normalize fullwidth A to ASCII A");
+}
+
+/// NFKC decomposes ﬁ ligature (U+FB01, 3 bytes) to fi (2 bytes).
+#[test]
+fn normalizer_nfkc_ligature() {
+    let json = byte_level_with_normalizer(r#"{"type": "NFKC"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // ﬁ ligature is 3 UTF-8 bytes (EF AC 81) → 3 tokens raw
+    let ligature = "\u{FB01}";
+    assert_eq!(ligature.len(), 3);
+    let raw_tokens = ctx_raw.encode_with(ligature, &opts);
+    assert_eq!(raw_tokens.len(), 3);
+
+    // NFKC decomposes to "fi" (2 bytes) → 2 tokens
+    let nfkc_tokens = ctx.encode_with(ligature, &opts);
+    let fi_tokens = ctx_raw.encode_with("fi", &opts);
+    assert_eq!(nfkc_tokens, fi_tokens, "NFKC should decompose fi ligature to 'fi'");
+}
+
+/// NFD decomposes composed é (2 bytes) to e + combining accent (3 bytes).
+#[test]
+fn normalizer_nfd_decomposes() {
+    let json = byte_level_with_normalizer(r#"{"type": "NFD"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    // Composed é is 2 UTF-8 bytes (C3 A9) → 2 tokens raw
+    let composed = "é";
+    assert_eq!(composed.len(), 2);
+    let raw_tokens = ctx_raw.encode_with(composed, &opts);
+    assert_eq!(raw_tokens.len(), 2);
+
+    // NFD decomposes to e (1 byte) + combining acute (2 bytes) = 3 bytes → 3 tokens
+    let nfd_tokens = ctx.encode_with(composed, &opts);
+    assert_eq!(nfd_tokens.len(), 3, "NFD should decompose é to 3 bytes (e + combining accent)");
+}
+
+/// NFKD normalizes fullwidth Ａ (U+FF21, 3 bytes) to ASCII A (1 byte).
+#[test]
+fn normalizer_nfkd_fullwidth() {
+    let json = byte_level_with_normalizer(r#"{"type": "NFKD"}"#);
+    let ctx = TokenizerTestContext::from_json(&json);
+    let ctx_raw = TokenizerTestContext::with_byte_level();
+    let opts = no_bos();
+
+    let fullwidth = "\u{FF21}";
+    assert_eq!(fullwidth.len(), 3);
+
+    // NFKD decomposes fullwidth to ASCII
+    let nfkd_tokens = ctx.encode_with(fullwidth, &opts);
+    let ascii_tokens = ctx_raw.encode_with("A", &opts);
+    assert_eq!(nfkd_tokens, ascii_tokens, "NFKD should decompose fullwidth A to ASCII A");
+}

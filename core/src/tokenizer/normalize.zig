@@ -19,6 +19,18 @@ pub const NormalizeError = error{
     Utf8ProcFailed,
 };
 
+const UnicodeNormForm = enum { nfc, nfd, nfkc, nfkd };
+
+/// Dispatch to the correct utf8proc normalization function.
+fn applyUnicodeNorm(input: [*c]const c.utf8proc_uint8_t, form: UnicodeNormForm) ?[*:0]c.utf8proc_uint8_t {
+    return switch (form) {
+        .nfc => c.utf8proc_NFC(input),
+        .nfd => c.utf8proc_NFD(input),
+        .nfkc => c.utf8proc_NFKC(input),
+        .nfkd => c.utf8proc_NFKD(input),
+    };
+}
+
 fn stripAccents(codepoint: c.utf8proc_int32_t) c.utf8proc_int32_t {
     var decomposed: [4]c.utf8proc_int32_t = undefined;
     var last_boundary_class: c_int = 0;
@@ -45,26 +57,25 @@ pub fn tokenizer_apply_normalizer_spec(tok: ?*ct.Tokenizer, spec: ?*const ct.Nor
     tokenizer.normalizer.replace_content = normalizer_spec.replace_content;
 }
 
-/// Apply NFC normalization while preserving embedded null bytes.
-/// utf8proc_NFC stops at null bytes, so we split input at nulls,
-/// NFC each segment, and reassemble with nulls preserved.
-fn applyNfcWithNullBytes(input_bytes: []const u8) NormalizeError![]u8 {
+/// Apply Unicode normalization while preserving embedded null bytes.
+/// utf8proc normalization functions stop at null bytes, so we split input
+/// at nulls, normalize each segment, and reassemble with nulls preserved.
+fn applyNormWithNullBytes(input_bytes: []const u8, form: UnicodeNormForm) NormalizeError![]u8 {
     // Fast path: no null bytes in input
     if (std.mem.indexOfScalar(u8, input_bytes, 0) == null) {
-        // No embedded nulls - use simple NFC
         const input_copy = try Allocator.alloc(u8, input_bytes.len + 1);
         errdefer Allocator.free(input_copy);
         @memcpy(input_copy[0..input_bytes.len], input_bytes);
         input_copy[input_bytes.len] = 0;
-        const nfc_result_ptr = c.utf8proc_NFC(@ptrCast(input_copy.ptr));
+        const result_ptr = applyUnicodeNorm(@ptrCast(input_copy.ptr), form);
         Allocator.free(input_copy);
-        if (nfc_result_ptr == null) return error.Utf8ProcFailed;
-        const nfc_result = nfc_result_ptr.?;
-        defer std.c.free(nfc_result);
-        var nfc_length: usize = 0;
-        while (nfc_result[nfc_length] != 0) : (nfc_length += 1) {}
-        const output_bytes = try Allocator.alloc(u8, nfc_length);
-        @memcpy(output_bytes, nfc_result[0..nfc_length]);
+        if (result_ptr == null) return error.Utf8ProcFailed;
+        const result = result_ptr.?;
+        defer std.c.free(result);
+        var result_length: usize = 0;
+        while (result[result_length] != 0) : (result_length += 1) {}
+        const output_bytes = try Allocator.alloc(u8, result_length);
+        @memcpy(output_bytes, result[0..result_length]);
         return output_bytes;
     }
 
@@ -79,20 +90,19 @@ fn applyNfcWithNullBytes(input_bytes: []const u8) NormalizeError![]u8 {
         while (segment_end < input_bytes.len and input_bytes[segment_end] != 0) : (segment_end += 1) {}
 
         if (segment_end > cursor) {
-            // NFC the segment (cursor..segment_end)
             const segment_bytes = input_bytes[cursor..segment_end];
             const segment_copy = try Allocator.alloc(u8, segment_bytes.len + 1);
             defer Allocator.free(segment_copy);
             @memcpy(segment_copy[0..segment_bytes.len], segment_bytes);
             segment_copy[segment_bytes.len] = 0;
 
-            const nfc_ptr = c.utf8proc_NFC(@ptrCast(segment_copy.ptr));
-            if (nfc_ptr == null) return error.Utf8ProcFailed;
-            const nfc_segment = nfc_ptr.?;
-            defer std.c.free(nfc_segment);
-            var nfc_len: usize = 0;
-            while (nfc_segment[nfc_len] != 0) : (nfc_len += 1) {}
-            try output_bytes.appendSlice(Allocator, nfc_segment[0..nfc_len]);
+            const norm_ptr = applyUnicodeNorm(@ptrCast(segment_copy.ptr), form);
+            if (norm_ptr == null) return error.Utf8ProcFailed;
+            const norm_segment = norm_ptr.?;
+            defer std.c.free(norm_segment);
+            var norm_len: usize = 0;
+            while (norm_segment[norm_len] != 0) : (norm_len += 1) {}
+            try output_bytes.appendSlice(Allocator, norm_segment[0..norm_len]);
         }
 
         // Append null byte if we're at one
@@ -113,15 +123,36 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
 
     var normalized_bytes = sentencepiece.text;
 
-    // Apply NFC normalization if enabled (compose combining characters)
-    // Note: utf8proc_NFC expects null-terminated input and stops at embedded nulls.
-    // We handle this by splitting at null bytes, NFC'ing each segment, and reassembling.
+    // Apply Unicode normalization forms if enabled.
+    // utf8proc functions expect null-terminated input and stop at embedded nulls.
+    // applyNormWithNullBytes handles this by splitting at nulls and reassembling.
     var nfc_bytes: ?[]u8 = null;
     if (normalizer.nfc != 0) {
-        nfc_bytes = try applyNfcWithNullBytes(normalized_bytes);
+        nfc_bytes = try applyNormWithNullBytes(normalized_bytes, .nfc);
         normalized_bytes = nfc_bytes.?;
     }
-    defer if (nfc_bytes) |owned_nfc| Allocator.free(owned_nfc);
+    defer if (nfc_bytes) |owned| Allocator.free(owned);
+
+    var nfd_bytes: ?[]u8 = null;
+    if (normalizer.nfd != 0) {
+        nfd_bytes = try applyNormWithNullBytes(normalized_bytes, .nfd);
+        normalized_bytes = nfd_bytes.?;
+    }
+    defer if (nfd_bytes) |owned| Allocator.free(owned);
+
+    var nfkc_bytes: ?[]u8 = null;
+    if (normalizer.nfkc != 0) {
+        nfkc_bytes = try applyNormWithNullBytes(normalized_bytes, .nfkc);
+        normalized_bytes = nfkc_bytes.?;
+    }
+    defer if (nfkc_bytes) |owned| Allocator.free(owned);
+
+    var nfkd_bytes: ?[]u8 = null;
+    if (normalizer.nfkd != 0) {
+        nfkd_bytes = try applyNormWithNullBytes(normalized_bytes, .nfkd);
+        normalized_bytes = nfkd_bytes.?;
+    }
+    defer if (nfkd_bytes) |owned| Allocator.free(owned);
 
     const normalized_capacity = normalized_bytes.len * 4 + 8;
     var normalized_buf = try Allocator.alloc(u8, normalized_capacity);
@@ -141,9 +172,14 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
             continue;
         }
 
-        // Map position in normalized_bytes to position in original input
-        // If sp_map exists, use it to get the true original position
-        const original_pos: i32 = if (sentencepiece.map) |m| m[input_index] else @intCast(input_index);
+        // Map position in normalized_bytes to position in original input.
+        // If sp_map exists, use it to get the true original position.
+        const original_pos: i32 = if (sentencepiece.map) |m| blk: {
+            // Normalization (NFD/NFKC) may change string length.
+            // Clamp index to prevent out-of-bounds access if text expanded.
+            if (input_index >= m.len) break :blk -1;
+            break :blk m[input_index];
+        } else @intCast(input_index);
 
         input_index += @intCast(consumed_len);
 
@@ -342,9 +378,9 @@ test "addPrefixSpace handles empty string" {
     try std.testing.expectEqual(@as(u8, ' '), normalized.text[0]);
 }
 
-test "applyNfcWithNullBytes handles text without nulls" {
+test "applyNormWithNullBytes handles text without nulls" {
     const input = "hello";
-    const result = try applyNfcWithNullBytes(input);
+    const result = try applyNormWithNullBytes(input, .nfc);
     defer Allocator.free(result);
 
     // NFC of "hello" is still "hello"

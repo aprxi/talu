@@ -1267,6 +1267,15 @@ fn applyNormalizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, are
             tokenizer.*.normalizer.nfkc = 1;
         } else if (std.mem.eql(u8, type_str, "NFKD")) {
             tokenizer.*.normalizer.nfkd = 1;
+        } else if (std.mem.eql(u8, type_str, "Lowercase")) {
+            tokenizer.*.normalizer.lowercase = 1;
+        } else if (std.mem.eql(u8, type_str, "StripAccents")) {
+            tokenizer.*.normalizer.strip_accents = 1;
+        } else if (std.mem.eql(u8, type_str, "BertNormalizer")) {
+            tokenizer.*.normalizer.lowercase = 1;
+            tokenizer.*.normalizer.strip_accents = 1;
+            tokenizer.*.normalizer.clean_text = 1;
+            tokenizer.*.normalizer.handle_chinese_chars = 1;
         } else if (std.mem.eql(u8, type_str, "Sequence")) {
             // Handle Sequence normalizer - process nested normalizers
             if (findSection(json_bytes, "\"normalizers\"")) |arr_section| {
