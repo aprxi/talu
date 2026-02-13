@@ -148,6 +148,49 @@ fn roundtrip_sentence() {
 }
 
 // ---------------------------------------------------------------------------
+// Decode cleanup: only specific punctuation removes leading space
+// ---------------------------------------------------------------------------
+
+/// Cleanup must NOT remove space before colon, closing-paren, or percent.
+/// HuggingFace `clean_up_tokenization_spaces` preserves space before these.
+///
+/// Bug: cleanup removes space before `)` and `:`, but HF only removes
+/// space before `.` `?` `!` `,` `'` and `-`.
+#[test]
+fn cleanup_preserves_space_before_closing_paren_and_colon() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "world": 4,
+      "(": 5, ")": 6, ":": 7, "%": 8, "100": 9
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    // "(" + "100" + "%" + ")" → "( 100 % )"
+    // Cleanup should NOT remove space before ) or %
+    let decoded = ctx.decode(&[5, 9, 8, 6]);
+    assert_eq!(decoded, "( 100 % )", "cleanup must not remove space before ) or %, got: {decoded:?}");
+
+    // "hello" + ":" → "hello :" (space before colon preserved)
+    let decoded = ctx.decode(&[3, 7]);
+    assert_eq!(decoded, "hello :", "cleanup must not remove space before :, got: {decoded:?}");
+}
+
+// ---------------------------------------------------------------------------
 // skip_special_tokens (ignored for WordPiece — BUG)
 // ---------------------------------------------------------------------------
 

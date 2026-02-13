@@ -133,6 +133,76 @@ fn skip_special_strips_sandwiched_bos() {
 // Bug: our decoder turns `\n` → newline, `\"` → `"`, `\\` → `\`.
 // Affects: Qwen, Llama-3, OpenAI, Mistral, GLM (~70 models).
 
+// ===========================================================================
+// SentencePiece BPE: unicode_to_byte must not corrupt non-byte-level tokens
+// ===========================================================================
+//
+// SentencePiece models (Llama, Mistral, Phi, Gemma, TinyLlama) use BPE with
+// raw UTF-8 token strings and ▁ for word boundaries. They do NOT use GPT-2's
+// byte-to-unicode mapping. The decoder's `unicode_to_byte` map must not be
+// applied to these tokens, or non-ASCII chars like é, ü, ñ get mangled.
+//
+// Bug: the BPE decoder applies `unicode_to_byte` to ALL codepoints, converting
+// é (U+00E9) to single byte 0xE9 which is invalid standalone UTF-8 → "�".
+// Affects: TinyLlama, Gemma, Phi-3, Mistral, e5-mistral (~100K token failures).
+
+/// Minimal SentencePiece-style BPE with ▁ word boundaries and non-ASCII tokens.
+const SENTENCEPIECE_BPE_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "\u2581caf": 4, "é": 5,
+      "\u2581r": 6, "\u2581és": 7, "um": 8,
+      "\u2581na": 9, "ï": 10, "ve": 11,
+      "\u2581Hello": 12, ",": 13, "\u2581world": 14, "!": 15,
+      "\u2581": 16
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+}"####;
+
+/// Decoding tokens with non-ASCII UTF-8 chars (é, ï) must preserve them.
+///
+/// Bug: unicode_to_byte maps codepoint U+00E9 → byte 0xE9, producing
+/// invalid UTF-8 → "�" instead of "é".
+#[test]
+fn sentencepiece_decode_preserves_accented_chars() {
+    let ctx = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
+    // "▁café" = tokens [4, 5] → "café" (with leading space stripped by Metaspace)
+    let decoded = ctx.decode(&[4, 5]);
+    assert_eq!(decoded, "café", "SentencePiece BPE must preserve é, got: {decoded:?}");
+}
+
+/// Decoding ï (U+00EF) must not be corrupted by byte-level mapping.
+#[test]
+fn sentencepiece_decode_preserves_diaeresis() {
+    let ctx = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
+    // "▁na" + "ï" + "ve" = tokens [9, 10, 11] → "naïve"
+    let decoded = ctx.decode(&[9, 10, 11]);
+    assert_eq!(decoded, "naïve", "SentencePiece BPE must preserve ï, got: {decoded:?}");
+}
+
+/// Full sentence roundtrip with SentencePiece tokens.
+#[test]
+fn sentencepiece_decode_full_sentence() {
+    let ctx = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
+    // "▁Hello" + "," + "▁world" + "!" → "Hello, world!"
+    let decoded = ctx.decode(&[12, 13, 14, 15]);
+    assert_eq!(decoded, "Hello, world!", "SentencePiece decode full sentence, got: {decoded:?}");
+}
+
 /// Minimal ByteLevel BPE tokenizer with merged tokens containing backslashes.
 ///
 /// Token 7 = `\n` (literal backslash + n)
