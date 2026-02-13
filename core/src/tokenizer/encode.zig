@@ -521,11 +521,16 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
         // Encode words separately
         for (pretokenized.tokens.items, 0..) |token_item, token_index| {
             // SentencePiece: ▁ prefix on non-first words (first gets it from normalizer prepend).
-            // Metaspace: ▁ prefix on ALL words when add_prefix_space is set,
-            // otherwise on non-first words only.
-            const add_sp_prefix = if (is_metaspace_bpe)
-                (tokenizer.pretokenizer.add_prefix_space != 0 or token_index > 0)
-            else
+            // Metaspace: tokens from splitMetaspace already have ▁ embedded
+            // (from space→▁ replacement). Only add ▁ if the token doesn't
+            // already start with ▁.
+            const add_sp_prefix = if (is_metaspace_bpe) blk: {
+                const tok_bytes = token_item.sliceConst();
+                const starts_with_sp = tok_bytes.len >= 3 and
+                    tok_bytes[0] == 0xE2 and tok_bytes[1] == 0x96 and tok_bytes[2] == 0x81;
+                break :blk !starts_with_sp and
+                    (tokenizer.pretokenizer.add_prefix_space != 0 or token_index > 0);
+            } else
                 (is_sentencepiece_bpe and token_index > 0);
             try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator);
         }

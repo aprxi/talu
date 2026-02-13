@@ -859,11 +859,11 @@ class TestTokenizerWithModel:
             padding_side="right",
         )
 
-        # First sequence: 3 real tokens, no padding
+        # First sequence: 3 real tokens (truncated), no padding
         assert result["attention_mask"][0] == [1, 1, 1]
 
-        # Second sequence: 1 real token (Hi), 2 padding
-        assert result["attention_mask"][1] == [1, 0, 0]
+        # Second sequence: BOS + Hi = 2 real tokens, 1 padding
+        assert result["attention_mask"][1] == [1, 1, 0]
 
     def test_batch_to_list_no_truncation_respects_max_length(self, tokenizer):
         """Without truncation, sequences longer than max_length stay long."""

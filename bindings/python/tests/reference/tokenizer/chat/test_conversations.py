@@ -275,8 +275,8 @@ class TestSpecialTokens:
 
         talu_templated = tokenizer.apply_chat_template([{"role": "user", "content": user_msg}])
 
-        # Encode both
-        talu_tokens = tokenizer.encode(talu_templated).tolist()
+        # Encode both (no special tokens — template text already contains them)
+        talu_tokens = tokenizer.encode(talu_templated, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(hf_templated, add_special_tokens=False)
 
         # If templates match, tokens should match

@@ -64,8 +64,8 @@ class TestDecodeCorrectness:
         """Decoding produces same result as transformers."""
         text = "Hello, world!"
 
-        # Encode with both
-        talu_tokens = tokenizer.encode(text).tolist()
+        # Encode with both (no special tokens for raw tokenization comparison)
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         # Decode with both
@@ -89,7 +89,7 @@ class TestDecodeCorrectness:
     )
     def test_decode_various_texts(self, tokenizer, hf_tokenizer, text):
         """Various texts decode correctly."""
-        tokens = tokenizer.encode(text).tolist()
+        tokens = tokenizer.encode(text, special_tokens=False).tolist()
 
         talu_decoded = tokenizer.decode(tokens)
         hf_decoded = hf_tokenizer.decode(tokens)

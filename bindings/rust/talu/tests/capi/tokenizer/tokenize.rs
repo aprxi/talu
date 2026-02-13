@@ -365,6 +365,132 @@ fn batch_encode_with_merges() {
     assert_eq!(batch.ids, [104, 69, 70, 71]);
 }
 
+// ===========================================================================
+// tokenize/tokenize_bytes must NOT include special tokens
+// ===========================================================================
+//
+// tokenizeToBytes used the full encode pipeline (with post_processor),
+// so a tokenizer with BOS would include <|begin_of_text|> in the output.
+// tokenize/tokenize_bytes is a pre-encode step that should only run
+// pretokenization + model (BPE/WP/Unigram), never the post_processor.
+
+/// Minimal BPE tokenizer with Sequence-wrapped TemplateProcessing.
+/// When encoded with add_bos=1, BOS (ID 1) is prepended.
+/// tokenize/tokenize_bytes must NOT include BOS.
+const TOKENIZE_BOS_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "H": 4, "i": 5, "e": 6, "l": 7, "o": 8
+    },
+    "merges": ["H i"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<|begin_of_text|>", "special": true},
+    {"id": 2, "content": "<|end_of_text|>", "special": true},
+    {"id": 3, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "Sequence",
+    "processors": [
+      {"type": "ByteLevel", "add_prefix_space": true, "trim_offsets": true, "use_regex": false},
+      {
+        "type": "TemplateProcessing",
+        "single": [
+          {"SpecialToken": {"id": "<|begin_of_text|>", "type_id": 0}},
+          {"Sequence": {"id": "A", "type_id": 0}}
+        ],
+        "pair": [
+          {"SpecialToken": {"id": "<|begin_of_text|>", "type_id": 0}},
+          {"Sequence": {"id": "A", "type_id": 0}},
+          {"Sequence": {"id": "B", "type_id": 0}}
+        ],
+        "special_tokens": {
+          "<|begin_of_text|>": {"id": "<|begin_of_text|>", "ids": [1], "tokens": ["<|begin_of_text|>"]}
+        }
+      }
+    ]
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+
+/// tokenize_bytes with a post_processor must NOT include BOS token bytes.
+#[test]
+fn tokenize_bytes_excludes_special_tokens() {
+    let ctx = TokenizerTestContext::from_json(TOKENIZE_BOS_JSON);
+    let text = "Hi";
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize_bytes(
+            ctx.handle(),
+            text.as_bytes().as_ptr(),
+            text.len(),
+        )
+    };
+    assert!(result.error_msg.is_null());
+
+    // "Hi" should tokenize without BOS — only the raw subword tokens.
+    // With the "H i" merge rule: "Hi" → ["Hi"] (1 token).
+    // Bug would produce ["<|begin_of_text|>", "Hi"] (2 tokens).
+    assert_eq!(
+        result.num_tokens, 1,
+        "tokenize_bytes must not include BOS, expected 1 token, got {}",
+        result.num_tokens
+    );
+
+    let offsets = unsafe {
+        std::slice::from_raw_parts(result.offsets, result.num_tokens + 1)
+    };
+    let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
+    let t0 = std::str::from_utf8(&data[offsets[0]..offsets[1]]).unwrap();
+    assert_eq!(t0, "Hi");
+
+    unsafe {
+        talu_sys::talu_tokenize_bytes_result_free(
+            result.data, result.data_len, result.offsets, result.num_tokens,
+        )
+    };
+}
+
+/// tokenize (strings) with a post_processor must NOT include BOS token.
+#[test]
+fn tokenize_strings_excludes_special_tokens() {
+    let ctx = TokenizerTestContext::from_json(TOKENIZE_BOS_JSON);
+    let text = "Hi";
+    let result = unsafe {
+        talu_sys::talu_tokenizer_tokenize(
+            ctx.handle(),
+            text.as_bytes().as_ptr(),
+            text.len(),
+        )
+    };
+    assert!(result.error_msg.is_null());
+
+    // Must be 1 token ("Hi"), not 2 (BOS + "Hi").
+    assert_eq!(
+        result.num_tokens, 1,
+        "tokenize must not include BOS, expected 1 token, got {}",
+        result.num_tokens
+    );
+
+    let ptrs = unsafe {
+        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens)
+    };
+    let t0 = unsafe { std::ffi::CStr::from_ptr(ptrs[0]) }
+        .to_string_lossy()
+        .to_string();
+    assert_eq!(t0, "Hi");
+
+    unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
+}
+
+// ===========================================================================
+// Batch encode with merges
+// ===========================================================================
+
 /// Padded tensor with merges: "hello" (1) padded to match "abc" (3).
 #[test]
 fn padded_tensor_with_merges() {

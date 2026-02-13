@@ -53,6 +53,14 @@ pub fn unescapeJsonString(allocator: std.mem.Allocator, input: []const u8) JsonU
                     try output_bytes.append(allocator, '/');
                     byte_index += 2;
                 },
+                'b' => {
+                    try output_bytes.append(allocator, 0x08); // backspace
+                    byte_index += 2;
+                },
+                'f' => {
+                    try output_bytes.append(allocator, 0x0C); // form feed
+                    byte_index += 2;
+                },
                 'u' => {
                     if (byte_index + 5 < input.len) {
                         const hex = input[byte_index + 2 .. byte_index + 6];

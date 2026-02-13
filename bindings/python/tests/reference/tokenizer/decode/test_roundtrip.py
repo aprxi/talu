@@ -153,10 +153,10 @@ class TestRoundtripLongText:
         """Multiple roundtrips produce consistent results."""
         text = "Consistency test text"
 
-        tokens1 = tokenizer.encode(text)
+        tokens1 = tokenizer.encode(text, special_tokens=False)
         decoded1 = tokenizer.decode(tokens1)
 
-        tokens2 = tokenizer.encode(decoded1)
+        tokens2 = tokenizer.encode(decoded1, special_tokens=False)
         decoded2 = tokenizer.decode(tokens2)
 
         # Second roundtrip should be stable
@@ -170,8 +170,8 @@ class TestRoundtripVsTransformers:
     @pytest.mark.parametrize("text", BASIC_STRINGS)
     def test_roundtrip_matches_transformers(self, tokenizer, hf_tokenizer, text):
         """Roundtrip matches transformers behavior."""
-        # Encode with talu
-        talu_tokens = tokenizer.encode(text)
+        # Encode with talu (no special tokens to match HF)
+        talu_tokens = tokenizer.encode(text, special_tokens=False)
         talu_decoded = tokenizer.decode(talu_tokens)
 
         # Encode with transformers

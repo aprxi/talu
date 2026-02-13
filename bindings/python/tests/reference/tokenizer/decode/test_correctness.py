@@ -423,7 +423,7 @@ class TestByteLevelBPEDecode:
         the full token sequence.  The decoded text must match the original
         (no replacement characters from mishandled byte boundaries).
         """
-        tokens = tokenizer.encode(text)
+        tokens = tokenizer.encode(text, special_tokens=False)
         decoded = tokenizer.decode(tokens)
 
         assert "\ufffd" not in decoded, (
@@ -502,7 +502,7 @@ class TestByteLevelBPEDecode:
         emojis = ["😊", "🚀", "🎉", "🔥", "💡", "🌍", "❤", "👍"]
 
         for emoji in emojis:
-            tokens = tokenizer.encode(emoji)
+            tokens = tokenizer.encode(emoji, special_tokens=False)
             decoded = tokenizer.decode(tokens)
 
             assert "\ufffd" not in decoded, (

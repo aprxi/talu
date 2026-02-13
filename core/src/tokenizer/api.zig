@@ -747,7 +747,8 @@ pub fn tokenizeToBytes(
     const encode = @import("pipeline.zig").encode;
 
     var token_encoding = std.mem.zeroes(ct.TokenizerEncoding);
-    if (encode.tokenizer_encode_struct(tokenizer_handle, text, &token_encoding) != 0) {
+    // tokenize (not encode): skip special tokens so BOS/EOS are not included
+    if (encode.tokenizer_encode_struct_with_options(tokenizer_handle, text, &token_encoding, .{ .add_special_tokens = false }) != 0) {
         return TokenizerError.EncodeFailed;
     }
     defer encode.tokenizer_encoding_free_struct(&token_encoding);

@@ -399,7 +399,6 @@ class TestMistralChatTemplate:
     """Tests for Mistral/Ministral chat template."""
 
     @pytest.mark.requires_model
-    @pytest.mark.xfail(reason=XFAIL_MINISTRAL_V5)
     def test_mistral_exact_match(self, talu, transformers, tokenizer_cache, hf_tokenizer_cache):
         """Mistral template exactly matches transformers."""
         tok, hf_tok, _ = get_model_tokenizers(
@@ -419,7 +418,6 @@ class TestMistralChatTemplate:
         assert talu_result == hf_result
 
     @pytest.mark.requires_model
-    @pytest.mark.xfail(reason=XFAIL_MINISTRAL_V5)
     def test_mistral_with_system(self, talu, transformers, tokenizer_cache, hf_tokenizer_cache):
         """Mistral with system message matches transformers."""
         tok, hf_tok, _ = get_model_tokenizers(

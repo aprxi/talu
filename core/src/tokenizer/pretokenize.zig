@@ -176,7 +176,10 @@ fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const
             .regex_invert = p.regex_invert,
         }, @src());
 
-        if (p.re) |re| {
+        if (p.metaspace != 0 and p.re == null) {
+            // Metaspace: replace spaces with ▁, then split on word boundaries
+            try splitMetaspace(&result, input, base_offset);
+        } else if (p.re) |re| {
             try splitByRegex(&result, input, base_offset, re, p.regex_split != 0, p.regex_invert != 0);
         } else {
             try splitByWhitespace(&result, input, base_offset, p.whitespace != 0, p.punctuation != 0);
@@ -265,6 +268,61 @@ fn splitByWhitespace(result: *PretokenizeResult, input: []const u8, base_offset:
     }
     if (byte_index > token_start) {
         try appendToken(result, input[token_start..byte_index], base_offset + token_start);
+    }
+}
+
+/// Split input using Metaspace conventions.
+/// Replaces spaces with ▁ (U+2581), then splits on word boundaries
+/// (where ▁ is preceded by a non-▁ character). Consecutive ▁ chars
+/// stay in one token. The resulting tokens have ▁ already embedded.
+fn splitMetaspace(result: *PretokenizeResult, input: []const u8, base_offset: usize) !void {
+    if (input.len == 0) return;
+
+    // Replace spaces with ▁ (3 bytes per space instead of 1)
+    var buf = std.ArrayListUnmanaged(u8){};
+    defer buf.deinit(Allocator);
+
+    // Track original position for each byte in the replaced buffer
+    var orig_pos_map = std.ArrayListUnmanaged(usize){};
+    defer orig_pos_map.deinit(Allocator);
+
+    for (input, 0..) |byte, orig_pos| {
+        if (byte == ' ') {
+            try buf.appendSlice(Allocator, "\xE2\x96\x81");
+            try orig_pos_map.append(Allocator, orig_pos);
+            try orig_pos_map.append(Allocator, orig_pos);
+            try orig_pos_map.append(Allocator, orig_pos);
+        } else {
+            try buf.append(Allocator, byte);
+            try orig_pos_map.append(Allocator, orig_pos);
+        }
+    }
+
+    const replaced = buf.items;
+    if (replaced.len == 0) return;
+
+    // Split before each ▁ that is preceded by a non-▁ character (word boundary).
+    // Consecutive ▁ chars form a single token. The first token includes leading ▁s.
+    var token_start: usize = 0;
+    var prev_was_sp = true; // don't split at start
+    var i: usize = 0;
+    while (i < replaced.len) {
+        if (i + 2 < replaced.len and replaced[i] == 0xE2 and replaced[i + 1] == 0x96 and replaced[i + 2] == 0x81) {
+            if (!prev_was_sp and i > token_start) {
+                const orig_start = orig_pos_map.items[token_start];
+                try appendToken(result, replaced[token_start..i], base_offset + orig_start);
+                token_start = i;
+            }
+            prev_was_sp = true;
+            i += 3;
+        } else {
+            prev_was_sp = false;
+            i += 1;
+        }
+    }
+    if (token_start < replaced.len) {
+        const orig_start = orig_pos_map.items[token_start];
+        try appendToken(result, replaced[token_start..], base_offset + orig_start);
     }
 }
 

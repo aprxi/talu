@@ -732,6 +732,23 @@ fn parsePreTokenizer(arena_allocator: std.mem.Allocator, json_scanner: *std.json
                 } else if (std.mem.eql(u8, key, "add_prefix_space")) {
                     const flag_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
                     pretokenizer.add_prefix_space = (flag_value == .true);
+                } else if (std.mem.eql(u8, key, "prepend_scheme")) {
+                    const scheme_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
+                    if (scheme_value == .allocated_string) {
+                        const scheme = scheme_value.allocated_string;
+                        if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
+                            pretokenizer.add_prefix_space = true;
+                        } else if (std.mem.eql(u8, scheme, "never")) {
+                            pretokenizer.add_prefix_space = false;
+                        }
+                    } else if (scheme_value == .string) {
+                        const scheme = scheme_value.string;
+                        if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
+                            pretokenizer.add_prefix_space = true;
+                        } else if (std.mem.eql(u8, scheme, "never")) {
+                            pretokenizer.add_prefix_space = false;
+                        }
+                    }
                 } else if (std.mem.eql(u8, key, "trim_offsets")) {
                     const flag_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
                     pretokenizer.trim_offsets = (flag_value == .true);
@@ -927,6 +944,18 @@ fn parseDecoder(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scan
                 } else if (std.mem.eql(u8, key, "add_prefix_space")) {
                     const val = try json_scanner.next();
                     if (val == .true) decoder.add_prefix_space = true;
+                } else if (std.mem.eql(u8, key, "prepend_scheme")) {
+                    const scheme_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
+                    const scheme = switch (scheme_value) {
+                        .allocated_string => |s| s,
+                        .string => |s| s,
+                        else => "",
+                    };
+                    if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
+                        decoder.add_prefix_space = true;
+                    } else if (std.mem.eql(u8, scheme, "never")) {
+                        decoder.add_prefix_space = false;
+                    }
                 } else {
                     try json_scanner.skipValue();
                 }
@@ -1436,6 +1465,14 @@ fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, a
     if (findJsonFieldValue(json_bytes, "\"add_prefix_space\"")) |v| {
         tokenizer.*.pretokenizer.add_prefix_space = if (std.mem.eql(u8, v, "true")) 1 else 0;
     }
+    // Newer HF config uses prepend_scheme instead of add_prefix_space (Metaspace)
+    if (findJsonFieldString(json_bytes, "\"prepend_scheme\"")) |scheme| {
+        if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
+            tokenizer.*.pretokenizer.add_prefix_space = 1;
+        } else if (std.mem.eql(u8, scheme, "never")) {
+            tokenizer.*.pretokenizer.add_prefix_space = 0;
+        }
+    }
     if (findJsonFieldValue(json_bytes, "\"trim_offsets\"")) |v| {
         tokenizer.*.pretokenizer.trim_offsets = if (std.mem.eql(u8, v, "true")) 1 else 0;
     }
@@ -1531,6 +1568,25 @@ fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, a
 fn applyPostProcessorFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) void {
     const type_str = findJsonFieldString(json_bytes, "\"type\"") orelse return;
 
+    // Sequence type: iterate processors array and apply each sub-processor
+    if (std.mem.eql(u8, type_str, "Sequence")) {
+        if (findSection(json_bytes, "\"processors\"")) |arr_section| {
+            if (arr_section.len > 0 and arr_section[0] == '[') {
+                const arr_end = findMatchingBrace(arr_section, '[', ']') orelse arr_section.len;
+                const arr_content = arr_section[0..arr_end];
+                var cursor: usize = 0;
+                while (cursor < arr_content.len) {
+                    while (cursor < arr_content.len and arr_content[cursor] != '{') : (cursor += 1) {}
+                    if (cursor >= arr_content.len) break;
+                    const obj_end = if (findMatchingBrace(arr_content[cursor..], '{', '}')) |len| cursor + len else break;
+                    applyPostProcessorFromJson(tokenizer, arr_content[cursor..obj_end]);
+                    cursor = obj_end;
+                }
+            }
+        }
+        return;
+    }
+
     // Set add_special for known post-processor types
     if (std.mem.eql(u8, type_str, "BertProcessing") or
         std.mem.eql(u8, type_str, "TemplateProcessing"))
@@ -1606,7 +1662,11 @@ fn applyPostProcessorFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) 
             sep_str = if (sep_str == null) "[SEP]" else sep_str;
         }
     }
-    if (sep_str == null) sep_str = cls_str;
+    // For BertProcessing/RobertaProcessing, default sep to cls.
+    // For TemplateProcessing, only add SEP if explicitly in special_tokens.
+    if (sep_str == null and !std.mem.eql(u8, type_str, "TemplateProcessing")) {
+        sep_str = cls_str;
+    }
 
     // Copy token strings into postproc
     if (cls_str) |cls| {
@@ -1636,6 +1696,22 @@ fn applyPostProcessorFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) 
 }
 
 fn applyDecoderFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) void {
+    // Handle Metaspace decoder: set add_prefix_space from prepend_scheme or add_prefix_space
+    if (findJsonFieldString(json_bytes, "\"type\"")) |dtype| {
+        if (std.mem.eql(u8, dtype, "Metaspace")) {
+            if (findJsonFieldValue(json_bytes, "\"add_prefix_space\"")) |v| {
+                tokenizer.decoder.add_prefix_space = if (std.mem.eql(u8, v, "true")) 1 else 0;
+            }
+            if (findJsonFieldString(json_bytes, "\"prepend_scheme\"")) |scheme| {
+                if (std.mem.eql(u8, scheme, "first") or std.mem.eql(u8, scheme, "always")) {
+                    tokenizer.decoder.add_prefix_space = 1;
+                } else if (std.mem.eql(u8, scheme, "never")) {
+                    tokenizer.decoder.add_prefix_space = 0;
+                }
+            }
+        }
+    }
+
     // Look for Strip decoder by finding "type": "Strip" pattern
     const strip_pattern = "\"type\": \"Strip\"";
     const strip_pattern2 = "\"type\":\"Strip\"";

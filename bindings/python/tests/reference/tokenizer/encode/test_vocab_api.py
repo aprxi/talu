@@ -366,10 +366,10 @@ class TestTokenize:
 
     @pytest.mark.requires_model
     def test_tokenize_length_matches_encode(self, tokenizer):
-        """tokenize() returns same number of tokens as encode()."""
+        """tokenize() returns same number of tokens as encode(special_tokens=False)."""
         text = "Hello world, this is a test."
         token_strings = tokenizer.tokenize(text)
-        token_ids = tokenizer.encode(text)
+        token_ids = tokenizer.encode(text, special_tokens=False)
         assert len(token_strings) == len(token_ids)
 
     @pytest.mark.requires_model
@@ -461,8 +461,8 @@ class TestCountTokens:
 
     @pytest.mark.requires_model
     def test_count_tokens_empty(self, tokenizer):
-        """count_tokens('') returns 0."""
-        assert tokenizer.count_tokens("") == 0
+        """count_tokens('', special_tokens=False) returns 0."""
+        assert tokenizer.count_tokens("", special_tokens=False) == 0
 
     @pytest.mark.requires_model
     def test_count_tokens_with_special_tokens(self, tokenizer):

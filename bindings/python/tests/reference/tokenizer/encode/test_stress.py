@@ -58,7 +58,7 @@ class TestLongText:
         words = ["word"] * 1000
         text = " ".join(words)
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens, (
@@ -75,7 +75,7 @@ class TestLongText:
         base = "Hello World 123 日本語 "
         text = (base * (10000 // len(base) + 1))[:10000]
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
@@ -91,7 +91,7 @@ class TestLongText:
         )
 
         for _ in range(10):
-            talu_tokens = tokenizer.encode(paragraph).tolist()
+            talu_tokens = tokenizer.encode(paragraph, special_tokens=False).tolist()
             hf_tokens = hf_tokenizer.encode(paragraph, add_special_tokens=False)
             assert talu_tokens == hf_tokens
 
@@ -105,7 +105,7 @@ class TestRepeatedPatterns:
         for char in ["a", "A", "1", " ", "."]:
             text = char * 100
 
-            talu_tokens = tokenizer.encode(text).tolist()
+            talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
             hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
             assert talu_tokens == hf_tokens, f"Mismatch for '{char}' x 100"
@@ -116,7 +116,7 @@ class TestRepeatedPatterns:
         for word in ["hello", "test", "123"]:
             text = (word + " ") * 50
 
-            talu_tokens = tokenizer.encode(text).tolist()
+            talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
             hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
             assert talu_tokens == hf_tokens, f"Mismatch for '{word}' x 50"
@@ -134,7 +134,7 @@ class TestRepeatedPatterns:
         for pattern in patterns:
             text = pattern * 20
 
-            talu_tokens = tokenizer.encode(text).tolist()
+            talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
             hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
             assert talu_tokens == hf_tokens, f"Mismatch for pattern '{pattern[:10]}' x 20"
@@ -148,7 +148,7 @@ class TestMixedContent:
         """Alternating language text encodes correctly."""
         text = "Hello 你好 Bonjour こんにちは Привет مرحبا " * 10
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
@@ -170,7 +170,7 @@ class TestMixedContent:
         This loop prints even numbers from 0 to 18.
         """
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
@@ -182,7 +182,7 @@ class TestMixedContent:
         text += "There are 1,000,000 microseconds in a second. "
         text += "Scientific notation: 6.022e23 atoms per mole."
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
@@ -296,7 +296,7 @@ class TestEdgeCasesStress:
         """Many newlines encode correctly."""
         text = "\n".join(["line"] * 100)
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
@@ -306,7 +306,7 @@ class TestEdgeCasesStress:
         """Many tabs encode correctly."""
         text = "\t".join(["word"] * 100)
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
@@ -316,7 +316,7 @@ class TestEdgeCasesStress:
         """Mixed whitespace patterns encode correctly."""
         text = "a  b   c\td\t\te\n\nf\r\ng"
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
@@ -333,7 +333,7 @@ class TestEdgeCasesStress:
         ]
         text = " ".join(emojis * 5)
 
-        talu_tokens = tokenizer.encode(text).tolist()
+        talu_tokens = tokenizer.encode(text, special_tokens=False).tolist()
         hf_tokens = hf_tokenizer.encode(text, add_special_tokens=False)
 
         assert talu_tokens == hf_tokens
