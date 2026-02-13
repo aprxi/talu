@@ -921,6 +921,9 @@ fn parseDecoder(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scan
                 } else if (std.mem.eql(u8, key, "stop")) {
                     const stop_token = try json_scanner.next();
                     if (stop_token == .number) decoder.strip_stop = std.fmt.parseInt(i32, stop_token.number, 10) catch 0;
+                } else if (std.mem.eql(u8, key, "add_prefix_space")) {
+                    const val = try json_scanner.next();
+                    if (val == .true) decoder.add_prefix_space = true;
                 } else {
                     try json_scanner.skipValue();
                 }
@@ -1593,6 +1596,7 @@ fn build_tokenizer_from_root(arena: *std.heap.ArenaAllocator, root: schema.Token
     // Apply decoder settings (e.g., Strip decoder for SentencePiece)
     tokenizer.decoder.strip_start = @intCast(root.decoder.strip_start);
     tokenizer.decoder.strip_stop = @intCast(root.decoder.strip_stop);
+    tokenizer.decoder.add_prefix_space = if (root.decoder.add_prefix_space) 1 else 0;
 
     return tokenizer;
 }

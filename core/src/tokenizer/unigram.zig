@@ -528,6 +528,11 @@ fn unigram_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: us
         strip_start -= 1;
     }
 
+    // Metaspace add_prefix_space: strip leading space added by pretokenizer
+    if (tokenizer.decoder.add_prefix_space != 0 and result.items.len > 0 and result.items[0] == ' ') {
+        _ = result.orderedRemove(0);
+    }
+
     // Null-terminate and return
     result.append(allocator, 0) catch return -1;
     out_len.* = result.items.len - 1; // exclude null terminator

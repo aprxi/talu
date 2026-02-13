@@ -75,6 +75,8 @@ pub const Decoder = struct {
     strip_start: i32 = 0,
     /// Number of trailing spaces to strip (from "Strip" decoder "stop" field)
     strip_stop: i32 = 0,
+    /// Metaspace decoder: strip leading space added during encode
+    add_prefix_space: bool = false,
 };
 
 pub const TokenizerRoot = struct {

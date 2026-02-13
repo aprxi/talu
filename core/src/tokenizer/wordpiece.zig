@@ -270,8 +270,9 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
 }
 
 fn isCleanupPunct(ch: u8) bool {
+    // Match HuggingFace's clean_up_tokenization_spaces behavior
     return switch (ch) {
-        '!', '"', '\'', ')', ',', '-', '.', ':', ';', '?', ']', '}' => true,
+        '.', '?', '!', ',', '\'', '-' => true,
         else => false,
     };
 }

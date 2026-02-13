@@ -151,6 +151,8 @@ pub const Decoder = extern struct {
     strip_start: c_int,
     /// Number of trailing spaces to strip (from Strip decoder "stop" field)
     strip_stop: c_int,
+    /// Metaspace decoder: strip leading space added during encode
+    add_prefix_space: c_int,
 };
 
 pub const Tokenizer = extern struct {

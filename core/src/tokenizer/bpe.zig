@@ -789,12 +789,14 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
             }
 
             var idx: usize = 0;
+            const use_byte_map = tok.pretokenizer.byte_level != 0;
             while (idx < token.slice.len) {
                 const codepoint = utf8Decode(token.slice, &idx);
                 // SentencePiece: U+2581 (▁) represents word boundary, convert to space
                 if (codepoint == 0x2581) {
                     result.append(allocator, ' ') catch return -1;
-                } else if (codepoint >= 0 and codepoint < model.unicode_to_byte.len and model.unicode_to_byte[@as(usize, @intCast(codepoint))] >= 0) {
+                } else if (use_byte_map and codepoint >= 0 and codepoint < model.unicode_to_byte.len and model.unicode_to_byte[@as(usize, @intCast(codepoint))] >= 0) {
+                    // GPT-2 byte-level: map Unicode codepoint back to original byte
                     result.append(allocator, @intCast(model.unicode_to_byte[@as(usize, @intCast(codepoint))])) catch return -1;
                 } else if (codepoint >= 0) {
                     var utf8_buf: [4]u8 = undefined;
@@ -821,8 +823,8 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
         strip_stop_count -= 1;
     }
 
-    // Strip leading space added by add_prefix_space pretokenizer
-    if (tok.pretokenizer.add_prefix_space != 0 and result.items.len > 0 and result.items[0] == ' ') {
+    // Strip leading space added by add_prefix_space (pretokenizer or Metaspace decoder)
+    if ((tok.pretokenizer.add_prefix_space != 0 or tok.decoder.add_prefix_space != 0) and result.items.len > 0 and result.items[0] == ' ') {
         _ = result.orderedRemove(0);
     }
 
