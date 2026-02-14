@@ -182,7 +182,7 @@ fn pretokenize_single_impl(pretokenizer: ?*const ct.PreTokenizer, input: []const
 
         if (p.metaspace != 0 and p.re == null) {
             // Metaspace: replace spaces with ▁, then split on word boundaries
-            try splitMetaspace(&result, input, base_offset);
+            try splitMetaspace(&result, input, base_offset, p.add_prefix_space != 0);
         } else if (p.re) |re| {
             try splitByRegex(&result, input, base_offset, re, p.regex_split != 0, p.regex_invert != 0);
         } else {
@@ -279,7 +279,7 @@ fn splitByWhitespace(result: *PretokenizeResult, input: []const u8, base_offset:
 /// Replaces spaces with ▁ (U+2581), then splits on word boundaries
 /// (where ▁ is preceded by a non-▁ character). Consecutive ▁ chars
 /// stay in one token. The resulting tokens have ▁ already embedded.
-fn splitMetaspace(result: *PretokenizeResult, input: []const u8, base_offset: usize) !void {
+fn splitMetaspace(result: *PretokenizeResult, input: []const u8, base_offset: usize, add_prefix_space: bool) !void {
     if (input.len == 0) return;
 
     // Replace spaces with ▁ (3 bytes per space instead of 1)
@@ -289,6 +289,15 @@ fn splitMetaspace(result: *PretokenizeResult, input: []const u8, base_offset: us
     // Track original position for each byte in the replaced buffer
     var orig_pos_map = std.ArrayListUnmanaged(usize){};
     defer orig_pos_map.deinit(Allocator);
+
+    // Prepend ▁ when add_prefix_space is set and input doesn't start with a space
+    if (add_prefix_space and input[0] != ' ') {
+        try buf.appendSlice(Allocator, "\xE2\x96\x81");
+        // All 3 bytes of the prepended ▁ map to position 0 in the original
+        try orig_pos_map.append(Allocator, 0);
+        try orig_pos_map.append(Allocator, 0);
+        try orig_pos_map.append(Allocator, 0);
+    }
 
     for (input, 0..) |byte, orig_pos| {
         if (byte == ' ') {

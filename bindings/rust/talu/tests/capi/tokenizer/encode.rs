@@ -648,12 +648,12 @@ const METASPACE_PREPEND_SCHEME_JSON: &str = r####"{
       "w": 12, "r": 13, "d": 14,
       "He": 15, "Hel": 16, "Hell": 17, "Hello": 18,
       "wo": 19, "wor": 20, "worl": 21, "world": 22,
-      "\u2581\u2581\u2581": 23
+      "\u2581\u2581\u2581": 23, "\u2581\u2581": 24
     },
     "merges": [
       "H e", "He l", "Hel l", "Hell o", "\u2581 Hello",
       "w o", "wo r", "wor l", "worl d", "\u2581 world",
-      "\u2581 \u2581\u2581"
+      "\u2581 \u2581", "\u2581\u2581 \u2581"
     ]
   },
   "added_tokens": [

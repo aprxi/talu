@@ -191,7 +191,7 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
                 if (codepoint == '\t' or codepoint == '\n' or codepoint == '\r') {
                     codepoint = ' ';
                 } else continue;
-            } else if (c.utf8proc_category(codepoint) == c.UTF8PROC_CATEGORY_ZS or std.ascii.isWhitespace(@intCast(@as(u32, @bitCast(codepoint)) & 0xFF))) {
+            } else if (c.utf8proc_category(codepoint) == c.UTF8PROC_CATEGORY_ZS) {
                 codepoint = ' ';
             }
         }

@@ -597,6 +597,127 @@ test "wordpieceDecode requires integration testing" {
     // Integration tests: tests/tokenizer/test_*.py
 }
 
+test "wordpieceDecodeWithOptions decodes token IDs with subword joining" {
+    const allocator = std.testing.allocator;
+
+    var model = try initModel(allocator);
+    try allocIdToToken(model, 3);
+    try addVocabEntry(model, "hello", 0);
+    try addVocabEntry(model, "##world", 1);
+    try addVocabEntry(model, "test", 2);
+
+    var tokenizer = try allocator.create(ct.Tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = ct.ModelType.wordpiece;
+    tokenizer.model = model;
+    model.owner = tokenizer;
+    defer {
+        tokenizer.model = null;
+        for (model.vocab_strings.items) |s| allocator.free(s);
+        model.vocab_strings.deinit(allocator);
+        model.vocab.deinit(allocator);
+        allocator.free(model.id_to_token);
+        allocator.destroy(model);
+        allocator.destroy(tokenizer);
+    }
+
+    // [hello, ##world, test] → "helloworld test"
+    var ids = [_]i32{ 0, 1, 2 };
+    var out: [*c]u8 = undefined;
+    var out_len: usize = 0;
+    const rc = wordpieceDecodeWithOptions(tokenizer, &ids, ids.len, &out, &out_len, .{});
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer allocator.free(out[0 .. out_len + 1]);
+
+    try std.testing.expectEqualStrings("helloworld test", out[0..out_len]);
+}
+
+test "wordpieceDecodeWithOptions skip_special_tokens omits special tokens" {
+    const allocator = std.testing.allocator;
+
+    var model = try initModel(allocator);
+    try allocIdToToken(model, 3);
+    try addVocabEntry(model, "[CLS]", 0);
+    try addVocabEntry(model, "hello", 1);
+    try addVocabEntry(model, "[SEP]", 2);
+
+    var tokenizer = try allocator.create(ct.Tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = ct.ModelType.wordpiece;
+    tokenizer.model = model;
+    model.owner = tokenizer;
+
+    // Mark [CLS] (id=0) and [SEP] (id=2) as special tokens
+    var sep_node = std.mem.zeroes(ct.AddedToken);
+    sep_node.id = 2;
+    sep_node.special = 1;
+    sep_node.next = null;
+
+    var cls_node = std.mem.zeroes(ct.AddedToken);
+    cls_node.id = 0;
+    cls_node.special = 1;
+    cls_node.next = &sep_node;
+    tokenizer.added = &cls_node;
+
+    defer {
+        tokenizer.model = null;
+        for (model.vocab_strings.items) |s| allocator.free(s);
+        model.vocab_strings.deinit(allocator);
+        model.vocab.deinit(allocator);
+        allocator.free(model.id_to_token);
+        allocator.destroy(model);
+        allocator.destroy(tokenizer);
+    }
+
+    // Decode [CLS, hello, SEP] with skip_special_tokens=true
+    var ids = [_]i32{ 0, 1, 2 };
+    var out: [*c]u8 = undefined;
+    var out_len: usize = 0;
+    const rc = wordpieceDecodeWithOptions(tokenizer, &ids, ids.len, &out, &out_len, .{ .skip_special_tokens = true });
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer allocator.free(out[0 .. out_len + 1]);
+
+    // Only "hello" should remain
+    try std.testing.expectEqualStrings("hello", out[0..out_len]);
+}
+
+test "wordpieceDecodeWithOptions applies cleanup_tokenization_spaces" {
+    const allocator = std.testing.allocator;
+
+    var model = try initModel(allocator);
+    try allocIdToToken(model, 5);
+    try addVocabEntry(model, "I", 0);
+    try addVocabEntry(model, "don", 1);
+    try addVocabEntry(model, "##'", 2);
+    try addVocabEntry(model, "##t", 3);
+    try addVocabEntry(model, ".", 4);
+
+    var tokenizer = try allocator.create(ct.Tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = ct.ModelType.wordpiece;
+    tokenizer.model = model;
+    model.owner = tokenizer;
+    defer {
+        tokenizer.model = null;
+        for (model.vocab_strings.items) |s| allocator.free(s);
+        model.vocab_strings.deinit(allocator);
+        model.vocab.deinit(allocator);
+        allocator.free(model.id_to_token);
+        allocator.destroy(model);
+        allocator.destroy(tokenizer);
+    }
+
+    // [I, don, ##', ##t, .] → "I don't." (contractions + punctuation cleanup)
+    var ids = [_]i32{ 0, 1, 2, 3, 4 };
+    var out: [*c]u8 = undefined;
+    var out_len: usize = 0;
+    const rc = wordpieceDecodeWithOptions(tokenizer, &ids, ids.len, &out, &out_len, .{});
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer allocator.free(out[0 .. out_len + 1]);
+
+    try std.testing.expectEqualStrings("I don't.", out[0..out_len]);
+}
+
 test "wordpieceDestroy requires integration testing" {
     // This function requires:
     // - Fully allocated WordPiece model

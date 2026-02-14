@@ -28,6 +28,10 @@ fn main() {
     let src = lib_dir.join(lib_name);
     let dst = deps_dir.join(lib_name);
 
+    // Re-run this build script whenever the native library changes so the
+    // copy in target/<profile>/deps/ stays in sync with zig-out/lib/.
+    println!("cargo:rerun-if-changed={}", src.display());
+
     if src.exists() {
         // Copy only if source is newer or destination is missing.
         let needs_copy = !dst.exists() || {

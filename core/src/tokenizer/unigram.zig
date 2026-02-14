@@ -280,7 +280,7 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
     }
 
     const len = word.len;
-    const inf: f32 = 1e9;
+    const neg_inf: f32 = -1e9;
     var best = try allocator.alloc(f32, len + 1);
     defer allocator.free(best);
     var best_len = try allocator.alloc(usize, len + 1);
@@ -288,7 +288,7 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
     var best_entry = try allocator.alloc(?*UniEntry, len + 1);
     defer allocator.free(best_entry);
     for (best, 0..) |*best_score, idx| {
-        best_score.* = inf;
+        best_score.* = neg_inf;
         best_len[idx] = 0;
         best_entry[idx] = null;
     }
@@ -302,7 +302,7 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
             if (token_slice.len == 0 or pos + token_slice.len > len) continue;
             if (std.mem.eql(u8, word[pos .. pos + token_slice.len], token_slice)) {
                 const cand = entry.score + best[pos + token_slice.len];
-                if (cand < best[pos]) {
+                if (cand > best[pos]) {
                     best[pos] = cand;
                     best_len[pos] = token_slice.len;
                     best_entry[pos] = entry;
@@ -313,7 +313,7 @@ fn encodeWord(model: *UnigramModel, tokenizer: *ct.Tokenizer, word: []const u8) 
             const unk = model.unk_entry.?;
             if (pos + 1 <= len) {
                 const cand = unk.score + best[pos + 1];
-                if (cand < best[pos]) {
+                if (cand > best[pos]) {
                     best[pos] = cand;
                     best_len[pos] = 1;
                     best_entry[pos] = unk;
@@ -730,6 +730,83 @@ test "unigramDecode requires integration testing" {
     // - Complete Unigram model with id_to_token mapping
     // - Token reconstruction from IDs
     // Integration tests: tests/tokenizer/test_*.py
+}
+
+test "unigramDecodeWithOptions decodes token IDs to text" {
+    const allocator = std.testing.allocator;
+
+    var model = try initModel(allocator);
+    // ▁hello (SentencePiece uses U+2581 as word boundary)
+    try addEntry(model, "\xe2\x96\x81hello", -1.0, 0);
+    try addEntry(model, "\xe2\x96\x81world", -1.5, 1);
+    try allocIdToToken(model, 2);
+    populateIdToToken(model);
+
+    var tokenizer = try allocator.create(ct.Tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = ct.ModelType.unigram;
+    tokenizer.model = model;
+    model.owner = tokenizer;
+    defer {
+        tokenizer.model = null;
+        for (model.vocab.items) |entry| allocator.free(entry.token);
+        model.vocab.deinit(allocator);
+        allocator.free(model.id_to_token);
+        allocator.destroy(model);
+        allocator.destroy(tokenizer);
+    }
+
+    var ids = [_]i32{ 0, 1 };
+    var out: [*c]u8 = undefined;
+    var out_len: usize = 0;
+    const rc = unigramDecodeWithOptions(tokenizer, &ids, ids.len, &out, &out_len, .{});
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer allocator.free(out[0 .. out_len + 1]);
+
+    try std.testing.expectEqualStrings(" hello world", out[0..out_len]);
+}
+
+test "unigramDecodeWithOptions skip_special_tokens omits special tokens" {
+    const allocator = std.testing.allocator;
+
+    var model = try initModel(allocator);
+    try addEntry(model, "\xe2\x96\x81hello", -1.0, 0);
+    try addEntry(model, "<s>", -0.5, 1);
+    try addEntry(model, "\xe2\x96\x81world", -1.5, 2);
+    try allocIdToToken(model, 3);
+    populateIdToToken(model);
+
+    var tokenizer = try allocator.create(ct.Tokenizer);
+    tokenizer.* = std.mem.zeroes(ct.Tokenizer);
+    tokenizer.type = ct.ModelType.unigram;
+    tokenizer.model = model;
+    model.owner = tokenizer;
+
+    // Add <s> as a special token (id=1) in the added-token linked list
+    var special_node = std.mem.zeroes(ct.AddedToken);
+    special_node.id = 1;
+    special_node.special = 1;
+    tokenizer.added = &special_node;
+
+    defer {
+        tokenizer.model = null;
+        for (model.vocab.items) |entry| allocator.free(entry.token);
+        model.vocab.deinit(allocator);
+        allocator.free(model.id_to_token);
+        allocator.destroy(model);
+        allocator.destroy(tokenizer);
+    }
+
+    // Decode [hello, <s>, world] with skip_special_tokens=true
+    var ids = [_]i32{ 0, 1, 2 };
+    var out: [*c]u8 = undefined;
+    var out_len: usize = 0;
+    const rc = unigramDecodeWithOptions(tokenizer, &ids, ids.len, &out, &out_len, .{ .skip_special_tokens = true });
+    try std.testing.expectEqual(@as(c_int, 0), rc);
+    defer allocator.free(out[0 .. out_len + 1]);
+
+    // <s> (id=1) should be omitted
+    try std.testing.expectEqualStrings(" hello world", out[0..out_len]);
 }
 
 test "unigramDestroy requires integration testing" {

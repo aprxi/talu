@@ -526,22 +526,18 @@ fn encodeSegment(tokenizer: *ct.Tokenizer, segment: []const u8, base_offset: usi
 
     const is_sentencepiece_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.regex_split != 0 and tokenizer.pretokenizer.byte_level == 0;
     const is_byte_level_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.byte_level != 0;
-    const is_metaspace_bpe = tokenizer.type == ct.ModelType.bpe and tokenizer.pretokenizer.metaspace != 0;
+    const is_metaspace = tokenizer.pretokenizer.metaspace != 0;
 
-    if (is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace_bpe) {
-        // Encode words separately
+    if (is_sentencepiece_bpe or is_byte_level_bpe or is_metaspace) {
+        // Encode words separately — Metaspace tokens already contain ▁ from
+        // splitMetaspace; SentencePiece/byte-level BPE words need per-word encoding.
         for (pretokenized.tokens.items, 0..) |token_item, token_index| {
-            // SentencePiece: ▁ prefix on non-first words (first gets it from normalizer prepend).
-            // Metaspace: tokens from splitMetaspace already have ▁ embedded
-            // (from space→▁ replacement). Only add ▁ if the token doesn't
-            // already start with ▁.
-            const add_sp_prefix = if (is_metaspace_bpe) blk: {
-                const tok_bytes = token_item.sliceConst();
-                const starts_with_sp = tok_bytes.len >= 3 and
-                    tok_bytes[0] == 0xE2 and tok_bytes[1] == 0x96 and tok_bytes[2] == 0x81;
-                break :blk !starts_with_sp and
-                    (tokenizer.pretokenizer.add_prefix_space != 0 or token_index > 0);
-            } else
+            // SentencePiece BPE: ▁ prefix on non-first words (first gets it from normalizer prepend).
+            // Metaspace (any model): tokens from splitMetaspace already have ▁
+            // embedded. No additional ▁ prefix needed.
+            const add_sp_prefix = if (is_metaspace)
+                false
+            else
                 (is_sentencepiece_bpe and token_index > 0);
             try encodeWord(tokenizer, token_item.sliceConst(), add_sp_prefix, accumulator);
         }

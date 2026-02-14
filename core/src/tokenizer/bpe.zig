@@ -519,40 +519,14 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
     // Check the tokenizer's pretokenizer settings
     const is_byte_level = tok.pretokenizer.byte_level != 0;
 
-    // Direct vocab lookup first - works for both SentencePiece and byte-level BPE
-    // For byte-level BPE: the pretokenizer already converted bytes to GPT-2 unicode,
-    // so the input is already in the correct format for vocab lookup
-    // For SentencePiece: tokens like "▁is" are stored as UTF-8 strings directly
-    if (model.vocab_hash.get(word)) |id| {
-        log.trace("tokenizer", "Direct vocab hit", .{ .id = id }, @src());
-        const ids = try allocator.alloc(i32, 1);
-        errdefer allocator.free(ids);
-        const toks = try allocator.alloc([*:0]u8, 1);
-        errdefer allocator.free(toks);
-        ids[0] = id;
-        const dup_tok = try allocator.dupeZ(u8, word);
-        toks[0] = dup_tok.ptr;
-        return EncodedWord{ .ids = ids, .tokens = toks };
-    }
-    log.trace("tokenizer", "Vocab miss, using BPE", .{}, @src());
-
+    // BPE merge process — the merge algorithm is authoritative when it can
+    // produce a valid tokenization. If any resulting token is NOT in vocab
+    // (would be UNK) but the whole word IS in vocab, fall back to direct lookup.
     var tokens = std.ArrayListUnmanaged([]const u8){};
     defer tokens.deinit(allocator);
 
-    // Split input into initial tokens for BPE merging
-    if (is_byte_level) {
-        // Byte-level BPE (GPT-2): input is already GPT-2 unicode encoded by pretokenizer
-        // Split by UTF-8 characters
-        var byte_idx: usize = 0;
-        while (byte_idx < word.len) {
-            const char_len = utf8CharLen(word[byte_idx]);
-            if (byte_idx + char_len > word.len) return error.InvalidUtf8;
-            try tokens.append(allocator, word[byte_idx .. byte_idx + char_len]);
-            byte_idx += char_len;
-        }
-    } else {
-        // SentencePiece BPE: split by UTF-8 characters directly
-        // Then apply BPE merges to respect merge priority order
+    // Split input into initial tokens for BPE merging (UTF-8 characters)
+    {
         var byte_idx: usize = 0;
         while (byte_idx < word.len) {
             const char_len = utf8CharLen(word[byte_idx]);
@@ -587,6 +561,32 @@ fn encodeWord(model: *BpeModel, tok: *ct.Tokenizer, word: []const u8) !EncodedWo
         // Update token list
         tokens.items[pos] = merged;
         _ = tokens.orderedRemove(pos + 1);
+    }
+
+    // Check if all merged tokens are in vocab. If any is missing and the
+    // whole word has a direct vocab entry, use the direct lookup as fallback.
+    // This handles models with empty/incomplete merge tables where the merge
+    // process can't build the word from characters.
+    {
+        var all_in_vocab = true;
+        for (tokens.items) |token| {
+            if (model.vocab_hash.get(token) == null) {
+                all_in_vocab = false;
+                break;
+            }
+        }
+        if (!all_in_vocab) {
+            if (model.vocab_hash.get(word)) |id| {
+                const ids = try allocator.alloc(i32, 1);
+                errdefer allocator.free(ids);
+                const toks = try allocator.alloc([*:0]u8, 1);
+                errdefer allocator.free(toks);
+                ids[0] = id;
+                const dup_tok = try allocator.dupeZ(u8, word);
+                toks[0] = dup_tok.ptr;
+                return EncodedWord{ .ids = ids, .tokens = toks };
+            }
+        }
     }
 
     // Convert to IDs
