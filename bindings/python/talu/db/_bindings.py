@@ -805,6 +805,115 @@ class DocumentStore:
         )
         check(rc, {"operation": "documents_update", "doc_id": doc_id})
 
+    # =========================================================================
+    # Blob Operations
+    # =========================================================================
+
+    def get_blob_ref(self, doc_id: str) -> str | None:
+        """
+        Get the external blob reference for a document payload.
+
+        Args:
+            doc_id: Document identifier.
+
+        Returns
+        -------
+            Blob reference (`sha256:<hex>` or `multi:<hex>`) when externalized,
+            otherwise None for inline payloads.
+
+        Raises
+        ------
+            StateError: If the store is closed.
+            StorageError: If the lookup fails.
+        """
+        from .._bindings import check
+
+        self._check_open()
+
+        out_has_external = c_bool(False)
+        out_ref = ctypes.create_string_buffer(128)
+
+        rc = self._lib.talu_documents_get_blob_ref(
+            self._path_bytes,
+            _to_bytes(doc_id),
+            out_ref,
+            len(out_ref),
+            byref(out_has_external),
+        )
+        check(rc, {"operation": "documents_get_blob_ref", "doc_id": doc_id})
+
+        if not out_has_external.value:
+            return None
+        return out_ref.value.decode("utf-8", errors="replace") or None
+
+    def iter_blob_chunks(self, blob_ref: str, *, chunk_size: int = 64 * 1024) -> Iterator[bytes]:
+        """
+        Stream an externalized blob as chunks.
+
+        Args:
+            blob_ref: Blob reference (`sha256:<hex>` or `multi:<hex>`).
+            chunk_size: Read chunk size in bytes.
+
+        Yields
+        ------
+            Blob content chunks.
+
+        Raises
+        ------
+            StateError: If the store is closed.
+            ValidationError: If chunk_size is invalid or blob_ref is malformed.
+            StorageError: If streaming fails.
+        """
+        from .._bindings import check
+        from ..exceptions import ValidationError
+
+        self._check_open()
+        if chunk_size <= 0:
+            raise ValidationError("chunk_size must be > 0")
+
+        stream = c_void_p()
+        rc = self._lib.talu_blobs_open_stream(
+            self._path_bytes,
+            _to_bytes(blob_ref),
+            byref(stream),
+        )
+        check(rc, {"operation": "blobs_open_stream", "blob_ref": blob_ref})
+
+        try:
+            buf = (ctypes.c_ubyte * chunk_size)()
+            while True:
+                out_read = c_size_t()
+                rc = self._lib.talu_blobs_stream_read(
+                    stream,
+                    cast(buf, c_void_p),
+                    chunk_size,
+                    byref(out_read),
+                )
+                check(rc, {"operation": "blobs_stream_read", "blob_ref": blob_ref})
+                if out_read.value == 0:
+                    break
+                yield bytes(buf[0 : out_read.value])
+        finally:
+            if stream.value:
+                self._lib.talu_blobs_stream_close(stream)
+
+    def read_blob(self, blob_ref: str, *, chunk_size: int = 64 * 1024) -> bytes:
+        """
+        Read an externalized blob into memory.
+
+        Args:
+            blob_ref: Blob reference (`sha256:<hex>` or `multi:<hex>`).
+            chunk_size: Streaming read chunk size.
+
+        Returns
+        -------
+            Full blob payload bytes.
+        """
+        out = bytearray()
+        for chunk in self.iter_blob_chunks(blob_ref, chunk_size=chunk_size):
+            out.extend(chunk)
+        return bytes(out)
+
     def delete(self, doc_id: str) -> None:
         """
         Delete a document.

@@ -32,6 +32,7 @@ pub const progress = @import("progress.zig");
 pub const memory = @import("memory.zig");
 pub const policy = @import("policy.zig");
 pub const documents = @import("documents.zig");
+pub const blobs = @import("blobs.zig");
 pub const plugins = @import("plugins.zig");
 
 pub const router = @import("router.zig");
@@ -482,6 +483,7 @@ pub const talu_documents_remove_tag = documents.talu_documents_remove_tag;
 pub const talu_documents_get_tags = documents.talu_documents_get_tags;
 pub const talu_documents_get_by_tag = documents.talu_documents_get_by_tag;
 pub const talu_documents_free_string_list = documents.talu_documents_free_string_list;
+pub const talu_documents_get_blob_ref = documents.talu_documents_get_blob_ref;
 pub const CDocumentRecord = documents.CDocumentRecord;
 pub const CDocumentSummary = documents.CDocumentSummary;
 pub const CDocumentList = documents.CDocumentList;
@@ -492,6 +494,14 @@ pub const CChangeRecord = documents.CChangeRecord;
 pub const CChangeList = documents.CChangeList;
 pub const CDeltaChain = documents.CDeltaChain;
 pub const CCompactionStats = documents.CCompactionStats;
+
+// Re-export Blob C API functions.
+pub const talu_blobs_put = blobs.talu_blobs_put;
+pub const talu_blobs_open_stream = blobs.talu_blobs_open_stream;
+pub const talu_blobs_stream_read = blobs.talu_blobs_stream_read;
+pub const talu_blobs_stream_total_size = blobs.talu_blobs_stream_total_size;
+pub const talu_blobs_stream_close = blobs.talu_blobs_stream_close;
+pub const BlobStreamHandle = blobs.BlobStreamHandle;
 
 // Re-export Plugins C API functions (UI plugin discovery).
 pub const talu_plugins_scan = plugins.talu_plugins_scan;

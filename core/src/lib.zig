@@ -361,4 +361,12 @@ comptime {
     _ = &capi.talu_documents_get_tags;
     _ = &capi.talu_documents_get_by_tag;
     _ = &capi.talu_documents_free_string_list;
+    _ = &capi.talu_documents_get_blob_ref;
+
+    // Blob API (raw content-addressable blob storage)
+    _ = &capi.talu_blobs_put;
+    _ = &capi.talu_blobs_open_stream;
+    _ = &capi.talu_blobs_stream_read;
+    _ = &capi.talu_blobs_stream_total_size;
+    _ = &capi.talu_blobs_stream_close;
 }

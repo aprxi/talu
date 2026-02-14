@@ -4,6 +4,7 @@
 //! - Document CRUD operations (`talu_documents_*`)
 //! - Document-tag associations (`talu_documents_add_tag`, `talu_documents_get_tags`)
 //! - Document search operations (`talu_documents_search`)
+//! - External blob references (`talu_documents_get_blob_ref`)
 
 const std = @import("std");
 const capi_error = @import("error.zig");
@@ -411,6 +412,80 @@ pub export fn talu_documents_get(
     defer record.deinit(allocator);
 
     populateDocumentRecord(out_doc, record);
+    return 0;
+}
+
+// =============================================================================
+// Document Blob API
+// =============================================================================
+
+/// Get the external blob reference for a document's JSON payload.
+///
+/// Parameters:
+///   - db_path: Path to TaluDB storage directory (null-terminated)
+///   - doc_id: Document UUID to query (null-terminated)
+///   - out_blob_ref: Output buffer for `sha256:<hex>` or `multi:<hex>` (nullable)
+///   - out_blob_ref_capacity: Output buffer capacity in bytes
+///   - out_has_external_ref: Output flag (true when ref exists, false for inline payload)
+///
+/// Returns: 0 on success, negative error code on failure.
+///
+/// Notes:
+///   - For inline documents, `out_has_external_ref=false` and `out_blob_ref` is set to empty if provided.
+///   - If `out_has_external_ref=true`, `out_blob_ref` must be large enough for ref + NUL.
+pub export fn talu_documents_get_blob_ref(
+    db_path: ?[*:0]const u8,
+    doc_id: ?[*:0]const u8,
+    out_blob_ref: ?[*]u8,
+    out_blob_ref_capacity: usize,
+    out_has_external_ref: ?*bool,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const has_external_ref = out_has_external_ref orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_has_external_ref is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    has_external_ref.* = false;
+
+    if (out_blob_ref_capacity > 0) {
+        const buf = out_blob_ref orelse {
+            capi_error.setErrorWithCode(.invalid_argument, "out_blob_ref is null", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        };
+        buf[0] = 0;
+    }
+
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const doc_id_slice = validateRequiredArg(doc_id, "doc_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+
+    const header_opt = documents.getDocumentHeader(allocator, db_path_slice, doc_id_slice) catch |err| {
+        capi_error.setErrorWithCode(.storage_error, "Failed to get document header: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+
+    if (header_opt == null) {
+        capi_error.setErrorWithCode(.storage_error, "Document not found", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    }
+
+    const header = header_opt.?;
+    defer documents.freeDocumentHeader(allocator, header);
+
+    const blob_ref = header.doc_json_ref orelse return 0;
+
+    if (out_blob_ref == null or out_blob_ref_capacity <= blob_ref.len) {
+        capi_error.setErrorWithCode(
+            .resource_exhausted,
+            "out_blob_ref buffer too small (need at least {d} bytes)",
+            .{blob_ref.len + 1},
+        );
+        return @intFromEnum(error_codes.ErrorCode.resource_exhausted);
+    }
+
+    const out_buf = out_blob_ref.?;
+    @memcpy(out_buf[0..blob_ref.len], blob_ref);
+    out_buf[blob_ref.len] = 0;
+    has_external_ref.* = true;
     return 0;
 }
 

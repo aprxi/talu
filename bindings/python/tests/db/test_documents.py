@@ -216,6 +216,62 @@ class TestDocumentCRUD:
             assert len(docs) == 2
 
 
+class TestDocumentBlobStreaming:
+    """Tests for externalized blob access and streaming."""
+
+    def test_get_blob_ref_returns_none_for_inline_payload(self, tmp_path: Path) -> None:
+        """Inline payloads should not expose a blob reference."""
+        with DocumentStore(str(tmp_path / "docs")) as store:
+            store.create(
+                doc_id="doc-inline",
+                doc_type="prompt",
+                title="Inline",
+                doc_json='{"content":"small"}',
+            )
+            assert store.get_blob_ref("doc-inline") is None
+
+    def test_iter_blob_chunks_reads_externalized_payload(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Stream reads should reconstruct single-blob externalized payloads."""
+        monkeypatch.setenv("TALU_DB_DOC_JSON_EXTERNALIZE_THRESHOLD_BYTES", "32")
+
+        payload = '{"content":"' + ("A" * 320) + '"}'
+        with DocumentStore(str(tmp_path / "docs")) as store:
+            store.create(
+                doc_id="doc-external",
+                doc_type="prompt",
+                title="Externalized",
+                doc_json=payload,
+            )
+
+            blob_ref = store.get_blob_ref("doc-external")
+            assert blob_ref is not None
+            assert blob_ref.startswith("sha256:")
+
+            streamed = b"".join(store.iter_blob_chunks(blob_ref, chunk_size=17))
+            assert streamed == payload.encode("utf-8")
+
+    def test_read_blob_supports_multipart_refs(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Multipart blob refs should stream and reassemble transparently."""
+        monkeypatch.setenv("TALU_DB_DOC_JSON_EXTERNALIZE_THRESHOLD_BYTES", "32")
+        monkeypatch.setenv("TALU_DB_BLOB_MULTIPART_CHUNK_SIZE_BYTES", "48")
+
+        payload = '{"content":"' + ("multipart-" * 80) + '"}'
+        with DocumentStore(str(tmp_path / "docs")) as store:
+            store.create(
+                doc_id="doc-multipart",
+                doc_type="prompt",
+                title="Multipart",
+                doc_json=payload,
+            )
+
+            blob_ref = store.get_blob_ref("doc-multipart")
+            assert blob_ref is not None
+            assert blob_ref.startswith("multi:")
+
+            loaded = store.read_blob(blob_ref, chunk_size=13)
+            assert loaded == payload.encode("utf-8")
+
+
 class TestDocumentSearch:
     """Tests for document search operations."""
 
