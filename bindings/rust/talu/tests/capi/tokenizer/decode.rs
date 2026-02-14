@@ -570,3 +570,74 @@ fn added_token_tab_content_decodes_to_tab() {
         "added token with \\t\\t\\t content must decode to 3 tab chars, got: {decoded6:?}"
     );
 }
+
+// ===========================================================================
+// SentencePiece BPE: no extra ▁ after second special token
+// ===========================================================================
+//
+// Models with a Prepend("▁") + Replace(" " → "▁") normalizer (SentencePiece
+// style) normalize the full input once. The Prepend adds ▁ at the start of
+// the text. When the text begins with a special token, the initial ▁ is
+// skipped and re-attached to the first non-special segment. However, no
+// extra ▁ should be added to segments after subsequent special tokens —
+// those segments already have ▁ from the Replace normalizer.
+//
+// Affects: microsoft/Phi-3-mini-128k-instruct, Phi-3-mini-4k-instruct,
+// Phi-3.5-mini-instruct, Phi-3.5-vision-instruct, Phi-mini-MoE-instruct.
+
+const PREPEND_REPLACE_BPE_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "h": 4, "e": 5, "l": 6, "o": 7,
+      "w": 8, "r": 9, "d": 10,
+      "\u2581h": 11, "\u2581he": 12, "\u2581hel": 13, "\u2581hell": 14, "\u2581hello": 15,
+      "\u2581w": 16, "\u2581wo": 17, "\u2581wor": 18, "\u2581worl": 19, "\u2581world": 20
+    },
+    "merges": [
+      "\u2581 h", "\u2581h e", "\u2581he l", "\u2581hel l", "\u2581hell o",
+      "\u2581 w", "\u2581w o", "\u2581wo r", "\u2581wor l", "\u2581worl d"
+    ]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": {
+    "type": "Sequence",
+    "normalizers": [
+      {"type": "Prepend", "prepend": "\u2581"},
+      {"type": "Replace", "pattern": {"String": " "}, "content": "\u2581"}
+    ]
+  },
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+
+/// After the second special token, no extra standalone ▁ should appear.
+///
+/// Input "<s> hello </s> world" normalizes to "▁<s>▁hello▁</s>▁world".
+/// The initial ▁ before <s> is re-attached to the first segment.
+/// But the segment "▁world" after </s> already has its ▁ from Replace
+/// and should NOT get an additional ▁ prepended.
+#[test]
+fn sentencepiece_no_extra_metaspace_after_second_special_token() {
+    let ctx = TokenizerTestContext::from_json(PREPEND_REPLACE_BPE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("<s> hello </s> world", &opts);
+    // Expected: <s>(1), ▁(3), ▁hello(15), ▁(3), </s>(2), ▁world(20)
+    // The ▁(3) after <s> is the re-attached initial Prepend ▁.
+    // There must be NO extra ▁(3) between </s>(2) and ▁world(20).
+    assert_eq!(
+        tokens, vec![1, 3, 15, 3, 2, 20],
+        "no extra ▁ after second special token, got: {tokens:?}"
+    );
+}

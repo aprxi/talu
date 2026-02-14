@@ -510,3 +510,115 @@ fn bert_normalizer_clean_text_whitespace_empty() {
         "BertNormalizer + BertPreTokenizer: whitespace-only must produce empty, got: {tokens:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WordPiece: max_input_chars_per_word enforcement
+// ---------------------------------------------------------------------------
+//
+// When a single word exceeds `max_input_chars_per_word`, WordPiece should
+// emit a single [UNK] token for that word instead of attempting subword
+// decomposition. This prevents quadratic blowup on adversarial inputs and
+// matches HuggingFace behavior.
+//
+// Affects: BAAI/bge-large-en-v1.5, sentence-transformers/all-MiniLM-L6-v2,
+// sentence-transformers/all-mpnet-base-v2 (long "aaa..." inputs).
+
+/// Words longer than max_input_chars_per_word produce [UNK].
+#[test]
+fn wordpiece_max_input_chars_per_word_produces_unk() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 10,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "a": 4, "##a": 5
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "hello" (5 chars) is within the limit → normal encoding
+    let short = ctx.encode_with("hello", &opts);
+    assert_eq!(
+        short, vec![3],
+        "word within limit encodes normally, got: {short:?}"
+    );
+    // "aaaaaaaaaaa" (11 chars) exceeds max_input_chars_per_word=10 → [UNK]
+    let long = ctx.encode_with("aaaaaaaaaaa", &opts);
+    assert_eq!(
+        long, vec![0],
+        "word exceeding max_input_chars_per_word must produce [UNK], got: {long:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BertNormalizer: clean_text replaces newlines with spaces
+// ---------------------------------------------------------------------------
+//
+// BertNormalizer's `clean_text` flag should replace control characters
+// (including \n, \t, \r) with spaces, not drop them entirely. Dropping
+// newlines causes words on adjacent lines to merge into a single token.
+//
+// Affects: BAAI/bge-large-en-v1.5, sentence-transformers/all-MiniLM-L6-v2
+// (encode "line1\nline2\nline3" produces wrong token IDs).
+
+/// Newlines between words are replaced with spaces, not dropped.
+#[test]
+fn bert_normalizer_clean_text_replaces_newline_with_space() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "line": 3, "##1": 4, "##2": 5, "##3": 6
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": false,
+    "strip_accents": false,
+    "lowercase": false
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "line1\nline2" — \n should be replaced with space, giving two words:
+    // "line1" → [line, ##1] and "line2" → [line, ##2]
+    let tokens = ctx.encode_with("line1\nline2", &opts);
+    assert_eq!(
+        tokens, vec![3, 4, 3, 5],
+        "newline must be replaced with space (producing two words), got: {tokens:?}"
+    );
+}
