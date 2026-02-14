@@ -461,6 +461,126 @@ fn lstrip_blocks_multiturn_indented_template() {
     );
 }
 
+
+// ===========================================================================
+// {% set %} reassignment inside for-loop
+// ===========================================================================
+//
+// In Jinja2, {% set content = message['content'] %} inside a for-loop must
+// update the variable on every iteration. Without correct scoping, the
+// variable "sticks" at the first iteration's value and all subsequent
+// iterations render stale content.
+// Affects: Qwen/Qwen3-VL-Thinking models (10 chat_template failures).
+
+/// Macro parameter scope must not leak across for-loops.
+///
+/// Qwen3-VL-Thinking templates use two sequential for-loops that both
+/// call the same macro and assign `{% set content = render_content(...) %}`.
+/// The macro parameter `content` must be freshly bound on each call.
+///
+/// Bug: `callMacro()` binds parameters to the global context, but
+/// `getVar()` searches local scopes first. A stale local `content` from
+/// a previous loop iteration is found instead of the macro's parameter,
+/// causing all iterations to render the first message's content.
+#[test]
+fn macro_param_scope_across_two_loops() {
+    // Macro with a parameter named `content` (same as the loop variable).
+    // First loop: iterates in reverse (like Qwen3-VL's multi-step tool check).
+    // Second loop: iterates forward and renders each message's content.
+    let tmpl = concat!(
+        "{%- macro render_content(content) -%}",
+        "{%- if content is string -%}",
+        "{{ content }}",
+        "{%- endif -%}",
+        "{%- endmacro -%}",
+        // First loop: sets `content` via macro call (reverse order).
+        "{%- for message in messages -%}",
+        "{%- set content = render_content(message['content']) -%}",
+        "{%- endfor -%}",
+        // Second loop: sets `content` via same macro call (forward order).
+        "{%- for message in messages -%}",
+        "{%- set content = render_content(message['content']) -%}",
+        "<|im_start|>{{ message['role'] }}\n{{ content }}<|im_end|>\n",
+        "{%- endfor -%}",
+    );
+    let msgs = r#"[
+        {"role":"system","content":"You are helpful."},
+        {"role":"user","content":"Hi"},
+        {"role":"assistant","content":"Hello!"}
+    ]"#;
+    let result = apply_chat_template(tmpl, msgs, false, "", "").unwrap();
+    // Each message must render its own content, not the first message's.
+    assert!(
+        result.contains("user\nHi<|im_end|>"),
+        "user message must contain 'Hi', not system content, got: {result:?}"
+    );
+    assert!(
+        result.contains("assistant\nHello!<|im_end|>"),
+        "assistant message must contain 'Hello!', not system content, got: {result:?}"
+    );
+}
+
+// ===========================================================================
+// add_generation_prompt with namespace and compound conditional
+// ===========================================================================
+//
+// DeepSeek-R1 templates use:
+//   {% set ns = namespace(is_tool=false) %}
+//   {% if add_generation_prompt and not ns.is_tool %}
+//     <|Assistant|><think>
+//   {% endif %}
+//
+// The generation prompt must be appended when add_generation_prompt=true
+// and ns.is_tool is false.
+// Affects: deepseek-ai/DeepSeek-R1 (8 chat_template failures).
+
+/// `add_generation_prompt and not ns.attr` must evaluate correctly.
+///
+/// When `add_generation_prompt` is true and `ns.is_tool` is false (its
+/// default), the compound condition `add_generation_prompt and not ns.is_tool`
+/// must be true and the generation prompt block must render.
+#[test]
+fn generation_prompt_with_namespace_compound_conditional() {
+    // Use {{ '...' }} expression to output the generation prompt, matching the
+    // real DeepSeek-R1 template pattern. This prevents {%- endif %} from
+    // trimming the trailing newline (which is inside an expression, not raw text).
+    let tmpl = concat!(
+        "{%- set ns = namespace(is_tool=false) -%}",
+        "{%- for message in messages -%}",
+        "<|{{ message['role'] }}|>{{ message['content'] }}",
+        "{%- endfor -%}",
+        "{%- if add_generation_prompt and not ns.is_tool %}",
+        "{{'<|Assistant|><think>\n'}}",
+        "{%- endif -%}",
+    );
+    let msgs = r#"[{"role":"user","content":"Hi"}]"#;
+    let result = apply_chat_template(tmpl, msgs, true, "", "").unwrap();
+    assert!(
+        result.ends_with("<|Assistant|><think>\n"),
+        "generation prompt must be appended when add_generation_prompt=true and ns.is_tool=false, got: {result:?}"
+    );
+}
+
+/// `add_generation_prompt=false` must suppress generation prompt even with namespace.
+#[test]
+fn generation_prompt_false_with_namespace_suppresses() {
+    let tmpl = concat!(
+        "{%- set ns = namespace(is_tool=false) -%}",
+        "{%- for message in messages -%}",
+        "<|{{ message['role'] }}|>{{ message['content'] }}",
+        "{%- endfor -%}",
+        "{%- if add_generation_prompt and not ns.is_tool -%}",
+        "<|Assistant|><think>\n",
+        "{%- endif -%}",
+    );
+    let msgs = r#"[{"role":"user","content":"Hi"}]"#;
+    let result = apply_chat_template(tmpl, msgs, false, "", "").unwrap();
+    assert!(
+        !result.contains("<|Assistant|>"),
+        "generation prompt must not appear when add_generation_prompt=false, got: {result:?}"
+    );
+}
+
 // ===========================================================================
 // Many messages stress
 // ===========================================================================

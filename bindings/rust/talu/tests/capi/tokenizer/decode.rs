@@ -415,3 +415,58 @@ fn decode_json_formfeed_escape() {
         "JSON \\f in vocab must decode to form feed (U+000C), got: {decoded:?}"
     );
 }
+
+// ===========================================================================
+// Added token ID mapping: explicit IDs must be honored
+// ===========================================================================
+//
+// Added tokens in tokenizer.json have explicit "id" fields that may be
+// non-sequential or have gaps. The loader must use these explicit IDs, not
+// the array position, when building the id→string mapping.
+//
+// Bug: added tokens are mapped by position rather than explicit ID, so
+// decode returns the wrong string for tokens with non-contiguous IDs.
+// Affects: microsoft/Phi-4-mini-flash-reasoning (8 vocab_decode failures).
+
+/// Minimal BPE tokenizer with non-contiguous added token IDs.
+const ADDED_TOKEN_IDS_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"hello": 0, "world": 1},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 5, "content": "<|first|>", "special": true},
+    {"id": 10, "content": "<|second|>", "special": true},
+    {"id": 15, "content": "<|third|>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+
+/// Added token with explicit ID must decode to its own content string.
+///
+/// Token ID 5 is "<|first|>", ID 10 is "<|second|>", ID 15 is "<|third|>".
+/// The decoder must use the explicit IDs, not array position.
+#[test]
+fn added_token_decode_uses_explicit_id() {
+    let ctx = TokenizerTestContext::from_json(ADDED_TOKEN_IDS_JSON);
+    assert_eq!(
+        ctx.decode(&[5]), "<|first|>",
+        "token ID 5 must decode to '<|first|>', got: {:?}",
+        ctx.decode(&[5])
+    );
+    assert_eq!(
+        ctx.decode(&[10]), "<|second|>",
+        "token ID 10 must decode to '<|second|>', got: {:?}",
+        ctx.decode(&[10])
+    );
+    assert_eq!(
+        ctx.decode(&[15]), "<|third|>",
+        "token ID 15 must decode to '<|third|>', got: {:?}",
+        ctx.decode(&[15])
+    );
+}

@@ -923,3 +923,152 @@ fn error_code_consistency_json() {
         assert_eq!(err, 605, "expected 605 for JSON: {json:?}, got {err}");
     }
 }
+
+// ===========================================================================
+// `not X is defined` operator precedence
+// ===========================================================================
+//
+// In Jinja2, `is` has higher precedence than `not`:
+//   `not X is defined` = `not (X is defined)`
+//
+// If the engine incorrectly parses it as `(not X) is defined`, the result
+// is always true (since `not X` produces a defined boolean value), which
+// causes `{% set X = false %}` to execute even when X is already defined.
+// Affects: deepseek-ai/DeepSeek-R1 templates (8 chat_template failures)
+// where add_generation_prompt gets overridden to false.
+
+/// `not X is defined` must parse as `not (X is defined)`.
+///
+/// When `x` is defined, `not x is defined` must be false. If the engine
+/// parses it as `(not x) is defined`, the result is always true because
+/// `not x` produces a defined value.
+#[test]
+fn not_is_defined_precedence() {
+    // x=true is defined, so `not x is defined` should be `not true` = false.
+    // The template should NOT execute the set block → output "true".
+    let tmpl = concat!(
+        "{% if not x is defined %}{% set x = false %}{% endif %}",
+        "{{ x }}",
+    );
+    let result = render_template(tmpl, r#"{"x": true}"#, false).unwrap();
+    assert_eq!(
+        result.trim(), "True",
+        "`not x is defined` must parse as `not (x is defined)`, \
+         but x was overridden to false, got: {result:?}"
+    );
+}
+
+/// `not X is defined` with false value: variable is still defined.
+///
+/// Even when `x=false`, `x` is defined. `not x is defined` should be
+/// `not (false is defined)` = `not true` = false. The set block must not
+/// execute.
+#[test]
+fn not_is_defined_false_value_still_defined() {
+    let tmpl = concat!(
+        "{% if not x is defined %}{% set x = 42 %}{% endif %}",
+        "{{ x }}",
+    );
+    let result = render_template(tmpl, r#"{"x": false}"#, false).unwrap();
+    assert_eq!(
+        result.trim(), "False",
+        "x=false is defined; `not x is defined` must be false, got: {result:?}"
+    );
+}
+
+// ===========================================================================
+// `is string` test
+// ===========================================================================
+//
+// Jinja2's `is string` test checks if a value is a string type.
+// Templates like Qwen3-VL use `{% if content is string %}` to distinguish
+// plain text from structured content arrays.
+// Affects: Qwen3-VL-Thinking template rendering (macro dispatches on string
+// vs array content).
+
+/// `is string` must return true for string values.
+#[test]
+fn is_string_true_for_strings() {
+    let tmpl = "{% if val is string %}yes{% else %}no{% endif %}";
+    let result = render_template(tmpl, r#"{"val": "hello"}"#, false).unwrap();
+    assert_eq!(result, "yes", "`is string` must be true for string values, got: {result:?}");
+}
+
+/// `is string` must return false for non-string values.
+#[test]
+fn is_string_false_for_non_strings() {
+    let tmpl = "{% if val is string %}yes{% else %}no{% endif %}";
+    // Array
+    let result = render_template(tmpl, r#"{"val": [1, 2, 3]}"#, false).unwrap();
+    assert_eq!(result, "no", "`is string` must be false for arrays, got: {result:?}");
+    // Number
+    let result = render_template(tmpl, r#"{"val": 42}"#, false).unwrap();
+    assert_eq!(result, "no", "`is string` must be false for numbers, got: {result:?}");
+}
+
+// ===========================================================================
+// Slice reversal: `list[::-1]`
+// ===========================================================================
+//
+// Jinja2 supports Python-style slice reversal. Templates like Qwen3-VL
+// iterate messages in reverse to find the last user query index:
+//   `{% for message in messages[::-1] %}`
+// Affects: Qwen3-VL-Thinking template (reverse loop for multi-step tool
+// detection).
+
+/// `list[::-1]` must reverse the list.
+#[test]
+fn slice_reversal() {
+    let tmpl = concat!(
+        "{%- for item in items[::-1] -%}",
+        "{{ item }}",
+        "{%- if not loop.last %},{% endif -%}",
+        "{%- endfor -%}",
+    );
+    let result = render_template(tmpl, r#"{"items": ["a", "b", "c"]}"#, false).unwrap();
+    assert_eq!(result, "c,b,a", "[::-1] must reverse the list, got: {result:?}");
+}
+
+// ===========================================================================
+// String methods: split, startswith, endswith, strip
+// ===========================================================================
+//
+// Templates use Python string methods on template values:
+//   content.split('</think>')[-1]  — split and negative indexing
+//   content.startswith('<tool_response>')
+//   content.strip('\n')
+// Affects: Qwen3-VL-Thinking and DeepSeek-R1 templates.
+
+/// `str.split(sep)[-1]` must return the last segment.
+#[test]
+fn string_split_negative_index() {
+    let tmpl = "{{ text.split('|')[-1] }}";
+    let result = render_template(tmpl, r#"{"text": "a|b|c"}"#, false).unwrap();
+    assert_eq!(result, "c", "split('|')[-1] must return last segment, got: {result:?}");
+}
+
+/// `str.startswith(prefix)` must test the prefix.
+#[test]
+fn string_startswith() {
+    let tmpl = "{% if text.startswith('hello') %}yes{% else %}no{% endif %}";
+    let result = render_template(tmpl, r#"{"text": "hello world"}"#, false).unwrap();
+    assert_eq!(result, "yes", "startswith must match prefix, got: {result:?}");
+    let result = render_template(tmpl, r#"{"text": "world hello"}"#, false).unwrap();
+    assert_eq!(result, "no", "startswith must not match non-prefix, got: {result:?}");
+}
+
+/// `str.endswith(suffix)` must test the suffix.
+#[test]
+fn string_endswith() {
+    let tmpl = "{% if text.endswith('world') %}yes{% else %}no{% endif %}";
+    let result = render_template(tmpl, r#"{"text": "hello world"}"#, false).unwrap();
+    assert_eq!(result, "yes", "endswith must match suffix, got: {result:?}");
+}
+
+/// `str.strip(chars)` must remove specified characters from both ends.
+#[test]
+fn string_strip_with_argument() {
+    let tmpl = "{{ text.strip('\\n') }}";
+    let result = render_template(tmpl, r#"{"text": "\nhello\n"}"#, false).unwrap();
+    assert_eq!(result, "hello", "strip('\\n') must remove newlines, got: {result:?}");
+}
