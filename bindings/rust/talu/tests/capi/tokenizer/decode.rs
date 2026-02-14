@@ -470,3 +470,118 @@ fn added_token_decode_uses_explicit_id() {
         ctx.decode(&[15])
     );
 }
+
+// ===========================================================================
+// Metaspace BPE: no extra ▁ after matched special token during encode
+// ===========================================================================
+//
+// SentencePiece BPE models with Metaspace pretokenizer match special tokens
+// (like <s>, </s>) first, then tokenize the remaining text segments. The
+// Metaspace pretokenizer converts spaces to ▁ (U+2581) for word boundaries.
+//
+// After a special token match, the next text segment starts with a space
+// (e.g. " are" after "</s>"). The pretokenizer's space-to-▁ conversion
+// should absorb this space into the ▁ prefix of the first word, NOT produce
+// a separate standalone ▁ token.
+//
+// Bug: the encode pipeline explicitly prepends ▁ to segments after special
+// tokens, AND the Metaspace pretokenizer converts the leading space to ▁,
+// causing double ▁ that splits into a standalone ▁ + ▁word.
+// Affects: microsoft/Phi-3 models (1 encode failure each × 5 models).
+
+/// Minimal SentencePiece BPE with <s>/<eos> special tokens and Metaspace.
+const METASPACE_SPECIAL_TOKEN_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "\u2581and": 4, "\u2581are": 5, "\u2581special": 6, "\u2581tokens": 7
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "prepend_scheme": "first", "add_prefix_space": true},
+  "post_processor": null,
+  "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
+}"####;
+
+/// Encoding text with a special token match must not produce an extra ▁ token.
+///
+/// For "<s> and </s> are special tokens":
+/// - <s> matched as special token (ID 1)
+/// - " and " tokenized → [▁and]
+/// - </s> matched as special token (ID 2)
+/// - " are special tokens" tokenized → [▁are, ▁special, ▁tokens]
+///
+/// There must be no standalone ▁ token between </s> and ▁are.
+#[test]
+fn no_extra_metaspace_after_special_token() {
+    let ctx = TokenizerTestContext::from_json(METASPACE_SPECIAL_TOKEN_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("<s> and </s> are special tokens", &opts);
+    // Expected: [<s>=1, ▁and=4, </s>=2, ▁are=5, ▁special=6, ▁tokens=7]
+    // Bug: produces [<s>=1, ▁and=4, </s>=2, ▁=3, ▁are=5, ▁special=6, ▁tokens=7]
+    //                                        ^^^ extra standalone ▁
+    assert_eq!(
+        tokens, vec![1, 4, 2, 5, 6, 7],
+        "no extra ▁ token after special token match, got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// ByteLevel BPE: added token with tab character decodes correctly
+// ===========================================================================
+//
+// Added tokens can contain tab characters (JSON escape \t → U+0009). The
+// loader must unescape the JSON, and the decoder must output the literal
+// tab character, not the two-character sequence "\t".
+//
+// Bug: for ByteLevel BPE models, added tokens containing tabs may be decoded
+// through the unicode_to_byte mapping which doesn't have an entry for low
+// codepoints like U+0009, or the token content may not be unescaped correctly.
+// Affects: microsoft/phi-1_5, phi-2 (8 vocab_decode failures each).
+
+/// Added token with tab character content must decode to literal tabs.
+#[test]
+fn added_token_tab_content_decodes_to_tab() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {"hello": 0, "world": 1},
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "hello", "special": false},
+    {"id": 1, "content": "world", "special": false},
+    {"id": 5, "content": "\t\t", "special": false},
+    {"id": 6, "content": "\t\t\t", "special": false}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": null,
+  "decoder": {"type": "ByteLevel"}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    // Token 5 = two tab characters, Token 6 = three tab characters
+    let decoded5 = ctx.decode(&[5]);
+    assert_eq!(
+        decoded5, "\t\t",
+        "added token with \\t\\t content must decode to 2 tab chars, got: {decoded5:?}"
+    );
+    let decoded6 = ctx.decode(&[6]);
+    assert_eq!(
+        decoded6, "\t\t\t",
+        "added token with \\t\\t\\t content must decode to 3 tab chars, got: {decoded6:?}"
+    );
+}

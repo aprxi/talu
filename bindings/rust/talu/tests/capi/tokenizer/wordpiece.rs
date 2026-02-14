@@ -338,3 +338,175 @@ fn encode_bert_postproc_empty_produces_cls_sep() {
         "BertProcessing: empty input must produce [CLS, SEP]"
     );
 }
+
+// ---------------------------------------------------------------------------
+// BertPreTokenizer: consecutive punctuation splitting
+// ---------------------------------------------------------------------------
+//
+// BertPreTokenizer must split every punctuation character individually, even
+// when multiple punctuation characters appear consecutively. "hello..." must
+// produce ["hello", ".", ".", "."], not ["hello", "..."].
+// Affects: BAAI/bge, sentence-transformers (~9 encode failures per model).
+
+/// Consecutive dots "..." must be split into individual "." tokens.
+#[test]
+fn bert_pretokenizer_splits_consecutive_dots() {
+    let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
+    // "hello..." → BertPreTokenizer → ["hello", ".", ".", "."]
+    // WordPiece: "hello"=4, "."=15, "."=15, "."=15
+    let tokens = ctx.encode("hello...");
+    assert_eq!(
+        tokens, vec![4, 15, 15, 15],
+        "BertPreTokenizer must split '...' into three '.' tokens, got: {tokens:?}"
+    );
+}
+
+/// Mixed consecutive punctuation "?!" must produce separate tokens.
+#[test]
+fn bert_pretokenizer_splits_mixed_consecutive_punct() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "?": 4, "!": 5, ".": 6, ",": 7, ":": 8
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    // "hello?!" → ["hello", "?", "!"]
+    let tokens = ctx.encode("hello?!");
+    assert_eq!(
+        tokens, vec![3, 4, 5],
+        "BertPreTokenizer must split '?!' into '?' and '!', got: {tokens:?}"
+    );
+
+    // "hello:..." → ["hello", ":", ".", ".", "."]
+    let tokens = ctx.encode("hello:...");
+    assert_eq!(
+        tokens, vec![3, 8, 6, 6, 6],
+        "BertPreTokenizer must split ':...' into individual chars, got: {tokens:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BertNormalizer: handle_chinese_chars must not split non-CJK characters
+// ---------------------------------------------------------------------------
+//
+// BertNormalizer with handle_chinese_chars=true adds spaces around CJK
+// characters (Unicode ranges U+4E00-U+9FFF, etc.) to split them for
+// WordPiece. However, non-CJK characters must NOT be affected.
+//
+// Bug: the CJK detection may incorrectly classify non-CJK codepoints,
+// causing "hello" to be split into individual characters ("h e l l o").
+// Affects: google-bert/bert-base-uncased (19 encode failures).
+
+/// BertNormalizer with all options enabled must still produce whole-word tokens.
+///
+/// When lowercase + clean_text + handle_chinese_chars + strip_accents are all
+/// active, ASCII words must remain intact (not split char-by-char).
+#[test]
+fn bert_normalizer_full_options_whole_word() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2, "[PAD]": 3,
+      "hello": 4, "world": 5, ",": 6, "!": 7,
+      "h": 8, "e": 9, "l": 10, "o": 11, "w": 12, "r": 13, "d": 14
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true},
+    {"id": 3, "content": "[PAD]", "special": true}
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": true,
+    "lowercase": true
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "Hello" must normalize to "hello" and match as whole word (ID 4),
+    // NOT split into individual characters [h, e, l, l, o] = [8, 9, 10, 10, 11].
+    let tokens = ctx.encode_with("Hello", &opts);
+    assert_eq!(
+        tokens, vec![4],
+        "BertNormalizer full options: 'Hello' must match whole word 'hello' (ID 4), got: {tokens:?}"
+    );
+}
+
+/// BertNormalizer with clean_text: whitespace-only input produces empty output.
+///
+/// clean_text normalizes whitespace to space, and BertPreTokenizer strips it.
+/// The result must be empty, not [UNK] tokens for each space.
+#[test]
+fn bert_normalizer_clean_text_whitespace_empty() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": true,
+    "lowercase": true
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "   " (three spaces) → after clean_text → "   " → BertPreTokenizer strips → []
+    let tokens = ctx.encode_with("   ", &opts);
+    assert_eq!(
+        tokens, Vec::<u32>::new(),
+        "BertNormalizer + BertPreTokenizer: whitespace-only must produce empty, got: {tokens:?}"
+    );
+}
