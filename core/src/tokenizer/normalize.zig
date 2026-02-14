@@ -196,7 +196,16 @@ pub fn normalize_text(normalizer: *const ct.Normalizer, input_bytes: []const u8)
             }
         }
 
-        const is_cjk = (codepoint >= 0x4E00 and codepoint <= 0x9FFF);
+        // HuggingFace _is_chinese_char: 8 CJK Unicode ranges
+        const cp = @as(u32, @bitCast(codepoint));
+        const is_cjk = (cp >= 0x4E00 and cp <= 0x9FFF) or // CJK Unified Ideographs
+            (cp >= 0x3400 and cp <= 0x4DBF) or // CJK Extension A
+            (cp >= 0x20000 and cp <= 0x2A6DF) or // CJK Extension B
+            (cp >= 0x2A700 and cp <= 0x2B73F) or // CJK Extension C
+            (cp >= 0x2B740 and cp <= 0x2B81F) or // CJK Extension D
+            (cp >= 0x2B820 and cp <= 0x2CEAF) or // CJK Extension E
+            (cp >= 0xF900 and cp <= 0xFAFF) or // CJK Compatibility Ideographs
+            (cp >= 0x2F800 and cp <= 0x2FA1F); // CJK Compatibility Supplement
 
         // Lowercase
         if (normalizer.lowercase != 0) {

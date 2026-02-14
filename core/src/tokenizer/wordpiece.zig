@@ -259,16 +259,69 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
         first = false;
     }
 
-    // Cleanup: remove space before certain punctuation characters
-    var write_pos: usize = 0;
-    for (result.items, 0..) |ch, read_pos| {
-        if (ch == ' ' and read_pos + 1 < result.items.len and isCleanupPunct(result.items[read_pos + 1])) {
-            continue; // skip the space
+    // Cleanup: match HuggingFace's clean_up_tokenization_spaces exactly.
+    // HF applies sequential str.replace() calls — order matters because
+    // earlier replacements create patterns matched by later ones.
+    // E.g. "n ' t" → (pass 1: " ' " → "'") → "n't" → (pass 2: " n't" → "n't")
+    //
+    // Pass 1: punctuation + apostrophe spacing
+    //   .replace(" .", ".").replace(" ?", "?").replace(" !", "!").replace(" ,", ",")
+    //   .replace(" ' ", "'")
+    {
+        var wp: usize = 0;
+        var rp: usize = 0;
+        while (rp < result.items.len) {
+            if (result.items[rp] == ' ' and rp + 1 < result.items.len) {
+                // " ." " ?" " !" " ," — remove space before punct
+                if (isCleanupPunct(result.items[rp + 1])) {
+                    rp += 1;
+                    continue;
+                }
+                // " ' " → "'" — remove both surrounding spaces
+                if (rp + 2 < result.items.len and result.items[rp + 1] == '\'' and result.items[rp + 2] == ' ') {
+                    result.items[wp] = '\'';
+                    wp += 1;
+                    rp += 3;
+                    continue;
+                }
+            }
+            result.items[wp] = result.items[rp];
+            wp += 1;
+            rp += 1;
         }
-        result.items[write_pos] = ch;
-        write_pos += 1;
+        result.items.len = wp;
     }
-    result.items.len = write_pos;
+    // Pass 2: contractions
+    //   .replace(" n't", "n't").replace(" 'm", "'m").replace(" 's", "'s")
+    //   .replace(" 've", "'ve").replace(" 're", "'re")
+    {
+        var wp: usize = 0;
+        var rp: usize = 0;
+        while (rp < result.items.len) {
+            if (rp + 1 < result.items.len and result.items[rp] == ' ') {
+                const rest = result.items[rp + 1 ..];
+                if (rest.len >= 3 and rest[0] == 'n' and rest[1] == '\'' and rest[2] == 't') {
+                    rp += 1;
+                    continue;
+                }
+                if (rest.len >= 2 and rest[0] == '\'' and (rest[1] == 'm' or rest[1] == 's')) {
+                    rp += 1;
+                    continue;
+                }
+                if (rest.len >= 3 and rest[0] == '\'' and
+                    ((rest[1] == 'v' and rest[2] == 'e') or
+                    (rest[1] == 'r' and rest[2] == 'e')))
+                {
+                    rp += 1;
+                    continue;
+                }
+            }
+            result.items[wp] = result.items[rp];
+            wp += 1;
+            rp += 1;
+        }
+        result.items.len = wp;
+    }
 
     // Null-terminate and return
     result.append(allocator, 0) catch return -1;
@@ -279,9 +332,10 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
 }
 
 fn isCleanupPunct(ch: u8) bool {
-    // Match HuggingFace's clean_up_tokenization_spaces behavior
+    // Match HuggingFace's clean_up_tokenization_spaces behavior:
+    // removes space before . ? ! , only. NOT before - : ) % etc.
     return switch (ch) {
-        '.', '?', '!', ',', '\'', '-' => true,
+        '.', '?', '!', ',' => true,
         else => false,
     };
 }

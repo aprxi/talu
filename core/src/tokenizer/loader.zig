@@ -1415,6 +1415,26 @@ fn findJsonFieldString(json_bytes: []const u8, field_bytes: []const u8) ?[]const
     return null;
 }
 
+/// Parse a JSON field whose value is a ["string", number] tuple (e.g. BertProcessing cls/sep).
+/// Returns the string element, or null if the field is absent or not in array format.
+fn findJsonFieldArrayString(json_bytes: []const u8, field_bytes: []const u8) ?[]const u8 {
+    const pos = std.mem.indexOf(u8, json_bytes, field_bytes) orelse return null;
+    var cursor = pos + field_bytes.len;
+    // Skip whitespace and colon
+    while (cursor < json_bytes.len and (json_bytes[cursor] == ' ' or json_bytes[cursor] == ':' or json_bytes[cursor] == '\t' or json_bytes[cursor] == '\n')) : (cursor += 1) {}
+    if (cursor >= json_bytes.len or json_bytes[cursor] != '[') return null;
+    cursor += 1;
+    // Skip whitespace inside array
+    while (cursor < json_bytes.len and (json_bytes[cursor] == ' ' or json_bytes[cursor] == '\t' or json_bytes[cursor] == '\n')) : (cursor += 1) {}
+    if (cursor >= json_bytes.len or json_bytes[cursor] != '"') return null;
+    cursor += 1;
+    const str_start = cursor;
+    while (cursor < json_bytes.len and json_bytes[cursor] != '"') {
+        if (json_bytes[cursor] == '\\') cursor += 2 else cursor += 1;
+    }
+    return json_bytes[str_start..cursor];
+}
+
 fn applyNormalizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, arena_allocator: std.mem.Allocator) !void {
     // Handle "type" field to infer normalization type
     if (findJsonFieldValue(json_bytes, "\"type\"")) |type_val| {
@@ -1659,8 +1679,12 @@ fn applyPostProcessorFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) 
     var sep_str: ?[]const u8 = null;
 
     if (std.mem.eql(u8, type_str, "BertProcessing")) {
-        cls_str = findJsonFieldString(json_bytes, "\"cls\"");
-        sep_str = findJsonFieldString(json_bytes, "\"sep\"");
+        // BertProcessing stores cls/sep as ["token_string", id] arrays.
+        // Try array format first, fall back to plain string.
+        cls_str = findJsonFieldArrayString(json_bytes, "\"cls\"") orelse
+            findJsonFieldString(json_bytes, "\"cls\"");
+        sep_str = findJsonFieldArrayString(json_bytes, "\"sep\"") orelse
+            findJsonFieldString(json_bytes, "\"sep\"");
     }
 
     // For TemplateProcessing: extract from special_tokens section
@@ -1865,12 +1889,14 @@ fn build_tokenizer_from_root(arena: *std.heap.ArenaAllocator, root: schema.Token
             .sep_token = if (root.post_processor.sep_token) |sep| (arena.allocator().dupeZ(u8, sep) catch return error.BuildFailed).ptr else null,
         };
         tok_fns.tokenizer_apply_postprocessor_spec(tokenizer, &postprocessor_spec);
+        // Reset IDs so they're re-resolved from the configured token strings.
+        // WordPiece init sets cls_id/sep_id from default [CLS]/[SEP] vocab lookup,
+        // but BertProcessing may configure different tokens (e.g. <s>/<\/s>).
+        tokenizer.postproc.cls_id = -1;
+        tokenizer.postproc.sep_id = -1;
     }
 
     // Resolve cls_id/sep_id from added tokens when post_processor is active.
-    // BPE/Unigram init sets cls_id/sep_id to -1; WordPiece resolves from its own
-    // vocab. For TemplateProcessing/BertProcessing on BPE models, the token
-    // strings (cls_token/sep_token) are set above but the IDs are never resolved.
     // Look up the token strings in the added_tokens list to find the correct IDs.
     if (tokenizer.postproc.add_special != 0 and tokenizer.postproc.cls_id == -1) {
         const cls_z: [*:0]const u8 = @ptrCast(&tokenizer.postproc.cls_token);
