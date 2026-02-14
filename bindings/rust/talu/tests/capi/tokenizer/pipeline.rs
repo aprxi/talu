@@ -99,9 +99,8 @@ fn gpt2_byte_to_unicode() -> [char; 256] {
     let mut table = ['\0'; 256];
     let mut shift = 256u32;
     for b in 0u16..=255 {
-        let is_direct = (33..=126).contains(&b)
-            || (161..=172).contains(&b)
-            || (174..=255).contains(&b);
+        let is_direct =
+            (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
         if is_direct {
             table[b as usize] = char::from_u32(b as u32).unwrap();
         } else {
@@ -183,7 +182,10 @@ fn normalizer_lowercase_decode_roundtrip() {
 
     let tokens = ctx.encode_with("HELLO", &opts);
     let decoded = ctx.decode(&tokens);
-    assert_eq!(decoded, "hello", "decode after lowercase should be lowercase");
+    assert_eq!(
+        decoded, "hello",
+        "decode after lowercase should be lowercase"
+    );
 }
 
 // ===========================================================================
@@ -231,7 +233,10 @@ fn normalizer_nfc_noop_on_composed() {
     let text = "café";
     let nfc_tokens = ctx_nfc.encode_with(text, &opts);
     let raw_tokens = ctx_raw.encode_with(text, &opts);
-    assert_eq!(nfc_tokens, raw_tokens, "already-composed should be unchanged");
+    assert_eq!(
+        nfc_tokens, raw_tokens,
+        "already-composed should be unchanged"
+    );
 }
 
 // ===========================================================================
@@ -286,7 +291,10 @@ fn normalizer_sequence_lowercase_then_nfc() {
     let input = "CAFE\u{0301}"; // CAFÉ with decomposed accent
     let tokens = ctx.encode_with(input, &opts);
     let expected_tokens = ctx_raw.encode_with("café", &opts);
-    assert_eq!(tokens, expected_tokens, "Sequence(Lowercase,NFC) should produce 'café'");
+    assert_eq!(
+        tokens, expected_tokens,
+        "Sequence(Lowercase,NFC) should produce 'café'"
+    );
 }
 
 // ===========================================================================
@@ -307,7 +315,11 @@ fn pretokenizer_whitespace_splits_words() {
     // "hello" = [h,e,l,l,o] = [76,73,80,80,83], "world" = [w,o,r,l,d] = [91,83,86,80,72]
     // Whitespace pre-tokenizer splits on whitespace; each word tokenized independently.
     // Space itself may or may not appear depending on behavior.
-    assert!(tokens.len() >= 10, "should have at least 10 tokens for two 5-letter words, got {}", tokens.len());
+    assert!(
+        tokens.len() >= 10,
+        "should have at least 10 tokens for two 5-letter words, got {}",
+        tokens.len()
+    );
     // Should NOT contain unk (3) for ASCII text.
     for (i, &t) in tokens.iter().enumerate() {
         assert_ne!(t, 3, "token {i} should not be unk");
@@ -366,7 +378,11 @@ fn pretokenizer_bert_splits_both() {
         assert_ne!(t, 3, "token {i} should not be unk");
     }
     // Should have tokens for all characters.
-    assert!(tokens.len() >= 11, "should tokenize all chars, got {}", tokens.len());
+    assert!(
+        tokens.len() >= 11,
+        "should tokenize all chars, got {}",
+        tokens.len()
+    );
 }
 
 // ===========================================================================
@@ -406,7 +422,10 @@ fn normalizer_plus_pretokenizer() {
 
     let upper_tokens = ctx.encode_with("HELLO WORLD", &opts);
     let lower_tokens = ctx.encode_with("hello world", &opts);
-    assert_eq!(upper_tokens, lower_tokens, "Lowercase should normalize before ByteLevel");
+    assert_eq!(
+        upper_tokens, lower_tokens,
+        "Lowercase should normalize before ByteLevel"
+    );
 
     // Verify decode produces lowercase.
     let decoded = ctx.decode(&upper_tokens);
@@ -429,7 +448,10 @@ fn normalizer_type_lowercase() {
 
     let upper = ctx.encode_with("HELLO", &opts);
     let lower = ctx.encode_with("hello", &opts);
-    assert_eq!(upper, lower, "type Lowercase should normalize uppercase to lowercase");
+    assert_eq!(
+        upper, lower,
+        "type Lowercase should normalize uppercase to lowercase"
+    );
 }
 
 /// {"type": "Lowercase"} roundtrip: encode("HELLO") decodes to "hello".
@@ -455,7 +477,10 @@ fn normalizer_type_strip_accents() {
     // Composed é (C3 A9) stripped to e (65)
     let stripped = ctx.encode_with("café", &opts);
     let plain = ctx_raw.encode_with("cafe", &opts);
-    assert_eq!(stripped, plain, "type StripAccents should remove accent from é");
+    assert_eq!(
+        stripped, plain,
+        "type StripAccents should remove accent from é"
+    );
 }
 
 /// {"type": "BertNormalizer"} lowercases AND strips accents.
@@ -469,7 +494,10 @@ fn normalizer_type_bert_normalizer() {
     // Should lowercase "CAFÉ" and strip the accent on É
     let tokens = ctx.encode_with("CAFÉ", &opts);
     let expected = ctx_raw.encode_with("cafe", &opts);
-    assert_eq!(tokens, expected, "BertNormalizer should lowercase + strip accents");
+    assert_eq!(
+        tokens, expected,
+        "BertNormalizer should lowercase + strip accents"
+    );
 }
 
 /// {"type": "BertNormalizer"} adds spaces around CJK characters.
@@ -508,7 +536,10 @@ fn normalizer_sequence_with_type_lowercase() {
     let input = "CAFE\u{0301}";
     let tokens = ctx.encode_with(input, &opts);
     let expected = ctx_raw.encode_with("café", &opts);
-    assert_eq!(tokens, expected, "Sequence(type:Lowercase, type:NFC) should produce 'café'");
+    assert_eq!(
+        tokens, expected,
+        "Sequence(type:Lowercase, type:NFC) should produce 'café'"
+    );
 }
 
 // ===========================================================================
@@ -532,7 +563,10 @@ fn normalizer_nfkc_fullwidth_to_ascii() {
     // NFKC normalizes to ASCII A (1 byte) → 1 token
     let nfkc_tokens = ctx.encode_with(fullwidth, &opts);
     let ascii_tokens = ctx_raw.encode_with("A", &opts);
-    assert_eq!(nfkc_tokens, ascii_tokens, "NFKC should normalize fullwidth A to ASCII A");
+    assert_eq!(
+        nfkc_tokens, ascii_tokens,
+        "NFKC should normalize fullwidth A to ASCII A"
+    );
 }
 
 /// NFKC decomposes ﬁ ligature (U+FB01, 3 bytes) to fi (2 bytes).
@@ -552,7 +586,10 @@ fn normalizer_nfkc_ligature() {
     // NFKC decomposes to "fi" (2 bytes) → 2 tokens
     let nfkc_tokens = ctx.encode_with(ligature, &opts);
     let fi_tokens = ctx_raw.encode_with("fi", &opts);
-    assert_eq!(nfkc_tokens, fi_tokens, "NFKC should decompose fi ligature to 'fi'");
+    assert_eq!(
+        nfkc_tokens, fi_tokens,
+        "NFKC should decompose fi ligature to 'fi'"
+    );
 }
 
 /// NFD decomposes composed é (2 bytes) to e + combining accent (3 bytes).
@@ -571,7 +608,11 @@ fn normalizer_nfd_decomposes() {
 
     // NFD decomposes to e (1 byte) + combining acute (2 bytes) = 3 bytes → 3 tokens
     let nfd_tokens = ctx.encode_with(composed, &opts);
-    assert_eq!(nfd_tokens.len(), 3, "NFD should decompose é to 3 bytes (e + combining accent)");
+    assert_eq!(
+        nfd_tokens.len(),
+        3,
+        "NFD should decompose é to 3 bytes (e + combining accent)"
+    );
 }
 
 /// NFKD normalizes fullwidth Ａ (U+FF21, 3 bytes) to ASCII A (1 byte).
@@ -588,5 +629,8 @@ fn normalizer_nfkd_fullwidth() {
     // NFKD decomposes fullwidth to ASCII
     let nfkd_tokens = ctx.encode_with(fullwidth, &opts);
     let ascii_tokens = ctx_raw.encode_with("A", &opts);
-    assert_eq!(nfkd_tokens, ascii_tokens, "NFKD should decompose fullwidth A to ASCII A");
+    assert_eq!(
+        nfkd_tokens, ascii_tokens,
+        "NFKD should decompose fullwidth A to ASCII A"
+    );
 }

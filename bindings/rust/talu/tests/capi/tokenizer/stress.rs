@@ -74,9 +74,7 @@ fn decode_1mb_roundtrip() {
 fn encode_offsets_100k_chars() {
     let ctx = TokenizerTestContext::new();
     let input = ascii_string(100_000);
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), input.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 100_000);
 
@@ -136,9 +134,9 @@ fn rapid_encode_free_200_cycles() {
 fn rapid_decode_free_200_cycles() {
     let ctx = TokenizerTestContext::new();
     let token_sets: &[&[u32]] = &[
-        &[44, 77],              // "Hi"
+        &[44, 77],             // "Hi"
         &[44, 73, 80, 80, 83], // "Hello"
-        &[37],                  // "A"
+        &[37],                 // "A"
         &[69, 70, 71],         // "abc"
         &[20, 21, 22],         // "012"
     ];
@@ -192,9 +190,7 @@ fn rapid_encode_offsets_free_100_cycles() {
 
     for i in 0..100 {
         let text = texts[i % texts.len()];
-        let result = unsafe {
-            super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
-        };
+        let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts) };
         assert!(result.error_msg.is_null(), "cycle {i}: should succeed");
         assert_eq!(result.num_tokens, text.len());
         unsafe { talu_sys::talu_encode_result_free(result) };
@@ -219,9 +215,7 @@ fn concurrent_encode_8_threads() {
     for thread_id in 0..num_threads {
         let shared = Arc::clone(&shared);
         let handle = thread::spawn(move || {
-            let texts: &[&[u8]] = &[
-                b"Hi", b"Hello", b"abc", b"012", b"A",
-            ];
+            let texts: &[&[u8]] = &[b"Hi", b"Hello", b"abc", b"012", b"A"];
             let expected: &[&[u32]] = &[
                 &[44, 77],
                 &[44, 73, 80, 80, 83],
@@ -233,16 +227,12 @@ fn concurrent_encode_8_threads() {
 
             for i in 0..iterations {
                 let idx = (thread_id + i) % texts.len();
-                let result = unsafe {
-                    super::common::encode_raw(shared.ptr(), texts[idx], &opts)
-                };
+                let result = unsafe { super::common::encode_raw(shared.ptr(), texts[idx], &opts) };
                 assert!(
                     result.error_msg.is_null(),
                     "thread {thread_id} iter {i}: encode failed"
                 );
-                let tokens = unsafe {
-                    std::slice::from_raw_parts(result.ids, result.num_tokens)
-                };
+                let tokens = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
                 assert_eq!(
                     tokens, expected[idx],
                     "thread {thread_id} iter {i}: wrong tokens"
@@ -254,8 +244,7 @@ fn concurrent_encode_8_threads() {
     }
 
     // Join ALL threads before ctx is dropped (handle must outlive threads).
-    let results: Vec<thread::Result<()>> =
-        handles.into_iter().map(|h| h.join()).collect();
+    let results: Vec<thread::Result<()>> = handles.into_iter().map(|h| h.join()).collect();
     for (i, result) in results.into_iter().enumerate() {
         result.unwrap_or_else(|_| panic!("Thread {i} panicked"));
     }
@@ -285,9 +274,7 @@ fn concurrent_decode_8_threads() {
             for i in 0..iterations {
                 let idx = (thread_id + i) % cases.len();
                 let (tokens, expected) = cases[idx];
-                let result = unsafe {
-                    super::common::decode_raw(shared.ptr(), tokens, &opts)
-                };
+                let result = unsafe { super::common::decode_raw(shared.ptr(), tokens, &opts) };
                 assert!(
                     result.error_msg.is_null(),
                     "thread {thread_id} iter {i}: decode failed"
@@ -296,18 +283,14 @@ fn concurrent_decode_8_threads() {
                     let slice = std::slice::from_raw_parts(result.text, result.text_len);
                     std::str::from_utf8(slice).unwrap()
                 };
-                assert_eq!(
-                    text, expected,
-                    "thread {thread_id} iter {i}: wrong decode"
-                );
+                assert_eq!(text, expected, "thread {thread_id} iter {i}: wrong decode");
                 unsafe { talu_sys::talu_decode_result_free(result.text, result.text_len) };
             }
         });
         handles.push(handle);
     }
 
-    let results: Vec<thread::Result<()>> =
-        handles.into_iter().map(|h| h.join()).collect();
+    let results: Vec<thread::Result<()>> = handles.into_iter().map(|h| h.join()).collect();
     for (i, result) in results.into_iter().enumerate() {
         result.unwrap_or_else(|_| panic!("Thread {i} panicked"));
     }
@@ -327,9 +310,7 @@ fn concurrent_roundtrip_8_threads() {
     for thread_id in 0..num_threads {
         let shared = Arc::clone(&shared);
         let handle = thread::spawn(move || {
-            let texts: &[&[u8]] = &[
-                b"Hi", b"Hello", b"abc", b"012", b"A",
-            ];
+            let texts: &[&[u8]] = &[b"Hi", b"Hello", b"abc", b"012", b"A"];
             let text_strs = ["Hi", "Hello", "abc", "012", "A"];
             let encode_opts = no_bos();
             let decode_opts = talu_sys::DecodeOptionsC::default();
@@ -338,9 +319,8 @@ fn concurrent_roundtrip_8_threads() {
                 let idx = (thread_id + i) % texts.len();
 
                 // Encode
-                let enc = unsafe {
-                    super::common::encode_raw(shared.ptr(), texts[idx], &encode_opts)
-                };
+                let enc =
+                    unsafe { super::common::encode_raw(shared.ptr(), texts[idx], &encode_opts) };
                 assert!(enc.error_msg.is_null());
 
                 // Decode
@@ -371,8 +351,7 @@ fn concurrent_roundtrip_8_threads() {
         handles.push(handle);
     }
 
-    let results: Vec<thread::Result<()>> =
-        handles.into_iter().map(|h| h.join()).collect();
+    let results: Vec<thread::Result<()>> = handles.into_iter().map(|h| h.join()).collect();
     for (i, result) in results.into_iter().enumerate() {
         result.unwrap_or_else(|_| panic!("Thread {i} panicked"));
     }
@@ -440,7 +419,8 @@ fn padded_tensor_50_sequences_varying_length() {
     let last_start = 49 * 50;
     for j in 0..50 {
         assert_eq!(
-            result.attention_mask[last_start + j], 1,
+            result.attention_mask[last_start + j],
+            1,
             "last row, col {j} should be real"
         );
     }
@@ -520,15 +500,12 @@ fn concurrent_tokenizer_creation_8_threads() {
 
                 // Encode "Hi" and verify.
                 let opts = no_bos();
-                let result = unsafe {
-                    super::common::encode_raw(h, b"Hi", &opts)
-                };
+                let result = unsafe { super::common::encode_raw(h, b"Hi", &opts) };
                 assert!(result.error_msg.is_null());
-                let tokens = unsafe {
-                    std::slice::from_raw_parts(result.ids, result.num_tokens)
-                };
+                let tokens = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
                 assert_eq!(
-                    tokens, &[44, 77],
+                    tokens,
+                    &[44, 77],
                     "thread {thread_id} iter {i}: wrong encode"
                 );
 
@@ -541,8 +518,7 @@ fn concurrent_tokenizer_creation_8_threads() {
         handles.push(handle);
     }
 
-    let results: Vec<thread::Result<()>> =
-        handles.into_iter().map(|h| h.join()).collect();
+    let results: Vec<thread::Result<()>> = handles.into_iter().map(|h| h.join()).collect();
     for (i, result) in results.into_iter().enumerate() {
         result.unwrap_or_else(|_| panic!("Thread {i} panicked"));
     }
@@ -596,7 +572,11 @@ fn concurrent_byte_level_encode_8_threads() {
     let handle = Arc::new(SharedHandle(ctx.handle()));
     let opts = no_bos();
 
-    let expected_ids: Vec<u32> = "café".as_bytes().iter().map(|&b| byte_token_id(b)).collect();
+    let expected_ids: Vec<u32> = "café"
+        .as_bytes()
+        .iter()
+        .map(|&b| byte_token_id(b))
+        .collect();
 
     let threads: Vec<_> = (0..8)
         .map(|_| {
@@ -605,13 +585,11 @@ fn concurrent_byte_level_encode_8_threads() {
             thread::spawn(move || {
                 let text = "café".as_bytes();
                 for _ in 0..50 {
-                    let result = unsafe {
-                        crate::capi::tokenizer::common::encode_raw(h.ptr(), text, &opts)
-                    };
+                    let result =
+                        unsafe { crate::capi::tokenizer::common::encode_raw(h.ptr(), text, &opts) };
                     assert!(result.error_msg.is_null());
-                    let tokens = unsafe {
-                        std::slice::from_raw_parts(result.ids, result.num_tokens)
-                    };
+                    let tokens =
+                        unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
                     assert_eq!(tokens, expected.as_slice(), "byte-level encode mismatch");
                     unsafe { talu_sys::talu_encode_result_free(result) };
                 }
@@ -630,7 +608,9 @@ fn concurrent_byte_level_roundtrip_8_threads() {
     let ctx = TokenizerTestContext::with_byte_level();
     let handle = Arc::new(SharedHandle(ctx.handle()));
     let opts = no_bos();
-    let decode_opts = talu_sys::DecodeOptionsC { skip_special_tokens: 0 };
+    let decode_opts = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
 
     let threads: Vec<_> = (0..8)
         .map(|_| {
@@ -639,23 +619,14 @@ fn concurrent_byte_level_roundtrip_8_threads() {
                 let text = "日本語";
                 for _ in 0..50 {
                     let result = unsafe {
-                        crate::capi::tokenizer::common::encode_raw(
-                            h.ptr(),
-                            text.as_bytes(),
-                            &opts,
-                        )
+                        crate::capi::tokenizer::common::encode_raw(h.ptr(), text.as_bytes(), &opts)
                     };
                     assert!(result.error_msg.is_null());
-                    let tokens = unsafe {
-                        std::slice::from_raw_parts(result.ids, result.num_tokens)
-                    };
+                    let tokens =
+                        unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
 
                     let dec_result = unsafe {
-                        crate::capi::tokenizer::common::decode_raw(
-                            h.ptr(),
-                            tokens,
-                            &decode_opts,
-                        )
+                        crate::capi::tokenizer::common::decode_raw(h.ptr(), tokens, &decode_opts)
                     };
                     assert!(dec_result.error_msg.is_null());
                     let decoded = unsafe {

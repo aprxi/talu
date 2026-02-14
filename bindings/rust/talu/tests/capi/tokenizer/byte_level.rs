@@ -6,7 +6,9 @@
 //!
 //! Token ID layout: byte b → ID b + 4.
 
-use crate::capi::tokenizer::common::{build_byte_level_tokenizer_json, byte_token_id, TokenizerTestContext};
+use crate::capi::tokenizer::common::{
+    build_byte_level_tokenizer_json, byte_token_id, TokenizerTestContext,
+};
 
 fn no_bos() -> talu_sys::EncodeOptions {
     talu_sys::EncodeOptions {
@@ -31,7 +33,11 @@ fn emoji_tokenizes_to_bytes_not_unk() {
     // Verify exact byte-to-ID mapping.
     let bytes = "😊".as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
-        assert_eq!(tokens[i], byte_token_id(b), "byte {i} (0x{b:02X}) ID mismatch");
+        assert_eq!(
+            tokens[i],
+            byte_token_id(b),
+            "byte {i} (0x{b:02X}) ID mismatch"
+        );
     }
 }
 
@@ -43,7 +49,11 @@ fn cafe_tokenizes_to_byte_tokens() {
     assert_eq!(tokens.len(), 5);
     let bytes = "café".as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
-        assert_eq!(tokens[i], byte_token_id(b), "byte {i} (0x{b:02X}) ID mismatch");
+        assert_eq!(
+            tokens[i],
+            byte_token_id(b),
+            "byte {i} (0x{b:02X}) ID mismatch"
+        );
     }
 }
 
@@ -55,7 +65,11 @@ fn cjk_tokenizes_to_byte_tokens() {
     assert_eq!(tokens.len(), 3);
     let bytes = "日".as_bytes();
     for (i, &b) in bytes.iter().enumerate() {
-        assert_eq!(tokens[i], byte_token_id(b), "byte {i} (0x{b:02X}) ID mismatch");
+        assert_eq!(
+            tokens[i],
+            byte_token_id(b),
+            "byte {i} (0x{b:02X}) ID mismatch"
+        );
     }
 }
 
@@ -76,11 +90,7 @@ fn all_ascii_bytes_produce_correct_token() {
             "byte 0x{b:02X}: expected at least 1 token"
         );
         assert_ne!(tokens[0], 3, "byte 0x{b:02X} should not be unk");
-        assert_eq!(
-            tokens[0],
-            byte_token_id(b),
-            "byte 0x{b:02X} ID mismatch"
-        );
+        assert_eq!(tokens[0], byte_token_id(b), "byte 0x{b:02X} ID mismatch");
     }
 }
 
@@ -163,9 +173,7 @@ fn byte_count_equals_token_count() {
 fn offsets_cover_full_emoji_span() {
     let ctx = TokenizerTestContext::with_byte_level();
     let text = "Hi😊bye";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, text.len()); // 2 + 4 + 3 = 9 bytes
 
@@ -199,7 +207,10 @@ fn batch_encode_unicode_roundtrip() {
         let end = batch.offsets[i + 1];
         let seq_tokens = &batch.ids[start..end];
         let decoded = ctx.decode(seq_tokens);
-        assert_eq!(decoded, *text, "roundtrip failed for sequence {i}: {text:?}");
+        assert_eq!(
+            decoded, *text,
+            "roundtrip failed for sequence {i}: {text:?}"
+        );
     }
 }
 
@@ -262,5 +273,8 @@ fn add_prefix_space_roundtrip() {
     let ctx = TokenizerTestContext::from_json(&json);
     let tokens = ctx.encode_with("Hello", &no_bos());
     let decoded = ctx.decode(&tokens);
-    assert_eq!(decoded, "Hello", "add_prefix_space roundtrip must not leak leading space");
+    assert_eq!(
+        decoded, "Hello",
+        "add_prefix_space roundtrip must not leak leading space"
+    );
 }

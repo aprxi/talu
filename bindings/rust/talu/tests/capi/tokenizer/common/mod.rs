@@ -235,8 +235,7 @@ impl TokenizerTestContext {
         let tokens = if result.ids.is_null() || result.num_tokens == 0 {
             Vec::new()
         } else {
-            let slice =
-                unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
+            let slice = unsafe { std::slice::from_raw_parts(result.ids, result.num_tokens) };
             let v = slice.to_vec();
             v
         };
@@ -275,11 +274,7 @@ impl TokenizerTestContext {
     }
 
     /// Batch encode multiple texts and return (ids, offsets, num_sequences).
-    pub fn encode_batch(
-        &self,
-        texts: &[&str],
-        options: &talu_sys::EncodeOptions,
-    ) -> BatchResult {
+    pub fn encode_batch(&self, texts: &[&str], options: &talu_sys::EncodeOptions) -> BatchResult {
         let ptrs: Vec<*const u8> = texts.iter().map(|t| t.as_bytes().as_ptr()).collect();
         let lengths: Vec<usize> = texts.iter().map(|t| t.len()).collect();
 
@@ -435,9 +430,8 @@ fn gpt2_byte_to_unicode() -> [char; 256] {
     let mut shift = 256u32;
 
     for b in 0u16..=255 {
-        let is_direct = (33..=126).contains(&b)
-            || (161..=172).contains(&b)
-            || (174..=255).contains(&b);
+        let is_direct =
+            (33..=126).contains(&b) || (161..=172).contains(&b) || (174..=255).contains(&b);
 
         if is_direct {
             table[b as usize] = char::from_u32(b as u32).unwrap();

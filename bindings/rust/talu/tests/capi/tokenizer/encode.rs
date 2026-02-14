@@ -196,9 +196,8 @@ fn count_tokens_matches_encode_length() {
         };
 
         // Encode result offsets count should also agree.
-        let encode_result = unsafe {
-            super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
-        };
+        let encode_result =
+            unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts) };
         assert!(encode_result.error_msg.is_null());
         assert_eq!(
             encode_result.num_tokens, encode_len,
@@ -296,7 +295,8 @@ fn encode_template_postproc_adds_bos_and_eos() {
     // "Hi" → [H=4, i=5], with BOS/EOS → [<s>=1, H=4, i=5, </s>=2]
     let tokens = ctx.encode_with("Hi", &opts);
     assert_eq!(
-        tokens, vec![1, 4, 5, 2],
+        tokens,
+        vec![1, 4, 5, 2],
         "TemplateProcessing must add BOS=1 and EOS=2, got: {tokens:?}"
     );
 }
@@ -311,7 +311,8 @@ fn encode_template_postproc_empty_string() {
     };
     let tokens = ctx.encode_with("", &opts);
     assert_eq!(
-        tokens, vec![1, 2],
+        tokens,
+        vec![1, 2],
         "empty string with TemplateProcessing should produce [BOS, EOS], got: {tokens:?}"
     );
 }
@@ -330,7 +331,8 @@ fn encode_template_postproc_skip_when_add_bos_zero() {
     // "Hi" → [H=4, i=5] only, no BOS/EOS
     let tokens = ctx.encode_with("Hi", &opts);
     assert_eq!(
-        tokens, vec![4, 5],
+        tokens,
+        vec![4, 5],
         "add_bos=0 must skip post_processor, got: {tokens:?}"
     );
 }
@@ -342,7 +344,8 @@ fn encode_template_postproc_default_opts_no_special() {
     let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
     let tokens = ctx.encode("Hi");
     assert_eq!(
-        tokens, vec![4, 5],
+        tokens,
+        vec![4, 5],
         "default encode must not add BOS/EOS, got: {tokens:?}"
     );
 }
@@ -407,7 +410,8 @@ fn encode_metaspace_single_word() {
     };
     let tokens = ctx.encode_with("Hello", &opts);
     assert_eq!(
-        tokens, vec![3],
+        tokens,
+        vec![3],
         "Metaspace encode 'Hello' → [▁Hello=3], got: {tokens:?}"
     );
 }
@@ -424,7 +428,8 @@ fn encode_metaspace_multi_word() {
     };
     let tokens = ctx.encode_with("Hello, world!", &opts);
     assert_eq!(
-        tokens, vec![3, 4, 5, 6],
+        tokens,
+        vec![3, 4, 5, 6],
         "Metaspace encode 'Hello, world!' → [▁Hello, comma, ▁world, !], got: {tokens:?}"
     );
 }
@@ -503,7 +508,8 @@ fn encode_sequence_wrapped_template_adds_bos() {
     // "Hi" → [H=4, i=5], with BOS → [<|begin_of_text|>=1, H=4, i=5]
     let tokens = ctx.encode_with("Hi", &opts);
     assert_eq!(
-        tokens, vec![1, 4, 5],
+        tokens,
+        vec![1, 4, 5],
         "Sequence-wrapped TemplateProcessing must add BOS=1, got: {tokens:?}"
     );
 }
@@ -521,7 +527,8 @@ fn encode_sequence_wrapped_template_no_eos() {
     // Empty string with BOS-only template → [BOS] only, no EOS
     let tokens = ctx.encode_with("", &opts);
     assert_eq!(
-        tokens, vec![1],
+        tokens,
+        vec![1],
         "BOS-only template must produce [BOS] for empty string, got: {tokens:?}"
     );
 }
@@ -592,7 +599,8 @@ fn encode_bos_only_template_no_trailing_token() {
     // "Hi" → [H=4, i=5], with BOS only → [<s>=1, H=4, i=5]
     let tokens = ctx.encode_with("Hi", &opts);
     assert_eq!(
-        tokens, vec![1, 4, 5],
+        tokens,
+        vec![1, 4, 5],
         "BOS-only template must not append extra token, got: {tokens:?}"
     );
 }
@@ -607,7 +615,8 @@ fn encode_bos_only_template_empty_string() {
     };
     let tokens = ctx.encode_with("", &opts);
     assert_eq!(
-        tokens, vec![1],
+        tokens,
+        vec![1],
         "BOS-only template empty string → [BOS] only, got: {tokens:?}"
     );
 }
@@ -670,7 +679,8 @@ fn encode_metaspace_prepend_scheme_first() {
     };
     let tokens = ctx.encode_with("Hello", &opts);
     assert_eq!(
-        tokens, vec![3],
+        tokens,
+        vec![3],
         "Metaspace prepend_scheme:'first' must prepend ▁: 'Hello' → [▁Hello=3], got: {tokens:?}"
     );
 }
@@ -687,7 +697,8 @@ fn encode_metaspace_whitespace_only() {
     };
     let tokens = ctx.encode_with("   ", &opts);
     assert_eq!(
-        tokens, vec![23],
+        tokens,
+        vec![23],
         "Metaspace whitespace '   ' → [▁▁▁=23], got: {tokens:?}"
     );
 }
@@ -752,7 +763,8 @@ fn encode_eos_only_template_appends_eos() {
     };
     let tokens = ctx.encode_with("Hi", &opts);
     assert_eq!(
-        tokens, vec![4, 5, 1],
+        tokens,
+        vec![4, 5, 1],
         "EOS-only template must produce [tokens..., EOS=1], got: {tokens:?}"
     );
 }
@@ -767,7 +779,8 @@ fn encode_eos_only_template_empty_string() {
     };
     let tokens = ctx.encode_with("", &opts);
     assert_eq!(
-        tokens, vec![1],
+        tokens,
+        vec![1],
         "EOS-only template empty string → [EOS=1], got: {tokens:?}"
     );
 }
@@ -783,7 +796,8 @@ fn encode_eos_only_template_no_special() {
     // With add_bos=0, post_processor is skipped → just raw tokens, no EOS.
     let tokens = ctx.encode_with("Hi", &opts);
     assert_eq!(
-        tokens, vec![4, 5],
+        tokens,
+        vec![4, 5],
         "add_bos=0 must skip post_processor (no EOS), got: {tokens:?}"
     );
 }

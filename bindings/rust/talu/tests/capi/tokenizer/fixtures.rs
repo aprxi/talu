@@ -117,7 +117,6 @@ struct Meta {
     eos_token: Option<String>,
 }
 
-
 // ---------------------------------------------------------------------------
 // Tokenizer handle (loads from JSON bytes)
 // ---------------------------------------------------------------------------
@@ -147,12 +146,7 @@ impl FixtureTokenizer {
     fn encode(&self, text: &str) -> Result<Vec<u32>, String> {
         let opts = talu_sys::EncodeOptions::default();
         let result = unsafe {
-            talu_tokenizer_encode(
-                self.handle,
-                text.as_bytes().as_ptr(),
-                text.len(),
-                &opts,
-            )
+            talu_tokenizer_encode(self.handle, text.as_bytes().as_ptr(), text.len(), &opts)
         };
         if !result.error_msg.is_null() {
             let msg = unsafe { CStr::from_ptr(result.error_msg as *const c_char) }
@@ -170,14 +164,12 @@ impl FixtureTokenizer {
     }
 
     fn encode_special(&self, text: &str) -> Result<Vec<u32>, String> {
-        let opts = talu_sys::EncodeOptions { add_bos: 1, ..Default::default() };
+        let opts = talu_sys::EncodeOptions {
+            add_bos: 1,
+            ..Default::default()
+        };
         let result = unsafe {
-            talu_tokenizer_encode(
-                self.handle,
-                text.as_bytes().as_ptr(),
-                text.len(),
-                &opts,
-            )
+            talu_tokenizer_encode(self.handle, text.as_bytes().as_ptr(), text.len(), &opts)
         };
         if !result.error_msg.is_null() {
             let msg = unsafe { CStr::from_ptr(result.error_msg as *const c_char) }
@@ -195,15 +187,11 @@ impl FixtureTokenizer {
     }
 
     fn decode(&self, tokens: &[u32]) -> Result<String, String> {
-        let opts = talu_sys::DecodeOptionsC { skip_special_tokens: 0 };
-        let result = unsafe {
-            talu_tokenizer_decode(
-                self.handle,
-                tokens.as_ptr(),
-                tokens.len(),
-                &opts,
-            )
+        let opts = talu_sys::DecodeOptionsC {
+            skip_special_tokens: 0,
         };
+        let result =
+            unsafe { talu_tokenizer_decode(self.handle, tokens.as_ptr(), tokens.len(), &opts) };
         if !result.error_msg.is_null() {
             let msg = unsafe { CStr::from_ptr(result.error_msg as *const c_char) }
                 .to_string_lossy()
@@ -263,9 +251,7 @@ fn apply_chat_template(
     }
 
     assert!(!out.is_null(), "chat template succeeded but output is null");
-    let s = unsafe { CStr::from_ptr(out) }
-        .to_string_lossy()
-        .to_string();
+    let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
     unsafe { talu_sys::talu_text_free(out) };
     Ok(s)
 }
@@ -332,10 +318,9 @@ fn load_model(model_path: &Path) -> Result<(FixtureTokenizer, Expected), String>
     let json_bytes = fs::read(model_path.join("tokenizer.json")).unwrap();
     let tok = FixtureTokenizer::try_from_json(&json_bytes)
         .ok_or_else(|| "talu_tokenizer_create_from_json returned error".to_string())?;
-    let expected: Expected = serde_json::from_str(
-        &fs::read_to_string(model_path.join("expected.json")).unwrap(),
-    )
-    .unwrap();
+    let expected: Expected =
+        serde_json::from_str(&fs::read_to_string(model_path.join("expected.json")).unwrap())
+            .unwrap();
 
     Ok((tok, expected))
 }
@@ -352,7 +337,11 @@ struct ModelStats {
 
 impl ModelStats {
     fn new() -> Self {
-        Self { passed: 0, failed: 0, examples: Vec::new() }
+        Self {
+            passed: 0,
+            failed: 0,
+            examples: Vec::new(),
+        }
     }
 
     fn pass(&mut self) {
@@ -422,7 +411,9 @@ fn fixture_encode() {
     let mut stats: BTreeMap<String, ModelStats> = BTreeMap::new();
 
     for (model_name, model_path) in &models {
-        let s = stats.entry(model_name.clone()).or_insert_with(ModelStats::new);
+        let s = stats
+            .entry(model_name.clone())
+            .or_insert_with(ModelStats::new);
 
         let (tok, expected) = match load_model(model_path) {
             Ok(v) => v,
@@ -474,7 +465,9 @@ fn fixture_encode_special() {
     let mut stats: BTreeMap<String, ModelStats> = BTreeMap::new();
 
     for (model_name, model_path) in &models {
-        let s = stats.entry(model_name.clone()).or_insert_with(ModelStats::new);
+        let s = stats
+            .entry(model_name.clone())
+            .or_insert_with(ModelStats::new);
 
         let (tok, expected) = match load_model(model_path) {
             Ok(v) => v,
@@ -529,7 +522,9 @@ fn fixture_roundtrip() {
     let mut stats: BTreeMap<String, ModelStats> = BTreeMap::new();
 
     for (model_name, model_path) in &models {
-        let s = stats.entry(model_name.clone()).or_insert_with(ModelStats::new);
+        let s = stats
+            .entry(model_name.clone())
+            .or_insert_with(ModelStats::new);
 
         let (tok, expected) = match load_model(model_path) {
             Ok(v) => v,
@@ -613,7 +608,9 @@ fn fixture_vocab_decode() {
             continue;
         }
 
-        let s = stats.entry(model_name.clone()).or_insert_with(ModelStats::new);
+        let s = stats
+            .entry(model_name.clone())
+            .or_insert_with(ModelStats::new);
 
         let json_bytes = fs::read(model_path.join("tokenizer.json")).unwrap();
         let tok = match FixtureTokenizer::try_from_json(&json_bytes) {
@@ -666,10 +663,9 @@ fn fixture_chat_template() {
     let mut stats: BTreeMap<String, ModelStats> = BTreeMap::new();
 
     for (model_name, model_path) in &models {
-        let expected: Expected = serde_json::from_str(
-            &fs::read_to_string(model_path.join("expected.json")).unwrap(),
-        )
-        .unwrap();
+        let expected: Expected =
+            serde_json::from_str(&fs::read_to_string(model_path.join("expected.json")).unwrap())
+                .unwrap();
 
         if expected.chat_template.is_empty() {
             continue;
@@ -680,12 +676,13 @@ fn fixture_chat_template() {
             None => continue,
         };
 
-        let s = stats.entry(model_name.clone()).or_insert_with(ModelStats::new);
+        let s = stats
+            .entry(model_name.clone())
+            .or_insert_with(ModelStats::new);
 
-        let meta: Meta = serde_json::from_str(
-            &fs::read_to_string(model_path.join("meta.json")).unwrap(),
-        )
-        .unwrap();
+        let meta: Meta =
+            serde_json::from_str(&fs::read_to_string(model_path.join("meta.json")).unwrap())
+                .unwrap();
         let bos = meta.bos_token.as_deref().unwrap_or("");
         let eos = meta.eos_token.as_deref().unwrap_or("");
 
@@ -706,7 +703,9 @@ fn fixture_chat_template() {
                 Ok(actual) if normalize_dates(&actual) != *expected_text => {
                     s.fail(format!(
                         "chat_template({:?})\n  expected: {:?}\n  actual:   {:?}",
-                        entry.name, expected_text, normalize_dates(&actual)
+                        entry.name,
+                        expected_text,
+                        normalize_dates(&actual)
                     ));
                 }
                 Err(rc) => {
@@ -715,7 +714,9 @@ fn fixture_chat_template() {
                         entry.name
                     ));
                 }
-                _ => { s.pass(); }
+                _ => {
+                    s.pass();
+                }
             }
         }
     }

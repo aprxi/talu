@@ -67,10 +67,7 @@ fn encode_esc_control_char() {
 fn encode_mixed_whitespace() {
     let ctx = TokenizerTestContext::new();
     // a=69, \t=3, b=70, \n=3, c=71
-    assert_eq!(
-        ctx.encode_with("a\tb\nc", &no_bos()),
-        [69, 3, 70, 3, 71]
-    );
+    assert_eq!(ctx.encode_with("a\tb\nc", &no_bos()), [69, 3, 70, 3, 71]);
 }
 
 // ===========================================================================

@@ -51,10 +51,7 @@ fn encode_emoji_4byte() {
 fn encode_mixed_ascii_emoji() {
     let ctx = TokenizerTestContext::new();
     // H=44, i=77, then 4 emoji bytes → unk
-    assert_eq!(
-        ctx.encode_with("Hi🎉", &no_bos()),
-        [44, 77, 3, 3, 3, 3]
-    );
+    assert_eq!(ctx.encode_with("Hi🎉", &no_bos()), [44, 77, 3, 3, 3, 3]);
 }
 
 /// Korean: "한" = 3 UTF-8 bytes → [3, 3, 3].
@@ -125,11 +122,11 @@ fn token_count_equals_byte_count() {
     let opts = no_bos();
 
     let cases = [
-        "Hello",       // 5 bytes
-        "café",        // 5 bytes
-        "日本語",      // 9 bytes
-        "🎉🚀",       // 8 bytes
-        "Hi 🎉 bye",  // 10 bytes
+        "Hello",     // 5 bytes
+        "café",      // 5 bytes
+        "日本語",    // 9 bytes
+        "🎉🚀",      // 8 bytes
+        "Hi 🎉 bye", // 10 bytes
     ];
     for text in cases {
         let tokens = ctx.encode_with(text, &opts);
@@ -166,8 +163,14 @@ fn decode_mixed_ascii_unk() {
     let tokens = ctx.encode_with("café", &no_bos());
     let decoded = ctx.decode(&tokens);
     // First 3 chars decode to "caf", last 2 tokens are <unk> substitutions.
-    assert!(decoded.starts_with("caf"), "should start with ASCII portion");
-    assert!(decoded.len() > 3, "should have unk substitutions after 'caf'");
+    assert!(
+        decoded.starts_with("caf"),
+        "should start with ASCII portion"
+    );
+    assert!(
+        decoded.len() > 3,
+        "should have unk substitutions after 'caf'"
+    );
 }
 
 // ===========================================================================
@@ -180,18 +183,13 @@ fn tokenize_strings_multibyte() {
     let ctx = TokenizerTestContext::new();
     let text = "café"; // 5 UTF-8 bytes
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 5);
 
-    let ptrs = unsafe {
-        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens)
-    };
+    let ptrs =
+        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens) };
     let tokens: Vec<String> = (0..result.num_tokens)
         .map(|i| {
             unsafe { std::ffi::CStr::from_ptr(ptrs[i]) }
@@ -213,11 +211,7 @@ fn tokenize_strings_emoji() {
     let ctx = TokenizerTestContext::new();
     let text = "🎉";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 4);
@@ -233,9 +227,7 @@ fn tokenize_strings_emoji() {
 fn encode_offsets_multibyte() {
     let ctx = TokenizerTestContext::new();
     let text = "café";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 5); // 5 bytes = 5 tokens = 5 offsets
 
@@ -256,9 +248,7 @@ fn encode_offsets_multibyte() {
 fn encode_offsets_emoji() {
     let ctx = TokenizerTestContext::new();
     let text = "🎉";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 4);
 
@@ -274,9 +264,7 @@ fn encode_offsets_emoji() {
 fn encode_offsets_mixed_ascii_emoji() {
     let ctx = TokenizerTestContext::new();
     let text = "Hi🎉bye";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, text.len());
 
@@ -300,9 +288,7 @@ fn encode_offsets_mixed_ascii_emoji() {
 fn encode_offsets_cjk() {
     let ctx = TokenizerTestContext::new();
     let text = "日本";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 6); // 6 bytes = 6 tokens = 6 offsets
 
@@ -322,10 +308,7 @@ fn encode_offsets_cjk() {
 fn merges_with_emoji() {
     let ctx = TokenizerTestContext::with_merges();
     // hello=104, then 4 emoji bytes → 3,3,3,3
-    assert_eq!(
-        ctx.encode_with("hello🎉", &no_bos()),
-        [104, 3, 3, 3, 3]
-    );
+    assert_eq!(ctx.encode_with("hello🎉", &no_bos()), [104, 3, 3, 3, 3]);
 }
 
 /// "hello world": "hello" merges, space→unk, "world" stays chars.

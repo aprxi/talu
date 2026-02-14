@@ -40,8 +40,12 @@ fn decode_empty() {
 #[test]
 fn decode_bos_token_base_fixture() {
     let ctx = TokenizerTestContext::new();
-    let skip = talu_sys::DecodeOptionsC { skip_special_tokens: 1 };
-    let retain = talu_sys::DecodeOptionsC { skip_special_tokens: 0 };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
+    let retain = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
 
     assert_eq!(ctx.decode_with(&[1], &skip), "<s>");
     assert_eq!(ctx.decode_with(&[1], &retain), "<s>");
@@ -75,7 +79,9 @@ fn decode_roundtrip() {
 #[test]
 fn skip_special_strips_bos() {
     let ctx = TokenizerTestContext::with_special_tokens();
-    let skip = talu_sys::DecodeOptionsC { skip_special_tokens: 1 };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
     // [BOS=1, H=44, i=77]
     assert_eq!(ctx.decode_with(&[1, 44, 77], &skip), "Hi");
 }
@@ -84,7 +90,9 @@ fn skip_special_strips_bos() {
 #[test]
 fn retain_special_keeps_bos() {
     let ctx = TokenizerTestContext::with_special_tokens();
-    let retain = talu_sys::DecodeOptionsC { skip_special_tokens: 0 };
+    let retain = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
     assert_eq!(ctx.decode_with(&[1, 44, 77], &retain), "<s>Hi");
 }
 
@@ -92,7 +100,9 @@ fn retain_special_keeps_bos() {
 #[test]
 fn skip_special_strips_bos_and_eos() {
     let ctx = TokenizerTestContext::with_special_tokens();
-    let skip = talu_sys::DecodeOptionsC { skip_special_tokens: 1 };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
     // [BOS=1, H=44, i=77, EOS=2]
     assert_eq!(ctx.decode_with(&[1, 44, 77, 2], &skip), "Hi");
 }
@@ -101,7 +111,9 @@ fn skip_special_strips_bos_and_eos() {
 #[test]
 fn retain_special_keeps_bos_and_eos() {
     let ctx = TokenizerTestContext::with_special_tokens();
-    let retain = talu_sys::DecodeOptionsC { skip_special_tokens: 0 };
+    let retain = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 0,
+    };
     assert_eq!(ctx.decode_with(&[1, 44, 77, 2], &retain), "<s>Hi</s>");
 }
 
@@ -109,7 +121,9 @@ fn retain_special_keeps_bos_and_eos() {
 #[test]
 fn skip_special_all_special_produces_empty() {
     let ctx = TokenizerTestContext::with_special_tokens();
-    let skip = talu_sys::DecodeOptionsC { skip_special_tokens: 1 };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
     assert_eq!(ctx.decode_with(&[1, 2], &skip), "");
 }
 
@@ -117,7 +131,9 @@ fn skip_special_all_special_produces_empty() {
 #[test]
 fn skip_special_strips_sandwiched_bos() {
     let ctx = TokenizerTestContext::with_special_tokens();
-    let skip = talu_sys::DecodeOptionsC { skip_special_tokens: 1 };
+    let skip = talu_sys::DecodeOptionsC {
+        skip_special_tokens: 1,
+    };
     // [H=44, BOS=1, i=77]
     assert_eq!(ctx.decode_with(&[44, 1, 77], &skip), "Hi");
 }
@@ -205,9 +221,11 @@ fn sequence_decode_four_metaspace_to_three_spaces() {
     // Token 4 = ▁▁▁▁ → "    " (4 spaces) → Strip(1) → "   " (3 spaces)
     let decoded = ctx.decode(&[4]);
     assert_eq!(
-        decoded, "   ",
+        decoded,
+        "   ",
         "▁▁▁▁ must decode to 3 spaces (4 replaced, Strip removes 1), got {:?} ({} chars)",
-        decoded, decoded.len()
+        decoded,
+        decoded.len()
     );
 }
 
@@ -261,7 +279,10 @@ fn sentencepiece_decode_preserves_accented_chars() {
     let ctx = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
     // "▁café" = tokens [4, 5] → "café" (with leading space stripped by Metaspace)
     let decoded = ctx.decode(&[4, 5]);
-    assert_eq!(decoded, "café", "SentencePiece BPE must preserve é, got: {decoded:?}");
+    assert_eq!(
+        decoded, "café",
+        "SentencePiece BPE must preserve é, got: {decoded:?}"
+    );
 }
 
 /// Decoding ï (U+00EF) must not be corrupted by byte-level mapping.
@@ -270,7 +291,10 @@ fn sentencepiece_decode_preserves_diaeresis() {
     let ctx = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
     // "▁na" + "ï" + "ve" = tokens [9, 10, 11] → "naïve"
     let decoded = ctx.decode(&[9, 10, 11]);
-    assert_eq!(decoded, "naïve", "SentencePiece BPE must preserve ï, got: {decoded:?}");
+    assert_eq!(
+        decoded, "naïve",
+        "SentencePiece BPE must preserve ï, got: {decoded:?}"
+    );
 }
 
 /// Full sentence roundtrip with SentencePiece tokens.
@@ -279,7 +303,10 @@ fn sentencepiece_decode_full_sentence() {
     let ctx = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
     // "▁Hello" + "," + "▁world" + "!" → "Hello, world!"
     let decoded = ctx.decode(&[12, 13, 14, 15]);
-    assert_eq!(decoded, "Hello, world!", "SentencePiece decode full sentence, got: {decoded:?}");
+    assert_eq!(
+        decoded, "Hello, world!",
+        "SentencePiece decode full sentence, got: {decoded:?}"
+    );
 }
 
 /// Minimal ByteLevel BPE tokenizer with merged tokens containing backslashes.
@@ -316,7 +343,10 @@ const BACKSLASH_TOKENIZER_JSON: &str = r####"{
 fn decode_backslash_n_literal() {
     let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
     let decoded = ctx.decode(&[7]);
-    assert_eq!(decoded, "\\n", "\\n must decode as two literal chars, not newline");
+    assert_eq!(
+        decoded, "\\n",
+        "\\n must decode as two literal chars, not newline"
+    );
 }
 
 #[test]
@@ -337,7 +367,10 @@ fn decode_double_backslash_literal() {
 fn decode_backslash_t_literal() {
     let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
     let decoded = ctx.decode(&[11]);
-    assert_eq!(decoded, "\\t", "\\t must decode as two literal chars, not tab");
+    assert_eq!(
+        decoded, "\\t",
+        "\\t must decode as two literal chars, not tab"
+    );
 }
 
 #[test]
@@ -345,7 +378,10 @@ fn decode_backslash_sequence_in_context() {
     let ctx = TokenizerTestContext::from_json(BACKSLASH_TOKENIZER_JSON);
     // "n" + "\n" + "n" — the middle token is a merged backslash-n
     let decoded = ctx.decode(&[5, 7, 5]);
-    assert_eq!(decoded, "n\\nn", "backslash tokens must stay literal in sequence");
+    assert_eq!(
+        decoded, "n\\nn",
+        "backslash tokens must stay literal in sequence"
+    );
 }
 
 // ===========================================================================
@@ -455,17 +491,20 @@ const ADDED_TOKEN_IDS_JSON: &str = r####"{
 fn added_token_decode_uses_explicit_id() {
     let ctx = TokenizerTestContext::from_json(ADDED_TOKEN_IDS_JSON);
     assert_eq!(
-        ctx.decode(&[5]), "<|first|>",
+        ctx.decode(&[5]),
+        "<|first|>",
         "token ID 5 must decode to '<|first|>', got: {:?}",
         ctx.decode(&[5])
     );
     assert_eq!(
-        ctx.decode(&[10]), "<|second|>",
+        ctx.decode(&[10]),
+        "<|second|>",
         "token ID 10 must decode to '<|second|>', got: {:?}",
         ctx.decode(&[10])
     );
     assert_eq!(
-        ctx.decode(&[15]), "<|third|>",
+        ctx.decode(&[15]),
+        "<|third|>",
         "token ID 15 must decode to '<|third|>', got: {:?}",
         ctx.decode(&[15])
     );
@@ -518,7 +557,8 @@ fn metaspace_encode_with_special_tokens() {
     };
     let tokens = ctx.encode_with("<s> and </s> are special tokens", &opts);
     assert_eq!(
-        tokens, vec![1, 4, 3, 2, 5, 6, 7],
+        tokens,
+        vec![1, 4, 3, 2, 5, 6, 7],
         "trailing space before </s> produces standalone ▁ token, got: {tokens:?}"
     );
 }
@@ -637,7 +677,61 @@ fn sentencepiece_no_extra_metaspace_after_second_special_token() {
     // The ▁(3) after <s> is the re-attached initial Prepend ▁.
     // There must be NO extra ▁(3) between </s>(2) and ▁world(20).
     assert_eq!(
-        tokens, vec![1, 3, 15, 3, 2, 20],
+        tokens,
+        vec![1, 3, 15, 3, 2, 20],
         "no extra ▁ after second special token, got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// BPE decode: contraction spacing in clean_up_tokenization_spaces
+// ===========================================================================
+//
+// HuggingFace's clean_up_tokenization_spaces removes space before apostrophe
+// in contractions: " n't" → "n't", " 'm" → "'m", " 's" → "'s", " 've" → "'ve",
+// " 're" → "'re". It also removes space before standalone apostrophe when
+// surrounded by spaces: " ' " → "'".
+//
+// Bug: our WordPiece cleanup treats apostrophe like any single-char punctuation
+// and removes the space before ALL apostrophes, not just contractions.
+// A possessive like "dog 's" is fine, but standalone "hello ' world" should
+// become "hello' world" (space before ' removed, space after preserved).
+
+/// Cleanup removes space before apostrophe contractions.
+///
+/// Contractions n't, 's, 'm must have space before apostrophe removed.
+#[test]
+fn cleanup_removes_contraction_space() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 200,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "i": 3, "do": 4, "n": 5, "'": 6, "t": 7,
+      "he": 8, "##'": 9, "##s": 10
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+
+    // "i" + "do" + "n" + "'" + "t" → "i don 't" before cleanup
+    // cleanup: " n't" → "n't" → "i don't"
+    let decoded = ctx.decode(&[3, 4, 5, 6, 7]);
+    assert_eq!(
+        decoded, "i don't",
+        "cleanup must remove space before n't contraction, got: {decoded:?}"
     );
 }

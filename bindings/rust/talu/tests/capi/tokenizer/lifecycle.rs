@@ -40,10 +40,7 @@ fn model_dir_empty_for_json_tokenizer() {
     let ctx = TokenizerTestContext::new();
     let mut out_path: *mut i8 = ptr::null_mut();
     let rc = unsafe {
-        talu_sys::talu_tokenizer_get_model_dir(
-            ctx.handle(),
-            &mut out_path as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_get_model_dir(ctx.handle(), &mut out_path as *mut _ as *mut c_void)
     };
     assert_eq!(rc, 0);
     assert!(!out_path.is_null());

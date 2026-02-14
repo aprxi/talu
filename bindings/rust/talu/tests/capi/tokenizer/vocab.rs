@@ -77,11 +77,7 @@ fn id_to_token_out_of_range() {
     let ctx = TokenizerTestContext::new();
     let mut out: *mut i8 = ptr::null_mut();
     let rc = unsafe {
-        talu_sys::talu_tokenizer_id_to_token(
-            ctx.handle(),
-            9999,
-            &mut out as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_id_to_token(ctx.handle(), 9999, &mut out as *mut _ as *mut c_void)
     };
     assert_ne!(rc, 0);
     assert!(out.is_null());
@@ -110,11 +106,7 @@ fn token_to_id_special_tokens() {
 fn token_to_id_unknown() {
     let ctx = TokenizerTestContext::new();
     let id = unsafe {
-        talu_sys::talu_tokenizer_token_to_id(
-            ctx.handle(),
-            b"nonexistent_xyz".as_ptr(),
-            15,
-        )
+        talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"nonexistent_xyz".as_ptr(), 15)
     };
     assert_eq!(id, -1);
 }
@@ -176,7 +168,10 @@ fn byte_level_vocab_entries() {
     let ctx = TokenizerTestContext::with_byte_level();
     let result = unsafe { talu_sys::talu_tokenizer_get_vocab(ctx.handle()) };
     assert!(result.error_msg.is_null());
-    assert_eq!(result.num_entries, 260, "byte-level vocab should have 260 entries");
+    assert_eq!(
+        result.num_entries, 260,
+        "byte-level vocab should have 260 entries"
+    );
 
     let ids = unsafe { std::slice::from_raw_parts(result.ids, result.num_entries) };
     let mut sorted_ids = ids.to_vec();
@@ -300,11 +295,7 @@ fn id_to_token_boundary_zero() {
     let ctx = TokenizerTestContext::new();
     let mut out: *mut i8 = ptr::null_mut();
     let rc = unsafe {
-        talu_sys::talu_tokenizer_id_to_token(
-            ctx.handle(),
-            0,
-            &mut out as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_id_to_token(ctx.handle(), 0, &mut out as *mut _ as *mut c_void)
     };
     assert_eq!(rc, 0, "ID 0 should be valid");
     let text = unsafe { std::ffi::CStr::from_ptr(out) }
@@ -322,11 +313,7 @@ fn id_to_token_boundary_last() {
     // Last valid ID = 98
     let mut out: *mut i8 = ptr::null_mut();
     let rc = unsafe {
-        talu_sys::talu_tokenizer_id_to_token(
-            ctx.handle(),
-            98,
-            &mut out as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_id_to_token(ctx.handle(), 98, &mut out as *mut _ as *mut c_void)
     };
     assert_eq!(rc, 0, "last ID (98) should be valid");
     unsafe { talu_sys::talu_text_free(out) };
@@ -334,11 +321,7 @@ fn id_to_token_boundary_last() {
     // ID 99 is out of range for base fixture.
     out = ptr::null_mut();
     let rc2 = unsafe {
-        talu_sys::talu_tokenizer_id_to_token(
-            ctx.handle(),
-            99,
-            &mut out as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_id_to_token(ctx.handle(), 99, &mut out as *mut _ as *mut c_void)
     };
     assert_ne!(rc2, 0, "ID 99 should be out of range");
 }
@@ -364,13 +347,14 @@ fn special_tokens_fixture_added_only_not_in_vocab() {
                 token.len(),
             )
         };
-        assert_eq!(id, -1, "added-only token {token:?} should not be found by token_to_id");
+        assert_eq!(
+            id, -1,
+            "added-only token {token:?} should not be found by token_to_id"
+        );
     }
 
     // But regular tokens ARE found.
-    let id = unsafe {
-        talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"H".as_ptr(), 1)
-    };
+    let id = unsafe { talu_sys::talu_tokenizer_token_to_id(ctx.handle(), b"H".as_ptr(), 1) };
     assert_eq!(id, 44, "regular token 'H' should be in vocab");
 }
 
@@ -381,7 +365,11 @@ fn vocab_size_across_fixtures() {
         ("base", TokenizerTestContext::new(), 99),
         ("merges", TokenizerTestContext::with_merges(), 105),
         ("byte_level", TokenizerTestContext::with_byte_level(), 260),
-        ("special_tokens", TokenizerTestContext::with_special_tokens(), 99),
+        (
+            "special_tokens",
+            TokenizerTestContext::with_special_tokens(),
+            99,
+        ),
     ];
     for (name, ctx, expected) in sizes {
         let size = unsafe { talu_sys::talu_tokenizer_get_vocab_size(ctx.handle()) };

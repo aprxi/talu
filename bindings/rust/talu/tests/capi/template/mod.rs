@@ -1,6 +1,6 @@
 //! Template and chat template CAPI tests.
 
-mod common;
 mod chat;
+mod common;
 mod memory;
 mod render;

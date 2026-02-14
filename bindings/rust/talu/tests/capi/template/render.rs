@@ -85,12 +85,7 @@ fn render_conditional_false() {
 /// Nested access: "{{ user.name }}".
 #[test]
 fn render_nested_object() {
-    let result = render_template(
-        "{{ user.name }}",
-        r#"{"user":{"name":"Bob"}}"#,
-        false,
-    )
-    .unwrap();
+    let result = render_template("{{ user.name }}", r#"{"user":{"name":"Bob"}}"#, false).unwrap();
     assert_eq!(result, "Bob");
 }
 
@@ -133,8 +128,8 @@ fn syntax_error_in_template() {
 /// Unclosed block returns syntax error (600).
 #[test]
 fn unclosed_block_errors() {
-    let err = render_template("{% for x in items %}{{ x }}", r#"{"items":[1]}"#, false)
-        .unwrap_err();
+    let err =
+        render_template("{% for x in items %}{{ x }}", r#"{"items":[1]}"#, false).unwrap_err();
     assert_eq!(err, 600, "expected template_syntax_error (600)");
 }
 
@@ -145,12 +140,7 @@ fn unclosed_block_errors() {
 /// Unicode in variable value passes through correctly.
 #[test]
 fn render_unicode_variable() {
-    let result = render_template(
-        "{{ text }}",
-        r#"{"text":"日本語 🎉 café"}"#,
-        false,
-    )
-    .unwrap();
+    let result = render_template("{{ text }}", r#"{"text":"日本語 🎉 café"}"#, false).unwrap();
     assert_eq!(result, "日本語 🎉 café");
 }
 
@@ -187,13 +177,8 @@ fn whitespace_trim_right() {
 /// Trim both sides in a for-loop produces compact output.
 #[test]
 fn whitespace_trim_for_loop() {
-    let tmpl = concat!(
-        "{%- for x in items -%}",
-        "{{ x }}",
-        "{%- endfor -%}",
-    );
-    let result =
-        render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
+    let tmpl = concat!("{%- for x in items -%}", "{{ x }}", "{%- endfor -%}",);
+    let result = render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
     assert_eq!(result, "abc");
 }
 
@@ -225,40 +210,29 @@ fn filter_lower() {
 /// `default` filter provides fallback for undefined variables.
 #[test]
 fn filter_default() {
-    let result =
-        render_template("{{ missing | default('N/A') }}", "{}", false).unwrap();
+    let result = render_template("{{ missing | default('N/A') }}", "{}", false).unwrap();
     assert_eq!(result, "N/A");
 }
 
 /// `default` filter does nothing when variable is defined.
 #[test]
 fn filter_default_defined() {
-    let result = render_template(
-        "{{ val | default('N/A') }}",
-        r#"{"val":"present"}"#,
-        false,
-    )
-    .unwrap();
+    let result =
+        render_template("{{ val | default('N/A') }}", r#"{"val":"present"}"#, false).unwrap();
     assert_eq!(result, "present");
 }
 
 /// `trim` filter strips leading/trailing whitespace.
 #[test]
 fn filter_trim() {
-    let result =
-        render_template("{{ text | trim }}", r#"{"text":"  hi  "}"#, false).unwrap();
+    let result = render_template("{{ text | trim }}", r#"{"text":"  hi  "}"#, false).unwrap();
     assert_eq!(result, "hi");
 }
 
 /// `length` filter returns collection size.
 #[test]
 fn filter_length() {
-    let result = render_template(
-        "{{ items | length }}",
-        r#"{"items":[1,2,3]}"#,
-        false,
-    )
-    .unwrap();
+    let result = render_template("{{ items | length }}", r#"{"items":[1,2,3]}"#, false).unwrap();
     assert_eq!(result, "3");
 }
 
@@ -277,16 +251,19 @@ fn filter_join() {
 /// `capitalize` filter capitalizes first character.
 #[test]
 fn filter_capitalize() {
-    let result =
-        render_template("{{ text | capitalize }}", r#"{"text":"hello world"}"#, false).unwrap();
+    let result = render_template(
+        "{{ text | capitalize }}",
+        r#"{"text":"hello world"}"#,
+        false,
+    )
+    .unwrap();
     assert_eq!(result, "Hello world");
 }
 
 /// `title` filter capitalizes each word.
 #[test]
 fn filter_title() {
-    let result =
-        render_template("{{ text | title }}", r#"{"text":"hello world"}"#, false).unwrap();
+    let result = render_template("{{ text | title }}", r#"{"text":"hello world"}"#, false).unwrap();
     assert_eq!(result, "Hello World");
 }
 
@@ -339,8 +316,7 @@ fn filter_reverse() {
 /// `int` filter converts string to integer.
 #[test]
 fn filter_int() {
-    let result =
-        render_template("{{ val | int + 1 }}", r#"{"val":"41"}"#, false).unwrap();
+    let result = render_template("{{ val | int + 1 }}", r#"{"val":"41"}"#, false).unwrap();
     assert_eq!(result, "42");
 }
 
@@ -382,8 +358,7 @@ fn loop_first_last() {
         "{% if loop.last %}]{% endif %}",
         "{% endfor %}",
     );
-    let result =
-        render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
+    let result = render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
     assert_eq!(result, "[abc]");
 }
 
@@ -403,8 +378,7 @@ fn loop_length() {
 #[test]
 fn loop_comma_separated() {
     let tmpl = "{% for x in items %}{{ x }}{% if not loop.last %}, {% endif %}{% endfor %}";
-    let result =
-        render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
+    let result = render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
     assert_eq!(result, "a, b, c");
 }
 
@@ -436,8 +410,7 @@ fn namespace_mutable_state() {
         "{% for x in items %}{% set ns.count = ns.count + 1 %}{% endfor %}",
         "{{ ns.count }}",
     );
-    let result =
-        render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
+    let result = render_template(tmpl, r#"{"items":["a","b","c"]}"#, false).unwrap();
     assert_eq!(result, "3");
 }
 
@@ -510,12 +483,8 @@ fn expr_not() {
 /// Ternary (inline if) expression.
 #[test]
 fn expr_ternary() {
-    let result = render_template(
-        "{{ 'yes' if flag else 'no' }}",
-        r#"{"flag":true}"#,
-        false,
-    )
-    .unwrap();
+    let result =
+        render_template("{{ 'yes' if flag else 'no' }}", r#"{"flag":true}"#, false).unwrap();
     assert_eq!(result, "yes");
 }
 
@@ -558,12 +527,7 @@ fn expr_string_concat() {
 /// Arithmetic in expressions.
 #[test]
 fn expr_arithmetic() {
-    let result = render_template(
-        "{{ (a + b) * 2 }}",
-        r#"{"a":3,"b":4}"#,
-        false,
-    )
-    .unwrap();
+    let result = render_template("{{ (a + b) * 2 }}", r#"{"a":3,"b":4}"#, false).unwrap();
     assert_eq!(result, "14");
 }
 
@@ -589,8 +553,14 @@ fn elif_chain() {
         "{% else %}other{% endif %}",
     );
     assert_eq!(render_template(tmpl, r#"{"val":2}"#, false).unwrap(), "two");
-    assert_eq!(render_template(tmpl, r#"{"val":3}"#, false).unwrap(), "three");
-    assert_eq!(render_template(tmpl, r#"{"val":9}"#, false).unwrap(), "other");
+    assert_eq!(
+        render_template(tmpl, r#"{"val":3}"#, false).unwrap(),
+        "three"
+    );
+    assert_eq!(
+        render_template(tmpl, r#"{"val":9}"#, false).unwrap(),
+        "other"
+    );
 }
 
 // ===========================================================================
@@ -600,24 +570,21 @@ fn elif_chain() {
 /// `.upper()` string method.
 #[test]
 fn method_upper() {
-    let result =
-        render_template("{{ name.upper() }}", r#"{"name":"hello"}"#, false).unwrap();
+    let result = render_template("{{ name.upper() }}", r#"{"name":"hello"}"#, false).unwrap();
     assert_eq!(result, "HELLO");
 }
 
 /// `.lower()` string method.
 #[test]
 fn method_lower() {
-    let result =
-        render_template("{{ name.lower() }}", r#"{"name":"HELLO"}"#, false).unwrap();
+    let result = render_template("{{ name.lower() }}", r#"{"name":"HELLO"}"#, false).unwrap();
     assert_eq!(result, "hello");
 }
 
 /// `.strip()` string method.
 #[test]
 fn method_strip() {
-    let result =
-        render_template("{{ text.strip() }}", r#"{"text":"  hi  "}"#, false).unwrap();
+    let result = render_template("{{ text.strip() }}", r#"{"text":"  hi  "}"#, false).unwrap();
     assert_eq!(result, "hi");
 }
 
@@ -628,12 +595,7 @@ fn method_strip() {
 /// Comments are stripped from output.
 #[test]
 fn comments_stripped() {
-    let result = render_template(
-        "before{# this is a comment #}after",
-        "{}",
-        false,
-    )
-    .unwrap();
+    let result = render_template("before{# this is a comment #}after", "{}", false).unwrap();
     assert_eq!(result, "beforeafter");
 }
 
@@ -652,24 +614,16 @@ fn multiline_comment() {
 /// `range()` generates a number sequence.
 #[test]
 fn builtin_range() {
-    let result = render_template(
-        "{% for i in range(4) %}{{ i }}{% endfor %}",
-        "{}",
-        false,
-    )
-    .unwrap();
+    let result =
+        render_template("{% for i in range(4) %}{{ i }}{% endfor %}", "{}", false).unwrap();
     assert_eq!(result, "0123");
 }
 
 /// `range(start, stop)` with explicit bounds.
 #[test]
 fn builtin_range_start_stop() {
-    let result = render_template(
-        "{% for i in range(2, 5) %}{{ i }}{% endfor %}",
-        "{}",
-        false,
-    )
-    .unwrap();
+    let result =
+        render_template("{% for i in range(2, 5) %}{{ i }}{% endfor %}", "{}", false).unwrap();
     assert_eq!(result, "234");
 }
 
@@ -694,8 +648,7 @@ fn nested_for_loops() {
 #[test]
 fn conditional_inside_loop() {
     let tmpl = "{% for x in items %}{% if x > 2 %}{{ x }}{% endif %}{% endfor %}";
-    let result =
-        render_template(tmpl, r#"{"items":[1,2,3,4]}"#, false).unwrap();
+    let result = render_template(tmpl, r#"{"items":[1,2,3,4]}"#, false).unwrap();
     assert_eq!(result, "34");
 }
 
@@ -703,8 +656,7 @@ fn conditional_inside_loop() {
 #[test]
 fn for_with_condition() {
     let tmpl = "{% for x in items if x > 2 %}{{ x }}{% endfor %}";
-    let result =
-        render_template(tmpl, r#"{"items":[1,2,3,4]}"#, false).unwrap();
+    let result = render_template(tmpl, r#"{"items":[1,2,3,4]}"#, false).unwrap();
     assert_eq!(result, "34");
 }
 
@@ -753,12 +705,8 @@ fn dict_iteration() {
 /// `{% filter upper %}` block applies filter to enclosed content.
 #[test]
 fn filter_block() {
-    let result = render_template(
-        "{% filter upper %}hello world{% endfilter %}",
-        "{}",
-        false,
-    )
-    .unwrap();
+    let result =
+        render_template("{% filter upper %}hello world{% endfilter %}", "{}", false).unwrap();
     assert_eq!(result, "HELLO WORLD");
 }
 
@@ -788,12 +736,7 @@ fn sanitize_long_template_literal() {
 fn sanitize_large_loop() {
     let items: Vec<String> = (0..1000).map(|i| i.to_string()).collect();
     let vars = format!(r#"{{"items":[{}]}}"#, items.join(","));
-    let result = render_template(
-        "{% for x in items %}{{ x }}{% endfor %}",
-        &vars,
-        false,
-    )
-    .unwrap();
+    let result = render_template("{% for x in items %}{{ x }}{% endfor %}", &vars, false).unwrap();
     // Should contain all numbers 0-999.
     assert!(result.contains("0"));
     assert!(result.contains("999"));
@@ -835,12 +778,7 @@ fn sanitize_html_in_value() {
 /// JSON with null value renders as empty or "None".
 #[test]
 fn sanitize_null_json_value() {
-    let result = render_template(
-        "{{ val }}",
-        r#"{"val":null}"#,
-        false,
-    )
-    .unwrap();
+    let result = render_template("{{ val }}", r#"{"val":null}"#, false).unwrap();
     // Null renders as empty string in non-strict mode.
     assert!(result.is_empty() || result == "None", "got: {result:?}");
 }
@@ -848,12 +786,7 @@ fn sanitize_null_json_value() {
 /// Very large number in JSON.
 #[test]
 fn sanitize_large_number() {
-    let result = render_template(
-        "{{ val + 1 }}",
-        r#"{"val":999999999}"#,
-        false,
-    )
-    .unwrap();
+    let result = render_template("{{ val + 1 }}", r#"{"val":999999999}"#, false).unwrap();
     assert_eq!(result, "1000000000");
 }
 
@@ -873,12 +806,7 @@ fn sanitize_boolean_values() {
 /// Empty JSON object renders variables as empty (non-strict).
 #[test]
 fn sanitize_empty_vars_non_strict() {
-    let result = render_template(
-        "{{ a }}{{ b }}{{ c }}",
-        "{}",
-        false,
-    )
-    .unwrap();
+    let result = render_template("{{ a }}{{ b }}{{ c }}", "{}", false).unwrap();
     assert_eq!(result, "");
 }
 
@@ -897,13 +825,7 @@ fn sanitize_multiple_errors() {
 /// Different syntax errors all return error code 600.
 #[test]
 fn error_code_consistency_syntax() {
-    let syntax_errors = [
-        "{% if %}",
-        "{% for %}",
-        "{% endfor %}",
-        "{{ }}",
-        "{%  %}",
-    ];
+    let syntax_errors = ["{% if %}", "{% for %}", "{% endfor %}", "{{ }}", "{%  %}"];
     for tmpl in syntax_errors {
         let err = render_template(tmpl, "{}", false).unwrap_err();
         assert_eq!(err, 600, "expected 600 for template: {tmpl:?}, got {err}");
@@ -952,7 +874,8 @@ fn not_is_defined_precedence() {
     );
     let result = render_template(tmpl, r#"{"x": true}"#, false).unwrap();
     assert_eq!(
-        result.trim(), "True",
+        result.trim(),
+        "True",
         "`not x is defined` must parse as `not (x is defined)`, \
          but x was overridden to false, got: {result:?}"
     );
@@ -971,7 +894,8 @@ fn not_is_defined_false_value_still_defined() {
     );
     let result = render_template(tmpl, r#"{"x": false}"#, false).unwrap();
     assert_eq!(
-        result.trim(), "False",
+        result.trim(),
+        "False",
         "x=false is defined; `not x is defined` must be false, got: {result:?}"
     );
 }
@@ -991,7 +915,10 @@ fn not_is_defined_false_value_still_defined() {
 fn is_string_true_for_strings() {
     let tmpl = "{% if val is string %}yes{% else %}no{% endif %}";
     let result = render_template(tmpl, r#"{"val": "hello"}"#, false).unwrap();
-    assert_eq!(result, "yes", "`is string` must be true for string values, got: {result:?}");
+    assert_eq!(
+        result, "yes",
+        "`is string` must be true for string values, got: {result:?}"
+    );
 }
 
 /// `is string` must return false for non-string values.
@@ -1000,10 +927,16 @@ fn is_string_false_for_non_strings() {
     let tmpl = "{% if val is string %}yes{% else %}no{% endif %}";
     // Array
     let result = render_template(tmpl, r#"{"val": [1, 2, 3]}"#, false).unwrap();
-    assert_eq!(result, "no", "`is string` must be false for arrays, got: {result:?}");
+    assert_eq!(
+        result, "no",
+        "`is string` must be false for arrays, got: {result:?}"
+    );
     // Number
     let result = render_template(tmpl, r#"{"val": 42}"#, false).unwrap();
-    assert_eq!(result, "no", "`is string` must be false for numbers, got: {result:?}");
+    assert_eq!(
+        result, "no",
+        "`is string` must be false for numbers, got: {result:?}"
+    );
 }
 
 // ===========================================================================
@@ -1026,7 +959,10 @@ fn slice_reversal() {
         "{%- endfor -%}",
     );
     let result = render_template(tmpl, r#"{"items": ["a", "b", "c"]}"#, false).unwrap();
-    assert_eq!(result, "c,b,a", "[::-1] must reverse the list, got: {result:?}");
+    assert_eq!(
+        result, "c,b,a",
+        "[::-1] must reverse the list, got: {result:?}"
+    );
 }
 
 // ===========================================================================
@@ -1044,7 +980,10 @@ fn slice_reversal() {
 fn string_split_negative_index() {
     let tmpl = "{{ text.split('|')[-1] }}";
     let result = render_template(tmpl, r#"{"text": "a|b|c"}"#, false).unwrap();
-    assert_eq!(result, "c", "split('|')[-1] must return last segment, got: {result:?}");
+    assert_eq!(
+        result, "c",
+        "split('|')[-1] must return last segment, got: {result:?}"
+    );
 }
 
 /// `str.startswith(prefix)` must test the prefix.
@@ -1052,9 +991,15 @@ fn string_split_negative_index() {
 fn string_startswith() {
     let tmpl = "{% if text.startswith('hello') %}yes{% else %}no{% endif %}";
     let result = render_template(tmpl, r#"{"text": "hello world"}"#, false).unwrap();
-    assert_eq!(result, "yes", "startswith must match prefix, got: {result:?}");
+    assert_eq!(
+        result, "yes",
+        "startswith must match prefix, got: {result:?}"
+    );
     let result = render_template(tmpl, r#"{"text": "world hello"}"#, false).unwrap();
-    assert_eq!(result, "no", "startswith must not match non-prefix, got: {result:?}");
+    assert_eq!(
+        result, "no",
+        "startswith must not match non-prefix, got: {result:?}"
+    );
 }
 
 /// `str.endswith(suffix)` must test the suffix.
@@ -1070,5 +1015,8 @@ fn string_endswith() {
 fn string_strip_with_argument() {
     let tmpl = "{{ text.strip('\\n') }}";
     let result = render_template(tmpl, r#"{"text": "\nhello\n"}"#, false).unwrap();
-    assert_eq!(result, "hello", "strip('\\n') must remove newlines, got: {result:?}");
+    assert_eq!(
+        result, "hello",
+        "strip('\\n') must remove newlines, got: {result:?}"
+    );
 }

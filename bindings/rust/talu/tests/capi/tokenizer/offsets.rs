@@ -17,14 +17,11 @@ fn no_bos() -> talu_sys::EncodeOptions {
 fn encode_offsets_hello() {
     let ctx = TokenizerTestContext::new();
     let text = "Hello";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 5);
 
-    let offsets =
-        unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
 
     // Each character occupies exactly one byte.
     for (i, off) in offsets.iter().enumerate() {
@@ -39,9 +36,7 @@ fn encode_offsets_hello() {
 #[test]
 fn encode_offsets_empty() {
     let ctx = TokenizerTestContext::new();
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), &[], &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), &[], &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 0);
     unsafe { talu_sys::talu_encode_result_free(result) };
@@ -52,12 +47,9 @@ fn encode_offsets_empty() {
 fn encode_offsets_contiguous() {
     let ctx = TokenizerTestContext::new();
     let text = "abc";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
-    let offsets =
-        unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
 
     // Verify contiguous: each offset.start == previous offset.end.
     assert_eq!(offsets[0].start, 0);
@@ -75,18 +67,13 @@ fn tokenize_hi_strings() {
     let ctx = TokenizerTestContext::new();
     let text = "Hi";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
-    let token_ptrs = unsafe {
-        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens)
-    };
+    let token_ptrs =
+        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens) };
     let t0 = unsafe { std::ffi::CStr::from_ptr(token_ptrs[0]) }
         .to_string_lossy()
         .to_string();
@@ -103,9 +90,7 @@ fn tokenize_hi_strings() {
 #[test]
 fn tokenize_empty() {
     let ctx = TokenizerTestContext::new();
-    let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(ctx.handle(), [].as_ptr(), 0)
-    };
+    let result = unsafe { talu_sys::talu_tokenizer_tokenize(ctx.handle(), [].as_ptr(), 0) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 0);
     unsafe { talu_sys::talu_tokenize_result_free(result.tokens, result.num_tokens) };
@@ -117,19 +102,13 @@ fn tokenize_bytes_hi() {
     let ctx = TokenizerTestContext::new();
     let text = "Hi";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize_bytes(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
     // Offsets array has num_tokens+1 entries.
-    let offsets = unsafe {
-        std::slice::from_raw_parts(result.offsets, result.num_tokens + 1)
-    };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
     assert_eq!(offsets[0], 0);
     assert_eq!(*offsets.last().unwrap(), result.data_len);
 
@@ -155,14 +134,11 @@ fn tokenize_bytes_hi() {
 fn encode_offsets_single_char() {
     let ctx = TokenizerTestContext::new();
     let text = "A";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 1);
 
-    let offsets =
-        unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
     assert_eq!(offsets[0].start, 0);
     assert_eq!(offsets[0].end, 1);
 
@@ -173,9 +149,7 @@ fn encode_offsets_single_char() {
 #[test]
 fn tokenize_bytes_empty() {
     let ctx = TokenizerTestContext::new();
-    let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), [].as_ptr(), 0)
-    };
+    let result = unsafe { talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), [].as_ptr(), 0) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 0);
     unsafe {
@@ -200,11 +174,7 @@ fn tokenize_bytes_count_matches_encode() {
     let encode_tokens = ctx.encode_with(text, &opts);
 
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize_bytes(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(
@@ -232,9 +202,7 @@ fn tokenize_bytes_count_matches_encode() {
 fn attention_mask_all_ones_hello() {
     let ctx = TokenizerTestContext::new();
     let text = "Hello";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 5);
 
@@ -250,9 +218,7 @@ fn attention_mask_all_ones_hello() {
 #[test]
 fn attention_mask_empty_input() {
     let ctx = TokenizerTestContext::new();
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), &[], &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), &[], &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 0);
     assert!(result.attention_mask.is_null());
@@ -264,14 +230,15 @@ fn attention_mask_empty_input() {
 fn attention_mask_byte_level_emoji() {
     let ctx = TokenizerTestContext::with_byte_level();
     let text = "Hi😊";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, text.len()); // 2 + 4 = 6 bytes
 
     let mask = unsafe { std::slice::from_raw_parts(result.attention_mask, result.num_tokens) };
-    assert!(mask.iter().all(|&m| m == 1), "all attention_mask values should be 1");
+    assert!(
+        mask.iter().all(|&m| m == 1),
+        "all attention_mask values should be 1"
+    );
 
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
@@ -280,9 +247,7 @@ fn attention_mask_byte_level_emoji() {
 #[test]
 fn attention_mask_single_token() {
     let ctx = TokenizerTestContext::new();
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), b"A", &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), b"A", &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 1);
 
@@ -301,17 +266,16 @@ fn attention_mask_single_token() {
 fn special_tokens_mask_all_zeros_hello() {
     let ctx = TokenizerTestContext::new();
     let text = "Hello";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 5);
 
-    let mask = unsafe {
-        std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens)
-    };
+    let mask = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
     for (i, &m) in mask.iter().enumerate() {
-        assert_eq!(m, 0, "special_tokens_mask[{i}] should be 0 (no post-processor)");
+        assert_eq!(
+            m, 0,
+            "special_tokens_mask[{i}] should be 0 (no post-processor)"
+        );
     }
 
     unsafe { talu_sys::talu_encode_result_free(result) };
@@ -321,9 +285,7 @@ fn special_tokens_mask_all_zeros_hello() {
 #[test]
 fn special_tokens_mask_empty_input() {
     let ctx = TokenizerTestContext::new();
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), &[], &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), &[], &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 0);
     assert!(result.special_tokens_mask.is_null());
@@ -335,15 +297,11 @@ fn special_tokens_mask_empty_input() {
 fn special_tokens_mask_byte_level_all_zeros() {
     let ctx = TokenizerTestContext::with_byte_level();
     let text = "café";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, text.len()); // 5 bytes
 
-    let mask = unsafe {
-        std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens)
-    };
+    let mask = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
     assert!(
         mask.iter().all(|&m| m == 0),
         "all special_tokens_mask values should be 0 (no post-processor)"
@@ -357,16 +315,12 @@ fn special_tokens_mask_byte_level_all_zeros() {
 fn special_tokens_mask_merges_all_zeros() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hello";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     // "hello" → [104] (fully merged)
     assert_eq!(result.num_tokens, 1);
 
-    let mask = unsafe {
-        std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens)
-    };
+    let mask = unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
     assert_eq!(mask, &[0], "merged token should not be special");
 
     unsafe { talu_sys::talu_encode_result_free(result) };
@@ -381,9 +335,7 @@ fn special_tokens_mask_merges_all_zeros() {
 fn encode_result_arrays_consistent_lengths() {
     let ctx = TokenizerTestContext::new();
     for text in ["Hello", "A", "abc123", "!@#"] {
-        let result = unsafe {
-            super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-        };
+        let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
         assert!(result.error_msg.is_null());
         let n = result.num_tokens;
         assert_eq!(n, text.len(), "num_tokens for {text:?}");
@@ -418,9 +370,7 @@ fn encode_result_arrays_consistent_lengths() {
 fn offsets_merged_hello_single_token() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hello";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     // "hello" → [104] (fully merged)
     assert_eq!(result.num_tokens, 1);
@@ -437,9 +387,7 @@ fn offsets_merged_hello_single_token() {
 fn offsets_merged_hell() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hell";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     // "hell" → [103]
     assert_eq!(result.num_tokens, 1);
@@ -456,9 +404,7 @@ fn offsets_merged_hell() {
 fn offsets_merged_followed_by_unmerged() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "helloabc";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     // "hello" → [104], a → [69], b → [70], c → [71]
     assert_eq!(result.num_tokens, 4);
@@ -477,9 +423,7 @@ fn offsets_merged_followed_by_unmerged() {
 fn offsets_merged_partial() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "helo";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     // "helo" → [hel=102, o=83]
     assert_eq!(result.num_tokens, 2);
@@ -496,12 +440,9 @@ fn offsets_merged_partial() {
 fn offsets_merged_contiguous_and_complete() {
     let ctx = TokenizerTestContext::with_merges();
     for text in ["hello", "hell", "helo", "lo", "abc"] {
-        let result = unsafe {
-            super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-        };
+        let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
         assert!(result.error_msg.is_null());
-        let offsets =
-            unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
+        let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens) };
 
         if !offsets.is_empty() {
             assert_eq!(offsets[0].start, 0, "first offset.start for {text:?}");
@@ -511,10 +452,7 @@ fn offsets_merged_contiguous_and_complete() {
                 "last offset.end for {text:?}"
             );
             for w in offsets.windows(2) {
-                assert_eq!(
-                    w[0].end, w[1].start,
-                    "contiguous offsets for {text:?}"
-                );
+                assert_eq!(w[0].end, w[1].start, "contiguous offsets for {text:?}");
             }
         }
         unsafe { talu_sys::talu_encode_result_free(result) };
@@ -530,9 +468,7 @@ fn offsets_merged_contiguous_and_complete() {
 fn offsets_byte_level_cafe() {
     let ctx = TokenizerTestContext::with_byte_level();
     let text = "café";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 5); // c(1) + a(1) + f(1) + é(2) = 5 bytes
 
@@ -551,9 +487,7 @@ fn offsets_byte_level_cjk() {
     let ctx = TokenizerTestContext::with_byte_level();
     let text = "日";
     assert_eq!(text.len(), 3);
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 3);
 
@@ -572,9 +506,7 @@ fn offsets_byte_level_mixed_ascii_emoji() {
     let text = "A😊B";
     // A(1 byte) + 😊(4 bytes) + B(1 byte) = 6 bytes
     assert_eq!(text.len(), 6);
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 6);
 
@@ -604,9 +536,7 @@ fn truncation_right_preserves_offsets() {
         max_length: 2,
         ..Default::default()
     };
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
@@ -620,10 +550,13 @@ fn truncation_right_preserves_offsets() {
     let attn = unsafe { std::slice::from_raw_parts(result.attention_mask, result.num_tokens) };
     assert_eq!(attn, &[1, 1], "attention_mask after right truncation");
 
-    let special = unsafe {
-        std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens)
-    };
-    assert_eq!(special, &[0, 0], "special_tokens_mask after right truncation");
+    let special =
+        unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    assert_eq!(
+        special,
+        &[0, 0],
+        "special_tokens_mask after right truncation"
+    );
 
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
@@ -640,9 +573,7 @@ fn truncation_left_preserves_offsets() {
         max_length: 2,
         ..Default::default()
     };
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
@@ -657,10 +588,13 @@ fn truncation_left_preserves_offsets() {
     let attn = unsafe { std::slice::from_raw_parts(result.attention_mask, result.num_tokens) };
     assert_eq!(attn, &[1, 1], "attention_mask after left truncation");
 
-    let special = unsafe {
-        std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens)
-    };
-    assert_eq!(special, &[0, 0], "special_tokens_mask after left truncation");
+    let special =
+        unsafe { std::slice::from_raw_parts(result.special_tokens_mask, result.num_tokens) };
+    assert_eq!(
+        special,
+        &[0, 0],
+        "special_tokens_mask after left truncation"
+    );
 
     unsafe { talu_sys::talu_encode_result_free(result) };
 }
@@ -677,9 +611,7 @@ fn truncation_to_one_preserves_all_fields() {
         max_length: 1,
         ..Default::default()
     };
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 1);
 
@@ -710,9 +642,7 @@ fn truncation_merged_preserves_offsets() {
         max_length: 2,
         ..Default::default()
     };
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
@@ -737,9 +667,7 @@ fn truncation_noop_all_fields_intact() {
         max_length: 100,
         ..Default::default()
     };
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts)
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &opts) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 

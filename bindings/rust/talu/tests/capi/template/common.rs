@@ -24,9 +24,7 @@ pub fn render_template(template: &str, json_vars: &str, strict: bool) -> Result<
     }
 
     assert!(!out.is_null(), "render succeeded but output is null");
-    let s = unsafe { CStr::from_ptr(out) }
-        .to_string_lossy()
-        .to_string();
+    let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
     unsafe { talu_sys::talu_text_free(out) };
     Ok(s)
 }
@@ -62,10 +60,11 @@ pub fn apply_chat_template(
         return Err(rc);
     }
 
-    assert!(!out.is_null(), "apply_chat_template succeeded but output is null");
-    let s = unsafe { CStr::from_ptr(out) }
-        .to_string_lossy()
-        .to_string();
+    assert!(
+        !out.is_null(),
+        "apply_chat_template succeeded but output is null"
+    );
+    let s = unsafe { CStr::from_ptr(out) }.to_string_lossy().to_string();
     unsafe { talu_sys::talu_text_free(out) };
     Ok(s)
 }
@@ -107,4 +106,3 @@ pub const MULTITURN_MSGS: &str = r#"[
     {"role":"assistant","content":"Hello!"},
     {"role":"user","content":"How are you?"}
 ]"#;
-

@@ -50,7 +50,10 @@ fn load_from_json() {
             &mut handle as *mut _ as *mut std::ffi::c_void,
         )
     };
-    assert_eq!(rc, 0, "Unigram tokenizer must load from JSON (got error {rc})");
+    assert_eq!(
+        rc, 0,
+        "Unigram tokenizer must load from JSON (got error {rc})"
+    );
     assert!(!handle.is_null());
     unsafe { talu_sys::talu_tokenizer_free(handle) };
 }
@@ -80,5 +83,8 @@ fn metaspace_decode_strips_prefix_space() {
     // Decode [1, 3, 2] → "▁Clark" + "s" + "▁grant" → " Clark" + "s" + " grant"
     // With add_prefix_space strip → "Clarks grant"
     let decoded = ctx.decode(&[1, 3, 2]);
-    assert_eq!(decoded, "Clarks grant", "Metaspace add_prefix_space must strip leading space, got: {decoded:?}");
+    assert_eq!(
+        decoded, "Clarks grant",
+        "Metaspace add_prefix_space must strip leading space, got: {decoded:?}"
+    );
 }

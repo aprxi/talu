@@ -130,18 +130,13 @@ fn tokenize_strings_with_merges() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hello";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 1);
 
-    let ptrs = unsafe {
-        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens)
-    };
+    let ptrs =
+        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens) };
     let t0 = unsafe { std::ffi::CStr::from_ptr(ptrs[0]) }
         .to_string_lossy()
         .to_string();
@@ -156,18 +151,13 @@ fn tokenize_strings_partial_merge() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "helo";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
-    let ptrs = unsafe {
-        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens)
-    };
+    let ptrs =
+        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens) };
     let tokens: Vec<String> = (0..result.num_tokens)
         .map(|i| {
             unsafe { std::ffi::CStr::from_ptr(ptrs[i]) }
@@ -186,18 +176,13 @@ fn tokenize_strings_no_merges() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "abc";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 3);
 
-    let ptrs = unsafe {
-        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens)
-    };
+    let ptrs =
+        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens) };
     let tokens: Vec<String> = (0..result.num_tokens)
         .map(|i| {
             unsafe { std::ffi::CStr::from_ptr(ptrs[i]) }
@@ -220,18 +205,12 @@ fn tokenize_bytes_merged_hello() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hello";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize_bytes(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 1);
 
-    let offsets = unsafe {
-        std::slice::from_raw_parts(result.offsets, result.num_tokens + 1)
-    };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
     assert_eq!(offsets, [0, 5]);
 
     let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
@@ -239,7 +218,10 @@ fn tokenize_bytes_merged_hello() {
 
     unsafe {
         talu_sys::talu_tokenize_bytes_result_free(
-            result.data, result.data_len, result.offsets, result.num_tokens,
+            result.data,
+            result.data_len,
+            result.offsets,
+            result.num_tokens,
         )
     };
 }
@@ -250,18 +232,12 @@ fn tokenize_bytes_partial_merge() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "helo";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize_bytes(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
-    let offsets = unsafe {
-        std::slice::from_raw_parts(result.offsets, result.num_tokens + 1)
-    };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
     let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
 
     let t0 = std::str::from_utf8(&data[offsets[0]..offsets[1]]).unwrap();
@@ -271,7 +247,10 @@ fn tokenize_bytes_partial_merge() {
 
     unsafe {
         talu_sys::talu_tokenize_bytes_result_free(
-            result.data, result.data_len, result.offsets, result.num_tokens,
+            result.data,
+            result.data_len,
+            result.offsets,
+            result.num_tokens,
         )
     };
 }
@@ -285,9 +264,7 @@ fn tokenize_bytes_partial_merge() {
 fn encode_offsets_merged_hello() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hello";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 1);
 
@@ -303,9 +280,7 @@ fn encode_offsets_merged_hello() {
 fn encode_offsets_partial_merge() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "helo";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
@@ -323,9 +298,7 @@ fn encode_offsets_partial_merge() {
 fn encode_offsets_repeated_merge() {
     let ctx = TokenizerTestContext::with_merges();
     let text = "hellohello";
-    let result = unsafe {
-        super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos())
-    };
+    let result = unsafe { super::common::encode_raw(ctx.handle(), text.as_bytes(), &no_bos()) };
     assert!(result.error_msg.is_null());
     assert_eq!(result.num_tokens, 2);
 
@@ -424,11 +397,7 @@ fn tokenize_bytes_excludes_special_tokens() {
     let ctx = TokenizerTestContext::from_json(TOKENIZE_BOS_JSON);
     let text = "Hi";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize_bytes(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize_bytes(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
 
@@ -441,16 +410,17 @@ fn tokenize_bytes_excludes_special_tokens() {
         result.num_tokens
     );
 
-    let offsets = unsafe {
-        std::slice::from_raw_parts(result.offsets, result.num_tokens + 1)
-    };
+    let offsets = unsafe { std::slice::from_raw_parts(result.offsets, result.num_tokens + 1) };
     let data = unsafe { std::slice::from_raw_parts(result.data, result.data_len) };
     let t0 = std::str::from_utf8(&data[offsets[0]..offsets[1]]).unwrap();
     assert_eq!(t0, "Hi");
 
     unsafe {
         talu_sys::talu_tokenize_bytes_result_free(
-            result.data, result.data_len, result.offsets, result.num_tokens,
+            result.data,
+            result.data_len,
+            result.offsets,
+            result.num_tokens,
         )
     };
 }
@@ -461,11 +431,7 @@ fn tokenize_strings_excludes_special_tokens() {
     let ctx = TokenizerTestContext::from_json(TOKENIZE_BOS_JSON);
     let text = "Hi";
     let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(
-            ctx.handle(),
-            text.as_bytes().as_ptr(),
-            text.len(),
-        )
+        talu_sys::talu_tokenizer_tokenize(ctx.handle(), text.as_bytes().as_ptr(), text.len())
     };
     assert!(result.error_msg.is_null());
 
@@ -476,9 +442,8 @@ fn tokenize_strings_excludes_special_tokens() {
         result.num_tokens
     );
 
-    let ptrs = unsafe {
-        std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens)
-    };
+    let ptrs =
+        unsafe { std::slice::from_raw_parts(result.tokens as *const *const i8, result.num_tokens) };
     let t0 = unsafe { std::ffi::CStr::from_ptr(ptrs[0]) }
         .to_string_lossy()
         .to_string();

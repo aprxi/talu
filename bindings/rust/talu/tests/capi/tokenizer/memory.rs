@@ -141,9 +141,8 @@ fn encode_batch_null_handle_returns_error() {
 #[test]
 fn tokenize_null_handle_returns_error() {
     let text = b"Hello";
-    let result = unsafe {
-        talu_sys::talu_tokenizer_tokenize(ptr::null_mut(), text.as_ptr(), text.len())
-    };
+    let result =
+        unsafe { talu_sys::talu_tokenizer_tokenize(ptr::null_mut(), text.as_ptr(), text.len()) };
     assert!(
         !result.error_msg.is_null(),
         "tokenize with null handle should set error_msg"
@@ -199,11 +198,7 @@ fn get_eos_tokens_null_handle_returns_empty() {
 fn id_to_token_null_handle_returns_error() {
     let mut out: *mut i8 = ptr::null_mut();
     let rc = unsafe {
-        talu_sys::talu_tokenizer_id_to_token(
-            ptr::null_mut(),
-            0,
-            &mut out as *mut _ as *mut c_void,
-        )
+        talu_sys::talu_tokenizer_id_to_token(ptr::null_mut(), 0, &mut out as *mut _ as *mut c_void)
     };
     assert_ne!(rc, 0, "id_to_token with null handle should return error");
     assert!(out.is_null(), "output should remain null on error");
@@ -247,17 +242,13 @@ fn tokenize_result_free_null_is_noop() {
 /// Freeing null tokenize bytes result is a no-op.
 #[test]
 fn tokenize_bytes_result_free_null_is_noop() {
-    unsafe {
-        talu_sys::talu_tokenize_bytes_result_free(ptr::null(), 0, ptr::null(), 0)
-    };
+    unsafe { talu_sys::talu_tokenize_bytes_result_free(ptr::null(), 0, ptr::null(), 0) };
 }
 
 /// Freeing null batch encode result is a no-op.
 #[test]
 fn batch_encode_result_free_null_is_noop() {
-    unsafe {
-        talu_sys::talu_batch_encode_result_free(ptr::null(), ptr::null(), 0, 0)
-    };
+    unsafe { talu_sys::talu_batch_encode_result_free(ptr::null(), ptr::null(), 0, 0) };
 }
 
 /// Freeing zeroed encode result is a no-op.
@@ -270,15 +261,11 @@ fn encode_result_free_zeroed_is_noop() {
 /// Freeing null padded tensor result is a no-op.
 #[test]
 fn padded_tensor_result_free_null_is_noop() {
-    unsafe {
-        talu_sys::talu_padded_tensor_result_free(ptr::null(), ptr::null(), 0, 0)
-    };
+    unsafe { talu_sys::talu_padded_tensor_result_free(ptr::null(), ptr::null(), 0, 0) };
 }
 
 /// Freeing null vocab result is a no-op.
 #[test]
 fn vocab_result_free_null_is_noop() {
-    unsafe {
-        talu_sys::talu_vocab_result_free(ptr::null(), ptr::null(), ptr::null(), 0)
-    };
+    unsafe { talu_sys::talu_vocab_result_free(ptr::null(), ptr::null(), ptr::null(), 0) };
 }

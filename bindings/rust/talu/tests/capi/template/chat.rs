@@ -4,8 +4,8 @@
 //! generation prompts, BOS/EOS tokens, and error handling.
 
 use crate::capi::template::common::{
-    apply_chat_template, BOS_EOS_TEMPLATE, GENERATION_TEMPLATE, MULTITURN_MSGS,
-    SIMPLE_TEMPLATE, SINGLE_USER_MSG,
+    apply_chat_template, BOS_EOS_TEMPLATE, GENERATION_TEMPLATE, MULTITURN_MSGS, SIMPLE_TEMPLATE,
+    SINGLE_USER_MSG,
 };
 
 // ===========================================================================
@@ -23,10 +23,22 @@ fn single_user_message() {
 #[test]
 fn multiturn_conversation() {
     let result = apply_chat_template(SIMPLE_TEMPLATE, MULTITURN_MSGS, false, "", "").unwrap();
-    assert!(result.contains("system: You are helpful."), "missing system msg in: {result:?}");
-    assert!(result.contains("user: Hi"), "missing first user msg in: {result:?}");
-    assert!(result.contains("assistant: Hello!"), "missing assistant msg in: {result:?}");
-    assert!(result.contains("user: How are you?"), "missing second user msg in: {result:?}");
+    assert!(
+        result.contains("system: You are helpful."),
+        "missing system msg in: {result:?}"
+    );
+    assert!(
+        result.contains("user: Hi"),
+        "missing first user msg in: {result:?}"
+    );
+    assert!(
+        result.contains("assistant: Hello!"),
+        "missing assistant msg in: {result:?}"
+    );
+    assert!(
+        result.contains("user: How are you?"),
+        "missing second user msg in: {result:?}"
+    );
 }
 
 // ===========================================================================
@@ -36,8 +48,7 @@ fn multiturn_conversation() {
 /// add_generation_prompt=true appends assistant header.
 #[test]
 fn add_generation_prompt_true() {
-    let result =
-        apply_chat_template(GENERATION_TEMPLATE, SINGLE_USER_MSG, true, "", "").unwrap();
+    let result = apply_chat_template(GENERATION_TEMPLATE, SINGLE_USER_MSG, true, "", "").unwrap();
     assert!(
         result.ends_with("<|assistant|>"),
         "expected assistant header at end, got: {result:?}"
@@ -47,8 +58,7 @@ fn add_generation_prompt_true() {
 /// add_generation_prompt=false does not append assistant header.
 #[test]
 fn add_generation_prompt_false() {
-    let result =
-        apply_chat_template(GENERATION_TEMPLATE, SINGLE_USER_MSG, false, "", "").unwrap();
+    let result = apply_chat_template(GENERATION_TEMPLATE, SINGLE_USER_MSG, false, "", "").unwrap();
     assert!(
         !result.ends_with("<|assistant|>"),
         "should not end with assistant header, got: {result:?}"
@@ -64,7 +74,10 @@ fn add_generation_prompt_false() {
 fn bos_token_injected() {
     let result =
         apply_chat_template(BOS_EOS_TEMPLATE, SINGLE_USER_MSG, false, "<s>", "</s>").unwrap();
-    assert!(result.starts_with("<s>"), "expected BOS at start, got: {result:?}");
+    assert!(
+        result.starts_with("<s>"),
+        "expected BOS at start, got: {result:?}"
+    );
 }
 
 /// EOS token appears between messages.
@@ -72,7 +85,10 @@ fn bos_token_injected() {
 fn eos_token_between_messages() {
     let msgs = r#"[{"role":"user","content":"A"},{"role":"assistant","content":"B"}]"#;
     let result = apply_chat_template(BOS_EOS_TEMPLATE, msgs, false, "", "</s>").unwrap();
-    assert!(result.contains("</s>"), "expected EOS between messages, got: {result:?}");
+    assert!(
+        result.contains("</s>"),
+        "expected EOS between messages, got: {result:?}"
+    );
 }
 
 // ===========================================================================
@@ -124,7 +140,10 @@ fn empty_content_in_message() {
 #[test]
 fn invalid_messages_json_errors() {
     let err = apply_chat_template(SIMPLE_TEMPLATE, "not json", false, "", "").unwrap_err();
-    assert_eq!(err, 999, "expected internal_error (999) for malformed messages JSON");
+    assert_eq!(
+        err, 999,
+        "expected internal_error (999) for malformed messages JSON"
+    );
 }
 
 // ===========================================================================
@@ -145,7 +164,10 @@ fn chatml_style_template() {
     let msgs = r#"[{"role":"user","content":"Hi"}]"#;
     let result = apply_chat_template(tmpl, msgs, true, "", "").unwrap();
     // \n before {%- endfor %} is trimmed; \n before {%- endif %} is trimmed.
-    assert_eq!(result, "<|im_start|>user\nHi<|im_end|><|im_start|>assistant");
+    assert_eq!(
+        result,
+        "<|im_start|>user\nHi<|im_end|><|im_start|>assistant"
+    );
 }
 
 /// Llama-style template with header IDs and BOS.
@@ -163,11 +185,23 @@ fn llama_style_template() {
     );
     let msgs = r#"[{"role":"system","content":"Be helpful."},{"role":"user","content":"Hi"}]"#;
     let result = apply_chat_template(tmpl, msgs, true, "<|begin_of_text|>", "").unwrap();
-    assert!(result.starts_with("<|begin_of_text|>"), "missing BOS: {result:?}");
-    assert!(result.contains("<|start_header_id|>system<|end_header_id|>"), "missing system header: {result:?}");
-    assert!(result.contains("Be helpful.<|eot_id|>"), "missing system content: {result:?}");
+    assert!(
+        result.starts_with("<|begin_of_text|>"),
+        "missing BOS: {result:?}"
+    );
+    assert!(
+        result.contains("<|start_header_id|>system<|end_header_id|>"),
+        "missing system header: {result:?}"
+    );
+    assert!(
+        result.contains("Be helpful.<|eot_id|>"),
+        "missing system content: {result:?}"
+    );
     // {%- endif %} trims the trailing \n\n from the generation prompt.
-    assert!(result.ends_with("<|start_header_id|>assistant<|end_header_id|>"), "missing gen prompt: {result:?}");
+    assert!(
+        result.ends_with("<|start_header_id|>assistant<|end_header_id|>"),
+        "missing gen prompt: {result:?}"
+    );
 }
 
 // ===========================================================================
@@ -212,7 +246,10 @@ fn role_conditional_rendering() {
         {"role":"user","content":"Bye"}
     ]"#;
     let result = apply_chat_template(tmpl, msgs, false, "", "").unwrap();
-    assert_eq!(result, "<<SYS>>You are helpful.<</SYS>>[INST]Hi[/INST]Hello![INST]Bye[/INST]");
+    assert_eq!(
+        result,
+        "<<SYS>>You are helpful.<</SYS>>[INST]Hi[/INST]Hello![INST]Bye[/INST]"
+    );
 }
 
 /// Only the first system message gets special treatment.
@@ -367,8 +404,7 @@ fn generation_prompt_with_bos() {
         "assistant: ",
         "{%- endif -%}",
     );
-    let result =
-        apply_chat_template(tmpl, SINGLE_USER_MSG, true, "<s>", "").unwrap();
+    let result = apply_chat_template(tmpl, SINGLE_USER_MSG, true, "<s>", "").unwrap();
     // \n before {%- endfor -%} trimmed; trailing space before {%- endif -%} trimmed.
     assert_eq!(result, "<s>user: Helloassistant:");
 }
@@ -460,7 +496,6 @@ fn lstrip_blocks_multiturn_indented_template() {
         "lstrip_blocks must strip indentation before conditionals, got: {result:?}"
     );
 }
-
 
 // ===========================================================================
 // {% set %} reassignment inside for-loop
