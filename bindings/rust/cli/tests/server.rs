@@ -1,6 +1,6 @@
 //! Talu server integration tests.
 //!
-//! Requires a pre-built `talu` CLI binary (see BUILD.md).
+//! Requires a pre-built `talu` CLI binary.
 //! Run: `cargo test --test server`
 
 mod server {
