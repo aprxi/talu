@@ -1310,7 +1310,32 @@ fn parseAndApplyAddedTokens(tokenizer: *ct.Tokenizer, json_bytes: []const u8, _:
         // Add token
         // Use c_allocator for persistent allocations (arena is freed on function return)
         if (token_content.len > 0) {
-            const content_dup = std.heap.c_allocator.dupeZ(u8, token_content) catch return error.OutOfMemory;
+            // Unescape JSON escape sequences (\t, \n, \\, etc.) and null-terminate.
+            // Unescaping can only shorten the string, so token_content.len is the max size.
+            const content_dup = std.heap.c_allocator.allocSentinel(u8, token_content.len, 0) catch return error.OutOfMemory;
+            var out_i: usize = 0;
+            var in_i: usize = 0;
+            while (in_i < token_content.len) {
+                if (token_content[in_i] == '\\' and in_i + 1 < token_content.len) {
+                    content_dup[out_i] = switch (token_content[in_i + 1]) {
+                        'n' => '\n',
+                        'r' => '\r',
+                        't' => '\t',
+                        'b' => 0x08,
+                        'f' => 0x0C,
+                        '\\' => '\\',
+                        '"' => '"',
+                        '/' => '/',
+                        else => token_content[in_i + 1],
+                    };
+                    in_i += 2;
+                } else {
+                    content_dup[out_i] = token_content[in_i];
+                    in_i += 1;
+                }
+                out_i += 1;
+            }
+            content_dup[out_i] = 0;
             const added_node = tok_fns.tokenizer_added_token_add(tokenizer, content_dup.ptr, token_id, special_flag);
             if (added_node != null) {
                 // Parse additional flags
@@ -1505,6 +1530,8 @@ fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, a
         } else if (std.mem.eql(u8, type_str, "Punctuation")) {
             tokenizer.*.pretokenizer.punctuation = 1;
         } else if (std.mem.eql(u8, type_str, "BertPreTokenizer")) {
+            // Clear model default regex — BertPreTokenizer uses whitespace/punctuation splitting
+            _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, null);
             tokenizer.*.pretokenizer.whitespace = 1;
             tokenizer.*.pretokenizer.punctuation = 1;
         } else if (std.mem.eql(u8, type_str, "Metaspace")) {

@@ -147,6 +147,10 @@ pub fn tokenizer_apply_pretokenizer_spec(tok: ?*ct.Tokenizer, spec: ?*const ct.P
     tokenizer.pretokenizer.metaspace = pretokenizer_spec.metaspace;
     if (pretokenizer_spec.pattern) |pat| {
         _ = tokenizer_pretokenizer_set(&tokenizer.pretokenizer, @ptrCast(pat));
+    } else if (pretokenizer_spec.whitespace != 0 or pretokenizer_spec.punctuation != 0 or pretokenizer_spec.metaspace != 0) {
+        // Non-regex pretokenizer: clear any model-default regex so the
+        // whitespace/punctuation/metaspace flags take effect.
+        _ = tokenizer_pretokenizer_set(&tokenizer.pretokenizer, null);
     }
 }
 

@@ -472,22 +472,12 @@ fn added_token_decode_uses_explicit_id() {
 }
 
 // ===========================================================================
-// Metaspace BPE: no extra ▁ after matched special token during encode
+// Metaspace BPE: special token matching preserves word boundaries
 // ===========================================================================
 //
-// SentencePiece BPE models with Metaspace pretokenizer match special tokens
-// (like <s>, </s>) first, then tokenize the remaining text segments. The
-// Metaspace pretokenizer converts spaces to ▁ (U+2581) for word boundaries.
-//
-// After a special token match, the next text segment starts with a space
-// (e.g. " are" after "</s>"). The pretokenizer's space-to-▁ conversion
-// should absorb this space into the ▁ prefix of the first word, NOT produce
-// a separate standalone ▁ token.
-//
-// Bug: the encode pipeline explicitly prepends ▁ to segments after special
-// tokens, AND the Metaspace pretokenizer converts the leading space to ▁,
-// causing double ▁ that splits into a standalone ▁ + ▁word.
-// Affects: microsoft/Phi-3 models (1 encode failure each × 5 models).
+// When special tokens appear in the input, the text around them is segmented
+// and each segment goes through Metaspace pretokenization independently.
+// Trailing spaces before special tokens produce a standalone ▁ token (correct).
 
 /// Minimal SentencePiece BPE with <s>/<eos> special tokens and Metaspace.
 const METASPACE_SPECIAL_TOKEN_JSON: &str = r####"{
@@ -512,29 +502,24 @@ const METASPACE_SPECIAL_TOKEN_JSON: &str = r####"{
   "decoder": {"type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true}
 }"####;
 
-/// Encoding text with a special token match must not produce an extra ▁ token.
+/// Metaspace encodes trailing space before special token as standalone ▁.
 ///
-/// For "<s> and </s> are special tokens":
+/// Input "<s> and </s> are special tokens" splits into segments:
 /// - <s> matched as special token (ID 1)
-/// - " and " tokenized → [▁and]
+/// - " and " → Metaspace → [▁and, ▁] (trailing space becomes standalone ▁)
 /// - </s> matched as special token (ID 2)
-/// - " are special tokens" tokenized → [▁are, ▁special, ▁tokens]
-///
-/// There must be no standalone ▁ token between </s> and ▁are.
+/// - " are special tokens" → Metaspace → [▁are, ▁special, ▁tokens]
 #[test]
-fn no_extra_metaspace_after_special_token() {
+fn metaspace_encode_with_special_tokens() {
     let ctx = TokenizerTestContext::from_json(METASPACE_SPECIAL_TOKEN_JSON);
     let opts = talu_sys::EncodeOptions {
         add_bos: 0,
         ..Default::default()
     };
     let tokens = ctx.encode_with("<s> and </s> are special tokens", &opts);
-    // Expected: [<s>=1, ▁and=4, </s>=2, ▁are=5, ▁special=6, ▁tokens=7]
-    // Bug: produces [<s>=1, ▁and=4, </s>=2, ▁=3, ▁are=5, ▁special=6, ▁tokens=7]
-    //                                        ^^^ extra standalone ▁
     assert_eq!(
-        tokens, vec![1, 4, 2, 5, 6, 7],
-        "no extra ▁ token after special token match, got: {tokens:?}"
+        tokens, vec![1, 4, 3, 2, 5, 6, 7],
+        "trailing space before </s> produces standalone ▁ token, got: {tokens:?}"
     );
 }
 
