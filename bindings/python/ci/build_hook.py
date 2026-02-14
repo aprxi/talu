@@ -100,6 +100,24 @@ class ZigBuildHook(BuildHookInterface):
             return "talu.exe"
         return "talu"
 
+    def _find_llvm_strip(self) -> str | None:
+        """Find llvm-strip on macOS (required for dylibs with GCC exception tables)."""
+        if shutil.which("llvm-strip"):
+            return "llvm-strip"
+        try:
+            result = subprocess.run(
+                ["brew", "--prefix", "llvm"],
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            llvm_strip = Path(result.stdout.strip()) / "bin" / "llvm-strip"
+            if llvm_strip.exists():
+                return str(llvm_strip)
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            pass
+        return None
+
     def _resolve_zig_root(self, package_root: Path) -> Path:
         """Resolve Zig project root for builds."""
         vendor_root = package_root / "vendor" / "talu"
@@ -146,12 +164,16 @@ class ZigBuildHook(BuildHookInterface):
             lib_path = zig_root / "zig-out" / "lib" / self._get_lib_name()
             bin_path = zig_root / "zig-out" / "bin" / self._get_bin_name()
             self._log("Stripping binaries...")
-            # macOS strip needs -x for dylibs: full strip fails on
-            # indirect symbol table entries (Metal, CoreFoundation, etc.)
             is_macos = platform.system() == "Darwin"
             if lib_path.exists():
-                strip_cmd = ["strip", "-x", str(lib_path)] if is_macos else ["strip", str(lib_path)]
-                subprocess.run(strip_cmd, check=False)
+                if is_macos:
+                    # macOS: Xcode strip fails on dylibs with GCC exception
+                    # tables. Use llvm-strip if available.
+                    llvm_strip = self._find_llvm_strip()
+                    if llvm_strip:
+                        subprocess.run([llvm_strip, str(lib_path)], check=False)
+                else:
+                    subprocess.run(["strip", str(lib_path)], check=False)
             if bin_path.exists():
                 subprocess.run(["strip", str(bin_path)], check=False)
 

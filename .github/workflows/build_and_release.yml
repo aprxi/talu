@@ -126,7 +126,7 @@ jobs:
       - name: Install dependencies (macOS)
         if: runner.os == 'macOS'
         run: |
-          brew install cmake
+          brew install cmake llvm
           RUST_VERSION="1.92.0"
           # Determine Rust target based on runner architecture
           if [ "$(uname -m)" = "arm64" ]; then
@@ -301,11 +301,10 @@ jobs:
             LIB_NAME="libtalu.so"
           fi
 
-          # macOS strip needs -x: full strip fails on dylibs that import
-          # framework symbols (Metal, CoreFoundation, Accelerate) via
-          # indirect symbol table entries. -x strips local symbols only.
+          # macOS: Xcode strip fails on dylibs with GCC exception tables
+          # in indirect symbol table. Use llvm-strip instead (26MB -> 22MB).
           if [ "$(uname)" = "Darwin" ]; then
-            strip -x zig-out/lib/$LIB_NAME
+            "$(brew --prefix llvm)/bin/llvm-strip" zig-out/lib/$LIB_NAME
           else
             strip zig-out/lib/$LIB_NAME
           fi
