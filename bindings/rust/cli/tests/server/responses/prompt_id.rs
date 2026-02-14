@@ -188,7 +188,11 @@ fn prompt_id_lineage_tracking() {
         .expect("should have session_id");
 
     let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
-    assert_eq!(conv_resp.status, 200, "get conversation: {}", conv_resp.body);
+    assert_eq!(
+        conv_resp.status, 200,
+        "get conversation: {}",
+        conv_resp.body
+    );
 
     let conv_json = conv_resp.json();
     assert_eq!(
@@ -228,7 +232,11 @@ fn prompt_id_streaming_lineage_tracking() {
         .expect("should have session_id");
 
     let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
-    assert_eq!(conv_resp.status, 200, "get conversation: {}", conv_resp.body);
+    assert_eq!(
+        conv_resp.status, 200,
+        "get conversation: {}",
+        conv_resp.body
+    );
 
     assert_eq!(
         conv_resp.json()["source_doc_id"].as_str(),
@@ -256,7 +264,11 @@ fn prompt_id_document_not_found() {
         "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "should return 400 for missing document: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "should return 400 for missing document: {}",
+        resp.body
+    );
 
     let json = resp.json();
     let error_msg = json["error"]["message"].as_str().unwrap_or("");
@@ -280,7 +292,11 @@ fn prompt_id_requires_storage() {
         "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "should return 400 without storage: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "should return 400 without storage: {}",
+        resp.body
+    );
 
     let json = resp.json();
     let error_msg = json["error"]["message"].as_str().unwrap_or("");
@@ -307,7 +323,11 @@ fn prompt_id_streaming_document_not_found() {
         "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 400, "streaming should return 400 for missing doc: {}", resp.body);
+    assert_eq!(
+        resp.status, 400,
+        "streaming should return 400 for missing doc: {}",
+        resp.body
+    );
 }
 
 // =============================================================================
@@ -331,7 +351,11 @@ fn prompt_id_document_without_system_prompt() {
         "max_output_tokens": 10,
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_eq!(resp.status, 200, "should succeed without system_prompt: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "should succeed without system_prompt: {}",
+        resp.body
+    );
 
     let json = resp.json();
     assert_eq!(json["object"].as_str(), Some("response"));
@@ -339,7 +363,10 @@ fn prompt_id_document_without_system_prompt() {
     let session_id = json["metadata"]["session_id"].as_str().expect("session_id");
     let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
     assert_eq!(conv_resp.status, 200);
-    assert_eq!(conv_resp.json()["source_doc_id"].as_str(), Some(doc_id.as_str()));
+    assert_eq!(
+        conv_resp.json()["source_doc_id"].as_str(),
+        Some(doc_id.as_str())
+    );
 }
 
 /// prompt_id combined with previous_response_id (chaining from a prompt-based conversation).
@@ -362,7 +389,9 @@ fn prompt_id_with_chaining() {
     assert_eq!(resp1.status, 200, "first request: {}", resp1.body);
     let json1 = resp1.json();
     let response_id = json1["id"].as_str().expect("should have response id");
-    let session_id = json1["metadata"]["session_id"].as_str().expect("session_id");
+    let session_id = json1["metadata"]["session_id"]
+        .as_str()
+        .expect("session_id");
 
     let body2 = serde_json::json!({
         "model": &model,
@@ -375,9 +404,14 @@ fn prompt_id_with_chaining() {
     assert_eq!(resp2.status, 200, "chained request: {}", resp2.body);
 
     let json2 = resp2.json();
-    let session_id2 = json2["metadata"]["session_id"].as_str().expect("session_id");
+    let session_id2 = json2["metadata"]["session_id"]
+        .as_str()
+        .expect("session_id");
 
-    assert_eq!(session_id, session_id2, "chained request should use same session");
+    assert_eq!(
+        session_id, session_id2,
+        "chained request should use same session"
+    );
 
     let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
     assert_eq!(conv_resp.status, 200);
@@ -438,7 +472,10 @@ fn prompt_id_streaming_with_chaining() {
         .as_str()
         .expect("session_id");
 
-    assert_eq!(session_id, session_id2, "streaming chain should use same session");
+    assert_eq!(
+        session_id, session_id2,
+        "streaming chain should use same session"
+    );
 
     let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
     assert_eq!(conv_resp.status, 200);
@@ -478,8 +515,14 @@ fn prompt_id_multiple_conversations_same_document() {
         session_ids.push(session_id);
     }
 
-    assert_ne!(session_ids[0], session_ids[1], "sessions should be different");
-    assert_ne!(session_ids[1], session_ids[2], "sessions should be different");
+    assert_ne!(
+        session_ids[0], session_ids[1],
+        "sessions should be different"
+    );
+    assert_ne!(
+        session_ids[1], session_ids[2],
+        "sessions should be different"
+    );
 
     for session_id in &session_ids {
         let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
@@ -531,7 +574,11 @@ fn list_conversations_by_source_doc_id() {
     post_json(ctx.addr(), "/v1/responses", &body);
 
     let list_resp = get(ctx.addr(), "/v1/conversations");
-    assert_eq!(list_resp.status, 200, "list conversations: {}", list_resp.body);
+    assert_eq!(
+        list_resp.status, 200,
+        "list conversations: {}",
+        list_resp.body
+    );
 
     let list_json = list_resp.json();
     let conversations = list_json["data"].as_array().expect("data array");
@@ -551,7 +598,10 @@ fn list_conversations_by_source_doc_id() {
 
     assert_eq!(doc1_count, 2, "should have 2 conversations from doc1");
     assert_eq!(doc2_count, 1, "should have 1 conversation from doc2");
-    assert_eq!(no_source_count, 1, "should have 1 conversation without source");
+    assert_eq!(
+        no_source_count, 1,
+        "should have 1 conversation without source"
+    );
 }
 
 // =============================================================================

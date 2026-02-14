@@ -9,6 +9,7 @@ use simplelog::{Config, LevelFilter, SimpleLogger};
 pub mod auth_gateway;
 pub mod conversations;
 pub mod documents;
+pub mod files;
 pub mod generated;
 pub mod handlers;
 pub mod http;

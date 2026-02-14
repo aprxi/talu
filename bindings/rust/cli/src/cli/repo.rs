@@ -224,7 +224,12 @@ pub(super) fn cmd_get(args: GetArgs) -> Result<()> {
         let store = pin_store
             .as_ref()
             .ok_or_else(|| anyhow!("internal error: pin store unavailable"))?;
-        return cmd_sync_pins(store, args.endpoint_url.as_deref(), dry_run, args.no_weights);
+        return cmd_sync_pins(
+            store,
+            args.endpoint_url.as_deref(),
+            dry_run,
+            args.no_weights,
+        );
     }
 
     let target = match args.target {
@@ -313,7 +318,12 @@ fn cmd_remove_pin(pin_store: &PinStore, model_uri: &str) -> Result<()> {
     Ok(())
 }
 
-fn cmd_sync_pins(pin_store: &PinStore, endpoint_url: Option<&str>, dry_run: bool, no_weights: bool) -> Result<()> {
+fn cmd_sync_pins(
+    pin_store: &PinStore,
+    endpoint_url: Option<&str>,
+    dry_run: bool,
+    no_weights: bool,
+) -> Result<()> {
     let entries = pin_store.list_pinned_entries()?;
     if entries.is_empty() {
         println!("No pinned models for this profile.");

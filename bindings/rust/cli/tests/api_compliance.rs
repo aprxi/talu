@@ -102,8 +102,8 @@ async fn body_json(resp: Response<Incoming>) -> (StatusCode, Value) {
 
 /// Build a Router with a real backend loaded (model inference enabled).
 fn build_app_with_model(model: &str) -> Router {
-    let backend =
-        InferenceBackend::new(model).unwrap_or_else(|e| panic!("failed to load model {model}: {e}"));
+    let backend = InferenceBackend::new(model)
+        .unwrap_or_else(|e| panic!("failed to load model {model}: {e}"));
 
     let state = AppState {
         backend: Arc::new(Mutex::new(BackendState {
@@ -555,7 +555,11 @@ fn streaming_request(model: &str, input: &str) -> Value {
 async fn test_streaming_content_type() {
     let model = require_model!();
     let app = build_app_with_model(&model);
-    let resp = send_request(&app, post_json("/v1/responses", &streaming_request(&model, "Hi"))).await;
+    let resp = send_request(
+        &app,
+        post_json("/v1/responses", &streaming_request(&model, "Hi")),
+    )
+    .await;
     let ct = resp
         .headers()
         .get("content-type")
@@ -572,7 +576,11 @@ async fn test_streaming_content_type() {
 async fn test_streaming_cache_headers() {
     let model = require_model!();
     let app = build_app_with_model(&model);
-    let resp = send_request(&app, post_json("/v1/responses", &streaming_request(&model, "Hi"))).await;
+    let resp = send_request(
+        &app,
+        post_json("/v1/responses", &streaming_request(&model, "Hi")),
+    )
+    .await;
     let cc = resp
         .headers()
         .get("cache-control")

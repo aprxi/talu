@@ -17,6 +17,7 @@ use tower_service::Service;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::conversations;
 use crate::server::documents;
+use crate::server::files;
 use crate::server::handlers;
 use crate::server::plugins;
 use crate::server::proxy;
@@ -269,6 +270,29 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/documents") | (Method::POST, "/documents") => {
                             documents::handle_create(state, req, auth, plugin_owner).await
+                        }
+                        (Method::POST, "/v1/files") | (Method::POST, "/files") => {
+                            files::handle_upload(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/files") | (Method::GET, "/files") => {
+                            files::handle_list(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/files/") || p.starts_with("/files/"))
+                                && p.ends_with("/content") =>
+                        {
+                            files::handle_get_content(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/files/") || p.starts_with("/files/"))
+                                && !p.ends_with("/content") =>
+                        {
+                            files::handle_get(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/files/") || p.starts_with("/files/") =>
+                        {
+                            files::handle_delete(state, req, auth).await
                         }
                         (Method::POST, "/v1/documents/search")
                         | (Method::POST, "/documents/search") => {

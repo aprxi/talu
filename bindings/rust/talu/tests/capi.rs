@@ -21,6 +21,7 @@ mod capi {
     }
 
     pub mod db {
+        pub mod blobs;
         pub mod chat;
         pub mod common;
         pub mod concurrency;

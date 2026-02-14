@@ -47,6 +47,7 @@
 //!
 //! Both implement [`responses::ResponsesView`] for read access to items.
 
+pub mod blobs;
 pub mod convert;
 pub mod documents;
 pub mod error;
@@ -70,6 +71,7 @@ pub use wrappers::{
 };
 
 // Re-export commonly used types for CLI convenience
+pub use blobs::{BlobError, BlobReadStream, BlobWriteStream, BlobsHandle};
 pub use convert::{
     ConvertOptions, ConvertProgress, ConvertResult, ProgressAction as ConvertProgressAction, Scheme,
 };

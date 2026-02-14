@@ -9,6 +9,7 @@ mod server {
     pub mod console;
     pub mod conversations;
     pub mod documents;
+    pub mod files;
     pub mod plugins;
     pub mod responses;
     pub mod search;

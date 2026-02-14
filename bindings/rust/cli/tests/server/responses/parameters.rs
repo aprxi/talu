@@ -3,7 +3,11 @@
 use crate::server::common::{get, model_config, post_json, require_model, ServerTestContext};
 
 /// Helper: generate with custom parameters.
-fn generate_with(ctx: &ServerTestContext, model: &str, extra: serde_json::Value) -> serde_json::Value {
+fn generate_with(
+    ctx: &ServerTestContext,
+    model: &str,
+    extra: serde_json::Value,
+) -> serde_json::Value {
     let mut body = serde_json::json!({
         "model": model,
         "input": "Hello",

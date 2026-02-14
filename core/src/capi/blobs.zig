@@ -14,10 +14,18 @@ const allocator = std.heap.c_allocator;
 /// Opaque handle for incremental blob reads.
 /// Thread safety: NOT thread-safe.
 pub const BlobStreamHandle = opaque {};
+/// Opaque handle for incremental blob writes.
+/// Thread safety: NOT thread-safe.
+pub const BlobWriteStreamHandle = opaque {};
 
 const BlobStreamState = struct {
     blob_store: db_blob_store.BlobStore,
     stream: db_blob_store.BlobReadStream,
+};
+
+const BlobWriteStreamState = struct {
+    blob_store: db_blob_store.BlobStore,
+    stream: ?db_blob_store.BlobPutStream,
 };
 
 fn validateDbPath(db_path: ?[*:0]const u8) ?[]const u8 {
@@ -117,6 +125,138 @@ pub export fn talu_blobs_put(
         return @intFromEnum(error_codes.ErrorCode.resource_exhausted);
     }
 
+    @memcpy(out[0..blob_ref_slice.len], blob_ref_slice);
+    out[blob_ref_slice.len] = 0;
+    return 0;
+}
+
+/// Open a streaming writer for blob uploads.
+///
+/// Parameters:
+///   - db_path: Path to TaluDB storage directory (null-terminated)
+///   - out_stream: Output write stream handle, close with talu_blobs_write_stream_close()
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_blobs_open_write_stream(
+    db_path: ?[*:0]const u8,
+    out_stream: ?*?*BlobWriteStreamHandle,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_stream orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_stream is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = null;
+
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+
+    const state = allocator.create(BlobWriteStreamState) catch |err| {
+        capi_error.setErrorWithCode(.out_of_memory, "Failed to allocate blob write stream state: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    errdefer allocator.destroy(state);
+
+    state.* = undefined;
+    state.blob_store = db_blob_store.BlobStore.init(allocator, db_path_slice) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to initialize blob store: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    errdefer state.blob_store.deinit();
+
+    state.stream = db_blob_store.BlobPutStream.init(&state.blob_store, allocator);
+    out.* = @ptrCast(state);
+    return 0;
+}
+
+/// Write bytes into a blob write stream.
+///
+/// Parameters:
+///   - stream_handle: Handle from talu_blobs_open_write_stream()
+///   - bytes: Payload chunk pointer (may be null when bytes_len=0)
+///   - bytes_len: Payload chunk length
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_blobs_write_stream_write(
+    stream_handle: ?*BlobWriteStreamHandle,
+    bytes: ?[*]const u8,
+    bytes_len: usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const handle = stream_handle orelse {
+        capi_error.setErrorWithCode(.invalid_handle, "stream_handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
+    };
+    if (bytes == null and bytes_len > 0) {
+        capi_error.setErrorWithCode(.invalid_argument, "bytes is null while bytes_len > 0", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }
+    if (bytes_len == 0) return 0;
+
+    const state: *BlobWriteStreamState = @ptrCast(@alignCast(handle));
+    const stream = if (state.stream) |*stream| stream else {
+        capi_error.setErrorWithCode(.invalid_handle, "stream is already finalized", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
+    };
+    stream.write(bytes.?[0..bytes_len]) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to write blob stream chunk: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    return 0;
+}
+
+/// Finalize a blob write stream and return a blob reference.
+///
+/// Parameters:
+///   - stream_handle: Handle from talu_blobs_open_write_stream()
+///   - out_blob_ref: Output buffer for `sha256:<hex>` or `multi:<hex>`
+///   - out_blob_ref_capacity: Output buffer capacity in bytes
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_blobs_write_stream_finish(
+    stream_handle: ?*BlobWriteStreamHandle,
+    out_blob_ref: ?[*]u8,
+    out_blob_ref_capacity: usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_blob_ref orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_blob_ref is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    if (out_blob_ref_capacity == 0) {
+        capi_error.setErrorWithCode(.invalid_argument, "out_blob_ref_capacity is zero", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }
+    out[0] = 0;
+
+    const handle = stream_handle orelse {
+        capi_error.setErrorWithCode(.invalid_handle, "stream_handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
+    };
+    const state: *BlobWriteStreamState = @ptrCast(@alignCast(handle));
+    const stream = if (state.stream) |*stream| stream else {
+        capi_error.setErrorWithCode(.invalid_handle, "stream is already finalized", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
+    };
+
+    const blob_ref = stream.finish() catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to finalize blob stream: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    stream.deinit();
+    state.stream = null;
+
+    const blob_ref_slice = blob_ref.refSlice();
+    if (out_blob_ref_capacity <= blob_ref_slice.len) {
+        capi_error.setErrorWithCode(
+            .resource_exhausted,
+            "out_blob_ref buffer too small (need at least {d} bytes)",
+            .{blob_ref_slice.len + 1},
+        );
+        return @intFromEnum(error_codes.ErrorCode.resource_exhausted);
+    }
     @memcpy(out[0..blob_ref_slice.len], blob_ref_slice);
     out[blob_ref_slice.len] = 0;
     return 0;
@@ -246,6 +386,20 @@ pub export fn talu_blobs_stream_close(stream_handle: ?*BlobStreamHandle) callcon
     allocator.destroy(state);
 }
 
+/// Close a blob write stream handle and release resources.
+/// Safe to call with null.
+pub export fn talu_blobs_write_stream_close(stream_handle: ?*BlobWriteStreamHandle) callconv(.c) void {
+    capi_error.clearError();
+    const handle = stream_handle orelse return;
+    const state: *BlobWriteStreamState = @ptrCast(@alignCast(handle));
+    if (state.stream) |*stream| {
+        stream.deinit();
+        state.stream = null;
+    }
+    state.blob_store.deinit();
+    allocator.destroy(state);
+}
+
 test "talu_blobs_put and talu_blobs_open_stream roundtrip bytes" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -284,4 +438,56 @@ test "talu_blobs_put and talu_blobs_open_stream roundtrip bytes" {
     }
 
     try std.testing.expectEqualStrings(payload, out.items);
+}
+
+test "talu_blobs_write_stream_write and finish roundtrip bytes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const root_path_z = try std.testing.allocator.dupeZ(u8, root_path);
+    defer std.testing.allocator.free(root_path_z);
+
+    var write_handle: ?*BlobWriteStreamHandle = null;
+    const open_rc = talu_blobs_open_write_stream(root_path_z.ptr, &write_handle);
+    try std.testing.expectEqual(@as(i32, 0), open_rc);
+    defer talu_blobs_write_stream_close(write_handle);
+
+    const chunk_a = "write-stream-";
+    const chunk_b = "payload";
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_write_stream_write(write_handle, chunk_a.ptr, chunk_a.len),
+    );
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_write_stream_write(write_handle, chunk_b.ptr, chunk_b.len),
+    );
+
+    var blob_ref_buf: [db_blob_store.ref_len + 1]u8 = undefined;
+    const finish_rc = talu_blobs_write_stream_finish(
+        write_handle,
+        &blob_ref_buf,
+        blob_ref_buf.len,
+    );
+    try std.testing.expectEqual(@as(i32, 0), finish_rc);
+
+    var stream_handle: ?*BlobStreamHandle = null;
+    const open_read_rc = talu_blobs_open_stream(root_path_z.ptr, @ptrCast(&blob_ref_buf), &stream_handle);
+    try std.testing.expectEqual(@as(i32, 0), open_read_rc);
+    defer talu_blobs_stream_close(stream_handle);
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    var buf: [8]u8 = undefined;
+    while (true) {
+        var read_len: usize = 0;
+        const read_rc = talu_blobs_stream_read(stream_handle, &buf, buf.len, &read_len);
+        try std.testing.expectEqual(@as(i32, 0), read_rc);
+        if (read_len == 0) break;
+        try out.appendSlice(std.testing.allocator, buf[0..read_len]);
+    }
+
+    try std.testing.expectEqualStrings("write-stream-payload", out.items);
 }

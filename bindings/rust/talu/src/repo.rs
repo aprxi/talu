@@ -225,11 +225,7 @@ pub fn resolve_model_path_ex(path: &str, offline: bool) -> Result<String> {
 }
 
 /// Resolves a model path with full control over offline mode and weight requirements.
-pub fn resolve_model_path_full(
-    path: &str,
-    offline: bool,
-    require_weights: bool,
-) -> Result<String> {
+pub fn resolve_model_path_full(path: &str, offline: bool, require_weights: bool) -> Result<String> {
     let c_str = CString::new(path)?;
     let mut out: *mut c_char = std::ptr::null_mut();
 

@@ -109,6 +109,73 @@ pub const BlobReadStream = struct {
     }
 };
 
+pub const BlobPutStream = struct {
+    store: *BlobStore,
+    allocator: Allocator,
+    chunk_size: usize,
+    current_chunk: std.ArrayList(u8),
+    part_digests: std.ArrayList(DigestKey),
+    total_size: u64 = 0,
+
+    pub fn init(store: *BlobStore, allocator: Allocator) BlobPutStream {
+        const resolved_chunk_size = if (store.multipart_chunk_size_bytes == 0)
+            default_multipart_chunk_size_bytes
+        else
+            store.multipart_chunk_size_bytes;
+        return .{
+            .store = store,
+            .allocator = allocator,
+            .chunk_size = resolved_chunk_size,
+            .current_chunk = .empty,
+            .part_digests = .empty,
+        };
+    }
+
+    pub fn deinit(self: *BlobPutStream) void {
+        self.current_chunk.deinit(self.allocator);
+        self.part_digests.deinit(self.allocator);
+    }
+
+    pub fn write(self: *BlobPutStream, bytes: []const u8) !void {
+        var remaining = bytes;
+        while (remaining.len > 0) {
+            if (self.current_chunk.items.len == self.chunk_size) {
+                try self.flushCurrentChunk();
+            }
+
+            const space = self.chunk_size - self.current_chunk.items.len;
+            const take_len = @min(space, remaining.len);
+            try self.current_chunk.appendSlice(self.allocator, remaining[0..take_len]);
+            self.total_size += take_len;
+            remaining = remaining[take_len..];
+        }
+    }
+
+    pub fn finish(self: *BlobPutStream) !BlobRef {
+        if (self.part_digests.items.len == 0) {
+            return self.store.putSingle(self.current_chunk.items);
+        }
+
+        if (self.current_chunk.items.len > 0) {
+            try self.flushCurrentChunk();
+        }
+        return self.store.putMultipartFromDigests(
+            self.part_digests.items,
+            self.total_size,
+            self.chunk_size,
+        );
+    }
+
+    fn flushCurrentChunk(self: *BlobPutStream) !void {
+        if (self.current_chunk.items.len == 0) return;
+        const part_ref = try self.store.putSingle(self.current_chunk.items);
+        const parsed = try parseRef(part_ref.refSlice());
+        if (parsed.kind != .sha256) return error.InvalidMultipartManifest;
+        try self.part_digests.append(self.allocator, parsed.digest_hex);
+        self.current_chunk.clearRetainingCapacity();
+    }
+};
+
 pub const BlobStore = struct {
     allocator: Allocator,
     root_dir: std.fs.Dir,
@@ -175,43 +242,20 @@ pub const BlobStore = struct {
         if (part_size == 0) return error.InvalidChunkSize;
         if (bytes.len <= part_size) return self.putSingle(bytes);
 
-        var manifest_json = std.ArrayList(u8).empty;
-        defer manifest_json.deinit(self.allocator);
-
-        const writer = manifest_json.writer(self.allocator);
-        try writer.print(
-            "{{\"v\":1,\"type\":\"multipart\",\"total_size\":{d},\"part_size\":{d},\"parts\":[",
-            .{ bytes.len, part_size },
-        );
+        var digests = std.ArrayList(DigestKey).empty;
+        defer digests.deinit(self.allocator);
 
         var offset: usize = 0;
-        var first = true;
         while (offset < bytes.len) {
             const end = @min(offset + part_size, bytes.len);
             const part_ref = try self.putSingle(bytes[offset..end]);
-            if (!first) try writer.writeByte(',');
-            first = false;
-            try writer.print("\"{s}\"", .{part_ref.refSlice()});
+            const parsed = try parseRef(part_ref.refSlice());
+            if (parsed.kind != .sha256) return error.InvalidMultipartManifest;
+            try digests.append(self.allocator, parsed.digest_hex);
             offset = end;
         }
-        try writer.writeAll("]}");
 
-        const manifest_bytes = try manifest_json.toOwnedSlice(self.allocator);
-        defer self.allocator.free(manifest_bytes);
-
-        const manifest_blob_ref = try self.putSingle(manifest_bytes);
-        const manifest_digest = manifest_blob_ref.refSlice()[sha256_ref_prefix.len..];
-
-        var out_ref: [ref_len]u8 = undefined;
-        @memcpy(out_ref[0..multipart_ref_prefix.len], multipart_ref_prefix);
-        @memcpy(out_ref[multipart_ref_prefix.len .. multipart_ref_prefix.len + digest_hex_len], manifest_digest);
-
-        return .{
-            .ref = out_ref,
-            .ref_len = multipart_ref_len,
-            .rel_path = manifest_blob_ref.rel_path,
-            .size_bytes = bytes.len,
-        };
+        return self.putMultipartFromDigests(digests.items, bytes.len, part_size);
     }
 
     pub fn open(self: *BlobStore, blob_ref: []const u8) !std.fs.File {
@@ -394,6 +438,45 @@ pub const BlobStore = struct {
         shard_path["blobs/".len] = shard0;
         shard_path["blobs/".len + 1] = shard1;
         try self.root_dir.makePath(shard_path[0..]);
+    }
+
+    fn putMultipartFromDigests(
+        self: *BlobStore,
+        part_digests: []const DigestKey,
+        total_size: u64,
+        part_size: usize,
+    ) !BlobRef {
+        if (part_digests.len == 0) return error.InvalidMultipartManifest;
+        if (part_size == 0) return error.InvalidChunkSize;
+
+        var manifest_json = std.ArrayList(u8).empty;
+        defer manifest_json.deinit(self.allocator);
+
+        const writer = manifest_json.writer(self.allocator);
+        try writer.print(
+            "{{\"v\":1,\"type\":\"multipart\",\"total_size\":{d},\"part_size\":{d},\"parts\":[",
+            .{ total_size, part_size },
+        );
+        for (part_digests, 0..) |part_digest, idx| {
+            if (idx > 0) try writer.writeByte(',');
+            const ref_buf = buildSha256RefString(part_digest);
+            try writer.print("\"{s}\"", .{ref_buf[0..sha256_ref_len]});
+        }
+        try writer.writeAll("]}");
+
+        const manifest_bytes = try manifest_json.toOwnedSlice(self.allocator);
+        defer self.allocator.free(manifest_bytes);
+
+        const manifest_blob_ref = try self.putSingle(manifest_bytes);
+        const parsed_manifest_ref = try parseRef(manifest_blob_ref.refSlice());
+        if (parsed_manifest_ref.kind != .sha256) return error.InvalidMultipartManifest;
+
+        return .{
+            .ref = buildMultipartRefString(parsed_manifest_ref.digest_hex),
+            .ref_len = multipart_ref_len,
+            .rel_path = manifest_blob_ref.rel_path,
+            .size_bytes = total_size,
+        };
     }
 };
 
@@ -665,6 +748,55 @@ test "BlobStore.openReadStream streams multipart blob incrementally" {
     try std.testing.expectEqualStrings(payload, out.items);
     try std.testing.expectEqual(@as(u64, payload.len), stream.bytes_read);
     try std.testing.expectEqual(@as(u64, payload.len), stream.total_size);
+}
+
+test "BlobPutStream.finish stores small payload as single blob" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+    store.multipart_chunk_size_bytes = 16;
+
+    var writer = BlobPutStream.init(&store, std.testing.allocator);
+    defer writer.deinit();
+
+    try writer.write("tiny");
+    const blob_ref = try writer.finish();
+    try std.testing.expect(std.mem.startsWith(u8, blob_ref.refSlice(), sha256_ref_prefix));
+
+    const loaded = try store.readAll(blob_ref.refSlice(), std.testing.allocator);
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings("tiny", loaded);
+}
+
+test "BlobPutStream.finish stores large payload as multipart blob" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+    store.multipart_chunk_size_bytes = 12;
+
+    var writer = BlobPutStream.init(&store, std.testing.allocator);
+    defer writer.deinit();
+
+    try writer.write("streaming-");
+    try writer.write("multipart-");
+    try writer.write("payload");
+
+    const blob_ref = try writer.finish();
+    try std.testing.expect(std.mem.startsWith(u8, blob_ref.refSlice(), multipart_ref_prefix));
+
+    const loaded = try store.readAll(blob_ref.refSlice(), std.testing.allocator);
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings("streaming-multipart-payload", loaded);
 }
 
 test "parseRef accepts sha256 and multipart prefixes" {
