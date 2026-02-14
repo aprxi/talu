@@ -126,6 +126,24 @@ pub fn load_from_slice_streaming(allocator: std.mem.Allocator, json_content: []c
         }
     }
 
+    // Extract max_input_chars_per_word from model section (used by WordPiece)
+    var max_input_chars_per_word: i32 = 200;
+    if (findSection(json_content, "\"model\"")) |model_section| {
+        const mic_search_len = @min(2000, model_section.len);
+        if (std.mem.indexOf(u8, model_section[0..mic_search_len], "\"max_input_chars_per_word\"")) |mic_pos| {
+            const after_key = model_section[mic_pos + "\"max_input_chars_per_word\"".len ..];
+            var skip: usize = 0;
+            while (skip < after_key.len and (after_key[skip] == ':' or after_key[skip] == ' ' or after_key[skip] == '\t')) : (skip += 1) {}
+            if (skip < after_key.len) {
+                const num_start = skip;
+                while (skip < after_key.len and after_key[skip] >= '0' and after_key[skip] <= '9') : (skip += 1) {}
+                if (skip > num_start) {
+                    max_input_chars_per_word = std.fmt.parseInt(i32, after_key[num_start..skip], 10) catch 200;
+                }
+            }
+        }
+    }
+
     // Parse small sections with std.json (added_tokens, normalizer, etc.)
     var added_token_entries = ManagedArrayList(schema.AddedToken).init(arena_allocator);
     var normalizer_spec: schema.Normalizer = .{};
@@ -157,6 +175,7 @@ pub fn load_from_slice_streaming(allocator: std.mem.Allocator, json_content: []c
             .unk_token = unk_token_str,
             .bos_token = null,
             .eos_token = null,
+            .max_input_chars_per_word = max_input_chars_per_word,
         },
         .added_tokens = try added_token_entries.toOwnedSlice(),
         .normalizer = normalizer_spec,
@@ -311,6 +330,7 @@ fn parseModel(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanne
     var bos_token_bytes: ?[]const u8 = null;
     var eos_token_bytes: ?[]const u8 = null;
     var is_unigram_vocab = false;
+    var max_input_chars: i32 = 200;
 
     while (true) {
         const json_token = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
@@ -333,6 +353,11 @@ fn parseModel(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanne
                 } else if (std.mem.eql(u8, key, "eos_token")) {
                     const token_value = try json_scanner.nextAlloc(arena_allocator, .alloc_always);
                     if (token_value == .allocated_string) eos_token_bytes = token_value.allocated_string;
+                } else if (std.mem.eql(u8, key, "max_input_chars_per_word")) {
+                    const val = try json_scanner.next();
+                    if (val == .number) {
+                        max_input_chars = std.fmt.parseInt(i32, val.number, 10) catch 200;
+                    }
                 } else {
                     // Skip unknown model fields (dropout, fuse_unk, byte_fallback, etc.)
                     try json_scanner.skipValue();
@@ -349,6 +374,7 @@ fn parseModel(arena_allocator: std.mem.Allocator, json_scanner: *std.json.Scanne
         .unk_token = unk_token_bytes,
         .bos_token = bos_token_bytes,
         .eos_token = eos_token_bytes,
+        .max_input_chars_per_word = max_input_chars,
     };
 }
 
@@ -1930,6 +1956,7 @@ fn build_wordpiece(arena: *std.heap.ArenaAllocator, model: schema.Model) !*ct.To
         .vocab = vocab_arr.ptr,
         .vocab_len = vocab_len,
         .unk_token = if (model.unk_token) |u| (try arena.allocator().dupeZ(u8, u)).ptr else null,
+        .max_input_chars_per_word = model.max_input_chars_per_word,
     };
     return @ptrCast(wordpiece_model.tokenizer_wordpiece_create_from_spec(@ptrCast(&model_spec)));
 }

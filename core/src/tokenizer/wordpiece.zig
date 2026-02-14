@@ -26,6 +26,7 @@ pub const WordPieceModel = struct {
     vocab_size: usize,
     unk_id: i32,
     unk_token: [16]u8,
+    max_input_chars_per_word: u32,
     owner: ?*ct.Tokenizer,
 };
 
@@ -57,6 +58,7 @@ fn initModel(allocator: std.mem.Allocator) !*WordPieceModel {
         .vocab_size = 0,
         .unk_id = DEFAULT_UNK_ID,
         .unk_token = undefined,
+        .max_input_chars_per_word = 200,
         .owner = null,
     };
     setUnkToken(model, DEFAULT_UNK);
@@ -108,6 +110,11 @@ fn encodeWord(model: *WordPieceModel, tokenizer: *ct.Tokenizer, word: []const u8
         const dup_tok = try allocator.dupeZ(u8, word);
         toks[0] = dup_tok.ptr;
         return EncodedWord{ .ids = ids, .tokens = toks };
+    }
+
+    // Words exceeding max_input_chars_per_word are treated as unknown
+    if (model.max_input_chars_per_word > 0 and word.len > model.max_input_chars_per_word) {
+        return error.UnknownWord;
     }
 
     var ids = std.ArrayList(i32).empty;
@@ -369,6 +376,10 @@ fn buildFromSpec(model: *WordPieceModel, spec: *const ct.WordPieceModelSpec) !vo
         const unk_ptr: [*:0]const u8 = @ptrCast(unk);
         setUnkToken(model, std.mem.sliceTo(unk_ptr, 0));
     }
+
+    if (spec.max_input_chars_per_word > 0) {
+        model.max_input_chars_per_word = @intCast(spec.max_input_chars_per_word);
+    }
 }
 
 fn buildFromVocabFile(model: *WordPieceModel, path_z: [*:0]const u8) !void {
@@ -469,6 +480,7 @@ test "setUnkToken copies token to buffer" {
         .vocab_size = 0,
         .unk_id = DEFAULT_UNK_ID,
         .unk_token = undefined,
+        .max_input_chars_per_word = 200,
         .owner = null,
     };
 

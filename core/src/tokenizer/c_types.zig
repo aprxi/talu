@@ -342,6 +342,7 @@ pub const WordPieceModelSpec = extern struct {
     vocab: [*c]const TokenIdPair,
     vocab_len: usize,
     unk_token: [*c]const u8,
+    max_input_chars_per_word: c_int = 200,
 };
 
 pub const UnigramVocabEntry = extern struct {

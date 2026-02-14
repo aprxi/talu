@@ -453,17 +453,21 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
 
     var cursor: usize = 0;
     var span_index: usize = 0;
-    var after_added_token = false;
 
     // Check if SentencePiece prepend is enabled
     const has_sp_prepend = tokenizer.normalizer.prepend != null;
     const prepend_bytes = if (tokenizer.normalizer.prepend) |p| std.mem.sliceTo(p, 0) else "";
+
+    // Track whether the initial prepend ▁ was skipped and needs re-attaching.
+    // This is a one-shot flag: once consumed by the first non-special segment, it stays false.
+    var needs_prepend = false;
 
     // Skip the prepend if input starts with an added token
     // (the prepend was added by normalization but shouldn't apply to added tokens)
     if (has_sp_prepend and spans.items.len > 0 and spans.items[0].start == prepend_bytes.len) {
         // First added token is right after the prepend - skip the prepend
         cursor = prepend_bytes.len;
+        needs_prepend = true; // Re-attach to first non-special segment
     }
 
     while (cursor < normalized.text.len) {
@@ -473,7 +477,6 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
             try accum.appendAdded(added_span.at);
             cursor = added_span.end;
             span_index += 1;
-            after_added_token = true; // Next segment should get prepend
             continue;
         }
 
@@ -485,8 +488,8 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
         }
 
         const segment = normalized.text[cursor..next_span_start];
-        const should_prepend = after_added_token and has_sp_prepend and prepend_bytes.len > 0;
-        after_added_token = false;
+        const should_prepend = needs_prepend and prepend_bytes.len > 0;
+        needs_prepend = false;
         try encodeSegmentMaybePrepended(tokenizer, segment, cursor, should_prepend, prepend_bytes, &accum);
         cursor = next_span_start;
     }

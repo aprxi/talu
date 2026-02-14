@@ -28,6 +28,7 @@ pub const Model = struct {
     unk_token: ?[]const u8 = null,
     bos_token: ?[]const u8 = null,
     eos_token: ?[]const u8 = null,
+    max_input_chars_per_word: i32 = 200,
 };
 
 pub const Normalizer = struct {
