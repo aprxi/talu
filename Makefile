@@ -37,8 +37,14 @@ deps:
 		rm -rf /tmp/sqlite-dl)
 	@test -d deps/curl || git clone --branch curl-8_17_0 --depth 1 https://github.com/curl/curl.git deps/curl
 	@test -d deps/mbedtls || (git clone --branch v3.6.2 --depth 1 --recurse-submodules https://github.com/Mbed-TLS/mbedtls.git deps/mbedtls)
+	@test -d deps/miniz || git clone --branch 3.1.1 --depth 1 https://github.com/richgel999/miniz.git deps/miniz
+	@test -f deps/miniz/miniz_export.h || printf '#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n' > deps/miniz/miniz_export.h
+	@test -d deps/file || git clone --branch FILE5_46 --depth 1 https://github.com/file/file.git deps/file
+	@test -f deps/file/src/magic.h || sed 's/X\.YY/5.46/' deps/file/src/magic.h.in > deps/file/src/magic.h
+	@test -f deps/file/magic.mgc || cp /usr/share/file/magic.mgc deps/file/magic.mgc
 	@test -f deps/cacert.pem || curl -sL https://curl.se/ca/cacert.pem -o deps/cacert.pem
 	@printf '%s\n%s\n' '//! Mozilla CA certificates - auto-generated, do not edit' 'pub const data = @embedFile("cacert.pem");' > deps/cacert.zig
+	@printf '%s\n%s\n' '//! Compiled magic database - auto-generated, do not edit' 'pub const data = @embedFile("file/magic.mgc");' > deps/magic_db.zig
 	@test -f deps/mbedtls/build/library/libmbedtls.a || $(MAKE) mbedtls-build
 	@test -f deps/curl/build/lib/libcurl.a || $(MAKE) curl-build
 ifeq ($(UNAME_S),Darwin)
