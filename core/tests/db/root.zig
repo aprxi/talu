@@ -11,3 +11,4 @@ pub const adapters = @import("adapters/root.zig");
 pub const table = @import("table/root.zig");
 pub const bloom_filter = @import("bloom_filter_test.zig");
 pub const bloom_cache = @import("bloom_cache_test.zig");
+pub const blob = @import("blob/root.zig");
