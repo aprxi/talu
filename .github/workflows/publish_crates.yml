@@ -1,0 +1,78 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g., v0.0.1-post.202602140912)'
+        required: true
+        type: string
+      dry_run:
+        description: 'Dry run (validate but do not upload)'
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate tag format
+        run: |
+          TAG="${{ inputs.tag }}"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+.*$ ]]; then
+            echo "::error::Invalid tag format '$TAG'. Expected format: v0.0.1, v0.0.1-post.202602140912, etc."
+            exit 1
+          fi
+          echo "Tag format valid: $TAG"
+
+      - name: Check release exists with library assets
+        run: |
+          if ! gh release view "${{ inputs.tag }}" --repo ${{ github.repository }} > /dev/null 2>&1; then
+            echo "::error::Release '${{ inputs.tag }}' not found."
+            echo ""
+            echo "Available releases:"
+            gh release list --repo ${{ github.repository }} --limit 10
+            exit 1
+          fi
+
+          # Verify library assets exist (consumers will download these at build time)
+          ASSETS=$(gh release view "${{ inputs.tag }}" --repo ${{ github.repository }} --json assets --jq '.assets[].name')
+          for target in x86_64-unknown-linux-gnu aarch64-apple-darwin; do
+            if ! echo "$ASSETS" | grep -q "libtalu-${target}.tar.gz"; then
+              echo "::error::Missing library asset: libtalu-${target}.tar.gz"
+              exit 1
+            fi
+          done
+          echo "Release found with all required library assets."
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Extract version from tag
+        id: version
+        run: |
+          # Strip leading 'v' from tag to get semver
+          VERSION="${{ inputs.tag }}"
+          VERSION="${VERSION#v}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Publish crates
+        run: |
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            echo "=== DRY RUN ==="
+            echo "Would publish talu-sys@${{ steps.version.outputs.version }} and talu@${{ steps.version.outputs.version }}"
+            echo ""
+            echo "To publish for real, run this workflow again with 'Dry run' unchecked."
+          else
+            TALU_RELEASE_VERSION="${{ steps.version.outputs.version }}" \
+              .github/scripts/publish-crates.sh
+          fi
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
