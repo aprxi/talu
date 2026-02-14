@@ -88,3 +88,110 @@ fn metaspace_decode_strips_prefix_space() {
         "Metaspace add_prefix_space must strip leading space, got: {decoded:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Unigram encode: basic encoding must produce correct tokens
+// ---------------------------------------------------------------------------
+//
+// The Unigram model uses the Viterbi algorithm to find the most likely
+// segmentation based on token scores (log probabilities). Tokens with higher
+// scores are preferred.
+//
+// Bug: flan-t5-large (Unigram model) produces completely wrong tokens —
+// individual byte/character IDs instead of proper Unigram subwords.
+// encode("Hello, world!") expected [8774, 6, 296, 55] got [566, 15, ...].
+// This suggests the Unigram encoding algorithm is broken or the vocab
+// isn't being used correctly during encoding.
+//
+// Affects: google/flan-t5-large (20/21 encode failures), potentially all
+// Unigram-based models (T5, ALBERT, XLNet).
+
+/// Unigram encoder must use Viterbi to find optimal segmentation.
+///
+/// With a vocab where "▁hello" has a high score, encoding "hello" with
+/// Metaspace pretokenizer (which prepends ▁) must produce ["▁hello"],
+/// not character-level fallback.
+#[test]
+fn unigram_encode_produces_correct_tokens() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581", -1.0],
+      ["\u2581hello", -5.0],
+      ["\u2581world", -5.0],
+      ["h", -10.0],
+      ["e", -10.0],
+      ["l", -10.0],
+      ["o", -10.0],
+      ["w", -10.0],
+      ["r", -10.0],
+      ["d", -10.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null,
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true }
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "hello" → Metaspace prepend → "▁hello" → Unigram Viterbi → [2] (▁hello)
+    let tokens = ctx.encode_with("hello", &opts);
+    assert_eq!(
+        tokens,
+        vec![2],
+        "Unigram must use Viterbi to match '▁hello' (score -5.0) over char fallback, got: {tokens:?}"
+    );
+}
+
+/// Unigram encoder handles multi-word input with Metaspace.
+///
+/// "hello world" → Metaspace → "▁hello▁world" → Unigram → [▁hello, ▁world].
+#[test]
+fn unigram_encode_multiword() {
+    let json = r#"{
+  "version": "1.0",
+  "model": {
+    "type": "Unigram",
+    "unk_id": 0,
+    "vocab": [
+      ["<unk>", 0.0],
+      ["\u2581", -1.0],
+      ["\u2581hello", -5.0],
+      ["\u2581world", -5.0],
+      ["h", -10.0],
+      ["e", -10.0],
+      ["l", -10.0],
+      ["o", -10.0],
+      ["w", -10.0],
+      ["r", -10.0],
+      ["d", -10.0]
+    ]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null,
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true }
+}"#;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "hello world" → "▁hello ▁world" → Unigram → [▁hello=2, ▁world=3]
+    let tokens = ctx.encode_with("hello world", &opts);
+    assert_eq!(
+        tokens,
+        vec![2, 3],
+        "Unigram multi-word encoding with Metaspace must produce [▁hello, ▁world], got: {tokens:?}"
+    );
+}

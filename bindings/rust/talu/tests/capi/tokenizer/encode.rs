@@ -801,3 +801,86 @@ fn encode_eos_only_template_no_special() {
         "add_bos=0 must skip post_processor (no EOS), got: {tokens:?}"
     );
 }
+
+// ===========================================================================
+// SentencePiece BPE: space token after special token must be preserved
+// ===========================================================================
+//
+// When encoding text that contains special tokens as literals (e.g.
+// "<s> and </s> are"), the text is split around special token spans.
+// After each special token, the remaining text starts with a space that
+// must be tokenized as a separate ▁ (metaspace) token.
+//
+// Bug: the space immediately after a special token is consumed or merged
+// into the following word, producing one fewer token than expected.
+//
+// Fixture evidence (TinyLlama, e5-mistral):
+//   encode("<s> and </s> are special tokens")
+//     expected: [1, 29871, 322, 29871, 2, 29871, 526, 4266, 18897]
+//     actual:   [1, 29871, 322, 29871, 2, 526, 4266, 18897]
+//   (29871 = ▁ standalone space token is missing after </s>)
+//
+// Affects: TinyLlama/TinyLlama-1.1B-Chat-v1.0,
+// intfloat/e5-mistral-7b-instruct (1/21 encode failures each).
+
+/// Space after a special token in the middle of text must be preserved.
+///
+/// "<s> and </s> are" should tokenize the space after </s> as a separate
+/// token, not merge it into the next word.
+#[test]
+fn space_after_special_token_preserved() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3, "and": 4, "are": 5,
+      "\u2581and": 6, "\u2581are": 7,
+      "a": 8, "n": 9, "d": 10, "r": 11, "e": 12
+    },
+    "merges": ["a n", "an d", "a r", "ar e"]
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true },
+  "post_processor": null,
+  "decoder": { "type": "Metaspace", "replacement": "\u2581", "add_prefix_space": true }
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "<s> and </s> are" with <s> and </s> as special tokens:
+    //   <s> → id=1 (special)
+    //   " and " → "▁and▁" → [▁=3, and=4, ▁=3] or [▁and=6, ▁=3]
+    //   </s> → id=2 (special)
+    //   " are" → "▁are" → [▁=3, are=5] or [▁are=7]
+    //
+    // The key assertion: there must be a ▁ token (id=3) after </s>,
+    // not merged into the next word.
+    let tokens = ctx.encode_with("<s> and </s> are", &opts);
+
+    // Find </s> (id=2) in the output and check that a ▁ follows it
+    let sep_pos = tokens.iter().position(|&t| t == 2);
+    assert!(
+        sep_pos.is_some(),
+        "Output must contain </s> token (id=2), got: {tokens:?}"
+    );
+    let after_sep = &tokens[sep_pos.unwrap() + 1..];
+    assert!(
+        !after_sep.is_empty(),
+        "There must be tokens after </s>, got: {tokens:?}"
+    );
+    // The first token after </s> should be ▁ (id=3) — the space must not
+    // be merged into the next word.
+    assert_eq!(
+        after_sep[0], 3,
+        "First token after </s> must be ▁ (id=3), not merged into next word. Full output: {tokens:?}"
+    );
+}

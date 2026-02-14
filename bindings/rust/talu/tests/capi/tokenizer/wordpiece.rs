@@ -831,3 +831,66 @@ fn handle_chinese_chars_detects_cjk_extension_a() {
         "CJK Extension A (U+3400) must be isolated by handle_chinese_chars, got: {tokens:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// WordPiece encode: emoji (4-byte UTF-8) must produce [UNK], not be dropped
+// ---------------------------------------------------------------------------
+//
+// HuggingFace's WordPiece encoder produces [UNK] for any word that can't be
+// decomposed into known subwords. Emoji characters like 🌍 (U+1F30D, 4-byte
+// UTF-8: F0 9F 8C 8D) are not in typical BERT vocabs and should produce a
+// single [UNK] token.
+//
+// Bug: emoji characters are silently dropped during encoding — the token
+// count is one less than expected. The emoji produces no output instead of
+// [UNK].
+//
+// Affects: BAAI/bge-large-en-v1.5, sentence-transformers/all-MiniLM-L6-v2,
+// sentence-transformers/all-mpnet-base-v2 (encode "Hello 你好 مرحبا 🌍"
+// missing final [UNK] for 🌍).
+
+/// Emoji character (🌍 U+1F30D) must produce [UNK], not be silently dropped.
+#[test]
+fn encode_emoji_produces_unk_not_dropped() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "WordPiece",
+    "unk_token": "[UNK]",
+    "continuing_subword_prefix": "##",
+    "max_input_chars_per_word": 100,
+    "vocab": {
+      "[UNK]": 0, "[CLS]": 1, "[SEP]": 2,
+      "hello": 3, "world": 4
+    }
+  },
+  "added_tokens": [
+    {"id": 0, "content": "[UNK]", "special": true},
+    {"id": 1, "content": "[CLS]", "special": true},
+    {"id": 2, "content": "[SEP]", "special": true}
+  ],
+  "normalizer": {
+    "type": "BertNormalizer",
+    "clean_text": true,
+    "handle_chinese_chars": true,
+    "strip_accents": true,
+    "lowercase": true
+  },
+  "pre_tokenizer": {"type": "BertPreTokenizer"},
+  "post_processor": null,
+  "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "hello 🌍 world" → ["hello", "🌍", "world"]
+    // "hello" → 3, "🌍" → [UNK]=0, "world" → 4
+    let tokens = ctx.encode_with("hello 🌍 world", &opts);
+    assert_eq!(
+        tokens,
+        vec![3, 0, 4],
+        "Emoji 🌍 (U+1F30D, 4-byte UTF-8) must produce [UNK], not be dropped, got: {tokens:?}"
+    );
+}
