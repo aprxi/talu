@@ -22,23 +22,18 @@ fn main() {
     println!("cargo:rustc-env=TALU_VERSION={}", version);
 
     // --- Locate the shared library ---
-    let lib_dir = match env::var("TALU_LIB_DIR") {
-        Ok(dir) => {
-            // Local / monorepo development: use the directory as-is.
-            let lib_dir = PathBuf::from(dir);
-            if !lib_dir.exists() {
-                panic!(
-                    "TALU_LIB_DIR is set to '{}' but that directory does not exist. \
-                     Build libtalu first (zig build release -Drelease).",
-                    lib_dir.display()
-                );
-            }
-            lib_dir
-        }
-        Err(_) => {
-            // crates.io / external consumer: download pre-built library from GitHub.
-            download_from_github()
-        }
+    // 1. Explicit env var (TALU_LIB_DIR) takes priority.
+    // 2. Monorepo detection: navigate up from talu-sys/ to find zig-out/lib/.
+    // 3. External consumer: download pre-built library from GitHub Releases.
+    let lib_dir = if let Some(lib_dir) = env::var("TALU_LIB_DIR").ok().map(PathBuf::from).filter(|p| p.exists()) {
+        // Explicit env var pointing to an existing directory.
+        lib_dir
+    } else if let Some(lib_dir) = find_monorepo_lib(&manifest_dir) {
+        // Monorepo: zig-out/lib/ found relative to talu-sys/.
+        lib_dir
+    } else {
+        // External consumer (crates.io): download from GitHub Releases.
+        download_from_github()
     };
 
     // --- Link to the shared library ---
@@ -50,6 +45,28 @@ fn main() {
     // embed rpath in their binaries/tests. Uses the DEP_<LINKS>_<KEY>
     // mechanism (links = "talu" -> DEP_TALU_LIB_DIR).
     println!("cargo:lib_dir={}", lib_dir.display());
+}
+
+/// Walk up from talu-sys/Cargo.toml to find zig-out/lib/ in the monorepo.
+/// Returns None when running outside the monorepo (e.g. crates.io consumer).
+fn find_monorepo_lib(manifest_dir: &PathBuf) -> Option<PathBuf> {
+    // talu-sys -> rust -> bindings -> repo root
+    let repo_root = manifest_dir.parent()?.parent()?.parent()?;
+    let lib_dir = repo_root.join("zig-out").join("lib");
+
+    let lib_name = if cfg!(target_os = "macos") {
+        "libtalu.dylib"
+    } else if cfg!(target_os = "windows") {
+        "talu.dll"
+    } else {
+        "libtalu.so"
+    };
+
+    if lib_dir.join(lib_name).exists() {
+        Some(lib_dir)
+    } else {
+        None
+    }
 }
 
 /// Download the pre-built libtalu archive from the matching GitHub Release
