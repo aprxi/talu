@@ -5,7 +5,19 @@
 
 import type { ApiClient } from "../../api.ts";
 import type { ModelsService, PromptsService } from "../../types.ts";
-import type { Notifications, ServiceAccess, EventBus, LayoutAccess, ClipboardAccess, DownloadAccess, ManagedTimers, ManagedObservers, FormatAccess } from "../../kernel/types.ts";
+import type {
+  Notifications,
+  ServiceAccess,
+  EventBus,
+  LayoutAccess,
+  ClipboardAccess,
+  DownloadAccess,
+  ManagedTimers,
+  ManagedObservers,
+  FormatAccess,
+  UploadAccess,
+  HookPipeline,
+} from "../../kernel/types.ts";
 
 export let api: ApiClient;
 export let notifications: Notifications;
@@ -17,6 +29,8 @@ export let download: DownloadAccess;
 export let timers: ManagedTimers;
 export let observe: ManagedObservers;
 export let format: FormatAccess;
+export let upload: UploadAccess;
+export let hooks: HookPipeline;
 
 export function initChatDeps(deps: {
   api: ApiClient;
@@ -29,6 +43,8 @@ export function initChatDeps(deps: {
   timers: ManagedTimers;
   observe: ManagedObservers;
   format: FormatAccess;
+  upload: UploadAccess;
+  hooks: HookPipeline;
 }): void {
   api = deps.api;
   notifications = deps.notifications;
@@ -40,6 +56,8 @@ export function initChatDeps(deps: {
   timers = deps.timers;
   observe = deps.observe;
   format = deps.format;
+  upload = deps.upload;
+  hooks = deps.hooks;
 }
 
 export function getModelsService(): ModelsService | undefined {

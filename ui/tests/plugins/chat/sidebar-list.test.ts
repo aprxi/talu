@@ -68,6 +68,11 @@ beforeEach(() => {
     layout: { setTitle: () => {} } as any,
     clipboard: { writeText: async () => {} } as any,
     download: { save: () => {} } as any,
+    upload: {} as any,
+    hooks: {
+      on: () => ({ dispose() {} }),
+      run: async <T>(_name: string, value: T) => value,
+    } as any,
     timers: {
       setTimeout(fn: () => void) { fn(); return { dispose() {} }; },
       setInterval() { return { dispose() {} }; },
@@ -183,6 +188,11 @@ describe("loadSessions", () => {
       layout: { setTitle: () => {} } as any,
       clipboard: { writeText: async () => {} } as any,
       download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: {
+        on: () => ({ dispose() {} }),
+        run: async <T>(_name: string, value: T) => value,
+      } as any,
       timers: { setTimeout(fn: () => void) { fn(); return { dispose() {} }; }, setInterval() { return { dispose() {} }; }, requestAnimationFrame(fn: () => void) { fn(); return { dispose() {} }; } } as any,
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,

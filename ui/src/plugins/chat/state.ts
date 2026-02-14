@@ -6,10 +6,11 @@
  * instead of the global ctx object.
  */
 
-import type { Conversation, FileObject } from "../../types.ts";
+import type { Conversation } from "../../types.ts";
+import type { UploadFileReference } from "../../kernel/types.ts";
 
 export interface ChatAttachment {
-  file: FileObject;
+  file: UploadFileReference;
   mimeType: string | null;
 }
 

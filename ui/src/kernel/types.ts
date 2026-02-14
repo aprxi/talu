@@ -128,6 +128,7 @@ export interface PluginContext {
   readonly format: FormatAccess;
   readonly clipboard: ClipboardAccess;
   readonly download: DownloadAccess;
+  readonly upload: UploadAccess;
 
 }
 
@@ -184,6 +185,7 @@ export interface HookPipeline {
     handler: (value: T) => T | { $block: true; reason: string } | void | Promise<T | { $block: true; reason: string } | void>,
     options?: { priority?: number },
   ): Disposable;
+  run<T = unknown>(name: string, value: T): Promise<T | { $block: true; reason: string }>;
 }
 
 // --- Tool Registry ---
@@ -369,4 +371,21 @@ export interface ClipboardAccess {
 
 export interface DownloadAccess {
   save(blob: Blob, filename: string): void;
+}
+
+// --- Upload Access ---
+
+export interface UploadFileReference {
+  id: string;
+  filename: string;
+  bytes: number;
+  createdAt: number;
+  purpose: string;
+}
+
+export interface UploadAccess {
+  upload(file: File, purpose?: string): Promise<UploadFileReference>;
+  get(fileId: string): Promise<UploadFileReference>;
+  delete(fileId: string): Promise<void>;
+  getContent(fileId: string): Promise<Blob>;
 }

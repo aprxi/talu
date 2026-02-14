@@ -104,6 +104,11 @@ beforeEach(() => {
     download: {
       save: (blob: Blob, filename: string) => { downloadCalls.push({ blob, filename }); },
     } as any,
+    upload: {} as any,
+    hooks: {
+      on: () => ({ dispose() {} }),
+      run: async <T>(_name: string, value: T) => value,
+    } as any,
     timers: {
       setTimeout(fn: () => void, ms: number): Disposable {
         const entry = { fn, ms, disposed: false };
@@ -211,6 +216,11 @@ describe("handleChatCopy", () => {
       layout: { setTitle: () => {} } as any,
       clipboard: { writeText: async () => { throw new Error("denied"); } } as any,
       download: {} as any,
+      upload: {} as any,
+      hooks: {
+        on: () => ({ dispose() {} }),
+        run: async <T>(_name: string, value: T) => value,
+      } as any,
       timers: { setTimeout: () => ({ dispose() {} }), setInterval: () => ({ dispose() {} }), requestAnimationFrame: (fn: () => void) => { fn(); return { dispose() {} }; } } as any,
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,

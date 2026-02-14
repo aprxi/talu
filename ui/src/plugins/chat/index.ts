@@ -110,6 +110,8 @@ export const chatPlugin: PluginDefinition = {
       timers: ctx.timers,
       observe: ctx.observe,
       format: ctx.format,
+      upload: ctx.upload,
+      hooks: ctx.hooks,
     });
 
     // Initialize thinking state from storage (before any rendering).

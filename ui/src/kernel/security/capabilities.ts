@@ -18,6 +18,7 @@ const KNOWN_CAPABILITIES = new Set([
   "commands",
   "renderers",
   "themes",
+  "upload",
 ]);
 
 export interface CapabilityCheckResult {

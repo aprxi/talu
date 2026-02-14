@@ -22,6 +22,7 @@ export const KNOWN_PERMISSIONS = new Set([
   "storage",    // ctx.storage — persistent key-value storage
   "clipboard",  // ctx.clipboard — write to system clipboard
   "download",   // ctx.download — trigger file downloads
+  "upload",     // ctx.upload — file upload/download APIs
   "hooks",      // ctx.hooks — intercept/transform kernel operations
   "tools",      // ctx.tools — register LLM-callable tools
 ]);

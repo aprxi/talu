@@ -51,5 +51,6 @@ describe("getKnownCapabilities", () => {
     expect(caps).toContain("tools");
     expect(caps).toContain("commands");
     expect(caps).toContain("storage");
+    expect(caps).toContain("upload");
   });
 });

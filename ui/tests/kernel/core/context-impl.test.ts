@@ -164,12 +164,25 @@ describe("createPluginContext — permission gates", () => {
     expect(() => ctx.hooks.on("test.hook", (v) => v)).toThrow(/hooks/);
   });
 
+  test("third-party without 'hooks' permission → throws on hooks.run", async () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
+    expect(() => ctx.hooks.run("test.hook", { a: 1 })).toThrow(/hooks/);
+  });
+
   test("third-party with 'hooks' permission → hooks.on allowed", () => {
     const disposables = new DisposableStore();
     const ctx = createPluginContext(thirdPartyManifest(["hooks"]), document.createElement("div"), infra, disposables, new AbortController());
     const d = ctx.hooks.on("test.hook", (v) => v);
     expect(typeof d.dispose).toBe("function");
     d.dispose();
+  });
+
+  test("third-party with 'hooks' permission → hooks.run allowed", async () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest(["hooks"]), document.createElement("div"), infra, disposables, new AbortController());
+    const out = await ctx.hooks.run("test.hook", { a: 1 });
+    expect(out).toEqual({ a: 1 });
   });
 
   test("third-party without 'tools' permission → throws on tools.register", () => {
@@ -186,6 +199,69 @@ describe("createPluginContext — permission gates", () => {
     const disposables = new DisposableStore();
     const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
     expect(() => ctx.download.save(new Blob([""]), "file.txt")).toThrow(/download/);
+  });
+
+  test("third-party without 'upload' permission → throws on upload", async () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
+    await expect(ctx.upload.upload(new File(["x"], "x.txt", { type: "text/plain" }))).rejects.toThrow(/upload/);
+  });
+
+  test("third-party with 'upload' permission → upload allowed", async () => {
+    const disposables = new DisposableStore();
+    const fetchSpy = spyOn(window, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          id: "file_1",
+          object: "file",
+          bytes: 1,
+          created_at: 123,
+          filename: "x.txt",
+          purpose: "assistants",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const ctx = createPluginContext(thirdPartyManifest(["upload"]), document.createElement("div"), infra, disposables, new AbortController());
+
+    const uploaded = await ctx.upload.upload(new File(["x"], "x.txt", { type: "text/plain" }));
+    expect(uploaded.id).toBe("file_1");
+    expect(uploaded.filename).toBe("x.txt");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    fetchSpy.mockRestore();
+  });
+
+  test("third-party with 'upload' permission → get/delete/getContent allowed", async () => {
+    const disposables = new DisposableStore();
+    const fetchSpy = spyOn(window, "fetch")
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            id: "file_2",
+            object: "file",
+            bytes: 3,
+            created_at: 456,
+            filename: "a.bin",
+            purpose: "assistants",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      )
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(new Blob(["abc"]), { status: 200 }));
+
+    const ctx = createPluginContext(thirdPartyManifest(["upload"]), document.createElement("div"), infra, disposables, new AbortController());
+
+    const file = await ctx.upload.get("file_2");
+    expect(file.id).toBe("file_2");
+    expect(file.createdAt).toBe(456);
+
+    await ctx.upload.delete("file_2");
+
+    const content = await ctx.upload.getContent("file_2");
+    expect(await content.text()).toBe("abc");
+    expect(fetchSpy).toHaveBeenCalledTimes(3);
+    fetchSpy.mockRestore();
   });
 });
 

@@ -1,6 +1,13 @@
 import { getChatDom } from "./dom.ts";
-import { api, notifications } from "./deps.ts";
+import { hooks, notifications, upload } from "./deps.ts";
 import { chatState, type ChatAttachment } from "./state.ts";
+
+interface ChatUploadBeforePayload {
+  filename: string;
+  mimeType: string | null;
+  size: number;
+  purpose: string;
+}
 
 function escapeHtml(input: string): string {
   return input
@@ -9,6 +16,46 @@ function escapeHtml(input: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
+}
+
+function escapeXmlAttr(input: string): string {
+  return input
+    .replaceAll("&", "&amp;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
+function isBlocked(value: unknown): value is { $block: true; reason: string } {
+  return Boolean(
+    value
+      && typeof value === "object"
+      && "$block" in value
+      && (value as { $block?: unknown }).$block === true,
+  );
+}
+
+function isValidAttachment(value: unknown): value is ChatAttachment {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as { file?: unknown; mimeType?: unknown };
+  if (!candidate.file || typeof candidate.file !== "object") return false;
+
+  const file = candidate.file as {
+    id?: unknown;
+    filename?: unknown;
+    bytes?: unknown;
+    createdAt?: unknown;
+    purpose?: unknown;
+  };
+
+  return (
+    typeof file.id === "string"
+    && typeof file.filename === "string"
+    && typeof file.bytes === "number"
+    && typeof file.createdAt === "number"
+    && typeof file.purpose === "string"
+    && (candidate.mimeType === null || typeof candidate.mimeType === "string")
+  );
 }
 
 function renderAttachmentList(container: HTMLElement): void {
@@ -61,18 +108,51 @@ async function uploadFiles(files: FileList): Promise<void> {
 
   try {
     for (const file of Array.from(files)) {
-      const result = await api.uploadFile(file);
-      if (!result.ok || !result.data) {
-        notifications.error(result.error ?? `Failed to upload ${file.name}`);
-        continue;
-      }
+      try {
+        const beforeUpload = await hooks.run<ChatUploadBeforePayload>("chat.upload.before", {
+          filename: file.name,
+          mimeType: file.type || null,
+          size: file.size,
+          purpose: "assistants",
+        });
+        if (isBlocked(beforeUpload)) {
+          notifications.warning(beforeUpload.reason || `Upload blocked for ${file.name}`);
+          continue;
+        }
 
-      const attachment: ChatAttachment = {
-        file: result.data,
-        mimeType: file.type || null,
-      };
-      chatState.attachments.push(attachment);
-      uploaded += 1;
+        const purposeOverride = (
+          beforeUpload
+          && typeof beforeUpload === "object"
+          && "purpose" in beforeUpload
+          && typeof (beforeUpload as { purpose?: unknown }).purpose === "string"
+        )
+          ? (beforeUpload as { purpose: string }).purpose.trim()
+          : "";
+        const purpose = purposeOverride
+          ? purposeOverride
+          : "assistants";
+        const fileRef = await upload.upload(file, purpose);
+
+        let attachment: ChatAttachment = {
+          file: fileRef,
+          mimeType: file.type || null,
+        };
+        const afterUpload = await hooks.run("chat.upload.after", attachment);
+        if (isBlocked(afterUpload)) {
+          void upload.delete(fileRef.id).catch(() => {});
+          notifications.warning(afterUpload.reason || `Upload blocked for ${file.name}`);
+          continue;
+        }
+        if (isValidAttachment(afterUpload)) {
+          attachment = afterUpload;
+        }
+
+        chatState.attachments.push(attachment);
+        uploaded += 1;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : `Failed to upload ${file.name}`;
+        notifications.error(msg);
+      }
     }
     if (uploaded > 0) {
       notifications.info(`Attached ${uploaded} file${uploaded === 1 ? "" : "s"}`);
@@ -136,17 +216,18 @@ export function clearAttachments(): void {
 }
 
 export function buildAttachmentReferencePrefix(attachments: ChatAttachment[]): string {
-  return attachments
-    .map((attachment) => {
-      const attrs = [
-        `id=${attachment.file.id}`,
-        `name=${attachment.file.filename}`,
-        `bytes=${attachment.file.bytes}`,
-      ];
-      if (attachment.mimeType) attrs.push(`mime=${attachment.mimeType}`);
-      return `[Attachment ${attrs.join(", ")}]`;
-    })
-    .join("\n");
+  const lines = attachments.map((attachment) => {
+    const attrs = [
+      `id="${escapeXmlAttr(attachment.file.id)}"`,
+      `name="${escapeXmlAttr(attachment.file.filename)}"`,
+      `bytes="${attachment.file.bytes}"`,
+    ];
+    if (attachment.mimeType) {
+      attrs.push(`mime_type="${escapeXmlAttr(attachment.mimeType)}"`);
+    }
+    return `<file_ref ${attrs.join(" ")} />`;
+  });
+  return `<attachments>\n${lines.join("\n")}\n</attachments>`;
 }
 
 export function composeUserInputWithAttachments(text: string): string {
@@ -157,4 +238,3 @@ export function composeUserInputWithAttachments(text: string): string {
   if (!trimmed) return `${prefix}\n\nPlease use the attached files above.`;
   return `${prefix}\n\n${trimmed}`;
 }
-

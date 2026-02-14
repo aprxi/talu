@@ -15,10 +15,9 @@ function makeAttachment(
   return {
     file: {
       id,
-      object: "file",
       bytes,
-      created_at: 123,
       filename,
+      createdAt: 123,
       purpose: "assistants",
     },
     mimeType,
@@ -42,8 +41,19 @@ describe("chat attachments helpers", () => {
       makeAttachment("file_2", "raw.bin", 99, null),
     ]);
 
-    expect(prefix).toContain("[Attachment id=file_1, name=report.pdf, bytes=2048, mime=application/pdf]");
-    expect(prefix).toContain("[Attachment id=file_2, name=raw.bin, bytes=99]");
+    expect(prefix).toContain("<attachments>");
+    expect(prefix).toContain('<file_ref id="file_1" name="report.pdf" bytes="2048" mime_type="application/pdf" />');
+    expect(prefix).toContain('<file_ref id="file_2" name="raw.bin" bytes="99" />');
+    expect(prefix).toContain("</attachments>");
+  });
+
+  test("buildAttachmentReferencePrefix escapes XML attributes", () => {
+    const prefix = buildAttachmentReferencePrefix([
+      makeAttachment("file_1", 'a "b" <c>.txt', 12, 'text/plain; charset="utf-8"'),
+    ]);
+
+    expect(prefix).toContain('name="a &quot;b&quot; &lt;c&gt;.txt"');
+    expect(prefix).toContain('mime_type="text/plain; charset=&quot;utf-8&quot;"');
   });
 
   test("composeUserInputWithAttachments returns raw trimmed text when no attachments", () => {
@@ -54,7 +64,7 @@ describe("chat attachments helpers", () => {
   test("composeUserInputWithAttachments prefixes attachments before user text", () => {
     chatState.attachments = [makeAttachment("file_1", "manual.pdf", 12345, "application/pdf")];
     const result = composeUserInputWithAttachments("Please summarize this.");
-    expect(result).toContain("[Attachment id=file_1, name=manual.pdf, bytes=12345, mime=application/pdf]");
+    expect(result).toContain('<file_ref id="file_1" name="manual.pdf" bytes="12345" mime_type="application/pdf" />');
     expect(result).toContain("Please summarize this.");
   });
 
@@ -64,4 +74,3 @@ describe("chat attachments helpers", () => {
     expect(result).toContain("Please use the attached files above.");
   });
 });
-

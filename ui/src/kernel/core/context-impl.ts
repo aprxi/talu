@@ -7,6 +7,7 @@ import type {
   CommandRegistry as CommandRegistryInterface,
   EventBus,
   StorageAccess,
+  UploadAccess,
 } from "../types.ts";
 import type { DisposableStore } from "./disposable.ts";
 import type { EventBusImpl } from "../system/event-bus.ts";
@@ -35,6 +36,7 @@ import { resolveKeybinding } from "../registries/keybindings.ts";
 import type { StatusBarManager } from "../ui/status-bar.ts";
 import type { ViewManager } from "../ui/view-manager.ts";
 import type { ModeManager } from "../ui/mode-manager.ts";
+import { createApiClient } from "../../api.ts";
 
 /** Shared kernel infrastructure passed to all plugin contexts. */
 export interface KernelInfrastructure {
@@ -98,6 +100,7 @@ export function createPluginContext(
 
   // Permission-gated wrappers for sensitive APIs.
   const rawNetwork = new NetworkAccessImpl(pluginId, token, infra.networkConnectivity);
+  const api = createApiClient((url, init) => rawNetwork.fetch(url, init));
   const networkAccess: { fetch(url: string, init?: RequestInit): Promise<Response> } = {
     fetch: (url, init) => { requirePermission("network"); return rawNetwork.fetch(url, init); },
   };
@@ -112,6 +115,52 @@ export function createPluginContext(
     dispose: () => storage.dispose(),
   };
 
+  function unwrapUploadResult<T>(op: string, result: { ok: boolean; data?: T; error?: string }): T {
+    if (result.ok && result.data !== undefined) {
+      return result.data;
+    }
+    throw new Error(result.error ? `Upload ${op} failed: ${result.error}` : `Upload ${op} failed`);
+  }
+
+  const uploadAccess: UploadAccess = {
+    async upload(file, purpose) {
+      requirePermission("upload");
+      const result = await api.uploadFile(file, purpose);
+      const data = unwrapUploadResult("upload", result);
+      return {
+        id: data.id,
+        filename: data.filename,
+        bytes: data.bytes,
+        createdAt: data.created_at,
+        purpose: data.purpose,
+      };
+    },
+    async get(fileId) {
+      requirePermission("upload");
+      const result = await api.getFile(fileId);
+      const data = unwrapUploadResult("get", result);
+      return {
+        id: data.id,
+        filename: data.filename,
+        bytes: data.bytes,
+        createdAt: data.created_at,
+        purpose: data.purpose,
+      };
+    },
+    async delete(fileId) {
+      requirePermission("upload");
+      const result = await api.deleteFile(fileId);
+      if (!result.ok) {
+        throw new Error(result.error ? `Upload delete failed: ${result.error}` : "Upload delete failed");
+      }
+    },
+    async getContent(fileId) {
+      requirePermission("upload");
+      const result = await api.getFileContent(fileId);
+      return unwrapUploadResult("getContent", result);
+    },
+  };
+
   // --- Scoped wrappers for shared singletons ---
 
   const hooks: HookPipeline = {
@@ -123,6 +172,10 @@ export function createPluginContext(
         handler as (value: unknown) => unknown,
         options,
       );
+    },
+    run: (name, value) => {
+      requirePermission("hooks");
+      return infra.hookPipeline.run(name, value);
     },
   };
 
@@ -237,6 +290,7 @@ export function createPluginContext(
         URL.revokeObjectURL(url);
       },
     },
+    upload: uploadAccess,
   };
 
   return Object.freeze(ctx);

@@ -93,6 +93,11 @@ beforeEach(() => {
     layout: {} as any,
     clipboard: {} as any,
     download: {} as any,
+    upload: {} as any,
+    hooks: {
+      on: () => ({ dispose() {} }),
+      run: async <T>(_name: string, value: T) => value,
+    } as any,
     timers: mockTimers(),
     observe: {} as any,
     format: {} as any,
