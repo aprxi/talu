@@ -219,3 +219,80 @@ fn upload_deduplicates_blob_content_across_distinct_file_metadata() {
     assert_eq!(get_b_content.status, 200, "body: {}", get_b_content.body);
     assert_eq!(get_b_content.body, payload);
 }
+
+#[test]
+fn upload_accepts_file_before_purpose_field() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let boundary = "----talu-upload-file-first";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"ordered.txt\"\r\nContent-Type: text/plain\r\n\r\nhello order\r\n--{b}\r\nContent-Disposition: form-data; name=\"purpose\"\r\n\r\nfine_tune\r\n--{b}--\r\n",
+        b = boundary,
+    );
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let headers = [("Content-Type", content_type.as_str())];
+
+    let upload_resp = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&body));
+    assert_eq!(upload_resp.status, 200, "body: {}", upload_resp.body);
+    let upload_json = upload_resp.json();
+    assert_eq!(upload_json["purpose"], "fine_tune");
+    assert_eq!(upload_json["filename"], "ordered.txt");
+}
+
+#[test]
+fn upload_sanitizes_path_like_filename() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let boundary = "----talu-upload-path-name";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"../../etc/passwd\"\r\nContent-Type: text/plain\r\n\r\nhello\r\n--{b}--\r\n",
+        b = boundary,
+    );
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let headers = [("Content-Type", content_type.as_str())];
+
+    let upload_resp = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&body));
+    assert_eq!(upload_resp.status, 200, "body: {}", upload_resp.body);
+    let upload_json = upload_resp.json();
+    assert_eq!(upload_json["filename"], "passwd");
+}
+
+#[test]
+fn upload_defaults_filename_when_missing() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let boundary = "----talu-upload-no-filename";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"\r\nContent-Type: application/octet-stream\r\n\r\nabc123\r\n--{b}--\r\n",
+        b = boundary,
+    );
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let headers = [("Content-Type", content_type.as_str())];
+
+    let upload_resp = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&body));
+    assert_eq!(upload_resp.status, 200, "body: {}", upload_resp.body);
+    let upload_json = upload_resp.json();
+    assert_eq!(upload_json["filename"], "upload.bin");
+}
+
+#[test]
+fn upload_preserves_unicode_filename() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let boundary = "----talu-upload-unicode-filename";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"测试.txt\"\r\nContent-Type: text/plain\r\n\r\nunicode\r\n--{b}--\r\n",
+        b = boundary,
+    );
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let headers = [("Content-Type", content_type.as_str())];
+
+    let upload_resp = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&body));
+    assert_eq!(upload_resp.status, 200, "body: {}", upload_resp.body);
+    let upload_json = upload_resp.json();
+    assert_eq!(upload_json["filename"], "测试.txt");
+}

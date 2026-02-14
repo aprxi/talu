@@ -8,7 +8,7 @@ fn write_stream_zero_byte_payload_produces_readable_empty_blob() {
     let ctx = TestContext::new();
     let blobs = BlobsHandle::open(ctx.db_path()).expect("open blobs");
 
-    let mut writer = blobs.open_write_stream().expect("open write stream");
+    let writer = blobs.open_write_stream().expect("open write stream");
     let blob_ref = writer.finish().expect("finish empty stream");
     let loaded = blobs.read_all(&blob_ref).expect("read_all");
     assert!(loaded.is_empty(), "expected empty payload");

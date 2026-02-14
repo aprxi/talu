@@ -750,6 +750,37 @@ test "sweepUnreferencedBlobs preserves multipart manifest and chunk blobs" {
     try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
 }
 
+test "sweepUnreferencedBlobsWithOptions now_unix_seconds overrides system clock" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const orphan_blob = try store.put("clock-override-orphan");
+
+    // With default grace period (15 min) and real clock, the freshly-created
+    // blob is too recent to delete.
+    const stats_recent = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{});
+    try std.testing.expectEqual(@as(usize, 0), stats_recent.deleted_blob_files);
+    try std.testing.expect(stats_recent.skipped_recent_blob_files >= 1);
+
+    // Override clock to far future so the blob appears old enough to delete.
+    const far_future: i64 = std.time.timestamp() + 2 * 60 * 60;
+    const stats_future = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .now_unix_seconds = far_future,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats_future.deleted_blob_files);
+    try std.testing.expect(stats_future.reclaimed_bytes > 0);
+
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
+}
+
 test "sweepUnreferencedBlobs default grace period protects recent unreferenced blobs" {
     const allocator = std.testing.allocator;
 

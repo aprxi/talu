@@ -159,9 +159,10 @@ pub async fn handle_upload(
     let file_id = format!("file_{}", uuid::Uuid::new_v4().simple());
     let purpose = upload.purpose.unwrap_or_else(|| "assistants".to_string());
     let created_at = now_unix_seconds();
+    let filename = sanitize_filename(&upload.filename).unwrap_or_else(|| "upload.bin".to_string());
     let metadata = serde_json::json!({
         "blob_ref": upload.blob_ref,
-        "original_name": upload.filename,
+        "original_name": filename,
         "mime_type": upload.mime_type,
         "size": upload.bytes,
         "purpose": purpose,
@@ -640,12 +641,8 @@ fn resolve_filename(
     file_part_filename: Option<String>,
     filename_field: Option<String>,
 ) -> Result<String, String> {
-    let file_part = file_part_filename
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty());
-    let field = filename_field
-        .map(|name| name.trim().to_string())
-        .filter(|name| !name.is_empty());
+    let file_part = file_part_filename.and_then(|name| sanitize_filename(&name));
+    let field = filename_field.and_then(|name| sanitize_filename(&name));
 
     if let (Some(a), Some(b)) = (&file_part, &field) {
         if a != b {
@@ -659,6 +656,24 @@ fn resolve_filename(
     Ok(file_part
         .or(field)
         .unwrap_or_else(|| "upload.bin".to_string()))
+}
+
+fn sanitize_filename(name: &str) -> Option<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let basename = trimmed
+        .rsplit(|ch| ch == '/' || ch == '\\')
+        .next()
+        .unwrap_or("")
+        .trim();
+    if basename.is_empty() || basename == "." || basename == ".." {
+        return None;
+    }
+
+    Some(basename.to_string())
 }
 
 fn now_unix_seconds() -> u64 {
@@ -759,6 +774,20 @@ mod tests {
         let resolved = resolve_filename(Some("same.txt".to_string()), Some("same.txt".to_string()))
             .expect("expected resolved filename");
         assert_eq!(resolved, "same.txt");
+    }
+
+    #[test]
+    fn resolve_filename_sanitizes_path_traversal() {
+        let resolved = resolve_filename(Some("../../etc/passwd".to_string()), None)
+            .expect("expected sanitized filename");
+        assert_eq!(resolved, "passwd");
+    }
+
+    #[test]
+    fn resolve_filename_uses_default_for_empty_name() {
+        let resolved =
+            resolve_filename(Some("   ".to_string()), None).expect("expected default filename");
+        assert_eq!(resolved, "upload.bin");
     }
 
     #[test]

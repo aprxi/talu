@@ -180,7 +180,6 @@ impl BlobsHandle {
         }
         Ok(BlobWriteStream {
             handle: stream_handle,
-            finished: false,
         })
     }
 
@@ -294,7 +293,6 @@ impl Drop for BlobReadStream {
 #[derive(Debug)]
 pub struct BlobWriteStream {
     handle: *mut c_void,
-    finished: bool,
 }
 
 // SAFETY: The handle is uniquely owned by `BlobWriteStream`, all operations require `&mut self`,
@@ -304,11 +302,6 @@ unsafe impl Send for BlobWriteStream {}
 impl BlobWriteStream {
     /// Write a chunk to the blob stream.
     pub fn write(&mut self, bytes: &[u8]) -> Result<(), BlobError> {
-        if self.finished {
-            return Err(BlobError::InvalidArgument(
-                "write called after finish".to_string(),
-            ));
-        }
         let bytes_ptr = if bytes.is_empty() {
             ptr::null()
         } else {
@@ -324,12 +317,9 @@ impl BlobWriteStream {
     }
 
     /// Finalize stream and return content-addressed blob reference.
-    pub fn finish(&mut self) -> Result<String, BlobError> {
-        if self.finished {
-            return Err(BlobError::InvalidArgument(
-                "finish called more than once".to_string(),
-            ));
-        }
+    ///
+    /// This consumes the stream so callers cannot write after finish.
+    pub fn finish(self) -> Result<String, BlobError> {
         let mut blob_ref_buf = [0u8; 129];
         // SAFETY: `handle` is valid and output buffer is writable.
         let code = unsafe {
@@ -345,7 +335,6 @@ impl BlobWriteStream {
                 "blob write stream finish failed",
             ));
         }
-        self.finished = true;
         // SAFETY: C API guarantees NUL-terminated output on success.
         let blob_ref = unsafe { CStr::from_ptr(blob_ref_buf.as_ptr() as *const c_char) }
             .to_string_lossy()
