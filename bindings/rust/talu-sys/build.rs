@@ -47,23 +47,17 @@ fn main() {
     println!("cargo:lib_dir={}", lib_dir.display());
 }
 
-/// Walk up from talu-sys/Cargo.toml to find zig-out/lib/ in the monorepo.
-/// Returns None when running outside the monorepo (e.g. crates.io consumer).
+/// Walk up from talu-sys/Cargo.toml to detect the monorepo and return
+/// the zig-out/lib/ path. Returns None outside the monorepo (crates.io).
+///
+/// Note: the library file may not exist yet when build.rs runs — the Zig
+/// build installs it after invoking cargo. The linker only needs it when
+/// the final binary links, by which point the file is in place.
 fn find_monorepo_lib(manifest_dir: &PathBuf) -> Option<PathBuf> {
     // talu-sys -> rust -> bindings -> repo root
     let repo_root = manifest_dir.parent()?.parent()?.parent()?;
-    let lib_dir = repo_root.join("zig-out").join("lib");
-
-    let lib_name = if cfg!(target_os = "macos") {
-        "libtalu.dylib"
-    } else if cfg!(target_os = "windows") {
-        "talu.dll"
-    } else {
-        "libtalu.so"
-    };
-
-    if lib_dir.join(lib_name).exists() {
-        Some(lib_dir)
+    if repo_root.join("build.zig").exists() {
+        Some(repo_root.join("zig-out").join("lib"))
     } else {
         None
     }
