@@ -71,6 +71,7 @@ pub const Durability = writer.Durability;
 pub const Manifest = manifest.Manifest;
 pub const BlobStore = blob.BlobStore;
 pub const BlobRef = blob.BlobRef;
+pub const BlobReadStream = blob.BlobReadStream;
 pub const BlobSweepStats = blob.SweepStats;
 pub const BlobSweepOptions = blob.SweepOptions;
 pub const Reader = reader.Reader;

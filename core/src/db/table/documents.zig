@@ -273,14 +273,17 @@ pub const DocumentAdapter = struct {
         var doc_json_inline: ?[]const u8 = record.doc_json;
         var doc_json_ref: ?[]const u8 = null;
         var doc_json_ref_buf: [db_blob_store.ref_len]u8 = undefined;
+        var doc_json_ref_len: usize = 0;
         var doc_json_trigram_bloom: ?[]const u8 = null;
         var doc_json_trigram_bloom_buf: [doc_json_trigram_bloom_bytes]u8 = undefined;
 
         if (record.doc_json.len > self.doc_json_externalize_threshold_bytes) {
-            const blob_ref = try self.blob_store.put(record.doc_json);
-            doc_json_ref_buf = blob_ref.ref;
+            const blob_ref = try self.blob_store.putAuto(record.doc_json);
+            const ref_slice = blob_ref.refSlice();
+            @memcpy(doc_json_ref_buf[0..ref_slice.len], ref_slice);
+            doc_json_ref_len = ref_slice.len;
             doc_json_inline = null;
-            doc_json_ref = doc_json_ref_buf[0..];
+            doc_json_ref = doc_json_ref_buf[0..doc_json_ref_len];
             doc_json_trigram_bloom_buf = buildDocJsonTrigramBloom(record.doc_json);
             doc_json_trigram_bloom = doc_json_trigram_bloom_buf[0..];
         }
@@ -734,9 +737,14 @@ pub const DocumentAdapter = struct {
         return latest;
     }
 
-    /// Load an externalized blob by reference (`sha256:<hex>`).
+    /// Load an externalized blob by reference (`sha256:<hex>` or `multi:<hex>`).
     pub fn loadBlob(self: *DocumentAdapter, allocator: Allocator, blob_ref: []const u8) ![]u8 {
         return self.blob_store.readAll(blob_ref, allocator);
+    }
+
+    /// Open a streaming reader for an externalized blob reference.
+    pub fn openBlobStream(self: *DocumentAdapter, allocator: Allocator, blob_ref: []const u8) !db_blob_store.BlobReadStream {
+        return self.blob_store.openReadStream(allocator, blob_ref);
     }
 
     /// Get document version history (all versions linked by parent_id).
@@ -2863,7 +2871,7 @@ test "DocumentRecord decode resolves external doc_json_ref" {
         allocator,
         original,
         null,
-        blob_ref.ref[0..],
+        blob_ref.refSlice(),
         null,
     );
     defer allocator.free(blob);
@@ -2987,6 +2995,104 @@ test "DocumentAdapter.getDocumentHeader and DocumentAdapter.loadBlob support laz
     const loaded_blob = try read_adapter.loadBlob(allocator, header.doc_json_ref.?);
     defer allocator.free(loaded_blob);
     try std.testing.expectEqualStrings(external_json, loaded_blob);
+}
+
+test "DocumentAdapter externalized doc_json can use multipart refs and loadBlob joins parts" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var adapter = try DocumentAdapter.init(allocator, root_path);
+    defer adapter.deinit();
+    adapter.doc_json_externalize_threshold_bytes = 16;
+    adapter.blob_store.multipart_chunk_size_bytes = 32;
+
+    const external_json =
+        "{\"_sys\":{},\"data\":{\"text\":\"this payload should be split into multipart chunks for blob storage integration testing\"}}";
+    const record = DocumentRecord{
+        .doc_id = "doc-multi-1",
+        .doc_type = "prompt",
+        .title = "Multipart header doc",
+        .doc_json = external_json,
+        .created_at_ms = 300,
+        .updated_at_ms = 300,
+    };
+
+    try adapter.writeDocument(record);
+    try adapter.flush();
+
+    var read_adapter = try DocumentAdapter.initReadOnly(allocator, root_path);
+    defer read_adapter.deinitReadOnly();
+
+    const header_opt = try read_adapter.getDocumentHeader(allocator, "doc-multi-1");
+    try std.testing.expect(header_opt != null);
+    var header = header_opt.?;
+    defer header.deinit(allocator);
+
+    try std.testing.expect(!header.has_inline_doc_json);
+    try std.testing.expect(header.doc_json_ref != null);
+    try std.testing.expect(std.mem.startsWith(u8, header.doc_json_ref.?, db_blob_store.multipart_ref_prefix));
+
+    const loaded_blob = try read_adapter.loadBlob(allocator, header.doc_json_ref.?);
+    defer allocator.free(loaded_blob);
+    try std.testing.expectEqualStrings(external_json, loaded_blob);
+}
+
+test "DocumentAdapter.openBlobStream streams externalized multipart doc_json" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var adapter = try DocumentAdapter.init(allocator, root_path);
+    defer adapter.deinit();
+    adapter.doc_json_externalize_threshold_bytes = 16;
+    adapter.blob_store.multipart_chunk_size_bytes = 24;
+
+    const external_json =
+        "{\"_sys\":{},\"data\":{\"text\":\"stream this multipart document payload without rebuilding API contracts later\"}}";
+    const record = DocumentRecord{
+        .doc_id = "doc-stream-1",
+        .doc_type = "prompt",
+        .title = "Stream doc",
+        .doc_json = external_json,
+        .created_at_ms = 400,
+        .updated_at_ms = 400,
+    };
+
+    try adapter.writeDocument(record);
+    try adapter.flush();
+
+    var read_adapter = try DocumentAdapter.initReadOnly(allocator, root_path);
+    defer read_adapter.deinitReadOnly();
+
+    const header_opt = try read_adapter.getDocumentHeader(allocator, "doc-stream-1");
+    try std.testing.expect(header_opt != null);
+    var header = header_opt.?;
+    defer header.deinit(allocator);
+    try std.testing.expect(header.doc_json_ref != null);
+
+    var stream = try read_adapter.openBlobStream(allocator, header.doc_json_ref.?);
+    defer stream.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(allocator);
+
+    var buf: [13]u8 = undefined;
+    while (true) {
+        const read_len = try stream.read(&buf);
+        if (read_len == 0) break;
+        try out.appendSlice(allocator, buf[0..read_len]);
+    }
+
+    try std.testing.expectEqualStrings(external_json, out.items);
 }
 
 test "getDocumentHeader wrapper reports inline payload for small doc_json" {
@@ -3200,7 +3306,7 @@ pub fn getDocumentHeader(alloc: Allocator, db_path: []const u8, doc_id: []const 
     return adapter.getDocumentHeader(alloc, doc_id);
 }
 
-/// Load an externalized blob by reference (`sha256:<hex>`).
+/// Load an externalized blob by reference (`sha256:<hex>` or `multi:<hex>`).
 /// Handles adapter lifecycle internally.
 /// Caller owns returned bytes; free with allocator.free().
 pub fn loadDocumentBlob(alloc: Allocator, db_path: []const u8, blob_ref: []const u8) ![]u8 {

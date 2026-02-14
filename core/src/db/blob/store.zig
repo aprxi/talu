@@ -4,37 +4,122 @@
 //!   blobs/<first-two-hex>/<full-64-hex-sha256>
 //!
 //! References are encoded as:
-//!   sha256:<64-hex>
+//!   sha256:<64-hex>          (single blob)
+//!   multi:<64-hex>           (multipart manifest blob digest)
 
 const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 
-pub const ref_prefix = "sha256:";
+pub const sha256_ref_prefix = "sha256:";
+pub const multipart_ref_prefix = "multi:";
+pub const ref_prefix = sha256_ref_prefix; // Backward-compatible alias.
 pub const digest_hex_len: usize = 64;
-pub const ref_len: usize = ref_prefix.len + digest_hex_len;
+pub const sha256_ref_len: usize = sha256_ref_prefix.len + digest_hex_len;
+pub const multipart_ref_len: usize = multipart_ref_prefix.len + digest_hex_len;
+pub const ref_len: usize = @max(sha256_ref_len, multipart_ref_len);
 pub const rel_path_len: usize = "blobs/".len + 2 + 1 + digest_hex_len;
+pub const default_multipart_chunk_size_bytes: usize = 32 * 1024 * 1024;
 
 const tmp_suffix_hex_len: usize = 16;
 const tmp_path_len: usize = "blobs/".len + 2 + 1 + ".tmp-".len + tmp_suffix_hex_len;
 const hex_chars = "0123456789abcdef";
+const env_multipart_chunk_size_bytes = "TALU_DB_BLOB_MULTIPART_CHUNK_SIZE_BYTES";
+
+pub const RefKind = enum {
+    sha256,
+    multipart,
+};
+
+pub const ParsedRef = struct {
+    kind: RefKind,
+    digest_hex: [digest_hex_len]u8,
+};
+
+const DigestKey = [digest_hex_len]u8;
+
+const MultipartManifest = struct {
+    v: u8,
+    type: []const u8,
+    total_size: u64,
+    part_size: u64,
+    parts: []const []const u8,
+};
 
 pub const BlobRef = struct {
     ref: [ref_len]u8,
+    ref_len: u8,
     rel_path: [rel_path_len]u8,
     size_bytes: u64,
+
+    pub fn refSlice(self: *const BlobRef) []const u8 {
+        return self.ref[0..self.ref_len];
+    }
+};
+
+pub const BlobReadStream = struct {
+    store: *BlobStore,
+    allocator: Allocator,
+    part_digests: []DigestKey,
+    total_size: u64,
+    bytes_read: u64 = 0,
+    current_part_idx: usize = 0,
+    current_part_file: ?std.fs.File = null,
+
+    pub fn deinit(self: *BlobReadStream) void {
+        if (self.current_part_file) |file| {
+            file.close();
+            self.current_part_file = null;
+        }
+        self.allocator.free(self.part_digests);
+    }
+
+    /// Read bytes from the blob stream into `buffer`.
+    /// Returns 0 when the stream is exhausted.
+    pub fn read(self: *BlobReadStream, buffer: []u8) !usize {
+        if (buffer.len == 0) return 0;
+
+        var written: usize = 0;
+        while (written < buffer.len) {
+            if (self.current_part_file == null) {
+                if (!try self.openNextPart()) break;
+            }
+
+            var file = self.current_part_file.?;
+            const read_len = try file.read(buffer[written..]);
+            if (read_len == 0) {
+                file.close();
+                self.current_part_file = null;
+                self.current_part_idx += 1;
+                continue;
+            }
+
+            written += read_len;
+            self.bytes_read += read_len;
+        }
+
+        return written;
+    }
+
+    fn openNextPart(self: *BlobReadStream) !bool {
+        if (self.current_part_idx >= self.part_digests.len) return false;
+        self.current_part_file = try self.store.openSingleByDigest(self.part_digests[self.current_part_idx]);
+        return true;
+    }
 };
 
 pub const BlobStore = struct {
     allocator: Allocator,
     root_dir: std.fs.Dir,
+    multipart_chunk_size_bytes: usize,
 
     pub fn init(allocator: Allocator, db_root: []const u8) !BlobStore {
         const root_dir = try std.fs.cwd().makeOpenPath(db_root, .{});
         return .{
             .allocator = allocator,
             .root_dir = root_dir,
+            .multipart_chunk_size_bytes = resolveMultipartChunkSizeBytes(),
         };
     }
 
@@ -42,13 +127,124 @@ pub const BlobStore = struct {
         self.root_dir.close();
     }
 
+    /// Open a streaming reader over a single or multipart blob reference.
+    pub fn openReadStream(self: *BlobStore, allocator: Allocator, blob_ref: []const u8) !BlobReadStream {
+        const parsed = try parseRef(blob_ref);
+        return switch (parsed.kind) {
+            .sha256 => blk: {
+                const part_digests = try allocator.alloc(DigestKey, 1);
+                part_digests[0] = parsed.digest_hex;
+                const stat = try self.statSingleByDigest(parsed.digest_hex);
+                break :blk .{
+                    .store = self,
+                    .allocator = allocator,
+                    .part_digests = part_digests,
+                    .total_size = @intCast(stat.size),
+                };
+            },
+            .multipart => blk: {
+                const parts = try self.loadMultipartParts(allocator, parsed.digest_hex);
+                break :blk .{
+                    .store = self,
+                    .allocator = allocator,
+                    .part_digests = parts.part_digests,
+                    .total_size = parts.total_size,
+                };
+            },
+        };
+    }
+
+    /// Store bytes as either a single CAS blob or a multipart manifest.
+    /// Uses `multipart_chunk_size_bytes` as the split threshold.
+    pub fn putAuto(self: *BlobStore, bytes: []const u8) !BlobRef {
+        if (self.multipart_chunk_size_bytes > 0 and bytes.len > self.multipart_chunk_size_bytes) {
+            return self.putMultipart(bytes);
+        }
+        return self.put(bytes);
+    }
+
+    /// Store bytes as a single CAS blob (`sha256:<hex>`).
     pub fn put(self: *BlobStore, bytes: []const u8) !BlobRef {
+        return self.putSingle(bytes);
+    }
+
+    /// Store bytes as multipart CAS using a manifest (`multi:<hex>`).
+    /// The manifest blob itself is still stored as a normal `sha256:<hex>` blob.
+    pub fn putMultipart(self: *BlobStore, bytes: []const u8) !BlobRef {
+        const part_size = self.multipart_chunk_size_bytes;
+        if (part_size == 0) return error.InvalidChunkSize;
+        if (bytes.len <= part_size) return self.putSingle(bytes);
+
+        var manifest_json = std.ArrayList(u8).empty;
+        defer manifest_json.deinit(self.allocator);
+
+        const writer = manifest_json.writer(self.allocator);
+        try writer.print(
+            "{{\"v\":1,\"type\":\"multipart\",\"total_size\":{d},\"part_size\":{d},\"parts\":[",
+            .{ bytes.len, part_size },
+        );
+
+        var offset: usize = 0;
+        var first = true;
+        while (offset < bytes.len) {
+            const end = @min(offset + part_size, bytes.len);
+            const part_ref = try self.putSingle(bytes[offset..end]);
+            if (!first) try writer.writeByte(',');
+            first = false;
+            try writer.print("\"{s}\"", .{part_ref.refSlice()});
+            offset = end;
+        }
+        try writer.writeAll("]}");
+
+        const manifest_bytes = try manifest_json.toOwnedSlice(self.allocator);
+        defer self.allocator.free(manifest_bytes);
+
+        const manifest_blob_ref = try self.putSingle(manifest_bytes);
+        const manifest_digest = manifest_blob_ref.refSlice()[sha256_ref_prefix.len..];
+
+        var out_ref: [ref_len]u8 = undefined;
+        @memcpy(out_ref[0..multipart_ref_prefix.len], multipart_ref_prefix);
+        @memcpy(out_ref[multipart_ref_prefix.len .. multipart_ref_prefix.len + digest_hex_len], manifest_digest);
+
+        return .{
+            .ref = out_ref,
+            .ref_len = multipart_ref_len,
+            .rel_path = manifest_blob_ref.rel_path,
+            .size_bytes = bytes.len,
+        };
+    }
+
+    pub fn open(self: *BlobStore, blob_ref: []const u8) !std.fs.File {
+        const parsed = try parseRef(blob_ref);
+        if (parsed.kind != .sha256) return error.UnsupportedRefKind;
+        const rel_path = buildRelativePath(parsed.digest_hex);
+        return self.root_dir.openFile(rel_path[0..], .{ .mode = .read_only });
+    }
+
+    pub fn readAll(self: *BlobStore, blob_ref: []const u8, allocator: Allocator) ![]u8 {
+        const parsed = try parseRef(blob_ref);
+        return switch (parsed.kind) {
+            .sha256 => self.readSingleByDigest(parsed.digest_hex, allocator),
+            .multipart => self.readMultipartByDigest(parsed.digest_hex, allocator),
+        };
+    }
+
+    pub fn verify(self: *BlobStore, blob_ref: []const u8) !void {
+        const parsed = try parseRef(blob_ref);
+        switch (parsed.kind) {
+            .sha256 => try self.verifySingleByDigest(parsed.digest_hex),
+            .multipart => try self.verifyMultipartByDigest(parsed.digest_hex),
+        }
+    }
+
+    fn putSingle(self: *BlobStore, bytes: []const u8) !BlobRef {
         var digest: [32]u8 = undefined;
         Sha256.hash(bytes, &digest, .{});
         const digest_hex = digestToHex(digest);
 
         const blob_ref = BlobRef{
-            .ref = buildRefString(digest_hex),
+            .ref = buildSha256RefString(digest_hex),
+            .ref_len = sha256_ref_len,
             .rel_path = buildRelativePath(digest_hex),
             .size_bytes = bytes.len,
         };
@@ -89,14 +285,8 @@ pub const BlobStore = struct {
         return error.TempPathCollision;
     }
 
-    pub fn open(self: *BlobStore, blob_ref: []const u8) !std.fs.File {
-        const digest_hex = try parseBlobRef(blob_ref);
-        const rel_path = buildRelativePath(digest_hex);
-        return self.root_dir.openFile(rel_path[0..], .{ .mode = .read_only });
-    }
-
-    pub fn readAll(self: *BlobStore, blob_ref: []const u8, allocator: Allocator) ![]u8 {
-        var file = try self.open(blob_ref);
+    fn readSingleByDigest(self: *BlobStore, digest_hex: [digest_hex_len]u8, allocator: Allocator) ![]u8 {
+        var file = try self.openSingleByDigest(digest_hex);
         defer file.close();
 
         const stat = try file.stat();
@@ -104,10 +294,31 @@ pub const BlobStore = struct {
         return file.readToEndAlloc(allocator, @intCast(stat.size));
     }
 
-    pub fn verify(self: *BlobStore, blob_ref: []const u8) !void {
-        const expected_hex = try parseBlobRef(blob_ref);
+    fn readMultipartByDigest(self: *BlobStore, manifest_digest: [digest_hex_len]u8, allocator: Allocator) ![]u8 {
+        const parts = try self.loadMultipartParts(allocator, manifest_digest);
+        defer allocator.free(parts.part_digests);
 
-        var file = try self.open(blob_ref);
+        if (parts.total_size > std.math.maxInt(usize)) return error.FileTooLarge;
+        const total_size: usize = @intCast(parts.total_size);
+        var out = try allocator.alloc(u8, total_size);
+        errdefer allocator.free(out);
+
+        var offset: usize = 0;
+        for (parts.part_digests) |part_digest| {
+            const part_bytes = try self.readSingleByDigest(part_digest, allocator);
+            defer allocator.free(part_bytes);
+
+            if (offset + part_bytes.len > out.len) return error.InvalidMultipartManifest;
+            @memcpy(out[offset .. offset + part_bytes.len], part_bytes);
+            offset += part_bytes.len;
+        }
+
+        if (offset != out.len) return error.InvalidMultipartManifest;
+        return out;
+    }
+
+    fn verifySingleByDigest(self: *BlobStore, expected_hex: [digest_hex_len]u8) !void {
+        var file = try self.openSingleByDigest(expected_hex);
         defer file.close();
 
         var hasher = Sha256.init(.{});
@@ -126,6 +337,57 @@ pub const BlobStore = struct {
         }
     }
 
+    fn verifyMultipartByDigest(self: *BlobStore, manifest_digest: [digest_hex_len]u8) !void {
+        try self.verifySingleByDigest(manifest_digest);
+
+        const parts = try self.loadMultipartParts(self.allocator, manifest_digest);
+        defer self.allocator.free(parts.part_digests);
+        for (parts.part_digests) |part_digest| {
+            try self.verifySingleByDigest(part_digest);
+        }
+    }
+
+    const MultipartParts = struct {
+        part_digests: []DigestKey,
+        total_size: u64,
+    };
+
+    fn loadMultipartParts(self: *BlobStore, allocator: Allocator, manifest_digest: DigestKey) !MultipartParts {
+        const manifest_bytes = try self.readSingleByDigest(manifest_digest, allocator);
+        defer allocator.free(manifest_bytes);
+
+        var parsed = std.json.parseFromSlice(MultipartManifest, allocator, manifest_bytes, .{}) catch return error.InvalidMultipartManifest;
+        defer parsed.deinit();
+
+        const manifest = parsed.value;
+        if (manifest.v != 1) return error.InvalidMultipartManifest;
+        if (!std.mem.eql(u8, manifest.type, "multipart")) return error.InvalidMultipartManifest;
+        if (manifest.part_size == 0) return error.InvalidMultipartManifest;
+
+        const part_digests = try allocator.alloc(DigestKey, manifest.parts.len);
+        errdefer allocator.free(part_digests);
+        for (manifest.parts, 0..) |part_ref, i| {
+            const part_parsed = parseRef(part_ref) catch return error.InvalidMultipartManifest;
+            if (part_parsed.kind != .sha256) return error.InvalidMultipartManifest;
+            part_digests[i] = part_parsed.digest_hex;
+        }
+
+        return .{
+            .part_digests = part_digests,
+            .total_size = manifest.total_size,
+        };
+    }
+
+    fn openSingleByDigest(self: *BlobStore, digest_hex: DigestKey) !std.fs.File {
+        const rel_path = buildRelativePath(digest_hex);
+        return self.root_dir.openFile(rel_path[0..], .{ .mode = .read_only });
+    }
+
+    fn statSingleByDigest(self: *BlobStore, digest_hex: DigestKey) !std.fs.File.Stat {
+        const rel_path = buildRelativePath(digest_hex);
+        return self.root_dir.statFile(rel_path[0..]);
+    }
+
     fn ensureShardDir(self: *BlobStore, shard0: u8, shard1: u8) !void {
         var shard_path: [8]u8 = undefined; // "blobs/aa"
         @memcpy(shard_path[0.."blobs/".len], "blobs/");
@@ -135,17 +397,24 @@ pub const BlobStore = struct {
     }
 };
 
-fn parseBlobRef(blob_ref: []const u8) ![digest_hex_len]u8 {
-    if (blob_ref.len != ref_len) return error.InvalidBlobRef;
-    if (!std.mem.startsWith(u8, blob_ref, ref_prefix)) return error.InvalidBlobRef;
-
+pub fn parseRef(blob_ref: []const u8) !ParsedRef {
     var digest_hex: [digest_hex_len]u8 = undefined;
-    for (blob_ref[ref_prefix.len..], 0..) |ch, idx| {
-        if (!std.ascii.isHex(ch)) return error.InvalidBlobRef;
-        digest_hex[idx] = std.ascii.toLower(ch);
-    }
 
-    return digest_hex;
+    if (blob_ref.len == sha256_ref_len and std.mem.startsWith(u8, blob_ref, sha256_ref_prefix)) {
+        for (blob_ref[sha256_ref_prefix.len..], 0..) |ch, idx| {
+            if (!std.ascii.isHex(ch)) return error.InvalidBlobRef;
+            digest_hex[idx] = std.ascii.toLower(ch);
+        }
+        return .{ .kind = .sha256, .digest_hex = digest_hex };
+    }
+    if (blob_ref.len == multipart_ref_len and std.mem.startsWith(u8, blob_ref, multipart_ref_prefix)) {
+        for (blob_ref[multipart_ref_prefix.len..], 0..) |ch, idx| {
+            if (!std.ascii.isHex(ch)) return error.InvalidBlobRef;
+            digest_hex[idx] = std.ascii.toLower(ch);
+        }
+        return .{ .kind = .multipart, .digest_hex = digest_hex };
+    }
+    return error.InvalidBlobRef;
 }
 
 fn digestToHex(digest: [32]u8) [digest_hex_len]u8 {
@@ -157,10 +426,17 @@ fn digestToHex(digest: [32]u8) [digest_hex_len]u8 {
     return out;
 }
 
-fn buildRefString(digest_hex: [digest_hex_len]u8) [ref_len]u8 {
+pub fn buildSha256RefString(digest_hex: [digest_hex_len]u8) [ref_len]u8 {
     var out: [ref_len]u8 = undefined;
-    @memcpy(out[0..ref_prefix.len], ref_prefix);
-    @memcpy(out[ref_prefix.len..], digest_hex[0..]);
+    @memcpy(out[0..sha256_ref_prefix.len], sha256_ref_prefix);
+    @memcpy(out[sha256_ref_prefix.len .. sha256_ref_prefix.len + digest_hex_len], digest_hex[0..]);
+    return out;
+}
+
+pub fn buildMultipartRefString(digest_hex: [digest_hex_len]u8) [ref_len]u8 {
+    var out: [ref_len]u8 = undefined;
+    @memcpy(out[0..multipart_ref_prefix.len], multipart_ref_prefix);
+    @memcpy(out[multipart_ref_prefix.len .. multipart_ref_prefix.len + digest_hex_len], digest_hex[0..]);
     return out;
 }
 
@@ -194,6 +470,14 @@ fn makeTempPath(shard0: u8, shard1: u8) [tmp_path_len]u8 {
     }
 
     return out;
+}
+
+fn resolveMultipartChunkSizeBytes() usize {
+    const env_ptr = std.posix.getenv(env_multipart_chunk_size_bytes) orelse return default_multipart_chunk_size_bytes;
+    const raw = std.mem.sliceTo(env_ptr, 0);
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return default_multipart_chunk_size_bytes;
+    return std.fmt.parseUnsigned(usize, trimmed, 10) catch default_multipart_chunk_size_bytes;
 }
 
 test "BlobStore.init opens db root" {
@@ -231,7 +515,7 @@ test "BlobStore.put deduplicates identical payloads" {
     const first = try store.put("same-content");
     const second = try store.put("same-content");
 
-    try std.testing.expectEqualStrings(first.ref[0..], second.ref[0..]);
+    try std.testing.expectEqualStrings(first.refSlice(), second.refSlice());
     try std.testing.expectEqualStrings(first.rel_path[0..], second.rel_path[0..]);
 
     const stored = try tmp.dir.readFileAlloc(std.testing.allocator, first.rel_path[0..], 1024);
@@ -250,7 +534,7 @@ test "BlobStore.open returns readable file for reference" {
     defer store.deinit();
 
     const blob_ref = try store.put("open-test");
-    var file = try store.open(blob_ref.ref[0..]);
+    var file = try store.open(blob_ref.refSlice());
     defer file.close();
 
     var buf: [16]u8 = undefined;
@@ -272,7 +556,7 @@ test "BlobStore.readAll reads full blob bytes" {
     defer store.deinit();
 
     const blob_ref = try store.put("read-all-payload");
-    const payload = try store.readAll(blob_ref.ref[0..], std.testing.allocator);
+    const payload = try store.readAll(blob_ref.refSlice(), std.testing.allocator);
     defer std.testing.allocator.free(payload);
 
     try std.testing.expectEqualStrings("read-all-payload", payload);
@@ -289,12 +573,109 @@ test "BlobStore.verify validates and detects tampering" {
     defer store.deinit();
 
     const blob_ref = try store.put("verify-me");
-    try store.verify(blob_ref.ref[0..]);
+    try store.verify(blob_ref.refSlice());
 
     var file = try tmp.dir.openFile(blob_ref.rel_path[0..], .{ .mode = .read_write });
     defer file.close();
     try file.pwriteAll("X", 0);
     try file.sync();
 
-    try std.testing.expectError(error.IntegrityMismatch, store.verify(blob_ref.ref[0..]));
+    try std.testing.expectError(error.IntegrityMismatch, store.verify(blob_ref.refSlice()));
+}
+
+test "BlobStore.putAuto creates multipart ref for large payloads and readAll reassembles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+    store.multipart_chunk_size_bytes = 16;
+
+    const large_payload =
+        "abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ--multipart-check";
+    const blob_ref = try store.putAuto(large_payload);
+    try std.testing.expect(std.mem.startsWith(u8, blob_ref.refSlice(), multipart_ref_prefix));
+
+    const loaded = try store.readAll(blob_ref.refSlice(), std.testing.allocator);
+    defer std.testing.allocator.free(loaded);
+    try std.testing.expectEqualStrings(large_payload, loaded);
+}
+
+test "BlobStore.openReadStream streams single blob incrementally" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+
+    const payload = "stream-single-payload";
+    const blob_ref = try store.put(payload);
+    var stream = try store.openReadStream(std.testing.allocator, blob_ref.refSlice());
+    defer stream.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+
+    var buf: [5]u8 = undefined;
+    while (true) {
+        const read_len = try stream.read(&buf);
+        if (read_len == 0) break;
+        try out.appendSlice(std.testing.allocator, buf[0..read_len]);
+    }
+
+    try std.testing.expectEqualStrings(payload, out.items);
+    try std.testing.expectEqual(@as(u64, payload.len), stream.bytes_read);
+    try std.testing.expectEqual(@as(u64, payload.len), stream.total_size);
+}
+
+test "BlobStore.openReadStream streams multipart blob incrementally" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+    store.multipart_chunk_size_bytes = 12;
+
+    const payload = "stream-multipart-payload-with-more-than-one-chunk";
+    const blob_ref = try store.putAuto(payload);
+    try std.testing.expect(std.mem.startsWith(u8, blob_ref.refSlice(), multipart_ref_prefix));
+
+    var stream = try store.openReadStream(std.testing.allocator, blob_ref.refSlice());
+    defer stream.deinit();
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+
+    var buf: [7]u8 = undefined;
+    while (true) {
+        const read_len = try stream.read(&buf);
+        if (read_len == 0) break;
+        try out.appendSlice(std.testing.allocator, buf[0..read_len]);
+    }
+
+    try std.testing.expectEqualStrings(payload, out.items);
+    try std.testing.expectEqual(@as(u64, payload.len), stream.bytes_read);
+    try std.testing.expectEqual(@as(u64, payload.len), stream.total_size);
+}
+
+test "parseRef accepts sha256 and multipart prefixes" {
+    var digest = std.mem.zeroes([digest_hex_len]u8);
+    @memset(digest[0..], 'a');
+
+    const sha_ref = buildSha256RefString(digest);
+    const parsed_sha = try parseRef(sha_ref[0..sha256_ref_len]);
+    try std.testing.expectEqual(RefKind.sha256, parsed_sha.kind);
+
+    const multi_ref = buildMultipartRefString(digest);
+    const parsed_multi = try parseRef(multi_ref[0..multipart_ref_len]);
+    try std.testing.expectEqual(RefKind.multipart, parsed_multi.kind);
 }

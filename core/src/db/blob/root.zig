@@ -5,5 +5,6 @@ pub const gc = @import("gc.zig");
 
 pub const BlobStore = store.BlobStore;
 pub const BlobRef = store.BlobRef;
+pub const BlobReadStream = store.BlobReadStream;
 pub const SweepStats = gc.SweepStats;
 pub const SweepOptions = gc.SweepOptions;

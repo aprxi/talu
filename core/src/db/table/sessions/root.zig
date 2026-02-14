@@ -395,15 +395,18 @@ pub const TableAdapter = struct {
         var record_json_inline: ?[]const u8 = record_json;
         var record_json_ref: ?[]const u8 = null;
         var record_json_ref_buf: [db_blob_store.ref_len]u8 = undefined;
+        var record_json_ref_len: usize = 0;
         var record_json_trigram_bloom: ?[]const u8 = null;
         var record_json_trigram_bloom_buf: [record_json_trigram_bloom_bytes]u8 = undefined;
 
         if (record_json.len > self.item_json_externalize_threshold_bytes) {
-            const blob_ref = try self.blob_store.put(record_json);
-            record_json_ref_buf = blob_ref.ref;
+            const blob_ref = try self.blob_store.putAuto(record_json);
+            const ref_slice = blob_ref.refSlice();
+            @memcpy(record_json_ref_buf[0..ref_slice.len], ref_slice);
+            record_json_ref_len = ref_slice.len;
             record_json_trigram_bloom_buf = buildRecordJsonTrigramBloom(record_json);
             record_json_inline = null;
-            record_json_ref = record_json_ref_buf[0..];
+            record_json_ref = record_json_ref_buf[0..record_json_ref_len];
             record_json_trigram_bloom = record_json_trigram_bloom_buf[0..];
         }
 
@@ -1241,6 +1244,79 @@ test "TableAdapter externalizes large item record_json and loadAll resolves it" 
         try std.testing.expectEqual(@as(usize, 1), records.len);
         try std.testing.expectEqual(@as(u64, 22), records[0].item_id);
         try std.testing.expectEqual(@as(i64, 777), records[0].created_at_ms);
+    }
+}
+
+test "TableAdapter externalized item record_json can use multipart refs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    const long_text = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    {
+        var be = try TableAdapter.init(std.testing.allocator, root_path, "session-multi-json");
+        defer be.backend().deinit();
+        be.item_json_externalize_threshold_bytes = 16;
+        be.blob_store.multipart_chunk_size_bytes = 32;
+
+        var content = [_]responses.backend.ItemContentPartRecord{
+            .{ .input_text = .{ .text = long_text } },
+        };
+        const record = ItemRecord{
+            .item_id = 33,
+            .created_at_ms = 888,
+            .item_type = .message,
+            .variant = .{ .message = .{ .role = .user, .status = .completed, .content = &content } },
+        };
+        try be.backend().onEvent(&StorageEvent{ .PutItem = record });
+        try be.fs_writer.flushBlock();
+    }
+
+    {
+        var ro = try TableAdapter.initReadOnly(std.testing.allocator, root_path);
+        defer ro.deinitReadOnly();
+
+        const blocks = try ro.fs_reader.getBlocks(std.testing.allocator);
+        defer std.testing.allocator.free(blocks);
+
+        var found_items_block = false;
+        for (blocks) |block| {
+            var file = ro.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            defer file.close();
+
+            const reader = block_reader.BlockReader.init(file, std.testing.allocator);
+            const header = reader.readHeader(block.offset) catch continue;
+            if (header.schema_id != schema_items or header.row_count == 0) continue;
+            found_items_block = true;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer std.testing.allocator.free(descs);
+            const payload_desc = findColumn(descs, col_payload) orelse return error.TestUnexpectedResult;
+
+            var payloads = try readVarBytesBuffers(file, block.offset, payload_desc, header.row_count, std.testing.allocator);
+            defer payloads.deinit(std.testing.allocator);
+
+            const payload = try payloads.sliceForRow(0);
+            const kv_reader = try kvbuf.KvBufReader.init(payload);
+            const ref_value = kv_reader.get(kvbuf.FieldIds.record_json_ref) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.startsWith(u8, ref_value, db_blob_store.multipart_ref_prefix));
+            break;
+        }
+        try std.testing.expect(found_items_block);
+    }
+
+    {
+        var be2 = try TableAdapter.init(std.testing.allocator, root_path, "session-multi-json");
+        const records = try be2.backend().loadAll(std.testing.allocator);
+        defer responses.backend.freeItemRecords(std.testing.allocator, records);
+        be2.backend().deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqual(@as(u64, 33), records[0].item_id);
+        try std.testing.expectEqual(@as(i64, 888), records[0].created_at_ms);
     }
 }
 

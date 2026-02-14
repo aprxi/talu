@@ -24,8 +24,17 @@ const schema_documents: u16 = 11;
 const schema_items: u16 = 3;
 const col_payload: u32 = 20;
 
+const DigestKey = [db_blob_store.digest_hex_len]u8;
+const DigestSet = std.AutoHashMap(DigestKey, void);
 const RefKey = [db_blob_store.ref_len]u8;
-const RefSet = std.AutoHashMap(RefKey, void);
+
+const MultipartManifest = struct {
+    v: u8,
+    type: []const u8,
+    total_size: u64,
+    part_size: u64,
+    parts: []const []const u8,
+};
 
 pub const SweepStats = struct {
     referenced_blob_count: usize = 0,
@@ -62,9 +71,9 @@ pub fn sweepUnreferencedBlobsWithOptions(
     var stats = SweepStats{};
     const now_unix_seconds = options.now_unix_seconds orelse std.time.timestamp();
 
-    var refs = try markReferencedBlobRefs(allocator, db_root, &stats.invalid_reference_count);
-    defer refs.deinit();
-    stats.referenced_blob_count = refs.count();
+    var digests = try markReferencedBlobDigests(allocator, db_root, &stats.invalid_reference_count);
+    defer digests.deinit();
+    stats.referenced_blob_count = digests.count();
 
     var root_dir = std.fs.cwd().openDir(db_root, .{ .iterate = true }) catch |err| switch (err) {
         error.FileNotFound => return stats,
@@ -104,13 +113,13 @@ pub fn sweepUnreferencedBlobsWithOptions(
                 continue;
             }
 
-            const ref_key = buildRefFromDigestName(shard_entry.name, file_entry.name) orelse {
+            const digest_key = buildDigestFromName(shard_entry.name, file_entry.name) orelse {
                 stats.skipped_invalid_entries += 1;
                 continue;
             };
             stats.total_blob_files += 1;
 
-            if (refs.contains(ref_key)) continue;
+            if (digests.contains(digest_key)) continue;
 
             const file_stat = shard_dir.statFile(file_entry.name) catch {
                 stats.skipped_invalid_entries += 1;
@@ -145,14 +154,14 @@ pub fn sweepUnreferencedBlobsWithOptions(
 /// Caller owns the returned slice.
 pub fn collectReferencedBlobRefs(allocator: Allocator, db_root: []const u8) ![]RefKey {
     var invalid_ref_count: usize = 0;
-    var refs = try markReferencedBlobRefs(allocator, db_root, &invalid_ref_count);
-    defer refs.deinit();
+    var digests = try markReferencedBlobDigests(allocator, db_root, &invalid_ref_count);
+    defer digests.deinit();
 
-    const out = try allocator.alloc(RefKey, refs.count());
+    const out = try allocator.alloc(RefKey, digests.count());
     var i: usize = 0;
-    var it = refs.iterator();
+    var it = digests.iterator();
     while (it.next()) |entry| : (i += 1) {
-        out[i] = entry.key_ptr.*;
+        out[i] = db_blob_store.buildSha256RefString(entry.key_ptr.*);
     }
 
     std.mem.sort(RefKey, out, {}, struct {
@@ -175,9 +184,12 @@ fn isOldEnoughForSweep(stat: std.fs.File.Stat, now_unix_seconds: i64, min_blob_a
     return age_seconds >= min_blob_age_seconds;
 }
 
-fn markReferencedBlobRefs(allocator: Allocator, db_root: []const u8, invalid_ref_count: *usize) !RefSet {
-    var refs = RefSet.init(allocator);
-    errdefer refs.deinit();
+fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_ref_count: *usize) !DigestSet {
+    var digests = DigestSet.init(allocator);
+    errdefer digests.deinit();
+
+    var store = try db_blob_store.BlobStore.init(allocator, db_root);
+    defer store.deinit();
 
     try markNamespaceBlockRefs(
         allocator,
@@ -185,7 +197,8 @@ fn markReferencedBlobRefs(allocator: Allocator, db_root: []const u8, invalid_ref
         docs_namespace,
         schema_documents,
         kvbuf.DocumentFieldIds.doc_json_ref,
-        &refs,
+        &store,
+        &digests,
         invalid_ref_count,
     );
     try markNamespaceBlockRefs(
@@ -194,7 +207,8 @@ fn markReferencedBlobRefs(allocator: Allocator, db_root: []const u8, invalid_ref
         chat_namespace,
         schema_items,
         kvbuf.FieldIds.record_json_ref,
-        &refs,
+        &store,
+        &digests,
         invalid_ref_count,
     );
 
@@ -204,7 +218,8 @@ fn markReferencedBlobRefs(allocator: Allocator, db_root: []const u8, invalid_ref
         docs_namespace,
         schema_documents,
         kvbuf.DocumentFieldIds.doc_json_ref,
-        &refs,
+        &store,
+        &digests,
         invalid_ref_count,
     );
     try markNamespaceWalRefs(
@@ -213,11 +228,12 @@ fn markReferencedBlobRefs(allocator: Allocator, db_root: []const u8, invalid_ref
         chat_namespace,
         schema_items,
         kvbuf.FieldIds.record_json_ref,
-        &refs,
+        &store,
+        &digests,
         invalid_ref_count,
     );
 
-    return refs;
+    return digests;
 }
 
 fn markNamespaceBlockRefs(
@@ -226,7 +242,8 @@ fn markNamespaceBlockRefs(
     namespace: []const u8,
     schema_id: u16,
     ref_field_id: u16,
-    refs: *RefSet,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
     invalid_ref_count: *usize,
 ) !void {
     var reader = try db_reader.Reader.open(allocator, db_root, namespace);
@@ -253,7 +270,7 @@ fn markNamespaceBlockRefs(
 
         for (0..header.row_count) |row_idx| {
             const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-            try markRefInPayload(payload, ref_field_id, refs, invalid_ref_count);
+            try markRefInPayload(payload, ref_field_id, store, digests, invalid_ref_count);
         }
     }
 }
@@ -264,7 +281,8 @@ fn markNamespaceWalRefs(
     namespace: []const u8,
     schema_id: u16,
     ref_field_id: u16,
-    refs: *RefSet,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
     invalid_ref_count: *usize,
 ) !void {
     var root_dir = std.fs.cwd().openDir(db_root, .{ .iterate = true }) catch |err| switch (err) {
@@ -296,7 +314,7 @@ fn markNamespaceWalRefs(
             const payload = payload_opt orelse break;
             defer allocator.free(payload);
 
-            try markRefInWalPayload(payload, schema_id, ref_field_id, refs, invalid_ref_count);
+            try markRefInWalPayload(payload, schema_id, ref_field_id, store, digests, invalid_ref_count);
         }
     }
 }
@@ -305,7 +323,8 @@ fn markRefInWalPayload(
     payload: []const u8,
     schema_id: u16,
     ref_field_id: u16,
-    refs: *RefSet,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
     invalid_ref_count: *usize,
 ) !void {
     var index: usize = 0;
@@ -331,54 +350,81 @@ fn markRefInWalPayload(
     }
 
     if (payload_col_data) |row_payload| {
-        try markRefInPayload(row_payload, ref_field_id, refs, invalid_ref_count);
+        try markRefInPayload(row_payload, ref_field_id, store, digests, invalid_ref_count);
     }
 }
 
 fn markRefInPayload(
     payload: []const u8,
     ref_field_id: u16,
-    refs: *RefSet,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
     invalid_ref_count: *usize,
 ) !void {
     if (!kvbuf.isKvBuf(payload)) return;
     const reader = kvbuf.KvBufReader.init(payload) catch return;
     const blob_ref = reader.get(ref_field_id) orelse return;
 
-    const ref_key = normalizeBlobRef(blob_ref) orelse {
+    const parsed = db_blob_store.parseRef(blob_ref) catch {
         invalid_ref_count.* += 1;
         return;
     };
-    try refs.put(ref_key, {});
+    try markReferenceRecursive(store, parsed, digests, invalid_ref_count, store.allocator);
 }
 
-fn normalizeBlobRef(blob_ref: []const u8) ?RefKey {
-    if (blob_ref.len != db_blob_store.ref_len) return null;
-    if (!std.mem.startsWith(u8, blob_ref, db_blob_store.ref_prefix)) return null;
+fn markReferenceRecursive(
+    store: *db_blob_store.BlobStore,
+    parsed_ref: db_blob_store.ParsedRef,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+    allocator: Allocator,
+) !void {
+    const gop = try digests.getOrPut(parsed_ref.digest_hex);
+    if (gop.found_existing) return;
 
-    var out: RefKey = undefined;
-    @memcpy(out[0..db_blob_store.ref_prefix.len], db_blob_store.ref_prefix);
-    for (blob_ref[db_blob_store.ref_prefix.len..], 0..) |ch, idx| {
-        if (!std.ascii.isHex(ch)) return null;
-        out[db_blob_store.ref_prefix.len + idx] = std.ascii.toLower(ch);
+    if (parsed_ref.kind != .multipart) return;
+
+    const manifest_sha_ref = db_blob_store.buildSha256RefString(parsed_ref.digest_hex);
+    const manifest_bytes = store.readAll(manifest_sha_ref[0..db_blob_store.sha256_ref_len], allocator) catch {
+        invalid_ref_count.* += 1;
+        return;
+    };
+    defer allocator.free(manifest_bytes);
+
+    var parsed_manifest = std.json.parseFromSlice(MultipartManifest, allocator, manifest_bytes, .{}) catch {
+        invalid_ref_count.* += 1;
+        return;
+    };
+    defer parsed_manifest.deinit();
+
+    const manifest = parsed_manifest.value;
+    if (manifest.v != 1 or !std.mem.eql(u8, manifest.type, "multipart")) {
+        invalid_ref_count.* += 1;
+        return;
     }
-    return out;
+
+    for (manifest.parts) |part_ref| {
+        const part_parsed = db_blob_store.parseRef(part_ref) catch {
+            invalid_ref_count.* += 1;
+            continue;
+        };
+        try markReferenceRecursive(store, part_parsed, digests, invalid_ref_count, allocator);
+    }
 }
 
-fn buildRefFromDigestName(shard_name: []const u8, digest_name: []const u8) ?RefKey {
+fn buildDigestFromName(shard_name: []const u8, digest_name: []const u8) ?DigestKey {
     if (shard_name.len != 2) return null;
     if (digest_name.len != db_blob_store.digest_hex_len) return null;
 
-    var out: RefKey = undefined;
-    @memcpy(out[0..db_blob_store.ref_prefix.len], db_blob_store.ref_prefix);
+    var out: DigestKey = undefined;
 
     for (digest_name, 0..) |ch, idx| {
         if (!std.ascii.isHex(ch)) return null;
-        out[db_blob_store.ref_prefix.len + idx] = std.ascii.toLower(ch);
+        out[idx] = std.ascii.toLower(ch);
     }
 
-    if (std.ascii.toLower(shard_name[0]) != out[db_blob_store.ref_prefix.len]) return null;
-    if (std.ascii.toLower(shard_name[1]) != out[db_blob_store.ref_prefix.len + 1]) return null;
+    if (std.ascii.toLower(shard_name[0]) != out[0]) return null;
+    if (std.ascii.toLower(shard_name[1]) != out[1]) return null;
     return out;
 }
 
@@ -536,7 +582,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
     {
         var doc_payload_writer = kvbuf.KvBufWriter.init();
         defer doc_payload_writer.deinit(allocator);
-        try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.ref[0..]);
+        try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.refSlice());
         const doc_payload = try doc_payload_writer.finish(allocator);
         defer allocator.free(doc_payload);
         var doc_writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, doc_payload, true);
@@ -546,7 +592,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
     {
         var chat_payload_writer = kvbuf.KvBufWriter.init();
         defer chat_payload_writer.deinit(allocator);
-        try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.ref[0..]);
+        try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.refSlice());
         const chat_payload = try chat_payload_writer.finish(allocator);
         defer allocator.free(chat_payload);
         var chat_writer = try appendPayloadRow(allocator, root_path, chat_namespace, schema_items, chat_payload, true);
@@ -558,7 +604,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
     {
         var wal_payload_writer = kvbuf.KvBufWriter.init();
         defer wal_payload_writer.deinit(allocator);
-        try wal_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, wal_blob.ref[0..]);
+        try wal_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, wal_blob.refSlice());
         const wal_payload = try wal_payload_writer.finish(allocator);
         defer allocator.free(wal_payload);
         wal_writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, wal_payload, false);
@@ -568,9 +614,9 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
     defer allocator.free(refs);
 
     try std.testing.expectEqual(@as(usize, 3), refs.len);
-    try std.testing.expect(containsRef(refs, doc_blob.ref[0..]));
-    try std.testing.expect(containsRef(refs, chat_blob.ref[0..]));
-    try std.testing.expect(containsRef(refs, wal_blob.ref[0..]));
+    try std.testing.expect(containsRef(refs, doc_blob.refSlice()));
+    try std.testing.expect(containsRef(refs, chat_blob.refSlice()));
+    try std.testing.expect(containsRef(refs, wal_blob.refSlice()));
 }
 
 test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced blobs" {
@@ -592,7 +638,7 @@ test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced
     {
         var doc_payload_writer = kvbuf.KvBufWriter.init();
         defer doc_payload_writer.deinit(allocator);
-        try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.ref[0..]);
+        try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.refSlice());
         const doc_payload = try doc_payload_writer.finish(allocator);
         defer allocator.free(doc_payload);
         var doc_writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, doc_payload, true);
@@ -602,7 +648,7 @@ test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced
     {
         var chat_payload_writer = kvbuf.KvBufWriter.init();
         defer chat_payload_writer.deinit(allocator);
-        try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.ref[0..]);
+        try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.refSlice());
         const chat_payload = try chat_payload_writer.finish(allocator);
         defer allocator.free(chat_payload);
         var chat_writer = try appendPayloadRow(allocator, root_path, chat_namespace, schema_items, chat_payload, true);
@@ -618,11 +664,11 @@ test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced
     try std.testing.expectEqual(@as(usize, 0), stats.skipped_recent_blob_files);
     try std.testing.expect(stats.reclaimed_bytes > 0);
 
-    const doc_bytes = try store.readAll(doc_blob.ref[0..], allocator);
+    const doc_bytes = try store.readAll(doc_blob.refSlice(), allocator);
     defer allocator.free(doc_bytes);
-    const chat_bytes = try store.readAll(chat_blob.ref[0..], allocator);
+    const chat_bytes = try store.readAll(chat_blob.refSlice(), allocator);
     defer allocator.free(chat_bytes);
-    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.ref[0..], allocator));
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
 }
 
 test "sweepUnreferencedBlobs keeps blobs referenced only from WAL" {
@@ -642,7 +688,7 @@ test "sweepUnreferencedBlobs keeps blobs referenced only from WAL" {
 
     var payload_writer = kvbuf.KvBufWriter.init();
     defer payload_writer.deinit(allocator);
-    try payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, wal_ref_blob.ref[0..]);
+    try payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, wal_ref_blob.refSlice());
     const payload = try payload_writer.finish(allocator);
     defer allocator.free(payload);
 
@@ -657,11 +703,51 @@ test "sweepUnreferencedBlobs keeps blobs referenced only from WAL" {
     try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
     try std.testing.expectEqual(@as(usize, 0), stats.skipped_recent_blob_files);
 
-    const wal_bytes = try store.readAll(wal_ref_blob.ref[0..], allocator);
+    const wal_bytes = try store.readAll(wal_ref_blob.refSlice(), allocator);
     defer allocator.free(wal_bytes);
     try std.testing.expectEqualStrings("wal-only-ref", wal_bytes);
 
-    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.ref[0..], allocator));
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
+}
+
+test "sweepUnreferencedBlobs preserves multipart manifest and chunk blobs" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+    store.multipart_chunk_size_bytes = 16;
+
+    const multi_blob = try store.putAuto("abcdefghijklmnopqrstuvwxyz0123456789--multipart-gc");
+    try std.testing.expect(std.mem.startsWith(u8, multi_blob.refSlice(), db_blob_store.multipart_ref_prefix));
+    const orphan_blob = try store.put("multipart-orphan");
+
+    var payload_writer = kvbuf.KvBufWriter.init();
+    defer payload_writer.deinit(allocator);
+    try payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, multi_blob.refSlice());
+    const payload = try payload_writer.finish(allocator);
+    defer allocator.free(payload);
+
+    var writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, payload, true);
+    defer writer.deinit();
+
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+
+    // multipart-gc should keep at least manifest + one chunk.
+    try std.testing.expect(stats.referenced_blob_count >= 2);
+    try std.testing.expect(stats.deleted_blob_files >= 1);
+
+    const loaded = try store.readAll(multi_blob.refSlice(), allocator);
+    defer allocator.free(loaded);
+    try std.testing.expectEqualStrings("abcdefghijklmnopqrstuvwxyz0123456789--multipart-gc", loaded);
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
 }
 
 test "sweepUnreferencedBlobs default grace period protects recent unreferenced blobs" {
@@ -685,7 +771,7 @@ test "sweepUnreferencedBlobs default grace period protects recent unreferenced b
     try std.testing.expectEqual(@as(usize, 0), stats.deleted_blob_files);
     try std.testing.expect(stats.skipped_recent_blob_files >= 2);
 
-    const orphan_bytes = try store.readAll(orphan_blob.ref[0..], allocator);
+    const orphan_bytes = try store.readAll(orphan_blob.refSlice(), allocator);
     defer allocator.free(orphan_bytes);
     try std.testing.expectEqualStrings("recent-orphan", orphan_bytes);
 }
