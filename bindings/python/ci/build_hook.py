@@ -146,8 +146,12 @@ class ZigBuildHook(BuildHookInterface):
             lib_path = zig_root / "zig-out" / "lib" / self._get_lib_name()
             bin_path = zig_root / "zig-out" / "bin" / self._get_bin_name()
             self._log("Stripping binaries...")
+            # macOS strip needs -x for dylibs: full strip fails on
+            # indirect symbol table entries (Metal, CoreFoundation, etc.)
+            is_macos = platform.system() == "Darwin"
             if lib_path.exists():
-                subprocess.run(["strip", str(lib_path)], check=False)
+                strip_cmd = ["strip", "-x", str(lib_path)] if is_macos else ["strip", str(lib_path)]
+                subprocess.run(strip_cmd, check=False)
             if bin_path.exists():
                 subprocess.run(["strip", str(bin_path)], check=False)
 
