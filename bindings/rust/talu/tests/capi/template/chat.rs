@@ -394,6 +394,77 @@ fn no_generation_prompt_ends_at_last() {
 // Many messages stress
 // ===========================================================================
 
+// ===========================================================================
+// lstrip_blocks: leading whitespace before block tags must be stripped
+// ===========================================================================
+//
+// HuggingFace chat templates run with lstrip_blocks=True by default.
+// When a line starts with a block tag ({% ... %}), all leading whitespace
+// on that line is stripped. Without this, indented templates produce
+// unwanted spaces in the output.
+// Affects: nvidia/NVIDIA-Nemotron (3 chat_template failures).
+
+/// Indented block tags must not produce leading whitespace in output.
+///
+/// With lstrip_blocks enabled, the spaces before `{% if %}` and `{% endif %}`
+/// are stripped, so the output has no leading whitespace.
+#[test]
+fn lstrip_blocks_strips_indentation() {
+    // Template with indented block tags (like Nemotron's template).
+    // The 8-space indent before {% if %} / {% endif %} must be stripped.
+    let tmpl = concat!(
+        "{%- for msg in messages %}\n",
+        "<|im_start|>{{ msg.role }}\n",
+        "{{ msg.content }}<|im_end|>\n",
+        "        {% if msg.role == 'user' %}\n",
+        "MARKER\n",
+        "        {% endif %}\n",
+        "{%- endfor -%}",
+    );
+    let msgs = r#"[{"role":"user","content":"Hi"}]"#;
+    let result = apply_chat_template(tmpl, msgs, false, "", "").unwrap();
+    // With lstrip_blocks, the "        " before {% if %} and {% endif %} is stripped.
+    // Without lstrip_blocks, "        " appears before MARKER.
+    assert!(
+        !result.contains("        MARKER"),
+        "lstrip_blocks must strip indentation before block tags, got: {result:?}"
+    );
+}
+
+/// Realistic Nemotron-style template: multi-turn with indented conditionals.
+///
+/// The template uses indented `{% if %}` blocks for role-specific handling.
+/// lstrip_blocks must strip the leading whitespace so the output matches.
+#[test]
+fn lstrip_blocks_multiturn_indented_template() {
+    // Simplified Nemotron pattern: indented conditionals within for loop.
+    let tmpl = concat!(
+        "{%- for msg in messages %}\n",
+        "<|im_start|>{{ msg.role }}\n",
+        "        {% if msg.role == 'assistant' %}\n",
+        "<think></think>{{ msg.content }}\n",
+        "        {% else %}\n",
+        "{{ msg.content }}\n",
+        "        {% endif %}\n",
+        "<|im_end|>\n",
+        "{%- endfor -%}",
+    );
+    let msgs = r#"[
+        {"role":"user","content":"Hello"},
+        {"role":"assistant","content":"Hi there!"}
+    ]"#;
+    let result = apply_chat_template(tmpl, msgs, false, "", "").unwrap();
+    // The assistant content must NOT have leading spaces from template indentation.
+    assert!(
+        !result.contains("        <think>"),
+        "lstrip_blocks must strip indentation before conditionals, got: {result:?}"
+    );
+}
+
+// ===========================================================================
+// Many messages stress
+// ===========================================================================
+
 /// 20 messages render correctly and completely.
 #[test]
 fn twenty_messages() {

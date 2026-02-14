@@ -146,6 +146,85 @@ fn skip_special_strips_sandwiched_bos() {
 // é (U+00E9) to single byte 0xE9 which is invalid standalone UTF-8 → "�".
 // Affects: TinyLlama, Gemma, Phi-3, Mistral, e5-mistral (~100K token failures).
 
+// ===========================================================================
+// Sequence decoder (Replace + Strip): leading space count
+// ===========================================================================
+//
+// SentencePiece models (Mistral, Llama, etc.) use a Sequence decoder:
+//   Replace(▁→space) + ByteFallback + Fuse + Strip(start=1, stop=0)
+//
+// The Strip decoder removes exactly 1 leading space. The Metaspace
+// pretokenizer's add_prefix_space (prepend_scheme="first") applies only
+// during encode — it must NOT cause an additional strip during decode.
+//
+// For a token containing N ▁ characters, the decode result must have N-1
+// spaces (N replaced to spaces, then Strip removes 1).
+// Affects: mistralai/Mistral-7B-v0.1, v0.3, Instruct variants
+// (~56 vocab_decode, 4 roundtrip failures).
+
+/// Minimal SentencePiece BPE with Sequence decoder matching Mistral's config.
+const SEQUENCE_STRIP_DECODER_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "\u2581\u2581\u2581\u2581": 4,
+      "\u2581Hello": 5, "\u2581world": 6
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "Metaspace", "replacement": "\u2581", "prepend_scheme": "first"},
+  "post_processor": null,
+  "decoder": {
+    "type": "Sequence",
+    "decoders": [
+      {"type": "Replace", "pattern": {"String": "\u2581"}, "content": " "},
+      {"type": "ByteFallback"},
+      {"type": "Fuse"},
+      {"type": "Strip", "content": " ", "start": 1, "stop": 0}
+    ]
+  }
+}"####;
+
+/// ▁▁▁▁ (4 metaspace chars) must decode to "   " (3 spaces).
+///
+/// Replace converts each ▁ to a space (4 spaces), then Strip removes
+/// exactly 1 leading space → 3 spaces. The pretokenizer's add_prefix_space
+/// must not cause a second strip.
+#[test]
+fn sequence_decode_four_metaspace_to_three_spaces() {
+    let ctx = TokenizerTestContext::from_json(SEQUENCE_STRIP_DECODER_JSON);
+    // Token 4 = ▁▁▁▁ → "    " (4 spaces) → Strip(1) → "   " (3 spaces)
+    let decoded = ctx.decode(&[4]);
+    assert_eq!(
+        decoded, "   ",
+        "▁▁▁▁ must decode to 3 spaces (4 replaced, Strip removes 1), got {:?} ({} chars)",
+        decoded, decoded.len()
+    );
+}
+
+/// ▁Hello + ▁world must decode to "Hello world".
+///
+/// Replace: " Hello" + " world" → Fuse: " Hello world" → Strip(1): "Hello world".
+/// The pretokenizer's add_prefix_space must not remove a second space.
+#[test]
+fn sequence_decode_words_strip_one_leading() {
+    let ctx = TokenizerTestContext::from_json(SEQUENCE_STRIP_DECODER_JSON);
+    let decoded = ctx.decode(&[5, 6]);
+    assert_eq!(
+        decoded, "Hello world",
+        "▁Hello + ▁world must decode to 'Hello world', got: {decoded:?}"
+    );
+}
+
 /// Minimal SentencePiece-style BPE with ▁ word boundaries and non-ASCII tokens.
 const SENTENCEPIECE_BPE_JSON: &str = r####"{
   "version": "1.0",

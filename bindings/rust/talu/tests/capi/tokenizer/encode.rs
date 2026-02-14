@@ -691,3 +691,99 @@ fn encode_metaspace_whitespace_only() {
         "Metaspace whitespace '   ' → [▁▁▁=23], got: {tokens:?}"
     );
 }
+
+// ===========================================================================
+// EOS-only TemplateProcessing (Qwen3-Embedding pattern)
+// ===========================================================================
+//
+// Qwen3-Embedding models use a TemplateProcessing post_processor that appends
+// EOS at the end without prepending BOS: template is [A, <|endoftext|>].
+// The encoder must place the special token at the END, not the start.
+// Affects: Qwen3-Embedding-0.6B, Qwen3-Embedding-8B, Qwen3-VL-Embedding-2B
+// (~60 encode_special failures).
+
+/// Minimal BPE with EOS-only TemplateProcessing.
+///
+/// The single template is [A, EOS] — content first, then EOS appended.
+/// No BOS is prepended. The special_tokens map has only `<|endoftext|>`.
+const EOS_ONLY_TEMPLATE_JSON: &str = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "H": 4, "i": 5, "e": 6, "l": 7, "o": 8
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<pad>", "special": true},
+    {"id": 1, "content": "<|endoftext|>", "special": true},
+    {"id": 2, "content": "<unk>", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}}
+    ],
+    "pair": [
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 0}},
+      {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "<|endoftext|>": {"id": "<|endoftext|>", "ids": [1], "tokens": ["<|endoftext|>"]}
+    }
+  },
+  "decoder": {"type": "ByteLevel"}
+}"####;
+
+/// EOS-only template must append EOS at end, not prepend BOS at start.
+///
+/// "Hi" → [H=4, i=5], with EOS → [H=4, i=5, <|endoftext|>=1]
+#[test]
+fn encode_eos_only_template_appends_eos() {
+    let ctx = TokenizerTestContext::from_json(EOS_ONLY_TEMPLATE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens, vec![4, 5, 1],
+        "EOS-only template must produce [tokens..., EOS=1], got: {tokens:?}"
+    );
+}
+
+/// EOS-only template: empty string produces [EOS] only.
+#[test]
+fn encode_eos_only_template_empty_string() {
+    let ctx = TokenizerTestContext::from_json(EOS_ONLY_TEMPLATE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(
+        tokens, vec![1],
+        "EOS-only template empty string → [EOS=1], got: {tokens:?}"
+    );
+}
+
+/// EOS-only template with add_bos=0 must skip post_processor entirely.
+#[test]
+fn encode_eos_only_template_no_special() {
+    let ctx = TokenizerTestContext::from_json(EOS_ONLY_TEMPLATE_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // With add_bos=0, post_processor is skipped → just raw tokens, no EOS.
+    let tokens = ctx.encode_with("Hi", &opts);
+    assert_eq!(
+        tokens, vec![4, 5],
+        "add_bos=0 must skip post_processor (no EOS), got: {tokens:?}"
+    );
+}

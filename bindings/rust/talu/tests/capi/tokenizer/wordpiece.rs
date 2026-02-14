@@ -259,6 +259,53 @@ const BERT_POSTPROC_JSON: &str = r####"{
   "decoder": {"type": "WordPiece", "prefix": "##", "cleanup": true}
 }"####;
 
+// ---------------------------------------------------------------------------
+// BertNormalizer: lowercasing before WordPiece lookup
+// ---------------------------------------------------------------------------
+//
+// BERT-uncased models use a BertNormalizer with lowercase=true. The normalizer
+// must convert input to lowercase before WordPiece lookup so that "Hello"
+// matches the lowercase vocab entry "hello". Without lowercasing, WordPiece
+// can't find "Hello" and falls back to character-by-character tokenization.
+// Affects: google-bert/bert-base-uncased (~19 encode, 19 roundtrip failures).
+
+/// Mixed-case "Hello" must be normalized to "hello" before WordPiece lookup.
+#[test]
+fn bert_normalizer_lowercases_before_wordpiece() {
+    let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "Hello" → lowercased "hello" → single token ID 4.
+    // Without normalizer: "Hello" → [H, e, l, l, o] character fallback.
+    let tokens = ctx.encode_with("Hello", &opts);
+    assert_eq!(
+        tokens, vec![4],
+        "BertNormalizer must lowercase 'Hello' → 'hello' (ID 4), got: {tokens:?}"
+    );
+}
+
+/// Multi-word mixed-case input must be lowercased before WordPiece.
+#[test]
+fn bert_normalizer_lowercases_multiword() {
+    let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 0,
+        ..Default::default()
+    };
+    // "Hello, World!" → "hello, world!" → [hello=4, ,=6, world=5, !=7]
+    let tokens = ctx.encode_with("Hello, World!", &opts);
+    assert_eq!(
+        tokens, vec![4, 6, 5, 7],
+        "BertNormalizer must lowercase before WordPiece, got: {tokens:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Encode: WordPiece tokenizer with BertProcessing post_processor
+// ---------------------------------------------------------------------------
+
 /// BertProcessing adds [CLS] and [SEP] to encode output.
 ///
 /// Bug: WordPiece encode with BertProcessing post_processor should
