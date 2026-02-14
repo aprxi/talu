@@ -205,6 +205,15 @@ jobs:
           # Copy wheel back, keep both sdist and wheel
           cp dist/*.whl $GITHUB_WORKSPACE/bindings/python/dist/
 
+          # Copy built library to repo root so library packaging step reuses it
+          SDIST_ZIG_OUT="$(pwd)/vendor/talu/zig-out/lib"
+          mkdir -p $GITHUB_WORKSPACE/zig-out/lib
+          if [ "$(uname)" = "Darwin" ]; then
+            cp "$SDIST_ZIG_OUT/libtalu.dylib" $GITHUB_WORKSPACE/zig-out/lib/
+          else
+            cp "$SDIST_ZIG_OUT/libtalu.so" $GITHUB_WORKSPACE/zig-out/lib/
+          fi
+
           # Verify wheel contains CLI binary in scripts
           echo "Verifying wheel contents..."
           unzip -l $GITHUB_WORKSPACE/bindings/python/dist/*.whl | grep -E "scripts|\.data"
@@ -279,8 +288,8 @@ jobs:
       # Standalone library archive (for talu-sys crate on crates.io)
       - name: Package library for talu-sys
         run: |
-          # Binary release already ran make build; Python release built
-          # inside the sdist, so rebuild at repo root if needed.
+          # Binary release: zig-out/lib exists from make build.
+          # Python release: copied from sdist build in previous step.
           if [ ! -f zig-out/lib/libtalu.so ] && [ ! -f zig-out/lib/libtalu.dylib ]; then
             make build
           fi
@@ -292,7 +301,14 @@ jobs:
             LIB_NAME="libtalu.so"
           fi
 
-          strip zig-out/lib/$LIB_NAME
+          # macOS strip needs -x: full strip fails on dylibs that import
+          # framework symbols (Metal, CoreFoundation, Accelerate) via
+          # indirect symbol table entries. -x strips local symbols only.
+          if [ "$(uname)" = "Darwin" ]; then
+            strip -x zig-out/lib/$LIB_NAME
+          else
+            strip zig-out/lib/$LIB_NAME
+          fi
           tar -czf lib-artifacts/libtalu-${{ matrix.rust_target }}.tar.gz \
             -C zig-out/lib $LIB_NAME
           shasum -a 256 lib-artifacts/libtalu-${{ matrix.rust_target }}.tar.gz \
