@@ -8,6 +8,7 @@ const kvbuf = @import("../../../io/kvbuf/root.zig");
 const db_writer = @import("../../writer.zig");
 const db_reader = @import("../../reader.zig");
 const block_reader = @import("../../block_reader.zig");
+const db_blob_store = @import("../../blob/store.zig");
 const types = @import("../../types.zig");
 const responses = @import("../../../responses/root.zig");
 
@@ -75,6 +76,10 @@ const schema_deletes: u16 = 2;
 const schema_sessions: u16 = 4;
 const schema_sessions_kvbuf: u16 = 5;
 const schema_embeddings: u16 = 10;
+const default_item_json_externalize_threshold_bytes: usize = 1 * 1024 * 1024;
+const record_json_trigram_bloom_bytes: usize = 64;
+const env_item_json_externalize_threshold_bytes = "TALU_DB_ITEM_JSON_EXTERNALIZE_THRESHOLD_BYTES";
+const env_shared_externalize_threshold_bytes = "TALU_DB_EXTERNALIZE_THRESHOLD_BYTES";
 
 /// Check if a schema ID is a session schema (4 or 5).
 fn isSessionSchema(schema_id: u16) bool {
@@ -91,6 +96,54 @@ const col_created_ts: u32 = 8;
 const col_ttl_ts: u32 = 9;
 const col_payload: u32 = 20;
 
+fn resolveItemJsonExternalizeThresholdBytes() usize {
+    if (readThresholdBytesFromEnvVar(env_item_json_externalize_threshold_bytes)) |threshold| return threshold;
+    if (readThresholdBytesFromEnvVar(env_shared_externalize_threshold_bytes)) |threshold| return threshold;
+    return default_item_json_externalize_threshold_bytes;
+}
+
+fn readThresholdBytesFromEnvVar(env_name: []const u8) ?usize {
+    const env_ptr = std.posix.getenv(env_name) orelse return null;
+    return parseThresholdBytes(std.mem.sliceTo(env_ptr, 0));
+}
+
+fn parseThresholdBytes(raw_value: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw_value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseUnsigned(usize, trimmed, 10) catch null;
+}
+
+fn buildRecordJsonTrigramBloom(text: []const u8) [record_json_trigram_bloom_bytes]u8 {
+    var bloom = std.mem.zeroes([record_json_trigram_bloom_bytes]u8);
+    if (text.len < 3) return bloom;
+
+    var i: usize = 0;
+    while (i + 2 < text.len) : (i += 1) {
+        const t0 = std.ascii.toLower(text[i]);
+        const t1 = std.ascii.toLower(text[i + 1]);
+        const t2 = std.ascii.toLower(text[i + 2]);
+        const h1, const h2 = trigramHashes(t0, t1, t2);
+        setBloomBit(&bloom, h1);
+        setBloomBit(&bloom, h2);
+    }
+
+    return bloom;
+}
+
+fn trigramHashes(t0: u8, t1: u8, t2: u8) struct { usize, usize } {
+    const trigram = [_]u8{ t0, t1, t2 };
+    const bit_count = record_json_trigram_bloom_bytes * 8;
+    const h1: usize = @intCast(std.hash.Wyhash.hash(0, &trigram) % bit_count);
+    const h2: usize = @intCast(std.hash.Wyhash.hash(0x9e3779b97f4a7c15, &trigram) % bit_count);
+    return .{ h1, h2 };
+}
+
+fn setBloomBit(bloom: *[record_json_trigram_bloom_bytes]u8, bit_idx: usize) void {
+    const byte_idx = bit_idx / 8;
+    const bit_mask: u8 = @as(u8, 1) << @as(u3, @intCast(bit_idx % 8));
+    bloom[byte_idx] |= bit_mask;
+}
+
 // ============================================================================
 // TableAdapter
 // ============================================================================
@@ -104,6 +157,8 @@ pub const TableAdapter = struct {
     fs_reader: *db_reader.Reader,
     session_id: []const u8,
     session_hash: u64,
+    blob_store: db_blob_store.BlobStore,
+    item_json_externalize_threshold_bytes: usize,
 
     /// Initialize a TaluDB-backed table adapter with write capabilities.
     /// Acquires a lock; returns error.LockUnavailable if another process holds the lock.
@@ -121,12 +176,17 @@ pub const TableAdapter = struct {
         reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "chat");
         errdefer reader_ptr.deinit();
 
+        var blob_store = try db_blob_store.BlobStore.init(allocator, db_root);
+        errdefer blob_store.deinit();
+
         return .{
             .allocator = allocator,
             .fs_writer = writer_ptr,
             .fs_reader = reader_ptr,
             .session_id = session_copy,
             .session_hash = computeSessionHash(session_id),
+            .blob_store = blob_store,
+            .item_json_externalize_threshold_bytes = resolveItemJsonExternalizeThresholdBytes(),
         };
     }
 
@@ -138,12 +198,17 @@ pub const TableAdapter = struct {
         errdefer alloc.destroy(reader_ptr);
         reader_ptr.* = try db_reader.Reader.open(alloc, db_root, "chat");
 
+        var blob_store = try db_blob_store.BlobStore.init(alloc, db_root);
+        errdefer blob_store.deinit();
+
         return .{
             .allocator = alloc,
             .fs_writer = undefined, // Not used for read-only operations
             .fs_reader = reader_ptr,
             .session_id = "",
             .session_hash = 0,
+            .blob_store = blob_store,
+            .item_json_externalize_threshold_bytes = resolveItemJsonExternalizeThresholdBytes(),
         };
     }
 
@@ -186,6 +251,7 @@ pub const TableAdapter = struct {
     pub fn deinitReadOnly(self: *TableAdapter) void {
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.blob_store.deinit();
     }
 
     /// Get a StorageBackend interface for this adapter.
@@ -297,6 +363,7 @@ pub const TableAdapter = struct {
         self.allocator.destroy(self.fs_writer);
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.blob_store.deinit();
         self.allocator.free(self.session_id);
     }
 
@@ -310,6 +377,7 @@ pub const TableAdapter = struct {
         self.allocator.destroy(self.fs_writer);
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.blob_store.deinit();
         self.allocator.free(self.session_id);
     }
 
@@ -320,7 +388,33 @@ pub const TableAdapter = struct {
     fn writeItem(self: *TableAdapter, record: ItemRecord) !void {
         try self.ensureSchema(schema_items);
 
-        const payload = try responses.serializeItemRecordToKvBuf(self.allocator, record, self.session_id);
+        const record_json_z = try responses.serializeItemRecordToJsonZ(self.allocator, record);
+        defer self.allocator.free(record_json_z);
+        const record_json = std.mem.sliceTo(record_json_z, 0);
+
+        var record_json_inline: ?[]const u8 = record_json;
+        var record_json_ref: ?[]const u8 = null;
+        var record_json_ref_buf: [db_blob_store.ref_len]u8 = undefined;
+        var record_json_trigram_bloom: ?[]const u8 = null;
+        var record_json_trigram_bloom_buf: [record_json_trigram_bloom_bytes]u8 = undefined;
+
+        if (record_json.len > self.item_json_externalize_threshold_bytes) {
+            const blob_ref = try self.blob_store.put(record_json);
+            record_json_ref_buf = blob_ref.ref;
+            record_json_trigram_bloom_buf = buildRecordJsonTrigramBloom(record_json);
+            record_json_inline = null;
+            record_json_ref = record_json_ref_buf[0..];
+            record_json_trigram_bloom = record_json_trigram_bloom_buf[0..];
+        }
+
+        const payload = try responses.serializeItemRecordToKvBufWithStorage(
+            self.allocator,
+            record,
+            self.session_id,
+            record_json_inline,
+            record_json_ref,
+            record_json_trigram_bloom,
+        );
         defer self.allocator.free(payload);
 
         var item_id_value = record.item_id;
@@ -456,7 +550,7 @@ pub const TableAdapter = struct {
         alloc: Allocator,
         params: ScanParams,
     ) ![]ScannedSessionRecord {
-        return scan.scanSessionsFiltered(self.fs_reader, alloc, params);
+        return scan.scanSessionsFiltered(self.fs_reader, &self.blob_store, alloc, params);
     }
 
     pub fn collectContentMatchHashes(
@@ -464,7 +558,7 @@ pub const TableAdapter = struct {
         alloc: Allocator,
         query: []const u8,
     ) !std.AutoHashMap(u64, []const u8) {
-        return scan.collectContentMatchHashes(self.fs_reader, alloc, query);
+        return scan.collectContentMatchHashes(self.fs_reader, &self.blob_store, alloc, query);
     }
 
     // ========================================================================
@@ -636,8 +730,15 @@ pub const TableAdapter = struct {
             return null;
         }
 
-        const record_json = reader.get(kvbuf.FieldIds.record_json) orelse return error.InvalidPayload;
-        return self.parseRecordJson(allocator, record_json, item_id, created_at_ms);
+        if (reader.get(kvbuf.FieldIds.record_json)) |record_json| {
+            return self.parseRecordJson(allocator, record_json, item_id, created_at_ms);
+        }
+        if (reader.get(kvbuf.FieldIds.record_json_ref)) |record_json_ref| {
+            const loaded_json = try self.blob_store.readAll(record_json_ref, allocator);
+            defer allocator.free(loaded_json);
+            return self.parseRecordJson(allocator, loaded_json, item_id, created_at_ms);
+        }
+        return error.InvalidPayload;
     }
 
     /// Decode a legacy JSON-encoded payload (backward compatibility).
@@ -934,6 +1035,19 @@ test "TableAdapter.backend returns StorageBackend" {
     storage.deinit();
 }
 
+test "parseThresholdBytes parses valid decimal thresholds" {
+    try std.testing.expectEqual(@as(?usize, 0), parseThresholdBytes("0"));
+    try std.testing.expectEqual(@as(?usize, 1048576), parseThresholdBytes("1048576"));
+    try std.testing.expectEqual(@as(?usize, 64), parseThresholdBytes(" 64 "));
+}
+
+test "parseThresholdBytes rejects invalid threshold values" {
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes(""));
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes(" "));
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes("abc"));
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes("-1"));
+}
+
 test "TableAdapter.onEvent writes wal" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1051,6 +1165,83 @@ test "TableAdapter.loadAll returns records" {
     try std.testing.expectEqual(@as(usize, 1), records.len);
     try std.testing.expectEqual(@as(u64, 9), records[0].item_id);
     try std.testing.expectEqual(@as(i64, 500), records[0].created_at_ms);
+}
+
+test "TableAdapter externalizes large item record_json and loadAll resolves it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    const long_text = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    {
+        var be = try TableAdapter.init(std.testing.allocator, root_path, "session-large-json");
+        defer be.backend().deinit();
+        be.item_json_externalize_threshold_bytes = 64;
+
+        var content = [_]responses.backend.ItemContentPartRecord{
+            .{ .input_text = .{ .text = long_text } },
+        };
+        const record = ItemRecord{
+            .item_id = 22,
+            .created_at_ms = 777,
+            .item_type = .message,
+            .variant = .{ .message = .{ .role = .user, .status = .completed, .content = &content } },
+        };
+        try be.backend().onEvent(&StorageEvent{ .PutItem = record });
+        try be.fs_writer.flushBlock();
+    }
+
+    // Verify stored row uses record_json_ref rather than inline record_json.
+    {
+        var ro = try TableAdapter.initReadOnly(std.testing.allocator, root_path);
+        defer ro.deinitReadOnly();
+
+        const blocks = try ro.fs_reader.getBlocks(std.testing.allocator);
+        defer std.testing.allocator.free(blocks);
+
+        var found_items_block = false;
+        for (blocks) |block| {
+            var file = ro.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            defer file.close();
+
+            const reader = block_reader.BlockReader.init(file, std.testing.allocator);
+            const header = reader.readHeader(block.offset) catch continue;
+            if (header.schema_id != schema_items or header.row_count == 0) continue;
+            found_items_block = true;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer std.testing.allocator.free(descs);
+            const payload_desc = findColumn(descs, col_payload) orelse return error.TestUnexpectedResult;
+
+            var payloads = try readVarBytesBuffers(file, block.offset, payload_desc, header.row_count, std.testing.allocator);
+            defer payloads.deinit(std.testing.allocator);
+
+            const payload = try payloads.sliceForRow(0);
+            const kv_reader = try kvbuf.KvBufReader.init(payload);
+            try std.testing.expect(kv_reader.get(kvbuf.FieldIds.record_json) == null);
+            const ref_value = kv_reader.get(kvbuf.FieldIds.record_json_ref) orelse return error.TestUnexpectedResult;
+            try std.testing.expect(std.mem.startsWith(u8, ref_value, "sha256:"));
+            const bloom = kv_reader.get(kvbuf.FieldIds.record_json_trigram_bloom) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(@as(usize, record_json_trigram_bloom_bytes), bloom.len);
+            break;
+        }
+        try std.testing.expect(found_items_block);
+    }
+
+    // Verify loadAll decodes the externalized JSON transparently.
+    {
+        var be2 = try TableAdapter.init(std.testing.allocator, root_path, "session-large-json");
+        const records = try be2.backend().loadAll(std.testing.allocator);
+        defer responses.backend.freeItemRecords(std.testing.allocator, records);
+        be2.backend().deinit();
+
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+        try std.testing.expectEqual(@as(u64, 22), records[0].item_id);
+        try std.testing.expectEqual(@as(i64, 777), records[0].created_at_ms);
+    }
 }
 
 test "TableAdapter.scanSessions returns written sessions" {

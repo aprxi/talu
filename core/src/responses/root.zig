@@ -96,6 +96,7 @@ pub const extractRole = storage_serializer.extractRole;
 // Record serialization (for ItemRecord - portable snapshots)
 pub const serializeItemRecordToJsonZ = record_serializer.serializeItemRecordToJsonZ;
 pub const serializeItemRecordToKvBuf = record_serializer.serializeItemRecordToKvBuf;
+pub const serializeItemRecordToKvBufWithStorage = record_serializer.serializeItemRecordToKvBufWithStorage;
 pub const extractRoleFromRecord = record_serializer.extractRoleFromRecord;
 
 // Record parsing (JSON → ItemRecord)
@@ -106,7 +107,6 @@ pub const itemStatusFromU8 = record_parser.itemStatusFromU8;
 // Re-export chat types (canonical location)
 pub const Chat = chat.Chat;
 pub const ResolutionConfig = chat.ResolutionConfig;
-
 
 /// Storage type enum for C API.
 /// Used by talu_chat_set_storage() to select backend.

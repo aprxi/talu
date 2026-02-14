@@ -44,10 +44,12 @@ pub fn serializeItemRecordToJsonZ(allocator: std.mem.Allocator, record: ItemReco
 
 /// Serialize an ItemRecord to a KvBuf binary blob for storage.
 ///
-/// The blob contains three fields:
+/// The blob contains storage/search fields:
 ///   - FieldIds.session_id: The session_id string.
 ///   - FieldIds.record_json: The full record JSON (same as serializeItemRecordToJsonZ output).
 ///   - FieldIds.content_text: Pre-extracted plain text from all content parts (for search).
+///   - FieldIds.record_json_ref: Optional external ref for large record JSON payloads.
+///   - FieldIds.record_json_trigram_bloom: Optional trigram bloom for external ref prefiltering.
 ///
 /// The content_text field enables zero-copy substring search without JSON parsing.
 /// Caller owns returned memory.
@@ -56,17 +58,44 @@ pub fn serializeItemRecordToKvBuf(
     record: ItemRecord,
     session_id: []const u8,
 ) ![]u8 {
+    const record_json_z = try serializeItemRecordToJsonZ(allocator, record);
+    defer allocator.free(record_json_z);
+    const record_json = std.mem.sliceTo(record_json_z, 0);
+    return serializeItemRecordToKvBufWithStorage(allocator, record, session_id, record_json, null, null);
+}
+
+/// Serialize an ItemRecord to KvBuf with either inline or externalized JSON.
+///
+/// Exactly one of `record_json_inline` or `record_json_ref` must be non-null.
+/// `record_json_ref` should contain a stable blob reference string (for example:
+/// `sha256:<hex>`), while `content_text` remains inline for search.
+pub fn serializeItemRecordToKvBufWithStorage(
+    allocator: std.mem.Allocator,
+    record: ItemRecord,
+    session_id: []const u8,
+    record_json_inline: ?[]const u8,
+    record_json_ref: ?[]const u8,
+    record_json_trigram_bloom: ?[]const u8,
+) ![]u8 {
+    if (record_json_inline == null and record_json_ref == null) return error.InvalidRecordStorage;
+    if (record_json_ref == null and record_json_trigram_bloom != null) return error.InvalidRecordStorage;
+
     var w = kvbuf.KvBufWriter.init();
     errdefer w.deinit(allocator);
 
     // Field 1: session_id
     try w.addString(allocator, kvbuf.FieldIds.session_id, session_id);
 
-    // Field 2: record JSON
-    const record_json_z = try serializeItemRecordToJsonZ(allocator, record);
-    defer allocator.free(record_json_z);
-    const record_json = std.mem.sliceTo(record_json_z, 0);
-    try w.addString(allocator, kvbuf.FieldIds.record_json, record_json);
+    // Field 2/4: record JSON (inline or external ref)
+    if (record_json_inline) |record_json| {
+        try w.addString(allocator, kvbuf.FieldIds.record_json, record_json);
+    }
+    if (record_json_ref) |record_json_ref_slice| {
+        try w.addString(allocator, kvbuf.FieldIds.record_json_ref, record_json_ref_slice);
+        if (record_json_trigram_bloom) |bloom| {
+            try w.addBytes(allocator, kvbuf.FieldIds.record_json_trigram_bloom, bloom);
+        }
+    }
 
     // Field 3: content_text (pre-extracted for search)
     const content_text = extractContentText(allocator, record);
@@ -486,6 +515,84 @@ test "serializeItemRecordToKvBuf - function_call has no content_text" {
     // function_call arguments "{}" is extracted as content_text
     const ctext = reader.get(kvbuf.FieldIds.content_text);
     try std.testing.expect(ctext != null);
+}
+
+test "serializeItemRecordToKvBufWithStorage stores record_json_ref when provided" {
+    const allocator = std.testing.allocator;
+
+    var content = [_]ItemContentPartRecord{
+        .{ .input_text = .{ .text = "Hello ref path" } },
+    };
+
+    const record = ItemRecord{
+        .item_id = 77,
+        .item_type = .message,
+        .created_at_ms = 42,
+        .variant = .{
+            .message = .{
+                .role = .user,
+                .status = .completed,
+                .content = &content,
+            },
+        },
+    };
+
+    const blob = try serializeItemRecordToKvBufWithStorage(
+        allocator,
+        record,
+        "ref-session",
+        null,
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        null,
+    );
+    defer allocator.free(blob);
+
+    const reader = try kvbuf.KvBufReader.init(blob);
+    try std.testing.expect(reader.get(kvbuf.FieldIds.record_json) == null);
+    const ref_value = reader.get(kvbuf.FieldIds.record_json_ref) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.startsWith(u8, ref_value, "sha256:"));
+    const ctext = reader.get(kvbuf.FieldIds.content_text) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("Hello ref path", ctext);
+}
+
+test "serializeItemRecordToKvBufWithStorage stores record_json_trigram_bloom when provided" {
+    const allocator = std.testing.allocator;
+
+    var content = [_]ItemContentPartRecord{
+        .{ .input_text = .{ .text = "Hello bloom path" } },
+    };
+
+    const record = ItemRecord{
+        .item_id = 78,
+        .item_type = .message,
+        .created_at_ms = 42,
+        .variant = .{
+            .message = .{
+                .role = .user,
+                .status = .completed,
+                .content = &content,
+            },
+        },
+    };
+
+    var bloom: [64]u8 = undefined;
+    @memset(bloom[0..], 0);
+    bloom[0] = 0x81;
+
+    const blob = try serializeItemRecordToKvBufWithStorage(
+        allocator,
+        record,
+        "ref-session",
+        null,
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        bloom[0..],
+    );
+    defer allocator.free(blob);
+
+    const reader = try kvbuf.KvBufReader.init(blob);
+    const stored = reader.get(kvbuf.FieldIds.record_json_trigram_bloom) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 64), stored.len);
+    try std.testing.expectEqual(@as(u8, 0x81), stored[0]);
 }
 
 test "extractContentText - message with multiple content parts" {

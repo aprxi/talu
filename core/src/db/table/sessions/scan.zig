@@ -6,6 +6,7 @@
 const std = @import("std");
 const kvbuf = @import("../../../io/kvbuf/root.zig");
 const db_reader = @import("../../reader.zig");
+const db_blob_store = @import("../../blob/store.zig");
 const block_reader = @import("../../block_reader.zig");
 const types = @import("../../types.zig");
 const parallel = @import("../../../compute/parallel.zig");
@@ -20,6 +21,7 @@ const ScannedSessionRecord = codec.ScannedSessionRecord;
 const schema_items: u16 = 3;
 const schema_sessions: u16 = 4;
 const schema_sessions_kvbuf: u16 = 5;
+const record_json_trigram_bloom_bytes: usize = 64;
 
 const col_session_hash: u32 = 3;
 const col_ts: u32 = 2;
@@ -120,6 +122,7 @@ pub const ScanParams = struct {
 /// non-deleted version of each session. Standalone version (no self).
 pub fn scanSessionsFiltered(
     fs_reader: *db_reader.Reader,
+    blob_store_opt: ?*db_blob_store.BlobStore,
     alloc: Allocator,
     params: ScanParams,
 ) ![]ScannedSessionRecord {
@@ -133,7 +136,7 @@ pub fn scanSessionsFiltered(
 
     if (params.search_query) |query| {
         if (query.len > 0) {
-            content_hashes = try collectContentMatchHashes(fs_reader, alloc, query);
+            content_hashes = try collectContentMatchHashes(fs_reader, blob_store_opt, alloc, query);
         }
     }
 
@@ -489,6 +492,7 @@ const ParallelScanCtx = struct {
     opened_files: []std.fs.File,
     work_items: []const BlockWork,
     query: []const u8,
+    blob_store_opt: ?*db_blob_store.BlobStore,
     maps: []std.AutoHashMap(u64, []const u8),
     alloc: Allocator,
 };
@@ -506,6 +510,7 @@ fn parallelScanWorker(start: usize, end: usize, ctx: *ParallelScanCtx) void {
             work.block_offset,
             ctx.alloc,
             ctx.query,
+            ctx.blob_store_opt,
             &ctx.maps[i],
         ) catch continue;
     }
@@ -526,6 +531,7 @@ fn scanItemBlockForContent(
     block_offset: u64,
     alloc: Allocator,
     query: []const u8,
+    blob_store_opt: ?*db_blob_store.BlobStore,
     matches: *std.AutoHashMap(u64, []const u8),
 ) !void {
     const header = try reader.readHeader(block_offset);
@@ -554,9 +560,40 @@ fn scanItemBlockForContent(
         if (kvbuf.isKvBuf(payload)) {
             // KvBuf path: zero-copy field access — scan only content bytes.
             const kvbuf_reader = kvbuf.KvBufReader.init(payload) catch continue;
-            const content_text = kvbuf_reader.get(kvbuf.FieldIds.content_text) orelse continue;
-            if (try search.extractSnippet(content_text, query, alloc)) |snippet| {
-                try matches.put(hash, snippet);
+            if (kvbuf_reader.get(kvbuf.FieldIds.content_text)) |content_text| {
+                if (try search.extractSnippet(content_text, query, alloc)) |snippet| {
+                    try matches.put(hash, snippet);
+                }
+                continue;
+            }
+            if (kvbuf_reader.get(kvbuf.FieldIds.record_json)) |record_json| {
+                if (search.textFindInsensitive(record_json, query) == null) continue;
+                const clean_text = try search.extractTextFromPayload(record_json, alloc);
+                defer if (clean_text) |t| alloc.free(t);
+                if (clean_text) |text| {
+                    if (try search.extractSnippet(text, query, alloc)) |snippet| {
+                        try matches.put(hash, snippet);
+                    }
+                }
+                continue;
+            }
+            if (kvbuf_reader.get(kvbuf.FieldIds.record_json_ref)) |record_json_ref| {
+                const blob_store = blob_store_opt orelse continue;
+                const trigram_bloom = kvbuf_reader.get(kvbuf.FieldIds.record_json_trigram_bloom);
+                if (!mayContainSubstringByTrigramBloom(trigram_bloom, query)) continue;
+
+                const loaded_json_opt = try readBlobForSearch(blob_store, record_json_ref, alloc);
+                const loaded_json = loaded_json_opt orelse continue;
+                defer alloc.free(loaded_json);
+                if (search.textFindInsensitive(loaded_json, query) == null) continue;
+
+                const clean_text = try search.extractTextFromPayload(loaded_json, alloc);
+                defer if (clean_text) |t| alloc.free(t);
+                if (clean_text) |text| {
+                    if (try search.extractSnippet(text, query, alloc)) |snippet| {
+                        try matches.put(hash, snippet);
+                    }
+                }
             }
         } else {
             // Legacy JSON path: raw substring pre-filter + JSON text extraction.
@@ -574,11 +611,55 @@ fn scanItemBlockForContent(
     }
 }
 
+fn mayContainSubstringByTrigramBloom(bloom_opt: ?[]const u8, query: []const u8) bool {
+    if (query.len < 3) return true;
+    const bloom = bloom_opt orelse return true;
+    if (bloom.len != record_json_trigram_bloom_bytes) return true;
+
+    var i: usize = 0;
+    while (i + 2 < query.len) : (i += 1) {
+        const t0 = std.ascii.toLower(query[i]);
+        const t1 = std.ascii.toLower(query[i + 1]);
+        const t2 = std.ascii.toLower(query[i + 2]);
+        const h1, const h2 = trigramHashes(t0, t1, t2);
+        if (!isBloomBitSet(bloom, h1) or !isBloomBitSet(bloom, h2)) return false;
+    }
+    return true;
+}
+
+fn readBlobForSearch(
+    blob_store: *db_blob_store.BlobStore,
+    blob_ref: []const u8,
+    alloc: Allocator,
+) !?[]u8 {
+    return blob_store.readAll(blob_ref, alloc) catch |err| switch (err) {
+        // Search should stay best-effort for missing/corrupt refs.
+        error.FileNotFound, error.InvalidBlobRef => null,
+        // Unexpected failures (for example, OOM) should not be hidden.
+        else => return err,
+    };
+}
+
+fn trigramHashes(t0: u8, t1: u8, t2: u8) struct { usize, usize } {
+    const trigram = [_]u8{ t0, t1, t2 };
+    const bit_count = record_json_trigram_bloom_bytes * 8;
+    const h1: usize = @intCast(std.hash.Wyhash.hash(0, &trigram) % bit_count);
+    const h2: usize = @intCast(std.hash.Wyhash.hash(0x9e3779b97f4a7c15, &trigram) % bit_count);
+    return .{ h1, h2 };
+}
+
+fn isBloomBitSet(bloom: []const u8, bit_idx: usize) bool {
+    const byte_idx = bit_idx / 8;
+    const bit_mask: u8 = @as(u8, 1) << @as(u3, @intCast(bit_idx % 8));
+    return (bloom[byte_idx] & bit_mask) != 0;
+}
+
 /// Scan all item blocks and collect session_hash values where any item's
 /// raw payload contains the search query (case-insensitive).
 /// Standalone version (no self).
 pub fn collectContentMatchHashes(
     fs_reader: *db_reader.Reader,
+    blob_store_opt: ?*db_blob_store.BlobStore,
     alloc: Allocator,
     query: []const u8,
 ) !std.AutoHashMap(u64, []const u8) {
@@ -664,6 +745,7 @@ pub fn collectContentMatchHashes(
         .opened_files = opened_files.items,
         .work_items = work_items.items,
         .query = query,
+        .blob_store_opt = blob_store_opt,
         .maps = maps,
         .alloc = alloc,
     };

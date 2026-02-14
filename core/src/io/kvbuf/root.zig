@@ -26,6 +26,10 @@ pub const FieldIds = struct {
     pub const record_json: u16 = 2;
     /// Concatenated plain text from all content parts (for search).
     pub const content_text: u16 = 3;
+    /// External blob reference for large record_json payloads (`sha256:<hex>`).
+    pub const record_json_ref: u16 = 4;
+    /// Optional trigram bloom (bytes) for externalized record_json prefiltering.
+    pub const record_json_trigram_bloom: u16 = 5;
 };
 
 /// Stable field IDs for SessionRecord KvBuf encoding (Schema 5).
@@ -115,6 +119,10 @@ pub const DocumentFieldIds = struct {
     pub const version_type: u16 = 12;
     /// Base document ID for delta versions.
     pub const base_doc_id: u16 = 13;
+    /// External blob reference for large doc_json payloads (`sha256:<hex>`).
+    pub const doc_json_ref: u16 = 14;
+    /// Optional trigram bloom (bytes) for externalized doc_json prefiltering.
+    pub const doc_json_trigram_bloom: u16 = 15;
 };
 
 /// Stable field IDs for DocumentTag junction KvBuf encoding (Schema 13).
@@ -181,4 +189,13 @@ test "FieldIds are stable" {
     try std.testing.expectEqual(@as(u16, 1), FieldIds.session_id);
     try std.testing.expectEqual(@as(u16, 2), FieldIds.record_json);
     try std.testing.expectEqual(@as(u16, 3), FieldIds.content_text);
+    try std.testing.expectEqual(@as(u16, 4), FieldIds.record_json_ref);
+    try std.testing.expectEqual(@as(u16, 5), FieldIds.record_json_trigram_bloom);
+}
+
+test "DocumentFieldIds include doc_json_ref" {
+    try std.testing.expectEqual(@as(u16, 5), DocumentFieldIds.doc_json);
+    try std.testing.expectEqual(@as(u16, 13), DocumentFieldIds.base_doc_id);
+    try std.testing.expectEqual(@as(u16, 14), DocumentFieldIds.doc_json_ref);
+    try std.testing.expectEqual(@as(u16, 15), DocumentFieldIds.doc_json_trigram_bloom);
 }

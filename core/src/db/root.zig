@@ -14,6 +14,7 @@
 //! - `writer` - Namespace write path (WAL + in-memory buffer + block flush)
 //! - `reader` - Namespace read path (manifest + current file)
 //! - `manifest` - Sealed segment index (JSON)
+//! - `blob` - Blob subsystem (content-addressable store + offline GC)
 //! - `vector` - Vector search domain (storage, search, indexing)
 //! - `table` - Table storage domain (chat, future structured storage)
 
@@ -48,6 +49,9 @@ pub const writer = @import("writer.zig");
 /// Sealed segment manifest.
 pub const manifest = @import("manifest.zig");
 
+/// Blob subsystem (content-addressable store + offline GC).
+pub const blob = @import("blob/root.zig");
+
 /// Namespace read path (manifest + current file).
 pub const reader = @import("reader.zig");
 
@@ -65,6 +69,10 @@ pub const WalIterator = wal.WalIterator;
 pub const Writer = writer.Writer;
 pub const Durability = writer.Durability;
 pub const Manifest = manifest.Manifest;
+pub const BlobStore = blob.BlobStore;
+pub const BlobRef = blob.BlobRef;
+pub const BlobSweepStats = blob.SweepStats;
+pub const BlobSweepOptions = blob.SweepOptions;
 pub const Reader = reader.Reader;
 pub const TableAdapter = table.sessions.TableAdapter;
 pub const VectorAdapter = vector.store.VectorAdapter;

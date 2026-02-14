@@ -14,6 +14,7 @@ const kvbuf = @import("../../io/kvbuf/root.zig");
 const db_writer = @import("../writer.zig");
 const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
+const db_blob_store = @import("../blob/store.zig");
 const types = @import("../types.zig");
 const parallel = @import("../../compute/parallel.zig");
 
@@ -23,6 +24,10 @@ const DocumentFieldIds = kvbuf.DocumentFieldIds;
 
 const schema_documents: u16 = 11;
 const schema_document_deletes: u16 = 12;
+const default_doc_json_externalize_threshold_bytes: usize = 1 * 1024 * 1024;
+const env_doc_json_externalize_threshold_bytes = "TALU_DB_DOC_JSON_EXTERNALIZE_THRESHOLD_BYTES";
+const env_shared_externalize_threshold_bytes = "TALU_DB_EXTERNALIZE_THRESHOLD_BYTES";
+const doc_json_trigram_bloom_bytes: usize = 64;
 
 // Column IDs for Documents table (Schema 11)
 const col_doc_hash: u32 = 1;
@@ -95,6 +100,39 @@ pub const DocumentRecord = struct {
     }
 };
 
+/// Lightweight document metadata without loading externalized doc_json content.
+pub const DocumentHeader = struct {
+    doc_id: []const u8,
+    doc_type: []const u8,
+    title: []const u8,
+    tags_text: ?[]const u8 = null,
+    parent_id: ?[]const u8 = null,
+    marker: ?[]const u8 = null,
+    group_id: ?[]const u8 = null,
+    owner_id: ?[]const u8 = null,
+    created_at_ms: i64,
+    updated_at_ms: i64,
+    expires_at_ms: i64 = 0,
+    version_type: ?[]const u8 = null,
+    base_doc_id: ?[]const u8 = null,
+    doc_json_ref: ?[]const u8 = null,
+    has_inline_doc_json: bool = false,
+
+    pub fn deinit(self: *DocumentHeader, allocator: Allocator) void {
+        allocator.free(self.doc_id);
+        allocator.free(self.doc_type);
+        allocator.free(self.title);
+        if (self.tags_text) |t| allocator.free(t);
+        if (self.parent_id) |p| allocator.free(p);
+        if (self.marker) |m| allocator.free(m);
+        if (self.group_id) |g| allocator.free(g);
+        if (self.owner_id) |o| allocator.free(o);
+        if (self.version_type) |v| allocator.free(v);
+        if (self.base_doc_id) |b| allocator.free(b);
+        if (self.doc_json_ref) |r| allocator.free(r);
+    }
+};
+
 /// Search result containing document and matching snippet.
 pub const SearchResult = struct {
     doc_id: []const u8,
@@ -161,7 +199,9 @@ pub const DocumentAdapter = struct {
     allocator: Allocator,
     fs_writer: *db_writer.Writer,
     fs_reader: *db_reader.Reader,
+    blob_store: db_blob_store.BlobStore,
     read_only: bool,
+    doc_json_externalize_threshold_bytes: usize,
 
     /// Initialize a TaluDB-backed document adapter with write capabilities.
     pub fn init(allocator: Allocator, db_root: []const u8) !DocumentAdapter {
@@ -175,11 +215,16 @@ pub const DocumentAdapter = struct {
         reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "docs");
         errdefer reader_ptr.deinit();
 
+        var blob_store = try db_blob_store.BlobStore.init(allocator, db_root);
+        errdefer blob_store.deinit();
+
         return .{
             .allocator = allocator,
             .fs_writer = writer_ptr,
             .fs_reader = reader_ptr,
+            .blob_store = blob_store,
             .read_only = false,
+            .doc_json_externalize_threshold_bytes = resolveDocJsonExternalizeThresholdBytes(),
         };
     }
 
@@ -189,11 +234,16 @@ pub const DocumentAdapter = struct {
         errdefer allocator.destroy(reader_ptr);
         reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "docs");
 
+        var blob_store = try db_blob_store.BlobStore.init(allocator, db_root);
+        errdefer blob_store.deinit();
+
         return .{
             .allocator = allocator,
             .fs_writer = undefined,
             .fs_reader = reader_ptr,
+            .blob_store = blob_store,
             .read_only = true,
+            .doc_json_externalize_threshold_bytes = resolveDocJsonExternalizeThresholdBytes(),
         };
     }
 
@@ -205,11 +255,13 @@ pub const DocumentAdapter = struct {
         }
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.blob_store.deinit();
     }
 
     pub fn deinitReadOnly(self: *DocumentAdapter) void {
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.blob_store.deinit();
     }
 
     // =========================================================================
@@ -218,7 +270,28 @@ pub const DocumentAdapter = struct {
 
     /// Write (create or update) a document record.
     pub fn writeDocument(self: *DocumentAdapter, record: DocumentRecord) !void {
-        const payload = try encodeDocumentRecordKvBuf(self.allocator, record);
+        var doc_json_inline: ?[]const u8 = record.doc_json;
+        var doc_json_ref: ?[]const u8 = null;
+        var doc_json_ref_buf: [db_blob_store.ref_len]u8 = undefined;
+        var doc_json_trigram_bloom: ?[]const u8 = null;
+        var doc_json_trigram_bloom_buf: [doc_json_trigram_bloom_bytes]u8 = undefined;
+
+        if (record.doc_json.len > self.doc_json_externalize_threshold_bytes) {
+            const blob_ref = try self.blob_store.put(record.doc_json);
+            doc_json_ref_buf = blob_ref.ref;
+            doc_json_inline = null;
+            doc_json_ref = doc_json_ref_buf[0..];
+            doc_json_trigram_bloom_buf = buildDocJsonTrigramBloom(record.doc_json);
+            doc_json_trigram_bloom = doc_json_trigram_bloom_buf[0..];
+        }
+
+        const payload = try encodeDocumentRecordKvBufWithStorage(
+            self.allocator,
+            record,
+            doc_json_inline,
+            doc_json_ref,
+            doc_json_trigram_bloom,
+        );
         defer self.allocator.free(payload);
 
         // Compute hashes for scalar columns
@@ -442,7 +515,7 @@ pub const DocumentAdapter = struct {
                 }
 
                 const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeDocumentRecord(allocator, payload) catch continue;
+                const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
                 if (record_opt) |record| {
                     // Check if we already have a newer version
                     if (latest.get(doc_hash)) |existing| {
@@ -551,7 +624,7 @@ pub const DocumentAdapter = struct {
                 }
 
                 const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeDocumentRecord(allocator, payload) catch continue;
+                const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
                 if (record_opt) |record| {
                     if (latest) |*old| old.deinit(allocator);
                     latest = record;
@@ -569,6 +642,101 @@ pub const DocumentAdapter = struct {
         }
 
         return latest;
+    }
+
+    /// Get a single document header by ID without loading externalized doc_json.
+    /// Returns null if document is not found or has expired.
+    pub fn getDocumentHeader(self: *DocumentAdapter, allocator: Allocator, doc_id: []const u8) !?DocumentHeader {
+        const target_hash = computeHash(doc_id);
+        const now_ms = std.time.milliTimestamp();
+
+        var deleted = std.AutoHashMap(u64, i64).init(allocator);
+        defer deleted.deinit();
+        try self.collectDeletedDocuments(allocator, &deleted);
+
+        var latest: ?DocumentHeader = null;
+        var latest_ts: i64 = 0;
+        var latest_expires: i64 = 0;
+
+        const blocks = try self.fs_reader.getBlocks(allocator);
+        defer allocator.free(blocks);
+
+        for (blocks) |block| {
+            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            defer file.close();
+
+            const reader = block_reader.BlockReader.init(file, allocator);
+            const header = reader.readHeader(block.offset) catch continue;
+            if (header.schema_id != schema_documents) continue;
+
+            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
+            defer allocator.free(descs);
+
+            if (header.row_count == 0) continue;
+
+            const hash_desc = findColumn(descs, col_doc_hash) orelse continue;
+            const ts_desc = findColumn(descs, col_ts) orelse continue;
+            const expires_desc = findColumn(descs, col_expires_at);
+            const payload_desc = findColumn(descs, col_payload) orelse continue;
+
+            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
+            defer allocator.free(hash_bytes);
+
+            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
+            defer allocator.free(ts_bytes);
+
+            var expires_bytes: ?[]const u8 = null;
+            defer if (expires_bytes) |eb| allocator.free(eb);
+            if (expires_desc) |ed| {
+                expires_bytes = reader.readColumnData(block.offset, ed, allocator) catch null;
+            }
+
+            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, header.row_count, allocator) catch continue;
+            defer payload_buffers.deinit(allocator);
+
+            for (0..header.row_count) |row_idx| {
+                const row_hash = readU64At(hash_bytes, row_idx) catch continue;
+                if (row_hash != target_hash) continue;
+
+                const ts = readI64At(ts_bytes, row_idx) catch continue;
+
+                if (deleted.get(row_hash)) |del_ts| {
+                    if (del_ts >= ts) continue;
+                }
+                if (ts <= latest_ts) continue;
+
+                var expires_at: i64 = 0;
+                if (expires_bytes) |eb| {
+                    expires_at = readI64At(eb, row_idx) catch 0;
+                }
+
+                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
+                const record_opt = decodeDocumentHeader(allocator, payload) catch continue;
+                if (record_opt) |record| {
+                    if (latest) |*old| old.deinit(allocator);
+                    latest = record;
+                    latest_ts = ts;
+                    latest_expires = expires_at;
+                }
+            }
+        }
+
+        if (latest != null and latest_expires > 0 and latest_expires < now_ms) {
+            var l = latest.?;
+            l.deinit(allocator);
+            return null;
+        }
+
+        if (latest) |*l| {
+            l.expires_at_ms = latest_expires;
+        }
+
+        return latest;
+    }
+
+    /// Load an externalized blob by reference (`sha256:<hex>`).
+    pub fn loadBlob(self: *DocumentAdapter, allocator: Allocator, blob_ref: []const u8) ![]u8 {
+        return self.blob_store.readAll(blob_ref, allocator);
     }
 
     /// Get document version history (all versions linked by parent_id).
@@ -612,7 +780,7 @@ pub const DocumentAdapter = struct {
                 if (parent_hash != target_parent_hash) continue;
 
                 const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeDocumentRecord(allocator, payload) catch continue;
+                const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
                 if (record_opt) |record| {
                     try results.append(allocator, record);
                 }
@@ -1659,6 +1827,7 @@ pub const DocumentAdapter = struct {
             .target_type_hash = target_type_hash,
             .deleted = &deleted,
             .now_ms = now_ms,
+            .blob_store = &self.blob_store,
             .result_lists = result_lists,
             .alloc = allocator,
         };
@@ -1829,6 +1998,7 @@ pub const DocumentAdapter = struct {
             .queries = queries,
             .deleted = &deleted,
             .now_ms = now_ms,
+            .blob_store = &self.blob_store,
             .batch_lists = batch_lists,
             .alloc = allocator,
         };
@@ -1911,6 +2081,7 @@ const ParallelSearchCtx = struct {
     target_type_hash: ?u64,
     deleted: *std.AutoHashMap(u64, i64),
     now_ms: i64,
+    blob_store: *db_blob_store.BlobStore,
     result_lists: []std.ArrayList(SearchMatch),
     alloc: Allocator,
 };
@@ -1928,6 +2099,7 @@ fn parallelSearchWorker(start: usize, end: usize, ctx: *ParallelSearchCtx) void 
             ctx.target_type_hash,
             ctx.deleted,
             ctx.now_ms,
+            ctx.blob_store,
             &ctx.result_lists[i],
         ) catch continue;
     }
@@ -1942,6 +2114,7 @@ fn scanBlockForMatches(
     target_type_hash: ?u64,
     deleted: *std.AutoHashMap(u64, i64),
     now_ms: i64,
+    blob_store: *db_blob_store.BlobStore,
     results: *std.ArrayList(SearchMatch),
 ) !void {
     const reader = block_reader.BlockReader.init(file, alloc);
@@ -2032,6 +2205,17 @@ fn scanBlockForMatches(
                 if (textFindInsensitive(json, query) != null) {
                     snippet = try extractSnippet(json, query, alloc);
                 }
+            } else if (kv_reader.get(DocumentFieldIds.doc_json_ref)) |doc_json_ref| {
+                const trigram_bloom = kv_reader.get(DocumentFieldIds.doc_json_trigram_bloom);
+                if (mayContainSubstringByTrigramBloom(trigram_bloom, query)) {
+                    const loaded_json_opt = try readBlobForSearch(blob_store, doc_json_ref, alloc);
+                    defer if (loaded_json_opt) |blob| alloc.free(blob);
+                    if (loaded_json_opt) |json| {
+                        if (textFindInsensitive(json, query) != null) {
+                            snippet = try extractSnippet(json, query, alloc);
+                        }
+                    }
+                }
             }
         }
 
@@ -2068,6 +2252,7 @@ const ParallelBatchSearchCtx = struct {
     queries: []const BatchQuery,
     deleted: *std.AutoHashMap(u64, i64),
     now_ms: i64,
+    blob_store: *db_blob_store.BlobStore,
     batch_lists: [][]std.ArrayList(BatchMatch), // [work_idx][query_idx]
     alloc: Allocator,
 };
@@ -2084,6 +2269,7 @@ fn parallelBatchSearchWorker(start: usize, end: usize, ctx: *ParallelBatchSearch
             ctx.queries,
             ctx.deleted,
             ctx.now_ms,
+            ctx.blob_store,
             ctx.batch_lists[i],
         ) catch continue;
     }
@@ -2097,6 +2283,7 @@ fn scanBlockForBatchMatches(
     queries: []const BatchQuery,
     deleted: *std.AutoHashMap(u64, i64),
     now_ms: i64,
+    blob_store: *db_blob_store.BlobStore,
     results: []std.ArrayList(BatchMatch), // One list per query
 ) !void {
     const reader = block_reader.BlockReader.init(file, alloc);
@@ -2139,6 +2326,8 @@ fn scanBlockForBatchMatches(
     for (queries, 0..) |q, qi| {
         query_type_hashes[qi] = if (q.doc_type) |t| computeHash(t) else null;
     }
+    const pending_qi = try alloc.alloc(usize, queries.len);
+    defer alloc.free(pending_qi);
 
     for (0..header.row_count) |row_idx| {
         const doc_hash = readU64At(hash_bytes, row_idx) catch continue;
@@ -2171,7 +2360,16 @@ fn scanBlockForBatchMatches(
         // Get searchable content
         const title = kv_reader.get(DocumentFieldIds.title);
         const tags_text = kv_reader.get(DocumentFieldIds.tags_text);
-        const doc_json = kv_reader.get(DocumentFieldIds.doc_json);
+        const inline_doc_json = kv_reader.get(DocumentFieldIds.doc_json);
+        const doc_json_ref = if (inline_doc_json == null)
+            kv_reader.get(DocumentFieldIds.doc_json_ref)
+        else
+            null;
+        const doc_json_trigram_bloom = kv_reader.get(DocumentFieldIds.doc_json_trigram_bloom);
+        var pending_count: usize = 0;
+
+        var loaded_doc_json: ?[]u8 = null;
+        defer if (loaded_doc_json) |blob| alloc.free(blob);
 
         // Test all queries against this row
         for (queries, 0..) |q, qi| {
@@ -2197,8 +2395,16 @@ fn scanBlockForBatchMatches(
             if (!found and tags_text != null) {
                 if (textFindInsensitive(tags_text.?, q.text) != null) found = true;
             }
-            if (!found and doc_json != null) {
-                if (textFindInsensitive(doc_json.?, q.text) != null) found = true;
+
+            if (!found and inline_doc_json != null) {
+                if (textFindInsensitive(inline_doc_json.?, q.text) != null) found = true;
+            }
+
+            if (!found and inline_doc_json == null and doc_json_ref != null) {
+                if (mayContainSubstringByTrigramBloom(doc_json_trigram_bloom, q.text)) {
+                    pending_qi[pending_count] = qi;
+                    pending_count += 1;
+                }
             }
 
             if (found) {
@@ -2206,6 +2412,20 @@ fn scanBlockForBatchMatches(
                     .doc_hash = doc_hash,
                     .doc_id = try alloc.dupe(u8, doc_id),
                 });
+            }
+        }
+
+        if (pending_count > 0 and doc_json_ref != null) {
+            loaded_doc_json = try readBlobForSearch(blob_store, doc_json_ref.?, alloc);
+            if (loaded_doc_json) |json| {
+                for (pending_qi[0..pending_count]) |qi| {
+                    if (textFindInsensitive(json, queries[qi].text) != null) {
+                        try results[qi].append(alloc, .{
+                            .doc_hash = doc_hash,
+                            .doc_id = try alloc.dupe(u8, doc_id),
+                        });
+                    }
+                }
             }
         }
     }
@@ -2216,6 +2436,18 @@ fn scanBlockForBatchMatches(
 // =============================================================================
 
 fn encodeDocumentRecordKvBuf(allocator: Allocator, record: DocumentRecord) ![]u8 {
+    return encodeDocumentRecordKvBufWithStorage(allocator, record, record.doc_json, null, null);
+}
+
+fn encodeDocumentRecordKvBufWithStorage(
+    allocator: Allocator,
+    record: DocumentRecord,
+    doc_json_inline: ?[]const u8,
+    doc_json_ref: ?[]const u8,
+    doc_json_trigram_bloom: ?[]const u8,
+) ![]u8 {
+    if (doc_json_inline == null and doc_json_ref == null) return error.InvalidPayload;
+
     var w = kvbuf.KvBufWriter.init();
     errdefer w.deinit(allocator);
 
@@ -2223,7 +2455,15 @@ fn encodeDocumentRecordKvBuf(allocator: Allocator, record: DocumentRecord) ![]u8
     try w.addString(allocator, DocumentFieldIds.doc_type, record.doc_type);
     try w.addString(allocator, DocumentFieldIds.title, record.title);
     if (record.tags_text) |t| try w.addString(allocator, DocumentFieldIds.tags_text, t);
-    try w.addString(allocator, DocumentFieldIds.doc_json, record.doc_json);
+    if (doc_json_inline) |doc_json| {
+        try w.addString(allocator, DocumentFieldIds.doc_json, doc_json);
+    }
+    if (doc_json_ref) |ref| {
+        try w.addString(allocator, DocumentFieldIds.doc_json_ref, ref);
+    }
+    if (doc_json_trigram_bloom) |bloom| {
+        try w.addBytes(allocator, DocumentFieldIds.doc_json_trigram_bloom, bloom);
+    }
     if (record.parent_id) |p| try w.addString(allocator, DocumentFieldIds.parent_id, p);
     if (record.marker) |m| try w.addString(allocator, DocumentFieldIds.marker, m);
     if (record.group_id) |g| try w.addString(allocator, DocumentFieldIds.group_id, g);
@@ -2239,6 +2479,14 @@ fn encodeDocumentRecordKvBuf(allocator: Allocator, record: DocumentRecord) ![]u8
 }
 
 fn decodeDocumentRecord(allocator: Allocator, payload: []const u8) !?DocumentRecord {
+    return decodeDocumentRecordWithBlobStore(allocator, payload, null);
+}
+
+fn decodeDocumentRecordWithBlobStore(
+    allocator: Allocator,
+    payload: []const u8,
+    blob_store: ?*db_blob_store.BlobStore,
+) !?DocumentRecord {
     if (!kvbuf.isKvBuf(payload)) return null;
 
     const reader = kvbuf.KvBufReader.init(payload) catch return null;
@@ -2246,23 +2494,71 @@ fn decodeDocumentRecord(allocator: Allocator, payload: []const u8) !?DocumentRec
     const doc_id = reader.get(DocumentFieldIds.doc_id) orelse return null;
     const doc_type = reader.get(DocumentFieldIds.doc_type) orelse return null;
     const title = reader.get(DocumentFieldIds.title) orelse return null;
-    const doc_json = reader.get(DocumentFieldIds.doc_json) orelse return null;
+    const doc_json = if (reader.get(DocumentFieldIds.doc_json)) |inline_json| blk: {
+        break :blk try allocator.dupe(u8, inline_json);
+    } else blk: {
+        const doc_json_ref = reader.get(DocumentFieldIds.doc_json_ref) orelse return null;
+        const store = blob_store orelse return error.MissingBlobStore;
+        break :blk try store.readAll(doc_json_ref, allocator);
+    };
 
-    return DocumentRecord{
-        .doc_id = try allocator.dupe(u8, doc_id),
-        .doc_type = try allocator.dupe(u8, doc_type),
-        .title = try allocator.dupe(u8, title),
-        .tags_text = if (reader.get(DocumentFieldIds.tags_text)) |t| try allocator.dupe(u8, t) else null,
-        .doc_json = try allocator.dupe(u8, doc_json),
-        .parent_id = if (reader.get(DocumentFieldIds.parent_id)) |p| try allocator.dupe(u8, p) else null,
-        .marker = if (reader.get(DocumentFieldIds.marker)) |m| try allocator.dupe(u8, m) else null,
-        .group_id = if (reader.get(DocumentFieldIds.group_id)) |g| try allocator.dupe(u8, g) else null,
-        .owner_id = if (reader.get(DocumentFieldIds.owner_id)) |o| try allocator.dupe(u8, o) else null,
+    var record = DocumentRecord{
+        .doc_id = "",
+        .doc_type = "",
+        .title = "",
+        .doc_json = "",
         .created_at_ms = reader.getI64(DocumentFieldIds.created_at_ms) orelse 0,
         .updated_at_ms = reader.getI64(DocumentFieldIds.updated_at_ms) orelse 0,
-        .version_type = if (reader.get(DocumentFieldIds.version_type)) |v| try allocator.dupe(u8, v) else null,
-        .base_doc_id = if (reader.get(DocumentFieldIds.base_doc_id)) |b| try allocator.dupe(u8, b) else null,
     };
+    errdefer record.deinit(allocator);
+
+    record.doc_id = try allocator.dupe(u8, doc_id);
+    record.doc_type = try allocator.dupe(u8, doc_type);
+    record.title = try allocator.dupe(u8, title);
+    record.doc_json = doc_json;
+    if (reader.get(DocumentFieldIds.tags_text)) |t| record.tags_text = try allocator.dupe(u8, t);
+    if (reader.get(DocumentFieldIds.parent_id)) |p| record.parent_id = try allocator.dupe(u8, p);
+    if (reader.get(DocumentFieldIds.marker)) |m| record.marker = try allocator.dupe(u8, m);
+    if (reader.get(DocumentFieldIds.group_id)) |g| record.group_id = try allocator.dupe(u8, g);
+    if (reader.get(DocumentFieldIds.owner_id)) |o| record.owner_id = try allocator.dupe(u8, o);
+    if (reader.get(DocumentFieldIds.version_type)) |v| record.version_type = try allocator.dupe(u8, v);
+    if (reader.get(DocumentFieldIds.base_doc_id)) |b| record.base_doc_id = try allocator.dupe(u8, b);
+
+    return record;
+}
+
+fn decodeDocumentHeader(allocator: Allocator, payload: []const u8) !?DocumentHeader {
+    if (!kvbuf.isKvBuf(payload)) return null;
+
+    const reader = kvbuf.KvBufReader.init(payload) catch return null;
+
+    const doc_id = reader.get(DocumentFieldIds.doc_id) orelse return null;
+    const doc_type = reader.get(DocumentFieldIds.doc_type) orelse return null;
+    const title = reader.get(DocumentFieldIds.title) orelse return null;
+
+    var header = DocumentHeader{
+        .doc_id = "",
+        .doc_type = "",
+        .title = "",
+        .created_at_ms = reader.getI64(DocumentFieldIds.created_at_ms) orelse 0,
+        .updated_at_ms = reader.getI64(DocumentFieldIds.updated_at_ms) orelse 0,
+        .has_inline_doc_json = reader.get(DocumentFieldIds.doc_json) != null,
+    };
+    errdefer header.deinit(allocator);
+
+    header.doc_id = try allocator.dupe(u8, doc_id);
+    header.doc_type = try allocator.dupe(u8, doc_type);
+    header.title = try allocator.dupe(u8, title);
+    if (reader.get(DocumentFieldIds.tags_text)) |t| header.tags_text = try allocator.dupe(u8, t);
+    if (reader.get(DocumentFieldIds.parent_id)) |p| header.parent_id = try allocator.dupe(u8, p);
+    if (reader.get(DocumentFieldIds.marker)) |m| header.marker = try allocator.dupe(u8, m);
+    if (reader.get(DocumentFieldIds.group_id)) |g| header.group_id = try allocator.dupe(u8, g);
+    if (reader.get(DocumentFieldIds.owner_id)) |o| header.owner_id = try allocator.dupe(u8, o);
+    if (reader.get(DocumentFieldIds.version_type)) |v| header.version_type = try allocator.dupe(u8, v);
+    if (reader.get(DocumentFieldIds.base_doc_id)) |b| header.base_doc_id = try allocator.dupe(u8, b);
+    if (reader.get(DocumentFieldIds.doc_json_ref)) |r| header.doc_json_ref = try allocator.dupe(u8, r);
+
+    return header;
 }
 
 // =============================================================================
@@ -2295,6 +2591,89 @@ fn readI64At(bytes: []const u8, row_idx: usize) !i64 {
     const offset = row_idx * 8;
     if (offset + 8 > bytes.len) return error.OutOfBounds;
     return std.mem.readInt(i64, bytes[offset..][0..8], .little);
+}
+
+fn resolveDocJsonExternalizeThresholdBytes() usize {
+    if (readThresholdBytesFromEnvVar(env_doc_json_externalize_threshold_bytes)) |threshold| return threshold;
+    if (readThresholdBytesFromEnvVar(env_shared_externalize_threshold_bytes)) |threshold| return threshold;
+    return default_doc_json_externalize_threshold_bytes;
+}
+
+fn readThresholdBytesFromEnvVar(env_name: []const u8) ?usize {
+    const env_ptr = std.posix.getenv(env_name) orelse return null;
+    return parseThresholdBytes(std.mem.sliceTo(env_ptr, 0));
+}
+
+fn parseThresholdBytes(raw_value: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw_value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return std.fmt.parseUnsigned(usize, trimmed, 10) catch null;
+}
+
+fn buildDocJsonTrigramBloom(text: []const u8) [doc_json_trigram_bloom_bytes]u8 {
+    var bloom = std.mem.zeroes([doc_json_trigram_bloom_bytes]u8);
+    if (text.len < 3) return bloom;
+
+    var i: usize = 0;
+    while (i + 2 < text.len) : (i += 1) {
+        const t0 = std.ascii.toLower(text[i]);
+        const t1 = std.ascii.toLower(text[i + 1]);
+        const t2 = std.ascii.toLower(text[i + 2]);
+        const h1, const h2 = trigramHashes(t0, t1, t2);
+        setBloomBit(&bloom, h1);
+        setBloomBit(&bloom, h2);
+    }
+
+    return bloom;
+}
+
+fn mayContainSubstringByTrigramBloom(bloom_opt: ?[]const u8, query: []const u8) bool {
+    if (query.len < 3) return true;
+    const bloom = bloom_opt orelse return true;
+    if (bloom.len != doc_json_trigram_bloom_bytes) return true;
+
+    var i: usize = 0;
+    while (i + 2 < query.len) : (i += 1) {
+        const t0 = std.ascii.toLower(query[i]);
+        const t1 = std.ascii.toLower(query[i + 1]);
+        const t2 = std.ascii.toLower(query[i + 2]);
+        const h1, const h2 = trigramHashes(t0, t1, t2);
+        if (!isBloomBitSet(bloom, h1) or !isBloomBitSet(bloom, h2)) return false;
+    }
+    return true;
+}
+
+fn trigramHashes(t0: u8, t1: u8, t2: u8) struct { usize, usize } {
+    const trigram = [_]u8{ t0, t1, t2 };
+    const bit_count = doc_json_trigram_bloom_bytes * 8;
+    const h1: usize = @intCast(std.hash.Wyhash.hash(0, &trigram) % bit_count);
+    const h2: usize = @intCast(std.hash.Wyhash.hash(0x9e3779b97f4a7c15, &trigram) % bit_count);
+    return .{ h1, h2 };
+}
+
+fn readBlobForSearch(
+    blob_store: *db_blob_store.BlobStore,
+    blob_ref: []const u8,
+    alloc: Allocator,
+) !?[]u8 {
+    return blob_store.readAll(blob_ref, alloc) catch |err| switch (err) {
+        // Search should remain best-effort for missing/corrupt refs.
+        error.FileNotFound, error.InvalidBlobRef => null,
+        // Unexpected failures (for example, OOM) should be surfaced.
+        else => return err,
+    };
+}
+
+fn setBloomBit(bloom: *[doc_json_trigram_bloom_bytes]u8, bit_idx: usize) void {
+    const byte_idx = bit_idx / 8;
+    const bit_mask: u8 = @as(u8, 1) << @as(u3, @intCast(bit_idx % 8));
+    bloom[byte_idx] |= bit_mask;
+}
+
+fn isBloomBitSet(bloom: []const u8, bit_idx: usize) bool {
+    const byte_idx = bit_idx / 8;
+    const bit_mask: u8 = @as(u8, 1) << @as(u3, @intCast(bit_idx % 8));
+    return (bloom[byte_idx] & bit_mask) != 0;
 }
 
 /// Case-insensitive substring search.
@@ -2456,6 +2835,233 @@ test "DocumentRecord encode/decode with optional fields null" {
     try std.testing.expect(decoded.owner_id == null);
 }
 
+test "DocumentRecord decode resolves external doc_json_ref" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var blob_store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer blob_store.deinit();
+
+    const external_json = "{\"content\":\"externalized\"}";
+    const blob_ref = try blob_store.put(external_json);
+
+    const original = DocumentRecord{
+        .doc_id = "doc-external",
+        .doc_type = "prompt",
+        .title = "External JSON",
+        .doc_json = "",
+        .created_at_ms = 1,
+        .updated_at_ms = 2,
+    };
+
+    const blob = try encodeDocumentRecordKvBufWithStorage(
+        allocator,
+        original,
+        null,
+        blob_ref.ref[0..],
+        null,
+    );
+    defer allocator.free(blob);
+
+    var decoded = (try decodeDocumentRecordWithBlobStore(allocator, blob, &blob_store)).?;
+    defer decoded.deinit(allocator);
+
+    try std.testing.expectEqualStrings("doc-external", decoded.doc_id);
+    try std.testing.expectEqualStrings(external_json, decoded.doc_json);
+}
+
+test "encodeDocumentRecordKvBufWithStorage stores doc_json_trigram_bloom when provided" {
+    const allocator = std.testing.allocator;
+
+    const record = DocumentRecord{
+        .doc_id = "doc-bloom",
+        .doc_type = "prompt",
+        .title = "Bloom test",
+        .doc_json = "",
+        .created_at_ms = 1,
+        .updated_at_ms = 1,
+    };
+
+    const bloom = buildDocJsonTrigramBloom("{\"content\":\"hello world\"}");
+    const blob = try encodeDocumentRecordKvBufWithStorage(
+        allocator,
+        record,
+        null,
+        "sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        bloom[0..],
+    );
+    defer allocator.free(blob);
+
+    const reader = try kvbuf.KvBufReader.init(blob);
+    const stored = reader.get(DocumentFieldIds.doc_json_trigram_bloom) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualSlices(u8, bloom[0..], stored);
+}
+
+test "DocumentAdapter.writeDocument externalizes large doc_json and reads transparently" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var adapter = try DocumentAdapter.init(allocator, root_path);
+    defer adapter.deinit();
+
+    const large_len = default_doc_json_externalize_threshold_bytes + 128;
+    const large_json = try allocator.alloc(u8, large_len);
+    defer allocator.free(large_json);
+    @memset(large_json, 'x');
+
+    const record = DocumentRecord{
+        .doc_id = "doc-large-1",
+        .doc_type = "prompt",
+        .title = "Large document",
+        .doc_json = large_json,
+        .created_at_ms = 100,
+        .updated_at_ms = 100,
+    };
+
+    try adapter.writeDocument(record);
+    try adapter.flush();
+
+    var read_adapter = try DocumentAdapter.initReadOnly(allocator, root_path);
+    defer read_adapter.deinitReadOnly();
+
+    const loaded = try read_adapter.getDocument(allocator, "doc-large-1");
+    try std.testing.expect(loaded != null);
+    defer {
+        var doc = loaded.?;
+        doc.deinit(allocator);
+    }
+
+    try std.testing.expectEqual(large_json.len, loaded.?.doc_json.len);
+    try std.testing.expectEqualSlices(u8, large_json, loaded.?.doc_json);
+}
+
+test "DocumentAdapter.getDocumentHeader and DocumentAdapter.loadBlob support lazy external doc_json" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var adapter = try DocumentAdapter.init(allocator, root_path);
+    defer adapter.deinit();
+    adapter.doc_json_externalize_threshold_bytes = 64;
+
+    const external_json =
+        "{\"_sys\":{},\"data\":{\"text\":\"this payload should be externalized because it is longer than the configured threshold\"}}";
+    const record = DocumentRecord{
+        .doc_id = "doc-lazy-1",
+        .doc_type = "prompt",
+        .title = "Lazy header doc",
+        .doc_json = external_json,
+        .created_at_ms = 200,
+        .updated_at_ms = 200,
+    };
+
+    try adapter.writeDocument(record);
+    try adapter.flush();
+
+    var read_adapter = try DocumentAdapter.initReadOnly(allocator, root_path);
+    defer read_adapter.deinitReadOnly();
+
+    const header_opt = try read_adapter.getDocumentHeader(allocator, "doc-lazy-1");
+    try std.testing.expect(header_opt != null);
+    var header = header_opt.?;
+    defer header.deinit(allocator);
+
+    try std.testing.expect(!header.has_inline_doc_json);
+    try std.testing.expect(header.doc_json_ref != null);
+    try std.testing.expect(std.mem.startsWith(u8, header.doc_json_ref.?, "sha256:"));
+
+    const loaded_blob = try read_adapter.loadBlob(allocator, header.doc_json_ref.?);
+    defer allocator.free(loaded_blob);
+    try std.testing.expectEqualStrings(external_json, loaded_blob);
+}
+
+test "getDocumentHeader wrapper reports inline payload for small doc_json" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    {
+        var adapter = try DocumentAdapter.init(allocator, root_path);
+        defer adapter.deinit();
+
+        const record = DocumentRecord{
+            .doc_id = "doc-inline-1",
+            .doc_type = "prompt",
+            .title = "Inline header doc",
+            .doc_json = "{\"small\":true}",
+            .created_at_ms = 1,
+            .updated_at_ms = 1,
+        };
+        try adapter.writeDocument(record);
+        try adapter.flush();
+    }
+
+    const header_opt = try getDocumentHeader(allocator, root_path, "doc-inline-1");
+    try std.testing.expect(header_opt != null);
+    defer freeDocumentHeader(allocator, header_opt.?);
+
+    try std.testing.expect(header_opt.?.has_inline_doc_json);
+    try std.testing.expect(header_opt.?.doc_json_ref == null);
+}
+
+test "loadDocumentBlob wrapper reads externalized payload" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    const external_json = "{\"big\":true,\"payload\":\"abcdefghijklmnopqrstuvwxyz0123456789\"}";
+
+    {
+        var adapter = try DocumentAdapter.init(allocator, root_path);
+        defer adapter.deinit();
+        adapter.doc_json_externalize_threshold_bytes = 32;
+
+        const record = DocumentRecord{
+            .doc_id = "doc-wrapper-blob-1",
+            .doc_type = "prompt",
+            .title = "Wrapper blob doc",
+            .doc_json = external_json,
+            .created_at_ms = 2,
+            .updated_at_ms = 2,
+        };
+        try adapter.writeDocument(record);
+        try adapter.flush();
+    }
+
+    const header_opt = try getDocumentHeader(allocator, root_path, "doc-wrapper-blob-1");
+    try std.testing.expect(header_opt != null);
+    defer freeDocumentHeader(allocator, header_opt.?);
+
+    try std.testing.expect(header_opt.?.doc_json_ref != null);
+    const blob_ref = header_opt.?.doc_json_ref.?;
+    const loaded = try loadDocumentBlob(allocator, root_path, blob_ref);
+    defer allocator.free(loaded);
+
+    try std.testing.expectEqualStrings(external_json, loaded);
+}
+
 test "computeHash is deterministic" {
     const h1 = computeHash("test-document");
     const h2 = computeHash("test-document");
@@ -2471,6 +3077,32 @@ test "computeOptionalHash handles null" {
 
     try std.testing.expectEqual(@as(u64, 0), h1);
     try std.testing.expect(h2 != 0);
+}
+
+test "parseThresholdBytes parses valid decimal thresholds" {
+    try std.testing.expectEqual(@as(?usize, 0), parseThresholdBytes("0"));
+    try std.testing.expectEqual(@as(?usize, 1048576), parseThresholdBytes("1048576"));
+    try std.testing.expectEqual(@as(?usize, 256), parseThresholdBytes(" 256 "));
+}
+
+test "parseThresholdBytes rejects invalid threshold values" {
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes(""));
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes("  "));
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes("-1"));
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes("abc"));
+    try std.testing.expectEqual(@as(?usize, null), parseThresholdBytes("12MB"));
+}
+
+test "buildDocJsonTrigramBloom indicates possible matches for present substrings" {
+    const bloom = buildDocJsonTrigramBloom("{\"content\":\"hello world\"}");
+    try std.testing.expect(mayContainSubstringByTrigramBloom(bloom[0..], "hello"));
+    try std.testing.expect(mayContainSubstringByTrigramBloom(bloom[0..], "world"));
+}
+
+test "mayContainSubstringByTrigramBloom rejects impossible queries with empty bloom" {
+    const bloom = std.mem.zeroes([doc_json_trigram_bloom_bytes]u8);
+    try std.testing.expect(!mayContainSubstringByTrigramBloom(bloom[0..], "xyz"));
+    try std.testing.expect(mayContainSubstringByTrigramBloom(bloom[0..], "xy"));
 }
 
 test "textFindInsensitive finds match" {
@@ -2558,6 +3190,25 @@ pub fn getDocument(alloc: Allocator, db_path: []const u8, doc_id: []const u8) !?
     return adapter.getDocument(alloc, doc_id);
 }
 
+/// Get a single document header by ID without loading externalized doc_json.
+/// Handles adapter lifecycle internally.
+/// Returns null if document not found.
+/// Caller owns returned header; free with freeDocumentHeader().
+pub fn getDocumentHeader(alloc: Allocator, db_path: []const u8, doc_id: []const u8) !?DocumentHeader {
+    var adapter = try DocumentAdapter.initReadOnly(alloc, db_path);
+    defer adapter.deinitReadOnly();
+    return adapter.getDocumentHeader(alloc, doc_id);
+}
+
+/// Load an externalized blob by reference (`sha256:<hex>`).
+/// Handles adapter lifecycle internally.
+/// Caller owns returned bytes; free with allocator.free().
+pub fn loadDocumentBlob(alloc: Allocator, db_path: []const u8, blob_ref: []const u8) ![]u8 {
+    var adapter = try DocumentAdapter.initReadOnly(alloc, db_path);
+    defer adapter.deinitReadOnly();
+    return adapter.loadBlob(alloc, blob_ref);
+}
+
 /// Create a new document.
 /// Handles adapter lifecycle internally.
 /// Returns error.LockUnavailable if another process holds the database lock.
@@ -2638,6 +3289,12 @@ pub fn freeDocumentRecords(alloc: Allocator, records: []DocumentRecord) void {
         rec.deinit(alloc);
     }
     alloc.free(records);
+}
+
+/// Free a single DocumentHeader returned by getDocumentHeader().
+pub fn freeDocumentHeader(alloc: Allocator, header: DocumentHeader) void {
+    var owned = header;
+    owned.deinit(alloc);
 }
 
 /// Search documents by content.
