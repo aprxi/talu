@@ -22,6 +22,8 @@ pub mod state;
 pub mod tags;
 pub mod tenant;
 
+const DEFAULT_MAX_FILE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+
 #[derive(Args, Debug)]
 pub struct ServerArgs {
     /// Model: local path or provider::model for remote backends
@@ -59,10 +61,17 @@ pub struct ServerArgs {
     /// Serve console UI from this directory instead of bundled assets
     #[arg(long)]
     pub html_dir: Option<PathBuf>,
+
+    /// Max request body size for `POST /v1/files` uploads (bytes).
+    #[arg(long, env = "TALU_MAX_FILE_UPLOAD_BYTES", default_value_t = DEFAULT_MAX_FILE_UPLOAD_BYTES)]
+    pub max_file_upload_bytes: u64,
 }
 
 pub fn run_server(args: ServerArgs) -> Result<()> {
     let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
+    if args.max_file_upload_bytes == 0 {
+        bail!("--max-file-upload-bytes must be greater than zero");
+    }
 
     let model = args.model.clone();
     let profile = args.profile.clone();
@@ -107,6 +116,7 @@ pub fn run_server(args: ServerArgs) -> Result<()> {
         bucket_path,
         html_dir: args.html_dir,
         plugin_tokens: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        max_file_upload_bytes: args.max_file_upload_bytes,
     };
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);

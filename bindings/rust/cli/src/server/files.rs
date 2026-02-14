@@ -48,6 +48,7 @@ struct ParsedMultipartUpload {
 #[derive(Debug)]
 enum UploadError {
     InvalidMultipart(String),
+    PayloadTooLarge(String),
     Blob(BlobError),
 }
 
@@ -132,6 +133,24 @@ pub async fn handle_upload(
             );
         }
     };
+    let max_upload_bytes = state.max_file_upload_bytes;
+    if let Some(content_length) = req
+        .headers()
+        .get(hyper::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok())
+    {
+        if content_length > max_upload_bytes {
+            return json_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "payload_too_large",
+                &format!(
+                    "Upload exceeds configured limit ({} > {} bytes)",
+                    content_length, max_upload_bytes
+                ),
+            );
+        }
+    }
 
     let storage_path = match auth.as_ref() {
         Some(ctx) => bucket.join(&ctx.storage_prefix),
@@ -143,10 +162,13 @@ pub async fn handle_upload(
         Err(e) => return blob_error_response(e),
     };
 
-    let upload = match stream_multipart_upload(req, &boundary, &blobs).await {
+    let upload = match stream_multipart_upload(req, &boundary, &blobs, max_upload_bytes).await {
         Ok(u) => u,
         Err(UploadError::InvalidMultipart(e)) => {
             return json_error(StatusCode::BAD_REQUEST, "invalid_multipart", &e);
+        }
+        Err(UploadError::PayloadTooLarge(e)) => {
+            return json_error(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large", &e);
         }
         Err(UploadError::Blob(e)) => return blob_error_response(e),
     };
@@ -533,18 +555,12 @@ fn parse_query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
 }
 
 fn extract_file_id(path: &str) -> Option<String> {
-    let mut parts = path.trim_start_matches('/').split('/');
-    let first = parts.next()?;
-    let second = parts.next()?;
-    let third = parts.next()?;
-
-    if first == "v1" && second == "files" && !third.is_empty() {
-        return Some(third.to_string());
+    let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+    match parts.as_slice() {
+        ["v1", "files", id, ..] if !id.is_empty() => Some((*id).to_string()),
+        ["files", id, ..] if !id.is_empty() => Some((*id).to_string()),
+        _ => None,
     }
-    if first == "files" && !second.is_empty() {
-        return Some(second.to_string());
-    }
-    None
 }
 
 fn extract_boundary(content_type: &str) -> Option<String> {
@@ -555,6 +571,7 @@ async fn stream_multipart_upload(
     req: Request<Incoming>,
     boundary: &str,
     blobs: &BlobsHandle,
+    max_upload_bytes: u64,
 ) -> Result<ParsedMultipartUpload, UploadError> {
     let body_stream = req.into_body().into_data_stream();
     let mut multipart = multer::Multipart::new(body_stream, boundary);
@@ -583,7 +600,17 @@ async fn stream_multipart_upload(
                 while let Some(chunk) = field.chunk().await.map_err(|e| {
                     UploadError::InvalidMultipart(format!("Failed reading file chunk: {}", e))
                 })? {
-                    file_size += chunk.len() as u64;
+                    file_size = file_size.checked_add(chunk.len() as u64).ok_or_else(|| {
+                        UploadError::PayloadTooLarge(
+                            "Upload size overflowed supported range".to_string(),
+                        )
+                    })?;
+                    if file_size > max_upload_bytes {
+                        return Err(UploadError::PayloadTooLarge(format!(
+                            "Upload exceeds configured limit ({} > {} bytes)",
+                            file_size, max_upload_bytes
+                        )));
+                    }
                     writer.write(&chunk).map_err(UploadError::Blob)?;
                 }
                 blob_ref = Some(writer.finish().map_err(UploadError::Blob)?);
@@ -747,7 +774,7 @@ fn blob_error_response(err: BlobError) -> Response<BoxBody> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_boundary, resolve_filename};
+    use super::{extract_boundary, extract_file_id, resolve_filename};
     use talu::blobs::BlobError;
 
     #[test]
@@ -788,6 +815,18 @@ mod tests {
         let resolved =
             resolve_filename(Some("   ".to_string()), None).expect("expected default filename");
         assert_eq!(resolved, "upload.bin");
+    }
+
+    #[test]
+    fn extract_file_id_supports_content_paths() {
+        assert_eq!(
+            extract_file_id("/v1/files/file_abc123/content").as_deref(),
+            Some("file_abc123")
+        );
+        assert_eq!(
+            extract_file_id("/files/file_abc123/content").as_deref(),
+            Some("file_abc123")
+        );
     }
 
     #[test]

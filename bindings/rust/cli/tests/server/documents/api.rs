@@ -3,7 +3,7 @@
 //! Tests for the Documents HTTP API endpoints.
 //! Uses in-process hyper connections (no TCP socket) for speed and determinism.
 //!
-//! Run: `LD_LIBRARY_PATH=zig-out/lib cargo test --test documents_api`
+//! Run: `cargo test -p talu-cli --test server server::documents::api`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -80,6 +80,7 @@ fn build_app_with_storage(temp_dir: &TempDir) -> Router {
         bucket_path: Some(temp_dir.path().to_path_buf()),
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
+        max_file_upload_bytes: 100 * 1024 * 1024,
     };
 
     Router::new(Arc::new(state))
@@ -99,6 +100,7 @@ fn build_app_no_storage() -> Router {
         bucket_path: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
+        max_file_upload_bytes: 100 * 1024 * 1024,
     };
 
     Router::new(Arc::new(state))

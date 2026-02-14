@@ -1,6 +1,6 @@
 //! `/v1/files` upload endpoint tests.
 
-use super::{files_config, no_bucket_config};
+use super::{files_config, files_config_with_upload_limit, no_bucket_config};
 use crate::server::common::{delete, get, send_request, ServerTestContext};
 use tempfile::TempDir;
 
@@ -295,4 +295,25 @@ fn upload_preserves_unicode_filename() {
     assert_eq!(upload_resp.status, 200, "body: {}", upload_resp.body);
     let upload_json = upload_resp.json();
     assert_eq!(upload_json["filename"], "测试.txt");
+}
+
+#[test]
+fn upload_rejects_payload_over_configured_limit() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config_with_upload_limit(temp.path(), 64));
+
+    let boundary = "----talu-upload-over-limit";
+    let payload = "x".repeat(256);
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"too-big.txt\"\r\nContent-Type: text/plain\r\n\r\n{payload}\r\n--{b}--\r\n",
+        b = boundary,
+        payload = payload,
+    );
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let headers = [("Content-Type", content_type.as_str())];
+
+    let upload_resp = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&body));
+    assert_eq!(upload_resp.status, 413, "body: {}", upload_resp.body);
+    let upload_json = upload_resp.json();
+    assert_eq!(upload_json["error"]["code"], "payload_too_large");
 }

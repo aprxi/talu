@@ -6,6 +6,7 @@
 mod server {
     pub mod auth;
     pub mod common;
+    pub mod compliance;
     pub mod console;
     pub mod conversations;
     pub mod documents;

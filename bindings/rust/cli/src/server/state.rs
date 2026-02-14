@@ -50,4 +50,6 @@ pub struct AppState {
     pub html_dir: Option<PathBuf>,
     /// Plugin capability tokens — maps bearer token → plugin_id + permissions.
     pub plugin_tokens: Mutex<PluginTokenStore>,
+    /// Max allowed size (bytes) for `/v1/files` uploads.
+    pub max_file_upload_bytes: u64,
 }

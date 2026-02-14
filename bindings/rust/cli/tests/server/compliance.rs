@@ -7,7 +7,7 @@
 //! determinism. Everything else is real, including inference on
 //! the model set via `TALU_TEST_MODEL`.
 //!
-//! Run: `LD_LIBRARY_PATH=zig-out/lib cargo test --test api_compliance -- --test-threads=1`
+//! Run: `cargo test -p talu-cli --test server server::compliance -- --test-threads=1`
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -117,6 +117,7 @@ fn build_app_with_model(model: &str) -> Router {
         bucket_path: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
+        max_file_upload_bytes: 100 * 1024 * 1024,
     };
 
     Router::new(Arc::new(state))
@@ -136,6 +137,7 @@ fn build_app_no_model() -> Router {
         bucket_path: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
+        max_file_upload_bytes: 100 * 1024 * 1024,
     };
 
     Router::new(Arc::new(state))

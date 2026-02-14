@@ -11,6 +11,7 @@
 //! - POST /v1/documents/:id/tags (add tags)
 //! - DELETE /v1/documents/:id/tags (remove tags)
 
+mod api;
 mod crud;
 mod search;
 mod tags;
