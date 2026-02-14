@@ -241,7 +241,9 @@ fn wordpiece_decode_impl(tokenizer: *ct.Tokenizer, ids: [*c]const i32, ids_len: 
         };
 
         const is_subword = token_slice.len >= 2 and token_slice[0] == '#' and token_slice[1] == '#';
-        const content = if (is_subword) token_slice[2..] else token_slice;
+        // Only strip ## prefix from non-first tokens. HuggingFace's WordPiece
+        // decoder checks `i != 0` — the first token always keeps its prefix.
+        const content = if (is_subword and !first) token_slice[2..] else token_slice;
 
         if (!is_subword and !first) {
             result.append(allocator, ' ') catch return -1;

@@ -1503,22 +1503,21 @@ pub const Evaluator = struct {
             else => return EvalError.TypeError,
         };
 
-        // Create a new scope for macro execution
-        // Save old variable values
-        var old_vars = std.StringHashMapUnmanaged(?TemplateInput){};
-        defer old_vars.deinit(self.ctx.arena.allocator());
+        // Push a local scope for macro parameters. This isolates them from
+        // both the global context and any enclosing loop scopes, so a macro
+        // parameter named `content` won't collide with a loop variable of
+        // the same name.
+        try self.pushScope();
+        defer self.popScope();
 
-        // Bind parameters
+        // Bind parameters into the macro's local scope
         for (macro.params, 0..) |param, param_idx| {
-            // Save old value if exists
-            old_vars.put(self.ctx.arena.allocator(), param.name, self.ctx.get(param.name)) catch return EvalError.OutOfMemory;
-
             // Check kwargs first
             var found_kwarg = false;
             for (kwargs) |kwarg| {
                 if (std.mem.eql(u8, kwarg.name, param.name)) {
                     const value = try self.evalExpr(kwarg.value);
-                    self.ctx.set(param.name, value) catch return EvalError.OutOfMemory;
+                    try self.setVar(param.name, value);
                     found_kwarg = true;
                     break;
                 }
@@ -1528,14 +1527,14 @@ pub const Evaluator = struct {
                 // Use positional arg if available
                 if (param_idx < args.len) {
                     const value = try self.evalExpr(args[param_idx]);
-                    self.ctx.set(param.name, value) catch return EvalError.OutOfMemory;
+                    try self.setVar(param.name, value);
                 } else if (param.default) |default_expr| {
                     // Use default value
                     const value = try self.evalExpr(default_expr);
-                    self.ctx.set(param.name, value) catch return EvalError.OutOfMemory;
+                    try self.setVar(param.name, value);
                 } else {
                     // Missing required parameter
-                    self.ctx.set(param.name, .none) catch return EvalError.OutOfMemory;
+                    try self.setVar(param.name, .none);
                 }
             }
         }
@@ -1543,14 +1542,6 @@ pub const Evaluator = struct {
         const temp_result = try self.renderNodesToString(macro.body);
         defer self.allocator.free(temp_result);
         const result = self.ctx.arena.allocator().dupe(u8, temp_result) catch return EvalError.OutOfMemory;
-
-        // Restore old variable values
-        var it = old_vars.iterator();
-        while (it.next()) |entry| {
-            if (entry.value_ptr.*) |old_val| {
-                self.ctx.set(entry.key_ptr.*, old_val) catch return EvalError.OutOfMemory;
-            }
-        }
 
         return .{ .string = result };
     }

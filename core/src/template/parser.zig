@@ -422,7 +422,10 @@ pub const Parser = struct {
 
     fn parseUnary(self: *Parser) ParseError!*const Expr {
         if (self.match(.kw_not)) {
-            return try self.allocExpr(.{ .unaryop = .{ .op = .not, .operand = try self.parseUnary() } });
+            // Parse operand at precedence 3 so that `is` tests (prec 3) bind
+            // tighter than prefix `not`. This makes `not x is defined` parse
+            // as `not (x is defined)`, matching Jinja2 semantics.
+            return try self.allocExpr(.{ .unaryop = .{ .op = .not, .operand = try self.parseExpressionImpl(3, false) } });
         }
         if (self.match(.minus)) {
             return try self.allocExpr(.{ .unaryop = .{ .op = .neg, .operand = try self.parseUnary() } });
