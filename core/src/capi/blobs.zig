@@ -7,6 +7,7 @@
 const std = @import("std");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
+const capi_documents = @import("documents.zig");
 const db_blob_store = @import("../db/blob/store.zig");
 
 const allocator = std.heap.c_allocator;
@@ -27,6 +28,9 @@ const BlobWriteStreamState = struct {
     blob_store: db_blob_store.BlobStore,
     stream: ?db_blob_store.BlobPutStream,
 };
+
+/// String list container for blob references.
+pub const CStringList = capi_documents.CStringList;
 
 fn validateDbPath(db_path: ?[*:0]const u8) ?[]const u8 {
     const slice = std.mem.sliceTo(db_path orelse {
@@ -60,10 +64,38 @@ fn blobErrorToCode(err: anyerror) error_codes.ErrorCode {
         error.InvalidChunkSize,
         => .invalid_argument,
         error.OutOfMemory => .out_of_memory,
+        error.NoSpaceLeft,
+        error.DiskQuota,
+        error.FileTooBig,
+        => .resource_exhausted,
         error.FileNotFound => .io_file_not_found,
         error.AccessDenied => .io_permission_denied,
         else => .storage_error,
     };
+}
+
+fn buildBlobRefList(digests: []const [db_blob_store.digest_hex_len]u8) !*CStringList {
+    const list = allocator.create(CStringList) catch return error.OutOfMemory;
+    errdefer allocator.destroy(list);
+
+    const arena_ptr = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
+    errdefer allocator.destroy(arena_ptr);
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena_ptr.deinit();
+
+    const arena = arena_ptr.allocator();
+    const items = arena.alloc(?[*:0]const u8, digests.len) catch return error.OutOfMemory;
+    for (digests, 0..) |digest, i| {
+        const ref_buf = db_blob_store.buildSha256RefString(digest);
+        items[i] = (arena.dupeZ(u8, ref_buf[0..db_blob_store.sha256_ref_len]) catch return error.OutOfMemory).ptr;
+    }
+
+    list.* = .{
+        .items = if (digests.len > 0) items.ptr else null,
+        .count = digests.len,
+        ._arena = @ptrCast(arena_ptr),
+    };
+    return list;
 }
 
 /// Store bytes in CAS blob storage and return a blob reference.
@@ -128,6 +160,95 @@ pub export fn talu_blobs_put(
     @memcpy(out[0..blob_ref_slice.len], blob_ref_slice);
     out[blob_ref_slice.len] = 0;
     return 0;
+}
+
+/// Check whether a blob reference resolves to stored bytes.
+///
+/// Parameters:
+///   - db_path: Path to TaluDB storage directory (null-terminated)
+///   - blob_ref: Blob reference (`sha256:<hex>` or `multi:<hex>`)
+///   - out_exists: Output boolean flag
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_blobs_exists(
+    db_path: ?[*:0]const u8,
+    blob_ref: ?[*:0]const u8,
+    out_exists: ?*bool,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_exists orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_exists is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = false;
+
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const blob_ref_slice = validateRequiredArg(blob_ref, "blob_ref") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+
+    var blob_store = db_blob_store.BlobStore.init(allocator, db_path_slice) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to initialize blob store: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    defer blob_store.deinit();
+
+    out.* = blob_store.exists(blob_ref_slice) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to check blob existence: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    return 0;
+}
+
+/// List stored physical blob references.
+///
+/// This returns `sha256:<hex>` references for stored shard files.
+/// Caller must free with `talu_blobs_free_string_list()`.
+pub export fn talu_blobs_list(
+    db_path: ?[*:0]const u8,
+    limit: usize,
+    out_refs: ?*?*CStringList,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_refs orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_refs is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = null;
+
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    var blob_store = db_blob_store.BlobStore.init(allocator, db_path_slice) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to initialize blob store: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    defer blob_store.deinit();
+
+    const digests = blob_store.listSingleDigests(allocator, limit) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to list blobs: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    defer allocator.free(digests);
+
+    out.* = buildBlobRefList(digests) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to build blob list: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    return 0;
+}
+
+pub export fn talu_blobs_free_string_list(list: ?*CStringList) callconv(.c) void {
+    capi_error.clearError();
+    const l = list orelse return;
+    if (l._arena) |arena_ptr| {
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(arena_ptr));
+        arena.deinit();
+        allocator.destroy(arena);
+        l._arena = null;
+    }
+    allocator.destroy(l);
 }
 
 /// Open a streaming writer for blob uploads.
@@ -490,4 +611,57 @@ test "talu_blobs_write_stream_write and finish roundtrip bytes" {
     }
 
     try std.testing.expectEqualStrings("write-stream-payload", out.items);
+}
+
+test "talu_blobs_exists reports true for stored blob and false for missing blob" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const root_path_z = try std.testing.allocator.dupeZ(u8, root_path);
+    defer std.testing.allocator.free(root_path_z);
+
+    const payload = "blob-exists-check";
+    var blob_ref_buf: [db_blob_store.ref_len + 1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_put(root_path_z.ptr, payload.ptr, payload.len, &blob_ref_buf, blob_ref_buf.len),
+    );
+
+    var exists = false;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_exists(root_path_z.ptr, @ptrCast(&blob_ref_buf), &exists),
+    );
+    try std.testing.expect(exists);
+
+    const missing: [*:0]const u8 = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    exists = true;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_exists(root_path_z.ptr, missing, &exists),
+    );
+    try std.testing.expect(!exists);
+}
+
+test "talu_blobs_list returns blob refs and talu_blobs_free_string_list releases list" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const root_path_z = try std.testing.allocator.dupeZ(u8, root_path);
+    defer std.testing.allocator.free(root_path_z);
+
+    var ref_a: [db_blob_store.ref_len + 1]u8 = undefined;
+    var ref_b: [db_blob_store.ref_len + 1]u8 = undefined;
+    try std.testing.expectEqual(@as(i32, 0), talu_blobs_put(root_path_z.ptr, "a".ptr, 1, &ref_a, ref_a.len));
+    try std.testing.expectEqual(@as(i32, 0), talu_blobs_put(root_path_z.ptr, "b".ptr, 1, &ref_b, ref_b.len));
+
+    var out_list: ?*CStringList = null;
+    try std.testing.expectEqual(@as(i32, 0), talu_blobs_list(root_path_z.ptr, 0, &out_list));
+    defer talu_blobs_free_string_list(out_list);
+    const list = out_list.?;
+    try std.testing.expect(list.count >= 2);
 }

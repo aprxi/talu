@@ -45,6 +45,12 @@ struct ParsedMultipartUpload {
     blob_ref: String,
 }
 
+#[derive(Debug)]
+enum UploadError {
+    InvalidMultipart(String),
+    Blob(BlobError),
+}
+
 #[derive(Debug, Serialize)]
 struct FileDeleteResponse {
     id: String,
@@ -139,7 +145,10 @@ pub async fn handle_upload(
 
     let upload = match stream_multipart_upload(req, &boundary, &blobs).await {
         Ok(u) => u,
-        Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_multipart", &e),
+        Err(UploadError::InvalidMultipart(e)) => {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_multipart", &e);
+        }
+        Err(UploadError::Blob(e)) => return blob_error_response(e),
     };
 
     let docs = match DocumentsHandle::open(&storage_path) {
@@ -545,7 +554,7 @@ async fn stream_multipart_upload(
     req: Request<Incoming>,
     boundary: &str,
     blobs: &BlobsHandle,
-) -> Result<ParsedMultipartUpload, String> {
+) -> Result<ParsedMultipartUpload, UploadError> {
     let body_stream = req.into_body().into_data_stream();
     let mut multipart = multer::Multipart::new(body_stream, boundary);
 
@@ -556,53 +565,41 @@ async fn stream_multipart_upload(
     let mut purpose: Option<String> = None;
     let mut file_size: u64 = 0;
 
-    while let Some(mut field) = multipart
-        .next_field()
-        .await
-        .map_err(|e| format!("Failed to parse multipart field: {}", e))?
-    {
+    while let Some(mut field) = multipart.next_field().await.map_err(|e| {
+        UploadError::InvalidMultipart(format!("Failed to parse multipart field: {}", e))
+    })? {
         let field_name = field.name().map(|s| s.to_string());
         match field_name.as_deref() {
             Some("file") => {
                 if blob_ref.is_some() {
-                    return Err("multiple file parts are not supported".to_string());
+                    return Err(UploadError::InvalidMultipart(
+                        "multiple file parts are not supported".to_string(),
+                    ));
                 }
-                let mut writer = blobs
-                    .open_write_stream()
-                    .map_err(|e| format!("Failed to open blob writer: {}", e))?;
+                let mut writer = blobs.open_write_stream().map_err(UploadError::Blob)?;
                 file_name = field.file_name().map(str::to_string);
                 file_mime = field.content_type().map(|m| m.to_string());
-                while let Some(chunk) = field
-                    .chunk()
-                    .await
-                    .map_err(|e| format!("Failed reading file chunk: {}", e))?
-                {
+                while let Some(chunk) = field.chunk().await.map_err(|e| {
+                    UploadError::InvalidMultipart(format!("Failed reading file chunk: {}", e))
+                })? {
                     file_size += chunk.len() as u64;
-                    writer
-                        .write(&chunk)
-                        .map_err(|e| format!("Failed writing blob chunk: {}", e))?;
+                    writer.write(&chunk).map_err(UploadError::Blob)?;
                 }
-                blob_ref = Some(
-                    writer
-                        .finish()
-                        .map_err(|e| format!("Failed finalizing blob stream: {}", e))?,
-                );
+                blob_ref = Some(writer.finish().map_err(UploadError::Blob)?);
             }
             Some("purpose") => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|e| format!("Invalid purpose field: {}", e))?;
+                let value = field.text().await.map_err(|e| {
+                    UploadError::InvalidMultipart(format!("Invalid purpose field: {}", e))
+                })?;
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
                     purpose = Some(trimmed.to_string());
                 }
             }
             Some("filename") => {
-                let value = field
-                    .text()
-                    .await
-                    .map_err(|e| format!("Invalid filename field: {}", e))?;
+                let value = field.text().await.map_err(|e| {
+                    UploadError::InvalidMultipart(format!("Invalid filename field: {}", e))
+                })?;
                 let trimmed = value.trim();
                 if !trimmed.is_empty() {
                     field_filename = Some(trimmed.to_string());
@@ -612,15 +609,23 @@ async fn stream_multipart_upload(
                 while field
                     .chunk()
                     .await
-                    .map_err(|e| format!("Failed draining multipart field: {}", e))?
+                    .map_err(|e| {
+                        UploadError::InvalidMultipart(format!(
+                            "Failed draining multipart field: {}",
+                            e
+                        ))
+                    })?
                     .is_some()
                 {}
             }
         }
     }
 
-    let blob_ref = blob_ref.ok_or_else(|| "missing multipart file field 'file'".to_string())?;
-    let filename = resolve_filename(file_name, field_filename)?;
+    let blob_ref = blob_ref.ok_or_else(|| {
+        UploadError::InvalidMultipart("missing multipart file field 'file'".to_string())
+    })?;
+    let filename =
+        resolve_filename(file_name, field_filename).map_err(UploadError::InvalidMultipart)?;
 
     Ok(ParsedMultipartUpload {
         filename,
@@ -716,6 +721,9 @@ fn blob_error_response(err: BlobError) -> Response<BoxBody> {
         BlobError::PermissionDenied(msg) => {
             json_error(StatusCode::FORBIDDEN, "permission_denied", &msg)
         }
+        BlobError::ResourceExhausted(msg) => {
+            json_error(StatusCode::INSUFFICIENT_STORAGE, "resource_exhausted", &msg)
+        }
         BlobError::StorageError(msg) => {
             json_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", &msg)
         }
@@ -725,6 +733,7 @@ fn blob_error_response(err: BlobError) -> Response<BoxBody> {
 #[cfg(test)]
 mod tests {
     use super::{extract_boundary, resolve_filename};
+    use talu::blobs::BlobError;
 
     #[test]
     fn extract_boundary_parses_content_type() {
@@ -750,5 +759,12 @@ mod tests {
         let resolved = resolve_filename(Some("same.txt".to_string()), Some("same.txt".to_string()))
             .expect("expected resolved filename");
         assert_eq!(resolved, "same.txt");
+    }
+
+    #[test]
+    fn blob_error_response_maps_resource_exhausted_to_507() {
+        let resp =
+            super::blob_error_response(BlobError::ResourceExhausted("disk full".to_string()));
+        assert_eq!(resp.status(), super::StatusCode::INSUFFICIENT_STORAGE);
     }
 }

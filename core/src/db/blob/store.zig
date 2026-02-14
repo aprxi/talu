@@ -281,6 +281,66 @@ pub const BlobStore = struct {
         }
     }
 
+    /// Check whether a blob reference currently resolves to stored content.
+    pub fn exists(self: *BlobStore, blob_ref: []const u8) !bool {
+        const parsed = try parseRef(blob_ref);
+        return switch (parsed.kind) {
+            .sha256 => try self.existsSingleByDigest(parsed.digest_hex),
+            .multipart => try self.existsMultipartByDigest(parsed.digest_hex),
+        };
+    }
+
+    /// List up to `limit` stored single-blob digests (`sha256` objects on disk).
+    /// Pass `0` for `limit` to return all digests.
+    pub fn listSingleDigests(self: *BlobStore, allocator: Allocator, limit: usize) ![]DigestKey {
+        var out = std.ArrayList(DigestKey).empty;
+        errdefer out.deinit(allocator);
+
+        var blobs_dir = self.root_dir.openDir("blobs", .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return out.toOwnedSlice(allocator),
+            else => return err,
+        };
+        defer blobs_dir.close();
+
+        var shard_iter = blobs_dir.iterate();
+        shards: while (try shard_iter.next()) |shard_entry| {
+            if (shard_entry.kind != .directory) continue;
+            if (shard_entry.name.len != 2) continue;
+            if (!std.ascii.isHex(shard_entry.name[0]) or !std.ascii.isHex(shard_entry.name[1])) continue;
+
+            var shard_dir = blobs_dir.openDir(shard_entry.name, .{ .iterate = true }) catch continue;
+            defer shard_dir.close();
+
+            var file_iter = shard_dir.iterate();
+            while (try file_iter.next()) |file_entry| {
+                if (file_entry.kind != .file) continue;
+                if (file_entry.name.len != digest_hex_len) continue;
+
+                var digest: DigestKey = undefined;
+                var valid = true;
+                for (file_entry.name, 0..) |ch, i| {
+                    if (!std.ascii.isHex(ch)) {
+                        valid = false;
+                        break;
+                    }
+                    digest[i] = std.ascii.toLower(ch);
+                }
+                if (!valid) continue;
+
+                try out.append(allocator, digest);
+                if (limit > 0 and out.items.len >= limit) break :shards;
+            }
+        }
+
+        const SortCtx = struct {
+            fn lessThan(_: void, a: DigestKey, b: DigestKey) bool {
+                return std.mem.lessThan(u8, a[0..], b[0..]);
+            }
+        };
+        std.mem.sort(DigestKey, out.items, {}, SortCtx.lessThan);
+        return out.toOwnedSlice(allocator);
+    }
+
     fn putSingle(self: *BlobStore, bytes: []const u8) !BlobRef {
         var digest: [32]u8 = undefined;
         Sha256.hash(bytes, &digest, .{});
@@ -389,6 +449,31 @@ pub const BlobStore = struct {
         for (parts.part_digests) |part_digest| {
             try self.verifySingleByDigest(part_digest);
         }
+    }
+
+    fn existsSingleByDigest(self: *BlobStore, digest_hex: DigestKey) !bool {
+        _ = self.statSingleByDigest(digest_hex) catch |err| switch (err) {
+            error.FileNotFound => return false,
+            else => return err,
+        };
+        return true;
+    }
+
+    fn existsMultipartByDigest(self: *BlobStore, manifest_digest: DigestKey) !bool {
+        if (!try self.existsSingleByDigest(manifest_digest)) return false;
+
+        const parts = self.loadMultipartParts(self.allocator, manifest_digest) catch |err| switch (err) {
+            error.FileNotFound,
+            error.InvalidMultipartManifest,
+            => return false,
+            else => return err,
+        };
+        defer self.allocator.free(parts.part_digests);
+
+        for (parts.part_digests) |part_digest| {
+            if (!try self.existsSingleByDigest(part_digest)) return false;
+        }
+        return true;
     }
 
     const MultipartParts = struct {
@@ -664,6 +749,66 @@ test "BlobStore.verify validates and detects tampering" {
     try file.sync();
 
     try std.testing.expectError(error.IntegrityMismatch, store.verify(blob_ref.refSlice()));
+}
+
+test "BlobStore.exists returns true for stored refs and false for missing refs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+
+    const payload = "exists-check-payload";
+    const blob_ref = try store.put(payload);
+    try std.testing.expect(try store.exists(blob_ref.refSlice()));
+
+    var missing_digest = std.mem.zeroes([digest_hex_len]u8);
+    @memset(missing_digest[0..], '0');
+    const missing_ref = buildSha256RefString(missing_digest);
+    try std.testing.expect(!(try store.exists(missing_ref[0..sha256_ref_len])));
+}
+
+test "BlobStore.listSingleDigests returns sorted digest list" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+
+    const blob_a = try store.put("alpha");
+    const blob_b = try store.put("beta");
+    const blob_c = try store.put("gamma");
+
+    const digests = try store.listSingleDigests(std.testing.allocator, 0);
+    defer std.testing.allocator.free(digests);
+    try std.testing.expect(digests.len >= 3);
+
+    var expected = std.ArrayList([digest_hex_len]u8).empty;
+    defer expected.deinit(std.testing.allocator);
+    try expected.append(std.testing.allocator, (try parseRef(blob_a.refSlice())).digest_hex);
+    try expected.append(std.testing.allocator, (try parseRef(blob_b.refSlice())).digest_hex);
+    try expected.append(std.testing.allocator, (try parseRef(blob_c.refSlice())).digest_hex);
+
+    for (expected.items) |digest| {
+        var found = false;
+        for (digests) |listed| {
+            if (std.mem.eql(u8, digest[0..], listed[0..])) {
+                found = true;
+                break;
+            }
+        }
+        try std.testing.expect(found);
+    }
+
+    for (digests[1..], 1..) |digest, idx| {
+        try std.testing.expect(!std.mem.lessThan(u8, digest[0..], digests[idx - 1][0..]));
+    }
 }
 
 test "BlobStore.putAuto creates multipart ref for large payloads and readAll reassembles" {

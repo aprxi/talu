@@ -170,3 +170,52 @@ fn upload_rejects_conflicting_filename_sources() {
     let msg = json["error"]["message"].as_str().unwrap_or_default();
     assert!(msg.contains("conflicting filename values"));
 }
+
+#[test]
+fn upload_deduplicates_blob_content_across_distinct_file_metadata() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let boundary_a = "----talu-upload-dedup-a";
+    let payload = "hello dedup world";
+    let body_a = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nContent-Type: text/plain\r\n\r\n{payload}\r\n--{b}--\r\n",
+        b = boundary_a,
+        payload = payload,
+    );
+    let content_type_a = format!("multipart/form-data; boundary={}", boundary_a);
+    let headers_a = [("Content-Type", content_type_a.as_str())];
+    let resp_a = send_request(ctx.addr(), "POST", "/v1/files", &headers_a, Some(&body_a));
+    assert_eq!(resp_a.status, 200, "body: {}", resp_a.body);
+    let file_a = resp_a.json()["id"].as_str().expect("file a id").to_string();
+
+    let boundary_b = "----talu-upload-dedup-b";
+    let body_b = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"b.txt\"\r\nContent-Type: text/plain\r\n\r\n{payload}\r\n--{b}--\r\n",
+        b = boundary_b,
+        payload = payload,
+    );
+    let content_type_b = format!("multipart/form-data; boundary={}", boundary_b);
+    let headers_b = [("Content-Type", content_type_b.as_str())];
+    let resp_b = send_request(ctx.addr(), "POST", "/v1/files", &headers_b, Some(&body_b));
+    assert_eq!(resp_b.status, 200, "body: {}", resp_b.body);
+    let file_b = resp_b.json()["id"].as_str().expect("file b id").to_string();
+
+    assert_ne!(file_a, file_b, "metadata records should be distinct");
+
+    let doc_a = get(ctx.addr(), &format!("/v1/documents/{}", file_a)).json();
+    let doc_b = get(ctx.addr(), &format!("/v1/documents/{}", file_b)).json();
+    let blob_a = doc_a["content"]["blob_ref"].as_str().expect("blob ref a");
+    let blob_b = doc_b["content"]["blob_ref"].as_str().expect("blob ref b");
+    assert_eq!(
+        blob_a, blob_b,
+        "same content should map to same CAS blob reference"
+    );
+
+    let del_a = delete(ctx.addr(), &format!("/v1/files/{}", file_a));
+    assert_eq!(del_a.status, 200, "body: {}", del_a.body);
+
+    let get_b_content = get(ctx.addr(), &format!("/v1/files/{}/content", file_b));
+    assert_eq!(get_b_content.status, 200, "body: {}", get_b_content.body);
+    assert_eq!(get_b_content.body, payload);
+}

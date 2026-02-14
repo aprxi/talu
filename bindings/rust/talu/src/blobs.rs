@@ -12,6 +12,7 @@ const ERROR_CODE_OK: i32 = 0;
 const ERROR_CODE_IO_FILE_NOT_FOUND: i32 = 500;
 const ERROR_CODE_IO_PERMISSION_DENIED: i32 = 501;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
+const ERROR_CODE_RESOURCE_EXHAUSTED: i32 = 905;
 
 /// Error type for blob operations.
 #[derive(Debug)]
@@ -19,6 +20,7 @@ pub enum BlobError {
     InvalidArgument(String),
     NotFound(String),
     PermissionDenied(String),
+    ResourceExhausted(String),
     StorageError(String),
 }
 
@@ -28,6 +30,7 @@ impl std::fmt::Display for BlobError {
             BlobError::InvalidArgument(msg) => write!(f, "Invalid argument: {msg}"),
             BlobError::NotFound(msg) => write!(f, "Blob not found: {msg}"),
             BlobError::PermissionDenied(msg) => write!(f, "Permission denied: {msg}"),
+            BlobError::ResourceExhausted(msg) => write!(f, "Resource exhausted: {msg}"),
             BlobError::StorageError(msg) => write!(f, "Storage error: {msg}"),
         }
     }
@@ -43,6 +46,7 @@ impl BlobError {
             ERROR_CODE_INVALID_ARGUMENT => BlobError::InvalidArgument(detail),
             ERROR_CODE_IO_FILE_NOT_FOUND => BlobError::NotFound(detail),
             ERROR_CODE_IO_PERMISSION_DENIED => BlobError::PermissionDenied(detail),
+            ERROR_CODE_RESOURCE_EXHAUSTED => BlobError::ResourceExhausted(detail),
             _ => BlobError::StorageError(detail),
         }
     }
@@ -104,6 +108,55 @@ impl BlobsHandle {
             ));
         }
         Ok(blob_ref)
+    }
+
+    /// Check if a blob reference currently resolves to stored bytes.
+    pub fn contains(&self, blob_ref: &str) -> Result<bool, BlobError> {
+        let blob_ref_c = CString::new(blob_ref)
+            .map_err(|_| BlobError::InvalidArgument("blob_ref contains null bytes".to_string()))?;
+        let mut out_exists = false;
+
+        // SAFETY: `path_cstr` and `blob_ref_c` are valid C strings, and `out_exists`
+        // points to writable memory for the output flag.
+        let code = unsafe {
+            talu_sys::talu_blobs_exists(
+                self.path_cstr.as_ptr(),
+                blob_ref_c.as_ptr(),
+                &mut out_exists as *mut _ as *mut c_void,
+            )
+        };
+        if code != ERROR_CODE_OK {
+            return Err(BlobError::from_code(code, "blob exists check failed"));
+        }
+        Ok(out_exists)
+    }
+
+    /// List stored physical blob references (`sha256:<hex>`).
+    ///
+    /// `limit=None` means no limit.
+    pub fn list(&self, limit: Option<usize>) -> Result<Vec<String>, BlobError> {
+        let mut out_list: *mut talu_sys::CStringList = ptr::null_mut();
+        let limit = limit.unwrap_or(0);
+
+        // SAFETY: `path_cstr` is valid and `out_list` points to writable memory.
+        let code = unsafe {
+            talu_sys::talu_blobs_list(
+                self.path_cstr.as_ptr(),
+                limit,
+                &mut out_list as *mut _ as *mut c_void,
+            )
+        };
+        if code != ERROR_CODE_OK {
+            return Err(BlobError::from_code(code, "blob list failed"));
+        }
+
+        if out_list.is_null() {
+            return Ok(Vec::new());
+        }
+        let refs = extract_string_list(out_list);
+        // SAFETY: list handle is owned by this function on success.
+        unsafe { talu_sys::talu_blobs_free_string_list(out_list) };
+        Ok(refs)
     }
 
     /// Open a streaming writer for incremental blob uploads.
@@ -314,5 +367,26 @@ impl Drop for BlobWriteStream {
         // SAFETY: `handle` was returned by `talu_blobs_open_write_stream` and is owned here.
         unsafe { talu_sys::talu_blobs_write_stream_close(self.handle) };
         self.handle = ptr::null_mut();
+    }
+}
+
+fn extract_string_list(list: *mut talu_sys::CStringList) -> Vec<String> {
+    if list.is_null() {
+        return Vec::new();
+    }
+
+    unsafe {
+        let l = &*list;
+        let mut out = Vec::with_capacity(l.count);
+        if !l.items.is_null() {
+            let items_ptr = l.items as *const *const c_char;
+            for i in 0..l.count {
+                let item = *items_ptr.add(i);
+                if !item.is_null() {
+                    out.push(CStr::from_ptr(item).to_string_lossy().to_string());
+                }
+            }
+        }
+        out
     }
 }

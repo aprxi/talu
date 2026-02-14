@@ -2376,6 +2376,16 @@ extern "C" {
         options: PaddedTensorOptions,
     ) -> PaddedTensorResult;
     // core/src/capi/blobs.zig
+    pub fn talu_blobs_exists(
+        db_path: *const c_char,
+        blob_ref: *const c_char,
+        out_exists: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/blobs.zig
+    pub fn talu_blobs_free_string_list(list: *mut CStringList);
+    // core/src/capi/blobs.zig
+    pub fn talu_blobs_list(db_path: *const c_char, limit: usize, out_refs: *mut c_void) -> c_int;
+    // core/src/capi/blobs.zig
     pub fn talu_blobs_open_stream(
         db_path: *const c_char,
         blob_ref: *const c_char,

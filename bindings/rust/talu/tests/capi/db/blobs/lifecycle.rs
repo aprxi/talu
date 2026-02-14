@@ -83,3 +83,31 @@ fn write_stream_roundtrip() {
     let loaded = blobs.read_all(&blob_ref).expect("read_all");
     assert_eq!(loaded, b"write-stream");
 }
+
+#[test]
+fn contains_reports_existing_and_missing_refs() {
+    let ctx = TestContext::new();
+    let blobs = BlobsHandle::open(ctx.db_path()).expect("open blobs");
+
+    let blob_ref = blobs.put(b"contains-payload").expect("put");
+    assert!(blobs.contains(&blob_ref).expect("contains existing"));
+
+    let missing = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
+    assert!(!blobs.contains(missing).expect("contains missing"));
+}
+
+#[test]
+fn list_returns_written_blob_refs() {
+    let ctx = TestContext::new();
+    let blobs = BlobsHandle::open(ctx.db_path()).expect("open blobs");
+
+    let ref_a = blobs.put(b"list-a").expect("put a");
+    let ref_b = blobs.put(b"list-b").expect("put b");
+    let refs = blobs.list(None).expect("list blobs");
+
+    assert!(refs.contains(&ref_a), "expected list to contain first blob");
+    assert!(
+        refs.contains(&ref_b),
+        "expected list to contain second blob"
+    );
+}
