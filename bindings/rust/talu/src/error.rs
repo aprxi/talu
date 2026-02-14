@@ -3,16 +3,36 @@
 use std::ffi::CStr;
 use talu_sys;
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum Error {
-    #[error("{0}")]
     Talu(String),
-
-    #[error("null string conversion")]
-    NulError(#[from] std::ffi::NulError),
-
-    #[error("{0}")]
+    NulError(std::ffi::NulError),
     Generic(String),
+}
+
+impl std::fmt::Display for Error {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Error::Talu(msg) => f.write_str(msg),
+            Error::NulError(_) => f.write_str("null string conversion"),
+            Error::Generic(msg) => f.write_str(msg),
+        }
+    }
+}
+
+impl std::error::Error for Error {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::NulError(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::ffi::NulError> for Error {
+    fn from(e: std::ffi::NulError) -> Self {
+        Error::NulError(e)
+    }
 }
 
 impl Error {

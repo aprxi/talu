@@ -43,36 +43,45 @@ const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 const ERROR_CODE_IO_FILE_NOT_FOUND: i32 = 500;
 
 /// Error types for storage operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum StorageError {
     /// Session not found or has been deleted.
-    #[error("Session not found: {0}")]
     SessionNotFound(String),
 
     /// Item not found within a session.
-    #[error("Item not found: {0}")]
     ItemNotFound(String),
 
     /// Tag not found.
-    #[error("Tag not found: {0}")]
     TagNotFound(String),
 
     /// Storage path does not exist or is not a valid TaluDB.
-    #[error("Storage not found: {0}")]
     StorageNotFound(PathBuf),
 
     /// Invalid argument provided.
-    #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
     /// Storage is corrupted or invalid.
-    #[error("Storage error: {0}")]
     StorageCorrupted(String),
 
     /// Generic I/O error.
-    #[error("I/O error: {0}")]
     IoError(String),
 }
+
+impl std::fmt::Display for StorageError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            StorageError::SessionNotFound(s) => write!(f, "Session not found: {s}"),
+            StorageError::ItemNotFound(s) => write!(f, "Item not found: {s}"),
+            StorageError::TagNotFound(s) => write!(f, "Tag not found: {s}"),
+            StorageError::StorageNotFound(p) => write!(f, "Storage not found: {}", p.display()),
+            StorageError::InvalidArgument(s) => write!(f, "Invalid argument: {s}"),
+            StorageError::StorageCorrupted(s) => write!(f, "Storage error: {s}"),
+            StorageError::IoError(s) => write!(f, "I/O error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for StorageError {}
 
 impl StorageError {
     /// Translate C API error code to StorageError.

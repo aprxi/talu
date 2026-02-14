@@ -6,5 +6,8 @@ license.workspace = true
 repository.workspace = true
 description = "Low-level FFI bindings for libtalu"
 links = "talu"
+readme = "README.md"
+categories = ["external-ffi-bindings"]
+keywords = ["talu", "llm", "inference"]
 
 [build-dependencies]

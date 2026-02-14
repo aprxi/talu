@@ -40,24 +40,33 @@ const ERROR_CODE_STORAGE_ERROR: i32 = 700;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 
 /// Error types for document operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum DocumentError {
     /// Document not found.
-    #[error("Document not found: {0}")]
     DocumentNotFound(String),
 
     /// Storage path does not exist or is not a valid TaluDB.
-    #[error("Storage not found: {0}")]
     StorageNotFound(PathBuf),
 
     /// Invalid argument provided.
-    #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
     /// Storage error.
-    #[error("Storage error: {0}")]
     StorageError(String),
 }
+
+impl std::fmt::Display for DocumentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DocumentError::DocumentNotFound(s) => write!(f, "Document not found: {s}"),
+            DocumentError::StorageNotFound(p) => write!(f, "Storage not found: {}", p.display()),
+            DocumentError::InvalidArgument(s) => write!(f, "Invalid argument: {s}"),
+            DocumentError::StorageError(s) => write!(f, "Storage error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for DocumentError {}
 
 impl DocumentError {
     fn from_code(code: i32, context: &str) -> Self {

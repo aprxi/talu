@@ -26,16 +26,25 @@ use std::os::raw::c_void;
 use crate::error;
 
 /// Error types for vector store operations.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug)]
 pub enum VectorError {
     /// Invalid argument (dimension mismatch, null path, etc.).
-    #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
     /// Storage I/O or corruption error.
-    #[error("Vector store error: {0}")]
     StoreError(String),
 }
+
+impl std::fmt::Display for VectorError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            VectorError::InvalidArgument(s) => write!(f, "Invalid argument: {s}"),
+            VectorError::StoreError(s) => write!(f, "Vector store error: {s}"),
+        }
+    }
+}
+
+impl std::error::Error for VectorError {}
 
 impl VectorError {
     fn from_last(fallback: &str) -> Self {
