@@ -823,8 +823,10 @@ fn bpe_decode_with_options_impl(model: *BpeModel, tok: *ct.Tokenizer, ids: [*c]c
         strip_stop_count -= 1;
     }
 
-    // Strip leading space added by add_prefix_space (pretokenizer or Metaspace decoder)
-    if ((tok.pretokenizer.add_prefix_space != 0 or tok.decoder.add_prefix_space != 0) and result.items.len > 0 and result.items[0] == ' ') {
+    // Strip leading space added by add_prefix_space (pretokenizer or Metaspace decoder).
+    // Skip when strip_start already removed leading spaces — the Strip decoder in a
+    // Sequence (e.g. Mistral) handles this; applying both would double-strip.
+    if (tok.decoder.strip_start == 0 and (tok.pretokenizer.add_prefix_space != 0 or tok.decoder.add_prefix_space != 0) and result.items.len > 0 and result.items[0] == ' ') {
         _ = result.orderedRemove(0);
     }
 

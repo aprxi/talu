@@ -61,37 +61,41 @@ fn postprocess_single_impl(postprocessor: *const ct.PostProcessor, encoding: *ct
     if (postprocessor.add_special == 0) return;
 
     const base_len = encoding.ids_len;
+    const has_cls = postprocessor.cls_token[0] != 0;
     const has_sep = postprocessor.sep_token[0] != 0;
-    const total_len = base_len + 1 + @as(usize, if (has_sep) 1 else 0);
+    if (!has_cls and !has_sep) return;
+    const total_len = base_len + @as(usize, if (has_cls) 1 else 0) + @as(usize, if (has_sep) 1 else 0);
 
     var buffers_out = try buffers.allocBuffers(total_len);
     errdefer buffers_out.deinit();
 
-    // CLS token at start
-    const cls_bytes = std.mem.sliceTo(&postprocessor.cls_token, 0);
     var write_index: usize = 0;
-    if (!appendSpecialToken(
-        buffers_out.ids,
-        buffers_out.tokens,
-        buffers_out.attention_mask,
-        buffers_out.type_ids,
-        buffers_out.special,
-        buffers_out.offsets,
-        &write_index,
-        postprocessor.cls_id,
-        cls_bytes,
-        0,
-        -1,
-        -1,
-    )) return error.OutOfMemory;
+
+    // CLS token at start (only if configured)
+    if (has_cls) {
+        const cls_bytes = std.mem.sliceTo(&postprocessor.cls_token, 0);
+        if (!appendSpecialToken(
+            buffers_out.ids,
+            buffers_out.tokens,
+            buffers_out.attention_mask,
+            buffers_out.type_ids,
+            buffers_out.special,
+            buffers_out.offsets,
+            &write_index,
+            postprocessor.cls_id,
+            cls_bytes,
+            0,
+            -1,
+            -1,
+        )) return error.OutOfMemory;
+    }
 
     // Copy original content
     buffers.fillFromEncoding(&buffers_out, &write_index, encoding, 0, .{ .start = -1, .end = -1 });
 
-    // SEP token at end (only if sep_token was explicitly configured)
+    // SEP token at end (only if configured)
     if (has_sep) {
         const sep_bytes = std.mem.sliceTo(&postprocessor.sep_token, 0);
-        write_index = total_len - 1;
         if (!appendSpecialToken(
             buffers_out.ids,
             buffers_out.tokens,

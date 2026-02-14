@@ -140,12 +140,18 @@ fn truncateEncoding(encoding: *ct.TokenizerEncoding, new_length: usize) void {
 
 fn pairSpecialTokenCount(tokenizer: *const ct.Tokenizer) usize {
     if (tokenizer.postproc.add_special == 0) return 0;
-    return if (tokenizer.postproc.pair != 0) 4 else 3;
+    const cls: usize = if (tokenizer.postproc.cls_id >= 0) 1 else 0;
+    const sep: usize = if (tokenizer.postproc.sep_id >= 0) 1 else 0;
+    // Pair: CLS? + SEP? after A + SEP? pair-between + content B + SEP? after B
+    // Non-pair: CLS? + content A + SEP? after A + content B + SEP? after B
+    return cls + sep * (if (tokenizer.postproc.pair != 0) @as(usize, 3) else 2);
 }
 
 fn truncationSpecialTokenCount(tokenizer: *const ct.Tokenizer) usize {
     if (tokenizer.postproc.add_special == 0) return 0;
-    return if (tokenizer.postproc.pair != 0) 3 else 2;
+    const cls: usize = if (tokenizer.postproc.cls_id >= 0) 1 else 0;
+    const sep: usize = if (tokenizer.postproc.sep_id >= 0) 1 else 0;
+    return cls + sep * (if (tokenizer.postproc.pair != 0) @as(usize, 2) else 1);
 }
 
 fn appendSpecial(
@@ -173,11 +179,13 @@ fn appendSpecial(
 }
 
 fn appendCls(tokenizer: *const ct.Tokenizer, buffers_out: *buffers.Buffers, write_index: *usize, offset: ct.Offset) bool {
+    if (tokenizer.postproc.cls_id < 0) return true;
     const cls_str = std.mem.sliceTo(&tokenizer.postproc.cls_token, 0);
     return appendSpecial(buffers_out, write_index, tokenizer.postproc.cls_id, cls_str, 0, offset);
 }
 
 fn appendSep(tokenizer: *const ct.Tokenizer, buffers_out: *buffers.Buffers, write_index: *usize, type_id: i32, offset: ct.Offset) bool {
+    if (tokenizer.postproc.sep_id < 0) return true;
     const sep_str = std.mem.sliceTo(&tokenizer.postproc.sep_token, 0);
     return appendSpecial(buffers_out, write_index, tokenizer.postproc.sep_id, sep_str, type_id, offset);
 }

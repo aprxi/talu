@@ -178,6 +178,7 @@ pub const Lexer = struct {
     }
 
     fn skipComment(self: *Lexer) LexerError!void {
+        const comment_start = self.pos;
         self.pos += 2; // Skip {#
 
         // Check for trim_left: {#-
@@ -185,6 +186,9 @@ pub const Lexer = struct {
             self.pos += 1;
             // Trim trailing whitespace from previous text token
             self.trimPreviousText();
+        } else {
+            // lstrip_blocks: strip line-leading whitespace before {# tags
+            self.lstripPreviousText(comment_start);
         }
 
         // Find end of comment
@@ -230,6 +234,9 @@ pub const Lexer = struct {
             self.pos += 1;
             // Apply trim to previous text token if any
             self.trimPreviousText();
+        } else if (c1 == '%') {
+            // lstrip_blocks: strip line-leading whitespace before {% tags
+            self.lstripPreviousText(start);
         }
 
         const tok_type: TokenType = if (c1 == '{') .print_open else .stmt_open;
@@ -522,6 +529,36 @@ pub const Lexer = struct {
         const last = &self.tokens.items[self.tokens.items.len - 1];
         if (last.type == .text) {
             last.value = std.mem.trimRight(u8, last.value, " \t\n\r");
+        }
+    }
+
+    /// lstrip_blocks: strip spaces/tabs from the current line in the previous
+    /// text token, but only if the entire source line up to the block tag
+    /// contains nothing but whitespace. Matches Jinja2 lstrip_blocks=True.
+    fn lstripPreviousText(self: *Lexer, tag_start: usize) void {
+        if (self.tokens.items.len == 0) return;
+        const last = &self.tokens.items[self.tokens.items.len - 1];
+        if (last.type != .text) return;
+        const text = last.value;
+        if (text.len == 0) return;
+
+        // Find start of line in source (position after last newline, or 0)
+        var line_start = tag_start;
+        while (line_start > 0) {
+            if (self.source[line_start - 1] == '\n') break;
+            line_start -= 1;
+        }
+
+        // Only strip if the entire line prefix (source[line_start..tag_start])
+        // is spaces/tabs — any non-whitespace means the tag is mid-line
+        for (self.source[line_start..tag_start]) |c| {
+            if (c != ' ' and c != '\t') return;
+        }
+
+        // Strip the trailing whitespace from the text token
+        const ws_len = tag_start - line_start;
+        if (ws_len > 0 and ws_len <= text.len) {
+            last.value = text[0 .. text.len - ws_len];
         }
     }
 

@@ -1652,8 +1652,23 @@ fn applyPostProcessorFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) 
         }
     }
 
-    // Default token strings
-    if (cls_str == null) {
+    // For TemplateProcessing with a single special token: check whether it
+    // appears before or after the content Sequence in the "single" template.
+    // If after (e.g. [Sequence(A), SpecialToken(EOS)]), assign to sep not cls.
+    if (std.mem.eql(u8, type_str, "TemplateProcessing") and cls_str != null and sep_str == null) {
+        if (findSection(json_bytes, "\"single\"")) |single_section| {
+            const seq_pos = std.mem.indexOf(u8, single_section, "\"Sequence\"");
+            const spec_pos = std.mem.indexOf(u8, single_section, "\"SpecialToken\"");
+            if (seq_pos != null and spec_pos != null and seq_pos.? < spec_pos.?) {
+                sep_str = cls_str;
+                cls_str = null;
+            }
+        }
+    }
+
+    // Default token strings (skip for TemplateProcessing — its cls/sep
+    // assignment is determined by template ordering, not convention)
+    if (cls_str == null and !std.mem.eql(u8, type_str, "TemplateProcessing")) {
         if (std.mem.eql(u8, type_str, "RobertaProcessing")) {
             cls_str = "<s>";
             sep_str = if (sep_str == null) "</s>" else sep_str;
