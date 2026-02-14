@@ -197,6 +197,7 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
         docs_namespace,
         schema_documents,
         kvbuf.DocumentFieldIds.doc_json_ref,
+        kvbuf.DocumentFieldIds.doc_json,
         &store,
         &digests,
         invalid_ref_count,
@@ -207,6 +208,7 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
         chat_namespace,
         schema_items,
         kvbuf.FieldIds.record_json_ref,
+        kvbuf.FieldIds.record_json,
         &store,
         &digests,
         invalid_ref_count,
@@ -218,6 +220,7 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
         docs_namespace,
         schema_documents,
         kvbuf.DocumentFieldIds.doc_json_ref,
+        kvbuf.DocumentFieldIds.doc_json,
         &store,
         &digests,
         invalid_ref_count,
@@ -228,6 +231,7 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
         chat_namespace,
         schema_items,
         kvbuf.FieldIds.record_json_ref,
+        kvbuf.FieldIds.record_json,
         &store,
         &digests,
         invalid_ref_count,
@@ -242,6 +246,7 @@ fn markNamespaceBlockRefs(
     namespace: []const u8,
     schema_id: u16,
     ref_field_id: u16,
+    inline_json_field_id: ?u16,
     store: *db_blob_store.BlobStore,
     digests: *DigestSet,
     invalid_ref_count: *usize,
@@ -270,7 +275,7 @@ fn markNamespaceBlockRefs(
 
         for (0..header.row_count) |row_idx| {
             const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-            try markRefInPayload(payload, ref_field_id, store, digests, invalid_ref_count);
+            try markRefInPayload(payload, ref_field_id, inline_json_field_id, store, digests, invalid_ref_count);
         }
     }
 }
@@ -281,6 +286,7 @@ fn markNamespaceWalRefs(
     namespace: []const u8,
     schema_id: u16,
     ref_field_id: u16,
+    inline_json_field_id: ?u16,
     store: *db_blob_store.BlobStore,
     digests: *DigestSet,
     invalid_ref_count: *usize,
@@ -314,7 +320,15 @@ fn markNamespaceWalRefs(
             const payload = payload_opt orelse break;
             defer allocator.free(payload);
 
-            try markRefInWalPayload(payload, schema_id, ref_field_id, store, digests, invalid_ref_count);
+            try markRefInWalPayload(
+                payload,
+                schema_id,
+                ref_field_id,
+                inline_json_field_id,
+                store,
+                digests,
+                invalid_ref_count,
+            );
         }
     }
 }
@@ -323,6 +337,7 @@ fn markRefInWalPayload(
     payload: []const u8,
     schema_id: u16,
     ref_field_id: u16,
+    inline_json_field_id: ?u16,
     store: *db_blob_store.BlobStore,
     digests: *DigestSet,
     invalid_ref_count: *usize,
@@ -350,26 +365,55 @@ fn markRefInWalPayload(
     }
 
     if (payload_col_data) |row_payload| {
-        try markRefInPayload(row_payload, ref_field_id, store, digests, invalid_ref_count);
+        try markRefInPayload(row_payload, ref_field_id, inline_json_field_id, store, digests, invalid_ref_count);
     }
 }
 
 fn markRefInPayload(
     payload: []const u8,
     ref_field_id: u16,
+    inline_json_field_id: ?u16,
     store: *db_blob_store.BlobStore,
     digests: *DigestSet,
     invalid_ref_count: *usize,
 ) !void {
     if (!kvbuf.isKvBuf(payload)) return;
     const reader = kvbuf.KvBufReader.init(payload) catch return;
-    const blob_ref = reader.get(ref_field_id) orelse return;
 
-    const parsed = db_blob_store.parseRef(blob_ref) catch {
+    if (reader.get(ref_field_id)) |blob_ref| {
+        const parsed = db_blob_store.parseRef(blob_ref) catch {
+            invalid_ref_count.* += 1;
+            return;
+        };
+        try markReferenceRecursive(store, parsed, digests, invalid_ref_count, store.allocator);
+    }
+
+    if (inline_json_field_id) |field_id| {
+        const inline_json = reader.get(field_id) orelse return;
+        try markInlineBlobRefInJson(inline_json, store, digests, invalid_ref_count);
+    }
+}
+
+fn markInlineBlobRefInJson(
+    json_payload: []const u8,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    var parsed_json = std.json.parseFromSlice(std.json.Value, store.allocator, json_payload, .{}) catch return;
+    defer parsed_json.deinit();
+
+    const root = parsed_json.value;
+    if (root != .object) return;
+    const blob_ref_val = root.object.get("blob_ref") orelse return;
+    if (blob_ref_val != .string) return;
+    if (blob_ref_val.string.len == 0) return;
+
+    const parsed_ref = db_blob_store.parseRef(blob_ref_val.string) catch {
         invalid_ref_count.* += 1;
         return;
     };
-    try markReferenceRecursive(store, parsed, digests, invalid_ref_count, store.allocator);
+    try markReferenceRecursive(store, parsed_ref, digests, invalid_ref_count, store.allocator);
 }
 
 fn markReferenceRecursive(
@@ -541,7 +585,7 @@ fn appendPayloadRow(
     flush: bool,
 ) !db_writer.Writer {
     var writer = try db_writer.Writer.open(allocator, db_root, namespace);
-    writer.setDurability(.full);
+    writer.durability = .full;
 
     const col = db_writer.ColumnValue{
         .column_id = col_payload,
@@ -707,6 +751,48 @@ test "sweepUnreferencedBlobs keeps blobs referenced only from WAL" {
     defer allocator.free(wal_bytes);
     try std.testing.expectEqualStrings("wal-only-ref", wal_bytes);
 
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
+}
+
+test "sweepUnreferencedBlobs preserves blobs referenced by inline doc_json blob_ref" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const referenced_blob = try store.put("inline-json-ref");
+    const orphan_blob = try store.put("inline-json-orphan");
+
+    var payload_writer = kvbuf.KvBufWriter.init();
+    defer payload_writer.deinit(allocator);
+    const inline_doc_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"blob_ref\":\"{s}\",\"original_name\":\"doc.pdf\",\"size\":14}}",
+        .{referenced_blob.refSlice()},
+    );
+    defer allocator.free(inline_doc_json);
+    try payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json, inline_doc_json);
+    const payload = try payload_writer.finish(allocator);
+    defer allocator.free(payload);
+
+    var writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, payload, true);
+    defer writer.deinit();
+
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 1), stats.referenced_blob_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
+
+    const keep = try store.readAll(referenced_blob.refSlice(), allocator);
+    defer allocator.free(keep);
+    try std.testing.expectEqualStrings("inline-json-ref", keep);
     try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
 }
 

@@ -91,6 +91,12 @@ struct FileDescriptor {
     mime_type: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContentRangeRequest {
+    Full,
+    Partial { start: u64, end: u64 },
+}
+
 /// POST /v1/files - Upload a file as blob + metadata document.
 pub async fn handle_upload(
     state: Arc<AppState>,
@@ -351,18 +357,57 @@ pub async fn handle_get_content(
         Ok(s) => s,
         Err(e) => return blob_error_response(e),
     };
+    let total_size = match blob_stream.total_size() {
+        Ok(size) => size,
+        Err(e) => return blob_error_response(e),
+    };
+    let range_header = match req.headers().get("range") {
+        Some(value) => match value.to_str() {
+            Ok(s) => Some(s),
+            Err(_) => return range_not_satisfiable(total_size),
+        },
+        None => None,
+    };
+    let requested_range = match parse_range_header(range_header, total_size) {
+        Ok(r) => r,
+        Err(()) => return range_not_satisfiable(total_size),
+    };
+
+    let (status, content_length, content_range_header) = match requested_range {
+        ContentRangeRequest::Full => (StatusCode::OK, total_size, None),
+        ContentRangeRequest::Partial { start, end } => {
+            if let Err(e) = blob_stream.seek(start) {
+                return blob_error_response(e);
+            }
+            (
+                StatusCode::PARTIAL_CONTENT,
+                end - start + 1,
+                Some(format!("bytes {}-{}/{}", start, end, total_size)),
+            )
+        }
+    };
 
     let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
     tokio::task::spawn_blocking(move || {
         const CHUNK_SIZE: usize = 64 * 1024;
         let mut buf = [0u8; CHUNK_SIZE];
+        let mut remaining = Some(content_length);
 
         loop {
-            match blob_stream.read(&mut buf) {
+            let next_read_len = match remaining {
+                Some(0) => break,
+                Some(rem) => CHUNK_SIZE.min(usize::try_from(rem).unwrap_or(usize::MAX)),
+                None => CHUNK_SIZE,
+            };
+
+            match blob_stream.read(&mut buf[..next_read_len]) {
                 Ok(0) => break,
                 Ok(n) => {
                     if tx.send(Bytes::copy_from_slice(&buf[..n])).is_err() {
                         break;
+                    }
+                    if let Some(rem) = remaining.as_mut() {
+                        *rem = rem.saturating_sub(n as u64);
                     }
                 }
                 Err(err) => {
@@ -377,8 +422,9 @@ pub async fn handle_get_content(
         .map(|chunk| Ok::<_, std::convert::Infallible>(Frame::data(chunk)));
     let body = StreamBody::new(stream).boxed();
 
-    Response::builder()
-        .status(StatusCode::OK)
+    let mut response_builder = Response::builder();
+    response_builder = response_builder
+        .status(status)
         .header(
             "content-type",
             descriptor
@@ -390,9 +436,12 @@ pub async fn handle_get_content(
             "content-disposition",
             format!("attachment; filename=\"{}\"", descriptor.filename),
         )
-        .header("content-length", descriptor.bytes.to_string())
-        .body(body)
-        .unwrap()
+        .header("accept-ranges", "bytes")
+        .header("content-length", content_length.to_string());
+    if let Some(header_value) = content_range_header {
+        response_builder = response_builder.header("content-range", header_value);
+    }
+    response_builder.body(body).unwrap()
 }
 
 /// DELETE /v1/files/:id - Delete file metadata (blob retained for CAS/GC lifecycle).
@@ -703,6 +752,60 @@ fn sanitize_filename(name: &str) -> Option<String> {
     Some(basename.to_string())
 }
 
+fn parse_range_header(
+    range_header: Option<&str>,
+    total_size: u64,
+) -> Result<ContentRangeRequest, ()> {
+    let Some(raw_range_header) = range_header else {
+        return Ok(ContentRangeRequest::Full);
+    };
+    let range_header = raw_range_header.trim();
+    if !range_header.starts_with("bytes=") {
+        return Err(());
+    }
+    let spec = &range_header["bytes=".len()..];
+    if spec.is_empty() || spec.contains(',') {
+        return Err(());
+    }
+    let (start_raw, end_raw) = spec.split_once('-').ok_or(())?;
+
+    if start_raw.is_empty() {
+        if end_raw.is_empty() || total_size == 0 {
+            return Err(());
+        }
+        let suffix_len = end_raw.parse::<u64>().map_err(|_| ())?;
+        if suffix_len == 0 {
+            return Err(());
+        }
+        let start = total_size.saturating_sub(suffix_len);
+        return Ok(ContentRangeRequest::Partial {
+            start,
+            end: total_size - 1,
+        });
+    }
+
+    if total_size == 0 {
+        return Err(());
+    }
+
+    let start = start_raw.parse::<u64>().map_err(|_| ())?;
+    if start >= total_size {
+        return Err(());
+    }
+
+    let end = if end_raw.is_empty() {
+        total_size - 1
+    } else {
+        let parsed_end = end_raw.parse::<u64>().map_err(|_| ())?;
+        if parsed_end < start {
+            return Err(());
+        }
+        parsed_end.min(total_size - 1)
+    };
+
+    Ok(ContentRangeRequest::Partial { start, end })
+}
+
 fn now_unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -729,6 +832,21 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody
     Response::builder()
         .status(status)
         .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body.to_string())).boxed())
+        .unwrap()
+}
+
+fn range_not_satisfiable(total_size: u64) -> Response<BoxBody> {
+    let body = serde_json::json!({
+        "error": {
+            "code": "invalid_range",
+            "message": "Requested range not satisfiable"
+        }
+    });
+    Response::builder()
+        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+        .header("content-type", "application/json")
+        .header("content-range", format!("bytes */{}", total_size))
         .body(Full::new(Bytes::from(body.to_string())).boxed())
         .unwrap()
 }

@@ -2,6 +2,7 @@
 
 mod concurrency;
 mod corruption;
+mod gc;
 mod hashing;
 mod interruption;
 mod large_io;

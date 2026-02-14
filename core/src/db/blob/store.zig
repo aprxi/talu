@@ -62,6 +62,7 @@ pub const BlobReadStream = struct {
     store: *BlobStore,
     allocator: Allocator,
     part_digests: []DigestKey,
+    part_sizes: []u64,
     total_size: u64,
     bytes_read: u64 = 0,
     current_part_idx: usize = 0,
@@ -73,6 +74,7 @@ pub const BlobReadStream = struct {
             self.current_part_file = null;
         }
         self.allocator.free(self.part_digests);
+        self.allocator.free(self.part_sizes);
     }
 
     /// Read bytes from the blob stream into `buffer`.
@@ -100,6 +102,36 @@ pub const BlobReadStream = struct {
         }
 
         return written;
+    }
+
+    /// Seek to an absolute byte offset from the beginning of the blob.
+    pub fn seek(self: *BlobReadStream, offset: u64) !void {
+        if (offset > self.total_size) return error.InvalidSeekOffset;
+
+        if (self.current_part_file) |file| {
+            file.close();
+            self.current_part_file = null;
+        }
+
+        self.bytes_read = offset;
+        if (offset == self.total_size) {
+            self.current_part_idx = self.part_digests.len;
+            return;
+        }
+
+        var part_idx: usize = 0;
+        var remaining = offset;
+        while (part_idx < self.part_sizes.len and remaining >= self.part_sizes[part_idx]) : (part_idx += 1) {
+            remaining -= self.part_sizes[part_idx];
+        }
+        if (part_idx >= self.part_digests.len) return error.InvalidSeekOffset;
+
+        var file = try self.store.openSingleByDigest(self.part_digests[part_idx]);
+        errdefer file.close();
+        if (remaining > 0) try file.seekTo(remaining);
+
+        self.current_part_idx = part_idx;
+        self.current_part_file = file;
     }
 
     fn openNextPart(self: *BlobReadStream) !bool {
@@ -200,21 +232,39 @@ pub const BlobStore = struct {
         return switch (parsed.kind) {
             .sha256 => blk: {
                 const part_digests = try allocator.alloc(DigestKey, 1);
+                errdefer allocator.free(part_digests);
+                const part_sizes = try allocator.alloc(u64, 1);
+                errdefer allocator.free(part_sizes);
                 part_digests[0] = parsed.digest_hex;
                 const stat = try self.statSingleByDigest(parsed.digest_hex);
+                part_sizes[0] = stat.size;
                 break :blk .{
                     .store = self,
                     .allocator = allocator,
                     .part_digests = part_digests,
+                    .part_sizes = part_sizes,
                     .total_size = @intCast(stat.size),
                 };
             },
             .multipart => blk: {
                 const parts = try self.loadMultipartParts(allocator, parsed.digest_hex);
+                errdefer allocator.free(parts.part_digests);
+                const part_sizes = try allocator.alloc(u64, parts.part_digests.len);
+                errdefer allocator.free(part_sizes);
+
+                var computed_total_size: u64 = 0;
+                for (parts.part_digests, 0..) |part_digest, i| {
+                    const part_stat = try self.statSingleByDigest(part_digest);
+                    part_sizes[i] = part_stat.size;
+                    computed_total_size += part_stat.size;
+                }
+                if (computed_total_size != parts.total_size) return error.InvalidMultipartManifest;
+
                 break :blk .{
                     .store = self,
                     .allocator = allocator,
                     .part_digests = parts.part_digests,
+                    .part_sizes = part_sizes,
                     .total_size = parts.total_size,
                 };
             },
@@ -893,6 +943,80 @@ test "BlobStore.openReadStream streams multipart blob incrementally" {
     try std.testing.expectEqualStrings(payload, out.items);
     try std.testing.expectEqual(@as(u64, payload.len), stream.bytes_read);
     try std.testing.expectEqual(@as(u64, payload.len), stream.total_size);
+}
+
+test "BlobReadStream.seek repositions single blob reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+
+    const payload = "0123456789abcdef";
+    const blob_ref = try store.put(payload);
+    var stream = try store.openReadStream(std.testing.allocator, blob_ref.refSlice());
+    defer stream.deinit();
+
+    try stream.seek(4);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    var buf: [6]u8 = undefined;
+    while (true) {
+        const read_len = try stream.read(&buf);
+        if (read_len == 0) break;
+        try out.appendSlice(std.testing.allocator, buf[0..read_len]);
+    }
+    try std.testing.expectEqualStrings(payload[4..], out.items);
+
+    try stream.seek(0);
+    var prefix_buf: [3]u8 = undefined;
+    const prefix_len = try stream.read(&prefix_buf);
+    try std.testing.expectEqual(@as(usize, 3), prefix_len);
+    try std.testing.expectEqualStrings("012", prefix_buf[0..prefix_len]);
+
+    try stream.seek(payload.len);
+    const eof_len = try stream.read(&prefix_buf);
+    try std.testing.expectEqual(@as(usize, 0), eof_len);
+    try std.testing.expectError(error.InvalidSeekOffset, stream.seek(payload.len + 1));
+}
+
+test "BlobReadStream.seek repositions multipart blob reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var store = try BlobStore.init(std.testing.allocator, root_path);
+    defer store.deinit();
+    store.multipart_chunk_size_bytes = 8;
+
+    const payload = "multipart-seek-payload-check";
+    const blob_ref = try store.putAuto(payload);
+    try std.testing.expect(std.mem.startsWith(u8, blob_ref.refSlice(), multipart_ref_prefix));
+
+    var stream = try store.openReadStream(std.testing.allocator, blob_ref.refSlice());
+    defer stream.deinit();
+
+    try stream.seek(10);
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    var buf: [5]u8 = undefined;
+    while (true) {
+        const read_len = try stream.read(&buf);
+        if (read_len == 0) break;
+        try out.appendSlice(std.testing.allocator, buf[0..read_len]);
+    }
+    try std.testing.expectEqualStrings(payload[10..], out.items);
+
+    try stream.seek(8);
+    var boundary_buf: [4]u8 = undefined;
+    const boundary_len = try stream.read(&boundary_buf);
+    try std.testing.expectEqual(@as(usize, 4), boundary_len);
+    try std.testing.expectEqualStrings(payload[8..12], boundary_buf[0..boundary_len]);
 }
 
 test "BlobPutStream.finish stores small payload as single blob" {

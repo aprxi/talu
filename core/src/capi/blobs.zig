@@ -8,6 +8,7 @@ const std = @import("std");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const capi_documents = @import("documents.zig");
+const db_blob_gc = @import("../db/blob/gc.zig");
 const db_blob_store = @import("../db/blob/store.zig");
 
 const allocator = std.heap.c_allocator;
@@ -31,6 +32,17 @@ const BlobWriteStreamState = struct {
 
 /// String list container for blob references.
 pub const CStringList = capi_documents.CStringList;
+
+/// C-compatible blob GC result statistics.
+pub const BlobGcStats = extern struct {
+    referenced_blob_count: usize,
+    total_blob_files: usize,
+    deleted_blob_files: usize,
+    reclaimed_bytes: u64,
+    invalid_reference_count: usize,
+    skipped_invalid_entries: usize,
+    skipped_recent_blob_files: usize,
+};
 
 fn validateDbPath(db_path: ?[*:0]const u8) ?[]const u8 {
     const slice = std.mem.sliceTo(db_path orelse {
@@ -62,6 +74,7 @@ fn blobErrorToCode(err: anyerror) error_codes.ErrorCode {
         error.UnsupportedRefKind,
         error.InvalidMultipartManifest,
         error.InvalidChunkSize,
+        error.InvalidSeekOffset,
         => .invalid_argument,
         error.OutOfMemory => .out_of_memory,
         error.NoSpaceLeft,
@@ -159,6 +172,48 @@ pub export fn talu_blobs_put(
 
     @memcpy(out[0..blob_ref_slice.len], blob_ref_slice);
     out[blob_ref_slice.len] = 0;
+    return 0;
+}
+
+/// Run blob mark-and-sweep garbage collection.
+///
+/// Parameters:
+///   - db_path: Path to TaluDB storage directory (null-terminated)
+///   - min_blob_age_seconds: Grace period before unreferenced blobs are deleted
+///   - out_stats: Output sweep statistics
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_blobs_gc(
+    db_path: ?[*:0]const u8,
+    min_blob_age_seconds: u64,
+    out_stats: ?*anyopaque,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out_ptr = out_stats orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_stats is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const out: *BlobGcStats = @ptrCast(@alignCast(out_ptr));
+    out.* = std.mem.zeroes(BlobGcStats);
+
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const stats = db_blob_gc.sweepUnreferencedBlobsWithOptions(allocator, db_path_slice, .{
+        .min_blob_age_seconds = min_blob_age_seconds,
+    }) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to sweep blobs: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+
+    out.* = .{
+        .referenced_blob_count = stats.referenced_blob_count,
+        .total_blob_files = stats.total_blob_files,
+        .deleted_blob_files = stats.deleted_blob_files,
+        .reclaimed_bytes = stats.reclaimed_bytes,
+        .invalid_reference_count = stats.invalid_reference_count,
+        .skipped_invalid_entries = stats.skipped_invalid_entries,
+        .skipped_recent_blob_files = stats.skipped_recent_blob_files,
+    };
     return 0;
 }
 
@@ -496,6 +551,32 @@ pub export fn talu_blobs_stream_total_size(
     return 0;
 }
 
+/// Seek a blob stream to an absolute byte offset.
+///
+/// Parameters:
+///   - stream_handle: Handle returned by talu_blobs_open_stream()
+///   - offset_bytes: Absolute offset from start of blob
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_blobs_stream_seek(
+    stream_handle: ?*BlobStreamHandle,
+    offset_bytes: u64,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const handle = stream_handle orelse {
+        capi_error.setErrorWithCode(.invalid_handle, "stream_handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_handle);
+    };
+
+    const state: *BlobStreamState = @ptrCast(@alignCast(handle));
+    state.stream.seek(offset_bytes) catch |err| {
+        const code = blobErrorToCode(err);
+        capi_error.setErrorWithCode(code, "Failed to seek blob stream: {s}", .{@errorName(err)});
+        return @intFromEnum(code);
+    };
+    return 0;
+}
+
 /// Close a blob stream handle and release resources.
 /// Safe to call with null.
 pub export fn talu_blobs_stream_close(stream_handle: ?*BlobStreamHandle) callconv(.c) void {
@@ -664,4 +745,66 @@ test "talu_blobs_list returns blob refs and talu_blobs_free_string_list releases
     defer talu_blobs_free_string_list(out_list);
     const list = out_list.?;
     try std.testing.expect(list.count >= 2);
+}
+
+test "talu_blobs_stream_seek repositions reads" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const root_path_z = try std.testing.allocator.dupeZ(u8, root_path);
+    defer std.testing.allocator.free(root_path_z);
+
+    const payload = "seekable-stream-payload";
+
+    var blob_ref_buf: [db_blob_store.ref_len + 1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_put(root_path_z.ptr, payload.ptr, payload.len, &blob_ref_buf, blob_ref_buf.len),
+    );
+
+    var stream_handle: ?*BlobStreamHandle = null;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_open_stream(root_path_z.ptr, @ptrCast(&blob_ref_buf), &stream_handle),
+    );
+    defer talu_blobs_stream_close(stream_handle);
+
+    try std.testing.expectEqual(@as(i32, 0), talu_blobs_stream_seek(stream_handle, 4));
+
+    var out = std.ArrayList(u8).empty;
+    defer out.deinit(std.testing.allocator);
+    var buf: [5]u8 = undefined;
+    while (true) {
+        var read_len: usize = 0;
+        try std.testing.expectEqual(
+            @as(i32, 0),
+            talu_blobs_stream_read(stream_handle, &buf, buf.len, &read_len),
+        );
+        if (read_len == 0) break;
+        try out.appendSlice(std.testing.allocator, buf[0..read_len]);
+    }
+    try std.testing.expectEqualStrings(payload[4..], out.items);
+}
+
+test "talu_blobs_gc deletes unreferenced blobs when grace period is zero" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    const root_path_z = try std.testing.allocator.dupeZ(u8, root_path);
+    defer std.testing.allocator.free(root_path_z);
+
+    var blob_ref_buf: [db_blob_store.ref_len + 1]u8 = undefined;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_blobs_put(root_path_z.ptr, "orphan".ptr, "orphan".len, &blob_ref_buf, blob_ref_buf.len),
+    );
+
+    var stats = std.mem.zeroes(BlobGcStats);
+    try std.testing.expectEqual(@as(i32, 0), talu_blobs_gc(root_path_z.ptr, 0, &stats));
+    try std.testing.expectEqual(@as(usize, 1), stats.total_blob_files);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
 }

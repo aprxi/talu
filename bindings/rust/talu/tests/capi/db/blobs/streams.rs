@@ -38,3 +38,24 @@ fn write_stream_handles_misaligned_chunk_sizes() {
     assert_eq!(&loaded[1..(1 + 4097)], medium.as_slice());
     assert_eq!(&loaded[(1 + 4097)..], large.as_slice());
 }
+
+#[test]
+fn read_stream_seek_repositions_for_subsequent_reads() {
+    let ctx = TestContext::new();
+    let blobs = BlobsHandle::open(ctx.db_path()).expect("open blobs");
+
+    let blob_ref = blobs.put(b"seek-stream-payload").expect("put");
+    let mut stream = blobs.open_stream(&blob_ref).expect("open stream");
+
+    stream.seek(5).expect("seek");
+    let mut out = Vec::new();
+    let mut buf = [0u8; 4];
+    loop {
+        let read = stream.read(&mut buf).expect("read");
+        if read == 0 {
+            break;
+        }
+        out.extend_from_slice(&buf[..read]);
+    }
+    assert_eq!(out, b"stream-payload");
+}

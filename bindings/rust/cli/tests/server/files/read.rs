@@ -21,6 +21,14 @@ fn upload_text_file(ctx: &ServerTestContext, filename: &str, mime: &str, payload
     resp.json()["id"].as_str().expect("file id").to_string()
 }
 
+fn get_with_headers(
+    ctx: &ServerTestContext,
+    path: &str,
+    headers: &[(&str, &str)],
+) -> crate::server::common::HttpResponse {
+    send_request(ctx.addr(), "GET", path, headers, None)
+}
+
 #[test]
 fn get_content_and_delete_return_404_for_unknown_file() {
     let temp = TempDir::new().expect("temp dir");
@@ -72,6 +80,58 @@ fn content_response_uses_uploaded_mime_type() {
 
     let ct = content_resp.header("content-type").unwrap_or("");
     assert!(ct.contains("image/png"), "unexpected content-type: {ct}");
+}
+
+#[test]
+fn content_range_start_end_returns_206_partial_content() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let payload = "0123456789";
+    let file_id = upload_text_file(&ctx, "range.txt", "text/plain", payload);
+    let path = format!("/v1/files/{}/content", file_id);
+    let resp = get_with_headers(&ctx, &path, &[("Range", "bytes=2-5")]);
+
+    assert_eq!(resp.status, 206, "body: {}", resp.body);
+    assert_eq!(resp.body, "2345");
+    assert_eq!(resp.header("content-range"), Some("bytes 2-5/10"));
+    assert_eq!(resp.header("content-length"), Some("4"));
+    assert_eq!(resp.header("accept-ranges"), Some("bytes"));
+}
+
+#[test]
+fn content_range_open_ended_and_suffix_forms_are_supported() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let payload = "abcdefghij";
+    let file_id = upload_text_file(&ctx, "range-open.txt", "text/plain", payload);
+    let path = format!("/v1/files/{}/content", file_id);
+
+    let open_ended = get_with_headers(&ctx, &path, &[("Range", "bytes=6-")]);
+    assert_eq!(open_ended.status, 206, "body: {}", open_ended.body);
+    assert_eq!(open_ended.body, "ghij");
+    assert_eq!(open_ended.header("content-range"), Some("bytes 6-9/10"));
+
+    let suffix = get_with_headers(&ctx, &path, &[("Range", "bytes=-3")]);
+    assert_eq!(suffix.status, 206, "body: {}", suffix.body);
+    assert_eq!(suffix.body, "hij");
+    assert_eq!(suffix.header("content-range"), Some("bytes 7-9/10"));
+}
+
+#[test]
+fn content_range_unsatisfiable_returns_416_with_content_range_star() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let payload = "abcdefghij";
+    let file_id = upload_text_file(&ctx, "range-invalid.txt", "text/plain", payload);
+    let path = format!("/v1/files/{}/content", file_id);
+    let resp = get_with_headers(&ctx, &path, &[("Range", "bytes=99-120")]);
+
+    assert_eq!(resp.status, 416, "body: {}", resp.body);
+    assert_eq!(resp.header("content-range"), Some("bytes */10"));
+    assert_eq!(resp.json()["error"]["code"], "invalid_range");
 }
 
 #[test]

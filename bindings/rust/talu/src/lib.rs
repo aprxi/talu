@@ -71,7 +71,7 @@ pub use wrappers::{
 };
 
 // Re-export commonly used types for CLI convenience
-pub use blobs::{BlobError, BlobReadStream, BlobWriteStream, BlobsHandle};
+pub use blobs::{BlobError, BlobGcStats, BlobReadStream, BlobWriteStream, BlobsHandle};
 pub use convert::{
     ConvertOptions, ConvertProgress, ConvertResult, ProgressAction as ConvertProgressAction, Scheme,
 };

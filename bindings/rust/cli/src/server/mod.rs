@@ -1,10 +1,11 @@
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
 use simplelog::{Config, LevelFilter, SimpleLogger};
+use talu::blobs::BlobsHandle;
 
 pub mod auth_gateway;
 pub mod conversations;
@@ -23,6 +24,7 @@ pub mod tags;
 pub mod tenant;
 
 const DEFAULT_MAX_FILE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_STARTUP_BLOB_GC_MIN_AGE_SECONDS: u64 = 15 * 60;
 
 #[derive(Args, Debug)]
 pub struct ServerArgs {
@@ -122,6 +124,25 @@ pub fn run_server(args: ServerArgs) -> Result<()> {
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
     log::info!("talu server starting");
     if let Some(ref bucket) = state.bucket_path {
+        let bucket_for_gc = bucket.clone();
+        std::thread::spawn(move || {
+            match run_startup_blob_gc_once(&bucket_for_gc, DEFAULT_STARTUP_BLOB_GC_MIN_AGE_SECONDS)
+            {
+                Ok(stats) => {
+                    log::info!(
+                        "startup blob gc: referenced={}, total={}, deleted={}, reclaimed_bytes={}",
+                        stats.referenced_blob_count,
+                        stats.total_blob_files,
+                        stats.deleted_blob_files,
+                        stats.reclaimed_bytes,
+                    );
+                }
+                Err(err) => {
+                    log::warn!("startup blob gc skipped: {err}");
+                }
+            }
+        });
+
         log::info!("profile: {}", profile);
         log::info!("bucket: {}", bucket.display());
     } else {
@@ -144,4 +165,33 @@ pub fn expand_socket_path(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+fn run_startup_blob_gc_once(bucket_path: &Path, min_blob_age_seconds: u64) -> Result<talu::BlobGcStats> {
+    let blobs = BlobsHandle::open(bucket_path).context("open blob storage for startup gc")?;
+    blobs
+        .gc_with_min_age(min_blob_age_seconds)
+        .context("run startup blob gc")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_startup_blob_gc_once;
+    use talu::blobs::BlobsHandle;
+
+    #[test]
+    fn run_startup_blob_gc_once_deletes_unreferenced_blobs_with_zero_grace() {
+        let tmp = tempfile::TempDir::new().expect("temp dir");
+        let blobs = BlobsHandle::open(tmp.path()).expect("open blobs");
+
+        let orphan_ref = blobs.put(b"startup-gc-orphan").expect("write orphan");
+        assert!(blobs.contains(&orphan_ref).expect("contains before gc"));
+
+        let stats = run_startup_blob_gc_once(tmp.path(), 0).expect("run startup gc");
+        assert_eq!(stats.total_blob_files, 1);
+        assert_eq!(stats.deleted_blob_files, 1);
+
+        let blobs = BlobsHandle::open(tmp.path()).expect("re-open blobs");
+        assert!(!blobs.contains(&orphan_ref).expect("contains after gc"));
+    }
 }

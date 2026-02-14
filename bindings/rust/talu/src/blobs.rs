@@ -13,6 +13,7 @@ const ERROR_CODE_IO_FILE_NOT_FOUND: i32 = 500;
 const ERROR_CODE_IO_PERMISSION_DENIED: i32 = 501;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 const ERROR_CODE_RESOURCE_EXHAUSTED: i32 = 905;
+const DEFAULT_GC_MIN_BLOB_AGE_SECONDS: u64 = 15 * 60;
 
 /// Error type for blob operations.
 #[derive(Debug)]
@@ -22,6 +23,32 @@ pub enum BlobError {
     PermissionDenied(String),
     ResourceExhausted(String),
     StorageError(String),
+}
+
+/// Blob mark-and-sweep statistics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BlobGcStats {
+    pub referenced_blob_count: usize,
+    pub total_blob_files: usize,
+    pub deleted_blob_files: usize,
+    pub reclaimed_bytes: u64,
+    pub invalid_reference_count: usize,
+    pub skipped_invalid_entries: usize,
+    pub skipped_recent_blob_files: usize,
+}
+
+impl From<talu_sys::BlobGcStats> for BlobGcStats {
+    fn from(value: talu_sys::BlobGcStats) -> Self {
+        Self {
+            referenced_blob_count: value.referenced_blob_count,
+            total_blob_files: value.total_blob_files,
+            deleted_blob_files: value.deleted_blob_files,
+            reclaimed_bytes: value.reclaimed_bytes,
+            invalid_reference_count: value.invalid_reference_count,
+            skipped_invalid_entries: value.skipped_invalid_entries,
+            skipped_recent_blob_files: value.skipped_recent_blob_files,
+        }
+    }
 }
 
 impl std::fmt::Display for BlobError {
@@ -159,6 +186,29 @@ impl BlobsHandle {
         Ok(refs)
     }
 
+    /// Run blob mark-and-sweep using the default GC grace period.
+    pub fn gc(&self) -> Result<BlobGcStats, BlobError> {
+        self.gc_with_min_age(DEFAULT_GC_MIN_BLOB_AGE_SECONDS)
+    }
+
+    /// Run blob mark-and-sweep with an explicit grace period.
+    pub fn gc_with_min_age(&self, min_blob_age_seconds: u64) -> Result<BlobGcStats, BlobError> {
+        let mut stats = talu_sys::BlobGcStats::default();
+
+        // SAFETY: `path_cstr` is a valid C string and `stats` points to writable output memory.
+        let code = unsafe {
+            talu_sys::talu_blobs_gc(
+                self.path_cstr.as_ptr(),
+                min_blob_age_seconds,
+                &mut stats as *mut _ as *mut c_void,
+            )
+        };
+        if code != ERROR_CODE_OK {
+            return Err(BlobError::from_code(code, "blob gc failed"));
+        }
+        Ok(stats.into())
+    }
+
     /// Open a streaming writer for incremental blob uploads.
     pub fn open_write_stream(&self) -> Result<BlobWriteStream, BlobError> {
         let mut stream_handle: *mut c_void = ptr::null_mut();
@@ -275,6 +325,16 @@ impl BlobReadStream {
             return Err(BlobError::from_code(code, "blob stream total_size failed"));
         }
         Ok(size)
+    }
+
+    /// Seek to an absolute byte offset from stream start.
+    pub fn seek(&mut self, offset_bytes: u64) -> Result<(), BlobError> {
+        // SAFETY: `self.handle` is valid and owned by this stream.
+        let code = unsafe { talu_sys::talu_blobs_stream_seek(self.handle, offset_bytes) };
+        if code != ERROR_CODE_OK {
+            return Err(BlobError::from_code(code, "blob stream seek failed"));
+        }
+        Ok(())
     }
 }
 
