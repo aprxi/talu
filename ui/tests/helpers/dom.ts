@@ -30,8 +30,8 @@ export function createDomRoot(
 /** Element IDs expected by getChatDom(). */
 export const CHAT_DOM_IDS = [
   "sidebar-list", "loader-sentinel", "new-conversation", "transcript",
-  "welcome-state", "welcome-input", "welcome-send", "welcome-model", "welcome-prompt",
-  "input-bar", "input-text", "input-send",
+  "welcome-state", "welcome-input", "welcome-send", "welcome-attach", "welcome-attachment-list", "welcome-model", "welcome-prompt",
+  "input-bar", "input-text", "input-send", "input-attach", "input-attachment-list", "chat-file-input",
   "right-panel", "close-right-panel", "panel-model",
   "panel-temperature", "panel-top-p", "panel-top-k", "panel-min-p",
   "panel-max-output-tokens", "panel-repetition-penalty", "panel-seed",

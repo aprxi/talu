@@ -144,6 +144,34 @@ describe("ApiClient — URL paths and methods", () => {
     expect(calls[0]!.url).toBe("/v1/documents/doc-1");
     expect(calls[0]!.init?.method).toBe("DELETE");
   });
+
+  test("uploadFile → POST /v1/files with FormData body", async () => {
+    const file = new File(["hello"], "note.txt", { type: "text/plain" });
+    await client.uploadFile(file, "assistants");
+    expect(calls[0]!.url).toBe("/v1/files");
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(calls[0]!.init?.body).toBeInstanceOf(FormData);
+  });
+
+  test("getFile → GET /v1/files/:id", async () => {
+    await client.getFile("file_123");
+    expect(calls[0]!.url).toBe("/v1/files/file_123");
+    expect(calls[0]!.init?.method).toBe("GET");
+  });
+
+  test("deleteFile → DELETE /v1/files/:id", async () => {
+    mockResponse = new Response(null, { status: 204 });
+    await client.deleteFile("file_123");
+    expect(calls[0]!.url).toBe("/v1/files/file_123");
+    expect(calls[0]!.init?.method).toBe("DELETE");
+  });
+
+  test("getFileContent → GET /v1/files/:id/content", async () => {
+    mockResponse = new Response("blob-bytes", { status: 200 });
+    await client.getFileContent("file_123");
+    expect(calls[0]!.url).toBe("/v1/files/file_123/content");
+    expect(calls[0]!.init?.method).toBe("GET");
+  });
 });
 
 // ── Headers ─────────────────────────────────────────────────────────────────
@@ -157,6 +185,12 @@ describe("ApiClient — headers", () => {
 
   test("GET does not send Content-Type", async () => {
     await client.getSettings();
+    expect(calls[0]!.init?.headers).toBeUndefined();
+  });
+
+  test("uploadFile does not set Content-Type header manually", async () => {
+    const file = new File(["hello"], "note.txt", { type: "text/plain" });
+    await client.uploadFile(file);
     expect(calls[0]!.init?.headers).toBeUndefined();
   });
 });
@@ -216,6 +250,17 @@ describe("ApiClient — response parsing", () => {
     expect(result.ok).toBe(false);
     // err?.error?.message is undefined → falls through to status text.
     expect(result.error).toBe("400 Error");
+  });
+
+  test("getFileContent returns blob on success", async () => {
+    mockResponse = new Response("binary-data", {
+      status: 200,
+      headers: { "Content-Type": "application/octet-stream" },
+    });
+    const result = await client.getFileContent("file_123");
+    expect(result.ok).toBe(true);
+    expect(result.data).toBeInstanceOf(Blob);
+    expect(await result.data!.text()).toBe("binary-data");
   });
 
   test("resetModelOverrides does not URL-encode modelId", async () => {

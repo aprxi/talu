@@ -113,6 +113,63 @@
   padding: 0 0.5rem 0.25rem;
 }
 
+.attachment-list {
+  margin: 0.25rem 0.5rem 0.5rem;
+}
+
+.attachment-list.hidden {
+  display: none !important;
+}
+
+.attachment-list-inner {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.375rem;
+}
+
+.attachment-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  max-width: 100%;
+  padding: 0.25rem 0.5rem;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 12px;
+}
+
+.attachment-name {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.attachment-meta {
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.attachment-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.attachment-remove:hover {
+  color: var(--text);
+  background: var(--bg-code);
+}
+
 .input-bar {
   position: relative;
   flex-shrink: 0;

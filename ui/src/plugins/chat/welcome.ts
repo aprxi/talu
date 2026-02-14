@@ -5,6 +5,7 @@ import { hideRightPanel } from "./panel-readonly.ts";
 import { updatePanelChatInfo } from "./panel-params.ts";
 import { layout } from "./deps.ts";
 import { renderSidebar } from "./sidebar-list.ts";
+import { clearAttachments } from "./attachments.ts";
 
 export function showWelcome(): void {
   const dom = getChatDom();
@@ -37,6 +38,7 @@ export function startNewConversation(): void {
 
   dom.transcriptContainer.innerHTML = "";
   showWelcome();
+  clearAttachments();
   dom.welcomeInput.value = "";
   dom.welcomeInput.style.height = "auto";
   dom.welcomeInput.focus();
@@ -47,6 +49,9 @@ export function setInputEnabled(enabled: boolean): void {
   dom.inputText.disabled = !enabled;
   dom.welcomeInput.disabled = !enabled;
   dom.welcomeSend.disabled = !enabled;
+  dom.welcomeAttach.disabled = !enabled;
+  dom.inputAttach.disabled = !enabled;
+  dom.fileInput.disabled = !enabled;
 
   if (enabled) {
     dom.inputSend.innerHTML = SEND_ICON;

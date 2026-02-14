@@ -371,6 +371,20 @@ export interface UpdateDocumentRequest {
 }
 
 // ---------------------------------------------------------------------------
+// Files API types
+// ---------------------------------------------------------------------------
+
+/** File record from /v1/files endpoints. */
+export interface FileObject {
+  id: string;
+  object: "file";
+  bytes: number;
+  created_at: number;
+  filename: string;
+  purpose: string;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin service contracts
 // ---------------------------------------------------------------------------
 

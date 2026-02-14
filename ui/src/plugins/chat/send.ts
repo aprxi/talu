@@ -7,6 +7,12 @@ import { setInputEnabled, showInputBar, hideWelcome } from "./welcome.ts";
 import { appendUserMessage, appendAssistantPlaceholder, addAssistantActionButtons, appendStoppedIndicator, scrollToBottom } from "./messages.ts";
 import { readSSEStream } from "./streaming.ts";
 import { ensureChatHeader } from "./selection.ts";
+import {
+  clearAttachments,
+  composeUserInputWithAttachments,
+  hasAttachments,
+  isAttachmentUploadInProgress,
+} from "./attachments.ts";
 import type { Conversation, CreateResponseRequest, UsageStats } from "../../types.ts";
 
 export function setupInputEvents(): void {
@@ -139,6 +145,9 @@ async function sendAndStream(opts: SendOptions): Promise<void> {
   opts.beforeSend?.();
   dom.inputText.value = "";
   dom.inputText.style.height = "auto";
+  dom.welcomeInput.value = "";
+  dom.welcomeInput.style.height = "auto";
+  clearAttachments();
   await streamResponse({
     text: opts.text,
     promptId: opts.promptId,
@@ -150,13 +159,15 @@ async function sendAndStream(opts: SendOptions): Promise<void> {
 /** Handle send from the centered welcome input — transitions to active conversation view. */
 async function handleWelcomeSend(): Promise<void> {
   const dom = getChatDom();
-  const text = dom.welcomeInput.value.trim();
-  if (!text || chatState.isGenerating) return;
+  const text = dom.welcomeInput.value;
+  if (chatState.isGenerating || isAttachmentUploadInProgress()) return;
+  if (!text.trim() && !hasAttachments()) return;
 
   const promptId = getPromptsService()?.getSelectedPromptId() ?? null;
+  const composedText = composeUserInputWithAttachments(text);
 
   await sendAndStream({
-    text,
+    text: composedText,
     promptId,
     beforeSend() {
       hideWelcome();
@@ -169,10 +180,11 @@ async function handleWelcomeSend(): Promise<void> {
 
 async function handleSend(): Promise<void> {
   const dom = getChatDom();
-  const text = dom.inputText.value.trim();
-  if (!text || chatState.isGenerating) return;
+  const text = dom.inputText.value;
+  if (chatState.isGenerating || isAttachmentUploadInProgress()) return;
+  if (!text.trim() && !hasAttachments()) return;
 
-  await sendAndStream({ text });
+  await sendAndStream({ text: composeUserInputWithAttachments(text) });
 }
 
 /**

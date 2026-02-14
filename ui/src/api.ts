@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject } from "./types.ts";
 
 const BASE = "";
 
@@ -26,10 +26,19 @@ export interface ApiClient {
   createDocument(doc: CreateDocumentRequest): Promise<ApiResult<Document>>;
   updateDocument(id: string, doc: UpdateDocumentRequest): Promise<ApiResult<Document>>;
   deleteDocument(id: string): Promise<ApiResult<void>>;
+  uploadFile(file: File, purpose?: string): Promise<ApiResult<FileObject>>;
+  getFile(id: string): Promise<ApiResult<FileObject>>;
+  deleteFile(id: string): Promise<ApiResult<void>>;
+  getFileContent(id: string): Promise<ApiResult<Blob>>;
 }
 
 export function createApiClient(fetchFn: FetchFn): ApiClient {
-  async function request<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
+  async function parseErrorMessage(resp: Response): Promise<string> {
+    const err = await resp.json().catch(() => null);
+    return err?.error?.message ?? `${resp.status} ${resp.statusText}`;
+  }
+
+  async function requestJson<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
     try {
       const opts: RequestInit = {
         method,
@@ -43,9 +52,7 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
       }
 
       if (!resp.ok) {
-        const err = await resp.json().catch(() => null);
-        const msg =
-          err?.error?.message ?? `${resp.status} ${resp.statusText}`;
+        const msg = await parseErrorMessage(resp);
         return { ok: false, error: msg };
       }
 
@@ -56,21 +63,57 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     }
   }
 
+  async function requestFormData<T>(method: string, path: string, body: FormData): Promise<ApiResult<T>> {
+    try {
+      const resp = await fetchFn(`${BASE}${path}`, { method, body });
+
+      if (resp.status === 204) {
+        return { ok: true };
+      }
+
+      if (!resp.ok) {
+        const msg = await parseErrorMessage(resp);
+        return { ok: false, error: msg };
+      }
+
+      const data = (await resp.json()) as T;
+      return { ok: true, data };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  async function requestBlob(method: string, path: string): Promise<ApiResult<Blob>> {
+    try {
+      const resp = await fetchFn(`${BASE}${path}`, { method });
+
+      if (!resp.ok) {
+        const msg = await parseErrorMessage(resp);
+        return { ok: false, error: msg };
+      }
+
+      const data = await resp.blob();
+      return { ok: true, data };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
   return {
     listConversations(cursor?: string | null, limit = 20) {
       const params = new URLSearchParams({ limit: String(limit) });
       if (cursor) params.set("cursor", cursor);
-      return request<ConversationList>("GET", `/v1/conversations?${params}`);
+      return requestJson<ConversationList>("GET", `/v1/conversations?${params}`);
     },
-    search: (req) => request<SearchResponse>("POST", "/v1/search", req),
-    getConversation: (id) => request<Conversation>("GET", `/v1/conversations/${encodeURIComponent(id)}`),
-    patchConversation: (id, patch) => request<Conversation>("PATCH", `/v1/conversations/${encodeURIComponent(id)}`, patch),
-    deleteConversation: (id) => request<void>("DELETE", `/v1/conversations/${encodeURIComponent(id)}`),
-    batchConversations: (req) => request<void>("POST", "/v1/conversations/batch", req),
-    forkConversation: (id, body) => request<Conversation>("POST", `/v1/conversations/${encodeURIComponent(id)}/fork`, body),
-    getSettings: () => request<Settings>("GET", "/v1/settings"),
-    patchSettings: (patch) => request<Settings>("PATCH", "/v1/settings", patch),
-    resetModelOverrides: (modelId) => request<Settings>("DELETE", `/v1/settings/models/${modelId}`),
+    search: (req) => requestJson<SearchResponse>("POST", "/v1/search", req),
+    getConversation: (id) => requestJson<Conversation>("GET", `/v1/conversations/${encodeURIComponent(id)}`),
+    patchConversation: (id, patch) => requestJson<Conversation>("PATCH", `/v1/conversations/${encodeURIComponent(id)}`, patch),
+    deleteConversation: (id) => requestJson<void>("DELETE", `/v1/conversations/${encodeURIComponent(id)}`),
+    batchConversations: (req) => requestJson<void>("POST", "/v1/conversations/batch", req),
+    forkConversation: (id, body) => requestJson<Conversation>("POST", `/v1/conversations/${encodeURIComponent(id)}/fork`, body),
+    getSettings: () => requestJson<Settings>("GET", "/v1/settings"),
+    patchSettings: (patch) => requestJson<Settings>("PATCH", "/v1/settings", patch),
+    resetModelOverrides: (modelId) => requestJson<Settings>("DELETE", `/v1/settings/models/${modelId}`),
     createResponse: (body, signal) => fetchFn(`${BASE}/v1/responses`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -81,12 +124,20 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
       const params = new URLSearchParams();
       if (type) params.set("type", type);
       const query = params.toString();
-      return request<DocumentList>("GET", `/v1/documents${query ? `?${query}` : ""}`);
+      return requestJson<DocumentList>("GET", `/v1/documents${query ? `?${query}` : ""}`);
     },
-    getDocument: (id) => request<Document>("GET", `/v1/documents/${encodeURIComponent(id)}`),
-    createDocument: (doc) => request<Document>("POST", "/v1/documents", doc),
-    updateDocument: (id, doc) => request<Document>("PATCH", `/v1/documents/${encodeURIComponent(id)}`, doc),
-    deleteDocument: (id) => request<void>("DELETE", `/v1/documents/${encodeURIComponent(id)}`),
+    getDocument: (id) => requestJson<Document>("GET", `/v1/documents/${encodeURIComponent(id)}`),
+    createDocument: (doc) => requestJson<Document>("POST", "/v1/documents", doc),
+    updateDocument: (id, doc) => requestJson<Document>("PATCH", `/v1/documents/${encodeURIComponent(id)}`, doc),
+    deleteDocument: (id) => requestJson<void>("DELETE", `/v1/documents/${encodeURIComponent(id)}`),
+    uploadFile: (file, purpose = "assistants") => {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      form.append("purpose", purpose);
+      return requestFormData<FileObject>("POST", "/v1/files", form);
+    },
+    getFile: (id) => requestJson<FileObject>("GET", `/v1/files/${encodeURIComponent(id)}`),
+    deleteFile: (id) => requestJson<void>("DELETE", `/v1/files/${encodeURIComponent(id)}`),
+    getFileContent: (id) => requestBlob("GET", `/v1/files/${encodeURIComponent(id)}/content`),
   };
 }
-

@@ -16,6 +16,8 @@ export interface ChatDom {
   welcomeState: HTMLElement;
   welcomeInput: HTMLTextAreaElement;
   welcomeSend: HTMLButtonElement;
+  welcomeAttach: HTMLButtonElement;
+  welcomeAttachmentList: HTMLElement;
   welcomeModel: HTMLSelectElement;
   welcomePrompt: HTMLSelectElement;
 
@@ -23,6 +25,9 @@ export interface ChatDom {
   inputBar: HTMLElement;
   inputText: HTMLTextAreaElement;
   inputSend: HTMLButtonElement;
+  inputAttach: HTMLButtonElement;
+  inputAttachmentList: HTMLElement;
+  fileInput: HTMLInputElement;
 
   // Right panel
   rightPanel: HTMLElement;
@@ -68,12 +73,17 @@ export function getChatDom(): ChatDom {
     welcomeState: q("#welcome-state"),
     welcomeInput: q<HTMLTextAreaElement>("#welcome-input"),
     welcomeSend: q<HTMLButtonElement>("#welcome-send"),
+    welcomeAttach: q<HTMLButtonElement>("#welcome-attach"),
+    welcomeAttachmentList: q("#welcome-attachment-list"),
     welcomeModel: q<HTMLSelectElement>("#welcome-model"),
     welcomePrompt: q<HTMLSelectElement>("#welcome-prompt"),
 
     inputBar: q("#input-bar"),
     inputText: q<HTMLTextAreaElement>("#input-text"),
     inputSend: q<HTMLButtonElement>("#input-send"),
+    inputAttach: q<HTMLButtonElement>("#input-attach"),
+    inputAttachmentList: q("#input-attachment-list"),
+    fileInput: q<HTMLInputElement>("#chat-file-input"),
 
     rightPanel: q("#right-panel"),
     closeRightPanelBtn: q<HTMLButtonElement>("#close-right-panel"),

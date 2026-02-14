@@ -6,13 +6,20 @@
  * instead of the global ctx object.
  */
 
-import type { Conversation } from "../../types.ts";
+import type { Conversation, FileObject } from "../../types.ts";
+
+export interface ChatAttachment {
+  file: FileObject;
+  mimeType: string | null;
+}
 
 export interface ChatState {
   sessions: Conversation[];
   activeSessionId: string | null;
   activeChat: Conversation | null;
   lastResponseId: string | null;
+  attachments: ChatAttachment[];
+  isUploadingAttachments: boolean;
   isGenerating: boolean;
   streamAbort: AbortController | null;
   pagination: {
@@ -27,6 +34,8 @@ export const chatState: ChatState = {
   activeSessionId: null,
   activeChat: null,
   lastResponseId: null,
+  attachments: [],
+  isUploadingAttachments: false,
   isGenerating: false,
   streamAbort: null,
   pagination: {

@@ -32,6 +32,7 @@ export function buildChatDOM(container: HTMLElement): void {
         <div id="welcome-state" class="welcome-state">
           <h2 class="welcome-title">Ask anything</h2>
           <div class="input-container">
+            <div id="welcome-attachment-list" class="attachment-list hidden"></div>
             <textarea id="welcome-input" rows="1" placeholder="Send a message..." class="input-textarea"></textarea>
             <div class="input-footer">
               <select id="welcome-model" class="form-select form-select-inline">
@@ -41,6 +42,9 @@ export function buildChatDOM(container: HTMLElement): void {
                 <option value="">No prompt</option>
               </select>
               <div class="flex-1"></div>
+              <button id="welcome-attach" class="btn btn-ghost btn-icon" title="Attach files">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.48l9.2-9.2a4 4 0 0 1 5.65 5.66l-9.2 9.19a2 2 0 0 1-2.82-2.82l8.49-8.48"/></svg>
+              </button>
               <button id="welcome-send" class="btn btn-primary btn-send">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
@@ -50,9 +54,13 @@ export function buildChatDOM(container: HTMLElement): void {
 
         <div id="input-bar" class="input-bar hidden">
           <div class="input-container">
+            <div id="input-attachment-list" class="attachment-list hidden"></div>
             <textarea id="input-text" rows="1" placeholder="Send a message..." class="input-textarea"></textarea>
             <div class="input-footer">
               <div class="flex-1"></div>
+              <button id="input-attach" class="btn btn-ghost btn-icon" title="Attach files">
+                <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.48l9.2-9.2a4 4 0 0 1 5.65 5.66l-9.2 9.19a2 2 0 0 1-2.82-2.82l8.49-8.48"/></svg>
+              </button>
               <button id="input-send" class="btn btn-primary btn-send">
                 <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
               </button>
@@ -133,4 +141,11 @@ export function buildChatDOM(container: HTMLElement): void {
         </div>
       </div>
     </aside>`;
+
+  const fileInput = document.createElement("input");
+  fileInput.id = "chat-file-input";
+  fileInput.type = "file";
+  fileInput.multiple = true;
+  fileInput.className = "hidden";
+  container.appendChild(fileInput);
 }
