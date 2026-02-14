@@ -146,39 +146,26 @@ fn skip_special_strips_sandwiched_bos() {
 // `\\`). The decoder must return these as literal characters — NOT interpret
 // them as C-style escape sequences.
 //
-// Bug: our decoder turns `\n` → newline, `\"` → `"`, `\\` → `\`.
-// Affects: Qwen, Llama-3, OpenAI, Mistral, GLM (~70 models).
+// The decoder must preserve literal backslash sequences in token content.
 
 // ===========================================================================
 // SentencePiece BPE: unicode_to_byte must not corrupt non-byte-level tokens
 // ===========================================================================
 //
-// SentencePiece models (Llama, Mistral, Phi, Gemma, TinyLlama) use BPE with
-// raw UTF-8 token strings and ▁ for word boundaries. They do NOT use GPT-2's
-// byte-to-unicode mapping. The decoder's `unicode_to_byte` map must not be
-// applied to these tokens, or non-ASCII chars like é, ü, ñ get mangled.
-//
-// Bug: the BPE decoder applies `unicode_to_byte` to ALL codepoints, converting
-// é (U+00E9) to single byte 0xE9 which is invalid standalone UTF-8 → "�".
-// Affects: TinyLlama, Gemma, Phi-3, Mistral, e5-mistral (~100K token failures).
+// SentencePiece BPE models use raw UTF-8 token strings and ▁ for word
+// boundaries. They do NOT use GPT-2's byte-to-unicode mapping. The decoder's
+// `unicode_to_byte` map must not be applied to these tokens, or non-ASCII
+// chars like é, ü, ñ get mangled into invalid UTF-8.
 
 // ===========================================================================
 // Sequence decoder (Replace + Strip): leading space count
 // ===========================================================================
 //
-// SentencePiece models (Mistral, Llama, etc.) use a Sequence decoder:
-//   Replace(▁→space) + ByteFallback + Fuse + Strip(start=1, stop=0)
-//
-// The Strip decoder removes exactly 1 leading space. The Metaspace
-// pretokenizer's add_prefix_space (prepend_scheme="first") applies only
-// during encode — it must NOT cause an additional strip during decode.
-//
-// For a token containing N ▁ characters, the decode result must have N-1
-// spaces (N replaced to spaces, then Strip removes 1).
-// Affects: mistralai/Mistral-7B-v0.1, v0.3, Instruct variants
-// (~56 vocab_decode, 4 roundtrip failures).
+// SentencePiece Sequence decoder: Replace(▁→space) + ByteFallback + Fuse +
+// Strip(start=1, stop=0). Strip removes exactly 1 leading space. For a token
+// containing N ▁ characters, the decode result must have N-1 spaces.
 
-/// Minimal SentencePiece BPE with Sequence decoder matching Mistral's config.
+/// Minimal SentencePiece BPE with Sequence decoder (Replace + ByteFallback + Fuse + Strip).
 const SEQUENCE_STRIP_DECODER_JSON: &str = r####"{
   "version": "1.0",
   "model": {
@@ -272,8 +259,9 @@ const SENTENCEPIECE_BPE_JSON: &str = r####"{
 
 /// Decoding tokens with non-ASCII UTF-8 chars (é, ï) must preserve them.
 ///
-/// Bug: unicode_to_byte maps codepoint U+00E9 → byte 0xE9, producing
-/// invalid UTF-8 → "�" instead of "é".
+/// SentencePiece BPE tokens contain raw UTF-8 (not byte-level mapped).
+/// The unicode_to_byte map must not be applied, or multi-byte chars get
+/// corrupted into invalid UTF-8.
 #[test]
 fn sentencepiece_decode_preserves_accented_chars() {
     let ctx = TokenizerTestContext::from_json(SENTENCEPIECE_BPE_JSON);
@@ -385,18 +373,12 @@ fn decode_backslash_sequence_in_context() {
 }
 
 // ===========================================================================
-// Bug D: JSON \b and \f escapes not decoded to control characters
+// JSON \b and \f escapes must be decoded to control characters
 // ===========================================================================
 //
 // Tokens in tokenizer.json vocab can contain JSON escape sequences \b
 // (backspace U+0008) and \f (form feed U+000C). The JSON parser must
 // unescape these to their control character values during loading.
-//
-// Bug: json_utils.unescapeJsonString doesn't handle \b and \f — they
-// fall through to the else branch which keeps the literal backslash.
-// Result: token "\\b" in JSON → stored as two chars (\, b) → decoded
-// as literal "\b" instead of backspace character.
-// Affects: Gemma, Mistral, e5-mistral, phi-1.5, phi-2 (~1530 failures).
 
 /// Minimal SentencePiece BPE with tokens containing \b and \f JSON escapes.
 ///
@@ -427,8 +409,6 @@ const CONTROL_CHAR_TOKENIZER_JSON: &str = r####"{
 }"####;
 
 /// JSON \b escape in vocab must decode to backspace (U+0008).
-///
-/// Bug: unescapeJsonString keeps \b as literal backslash + b.
 #[test]
 fn decode_json_backspace_escape() {
     let ctx = TokenizerTestContext::from_json(CONTROL_CHAR_TOKENIZER_JSON);
@@ -440,8 +420,6 @@ fn decode_json_backspace_escape() {
 }
 
 /// JSON \f escape in vocab must decode to form feed (U+000C).
-///
-/// Bug: unescapeJsonString keeps \f as literal backslash + f.
 #[test]
 fn decode_json_formfeed_escape() {
     let ctx = TokenizerTestContext::from_json(CONTROL_CHAR_TOKENIZER_JSON);
@@ -459,10 +437,6 @@ fn decode_json_formfeed_escape() {
 // Added tokens in tokenizer.json have explicit "id" fields that may be
 // non-sequential or have gaps. The loader must use these explicit IDs, not
 // the array position, when building the id→string mapping.
-//
-// Bug: added tokens are mapped by position rather than explicit ID, so
-// decode returns the wrong string for tokens with non-contiguous IDs.
-// Affects: microsoft/Phi-4-mini-flash-reasoning (8 vocab_decode failures).
 
 /// Minimal BPE tokenizer with non-contiguous added token IDs.
 const ADDED_TOKEN_IDS_JSON: &str = r####"{
@@ -570,11 +544,6 @@ fn metaspace_encode_with_special_tokens() {
 // Added tokens can contain tab characters (JSON escape \t → U+0009). The
 // loader must unescape the JSON, and the decoder must output the literal
 // tab character, not the two-character sequence "\t".
-//
-// Bug: for ByteLevel BPE models, added tokens containing tabs may be decoded
-// through the unicode_to_byte mapping which doesn't have an entry for low
-// codepoints like U+0009, or the token content may not be unescaped correctly.
-// Affects: microsoft/phi-1_5, phi-2 (8 vocab_decode failures each).
 
 /// Added token with tab character content must decode to literal tabs.
 #[test]
@@ -621,9 +590,6 @@ fn added_token_tab_content_decodes_to_tab() {
 // skipped and re-attached to the first non-special segment. However, no
 // extra ▁ should be added to segments after subsequent special tokens —
 // those segments already have ▁ from the Replace normalizer.
-//
-// Affects: microsoft/Phi-3-mini-128k-instruct, Phi-3-mini-4k-instruct,
-// Phi-3.5-mini-instruct, Phi-3.5-vision-instruct, Phi-mini-MoE-instruct.
 
 const PREPEND_REPLACE_BPE_JSON: &str = r####"{
   "version": "1.0",
@@ -659,27 +625,27 @@ const PREPEND_REPLACE_BPE_JSON: &str = r####"{
   "decoder": null
 }"####;
 
-/// After the second special token, no extra standalone ▁ should appear.
+/// SentencePiece Prepend must re-arm after each special token.
 ///
 /// Input "<s> hello </s> world" normalizes to "▁<s>▁hello▁</s>▁world".
-/// The initial ▁ before <s> is re-attached to the first segment.
-/// But the segment "▁world" after </s> already has its ▁ from Replace
-/// and should NOT get an additional ▁ prepended.
+/// The initial ▁ before <s> is re-attached to the first segment ("▁hello▁").
+/// After </s>, the Prepend ▁ must ALSO re-attach to "▁world", producing an
+/// extra standalone ▁ token.
 #[test]
-fn sentencepiece_no_extra_metaspace_after_second_special_token() {
+fn sentencepiece_prepend_rearms_after_second_special_token() {
     let ctx = TokenizerTestContext::from_json(PREPEND_REPLACE_BPE_JSON);
     let opts = talu_sys::EncodeOptions {
         add_bos: 0,
         ..Default::default()
     };
     let tokens = ctx.encode_with("<s> hello </s> world", &opts);
-    // Expected: <s>(1), ▁(3), ▁hello(15), ▁(3), </s>(2), ▁world(20)
+    // Expected: <s>(1), ▁(3), ▁hello(15), ▁(3), </s>(2), ▁(3), ▁world(20)
     // The ▁(3) after <s> is the re-attached initial Prepend ▁.
-    // There must be NO extra ▁(3) between </s>(2) and ▁world(20).
+    // The ▁(3) after </s> is the re-armed Prepend ▁ for the next segment.
     assert_eq!(
         tokens,
-        vec![1, 3, 15, 3, 2, 20],
-        "no extra ▁ after second special token, got: {tokens:?}"
+        vec![1, 3, 15, 3, 2, 3, 20],
+        "prepend ▁ must re-arm after every special token, got: {tokens:?}"
     );
 }
 
@@ -691,11 +657,6 @@ fn sentencepiece_no_extra_metaspace_after_second_special_token() {
 // in contractions: " n't" → "n't", " 'm" → "'m", " 's" → "'s", " 've" → "'ve",
 // " 're" → "'re". It also removes space before standalone apostrophe when
 // surrounded by spaces: " ' " → "'".
-//
-// Bug: our WordPiece cleanup treats apostrophe like any single-char punctuation
-// and removes the space before ALL apostrophes, not just contractions.
-// A possessive like "dog 's" is fine, but standalone "hello ' world" should
-// become "hello' world" (space before ' removed, space after preserved).
 
 /// Cleanup removes space before apostrophe contractions.
 ///

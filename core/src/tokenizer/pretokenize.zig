@@ -209,17 +209,17 @@ fn splitByRegex(result: *PretokenizeResult, input: []const u8, base_offset: usiz
     defer pcre2_match_data_free(match_data);
 
     // Determine what to emit:
-    // - is_split=true, is_invert=false: emit gaps (split on pattern)
-    // - is_split=false, is_invert=false: emit matches
-    // - is_split=true, is_invert=true: emit matches (invert overrides split)
-    // - is_split=false, is_invert=true: emit matches (invert overrides emit gaps)
-    const emit_gaps = split_matches and !invert_matches;
+    // - split=true,  invert=false: emit gaps only (MergedWith*, Removed)
+    // - split=false, invert=false: emit matches AND gaps (Isolated)
+    // - split=*,     invert=true:  emit matches only
+    const emit_matches = !split_matches or invert_matches;
+    const emit_gaps = !invert_matches;
 
     var cursor: usize = 0;
     while (cursor <= input.len) {
         const match_rc = pcre2_match(regex_code, @ptrCast(input.ptr), input.len, cursor, match_data);
         if (match_rc <= 0) {
-            // No more matches - emit remaining text if we're emitting gaps
+            // No more matches - emit remaining text as a gap
             if (emit_gaps and cursor < input.len) {
                 try appendToken(result, input[cursor..], base_offset + cursor);
             }
@@ -229,23 +229,21 @@ fn splitByRegex(result: *PretokenizeResult, input: []const u8, base_offset: usiz
         const match_start: usize = @intCast(ovector[0]);
         const match_end: usize = @intCast(ovector[1]);
 
-        if (emit_gaps) {
-            // Emit the gap before the match
-            if (match_start > cursor) {
-                try appendToken(result, input[cursor..match_start], base_offset + cursor);
-            }
-            cursor = if (match_end == match_start) match_end + 1 else match_end;
-            continue;
-        }
-
-        // Emit matches
         if (match_end == match_start) {
             cursor = match_end + 1;
             continue;
         }
 
-        log.trace("tokenizer", "Regex match", .{ .start = match_start, .end = match_end }, @src());
-        try appendToken(result, input[match_start..match_end], base_offset + match_start);
+        // Emit the gap before the match
+        if (emit_gaps and match_start > cursor) {
+            try appendToken(result, input[cursor..match_start], base_offset + cursor);
+        }
+
+        // Emit the match itself
+        if (emit_matches) {
+            try appendToken(result, input[match_start..match_end], base_offset + match_start);
+        }
+
         cursor = match_end;
     }
 }
@@ -565,4 +563,10 @@ test "pretokenize requires integration testing" {
     // - Proper byte-level encoding support
     // - Complete tokenizer context
     // Integration tests: tests/tokenizer/test_*.py
+}
+
+test "pretokenize requires integration testing 2" {
+    // GPT-4 regex \p{N}{1,3} is greedy: "2025" → "202" + "5" in PCRE2.
+    // HuggingFace fancy-regex produces "20" + "25" (possibly different semantics).
+    // This difference is tracked as a known issue for granite-4.0-h-1B.
 }

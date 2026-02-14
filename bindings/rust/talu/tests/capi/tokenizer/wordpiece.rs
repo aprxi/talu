@@ -153,10 +153,9 @@ fn roundtrip_sentence() {
 // ---------------------------------------------------------------------------
 
 /// Cleanup must NOT remove space before colon, closing-paren, or percent.
-/// HuggingFace `clean_up_tokenization_spaces` preserves space before these.
 ///
-/// Bug: cleanup removes space before `)` and `:`, but HF only removes
-/// space before `.` `?` `!` `,` `'` and `-`.
+/// `clean_up_tokenization_spaces` only removes space before `.` `?` `!` `,`
+/// `'` and `-`. Space before `)`, `:`, and `%` must be preserved.
 #[test]
 fn cleanup_preserves_space_before_closing_paren_and_colon() {
     let json = r####"{
@@ -198,13 +197,10 @@ fn cleanup_preserves_space_before_closing_paren_and_colon() {
 }
 
 // ---------------------------------------------------------------------------
-// skip_special_tokens (ignored for WordPiece — BUG)
+// skip_special_tokens for WordPiece
 // ---------------------------------------------------------------------------
 
-/// skip_special_tokens=1 should strip [CLS] and [SEP] from output.
-///
-/// Bug: `decodeWithOptions()` ignores `skip_special_tokens` for WordPiece
-/// models (only BPE honors decode options). This test will fail until fixed.
+/// skip_special_tokens=1 must strip [CLS] and [SEP] from decode output.
 #[test]
 fn skip_special_strips_cls_and_sep() {
     let ctx = TokenizerTestContext::from_json(WORDPIECE_JSON);
@@ -236,11 +232,6 @@ fn skip_special_all_special_produces_empty() {
 // BERT-family models use a BertProcessing post_processor that adds [CLS] at
 // the start and [SEP] at the end of encoded output. The post_processor must
 // resolve the token strings "[CLS]" and "[SEP]" to their vocab IDs.
-//
-// Bug: `encode_special("")` should produce [101, 102] ([CLS] + [SEP]) for
-// BERT models, but produces [] (empty). The post_processor's cls_id/sep_id
-// are not resolved, or the BertProcessing path is not activated.
-// Affects: BAAI/bge, sentence-transformers, google-bert (~10 models).
 
 /// WordPiece tokenizer with BertProcessing post_processor.
 const BERT_POSTPROC_JSON: &str = r####"{
@@ -279,7 +270,6 @@ const BERT_POSTPROC_JSON: &str = r####"{
 // must convert input to lowercase before WordPiece lookup so that "Hello"
 // matches the lowercase vocab entry "hello". Without lowercasing, WordPiece
 // can't find "Hello" and falls back to character-by-character tokenization.
-// Affects: google-bert/bert-base-uncased (~19 encode, 19 roundtrip failures).
 
 /// Mixed-case "Hello" must be normalized to "hello" before WordPiece lookup.
 #[test]
@@ -321,9 +311,6 @@ fn bert_normalizer_lowercases_multiword() {
 // ---------------------------------------------------------------------------
 
 /// BertProcessing adds [CLS] and [SEP] to encode output.
-///
-/// Bug: WordPiece encode with BertProcessing post_processor should
-/// wrap output with [CLS]=1 and [SEP]=2.
 #[test]
 fn encode_bert_postproc_adds_cls_sep() {
     let ctx = TokenizerTestContext::from_json(BERT_POSTPROC_JSON);
@@ -361,7 +348,6 @@ fn encode_bert_postproc_empty_produces_cls_sep() {
 // BertPreTokenizer must split every punctuation character individually, even
 // when multiple punctuation characters appear consecutively. "hello..." must
 // produce ["hello", ".", ".", "."], not ["hello", "..."].
-// Affects: BAAI/bge, sentence-transformers (~9 encode failures per model).
 
 /// Consecutive dots "..." must be split into individual "." tokens.
 #[test]
@@ -427,10 +413,6 @@ fn bert_pretokenizer_splits_mixed_consecutive_punct() {
 // BertNormalizer with handle_chinese_chars=true adds spaces around CJK
 // characters (Unicode ranges U+4E00-U+9FFF, etc.) to split them for
 // WordPiece. However, non-CJK characters must NOT be affected.
-//
-// Bug: the CJK detection may incorrectly classify non-CJK codepoints,
-// causing "hello" to be split into individual characters ("h e l l o").
-// Affects: google-bert/bert-base-uncased (19 encode failures).
 
 /// BertNormalizer with all options enabled must still produce whole-word tokens.
 ///
@@ -536,11 +518,7 @@ fn bert_normalizer_clean_text_whitespace_empty() {
 //
 // When a single word exceeds `max_input_chars_per_word`, WordPiece should
 // emit a single [UNK] token for that word instead of attempting subword
-// decomposition. This prevents quadratic blowup on adversarial inputs and
-// matches HuggingFace behavior.
-//
-// Affects: BAAI/bge-large-en-v1.5, sentence-transformers/all-MiniLM-L6-v2,
-// sentence-transformers/all-mpnet-base-v2 (long "aaa..." inputs).
+// decomposition. This prevents quadratic blowup on adversarial inputs.
 
 /// Words longer than max_input_chars_per_word produce [UNK].
 #[test]
@@ -595,9 +573,6 @@ fn wordpiece_max_input_chars_per_word_produces_unk() {
 // BertNormalizer's `clean_text` flag should replace control characters
 // (including \n, \t, \r) with spaces, not drop them entirely. Dropping
 // newlines causes words on adjacent lines to merge into a single token.
-//
-// Affects: BAAI/bge-large-en-v1.5, sentence-transformers/all-MiniLM-L6-v2
-// (encode "line1\nline2\nline3" produces wrong token IDs).
 
 /// Newlines between words are replaced with spaces, not dropped.
 #[test]
@@ -651,11 +626,8 @@ fn bert_normalizer_clean_text_replaces_newline_with_space() {
 //
 // Post-processor CLS/SEP token IDs must come from the post_processor JSON
 // configuration ("cls": ["<s>", 3], "sep": ["</s>", 4]), not from
-// hardcoded token names like [CLS]/[SEP]. RoBERTa-family models use
-// <s> and </s> as CLS/SEP, and the post-processor must honor those.
-//
-// Affects: sentence-transformers/all-mpnet-base-v2 (encode_special uses
-// [CLS]=105 and [SEP]=106 instead of the configured <s>=0 and </s>=2).
+// hardcoded token names like [CLS]/[SEP]. Models that use <s> and </s> as
+// CLS/SEP must have the post-processor honor those configured values.
 
 /// BertProcessing with <s>/<\/s> tokens uses IDs from config, not [CLS]/[SEP].
 #[test]
@@ -709,14 +681,9 @@ fn bert_postproc_uses_configured_cls_sep_not_defaults() {
 // WordPiece decode cleanup: space before dash must be preserved
 // ---------------------------------------------------------------------------
 //
-// HuggingFace's `clean_up_tokenization_spaces` removes space before a small
-// set of punctuation: . ? ! , ' (and contractions like n't, 'm, etc.).
-// Space before dash (-) must NOT be removed. Markdown-style lists like
-// "# title - item 1 - item 2" must decode with spaces around dashes.
-//
-// Affects: BAAI/bge-large-en-v1.5, sentence-transformers/all-MiniLM-L6-v2,
-// sentence-transformers/all-mpnet-base-v2 (roundtrip "# Title\n\n- item 1"
-// decodes as "# title- item 1" instead of "# title - item 1").
+// `clean_up_tokenization_spaces` removes space before a small set of
+// punctuation: . ? ! , ' (and contractions like n't, 'm, etc.).
+// Space before dash (-) must NOT be removed.
 
 /// Cleanup removes space before comma but preserves space before dash.
 #[test]
@@ -764,21 +731,10 @@ fn cleanup_removes_comma_space_but_preserves_dash_space() {
 // BertNormalizer: handle_chinese_chars must detect extended CJK ranges
 // ---------------------------------------------------------------------------
 //
-// HuggingFace's BertNormalizer._is_chinese_char checks 8 Unicode ranges:
-//   0x4E00-0x9FFF   (CJK Unified Ideographs)
-//   0x3400-0x4DBF   (CJK Extension A)
-//   0x20000-0x2A6DF (CJK Extension B)
-//   0xF900-0xFAFF   (CJK Compatibility Ideographs)
-//   0x2F800-0x2FA1F (CJK Compatibility Supplement)
-//   ...and more
-//
-// Bug: our handle_chinese_chars only checks 0x4E00-0x9FFF. Characters in
-// CJK Extension A (U+3400-U+4DBF) or Extension B (U+20000-U+2A6DF) are
-// not detected, so they don't get spaces added around them. When adjacent
-// to other text, they merge into one long word that WordPiece can't match.
-//
-// Affects: google-bert/bert-base-uncased, BAAI/bge, sentence-transformers
-// (CJK inputs produce wrong tokenization — characters not isolated).
+// handle_chinese_chars must check all CJK Unicode ranges, not just the
+// basic CJK Unified Ideographs (U+4E00-U+9FFF). Extended ranges include
+// CJK Extension A (U+3400-U+4DBF), Extension B (U+20000-U+2A6DF),
+// Compatibility Ideographs (U+F900-U+FAFF), and more.
 
 /// CJK Extension A character (U+3400) must be isolated by handle_chinese_chars.
 ///
@@ -836,18 +792,9 @@ fn handle_chinese_chars_detects_cjk_extension_a() {
 // WordPiece encode: emoji (4-byte UTF-8) must produce [UNK], not be dropped
 // ---------------------------------------------------------------------------
 //
-// HuggingFace's WordPiece encoder produces [UNK] for any word that can't be
-// decomposed into known subwords. Emoji characters like 🌍 (U+1F30D, 4-byte
-// UTF-8: F0 9F 8C 8D) are not in typical BERT vocabs and should produce a
-// single [UNK] token.
-//
-// Bug: emoji characters are silently dropped during encoding — the token
-// count is one less than expected. The emoji produces no output instead of
-// [UNK].
-//
-// Affects: BAAI/bge-large-en-v1.5, sentence-transformers/all-MiniLM-L6-v2,
-// sentence-transformers/all-mpnet-base-v2 (encode "Hello 你好 مرحبا 🌍"
-// missing final [UNK] for 🌍).
+// WordPiece encoder produces [UNK] for any word that can't be decomposed
+// into known subwords. Emoji characters (4-byte UTF-8) not in the vocab
+// must produce a single [UNK] token, not be silently dropped.
 
 /// Emoji character (🌍 U+1F30D) must produce [UNK], not be silently dropped.
 #[test]

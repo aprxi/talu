@@ -1,18 +1,8 @@
 //! Unigram (SentencePiece) model tests.
 //!
-//! Tests specific to the Unigram tokenization model used by SentencePiece-based
-//! models (T5, Llama, ALBERT, XLNet, etc.).
-//!
-//! ## Known bugs (two layers)
-//!
-//! **Loading:** `load_from_slice_streaming` uses a fast-path vocab parser that
-//! only handles object-style vocabs `{"token": id}`. Unigram uses array-style
-//! `[["token", score], ...]` which is silently skipped → empty vocab → load
-//! fails with error 999. All decode tests below are blocked by this.
-//!
-//! **Decode (once loading is fixed):** the Unigram decode path uses a naive
-//! space-join that doesn't apply ▁→space replacement, strip behavior, or
-//! `skip_special_tokens`.
+//! Tests specific to the Unigram tokenization model: array-style vocab loading,
+//! Viterbi encoding, Metaspace decode with ▁→space replacement, and
+//! skip_special_tokens support.
 
 use crate::capi::tokenizer::common::TokenizerTestContext;
 
@@ -20,12 +10,10 @@ use crate::capi::tokenizer::common::TokenizerTestContext;
 // Loading: Unigram JSON fails to load
 // ---------------------------------------------------------------------------
 
-/// Unigram tokenizer JSON must load successfully.
+/// Unigram tokenizer JSON with array-style vocab must load successfully.
 ///
-/// Bug: `load_from_slice_streaming` fast-path vocab parser checks for `{`
-/// (object), but Unigram vocab is `[` (array). The array is silently skipped,
-/// producing an empty vocab, causing `tokenizer_unigram_create_from_spec`
-/// to return null (vocab_len == 0 guard).
+/// Unigram uses `[["token", score], ...]` array format instead of the
+/// object-style `{"token": id}` format. The loader must parse both.
 #[test]
 fn load_from_json() {
     let json = r#"{
@@ -61,9 +49,6 @@ fn load_from_json() {
 /// Metaspace decoder with `add_prefix_space: true` must strip the leading space
 /// during decode. SentencePiece tokens use ▁ (U+2581) for word boundaries;
 /// the first ▁ was added by the pretokenizer and must be removed on decode.
-///
-/// Bug: `unigram_decode` converts ▁→space but does not check the Metaspace
-/// decoder's `add_prefix_space` flag, so the leading space persists.
 #[test]
 fn metaspace_decode_strips_prefix_space() {
     let json = r#"{
@@ -96,15 +81,6 @@ fn metaspace_decode_strips_prefix_space() {
 // The Unigram model uses the Viterbi algorithm to find the most likely
 // segmentation based on token scores (log probabilities). Tokens with higher
 // scores are preferred.
-//
-// Bug: flan-t5-large (Unigram model) produces completely wrong tokens —
-// individual byte/character IDs instead of proper Unigram subwords.
-// encode("Hello, world!") expected [8774, 6, 296, 55] got [566, 15, ...].
-// This suggests the Unigram encoding algorithm is broken or the vocab
-// isn't being used correctly during encoding.
-//
-// Affects: google/flan-t5-large (20/21 encode failures), potentially all
-// Unigram-based models (T5, ALBERT, XLNet).
 
 /// Unigram encoder must use Viterbi to find optimal segmentation.
 ///

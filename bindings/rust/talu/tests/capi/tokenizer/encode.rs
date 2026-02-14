@@ -226,14 +226,8 @@ fn encode_decode_roundtrip() {
 // TemplateProcessing post_processor: BOS/EOS insertion during encode
 // ===========================================================================
 //
-// When a tokenizer has a TemplateProcessing post_processor, encode with
-// add_bos=1 must prepend the BOS token and append the EOS token.
-//
-// Bug: `build_tokenizer_from_root` copies the cls_token/sep_token strings
-// from the post_processor spec but never resolves their IDs from the vocab.
-// cls_id/sep_id stay at -1, so the wrong token ID (-1 / 4294967295) is
-// inserted, or no token is inserted at all.
-// Affects: Llama-3, Gemma, LiquidAI, TinyLlama, Mistral (~52 models).
+// Encode with add_bos=1 must resolve CLS/SEP token IDs from the vocab and
+// prepend BOS / append EOS according to the template.
 
 /// Minimal BPE tokenizer with TemplateProcessing post_processor.
 ///
@@ -284,7 +278,7 @@ const TEMPLATE_POSTPROC_JSON: &str = r####"{
 
 /// TemplateProcessing post_processor must prepend BOS and append EOS.
 ///
-/// Bug: cls_id/sep_id never resolved from vocab → wrong or missing BOS/EOS.
+/// Verifies cls_id/sep_id are resolved from vocab → correct BOS/EOS inserted.
 #[test]
 fn encode_template_postproc_adds_bos_and_eos() {
     let ctx = TokenizerTestContext::from_json(TEMPLATE_POSTPROC_JSON);
@@ -354,14 +348,8 @@ fn encode_template_postproc_default_opts_no_special() {
 // Metaspace pretokenizer: encode must add ▁ prefix and replace spaces
 // ===========================================================================
 //
-// SentencePiece BPE models (Mistral, TinyLlama, Phi-3, etc.) use a Metaspace
-// pretokenizer that:
-// 1. Prepends ▁ to the input when add_prefix_space is true
-// 2. Replaces internal spaces with ▁
-//
-// Bug: spaces are tokenized as individual characters instead of being
-// converted to ▁ and merged with adjacent text.
-// Affects: Mistral-7B (all versions), ~80 encode failures.
+// Metaspace pretokenizer must prepend ▁ when add_prefix_space is true
+// and replace internal spaces with ▁.
 
 /// Minimal SentencePiece BPE with Metaspace pretokenizer.
 ///
@@ -399,7 +387,7 @@ const METASPACE_ENCODE_JSON: &str = r####"{
 ///
 /// "Hello" with add_prefix_space=true → "▁Hello" → token [3] (▁Hello)
 ///
-/// Bug: Metaspace pretokenizer may not prepend ▁ during encode, causing
+/// Verifies Metaspace pretokenizer prepends ▁ during encode. Without it,
 /// "Hello" to be tokenized character-by-character.
 #[test]
 fn encode_metaspace_single_word() {
@@ -435,25 +423,16 @@ fn encode_metaspace_multi_word() {
 }
 
 // ===========================================================================
-// Bug A: Sequence-wrapped TemplateProcessing (Llama-3 pattern)
+// Sequence-wrapped TemplateProcessing
 // ===========================================================================
 //
-// Llama-3 and ~30 other models wrap TemplateProcessing inside a
-// "Sequence" post_processor:
-//   "post_processor": {
-//     "type": "Sequence",
-//     "processors": [ {"type":"ByteLevel",...}, {"type":"TemplateProcessing",...} ]
-//   }
-//
-// Bug: applyPostProcessorFromJson only checks the top-level "type" field.
-// When it sees "Sequence", it doesn't recognize it and returns without
-// parsing the inner TemplateProcessing. Result: BOS never added.
-// Affects: Llama-3, LiquidAI, Schematron (~30 models, 630 encode_special failures).
+// When TemplateProcessing is nested inside a Sequence post_processor,
+// the loader must recurse into the processors array to find and apply it.
 
 /// Minimal BPE tokenizer with Sequence-wrapped TemplateProcessing.
 ///
-/// Mimics Llama-3 pattern: post_processor is Sequence containing
-/// ByteLevel + TemplateProcessing. BOS token is `<|begin_of_text|>` (ID 1).
+/// Post_processor is Sequence containing ByteLevel + TemplateProcessing.
+/// BOS token is `<|begin_of_text|>` (ID 1).
 const SEQUENCE_POSTPROC_JSON: &str = r####"{
   "version": "1.0",
   "model": {
@@ -497,7 +476,7 @@ const SEQUENCE_POSTPROC_JSON: &str = r####"{
 
 /// Sequence-wrapped TemplateProcessing must prepend BOS.
 ///
-/// Bug: "Sequence" type not unwrapped → inner TemplateProcessing ignored → no BOS.
+/// Verifies Sequence-wrapped TemplateProcessing is found and applied.
 #[test]
 fn encode_sequence_wrapped_template_adds_bos() {
     let ctx = TokenizerTestContext::from_json(SEQUENCE_POSTPROC_JSON);
@@ -534,17 +513,11 @@ fn encode_sequence_wrapped_template_no_eos() {
 }
 
 // ===========================================================================
-// Bug B: BOS-only template adds unwanted SEP token at end
+// BOS-only TemplateProcessing must not append an unwanted SEP
 // ===========================================================================
 //
-// Models like TinyLlama have TemplateProcessing with only BOS in the
-// single template: [<s>, A]. No EOS/SEP.
-//
-// Bug: applyPostProcessorFromJson defaults sep_str = cls_str when the
-// special_tokens map has only one entry. The encode post_processor then
-// appends sep_id (which equals cls_id) at the end.
-// Result: [BOS, tokens..., BOS] instead of [BOS, tokens...].
-// Affects: TinyLlama, Gemma, Mistral, ~15 models, 315 encode_special failures.
+// When the single template is [<s>, A] with no EOS/SEP, the encoder must
+// prepend BOS only. It must not default SEP to the CLS token.
 
 /// Minimal BPE with BOS-only TemplateProcessing (no EOS in template).
 ///
@@ -588,7 +561,7 @@ const BOS_ONLY_TEMPLATE_JSON: &str = r####"{
 
 /// BOS-only template must NOT append any token at end.
 ///
-/// Bug: sep_str defaults to cls_str → sep_id=1 (BOS) appended at end.
+/// Verifies SEP is not added when the template only specifies BOS.
 #[test]
 fn encode_bos_only_template_no_trailing_token() {
     let ctx = TokenizerTestContext::from_json(BOS_ONLY_TEMPLATE_JSON);
@@ -622,16 +595,11 @@ fn encode_bos_only_template_empty_string() {
 }
 
 // ===========================================================================
-// Bug C: Metaspace prepend_scheme:"first" not handled
+// Metaspace prepend_scheme:"first" must be handled as add_prefix_space
 // ===========================================================================
 //
-// Mistral models use `prepend_scheme: "first"` instead of `add_prefix_space: true`.
-// This is the newer HuggingFace Metaspace config format.
-//
-// Bug: applyPreTokenizerFromJson only checks for `add_prefix_space`, missing
-// the `prepend_scheme` field. Result: ▁ not prepended → wrong first token.
-// Also: whitespace-only input produces empty output instead of space tokens.
-// Affects: Mistral v0.1, v0.3 (4 models, 80 encode failures).
+// The newer HuggingFace config uses `prepend_scheme: "first"` instead of
+// `add_prefix_space: true`. Both must produce the same ▁ prefix behavior.
 
 /// Minimal SentencePiece BPE with Metaspace using prepend_scheme:"first".
 ///
@@ -669,7 +637,7 @@ const METASPACE_PREPEND_SCHEME_JSON: &str = r####"{
 
 /// Metaspace with prepend_scheme:"first" must prepend ▁ to first word.
 ///
-/// Bug: Only add_prefix_space is checked; prepend_scheme is ignored.
+/// Verifies prepend_scheme:"first" is recognized as add_prefix_space.
 #[test]
 fn encode_metaspace_prepend_scheme_first() {
     let ctx = TokenizerTestContext::from_json(METASPACE_PREPEND_SCHEME_JSON);
@@ -687,7 +655,7 @@ fn encode_metaspace_prepend_scheme_first() {
 
 /// Metaspace with prepend_scheme:"first": whitespace-only must not be empty.
 ///
-/// Bug: whitespace-only input "   " produces [] instead of a space token.
+/// Verifies whitespace-only input "   " produces space tokens, not empty.
 #[test]
 fn encode_metaspace_whitespace_only() {
     let ctx = TokenizerTestContext::from_json(METASPACE_PREPEND_SCHEME_JSON);
@@ -704,14 +672,11 @@ fn encode_metaspace_whitespace_only() {
 }
 
 // ===========================================================================
-// EOS-only TemplateProcessing (Qwen3-Embedding pattern)
+// EOS-only TemplateProcessing must append EOS without prepending BOS
 // ===========================================================================
 //
-// Qwen3-Embedding models use a TemplateProcessing post_processor that appends
-// EOS at the end without prepending BOS: template is [A, <|endoftext|>].
-// The encoder must place the special token at the END, not the start.
-// Affects: Qwen3-Embedding-0.6B, Qwen3-Embedding-8B, Qwen3-VL-Embedding-2B
-// (~60 encode_special failures).
+// When the single template is [A, <|endoftext|>], the encoder must append
+// EOS at the end without prepending any BOS token.
 
 /// Minimal BPE with EOS-only TemplateProcessing.
 ///
@@ -811,17 +776,8 @@ fn encode_eos_only_template_no_special() {
 // After each special token, the remaining text starts with a space that
 // must be tokenized as a separate ▁ (metaspace) token.
 //
-// Bug: the space immediately after a special token is consumed or merged
-// into the following word, producing one fewer token than expected.
-//
-// Fixture evidence (TinyLlama, e5-mistral):
-//   encode("<s> and </s> are special tokens")
-//     expected: [1, 29871, 322, 29871, 2, 29871, 526, 4266, 18897]
-//     actual:   [1, 29871, 322, 29871, 2, 526, 4266, 18897]
-//   (29871 = ▁ standalone space token is missing after </s>)
-//
-// Affects: TinyLlama/TinyLlama-1.1B-Chat-v1.0,
-// intfloat/e5-mistral-7b-instruct (1/21 encode failures each).
+// The space after a special token must appear as a separate ▁ token,
+// not be consumed or merged into the following word.
 
 /// Space after a special token in the middle of text must be preserved.
 ///
@@ -882,5 +838,366 @@ fn space_after_special_token_preserved() {
     assert_eq!(
         after_sep[0], 3,
         "First token after </s> must be ▁ (id=3), not merged into next word. Full output: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// SentencePiece BPE: normalizer prepend ▁ must re-attach after every special
+// token, not just the first one.
+// ===========================================================================
+//
+// When the normalizer has a `prepend: "▁"` (SentencePiece convention), the
+// encoder skips the leading ▁ when the input starts with a special token and
+// re-attaches it to the first non-special segment. But this is a one-shot
+// flag: after the first segment consumes it, subsequent segments after
+// special tokens mid-text do NOT get ▁ re-attached.
+//
+// The normalizer prepend ▁ must re-attach after every special token span,
+// not just the first non-special segment.
+
+/// SentencePiece BPE: ▁ must be re-prepended after each mid-text special token.
+///
+/// Uses only Prepend normalizer (no Replace) and spaceless input so the
+/// prepend is the ONLY source of ▁. Without the fix, "world" after </s>
+/// starts with 'w'; with the fix, it starts with '▁'.
+#[test]
+fn sentencepiece_prepend_after_every_special_token() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "h": 4, "e": 5, "l": 6, "o": 7,
+      "w": 8, "r": 9, "d": 10
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": true}
+  ],
+  "normalizer": {
+    "type": "Prepend",
+    "prepend": "\u2581"
+  },
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode("<s>hello</s>world");
+
+    // Normalized: "▁<s>hello</s>world"
+    // Segments: <s>(1) | "hello" | </s>(2) | "world"
+    // ▁ prefix skipped at start (starts with <s>), re-attached to "hello":
+    //   "hello" + prepend → "▁hello" → [▁=3, h=4, e=5, l=6, l=6, o=7]
+    // After </s>, ▁ must be re-attached to "world":
+    //   "world" + prepend → "▁world" → [▁=3, w=8, o=7, r=9, l=6, d=10]
+    // Without the fix, "world" has no prepend:
+    //   "world" (no prepend) → [w=8, o=7, r=9, l=6, d=10]
+    let sep_pos = tokens.iter().position(|&t| t == 2);
+    assert!(
+        sep_pos.is_some(),
+        "Output must contain </s> token (id=2), got: {tokens:?}"
+    );
+    let after_sep = &tokens[sep_pos.unwrap() + 1..];
+    assert!(
+        !after_sep.is_empty(),
+        "There must be tokens after </s>, got: {tokens:?}"
+    );
+    assert_eq!(
+        after_sep[0], 3,
+        "First token after </s> must be ▁ (id=3) — prepend must re-attach after every special token. Got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// TemplateProcessing: CLS/SEP token selection must use template ordering,
+// not JSON map iteration order.
+// ===========================================================================
+//
+// The TemplateProcessing post-processor has a `special_tokens` map that
+// maps token names to IDs. The loader picks the first key as CLS and the
+// second key as SEP. But JSON object iteration order is not guaranteed,
+// so a map with [CLS], [MASK], [PAD], [SEP], [UNK] may pick [MASK] as
+// SEP instead of [SEP].
+//
+// CLS/SEP must be selected by parsing the template array, not by iterating
+// special_tokens map keys (which have no guaranteed order).
+
+/// TemplateProcessing must select CLS/SEP tokens from template, not map order.
+///
+/// When the special_tokens map has multiple entries, the loader must parse
+/// the "single" template array to determine which token is CLS (before
+/// content) and which is SEP (after content).
+#[test]
+fn template_processing_correct_sep_token() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "hello": 0, "world": 1,
+      "[UNK]": 10, "[CLS]": 11, "[SEP]": 12, "[PAD]": 13, "[MASK]": 14
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 10, "content": "[UNK]", "special": true},
+    {"id": 11, "content": "[CLS]", "special": true},
+    {"id": 12, "content": "[SEP]", "special": true},
+    {"id": 13, "content": "[PAD]", "special": true},
+    {"id": 14, "content": "[MASK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+    ],
+    "pair": [
+      {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "[SEP]", "type_id": 0}},
+      {"Sequence": {"id": "B", "type_id": 1}},
+      {"SpecialToken": {"id": "[SEP]", "type_id": 1}}
+    ],
+    "special_tokens": {
+      "[CLS]": {"id": "[CLS]", "ids": [11], "tokens": ["[CLS]"]},
+      "[MASK]": {"id": "[MASK]", "ids": [14], "tokens": ["[MASK]"]},
+      "[PAD]": {"id": "[PAD]", "ids": [13], "tokens": ["[PAD]"]},
+      "[SEP]": {"id": "[SEP]", "ids": [12], "tokens": ["[SEP]"]},
+      "[UNK]": {"id": "[UNK]", "ids": [10], "tokens": ["[UNK]"]}
+    }
+  },
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    // encode_with adds CLS/SEP from post-processor when add_bos=1.
+    let tokens = ctx.encode_with("hello", &opts);
+
+    // Expected: [CLS]=11, <content>, [SEP]=12
+    // Without template parsing, [SEP] may be selected as [MASK]=14
+    let last = *tokens.last().unwrap();
+    assert_eq!(
+        last, 12,
+        "Last token must be [SEP]=12, not [MASK]=14 or any other token. Got: {tokens:?}"
+    );
+    assert_eq!(
+        tokens[0], 11,
+        "First token must be [CLS]=11. Got: {tokens:?}"
+    );
+}
+
+/// TemplateProcessing: empty input must still get CLS + SEP tokens.
+///
+/// Empty input with CLS/SEP template must still produce [CLS, SEP].
+#[test]
+fn template_processing_empty_input_gets_cls_sep() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "[UNK]": 10, "[CLS]": 11, "[SEP]": 12, "[PAD]": 13, "[MASK]": 14
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 10, "content": "[UNK]", "special": true},
+    {"id": 11, "content": "[CLS]", "special": true},
+    {"id": 12, "content": "[SEP]", "special": true},
+    {"id": 13, "content": "[PAD]", "special": true},
+    {"id": 14, "content": "[MASK]", "special": true}
+  ],
+  "normalizer": null,
+  "pre_tokenizer": {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true, "use_regex": true},
+  "post_processor": {
+    "type": "TemplateProcessing",
+    "single": [
+      {"SpecialToken": {"id": "[CLS]", "type_id": 0}},
+      {"Sequence": {"id": "A", "type_id": 0}},
+      {"SpecialToken": {"id": "[SEP]", "type_id": 0}}
+    ],
+    "special_tokens": {
+      "[CLS]": {"id": "[CLS]", "ids": [11], "tokens": ["[CLS]"]},
+      "[MASK]": {"id": "[MASK]", "ids": [14], "tokens": ["[MASK]"]},
+      "[PAD]": {"id": "[PAD]", "ids": [13], "tokens": ["[PAD]"]},
+      "[SEP]": {"id": "[SEP]", "ids": [12], "tokens": ["[SEP]"]},
+      "[UNK]": {"id": "[UNK]", "ids": [10], "tokens": ["[UNK]"]}
+    }
+  },
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let opts = talu_sys::EncodeOptions {
+        add_bos: 1,
+        ..Default::default()
+    };
+    // Empty input should produce just [CLS, SEP]
+    let tokens = ctx.encode_with("", &opts);
+    assert_eq!(
+        tokens,
+        vec![11, 12],
+        "Empty input must produce [CLS=11, SEP=12], got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// Added token rstrip: trailing whitespace consumed by the token
+// ===========================================================================
+//
+// When an added token has rstrip=true, the space (or SentencePiece ▁)
+// immediately after it should be consumed into the token's span, so
+// the next segment does NOT start with a space/▁.
+//
+// Added tokens with rstrip=true must consume trailing whitespace
+// (including ▁ after normalization) into the token span.
+
+/// Added token with rstrip=true must consume trailing whitespace.
+///
+/// Uses Prepend+Replace normalizer (SentencePiece-style) so spaces become ▁.
+/// The </s> token has rstrip=true, so the ▁ after it should be consumed
+/// and NOT appear as a standalone token.
+#[test]
+fn rstrip_added_token_consumes_trailing_space() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "<unk>": 0, "<s>": 1, "</s>": 2,
+      "\u2581": 3,
+      "h": 4, "e": 5, "l": 6, "o": 7,
+      "w": 8, "r": 9, "d": 10
+    },
+    "merges": []
+  },
+  "added_tokens": [
+    {"id": 0, "content": "<unk>", "special": true},
+    {"id": 1, "content": "<s>", "special": true},
+    {"id": 2, "content": "</s>", "special": false, "rstrip": true}
+  ],
+  "normalizer": {
+    "type": "Sequence",
+    "normalizers": [
+      {"type": "Prepend", "prepend": "\u2581"},
+      {"type": "Replace", "pattern": {"String": " "}, "content": "\u2581"}
+    ]
+  },
+  "pre_tokenizer": null,
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    // Input: </s> followed by space then "world"
+    let tokens = ctx.encode("</s> world");
+
+    // Normalized: "▁</s>▁world"
+    // </s> has rstrip=true → consumes the trailing ▁ (originally a space)
+    // So the segment after </s> is "world" (no leading ▁), with prepend → "▁world"
+    //   [</s>=2, ▁=3, w=8, o=7, r=9, l=6, d=10]
+    // Without rstrip, the ▁ after </s> is NOT consumed, so:
+    //   [</s>=2, ▁=3, ▁=3, w=8, o=7, r=9, l=6, d=10]
+    //   (two ▁ tokens — one from rstrip space, one from prepend)
+
+    let sep_pos = tokens.iter().position(|&t| t == 2);
+    assert!(
+        sep_pos.is_some(),
+        "Output must contain </s> token (id=2), got: {tokens:?}"
+    );
+    let after_sep = &tokens[sep_pos.unwrap() + 1..];
+    assert!(
+        !after_sep.is_empty(),
+        "There must be tokens after </s>, got: {tokens:?}"
+    );
+    // With rstrip working: exactly one ▁ (from prepend), not two
+    assert_eq!(
+        after_sep[0], 3,
+        "First token after </s> must be ▁ (id=3) from prepend. Got: {tokens:?}"
+    );
+    // Verify no double ▁
+    assert_ne!(
+        after_sep.get(1).copied(),
+        Some(3),
+        "Must not have double ▁ after </s> — rstrip should consume the space. Got: {tokens:?}"
+    );
+}
+
+// ===========================================================================
+// Split(String pattern) must be treated as literal, not regex.
+// ===========================================================================
+//
+// When a Split pretokenizer has pattern type {"String": "..."}, the value
+// is a literal string match, not a regex. Some models store a regex-like
+// string as a String pattern — which never matches literally, making the
+// Split a no-op. The ByteLevel pretokenizer then handles the actual
+// splitting via use_regex=true.
+//
+// Three bugs combined:
+// 1. String pattern compiled as regex (interpreted regex metacharacters)
+// 2. Isolated behavior only emitted matches, not matches+gaps
+// 3. ByteLevel use_regex=true didn't set the GPT-2 regex
+
+/// Split with String pattern must be a literal match, not regex.
+///
+/// Uses Sequence[Split(String, Isolated), ByteLevel(use_regex=true)].
+/// The String pattern never matches literally, so the Split is a no-op.
+/// ByteLevel with use_regex=true provides the actual GPT-2 regex splitting.
+#[test]
+fn split_string_pattern_is_literal_not_regex() {
+    let json = r####"{
+  "version": "1.0",
+  "model": {
+    "type": "BPE",
+    "vocab": {
+      "Hello": 0, "Ġworld": 1, "ĠĠĠĠ": 2, "Ġ": 3, "world": 4,
+      "ĠĠĠ": 5, "Ġhello": 6, "hello": 7
+    },
+    "merges": ["Ġ world"]
+  },
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": {
+    "type": "Sequence",
+    "pretokenizers": [
+      {
+        "type": "Split",
+        "pattern": {"String": "[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}"},
+        "behavior": "Isolated",
+        "invert": false
+      },
+      {
+        "type": "ByteLevel",
+        "add_prefix_space": false,
+        "trim_offsets": true,
+        "use_regex": true
+      }
+    ]
+  },
+  "post_processor": null,
+  "decoder": null
+}"####;
+    let ctx = TokenizerTestContext::from_json(json);
+    let tokens = ctx.encode("Hello world");
+
+    // The String pattern "[^\r\n\p{L}..." never matches literally in "Hello world".
+    // Split(Isolated) passes the entire input through as a gap.
+    // ByteLevel(use_regex=true) splits " world" → "Ġworld" (merged).
+    // Without the fix, String is compiled as regex → wrong splits.
+    assert_eq!(
+        tokens,
+        vec![0, 1],
+        "Expected [Hello=0, Ġworld=1] — Split(String) is no-op, ByteLevel splits. Got: {tokens:?}"
     );
 }

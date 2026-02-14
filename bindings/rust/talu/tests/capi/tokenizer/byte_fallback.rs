@@ -1,8 +1,8 @@
 //! SentencePiece byte-fallback decoder tests.
 //!
 //! Tests `<0xXX>` byte-fallback tokens used by SentencePiece-based models
-//! (Llama, T5, Gemma, etc.) for representing raw bytes when subword
-//! tokenization cannot find a match in the vocabulary.
+//! for representing raw bytes when subword tokenization cannot find a match
+//! in the vocabulary.
 //!
 //! The decoder pipeline for these models is typically:
 //!   Sequence(Replace(▁→space), ByteFallback, Fuse, Strip(start=1))

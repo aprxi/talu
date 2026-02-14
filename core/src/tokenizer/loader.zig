@@ -1571,6 +1571,14 @@ fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, a
             }
         } else if (std.mem.eql(u8, type_str, "ByteLevel")) {
             tokenizer.*.pretokenizer.byte_level = 1;
+            // ByteLevel with use_regex=true needs its own GPT-2 regex for splitting.
+            // This overrides any prior regex (e.g., a no-op \Q...\E from a String Split).
+            if (findJsonFieldValue(json_bytes, "\"use_regex\"")) |v| {
+                if (std.mem.eql(u8, v, "true")) {
+                    const gpt2_pattern: [*:0]const u8 = "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
+                    _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, gpt2_pattern);
+                }
+            }
         } else if (std.mem.eql(u8, type_str, "Whitespace") or std.mem.eql(u8, type_str, "WhitespaceSplit")) {
             tokenizer.*.pretokenizer.whitespace = 1;
         } else if (std.mem.eql(u8, type_str, "Punctuation")) {
@@ -1618,9 +1626,16 @@ fn applyPreTokenizerFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8, a
                 if (pattern_section.len > 0 and pattern_section[0] == '{') {
                     // Object format: {"String": " "} or {"Regex": "..."}
                     if (findJsonFieldString(pattern_section, "\"String\"")) |str_pattern| {
-                        // Unescape JSON string and compile pattern as regex
+                        // String patterns are literal matches — wrap with \Q...\E so
+                        // PCRE2 treats the value as a literal, not as a regex.
                         const unescaped = try json_utils.unescapeJsonString(arena_allocator, str_pattern);
-                        const pat_z = std.heap.c_allocator.dupeZ(u8, unescaped) catch return error.OutOfMemory;
+                        const content_len = 2 + unescaped.len + 2; // \Q + content + \E
+                        const pat_z = std.heap.c_allocator.allocSentinel(u8, content_len, 0) catch return error.OutOfMemory;
+                        pat_z[0] = '\\';
+                        pat_z[1] = 'Q';
+                        @memcpy(pat_z[2 .. 2 + unescaped.len], unescaped);
+                        pat_z[2 + unescaped.len] = '\\';
+                        pat_z[2 + unescaped.len + 1] = 'E';
                         _ = tok_fns.tokenizer_pretokenizer_set(&tokenizer.*.pretokenizer, pat_z.ptr);
                     } else if (findJsonFieldString(pattern_section, "\"Regex\"")) |regex_pattern| {
                         // Unescape JSON string and compile pattern as regex
@@ -1687,58 +1702,34 @@ fn applyPostProcessorFromJson(tokenizer: *ct.Tokenizer, json_bytes: []const u8) 
             findJsonFieldString(json_bytes, "\"sep\"");
     }
 
-    // For TemplateProcessing: extract from special_tokens section
+    // For TemplateProcessing: determine CLS/SEP from the "single" template
+    // structure, not from special_tokens map iteration order (which is
+    // undefined in JSON). SpecialToken before Sequence(A) → CLS; after → SEP.
     if (std.mem.eql(u8, type_str, "TemplateProcessing")) {
-        if (findSection(json_bytes, "\"special_tokens\"")) |st_section| {
-            // Find token strings by looking for "id" fields
-            // The special_tokens map has entries like: "<s>": {"id": "<s>", "ids": [1], ...}
-            // We extract the keys (which are the token strings)
-            var cursor: usize = 0;
-            var found_first = false;
-            while (cursor < st_section.len) {
-                if (st_section[cursor] == '"') {
-                    const str_start = cursor + 1;
-                    cursor += 1;
-                    while (cursor < st_section.len and st_section[cursor] != '"') {
-                        if (st_section[cursor] == '\\') cursor += 2 else cursor += 1;
-                    }
-                    const str_end = cursor;
-                    if (cursor < st_section.len) cursor += 1;
-                    // Check if this is followed by ':' (a key, not a value)
-                    var peek = cursor;
-                    while (peek < st_section.len and (st_section[peek] == ' ' or st_section[peek] == '\n' or st_section[peek] == '\t')) : (peek += 1) {}
-                    if (peek < st_section.len and st_section[peek] == ':') {
-                        const key = st_section[str_start..str_end];
-                        if (!found_first) {
-                            cls_str = key;
-                            found_first = true;
-                        } else if (sep_str == null) {
-                            sep_str = key;
-                        }
-                        cursor = peek + 1;
-                        // Skip past the value object to avoid picking up nested keys
-                        while (cursor < st_section.len and st_section[cursor] != '{') : (cursor += 1) {}
-                        if (cursor < st_section.len) {
-                            cursor = cursor + (findMatchingBrace(st_section[cursor..], '{', '}') orelse (st_section.len - cursor));
-                        }
-                    }
-                } else {
-                    cursor += 1;
-                }
-            }
-        }
-    }
-
-    // For TemplateProcessing with a single special token: check whether it
-    // appears before or after the content Sequence in the "single" template.
-    // If after (e.g. [Sequence(A), SpecialToken(EOS)]), assign to sep not cls.
-    if (std.mem.eql(u8, type_str, "TemplateProcessing") and cls_str != null and sep_str == null) {
-        if (findSection(json_bytes, "\"single\"")) |single_section| {
+        if (findSection(json_bytes, "\"single\"")) |single_raw| {
+            // Scope to just the [...] array (findSection returns from '[' to EOF)
+            const single_end = findMatchingBrace(single_raw, '[', ']') orelse single_raw.len;
+            const single_section = single_raw[0..single_end];
             const seq_pos = std.mem.indexOf(u8, single_section, "\"Sequence\"");
-            const spec_pos = std.mem.indexOf(u8, single_section, "\"SpecialToken\"");
-            if (seq_pos != null and spec_pos != null and seq_pos.? < spec_pos.?) {
-                sep_str = cls_str;
-                cls_str = null;
+            var search_pos: usize = 0;
+            while (std.mem.indexOfPos(u8, single_section, search_pos, "\"SpecialToken\"")) |spec_pos| {
+                // Extract the "id" string from the SpecialToken object.
+                // Limit search scope to avoid crossing into the next entry.
+                const search_end = @min(spec_pos + 200, single_section.len);
+                const spec_slice = single_section[spec_pos..search_end];
+                if (findJsonFieldString(spec_slice, "\"id\"")) |id_str| {
+                    if (seq_pos) |sp| {
+                        if (spec_pos < sp) {
+                            if (cls_str == null) cls_str = id_str;
+                        } else {
+                            if (sep_str == null) sep_str = id_str;
+                        }
+                    } else {
+                        // No Sequence in template — treat first token as CLS
+                        if (cls_str == null) cls_str = id_str;
+                    }
+                }
+                search_pos = spec_pos + "\"SpecialToken\"".len;
             }
         }
     }

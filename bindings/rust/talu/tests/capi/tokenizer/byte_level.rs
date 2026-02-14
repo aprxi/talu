@@ -263,9 +263,6 @@ fn byte_level_vocab_size() {
 /// The ByteLevel pretokenizer adds a space (→ Ġ) before the first token.
 /// The decoder must strip this added prefix so "Hello" roundtrips to "Hello",
 /// not " Hello".
-///
-/// Bug: the decode path does not track or reverse `add_prefix_space`, so the
-/// leading space leaks into the output.
 #[test]
 fn add_prefix_space_roundtrip() {
     let json = build_byte_level_tokenizer_json()

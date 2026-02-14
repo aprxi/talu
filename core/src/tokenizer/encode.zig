@@ -109,11 +109,28 @@ fn collect_added_spans(tokenizer: *ct.Tokenizer, normalized: []const u8, normali
         }
 
         if (best_match) |matched| {
-            spans.append(Allocator, .{ .start = cursor, .end = cursor + best_match_len, .at = matched }) catch {
+            var span_end = cursor + best_match_len;
+            // rstrip: consume trailing whitespace after the token.
+            // Check both ASCII whitespace and ▁ (U+2581 = E2 96 81), which
+            // is the SentencePiece space replacement after normalization.
+            if (matched.rstrip != 0) {
+                while (span_end < normalized.len) {
+                    if (std.ascii.isWhitespace(normalized[span_end])) {
+                        span_end += 1;
+                    } else if (span_end + 3 <= normalized.len and
+                        normalized[span_end] == 0xE2 and
+                        normalized[span_end + 1] == 0x96 and
+                        normalized[span_end + 2] == 0x81)
+                    {
+                        span_end += 3;
+                    } else break;
+                }
+            }
+            spans.append(Allocator, .{ .start = cursor, .end = span_end, .at = matched }) catch {
                 spans.deinit(Allocator);
                 return null;
             };
-            cursor += best_match_len;
+            cursor = span_end;
         } else {
             cursor += 1;
         }
@@ -416,6 +433,13 @@ fn encode_internal_impl(tokenizer: *ct.Tokenizer, input: []const u8, out: *ct.To
         errdefer accum.deinit();
         try accum.appendAdded(at);
         try accum.buildOutput(out);
+        // Still apply post-processing (CLS/SEP) for non-special added tokens
+        if (apply_postprocess and tokenizer.postproc.add_special != 0) {
+            if (postprocess.postprocess_single(&tokenizer.postproc, out) != 0) {
+                tokenizer_encoding_free_struct(out);
+                return error.OutOfMemory;
+            }
+        }
         return 0;
     }
 
@@ -477,6 +501,9 @@ fn encodeNormalized(tokenizer: *ct.Tokenizer, input: []const u8, normalized: *co
             try accum.appendAdded(added_span.at);
             cursor = added_span.end;
             span_index += 1;
+            // Re-arm prepend for the next non-special segment: SentencePiece
+            // treats each span after a special token as a new "sentence start".
+            if (has_sp_prepend) needs_prepend = true;
             continue;
         }
 
