@@ -51,6 +51,7 @@ pub mod blobs;
 pub mod convert;
 pub mod documents;
 pub mod error;
+pub mod file;
 pub mod logging;
 pub mod model;
 pub mod plugins;
@@ -78,6 +79,10 @@ pub use convert::{
 pub use documents::{
     ChangeAction, ChangeRecord, CompactionStats, DocumentError, DocumentRecord, DocumentSummary,
     DocumentsHandle, SearchResult as DocSearchResult,
+};
+pub use file::{
+    FileInfo, FileKind, FitMode, ImageFormat, ImageInfo, Limits as FileLimits, OutputFormat,
+    ResizeFilter, ResizeOptions, TransformOptions as FileTransformOptions, TransformResult,
 };
 pub use logging::{LogFormat, LogLevel};
 pub use model::{GenerationConfigInfo, ModelInfo, QuantMethod};

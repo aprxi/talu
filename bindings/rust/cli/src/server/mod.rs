@@ -167,7 +167,10 @@ pub fn expand_socket_path(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn run_startup_blob_gc_once(bucket_path: &Path, min_blob_age_seconds: u64) -> Result<talu::BlobGcStats> {
+fn run_startup_blob_gc_once(
+    bucket_path: &Path,
+    min_blob_age_seconds: u64,
+) -> Result<talu::BlobGcStats> {
     let blobs = BlobsHandle::open(bucket_path).context("open blob storage for startup gc")?;
     blobs
         .gc_with_min_age(min_blob_age_seconds)

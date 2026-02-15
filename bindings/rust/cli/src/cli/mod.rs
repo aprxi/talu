@@ -1,6 +1,7 @@
 mod ask;
 mod convert;
 mod db;
+mod file;
 mod models;
 mod repo;
 mod sessions;
@@ -76,6 +77,8 @@ pub(super) enum Commands {
     Shell(ShellArgs),
     /// Set default model (interactive picker or explicit)
     Set(SetArgs),
+    /// Inspect and transform input files for inference
+    File(FileArgs),
 }
 
 #[derive(Args)]
@@ -347,6 +350,45 @@ pub(super) struct TokenizeArgs {
     pub text: Vec<String>,
 }
 
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileFitArg {
+    Stretch,
+    Contain,
+    Cover,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum FileFormatArg {
+    Jpeg,
+    Png,
+}
+
+#[derive(Args)]
+pub(super) struct FileArgs {
+    /// Input file path
+    pub path: PathBuf,
+
+    /// Resize to WxH (e.g. 512x512)
+    #[arg(long)]
+    pub resize: Option<String>,
+
+    /// Fit mode when resizing
+    #[arg(long, value_enum)]
+    pub fit: Option<FileFitArg>,
+
+    /// Output file path (never overwrites input path)
+    #[arg(long)]
+    pub output: Option<PathBuf>,
+
+    /// Output format (jpeg|png). If omitted, inferred from output extension or input.
+    #[arg(long, value_enum)]
+    pub format: Option<FileFormatArg>,
+
+    /// JPEG quality (1-100) when output format is jpeg
+    #[arg(long)]
+    pub quality: Option<u8>,
+}
+
 #[derive(Args)]
 pub(super) struct LsArgs {
     /// Target: provider:: (vllm::, ollama::), Org prefix (Qwen), or Org/Model for files
@@ -526,7 +568,7 @@ fn should_implicit_ask(args: &[String], stdin_is_pipe: bool) -> bool {
     // If first arg is a known subcommand, don't add implicit ask
     let subcommands = [
         "ask", "help", "serve", "convert", "tokenize", "ls", "get", "rm", "describe", "xray",
-        "shell", "set", "sample",
+        "shell", "set", "sample", "file",
     ];
     if subcommands.iter().any(|&cmd| cmd == first) {
         return false;
@@ -589,6 +631,7 @@ fn run_inner() -> Result<()> {
         Some(Commands::Xray(args)) => xray::cmd_xray(args),
         Some(Commands::Shell(args)) => shell::cmd_shell(args, stdin_is_pipe),
         Some(Commands::Set(args)) => cmd_set(args),
+        Some(Commands::File(args)) => file::cmd_file(args),
     }
 }
 
@@ -1042,5 +1085,44 @@ mod tests {
     #[test]
     fn reject_ls_pinned_with_hub_flag() {
         assert!(parse(&["talu", "ls", "-P", "-H"]).is_err());
+    }
+
+    #[test]
+    fn parse_file_info_command() {
+        let cli = parse(&["talu", "file", "image.png"]).expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::File(args)) => {
+                assert_eq!(args.path, PathBuf::from("image.png"));
+                assert!(args.resize.is_none());
+                assert!(args.output.is_none());
+            }
+            _ => panic!("expected file command"),
+        }
+    }
+
+    #[test]
+    fn parse_file_transform_flags() {
+        let cli = parse(&[
+            "talu",
+            "file",
+            "image.png",
+            "--resize",
+            "512x512",
+            "--fit",
+            "cover",
+            "--output",
+            "out.png",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::File(args)) => {
+                assert_eq!(args.resize.as_deref(), Some("512x512"));
+                assert_eq!(args.fit, Some(FileFitArg::Cover));
+                assert_eq!(args.output, Some(PathBuf::from("out.png")));
+            }
+            _ => panic!("expected file command"),
+        }
     }
 }

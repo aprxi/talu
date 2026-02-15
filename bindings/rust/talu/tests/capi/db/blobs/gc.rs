@@ -38,7 +38,9 @@ fn gc_preserves_inline_file_metadata_blob_ref_and_deletes_orphan_blob() {
     );
 
     assert!(
-        blobs.contains(&referenced_blob).expect("contains referenced"),
+        blobs
+            .contains(&referenced_blob)
+            .expect("contains referenced"),
         "referenced blob should remain"
     );
     assert!(

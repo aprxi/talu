@@ -25,7 +25,11 @@ fn main() {
     // 1. Explicit env var (TALU_LIB_DIR) takes priority.
     // 2. Monorepo detection: navigate up from talu-sys/ to find zig-out/lib/.
     // 3. External consumer: download pre-built library from GitHub Releases.
-    let lib_dir = if let Some(lib_dir) = env::var("TALU_LIB_DIR").ok().map(PathBuf::from).filter(|p| p.exists()) {
+    let lib_dir = if let Some(lib_dir) = env::var("TALU_LIB_DIR")
+        .ok()
+        .map(PathBuf::from)
+        .filter(|p| p.exists())
+    {
         // Explicit env var pointing to an existing directory.
         lib_dir
     } else if let Some(lib_dir) = find_monorepo_lib(&manifest_dir) {
