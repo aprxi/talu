@@ -37,6 +37,46 @@ fn isWebp(bytes: []const u8) bool {
     return bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP");
 }
 
+test "detect recognizes JPEG magic bytes" {
+    const jpeg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xE0 };
+    try std.testing.expectEqual(Format.jpeg, detect(&jpeg).?);
+}
+
+test "detect recognizes PNG magic bytes" {
+    const png = [_]u8{ 0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A };
+    try std.testing.expectEqual(Format.png, detect(&png).?);
+}
+
+test "detect recognizes WebP magic bytes" {
+    const webp = [_]u8{ 'R', 'I', 'F', 'F', 0x00, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P' };
+    try std.testing.expectEqual(Format.webp, detect(&webp).?);
+}
+
+test "detect returns null for unknown bytes" {
+    try std.testing.expectEqual(@as(?Format, null), detect("not an image"));
+}
+
+test "detect returns null for empty input" {
+    try std.testing.expectEqual(@as(?Format, null), detect(""));
+}
+
+test "detect returns null for truncated JPEG" {
+    try std.testing.expectEqual(@as(?Format, null), detect(&[_]u8{ 0xFF, 0xD8 }));
+}
+
+test "detectWithFallback recognizes JPEG via magic bytes" {
+    const jpeg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xE0 };
+    try std.testing.expectEqual(Format.jpeg, detectWithFallback(&jpeg).?);
+}
+
+test "detectWithFallback returns null for non-image data" {
+    try std.testing.expectEqual(@as(?Format, null), detectWithFallback("Hello, world!"));
+}
+
+test "detectWithFallback returns null for empty input" {
+    try std.testing.expectEqual(@as(?Format, null), detectWithFallback(""));
+}
+
 fn detectWithLibmagic(bytes: []const u8) ?Format {
     if (bytes.len == 0) return null;
 

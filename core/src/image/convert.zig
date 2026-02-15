@@ -205,3 +205,53 @@ fn cloneImage(allocator: std.mem.Allocator, src: pixel.Image) !pixel.Image {
         .data = out,
     };
 }
+
+test "convert clones rgb8 to rgb8 unchanged" {
+    const data = [_]u8{ 255, 0, 0, 0, 255, 0 };
+    const src: pixel.Image = .{ .width = 2, .height = 1, .stride = 6, .format = .rgb8, .data = @constCast(&data) };
+    var out = try convert(std.testing.allocator, src, .{ .format = .rgb8 });
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pixel.PixelFormat.rgb8, out.format);
+    try std.testing.expectEqual(@as(u8, 255), out.data[0]);
+    try std.testing.expectEqual(@as(u8, 0), out.data[1]);
+}
+
+test "convert rgb8 to gray8" {
+    // Pure white (255,255,255) → luminance 255
+    const data = [_]u8{ 255, 255, 255 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 3, .format = .rgb8, .data = @constCast(&data) };
+    var out = try convert(std.testing.allocator, src, .{ .format = .gray8 });
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pixel.PixelFormat.gray8, out.format);
+    // luminance(255,255,255) = (255*30 + 255*59 + 255*11)/100 = 255
+    try std.testing.expectEqual(@as(u8, 255), out.data[0]);
+}
+
+test "convert gray8 to rgba8" {
+    const data = [_]u8{128};
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 1, .format = .gray8, .data = @constCast(&data) };
+    var out = try convert(std.testing.allocator, src, .{ .format = .rgba8 });
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pixel.PixelFormat.rgba8, out.format);
+    try std.testing.expectEqual(@as(u8, 128), out.data[0]);
+    try std.testing.expectEqual(@as(u8, 128), out.data[1]);
+    try std.testing.expectEqual(@as(u8, 128), out.data[2]);
+    try std.testing.expectEqual(@as(u8, 255), out.data[3]);
+}
+
+test "convert rgba8 to rgb8 with discard alpha" {
+    const data = [_]u8{ 100, 150, 200, 128 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 4, .format = .rgba8, .data = @constCast(&data) };
+    var out = try convert(std.testing.allocator, src, .{ .format = .rgb8, .alpha = .discard });
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(pixel.PixelFormat.rgb8, out.format);
+    try std.testing.expectEqual(@as(u8, 100), out.data[0]);
+    try std.testing.expectEqual(@as(u8, 150), out.data[1]);
+    try std.testing.expectEqual(@as(u8, 200), out.data[2]);
+}
+
+test "convert rgba8 to rgb8 with keep alpha returns error" {
+    const data = [_]u8{ 100, 150, 200, 128 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 4, .format = .rgba8, .data = @constCast(&data) };
+    try std.testing.expectError(error.InvalidArgument, convert(std.testing.allocator, src, .{ .format = .rgb8, .alpha = .keep }));
+}

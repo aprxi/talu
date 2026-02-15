@@ -324,3 +324,68 @@ fn cloneImage(allocator: std.mem.Allocator, src: pixel.Image) !pixel.Image {
         .data = out,
     };
 }
+
+test "resize stretch nearest 1x1 to 2x2" {
+    const data = [_]u8{ 255, 0, 0 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 3, .format = .rgb8, .data = @constCast(&data) };
+    var out = try resize(std.testing.allocator, src, .{
+        .out_w = 2,
+        .out_h = 2,
+        .fit = .stretch,
+        .filter = .nearest,
+    }, .{});
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), out.width);
+    try std.testing.expectEqual(@as(u32, 2), out.height);
+    // All pixels should be red
+    try std.testing.expectEqual(@as(u8, 255), out.data[0]);
+    try std.testing.expectEqual(@as(u8, 0), out.data[1]);
+    try std.testing.expectEqual(@as(u8, 0), out.data[2]);
+}
+
+test "resize contain pads with pad_color" {
+    // 1x1 red into 3x1 with green pad → center pixel red, sides green
+    const data = [_]u8{ 255, 0, 0 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 3, .format = .rgb8, .data = @constCast(&data) };
+    var out = try resize(std.testing.allocator, src, .{
+        .out_w = 3,
+        .out_h = 1,
+        .fit = .contain,
+        .filter = .nearest,
+        .pad_color = .{ .r = 0, .g = 255, .b = 0 },
+    }, .{});
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 3), out.width);
+    // Left pad pixel should be green
+    try std.testing.expectEqual(@as(u8, 0), out.data[0]);
+    try std.testing.expectEqual(@as(u8, 255), out.data[1]);
+    // Center pixel should be red
+    try std.testing.expectEqual(@as(u8, 255), out.data[3]);
+    try std.testing.expectEqual(@as(u8, 0), out.data[4]);
+}
+
+test "resize rejects zero dimensions" {
+    const data = [_]u8{ 255, 0, 0 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 3, .format = .rgb8, .data = @constCast(&data) };
+    try std.testing.expectError(error.InvalidImageDimensions, resize(std.testing.allocator, src, .{
+        .out_w = 0,
+        .out_h = 1,
+        .fit = .stretch,
+        .filter = .nearest,
+    }, .{}));
+}
+
+test "resize same dimensions clones image" {
+    const data = [_]u8{ 10, 20, 30 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 3, .format = .rgb8, .data = @constCast(&data) };
+    var out = try resize(std.testing.allocator, src, .{
+        .out_w = 1,
+        .out_h = 1,
+        .fit = .stretch,
+        .filter = .nearest,
+    }, .{});
+    defer out.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u8, 10), out.data[0]);
+    try std.testing.expectEqual(@as(u8, 20), out.data[1]);
+    try std.testing.expectEqual(@as(u8, 30), out.data[2]);
+}

@@ -152,3 +152,32 @@ pub fn encode(
     @memcpy(out, jpeg_buf[0..out_len]);
     return out;
 }
+
+test "decode roundtrips an encoded JPEG" {
+    // Encode a synthetic 1x1 red pixel, then decode it back.
+    var data = [_]u8{ 200, 100, 50 };
+    const src: pixel.Image = .{ .width = 1, .height = 1, .stride = 3, .format = .rgb8, .data = &data };
+    const jpeg_bytes = try encode(std.testing.allocator, src, 95);
+    defer std.testing.allocator.free(jpeg_bytes);
+
+    var img = try decode(std.testing.allocator, jpeg_bytes, .{}, false);
+    defer img.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), img.width);
+    try std.testing.expectEqual(@as(u32, 1), img.height);
+    try std.testing.expectEqual(pixel.PixelFormat.rgb8, img.format);
+}
+
+test "decode rejects invalid JPEG data" {
+    var garbage = [_]u8{ 0x00, 0x01, 0x02, 0x03 };
+    try std.testing.expectError(error.JpegHeaderFailed, decode(std.testing.allocator, &garbage, .{}, false));
+}
+
+test "encode produces JPEG with SOI marker" {
+    var data = [_]u8{ 200, 100, 50 };
+    const img: pixel.Image = .{ .width = 1, .height = 1, .stride = 3, .format = .rgb8, .data = &data };
+    const jpeg_bytes = try encode(std.testing.allocator, img, 90);
+    defer std.testing.allocator.free(jpeg_bytes);
+    try std.testing.expect(jpeg_bytes.len >= 3);
+    try std.testing.expectEqual(@as(u8, 0xFF), jpeg_bytes[0]);
+    try std.testing.expectEqual(@as(u8, 0xD8), jpeg_bytes[1]);
+}
