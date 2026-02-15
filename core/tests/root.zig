@@ -100,6 +100,9 @@ pub const responses = @import("responses/root.zig");
 // policy (IAM-style tool call firewall)
 pub const policy = @import("policy/root.zig");
 
+// image (decode/convert/model_input/encode/capi)
+pub const image = @import("image/root.zig");
+
 // root exports
 pub const device = @import("device_test.zig");
 

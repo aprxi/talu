@@ -40,6 +40,9 @@ deps:
 	@test -d deps/miniz || git clone --branch 3.1.1 --depth 1 https://github.com/richgel999/miniz.git deps/miniz
 	@test -f deps/miniz/miniz_export.h || printf '#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n' > deps/miniz/miniz_export.h
 	@test -d deps/file || git clone --branch FILE5_46 --depth 1 https://github.com/file/file.git deps/file
+	@test -d deps/jpeg-turbo || git clone --branch 3.1.3 --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo.git deps/jpeg-turbo
+	@test -d deps/spng || git clone --branch v0.7.4 --depth 1 https://github.com/randy408/libspng.git deps/spng
+	@test -d deps/webp || git clone --branch v1.6.0 --depth 1 https://github.com/webmproject/libwebp.git deps/webp
 	@test -f deps/file/src/magic.h || sed 's/X\.YY/5.46/' deps/file/src/magic.h.in > deps/file/src/magic.h
 	@test -f deps/file/magic.mgc || cp /usr/share/file/magic.mgc deps/file/magic.mgc
 	@test -f deps/cacert.pem || curl -sL https://curl.se/ca/cacert.pem -o deps/cacert.pem

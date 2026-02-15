@@ -232,10 +232,529 @@ fn addMiniz(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.built
     lib.linkLibC();
     lib.addIncludePath(b.path("deps/miniz"));
     lib.addCSourceFiles(.{
-        .files = &.{"deps/miniz/miniz.c"},
+        .files = &.{
+            "deps/miniz/miniz.c",
+            "deps/miniz/miniz_tdef.c",
+            "deps/miniz/miniz_tinfl.c",
+            "deps/miniz/miniz_zip.c",
+        },
     });
 
     return .{ .lib = lib, .include_dir = b.path("deps/miniz") };
+}
+
+// =============================================================================
+// JPEG (libjpeg-turbo), PNG (libspng), and WebP (libwebp)
+// =============================================================================
+
+const JpegTurbo = struct {
+    lib: *std.Build.Step.Compile,
+    jpeg12_lib: *std.Build.Step.Compile,
+    jpeg16_lib: *std.Build.Step.Compile,
+    turbojpeg12_lib: *std.Build.Step.Compile,
+    turbojpeg16_lib: *std.Build.Step.Compile,
+    include_dir: std.Build.LazyPath,
+    generated_include_dir: std.Build.LazyPath,
+};
+
+fn addJpegTurbo(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) JpegTurbo {
+    const generated = b.addWriteFiles();
+    _ = generated.add("jconfig.h",
+        \\/* Version ID for the JPEG library. */
+        \\#define JPEG_LIB_VERSION  62
+        \\/* libjpeg-turbo version */
+        \\#define LIBJPEG_TURBO_VERSION  3.1.3
+        \\/* libjpeg-turbo version in integer form */
+        \\#define LIBJPEG_TURBO_VERSION_NUMBER  3001003
+        \\/* Support arithmetic encoding when using 8-bit samples */
+        \\#define C_ARITH_CODING_SUPPORTED 1
+        \\/* Support arithmetic decoding when using 8-bit samples */
+        \\#define D_ARITH_CODING_SUPPORTED 1
+        \\/* Support in-memory source/destination managers */
+        \\#define MEM_SRCDST_SUPPORTED  1
+        \\/* Use accelerated SIMD routines when using 8-bit samples */
+        \\/* #undef WITH_SIMD */
+        \\#ifndef BITS_IN_JSAMPLE
+        \\#define BITS_IN_JSAMPLE  8
+        \\#endif
+        \\#ifdef _WIN32
+        \\#undef RIGHT_SHIFT_IS_UNSIGNED
+        \\#ifndef __RPCNDR_H__
+        \\typedef unsigned char boolean;
+        \\#endif
+        \\#define HAVE_BOOLEAN
+        \\#if !(defined(_BASETSD_H_) || defined(_BASETSD_H))
+        \\typedef short INT16;
+        \\typedef signed int INT32;
+        \\#endif
+        \\#define XMD_H
+        \\#else
+        \\/* #undef RIGHT_SHIFT_IS_UNSIGNED */
+        \\#endif
+    );
+    _ = generated.add("jconfigint.h",
+        \\/* libjpeg-turbo build number */
+        \\#define BUILD  "20260215"
+        \\/* How to hide global symbols. */
+        \\#define HIDDEN  __attribute__((visibility("hidden")))
+        \\/* Compiler's inline keyword */
+        \\#undef inline
+        \\/* How to obtain function inlining. */
+        \\#define INLINE  __inline__ __attribute__((always_inline))
+        \\/* How to obtain thread-local storage */
+        \\#define THREAD_LOCAL  __thread
+        \\/* Define to the full name of this package. */
+        \\#define PACKAGE_NAME  "libjpeg-turbo"
+        \\/* Version number of package */
+        \\#define VERSION  "3.1.3"
+        \\/* The size of `size_t', as computed by sizeof. */
+        \\#define SIZEOF_SIZE_T  8
+        \\/* Define if compiler has __builtin_ctzl() and sizeof(unsigned long) == sizeof(size_t). */
+        \\#define HAVE_BUILTIN_CTZL
+        \\/* Define to 1 if you have the <intrin.h> header file. */
+        \\/* #undef HAVE_INTRIN_H */
+        \\#if defined(_MSC_VER) && defined(HAVE_INTRIN_H)
+        \\#if (SIZEOF_SIZE_T == 8)
+        \\#define HAVE_BITSCANFORWARD64
+        \\#elif (SIZEOF_SIZE_T == 4)
+        \\#define HAVE_BITSCANFORWARD
+        \\#endif
+        \\#endif
+        \\#if defined(__has_attribute)
+        \\#if __has_attribute(fallthrough)
+        \\#define FALLTHROUGH  __attribute__((fallthrough));
+        \\#else
+        \\#define FALLTHROUGH
+        \\#endif
+        \\#else
+        \\#define FALLTHROUGH
+        \\#endif
+        \\#ifndef BITS_IN_JSAMPLE
+        \\#define BITS_IN_JSAMPLE  8
+        \\#endif
+        \\#undef C_ARITH_CODING_SUPPORTED
+        \\#undef D_ARITH_CODING_SUPPORTED
+        \\#undef WITH_SIMD
+        \\#if BITS_IN_JSAMPLE == 8
+        \\#define C_ARITH_CODING_SUPPORTED 1
+        \\#define D_ARITH_CODING_SUPPORTED 1
+        \\/* #undef WITH_SIMD */
+        \\#endif
+    );
+    _ = generated.add("jversion.h",
+        \\#if JPEG_LIB_VERSION >= 80
+        \\#define JVERSION        "8d  15-Jan-2012"
+        \\#elif JPEG_LIB_VERSION >= 70
+        \\#define JVERSION        "7  27-Jun-2009"
+        \\#else
+        \\#define JVERSION        "6b  27-Mar-1998"
+        \\#endif
+        \\#define JCOPYRIGHT1 \
+        \\  "Copyright (C) 2009-2024 D. R. Commander\n" \
+        \\  "Copyright (C) 2015, 2020 Google, Inc.\n" \
+        \\  "Copyright (C) 2019-2020 Arm Limited\n" \
+        \\  "Copyright (C) 2015-2016, 2018 Matthieu Darbois\n" \
+        \\  "Copyright (C) 2011-2016 Siarhei Siamashka\n" \
+        \\  "Copyright (C) 2015 Intel Corporation\n"
+        \\#define JCOPYRIGHT2 \
+        \\  "Copyright (C) 2013-2014 Linaro Limited\n" \
+        \\  "Copyright (C) 2013-2014 MIPS Technologies, Inc.\n" \
+        \\  "Copyright (C) 2009, 2012 Pierre Ossman for Cendio AB\n" \
+        \\  "Copyright (C) 2009-2011 Nokia Corporation and/or its subsidiary(-ies)\n" \
+        \\  "Copyright (C) 1999-2006 MIYASAKA Masaru\n" \
+        \\  "Copyright (C) 1999 Ken Murchison\n" \
+        \\  "Copyright (C) 1991-2020 Thomas G. Lane, Guido Vollbeding\n"
+        \\#define JCOPYRIGHT_SHORT \
+        \\  "Copyright (C) 1991-2024 The libjpeg-turbo Project and many others"
+    );
+
+    const generated_include_dir = generated.getDirectory();
+    const include_dir = b.path("deps/jpeg-turbo/src");
+
+    const turbo_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const lib = b.addLibrary(.{
+        .name = "turbojpeg",
+        .root_module = turbo_mod,
+        .linkage = .static,
+    });
+    lib.linkLibC();
+    lib.addIncludePath(generated_include_dir);
+    lib.addIncludePath(include_dir);
+    lib.addCSourceFiles(.{
+        .files = &.{
+            // Common JPEG sources (8-bit precision build)
+            "deps/jpeg-turbo/src/jcapistd.c",
+            "deps/jpeg-turbo/src/jccolor.c",
+            "deps/jpeg-turbo/src/jcdiffct.c",
+            "deps/jpeg-turbo/src/jclossls.c",
+            "deps/jpeg-turbo/src/jcmainct.c",
+            "deps/jpeg-turbo/src/jcprepct.c",
+            "deps/jpeg-turbo/src/jcsample.c",
+            "deps/jpeg-turbo/src/jdapistd.c",
+            "deps/jpeg-turbo/src/jdcolor.c",
+            "deps/jpeg-turbo/src/jddiffct.c",
+            "deps/jpeg-turbo/src/jdlossls.c",
+            "deps/jpeg-turbo/src/jdmainct.c",
+            "deps/jpeg-turbo/src/jdpostct.c",
+            "deps/jpeg-turbo/src/jdsample.c",
+            "deps/jpeg-turbo/src/jutils.c",
+            "deps/jpeg-turbo/src/jccoefct.c",
+            "deps/jpeg-turbo/src/jcdctmgr.c",
+            "deps/jpeg-turbo/src/jdcoefct.c",
+            "deps/jpeg-turbo/src/jddctmgr.c",
+            "deps/jpeg-turbo/src/jdmerge.c",
+            "deps/jpeg-turbo/src/jfdctfst.c",
+            "deps/jpeg-turbo/src/jfdctint.c",
+            "deps/jpeg-turbo/src/jidctflt.c",
+            "deps/jpeg-turbo/src/jidctfst.c",
+            "deps/jpeg-turbo/src/jidctint.c",
+            "deps/jpeg-turbo/src/jidctred.c",
+            "deps/jpeg-turbo/src/jquant1.c",
+            "deps/jpeg-turbo/src/jquant2.c",
+            "deps/jpeg-turbo/src/jcapimin.c",
+            "deps/jpeg-turbo/src/jchuff.c",
+            "deps/jpeg-turbo/src/jcicc.c",
+            "deps/jpeg-turbo/src/jcinit.c",
+            "deps/jpeg-turbo/src/jclhuff.c",
+            "deps/jpeg-turbo/src/jcmarker.c",
+            "deps/jpeg-turbo/src/jcmaster.c",
+            "deps/jpeg-turbo/src/jcomapi.c",
+            "deps/jpeg-turbo/src/jcparam.c",
+            "deps/jpeg-turbo/src/jcphuff.c",
+            "deps/jpeg-turbo/src/jctrans.c",
+            "deps/jpeg-turbo/src/jdapimin.c",
+            "deps/jpeg-turbo/src/jdatadst.c",
+            "deps/jpeg-turbo/src/jdatasrc.c",
+            "deps/jpeg-turbo/src/jdhuff.c",
+            "deps/jpeg-turbo/src/jdicc.c",
+            "deps/jpeg-turbo/src/jdinput.c",
+            "deps/jpeg-turbo/src/jdlhuff.c",
+            "deps/jpeg-turbo/src/jdmarker.c",
+            "deps/jpeg-turbo/src/jdmaster.c",
+            "deps/jpeg-turbo/src/jdphuff.c",
+            "deps/jpeg-turbo/src/jdtrans.c",
+            "deps/jpeg-turbo/src/jerror.c",
+            "deps/jpeg-turbo/src/jfdctflt.c",
+            "deps/jpeg-turbo/src/jmemmgr.c",
+            "deps/jpeg-turbo/src/jmemnobs.c",
+            "deps/jpeg-turbo/src/jpeg_nbits.c",
+            "deps/jpeg-turbo/src/jaricom.c",
+            "deps/jpeg-turbo/src/jcarith.c",
+            "deps/jpeg-turbo/src/jdarith.c",
+            // TurboJPEG API + helpers
+            "deps/jpeg-turbo/src/turbojpeg.c",
+            "deps/jpeg-turbo/src/transupp.c",
+            "deps/jpeg-turbo/src/jdatadst-tj.c",
+            "deps/jpeg-turbo/src/jdatasrc-tj.c",
+            "deps/jpeg-turbo/src/rdbmp.c",
+            "deps/jpeg-turbo/src/rdppm.c",
+            "deps/jpeg-turbo/src/wrbmp.c",
+            "deps/jpeg-turbo/src/wrppm.c",
+        },
+        .flags = &.{
+            "-fPIC",
+            "-DBMP_SUPPORTED",
+            "-DPPM_SUPPORTED",
+        },
+    });
+
+    const jpeg12_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const jpeg12_lib = b.addLibrary(.{
+        .name = "jpeg12",
+        .root_module = jpeg12_mod,
+        .linkage = .static,
+    });
+    jpeg12_lib.linkLibC();
+    jpeg12_lib.addIncludePath(generated_include_dir);
+    jpeg12_lib.addIncludePath(include_dir);
+    jpeg12_lib.addCSourceFiles(.{
+        .files = &.{
+            "deps/jpeg-turbo/src/jcapistd.c",
+            "deps/jpeg-turbo/src/jccolor.c",
+            "deps/jpeg-turbo/src/jcdiffct.c",
+            "deps/jpeg-turbo/src/jclossls.c",
+            "deps/jpeg-turbo/src/jcmainct.c",
+            "deps/jpeg-turbo/src/jcprepct.c",
+            "deps/jpeg-turbo/src/jcsample.c",
+            "deps/jpeg-turbo/src/jdapistd.c",
+            "deps/jpeg-turbo/src/jdcolor.c",
+            "deps/jpeg-turbo/src/jddiffct.c",
+            "deps/jpeg-turbo/src/jdlossls.c",
+            "deps/jpeg-turbo/src/jdmainct.c",
+            "deps/jpeg-turbo/src/jdpostct.c",
+            "deps/jpeg-turbo/src/jdsample.c",
+            "deps/jpeg-turbo/src/jutils.c",
+            "deps/jpeg-turbo/src/jccoefct.c",
+            "deps/jpeg-turbo/src/jcdctmgr.c",
+            "deps/jpeg-turbo/src/jdcoefct.c",
+            "deps/jpeg-turbo/src/jddctmgr.c",
+            "deps/jpeg-turbo/src/jdmerge.c",
+            "deps/jpeg-turbo/src/jfdctfst.c",
+            "deps/jpeg-turbo/src/jfdctint.c",
+            "deps/jpeg-turbo/src/jidctflt.c",
+            "deps/jpeg-turbo/src/jidctfst.c",
+            "deps/jpeg-turbo/src/jidctint.c",
+            "deps/jpeg-turbo/src/jidctred.c",
+            "deps/jpeg-turbo/src/jquant1.c",
+            "deps/jpeg-turbo/src/jquant2.c",
+        },
+        .flags = &.{
+            "-fPIC",
+            "-DBITS_IN_JSAMPLE=12",
+        },
+    });
+
+    const jpeg16_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const jpeg16_lib = b.addLibrary(.{
+        .name = "jpeg16",
+        .root_module = jpeg16_mod,
+        .linkage = .static,
+    });
+    jpeg16_lib.linkLibC();
+    jpeg16_lib.addIncludePath(generated_include_dir);
+    jpeg16_lib.addIncludePath(include_dir);
+    jpeg16_lib.addCSourceFiles(.{
+        .files = &.{
+            "deps/jpeg-turbo/src/jcapistd.c",
+            "deps/jpeg-turbo/src/jccolor.c",
+            "deps/jpeg-turbo/src/jcdiffct.c",
+            "deps/jpeg-turbo/src/jclossls.c",
+            "deps/jpeg-turbo/src/jcmainct.c",
+            "deps/jpeg-turbo/src/jcprepct.c",
+            "deps/jpeg-turbo/src/jcsample.c",
+            "deps/jpeg-turbo/src/jdapistd.c",
+            "deps/jpeg-turbo/src/jdcolor.c",
+            "deps/jpeg-turbo/src/jddiffct.c",
+            "deps/jpeg-turbo/src/jdlossls.c",
+            "deps/jpeg-turbo/src/jdmainct.c",
+            "deps/jpeg-turbo/src/jdpostct.c",
+            "deps/jpeg-turbo/src/jdsample.c",
+            "deps/jpeg-turbo/src/jutils.c",
+        },
+        .flags = &.{
+            "-fPIC",
+            "-DBITS_IN_JSAMPLE=16",
+        },
+    });
+
+    const turbojpeg12_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const turbojpeg12_lib = b.addLibrary(.{
+        .name = "turbojpeg12",
+        .root_module = turbojpeg12_mod,
+        .linkage = .static,
+    });
+    turbojpeg12_lib.linkLibC();
+    turbojpeg12_lib.addIncludePath(generated_include_dir);
+    turbojpeg12_lib.addIncludePath(include_dir);
+    turbojpeg12_lib.addCSourceFiles(.{
+        .files = &.{
+            "deps/jpeg-turbo/src/rdppm.c",
+            "deps/jpeg-turbo/src/wrppm.c",
+        },
+        .flags = &.{
+            "-fPIC",
+            "-DBITS_IN_JSAMPLE=12",
+            "-DPPM_SUPPORTED",
+        },
+    });
+
+    const turbojpeg16_mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const turbojpeg16_lib = b.addLibrary(.{
+        .name = "turbojpeg16",
+        .root_module = turbojpeg16_mod,
+        .linkage = .static,
+    });
+    turbojpeg16_lib.linkLibC();
+    turbojpeg16_lib.addIncludePath(generated_include_dir);
+    turbojpeg16_lib.addIncludePath(include_dir);
+    turbojpeg16_lib.addCSourceFiles(.{
+        .files = &.{
+            "deps/jpeg-turbo/src/rdppm.c",
+            "deps/jpeg-turbo/src/wrppm.c",
+        },
+        .flags = &.{
+            "-fPIC",
+            "-DBITS_IN_JSAMPLE=16",
+            "-DPPM_SUPPORTED",
+        },
+    });
+
+    lib.linkLibrary(jpeg12_lib);
+    lib.linkLibrary(jpeg16_lib);
+    lib.linkLibrary(turbojpeg12_lib);
+    lib.linkLibrary(turbojpeg16_lib);
+
+    return .{
+        .lib = lib,
+        .jpeg12_lib = jpeg12_lib,
+        .jpeg16_lib = jpeg16_lib,
+        .turbojpeg12_lib = turbojpeg12_lib,
+        .turbojpeg16_lib = turbojpeg16_lib,
+        .include_dir = include_dir,
+        .generated_include_dir = generated_include_dir,
+    };
+}
+
+const Spng = struct {
+    lib: *std.Build.Step.Compile,
+    include_dir: std.Build.LazyPath,
+};
+
+fn addSpng(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    miniz: Miniz,
+) Spng {
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addCMacro("SPNG_USE_MINIZ", "");
+    mod.addCMacro("SPNG_STATIC", "");
+
+    const lib = b.addLibrary(.{
+        .name = "spng",
+        .root_module = mod,
+        .linkage = .static,
+    });
+    lib.linkLibC();
+    lib.linkLibrary(miniz.lib);
+    lib.addIncludePath(b.path("deps/spng/spng"));
+    lib.addIncludePath(miniz.include_dir);
+    lib.addCSourceFiles(.{
+        .files = &.{"deps/spng/spng/spng.c"},
+    });
+
+    return .{ .lib = lib, .include_dir = b.path("deps/spng/spng") };
+}
+
+const Webp = struct {
+    lib: *std.Build.Step.Compile,
+    include_dir: std.Build.LazyPath,
+};
+
+fn addWebp(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) Webp {
+    const target_arch = target.result.cpu.arch;
+    const mod = b.createModule(.{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    if (target_arch == .x86_64) {
+        mod.addCMacro("WEBP_HAVE_SSE2", "1");
+        mod.addCMacro("WEBP_HAVE_SSE41", "1");
+    } else if (target_arch == .aarch64) {
+        mod.addCMacro("WEBP_HAVE_NEON", "1");
+    }
+
+    const lib = b.addLibrary(.{
+        .name = "webp",
+        .root_module = mod,
+        .linkage = .static,
+    });
+    lib.linkLibC();
+    lib.addIncludePath(b.path("deps/webp"));
+    lib.addIncludePath(b.path("deps/webp/src"));
+
+    lib.addCSourceFiles(.{
+        .files = &.{
+            "deps/webp/src/dec/alpha_dec.c",
+            "deps/webp/src/dec/buffer_dec.c",
+            "deps/webp/src/dec/frame_dec.c",
+            "deps/webp/src/dec/idec_dec.c",
+            "deps/webp/src/dec/io_dec.c",
+            "deps/webp/src/dec/quant_dec.c",
+            "deps/webp/src/dec/tree_dec.c",
+            "deps/webp/src/dec/vp8_dec.c",
+            "deps/webp/src/dec/vp8l_dec.c",
+            "deps/webp/src/dec/webp_dec.c",
+            "deps/webp/src/dsp/alpha_processing.c",
+            "deps/webp/src/dsp/cpu.c",
+            "deps/webp/src/dsp/dec.c",
+            "deps/webp/src/dsp/dec_clip_tables.c",
+            "deps/webp/src/dsp/filters.c",
+            "deps/webp/src/dsp/lossless.c",
+            "deps/webp/src/dsp/rescaler.c",
+            "deps/webp/src/dsp/upsampling.c",
+            "deps/webp/src/dsp/yuv.c",
+            "deps/webp/src/utils/bit_reader_utils.c",
+            "deps/webp/src/utils/color_cache_utils.c",
+            "deps/webp/src/utils/filters_utils.c",
+            "deps/webp/src/utils/huffman_utils.c",
+            "deps/webp/src/utils/palette.c",
+            "deps/webp/src/utils/quant_levels_dec_utils.c",
+            "deps/webp/src/utils/random_utils.c",
+            "deps/webp/src/utils/rescaler_utils.c",
+            "deps/webp/src/utils/thread_utils.c",
+            "deps/webp/src/utils/utils.c",
+        },
+    });
+
+    if (target_arch == .x86_64) {
+        lib.addCSourceFiles(.{
+            .files = &.{
+                "deps/webp/src/dsp/alpha_processing_sse2.c",
+                "deps/webp/src/dsp/dec_sse2.c",
+                "deps/webp/src/dsp/filters_sse2.c",
+                "deps/webp/src/dsp/lossless_sse2.c",
+                "deps/webp/src/dsp/rescaler_sse2.c",
+                "deps/webp/src/dsp/upsampling_sse2.c",
+                "deps/webp/src/dsp/yuv_sse2.c",
+            },
+            .flags = &.{"-msse2"},
+        });
+        lib.addCSourceFiles(.{
+            .files = &.{
+                "deps/webp/src/dsp/alpha_processing_sse41.c",
+                "deps/webp/src/dsp/dec_sse41.c",
+                "deps/webp/src/dsp/lossless_sse41.c",
+                "deps/webp/src/dsp/upsampling_sse41.c",
+                "deps/webp/src/dsp/yuv_sse41.c",
+            },
+            .flags = &.{"-msse4.1"},
+        });
+    } else if (target_arch == .aarch64) {
+        lib.addCSourceFiles(.{
+            .files = &.{
+                "deps/webp/src/dsp/alpha_processing_neon.c",
+                "deps/webp/src/dsp/dec_neon.c",
+                "deps/webp/src/dsp/filters_neon.c",
+                "deps/webp/src/dsp/lossless_neon.c",
+                "deps/webp/src/dsp/rescaler_neon.c",
+                "deps/webp/src/dsp/upsampling_neon.c",
+                "deps/webp/src/dsp/yuv_neon.c",
+            },
+        });
+    }
+
+    return .{ .lib = lib, .include_dir = b.path("deps/webp/src") };
 }
 
 // =============================================================================
@@ -324,6 +843,8 @@ fn addLibMagic(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
             "deps/file/src/der.c",
             // Compat implementations for functions not in glibc 2.28
             "deps/file/src/fmtcheck.c",
+            "deps/file/src/strlcpy.c",
+            "deps/file/src/strlcat.c",
         },
     });
 
@@ -340,6 +861,9 @@ fn addCDependencies(
     pcre2: Pcre2,
     miniz: Miniz,
     libmagic: LibMagic,
+    jpeg_turbo: JpegTurbo,
+    spng: Spng,
+    webp: Webp,
 ) void {
     mod.addIncludePath(b.path("src/text"));
     mod.addIncludePath(b.path("include"));
@@ -349,6 +873,10 @@ fn addCDependencies(
     mod.addIncludePath(b.path("deps/curl/include"));
     mod.addIncludePath(miniz.include_dir);
     mod.addIncludePath(libmagic.include_dir);
+    mod.addIncludePath(jpeg_turbo.generated_include_dir);
+    mod.addIncludePath(jpeg_turbo.include_dir);
+    mod.addIncludePath(spng.include_dir);
+    mod.addIncludePath(webp.include_dir);
 
     // Mozilla CA certificates bundle for HTTPS - generated during `make deps`
     mod.addImport("cacert", b.createModule(.{
@@ -367,12 +895,22 @@ fn linkCDependencies(
     pcre2: Pcre2,
     miniz: Miniz,
     libmagic: LibMagic,
+    jpeg_turbo: JpegTurbo,
+    spng: Spng,
+    webp: Webp,
     comptime skip_external_archives: bool,
 ) void {
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
     artifact.linkLibrary(miniz.lib);
     artifact.linkLibrary(libmagic.lib);
+    artifact.linkLibrary(jpeg_turbo.lib);
+    artifact.linkLibrary(jpeg_turbo.jpeg12_lib);
+    artifact.linkLibrary(jpeg_turbo.jpeg16_lib);
+    artifact.linkLibrary(jpeg_turbo.turbojpeg12_lib);
+    artifact.linkLibrary(jpeg_turbo.turbojpeg16_lib);
+    artifact.linkLibrary(spng.lib);
+    artifact.linkLibrary(webp.lib);
 
     // For static libraries, skip external .a archives to avoid nested archive warnings.
     // The final executable/shared lib will link them directly.
@@ -417,11 +955,21 @@ fn linkExternalArchives(
     pcre2: Pcre2,
     miniz: Miniz,
     libmagic: LibMagic,
+    jpeg_turbo: JpegTurbo,
+    spng: Spng,
+    webp: Webp,
 ) void {
     artifact.linkLibC();
     artifact.linkLibrary(pcre2.lib);
     artifact.linkLibrary(miniz.lib);
     artifact.linkLibrary(libmagic.lib);
+    artifact.linkLibrary(jpeg_turbo.lib);
+    artifact.linkLibrary(jpeg_turbo.jpeg12_lib);
+    artifact.linkLibrary(jpeg_turbo.jpeg16_lib);
+    artifact.linkLibrary(jpeg_turbo.turbojpeg12_lib);
+    artifact.linkLibrary(jpeg_turbo.turbojpeg16_lib);
+    artifact.linkLibrary(spng.lib);
+    artifact.linkLibrary(webp.lib);
 
     // Link pre-built libcurl static library
     artifact.addObjectFile(b.path("deps/curl/build/lib/libcurl.a"));
@@ -667,6 +1215,9 @@ pub fn build(b: *std.Build) void {
     const sqlite3 = addSqlite3(b, target, optimize);
     const miniz = addMiniz(b, target, optimize);
     const libmagic = addLibMagic(b, target, optimize);
+    const jpeg_turbo = addJpegTurbo(b, target, optimize);
+    const spng = addSpng(b, target, optimize, miniz);
+    const webp = addWebp(b, target, optimize);
 
     // ==========================================================================
     // Generate embedded_graphs.zig from bindings/python/talu/_graphs/*.json
@@ -684,14 +1235,14 @@ pub fn build(b: *std.Build) void {
     });
     lib_mod.addOptions("build_options", build_options);
     lib_mod.addImport("embedded_graphs", embedded_graphs_mod);
-    addCDependencies(b, lib_mod, pcre2, miniz, libmagic);
+    addCDependencies(b, lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "talu",
         .root_module = lib_mod,
     });
-    linkCDependencies(b, lib, pcre2, miniz, libmagic, false);
+    linkCDependencies(b, lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, false);
     addMetalSupport(b, lib_mod, lib, enable_metal);
 
     b.installArtifact(lib);
@@ -715,7 +1266,6 @@ pub fn build(b: *std.Build) void {
     );
     python_install_step.dependOn(&copy_to_python.step);
 
-
     // ==========================================================================
     // Native static library
     // ==========================================================================
@@ -728,7 +1278,7 @@ pub fn build(b: *std.Build) void {
 
     static_lib_mod.addOptions("build_options", build_options);
     static_lib_mod.addImport("embedded_graphs", embedded_graphs_mod);
-    addCDependencies(b, static_lib_mod, pcre2, miniz, libmagic);
+    addCDependencies(b, static_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
     const static_lib = b.addLibrary(.{
         .linkage = .static,
@@ -736,7 +1286,7 @@ pub fn build(b: *std.Build) void {
         .root_module = static_lib_mod,
     });
     // Skip external .a archives for static lib - they'll be linked by the final executable
-    linkCDependencies(b, static_lib, pcre2, miniz, libmagic, true);
+    linkCDependencies(b, static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, true);
     addMetalSupport(b, static_lib_mod, static_lib, enable_metal);
 
     const static_step = b.step("static", "Build static library");
@@ -760,7 +1310,7 @@ pub fn build(b: *std.Build) void {
     exe.step.dependOn(&cargo_cmd.step);
     exe.linkLibrary(static_lib);
     // Link all deps including external .a archives (curl, mbedtls)
-    linkCDependencies(b, exe, pcre2, miniz, libmagic, false);
+    linkCDependencies(b, exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, false);
     exe.addObjectFile(b.path("bindings/rust/target/release/libtalu_cli.a"));
 
     // Link platform-specific runtime libraries for Rust CLI
@@ -771,7 +1321,6 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("dl");
         exe.linkSystemLibrary("pthread");
         exe.linkSystemLibrary("m");
-
     }
     exe.linkLibrary(sqlite3.lib);
     // macOS frameworks already linked via linkCDependencies
@@ -847,7 +1396,7 @@ pub fn build(b: *std.Build) void {
         });
         dump_lib_mod.addOptions("build_options", dump_build_options);
         dump_lib_mod.addImport("embedded_graphs", embedded_graphs_mod);
-        addCDependencies(b, dump_lib_mod, pcre2, miniz, libmagic);
+        addCDependencies(b, dump_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
         const dump_static_lib = b.addLibrary(.{
             .linkage = .static,
@@ -855,7 +1404,7 @@ pub fn build(b: *std.Build) void {
             .root_module = dump_lib_mod,
         });
         // Add C sources to static lib with skip_external_archives=true (matches main build pattern)
-        linkCDependencies(b, dump_static_lib, pcre2, miniz, libmagic, true);
+        linkCDependencies(b, dump_static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, true);
         addMetalSupport(b, dump_lib_mod, dump_static_lib, enable_metal);
 
         // Dump CLI executable - only links static lib and external archives (no C sources)
@@ -873,7 +1422,7 @@ pub fn build(b: *std.Build) void {
         });
         dump_exe.linkLibrary(dump_static_lib);
         // Only link external archives - C sources are in the static lib
-        linkExternalArchives(b, dump_exe, pcre2, miniz, libmagic);
+        linkExternalArchives(b, dump_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
         addMetalSupport(b, dump_cli_mod, dump_exe, enable_metal);
 
         dump_step.dependOn(&b.addInstallArtifact(dump_exe, .{}).step);
@@ -890,12 +1439,12 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addOptions("build_options", build_options);
     test_mod.addImport("embedded_graphs", embedded_graphs_mod);
-    addCDependencies(b, test_mod, pcre2, miniz, libmagic);
+    addCDependencies(b, test_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
-    linkCDependencies(b, tests, pcre2, miniz, libmagic, false);
+    linkCDependencies(b, tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, false);
     addMetalSupport(b, test_mod, tests, enable_metal);
 
     const run_tests = b.addRunArtifact(tests);

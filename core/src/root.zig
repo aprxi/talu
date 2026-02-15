@@ -17,6 +17,7 @@ pub const dtype = @import("dtype.zig");
 pub const compute = @import("compute/root.zig");
 pub const validate = @import("validate/root.zig");
 pub const db = @import("db/root.zig");
+pub const image = @import("image/root.zig");
 
 // =============================================================================
 // Behavioral Type Exports
@@ -29,3 +30,5 @@ pub const OwnedTensor = tensor.OwnedTensor;
 pub const DType = dtype.DType;
 pub const Device = compute.Device;
 pub const DeviceType = compute.DeviceType;
+pub const Image = image.Image;
+pub const ModelBuffer = image.ModelBuffer;

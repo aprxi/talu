@@ -171,6 +171,16 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "CStringList")) return if (is_const) "*const CStringList" else "*mut CStringList";
             if (eql(pointee, "CTagList")) return if (is_const) "*const CTagList" else "*mut CTagList";
             if (eql(pointee, "CTagRecord")) return if (is_const) "*const CTagRecord" else "*mut CTagRecord";
+            // File/image C API structs
+            if (eql(pointee, "TaluImage")) return if (is_const) "*const TaluImage" else "*mut TaluImage";
+            if (eql(pointee, "TaluImageDecodeOptions")) return if (is_const) "*const TaluImageDecodeOptions" else "*mut TaluImageDecodeOptions";
+            if (eql(pointee, "TaluImageConvertOptions")) return if (is_const) "*const TaluImageConvertOptions" else "*mut TaluImageConvertOptions";
+            if (eql(pointee, "TaluImageResizeOptions")) return if (is_const) "*const TaluImageResizeOptions" else "*mut TaluImageResizeOptions";
+            if (eql(pointee, "TaluImageEncodeOptions")) return if (is_const) "*const TaluImageEncodeOptions" else "*mut TaluImageEncodeOptions";
+            if (eql(pointee, "TaluModelInputSpec")) return if (is_const) "*const TaluModelInputSpec" else "*mut TaluModelInputSpec";
+            if (eql(pointee, "TaluModelBuffer")) return if (is_const) "*const TaluModelBuffer" else "*mut TaluModelBuffer";
+            if (eql(pointee, "TaluFileInfo")) return if (is_const) "*const TaluFileInfo" else "*mut TaluFileInfo";
+            if (eql(pointee, "TaluFileTransformOptions")) return if (is_const) "*const TaluFileTransformOptions" else "*mut TaluFileTransformOptions";
             // Document types
             if (eql(pointee, "CDocumentRecord")) return if (is_const) "*const CDocumentRecord" else "*mut CDocumentRecord";
             if (eql(pointee, "CDocumentSummary")) return if (is_const) "*const CDocumentSummary" else "*mut CDocumentSummary";

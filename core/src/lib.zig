@@ -174,6 +174,19 @@ comptime {
     _ = &capi.talu_convert_free_string;
     _ = &capi.talu_convert_schemes;
 
+    // Image API
+    _ = &capi.talu_image_decode;
+    _ = &capi.talu_image_convert;
+    _ = &capi.talu_image_to_model_input;
+    _ = &capi.talu_image_encode;
+    _ = &capi.talu_image_free;
+    _ = &capi.talu_model_buffer_free;
+    _ = &capi.talu_image_encode_free;
+    _ = &capi.talu_file_inspect;
+    _ = &capi.talu_file_info_free;
+    _ = &capi.talu_file_transform;
+    _ = &capi.talu_file_bytes_free;
+
     // Repo API
     _ = &capi.talu_repo_is_cached;
     _ = &capi.talu_repo_get_cached_path;

@@ -34,6 +34,7 @@ pub const policy = @import("policy.zig");
 pub const documents = @import("documents.zig");
 pub const blobs = @import("blobs.zig");
 pub const plugins = @import("plugins.zig");
+pub const file_api = @import("file.zig");
 
 pub const router = @import("router.zig");
 
@@ -142,6 +143,30 @@ pub const talu_arch_detect = arch.talu_arch_detect;
 pub const talu_convert = converter.talu_convert;
 pub const talu_convert_free_string = converter.talu_convert_free_string;
 pub const talu_convert_schemes = converter.talu_convert_schemes;
+
+// Re-export image C API functions.
+pub const talu_image_decode = file_api.talu_image_decode;
+pub const talu_image_convert = file_api.talu_image_convert;
+pub const talu_image_to_model_input = file_api.talu_image_to_model_input;
+pub const talu_image_encode = file_api.talu_image_encode;
+pub const talu_image_free = file_api.talu_image_free;
+pub const talu_model_buffer_free = file_api.talu_model_buffer_free;
+pub const talu_image_encode_free = file_api.talu_image_encode_free;
+pub const TaluImage = file_api.TaluImage;
+pub const TaluImageDecodeOptions = file_api.TaluImageDecodeOptions;
+pub const TaluImageConvertOptions = file_api.TaluImageConvertOptions;
+pub const TaluImageResizeOptions = file_api.TaluImageResizeOptions;
+pub const TaluModelInputSpec = file_api.TaluModelInputSpec;
+pub const TaluModelBuffer = file_api.TaluModelBuffer;
+pub const TaluImageEncodeOptions = file_api.TaluImageEncodeOptions;
+
+// Re-export file-level C API functions.
+pub const talu_file_inspect = file_api.talu_file_inspect;
+pub const talu_file_info_free = file_api.talu_file_info_free;
+pub const talu_file_transform = file_api.talu_file_transform;
+pub const talu_file_bytes_free = file_api.talu_file_bytes_free;
+pub const TaluFileInfo = file_api.TaluFileInfo;
+pub const TaluFileTransformOptions = file_api.TaluFileTransformOptions;
 
 // Re-export repo C API functions.
 pub const talu_repo_is_cached = repo.talu_repo_is_cached;
