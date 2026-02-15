@@ -11,6 +11,7 @@ const resize_mod = @import("resize.zig");
 const convert_mod = @import("convert.zig");
 const model_input_mod = @import("model_input.zig");
 const encode_mod = @import("encode.zig");
+const preprocess_mod = @import("preprocess.zig");
 const codecs = @import("codecs/root.zig");
 
 pub const Image = pixel.Image;
@@ -32,6 +33,15 @@ pub const ModelInputSpec = model_input_mod.ModelInputSpec;
 pub const ModelBuffer = model_input_mod.ModelBuffer;
 pub const EncodeFormat = encode_mod.EncodeFormat;
 pub const EncodeOptions = encode_mod.EncodeOptions;
+pub const VisionNormalize = preprocess_mod.VisionNormalize;
+pub const PlanarF32Spec = preprocess_mod.PlanarF32Spec;
+pub const SmartResizeOptions = preprocess_mod.SmartResizeOptions;
+pub const SmartResizeResult = preprocess_mod.SmartResizeResult;
+pub const VisionGrid = preprocess_mod.VisionGrid;
+pub const TokenCountOptions = preprocess_mod.TokenCountOptions;
+pub const ExplicitResize = preprocess_mod.ExplicitResize;
+pub const VisionPreprocessOptions = preprocess_mod.VisionPreprocessOptions;
+pub const VisionPreprocessResult = preprocess_mod.VisionPreprocessResult;
 pub const bytesPerPixel = pixel.bytesPerPixel;
 
 pub const DecodeOptions = struct {
@@ -77,6 +87,12 @@ pub fn decode(
 }
 
 pub const convert = convert_mod.convert;
+pub const smartResize = preprocess_mod.smartResize;
+pub const toPlanarF32 = preprocess_mod.toPlanarF32;
+pub const calculateVisionGrid = preprocess_mod.calculateVisionGrid;
+pub const calculateMergedTokenCount = preprocess_mod.calculateMergedTokenCount;
+pub const calculateTokenCountForImage = preprocess_mod.calculateTokenCountForImage;
+pub const preprocessImage = preprocess_mod.preprocessImage;
 
 pub fn toModelInput(
     allocator: std.mem.Allocator,
