@@ -7,6 +7,7 @@
 
 mod capi {
     pub mod abi;
+    pub mod file;
 
     pub mod responses {
         pub mod chat;
