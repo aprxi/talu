@@ -52,4 +52,6 @@ pub struct AppState {
     pub plugin_tokens: Mutex<PluginTokenStore>,
     /// Max allowed size (bytes) for `/v1/files` uploads.
     pub max_file_upload_bytes: u64,
+    /// Max allowed size (bytes) for `/v1/file/inspect` and `/v1/file/transform` in-memory operations.
+    pub max_file_inspect_bytes: u64,
 }

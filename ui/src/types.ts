@@ -385,6 +385,28 @@ export interface FileObject {
 }
 
 // ---------------------------------------------------------------------------
+// File Inspect/Transform API types (stateless /v1/file namespace)
+// ---------------------------------------------------------------------------
+
+/** Image metadata from file inspection. */
+export interface FileImageInfo {
+  format: string;
+  width: number;
+  height: number;
+  exif_orientation: number;
+  aspect_ratio: number;
+}
+
+/** Response from POST /v1/file/inspect. */
+export interface FileInspection {
+  kind: string;
+  mime: string;
+  description: string;
+  size: number;
+  image: FileImageInfo | null;
+}
+
+// ---------------------------------------------------------------------------
 // Plugin service contracts
 // ---------------------------------------------------------------------------
 

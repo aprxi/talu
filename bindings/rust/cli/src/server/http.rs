@@ -17,6 +17,7 @@ use tower_service::Service;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::conversations;
 use crate::server::documents;
+use crate::server::file;
 use crate::server::files;
 use crate::server::handlers;
 use crate::server::plugins;
@@ -270,6 +271,14 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/documents") | (Method::POST, "/documents") => {
                             documents::handle_create(state, req, auth, plugin_owner).await
+                        }
+                        // Stateless file inspect/transform (no storage required)
+                        (Method::POST, "/v1/file/inspect") | (Method::POST, "/file/inspect") => {
+                            file::handle_inspect(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/file/transform")
+                        | (Method::POST, "/file/transform") => {
+                            file::handle_transform(state, req, auth).await
                         }
                         (Method::POST, "/v1/files") | (Method::POST, "/files") => {
                             files::handle_upload(state, req, auth).await

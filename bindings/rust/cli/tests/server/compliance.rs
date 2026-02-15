@@ -118,6 +118,7 @@ fn build_app_with_model(model: &str) -> Router {
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
+        max_file_inspect_bytes: 50 * 1024 * 1024,
     };
 
     Router::new(Arc::new(state))
@@ -138,6 +139,7 @@ fn build_app_no_model() -> Router {
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
+        max_file_inspect_bytes: 50 * 1024 * 1024,
     };
 
     Router::new(Arc::new(state))

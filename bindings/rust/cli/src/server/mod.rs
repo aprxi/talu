@@ -10,6 +10,7 @@ use talu::blobs::BlobsHandle;
 pub mod auth_gateway;
 pub mod conversations;
 pub mod documents;
+pub mod file;
 pub mod files;
 pub mod generated;
 pub mod handlers;
@@ -24,6 +25,7 @@ pub mod tags;
 pub mod tenant;
 
 const DEFAULT_MAX_FILE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
+const DEFAULT_MAX_FILE_INSPECT_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_STARTUP_BLOB_GC_MIN_AGE_SECONDS: u64 = 15 * 60;
 
 #[derive(Args, Debug)]
@@ -67,6 +69,10 @@ pub struct ServerArgs {
     /// Max request body size for `POST /v1/files` uploads (bytes).
     #[arg(long, env = "TALU_MAX_FILE_UPLOAD_BYTES", default_value_t = DEFAULT_MAX_FILE_UPLOAD_BYTES)]
     pub max_file_upload_bytes: u64,
+
+    /// Max request body size for `POST /v1/file/inspect` and `POST /v1/file/transform` (bytes).
+    #[arg(long, env = "TALU_MAX_FILE_INSPECT_BYTES", default_value_t = DEFAULT_MAX_FILE_INSPECT_BYTES)]
+    pub max_file_inspect_bytes: u64,
 }
 
 pub fn run_server(args: ServerArgs) -> Result<()> {
@@ -119,6 +125,7 @@ pub fn run_server(args: ServerArgs) -> Result<()> {
         html_dir: args.html_dir,
         plugin_tokens: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         max_file_upload_bytes: args.max_file_upload_bytes,
+        max_file_inspect_bytes: args.max_file_inspect_bytes,
     };
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);

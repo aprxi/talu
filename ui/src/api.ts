@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileInspection } from "./types.ts";
 
 const BASE = "";
 
@@ -30,6 +30,8 @@ export interface ApiClient {
   getFile(id: string): Promise<ApiResult<FileObject>>;
   deleteFile(id: string): Promise<ApiResult<void>>;
   getFileContent(id: string): Promise<ApiResult<Blob>>;
+  inspectFile(file: File): Promise<ApiResult<FileInspection>>;
+  transformFile(file: File, opts?: { resize?: string; fit?: string; format?: string; quality?: number }): Promise<ApiResult<Blob>>;
 }
 
 export function createApiClient(fetchFn: FetchFn): ApiClient {
@@ -139,5 +141,30 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     getFile: (id) => requestJson<FileObject>("GET", `/v1/files/${encodeURIComponent(id)}`),
     deleteFile: (id) => requestJson<void>("DELETE", `/v1/files/${encodeURIComponent(id)}`),
     getFileContent: (id) => requestBlob("GET", `/v1/files/${encodeURIComponent(id)}/content`),
+    inspectFile: (file) => {
+      const form = new FormData();
+      form.append("file", file, file.name);
+      return requestFormData<FileInspection>("POST", "/v1/file/inspect", form);
+    },
+    transformFile: async (file, opts = {}) => {
+      try {
+        const form = new FormData();
+        form.append("file", file, file.name);
+        if (opts.resize) form.append("resize", opts.resize);
+        if (opts.fit) form.append("fit", opts.fit);
+        if (opts.format) form.append("format", opts.format);
+        if (opts.quality !== undefined) form.append("quality", String(opts.quality));
+
+        const resp = await fetchFn(`${BASE}/v1/file/transform`, { method: "POST", body: form });
+        if (!resp.ok) {
+          const msg = await parseErrorMessage(resp);
+          return { ok: false, error: msg };
+        }
+        const data = await resp.blob();
+        return { ok: true, data };
+      } catch (e) {
+        return { ok: false, error: e instanceof Error ? e.message : String(e) };
+      }
+    },
   };
 }
