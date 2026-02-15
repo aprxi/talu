@@ -1,0 +1,73 @@
+Remove abseil-cpp dependency from PDFium.
+
+Only two source files use abseil types. Replace them with standard C++
+equivalents:
+  - absl::InlinedVector<T,N,A> → std::vector<T,A>  (cpdf_sampledfunc.cpp)
+  - absl::flat_hash_set<T>     → std::unordered_set<T>  (cpdf_nametree.cpp)
+
+--- a/core/fpdfapi/page/cpdf_sampledfunc.cpp
++++ b/core/fpdfapi/page/cpdf_sampledfunc.cpp
+@@ -9,6 +9,7 @@
+ #include <algorithm>
+ #include <utility>
++#include <vector>
+
+ #include "core/fpdfapi/parser/cpdf_array.h"
+ #include "core/fpdfapi/parser/cpdf_dictionary.h"
+@@ -17,7 +18,6 @@
+ #include "core/fxcrt/cfx_bitstream.h"
+ #include "core/fxcrt/compiler_specific.h"
+ #include "core/fxcrt/fx_memory_wrappers.h"
+ #include "core/fxcrt/fx_safe_types.h"
+-#include "third_party/abseil-cpp/absl/container/inlined_vector.h"
+
+ namespace {
+@@ -114,8 +114,8 @@
+-  absl::InlinedVector<float, 16, FxAllocAllocator<float>> encoded_input(
++  std::vector<float, FxAllocAllocator<float>> encoded_input(
+       inputs_);
+-  absl::InlinedVector<uint32_t, 16, FxAllocAllocator<uint32_t>> index(inputs_);
+-  absl::InlinedVector<uint32_t, 16, FxAllocAllocator<uint32_t>> blocksize(
++  std::vector<uint32_t, FxAllocAllocator<uint32_t>> index(inputs_);
++  std::vector<uint32_t, FxAllocAllocator<uint32_t>> blocksize(
+       inputs_);
+
+--- a/core/fpdfdoc/cpdf_nametree.cpp
++++ b/core/fpdfdoc/cpdf_nametree.cpp
+@@ -9,6 +9,7 @@
+ #include <utility>
+ #include <vector>
++#include <unordered_set>
+
+ #include "core/fpdfapi/parser/cpdf_array.h"
+@@ -20,7 +21,6 @@
+ #include "core/fxcrt/check.h"
+ #include "core/fxcrt/ptr_util.h"
+ #include "core/fxcrt/stl_util.h"
+-#include "third_party/abseil-cpp/absl/container/flat_hash_set.h"
+
+ namespace {
+@@ -193,12 +193,12 @@
+-bool IsTraversedObject(const CPDF_Object* obj,
+-                       absl::flat_hash_set<uint32_t>* seen_obj_nums) {
++bool IsTraversedObject(
++    const CPDF_Object* obj,
++    std::unordered_set<uint32_t>* seen_obj_nums) {
+@@ -204,8 +204,8 @@
+-bool IsArrayWithTraversedObject(const CPDF_Array* array,
+-                                absl::flat_hash_set<uint32_t>* seen_obj_nums) {
++bool IsArrayWithTraversedObject(
++    const CPDF_Array* array,
++    std::unordered_set<uint32_t>* seen_obj_nums) {
+@@ -230,7 +230,7 @@
+-    absl::flat_hash_set<uint32_t>* seen_obj_nums) {
++    std::unordered_set<uint32_t>* seen_obj_nums) {
+@@ -320,7 +320,7 @@
+-  absl::flat_hash_set<uint32_t> seen_obj_nums;
++  std::unordered_set<uint32_t> seen_obj_nums;
+@@ -401,7 +401,7 @@
+-                          absl::flat_hash_set<const CPDF_Dictionary*>& seen) {
++                          std::unordered_set<const CPDF_Dictionary*>& seen) {
+@@ -538,7 +538,7 @@
+-  absl::flat_hash_set<const CPDF_Dictionary*> seen;
++  std::unordered_set<const CPDF_Dictionary*> seen;

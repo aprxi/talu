@@ -165,6 +165,8 @@ pub const talu_file_inspect = file_api.talu_file_inspect;
 pub const talu_file_info_free = file_api.talu_file_info_free;
 pub const talu_file_transform = file_api.talu_file_transform;
 pub const talu_file_bytes_free = file_api.talu_file_bytes_free;
+pub const talu_pdf_render_page = file_api.talu_pdf_render_page;
+pub const talu_pdf_page_count = file_api.talu_pdf_page_count;
 pub const TaluFileInfo = file_api.TaluFileInfo;
 pub const TaluFileTransformOptions = file_api.TaluFileTransformOptions;
 

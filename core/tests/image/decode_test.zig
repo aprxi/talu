@@ -6,11 +6,13 @@ const png_red = @embedFile("corpus/1x1_red.png");
 const jpg_red = @embedFile("corpus/1x1_red.jpg");
 const webp_red = @embedFile("corpus/1x1_red.webp");
 const jpg_2x3 = @embedFile("corpus/2x3_blue.jpg");
+const pdf_1page = @embedFile("corpus/1x1_page.pdf");
 
-test "image.detectFormat recognizes jpeg/png/webp" {
+test "image.detectFormat recognizes jpeg/png/webp/pdf" {
     try std.testing.expectEqual(image.Format.png, image.detectFormat(png_red).?);
     try std.testing.expectEqual(image.Format.jpeg, image.detectFormat(jpg_red).?);
     try std.testing.expectEqual(image.Format.webp, image.detectFormat(webp_red).?);
+    try std.testing.expectEqual(image.Format.pdf, image.detectFormat(pdf_1page).?);
 }
 
 test "image.decode decodes minimal jpeg/png/webp" {
@@ -28,6 +30,16 @@ test "image.decode decodes minimal jpeg/png/webp" {
     defer webp_img.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u32, 1), webp_img.width);
     try std.testing.expectEqual(@as(u32, 1), webp_img.height);
+}
+
+test "image.decode decodes minimal pdf" {
+    var pdf_img = try image.decode(std.testing.allocator, pdf_1page, .{});
+    defer pdf_img.deinit(std.testing.allocator);
+
+    // 72pt page at default 150 DPI → ceil(72 * 150/72) = 150px
+    try std.testing.expectEqual(@as(u32, 150), pdf_img.width);
+    try std.testing.expectEqual(@as(u32, 150), pdf_img.height);
+    try std.testing.expectEqual(image.PixelFormat.rgba8, pdf_img.format);
 }
 
 test "image.decode rejects unsupported format" {

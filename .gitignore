@@ -57,6 +57,7 @@ exported_models/
 imported_models/
 checkpoints/
 zig-cache/
+.zig-cache/
 zig-out
 uv.lock
 

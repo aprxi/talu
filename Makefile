@@ -1,4 +1,4 @@
-.PHONY: all deps build static clean clean-deps test graphs docs curl-build mlx-build mbedtls-build gen-bindings ui
+.PHONY: all deps build static clean clean-deps test graphs docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
 
 # Detect platform-specific settings
 UNAME_S := $(shell uname -s)
@@ -48,8 +48,14 @@ deps:
 	@test -f deps/cacert.pem || curl -sL https://curl.se/ca/cacert.pem -o deps/cacert.pem
 	@printf '%s\n%s\n' '//! Mozilla CA certificates - auto-generated, do not edit' 'pub const data = @embedFile("cacert.pem");' > deps/cacert.zig
 	@printf '%s\n%s\n' '//! Compiled magic database - auto-generated, do not edit' 'pub const data = @embedFile("file/magic.mgc");' > deps/magic_db.zig
+	@test -d deps/freetype || git clone --branch VER-2-13-3 --depth 1 https://github.com/freetype/freetype.git deps/freetype
+	@test -d deps/pdfium || git clone --depth 1 https://pdfium.googlesource.com/pdfium deps/pdfium
+	@test -d deps/pdfium/third_party/fast_float/fast_float || \
+		git clone --branch v8.0.0 --depth 1 https://github.com/fastfloat/fast_float.git deps/pdfium/third_party/fast_float/fast_float
 	@test -f deps/mbedtls/build/library/libmbedtls.a || $(MAKE) mbedtls-build
 	@test -f deps/curl/build/lib/libcurl.a || $(MAKE) curl-build
+	@test -f deps/freetype/build/libfreetype.a || $(MAKE) freetype-build
+	@test -f deps/pdfium/cmake-build/libpdfium.a || $(MAKE) pdfium-build
 ifeq ($(UNAME_S),Darwin)
 	@test -f deps/mlx/lib/libmlx.a || $(MAKE) mlx-build
 endif
@@ -193,6 +199,79 @@ else
 		-DCURL_DISABLE_SRP=ON
 endif
 	@cd deps/curl/build && cmake --build . --config Release -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+
+freetype-build:
+	@echo "Building FreeType static library..."
+	@rm -rf deps/freetype/build
+	@mkdir -p deps/freetype/build
+ifeq ($(UNAME_S),Darwin)
+	@cd deps/freetype/build && cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DFT_DISABLE_BZIP2=ON \
+		-DFT_DISABLE_BROTLI=ON \
+		-DFT_DISABLE_HARFBUZZ=ON \
+		-DFT_DISABLE_PNG=ON \
+		-DFT_DISABLE_ZLIB=ON
+else
+	@cd deps/freetype/build && \
+	CC="zig cc $(ZIG_CC_FLAGS)" cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DFT_DISABLE_BZIP2=ON \
+		-DFT_DISABLE_BROTLI=ON \
+		-DFT_DISABLE_HARFBUZZ=ON \
+		-DFT_DISABLE_PNG=ON \
+		-DFT_DISABLE_ZLIB=ON
+endif
+	@cd deps/freetype/build && cmake --build . --config Release -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+	@echo "FreeType installed to deps/freetype/build/"
+
+pdfium-build: freetype-build
+	@echo "Building PDFium static library..."
+	# Copy our CMake build and shim headers into PDFium source tree
+	@cp ports/pdfium/CMakeLists.txt deps/pdfium/
+	@cp ports/pdfium/buildflag.h deps/pdfium/build/
+	@cp ports/pdfium/build_config.h deps/pdfium/build/
+	# Patch out abseil dependency (2 files)
+	@cd deps/pdfium && sed -i \
+		-e 's|#include "third_party/abseil-cpp/absl/container/inlined_vector.h"|#include <vector>|' \
+		-e 's|absl::InlinedVector<float, 16, FxAllocAllocator<float>>|std::vector<float, FxAllocAllocator<float>>|' \
+		-e 's|absl::InlinedVector<uint32_t, 16, FxAllocAllocator<uint32_t>>|std::vector<uint32_t, FxAllocAllocator<uint32_t>>|' \
+		core/fpdfapi/page/cpdf_sampledfunc.cpp
+	@cd deps/pdfium && sed -i \
+		-e 's|#include "third_party/abseil-cpp/absl/container/flat_hash_set.h"|#include <unordered_set>|' \
+		-e 's|absl::flat_hash_set|std::unordered_set|g' \
+		core/fpdfdoc/cpdf_nametree.cpp
+	# Build with zig cc/c++ for glibc 2.28 compatibility
+	@rm -rf deps/pdfium/cmake-build
+	@mkdir -p deps/pdfium/cmake-build
+ifeq ($(UNAME_S),Darwin)
+	@cd deps/pdfium/cmake-build && cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DFREETYPE_INCLUDE_DIR=$(CURDIR)/deps/freetype/include \
+		-DFREETYPE_LIBRARY=$(CURDIR)/deps/freetype/build/libfreetype.a \
+		-DJPEG_INCLUDE_DIR="$(CURDIR)/deps/jpeg-turbo/src;$(CURDIR)/ports/pdfium/jpeg_compat" \
+		-DICU_INCLUDE_DIR=$(CURDIR)/ports/pdfium/icu_stubs \
+		-DZLIB_INCLUDE_DIR=$(CURDIR)/ports/pdfium/zlib_compat
+else
+	@cd deps/pdfium/cmake-build && \
+	CC="zig cc $(ZIG_CC_FLAGS)" CXX="zig c++ $(ZIG_CC_FLAGS)" cmake .. \
+		-DCMAKE_BUILD_TYPE=Release \
+		-DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+		-DBUILD_SHARED_LIBS=OFF \
+		-DFREETYPE_INCLUDE_DIR=$(CURDIR)/deps/freetype/include \
+		-DFREETYPE_LIBRARY=$(CURDIR)/deps/freetype/build/libfreetype.a \
+		-DJPEG_INCLUDE_DIR="$(CURDIR)/deps/jpeg-turbo/src;$(CURDIR)/ports/pdfium/jpeg_compat" \
+		-DICU_INCLUDE_DIR=$(CURDIR)/ports/pdfium/icu_stubs \
+		-DZLIB_INCLUDE_DIR=$(CURDIR)/ports/pdfium/zlib_compat
+endif
+	@cd deps/pdfium/cmake-build && cmake --build . --config Release -j$$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+	@echo "PDFium installed to deps/pdfium/cmake-build/"
 
 build: deps sync-version gen-bindings ui
 	zig build release $(ZIG_BUILD_FLAGS)

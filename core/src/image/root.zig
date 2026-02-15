@@ -72,6 +72,7 @@ pub fn decode(
         .jpeg => try codecs.jpeg.decode(allocator, bytes, opts.limits, opts.apply_orientation),
         .png => try codecs.png.decode(allocator, bytes, opts.limits),
         .webp => try codecs.webp.decode(allocator, bytes, opts.limits),
+        .pdf => try codecs.pdf.decode(allocator, bytes, opts.limits),
     };
     errdefer decoded.deinit(allocator);
 
@@ -177,7 +178,7 @@ pub fn transformImage(
 
     const out_format = spec.output_format orelse switch (input_format) {
         .jpeg => EncodeFormat.jpeg,
-        .png, .webp => EncodeFormat.png,
+        .png, .webp, .pdf => EncodeFormat.png,
     };
     const encoded = try encode_mod.encode(allocator, final_img, .{
         .format = out_format,

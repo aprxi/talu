@@ -49,807 +49,24 @@ fn getVersion(b: *std.Build) []const u8 {
 }
 
 // =============================================================================
-// PCRE2 dependency
+// Dependencies — each built from ports/<dep>/build.zig
 // =============================================================================
 
-const Pcre2 = struct {
-    lib: *std.Build.Step.Compile,
-    include_dir: std.Build.LazyPath,
-};
+const pcre2_port = @import("ports/pcre2/build.zig");
+const sqlite_port = @import("ports/sqlite/build.zig");
+const miniz_port = @import("ports/miniz/build.zig");
+const jpeg_turbo_port = @import("ports/jpeg-turbo/build.zig");
+const spng_port = @import("ports/spng/build.zig");
+const webp_port = @import("ports/webp/build.zig");
+const libmagic_port = @import("ports/libmagic/build.zig");
 
-fn addPcre2(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Pcre2 {
-    const config_header = b.addConfigHeader(
-        .{
-            .style = .{ .cmake = b.path("deps/pcre2/src/config-cmake.h.in") },
-            .include_path = "config.h",
-        },
-        .{
-            .HAVE_ASSERT_H = true,
-            .HAVE_UNISTD_H = target.result.os.tag != .windows,
-            .HAVE_WINDOWS_H = target.result.os.tag == .windows,
-            .HAVE_ATTRIBUTE_UNINITIALIZED = true,
-            .HAVE_BUILTIN_MUL_OVERFLOW = true,
-            .HAVE_BUILTIN_UNREACHABLE = true,
-            .SUPPORT_PCRE2_8 = true,
-            .SUPPORT_PCRE2_16 = false,
-            .SUPPORT_PCRE2_32 = false,
-            .SUPPORT_UNICODE = true,
-            .SUPPORT_JIT = false,
-            .PCRE2_EXPORT = null,
-            .PCRE2_LINK_SIZE = 2,
-            .PCRE2_HEAP_LIMIT = 20000000,
-            .PCRE2_MATCH_LIMIT = 10000000,
-            .PCRE2_MATCH_LIMIT_DEPTH = "MATCH_LIMIT",
-            .PCRE2_MAX_VARLOOKBEHIND = 255,
-            .NEWLINE_DEFAULT = 2,
-            .PCRE2_PARENS_NEST_LIMIT = 250,
-            .PCRE2GREP_BUFSIZE = 20480,
-            .PCRE2GREP_MAX_BUFSIZE = 1048576,
-        },
-    );
-
-    const header_dir = b.addWriteFiles();
-    _ = header_dir.addCopyFile(b.path("deps/pcre2/src/pcre2.h.generic"), "pcre2.h");
-
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    mod.addCMacro("HAVE_CONFIG_H", "");
-    mod.addCMacro("PCRE2_CODE_UNIT_WIDTH", "8");
-    mod.addCMacro("PCRE2_STATIC", "");
-
-    const lib = b.addLibrary(.{
-        .name = "pcre2-8",
-        .root_module = mod,
-        .linkage = .static,
-    });
-    lib.linkLibC();
-    lib.addConfigHeader(config_header);
-    lib.addIncludePath(header_dir.getDirectory());
-    lib.addIncludePath(b.path("deps/pcre2/src"));
-
-    const chartables = b.addWriteFiles();
-    const chartables_file = chartables.addCopyFile(b.path("deps/pcre2/src/pcre2_chartables.c.dist"), "pcre2_chartables.c");
-    lib.addCSourceFile(.{ .file = chartables_file });
-
-    lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/pcre2/src/pcre2_auto_possess.c",
-            "deps/pcre2/src/pcre2_chkdint.c",
-            "deps/pcre2/src/pcre2_compile.c",
-            "deps/pcre2/src/pcre2_compile_cgroup.c",
-            "deps/pcre2/src/pcre2_compile_class.c",
-            "deps/pcre2/src/pcre2_config.c",
-            "deps/pcre2/src/pcre2_context.c",
-            "deps/pcre2/src/pcre2_convert.c",
-            "deps/pcre2/src/pcre2_dfa_match.c",
-            "deps/pcre2/src/pcre2_error.c",
-            "deps/pcre2/src/pcre2_extuni.c",
-            "deps/pcre2/src/pcre2_find_bracket.c",
-            "deps/pcre2/src/pcre2_jit_compile.c",
-            "deps/pcre2/src/pcre2_maketables.c",
-            "deps/pcre2/src/pcre2_match.c",
-            "deps/pcre2/src/pcre2_match_data.c",
-            "deps/pcre2/src/pcre2_match_next.c",
-            "deps/pcre2/src/pcre2_newline.c",
-            "deps/pcre2/src/pcre2_ord2utf.c",
-            "deps/pcre2/src/pcre2_pattern_info.c",
-            "deps/pcre2/src/pcre2_script_run.c",
-            "deps/pcre2/src/pcre2_serialize.c",
-            "deps/pcre2/src/pcre2_string_utils.c",
-            "deps/pcre2/src/pcre2_study.c",
-            "deps/pcre2/src/pcre2_substitute.c",
-            "deps/pcre2/src/pcre2_substring.c",
-            "deps/pcre2/src/pcre2_tables.c",
-            "deps/pcre2/src/pcre2_ucd.c",
-            "deps/pcre2/src/pcre2_valid_utf.c",
-            "deps/pcre2/src/pcre2_xclass.c",
-        },
-    });
-
-    return .{ .lib = lib, .include_dir = header_dir.getDirectory() };
-}
-
-// =============================================================================
-// SQLite3 dependency (amalgamation, minimal build)
-// =============================================================================
-
-const Sqlite3 = struct {
-    lib: *std.Build.Step.Compile,
-    include_dir: std.Build.LazyPath,
-};
-
-fn addSqlite3(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Sqlite3 {
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
-    // Strip unused features for minimal binary size.
-    // PinStore only uses: open/close/exec/prepare/step/bind/column/changes/errmsg.
-    mod.addCMacro("SQLITE_OMIT_LOAD_EXTENSION", "1");
-    mod.addCMacro("SQLITE_OMIT_JSON", "1");
-    mod.addCMacro("SQLITE_OMIT_FTS3", "1");
-    mod.addCMacro("SQLITE_OMIT_FTS4", "1");
-    mod.addCMacro("SQLITE_OMIT_FTS5", "1");
-    mod.addCMacro("SQLITE_OMIT_RTREE", "1");
-    mod.addCMacro("SQLITE_OMIT_GEOPOLY", "1");
-    mod.addCMacro("SQLITE_OMIT_DECLTYPE", "1");
-    mod.addCMacro("SQLITE_OMIT_DEPRECATED", "1");
-    mod.addCMacro("SQLITE_OMIT_SHARED_CACHE", "1");
-    mod.addCMacro("SQLITE_OMIT_UTF16", "1");
-    mod.addCMacro("SQLITE_OMIT_DESERIALIZE", "1");
-    mod.addCMacro("SQLITE_OMIT_COMPLETE", "1");
-    mod.addCMacro("SQLITE_OMIT_EXPLAIN", "1");
-    mod.addCMacro("SQLITE_OMIT_AUTHORIZATION", "1");
-    mod.addCMacro("SQLITE_OMIT_TRACE", "1");
-    mod.addCMacro("SQLITE_OMIT_PROGRESS_CALLBACK", "1");
-    mod.addCMacro("SQLITE_OMIT_GET_TABLE", "1");
-    mod.addCMacro("SQLITE_THREADSAFE", "1");
-    mod.addCMacro("SQLITE_DQS", "0");
-    mod.addCMacro("SQLITE_DEFAULT_MEMSTATUS", "0");
-
-    const lib = b.addLibrary(.{
-        .name = "sqlite3",
-        .root_module = mod,
-        .linkage = .static,
-    });
-    lib.linkLibC();
-    lib.addIncludePath(b.path("deps/sqlite"));
-    lib.addCSourceFiles(.{
-        .files = &.{"deps/sqlite/sqlite3.c"},
-    });
-
-    return .{ .lib = lib, .include_dir = b.path("deps/sqlite") };
-}
-
-// =============================================================================
-// Miniz dependency (zip/deflate, amalgamation)
-// =============================================================================
-
-const Miniz = struct {
-    lib: *std.Build.Step.Compile,
-    include_dir: std.Build.LazyPath,
-};
-
-fn addMiniz(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Miniz {
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    // Static build — MINIZ_EXPORT is empty (normally generated by CMake/Meson)
-    mod.addCMacro("MINIZ_EXPORT", "");
-
-    const lib = b.addLibrary(.{
-        .name = "miniz",
-        .root_module = mod,
-        .linkage = .static,
-    });
-    lib.linkLibC();
-    lib.addIncludePath(b.path("deps/miniz"));
-    lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/miniz/miniz.c",
-            "deps/miniz/miniz_tdef.c",
-            "deps/miniz/miniz_tinfl.c",
-            "deps/miniz/miniz_zip.c",
-        },
-    });
-
-    return .{ .lib = lib, .include_dir = b.path("deps/miniz") };
-}
-
-// =============================================================================
-// JPEG (libjpeg-turbo), PNG (libspng), and WebP (libwebp)
-// =============================================================================
-
-const JpegTurbo = struct {
-    lib: *std.Build.Step.Compile,
-    jpeg12_lib: *std.Build.Step.Compile,
-    jpeg16_lib: *std.Build.Step.Compile,
-    turbojpeg12_lib: *std.Build.Step.Compile,
-    turbojpeg16_lib: *std.Build.Step.Compile,
-    include_dir: std.Build.LazyPath,
-    generated_include_dir: std.Build.LazyPath,
-};
-
-fn addJpegTurbo(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) JpegTurbo {
-    const generated = b.addWriteFiles();
-    _ = generated.add("jconfig.h",
-        \\/* Version ID for the JPEG library. */
-        \\#define JPEG_LIB_VERSION  62
-        \\/* libjpeg-turbo version */
-        \\#define LIBJPEG_TURBO_VERSION  3.1.3
-        \\/* libjpeg-turbo version in integer form */
-        \\#define LIBJPEG_TURBO_VERSION_NUMBER  3001003
-        \\/* Support arithmetic encoding when using 8-bit samples */
-        \\#define C_ARITH_CODING_SUPPORTED 1
-        \\/* Support arithmetic decoding when using 8-bit samples */
-        \\#define D_ARITH_CODING_SUPPORTED 1
-        \\/* Support in-memory source/destination managers */
-        \\#define MEM_SRCDST_SUPPORTED  1
-        \\/* Use accelerated SIMD routines when using 8-bit samples */
-        \\/* #undef WITH_SIMD */
-        \\#ifndef BITS_IN_JSAMPLE
-        \\#define BITS_IN_JSAMPLE  8
-        \\#endif
-        \\#ifdef _WIN32
-        \\#undef RIGHT_SHIFT_IS_UNSIGNED
-        \\#ifndef __RPCNDR_H__
-        \\typedef unsigned char boolean;
-        \\#endif
-        \\#define HAVE_BOOLEAN
-        \\#if !(defined(_BASETSD_H_) || defined(_BASETSD_H))
-        \\typedef short INT16;
-        \\typedef signed int INT32;
-        \\#endif
-        \\#define XMD_H
-        \\#else
-        \\/* #undef RIGHT_SHIFT_IS_UNSIGNED */
-        \\#endif
-    );
-    _ = generated.add("jconfigint.h",
-        \\/* libjpeg-turbo build number */
-        \\#define BUILD  "20260215"
-        \\/* How to hide global symbols. */
-        \\#define HIDDEN  __attribute__((visibility("hidden")))
-        \\/* Compiler's inline keyword */
-        \\#undef inline
-        \\/* How to obtain function inlining. */
-        \\#define INLINE  __inline__ __attribute__((always_inline))
-        \\/* How to obtain thread-local storage */
-        \\#define THREAD_LOCAL  __thread
-        \\/* Define to the full name of this package. */
-        \\#define PACKAGE_NAME  "libjpeg-turbo"
-        \\/* Version number of package */
-        \\#define VERSION  "3.1.3"
-        \\/* The size of `size_t', as computed by sizeof. */
-        \\#define SIZEOF_SIZE_T  8
-        \\/* Define if compiler has __builtin_ctzl() and sizeof(unsigned long) == sizeof(size_t). */
-        \\#define HAVE_BUILTIN_CTZL
-        \\/* Define to 1 if you have the <intrin.h> header file. */
-        \\/* #undef HAVE_INTRIN_H */
-        \\#if defined(_MSC_VER) && defined(HAVE_INTRIN_H)
-        \\#if (SIZEOF_SIZE_T == 8)
-        \\#define HAVE_BITSCANFORWARD64
-        \\#elif (SIZEOF_SIZE_T == 4)
-        \\#define HAVE_BITSCANFORWARD
-        \\#endif
-        \\#endif
-        \\#if defined(__has_attribute)
-        \\#if __has_attribute(fallthrough)
-        \\#define FALLTHROUGH  __attribute__((fallthrough));
-        \\#else
-        \\#define FALLTHROUGH
-        \\#endif
-        \\#else
-        \\#define FALLTHROUGH
-        \\#endif
-        \\#ifndef BITS_IN_JSAMPLE
-        \\#define BITS_IN_JSAMPLE  8
-        \\#endif
-        \\#undef C_ARITH_CODING_SUPPORTED
-        \\#undef D_ARITH_CODING_SUPPORTED
-        \\#undef WITH_SIMD
-        \\#if BITS_IN_JSAMPLE == 8
-        \\#define C_ARITH_CODING_SUPPORTED 1
-        \\#define D_ARITH_CODING_SUPPORTED 1
-        \\/* #undef WITH_SIMD */
-        \\#endif
-    );
-    _ = generated.add("jversion.h",
-        \\#if JPEG_LIB_VERSION >= 80
-        \\#define JVERSION        "8d  15-Jan-2012"
-        \\#elif JPEG_LIB_VERSION >= 70
-        \\#define JVERSION        "7  27-Jun-2009"
-        \\#else
-        \\#define JVERSION        "6b  27-Mar-1998"
-        \\#endif
-        \\#define JCOPYRIGHT1 \
-        \\  "Copyright (C) 2009-2024 D. R. Commander\n" \
-        \\  "Copyright (C) 2015, 2020 Google, Inc.\n" \
-        \\  "Copyright (C) 2019-2020 Arm Limited\n" \
-        \\  "Copyright (C) 2015-2016, 2018 Matthieu Darbois\n" \
-        \\  "Copyright (C) 2011-2016 Siarhei Siamashka\n" \
-        \\  "Copyright (C) 2015 Intel Corporation\n"
-        \\#define JCOPYRIGHT2 \
-        \\  "Copyright (C) 2013-2014 Linaro Limited\n" \
-        \\  "Copyright (C) 2013-2014 MIPS Technologies, Inc.\n" \
-        \\  "Copyright (C) 2009, 2012 Pierre Ossman for Cendio AB\n" \
-        \\  "Copyright (C) 2009-2011 Nokia Corporation and/or its subsidiary(-ies)\n" \
-        \\  "Copyright (C) 1999-2006 MIYASAKA Masaru\n" \
-        \\  "Copyright (C) 1999 Ken Murchison\n" \
-        \\  "Copyright (C) 1991-2020 Thomas G. Lane, Guido Vollbeding\n"
-        \\#define JCOPYRIGHT_SHORT \
-        \\  "Copyright (C) 1991-2024 The libjpeg-turbo Project and many others"
-    );
-
-    const generated_include_dir = generated.getDirectory();
-    const include_dir = b.path("deps/jpeg-turbo/src");
-
-    const turbo_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const lib = b.addLibrary(.{
-        .name = "turbojpeg",
-        .root_module = turbo_mod,
-        .linkage = .static,
-    });
-    lib.linkLibC();
-    lib.addIncludePath(generated_include_dir);
-    lib.addIncludePath(include_dir);
-    lib.addCSourceFiles(.{
-        .files = &.{
-            // Common JPEG sources (8-bit precision build)
-            "deps/jpeg-turbo/src/jcapistd.c",
-            "deps/jpeg-turbo/src/jccolor.c",
-            "deps/jpeg-turbo/src/jcdiffct.c",
-            "deps/jpeg-turbo/src/jclossls.c",
-            "deps/jpeg-turbo/src/jcmainct.c",
-            "deps/jpeg-turbo/src/jcprepct.c",
-            "deps/jpeg-turbo/src/jcsample.c",
-            "deps/jpeg-turbo/src/jdapistd.c",
-            "deps/jpeg-turbo/src/jdcolor.c",
-            "deps/jpeg-turbo/src/jddiffct.c",
-            "deps/jpeg-turbo/src/jdlossls.c",
-            "deps/jpeg-turbo/src/jdmainct.c",
-            "deps/jpeg-turbo/src/jdpostct.c",
-            "deps/jpeg-turbo/src/jdsample.c",
-            "deps/jpeg-turbo/src/jutils.c",
-            "deps/jpeg-turbo/src/jccoefct.c",
-            "deps/jpeg-turbo/src/jcdctmgr.c",
-            "deps/jpeg-turbo/src/jdcoefct.c",
-            "deps/jpeg-turbo/src/jddctmgr.c",
-            "deps/jpeg-turbo/src/jdmerge.c",
-            "deps/jpeg-turbo/src/jfdctfst.c",
-            "deps/jpeg-turbo/src/jfdctint.c",
-            "deps/jpeg-turbo/src/jidctflt.c",
-            "deps/jpeg-turbo/src/jidctfst.c",
-            "deps/jpeg-turbo/src/jidctint.c",
-            "deps/jpeg-turbo/src/jidctred.c",
-            "deps/jpeg-turbo/src/jquant1.c",
-            "deps/jpeg-turbo/src/jquant2.c",
-            "deps/jpeg-turbo/src/jcapimin.c",
-            "deps/jpeg-turbo/src/jchuff.c",
-            "deps/jpeg-turbo/src/jcicc.c",
-            "deps/jpeg-turbo/src/jcinit.c",
-            "deps/jpeg-turbo/src/jclhuff.c",
-            "deps/jpeg-turbo/src/jcmarker.c",
-            "deps/jpeg-turbo/src/jcmaster.c",
-            "deps/jpeg-turbo/src/jcomapi.c",
-            "deps/jpeg-turbo/src/jcparam.c",
-            "deps/jpeg-turbo/src/jcphuff.c",
-            "deps/jpeg-turbo/src/jctrans.c",
-            "deps/jpeg-turbo/src/jdapimin.c",
-            "deps/jpeg-turbo/src/jdatadst.c",
-            "deps/jpeg-turbo/src/jdatasrc.c",
-            "deps/jpeg-turbo/src/jdhuff.c",
-            "deps/jpeg-turbo/src/jdicc.c",
-            "deps/jpeg-turbo/src/jdinput.c",
-            "deps/jpeg-turbo/src/jdlhuff.c",
-            "deps/jpeg-turbo/src/jdmarker.c",
-            "deps/jpeg-turbo/src/jdmaster.c",
-            "deps/jpeg-turbo/src/jdphuff.c",
-            "deps/jpeg-turbo/src/jdtrans.c",
-            "deps/jpeg-turbo/src/jerror.c",
-            "deps/jpeg-turbo/src/jfdctflt.c",
-            "deps/jpeg-turbo/src/jmemmgr.c",
-            "deps/jpeg-turbo/src/jmemnobs.c",
-            "deps/jpeg-turbo/src/jpeg_nbits.c",
-            "deps/jpeg-turbo/src/jaricom.c",
-            "deps/jpeg-turbo/src/jcarith.c",
-            "deps/jpeg-turbo/src/jdarith.c",
-            // TurboJPEG API + helpers
-            "deps/jpeg-turbo/src/turbojpeg.c",
-            "deps/jpeg-turbo/src/transupp.c",
-            "deps/jpeg-turbo/src/jdatadst-tj.c",
-            "deps/jpeg-turbo/src/jdatasrc-tj.c",
-            "deps/jpeg-turbo/src/rdbmp.c",
-            "deps/jpeg-turbo/src/rdppm.c",
-            "deps/jpeg-turbo/src/wrbmp.c",
-            "deps/jpeg-turbo/src/wrppm.c",
-        },
-        .flags = &.{
-            "-fPIC",
-            "-DBMP_SUPPORTED",
-            "-DPPM_SUPPORTED",
-        },
-    });
-
-    const jpeg12_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const jpeg12_lib = b.addLibrary(.{
-        .name = "jpeg12",
-        .root_module = jpeg12_mod,
-        .linkage = .static,
-    });
-    jpeg12_lib.linkLibC();
-    jpeg12_lib.addIncludePath(generated_include_dir);
-    jpeg12_lib.addIncludePath(include_dir);
-    jpeg12_lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/jpeg-turbo/src/jcapistd.c",
-            "deps/jpeg-turbo/src/jccolor.c",
-            "deps/jpeg-turbo/src/jcdiffct.c",
-            "deps/jpeg-turbo/src/jclossls.c",
-            "deps/jpeg-turbo/src/jcmainct.c",
-            "deps/jpeg-turbo/src/jcprepct.c",
-            "deps/jpeg-turbo/src/jcsample.c",
-            "deps/jpeg-turbo/src/jdapistd.c",
-            "deps/jpeg-turbo/src/jdcolor.c",
-            "deps/jpeg-turbo/src/jddiffct.c",
-            "deps/jpeg-turbo/src/jdlossls.c",
-            "deps/jpeg-turbo/src/jdmainct.c",
-            "deps/jpeg-turbo/src/jdpostct.c",
-            "deps/jpeg-turbo/src/jdsample.c",
-            "deps/jpeg-turbo/src/jutils.c",
-            "deps/jpeg-turbo/src/jccoefct.c",
-            "deps/jpeg-turbo/src/jcdctmgr.c",
-            "deps/jpeg-turbo/src/jdcoefct.c",
-            "deps/jpeg-turbo/src/jddctmgr.c",
-            "deps/jpeg-turbo/src/jdmerge.c",
-            "deps/jpeg-turbo/src/jfdctfst.c",
-            "deps/jpeg-turbo/src/jfdctint.c",
-            "deps/jpeg-turbo/src/jidctflt.c",
-            "deps/jpeg-turbo/src/jidctfst.c",
-            "deps/jpeg-turbo/src/jidctint.c",
-            "deps/jpeg-turbo/src/jidctred.c",
-            "deps/jpeg-turbo/src/jquant1.c",
-            "deps/jpeg-turbo/src/jquant2.c",
-        },
-        .flags = &.{
-            "-fPIC",
-            "-DBITS_IN_JSAMPLE=12",
-        },
-    });
-
-    const jpeg16_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const jpeg16_lib = b.addLibrary(.{
-        .name = "jpeg16",
-        .root_module = jpeg16_mod,
-        .linkage = .static,
-    });
-    jpeg16_lib.linkLibC();
-    jpeg16_lib.addIncludePath(generated_include_dir);
-    jpeg16_lib.addIncludePath(include_dir);
-    jpeg16_lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/jpeg-turbo/src/jcapistd.c",
-            "deps/jpeg-turbo/src/jccolor.c",
-            "deps/jpeg-turbo/src/jcdiffct.c",
-            "deps/jpeg-turbo/src/jclossls.c",
-            "deps/jpeg-turbo/src/jcmainct.c",
-            "deps/jpeg-turbo/src/jcprepct.c",
-            "deps/jpeg-turbo/src/jcsample.c",
-            "deps/jpeg-turbo/src/jdapistd.c",
-            "deps/jpeg-turbo/src/jdcolor.c",
-            "deps/jpeg-turbo/src/jddiffct.c",
-            "deps/jpeg-turbo/src/jdlossls.c",
-            "deps/jpeg-turbo/src/jdmainct.c",
-            "deps/jpeg-turbo/src/jdpostct.c",
-            "deps/jpeg-turbo/src/jdsample.c",
-            "deps/jpeg-turbo/src/jutils.c",
-        },
-        .flags = &.{
-            "-fPIC",
-            "-DBITS_IN_JSAMPLE=16",
-        },
-    });
-
-    const turbojpeg12_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const turbojpeg12_lib = b.addLibrary(.{
-        .name = "turbojpeg12",
-        .root_module = turbojpeg12_mod,
-        .linkage = .static,
-    });
-    turbojpeg12_lib.linkLibC();
-    turbojpeg12_lib.addIncludePath(generated_include_dir);
-    turbojpeg12_lib.addIncludePath(include_dir);
-    turbojpeg12_lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/jpeg-turbo/src/rdppm.c",
-            "deps/jpeg-turbo/src/wrppm.c",
-        },
-        .flags = &.{
-            "-fPIC",
-            "-DBITS_IN_JSAMPLE=12",
-            "-DPPM_SUPPORTED",
-        },
-    });
-
-    const turbojpeg16_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    const turbojpeg16_lib = b.addLibrary(.{
-        .name = "turbojpeg16",
-        .root_module = turbojpeg16_mod,
-        .linkage = .static,
-    });
-    turbojpeg16_lib.linkLibC();
-    turbojpeg16_lib.addIncludePath(generated_include_dir);
-    turbojpeg16_lib.addIncludePath(include_dir);
-    turbojpeg16_lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/jpeg-turbo/src/rdppm.c",
-            "deps/jpeg-turbo/src/wrppm.c",
-        },
-        .flags = &.{
-            "-fPIC",
-            "-DBITS_IN_JSAMPLE=16",
-            "-DPPM_SUPPORTED",
-        },
-    });
-
-    lib.linkLibrary(jpeg12_lib);
-    lib.linkLibrary(jpeg16_lib);
-    lib.linkLibrary(turbojpeg12_lib);
-    lib.linkLibrary(turbojpeg16_lib);
-
-    return .{
-        .lib = lib,
-        .jpeg12_lib = jpeg12_lib,
-        .jpeg16_lib = jpeg16_lib,
-        .turbojpeg12_lib = turbojpeg12_lib,
-        .turbojpeg16_lib = turbojpeg16_lib,
-        .include_dir = include_dir,
-        .generated_include_dir = generated_include_dir,
-    };
-}
-
-const Spng = struct {
-    lib: *std.Build.Step.Compile,
-    include_dir: std.Build.LazyPath,
-};
-
-fn addSpng(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    miniz: Miniz,
-) Spng {
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    mod.addCMacro("SPNG_USE_MINIZ", "");
-    mod.addCMacro("SPNG_STATIC", "");
-
-    const lib = b.addLibrary(.{
-        .name = "spng",
-        .root_module = mod,
-        .linkage = .static,
-    });
-    lib.linkLibC();
-    lib.linkLibrary(miniz.lib);
-    lib.addIncludePath(b.path("deps/spng/spng"));
-    lib.addIncludePath(miniz.include_dir);
-    lib.addCSourceFiles(.{
-        .files = &.{"deps/spng/spng/spng.c"},
-    });
-
-    return .{ .lib = lib, .include_dir = b.path("deps/spng/spng") };
-}
-
-const Webp = struct {
-    lib: *std.Build.Step.Compile,
-    include_dir: std.Build.LazyPath,
-};
-
-fn addWebp(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-) Webp {
-    const target_arch = target.result.cpu.arch;
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-
-    if (target_arch == .x86_64) {
-        mod.addCMacro("WEBP_HAVE_SSE2", "1");
-        mod.addCMacro("WEBP_HAVE_SSE41", "1");
-    } else if (target_arch == .aarch64) {
-        mod.addCMacro("WEBP_HAVE_NEON", "1");
-    }
-
-    const lib = b.addLibrary(.{
-        .name = "webp",
-        .root_module = mod,
-        .linkage = .static,
-    });
-    lib.linkLibC();
-    lib.addIncludePath(b.path("deps/webp"));
-    lib.addIncludePath(b.path("deps/webp/src"));
-
-    lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/webp/src/dec/alpha_dec.c",
-            "deps/webp/src/dec/buffer_dec.c",
-            "deps/webp/src/dec/frame_dec.c",
-            "deps/webp/src/dec/idec_dec.c",
-            "deps/webp/src/dec/io_dec.c",
-            "deps/webp/src/dec/quant_dec.c",
-            "deps/webp/src/dec/tree_dec.c",
-            "deps/webp/src/dec/vp8_dec.c",
-            "deps/webp/src/dec/vp8l_dec.c",
-            "deps/webp/src/dec/webp_dec.c",
-            "deps/webp/src/dsp/alpha_processing.c",
-            "deps/webp/src/dsp/cpu.c",
-            "deps/webp/src/dsp/dec.c",
-            "deps/webp/src/dsp/dec_clip_tables.c",
-            "deps/webp/src/dsp/filters.c",
-            "deps/webp/src/dsp/lossless.c",
-            "deps/webp/src/dsp/rescaler.c",
-            "deps/webp/src/dsp/upsampling.c",
-            "deps/webp/src/dsp/yuv.c",
-            "deps/webp/src/utils/bit_reader_utils.c",
-            "deps/webp/src/utils/color_cache_utils.c",
-            "deps/webp/src/utils/filters_utils.c",
-            "deps/webp/src/utils/huffman_utils.c",
-            "deps/webp/src/utils/palette.c",
-            "deps/webp/src/utils/quant_levels_dec_utils.c",
-            "deps/webp/src/utils/random_utils.c",
-            "deps/webp/src/utils/rescaler_utils.c",
-            "deps/webp/src/utils/thread_utils.c",
-            "deps/webp/src/utils/utils.c",
-        },
-    });
-
-    if (target_arch == .x86_64) {
-        lib.addCSourceFiles(.{
-            .files = &.{
-                "deps/webp/src/dsp/alpha_processing_sse2.c",
-                "deps/webp/src/dsp/dec_sse2.c",
-                "deps/webp/src/dsp/filters_sse2.c",
-                "deps/webp/src/dsp/lossless_sse2.c",
-                "deps/webp/src/dsp/rescaler_sse2.c",
-                "deps/webp/src/dsp/upsampling_sse2.c",
-                "deps/webp/src/dsp/yuv_sse2.c",
-            },
-            .flags = &.{"-msse2"},
-        });
-        lib.addCSourceFiles(.{
-            .files = &.{
-                "deps/webp/src/dsp/alpha_processing_sse41.c",
-                "deps/webp/src/dsp/dec_sse41.c",
-                "deps/webp/src/dsp/lossless_sse41.c",
-                "deps/webp/src/dsp/upsampling_sse41.c",
-                "deps/webp/src/dsp/yuv_sse41.c",
-            },
-            .flags = &.{"-msse4.1"},
-        });
-    } else if (target_arch == .aarch64) {
-        lib.addCSourceFiles(.{
-            .files = &.{
-                "deps/webp/src/dsp/alpha_processing_neon.c",
-                "deps/webp/src/dsp/dec_neon.c",
-                "deps/webp/src/dsp/filters_neon.c",
-                "deps/webp/src/dsp/lossless_neon.c",
-                "deps/webp/src/dsp/rescaler_neon.c",
-                "deps/webp/src/dsp/upsampling_neon.c",
-                "deps/webp/src/dsp/yuv_neon.c",
-            },
-        });
-    }
-
-    return .{ .lib = lib, .include_dir = b.path("deps/webp/src") };
-}
-
-// =============================================================================
-// Libmagic dependency (file type detection)
-// =============================================================================
-
-const LibMagic = struct {
-    lib: *std.Build.Step.Compile,
-    include_dir: std.Build.LazyPath,
-};
-
-fn addLibMagic(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) LibMagic {
-    const mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    mod.addCMacro("HAVE_CONFIG_H", "");
-    mod.addCMacro("_GNU_SOURCE", "");
-
-    const lib = b.addLibrary(.{
-        .name = "magic",
-        .root_module = mod,
-        .linkage = .static,
-    });
-    lib.linkLibC();
-
-    // Generate config.h and magic.h via WriteFiles (libmagic uses autotools, no cmake template).
-    // magic.h.in only needs X.YY replaced with the version string.
-    // config.h defines POSIX features available on both Linux glibc 2.28+ and macOS.
-    const generated = b.addWriteFiles();
-    _ = generated.add("config.h",
-        \\#ifndef CONFIG_H
-        \\#define CONFIG_H
-        \\#define HAVE_STDINT_H 1
-        \\#define HAVE_INTTYPES_H 1
-        \\#define HAVE_UNISTD_H 1
-        \\#define HAVE_STDLIB_H 1
-        \\#define HAVE_STRING_H 1
-        \\#define HAVE_SYS_STAT_H 1
-        \\#define HAVE_SYS_TYPES_H 1
-        \\#define HAVE_FCNTL_H 1
-        \\#define HAVE_LIMITS_H 1
-        \\#define HAVE_SIGNAL_H 1
-        \\#define HAVE_SYS_WAIT_H 1
-        \\#define HAVE_VASPRINTF 1
-        \\#define HAVE_ASPRINTF 1
-        \\#define HAVE_DPRINTF 1
-        \\#define HAVE_STRNDUP 1
-        \\#define HAVE_PREAD 1
-        \\#define HAVE_MMAP 1
-        \\#define HAVE_GETLINE 1
-        \\#define HAVE_STRCASESTR 1
-        \\#define HAVE_CTIME_R 1
-        \\#define HAVE_ASCTIME_R 1
-        \\#define HAVE_GMTIME_R 1
-        \\#define HAVE_LOCALTIME_R 1
-        \\#define HAVE_FORK 1
-        \\#define HAVE_VISIBILITY 1
-        \\#define VERSION "5.46"
-        \\#endif
-    );
-    lib.addIncludePath(generated.getDirectory());
-    lib.addIncludePath(b.path("deps/file/src"));
-
-    lib.addCSourceFiles(.{
-        .files = &.{
-            "deps/file/src/magic.c",
-            "deps/file/src/apprentice.c",
-            "deps/file/src/softmagic.c",
-            "deps/file/src/ascmagic.c",
-            "deps/file/src/encoding.c",
-            "deps/file/src/compress.c",
-            "deps/file/src/is_csv.c",
-            "deps/file/src/is_json.c",
-            "deps/file/src/is_simh.c",
-            "deps/file/src/is_tar.c",
-            "deps/file/src/readelf.c",
-            "deps/file/src/print.c",
-            "deps/file/src/fsmagic.c",
-            "deps/file/src/funcs.c",
-            "deps/file/src/buffer.c",
-            "deps/file/src/cdf.c",
-            "deps/file/src/cdf_time.c",
-            "deps/file/src/readcdf.c",
-            "deps/file/src/der.c",
-            // Compat implementations for functions not in glibc 2.28
-            "deps/file/src/fmtcheck.c",
-            "deps/file/src/strlcpy.c",
-            "deps/file/src/strlcat.c",
-        },
-    });
-
-    return .{ .lib = lib, .include_dir = b.path("deps/file/src") };
-}
+const Pcre2 = pcre2_port.Pcre2;
+const Sqlite3 = sqlite_port.Sqlite3;
+const Miniz = miniz_port.Miniz;
+const JpegTurbo = jpeg_turbo_port.JpegTurbo;
+const Spng = spng_port.Spng;
+const Webp = webp_port.Webp;
+const LibMagic = libmagic_port.LibMagic;
 
 // =============================================================================
 // Helper to add C dependencies to a module
@@ -871,6 +88,7 @@ fn addCDependencies(
     mod.addIncludePath(pcre2.include_dir);
     mod.addIncludePath(b.path("deps/pcre2/src"));
     mod.addIncludePath(b.path("deps/curl/include"));
+    mod.addIncludePath(b.path("deps/pdfium/public"));
     mod.addIncludePath(miniz.include_dir);
     mod.addIncludePath(libmagic.include_dir);
     mod.addIncludePath(jpeg_turbo.generated_include_dir);
@@ -923,6 +141,14 @@ fn linkCDependencies(
         artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedx509.a"));
         artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedcrypto.a"));
 
+        // Link PDFium for PDF rendering
+        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libpdfium.a"));
+        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libagg.a"));
+        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/liblcms.a"));
+        artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libopenjpeg.a"));
+        artifact.addObjectFile(b.path("deps/freetype/build/libfreetype.a"));
+        artifact.linkLibCpp();
+
         const target_os = artifact.rootModuleTarget().os.tag;
         if (target_os == .macos) {
             artifact.linkFramework("CoreFoundation");
@@ -930,12 +156,26 @@ fn linkCDependencies(
             artifact.linkFramework("Security");
         }
         artifact.linkSystemLibrary("pthread");
-    }
 
-    artifact.addCSourceFiles(.{
-        .files = &.{"deps/utf8proc/utf8proc.c"},
-        .flags = &.{"-std=gnu11"},
-    });
+        // PDFium ICU shim: u_tolower, u_isalpha, etc. backed by utf8proc.
+        artifact.addCSourceFiles(.{
+            .files = &.{"ports/pdfium/icu_shim.c"},
+            .flags = &.{ "-std=gnu11", "-Ideps/utf8proc" },
+        });
+        // PDFium zlib shim: inflate, compress, etc. forwarded to miniz.
+        // Must define MINIZ_NO_ZLIB_COMPATIBLE_NAMES to avoid conflicting
+        // inline definitions from miniz.h.
+        artifact.addCSourceFiles(.{
+            .files = &.{"ports/pdfium/zlib_shim.c"},
+            .flags = &.{ "-std=gnu11", "-DMINIZ_NO_ZLIB_COMPATIBLE_NAMES" },
+        });
+        artifact.addIncludePath(miniz.include_dir);
+
+        artifact.addCSourceFiles(.{
+            .files = &.{"deps/utf8proc/utf8proc.c"},
+            .flags = &.{"-std=gnu11"},
+        });
+    }
 
     // Signal guard for graceful SIGBUS handling
     const target_os = artifact.rootModuleTarget().os.tag;
@@ -978,6 +218,14 @@ fn linkExternalArchives(
     artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedtls.a"));
     artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedx509.a"));
     artifact.addObjectFile(b.path("deps/mbedtls/build/library/libmbedcrypto.a"));
+
+    // Link PDFium for PDF rendering
+    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libpdfium.a"));
+    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libagg.a"));
+    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/liblcms.a"));
+    artifact.addObjectFile(b.path("deps/pdfium/cmake-build/libopenjpeg.a"));
+    artifact.addObjectFile(b.path("deps/freetype/build/libfreetype.a"));
+    artifact.linkLibCpp();
 
     const target_os = artifact.rootModuleTarget().os.tag;
     if (target_os == .macos) {
@@ -1211,13 +459,13 @@ pub fn build(b: *std.Build) void {
     build_options.addOption([]const u8, "version", version);
 
     // Build dependencies
-    const pcre2 = addPcre2(b, target, optimize);
-    const sqlite3 = addSqlite3(b, target, optimize);
-    const miniz = addMiniz(b, target, optimize);
-    const libmagic = addLibMagic(b, target, optimize);
-    const jpeg_turbo = addJpegTurbo(b, target, optimize);
-    const spng = addSpng(b, target, optimize, miniz);
-    const webp = addWebp(b, target, optimize);
+    const pcre2 = pcre2_port.add(b, target, optimize);
+    const sqlite3 = sqlite_port.add(b, target, optimize);
+    const miniz = miniz_port.add(b, target, optimize);
+    const libmagic = libmagic_port.add(b, target, optimize);
+    const jpeg_turbo = jpeg_turbo_port.add(b, target, optimize);
+    const spng = spng_port.add(b, target, optimize, miniz);
+    const webp = webp_port.add(b, target, optimize);
 
     // ==========================================================================
     // Generate embedded_graphs.zig from bindings/python/talu/_graphs/*.json

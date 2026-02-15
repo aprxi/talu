@@ -628,6 +628,7 @@ fn probeImageMeta(bytes: []const u8, fmt: image.Format) !ImageMeta {
         .jpeg => try probeJpegMeta(bytes),
         .png => try probePngMeta(bytes),
         .webp => try probeWebpMeta(bytes),
+        .pdf => try probePdfMeta(bytes),
     };
 }
 
@@ -687,6 +688,21 @@ fn probeWebpMeta(bytes: []const u8) !ImageMeta {
     };
 }
 
+fn probePdfMeta(bytes: []const u8) !ImageMeta {
+    const codecs = @import("../image/codecs/root.zig");
+    const dims = try codecs.pdf.pageDimensions(bytes, 0);
+    // Convert PDF points to pixels at 150 DPI (default render DPI)
+    const scale: f32 = 150.0 / 72.0;
+    const w: u32 = @intFromFloat(@ceil(dims.width_points * scale));
+    const h: u32 = @intFromFloat(@ceil(dims.height_points * scale));
+    if (w == 0 or h == 0) return error.InvalidImageDimensions;
+    return .{
+        .width = w,
+        .height = h,
+        .exif_orientation = 1,
+    };
+}
+
 fn detectMagicString(bytes: []const u8, flags: c_int) !?[]u8 {
     if (bytes.len == 0) return null;
     const cookie = magic_open(flags) orelse return null;
@@ -739,6 +755,7 @@ fn imageMime(fmt: image.Format) []const u8 {
         .jpeg => "image/jpeg",
         .png => "image/png",
         .webp => "image/webp",
+        .pdf => "application/pdf",
     };
 }
 
@@ -747,6 +764,7 @@ fn imageDescription(fmt: image.Format) []const u8 {
         .jpeg => "JPEG image data",
         .png => "PNG image data",
         .webp => "WebP image data",
+        .pdf => "PDF document",
     };
 }
 
@@ -782,6 +800,7 @@ fn imageFormatToFileC(v: image.Format) c_int {
         .jpeg => 1,
         .png => 2,
         .webp => 3,
+        .pdf => 4,
     };
 }
 
@@ -874,4 +893,74 @@ fn encodeFormatFromC(v: c_int) !image.EncodeFormat {
         1 => .png,
         else => error.InvalidArgument,
     };
+}
+
+// =========================================================================
+// PDF-specific C API
+// =========================================================================
+
+/// Render a specific page of a PDF to an RGBA8 image.
+pub export fn talu_pdf_render_page(
+    bytes: ?[*]const u8,
+    bytes_len: usize,
+    page_index: u32,
+    dpi: u32,
+    out_image: ?*TaluImage,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const out = out_image orelse {
+        capi_error.setError(error.InvalidArgument, "out_image is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = std.mem.zeroes(TaluImage);
+
+    if (bytes == null or bytes_len == 0) {
+        capi_error.setError(error.InvalidArgument, "bytes is null or empty", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }
+
+    const codecs = @import("../image/codecs/root.zig");
+    const rendered = codecs.pdf.renderPage(
+        allocator,
+        bytes.?[0..bytes_len],
+        page_index,
+        if (dpi == 0) 150 else dpi,
+        default_limits,
+    ) catch |err| {
+        capi_error.setError(err, "PDF render failed: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out.* = toCImage(rendered);
+    return 0;
+}
+
+/// Return the number of pages in a PDF document.
+pub export fn talu_pdf_page_count(
+    bytes: ?[*]const u8,
+    bytes_len: usize,
+    out_count: ?*u32,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const out = out_count orelse {
+        capi_error.setError(error.InvalidArgument, "out_count is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = 0;
+
+    if (bytes == null or bytes_len == 0) {
+        capi_error.setError(error.InvalidArgument, "bytes is null or empty", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }
+
+    const codecs = @import("../image/codecs/root.zig");
+    const count = codecs.pdf.pageCount(bytes.?[0..bytes_len]) catch |err| {
+        capi_error.setError(err, "PDF page count failed: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out.* = count;
+    return 0;
 }

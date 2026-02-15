@@ -6,6 +6,7 @@ pub const Format = enum {
     jpeg,
     png,
     webp,
+    pdf,
 };
 
 const MAGIC_MIME_TYPE: c_int = 0x0000010;
@@ -19,6 +20,7 @@ pub fn detect(bytes: []const u8) ?Format {
     if (isJpeg(bytes)) return .jpeg;
     if (isPng(bytes)) return .png;
     if (isWebp(bytes)) return .webp;
+    if (isPdf(bytes)) return .pdf;
     return null;
 }
 
@@ -39,6 +41,10 @@ fn isWebp(bytes: []const u8) bool {
     return bytes.len >= 12 and std.mem.eql(u8, bytes[0..4], "RIFF") and std.mem.eql(u8, bytes[8..12], "WEBP");
 }
 
+fn isPdf(bytes: []const u8) bool {
+    return bytes.len >= 5 and std.mem.eql(u8, bytes[0..5], "%PDF-");
+}
+
 test "detect recognizes JPEG magic bytes" {
     const jpeg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xE0 };
     try std.testing.expectEqual(Format.jpeg, detect(&jpeg).?);
@@ -52,6 +58,11 @@ test "detect recognizes PNG magic bytes" {
 test "detect recognizes WebP magic bytes" {
     const webp = [_]u8{ 'R', 'I', 'F', 'F', 0x00, 0x00, 0x00, 0x00, 'W', 'E', 'B', 'P' };
     try std.testing.expectEqual(Format.webp, detect(&webp).?);
+}
+
+test "detect recognizes PDF magic bytes" {
+    const pdf = "%PDF-1.7 test content";
+    try std.testing.expectEqual(Format.pdf, detect(pdf).?);
 }
 
 test "detect returns null for unknown bytes" {
@@ -100,5 +111,6 @@ fn detectWithLibmagic(bytes: []const u8) ?Format {
     if (std.mem.startsWith(u8, mime, "image/jpeg")) return .jpeg;
     if (std.mem.startsWith(u8, mime, "image/png")) return .png;
     if (std.mem.startsWith(u8, mime, "image/webp")) return .webp;
+    if (std.mem.startsWith(u8, mime, "application/pdf")) return .pdf;
     return null;
 }

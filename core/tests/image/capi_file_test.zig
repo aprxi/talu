@@ -4,6 +4,7 @@ const capi = main.capi;
 
 const png_red = @embedFile("corpus/1x1_red.png");
 const webp_red = @embedFile("corpus/1x1_red.webp");
+const pdf_1page = @embedFile("corpus/1x1_page.pdf");
 
 test "capi file inspect image returns metadata" {
     var info = std.mem.zeroes(capi.TaluFileInfo);
@@ -65,4 +66,56 @@ test "capi file transform resize webp to png" {
     try std.testing.expectEqual(@as(c_int, 2), out_info.image_format); // png
     try std.testing.expectEqual(@as(u32, 2), out_info.width);
     try std.testing.expectEqual(@as(u32, 2), out_info.height);
+}
+
+test "talu_file_inspect recognizes pdf" {
+    var info = std.mem.zeroes(capi.TaluFileInfo);
+    const rc = capi.talu_file_inspect(pdf_1page.ptr, pdf_1page.len, &info);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer capi.talu_file_info_free(&info);
+
+    try std.testing.expectEqual(@as(c_int, 1), info.kind);
+    try std.testing.expectEqual(@as(c_int, 4), info.image_format); // pdf = 4
+    // 72pt page at 150 DPI → ceil(72 * 150/72) = 150px
+    try std.testing.expectEqual(@as(u32, 150), info.width);
+    try std.testing.expectEqual(@as(u32, 150), info.height);
+}
+
+test "talu_pdf_page_count returns page count" {
+    var count: u32 = 0;
+    const rc = capi.talu_pdf_page_count(pdf_1page.ptr, pdf_1page.len, &count);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    try std.testing.expectEqual(@as(u32, 1), count);
+}
+
+test "talu_pdf_page_count rejects null bytes" {
+    var count: u32 = 0;
+    const rc = capi.talu_pdf_page_count(null, 0, &count);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_pdf_render_page renders first page" {
+    var img = std.mem.zeroes(capi.TaluImage);
+    const rc = capi.talu_pdf_render_page(pdf_1page.ptr, pdf_1page.len, 0, 72, &img);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer capi.talu_image_free(&img);
+
+    // 72pt page at 72 DPI → 72px
+    try std.testing.expectEqual(@as(u32, 72), img.width);
+    try std.testing.expectEqual(@as(u32, 72), img.height);
+    try std.testing.expectEqual(@as(c_int, 2), img.format); // rgba8 = 2
+    try std.testing.expect(img.data != null);
+    try std.testing.expect(img.len > 0);
+}
+
+test "talu_pdf_render_page rejects null bytes" {
+    var img = std.mem.zeroes(capi.TaluImage);
+    const rc = capi.talu_pdf_render_page(null, 0, 0, 72, &img);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_pdf_render_page rejects invalid page index" {
+    var img = std.mem.zeroes(capi.TaluImage);
+    const rc = capi.talu_pdf_render_page(pdf_1page.ptr, pdf_1page.len, 99, 72, &img);
+    try std.testing.expect(rc != 0);
 }
