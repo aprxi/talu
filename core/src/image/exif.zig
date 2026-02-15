@@ -1,3 +1,5 @@
+//! EXIF orientation parsing and pixel remapping for JPEG images.
+
 const std = @import("std");
 const pixel = @import("pixel.zig");
 
@@ -297,6 +299,7 @@ test "applyOrientation rotate_180 reverses pixels" {
     // 2x1 grayscale: [10, 20] → [20, 10]
     const alloc = std.testing.allocator;
     const src = try alloc.alloc(u8, 2);
+    errdefer alloc.free(src); // applyOrientation takes ownership on success only
     src[0] = 10;
     src[1] = 20;
     var img: pixel.Image = .{ .width = 2, .height = 1, .stride = 2, .format = .gray8, .data = src };
@@ -310,6 +313,7 @@ test "applyOrientation rotate_90_cw swaps dimensions" {
     // 2x3 grid → should become 3x2
     const alloc = std.testing.allocator;
     const src = try alloc.alloc(u8, 6);
+    errdefer alloc.free(src); // applyOrientation takes ownership on success only
     // Row 0: 1 2, Row 1: 3 4, Row 2: 5 6
     @memcpy(src, &[_]u8{ 1, 2, 3, 4, 5, 6 });
     var img: pixel.Image = .{ .width = 2, .height = 3, .stride = 2, .format = .gray8, .data = src };
@@ -324,6 +328,7 @@ test "applyOrientation rotate_90_cw swaps dimensions" {
 test "applyOrientation mirror_h flips horizontally" {
     const alloc = std.testing.allocator;
     const src = try alloc.alloc(u8, 4);
+    errdefer alloc.free(src); // applyOrientation takes ownership on success only
     // 2x2: [1 2 / 3 4] → [2 1 / 4 3]
     @memcpy(src, &[_]u8{ 1, 2, 3, 4 });
     var img: pixel.Image = .{ .width = 2, .height = 2, .stride = 2, .format = .gray8, .data = src };

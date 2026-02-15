@@ -87,6 +87,20 @@ fn blobErrorToCode(err: anyerror) error_codes.ErrorCode {
     };
 }
 
+fn writeBlobRefToBuffer(ref_slice: []const u8, out: [*]u8, capacity: usize) i32 {
+    if (capacity <= ref_slice.len) {
+        capi_error.setErrorWithCode(
+            .resource_exhausted,
+            "out_blob_ref buffer too small (need at least {d} bytes)",
+            .{ref_slice.len + 1},
+        );
+        return @intFromEnum(error_codes.ErrorCode.resource_exhausted);
+    }
+    @memcpy(out[0..ref_slice.len], ref_slice);
+    out[ref_slice.len] = 0;
+    return 0;
+}
+
 fn buildBlobRefList(digests: []const [db_blob_store.digest_hex_len]u8) !*CStringList {
     const list = allocator.create(CStringList) catch return error.OutOfMemory;
     errdefer allocator.destroy(list);
@@ -159,20 +173,7 @@ pub export fn talu_blobs_put(
         capi_error.setErrorWithCode(code, "Failed to write blob: {s}", .{@errorName(err)});
         return @intFromEnum(code);
     };
-    const blob_ref_slice = blob_ref.refSlice();
-
-    if (out_blob_ref_capacity <= blob_ref_slice.len) {
-        capi_error.setErrorWithCode(
-            .resource_exhausted,
-            "out_blob_ref buffer too small (need at least {d} bytes)",
-            .{blob_ref_slice.len + 1},
-        );
-        return @intFromEnum(error_codes.ErrorCode.resource_exhausted);
-    }
-
-    @memcpy(out[0..blob_ref_slice.len], blob_ref_slice);
-    out[blob_ref_slice.len] = 0;
-    return 0;
+    return writeBlobRefToBuffer(blob_ref.refSlice(), out, out_blob_ref_capacity);
 }
 
 /// Run blob mark-and-sweep garbage collection.
@@ -423,19 +424,7 @@ pub export fn talu_blobs_write_stream_finish(
     };
     stream.deinit();
     state.stream = null;
-
-    const blob_ref_slice = blob_ref.refSlice();
-    if (out_blob_ref_capacity <= blob_ref_slice.len) {
-        capi_error.setErrorWithCode(
-            .resource_exhausted,
-            "out_blob_ref buffer too small (need at least {d} bytes)",
-            .{blob_ref_slice.len + 1},
-        );
-        return @intFromEnum(error_codes.ErrorCode.resource_exhausted);
-    }
-    @memcpy(out[0..blob_ref_slice.len], blob_ref_slice);
-    out[blob_ref_slice.len] = 0;
-    return 0;
+    return writeBlobRefToBuffer(blob_ref.refSlice(), out, out_blob_ref_capacity);
 }
 
 /// Open a streaming reader for a blob reference.
@@ -630,7 +619,7 @@ test "talu_blobs_put and talu_blobs_open_stream roundtrip bytes" {
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
-    var buf: [5]u8 = undefined;
+    var buf: [5]u8 = undefined; // Scratch buffer, overwritten by talu_blobs_stream_read each iteration
     while (true) {
         var read_len: usize = 0;
         const read_rc = talu_blobs_stream_read(stream_handle, &buf, buf.len, &read_len);
@@ -682,7 +671,7 @@ test "talu_blobs_write_stream_write and finish roundtrip bytes" {
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
-    var buf: [8]u8 = undefined;
+    var buf: [8]u8 = undefined; // Scratch buffer, overwritten by talu_blobs_stream_read each iteration
     while (true) {
         var read_len: usize = 0;
         const read_rc = talu_blobs_stream_read(stream_handle, &buf, buf.len, &read_len);
@@ -775,7 +764,7 @@ test "talu_blobs_stream_seek repositions reads" {
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
-    var buf: [5]u8 = undefined;
+    var buf: [5]u8 = undefined; // Scratch buffer, overwritten by talu_blobs_stream_read each iteration
     while (true) {
         var read_len: usize = 0;
         try std.testing.expectEqual(

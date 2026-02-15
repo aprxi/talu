@@ -1,3 +1,5 @@
+//! PNG image decoder and encoder using libspng.
+
 const std = @import("std");
 const pixel = @import("../pixel.zig");
 const limits_mod = @import("../limits.zig");

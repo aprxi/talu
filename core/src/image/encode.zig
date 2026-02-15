@@ -1,3 +1,5 @@
+//! Image encoding dispatcher: delegates to codec-specific encoders.
+
 const std = @import("std");
 const pixel = @import("pixel.zig");
 const codecs = @import("codecs/root.zig");

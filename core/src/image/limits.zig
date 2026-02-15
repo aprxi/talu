@@ -1,3 +1,5 @@
+//! Configurable size and dimension limits for image decoding and conversion.
+
 const std = @import("std");
 
 pub const Limits = struct {

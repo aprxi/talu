@@ -149,62 +149,48 @@ pub const TaluFileTransformOptions = extern struct {
     _reserved: [14]u8,
 };
 
+fn inspectFileImpl(input: []const u8, out: *TaluFileInfo) !void {
+    if (try detectMagicString(input, MAGIC_MIME_TYPE)) |mime| {
+        out.mime_ptr = mime.ptr;
+        out.mime_len = mime.len;
+        if (std.mem.startsWith(u8, mime, "image/")) out.kind = 1;
+    }
+    if (try detectMagicString(input, MAGIC_NONE)) |desc| {
+        out.description_ptr = desc.ptr;
+        out.description_len = desc.len;
+    }
+    const fmt = image.detectFormat(input);
+    if (fmt) |image_fmt| {
+        out.kind = 1;
+        out.image_format = imageFormatToFileC(image_fmt);
+        if (probeImageMeta(input, image_fmt)) |meta| {
+            out.width = meta.width;
+            out.height = meta.height;
+            out.exif_orientation = meta.exif_orientation;
+        } else |_| {}
+    }
+    try ensureFallbackClassification(out, input, fmt);
+}
+
 pub export fn talu_file_inspect(
     bytes: ?[*]const u8,
     bytes_len: usize,
     out_info: ?*TaluFileInfo,
 ) callconv(.c) i32 {
     capi_error.clearError();
-
     const out = out_info orelse {
         capi_error.setError(error.InvalidArgument, "out_info is null", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
     out.* = std.mem.zeroes(TaluFileInfo);
-
     if (bytes == null or bytes_len == 0) {
         capi_error.setError(error.InvalidArgument, "bytes is null or empty", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }
-
-    const input = bytes.?[0..bytes_len];
-
-    if (detectMagicString(input, MAGIC_MIME_TYPE) catch |err| {
-        capi_error.setError(err, "file mime detect failed", .{});
-        return @intFromEnum(error_codes.errorToCode(err));
-    }) |mime| {
-        out.mime_ptr = mime.ptr;
-        out.mime_len = mime.len;
-        if (std.mem.startsWith(u8, mime, "image/")) out.kind = 1;
-    }
-
-    if (detectMagicString(input, MAGIC_NONE) catch |err| {
-        capi_error.setError(err, "file description detect failed", .{});
-        return @intFromEnum(error_codes.errorToCode(err));
-    }) |desc| {
-        out.description_ptr = desc.ptr;
-        out.description_len = desc.len;
-    }
-
-    const fmt = image.detectFormat(input);
-    if (fmt) |image_fmt| {
-        out.kind = 1;
-        out.image_format = imageFormatToFileC(image_fmt);
-
-        if (probeImageMeta(input, image_fmt)) |meta| {
-            out.width = meta.width;
-            out.height = meta.height;
-            out.exif_orientation = meta.exif_orientation;
-        } else |_| {
-            // Keep image kind + format; dimensions are optional metadata.
-        }
-    }
-
-    ensureFallbackClassification(out, input, fmt) catch |err| {
-        capi_error.setError(err, "file inspect fallback classification failed", .{});
+    inspectFileImpl(bytes.?[0..bytes_len], out) catch |err| {
+        capi_error.setError(err, "file inspect failed: {s}", .{@errorName(err)});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-
     return 0;
 }
 
@@ -240,7 +226,6 @@ pub export fn talu_file_transform(
     };
     out_ptr.* = null;
     out_n.* = 0;
-
     if (out_info) |info| info.* = std.mem.zeroes(TaluFileInfo);
 
     if (bytes == null or bytes_len == 0) {
@@ -253,68 +238,32 @@ pub export fn talu_file_transform(
         capi_error.setError(err, "invalid file transform options", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-
     const input_format = image.detectFormat(input) orelse {
         capi_error.setError(error.UnsupportedImageFormat, "unsupported input format for transform", .{});
         return @intFromEnum(error_codes.ErrorCode.convert_unsupported_format);
     };
 
-    var decoded = image.decode(allocator, input, .{
+    const result = image.transformImage(allocator, input, input_format, .{
         .limits = transform_opts.limits,
-        .prefer_format = .rgb8,
-        .apply_orientation = true,
-        .alpha = .composite,
-        .alpha_background = transform_opts.pad_color,
-    }) catch |err| {
-        capi_error.setError(err, "file transform decode failed: {s}", .{@errorName(err)});
-        return @intFromEnum(error_codes.errorToCode(err));
-    };
-    defer decoded.deinit(allocator);
-
-    var final_img = decoded;
-    var final_owned = false;
-    if (transform_opts.resize) |resize_opts| {
-        final_img = image.convert(allocator, decoded, .{
-            .format = .rgb8,
-            .resize = resize_opts,
-            .alpha = .composite,
-            .alpha_background = transform_opts.pad_color,
-            .limits = transform_opts.limits,
-        }) catch |err| {
-            capi_error.setError(err, "file transform resize failed: {s}", .{@errorName(err)});
-            return @intFromEnum(error_codes.errorToCode(err));
-        };
-        final_owned = true;
-    }
-    defer if (final_owned) final_img.deinit(allocator);
-
-    const encode_format = transform_opts.output_format orelse switch (input_format) {
-        .jpeg => image.EncodeFormat.jpeg,
-        .png, .webp => image.EncodeFormat.png,
-    };
-    const encoded = image.encode(allocator, final_img, .{
-        .format = encode_format,
+        .resize = transform_opts.resize,
+        .output_format = transform_opts.output_format,
         .jpeg_quality = transform_opts.jpeg_quality,
+        .pad_color = transform_opts.pad_color,
     }) catch |err| {
-        capi_error.setError(err, "file transform encode failed: {s}", .{@errorName(err)});
+        capi_error.setError(err, "file transform failed: {s}", .{@errorName(err)});
         return @intFromEnum(error_codes.errorToCode(err));
     };
 
-    out_ptr.* = if (encoded.len == 0) null else encoded.ptr;
-    out_n.* = encoded.len;
-
+    out_ptr.* = if (result.data.len == 0) null else result.data.ptr;
+    out_n.* = result.data.len;
     if (out_info) |info| {
         info.* = std.mem.zeroes(TaluFileInfo);
         info.kind = 1;
-        info.image_format = switch (encode_format) {
-            .jpeg => 1,
-            .png => 2,
-        };
-        info.width = final_img.width;
-        info.height = final_img.height;
+        info.image_format = switch (result.encode_format) { .jpeg => 1, .png => 2 };
+        info.width = result.width;
+        info.height = result.height;
         info.exif_orientation = 1;
     }
-
     return 0;
 }
 

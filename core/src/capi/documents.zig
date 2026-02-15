@@ -441,51 +441,39 @@ pub export fn talu_documents_get_blob_ref(
     out_has_external_ref: ?*bool,
 ) callconv(.c) i32 {
     capi_error.clearError();
-    const has_external_ref = out_has_external_ref orelse {
+    const has_ref = out_has_external_ref orelse {
         capi_error.setErrorWithCode(.invalid_argument, "out_has_external_ref is null", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
-    has_external_ref.* = false;
-
+    has_ref.* = false;
     if (out_blob_ref_capacity > 0) {
-        const buf = out_blob_ref orelse {
+        if (out_blob_ref) |buf| {
+            buf[0] = 0;
+        } else {
             capi_error.setErrorWithCode(.invalid_argument, "out_blob_ref is null", .{});
             return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-        };
-        buf[0] = 0;
+        }
     }
-
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const doc_id_slice = validateRequiredArg(doc_id, "doc_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
 
-    const header_opt = documents.getDocumentHeader(allocator, db_path_slice, doc_id_slice) catch |err| {
+    const header = (documents.getDocumentHeader(allocator, db_path_slice, doc_id_slice) catch |err| {
         capi_error.setErrorWithCode(.storage_error, "Failed to get document header: {s}", .{@errorName(err)});
         return @intFromEnum(error_codes.ErrorCode.storage_error);
-    };
-
-    if (header_opt == null) {
+    }) orelse {
         capi_error.setErrorWithCode(.storage_error, "Document not found", .{});
         return @intFromEnum(error_codes.ErrorCode.storage_error);
-    }
-
-    const header = header_opt.?;
+    };
     defer documents.freeDocumentHeader(allocator, header);
 
     const blob_ref = header.doc_json_ref orelse return 0;
-
     if (out_blob_ref == null or out_blob_ref_capacity <= blob_ref.len) {
-        capi_error.setErrorWithCode(
-            .resource_exhausted,
-            "out_blob_ref buffer too small (need at least {d} bytes)",
-            .{blob_ref.len + 1},
-        );
+        capi_error.setErrorWithCode(.resource_exhausted, "out_blob_ref buffer too small (need at least {d} bytes)", .{blob_ref.len + 1});
         return @intFromEnum(error_codes.ErrorCode.resource_exhausted);
     }
-
-    const out_buf = out_blob_ref.?;
-    @memcpy(out_buf[0..blob_ref.len], blob_ref);
-    out_buf[blob_ref.len] = 0;
-    has_external_ref.* = true;
+    @memcpy(out_blob_ref.?[0..blob_ref.len], blob_ref);
+    out_blob_ref.?[blob_ref.len] = 0;
+    has_ref.* = true;
     return 0;
 }
 

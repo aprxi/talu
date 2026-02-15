@@ -1,3 +1,5 @@
+//! Image resizing with nearest, bilinear, and bicubic filters.
+
 const std = @import("std");
 const pixel = @import("pixel.zig");
 const limits_mod = @import("limits.zig");

@@ -128,3 +128,66 @@ pub fn toModelInput(
 
 pub const encode = encode_mod.encode;
 pub const codecs_internal = codecs;
+
+pub const TransformSpec = struct {
+    limits: Limits = .{},
+    resize: ?ResizeOptions = null,
+    output_format: ?EncodeFormat = null,
+    jpeg_quality: u8 = 85,
+    pad_color: Rgb8 = .{ .r = 0, .g = 0, .b = 0 },
+};
+
+pub const TransformResult = struct {
+    data: []u8,
+    width: u32,
+    height: u32,
+    encode_format: EncodeFormat,
+};
+
+/// Decode, optionally resize, and re-encode an image in a single pipeline.
+/// The input format is auto-detected. Caller owns the returned data.
+pub fn transformImage(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    input_format: Format,
+    spec: TransformSpec,
+) !TransformResult {
+    var decoded = try decode(allocator, bytes, .{
+        .limits = spec.limits,
+        .prefer_format = .rgb8,
+        .apply_orientation = true,
+        .alpha = .composite,
+        .alpha_background = spec.pad_color,
+    });
+    defer decoded.deinit(allocator);
+
+    var final_img = decoded;
+    var final_owned = false;
+    if (spec.resize) |resize_opts| {
+        final_img = try convert_mod.convert(allocator, decoded, .{
+            .format = .rgb8,
+            .resize = resize_opts,
+            .alpha = .composite,
+            .alpha_background = spec.pad_color,
+            .limits = spec.limits,
+        });
+        final_owned = true;
+    }
+    defer if (final_owned) final_img.deinit(allocator);
+
+    const out_format = spec.output_format orelse switch (input_format) {
+        .jpeg => EncodeFormat.jpeg,
+        .png, .webp => EncodeFormat.png,
+    };
+    const encoded = try encode_mod.encode(allocator, final_img, .{
+        .format = out_format,
+        .jpeg_quality = spec.jpeg_quality,
+    });
+
+    return .{
+        .data = encoded,
+        .width = final_img.width,
+        .height = final_img.height,
+        .encode_format = out_format,
+    };
+}

@@ -1,3 +1,5 @@
+//! Tensor packing for vision model inputs: layout, normalization, and dtype conversion.
+
 const std = @import("std");
 const pixel = @import("pixel.zig");
 const limits_mod = @import("limits.zig");

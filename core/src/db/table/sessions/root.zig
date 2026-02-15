@@ -394,10 +394,10 @@ pub const TableAdapter = struct {
 
         var record_json_inline: ?[]const u8 = record_json;
         var record_json_ref: ?[]const u8 = null;
-        var record_json_ref_buf: [db_blob_store.ref_len]u8 = undefined;
+        var record_json_ref_buf: [db_blob_store.ref_len]u8 = undefined; // Written by @memcpy below when externalized
         var record_json_ref_len: usize = 0;
         var record_json_trigram_bloom: ?[]const u8 = null;
-        var record_json_trigram_bloom_buf: [record_json_trigram_bloom_bytes]u8 = undefined;
+        var record_json_trigram_bloom_buf: [record_json_trigram_bloom_bytes]u8 = undefined; // Written by computeTrigramBloom below when externalized
 
         if (record_json.len > self.item_json_externalize_threshold_bytes) {
             const blob_ref = try self.blob_store.putAuto(record_json);

@@ -272,10 +272,10 @@ pub const DocumentAdapter = struct {
     pub fn writeDocument(self: *DocumentAdapter, record: DocumentRecord) !void {
         var doc_json_inline: ?[]const u8 = record.doc_json;
         var doc_json_ref: ?[]const u8 = null;
-        var doc_json_ref_buf: [db_blob_store.ref_len]u8 = undefined;
+        var doc_json_ref_buf: [db_blob_store.ref_len]u8 = undefined; // Written by @memcpy below when externalized
         var doc_json_ref_len: usize = 0;
         var doc_json_trigram_bloom: ?[]const u8 = null;
-        var doc_json_trigram_bloom_buf: [doc_json_trigram_bloom_bytes]u8 = undefined;
+        var doc_json_trigram_bloom_buf: [doc_json_trigram_bloom_bytes]u8 = undefined; // Written by computeTrigramBloom below when externalized
 
         if (record.doc_json.len > self.doc_json_externalize_threshold_bytes) {
             const blob_ref = try self.blob_store.putAuto(record.doc_json);
@@ -3085,7 +3085,7 @@ test "DocumentAdapter.openBlobStream streams externalized multipart doc_json" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(allocator);
 
-    var buf: [13]u8 = undefined;
+    var buf: [13]u8 = undefined; // Scratch buffer, overwritten by stream.read each iteration
     while (true) {
         const read_len = try stream.read(&buf);
         if (read_len == 0) break;

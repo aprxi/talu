@@ -319,67 +319,20 @@ pub export fn talu_tokenizer_encode(
     };
 
     const params = computeTruncation(rich.ids.len, options);
+    rich.truncate(params.start, params.count) catch {
+        rich.deinit();
+        capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
+        var err = std.mem.zeroes(EncodeResult);
+        err.error_msg = "OutOfMemory";
+        return err;
+    };
 
     var ret = std.mem.zeroes(EncodeResult);
-    if (params.count == 0) {
-        rich.deinit();
-        return ret;
-    }
-
-    if (params.start == 0 and params.count == rich.ids.len) {
-        // No truncation — transfer ownership directly.
-        ret.ids = rich.ids.ptr;
-        ret.offsets = @ptrCast(rich.offsets.ptr);
-        ret.attention_mask = rich.attention_mask.ptr;
-        ret.special_tokens_mask = rich.special_tokens_mask.ptr;
-        ret.num_tokens = rich.ids.len;
-    } else {
-        // Truncation: copy the requested window, free originals.
-        const out_ids = allocator.alloc(u32, params.count) catch {
-            rich.deinit();
-            capi_error.setError(error.OutOfMemory, "Allocation failed", .{});
-            var err = std.mem.zeroes(EncodeResult);
-            err.error_msg = "OutOfMemory";
-            return err;
-        };
-        const out_offsets = allocator.alloc(TokenOffset, params.count) catch {
-            allocator.free(out_ids);
-            rich.deinit();
-            var err = std.mem.zeroes(EncodeResult);
-            err.error_msg = "OutOfMemory";
-            return err;
-        };
-        const out_mask = allocator.alloc(u32, params.count) catch {
-            allocator.free(out_ids);
-            allocator.free(out_offsets);
-            rich.deinit();
-            var err = std.mem.zeroes(EncodeResult);
-            err.error_msg = "OutOfMemory";
-            return err;
-        };
-        const out_special = allocator.alloc(u32, params.count) catch {
-            allocator.free(out_ids);
-            allocator.free(out_offsets);
-            allocator.free(out_mask);
-            rich.deinit();
-            var err = std.mem.zeroes(EncodeResult);
-            err.error_msg = "OutOfMemory";
-            return err;
-        };
-
-        @memcpy(out_ids, rich.ids[params.start..][0..params.count]);
-        const src_offsets: [*]const TokenOffset = @ptrCast(rich.offsets[params.start..].ptr);
-        @memcpy(out_offsets, src_offsets[0..params.count]);
-        @memcpy(out_mask, rich.attention_mask[params.start..][0..params.count]);
-        @memcpy(out_special, rich.special_tokens_mask[params.start..][0..params.count]);
-        rich.deinit();
-
-        ret.ids = out_ids.ptr;
-        ret.offsets = @ptrCast(out_offsets.ptr);
-        ret.attention_mask = out_mask.ptr;
-        ret.special_tokens_mask = out_special.ptr;
-        ret.num_tokens = params.count;
-    }
+    ret.ids = if (rich.ids.len > 0) rich.ids.ptr else null;
+    ret.offsets = if (rich.offsets.len > 0) @ptrCast(rich.offsets.ptr) else null;
+    ret.attention_mask = if (rich.attention_mask.len > 0) rich.attention_mask.ptr else null;
+    ret.special_tokens_mask = if (rich.special_tokens_mask.len > 0) rich.special_tokens_mask.ptr else null;
+    ret.num_tokens = rich.ids.len;
     return ret;
 }
 

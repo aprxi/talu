@@ -366,7 +366,7 @@ pub const BlobStore = struct {
                 if (file_entry.kind != .file) continue;
                 if (file_entry.name.len != digest_hex_len) continue;
 
-                var digest: DigestKey = undefined;
+                var digest: DigestKey = undefined; // Filled element-by-element in the loop below
                 var valid = true;
                 for (file_entry.name, 0..) |ch, i| {
                     if (!std.ascii.isHex(ch)) {
@@ -476,14 +476,14 @@ pub const BlobStore = struct {
         defer file.close();
 
         var hasher = Sha256.init(.{});
-        var buf: [16 * 1024]u8 = undefined;
+        var buf: [16 * 1024]u8 = undefined; // Scratch buffer, overwritten by file.read each iteration
         while (true) {
             const read_len = try file.read(&buf);
             if (read_len == 0) break;
             hasher.update(buf[0..read_len]);
         }
 
-        var digest: [32]u8 = undefined;
+        var digest: [32]u8 = undefined; // Overwritten by hasher.final on the next line
         hasher.final(&digest);
         const actual_hex = digestToHex(digest);
         if (!std.mem.eql(u8, expected_hex[0..], actual_hex[0..])) {
@@ -616,7 +616,7 @@ pub const BlobStore = struct {
 };
 
 pub fn parseRef(blob_ref: []const u8) !ParsedRef {
-    var digest_hex: [digest_hex_len]u8 = undefined;
+    var digest_hex: [digest_hex_len]u8 = undefined; // Filled element-by-element in the matching branch below
 
     if (blob_ref.len == sha256_ref_len and std.mem.startsWith(u8, blob_ref, sha256_ref_prefix)) {
         for (blob_ref[sha256_ref_prefix.len..], 0..) |ch, idx| {
@@ -900,7 +900,7 @@ test "BlobStore.openReadStream streams single blob incrementally" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    var buf: [5]u8 = undefined;
+    var buf: [5]u8 = undefined; // Scratch buffer, overwritten by stream.read each iteration
     while (true) {
         const read_len = try stream.read(&buf);
         if (read_len == 0) break;
@@ -933,7 +933,7 @@ test "BlobStore.openReadStream streams multipart blob incrementally" {
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
 
-    var buf: [7]u8 = undefined;
+    var buf: [7]u8 = undefined; // Scratch buffer, overwritten by stream.read each iteration
     while (true) {
         const read_len = try stream.read(&buf);
         if (read_len == 0) break;
@@ -963,7 +963,7 @@ test "BlobReadStream.seek repositions single blob reads" {
     try stream.seek(4);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
-    var buf: [6]u8 = undefined;
+    var buf: [6]u8 = undefined; // Scratch buffer, overwritten by stream.read each iteration
     while (true) {
         const read_len = try stream.read(&buf);
         if (read_len == 0) break;
@@ -972,7 +972,7 @@ test "BlobReadStream.seek repositions single blob reads" {
     try std.testing.expectEqualStrings(payload[4..], out.items);
 
     try stream.seek(0);
-    var prefix_buf: [3]u8 = undefined;
+    var prefix_buf: [3]u8 = undefined; // Overwritten by stream.read on the next line
     const prefix_len = try stream.read(&prefix_buf);
     try std.testing.expectEqual(@as(usize, 3), prefix_len);
     try std.testing.expectEqualStrings("012", prefix_buf[0..prefix_len]);
@@ -1004,7 +1004,7 @@ test "BlobReadStream.seek repositions multipart blob reads" {
     try stream.seek(10);
     var out = std.ArrayList(u8).empty;
     defer out.deinit(std.testing.allocator);
-    var buf: [5]u8 = undefined;
+    var buf: [5]u8 = undefined; // Scratch buffer, overwritten by stream.read each iteration
     while (true) {
         const read_len = try stream.read(&buf);
         if (read_len == 0) break;
@@ -1013,7 +1013,7 @@ test "BlobReadStream.seek repositions multipart blob reads" {
     try std.testing.expectEqualStrings(payload[10..], out.items);
 
     try stream.seek(8);
-    var boundary_buf: [4]u8 = undefined;
+    var boundary_buf: [4]u8 = undefined; // Overwritten by stream.read on the next line
     const boundary_len = try stream.read(&boundary_buf);
     try std.testing.expectEqual(@as(usize, 4), boundary_len);
     try std.testing.expectEqualStrings(payload[8..12], boundary_buf[0..boundary_len]);

@@ -1,3 +1,5 @@
+//! WebP image decoder using libwebp.
+
 const std = @import("std");
 const pixel = @import("../pixel.zig");
 const limits_mod = @import("../limits.zig");

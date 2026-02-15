@@ -1,3 +1,5 @@
+//! Vision preprocessing: smart resize, planar F32 conversion, and grid tiling.
+
 const std = @import("std");
 const pixel = @import("pixel.zig");
 const limits_mod = @import("limits.zig");

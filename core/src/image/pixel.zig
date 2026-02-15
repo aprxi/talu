@@ -1,3 +1,5 @@
+//! Core pixel types: formats, color values, and the Image container.
+
 const std = @import("std");
 
 pub const PixelFormat = enum(u8) {

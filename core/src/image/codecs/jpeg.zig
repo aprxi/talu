@@ -1,3 +1,5 @@
+//! JPEG image decoder and encoder using libturbojpeg.
+
 const std = @import("std");
 const pixel = @import("../pixel.zig");
 const limits_mod = @import("../limits.zig");

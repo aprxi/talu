@@ -1,3 +1,5 @@
+//! Alpha channel handling: strip, composite over background, or keep.
+
 const std = @import("std");
 const pixel = @import("pixel.zig");
 

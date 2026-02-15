@@ -1,3 +1,5 @@
+//! Image format detection via magic bytes and libmagic fallback.
+
 const std = @import("std");
 
 pub const Format = enum {

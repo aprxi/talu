@@ -1,3 +1,5 @@
+//! Pixel format conversion, alpha handling, and optional resizing pipeline.
+
 const std = @import("std");
 const pixel = @import("pixel.zig");
 const limits_mod = @import("limits.zig");

@@ -82,6 +82,42 @@ pub const Encoding = struct {
         if (self.special_tokens_mask.len > 0) self.allocator.free(self.special_tokens_mask);
         self.* = undefined;
     }
+
+    /// Truncate the encoding to the window [start..start+count].
+    /// Allocates new arrays for the window and frees the originals.
+    /// If start == 0 and count == ids.len, this is a no-op.
+    pub fn truncate(self: *Encoding, start: usize, count: usize) !void {
+        if (count == 0) {
+            self.deinit();
+            return;
+        }
+        if (start == 0 and count == self.ids.len) return;
+
+        const alloc = self.allocator;
+        const out_ids = try alloc.alloc(u32, count);
+        errdefer alloc.free(out_ids);
+        const out_offsets = try alloc.alloc(TokenOffset, count);
+        errdefer alloc.free(out_offsets);
+        const out_mask = try alloc.alloc(u32, count);
+        errdefer alloc.free(out_mask);
+        const out_special = try alloc.alloc(u32, count);
+        errdefer alloc.free(out_special);
+
+        @memcpy(out_ids, self.ids[start..][0..count]);
+        @memcpy(out_offsets, self.offsets[start..][0..count]);
+        @memcpy(out_mask, self.attention_mask[start..][0..count]);
+        @memcpy(out_special, self.special_tokens_mask[start..][0..count]);
+
+        const saved_alloc = self.allocator;
+        self.deinit();
+        self.* = .{
+            .ids = out_ids,
+            .offsets = out_offsets,
+            .attention_mask = out_mask,
+            .special_tokens_mask = out_special,
+            .allocator = saved_alloc,
+        };
+    }
 };
 
 /// Single-pass encode producing IDs, offsets, attention mask, and special tokens mask.

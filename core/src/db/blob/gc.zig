@@ -460,7 +460,7 @@ fn buildDigestFromName(shard_name: []const u8, digest_name: []const u8) ?DigestK
     if (shard_name.len != 2) return null;
     if (digest_name.len != db_blob_store.digest_hex_len) return null;
 
-    var out: DigestKey = undefined;
+    var out: DigestKey = undefined; // Filled element-by-element in the loop below
 
     for (digest_name, 0..) |ch, idx| {
         if (!std.ascii.isHex(ch)) return null;
