@@ -80,12 +80,21 @@ pub fn add(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             "deps/file/src/cdf_time.c",
             "deps/file/src/readcdf.c",
             "deps/file/src/der.c",
-            // Compat implementations for functions not in glibc 2.28
+            // fmtcheck not in glibc 2.28
             "deps/file/src/fmtcheck.c",
-            "deps/file/src/strlcpy.c",
-            "deps/file/src/strlcat.c",
         },
     });
+
+    // strlcpy/strlcat: only needed on Linux (glibc doesn't have them).
+    // macOS provides these natively and defines them as fortified macros.
+    if (target.result.os.tag == .linux) {
+        lib.addCSourceFiles(.{
+            .files = &.{
+                "deps/file/src/strlcpy.c",
+                "deps/file/src/strlcat.c",
+            },
+        });
+    }
 
     return .{ .lib = lib, .include_dir = b.path("deps/file/src") };
 }

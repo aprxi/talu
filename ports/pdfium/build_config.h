@@ -40,7 +40,13 @@
 #define BUILDFLAG_INTERNAL_IS_LINUX 0
 #endif
 
-#if defined(__APPLE__)
+// PDFIUM_HEADLESS: Build without platform-specific font rendering.
+// Forces Linux-like code paths on all platforms for a fully static build.
+#if defined(PDFIUM_HEADLESS)
+#define BUILDFLAG_INTERNAL_IS_APPLE 0
+#define BUILDFLAG_INTERNAL_IS_MAC 0
+#define BUILDFLAG_INTERNAL_IS_IOS 0
+#elif defined(__APPLE__)
 #define BUILDFLAG_INTERNAL_IS_APPLE 1
 #include <TargetConditionals.h>
 #if TARGET_OS_MAC && !TARGET_OS_IPHONE

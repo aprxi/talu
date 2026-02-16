@@ -562,6 +562,9 @@ set(PDFIUM_SOURCES
 )
 
 # Platform-specific sources
+# Use headless mode for static builds (no system font dependencies)
+option(PDFIUM_HEADLESS "Build without platform font rendering (static build)" ON)
+
 if(WIN32)
     list(APPEND PDFIUM_SOURCES
         core/fxcrt/code_point_view.cpp
@@ -583,11 +586,28 @@ if(WIN32)
         core/fpdfapi/render/cpdf_windowsrenderdevice.cpp
     )
 else()
+    # POSIX (Linux/macOS) - use headless implementation for static builds
     list(APPEND PDFIUM_SOURCES
         core/fxcrt/cfx_fileaccess_posix.cpp
         core/fxcrt/fx_folder_posix.cpp
-        core/fxge/linux/fx_linux_impl.cpp
     )
+    if(PDFIUM_HEADLESS)
+        # Headless: no system font rendering, no framework dependencies
+        list(APPEND PDFIUM_SOURCES
+            ${CMAKE_CURRENT_SOURCE_DIR}/../../ports/pdfium/fx_headless_impl.cpp
+        )
+        add_definitions(-DPDFIUM_HEADLESS)
+    elseif(APPLE)
+        list(APPEND PDFIUM_SOURCES
+            core/fxge/apple/fx_apple_impl.cpp
+            core/fxge/apple/fx_apple_platform.cpp
+            core/fxge/apple/fx_quartz_device.cpp
+        )
+    else()
+        list(APPEND PDFIUM_SOURCES
+            core/fxge/linux/fx_linux_impl.cpp
+        )
+    endif()
 endif()
 
 # ---------------------------------------------------------------------------
@@ -620,6 +640,16 @@ target_link_libraries(pdfium PRIVATE
     agg lcms openjpeg
     freetype_imported
 )
+
+# macOS: link CoreGraphics and CoreFoundation only for non-headless Apple builds
+if(APPLE AND NOT PDFIUM_HEADLESS)
+    find_library(COREGRAPHICS_FRAMEWORK CoreGraphics)
+    find_library(COREFOUNDATION_FRAMEWORK CoreFoundation)
+    target_link_libraries(pdfium PRIVATE
+        ${COREGRAPHICS_FRAMEWORK}
+        ${COREFOUNDATION_FRAMEWORK}
+    )
+endif()
 
 install(TARGETS pdfium agg lcms openjpeg
     ARCHIVE DESTINATION lib

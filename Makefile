@@ -9,6 +9,8 @@ ifeq ($(UNAME_S),Darwin)
 	# macOS: no special CPU flags needed, native detection works
 	ZIG_BUILD_FLAGS := -Drelease
 	ZIG_CC_FLAGS := -fno-sanitize=all -DNDEBUG -O3
+	# BSD sed requires '' after -i for in-place edit without backup
+	SED_INPLACE := sed -i ''
 	# Metal GPU is enabled by default. Set TALU_DISABLE_METAL=1 for CPU-only builds.
 	ifdef TALU_DISABLE_METAL
 		ZIG_BUILD_FLAGS += -Dmetal=false
@@ -19,6 +21,8 @@ else
 	# Use x86_64_v3 for AVX2 support (fixes register allocation with SIMD code)
 	ZIG_BUILD_FLAGS := -Drelease -Dcpu=x86_64_v3
 	ZIG_CC_FLAGS := -target x86_64-linux-gnu.2.28 -mcpu=x86_64_v3 -fno-sanitize=all -DNDEBUG -O3
+	# GNU sed uses -i without argument
+	SED_INPLACE := sed -i
 endif
 
 all: build
@@ -237,12 +241,12 @@ pdfium-build: freetype-build
 	@cp ports/pdfium/buildflag.h deps/pdfium/build/
 	@cp ports/pdfium/build_config.h deps/pdfium/build/
 	# Patch out abseil dependency (2 files)
-	@cd deps/pdfium && sed -i \
+	@cd deps/pdfium && $(SED_INPLACE) \
 		-e 's|#include "third_party/abseil-cpp/absl/container/inlined_vector.h"|#include <vector>|' \
 		-e 's|absl::InlinedVector<float, 16, FxAllocAllocator<float>>|std::vector<float, FxAllocAllocator<float>>|' \
 		-e 's|absl::InlinedVector<uint32_t, 16, FxAllocAllocator<uint32_t>>|std::vector<uint32_t, FxAllocAllocator<uint32_t>>|' \
 		core/fpdfapi/page/cpdf_sampledfunc.cpp
-	@cd deps/pdfium && sed -i \
+	@cd deps/pdfium && $(SED_INPLACE) \
 		-e 's|#include "third_party/abseil-cpp/absl/container/flat_hash_set.h"|#include <unordered_set>|' \
 		-e 's|absl::flat_hash_set|std::unordered_set|g' \
 		core/fpdfdoc/cpdf_nametree.cpp
