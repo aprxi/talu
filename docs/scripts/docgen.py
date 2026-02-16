@@ -169,7 +169,7 @@ MODULE_PAGES = _build_module_pages()
 # Display order for reference modules (by importance).
 # Modules not listed here are excluded from nav/index (e.g. xray).
 # Three tiers: primary (class-based), secondary (function-based utilities), supporting.
-MODULE_ORDER = ["chat", "tokenizer", "template", "validate", "db", "converter", "repository", "client", "profile", "types", "router", "exceptions"]
+MODULE_ORDER = ["chat", "file", "tokenizer", "template", "validate", "db", "converter", "repository", "client", "profile", "types", "router", "exceptions"]
 
 # Tier boundaries for index page and sidebar separators.
 _SECONDARY_MODULES = {"converter", "repository"}
