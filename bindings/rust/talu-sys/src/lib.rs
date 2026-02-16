@@ -2278,11 +2278,7 @@ pub struct TaluFileInfo {
     pub mime_len: usize,
     pub description_ptr: *const u8,
     pub description_len: usize,
-    pub image_format: c_int,
-    pub width: u32,
-    pub height: u32,
-    pub exif_orientation: u8,
-    pub _reserved: [u8; 7],
+    pub _reserved: [u8; 16],
 }
 
 impl Default for TaluFileInfo {
@@ -2293,11 +2289,30 @@ impl Default for TaluFileInfo {
             mime_len: 0,
             description_ptr: std::ptr::null(),
             description_len: 0,
-            image_format: 0,
+            _reserved: [0; 16],
+        }
+    }
+}
+
+/// Source: core/src/capi/file.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TaluImageInfo {
+    pub format: c_int,
+    pub width: u32,
+    pub height: u32,
+    pub orientation: u8,
+    pub _reserved: [u8; 11],
+}
+
+impl Default for TaluImageInfo {
+    fn default() -> Self {
+        Self {
+            format: 0,
             width: 0,
             height: 0,
-            exif_orientation: 0,
-            _reserved: [0; 7],
+            orientation: 0,
+            _reserved: [0; 11],
         }
     }
 }
@@ -3105,6 +3120,7 @@ extern "C" {
         bytes: *const u8,
         bytes_len: usize,
         out_info: *mut TaluFileInfo,
+        out_image: *mut TaluImageInfo,
     ) -> c_int;
     // core/src/capi/file.zig
     pub fn talu_file_transform(
@@ -3113,7 +3129,7 @@ extern "C" {
         opts: *const TaluFileTransformOptions,
         out_bytes: *mut c_void,
         out_len: *mut c_void,
-        out_info: *mut TaluFileInfo,
+        out_image: *mut TaluImageInfo,
     ) -> c_int;
     // core/src/capi/template.zig
     pub fn talu_free_spans(spans: *mut c_void, count: u32);

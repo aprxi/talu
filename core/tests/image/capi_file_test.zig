@@ -8,14 +8,15 @@ const pdf_1page = @embedFile("corpus/1x1_page.pdf");
 
 test "capi file inspect image returns metadata" {
     var info = std.mem.zeroes(capi.TaluFileInfo);
-    const rc = capi.talu_file_inspect(png_red.ptr, png_red.len, &info);
+    var img = std.mem.zeroes(capi.TaluImageInfo);
+    const rc = capi.talu_file_inspect(png_red.ptr, png_red.len, &info, &img);
     try std.testing.expectEqual(@as(i32, 0), rc);
     defer capi.talu_file_info_free(&info);
 
     try std.testing.expectEqual(@as(c_int, 1), info.kind);
-    try std.testing.expectEqual(@as(c_int, 2), info.image_format); // png
-    try std.testing.expectEqual(@as(u32, 1), info.width);
-    try std.testing.expectEqual(@as(u32, 1), info.height);
+    try std.testing.expectEqual(@as(c_int, 2), img.format); // png
+    try std.testing.expectEqual(@as(u32, 1), img.width);
+    try std.testing.expectEqual(@as(u32, 1), img.height);
     try std.testing.expect(info.mime_len > 0);
     try std.testing.expect(info.description_len > 0);
 }
@@ -24,13 +25,24 @@ test "capi file inspect unknown bytes still reports mime/description" {
     const random = "not an image";
 
     var info = std.mem.zeroes(capi.TaluFileInfo);
-    const rc = capi.talu_file_inspect(random.ptr, random.len, &info);
+    var img = std.mem.zeroes(capi.TaluImageInfo);
+    const rc = capi.talu_file_inspect(random.ptr, random.len, &info, &img);
     try std.testing.expectEqual(@as(i32, 0), rc);
     defer capi.talu_file_info_free(&info);
 
     try std.testing.expectEqual(@as(c_int, 0), info.kind);
-    try std.testing.expectEqual(@as(c_int, 0), info.image_format);
+    try std.testing.expectEqual(@as(c_int, 0), img.format);
     try std.testing.expect(info.mime_len > 0 or info.description_len > 0);
+}
+
+test "capi file inspect with null out_image succeeds" {
+    var info = std.mem.zeroes(capi.TaluFileInfo);
+    const rc = capi.talu_file_inspect(png_red.ptr, png_red.len, &info, null);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer capi.talu_file_info_free(&info);
+
+    try std.testing.expectEqual(@as(c_int, 1), info.kind);
+    try std.testing.expect(info.mime_len > 0);
 }
 
 test "capi file transform resize webp to png" {
@@ -45,7 +57,7 @@ test "capi file transform resize webp to png" {
 
     var out_bytes: ?[*]u8 = null;
     var out_len: usize = 0;
-    var out_info = std.mem.zeroes(capi.TaluFileInfo);
+    var out_image = std.mem.zeroes(capi.TaluImageInfo);
 
     const rc = capi.talu_file_transform(
         webp_red.ptr,
@@ -53,32 +65,31 @@ test "capi file transform resize webp to png" {
         &opts,
         &out_bytes,
         &out_len,
-        &out_info,
+        &out_image,
     );
     try std.testing.expectEqual(@as(i32, 0), rc);
     defer capi.talu_file_bytes_free(out_bytes, out_len);
-    defer capi.talu_file_info_free(&out_info);
 
     const ptr = out_bytes orelse return error.TestUnexpectedResult;
     try std.testing.expect(out_len > 8);
     try std.testing.expect(ptr[0] == 0x89 and ptr[1] == 0x50 and ptr[2] == 0x4E and ptr[3] == 0x47);
-    try std.testing.expectEqual(@as(c_int, 1), out_info.kind);
-    try std.testing.expectEqual(@as(c_int, 2), out_info.image_format); // png
-    try std.testing.expectEqual(@as(u32, 2), out_info.width);
-    try std.testing.expectEqual(@as(u32, 2), out_info.height);
+    try std.testing.expectEqual(@as(c_int, 2), out_image.format); // png
+    try std.testing.expectEqual(@as(u32, 2), out_image.width);
+    try std.testing.expectEqual(@as(u32, 2), out_image.height);
 }
 
 test "talu_file_inspect recognizes pdf" {
     var info = std.mem.zeroes(capi.TaluFileInfo);
-    const rc = capi.talu_file_inspect(pdf_1page.ptr, pdf_1page.len, &info);
+    var img = std.mem.zeroes(capi.TaluImageInfo);
+    const rc = capi.talu_file_inspect(pdf_1page.ptr, pdf_1page.len, &info, &img);
     try std.testing.expectEqual(@as(i32, 0), rc);
     defer capi.talu_file_info_free(&info);
 
     try std.testing.expectEqual(@as(c_int, 1), info.kind);
-    try std.testing.expectEqual(@as(c_int, 4), info.image_format); // pdf = 4
+    try std.testing.expectEqual(@as(c_int, 4), img.format); // pdf = 4
     // 72pt page at 150 DPI → ceil(72 * 150/72) = 150px
-    try std.testing.expectEqual(@as(u32, 150), info.width);
-    try std.testing.expectEqual(@as(u32, 150), info.height);
+    try std.testing.expectEqual(@as(u32, 150), img.width);
+    try std.testing.expectEqual(@as(u32, 150), img.height);
 }
 
 test "talu_pdf_page_count returns page count" {

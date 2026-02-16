@@ -1093,7 +1093,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::File(args)) => {
-                assert_eq!(args.path, PathBuf::from("image.png"));
+                assert_eq!(args.path, Some(PathBuf::from("image.png")));
                 assert!(args.resize.is_none());
                 assert!(args.output.is_none());
             }

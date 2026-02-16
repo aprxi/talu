@@ -299,11 +299,10 @@ async fn inspect_elf_bytes_returns_binary_kind() {
 }
 
 #[tokio::test]
-async fn inspect_pdf_header_classified_as_text_due_to_ascii_content() {
+async fn inspect_pdf_header_detected_as_image() {
     let app = build_app();
-    // PDF headers are printable ASCII (%PDF-1.4...), so the text heuristic classifies
-    // them as text/plain. This documents that the kind mapping depends on the MIME
-    // returned by content detection, not on file extension or declared type.
+    // PDF headers start with %PDF- magic bytes, which the image format detector
+    // recognizes as PDF (format=4). This classifies the file as kind=image.
     let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
     let req = multipart_request(
         "POST",
@@ -318,10 +317,8 @@ async fn inspect_pdf_header_classified_as_text_due_to_ascii_content() {
     let (status, json) = body_json(send_request(&app, req).await).await;
 
     assert_eq!(status, StatusCode::OK);
-    // PDF header bytes are all printable ASCII → detected as text, not binary.
-    assert_eq!(json["kind"], "text");
+    assert_eq!(json["kind"], "image");
     assert_eq!(json["size"], pdf.len() as u64);
-    assert!(json["image"].is_null());
 }
 
 // ---------------------------------------------------------------------------

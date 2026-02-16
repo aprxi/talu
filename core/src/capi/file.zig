@@ -124,11 +124,15 @@ pub const TaluFileInfo = extern struct {
     mime_len: usize,
     description_ptr: ?[*]u8,
     description_len: usize,
-    image_format: c_int, // 0=unknown, 1=jpeg, 2=png, 3=webp
+    _reserved: [16]u8,
+};
+
+pub const TaluImageInfo = extern struct {
+    format: c_int, // 0=unknown, 1=jpeg, 2=png, 3=webp, 4=pdf
     width: u32,
     height: u32,
-    exif_orientation: u8, // 1..8 for images, 0 if unknown
-    _reserved: [7]u8,
+    orientation: u8, // 1..8 for images, 0 if unknown
+    _reserved: [11]u8,
 };
 
 pub const TaluFileTransformOptions = extern struct {
@@ -149,7 +153,7 @@ pub const TaluFileTransformOptions = extern struct {
     _reserved: [14]u8,
 };
 
-fn inspectFileImpl(input: []const u8, out: *TaluFileInfo) !void {
+fn inspectFileImpl(input: []const u8, out: *TaluFileInfo, out_image: ?*TaluImageInfo) !void {
     if (try detectMagicString(input, MAGIC_MIME_TYPE)) |mime| {
         out.mime_ptr = mime.ptr;
         out.mime_len = mime.len;
@@ -162,12 +166,14 @@ fn inspectFileImpl(input: []const u8, out: *TaluFileInfo) !void {
     const fmt = image.detectFormat(input);
     if (fmt) |image_fmt| {
         out.kind = 1;
-        out.image_format = imageFormatToFileC(image_fmt);
-        if (probeImageMeta(input, image_fmt)) |meta| {
-            out.width = meta.width;
-            out.height = meta.height;
-            out.exif_orientation = meta.exif_orientation;
-        } else |_| {}
+        if (out_image) |img| {
+            img.format = imageFormatToFileC(image_fmt);
+            if (probeImageMeta(input, image_fmt)) |meta| {
+                img.width = meta.width;
+                img.height = meta.height;
+                img.orientation = meta.exif_orientation;
+            } else |_| {}
+        }
     }
     try ensureFallbackClassification(out, input, fmt);
 }
@@ -176,6 +182,7 @@ pub export fn talu_file_inspect(
     bytes: ?[*]const u8,
     bytes_len: usize,
     out_info: ?*TaluFileInfo,
+    out_image: ?*TaluImageInfo,
 ) callconv(.c) i32 {
     capi_error.clearError();
     const out = out_info orelse {
@@ -183,11 +190,12 @@ pub export fn talu_file_inspect(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
     out.* = std.mem.zeroes(TaluFileInfo);
+    if (out_image) |img| img.* = std.mem.zeroes(TaluImageInfo);
     if (bytes == null or bytes_len == 0) {
         capi_error.setError(error.InvalidArgument, "bytes is null or empty", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }
-    inspectFileImpl(bytes.?[0..bytes_len], out) catch |err| {
+    inspectFileImpl(bytes.?[0..bytes_len], out, out_image) catch |err| {
         capi_error.setError(err, "file inspect failed: {s}", .{@errorName(err)});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -212,7 +220,7 @@ pub export fn talu_file_transform(
     opts: ?*const TaluFileTransformOptions,
     out_bytes: ?*?[*]u8,
     out_len: ?*usize,
-    out_info: ?*TaluFileInfo,
+    out_image: ?*TaluImageInfo,
 ) callconv(.c) i32 {
     capi_error.clearError();
 
@@ -226,7 +234,7 @@ pub export fn talu_file_transform(
     };
     out_ptr.* = null;
     out_n.* = 0;
-    if (out_info) |info| info.* = std.mem.zeroes(TaluFileInfo);
+    if (out_image) |img| img.* = std.mem.zeroes(TaluImageInfo);
 
     if (bytes == null or bytes_len == 0) {
         capi_error.setError(error.InvalidArgument, "bytes is null or empty", .{});
@@ -256,13 +264,11 @@ pub export fn talu_file_transform(
 
     out_ptr.* = if (result.data.len == 0) null else result.data.ptr;
     out_n.* = result.data.len;
-    if (out_info) |info| {
-        info.* = std.mem.zeroes(TaluFileInfo);
-        info.kind = 1;
-        info.image_format = switch (result.encode_format) { .jpeg => 1, .png => 2 };
-        info.width = result.width;
-        info.height = result.height;
-        info.exif_orientation = 1;
+    if (out_image) |img| {
+        img.format = switch (result.encode_format) { .jpeg => 1, .png => 2 };
+        img.width = result.width;
+        img.height = result.height;
+        img.orientation = 1;
     }
     return 0;
 }

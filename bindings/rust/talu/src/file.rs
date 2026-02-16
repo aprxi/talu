@@ -103,13 +103,16 @@ pub fn inspect_bytes(bytes: &[u8]) -> Result<FileInfo> {
     }
 
     let mut c_info = talu_sys::TaluFileInfo::default();
-    // SAFETY: bytes pointer/len are valid for the call; c_info is a valid out-struct.
-    let rc = unsafe { talu_sys::talu_file_inspect(bytes.as_ptr(), bytes.len(), &mut c_info) };
+    let mut c_image = talu_sys::TaluImageInfo::default();
+    // SAFETY: bytes pointer/len are valid for the call; out-structs are valid.
+    let rc = unsafe {
+        talu_sys::talu_file_inspect(bytes.as_ptr(), bytes.len(), &mut c_info, &mut c_image)
+    };
     if rc != 0 {
         return Err(error_from_last_or("Failed to inspect file"));
     }
 
-    let info = file_info_from_c(&c_info);
+    let info = file_info_from_c(&c_info, &c_image);
 
     // SAFETY: c_info was initialized by talu_file_inspect and may own heap strings.
     unsafe { talu_sys::talu_file_info_free(&mut c_info) };
@@ -124,7 +127,7 @@ pub fn transform_image_bytes(bytes: &[u8], opts: TransformOptions) -> Result<Tra
 
     let mut c_out_ptr: *const u8 = std::ptr::null();
     let mut c_out_len: usize = 0;
-    let mut c_info = talu_sys::TaluFileInfo::default();
+    let mut c_image = talu_sys::TaluImageInfo::default();
     let c_opts = to_c_transform_options(opts);
 
     // SAFETY: bytes pointer/len are valid; output pointers are valid writable out-params.
@@ -135,12 +138,10 @@ pub fn transform_image_bytes(bytes: &[u8], opts: TransformOptions) -> Result<Tra
             &c_opts,
             (&mut c_out_ptr as *mut *const u8).cast::<c_void>(),
             (&mut c_out_len as *mut usize).cast::<c_void>(),
-            &mut c_info,
+            &mut c_image,
         )
     };
     if rc != 0 {
-        // SAFETY: c_info may own strings even on failure.
-        unsafe { talu_sys::talu_file_info_free(&mut c_info) };
         return Err(error_from_last_or("Failed to transform file"));
     }
 
@@ -155,38 +156,35 @@ pub fn transform_image_bytes(bytes: &[u8], opts: TransformOptions) -> Result<Tra
     // SAFETY: out buffer was allocated by C API and must be freed once copied.
     unsafe { talu_sys::talu_file_bytes_free(c_out_ptr, c_out_len) };
 
-    let file_info = file_info_from_c(&c_info);
-    // SAFETY: free any optional strings owned by c_info.
-    unsafe { talu_sys::talu_file_info_free(&mut c_info) };
-
     Ok(TransformResult {
         bytes: out_bytes,
-        image: file_info.image,
+        image: image_info_from_c(&c_image),
     })
 }
 
-fn file_info_from_c(c_info: &talu_sys::TaluFileInfo) -> FileInfo {
+fn file_info_from_c(c_info: &talu_sys::TaluFileInfo, c_image: &talu_sys::TaluImageInfo) -> FileInfo {
     let mime = copy_c_bytes(c_info.mime_ptr, c_info.mime_len);
     let description = copy_c_bytes(c_info.description_ptr, c_info.description_len);
     let kind = file_kind_from_c(c_info.kind);
-
-    let image = if kind == FileKind::Image {
-        Some(ImageInfo {
-            format: image_format_from_c(c_info.image_format),
-            width: c_info.width,
-            height: c_info.height,
-            exif_orientation: c_info.exif_orientation,
-        })
-    } else {
-        None
-    };
 
     FileInfo {
         kind,
         mime,
         description,
-        image,
+        image: image_info_from_c(c_image),
     }
+}
+
+fn image_info_from_c(c_image: &talu_sys::TaluImageInfo) -> Option<ImageInfo> {
+    if c_image.format == 0 && c_image.width == 0 && c_image.height == 0 {
+        return None;
+    }
+    Some(ImageInfo {
+        format: image_format_from_c(c_image.format),
+        width: c_image.width,
+        height: c_image.height,
+        exif_orientation: c_image.orientation,
+    })
 }
 
 fn copy_c_bytes(ptr: *const u8, len: usize) -> String {

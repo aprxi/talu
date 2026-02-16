@@ -69,17 +69,22 @@ fn files_alias_routes_work_for_list_get_content_and_delete() {
 }
 
 #[test]
-fn content_response_uses_uploaded_mime_type() {
+fn content_response_uses_detected_mime_type() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(files_config(temp.path()));
 
+    // Upload text content with a declared image/png MIME type.
+    // The server inspects actual content and overrides the declared type.
     let file_id = upload_text_file(&ctx, "image-name.bin", "image/png", "not-a-real-png");
 
     let content_resp = get(ctx.addr(), &format!("/v1/files/{}/content", file_id));
     assert_eq!(content_resp.status, 200, "body: {}", content_resp.body);
 
     let ct = content_resp.header("content-type").unwrap_or("");
-    assert!(ct.contains("image/png"), "unexpected content-type: {ct}");
+    assert!(
+        ct.contains("text/plain"),
+        "expected detected type text/plain, got: {ct}"
+    );
 }
 
 #[test]
