@@ -222,7 +222,7 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
     }
 
     if let Ok(info) = talu::file::inspect_bytes(&stdin_buf) {
-        if info.kind == talu::file::FileKind::ImageDocument {
+        if info.kind == talu::file::FileKind::Image {
             let mime = map_stdin_image_mime(&info);
             let data_url = format!("data:{};base64,{}", mime, encode_base64(&stdin_buf));
             return Ok(ParsedStdin {

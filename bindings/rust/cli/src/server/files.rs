@@ -750,7 +750,7 @@ async fn inspect_blob_failsafe(
 
 fn map_file_kind(kind: &file::FileKind, mime: &str) -> &'static str {
     match kind {
-        file::FileKind::ImageDocument => "image",
+        file::FileKind::Image => "image",
         file::FileKind::Document => "document",
         file::FileKind::Unknown => {
             if mime.starts_with("text/") {

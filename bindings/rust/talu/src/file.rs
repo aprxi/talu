@@ -6,14 +6,14 @@ use std::ffi::c_void;
 
 /// File classification.
 ///
-/// - `ImageDocument` — raster image (JPEG, PNG, WebP). The file IS pixels;
+/// - `Image` — raster image (JPEG, PNG, WebP). The file IS pixels;
 ///   intrinsic width/height/orientation are in `ImageInfo`.
 /// - `Document` — rendered format (PDF, future: DOCX). The file DESCRIBES
 ///   content that becomes pixels when rendered. No intrinsic dimensions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
     Unknown,
-    ImageDocument,
+    Image,
     Document,
 }
 
@@ -205,7 +205,7 @@ fn copy_c_bytes(ptr: *const u8, len: usize) -> String {
 
 fn file_kind_from_c(v: i32) -> FileKind {
     match v {
-        1 => FileKind::ImageDocument,
+        1 => FileKind::Image,
         2 => FileKind::Document,
         _ => FileKind::Unknown,
     }
@@ -281,7 +281,7 @@ mod tests {
     #[test]
     fn file_kind_mapping() {
         assert_eq!(file_kind_from_c(0), FileKind::Unknown);
-        assert_eq!(file_kind_from_c(1), FileKind::ImageDocument);
+        assert_eq!(file_kind_from_c(1), FileKind::Image);
         assert_eq!(file_kind_from_c(2), FileKind::Document);
     }
 }

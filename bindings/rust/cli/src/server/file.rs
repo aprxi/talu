@@ -303,7 +303,7 @@ fn extract_boundary(req: &Request<Incoming>) -> Option<String> {
 
 fn map_kind(kind: &FileKind, mime: &str) -> &'static str {
     match kind {
-        FileKind::ImageDocument => "image",
+        FileKind::Image => "image",
         FileKind::Document => "document",
         FileKind::Unknown => {
             if mime.starts_with("text/") {
@@ -495,8 +495,8 @@ mod tests {
 
     #[test]
     fn map_kind_image() {
-        assert_eq!(map_kind(&FileKind::ImageDocument, "image/jpeg"), "image");
-        assert_eq!(map_kind(&FileKind::ImageDocument, "image/png"), "image");
+        assert_eq!(map_kind(&FileKind::Image, "image/jpeg"), "image");
+        assert_eq!(map_kind(&FileKind::Image, "image/png"), "image");
     }
 
     #[test]

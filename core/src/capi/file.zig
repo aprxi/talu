@@ -122,13 +122,13 @@ pub const TaluImageEncodeOptions = extern struct {
 ///
 /// kind values:
 ///   0 = unknown — unrecognized file type.
-///   1 = image_document — raster image (JPEG, PNG, WebP). The file IS pixels;
+///   1 = image — raster image (JPEG, PNG, WebP). The file IS pixels;
 ///       intrinsic width/height/orientation are in the companion TaluImageInfo.
 ///   2 = document — rendered format (PDF, future: DOCX, PPTX). The file DESCRIBES
 ///       content that becomes pixels when rendered at a chosen DPI. No intrinsic
 ///       pixel dimensions; TaluImageInfo stays zeroed.
 pub const TaluFileInfo = extern struct {
-    kind: c_int, // 0=unknown, 1=image_document, 2=document
+    kind: c_int, // 0=unknown, 1=image, 2=document
     mime_ptr: ?[*]u8,
     mime_len: usize,
     description_ptr: ?[*]u8,
@@ -136,10 +136,10 @@ pub const TaluFileInfo = extern struct {
     _reserved: [16]u8,
 };
 
-/// Raster image metadata (only meaningful when TaluFileInfo.kind == 1).
+/// Raster image metadata (only meaningful when TaluFileInfo.kind == 1, image).
 ///
-/// For rendered documents (kind == 2), this struct stays zeroed — those formats
-/// have no intrinsic pixel dimensions.
+/// For documents (kind == 2), this struct stays zeroed — those formats have
+/// no intrinsic pixel dimensions.
 pub const TaluImageInfo = extern struct {
     format: c_int, // 0=unknown, 1=jpeg, 2=png, 3=webp
     width: u32,
@@ -169,7 +169,7 @@ pub const TaluFileTransformOptions = extern struct {
 /// Per-format metadata for known file formats.
 /// Adding a new format? Add one entry here and a probeXxxMeta function.
 const FormatMeta = struct {
-    kind: c_int, // 1 = image_document, 2 = document
+    kind: c_int, // 1 = image, 2 = document
     format_id: c_int, // TaluImageInfo.format value (0 for documents)
     mime: []const u8,
     description: []const u8,
@@ -195,7 +195,7 @@ fn inspectFileImpl(input: []const u8, out: *TaluFileInfo, out_image: ?*TaluImage
         try setOwnedBytes(&out.mime_ptr, &out.mime_len, fm.mime);
         try setOwnedBytes(&out.description_ptr, &out.description_len, fm.description);
 
-        if (fm.kind == 1) { // image_document — populate raster metadata
+        if (fm.kind == 1) { // image — populate raster metadata
             if (out_image) |img| {
                 img.format = fm.format_id;
                 if (probeImageMeta(input, image_fmt)) |probe| {
