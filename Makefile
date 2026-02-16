@@ -50,8 +50,8 @@ deps:
 	@printf '%s\n%s\n' '//! Compiled magic database - auto-generated, do not edit' 'pub const data = @embedFile("file/magic.mgc");' > deps/magic_db.zig
 	@test -d deps/freetype || git clone --branch VER-2-13-3 --depth 1 https://github.com/freetype/freetype.git deps/freetype
 	@test -d deps/pdfium || git clone --depth 1 https://pdfium.googlesource.com/pdfium deps/pdfium
-	@test -d deps/pdfium/third_party/fast_float/fast_float || \
-		git clone --branch v8.0.0 --depth 1 https://github.com/fastfloat/fast_float.git deps/pdfium/third_party/fast_float/fast_float
+	@test -d deps/pdfium/third_party/fast_float/src || \
+		git clone --branch v8.2.3 --depth 1 https://github.com/fastfloat/fast_float.git deps/pdfium/third_party/fast_float/src
 	@test -f deps/mbedtls/build/library/libmbedtls.a || $(MAKE) mbedtls-build
 	@test -f deps/curl/build/lib/libcurl.a || $(MAKE) curl-build
 	@test -f deps/freetype/build/libfreetype.a || $(MAKE) freetype-build
@@ -233,6 +233,7 @@ pdfium-build: freetype-build
 	@echo "Building PDFium static library..."
 	# Copy our CMake build and shim headers into PDFium source tree
 	@cp ports/pdfium/CMakeLists.txt deps/pdfium/
+	@mkdir -p deps/pdfium/build
 	@cp ports/pdfium/buildflag.h deps/pdfium/build/
 	@cp ports/pdfium/build_config.h deps/pdfium/build/
 	# Patch out abseil dependency (2 files)

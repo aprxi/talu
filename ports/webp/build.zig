@@ -20,6 +20,7 @@ pub fn add(
     if (target_arch == .x86_64) {
         mod.addCMacro("WEBP_HAVE_SSE2", "1");
         mod.addCMacro("WEBP_HAVE_SSE41", "1");
+        mod.addCMacro("WEBP_HAVE_AVX2", "1");
     } else if (target_arch == .aarch64) {
         mod.addCMacro("WEBP_HAVE_NEON", "1");
     }
@@ -89,6 +90,12 @@ pub fn add(
                 "deps/webp/src/dsp/yuv_sse41.c",
             },
             .flags = &.{"-msse4.1"},
+        });
+        lib.addCSourceFiles(.{
+            .files = &.{
+                "deps/webp/src/dsp/lossless_avx2.c",
+            },
+            .flags = &.{"-mavx2"},
         });
     } else if (target_arch == .aarch64) {
         lib.addCSourceFiles(.{
