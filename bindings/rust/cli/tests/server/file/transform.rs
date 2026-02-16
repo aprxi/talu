@@ -176,7 +176,11 @@ async fn transform_resize_cover_produces_exact_target_dimensions() {
     assert_eq!(status, StatusCode::OK);
 
     let (w, h) = png_dimensions(&body);
-    assert_eq!((w, h), (1, 1), "cover mode should produce exact target dimensions");
+    assert_eq!(
+        (w, h),
+        (1, 1),
+        "cover mode should produce exact target dimensions"
+    );
 }
 
 #[tokio::test]
@@ -202,7 +206,11 @@ async fn transform_resize_contain_fits_within_bounding_box() {
 
     // Contain mode pads to target dimensions.
     let (w, h) = png_dimensions(&body);
-    assert_eq!((w, h), (10, 10), "contain mode should produce target dimensions with padding");
+    assert_eq!(
+        (w, h),
+        (10, 10),
+        "contain mode should produce target dimensions with padding"
+    );
 }
 
 #[tokio::test]
@@ -224,7 +232,11 @@ async fn transform_resize_stretch_distorts_to_target_dimensions() {
     assert_eq!(status, StatusCode::OK);
 
     let (w, h) = png_dimensions(&body);
-    assert_eq!((w, h), (10, 5), "stretch mode should produce exact target dimensions");
+    assert_eq!(
+        (w, h),
+        (10, 5),
+        "stretch mode should produce exact target dimensions"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -298,7 +310,10 @@ async fn transform_rejects_invalid_resize_string() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["error"]["code"], "invalid_argument");
     let msg = json["error"]["message"].as_str().expect("message");
-    assert!(msg.contains("abc"), "error should echo the invalid value: {msg}");
+    assert!(
+        msg.contains("abc"),
+        "error should echo the invalid value: {msg}"
+    );
 }
 
 #[tokio::test]
@@ -338,7 +353,10 @@ async fn transform_rejects_quality_out_of_range() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(json["error"]["code"], "invalid_argument");
     let msg = json["error"]["message"].as_str().expect("message");
-    assert!(msg.contains("1-100"), "error should state valid range: {msg}");
+    assert!(
+        msg.contains("1-100"),
+        "error should state valid range: {msg}"
+    );
 }
 
 #[tokio::test]

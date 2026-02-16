@@ -275,8 +275,7 @@ pub async fn handle_upload(
         }
     }
 
-    let metadata_json =
-        serde_json::to_string(&doc_content).unwrap_or_else(|_| "{}".to_string());
+    let metadata_json = serde_json::to_string(&doc_content).unwrap_or_else(|_| "{}".to_string());
 
     if let Err(e) = docs.create(
         &file_id,
@@ -720,9 +719,12 @@ async fn inspect_blob_failsafe(
     }
     buf.truncate(pos);
 
-    let result = tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(
-        move || std::panic::catch_unwind(AssertUnwindSafe(|| file::inspect_bytes(&buf))),
-    ))
+    let result = tokio::time::timeout(
+        Duration::from_secs(2),
+        tokio::task::spawn_blocking(move || {
+            std::panic::catch_unwind(AssertUnwindSafe(|| file::inspect_bytes(&buf)))
+        }),
+    )
     .await;
 
     match result {
@@ -1219,9 +1221,7 @@ fn blob_error_response(err: BlobError) -> Response<BoxBody> {
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        extract_boundary, extract_file_id, resolve_filename, FileDocumentContent,
-    };
+    use super::{extract_boundary, extract_file_id, resolve_filename, FileDocumentContent};
     use talu::blobs::BlobError;
 
     #[test]

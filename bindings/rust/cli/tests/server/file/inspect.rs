@@ -30,7 +30,9 @@ async fn inspect_text_file_returns_complete_response() {
     assert_eq!(json["size"], 13);
     assert!(json["image"].is_null());
     // libmagic produces a non-empty description for ASCII text.
-    let desc = json["description"].as_str().expect("description should be a string");
+    let desc = json["description"]
+        .as_str()
+        .expect("description should be a string");
     assert!(
         desc.contains("text") || desc.contains("ASCII"),
         "expected text-related description, got: {desc}"
@@ -416,7 +418,11 @@ async fn inspect_detects_mime_from_content_not_declared_type() {
 #[tokio::test]
 async fn inspect_missing_file_part_returns_400() {
     let app = build_app();
-    let req = multipart_no_file("/v1/file/inspect", "----inspect-nofile", &[("extra", "value")]);
+    let req = multipart_no_file(
+        "/v1/file/inspect",
+        "----inspect-nofile",
+        &[("extra", "value")],
+    );
 
     let (status, json) = body_json(send_request(&app, req).await).await;
 

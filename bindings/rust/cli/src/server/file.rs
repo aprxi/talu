@@ -253,24 +253,27 @@ pub async fn handle_transform(
     };
 
     let bytes = parsed.file_bytes;
-    let result =
-        match tokio::task::spawn_blocking(move || file::transform_image_bytes(&bytes, opts)).await {
-            Ok(Ok(result)) => result,
-            Ok(Err(e)) => {
-                return json_error(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "transform_failed",
-                    &format!("Image transformation failed: {}", e),
-                )
-            }
-            Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "internal_error",
-                    &format!("Transform task failed: {}", e),
-                )
-            }
-        };
+    let result = match tokio::task::spawn_blocking(move || {
+        file::transform_image_bytes(&bytes, opts)
+    })
+    .await
+    {
+        Ok(Ok(result)) => result,
+        Ok(Err(e)) => {
+            return json_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "transform_failed",
+                &format!("Image transformation failed: {}", e),
+            )
+        }
+        Err(e) => {
+            return json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal_error",
+                &format!("Transform task failed: {}", e),
+            )
+        }
+    };
 
     let content_type = result
         .image
@@ -521,9 +524,15 @@ mod tests {
 
     #[test]
     fn image_format_content_types() {
-        assert_eq!(image_format_to_content_type(ImageFormat::Jpeg), "image/jpeg");
+        assert_eq!(
+            image_format_to_content_type(ImageFormat::Jpeg),
+            "image/jpeg"
+        );
         assert_eq!(image_format_to_content_type(ImageFormat::Png), "image/png");
-        assert_eq!(image_format_to_content_type(ImageFormat::Webp), "image/webp");
+        assert_eq!(
+            image_format_to_content_type(ImageFormat::Webp),
+            "image/webp"
+        );
         assert_eq!(
             image_format_to_content_type(ImageFormat::Unknown),
             "application/octet-stream"

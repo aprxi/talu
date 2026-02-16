@@ -162,11 +162,7 @@ fn multipart_request(
 }
 
 /// Build a multipart/form-data body with only text fields (no file part).
-fn multipart_no_file(
-    uri: &str,
-    boundary: &str,
-    fields: &[(&str, &str)],
-) -> Request<Full<Bytes>> {
+fn multipart_no_file(uri: &str, boundary: &str, fields: &[(&str, &str)]) -> Request<Full<Bytes>> {
     let mut body = Vec::new();
     for (name, value) in fields {
         body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());

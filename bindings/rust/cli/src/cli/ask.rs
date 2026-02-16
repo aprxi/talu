@@ -19,6 +19,8 @@ use super::{AskArgs, AskOutputFormat};
 
 use super::models::list_provider_models;
 
+const DEFAULT_STDIN_IMAGE_PROMPT: &str = "Describe this image.";
+
 struct StreamCtx {
     raw_output: bool,
     hide_thinking: bool,
@@ -153,6 +155,114 @@ fn latest_visible_text(chat: &ChatHandle, include_reasoning: bool) -> Result<Opt
     Ok(None)
 }
 
+#[derive(Debug)]
+struct ParsedStdin {
+    text: Option<String>,
+    image: Option<talu::router::ContentPart>,
+}
+
+fn map_stdin_image_mime(info: &talu::file::FileInfo) -> String {
+    if !info.mime.is_empty() && info.mime.starts_with("image/") {
+        return info.mime.clone();
+    }
+    match info.image.map(|image| image.format) {
+        Some(talu::file::ImageFormat::Jpeg) => "image/jpeg".to_string(),
+        Some(talu::file::ImageFormat::Png) => "image/png".to_string(),
+        Some(talu::file::ImageFormat::Webp) => "image/webp".to_string(),
+        _ => "application/octet-stream".to_string(),
+    }
+}
+
+fn trim_trailing_stdin_whitespace(bytes: &mut Vec<u8>) {
+    while matches!(bytes.last(), Some(b'\n' | b'\r' | b' ')) {
+        bytes.pop();
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        let b0 = bytes[i];
+        let b1 = bytes[i + 1];
+        let b2 = bytes[i + 2];
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        i += 3;
+    }
+
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let b0 = bytes[i];
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[((b0 & 0x03) << 4) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let b0 = bytes[i];
+        let b1 = bytes[i + 1];
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(TABLE[((b1 & 0x0f) << 2) as usize] as char);
+        out.push('=');
+    }
+
+    out
+}
+
+fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
+    if stdin_buf.is_empty() {
+        return Ok(ParsedStdin {
+            text: None,
+            image: None,
+        });
+    }
+
+    if let Ok(info) = talu::file::inspect_bytes(&stdin_buf) {
+        if info.kind == talu::file::FileKind::Image {
+            let mime = map_stdin_image_mime(&info);
+            let data_url = format!("data:{};base64,{}", mime, encode_base64(&stdin_buf));
+            return Ok(ParsedStdin {
+                text: None,
+                image: Some(talu::router::ContentPart::ImageUrl {
+                    url: data_url,
+                    mime: Some(mime),
+                }),
+            });
+        }
+
+        if !info.mime.starts_with("text/") && stdin_buf.contains(&0) {
+            bail!(
+                "Error: stdin contains binary data ({}) and cannot be used as text prompt.",
+                if info.mime.is_empty() {
+                    "unknown MIME"
+                } else {
+                    info.mime.as_str()
+                }
+            );
+        }
+    }
+
+    trim_trailing_stdin_whitespace(&mut stdin_buf);
+    if stdin_buf.is_empty() {
+        return Ok(ParsedStdin {
+            text: None,
+            image: None,
+        });
+    }
+    let text = String::from_utf8_lossy(&stdin_buf).to_string();
+    if text.contains('\0') {
+        bail!("Error: stdin contains NUL bytes and cannot be used as text prompt.");
+    }
+    Ok(ParsedStdin {
+        text: Some(text),
+        image: None,
+    })
+}
+
 /// Chat: new session by default; append via --session.
 pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result<()> {
     let no_chat = args.no_chat;
@@ -164,6 +274,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     let hide_thinking = args.hide_thinking;
     let mut system_msg = args.system.clone();
     let mut prompt_parts = args.prompt.clone();
+    let mut stdin_image_part: Option<talu::router::ContentPart> = None;
     let endpoint_url_override = args.endpoint_url.clone();
     let seed = args.seed.unwrap_or(0);
     let db_path =
@@ -234,13 +345,16 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     if stdin_is_pipe {
         let mut stdin_buf = Vec::new();
         if io::stdin().read_to_end(&mut stdin_buf).is_ok() && !stdin_buf.is_empty() {
-            while matches!(stdin_buf.last(), Some(b'\n' | b'\r' | b' ')) {
-                stdin_buf.pop();
+            let parsed = parse_stdin_content(stdin_buf)?;
+            if let Some(text) = parsed.text {
+                prompt_parts.push(text);
             }
-            if !stdin_buf.is_empty() {
-                prompt_parts.push(String::from_utf8_lossy(&stdin_buf).to_string());
-            }
+            stdin_image_part = parsed.image;
         }
+    }
+
+    if stdin_image_part.is_some() && prompt_parts.is_empty() {
+        prompt_parts.push(DEFAULT_STDIN_IMAGE_PROMPT.to_string());
     }
 
     let prompt = prompt_parts.join(" ");
@@ -413,6 +527,9 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
 
     // Handle remote providers
     if let ModelTarget::Remote { provider, model } = target {
+        if stdin_image_part.is_some() {
+            bail!("Error: piped image input is currently supported only for local models.");
+        }
         return cmd_ask_remote(
             &provider,
             model,
@@ -484,7 +601,13 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
         chat.set_storage_db(&db_str, &session_id)?;
     }
 
-    let content = vec![talu::router::ContentPart::Text(prompt.clone())];
+    let mut content = Vec::new();
+    if let Some(image_part) = stdin_image_part {
+        content.push(image_part);
+    }
+    if !prompt.is_empty() {
+        content.push(talu::router::ContentPart::Text(prompt.clone()));
+    }
 
     let mut cfg = talu::router::GenerateConfig {
         max_tokens,
@@ -917,4 +1040,46 @@ fn cmd_ask_remote(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encode_base64_known_vectors() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"hello"), "aGVsbG8=");
+    }
+
+    #[test]
+    fn parse_stdin_content_text_trims_trailing_whitespace() {
+        let parsed = parse_stdin_content(b"hello world\n".to_vec()).expect("parse text stdin");
+        assert_eq!(parsed.text.as_deref(), Some("hello world"));
+        assert!(parsed.image.is_none());
+    }
+
+    #[test]
+    fn parse_stdin_content_image_builds_data_url() {
+        let jpeg = include_bytes!("../../../../../core/tests/image/corpus/1x1_red.jpg");
+        let parsed = parse_stdin_content(jpeg.to_vec()).expect("parse jpeg stdin");
+        assert!(parsed.text.is_none());
+        match parsed.image {
+            Some(talu::router::ContentPart::ImageUrl { url, mime }) => {
+                assert_eq!(mime.as_deref(), Some("image/jpeg"));
+                assert!(url.starts_with("data:image/jpeg;base64,"));
+            }
+            _ => panic!("expected image url content part"),
+        }
+    }
+
+    #[test]
+    fn parse_stdin_content_rejects_binary_nul_data() {
+        let err = parse_stdin_content(vec![0, 1, 2, 3]).expect_err("binary stdin should fail");
+        let msg = err.to_string();
+        assert!(msg.contains("binary data"));
+    }
 }

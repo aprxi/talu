@@ -41,6 +41,27 @@ pub const GenerateContentPart = extern struct {
     mime_ptr: ?[*:0]const u8,
 };
 
+fn contentTypeFromGeneratePart(raw: u8) ContentType {
+    return switch (raw) {
+        0 => .input_text,
+        1 => .input_image,
+        2 => .input_audio,
+        3 => .input_video,
+        4 => .input_file,
+        else => .unknown,
+    };
+}
+
+fn appendUserMessageFromParts(chat: *Chat, parts: []const GenerateContentPart) !void {
+    const msg = try chat.conv.appendEmptyMessage(.user);
+    for (parts) |c_part| {
+        const content_type = contentTypeFromGeneratePart(c_part.content_type);
+        const part = try chat.conv.addContentPart(msg, content_type);
+        try part.appendData(chat.conv.allocator, c_part.data_ptr[0..c_part.data_len]);
+    }
+    chat.conv.finalizeItem(msg);
+}
+
 /// Logit bias entry from C API.
 pub const CLogitBiasEntry = extern struct {
     token_id: u32,
@@ -330,15 +351,9 @@ pub fn generate(
     const engine = root.getOrCreateEngineWithConfig(allocator, resolved_id, resolution) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.model_not_found) };
 
     // Create user message from content parts
-    const user_row = chat.msgs.createMessage(.user) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-    for (parts) |c_part| {
-        const part = chat.msgs.addPart(user_row, @enumFromInt(c_part.content_type)) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-        part.appendData(chat.msgs.allocator, c_part.data_ptr[0..c_part.data_len]) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-        if (c_part.mime_ptr) |mime| {
-            part.setMime(chat.msgs.allocator, std.mem.sliceTo(mime, 0)) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-        }
-    }
-    chat.msgs.finalizeMessage(user_row);
+    appendUserMessageFromParts(chat, parts) catch {
+        return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+    };
 
     // Build options
     var built = buildOptions(allocator, config, engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
@@ -397,21 +412,9 @@ pub fn generateWithBackend(
     // If parts are empty, continue from the current conversation state
     // (used by agent loops after appending tool call outputs).
     if (parts.len > 0) {
-        // Build combined content from all parts (most common case is single text part)
-        var content_buf: std.ArrayListUnmanaged(u8) = .{};
-        defer content_buf.deinit(allocator);
-
-        for (parts) |c_part| {
-            // For now, only support text content (content_type 0)
-            if (c_part.content_type == 0) {
-                content_buf.appendSlice(allocator, c_part.data_ptr[0..c_part.data_len]) catch
-                    return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
-            }
-        }
-
-        // Add as user message via Chat API
-        chat.append(.user, content_buf.items) catch
+        appendUserMessageFromParts(chat, parts) catch {
             return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
+        };
     } else if (chat.conv.len() == 0) {
         // Empty conversation with no content — this is an error
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_empty_prompt) };
@@ -804,22 +807,11 @@ pub fn createIterator(
     backend_ptr: *InferenceBackend,
     config: ?*const CGenerateConfig,
 ) CreateIteratorError!*iterator_mod.TokenIterator {
-    // Build content from parts
-    var content_buf: std.ArrayListUnmanaged(u8) = .{};
-    defer content_buf.deinit(allocator);
-
-    for (content_parts) |c_part| {
-        if (c_part.content_type == 0) {
-            content_buf.appendSlice(allocator, c_part.data_ptr[0..c_part.data_len]) catch {
-                return error.OutOfMemory;
-            };
-        }
+    if (content_parts.len > 0) {
+        appendUserMessageFromParts(chat, content_parts) catch {
+            return error.OutOfMemory;
+        };
     }
-
-    // Add user message to chat
-    chat.append(.user, content_buf.items) catch {
-        return error.OutOfMemory;
-    };
 
     // Dispatch based on backend type
     switch (backend_ptr.backend) {
@@ -913,6 +905,54 @@ fn buildOptions(
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "contentTypeFromGeneratePart maps known and unknown values" {
+    try std.testing.expectEqual(ContentType.input_text, contentTypeFromGeneratePart(0));
+    try std.testing.expectEqual(ContentType.input_image, contentTypeFromGeneratePart(1));
+    try std.testing.expectEqual(ContentType.input_audio, contentTypeFromGeneratePart(2));
+    try std.testing.expectEqual(ContentType.input_video, contentTypeFromGeneratePart(3));
+    try std.testing.expectEqual(ContentType.input_file, contentTypeFromGeneratePart(4));
+    try std.testing.expectEqual(ContentType.unknown, contentTypeFromGeneratePart(99));
+}
+
+test "appendUserMessageFromParts preserves non-text content parts" {
+    var chat = try Chat.init(std.testing.allocator);
+    defer chat.deinit();
+
+    const image_url = "data:image/jpeg;base64,/9j/4AAQSk";
+    const prompt_text = "describe this image";
+    const mime: [*:0]const u8 = "image/jpeg";
+
+    const parts = [_]GenerateContentPart{
+        .{
+            .content_type = 1,
+            .data_ptr = image_url.ptr,
+            .data_len = image_url.len,
+            .mime_ptr = mime,
+        },
+        .{
+            .content_type = 0,
+            .data_ptr = prompt_text.ptr,
+            .data_len = prompt_text.len,
+            .mime_ptr = null,
+        },
+    };
+
+    try appendUserMessageFromParts(&chat, &parts);
+
+    try std.testing.expectEqual(@as(usize, 1), chat.len());
+    const item = chat.get(0).?;
+    const msg = item.asMessage().?;
+    try std.testing.expectEqual(@as(usize, 2), msg.partCount());
+
+    const part0 = msg.getPart(0).?;
+    try std.testing.expectEqual(ContentType.input_image, part0.getContentType());
+    try std.testing.expectEqualStrings(image_url, part0.getData());
+
+    const part1 = msg.getPart(1).?;
+    try std.testing.expectEqual(ContentType.input_text, part1.getContentType());
+    try std.testing.expectEqualStrings(prompt_text, part1.getData());
+}
 
 test "CGenerateConfig defaults" {
     // Test Zig default initialization (what Zig code gets)
