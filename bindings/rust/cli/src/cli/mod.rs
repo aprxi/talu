@@ -365,8 +365,8 @@ pub(super) enum FileFormatArg {
 
 #[derive(Args)]
 pub(super) struct FileArgs {
-    /// Input file path
-    pub path: PathBuf,
+    /// Input file path (reads from stdin if omitted or "-")
+    pub path: Option<PathBuf>,
 
     /// Resize to WxH (e.g. 512x512)
     #[arg(long)]

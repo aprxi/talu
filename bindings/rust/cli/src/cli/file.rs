@@ -1,13 +1,33 @@
 use anyhow::{anyhow, bail, Context, Result};
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use super::{FileArgs, FileFitArg, FileFormatArg};
 
+fn is_stdin(path: &Option<PathBuf>) -> bool {
+    match path {
+        None => true,
+        Some(p) => p.as_os_str() == "-",
+    }
+}
+
 pub(super) fn cmd_file(args: FileArgs) -> Result<()> {
-    let input_path = args.path;
-    let bytes = fs::read(&input_path)
-        .with_context(|| format!("Error: failed to read {}", input_path.display()))?;
+    let from_stdin = is_stdin(&args.path);
+    let bytes = if from_stdin {
+        let mut buf = Vec::new();
+        std::io::stdin()
+            .read_to_end(&mut buf)
+            .context("Error: failed to read from stdin")?;
+        if buf.is_empty() {
+            bail!("Error: no data received on stdin.");
+        }
+        buf
+    } else {
+        let input_path = args.path.as_ref().unwrap();
+        fs::read(input_path)
+            .with_context(|| format!("Error: failed to read {}", input_path.display()))?
+    };
 
     let transform_requested = args.resize.is_some()
         || args.fit.is_some()
@@ -17,8 +37,16 @@ pub(super) fn cmd_file(args: FileArgs) -> Result<()> {
 
     if !transform_requested {
         let info = talu::file::inspect_bytes(&bytes)?;
-        print_file_info(&input_path, &info);
+        if from_stdin {
+            print_file_info(Path::new("<stdin>"), &info);
+        } else {
+            print_file_info(args.path.as_deref().unwrap(), &info);
+        }
         return Ok(());
+    }
+
+    if from_stdin && args.output.is_none() {
+        bail!("Error: --output is required when reading from stdin.");
     }
 
     let resize = if let Some(spec) = args.resize.as_deref() {
@@ -33,9 +61,12 @@ pub(super) fn cmd_file(args: FileArgs) -> Result<()> {
         None
     };
 
-    let inferred_format = infer_output_format(args.format, args.output.as_deref(), &input_path)?;
-    let output_path = resolve_output_path(args.output, &input_path, inferred_format)?;
-    ensure_not_in_place(&input_path, &output_path)?;
+    let input_path_ref = args.path.as_deref().unwrap_or_else(|| Path::new("stdin"));
+    let inferred_format = infer_output_format(args.format, args.output.as_deref(), input_path_ref)?;
+    let output_path = resolve_output_path(args.output, input_path_ref, inferred_format)?;
+    if !from_stdin {
+        ensure_not_in_place(input_path_ref, &output_path)?;
+    }
 
     let opts = talu::file::TransformOptions {
         resize,
