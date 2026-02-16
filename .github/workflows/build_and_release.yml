@@ -173,7 +173,7 @@ jobs:
 
           # Prepare vendor/talu with source files for sdist
           mkdir -p bindings/python/vendor/talu/bindings
-          cp -r core build.zig VERSION Makefile bindings/python/vendor/talu/
+          cp -r core build.zig VERSION Makefile ports bindings/python/vendor/talu/
           cp -r bindings/rust bindings/python/vendor/talu/bindings/
           mkdir -p bindings/python/vendor/talu/tools/archs
           cp -r tools/archs/_graphs bindings/python/vendor/talu/tools/archs/
