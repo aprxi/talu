@@ -199,7 +199,7 @@ pub async fn handle_inspect(
         }
     };
 
-    let kind = map_kind(&info.kind, &info.mime);
+    let kind = map_kind(&info.kind);
     let image = info.image.map(|img| ImageMetadata {
         format: image_format_to_string(img.format),
         width: img.width,
@@ -301,17 +301,14 @@ fn extract_boundary(req: &Request<Incoming>) -> Option<String> {
     multer::parse_boundary(ct).ok()
 }
 
-fn map_kind(kind: &FileKind, mime: &str) -> &'static str {
+fn map_kind(kind: &FileKind) -> &'static str {
     match kind {
+        FileKind::Binary => "binary",
         FileKind::Image => "image",
         FileKind::Document => "document",
-        FileKind::Unknown => {
-            if mime.starts_with("text/") {
-                "text"
-            } else {
-                "binary"
-            }
-        }
+        FileKind::Audio => "audio",
+        FileKind::Video => "video",
+        FileKind::Text => "text",
     }
 }
 
@@ -494,29 +491,13 @@ mod tests {
     }
 
     #[test]
-    fn map_kind_image() {
-        assert_eq!(map_kind(&FileKind::Image, "image/jpeg"), "image");
-        assert_eq!(map_kind(&FileKind::Image, "image/png"), "image");
-    }
-
-    #[test]
-    fn map_kind_text() {
-        assert_eq!(map_kind(&FileKind::Unknown, "text/plain"), "text");
-        assert_eq!(map_kind(&FileKind::Unknown, "text/html"), "text");
-    }
-
-    #[test]
-    fn map_kind_document() {
-        assert_eq!(map_kind(&FileKind::Document, "application/pdf"), "document");
-    }
-
-    #[test]
-    fn map_kind_binary() {
-        assert_eq!(
-            map_kind(&FileKind::Unknown, "application/octet-stream"),
-            "binary"
-        );
-        assert_eq!(map_kind(&FileKind::Unknown, ""), "binary");
+    fn map_kind_all_variants() {
+        assert_eq!(map_kind(&FileKind::Binary), "binary");
+        assert_eq!(map_kind(&FileKind::Image), "image");
+        assert_eq!(map_kind(&FileKind::Document), "document");
+        assert_eq!(map_kind(&FileKind::Audio), "audio");
+        assert_eq!(map_kind(&FileKind::Video), "video");
+        assert_eq!(map_kind(&FileKind::Text), "text");
     }
 
     #[test]

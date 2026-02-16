@@ -89,9 +89,12 @@ fn print_file_info(path: &Path, info: &talu::file::FileInfo) {
     println!(
         "Kind: {}",
         match info.kind {
+            talu::file::FileKind::Binary => "binary",
             talu::file::FileKind::Image => "image",
             talu::file::FileKind::Document => "document",
-            talu::file::FileKind::Unknown => "unknown",
+            talu::file::FileKind::Audio => "audio",
+            talu::file::FileKind::Video => "video",
+            talu::file::FileKind::Text => "text",
         }
     );
 

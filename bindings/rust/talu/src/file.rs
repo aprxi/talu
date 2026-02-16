@@ -6,15 +6,22 @@ use std::ffi::c_void;
 
 /// File classification.
 ///
+/// - `Binary` — unrecognized or non-text file (executables, archives, etc.).
 /// - `Image` — raster image (JPEG, PNG, WebP). The file IS pixels;
 ///   intrinsic width/height/orientation are in `ImageInfo`.
 /// - `Document` — rendered format (PDF, future: DOCX). The file DESCRIBES
 ///   content that becomes pixels when rendered. No intrinsic dimensions.
+/// - `Audio` — audio file (MP3, WAV, OGG, FLAC, etc.).
+/// - `Video` — video file (MP4, WebM, AVI, etc.).
+/// - `Text` — human-readable text (plain text, JSON, XML, HTML, YAML, etc.).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileKind {
-    Unknown,
+    Binary,
     Image,
     Document,
+    Audio,
+    Video,
+    Text,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -207,7 +214,10 @@ fn file_kind_from_c(v: i32) -> FileKind {
     match v {
         1 => FileKind::Image,
         2 => FileKind::Document,
-        _ => FileKind::Unknown,
+        3 => FileKind::Audio,
+        4 => FileKind::Video,
+        5 => FileKind::Text,
+        _ => FileKind::Binary,
     }
 }
 
@@ -280,8 +290,12 @@ mod tests {
 
     #[test]
     fn file_kind_mapping() {
-        assert_eq!(file_kind_from_c(0), FileKind::Unknown);
+        assert_eq!(file_kind_from_c(0), FileKind::Binary);
         assert_eq!(file_kind_from_c(1), FileKind::Image);
         assert_eq!(file_kind_from_c(2), FileKind::Document);
+        assert_eq!(file_kind_from_c(3), FileKind::Audio);
+        assert_eq!(file_kind_from_c(4), FileKind::Video);
+        assert_eq!(file_kind_from_c(5), FileKind::Text);
+        assert_eq!(file_kind_from_c(99), FileKind::Binary);
     }
 }

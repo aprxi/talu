@@ -121,14 +121,17 @@ pub const TaluImageEncodeOptions = extern struct {
 /// File classification result.
 ///
 /// kind values:
-///   0 = unknown — unrecognized file type.
+///   0 = binary — unrecognized or non-text file (executables, archives, etc.).
 ///   1 = image — raster image (JPEG, PNG, WebP). The file IS pixels;
 ///       intrinsic width/height/orientation are in the companion TaluImageInfo.
 ///   2 = document — rendered format (PDF, future: DOCX, PPTX). The file DESCRIBES
 ///       content that becomes pixels when rendered at a chosen DPI. No intrinsic
 ///       pixel dimensions; TaluImageInfo stays zeroed.
+///   3 = audio — audio file (MP3, WAV, OGG, FLAC, etc.).
+///   4 = video — video file (MP4, WebM, AVI, etc.).
+///   5 = text — human-readable text (plain text, JSON, XML, HTML, YAML, CSV, etc.).
 pub const TaluFileInfo = extern struct {
-    kind: c_int, // 0=unknown, 1=image, 2=document
+    kind: c_int, // 0=binary, 1=image, 2=document, 3=audio, 4=video, 5=text
     mime_ptr: ?[*]u8,
     mime_len: usize,
     description_ptr: ?[*]u8,
@@ -138,8 +141,8 @@ pub const TaluFileInfo = extern struct {
 
 /// Raster image metadata (only meaningful when TaluFileInfo.kind == 1, image).
 ///
-/// For documents (kind == 2), this struct stays zeroed — those formats have
-/// no intrinsic pixel dimensions.
+/// For all other kinds (document, audio, video, text, binary), this struct
+/// stays zeroed — only raster images have intrinsic pixel dimensions.
 pub const TaluImageInfo = extern struct {
     format: c_int, // 0=unknown, 1=jpeg, 2=png, 3=webp
     width: u32,
@@ -169,7 +172,7 @@ pub const TaluFileTransformOptions = extern struct {
 /// Per-format metadata for known file formats.
 /// Adding a new format? Add one entry here and a probeXxxMeta function.
 const FormatMeta = struct {
-    kind: c_int, // 1 = image, 2 = document
+    kind: c_int, // matches TaluFileInfo.kind
     format_id: c_int, // TaluImageInfo.format value (0 for documents)
     mime: []const u8,
     description: []const u8,
@@ -195,7 +198,7 @@ fn inspectFileImpl(input: []const u8, out: *TaluFileInfo, out_image: ?*TaluImage
         try setOwnedBytes(&out.mime_ptr, &out.mime_len, fm.mime);
         try setOwnedBytes(&out.description_ptr, &out.description_len, fm.description);
 
-        if (fm.kind == 1) { // image — populate raster metadata
+        if (fm.kind == 1) { // image: populate raster metadata
             if (out_image) |img| {
                 img.format = fm.format_id;
                 if (probeImageMeta(input, image_fmt)) |probe| {
@@ -215,8 +218,8 @@ fn inspectFileImpl(input: []const u8, out: *TaluFileInfo, out_image: ?*TaluImage
             out.description_ptr = desc.ptr;
             out.description_len = desc.len;
         }
-        // kind stays 0 (unknown). Fill gaps if libmagic also failed.
-        try classifyUnknownFallback(out, input);
+        // Fill MIME/description gaps and classify kind from MIME prefix.
+        try classifyByMime(out, input);
     }
 }
 
@@ -755,8 +758,10 @@ fn detectMagicString(bytes: []const u8, flags: c_int) !?[]u8 {
     return try allocator.dupe(u8, value);
 }
 
-/// Fill in MIME and description for unknown formats when libmagic failed.
-fn classifyUnknownFallback(out: *TaluFileInfo, bytes: []const u8) !void {
+/// Fill in MIME/description gaps when libmagic failed, then classify kind
+/// based on the MIME prefix. Runs only for formats not in our formatMeta table.
+fn classifyByMime(out: *TaluFileInfo, bytes: []const u8) !void {
+    // Ensure MIME and description are populated (fallback if libmagic failed).
     if (out.mime_ptr == null) {
         const mime: []const u8 = if (looksLikeText(bytes)) "text/plain" else "application/octet-stream";
         try setOwnedBytes(&out.mime_ptr, &out.mime_len, mime);
@@ -765,6 +770,46 @@ fn classifyUnknownFallback(out: *TaluFileInfo, bytes: []const u8) !void {
         const desc: []const u8 = if (looksLikeText(bytes)) "ASCII text" else "data";
         try setOwnedBytes(&out.description_ptr, &out.description_len, desc);
     }
+
+    // Classify kind from MIME. Known formats (image, document) are handled by
+    // formatMeta and never reach here; this covers libmagic-detected types.
+    if (out.mime_ptr) |mime_ptr| {
+        const mime = mime_ptr[0..out.mime_len];
+        if (std.mem.startsWith(u8, mime, "text/")) {
+            out.kind = 5; // text
+        } else if (std.mem.startsWith(u8, mime, "audio/")) {
+            out.kind = 3; // audio
+        } else if (std.mem.startsWith(u8, mime, "video/")) {
+            out.kind = 4; // video
+        } else if (isTextLikeApplication(mime)) {
+            out.kind = 5; // text (application/json, application/xml, etc.)
+        }
+        // else: stays 0 (binary)
+    }
+}
+
+/// Returns true for application/* MIME types that are human-readable text.
+fn isTextLikeApplication(mime: []const u8) bool {
+    const text_types = [_][]const u8{
+        "application/json",
+        "application/xml",
+        "application/javascript",
+        "application/yaml",
+        "application/x-yaml",
+        "application/toml",
+        "application/x-sh",
+        "application/x-shellscript",
+    };
+    for (text_types) |t| {
+        if (std.mem.eql(u8, mime, t)) return true;
+    }
+    // Structured syntax suffixes: application/*+json, application/*+xml
+    if (std.mem.startsWith(u8, mime, "application/")) {
+        if (std.mem.endsWith(u8, mime, "+json") or std.mem.endsWith(u8, mime, "+xml")) {
+            return true;
+        }
+    }
+    return false;
 }
 
 fn setOwnedBytes(out_ptr: *?[*]u8, out_len: *usize, value: []const u8) !void {

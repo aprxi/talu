@@ -251,7 +251,7 @@ pub async fn handle_upload(
     let mut resp_image: Option<FileImageMetadata> = None;
 
     if let Some(info) = inspection {
-        let kind_str = map_file_kind(&info.kind, &info.mime);
+        let kind_str = map_file_kind(&info.kind);
         doc_content.kind = Some(kind_str.to_string());
         doc_content.description = Some(info.description);
 
@@ -748,17 +748,14 @@ async fn inspect_blob_failsafe(
     }
 }
 
-fn map_file_kind(kind: &file::FileKind, mime: &str) -> &'static str {
+fn map_file_kind(kind: &file::FileKind) -> &'static str {
     match kind {
+        file::FileKind::Binary => "binary",
         file::FileKind::Image => "image",
         file::FileKind::Document => "document",
-        file::FileKind::Unknown => {
-            if mime.starts_with("text/") {
-                "text"
-            } else {
-                "binary"
-            }
-        }
+        file::FileKind::Audio => "audio",
+        file::FileKind::Video => "video",
+        file::FileKind::Text => "text",
     }
 }
 

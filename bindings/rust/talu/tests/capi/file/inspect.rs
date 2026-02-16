@@ -2,7 +2,7 @@
 //!
 //! Validates: content-based MIME detection, image metadata extraction
 //! (format, dimensions, EXIF orientation), kind classification
-//! (Image vs Unknown), and error paths.
+//! (Image, Document, Text, Audio, Video, Binary), and error paths.
 
 use talu::file::{self, FileKind, ImageFormat};
 
@@ -84,15 +84,15 @@ fn inspect_jpeg_with_exif_reports_orientation() {
 }
 
 // ---------------------------------------------------------------------------
-// Non-image detection: text and binary via FileKind::Unknown
+// Non-image detection: text and binary
 // ---------------------------------------------------------------------------
 
-/// ASCII text produces FileKind::Unknown with text/plain MIME.
+/// ASCII text produces FileKind::Text with text/plain MIME.
 #[test]
-fn inspect_ascii_text_returns_unknown_kind_with_text_mime() {
+fn inspect_ascii_text_returns_text_kind() {
     let info = file::inspect_bytes(b"Hello, world!").expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Unknown);
+    assert_eq!(info.kind, FileKind::Text);
     assert_eq!(info.mime, "text/plain");
     assert!(info.image.is_none());
     assert!(
@@ -102,13 +102,13 @@ fn inspect_ascii_text_returns_unknown_kind_with_text_mime() {
 }
 
 /// Binary data (sequential bytes with many non-printable chars) produces
-/// FileKind::Unknown with a non-text MIME.
+/// FileKind::Binary with a non-text MIME.
 #[test]
-fn inspect_binary_data_returns_unknown_kind_with_binary_mime() {
+fn inspect_binary_data_returns_binary_kind() {
     let garbage: Vec<u8> = (0..128).collect();
     let info = file::inspect_bytes(&garbage).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Unknown);
+    assert_eq!(info.kind, FileKind::Binary);
     assert!(
         !info.mime.starts_with("text/"),
         "binary data should not have text/ MIME, got: {}",
@@ -117,9 +117,9 @@ fn inspect_binary_data_returns_unknown_kind_with_binary_mime() {
     assert!(info.image.is_none());
 }
 
-/// ZIP magic bytes produce FileKind::Unknown (not an image) with non-text MIME.
+/// ZIP magic bytes produce FileKind::Binary with non-text MIME.
 #[test]
-fn inspect_zip_bytes_returns_unknown_kind() {
+fn inspect_zip_bytes_returns_binary_kind() {
     #[rustfmt::skip]
     let zip: &[u8] = &[
         0x50, 0x4B, 0x03, 0x04, // PK signature
@@ -130,7 +130,7 @@ fn inspect_zip_bytes_returns_unknown_kind() {
     ];
     let info = file::inspect_bytes(zip).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Unknown);
+    assert_eq!(info.kind, FileKind::Binary);
     assert!(info.image.is_none());
     assert!(
         !info.mime.starts_with("image/"),
@@ -139,9 +139,9 @@ fn inspect_zip_bytes_returns_unknown_kind() {
     );
 }
 
-/// ELF magic bytes produce FileKind::Unknown with non-text/non-image MIME.
+/// ELF magic bytes produce FileKind::Binary with non-text/non-image MIME.
 #[test]
-fn inspect_elf_bytes_returns_unknown_kind() {
+fn inspect_elf_bytes_returns_binary_kind() {
     #[rustfmt::skip]
     let elf: &[u8] = &[
         0x7F, 0x45, 0x4C, 0x46, // \x7fELF
@@ -152,7 +152,7 @@ fn inspect_elf_bytes_returns_unknown_kind() {
     ];
     let info = file::inspect_bytes(elf).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Unknown);
+    assert_eq!(info.kind, FileKind::Binary);
     assert!(info.image.is_none());
     assert!(
         !info.mime.starts_with("text/") && !info.mime.starts_with("image/"),
