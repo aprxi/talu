@@ -1643,7 +1643,7 @@ pub struct CGenerateConfig {
     pub top_p: f32,
     pub min_p: f32,
     pub repetition_penalty: f32,
-    pub stop_sequences: *const c_char,
+    pub stop_sequences: *const *const c_char,
     pub stop_sequence_count: usize,
     pub logit_bias: *const CLogitBiasEntry,
     pub logit_bias_count: usize,
@@ -2670,7 +2670,7 @@ extern "C" {
     // core/src/capi/router.zig
     pub fn talu_backend_get_capabilities(
         backend_type_raw: c_int,
-        backend_config: BackendUnion,
+        backend_config: *const BackendUnion,
         out_caps: *mut TaluCapabilities,
     ) -> c_int;
     // core/src/capi/router.zig

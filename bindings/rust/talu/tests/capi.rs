@@ -34,6 +34,7 @@ mod capi {
     }
 
     pub mod policy;
+    pub mod router;
     pub mod template;
     pub mod tensor;
     pub mod tokenizer;

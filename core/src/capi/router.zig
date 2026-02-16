@@ -91,9 +91,12 @@ pub const BackendCreateOptions = extern struct {
 // Generation API
 // =============================================================================
 
-/// Frees a generation result returned by talu_router_generate_with_backend or talu_router_stream_with_backend.
-pub export fn talu_router_result_free(result: *RouterGenerateResult) callconv(.c) void {
-    capi_bridge.freeResult(allocator, result);
+/// Frees a generation result returned by talu_router_generate_with_backend.
+///
+/// Passing null is a safe no-op.
+pub export fn talu_router_result_free(result: ?*RouterGenerateResult) callconv(.c) void {
+    const ptr = result orelse return;
+    capi_bridge.freeResult(allocator, ptr);
 }
 
 /// Closes all cached inference engines and frees their resources.
@@ -593,8 +596,11 @@ pub export fn talu_backend_list_models(backend: ?*TaluInferenceBackend) callconv
 }
 
 /// Free result from talu_backend_list_models.
-pub export fn talu_backend_list_models_free(result: *RemoteModelListResult) callconv(.c) void {
-    capi_bridge.freeModelListResult(allocator, result);
+///
+/// Passing null is a safe no-op.
+pub export fn talu_backend_list_models_free(result: ?*RemoteModelListResult) callconv(.c) void {
+    const ptr = result orelse return;
+    capi_bridge.freeModelListResult(allocator, ptr);
 }
 
 // =============================================================================
