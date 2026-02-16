@@ -343,12 +343,14 @@ pub async fn handle_list(
         Err(e) => return document_error_response(e),
     };
 
-    let rows = match docs.list(Some("file"), None, None, Some(marker_filter), limit) {
+    // Don't pass marker to the scan layer — it filters per-row before
+    // deduplication, so old versions with the previous marker leak through
+    // when a document's marker has been updated.  Filter after dedup instead.
+    let rows = match docs.list(Some("file"), None, None, None, limit) {
         Ok(v) => v,
         Err(e) => return document_error_response(e),
     };
 
-    let has_more = rows.len() >= limit as usize;
     let mut data = Vec::with_capacity(rows.len());
     for row in rows {
         let doc = match docs.get(&row.doc_id) {
@@ -360,9 +362,14 @@ pub async fn handle_list(
             Ok(d) => d,
             Err(resp) => return resp,
         };
-        data.push(to_file_object_response(descriptor));
+        let resp = to_file_object_response(descriptor);
+        let effective_marker = resp.marker.as_deref().unwrap_or("active");
+        if effective_marker == marker_filter {
+            data.push(resp);
+        }
     }
 
+    let has_more = data.len() >= limit as usize;
     json_response(
         StatusCode::OK,
         &FileListResponse {

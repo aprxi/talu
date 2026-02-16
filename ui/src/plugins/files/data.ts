@@ -107,12 +107,6 @@ export async function archiveFiles(): Promise<void> {
   const ids = [...fState.selectedIds];
   if (ids.length === 0) return;
 
-  const ok = await dialogs.confirm({
-    title: "Archive files",
-    message: `Archive ${ids.length} file${ids.length > 1 ? "s" : ""}?`,
-  });
-  if (!ok) return;
-
   let count = 0;
   for (const id of ids) {
     const result = await api.updateFile(id, { marker: "archived" });
