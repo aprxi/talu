@@ -325,7 +325,7 @@ ARCHITECTURES = {
     },
     "lfm2": {
         "name": "lfm2",
-        "model_types": ["lfm2"],
+        "model_types": ["lfm2", "lfm2_vl"],
         "module": "lfm2.lfm2",
         "block_class": "HybridBlock",
         "model_ids": ["LiquidAI/LFM2-350M"],

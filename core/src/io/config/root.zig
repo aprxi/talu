@@ -86,6 +86,13 @@ fn getObjectIntField(obj: std.json.ObjectMap, key: []const u8) ?i32 {
     };
 }
 
+fn getObjectFirstIntField(obj: std.json.ObjectMap, keys: []const []const u8) ?i32 {
+    for (keys) |key| {
+        if (getObjectIntField(obj, key)) |value| return value;
+    }
+    return null;
+}
+
 // =============================================================================
 // Architecture Detection
 // =============================================================================
@@ -604,14 +611,23 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         null;
 
     const vision_hidden_size = if (vision_obj) |obj| getObjectIntField(obj, "hidden_size") orelse 0 else 0;
-    const vision_depth = if (vision_obj) |obj| getObjectIntField(obj, "depth") orelse 0 else 0;
-    const vision_num_heads = if (vision_obj) |obj| getObjectIntField(obj, "num_heads") orelse 0 else 0;
+    const vision_depth = if (vision_obj) |obj| getObjectFirstIntField(obj, &.{ "depth", "num_hidden_layers" }) orelse 0 else 0;
+    const vision_num_heads = if (vision_obj) |obj| getObjectFirstIntField(obj, &.{ "num_heads", "num_attention_heads" }) orelse 0 else 0;
     const vision_intermediate_size = if (vision_obj) |obj| getObjectIntField(obj, "intermediate_size") orelse 0 else 0;
+    const projector_hidden_size = getObjectIntField(root_obj, "projector_hidden_size") orelse 0;
     const vision_out_hidden_size = if (vision_obj) |obj| getObjectIntField(obj, "out_hidden_size") orelse 0 else 0;
     const vision_patch_size = if (vision_obj) |obj| getObjectIntField(obj, "patch_size") orelse 0 else 0;
-    const vision_spatial_merge_size = if (vision_obj) |obj| getObjectIntField(obj, "spatial_merge_size") orelse 0 else 0;
-    const vision_temporal_patch_size = if (vision_obj) |obj| getObjectIntField(obj, "temporal_patch_size") orelse 0 else 0;
-    const vision_num_position_embeddings = if (vision_obj) |obj| getObjectIntField(obj, "num_position_embeddings") orelse 0 else 0;
+    const vision_spatial_merge_size = if (vision_obj) |obj|
+        getObjectIntField(obj, "spatial_merge_size") orelse
+            getObjectIntField(root_obj, "downsample_factor") orelse 1
+    else
+        0;
+    const vision_temporal_patch_size = if (vision_obj) |obj| getObjectIntField(obj, "temporal_patch_size") orelse 1 else 0;
+    const vision_num_position_embeddings = if (vision_obj) |obj| getObjectFirstIntField(obj, &.{ "num_position_embeddings", "num_patches" }) orelse 0 else 0;
+    const vision_max_num_patches = if (vision_obj != null)
+        getObjectIntField(root_obj, "max_num_patches") orelse vision_num_position_embeddings
+    else
+        0;
     var vision_probe_layers: [8]u16 = [_]u16{0} ** 8;
     var vision_probe_layer_count: u8 = 0;
     if (vision_obj) |obj| {
@@ -679,14 +695,16 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         .vision_depth = vision_depth,
         .vision_num_heads = vision_num_heads,
         .vision_intermediate_size = vision_intermediate_size,
+        .projector_hidden_size = projector_hidden_size,
         .vision_out_hidden_size = vision_out_hidden_size,
         .vision_patch_size = vision_patch_size,
         .vision_spatial_merge_size = vision_spatial_merge_size,
         .vision_temporal_patch_size = vision_temporal_patch_size,
         .vision_num_position_embeddings = vision_num_position_embeddings,
-        .image_token_id = getObjectIntField(root_obj, "image_token_id") orelse 0,
-        .vision_start_token_id = getObjectIntField(root_obj, "vision_start_token_id") orelse 0,
-        .vision_end_token_id = getObjectIntField(root_obj, "vision_end_token_id") orelse 0,
+        .vision_max_num_patches = vision_max_num_patches,
+        .image_token_id = getObjectFirstIntField(root_obj, &.{ "image_token_id", "image_token_index" }) orelse 0,
+        .vision_start_token_id = getObjectFirstIntField(root_obj, &.{ "vision_start_token_id", "image_start_token_id" }) orelse 0,
+        .vision_end_token_id = getObjectFirstIntField(root_obj, &.{ "vision_end_token_id", "image_end_token_id" }) orelse 0,
         .vision_probe_layer_count = vision_probe_layer_count,
         .vision_probe_layers = vision_probe_layers,
     };
@@ -1260,6 +1278,57 @@ test "loadConfig parses vision deepstack probe layers from vision_config" {
     try std.testing.expectEqual(@as(u16, 5), config.vision_probe_layers[0]);
     try std.testing.expectEqual(@as(u16, 11), config.vision_probe_layers[1]);
     try std.testing.expectEqual(@as(u16, 17), config.vision_probe_layers[2]);
+}
+
+test "loadConfig parses generic vision fallback fields and image token aliases" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "multimodal_vit",
+        \\  "image_token_index": 396,
+        \\  "downsample_factor": 2,
+        \\  "max_num_patches": 1024,
+        \\  "projector_hidden_size": 2560,
+        \\  "text_config": {
+        \\    "vocab_size": 32000,
+        \\    "hidden_size": 1024,
+        \\    "num_hidden_layers": 16,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "intermediate_size": 4096,
+        \\    "max_position_embeddings": 32768,
+        \\    "rms_norm_eps": 1e-6,
+        \\    "rope_theta": 1000000.0
+        \\  },
+        \\  "vision_config": {
+        \\    "hidden_size": 768,
+        \\    "num_hidden_layers": 12,
+        \\    "num_attention_heads": 12,
+        \\    "intermediate_size": 3072,
+        \\    "patch_size": 16,
+        \\    "num_patches": 256
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(@as(i32, 768), config.vision_hidden_size);
+    try std.testing.expectEqual(@as(i32, 12), config.vision_depth);
+    try std.testing.expectEqual(@as(i32, 12), config.vision_num_heads);
+    try std.testing.expectEqual(@as(i32, 3072), config.vision_intermediate_size);
+    try std.testing.expectEqual(@as(i32, 2560), config.projector_hidden_size);
+    try std.testing.expectEqual(@as(i32, 16), config.vision_patch_size);
+    try std.testing.expectEqual(@as(i32, 2), config.vision_spatial_merge_size);
+    try std.testing.expectEqual(@as(i32, 1), config.vision_temporal_patch_size);
+    try std.testing.expectEqual(@as(i32, 256), config.vision_num_position_embeddings);
+    try std.testing.expectEqual(@as(i32, 1024), config.vision_max_num_patches);
+    try std.testing.expectEqual(@as(i32, 396), config.image_token_id);
 }
 
 // Re-export behavioral types from generation.zig so check_coverage.sh --integration can verify test coverage

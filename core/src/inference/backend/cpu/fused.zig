@@ -838,9 +838,6 @@ pub const FusedCpuBackend = struct {
         if (parsed_total == half_dim and parsed[1] > 0 and parsed[2] > 0) {
             return .{ parsed[0], parsed[1], parsed[2] };
         }
-        if (half_dim == 64 and config.vision_hidden_size > 0) {
-            return .{ 24, 20, 20 };
-        }
         return .{ 0, 0, 0 };
     }
 

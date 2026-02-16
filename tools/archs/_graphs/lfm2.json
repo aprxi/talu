@@ -1,10 +1,12 @@
 {
   "name": "lfm2",
   "model_types": [
-    "lfm2"
+    "lfm2",
+    "lfm2_vl"
   ],
   "weight_prefixes": [
     "model.layers.{d}.",
+    "model.language_model.layers.{d}.",
     "layers.{d}.",
     "transformer.h.{d}.",
     "backbone.layers.{d}.",
@@ -390,6 +392,7 @@
       "id": "token_embeddings",
       "candidates": [
         "model.embed_tokens.weight",
+        "model.language_model.embed_tokens.weight",
         "embed_tokens.weight",
         "transformer.wte.weight",
         "backbone.embedding.weight",
@@ -404,6 +407,8 @@
       "id": "ln_final",
       "candidates": [
         "model.norm.weight",
+        "model.language_model.embedding_norm.weight",
+        "model.language_model.norm.weight",
         "norm.weight",
         "transformer.ln_f.weight",
         "backbone.norm.weight",
@@ -419,6 +424,7 @@
       "id": "lm_head",
       "candidates": [
         "lm_head.weight",
+        "model.language_model.lm_head.weight",
         "output.weight",
         "transformer.lm_head.weight",
         "language_model.lm_head.weight"

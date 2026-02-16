@@ -649,11 +649,13 @@ pub const ModelConfig = struct {
     vision_depth: i32 = 0,
     vision_num_heads: i32 = 0,
     vision_intermediate_size: i32 = 0,
+    projector_hidden_size: i32 = 0,
     vision_out_hidden_size: i32 = 0,
     vision_patch_size: i32 = 0,
     vision_spatial_merge_size: i32 = 0,
     vision_temporal_patch_size: i32 = 0,
     vision_num_position_embeddings: i32 = 0,
+    vision_max_num_patches: i32 = 0,
     // Vision special token IDs (0 means "unset")
     image_token_id: i32 = 0,
     vision_start_token_id: i32 = 0,

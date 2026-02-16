@@ -960,7 +960,7 @@ test "loadGenerationConfig reads token IDs from config.json text_config fallback
 
     const config_json =
         \\{
-        \\  "model_type": "qwen3_vl",
+        \\  "model_type": "multimodal_text_bridge",
         \\  "text_config": {
         \\    "bos_token_id": 151643,
         \\    "eos_token_id": 151645,

@@ -507,7 +507,7 @@ pub const LocalEngine = struct {
         const messages_json = try protocol.completions.serialize(
             self.allocator,
             chat.conv,
-            .{}, // Default options
+            .{ .image_content_type = .image },
         );
         defer self.allocator.free(messages_json);
 
@@ -693,8 +693,15 @@ pub const LocalEngine = struct {
         const encoded_tokens = try self.tok.encode(prompt);
         defer self.allocator.free(encoded_tokens);
 
+        const vision_boundaries = if (vision_prompt != null) self.resolveVisionBoundaryTokens() else VisionBoundaryTokens{};
         const prompt_tokens_no_bos = if (vision_prompt) |*vp|
-            try expandImagePadTokens(self.allocator, encoded_tokens, vp.prefill.image_token_id, vp.token_counts)
+            try expandImagePadTokens(
+                self.allocator,
+                encoded_tokens,
+                vp.prefill.image_token_id,
+                vp.token_counts,
+                vision_boundaries,
+            )
         else
             try self.allocator.dupe(u32, encoded_tokens);
         defer self.allocator.free(prompt_tokens_no_bos);
@@ -908,6 +915,11 @@ pub const LocalEngine = struct {
         }
     };
 
+    const VisionBoundaryTokens = struct {
+        start_token_id: ?u32 = null,
+        end_token_id: ?u32 = null,
+    };
+
     fn collectVisionPromptInput(self: *LocalEngine, chat: *Chat) !?VisionPromptInput {
         const image_count = countInputImageParts(chat);
         if (image_count == 0) return null;
@@ -988,6 +1000,14 @@ pub const LocalEngine = struct {
         const temporal_patch_size = try requirePositiveConfigU32(self.loaded.config.vision_temporal_patch_size);
         const spatial_merge_size = try requirePositiveConfigU32(self.loaded.config.vision_spatial_merge_size);
         const resize_factor = try std.math.mul(u32, patch_size, spatial_merge_size);
+        const fixed_pixels: u32 = blk: {
+            if (self.loaded.config.vision_num_position_embeddings <= 0) break :blk 0;
+            if (temporal_patch_size != 1 or spatial_merge_size != 1) break :blk 0;
+            const n_pos = std.math.cast(u64, self.loaded.config.vision_num_position_embeddings) orelse break :blk 0;
+            const patch_area = try std.math.mul(u64, patch_size, patch_size);
+            const pixels_u64 = try std.math.mul(u64, n_pos, patch_area);
+            break :blk std.math.cast(u32, pixels_u64) orelse return error.InvalidShape;
+        };
 
         return .{
             .normalize = .minus_one_to_one,
@@ -997,8 +1017,8 @@ pub const LocalEngine = struct {
             .spatial_merge_size = spatial_merge_size,
             .smart_resize = .{
                 .factor = resize_factor,
-                .min_pixels = 0,
-                .max_pixels = 0,
+                .min_pixels = fixed_pixels,
+                .max_pixels = fixed_pixels,
             },
         };
     }
@@ -1035,6 +1055,7 @@ pub const LocalEngine = struct {
         tokens: []const u32,
         image_token_id: u32,
         token_counts: []const usize,
+        boundaries: VisionBoundaryTokens,
     ) ![]u32 {
         if (token_counts.len == 0) return allocator.dupe(u32, tokens);
 
@@ -1044,10 +1065,29 @@ pub const LocalEngine = struct {
         }
         if (placeholders != token_counts.len) return error.InvalidPromptImageTokens;
 
-        var expanded_len = tokens.len;
-        for (token_counts) |count| {
+        var expanded_len: usize = 0;
+        var image_idx_for_len: usize = 0;
+        for (tokens, 0..) |tok, token_idx| {
+            if (tok != image_token_id) {
+                expanded_len += 1;
+                continue;
+            }
+
+            const count = token_counts[image_idx_for_len];
             if (count == 0) return error.InvalidImageDimensions;
-            expanded_len = try std.math.add(usize, expanded_len, count - 1);
+            expanded_len = try std.math.add(usize, expanded_len, count);
+
+            if (boundaries.start_token_id) |start_token_id| {
+                if (token_idx == 0 or tokens[token_idx - 1] != start_token_id) {
+                    expanded_len = try std.math.add(usize, expanded_len, 1);
+                }
+            }
+            if (boundaries.end_token_id) |end_token_id| {
+                if (token_idx + 1 >= tokens.len or tokens[token_idx + 1] != end_token_id) {
+                    expanded_len = try std.math.add(usize, expanded_len, 1);
+                }
+            }
+            image_idx_for_len += 1;
         }
 
         const out = try allocator.alloc(u32, expanded_len);
@@ -1055,11 +1095,23 @@ pub const LocalEngine = struct {
 
         var image_idx: usize = 0;
         var write_idx: usize = 0;
-        for (tokens) |tok| {
+        for (tokens, 0..) |tok, token_idx| {
             if (tok == image_token_id) {
                 const repeat = token_counts[image_idx];
+                if (boundaries.start_token_id) |start_token_id| {
+                    if (token_idx == 0 or tokens[token_idx - 1] != start_token_id) {
+                        out[write_idx] = start_token_id;
+                        write_idx += 1;
+                    }
+                }
                 @memset(out[write_idx .. write_idx + repeat], image_token_id);
                 write_idx += repeat;
+                if (boundaries.end_token_id) |end_token_id| {
+                    if (token_idx + 1 >= tokens.len or tokens[token_idx + 1] != end_token_id) {
+                        out[write_idx] = end_token_id;
+                        write_idx += 1;
+                    }
+                }
                 image_idx += 1;
             } else {
                 out[write_idx] = tok;
@@ -1069,6 +1121,37 @@ pub const LocalEngine = struct {
 
         if (write_idx != expanded_len or image_idx != token_counts.len) return error.InvalidPromptImageTokens;
         return out;
+    }
+
+    fn resolveVisionBoundaryTokens(self: *const LocalEngine) VisionBoundaryTokens {
+        var boundaries = VisionBoundaryTokens{};
+
+        boundaries.start_token_id = if (self.loaded.config.vision_start_token_id > 0)
+            std.math.cast(u32, self.loaded.config.vision_start_token_id)
+        else
+            null;
+        if (boundaries.start_token_id == null) {
+            boundaries.start_token_id = tokenIdByCandidates(&self.tok, &.{ "<|vision_start|>", "<|image_start|>" });
+        }
+
+        boundaries.end_token_id = if (self.loaded.config.vision_end_token_id > 0)
+            std.math.cast(u32, self.loaded.config.vision_end_token_id)
+        else
+            null;
+        if (boundaries.end_token_id == null) {
+            boundaries.end_token_id = tokenIdByCandidates(&self.tok, &.{ "<|vision_end|>", "<|image_end|>" });
+        }
+
+        return boundaries;
+    }
+
+    fn tokenIdByCandidates(tok: *const tokenizer_mod.Tokenizer, candidates: []const []const u8) ?u32 {
+        for (candidates) |name| {
+            const id_i32 = tok.tokenizer_handle.tokenToId(name) orelse continue;
+            if (id_i32 < 0) continue;
+            return std.math.cast(u32, id_i32) orelse continue;
+        }
+        return null;
     }
 
     /// Generate using legacy session.generate (for non-batching backends).
@@ -1500,7 +1583,7 @@ pub const LocalEngine = struct {
         const messages_json = try protocol.completions.serialize(
             self.allocator,
             chat.conv,
-            .{}, // Default options
+            .{ .image_content_type = .image },
         );
         defer self.allocator.free(messages_json);
 
@@ -1709,10 +1792,44 @@ test "expandImagePadTokens repeats placeholders per token count" {
     const tokens = [_]u32{ 10, 99, 11, 99, 12 };
     const token_counts = [_]usize{ 3, 1 };
 
-    const expanded = try LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts);
+    const expanded = try LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts, .{});
     defer allocator.free(expanded);
 
     try std.testing.expectEqualSlices(u32, &[_]u32{ 10, 99, 99, 99, 11, 99, 12 }, expanded);
+}
+
+test "expandImagePadTokens inserts boundary tokens around expanded image span" {
+    const allocator = std.testing.allocator;
+    const tokens = [_]u32{ 10, 99, 11 };
+    const token_counts = [_]usize{2};
+
+    const expanded = try LocalEngine.expandImagePadTokens(
+        allocator,
+        &tokens,
+        99,
+        &token_counts,
+        .{ .start_token_id = 7, .end_token_id = 8 },
+    );
+    defer allocator.free(expanded);
+
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 10, 7, 99, 99, 8, 11 }, expanded);
+}
+
+test "expandImagePadTokens preserves existing boundary tokens" {
+    const allocator = std.testing.allocator;
+    const tokens = [_]u32{ 10, 7, 99, 8, 11 };
+    const token_counts = [_]usize{3};
+
+    const expanded = try LocalEngine.expandImagePadTokens(
+        allocator,
+        &tokens,
+        99,
+        &token_counts,
+        .{ .start_token_id = 7, .end_token_id = 8 },
+    );
+    defer allocator.free(expanded);
+
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 10, 7, 99, 99, 99, 8, 11 }, expanded);
 }
 
 test "expandImagePadTokens rejects placeholder mismatch" {
@@ -1722,6 +1839,6 @@ test "expandImagePadTokens rejects placeholder mismatch" {
 
     try std.testing.expectError(
         error.InvalidPromptImageTokens,
-        LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts),
+        LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts, .{}),
     );
 }

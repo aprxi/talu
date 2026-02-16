@@ -140,6 +140,21 @@ pub const MultiHeadAttention = struct {
     /// Optional Flash Attention kernel (set at model load time if compatible).
     flash_attention_fn: ?FlashAttentionFn = null,
 
+    fn shouldUseFlash(
+        self: *const MultiHeadAttention,
+        use_cache: bool,
+        exact_softmax: bool,
+        sequence_len: usize,
+    ) bool {
+        return !use_cache and
+            !exact_softmax and
+            self.flash_attention_fn != null and
+            self.sinks == null and
+            self.is_causal and
+            self.n_heads == self.n_kv_heads and
+            sequence_len > FLASH_ATTENTION_THRESHOLD;
+    }
+
     pub fn forward(
         self: *const MultiHeadAttention,
         input_tensor: *const Tensor, // [1, sequence_len, d_model]
@@ -546,12 +561,7 @@ pub const MultiHeadAttention = struct {
             return;
         }
 
-        const can_use_flash = !use_cache and
-            !exact_softmax and
-            self.flash_attention_fn != null and
-            self.sinks == null and
-            self.n_heads == self.n_kv_heads and
-            sequence_len > FLASH_ATTENTION_THRESHOLD;
+        const can_use_flash = self.shouldUseFlash(use_cache, exact_softmax, sequence_len);
 
         if (can_use_flash) {
             const head_dim = self.head_dim;
@@ -1680,6 +1690,49 @@ fn forwardBatchedDecode(
 // =============================================================================
 // Unit Tests
 // =============================================================================
+
+fn noopFlashAttention(
+    _: [*]f32,
+    _: usize,
+    _: usize,
+    _: [*]const f32,
+    _: usize,
+    _: usize,
+    _: [*]const f32,
+    _: usize,
+    _: usize,
+    _: [*]const f32,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: usize,
+    _: f32,
+    _: usize,
+    _: usize,
+) void {}
+
+test "MultiHeadAttention.shouldUseFlash rejects non-causal prefill" {
+    var o_proj_data = [_]f32{0} ** 16;
+    const o_proj = Tensor.view2DSlice(&o_proj_data, 4, 4);
+    const mha = MultiHeadAttention{
+        .d_model = 8,
+        .n_heads = 2,
+        .n_kv_heads = 2,
+        .head_dim = 4,
+        .max_seq_len = 1024,
+        .scale = 0.5,
+        .is_causal = false,
+        .o_proj = &o_proj,
+        .allocator = std.testing.allocator,
+        .matmul_qkv = undefined,
+        .matmul_o = undefined,
+        .flash_attention_fn = noopFlashAttention,
+    };
+
+    try std.testing.expect(!mha.shouldUseFlash(false, false, FLASH_ATTENTION_THRESHOLD + 1));
+}
 
 test "MultiHeadAttention.forward RoPE position 0 identity" {
     const allocator = std.testing.allocator;

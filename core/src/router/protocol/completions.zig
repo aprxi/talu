@@ -49,11 +49,21 @@ const MessageData = responses_mod.MessageData;
 
 /// Options for Completions projection.
 pub const Options = struct {
+    pub const ImageContentType = enum {
+        image_url,
+        image,
+    };
+
     /// Include reasoning in output (emit summary as system message).
     include_reasoning: bool = false,
 
     /// Dereference item_reference items (look up and inline content).
     dereference_references: bool = true,
+
+    /// Content "type" value for image parts.
+    /// - `image_url`: OpenAI Chat Completions style.
+    /// - `image`: HF chat-template style (e.g., templates that emit `<image>`).
+    image_content_type: ImageContentType = .image_url,
 };
 
 /// Serialize a Conversation to Chat Completions JSON format.
@@ -178,7 +188,7 @@ pub fn serialize(
                     };
 
                     try writer.print("{{\"role\":\"{s}\",\"content\":", .{role_str});
-                    try writeMessageContent(writer, msg);
+                    try writeMessageContent(writer, msg, opts);
                     try writer.writeByte('}');
                 }
             },
@@ -365,7 +375,7 @@ const PendingAssistant = struct {
         }
 
         if (has_non_text) {
-            try writeContentPartsCompletions(buf_writer, msg.content.items);
+            try writeContentPartsCompletions(buf_writer, msg.content.items, .{});
         } else {
             try buf_writer.writeByte('"');
             for (msg.content.items) |*part| {
@@ -435,7 +445,7 @@ fn flushPendingAssistant(
 }
 
 /// Write message content (shared by assistant and non-assistant paths).
-fn writeMessageContent(writer: anytype, msg: *const MessageData) !void {
+fn writeMessageContent(writer: anytype, msg: *const MessageData, opts: Options) !void {
     // Check if multimodal
     var has_non_text = false;
     for (msg.content.items) |*part| {
@@ -449,7 +459,7 @@ fn writeMessageContent(writer: anytype, msg: *const MessageData) !void {
     }
 
     if (has_non_text) {
-        try writeContentPartsCompletions(writer, msg.content.items);
+        try writeContentPartsCompletions(writer, msg.content.items, opts);
     } else {
         try writer.writeByte('"');
         for (msg.content.items) |*part| {
@@ -480,7 +490,7 @@ fn writeToolCallsMessage(writer: anytype, tool_calls: []const PendingToolCall) !
 }
 
 /// Write content parts in Completions format (for multimodal).
-fn writeContentPartsCompletions(writer: anytype, parts: []const ContentPart) !void {
+fn writeContentPartsCompletions(writer: anytype, parts: []const ContentPart, opts: Options) !void {
     try writer.writeByte('[');
 
     for (parts, 0..) |*part, j| {
@@ -493,9 +503,21 @@ fn writeContentPartsCompletions(writer: anytype, parts: []const ContentPart) !vo
                 try writer.writeByte('}');
             },
             .input_image => |img| {
-                try writer.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
-                try writer.print("{f}", .{std.json.fmt(part.getData(), .{})});
-                try writer.print(",\"detail\":\"{s}\"}}}}", .{img.detail.toString()});
+                switch (opts.image_content_type) {
+                    .image_url => {
+                        try writer.writeAll("{\"type\":\"image_url\",\"image_url\":{\"url\":");
+                        try writer.print("{f}", .{std.json.fmt(part.getData(), .{})});
+                        try writer.print(",\"detail\":\"{s}\"}}}}", .{img.detail.toString()});
+                    },
+                    .image => {
+                        try writer.writeAll("{\"type\":\"image\",\"image\":");
+                        try writer.print("{f}", .{std.json.fmt(part.getData(), .{})});
+                        try writer.writeAll(",\"image_url\":{\"url\":");
+                        try writer.print("{f}", .{std.json.fmt(part.getData(), .{})});
+                        try writer.print(",\"detail\":\"{s}\"}}", .{img.detail.toString()});
+                        try writer.writeByte('}');
+                    },
+                }
             },
             else => {
                 // Other types: emit as generic data
@@ -603,6 +625,27 @@ test "serialize function calls (backward folding)" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_calls\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"role\":\"tool\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"tool_call_id\":\"call_123\"") != null);
+}
+
+test "serialize multimodal image content supports template image type option" {
+    const allocator = std.testing.allocator;
+
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    const user_msg = try conv.appendEmptyMessage(.user);
+    const image_part = try conv.addContentPart(user_msg, .input_image);
+    try image_part.appendData(allocator, "data:image/png;base64,AAAA");
+    conv.finalizeItem(user_msg);
+
+    const json_default = try serialize(allocator, conv, .{});
+    defer allocator.free(json_default);
+    try std.testing.expect(std.mem.indexOf(u8, json_default, "\"type\":\"image_url\"") != null);
+
+    const json_template = try serialize(allocator, conv, .{ .image_content_type = .image });
+    defer allocator.free(json_template);
+    try std.testing.expect(std.mem.indexOf(u8, json_template, "\"type\":\"image\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json_template, "\"image_url\"") != null);
 }
 
 // =============================================================================
