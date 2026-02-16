@@ -52,6 +52,7 @@ const BatchedKVCache = kernels.BatchedKVCache;
 const LayeredBatchedKVCache = kernels.LayeredBatchedKVCache;
 const BatchedAttnTemp = kernels.BatchedAttnTemp;
 const attn_mod = @import("kernels/attention.zig");
+const vision_runtime_mod = @import("vision_runtime.zig");
 
 /// Request for a single decode step.
 pub const DecodeRequest = struct {
@@ -91,6 +92,8 @@ pub const FusedCpuBackend = struct {
 
     /// Standard scratch (for FFN, etc.)
     scratch: cpu_blocks.ScratchBuffer,
+    /// Optional multimodal vision runtime (loaded for models with vision config).
+    vision_runtime: ?vision_runtime_mod.VisionRuntime = null,
 
     /// Per-sequence hidden buffers [max_batch_size][d_model]
     hidden_buffers: []f32,
@@ -106,6 +109,8 @@ pub const FusedCpuBackend = struct {
 
     /// Per-sequence logits buffers [max_batch_size][vocab_size]
     logits_buffers: []f32,
+    /// Per-slot RoPE position delta used during decode for multimodal prompts.
+    slot_rope_position_deltas: []isize,
 
     // Model dimensions
     d_model: usize,
@@ -121,6 +126,7 @@ pub const FusedCpuBackend = struct {
     prefill_progress_ctx: ?*anyopaque = null,
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
+    pub const PrefillVisionInput = vision_runtime_mod.PrefillVisionInput;
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -173,6 +179,9 @@ pub const FusedCpuBackend = struct {
             layer_total,
         );
         errdefer scratch.deinit();
+
+        var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
+        errdefer if (vision_runtime) |*rt| rt.deinit();
 
         // Initialize Mamba state for heterogeneous models
         var mamba_layer_count: usize = 0;
@@ -265,6 +274,9 @@ pub const FusedCpuBackend = struct {
 
         const logits_buffers = try allocator.alloc(f32, max_batch_size * vocab_size);
         errdefer allocator.free(logits_buffers);
+        const slot_rope_position_deltas = try allocator.alloc(isize, max_batch_size);
+        errdefer allocator.free(slot_rope_position_deltas);
+        @memset(slot_rope_position_deltas, 0);
 
         return FusedCpuBackend{
             .allocator = allocator,
@@ -274,11 +286,13 @@ pub const FusedCpuBackend = struct {
             .kv_cache = kv_cache,
             .batched_attn_scratch = batched_attn_scratch,
             .scratch = scratch,
+            .vision_runtime = vision_runtime,
             .hidden_buffers = hidden_buffers,
             .norm_buffers = norm_buffers,
             .attn_out_buffers = attn_out_buffers,
             .ffn_out_buffers = ffn_out_buffers,
             .logits_buffers = logits_buffers,
+            .slot_rope_position_deltas = slot_rope_position_deltas,
             .d_model = model_width,
             .vocab_size = vocab_size,
             .max_batch_size = max_batch_size,
@@ -290,11 +304,15 @@ pub const FusedCpuBackend = struct {
     }
 
     pub fn deinit(self: *FusedCpuBackend) void {
+        if (self.vision_runtime) |*vision| {
+            vision.deinit();
+        }
         self.allocator.free(self.logits_buffers);
         self.allocator.free(self.ffn_out_buffers);
         self.allocator.free(self.attn_out_buffers);
         self.allocator.free(self.norm_buffers);
         self.allocator.free(self.hidden_buffers);
+        self.allocator.free(self.slot_rope_position_deltas);
         self.allocator.free(self.model.layers);
         self.scratch.deinit();
         self.batched_attn_scratch.deinit();
@@ -308,17 +326,21 @@ pub const FusedCpuBackend = struct {
 
     /// Allocate a slot for a new sequence.
     pub fn allocSlot(self: *FusedCpuBackend) ?usize {
-        return self.kv_cache.allocSlot();
+        const slot = self.kv_cache.allocSlot() orelse return null;
+        self.slot_rope_position_deltas[slot] = 0;
+        return slot;
     }
 
     /// Free a slot when sequence completes.
     pub fn freeSlot(self: *FusedCpuBackend, slot_index: usize) void {
         self.kv_cache.freeSlot(slot_index);
+        self.slot_rope_position_deltas[slot_index] = 0;
     }
 
     /// Reset a slot for reuse (new conversation in same slot).
     pub fn resetSlot(self: *FusedCpuBackend, slot_index: usize) void {
         self.kv_cache.resetSlot(slot_index);
+        self.slot_rope_position_deltas[slot_index] = 0;
     }
 
     /// Get current position for a slot.
@@ -345,6 +367,8 @@ pub const FusedCpuBackend = struct {
     pub fn decode(self: *FusedCpuBackend, token: u32, position: usize, logits_out: []f32) !void {
         const model_dim = self.d_model;
         const token_ids = &[_]u32{token};
+        self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[0]);
+        defer self.setPositionDeltaForTextLayers(0);
 
         // 1. Get embedding for the token
         const hidden_buffer = self.getHiddenBuffer(0);
@@ -395,6 +419,8 @@ pub const FusedCpuBackend = struct {
 
         var current_token = first_token;
         var generated_count: usize = 0;
+        self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[0]);
+        defer self.setPositionDeltaForTextLayers(0);
 
         const model_dim = self.d_model;
         const hidden_buffer = self.getHiddenBuffer(0);
@@ -461,6 +487,8 @@ pub const FusedCpuBackend = struct {
         const hidden_buffer = self.getHiddenBuffer(slot_index);
         const logits_buffer = self.getLogitsBuffer(slot_index);
         const token_ids = &[_]u32{token};
+        self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[slot_index]);
+        defer self.setPositionDeltaForTextLayers(0);
 
         // 1. Get embedding
         var hidden_view_3d = Tensor.view3D(
@@ -526,6 +554,17 @@ pub const FusedCpuBackend = struct {
         tokens: []const u32,
         logits_out: []f32,
     ) !void {
+        return self.prefillSlotWithVision(slot_index, tokens, null, logits_out);
+    }
+
+    /// Prefill with optional preprocessed vision input.
+    pub fn prefillSlotWithVision(
+        self: *FusedCpuBackend,
+        slot_index: usize,
+        tokens: []const u32,
+        vision_input: ?*const PrefillVisionInput,
+        logits_out: []f32,
+    ) !void {
         const prompt_len = tokens.len;
         if (prompt_len == 0) return;
 
@@ -533,6 +572,7 @@ pub const FusedCpuBackend = struct {
 
         // Reset the slot in batched cache
         self.kv_cache.resetSlot(slot_index);
+        self.slot_rope_position_deltas[slot_index] = 0;
 
         // Allocate prefill buffer
         const prefill_buffer = try self.allocator.alloc(f32, prompt_len * model_dim);
@@ -550,6 +590,87 @@ pub const FusedCpuBackend = struct {
         log.debug("inference", "Prefill: embedding", .{ .prompt_len = prompt_len }, @src());
         try self.model.embed_tokens.forward(tokens, &prefill_view_3d);
         applyEmbeddingScaling(&self.loaded.config, prefill_buffer);
+
+        // Optional multimodal scatter for image placeholders.
+        var deepstack_ctx: ?Transformer.DeepstackAdditions = null;
+        var image_token_positions: []usize = &.{};
+        defer if (image_token_positions.len > 0) self.allocator.free(image_token_positions);
+        var encoded_vision_output: ?vision_runtime_mod.EncodedVisionOutput = null;
+        defer if (encoded_vision_output) |*encoded| encoded.deinit(self.allocator);
+        var text_mrope_cos: []f32 = &.{};
+        var text_mrope_sin: []f32 = &.{};
+        var text_mrope_enabled = false;
+        defer if (text_mrope_cos.len > 0) self.allocator.free(text_mrope_cos);
+        defer if (text_mrope_sin.len > 0) self.allocator.free(text_mrope_sin);
+        defer if (text_mrope_enabled) self.clearRuntimeRoPEForTextLayers();
+
+        if (vision_input) |vi| {
+            const vision = if (self.vision_runtime) |*rt|
+                rt
+            else
+                return error.UnsupportedContentType;
+            encoded_vision_output = try vision.encodeImages(vi.images);
+            const encoded = &encoded_vision_output.?;
+
+            try vision_runtime_mod.scatterVisionEmbeddings(
+                prefill_buffer,
+                prompt_len,
+                model_dim,
+                tokens,
+                vi.image_token_id,
+                encoded.merged_embeddings,
+            );
+
+            if (encoded.deepstack_layer_embeddings.len > 0) {
+                image_token_positions = try collectTokenPositions(self.allocator, tokens, vi.image_token_id);
+                if (image_token_positions.len == 0) return error.InvalidPromptImageTokens;
+                const expected_values = image_token_positions.len * model_dim;
+                const layer0_values = if (encoded.deepstack_layer_embeddings.len > 0)
+                    encoded.deepstack_layer_embeddings[0].len
+                else
+                    0;
+                log.debug("inference", "Vision deepstack prepared", .{
+                    .image_positions = image_token_positions.len,
+                    .expected_values = expected_values,
+                    .layer_count = encoded.deepstack_layer_embeddings.len,
+                    .layer0_values = layer0_values,
+                }, @src());
+                deepstack_ctx = .{
+                    .positions = image_token_positions,
+                    .layer_features = encoded.deepstack_layer_embeddings,
+                };
+            }
+
+            const mrope_section = resolveMropeSection(&self.loaded.config, self.head_dim);
+            const mrope_total = mrope_section[0] + mrope_section[1] + mrope_section[2];
+            if (mrope_total > 0) {
+                const spatial_merge = std.math.cast(usize, self.loaded.config.vision_spatial_merge_size) orelse return error.InvalidShape;
+                const tables = try buildMultimodalMropeTables(
+                    self.allocator,
+                    tokens,
+                    vi.images,
+                    vi.image_token_id,
+                    spatial_merge,
+                    self.head_dim,
+                    self.loaded.config.rope_theta,
+                    mrope_section,
+                );
+                text_mrope_cos = tables.cos;
+                text_mrope_sin = tables.sin;
+                self.slot_rope_position_deltas[slot_index] = tables.position_delta;
+                try self.setRuntimeRoPEForTextLayers(text_mrope_cos, text_mrope_sin, self.head_dim);
+                text_mrope_enabled = true;
+                log.debug("inference", "Text MRoPE prepared", .{
+                    .seq_len = prompt_len,
+                    .head_dim = self.head_dim,
+                    .section_t = mrope_section[0],
+                    .section_h = mrope_section[1],
+                    .section_w = mrope_section[2],
+                    .position_delta = self.slot_rope_position_deltas[slot_index],
+                }, @src());
+            }
+        }
+
         if (trace.isEnabled()) {
             trace.emit(
                 .embed,
@@ -576,7 +697,26 @@ pub const FusedCpuBackend = struct {
             self.model.prefill_progress_ctx = null;
         }
 
-        try self.model.forwardWithBatchedCache(&prefill_view_3d, &prefill_view_3d, &self.scratch, &self.kv_cache, slot_index, false);
+        if (deepstack_ctx) |*ctx| {
+            try self.model.forwardWithBatchedCacheWithDeepstack(
+                &prefill_view_3d,
+                &prefill_view_3d,
+                &self.scratch,
+                &self.kv_cache,
+                slot_index,
+                false,
+                ctx,
+            );
+        } else {
+            try self.model.forwardWithBatchedCache(
+                &prefill_view_3d,
+                &prefill_view_3d,
+                &self.scratch,
+                &self.kv_cache,
+                slot_index,
+                false,
+            );
+        }
         log.debug("inference", "Prefill: forward done", .{ .prompt_len = prompt_len }, @src());
 
         // 3. Final layer norm on last position
@@ -624,6 +764,242 @@ pub const FusedCpuBackend = struct {
         }
     }
 
+    fn collectTokenPositions(
+        allocator: std.mem.Allocator,
+        token_ids: []const u32,
+        needle: u32,
+    ) ![]usize {
+        var count: usize = 0;
+        for (token_ids) |token| {
+            if (token == needle) count += 1;
+        }
+        if (count == 0) return &.{};
+
+        const positions = try allocator.alloc(usize, count);
+        errdefer allocator.free(positions);
+
+        var write_idx: usize = 0;
+        for (token_ids, 0..) |token, idx| {
+            if (token != needle) continue;
+            positions[write_idx] = idx;
+            write_idx += 1;
+        }
+        std.debug.assert(write_idx == count);
+        return positions;
+    }
+
+    fn setRuntimeRoPEForTextLayers(
+        self: *FusedCpuBackend,
+        cos: []const f32,
+        sin: []const f32,
+        dim: usize,
+    ) !void {
+        if (cos.len != sin.len) return error.InvalidShape;
+        for (self.model.layers) |layer| {
+            var block_mut: *cpu_blocks.TransformerBlock = @constCast(layer.block);
+            if (block_mut.getAttentionMut()) |attn| {
+                attn.runtime_rope = .{
+                    .cos = cos,
+                    .sin = sin,
+                    .dim = dim,
+                };
+            }
+        }
+    }
+
+    fn clearRuntimeRoPEForTextLayers(self: *FusedCpuBackend) void {
+        for (self.model.layers) |layer| {
+            var block_mut: *cpu_blocks.TransformerBlock = @constCast(layer.block);
+            if (block_mut.getAttentionMut()) |attn| {
+                attn.runtime_rope = null;
+            }
+        }
+    }
+
+    fn setPositionDeltaForTextLayers(self: *FusedCpuBackend, delta: isize) void {
+        for (self.model.layers) |layer| {
+            var block_mut: *cpu_blocks.TransformerBlock = @constCast(layer.block);
+            if (block_mut.getAttentionMut()) |attn| {
+                attn.position_delta = delta;
+            }
+        }
+    }
+
+    const MropeTables = struct {
+        cos: []f32,
+        sin: []f32,
+        position_delta: isize,
+    };
+
+    fn resolveMropeSection(config: *const tensor.ModelConfig, head_dim: usize) [3]usize {
+        const half_dim = head_dim / 2;
+        const parsed = config.rope_scaling.mrope_section;
+        const parsed_total = @as(usize, parsed[0]) + @as(usize, parsed[1]) + @as(usize, parsed[2]);
+        if (parsed_total == half_dim and parsed[1] > 0 and parsed[2] > 0) {
+            return .{ parsed[0], parsed[1], parsed[2] };
+        }
+        if (half_dim == 64 and config.vision_hidden_size > 0) {
+            return .{ 24, 20, 20 };
+        }
+        return .{ 0, 0, 0 };
+    }
+
+    fn buildMultimodalMropeTables(
+        allocator: std.mem.Allocator,
+        tokens: []const u32,
+        images: []const vision_runtime_mod.PrefillVisionImage,
+        image_token_id: u32,
+        spatial_merge_size: usize,
+        head_dim: usize,
+        rope_theta: f32,
+        mrope_section: [3]usize,
+    ) !MropeTables {
+        if (tokens.len == 0) return .{ .cos = &.{}, .sin = &.{}, .position_delta = 0 };
+        if ((head_dim % 2) != 0 or mrope_section[0] + mrope_section[1] + mrope_section[2] != head_dim / 2) {
+            return error.InvalidShape;
+        }
+
+        const seq_len = tokens.len;
+        const pos_t = try allocator.alloc(u32, seq_len);
+        defer allocator.free(pos_t);
+        const pos_h = try allocator.alloc(u32, seq_len);
+        defer allocator.free(pos_h);
+        const pos_w = try allocator.alloc(u32, seq_len);
+        defer allocator.free(pos_w);
+
+        try buildMultimodalMropePositions(
+            tokens,
+            images,
+            image_token_id,
+            spatial_merge_size,
+            pos_t,
+            pos_h,
+            pos_w,
+        );
+
+        const half_dim = head_dim / 2;
+        const inv_freq = try allocator.alloc(f32, half_dim);
+        defer allocator.free(inv_freq);
+        for (0..half_dim) |idx| {
+            const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(head_dim));
+            inv_freq[idx] = 1.0 / std.math.pow(f32, rope_theta, exponent);
+        }
+
+        const cos = try allocator.alloc(f32, seq_len * head_dim);
+        errdefer allocator.free(cos);
+        const sin = try allocator.alloc(f32, seq_len * head_dim);
+        errdefer allocator.free(sin);
+
+        const h_limit = mrope_section[1] * 3;
+        const w_limit = mrope_section[2] * 3;
+        for (0..seq_len) |token_idx| {
+            const base = token_idx * head_dim;
+            for (0..half_dim) |freq_idx| {
+                var pos_component = pos_t[token_idx];
+                if (freq_idx < h_limit and (freq_idx % 3) == 1) pos_component = pos_h[token_idx];
+                if (freq_idx < w_limit and (freq_idx % 3) == 2) pos_component = pos_w[token_idx];
+
+                const angle = @as(f32, @floatFromInt(pos_component)) * inv_freq[freq_idx];
+                const c = @cos(angle);
+                const s = @sin(angle);
+                cos[base + freq_idx] = c;
+                sin[base + freq_idx] = s;
+                cos[base + half_dim + freq_idx] = c;
+                sin[base + half_dim + freq_idx] = s;
+            }
+        }
+
+        var max_pos: u32 = 0;
+        for (0..seq_len) |idx| {
+            max_pos = @max(max_pos, pos_t[idx]);
+            max_pos = @max(max_pos, pos_h[idx]);
+            max_pos = @max(max_pos, pos_w[idx]);
+        }
+        const delta_i64 = (@as(i64, max_pos) + 1) - @as(i64, @intCast(seq_len));
+        const position_delta = std.math.cast(isize, delta_i64) orelse return error.InvalidShape;
+
+        return .{
+            .cos = cos,
+            .sin = sin,
+            .position_delta = position_delta,
+        };
+    }
+
+    fn buildMultimodalMropePositions(
+        tokens: []const u32,
+        images: []const vision_runtime_mod.PrefillVisionImage,
+        image_token_id: u32,
+        spatial_merge_size: usize,
+        pos_t: []u32,
+        pos_h: []u32,
+        pos_w: []u32,
+    ) !void {
+        if (pos_t.len != tokens.len or pos_h.len != tokens.len or pos_w.len != tokens.len) return error.InvalidShape;
+        if (spatial_merge_size == 0) return error.InvalidShape;
+
+        var image_idx: usize = 0;
+        var scan_pos: usize = 0;
+        var write_pos: usize = 0;
+        var next_base: u32 = 0;
+
+        while (image_idx < images.len) {
+            const image_start = std.mem.indexOfScalarPos(u32, tokens, scan_pos, image_token_id) orelse return error.InvalidPromptImageTokens;
+            const text_len = image_start - scan_pos;
+
+            for (0..text_len) |offset| {
+                const step: u32 = @intCast(offset);
+                const pos = next_base + step;
+                pos_t[write_pos] = pos;
+                pos_h[write_pos] = pos;
+                pos_w[write_pos] = pos;
+                write_pos += 1;
+            }
+            next_base += @intCast(text_len);
+
+            const img = images[image_idx];
+            const grid_t: usize = @intCast(img.grid.temporal);
+            const grid_h: usize = @intCast(img.grid.height);
+            const grid_w: usize = @intCast(img.grid.width);
+            if ((grid_h % spatial_merge_size) != 0 or (grid_w % spatial_merge_size) != 0) return error.InvalidPromptImageTokens;
+
+            const llm_h = grid_h / spatial_merge_size;
+            const llm_w = grid_w / spatial_merge_size;
+            const image_tokens = grid_t * llm_h * llm_w;
+            if (image_tokens != img.token_count) return error.InvalidPromptImageTokens;
+
+            for (0..grid_t) |t_idx| {
+                for (0..llm_h) |h_idx| {
+                    for (0..llm_w) |w_idx| {
+                        pos_t[write_pos] = next_base + @as(u32, @intCast(t_idx));
+                        pos_h[write_pos] = next_base + @as(u32, @intCast(h_idx));
+                        pos_w[write_pos] = next_base + @as(u32, @intCast(w_idx));
+                        write_pos += 1;
+                    }
+                }
+            }
+
+            const advance = @max(grid_t, @max(llm_h, llm_w));
+            next_base += @as(u32, @intCast(advance));
+            scan_pos = image_start + image_tokens;
+            image_idx += 1;
+        }
+
+        if (std.mem.indexOfScalarPos(u32, tokens, scan_pos, image_token_id) != null) return error.InvalidPromptImageTokens;
+
+        const trailing_len = tokens.len - scan_pos;
+        for (0..trailing_len) |offset| {
+            const step: u32 = @intCast(offset);
+            const pos = next_base + step;
+            pos_t[write_pos] = pos;
+            pos_h[write_pos] = pos;
+            pos_w[write_pos] = pos;
+            write_pos += 1;
+        }
+        if (write_pos != tokens.len) return error.InvalidPromptImageTokens;
+
+        // Model-specific template validation can be layered on top of this generic position builder.
+    }
+
     // =========================================================================
     // Batched Decode
     // =========================================================================
@@ -657,6 +1033,7 @@ pub const FusedCpuBackend = struct {
         if (request_total == 0) return;
         std.debug.assert(results.len >= request_total);
         std.debug.assert(request_total <= self.max_batch_size);
+        defer self.setPositionDeltaForTextLayers(0);
 
         const model_width = self.d_model;
 
@@ -665,6 +1042,7 @@ pub const FusedCpuBackend = struct {
         for (requests, 0..) |request, request_index| {
             const hidden_values = self.getHiddenBuffer(request.slot_index);
             const token_ids = &[_]u32{request.token};
+            self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[request.slot_index]);
 
             // 1. Get embedding
             var hidden_tensor_view = Tensor.view3D(
@@ -1246,6 +1624,53 @@ test "decode applyLogitsScaling inverse" {
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), values[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 6.0), values[2], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 8.0), values[3], 0.001);
+}
+
+test "buildMultimodalMropeTables computes multimodal decode position_delta" {
+    const allocator = std.testing.allocator;
+    const image_token_id: u32 = 151655;
+    const vision_start_token_id: u32 = 151652;
+    const vision_end_token_id: u32 = 151653;
+    const seq_len: usize = 198;
+    const image_span: usize = 169;
+    const image_start: usize = 15;
+
+    const tokens = try allocator.alloc(u32, seq_len);
+    defer allocator.free(tokens);
+    @memset(tokens, 42);
+    tokens[image_start - 1] = vision_start_token_id;
+    for (0..image_span) |idx| tokens[image_start + idx] = image_token_id;
+    tokens[image_start + image_span] = vision_end_token_id;
+
+    const images = [_]vision_runtime_mod.PrefillVisionImage{
+        .{
+            .pixels = &.{},
+            .width = 416,
+            .height = 416,
+            .grid = .{ .temporal = 1, .height = 26, .width = 26 },
+            .token_count = image_span,
+        },
+    };
+
+    const tables = try FusedCpuBackend.buildMultimodalMropeTables(
+        allocator,
+        tokens,
+        images[0..],
+        image_token_id,
+        2,
+        128,
+        5_000_000.0,
+        .{ 24, 20, 20 },
+    );
+    defer allocator.free(tables.cos);
+    defer allocator.free(tables.sin);
+
+    try std.testing.expectEqual(seq_len * 128, tables.cos.len);
+    try std.testing.expectEqual(seq_len * 128, tables.sin.len);
+    // Matches HF rope_deltas behavior for this prompt shape:
+    // max multimodal pos id is 41, so next decode pos starts at 42.
+    // delta = 42 - 198 = -156.
+    try std.testing.expectEqual(@as(isize, -156), tables.position_delta);
 }
 
 test "allocSlot LayeredBatchedKVCache" {

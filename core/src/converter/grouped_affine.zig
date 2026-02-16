@@ -110,10 +110,16 @@ pub fn convertToGroupedAffine(
         };
         if (std.fs.cwd().openDir(output_dir_path, .{})) |d| {
             var dir = d;
+            if (isCompleteConversionOutput(dir)) {
+                dir.close();
+                // Idempotent: already converted, return the existing path
+                log.info("convert", "Output already exists, skipping", .{ .path = output_dir_path });
+                return output_dir_path;
+            }
             dir.close();
-            // Idempotent: already converted, return the existing path
-            log.info("convert", "Output already exists, skipping", .{ .path = output_dir_path });
-            return output_dir_path;
+            // Incomplete output (e.g. failed prior conversion): clean and retry.
+            log.warn("convert", "Removing incomplete output directory before conversion", .{ .path = output_dir_path });
+            try std.fs.cwd().deleteTree(output_dir_path);
         } else |_| {}
     }
 
@@ -134,6 +140,8 @@ pub fn convertToGroupedAffine(
     }
 
     // 8. Create output directory structure
+    var keep_output = false;
+    errdefer if (!keep_output) std.fs.cwd().deleteTree(output_dir_path) catch {};
     var output_dir = try gaf_paths.GAFModelDir.init(allocator, output_dir_path);
     defer output_dir.deinit();
 
@@ -208,7 +216,16 @@ pub fn convertToGroupedAffine(
         log.warn("converter", "Failed to generate model card", .{ .err = @errorName(err) });
     };
 
+    keep_output = true;
     return output_dir_path;
+}
+
+fn isCompleteConversionOutput(dir: std.fs.Dir) bool {
+    dir.access("config.json", .{}) catch return false;
+    dir.access("model.safetensors", .{}) catch {
+        dir.access("model.safetensors.index.json", .{}) catch return false;
+    };
+    return true;
 }
 
 /// Quantize all tensors and write to SafeTensors file.
@@ -687,6 +704,25 @@ test "ConvertOptions: without quantization (preserve precision)" {
         .output_dir = "output",
     };
     try std.testing.expect(options.quant == null);
+}
+
+test "isCompleteConversionOutput requires config and weights" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = "{}" });
+    {
+        var dir = try tmp.dir.openDir(".", .{});
+        defer dir.close();
+        try std.testing.expect(!isCompleteConversionOutput(dir));
+    }
+
+    try tmp.dir.writeFile(.{ .sub_path = "model.safetensors", .data = "x" });
+    {
+        var dir = try tmp.dir.openDir(".", .{});
+        defer dir.close();
+        try std.testing.expect(isCompleteConversionOutput(dir));
+    }
 }
 
 // =============================================================================

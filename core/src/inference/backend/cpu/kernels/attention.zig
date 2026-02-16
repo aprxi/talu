@@ -74,6 +74,15 @@ pub const AttnCache = struct {
 
 /// Multi-head attention layer with grouped query attention support.
 pub const MultiHeadAttention = struct {
+    pub const RuntimeRoPE = struct {
+        /// Flat table [seq_len * dim]
+        cos: []const f32,
+        /// Flat table [seq_len * dim]
+        sin: []const f32,
+        /// Rotary width applied to each head.
+        dim: usize,
+    };
+
     d_model: usize,
     n_heads: usize,
     n_kv_heads: usize,
@@ -98,6 +107,13 @@ pub const MultiHeadAttention = struct {
     o_proj: *const Tensor,
     fused_qkv: ?Tensor = null,
     rope: ?*RoPE = null,
+    /// Optional per-token precomputed RoPE table (used by multimodal vision prefill).
+    /// When set, this overrides `rope` for prefill-style calls.
+    runtime_rope: ?RuntimeRoPE = null,
+    /// Optional signed offset applied to static RoPE positions.
+    /// Used for multimodal decode where generated token positions continue from
+    /// M-RoPE text positions rather than raw prompt length.
+    position_delta: isize = 0,
     // QKNorm (optional) - applied after Q/K projection, before RoPE
     q_norm: ?*const Tensor = null,
     k_norm: ?*const Tensor = null,
@@ -227,11 +243,24 @@ pub const MultiHeadAttention = struct {
         // Note: For partial rotary, rope.dim < head_dim. We only apply RoPE
         // to the first rope.dim dimensions, leaving the rest unchanged.
         const pos_offset = if (use_cache) cache.cache_position else 0;
-        if (self.rope) |rope| {
+        if (self.runtime_rope) |runtime_rope| {
+            try applyRuntimeRoPE(
+                query_view.asSlice(f32),
+                key_view.asSlice(f32),
+                sequence_len,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                query_dim,
+                kv_total_dim,
+                pos_offset,
+                runtime_rope,
+            );
+        } else if (self.rope) |rope| {
             const rope_dim = rope.dim;
             var token_index: usize = 0;
             while (token_index < sequence_len) : (token_index += 1) {
-                const pos = pos_offset + token_index;
+                const pos = try applyPositionDelta(pos_offset + token_index, self.position_delta);
                 var head_index: usize = 0;
                 while (head_index < self.n_heads) : (head_index += 1) {
                     const offset = token_index * query_dim + head_index * self.head_dim;
@@ -496,7 +525,7 @@ pub const MultiHeadAttention = struct {
             }
             if (trace.isEnabled()) {
                 const trace_position_out: u32 = @intCast(cache.cache_position);
-                    trace.emit(
+                trace.emit(
                     .attn_out,
                     self.layer_idx,
                     0,
@@ -918,10 +947,23 @@ pub const MultiHeadAttention = struct {
         const pos_offset = if (use_cache) cache_position else 0;
 
         // Apply RoPE (after QKNorm)
-        if (self.rope) |rope| {
+        if (self.runtime_rope) |runtime_rope| {
+            try applyRuntimeRoPE(
+                query_view.asSlice(f32),
+                key_view.asSlice(f32),
+                sequence_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                query_dim,
+                kv_total_dim,
+                pos_offset,
+                runtime_rope,
+            );
+        } else if (self.rope) |rope| {
             const rope_dim = rope.dim;
             for (0..sequence_len) |token_index| {
-                const pos = pos_offset + token_index;
+                const pos = try applyPositionDelta(pos_offset + token_index, self.position_delta);
                 for (0..n_heads) |head_index| {
                     const offset = token_index * query_dim + head_index * head_dim;
                     rope.applyInPlace(query_view.asSlice(f32)[offset .. offset + rope_dim], pos);
@@ -943,7 +985,7 @@ pub const MultiHeadAttention = struct {
             trace.emit(.attn_k, self.layer_idx, 0, trace_pos, key_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 }, 3, k_kernel);
             trace.emit(.attn_v, self.layer_idx, 0, trace_pos, value_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(kv_total_dim), 0 }, 3, v_kernel);
             // Emit embed_pos after Q/K/V (RoPE was applied in-place before projection trace)
-            if (self.rope != null) {
+            if (self.rope != null or self.runtime_rope != null) {
                 trace.emit(.embed_pos, self.layer_idx, 0, trace_pos, query_view.data().ptr, .f32, .{ 1, @intCast(sequence_len), @intCast(query_dim), 0 }, 3, "rope");
             }
         }
@@ -1304,6 +1346,56 @@ fn addBias(data: []f32, bias: []const f32, sequence_len: usize, dim: usize) void
             row[vec_idx] += bias[vec_idx];
         }
     }
+}
+
+fn applyRuntimeRoPE(
+    query_values: []f32,
+    key_values: []f32,
+    sequence_len: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    query_dim: usize,
+    kv_total_dim: usize,
+    pos_offset: usize,
+    runtime_rope: MultiHeadAttention.RuntimeRoPE,
+) !void {
+    const rope_dim = runtime_rope.dim;
+    if (rope_dim == 0 or rope_dim > head_dim or (rope_dim % 2) != 0) return error.InvalidShape;
+
+    for (0..sequence_len) |token_index| {
+        const pos = pos_offset + token_index;
+        const base = pos * rope_dim;
+        if (base + rope_dim > runtime_rope.cos.len or base + rope_dim > runtime_rope.sin.len) return error.InvalidShape;
+        const cos = runtime_rope.cos[base .. base + rope_dim];
+        const sin = runtime_rope.sin[base .. base + rope_dim];
+
+        for (0..n_heads) |head_index| {
+            const offset = token_index * query_dim + head_index * head_dim;
+            applyRoPEFromCosSin(query_values[offset .. offset + rope_dim], cos, sin);
+        }
+        for (0..n_kv_heads) |head_index| {
+            const offset = token_index * kv_total_dim + head_index * head_dim;
+            applyRoPEFromCosSin(key_values[offset .. offset + rope_dim], cos, sin);
+        }
+    }
+}
+
+fn applyRoPEFromCosSin(vec: []f32, cos: []const f32, sin: []const f32) void {
+    const half = vec.len / 2;
+    for (0..half) |idx| {
+        const x1 = vec[idx];
+        const x2 = vec[idx + half];
+        vec[idx] = x1 * cos[idx] - x2 * sin[idx];
+        vec[idx + half] = x2 * cos[idx + half] + x1 * sin[idx + half];
+    }
+}
+
+fn applyPositionDelta(base_pos: usize, delta: isize) !usize {
+    if (delta == 0) return base_pos;
+    const shifted: i64 = @as(i64, @intCast(base_pos)) + @as(i64, delta);
+    if (shifted < 0) return error.InvalidShape;
+    return @as(usize, @intCast(shifted));
 }
 
 // =============================================================================
@@ -2876,4 +2968,13 @@ test "MultiHeadAttention.ensureKvCapacity: preserves cached data during growth" 
 
     // Cache position should be preserved
     try std.testing.expectEqual(@as(usize, 2), cache.cache_position);
+}
+
+test "applyPositionDelta applies negative multimodal offset" {
+    try std.testing.expectEqual(@as(usize, 42), try applyPositionDelta(198, -156));
+    try std.testing.expectEqual(@as(usize, 43), try applyPositionDelta(199, -156));
+}
+
+test "applyPositionDelta rejects negative resulting positions" {
+    try std.testing.expectError(error.InvalidShape, applyPositionDelta(3, -4));
 }

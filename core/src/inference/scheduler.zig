@@ -81,6 +81,8 @@ pub const Request = struct {
     sampling_config: sampling.SamplingConfig,
     /// Optional grammar sampler for constrained decoding.
     grammar_sampler: ?*validate.sampler.ConstrainedSampler = null,
+    /// Optional backend-specific vision prefill payload.
+    vision_input: ?*const anyopaque = null,
     /// Error message if state == failed
     error_msg: ?[]const u8,
     /// Priority (higher = more urgent, for priority scheduling)
@@ -150,6 +152,7 @@ pub const SchedulerConfig = struct {
 /// - `allocSlot() ?usize` - allocate a slot, returns null if full
 /// - `freeSlot(slot_index: usize) void` - release a slot
 /// - `prefillSlot(slot_index: usize, tokens: []const u32, logits_out: []f32) !void` - prefill
+/// - optional: `prefillSlotWithVision(slot_index, tokens, vision_input, logits_out) !void`
 /// - `decodeBatch(requests: []const DecodeRequest, results: []DecodeResult) !void` - batch decode
 pub fn GenericScheduler(comptime BackendType: type) type {
     return struct {
@@ -305,6 +308,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .callback_data = submit_config.callback_data,
                 .sampling_config = submit_config.sampling orelse self.config.default_sampling,
                 .grammar_sampler = submit_config.grammar_sampler,
+                .vision_input = submit_config.vision_input,
                 .error_msg = null,
                 .priority = submit_config.priority,
                 .submit_time = std.time.milliTimestamp(),
@@ -338,6 +342,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             /// This allows external cancellation (e.g., client disconnect) without
             /// waiting for the next callback invocation.
             stop_flag: ?*const std.atomic.Value(bool) = null,
+            /// Optional backend-specific vision prefill payload.
+            /// For FusedCpuBackend this is `*const PrefillVisionInput`.
+            vision_input: ?*const anyopaque = null,
         };
 
         /// Cancel a request.
@@ -583,6 +590,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const callback_data = submit_config.callback_data;
             const grammar_sampler = submit_config.grammar_sampler;
             const stop_flag = submit_config.stop_flag;
+            const vision_input = submit_config.vision_input;
 
             // Fast path: if no other requests are active, bypass the full step() machinery
             // This avoids per-token overhead from ArrayList iterations and allocations
@@ -596,6 +604,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     callback,
                     callback_data,
                     grammar_sampler,
+                    vision_input,
                     stop_flag,
                 );
             }
@@ -652,6 +661,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             callback: ?*const fn (u64, u32, bool, ?*anyopaque) void,
             callback_data: ?*anyopaque,
             grammar_sampler: ?*validate.sampler.ConstrainedSampler,
+            vision_input: ?*const anyopaque,
             stop_flag: ?*const std.atomic.Value(bool),
         ) !GenerateSyncResult {
             // Check stop flag early - if already cancelled, return immediately
@@ -674,7 +684,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             var prefill_timer = std.time.Timer.start() catch unreachable;
             // Prefill
-            try self.backend.prefillSlot(slot_index, prompt_tokens, self.logits_buffer);
+            try self.prefillWithOptionalVision(slot_index, prompt_tokens, vision_input);
             const prefill_ns = prefill_timer.read();
             log.debug("scheduler", "Prefill complete", .{
                 .slot_index = slot_index,
@@ -932,10 +942,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (request_entry.slot_index == null) continue;
 
                 // Run prefill for this request
-                try self.backend.prefillSlot(
+                try self.prefillWithOptionalVision(
                     request_entry.slot_index.?,
                     request_entry.prompt_tokens,
-                    self.logits_buffer,
+                    request_entry.vision_input,
                 );
 
                 request_entry.token_position = request_entry.prompt_tokens.len;
@@ -1032,6 +1042,28 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 }
             }
             return 0;
+        }
+
+        fn prefillWithOptionalVision(
+            self: *Self,
+            slot_index: usize,
+            prompt_tokens: []const u32,
+            vision_input: ?*const anyopaque,
+        ) !void {
+            if (vision_input) |opaque_ptr| {
+                if (comptime @hasDecl(BackendType, "prefillSlotWithVision") and @hasDecl(BackendType, "PrefillVisionInput")) {
+                    const typed_input: *const BackendType.PrefillVisionInput = @ptrCast(@alignCast(opaque_ptr));
+                    return self.backend.prefillSlotWithVision(
+                        slot_index,
+                        prompt_tokens,
+                        typed_input,
+                        self.logits_buffer,
+                    );
+                }
+                return error.UnsupportedContentType;
+            }
+
+            return self.backend.prefillSlot(slot_index, prompt_tokens, self.logits_buffer);
         }
     };
 }

@@ -59,6 +59,14 @@ echo "hello" | talu -m LiquidAI/LFM2-350M
 echo "hello" | talu
 ```
 
+For multimodal models, piped image bytes are treated as an image input. If no
+text prompt is provided, talu uses `Describe this image.` automatically.
+
+```bash
+cat test.jpeg | talu ask -m Qwen/Qwen3-VL-2B-Instruct
+cat test.jpeg | talu ask -m Qwen/Qwen3-VL-2B-Instruct "What objects are visible?"
+```
+
 ### Quantize a model
 
 ```bash

@@ -584,6 +584,9 @@ pub const RopeScaling = struct {
     mscale_all_dim: f32 = 0.0,
     truncate: bool = true,
     original_max_position_embeddings: i32 = 8192,
+    /// Optional multimodal RoPE section sizes (model-defined).
+    mrope_section: [3]u32 = .{ 0, 0, 0 },
+    mrope_interleaved: bool = false,
 };
 
 pub const ModelArch = enum {
@@ -641,6 +644,23 @@ pub const ModelConfig = struct {
     shortconv_conv_dim: i32 = 0, // Intermediate dimension
     shortconv_conv_dim_out: i32 = 0, // Output dimension (usually = d_model)
     shortconv_has_bias: bool = false, // Whether conv has bias
+    // Vision encoder config (for multimodal models)
+    vision_hidden_size: i32 = 0,
+    vision_depth: i32 = 0,
+    vision_num_heads: i32 = 0,
+    vision_intermediate_size: i32 = 0,
+    vision_out_hidden_size: i32 = 0,
+    vision_patch_size: i32 = 0,
+    vision_spatial_merge_size: i32 = 0,
+    vision_temporal_patch_size: i32 = 0,
+    vision_num_position_embeddings: i32 = 0,
+    // Vision special token IDs (0 means "unset")
+    image_token_id: i32 = 0,
+    vision_start_token_id: i32 = 0,
+    vision_end_token_id: i32 = 0,
+    // Optional vision probe layer indexes (for model-specific deepstack-style injection).
+    vision_probe_layer_count: u8 = 0,
+    vision_probe_layers: [8]u16 = [_]u16{0} ** 8,
     /// Whether Flash Attention is compatible with this model's head_dim.
     flash_attn_compatible: bool = false,
 

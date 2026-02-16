@@ -26,6 +26,18 @@ pub fn parseRopeScalingFromObject(obj: std.json.ObjectMap) tensor.RopeScaling {
         }
     }
 
+    var mrope_section: [3]u32 = .{ 0, 0, 0 };
+    if (obj.get("mrope_section")) |section_value| {
+        if (section_value == .array and section_value.array.items.len == 3) {
+            for (0..3) |idx| {
+                const value = section_value.array.items[idx];
+                if (value == .integer) {
+                    mrope_section[idx] = std.math.cast(u32, value.integer) orelse 0;
+                }
+            }
+        }
+    }
+
     return .{
         .rope_type = rope_type,
         .factor = getFloatField(obj, "factor") orelse 1.0,
@@ -43,6 +55,8 @@ pub fn parseRopeScalingFromObject(obj: std.json.ObjectMap) tensor.RopeScaling {
             (if (v == .integer) @as(i32, @intCast(v.integer)) else 8192)
         else
             8192,
+        .mrope_section = mrope_section,
+        .mrope_interleaved = getBoolField(obj, "mrope_interleaved") orelse false,
     };
 }
 
@@ -60,6 +74,14 @@ fn getBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
     const value = obj.get(key) orelse return null;
     return switch (value) {
         .bool => value.bool,
+        else => null,
+    };
+}
+
+fn getObjectIntField(obj: std.json.ObjectMap, key: []const u8) ?i32 {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .integer => std.math.cast(i32, value.integer),
         else => null,
     };
 }
@@ -132,6 +154,8 @@ const JsonConfig = struct {
         mscale_all_dim: ?f64 = null,
         truncate: ?bool = null,
         original_max_position_embeddings: ?i64 = null,
+        mrope_section: ?[]const i64 = null,
+        mrope_interleaved: ?bool = null,
     } = null,
     // RoPE parameters (Mistral3/YARN-style)
     rope_parameters: ?struct {
@@ -321,17 +345,28 @@ pub fn readModelType(allocator: std.mem.Allocator, path: []const u8) !?[]const u
 
     if (raw_parsed.value != .object) return null;
 
-    // Check text_config first (for multimodal models), then root
-    const config_obj = if (raw_parsed.value.object.get("text_config")) |tc|
-        if (tc == .object) tc.object else raw_parsed.value.object
-    else
-        raw_parsed.value.object;
+    const root_obj = raw_parsed.value.object;
 
-    if (config_obj.get("model_type")) |v| {
+    // Prefer root-level model_type. This is the primary architecture identifier
+    // for model bundles and conversion graphs.
+    if (root_obj.get("model_type")) |v| {
         return switch (v) {
             .string => |s| try allocator.dupe(u8, s),
             else => null,
         };
+    }
+
+    // Fall back to text_config.model_type for multimodal wrappers that only
+    // define model_type in the text sub-config.
+    if (root_obj.get("text_config")) |tc| {
+        if (tc == .object) {
+            if (tc.object.get("model_type")) |v| {
+                return switch (v) {
+                    .string => |s| try allocator.dupe(u8, s),
+                    else => null,
+                };
+            }
+        }
     }
     return null;
 }
@@ -425,11 +460,16 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
     };
     defer raw_parsed.deinit();
 
+    const root_obj = if (raw_parsed.value == .object)
+        raw_parsed.value.object
+    else
+        return error.InvalidJson;
+
     // Determine which value to parse as JsonConfig:
     // - If multimodal model with text_config, use that subobject
     // - Otherwise use the root object
     const config_value: std.json.Value = if (raw_parsed.value == .object) blk: {
-        if (raw_parsed.value.object.get("text_config")) |text_config| {
+        if (root_obj.get("text_config")) |text_config| {
             break :blk text_config;
         }
         break :blk raw_parsed.value;
@@ -510,6 +550,15 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         const mscale = if (rope_scaling_config.mscale) |f| @as(f32, @floatCast(f)) else 0.0;
         const mscale_all_dim = if (rope_scaling_config.mscale_all_dim) |f| @as(f32, @floatCast(f)) else 0.0;
         const truncate = rope_scaling_config.truncate orelse true;
+        var mrope_section: [3]u32 = .{ 0, 0, 0 };
+        if (rope_scaling_config.mrope_section) |section| {
+            if (section.len == 3) {
+                for (0..3) |idx| {
+                    mrope_section[idx] = std.math.cast(u32, section[idx]) orelse 0;
+                }
+            }
+        }
+
         break :blk .{
             .rope_type = rope_type_val,
             .factor = if (rope_scaling_config.factor) |f| @floatCast(f) else 1.0,
@@ -522,6 +571,8 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
             .mscale_all_dim = mscale_all_dim,
             .truncate = truncate,
             .original_max_position_embeddings = if (rope_scaling_config.original_max_position_embeddings) |v| @intCast(v) else 8192,
+            .mrope_section = mrope_section,
+            .mrope_interleaved = rope_scaling_config.mrope_interleaved orelse false,
         };
     } else .{};
 
@@ -544,6 +595,39 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
     else
         0; // 0 means use head_dim
 
+    const vision_obj: ?std.json.ObjectMap = if (root_obj.get("vision_config")) |vision_cfg|
+        switch (vision_cfg) {
+            .object => vision_cfg.object,
+            else => null,
+        }
+    else
+        null;
+
+    const vision_hidden_size = if (vision_obj) |obj| getObjectIntField(obj, "hidden_size") orelse 0 else 0;
+    const vision_depth = if (vision_obj) |obj| getObjectIntField(obj, "depth") orelse 0 else 0;
+    const vision_num_heads = if (vision_obj) |obj| getObjectIntField(obj, "num_heads") orelse 0 else 0;
+    const vision_intermediate_size = if (vision_obj) |obj| getObjectIntField(obj, "intermediate_size") orelse 0 else 0;
+    const vision_out_hidden_size = if (vision_obj) |obj| getObjectIntField(obj, "out_hidden_size") orelse 0 else 0;
+    const vision_patch_size = if (vision_obj) |obj| getObjectIntField(obj, "patch_size") orelse 0 else 0;
+    const vision_spatial_merge_size = if (vision_obj) |obj| getObjectIntField(obj, "spatial_merge_size") orelse 0 else 0;
+    const vision_temporal_patch_size = if (vision_obj) |obj| getObjectIntField(obj, "temporal_patch_size") orelse 0 else 0;
+    const vision_num_position_embeddings = if (vision_obj) |obj| getObjectIntField(obj, "num_position_embeddings") orelse 0 else 0;
+    var vision_probe_layers: [8]u16 = [_]u16{0} ** 8;
+    var vision_probe_layer_count: u8 = 0;
+    if (vision_obj) |obj| {
+        if (obj.get("deepstack_visual_indexes")) |raw_layers| {
+            if (raw_layers == .array) {
+                for (raw_layers.array.items) |item| {
+                    if (vision_probe_layer_count >= vision_probe_layers.len) break;
+                    if (item != .integer) continue;
+                    if (item.integer < 0) continue;
+                    const casted = std.math.cast(u16, item.integer) orelse continue;
+                    vision_probe_layers[vision_probe_layer_count] = casted;
+                    vision_probe_layer_count += 1;
+                }
+            }
+        }
+    }
     var config = ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
@@ -591,6 +675,20 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         .shortconv_conv_dim = config_json.intOrDefault("conv_dim", 0),
         .shortconv_conv_dim_out = config_json.intOrDefault("conv_dim_out", 0),
         .shortconv_has_bias = config_json.conv_bias orelse false,
+        .vision_hidden_size = vision_hidden_size,
+        .vision_depth = vision_depth,
+        .vision_num_heads = vision_num_heads,
+        .vision_intermediate_size = vision_intermediate_size,
+        .vision_out_hidden_size = vision_out_hidden_size,
+        .vision_patch_size = vision_patch_size,
+        .vision_spatial_merge_size = vision_spatial_merge_size,
+        .vision_temporal_patch_size = vision_temporal_patch_size,
+        .vision_num_position_embeddings = vision_num_position_embeddings,
+        .image_token_id = getObjectIntField(root_obj, "image_token_id") orelse 0,
+        .vision_start_token_id = getObjectIntField(root_obj, "vision_start_token_id") orelse 0,
+        .vision_end_token_id = getObjectIntField(root_obj, "vision_end_token_id") orelse 0,
+        .vision_probe_layer_count = vision_probe_layer_count,
+        .vision_probe_layers = vision_probe_layers,
     };
     config.initFlashAttnCompat();
     return config;
@@ -1050,6 +1148,118 @@ test "ArchitectureCheck.getArchitecture returns null when not present" {
 
     const result = check.getArchitecture();
     try std.testing.expect(result == null);
+}
+
+test "readModelType falls back to root model_type when text_config omits it" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "multimodal_vit",
+        \\  "text_config": {
+        \\    "hidden_size": 2048
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const model_type = try readModelType(std.testing.allocator, path);
+    defer if (model_type) |m| std.testing.allocator.free(m);
+    try std.testing.expect(model_type != null);
+    try std.testing.expectEqualStrings("multimodal_vit", model_type.?);
+}
+
+test "readModelType prefers root model_type when text_config also has model_type" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "multimodal_root_arch",
+        \\  "text_config": {
+        \\    "model_type": "text_sub_arch"
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const model_type = try readModelType(std.testing.allocator, path);
+    defer if (model_type) |m| std.testing.allocator.free(m);
+    try std.testing.expect(model_type != null);
+    try std.testing.expectEqualStrings("multimodal_root_arch", model_type.?);
+}
+
+test "readModelType falls back to text_config model_type when root is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "text_config": {
+        \\    "model_type": "llama"
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const model_type = try readModelType(std.testing.allocator, path);
+    defer if (model_type) |m| std.testing.allocator.free(m);
+    try std.testing.expect(model_type != null);
+    try std.testing.expectEqualStrings("llama", model_type.?);
+}
+
+test "loadConfig parses vision deepstack probe layers from vision_config" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "multimodal_vit",
+        \\  "text_config": {
+        \\    "vocab_size": 151936,
+        \\    "hidden_size": 2048,
+        \\    "num_hidden_layers": 28,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "intermediate_size": 6144,
+        \\    "max_position_embeddings": 32768,
+        \\    "rms_norm_eps": 1e-6,
+        \\    "rope_theta": 5000000.0
+        \\  },
+        \\  "vision_config": {
+        \\    "hidden_size": 1024,
+        \\    "depth": 24,
+        \\    "num_heads": 16,
+        \\    "intermediate_size": 4096,
+        \\    "out_hidden_size": 2048,
+        \\    "patch_size": 16,
+        \\    "spatial_merge_size": 2,
+        \\    "temporal_patch_size": 2,
+        \\    "num_position_embeddings": 2304,
+        \\    "deepstack_visual_indexes": [5, 11, 17]
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(@as(u8, 3), config.vision_probe_layer_count);
+    try std.testing.expectEqual(@as(u16, 5), config.vision_probe_layers[0]);
+    try std.testing.expectEqual(@as(u16, 11), config.vision_probe_layers[1]);
+    try std.testing.expectEqual(@as(u16, 17), config.vision_probe_layers[2]);
 }
 
 // Re-export behavioral types from generation.zig so check_coverage.sh --integration can verify test coverage

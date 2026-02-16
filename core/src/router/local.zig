@@ -32,10 +32,12 @@ const session_mod = inference.session;
 const FinishReason = session_mod.FinishReason;
 const backend_root = @import("../inference/backend/root.zig");
 const Backend = backend_root.Backend;
+const vision_runtime_mod = @import("../inference/backend/cpu/vision_runtime.zig");
 const log = @import("../log.zig");
 pub const PoolingStrategy = backend_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const io = @import("../io/root.zig");
+const image_mod = @import("../image/root.zig");
 const io_weights = io.weights;
 const gen_config_mod = @import("../io/config/generation.zig");
 const validate_mod = @import("../validate/root.zig");
@@ -683,23 +685,32 @@ pub const LocalEngine = struct {
         grammar_sampler: ?*ConstrainedSampler,
         is_tool_generation: bool,
     ) !GenerationResult {
+        var vision_prompt = try self.collectVisionPromptInput(chat);
+        defer if (vision_prompt) |*vp| vp.deinit(self.allocator);
+
         // Tokenize prompt
         log.debug("inference", "Tokenizing prompt", .{ .prompt_bytes = prompt.len }, @src());
         const encoded_tokens = try self.tok.encode(prompt);
         defer self.allocator.free(encoded_tokens);
 
+        const prompt_tokens_no_bos = if (vision_prompt) |*vp|
+            try expandImagePadTokens(self.allocator, encoded_tokens, vp.prefill.image_token_id, vp.token_counts)
+        else
+            try self.allocator.dupe(u32, encoded_tokens);
+        defer self.allocator.free(prompt_tokens_no_bos);
+
         // Prepend BOS token if configured
         var prepend_bos = bos_token_id != null;
-        if (prepend_bos and encoded_tokens.len > 0 and encoded_tokens[0] == bos_token_id.?) {
+        if (prepend_bos and prompt_tokens_no_bos.len > 0 and prompt_tokens_no_bos[0] == bos_token_id.?) {
             prepend_bos = false;
         }
 
         const prompt_tokens = if (prepend_bos) blk: {
-            const tokens = try self.allocator.alloc(u32, encoded_tokens.len + 1);
+            const tokens = try self.allocator.alloc(u32, prompt_tokens_no_bos.len + 1);
             tokens[0] = bos_token_id.?;
-            @memcpy(tokens[1..], encoded_tokens);
+            @memcpy(tokens[1..], prompt_tokens_no_bos);
             break :blk tokens;
-        } else try self.allocator.dupe(u32, encoded_tokens);
+        } else try self.allocator.dupe(u32, prompt_tokens_no_bos);
         defer self.allocator.free(prompt_tokens);
 
         const prompt_len = prompt_tokens.len;
@@ -733,6 +744,11 @@ pub const LocalEngine = struct {
             .original_data = opts.callback_data,
         };
 
+        const vision_input_ptr: ?*const anyopaque = if (vision_prompt) |*vp|
+            @ptrCast(&vp.prefill)
+        else
+            null;
+
         // Generate synchronously
         var result = try scheduler.generateSync(prompt_tokens, max_tokens, .{
             .eos_token_ids = self.gen_config.eos_token_ids,
@@ -742,6 +758,7 @@ pub const LocalEngine = struct {
             .sampling = sampling_config,
             .grammar_sampler = grammar_sampler,
             .stop_flag = opts.stop_flag,
+            .vision_input = vision_input_ptr,
         });
         defer result.deinit(self.allocator);
 
@@ -878,6 +895,180 @@ pub const LocalEngine = struct {
             .decode_ns = result.decode_ns,
             .finish_reason = finish_reason,
         };
+    }
+
+    const VisionPromptInput = struct {
+        prefill: vision_runtime_mod.PrefillVisionInput,
+        token_counts: []usize,
+
+        fn deinit(self: *VisionPromptInput, allocator: std.mem.Allocator) void {
+            self.prefill.deinit(allocator);
+            if (self.token_counts.len > 0) allocator.free(self.token_counts);
+            self.* = undefined;
+        }
+    };
+
+    fn collectVisionPromptInput(self: *LocalEngine, chat: *Chat) !?VisionPromptInput {
+        const image_count = countInputImageParts(chat);
+        if (image_count == 0) return null;
+        if (self.loaded.config.image_token_id <= 0) return error.UnsupportedContentType;
+
+        const preprocess_opts = try self.buildVisionPreprocessOptions();
+
+        var written: usize = 0;
+        const images = try self.allocator.alloc(vision_runtime_mod.PrefillVisionImage, image_count);
+        errdefer {
+            for (images[0..written]) |*img| img.deinit(self.allocator);
+            self.allocator.free(images);
+        }
+        const token_counts = try self.allocator.alloc(usize, image_count);
+        errdefer self.allocator.free(token_counts);
+
+        for (0..chat.conv.len()) |item_index| {
+            const item = chat.conv.getItem(item_index) orelse continue;
+            const msg = item.asMessage() orelse continue;
+
+            for (0..msg.partCount()) |part_index| {
+                const part = msg.getPart(part_index) orelse continue;
+                if (part.getContentType() != .input_image) continue;
+
+                const image_bytes = try decodeImageDataUrl(self.allocator, part.getData());
+                defer self.allocator.free(image_bytes);
+
+                var decoded = try image_mod.decode(self.allocator, image_bytes, .{
+                    .prefer_format = .rgb8,
+                    .apply_orientation = true,
+                });
+                defer decoded.deinit(self.allocator);
+
+                var prep = try image_mod.preprocessImage(self.allocator, decoded, preprocess_opts);
+                errdefer prep.deinit(self.allocator);
+
+                images[written] = .{
+                    .pixels = prep.pixels,
+                    .width = prep.width,
+                    .height = prep.height,
+                    .grid = prep.grid,
+                    .token_count = @intCast(prep.token_count),
+                };
+                token_counts[written] = @intCast(prep.token_count);
+                written += 1;
+
+                prep.pixels = &.{};
+                prep.deinit(self.allocator);
+            }
+        }
+
+        if (written != image_count) return error.InvalidState;
+
+        return VisionPromptInput{
+            .prefill = .{
+                .images = images,
+                .image_token_id = @intCast(self.loaded.config.image_token_id),
+            },
+            .token_counts = token_counts,
+        };
+    }
+
+    fn countInputImageParts(chat: *Chat) usize {
+        var count: usize = 0;
+        for (0..chat.conv.len()) |item_index| {
+            const item = chat.conv.getItem(item_index) orelse continue;
+            const msg = item.asMessage() orelse continue;
+            for (0..msg.partCount()) |part_index| {
+                const part = msg.getPart(part_index) orelse continue;
+                if (part.getContentType() == .input_image) count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn buildVisionPreprocessOptions(self: *const LocalEngine) !image_mod.VisionPreprocessOptions {
+        const patch_size = try requirePositiveConfigU32(self.loaded.config.vision_patch_size);
+        const temporal_patch_size = try requirePositiveConfigU32(self.loaded.config.vision_temporal_patch_size);
+        const spatial_merge_size = try requirePositiveConfigU32(self.loaded.config.vision_spatial_merge_size);
+        const resize_factor = try std.math.mul(u32, patch_size, spatial_merge_size);
+
+        return .{
+            .normalize = .minus_one_to_one,
+            .temporal_frames = temporal_patch_size,
+            .patch_size = patch_size,
+            .temporal_patch_size = temporal_patch_size,
+            .spatial_merge_size = spatial_merge_size,
+            .smart_resize = .{
+                .factor = resize_factor,
+                .min_pixels = 0,
+                .max_pixels = 0,
+            },
+        };
+    }
+
+    fn requirePositiveConfigU32(value: i32) !u32 {
+        if (value <= 0) return error.UnsupportedContentType;
+        return std.math.cast(u32, value) orelse error.UnsupportedContentType;
+    }
+
+    fn decodeImageDataUrl(allocator: std.mem.Allocator, image_url: []const u8) ![]u8 {
+        if (!std.mem.startsWith(u8, image_url, "data:")) return error.UnsupportedContentType;
+
+        const comma_index = std.mem.indexOfScalar(u8, image_url, ',') orelse return error.UnsupportedContentType;
+        if (comma_index <= "data:".len or comma_index + 1 >= image_url.len) return error.UnsupportedContentType;
+
+        const metadata = image_url["data:".len..comma_index];
+        if (!std.mem.endsWith(u8, metadata, ";base64")) return error.UnsupportedContentType;
+
+        const mime_end = std.mem.indexOfScalar(u8, metadata, ';') orelse metadata.len;
+        const mime = metadata[0..mime_end];
+        if (!std.mem.startsWith(u8, mime, "image/")) return error.UnsupportedContentType;
+
+        const payload = image_url[comma_index + 1 ..];
+        const decoded_capacity = std.base64.standard.Decoder.calcSizeForSlice(payload) catch return error.InvalidArgument;
+        const decoded = try allocator.alloc(u8, decoded_capacity);
+        errdefer allocator.free(decoded);
+
+        std.base64.standard.Decoder.decode(decoded, payload) catch return error.InvalidArgument;
+        return decoded;
+    }
+
+    fn expandImagePadTokens(
+        allocator: std.mem.Allocator,
+        tokens: []const u32,
+        image_token_id: u32,
+        token_counts: []const usize,
+    ) ![]u32 {
+        if (token_counts.len == 0) return allocator.dupe(u32, tokens);
+
+        var placeholders: usize = 0;
+        for (tokens) |tok| {
+            if (tok == image_token_id) placeholders += 1;
+        }
+        if (placeholders != token_counts.len) return error.InvalidPromptImageTokens;
+
+        var expanded_len = tokens.len;
+        for (token_counts) |count| {
+            if (count == 0) return error.InvalidImageDimensions;
+            expanded_len = try std.math.add(usize, expanded_len, count - 1);
+        }
+
+        const out = try allocator.alloc(u32, expanded_len);
+        errdefer allocator.free(out);
+
+        var image_idx: usize = 0;
+        var write_idx: usize = 0;
+        for (tokens) |tok| {
+            if (tok == image_token_id) {
+                const repeat = token_counts[image_idx];
+                @memset(out[write_idx .. write_idx + repeat], image_token_id);
+                write_idx += repeat;
+                image_idx += 1;
+            } else {
+                out[write_idx] = tok;
+                write_idx += 1;
+            }
+        }
+
+        if (write_idx != expanded_len or image_idx != token_counts.len) return error.InvalidPromptImageTokens;
+        return out;
     }
 
     /// Generate using legacy session.generate (for non-batching backends).
@@ -1493,4 +1684,44 @@ test "GenerationResult struct empty" {
 
     try std.testing.expectEqual(@as(usize, 0), result.text.len);
     try std.testing.expectEqual(@as(usize, 0), result.tokens.len);
+}
+
+test "decodeImageDataUrl decodes base64 image payload" {
+    const allocator = std.testing.allocator;
+    const url = "data:image/png;base64,AQID";
+
+    const decoded = try LocalEngine.decodeImageDataUrl(allocator, url);
+    defer allocator.free(decoded);
+
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3 }, decoded);
+}
+
+test "decodeImageDataUrl rejects unsupported scheme" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(
+        error.UnsupportedContentType,
+        LocalEngine.decodeImageDataUrl(allocator, "https://example.com/image.png"),
+    );
+}
+
+test "expandImagePadTokens repeats placeholders per token count" {
+    const allocator = std.testing.allocator;
+    const tokens = [_]u32{ 10, 99, 11, 99, 12 };
+    const token_counts = [_]usize{ 3, 1 };
+
+    const expanded = try LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts);
+    defer allocator.free(expanded);
+
+    try std.testing.expectEqualSlices(u32, &[_]u32{ 10, 99, 99, 99, 11, 99, 12 }, expanded);
+}
+
+test "expandImagePadTokens rejects placeholder mismatch" {
+    const allocator = std.testing.allocator;
+    const tokens = [_]u32{ 10, 99, 11 };
+    const token_counts = [_]usize{ 1, 2 };
+
+    try std.testing.expectError(
+        error.InvalidPromptImageTokens,
+        LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts),
+    );
 }

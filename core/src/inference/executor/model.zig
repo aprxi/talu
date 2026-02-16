@@ -66,6 +66,13 @@ pub const Transformer = struct {
     tensor_count: usize = 0,
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
+    pub const DeepstackAdditions = struct {
+        /// Token positions in the prompt where visual placeholders were scattered.
+        positions: []const usize,
+        /// Per-decoder-layer visual embeddings to add at `positions`.
+        /// Layer 0 consumes layer_features[0], layer 1 consumes layer_features[1], etc.
+        layer_features: []const []const f32,
+    };
 
     /// Forward pass through transformer layers only (not embedding or final norm).
     /// This is the core transformer body: hidden_states -> layers -> hidden_states
@@ -147,6 +154,27 @@ pub const Transformer = struct {
         slot_index: usize,
         use_cache: bool,
     ) !void {
+        return self.forwardWithBatchedCacheWithDeepstack(
+            input_tensor,
+            output_tensor,
+            scratch,
+            batched_cache,
+            slot_index,
+            use_cache,
+            null,
+        );
+    }
+
+    pub fn forwardWithBatchedCacheWithDeepstack(
+        self: *const Transformer,
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        scratch: *ScratchBuffer,
+        batched_cache: *LayeredBatchedKVCache,
+        slot_index: usize,
+        use_cache: bool,
+        deepstack: ?*const DeepstackAdditions,
+    ) !void {
         if (!use_cache) batched_cache.resetSlot(slot_index);
         const seq_len: usize = @intCast(input_tensor.shape[1]);
         try scratch.ensure(seq_len);
@@ -174,9 +202,19 @@ pub const Transformer = struct {
             if (write_to_scratch_view) {
                 try layer.forwardWithBatchedCache(current_input_tensor, &scratch_tensor_view, scratch, layer_cache, slot_index, use_cache);
                 current_input_tensor = &scratch_tensor_view;
+                if (deepstack) |ctx| {
+                    if (layer_idx < ctx.layer_features.len) {
+                        try applyDeepstackAdditions(&scratch_tensor_view, seq_len, self.hidden_size, ctx.positions, ctx.layer_features[layer_idx]);
+                    }
+                }
             } else {
                 try layer.forwardWithBatchedCache(current_input_tensor, output_tensor, scratch, layer_cache, slot_index, use_cache);
                 current_input_tensor = output_tensor;
+                if (deepstack) |ctx| {
+                    if (layer_idx < ctx.layer_features.len) {
+                        try applyDeepstackAdditions(output_tensor, seq_len, self.hidden_size, ctx.positions, ctx.layer_features[layer_idx]);
+                    }
+                }
             }
             write_to_scratch_view = !write_to_scratch_view;
 
@@ -209,6 +247,31 @@ pub const Transformer = struct {
         // Copy final result to out if needed
         if (current_input_tensor != output_tensor) {
             block_kernels.copyTensor(current_input_tensor, output_tensor);
+        }
+    }
+
+    fn applyDeepstackAdditions(
+        hidden: *Tensor,
+        seq_len: usize,
+        hidden_size: usize,
+        positions: []const usize,
+        features: []const f32,
+    ) !void {
+        if (positions.len == 0) return;
+
+        const hidden_flat = hidden.asSliceMut(f32);
+        if (hidden_flat.len < seq_len * hidden_size) return error.InvalidShape;
+
+        if (features.len % hidden_size != 0) return;
+        const available_rows = features.len / hidden_size;
+        const row_count = @min(positions.len, available_rows);
+
+        for (0..row_count) |row_idx| {
+            const token_pos = positions[row_idx];
+            if (token_pos >= seq_len) continue;
+            const dst = hidden_flat[token_pos * hidden_size ..][0..hidden_size];
+            const src = features[row_idx * hidden_size ..][0..hidden_size];
+            for (dst, src) |*d, s| d.* += s;
         }
     }
 
