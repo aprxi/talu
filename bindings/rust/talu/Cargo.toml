@@ -39,3 +39,7 @@ harness = false
 [[bench]]
 name = "rag"
 harness = false
+
+[[bench]]
+name = "documents"
+harness = false

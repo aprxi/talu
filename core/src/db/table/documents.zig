@@ -557,6 +557,10 @@ pub const DocumentAdapter = struct {
 
     /// Get a single document by ID.
     /// Returns null if document is not found or has expired.
+    ///
+    /// Uses reverse scanning (newest block first, last row first) so that the
+    /// first matching row is the latest version.  This makes point lookups
+    /// O(1) in the common case (document was recently written/updated).
     pub fn getDocument(self: *DocumentAdapter, allocator: Allocator, doc_id: []const u8) !?DocumentRecord {
         const target_hash = computeHash(doc_id);
         const now_ms = std.time.milliTimestamp();
@@ -566,14 +570,16 @@ pub const DocumentAdapter = struct {
         defer deleted.deinit();
         try self.collectDeletedDocuments(allocator, &deleted);
 
-        var latest: ?DocumentRecord = null;
-        var latest_ts: i64 = 0;
-        var latest_expires: i64 = 0;
-
         const blocks = try self.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
-        for (blocks) |block| {
+        // Reverse-scan: newest blocks first (current.talu blocks are at the
+        // end of the slice, sealed segments at the front).
+        var block_idx = blocks.len;
+        while (block_idx > 0) {
+            block_idx -= 1;
+            const block = blocks[block_idx];
+
             var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
@@ -607,7 +613,11 @@ pub const DocumentAdapter = struct {
             var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
             defer payload_buffers.deinit(allocator);
 
-            for (0..row_count) |row_idx| {
+            // Reverse-scan rows within block (last written = highest index).
+            var row_idx = row_count;
+            while (row_idx > 0) {
+                row_idx -= 1;
+
                 const doc_hash = readU64At(hash_bytes, row_idx) catch continue;
                 if (doc_hash != target_hash) continue;
 
@@ -618,9 +628,7 @@ pub const DocumentAdapter = struct {
                     if (del_ts >= ts) continue;
                 }
 
-                if (ts <= latest_ts) continue;
-
-                // Get expiration time for this row
+                // First non-deleted match in reverse order is the latest version.
                 var expires_at: i64 = 0;
                 if (expires_bytes) |eb| {
                     expires_at = readI64At(eb, row_idx) catch 0;
@@ -629,26 +637,25 @@ pub const DocumentAdapter = struct {
                 const payload = payload_buffers.sliceForRow(row_idx) catch continue;
                 const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
                 if (record_opt) |record| {
-                    if (latest) |*old| old.deinit(allocator);
-                    latest = record;
-                    latest_ts = ts;
-                    latest_expires = expires_at;
+                    // Check expiration before returning.
+                    if (expires_at > 0 and expires_at < now_ms) {
+                        var r = record;
+                        r.deinit(allocator);
+                        return null;
+                    }
+                    return record;
                 }
             }
         }
 
-        // Check if the latest version is expired
-        if (latest != null and latest_expires > 0 and latest_expires < now_ms) {
-            var l = latest.?;
-            l.deinit(allocator);
-            return null;
-        }
-
-        return latest;
+        return null;
     }
 
     /// Get a single document header by ID without loading externalized doc_json.
     /// Returns null if document is not found or has expired.
+    ///
+    /// Uses reverse scanning (newest block first, last row first) for O(1)
+    /// best-case point lookups.
     pub fn getDocumentHeader(self: *DocumentAdapter, allocator: Allocator, doc_id: []const u8) !?DocumentHeader {
         const target_hash = computeHash(doc_id);
         const now_ms = std.time.milliTimestamp();
@@ -657,14 +664,15 @@ pub const DocumentAdapter = struct {
         defer deleted.deinit();
         try self.collectDeletedDocuments(allocator, &deleted);
 
-        var latest: ?DocumentHeader = null;
-        var latest_ts: i64 = 0;
-        var latest_expires: i64 = 0;
-
         const blocks = try self.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
-        for (blocks) |block| {
+        // Reverse-scan: newest blocks first.
+        var block_idx = blocks.len;
+        while (block_idx > 0) {
+            block_idx -= 1;
+            const block = blocks[block_idx];
+
             var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
@@ -697,7 +705,11 @@ pub const DocumentAdapter = struct {
             var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, header.row_count, allocator) catch continue;
             defer payload_buffers.deinit(allocator);
 
-            for (0..header.row_count) |row_idx| {
+            // Reverse-scan rows within block.
+            var row_idx = header.row_count;
+            while (row_idx > 0) {
+                row_idx -= 1;
+
                 const row_hash = readU64At(hash_bytes, row_idx) catch continue;
                 if (row_hash != target_hash) continue;
 
@@ -706,8 +718,8 @@ pub const DocumentAdapter = struct {
                 if (deleted.get(row_hash)) |del_ts| {
                     if (del_ts >= ts) continue;
                 }
-                if (ts <= latest_ts) continue;
 
+                // First non-deleted match in reverse order is the latest version.
                 var expires_at: i64 = 0;
                 if (expires_bytes) |eb| {
                     expires_at = readI64At(eb, row_idx) catch 0;
@@ -716,25 +728,19 @@ pub const DocumentAdapter = struct {
                 const payload = payload_buffers.sliceForRow(row_idx) catch continue;
                 const record_opt = decodeDocumentHeader(allocator, payload) catch continue;
                 if (record_opt) |record| {
-                    if (latest) |*old| old.deinit(allocator);
-                    latest = record;
-                    latest_ts = ts;
-                    latest_expires = expires_at;
+                    if (expires_at > 0 and expires_at < now_ms) {
+                        var r = record;
+                        r.deinit(allocator);
+                        return null;
+                    }
+                    var result = record;
+                    result.expires_at_ms = expires_at;
+                    return result;
                 }
             }
         }
 
-        if (latest != null and latest_expires > 0 and latest_expires < now_ms) {
-            var l = latest.?;
-            l.deinit(allocator);
-            return null;
-        }
-
-        if (latest) |*l| {
-            l.expires_at_ms = latest_expires;
-        }
-
-        return latest;
+        return null;
     }
 
     /// Load an externalized blob by reference (`sha256:<hex>` or `multi:<hex>`).
