@@ -66,6 +66,37 @@ export const SETTINGS_DOM_IDS = [
   "sp-model-label", "sp-reset-model", "sp-status",
 ];
 
+/** Element IDs expected by getFilesDom(). */
+export const FILES_DOM_IDS = [
+  "fp-upload", "fp-file-input", "fp-search", "fp-search-clear",
+  "fp-stats", "fp-count", "fp-tbody", "fp-table-container",
+  "fp-drop-overlay", "fp-preview", "fp-preview-content",
+  "fp-tab-all", "fp-tab-archived", "fp-select-all",
+  "fp-archive", "fp-restore", "fp-delete", "fp-cancel",
+  "fp-bulk-actions", "fp-toolbar",
+];
+
+/** Extra class-based elements for getFilesDom(). */
+export const FILES_DOM_EXTRAS: { tag: string; className: string }[] = [
+  { tag: "div", className: "files-main-drop" },
+];
+
+/** Tag overrides for files DOM elements that need specific types. */
+export const FILES_DOM_TAGS: Record<string, string> = {
+  "fp-file-input": "input",
+  "fp-search": "input",
+  "fp-upload": "button",
+  "fp-tab-all": "button",
+  "fp-tab-archived": "button",
+  "fp-select-all": "button",
+  "fp-archive": "button",
+  "fp-restore": "button",
+  "fp-delete": "button",
+  "fp-cancel": "button",
+  "fp-search-clear": "button",
+  "fp-tbody": "tbody",
+};
+
 /** Tag overrides for settings DOM elements that need specific types. */
 export const SETTINGS_DOM_TAGS: Record<string, string> = {
   "sp-model": "select",

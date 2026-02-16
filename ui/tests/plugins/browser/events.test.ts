@@ -4,7 +4,7 @@ import { bState, search } from "../../../src/plugins/browser/state.ts";
 import { initBrowserDom, getBrowserDom } from "../../../src/plugins/browser/dom.ts";
 import { initBrowserDeps } from "../../../src/plugins/browser/deps.ts";
 import { createDomRoot, BROWSER_DOM_IDS, BROWSER_DOM_EXTRAS } from "../../helpers/dom.ts";
-import type { Disposable } from "../../../src/kernel/types.ts";
+import { mockControllableTimers } from "../../helpers/mocks.ts";
 
 /**
  * Tests for browser event wiring — search input debouncing, tab switching,
@@ -16,11 +16,11 @@ import type { Disposable } from "../../../src/kernel/types.ts";
 
 // -- Mock state --------------------------------------------------------------
 
-let timerCallbacks: { fn: () => void; ms: number; disposed: boolean }[];
+let ct: ReturnType<typeof mockControllableTimers>;
 let apiCalls: { method: string; args: unknown[] }[];
 
 beforeEach(() => {
-  timerCallbacks = [];
+  ct = mockControllableTimers();
   apiCalls = [];
 
   // Reset state.
@@ -56,15 +56,7 @@ beforeEach(() => {
       selectChat: async () => {},
     } as any,
     download: {} as any,
-    timers: {
-      setTimeout(fn: () => void, ms: number): Disposable {
-        const entry = { fn, ms, disposed: false };
-        timerCallbacks.push(entry);
-        return { dispose() { entry.disposed = true; } };
-      },
-      setInterval() { return { dispose() {} }; },
-      requestAnimationFrame(fn: () => void) { fn(); return { dispose() {} }; },
-    } as any,
+    timers: ct.timers,
   });
 });
 
@@ -128,8 +120,8 @@ describe("Search debouncing", () => {
     (dom.searchInput as HTMLInputElement).value = "test";
     dom.searchInput.dispatchEvent(new Event("input"));
 
-    expect(timerCallbacks.length).toBe(1);
-    expect(timerCallbacks[0]!.ms).toBe(300);
+    expect(ct.pending.length).toBe(1);
+    expect(ct.pending[0]!.ms).toBe(300);
   });
 
   test("rapid typing cancels previous timer", () => {
@@ -142,9 +134,9 @@ describe("Search debouncing", () => {
     (dom.searchInput as HTMLInputElement).value = "tes";
     dom.searchInput.dispatchEvent(new Event("input"));
 
-    expect(timerCallbacks[0]!.disposed).toBe(true);
-    expect(timerCallbacks[1]!.disposed).toBe(true);
-    expect(timerCallbacks[2]!.disposed).toBe(false);
+    expect(ct.pending[0]!.disposed).toBe(true);
+    expect(ct.pending[1]!.disposed).toBe(true);
+    expect(ct.pending[2]!.disposed).toBe(false);
   });
 
   test("debounce callback resets search state", async () => {
@@ -158,7 +150,7 @@ describe("Search debouncing", () => {
     dom.searchInput.dispatchEvent(new Event("input"));
 
     // Fire the debounced callback.
-    timerCallbacks[0]!.fn();
+    ct.pending[0]!.fn();
     await new Promise((r) => setTimeout(r, 10));
 
     expect(search.query).toBe("new query");
@@ -176,7 +168,7 @@ describe("Search debouncing", () => {
     (dom.searchInput as HTMLInputElement).value = "same";
     dom.searchInput.dispatchEvent(new Event("input"));
 
-    timerCallbacks[0]!.fn();
+    ct.pending[0]!.fn();
     await new Promise((r) => setTimeout(r, 10));
 
     // No API call because query didn't change.
@@ -211,7 +203,7 @@ describe("Search debouncing", () => {
 
     expect((dom.searchInput as HTMLInputElement).value).toBe("");
     // Should have scheduled a debounce timer via the input event.
-    expect(timerCallbacks.length).toBeGreaterThan(0);
+    expect(ct.pending.length).toBeGreaterThan(0);
   });
 });
 

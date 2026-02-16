@@ -19,6 +19,47 @@ export function mockTimers(): ManagedTimers {
   } as ManagedTimers;
 }
 
+/**
+ * Controllable timer mock for debounce/timeout verification.
+ *
+ * Captures scheduled callbacks in `.pending` instead of firing them.
+ * Use `.flush()` to fire all pending, or `.advance(ms)` to fire only
+ * those with delay ≤ ms.
+ */
+export function mockControllableTimers() {
+  const pending: { fn: () => void; ms: number; disposed: boolean }[] = [];
+  return {
+    timers: {
+      setTimeout(fn: () => void, ms: number): Disposable {
+        const entry = { fn, ms, disposed: false };
+        pending.push(entry);
+        return { dispose() { entry.disposed = true; } };
+      },
+      setInterval() { return { dispose() {} } as Disposable; },
+      clearTimeout() {},
+      clearInterval() {},
+      requestAnimationFrame(fn: () => void) { fn(); return 0 as any; },
+      cancelAnimationFrame() {},
+      cap: 100,
+    } as ManagedTimers,
+    pending,
+    /** Fire all pending non-disposed callbacks and clear the queue. */
+    flush() {
+      for (const e of pending) if (!e.disposed) e.fn();
+      pending.length = 0;
+    },
+    /** Fire only callbacks with delay ≤ ms, then mark them disposed. */
+    advance(ms: number) {
+      for (const e of [...pending]) {
+        if (!e.disposed && e.ms <= ms) {
+          e.fn();
+          e.disposed = true;
+        }
+      }
+    },
+  };
+}
+
 /** Notifications that record messages for assertion. */
 export function mockNotifications(): {
   mock: Notifications & { success(msg: string): void };

@@ -13,8 +13,7 @@ import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
 import { initThinkingState } from "../../../src/render/helpers.ts";
 import { createDomRoot, CHAT_DOM_IDS } from "../../helpers/dom.ts";
-import { mockNotifications } from "../../helpers/mocks.ts";
-import type { Disposable } from "../../../src/kernel/types.ts";
+import { mockNotifications, mockControllableTimers } from "../../helpers/mocks.ts";
 
 /**
  * Tests for chat actions — toggle thinking, copy, export, fork,
@@ -30,7 +29,7 @@ import type { Disposable } from "../../../src/kernel/types.ts";
 let apiCalls: { method: string; args: unknown[] }[];
 let clipboardText: string | null;
 let downloadCalls: { blob: Blob; filename: string }[];
-let timerCallbacks: { fn: () => void; ms: number; disposed: boolean }[];
+let ct: ReturnType<typeof mockControllableTimers>;
 let notif: ReturnType<typeof mockNotifications>;
 
 let forkResult: any;
@@ -41,7 +40,7 @@ beforeEach(() => {
   apiCalls = [];
   clipboardText = null;
   downloadCalls = [];
-  timerCallbacks = [];
+  ct = mockControllableTimers();
   notif = mockNotifications();
 
   forkResult = { ok: true, data: { id: "forked-1" } };
@@ -109,15 +108,7 @@ beforeEach(() => {
       on: () => ({ dispose() {} }),
       run: async <T>(_name: string, value: T) => value,
     } as any,
-    timers: {
-      setTimeout(fn: () => void, ms: number): Disposable {
-        const entry = { fn, ms, disposed: false };
-        timerCallbacks.push(entry);
-        return { dispose() { entry.disposed = true; } };
-      },
-      setInterval() { return { dispose() {} }; },
-      requestAnimationFrame(fn: () => void) { fn(); return { dispose() {} }; },
-    } as any,
+    timers: ct.timers,
     observe: {
       intersection: () => ({ dispose() {} }),
       mutation: () => ({ dispose() {} }),
@@ -415,8 +406,8 @@ describe("handleChatDelete", () => {
     chatState.activeSessionId = "c1";
     const btn = document.createElement("button");
     handleChatDelete(btn);
-    expect(timerCallbacks.length).toBe(1);
-    expect(timerCallbacks[0]!.ms).toBe(3000);
+    expect(ct.pending.length).toBe(1);
+    expect(ct.pending[0]!.ms).toBe(3000);
   });
 
   test("timer auto-resets confirmation state", () => {
@@ -425,7 +416,7 @@ describe("handleChatDelete", () => {
     handleChatDelete(btn);
 
     // Fire the auto-reset timer.
-    timerCallbacks[0]!.fn();
+    ct.pending[0]!.fn();
 
     expect(btn.dataset["confirm"]).toBe("");
     expect(btn.title).toBe("Delete conversation");
