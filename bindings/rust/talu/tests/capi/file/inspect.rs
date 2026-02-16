@@ -12,12 +12,12 @@ use super::*;
 // Image detection: PNG, JPEG, WebP
 // ---------------------------------------------------------------------------
 
-/// PNG bytes produce FileKind::Image with correct format and dimensions.
+/// PNG bytes produce FileKind::ImageDocument with correct format and dimensions.
 #[test]
 fn inspect_png_returns_image_with_metadata() {
     let info = file::inspect_bytes(RED_PNG).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Image);
+    assert_eq!(info.kind, FileKind::ImageDocument);
     assert_eq!(info.mime, "image/png");
 
     let image = info.image.expect("image metadata should be present for PNG");
@@ -28,12 +28,12 @@ fn inspect_png_returns_image_with_metadata() {
     assert_eq!(image.exif_orientation, 1);
 }
 
-/// JPEG bytes produce FileKind::Image with correct format and dimensions.
+/// JPEG bytes produce FileKind::ImageDocument with correct format and dimensions.
 #[test]
 fn inspect_jpeg_returns_image_with_metadata() {
     let info = file::inspect_bytes(RED_JPEG).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Image);
+    assert_eq!(info.kind, FileKind::ImageDocument);
     assert_eq!(info.mime, "image/jpeg");
 
     let image = info.image.expect("image metadata should be present for JPEG");
@@ -42,12 +42,12 @@ fn inspect_jpeg_returns_image_with_metadata() {
     assert_eq!(image.height, 1);
 }
 
-/// WebP bytes produce FileKind::Image with correct format and dimensions.
+/// WebP bytes produce FileKind::ImageDocument with correct format and dimensions.
 #[test]
 fn inspect_webp_returns_image_with_metadata() {
     let info = file::inspect_bytes(RED_WEBP).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Image);
+    assert_eq!(info.kind, FileKind::ImageDocument);
     assert_eq!(info.mime, "image/webp");
 
     let image = info.image.expect("image metadata should be present for WebP");
@@ -61,7 +61,7 @@ fn inspect_webp_returns_image_with_metadata() {
 fn inspect_non_square_image_reports_correct_dimensions() {
     let info = file::inspect_bytes(BLUE_JPEG_2X3).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Image);
+    assert_eq!(info.kind, FileKind::ImageDocument);
     let image = info.image.expect("image metadata");
     assert_eq!(image.format, ImageFormat::Jpeg);
     assert_eq!(image.width, 2);
@@ -73,7 +73,7 @@ fn inspect_non_square_image_reports_correct_dimensions() {
 fn inspect_jpeg_with_exif_reports_orientation() {
     let info = file::inspect_bytes(EXIF_ROTATE90).expect("inspect_bytes failed");
 
-    assert_eq!(info.kind, FileKind::Image);
+    assert_eq!(info.kind, FileKind::ImageDocument);
     let image = info.image.expect("image metadata");
     assert_eq!(image.format, ImageFormat::Jpeg);
     // EXIF orientation 6 = 90 degrees clockwise.
@@ -210,6 +210,6 @@ fn inspect_truncated_png_does_not_panic() {
     // The critical check is that it does not panic or segfault.
     if let Ok(info) = result {
         // If it succeeds, kind should still be Image (magic bytes detected).
-        assert_eq!(info.kind, FileKind::Image);
+        assert_eq!(info.kind, FileKind::ImageDocument);
     }
 }

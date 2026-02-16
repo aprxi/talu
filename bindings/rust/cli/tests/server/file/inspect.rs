@@ -299,10 +299,10 @@ async fn inspect_elf_bytes_returns_binary_kind() {
 }
 
 #[tokio::test]
-async fn inspect_pdf_header_detected_as_image() {
+async fn inspect_pdf_header_detected_as_document() {
     let app = build_app();
-    // PDF headers start with %PDF- magic bytes, which the image format detector
-    // recognizes as PDF (format=4). This classifies the file as kind=image.
+    // PDF headers start with %PDF- magic bytes. PDF is a rendered format (kind=document)
+    // — no intrinsic pixel dimensions; image metadata is null.
     let pdf = b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog >>\nendobj\n";
     let req = multipart_request(
         "POST",
@@ -317,8 +317,9 @@ async fn inspect_pdf_header_detected_as_image() {
     let (status, json) = body_json(send_request(&app, req).await).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(json["kind"], "image");
+    assert_eq!(json["kind"], "document");
     assert_eq!(json["size"], pdf.len() as u64);
+    assert!(json["image"].is_null(), "PDF should have no image metadata");
 }
 
 // ---------------------------------------------------------------------------

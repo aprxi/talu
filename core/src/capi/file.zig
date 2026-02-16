@@ -118,8 +118,17 @@ pub const TaluImageEncodeOptions = extern struct {
     _reserved: [27]u8,
 };
 
+/// File classification result.
+///
+/// kind values:
+///   0 = unknown — unrecognized file type.
+///   1 = image_document — raster image (JPEG, PNG, WebP). The file IS pixels;
+///       intrinsic width/height/orientation are in the companion TaluImageInfo.
+///   2 = document — rendered format (PDF, future: DOCX, PPTX). The file DESCRIBES
+///       content that becomes pixels when rendered at a chosen DPI. No intrinsic
+///       pixel dimensions; TaluImageInfo stays zeroed.
 pub const TaluFileInfo = extern struct {
-    kind: c_int, // 0=unknown, 1=image
+    kind: c_int, // 0=unknown, 1=image_document, 2=document
     mime_ptr: ?[*]u8,
     mime_len: usize,
     description_ptr: ?[*]u8,
@@ -127,8 +136,12 @@ pub const TaluFileInfo = extern struct {
     _reserved: [16]u8,
 };
 
+/// Raster image metadata (only meaningful when TaluFileInfo.kind == 1).
+///
+/// For rendered documents (kind == 2), this struct stays zeroed — those formats
+/// have no intrinsic pixel dimensions.
 pub const TaluImageInfo = extern struct {
-    format: c_int, // 0=unknown, 1=jpeg, 2=png, 3=webp, 4=pdf
+    format: c_int, // 0=unknown, 1=jpeg, 2=png, 3=webp
     width: u32,
     height: u32,
     orientation: u8, // 1..8 for images, 0 if unknown
@@ -153,29 +166,58 @@ pub const TaluFileTransformOptions = extern struct {
     _reserved: [14]u8,
 };
 
+/// Per-format metadata for known file formats.
+/// Adding a new format? Add one entry here and a probeXxxMeta function.
+const FormatMeta = struct {
+    kind: c_int, // 1 = image_document, 2 = document
+    format_id: c_int, // TaluImageInfo.format value (0 for documents)
+    mime: []const u8,
+    description: []const u8,
+};
+
+fn formatMeta(fmt: image.Format) FormatMeta {
+    return switch (fmt) {
+        .jpeg => .{ .kind = 1, .format_id = 1, .mime = "image/jpeg", .description = "JPEG image data" },
+        .png => .{ .kind = 1, .format_id = 2, .mime = "image/png", .description = "PNG image data" },
+        .webp => .{ .kind = 1, .format_id = 3, .mime = "image/webp", .description = "WebP image data" },
+        .pdf => .{ .kind = 2, .format_id = 0, .mime = "application/pdf", .description = "PDF document" },
+    };
+}
+
 fn inspectFileImpl(input: []const u8, out: *TaluFileInfo, out_image: ?*TaluImageInfo) !void {
-    if (try detectMagicString(input, MAGIC_MIME_TYPE)) |mime| {
-        out.mime_ptr = mime.ptr;
-        out.mime_len = mime.len;
-        if (std.mem.startsWith(u8, mime, "image/")) out.kind = 1;
-    }
-    if (try detectMagicString(input, MAGIC_NONE)) |desc| {
-        out.description_ptr = desc.ptr;
-        out.description_len = desc.len;
-    }
+    // Fast path: check magic bytes for known formats first.
+    // Known formats derive MIME/description/kind from our own tables —
+    // no libmagic overhead.
     const fmt = image.detectFormat(input);
     if (fmt) |image_fmt| {
-        out.kind = 1;
-        if (out_image) |img| {
-            img.format = imageFormatToFileC(image_fmt);
-            if (probeImageMeta(input, image_fmt)) |meta| {
-                img.width = meta.width;
-                img.height = meta.height;
-                img.orientation = meta.exif_orientation;
-            } else |_| {}
+        const fm = formatMeta(image_fmt);
+        out.kind = fm.kind;
+        try setOwnedBytes(&out.mime_ptr, &out.mime_len, fm.mime);
+        try setOwnedBytes(&out.description_ptr, &out.description_len, fm.description);
+
+        if (fm.kind == 1) { // image_document — populate raster metadata
+            if (out_image) |img| {
+                img.format = fm.format_id;
+                if (probeImageMeta(input, image_fmt)) |probe| {
+                    img.width = probe.width;
+                    img.height = probe.height;
+                    img.orientation = probe.exif_orientation;
+                } else |_| {}
+            }
         }
+    } else {
+        // Unknown format — fall back to libmagic for MIME and description.
+        if (try detectMagicString(input, MAGIC_MIME_TYPE)) |mime| {
+            out.mime_ptr = mime.ptr;
+            out.mime_len = mime.len;
+        }
+        if (try detectMagicString(input, MAGIC_NONE)) |desc| {
+            out.description_ptr = desc.ptr;
+            out.description_len = desc.len;
+        }
+        // kind stays 0 (unknown). Fill gaps if libmagic also failed.
+        try classifyUnknownFallback(out, input);
     }
-    try ensureFallbackClassification(out, input, fmt);
 }
 
 pub export fn talu_file_inspect(
@@ -634,7 +676,7 @@ fn probeImageMeta(bytes: []const u8, fmt: image.Format) !ImageMeta {
         .jpeg => try probeJpegMeta(bytes),
         .png => try probePngMeta(bytes),
         .webp => try probeWebpMeta(bytes),
-        .pdf => try probePdfMeta(bytes),
+        .pdf => unreachable, // PDF is kind=2 (document); never probed as raster.
     };
 }
 
@@ -694,21 +736,6 @@ fn probeWebpMeta(bytes: []const u8) !ImageMeta {
     };
 }
 
-fn probePdfMeta(bytes: []const u8) !ImageMeta {
-    const codecs = @import("../image/codecs/root.zig");
-    const dims = try codecs.pdf.pageDimensions(bytes, 0);
-    // Convert PDF points to pixels at 150 DPI (default render DPI)
-    const scale: f32 = 150.0 / 72.0;
-    const w: u32 = @intFromFloat(@ceil(dims.width_points * scale));
-    const h: u32 = @intFromFloat(@ceil(dims.height_points * scale));
-    if (w == 0 or h == 0) return error.InvalidImageDimensions;
-    return .{
-        .width = w,
-        .height = h,
-        .exif_orientation = 1,
-    };
-}
-
 fn detectMagicString(bytes: []const u8, flags: c_int) !?[]u8 {
     if (bytes.len == 0) return null;
     const cookie = magic_open(flags) orelse return null;
@@ -728,24 +755,14 @@ fn detectMagicString(bytes: []const u8, flags: c_int) !?[]u8 {
     return try allocator.dupe(u8, value);
 }
 
-fn ensureFallbackClassification(out: *TaluFileInfo, bytes: []const u8, fmt: ?image.Format) !void {
+/// Fill in MIME and description for unknown formats when libmagic failed.
+fn classifyUnknownFallback(out: *TaluFileInfo, bytes: []const u8) !void {
     if (out.mime_ptr == null) {
-        const mime = if (fmt) |image_fmt|
-            imageMime(image_fmt)
-        else if (looksLikeText(bytes))
-            "text/plain"
-        else
-            "application/octet-stream";
+        const mime: []const u8 = if (looksLikeText(bytes)) "text/plain" else "application/octet-stream";
         try setOwnedBytes(&out.mime_ptr, &out.mime_len, mime);
     }
-
     if (out.description_ptr == null) {
-        const desc = if (fmt) |image_fmt|
-            imageDescription(image_fmt)
-        else if (looksLikeText(bytes))
-            "ASCII text"
-        else
-            "data";
+        const desc: []const u8 = if (looksLikeText(bytes)) "ASCII text" else "data";
         try setOwnedBytes(&out.description_ptr, &out.description_len, desc);
     }
 }
@@ -754,24 +771,6 @@ fn setOwnedBytes(out_ptr: *?[*]u8, out_len: *usize, value: []const u8) !void {
     const owned = try allocator.dupe(u8, value);
     out_ptr.* = if (owned.len == 0) null else owned.ptr;
     out_len.* = owned.len;
-}
-
-fn imageMime(fmt: image.Format) []const u8 {
-    return switch (fmt) {
-        .jpeg => "image/jpeg",
-        .png => "image/png",
-        .webp => "image/webp",
-        .pdf => "application/pdf",
-    };
-}
-
-fn imageDescription(fmt: image.Format) []const u8 {
-    return switch (fmt) {
-        .jpeg => "JPEG image data",
-        .png => "PNG image data",
-        .webp => "WebP image data",
-        .pdf => "PDF document",
-    };
 }
 
 fn looksLikeText(bytes: []const u8) bool {
@@ -798,15 +797,6 @@ fn fileOutputFormatFromC(v: c_int) !?image.EncodeFormat {
         1 => .jpeg,
         2 => .png,
         else => error.InvalidArgument,
-    };
-}
-
-fn imageFormatToFileC(v: image.Format) c_int {
-    return switch (v) {
-        .jpeg => 1,
-        .png => 2,
-        .webp => 3,
-        .pdf => 4,
     };
 }
 

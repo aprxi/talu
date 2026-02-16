@@ -78,18 +78,19 @@ test "capi file transform resize webp to png" {
     try std.testing.expectEqual(@as(u32, 2), out_image.height);
 }
 
-test "talu_file_inspect recognizes pdf" {
+test "talu_file_inspect recognizes pdf as document" {
     var info = std.mem.zeroes(capi.TaluFileInfo);
     var img = std.mem.zeroes(capi.TaluImageInfo);
     const rc = capi.talu_file_inspect(pdf_1page.ptr, pdf_1page.len, &info, &img);
     try std.testing.expectEqual(@as(i32, 0), rc);
     defer capi.talu_file_info_free(&info);
 
-    try std.testing.expectEqual(@as(c_int, 1), info.kind);
-    try std.testing.expectEqual(@as(c_int, 4), img.format); // pdf = 4
-    // 72pt page at 150 DPI → ceil(72 * 150/72) = 150px
-    try std.testing.expectEqual(@as(u32, 150), img.width);
-    try std.testing.expectEqual(@as(u32, 150), img.height);
+    // PDF is kind=2 (document) — a rendered format with no intrinsic pixel
+    // dimensions. TaluImageInfo stays zeroed.
+    try std.testing.expectEqual(@as(c_int, 2), info.kind);
+    try std.testing.expectEqual(@as(c_int, 0), img.format);
+    try std.testing.expectEqual(@as(u32, 0), img.width);
+    try std.testing.expectEqual(@as(u32, 0), img.height);
 }
 
 test "talu_pdf_page_count returns page count" {

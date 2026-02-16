@@ -89,7 +89,8 @@ fn print_file_info(path: &Path, info: &talu::file::FileInfo) {
     println!(
         "Kind: {}",
         match info.kind {
-            talu::file::FileKind::Image => "image",
+            talu::file::FileKind::ImageDocument => "image",
+            talu::file::FileKind::Document => "document",
             talu::file::FileKind::Unknown => "unknown",
         }
     );
