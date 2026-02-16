@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileInspection } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileInspection } from "./types.ts";
 
 const BASE = "";
 
@@ -26,8 +26,10 @@ export interface ApiClient {
   createDocument(doc: CreateDocumentRequest): Promise<ApiResult<Document>>;
   updateDocument(id: string, doc: UpdateDocumentRequest): Promise<ApiResult<Document>>;
   deleteDocument(id: string): Promise<ApiResult<void>>;
+  listFiles(limit?: number, marker?: string): Promise<ApiResult<FileList>>;
   uploadFile(file: File, purpose?: string): Promise<ApiResult<FileObject>>;
   getFile(id: string): Promise<ApiResult<FileObject>>;
+  updateFile(id: string, patch: { filename?: string; marker?: string }): Promise<ApiResult<FileObject>>;
   deleteFile(id: string): Promise<ApiResult<void>>;
   getFileContent(id: string): Promise<ApiResult<Blob>>;
   inspectFile(file: File): Promise<ApiResult<FileInspection>>;
@@ -132,6 +134,11 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     createDocument: (doc) => requestJson<Document>("POST", "/v1/documents", doc),
     updateDocument: (id, doc) => requestJson<Document>("PATCH", `/v1/documents/${encodeURIComponent(id)}`, doc),
     deleteDocument: (id) => requestJson<void>("DELETE", `/v1/documents/${encodeURIComponent(id)}`),
+    listFiles: (limit = 100, marker?: string) => {
+      const params = new URLSearchParams({ limit: String(limit) });
+      if (marker) params.set("marker", marker);
+      return requestJson<FileList>("GET", `/v1/files?${params}`);
+    },
     uploadFile: (file, purpose = "assistants") => {
       const form = new FormData();
       form.append("file", file, file.name);
@@ -139,6 +146,8 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
       return requestFormData<FileObject>("POST", "/v1/files", form);
     },
     getFile: (id) => requestJson<FileObject>("GET", `/v1/files/${encodeURIComponent(id)}`),
+    updateFile: (id, patch) =>
+      requestJson<FileObject>("PATCH", `/v1/files/${encodeURIComponent(id)}`, patch),
     deleteFile: (id) => requestJson<void>("DELETE", `/v1/files/${encodeURIComponent(id)}`),
     getFileContent: (id) => requestBlob("GET", `/v1/files/${encodeURIComponent(id)}/content`),
     inspectFile: (file) => {

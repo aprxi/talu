@@ -298,6 +298,11 @@ impl Service<Request<Incoming>> for Router {
                         {
                             files::handle_get(state, req, auth).await
                         }
+                        (Method::PATCH, p)
+                            if p.starts_with("/v1/files/") || p.starts_with("/files/") =>
+                        {
+                            files::handle_patch(state, req, auth).await
+                        }
                         (Method::DELETE, p)
                             if p.starts_with("/v1/files/") || p.starts_with("/files/") =>
                         {

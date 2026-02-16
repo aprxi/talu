@@ -382,6 +382,21 @@ export interface FileObject {
   created_at: number;
   filename: string;
   purpose: string;
+  /** Detected MIME type (from inspection, may differ from browser-supplied). */
+  mime_type?: string;
+  /** High-level file kind: "image", "text", or "binary". */
+  kind?: string;
+  /** Image-specific metadata (present only for image files). */
+  image?: FileImageInfo;
+  /** Marker: "active" or "archived". */
+  marker?: string;
+}
+
+/** Paginated file list from GET /v1/files. */
+export interface FileList {
+  object: "list";
+  data: FileObject[];
+  has_more: boolean;
 }
 
 // ---------------------------------------------------------------------------

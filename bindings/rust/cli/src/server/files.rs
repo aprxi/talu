@@ -3,9 +3,14 @@
 //! Implements `POST /v1/files` (`/files`) using:
 //! - `talu::blobs::BlobsHandle` for raw bytes
 //! - `talu::documents::DocumentsHandle` for metadata (`doc_type = "file"`)
+//!
+//! On upload the handler runs `talu::file::inspect_bytes` to detect MIME type,
+//! file kind, and image dimensions.  Inspection is fail-safe: timeouts, panics,
+//! and errors are logged and the upload succeeds with metadata fields absent.
 
+use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, StreamBody};
@@ -15,6 +20,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use talu::blobs::{BlobError, BlobsHandle};
 use talu::documents::{DocumentError, DocumentRecord, DocumentsHandle};
+use talu::file;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
@@ -34,6 +40,23 @@ struct FileObjectResponse {
     purpose: String,
     status: String,
     status_details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mime_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    image: Option<FileImageMetadata>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    marker: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct FileImageMetadata {
+    format: String,
+    width: u32,
+    height: u32,
+    exif_orientation: u8,
+    aspect_ratio: f64,
 }
 
 #[derive(Debug)]
@@ -66,7 +89,7 @@ struct FileListResponse {
     has_more: bool,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FileDocumentContent {
     #[serde(default)]
     blob_ref: Option<String>,
@@ -78,6 +101,12 @@ struct FileDocumentContent {
     size: Option<u64>,
     #[serde(default)]
     purpose: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    kind: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image: Option<FileImageMetadata>,
 }
 
 #[derive(Debug)]
@@ -89,6 +118,9 @@ struct FileDescriptor {
     created_at: u64,
     blob_ref: String,
     mime_type: Option<String>,
+    kind: Option<String>,
+    image: Option<FileImageMetadata>,
+    marker: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,19 +220,69 @@ pub async fn handle_upload(
     let purpose = upload.purpose.unwrap_or_else(|| "assistants".to_string());
     let created_at = now_unix_seconds();
     let filename = sanitize_filename(&upload.filename).unwrap_or_else(|| "upload.bin".to_string());
-    let metadata = serde_json::json!({
-        "blob_ref": upload.blob_ref,
-        "original_name": filename,
-        "mime_type": upload.mime_type,
-        "size": upload.bytes,
-        "purpose": purpose,
-    });
+
+    // Fail-safe inspection: read blob back, inspect, store metadata.
+    // Timeouts, panics, and errors are logged — upload always succeeds.
+    let inspection = inspect_blob_failsafe(
+        &blobs,
+        &upload.blob_ref,
+        upload.bytes,
+        state.max_file_inspect_bytes,
+    )
+    .await;
+
+    let detected_mime = inspection
+        .as_ref()
+        .map(|i| i.mime.clone())
+        .or(upload.mime_type.clone());
+
+    let mut doc_content = FileDocumentContent {
+        blob_ref: Some(upload.blob_ref.clone()),
+        original_name: Some(filename.clone()),
+        mime_type: detected_mime.clone(),
+        size: Some(upload.bytes),
+        purpose: Some(purpose.clone()),
+        kind: None,
+        description: None,
+        image: None,
+    };
+
+    let mut resp_kind: Option<String> = None;
+    let mut resp_image: Option<FileImageMetadata> = None;
+
+    if let Some(info) = inspection {
+        let kind_str = map_file_kind(&info.kind, &info.mime);
+        doc_content.kind = Some(kind_str.to_string());
+        doc_content.description = Some(info.description);
+
+        resp_kind = Some(kind_str.to_string());
+
+        if let Some(img) = info.image {
+            let aspect = if img.height > 0 {
+                img.width as f64 / img.height as f64
+            } else {
+                0.0
+            };
+            let meta = FileImageMetadata {
+                format: image_format_str(img.format),
+                width: img.width,
+                height: img.height,
+                exif_orientation: img.exif_orientation,
+                aspect_ratio: aspect,
+            };
+            doc_content.image = Some(meta.clone());
+            resp_image = Some(meta);
+        }
+    }
+
+    let metadata_json =
+        serde_json::to_string(&doc_content).unwrap_or_else(|_| "{}".to_string());
 
     if let Err(e) = docs.create(
         &file_id,
         "file",
-        metadata["original_name"].as_str().unwrap_or_default(),
-        &metadata.to_string(),
+        &filename,
+        &metadata_json,
         None,
         None,
         Some("active"),
@@ -215,16 +297,14 @@ pub async fn handle_upload(
         object: "file".to_string(),
         bytes: upload.bytes,
         created_at,
-        filename: metadata["original_name"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string(),
-        purpose: metadata["purpose"]
-            .as_str()
-            .unwrap_or("assistants")
-            .to_string(),
+        filename,
+        purpose,
         status: "processed".to_string(),
         status_details: None,
+        mime_type: detected_mime,
+        kind: resp_kind,
+        image: resp_image,
+        marker: Some("active".to_string()),
     };
 
     json_response(StatusCode::OK, &response)
@@ -247,9 +327,11 @@ pub async fn handle_list(
         }
     };
 
-    let limit = parse_query_param(req.uri().query().unwrap_or(""), "limit")
+    let query_str = req.uri().query().unwrap_or("");
+    let limit = parse_query_param(query_str, "limit")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(100);
+    let marker_filter = parse_query_param(query_str, "marker").unwrap_or("active");
 
     let storage_path = match auth.as_ref() {
         Some(ctx) => bucket.join(&ctx.storage_prefix),
@@ -261,7 +343,7 @@ pub async fn handle_list(
         Err(e) => return document_error_response(e),
     };
 
-    let rows = match docs.list(Some("file"), None, None, Some("active"), limit) {
+    let rows = match docs.list(Some("file"), None, None, Some(marker_filter), limit) {
         Ok(v) => v,
         Err(e) => return document_error_response(e),
     };
@@ -548,6 +630,9 @@ fn descriptor_from_doc(doc: DocumentRecord) -> Result<FileDescriptor, Response<B
             mime_type: None,
             size: None,
             purpose: None,
+            kind: None,
+            description: None,
+            image: None,
         });
 
     let blob_ref = match parsed.blob_ref {
@@ -575,6 +660,9 @@ fn descriptor_from_doc(doc: DocumentRecord) -> Result<FileDescriptor, Response<B
         created_at: (doc.created_at_ms.max(0) as u64) / 1000,
         blob_ref,
         mime_type: parsed.mime_type,
+        kind: parsed.kind,
+        image: parsed.image,
+        marker: doc.marker,
     })
 }
 
@@ -588,7 +676,239 @@ fn to_file_object_response(descriptor: FileDescriptor) -> FileObjectResponse {
         purpose: descriptor.purpose,
         status: "processed".to_string(),
         status_details: None,
+        mime_type: descriptor.mime_type,
+        kind: descriptor.kind,
+        image: descriptor.image,
+        marker: descriptor.marker,
     }
+}
+
+// ---------------------------------------------------------------------------
+// Fail-safe file inspection
+// ---------------------------------------------------------------------------
+
+/// Read the blob back and run `file::inspect_bytes` with timeout + panic guard.
+/// Returns `None` on any failure — the upload must never be blocked by inspection.
+async fn inspect_blob_failsafe(
+    blobs: &BlobsHandle,
+    blob_ref: &str,
+    file_bytes: u64,
+    max_inspect_bytes: u64,
+) -> Option<file::FileInfo> {
+    if file_bytes == 0 || file_bytes > max_inspect_bytes {
+        return None;
+    }
+
+    let mut stream = blobs.open_stream(blob_ref).ok()?;
+    let total = stream.total_size().ok()?;
+    let cap = total.min(max_inspect_bytes) as usize;
+    let mut buf = vec![0u8; cap];
+    let mut pos = 0usize;
+    while pos < cap {
+        match stream.read(&mut buf[pos..]) {
+            Ok(0) => break,
+            Ok(n) => pos += n,
+            Err(_) => return None,
+        }
+    }
+    buf.truncate(pos);
+
+    let result = tokio::time::timeout(Duration::from_secs(2), tokio::task::spawn_blocking(
+        move || std::panic::catch_unwind(AssertUnwindSafe(|| file::inspect_bytes(&buf))),
+    ))
+    .await;
+
+    match result {
+        Ok(Ok(Ok(Ok(info)))) => Some(info),
+        Ok(Ok(Ok(Err(e)))) => {
+            log::warn!("file inspection error (non-fatal): {e}");
+            None
+        }
+        Ok(Ok(Err(_panic))) => {
+            log::warn!("file inspection panicked (non-fatal)");
+            None
+        }
+        Ok(Err(e)) => {
+            log::warn!("file inspection task join error (non-fatal): {e}");
+            None
+        }
+        Err(_timeout) => {
+            log::warn!("file inspection timed out (non-fatal)");
+            None
+        }
+    }
+}
+
+fn map_file_kind(kind: &file::FileKind, mime: &str) -> &'static str {
+    match kind {
+        file::FileKind::Image => "image",
+        file::FileKind::Unknown => {
+            if mime.starts_with("text/") {
+                "text"
+            } else {
+                "binary"
+            }
+        }
+    }
+}
+
+fn image_format_str(f: file::ImageFormat) -> String {
+    match f {
+        file::ImageFormat::Jpeg => "jpeg".to_string(),
+        file::ImageFormat::Png => "png".to_string(),
+        file::ImageFormat::Webp => "webp".to_string(),
+        file::ImageFormat::Unknown => "unknown".to_string(),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PATCH handler
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+struct FilePatchRequest {
+    #[serde(default)]
+    filename: Option<String>,
+    #[serde(default)]
+    marker: Option<String>,
+}
+
+/// PATCH /v1/files/:id - Rename a file (update metadata).
+pub async fn handle_patch(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let file_id = match extract_file_id(req.uri().path()) {
+        Some(id) => id,
+        None => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "Invalid file id path",
+            );
+        }
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                &format!("Failed to read body: {e}"),
+            );
+        }
+    };
+
+    let patch: FilePatchRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                &format!("Invalid JSON: {e}"),
+            );
+        }
+    };
+
+    let (doc, storage_path) = match load_file_doc(state, auth, &file_id) {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
+
+    // Validate marker if provided.
+    let new_marker = match &patch.marker {
+        Some(m) => match m.as_str() {
+            "active" | "archived" => Some(m.as_str()),
+            _ => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "marker must be 'active' or 'archived'",
+                );
+            }
+        },
+        None => None,
+    };
+
+    // Determine new filename.
+    let new_filename = match patch.filename {
+        Some(raw) => match sanitize_filename(&raw) {
+            Some(name) => Some(name),
+            None => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "Invalid filename",
+                );
+            }
+        },
+        None => None,
+    };
+
+    // Nothing to update — return current state.
+    if new_filename.is_none() && new_marker.is_none() {
+        let descriptor = match descriptor_from_doc(doc) {
+            Ok(d) => d,
+            Err(resp) => return resp,
+        };
+        return json_response(StatusCode::OK, &to_file_object_response(descriptor));
+    }
+
+    // Update doc_json if filename changed.
+    let new_json = if let Some(ref name) = new_filename {
+        let mut content: FileDocumentContent =
+            serde_json::from_str(&doc.doc_json).unwrap_or(FileDocumentContent {
+                blob_ref: None,
+                original_name: None,
+                mime_type: None,
+                size: None,
+                purpose: None,
+                kind: None,
+                description: None,
+                image: None,
+            });
+        content.original_name = Some(name.clone());
+        Some(serde_json::to_string(&content).unwrap_or_else(|_| doc.doc_json.clone()))
+    } else {
+        None
+    };
+
+    let docs = match DocumentsHandle::open(&storage_path) {
+        Ok(h) => h,
+        Err(e) => return document_error_response(e),
+    };
+
+    if let Err(e) = docs.update(
+        &file_id,
+        new_filename.as_deref(),
+        new_json.as_deref(),
+        None,
+        new_marker,
+    ) {
+        return document_error_response(e);
+    }
+
+    // Re-fetch updated document.
+    let updated_doc = match docs.get(&file_id) {
+        Ok(Some(d)) => d,
+        Ok(None) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("File not found: {file_id}"),
+            );
+        }
+        Err(e) => return document_error_response(e),
+    };
+
+    let descriptor = match descriptor_from_doc(updated_doc) {
+        Ok(d) => d,
+        Err(resp) => return resp,
+    };
+
+    json_response(StatusCode::OK, &to_file_object_response(descriptor))
 }
 
 fn parse_query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {
@@ -892,7 +1212,9 @@ fn blob_error_response(err: BlobError) -> Response<BoxBody> {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_boundary, extract_file_id, resolve_filename};
+    use super::{
+        extract_boundary, extract_file_id, resolve_filename, FileDocumentContent,
+    };
     use talu::blobs::BlobError;
 
     #[test]
@@ -952,5 +1274,63 @@ mod tests {
         let resp =
             super::blob_error_response(BlobError::ResourceExhausted("disk full".to_string()));
         assert_eq!(resp.status(), super::StatusCode::INSUFFICIENT_STORAGE);
+    }
+
+    #[test]
+    fn file_doc_content_deserializes_old_format() {
+        let json = r#"{"blob_ref":"sha256:abc","original_name":"test.txt","mime_type":"text/plain","size":100,"purpose":"assistants"}"#;
+        let parsed: FileDocumentContent = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.blob_ref.as_deref(), Some("sha256:abc"));
+        assert_eq!(parsed.original_name.as_deref(), Some("test.txt"));
+        assert!(parsed.kind.is_none());
+        assert!(parsed.description.is_none());
+        assert!(parsed.image.is_none());
+    }
+
+    #[test]
+    fn file_doc_content_deserializes_enriched_format() {
+        let json = r#"{
+            "blob_ref": "sha256:abc",
+            "original_name": "photo.jpg",
+            "mime_type": "image/jpeg",
+            "size": 1024,
+            "purpose": "assistants",
+            "kind": "image",
+            "description": "JPEG image data",
+            "image": {
+                "format": "jpeg",
+                "width": 1920,
+                "height": 1080,
+                "exif_orientation": 1,
+                "aspect_ratio": 1.777
+            }
+        }"#;
+        let parsed: FileDocumentContent = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.kind.as_deref(), Some("image"));
+        assert_eq!(parsed.description.as_deref(), Some("JPEG image data"));
+        let img = parsed.image.unwrap();
+        assert_eq!(img.width, 1920);
+        assert_eq!(img.height, 1080);
+        assert_eq!(img.format, "jpeg");
+    }
+
+    #[test]
+    fn file_doc_content_roundtrip_serialization() {
+        let content = FileDocumentContent {
+            blob_ref: Some("sha256:abc".to_string()),
+            original_name: Some("test.txt".to_string()),
+            mime_type: Some("text/plain".to_string()),
+            size: Some(100),
+            purpose: Some("assistants".to_string()),
+            kind: Some("text".to_string()),
+            description: Some("ASCII text".to_string()),
+            image: None,
+        };
+        let json = serde_json::to_string(&content).unwrap();
+        let parsed: FileDocumentContent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.kind.as_deref(), Some("text"));
+        assert!(parsed.image.is_none());
+        // image field should be absent in JSON (skip_serializing_if)
+        assert!(!json.contains("\"image\""));
     }
 }
