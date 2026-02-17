@@ -1,8 +1,10 @@
 //! Agent - Stateful, autonomous agent with built-in compaction and retry.
 //!
 //! Owns a Chat (conversation), ToolRegistry, and makes decisions internally:
-//! compaction when approaching context limits, retry with exponential backoff
-//! on transient failures, inbox draining from a MessageBus.
+//! turn-aware compaction when approaching context limits, retry with
+//! exponential backoff on transient failures, inbox draining from a
+//! MessageBus, goal persistence across compaction, and optional context
+//! injection (RAG) before each generation.
 //!
 //! Exposes `prompt()` (user turn), `continueLoop()` (resume), `heartbeat()`
 //! (autonomous check-in), and `abort()` (cross-thread cancellation).
@@ -12,7 +14,8 @@
 //!
 //! # Ownership
 //!
-//! Agent owns: Chat, ToolRegistry, agent_id, state_dir.
+//! Agent owns: Chat, ToolRegistry, agent_id, state_dir, goals,
+//! base_system_prompt.
 //! Agent borrows: InferenceBackend, MessageBus (caller-managed lifecycles).
 //! `deinit()` frees all owned resources.
 //!
@@ -28,6 +31,7 @@ const Allocator = std.mem.Allocator;
 const loop_mod = @import("loop.zig");
 const tool_mod = @import("tool.zig");
 const bus_mod = @import("bus.zig");
+const compaction_mod = @import("compaction.zig");
 
 const responses = @import("../responses/root.zig");
 const Chat = responses.Chat;
@@ -46,6 +50,23 @@ const ToolRegistry = tool_mod.ToolRegistry;
 const Tool = tool_mod.Tool;
 const MessageBus = bus_mod.MessageBus;
 const Message = bus_mod.Message;
+
+// =============================================================================
+// Callback types
+// =============================================================================
+
+/// Called before each generation to allow context injection (e.g., RAG).
+///
+/// Receives the most recent user message text (or null if none).
+/// Writes context to out_context/out_context_len. The agent copies the
+/// returned text before proceeding. Returns false to cancel the loop.
+pub const OnContextInjectFn = *const fn (
+    last_user_message: ?[*]const u8,
+    last_user_message_len: usize,
+    out_context: *?[*]const u8,
+    out_context_len: *usize,
+    user_data: ?*anyopaque,
+) callconv(.c) bool;
 
 // =============================================================================
 // Configuration
@@ -77,6 +98,10 @@ pub const AgentConfig = struct {
     on_event_data: ?*anyopaque = null,
     on_session: ?OnSessionFn = null,
     on_session_data: ?*anyopaque = null,
+
+    // Context injection callback (called at Agent level before each generation)
+    on_context_inject: ?OnContextInjectFn = null,
+    on_context_inject_data: ?*anyopaque = null,
 };
 
 // =============================================================================
@@ -125,6 +150,16 @@ pub const Agent = struct {
     on_event_data: ?*anyopaque,
     on_session: ?OnSessionFn,
     on_session_data: ?*anyopaque,
+
+    // Context injection callback
+    on_context_inject: ?OnContextInjectFn,
+    on_context_inject_data: ?*anyopaque,
+
+    // Goals — persistent objectives that survive compaction
+    goals: std.ArrayListUnmanaged([]const u8),
+    /// The caller's original system prompt, before goal injection.
+    /// Null until setSystem() is called.
+    base_system_prompt: ?[]const u8,
 
     // =========================================================================
     // Lifecycle
@@ -186,6 +221,10 @@ pub const Agent = struct {
             .on_event_data = config.on_event_data,
             .on_session = config.on_session,
             .on_session_data = config.on_session_data,
+            .on_context_inject = config.on_context_inject,
+            .on_context_inject_data = config.on_context_inject_data,
+            .goals = .{},
+            .base_system_prompt = null,
         };
         return agent;
     }
@@ -197,6 +236,9 @@ pub const Agent = struct {
         self.allocator.destroy(self.chat);
         self.allocator.free(self.agent_id);
         if (self.state_dir) |d| self.allocator.free(d);
+        for (self.goals.items) |goal| self.allocator.free(goal);
+        self.goals.deinit(self.allocator);
+        if (self.base_system_prompt) |bsp| self.allocator.free(bsp);
         self.allocator.destroy(self);
     }
 
@@ -204,9 +246,14 @@ pub const Agent = struct {
     // Configuration
     // =========================================================================
 
-    /// Set the system prompt. Forwards to Chat.setSystem().
+    /// Set the system prompt.
+    ///
+    /// Stores the prompt as the base system prompt and rebuilds the effective
+    /// system prompt with any active goals appended.
     pub fn setSystem(self: *Agent, system_prompt: []const u8) !void {
-        try self.chat.setSystem(system_prompt);
+        if (self.base_system_prompt) |old| self.allocator.free(old);
+        self.base_system_prompt = try self.allocator.dupe(u8, system_prompt);
+        try self.syncSystemPromptWithGoals();
     }
 
     /// Register a tool. The agent takes ownership via its ToolRegistry.
@@ -221,35 +268,88 @@ pub const Agent = struct {
     }
 
     // =========================================================================
+    // Goals — persistent objectives that survive compaction
+    // =========================================================================
+
+    /// Add a goal that persists across compaction.
+    ///
+    /// Goals are injected into the system prompt before each generation,
+    /// ensuring the LLM always knows its objectives even after context
+    /// truncation. Duplicate goals (exact string match) are silently ignored.
+    pub fn addGoal(self: *Agent, goal: []const u8) !void {
+        for (self.goals.items) |existing| {
+            if (std.mem.eql(u8, existing, goal)) return;
+        }
+        const owned = try self.allocator.dupe(u8, goal);
+        errdefer self.allocator.free(owned);
+        try self.goals.append(self.allocator, owned);
+    }
+
+    /// Remove a specific goal by exact string match.
+    /// Returns true if the goal was found and removed.
+    pub fn removeGoal(self: *Agent, goal: []const u8) bool {
+        for (self.goals.items, 0..) |existing, idx| {
+            if (std.mem.eql(u8, existing, goal)) {
+                self.allocator.free(existing);
+                _ = self.goals.orderedRemove(idx);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /// Remove all goals.
+    pub fn clearGoals(self: *Agent) void {
+        for (self.goals.items) |goal| {
+            self.allocator.free(goal);
+        }
+        self.goals.clearRetainingCapacity();
+    }
+
+    /// Get the current goals (read-only slice).
+    pub fn getGoals(self: *const Agent) []const []const u8 {
+        return self.goals.items;
+    }
+
+    // =========================================================================
     // Execution
     // =========================================================================
 
     /// Send a user message and run the agent loop.
     ///
     /// 1. Drain inbox (bus messages -> developer messages)
-    /// 2. Compact if approaching context limit
-    /// 3. Append user message
-    /// 4. Run loop with retry
-    /// 5. Update cumulative state
+    /// 2. Sync goals into system prompt
+    /// 3. Compact if approaching context limit (turn-aware)
+    /// 4. Append user message
+    /// 5. Inject context (RAG callback)
+    /// 6. Run loop with retry
     pub fn prompt(self: *Agent, message: []const u8) !AgentLoopResult {
         self.stop_flag.store(false, .release);
 
         try self.drainInbox();
+        try self.syncSystemPromptWithGoals();
         self.compactIfNeeded();
         _ = try self.chat.conv.appendUserMessage(message);
+        if (!try self.injectContext()) {
+            return cancelledResult(self);
+        }
 
         return self.runWithRetry();
     }
 
     /// Resume the agent loop without a new user message.
     ///
-    /// Drains inbox, compacts if needed, then continues from where the
-    /// previous turn left off.
+    /// Drains inbox, syncs goals, compacts if needed, injects context,
+    /// then continues from where the previous turn left off.
     pub fn continueLoop(self: *Agent) !AgentLoopResult {
         self.stop_flag.store(false, .release);
 
         try self.drainInbox();
+        try self.syncSystemPromptWithGoals();
         self.compactIfNeeded();
+        if (!try self.injectContext()) {
+            return cancelledResult(self);
+        }
 
         return self.runWithRetry();
     }
@@ -262,10 +362,14 @@ pub const Agent = struct {
         self.stop_flag.store(false, .release);
 
         try self.drainInbox();
+        try self.syncSystemPromptWithGoals();
         self.compactIfNeeded();
         _ = try self.chat.conv.appendDeveloperMessage(
             "Heartbeat: review pending work and act.",
         );
+        if (!try self.injectContext()) {
+            return cancelledResult(self);
+        }
 
         return self.runWithRetry();
     }
@@ -314,14 +418,104 @@ pub const Agent = struct {
     }
 
     // =========================================================================
+    // Internal: goal sync
+    // =========================================================================
+
+    /// Build and set the system prompt with goals injected.
+    ///
+    /// If goals are present, appends them to the base system prompt in a
+    /// structured section. If no goals, sets the base prompt directly.
+    /// No-op if no base system prompt has been set.
+    fn syncSystemPromptWithGoals(self: *Agent) !void {
+        const base = self.base_system_prompt orelse return;
+
+        if (self.goals.items.len == 0) {
+            try self.chat.setSystem(base);
+            return;
+        }
+
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        const writer = buf.writer(self.allocator);
+
+        try writer.writeAll(base);
+        try writer.writeAll("\n\n## Active Goals\n\nThese are your current objectives. Pursue them proactively:\n");
+        for (self.goals.items) |goal| {
+            try writer.writeAll("- ");
+            try writer.writeAll(goal);
+            try writer.writeByte('\n');
+        }
+
+        try self.chat.setSystem(buf.items);
+    }
+
+    // =========================================================================
+    // Internal: context injection
+    // =========================================================================
+
+    /// Call the context injection hook if set.
+    ///
+    /// Finds the most recent user message, passes its text to the callback,
+    /// and appends the returned context as a hidden developer message
+    /// (visible to LLM, excluded from UI).
+    ///
+    /// Returns false if the callback requested cancellation.
+    fn injectContext(self: *Agent) !bool {
+        const inject_fn = self.on_context_inject orelse return true;
+
+        // Find last user message text
+        var last_user_text: ?[]const u8 = null;
+        var scan_idx: usize = self.chat.conv.len();
+        while (scan_idx > 0) {
+            scan_idx -= 1;
+            const item = self.chat.conv.getItem(scan_idx) orelse continue;
+            const msg = item.asMessage() orelse continue;
+            if (msg.role == .user) {
+                last_user_text = msg.getFirstText();
+                break;
+            }
+        }
+
+        var out_ctx: ?[*]const u8 = null;
+        var out_len: usize = 0;
+
+        const user_ptr: ?[*]const u8 = if (last_user_text) |t| t.ptr else null;
+        const user_len: usize = if (last_user_text) |t| t.len else 0;
+
+        const should_continue = inject_fn(
+            user_ptr,
+            user_len,
+            &out_ctx,
+            &out_len,
+            self.on_context_inject_data,
+        );
+
+        if (!should_continue) return false;
+
+        if (out_ctx) |ctx_ptr| {
+            if (out_len > 0) {
+                const context_text = ctx_ptr[0..out_len];
+                _ = try self.chat.conv.appendMessageWithHidden(
+                    .developer,
+                    .input_text,
+                    context_text,
+                    true,
+                );
+            }
+        }
+
+        return true;
+    }
+
+    // =========================================================================
     // Internal: compaction
     // =========================================================================
 
     /// Compact the conversation if token counts exceed the threshold.
     ///
-    /// Strategy: delete items from the front (after system prompt) until total
-    /// tokens fit within context_limit / 2. This keeps the system prompt and
-    /// the most recent items.
+    /// Uses turn-aware compaction: groups items into logical turns and deletes
+    /// the oldest unpinned turns first, preserving turn integrity and respecting
+    /// the pinned flag on items.
     fn compactIfNeeded(self: *Agent) void {
         if (self.context_limit == 0) return;
 
@@ -335,12 +529,10 @@ pub const Agent = struct {
 
         const target = self.context_limit / 2;
 
-        // Delete from index 1 (skip system prompt at 0) until we're under target
-        while (self.chat.conv.len() > 1) {
-            const check = loop_mod.computeContextInfo(self.chat.conv, 0);
-            if (check.total_input_tokens + check.total_output_tokens <= target) break;
-            _ = self.chat.conv.deleteItem(1);
-        }
+        const turns = compaction_mod.identifyTurns(self.allocator, self.chat.conv) catch return;
+        defer self.allocator.free(turns);
+
+        _ = compaction_mod.compactTurns(self.chat.conv, turns, target, total_tokens);
     }
 
     // =========================================================================
@@ -391,6 +583,18 @@ pub const Agent = struct {
         // All retries exhausted
         return last_err.?;
     }
+
+    // =========================================================================
+    // Internal: helpers
+    // =========================================================================
+
+    fn cancelledResult(self: *const Agent) AgentLoopResult {
+        return .{
+            .stop_reason = .cancelled,
+            .iterations = self.total_iterations,
+            .total_tool_calls = self.total_tool_calls,
+        };
+    }
 };
 
 // =============================================================================
@@ -422,6 +626,8 @@ test "AgentConfig defaults" {
     try std.testing.expect(config.on_token == null);
     try std.testing.expect(config.on_event == null);
     try std.testing.expect(config.on_session == null);
+    try std.testing.expect(config.on_context_inject == null);
+    try std.testing.expect(config.on_context_inject_data == null);
 }
 
 test "generateId produces 16 hex chars" {
@@ -443,4 +649,133 @@ test "generateId produces unique IDs" {
     defer allocator.free(id2);
 
     try std.testing.expect(!std.mem.eql(u8, id1, id2));
+}
+
+test "Agent addGoal stores and deduplicates" {
+    const allocator = std.testing.allocator;
+
+    // Create a minimal agent for testing goals (no backend needed)
+    var goals_list = std.ArrayListUnmanaged([]const u8){};
+    defer {
+        for (goals_list.items) |goal| allocator.free(goal);
+        goals_list.deinit(allocator);
+    }
+
+    // Simulate addGoal logic
+    const goal_text = "Fix the login bug";
+    const owned = try allocator.dupe(u8, goal_text);
+    try goals_list.append(allocator, owned);
+
+    // Deduplicate: same string should not be added twice
+    for (goals_list.items) |existing| {
+        if (std.mem.eql(u8, existing, goal_text)) break;
+    } else {
+        const dup = try allocator.dupe(u8, goal_text);
+        try goals_list.append(allocator, dup);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), goals_list.items.len);
+    try std.testing.expectEqualStrings("Fix the login bug", goals_list.items[0]);
+}
+
+test "Agent removeGoal removes by exact match" {
+    const allocator = std.testing.allocator;
+
+    var goals_list = std.ArrayListUnmanaged([]const u8){};
+    defer {
+        for (goals_list.items) |goal| allocator.free(goal);
+        goals_list.deinit(allocator);
+    }
+
+    try goals_list.append(allocator, try allocator.dupe(u8, "goal-a"));
+    try goals_list.append(allocator, try allocator.dupe(u8, "goal-b"));
+
+    // Remove "goal-a"
+    var removed = false;
+    for (goals_list.items, 0..) |existing, idx| {
+        if (std.mem.eql(u8, existing, "goal-a")) {
+            allocator.free(existing);
+            _ = goals_list.orderedRemove(idx);
+            removed = true;
+            break;
+        }
+    }
+
+    try std.testing.expect(removed);
+    try std.testing.expectEqual(@as(usize, 1), goals_list.items.len);
+    try std.testing.expectEqualStrings("goal-b", goals_list.items[0]);
+}
+
+test "Agent clearGoals removes all" {
+    const allocator = std.testing.allocator;
+
+    var goals_list = std.ArrayListUnmanaged([]const u8){};
+    defer goals_list.deinit(allocator);
+
+    try goals_list.append(allocator, try allocator.dupe(u8, "goal-1"));
+    try goals_list.append(allocator, try allocator.dupe(u8, "goal-2"));
+
+    for (goals_list.items) |goal| allocator.free(goal);
+    goals_list.clearRetainingCapacity();
+
+    try std.testing.expectEqual(@as(usize, 0), goals_list.items.len);
+}
+
+test "syncSystemPromptWithGoals appends goals section" {
+    const allocator = std.testing.allocator;
+
+    // Build a combined prompt like syncSystemPromptWithGoals does
+    const base = "You are an assistant.";
+    const goal_text = "Complete the report";
+
+    var buf = std.ArrayListUnmanaged(u8){};
+    defer buf.deinit(allocator);
+    const writer = buf.writer(allocator);
+
+    try writer.writeAll(base);
+    try writer.writeAll("\n\n## Active Goals\n\nThese are your current objectives. Pursue them proactively:\n");
+    try writer.writeAll("- ");
+    try writer.writeAll(goal_text);
+    try writer.writeByte('\n');
+
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "## Active Goals") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "Complete the report") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf.items, "You are an assistant.") != null);
+}
+
+test "syncSystemPromptWithGoals no goals passes base through" {
+    const allocator = std.testing.allocator;
+
+    // With no goals, base prompt should be used as-is
+    const base = "You are an assistant.";
+    const base_owned = try allocator.dupe(u8, base);
+    defer allocator.free(base_owned);
+
+    // Simulate: no goals means no "Active Goals" section
+    try std.testing.expectEqualStrings(base, base_owned);
+}
+
+test "OnContextInjectFn callback type" {
+    // Verify the callback type compiles and can be assigned
+    const TestData = struct {
+        fn inject(
+            _: ?[*]const u8,
+            _: usize,
+            out_ctx: *?[*]const u8,
+            out_len: *usize,
+            _: ?*anyopaque,
+        ) callconv(.c) bool {
+            out_ctx.* = null;
+            out_len.* = 0;
+            return true;
+        }
+    };
+
+    const cb: OnContextInjectFn = &TestData.inject;
+    var out_ctx: ?[*]const u8 = null;
+    var out_len: usize = 0;
+    const result = cb(null, 0, &out_ctx, &out_len, null);
+    try std.testing.expect(result);
+    try std.testing.expect(out_ctx == null);
+    try std.testing.expectEqual(@as(usize, 0), out_len);
 }

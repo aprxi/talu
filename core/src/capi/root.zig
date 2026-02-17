@@ -578,6 +578,15 @@ pub const talu_agent_get_id = agent.talu_agent_get_id;
 pub const TaluAgent = agent.TaluAgent;
 pub const CAgentCreateConfig = agent.CAgentCreateConfig;
 
+// Re-export Agent goal C API functions.
+pub const talu_agent_add_goal = agent.talu_agent_add_goal;
+pub const talu_agent_remove_goal = agent.talu_agent_remove_goal;
+pub const talu_agent_clear_goals = agent.talu_agent_clear_goals;
+pub const talu_agent_goal_count = agent.talu_agent_goal_count;
+
+// Re-export Agent context injection C API.
+pub const talu_agent_set_context_inject = agent.talu_agent_set_context_inject;
+
 // Re-export MessageBus C API functions.
 pub const talu_agent_bus_create = agent.talu_agent_bus_create;
 pub const talu_agent_bus_free = agent.talu_agent_bus_free;

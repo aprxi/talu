@@ -404,6 +404,15 @@ comptime {
     _ = &capi.talu_agent_get_chat;
     _ = &capi.talu_agent_get_id;
 
+    // Agent goal API
+    _ = &capi.talu_agent_add_goal;
+    _ = &capi.talu_agent_remove_goal;
+    _ = &capi.talu_agent_clear_goals;
+    _ = &capi.talu_agent_goal_count;
+
+    // Agent context injection API
+    _ = &capi.talu_agent_set_context_inject;
+
     // MessageBus API
     _ = &capi.talu_agent_bus_create;
     _ = &capi.talu_agent_bus_free;

@@ -30,6 +30,7 @@ const OnContextFn = agent_mod.OnContextFn;
 const OnBeforeToolFn = agent_mod.OnBeforeToolFn;
 const OnAfterToolFn = agent_mod.OnAfterToolFn;
 const OnSessionFn = agent_mod.OnSessionFn;
+const OnContextInjectFn = agent_mod.OnContextInjectFn;
 const Chat = chat_mod.Chat;
 const InferenceBackend = router_mod.InferenceBackend;
 const CGenerateConfig = router_mod.capi_bridge.CGenerateConfig;
@@ -501,6 +502,10 @@ pub const CAgentCreateConfig = extern struct {
     on_event_data: ?*anyopaque = null,
     on_session: ?OnSessionFn = null,
     on_session_data: ?*anyopaque = null,
+
+    // Context injection callback (RAG hook)
+    on_context_inject: ?OnContextInjectFn = null,
+    on_context_inject_data: ?*anyopaque = null,
 };
 
 /// Create a stateful agent. Caller owns the returned handle.
@@ -539,6 +544,8 @@ pub export fn talu_agent_create(
         agent_config.on_event_data = cfg.on_event_data;
         agent_config.on_session = cfg.on_session;
         agent_config.on_session_data = cfg.on_session_data;
+        agent_config.on_context_inject = cfg.on_context_inject;
+        agent_config.on_context_inject_data = cfg.on_context_inject_data;
 
         if (cfg.agent_id) |id_z| {
             agent_config.agent_id = std.mem.span(id_z);
@@ -780,6 +787,106 @@ pub export fn talu_agent_get_id(
 
     if (out_ptr) |p| p.* = agent_ptr.agent_id.ptr;
     if (out_len) |l| l.* = agent_ptr.agent_id.len;
+    return 0;
+}
+
+// =============================================================================
+// Agent goals — C API
+// =============================================================================
+
+/// Add a persistent goal to the agent.
+///
+/// Goals are injected into the system prompt before each generation, ensuring
+/// the LLM always knows its objectives even after context compaction.
+/// Duplicate goals (exact string match) are silently ignored.
+pub export fn talu_agent_add_goal(
+    handle: ?*TaluAgent,
+    goal: ?[*:0]const u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const goal_z = goal orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "goal is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    agent_ptr.addGoal(std.mem.span(goal_z)) catch |err| {
+        capi_error.setError(err, "failed to add goal", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    return 0;
+}
+
+/// Remove a specific goal by exact string match.
+///
+/// Returns 0 if the goal was found and removed, non-zero if not found.
+pub export fn talu_agent_remove_goal(
+    handle: ?*TaluAgent,
+    goal: ?[*:0]const u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const goal_z = goal orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "goal is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    if (agent_ptr.removeGoal(std.mem.span(goal_z))) {
+        return 0;
+    }
+    return 1;
+}
+
+/// Remove all goals from the agent.
+pub export fn talu_agent_clear_goals(
+    handle: ?*TaluAgent,
+) callconv(.c) void {
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse return));
+    agent_ptr.clearGoals();
+}
+
+/// Get the number of active goals.
+pub export fn talu_agent_goal_count(
+    handle: ?*const TaluAgent,
+) callconv(.c) usize {
+    const agent_ptr: *const Agent = @ptrCast(@alignCast(handle orelse return 0));
+    return agent_ptr.getGoals().len;
+}
+
+// =============================================================================
+// Agent context injection — C API
+// =============================================================================
+
+/// Set the context injection callback on an existing agent.
+///
+/// The callback is called before each generation with the last user message
+/// text. It can return additional context to inject as a hidden developer
+/// message (visible to LLM, hidden from UI).
+pub export fn talu_agent_set_context_inject(
+    handle: ?*TaluAgent,
+    inject_fn: ?OnContextInjectFn,
+    user_data: ?*anyopaque,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    agent_ptr.on_context_inject = inject_fn;
+    agent_ptr.on_context_inject_data = user_data;
     return 0;
 }
 
@@ -1044,6 +1151,8 @@ test "CAgentCreateConfig zeroed is valid" {
     try std.testing.expect(config.on_token == null);
     try std.testing.expect(config.on_event == null);
     try std.testing.expect(config.on_session == null);
+    try std.testing.expect(config.on_context_inject == null);
+    try std.testing.expect(config.on_context_inject_data == null);
 }
 
 test "talu_agent_create null backend returns error" {
@@ -1117,4 +1226,36 @@ test "talu_agent_bus_unregister null is safe" {
 
 test "talu_agent_bus_remove_peer null is safe" {
     talu_agent_bus_remove_peer(null, "x");
+}
+
+// =============================================================================
+// Goal + context injection C API tests
+// =============================================================================
+
+test "talu_agent_add_goal null handle returns error" {
+    const rc = talu_agent_add_goal(null, "some goal");
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_add_goal null goal returns error" {
+    const rc = talu_agent_add_goal(@ptrFromInt(0x1), null);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_remove_goal null handle returns error" {
+    const rc = talu_agent_remove_goal(null, "some goal");
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_clear_goals null is safe" {
+    talu_agent_clear_goals(null);
+}
+
+test "talu_agent_goal_count null returns 0" {
+    try std.testing.expectEqual(@as(usize, 0), talu_agent_goal_count(null));
+}
+
+test "talu_agent_set_context_inject null handle returns error" {
+    const rc = talu_agent_set_context_inject(null, null, null);
+    try std.testing.expect(rc != 0);
 }

@@ -17,6 +17,7 @@ pub const context = @import("context.zig");
 pub const loop = @import("loop.zig");
 pub const agent = @import("agent.zig");
 pub const bus = @import("bus.zig");
+pub const compaction = @import("compaction.zig");
 
 // Re-export primary types at module level
 
@@ -51,6 +52,12 @@ pub const run = loop.run;
 pub const Agent = agent.Agent;
 pub const AgentConfig = agent.AgentConfig;
 pub const AgentError = agent.AgentError;
+pub const OnContextInjectFn = agent.OnContextInjectFn;
+
+// Compaction
+pub const Turn = compaction.Turn;
+pub const identifyTurns = compaction.identifyTurns;
+pub const compactTurns = compaction.compactTurns;
 
 // Inter-agent messaging
 pub const MessageBus = bus.MessageBus;
