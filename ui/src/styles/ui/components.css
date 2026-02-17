@@ -296,6 +296,39 @@
 }
 
 /* =============================================================================
+   Menu Slots (kernel contributed menu items)
+   ============================================================================= */
+
+.menu-slot {
+  display: contents;
+}
+
+.menu-slot-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0.375rem;
+  border-radius: 4px;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.menu-slot-btn:hover {
+  background: var(--bg-code);
+  color: var(--text);
+}
+
+.menu-slot-btn svg {
+  width: 16px;
+  height: 16px;
+}
+
+/* =============================================================================
    Toast
    ============================================================================= */
 
