@@ -27,7 +27,8 @@ function makeConvo(id: string, tags: string[] = []): Conversation {
     model: "gpt-4",
     title: `Convo ${id}`,
     items: [],
-    metadata: { tags },
+    tags: tags.map((name, i) => ({ id: `tag-${i}`, name })),
+    metadata: {},
   } as Conversation;
 }
 

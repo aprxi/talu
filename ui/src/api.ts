@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileInspection } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileInspection } from "./types.ts";
 
 const BASE = "";
 
@@ -17,6 +17,8 @@ export interface ApiClient {
   deleteConversation(id: string): Promise<ApiResult<void>>;
   batchConversations(req: BatchRequest): Promise<ApiResult<void>>;
   forkConversation(id: string, body: ForkRequest): Promise<ApiResult<Conversation>>;
+  addConversationTags(id: string, tags: string[]): Promise<ApiResult<{ tags: ConversationTag[] }>>;
+  removeConversationTags(id: string, tags: string[]): Promise<ApiResult<{ tags: ConversationTag[] }>>;
   getSettings(): Promise<ApiResult<Settings>>;
   patchSettings(patch: SettingsPatch): Promise<ApiResult<Settings>>;
   resetModelOverrides(modelId: string): Promise<ApiResult<Settings>>;
@@ -115,6 +117,8 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     deleteConversation: (id) => requestJson<void>("DELETE", `/v1/conversations/${encodeURIComponent(id)}`),
     batchConversations: (req) => requestJson<void>("POST", "/v1/conversations/batch", req),
     forkConversation: (id, body) => requestJson<Conversation>("POST", `/v1/conversations/${encodeURIComponent(id)}/fork`, body),
+    addConversationTags: (id, tags) => requestJson<{ tags: ConversationTag[] }>("POST", `/v1/conversations/${encodeURIComponent(id)}/tags`, { tags }),
+    removeConversationTags: (id, tags) => requestJson<{ tags: ConversationTag[] }>("DELETE", `/v1/conversations/${encodeURIComponent(id)}/tags`, { tags }),
     getSettings: () => requestJson<Settings>("GET", "/v1/settings"),
     patchSettings: (patch) => requestJson<Settings>("PATCH", "/v1/settings", patch),
     resetModelOverrides: (modelId) => requestJson<Settings>("DELETE", `/v1/settings/models/${modelId}`),

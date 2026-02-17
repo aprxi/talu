@@ -53,11 +53,12 @@ export function isArchived(chat: Conversation): boolean {
   return chat.marker === "archived";
 }
 
-/** Extract tags array from conversation metadata. Returns empty array if none. */
+/** Extract tag names from conversation. Reads from the relational `tags` field
+ *  (source of truth, synced with the search index). Returns empty array if none. */
 export function getTags(chat: Conversation): string[] {
-  const tags = chat.metadata?.tags;
+  const tags = chat.tags;
   if (!Array.isArray(tags)) return [];
-  return tags.filter((t): t is string => typeof t === "string");
+  return tags.map((t) => (typeof t === "string" ? t : t?.name)).filter((n): n is string => typeof n === "string");
 }
 
 // Re-export icons used by sidebar/browser render modules.

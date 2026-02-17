@@ -1,5 +1,12 @@
 import type { Disposable } from "./kernel/types.ts";
 
+/** Tag associated with a conversation (from the relational tags table). */
+export interface ConversationTag {
+  id: string;
+  name: string;
+  color?: string | null;
+}
+
 /** Conversation session summary (from list) or full (from get, with items). */
 export interface Conversation {
   id: string;
@@ -14,6 +21,8 @@ export interface Conversation {
   /** Source document ID (e.g., prompt) that created this conversation. */
   source_doc_id: string | null;
   metadata: Record<string, unknown>;
+  /** Tags from the relational tags table (source of truth for search). */
+  tags?: ConversationTag[];
   search_snippet?: string | null;
   items?: Item[];
 }

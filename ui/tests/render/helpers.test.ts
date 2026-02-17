@@ -97,34 +97,39 @@ describe("isArchived", () => {
 // ── getTags ─────────────────────────────────────────────────────────────────
 
 describe("getTags", () => {
-  test("returns tags from metadata", () => {
-    const c = makeConvo({ metadata: { tags: ["a", "b"] } });
+  test("returns tag names from conversation.tags", () => {
+    const c = makeConvo({ tags: [{ id: "1", name: "a" }, { id: "2", name: "b" }] } as any);
     expect(getTags(c)).toEqual(["a", "b"]);
   });
 
-  test("returns empty array when no metadata", () => {
-    const c = makeConvo({ metadata: undefined });
+  test("returns empty array when tags is undefined", () => {
+    const c = makeConvo({ tags: undefined } as any);
     expect(getTags(c)).toEqual([]);
   });
 
   test("returns empty array when tags is not an array", () => {
-    const c = makeConvo({ metadata: { tags: "not-array" } as any });
+    const c = makeConvo({ tags: "not-array" } as any);
     expect(getTags(c)).toEqual([]);
   });
 
-  test("filters out non-string elements", () => {
-    const c = makeConvo({ metadata: { tags: ["valid", 42, null, "also-valid"] } as any });
+  test("filters out entries without a name", () => {
+    const c = makeConvo({ tags: [{ id: "1", name: "valid" }, null, { id: "3", name: "also-valid" }] } as any);
     expect(getTags(c)).toEqual(["valid", "also-valid"]);
   });
 
   test("returns empty array when tags is null", () => {
-    const c = makeConvo({ metadata: { tags: null } as any });
+    const c = makeConvo({ tags: null } as any);
     expect(getTags(c)).toEqual([]);
   });
 
   test("returns empty array for empty tags array", () => {
-    const c = makeConvo({ metadata: { tags: [] } });
+    const c = makeConvo({ tags: [] } as any);
     expect(getTags(c)).toEqual([]);
+  });
+
+  test("handles bare string entries for backward compatibility", () => {
+    const c = makeConvo({ tags: ["a", "b"] } as any);
+    expect(getTags(c)).toEqual(["a", "b"]);
   });
 });
 

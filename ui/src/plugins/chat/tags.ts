@@ -82,7 +82,7 @@ export function handleAddTagPrompt(): void {
   });
 }
 
-/** Add a tag to the active chat. */
+/** Add a tag to the active chat via the dedicated tags API. */
 export async function addTagToChat(tag: string): Promise<void> {
   if (!chatState.activeSessionId || !chatState.activeChat) {
     notifications.error("No active conversation");
@@ -111,42 +111,34 @@ export async function addTagToChat(tag: string): Promise<void> {
     return;
   }
 
-  const newTags = [...currentTags, normalized];
-  const patchResult = await api.patchConversation(chatState.activeSessionId, {
-    metadata: { ...chatState.activeChat.metadata, tags: newTags },
-  });
+  const result = await api.addConversationTags(chatState.activeSessionId, [normalized]);
 
-  if (!patchResult.ok) {
-    notifications.error(patchResult.error ?? "Failed to add tag");
+  if (!result.ok) {
+    notifications.error(result.error ?? "Failed to add tag");
     return;
   }
 
-  // Update local state directly (backend GET doesn't return metadata correctly)
-  chatState.activeChat.metadata = { ...chatState.activeChat.metadata, tags: newTags };
+  // Update local state from API response (relational source of truth)
+  chatState.activeChat.tags = result.data?.tags ?? [];
   updateSessionInList(chatState.activeChat);
   updateHeaderTags(chatState.activeChat);
   renderSidebar();
   notifications.info("Tag added");
 }
 
-/** Remove a tag from the active chat. */
+/** Remove a tag from the active chat via the dedicated tags API. */
 export async function removeTagFromChat(tag: string): Promise<void> {
   if (!chatState.activeSessionId || !chatState.activeChat) return;
 
-  const currentTags = getTags(chatState.activeChat);
-  const newTags = currentTags.filter((t) => t !== tag);
-
-  const result = await api.patchConversation(chatState.activeSessionId, {
-    metadata: { ...chatState.activeChat.metadata, tags: newTags },
-  });
+  const result = await api.removeConversationTags(chatState.activeSessionId, [tag]);
 
   if (!result.ok) {
     notifications.error(result.error ?? "Failed to remove tag");
     return;
   }
 
-  // Update local state directly (backend GET doesn't return metadata correctly)
-  chatState.activeChat.metadata = { ...chatState.activeChat.metadata, tags: newTags };
+  // Update local state from API response (relational source of truth)
+  chatState.activeChat.tags = result.data?.tags ?? [];
   updateSessionInList(chatState.activeChat);
   updateHeaderTags(chatState.activeChat);
   renderSidebar();

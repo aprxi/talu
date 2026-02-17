@@ -407,15 +407,15 @@ describe("renderTranscriptHeader", () => {
     expect(date).not.toBeNull();
   });
 
-  test("renders tags from metadata", () => {
-    const chat = makeConvo("c1", { metadata: { tags: ["rust", "wasm"] } });
+  test("renders tags from conversation.tags", () => {
+    const chat = makeConvo("c1", { tags: [{ id: "1", name: "rust" }, { id: "2", name: "wasm" }] } as any);
     const el = renderTranscriptHeader(chat);
     const tags = el.querySelectorAll(".tag-pill");
     expect(tags.length).toBe(2);
   });
 
   test("tag pills have remove buttons", () => {
-    const chat = makeConvo("c1", { metadata: { tags: ["test"] } });
+    const chat = makeConvo("c1", { tags: [{ id: "1", name: "test" }] } as any);
     const el = renderTranscriptHeader(chat);
     const removeBtn = el.querySelector(".tag-remove");
     expect(removeBtn).not.toBeNull();
@@ -423,14 +423,14 @@ describe("renderTranscriptHeader", () => {
   });
 
   test("shows add-tag button when under 5 tags", () => {
-    const chat = makeConvo("c1", { metadata: { tags: ["a", "b"] } });
+    const chat = makeConvo("c1", { tags: [{ id: "1", name: "a" }, { id: "2", name: "b" }] } as any);
     const el = renderTranscriptHeader(chat);
     const addBtn = el.querySelector("[data-action='add-tag']");
     expect(addBtn).not.toBeNull();
   });
 
   test("hides add-tag button at 5 tags", () => {
-    const chat = makeConvo("c1", { metadata: { tags: ["a", "b", "c", "d", "e"] } });
+    const chat = makeConvo("c1", { tags: [{ id: "1", name: "a" }, { id: "2", name: "b" }, { id: "3", name: "c" }, { id: "4", name: "d" }, { id: "5", name: "e" }] } as any);
     const el = renderTranscriptHeader(chat);
     const addBtn = el.querySelector("[data-action='add-tag']");
     expect(addBtn).toBeNull();
