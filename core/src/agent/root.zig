@@ -41,6 +41,7 @@ pub const OnTokenFn = loop.OnTokenFn;
 pub const OnEventFn = loop.OnEventFn;
 pub const OnContextFn = loop.OnContextFn;
 pub const ContextInfo = loop.ContextInfo;
+pub const ToolConfirmation = loop.ToolConfirmation;
 pub const OnBeforeToolFn = loop.OnBeforeToolFn;
 pub const OnAfterToolFn = loop.OnAfterToolFn;
 pub const OnSessionFn = loop.OnSessionFn;
@@ -53,15 +54,20 @@ pub const Agent = agent.Agent;
 pub const AgentConfig = agent.AgentConfig;
 pub const AgentError = agent.AgentError;
 pub const OnContextInjectFn = agent.OnContextInjectFn;
+pub const OnEmbedFn = agent.OnEmbedFn;
+pub const OnResolveDocFn = agent.OnResolveDocFn;
+pub const RagConfig = agent.RagConfig;
 
 // Compaction
 pub const Turn = compaction.Turn;
 pub const identifyTurns = compaction.identifyTurns;
 pub const compactTurns = compaction.compactTurns;
+pub const truncateOversizedItem = compaction.truncateOversizedItem;
 
 // Inter-agent messaging
 pub const MessageBus = bus.MessageBus;
 pub const BusError = bus.BusError;
 pub const Message = bus.Message;
+pub const OnMessageNotifyFn = bus.OnMessageNotifyFn;
 pub const PeerTransport = bus.PeerTransport;
 pub const PeerInfo = bus.PeerInfo;

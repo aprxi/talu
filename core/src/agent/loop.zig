@@ -126,15 +126,31 @@ pub const OnContextFn = *const fn (
 // Callback types — tool middleware
 // =============================================================================
 
-/// Called before tool execution. Return false to SKIP this tool call.
-/// The loop will append a "Tool execution blocked by caller." output and
-/// continue to the next tool call.
+/// Tool confirmation decision returned by OnBeforeToolFn.
+pub const ToolConfirmation = enum(u8) {
+    /// Proceed with tool execution.
+    allow = 0,
+    /// Skip this tool call. Uses custom deny reason if provided,
+    /// otherwise a default message. Continues to the next tool call.
+    deny = 1,
+    /// Cancel the entire agent loop. Returns .cancelled stop reason.
+    cancel = 2,
+};
+
+/// Called before tool execution. Returns a ToolConfirmation decision (as u8).
+///
+/// The callback may block as long as needed (e.g., for human-in-the-loop
+/// confirmation). On deny/cancel, set out_deny_reason/out_deny_reason_len
+/// for a custom message in the conversation. The pointer must be valid at
+/// callback return; the loop copies it immediately.
 pub const OnBeforeToolFn = *const fn (
     tool_name: [*:0]const u8,
     tool_arguments: [*]const u8,
     tool_arguments_len: usize,
+    out_deny_reason: *?[*]const u8,
+    out_deny_reason_len: *usize,
     user_data: ?*anyopaque,
-) callconv(.c) bool;
+) callconv(.c) u8;
 
 /// Called after tool execution with the result. Return false to cancel
 /// the loop. Cannot modify the output (already appended to conversation).
@@ -232,6 +248,10 @@ pub const AgentLoopConfig = struct {
     /// Session lifecycle callback — loop_start, loop_end, storage_error.
     on_session: ?OnSessionFn = null,
     on_session_data: ?*anyopaque = null,
+
+    /// Maximum bytes for tool output. 0 = unlimited.
+    /// Output exceeding this limit is truncated with a marker.
+    max_tool_output_bytes: usize = 0,
 };
 
 pub const LoopStopReason = enum(u8) {
@@ -570,29 +590,47 @@ fn executeToolCalls(
             continue;
         }
 
-        // Tool middleware: on_before_tool — can skip this tool call
+        // Tool middleware: on_before_tool — allow/deny/cancel
         if (config.on_before_tool) |before_fn| {
-            if (!before_fn(
+            var deny_reason: ?[*]const u8 = null;
+            var deny_reason_len: usize = 0;
+            const decision: ToolConfirmation = @enumFromInt(before_fn(
                 name_z,
                 args_slice.ptr,
                 args_slice.len,
+                &deny_reason,
+                &deny_reason_len,
                 config.on_before_tool_data,
-            )) {
-                _ = try conv.appendFunctionCallOutput(
-                    fc.call_id,
-                    "Tool execution blocked by caller.",
-                );
+            ));
 
-                // Emit tool_start + tool_end with error for blocked tool
-                _ = emitEvent(config, .tool_start, iteration, .{
-                    .tool_name = name_z,
-                });
-                _ = emitEvent(config, .tool_end, iteration, .{
-                    .tool_name = name_z,
-                    .tool_is_error = 1,
-                });
+            switch (decision) {
+                .allow => {},
+                .deny => {
+                    const reason = if (deny_reason) |r|
+                        r[0..deny_reason_len]
+                    else
+                        "Tool execution blocked by caller.";
+                    _ = try conv.appendFunctionCallOutput(fc.call_id, reason);
 
-                continue;
+                    // Emit tool_start + tool_end with error for denied tool
+                    _ = emitEvent(config, .tool_start, iteration, .{
+                        .tool_name = name_z,
+                    });
+                    _ = emitEvent(config, .tool_end, iteration, .{
+                        .tool_name = name_z,
+                        .tool_is_error = 1,
+                    });
+
+                    continue;
+                },
+                .cancel => {
+                    const reason = if (deny_reason) |r|
+                        r[0..deny_reason_len]
+                    else
+                        "Tool execution cancelled by caller.";
+                    _ = try conv.appendFunctionCallOutput(fc.call_id, reason);
+                    return .stop_cancelled;
+                },
             }
         }
 
@@ -644,7 +682,21 @@ fn executeToolCalls(
             };
             defer tool_result.deinit(allocator);
 
-            _ = try conv.appendFunctionCallOutput(fc.call_id, tool_result.output);
+            // Truncate oversized tool output
+            const truncation_marker = "\n...(output truncated)";
+            var truncated_buf: ?[]u8 = null;
+            defer if (truncated_buf) |buf| allocator.free(buf);
+
+            var output = tool_result.output;
+            if (config.max_tool_output_bytes > 0 and output.len > config.max_tool_output_bytes) {
+                const keep = config.max_tool_output_bytes;
+                truncated_buf = try allocator.alloc(u8, keep + truncation_marker.len);
+                @memcpy(truncated_buf.?[0..keep], output[0..keep]);
+                @memcpy(truncated_buf.?[keep..][0..truncation_marker.len], truncation_marker);
+                output = truncated_buf.?;
+            }
+
+            _ = try conv.appendFunctionCallOutput(fc.call_id, output);
 
             // Emit tool_end with success
             _ = emitEvent(config, .tool_end, iteration, .{
@@ -652,12 +704,12 @@ fn executeToolCalls(
                 .tool_is_error = if (tool_result.is_error) @as(u8, 1) else @as(u8, 0),
             });
 
-            // Tool middleware: on_after_tool
+            // Tool middleware: on_after_tool (receives truncated output)
             if (config.on_after_tool) |after_fn| {
                 if (!after_fn(
                     name_z,
-                    tool_result.output.ptr,
-                    tool_result.output.len,
+                    output.ptr,
+                    output.len,
                     if (tool_result.is_error) @as(u8, 1) else @as(u8, 0),
                     config.on_after_tool_data,
                 )) {
@@ -807,6 +859,7 @@ test "AgentLoopConfig defaults" {
     try std.testing.expect(config.on_after_tool_data == null);
     try std.testing.expect(config.on_session == null);
     try std.testing.expect(config.on_session_data == null);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_output_bytes);
 }
 
 test "LoopStopReason enum values" {
@@ -902,6 +955,78 @@ test "emitSessionEvent is noop when no callback set" {
     emitSessionEvent(config, .loop_start, 0, 0, 0);
     emitSessionEvent(config, .loop_end, 5, 3, @intFromEnum(LoopStopReason.completed));
     emitSessionEvent(config, .storage_error, 2, 1, 0);
+}
+
+test "ToolConfirmation enum values" {
+    try std.testing.expectEqual(@as(u8, 0), @intFromEnum(ToolConfirmation.allow));
+    try std.testing.expectEqual(@as(u8, 1), @intFromEnum(ToolConfirmation.deny));
+    try std.testing.expectEqual(@as(u8, 2), @intFromEnum(ToolConfirmation.cancel));
+}
+
+test "ToolConfirmation roundtrip from u8" {
+    try std.testing.expectEqual(ToolConfirmation.allow, @as(ToolConfirmation, @enumFromInt(@as(u8, 0))));
+    try std.testing.expectEqual(ToolConfirmation.deny, @as(ToolConfirmation, @enumFromInt(@as(u8, 1))));
+    try std.testing.expectEqual(ToolConfirmation.cancel, @as(ToolConfirmation, @enumFromInt(@as(u8, 2))));
+}
+
+test "OnBeforeToolFn signature accepts deny reason out-params" {
+    // Verify the callback type compiles with the expected signature
+    const Ctx = struct {
+        fn allowCallback(
+            _: [*:0]const u8,
+            _: [*]const u8,
+            _: usize,
+            _: *?[*]const u8,
+            _: *usize,
+            _: ?*anyopaque,
+        ) callconv(.c) u8 {
+            return @intFromEnum(ToolConfirmation.allow);
+        }
+
+        fn denyCallback(
+            _: [*:0]const u8,
+            _: [*]const u8,
+            _: usize,
+            out_reason: *?[*]const u8,
+            out_reason_len: *usize,
+            _: ?*anyopaque,
+        ) callconv(.c) u8 {
+            const reason = "User denied this action";
+            out_reason.* = reason.ptr;
+            out_reason_len.* = reason.len;
+            return @intFromEnum(ToolConfirmation.deny);
+        }
+
+        fn cancelCallback(
+            _: [*:0]const u8,
+            _: [*]const u8,
+            _: usize,
+            _: *?[*]const u8,
+            _: *usize,
+            _: ?*anyopaque,
+        ) callconv(.c) u8 {
+            return @intFromEnum(ToolConfirmation.cancel);
+        }
+    };
+
+    // Verify all three callbacks are valid OnBeforeToolFn values
+    const allow_fn: OnBeforeToolFn = Ctx.allowCallback;
+    const deny_fn: OnBeforeToolFn = Ctx.denyCallback;
+    const cancel_fn: OnBeforeToolFn = Ctx.cancelCallback;
+
+    // Exercise the callbacks to verify they produce expected values
+    var deny_reason: ?[*]const u8 = null;
+    var deny_reason_len: usize = 0;
+
+    try std.testing.expectEqual(@as(u8, 0), allow_fn("t\x00".ptr, "{}".ptr, 2, &deny_reason, &deny_reason_len, null));
+
+    deny_reason = null;
+    deny_reason_len = 0;
+    try std.testing.expectEqual(@as(u8, 1), deny_fn("t\x00".ptr, "{}".ptr, 2, &deny_reason, &deny_reason_len, null));
+    try std.testing.expect(deny_reason != null);
+    try std.testing.expectEqual(@as(usize, 23), deny_reason_len);
+
+    try std.testing.expectEqual(@as(u8, 2), cancel_fn("t\x00".ptr, "{}".ptr, 2, &deny_reason, &deny_reason_len, null));
 }
 
 test "emitSessionEvent calls callback with correct fields" {

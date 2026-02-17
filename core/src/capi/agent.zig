@@ -13,6 +13,7 @@ const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
 const chat_mod = @import("../responses/chat.zig");
 const router_mod = @import("../router/root.zig");
+const db_mod = @import("../db/root.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 
@@ -31,6 +32,12 @@ const OnBeforeToolFn = agent_mod.OnBeforeToolFn;
 const OnAfterToolFn = agent_mod.OnAfterToolFn;
 const OnSessionFn = agent_mod.OnSessionFn;
 const OnContextInjectFn = agent_mod.OnContextInjectFn;
+const OnEmbedFn = agent_mod.OnEmbedFn;
+const OnResolveDocFn = agent_mod.OnResolveDocFn;
+const RagConfig = agent_mod.RagConfig;
+const OnMessageNotifyFn = agent_mod.OnMessageNotifyFn;
+const VectorAdapter = db_mod.VectorAdapter;
+const VectorStoreHandle = @import("db.zig").VectorStoreHandle;
 const Chat = chat_mod.Chat;
 const InferenceBackend = router_mod.InferenceBackend;
 const CGenerateConfig = router_mod.capi_bridge.CGenerateConfig;
@@ -323,6 +330,9 @@ pub const CAgentLoopConfig = extern struct {
     /// Session lifecycle callback (loop_start, loop_end, storage_error).
     on_session: ?OnSessionFn = null,
     on_session_data: ?*anyopaque = null,
+
+    /// Maximum bytes for tool output. 0 = unlimited.
+    max_tool_output_bytes: usize = 0,
 };
 
 /// C-compatible agent loop result.
@@ -382,6 +392,7 @@ pub export fn talu_agent_run(
         loop_config.on_after_tool_data = cfg.on_after_tool_data;
         loop_config.on_session = cfg.on_session;
         loop_config.on_session_data = cfg.on_session_data;
+        loop_config.max_tool_output_bytes = cfg.max_tool_output_bytes;
     }
 
     const result = agent_mod.run(allocator, chat, backend, registry, loop_config) catch |err| {
@@ -458,6 +469,7 @@ test "CAgentLoopConfig zeroed is valid" {
     try std.testing.expect(config.on_after_tool_data == null);
     try std.testing.expect(config.on_session == null);
     try std.testing.expect(config.on_session_data == null);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_output_bytes);
 }
 
 test "CAgentLoopResult zeroed is valid" {
@@ -506,6 +518,15 @@ pub const CAgentCreateConfig = extern struct {
     // Context injection callback (RAG hook)
     on_context_inject: ?OnContextInjectFn = null,
     on_context_inject_data: ?*anyopaque = null,
+
+    // Tool middleware callbacks
+    on_before_tool: ?OnBeforeToolFn = null,
+    on_before_tool_data: ?*anyopaque = null,
+    on_after_tool: ?OnAfterToolFn = null,
+    on_after_tool_data: ?*anyopaque = null,
+
+    /// Maximum bytes for tool output. 0 = unlimited.
+    max_tool_output_bytes: usize = 0,
 };
 
 /// Create a stateful agent. Caller owns the returned handle.
@@ -546,6 +567,11 @@ pub export fn talu_agent_create(
         agent_config.on_session_data = cfg.on_session_data;
         agent_config.on_context_inject = cfg.on_context_inject;
         agent_config.on_context_inject_data = cfg.on_context_inject_data;
+        agent_config.on_before_tool = cfg.on_before_tool;
+        agent_config.on_before_tool_data = cfg.on_before_tool_data;
+        agent_config.on_after_tool = cfg.on_after_tool;
+        agent_config.on_after_tool_data = cfg.on_after_tool_data;
+        agent_config.max_tool_output_bytes = cfg.max_tool_output_bytes;
 
         if (cfg.agent_id) |id_z| {
             agent_config.agent_id = std.mem.span(id_z);
@@ -870,9 +896,11 @@ pub export fn talu_agent_goal_count(
 
 /// Set the context injection callback on an existing agent.
 ///
-/// The callback is called before each generation with the last user message
-/// text. It can return additional context to inject as a hidden developer
-/// message (visible to LLM, hidden from UI).
+/// The callback is called before each generation with the agent's Chat as
+/// an opaque handle. The callback can inspect the full conversation via
+/// C API functions (talu_chat_get_messages, etc.) to construct a RAG query.
+/// It can return additional context to inject as a hidden developer message
+/// (visible to LLM, hidden from UI).
 pub export fn talu_agent_set_context_inject(
     handle: ?*TaluAgent,
     inject_fn: ?OnContextInjectFn,
@@ -890,6 +918,146 @@ pub export fn talu_agent_set_context_inject(
     return 0;
 }
 
+// =============================================================================
+// Agent tool middleware — C API setters
+// =============================================================================
+
+/// Set the before-tool callback on an existing agent.
+///
+/// The callback is called before each tool execution. Return values:
+///   0 (allow): proceed with execution.
+///   1 (deny): skip tool, use deny reason if provided.
+///   2 (cancel): stop the entire loop.
+pub export fn talu_agent_set_before_tool(
+    handle: ?*TaluAgent,
+    before_fn: ?OnBeforeToolFn,
+    user_data: ?*anyopaque,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    agent_ptr.on_before_tool = before_fn;
+    agent_ptr.on_before_tool_data = user_data;
+    return 0;
+}
+
+/// Set the after-tool callback on an existing agent.
+///
+/// The callback is called after each tool execution. Return false to cancel
+/// the loop.
+pub export fn talu_agent_set_after_tool(
+    handle: ?*TaluAgent,
+    after_fn: ?OnAfterToolFn,
+    user_data: ?*anyopaque,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    agent_ptr.on_after_tool = after_fn;
+    agent_ptr.on_after_tool_data = user_data;
+    return 0;
+}
+
+// =============================================================================
+// Bus notification — C API
+// =============================================================================
+
+/// Set a notification callback on a bus mailbox.
+///
+/// The callback fires (outside the bus lock) whenever a message is enqueued
+/// for the given agent. Pass null to clear the notification.
+pub export fn talu_agent_bus_set_notify(
+    handle: ?*TaluAgentBus,
+    agent_id: ?[*:0]const u8,
+    notify_fn: ?OnMessageNotifyFn,
+    user_data: ?*anyopaque,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const bus_ptr: *MessageBus = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "bus handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const id_z = agent_id orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent_id is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    bus_ptr.setNotify(std.mem.span(id_z), notify_fn, user_data) catch |err| {
+        capi_error.setError(err, "failed to set bus notify", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    return 0;
+}
+
+// =============================================================================
+// Agent active receiver — C API
+// =============================================================================
+
+/// Block until a message arrives or timeout elapses.
+///
+/// timeout_ms: maximum wait in milliseconds (0 = check immediately).
+/// out_received: set to 1 if a message arrived, 0 on timeout.
+/// Thread-safe: can be called from any thread.
+pub export fn talu_agent_wait_for_message(
+    handle: ?*TaluAgent,
+    timeout_ms: u64,
+    out_received: ?*u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const timeout_ns = timeout_ms * std.time.ns_per_ms;
+    const received = agent_ptr.waitForMessage(timeout_ns);
+
+    if (out_received) |out| {
+        out.* = if (received) 1 else 0;
+    }
+
+    return 0;
+}
+
+/// Run an autonomous message-driven loop.
+///
+/// Runs heartbeat when messages arrive, waits between iterations.
+/// Stops on abort(), generation error, or non-recoverable stop reason.
+/// idle_timeout_ms controls max wait between message checks.
+pub export fn talu_agent_run_loop(
+    handle: ?*TaluAgent,
+    idle_timeout_ms: u64,
+    out_result: ?*CAgentLoopResult,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const idle_timeout_ns = idle_timeout_ms * std.time.ns_per_ms;
+    const result = agent_ptr.runLoop(idle_timeout_ns) catch |err| {
+        capi_error.setError(err, "agent run loop failed", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    writeLoopResult(out_result, result);
+    return 0;
+}
+
 /// Write an AgentLoopResult to the C output struct.
 fn writeLoopResult(out: ?*CAgentLoopResult, result: AgentLoopResult) void {
     const out_ptr = out orelse return;
@@ -897,6 +1065,61 @@ fn writeLoopResult(out: ?*CAgentLoopResult, result: AgentLoopResult) void {
     out_ptr.stop_reason = @intFromEnum(result.stop_reason);
     out_ptr.iterations = result.iterations;
     out_ptr.total_tool_calls = result.total_tool_calls;
+}
+
+// =============================================================================
+// Vector Store RAG — C API
+// =============================================================================
+
+/// C-compatible configuration for built-in vector store RAG.
+///
+/// All-zeroed is a valid (no-op) config: top_k=0, no callbacks.
+pub const CRagConfig = extern struct {
+    /// Maximum number of results to retrieve. 0 = use default (5).
+    top_k: u32 = 5,
+    /// Minimum score threshold. 0.0 = no filtering.
+    min_score: f32 = 0.0,
+    /// Callback to embed text into a query vector.
+    on_embed: ?OnEmbedFn = null,
+    on_embed_data: ?*anyopaque = null,
+    /// Callback to resolve doc IDs + scores into context text.
+    on_resolve: ?OnResolveDocFn = null,
+    on_resolve_data: ?*anyopaque = null,
+};
+
+/// Wire a vector store to the agent for built-in RAG.
+///
+/// Before each generation, the agent embeds the last user message, searches the
+/// store, resolves results via the callback, and injects context.
+///
+/// Both agent_handle and store_handle must be non-null.
+/// Returns 0 on success, error code on failure.
+pub export fn talu_agent_set_vector_store(
+    agent_handle: ?*TaluAgent,
+    store_handle: ?*VectorStoreHandle,
+    config_ptr: ?*const CRagConfig,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const agent: *Agent = @ptrCast(@alignCast(agent_handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+    const store: *VectorAdapter = @ptrCast(@alignCast(store_handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "store handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const config = if (config_ptr) |c| RagConfig{
+        .top_k = if (c.top_k == 0) 5 else c.top_k,
+        .min_score = c.min_score,
+        .on_embed = c.on_embed,
+        .on_embed_data = c.on_embed_data,
+        .on_resolve = c.on_resolve,
+        .on_resolve_data = c.on_resolve_data,
+    } else RagConfig{};
+
+    agent.setVectorStore(store, config);
+    return 0;
 }
 
 // =============================================================================
@@ -1153,6 +1376,9 @@ test "CAgentCreateConfig zeroed is valid" {
     try std.testing.expect(config.on_session == null);
     try std.testing.expect(config.on_context_inject == null);
     try std.testing.expect(config.on_context_inject_data == null);
+    try std.testing.expect(config.on_before_tool == null);
+    try std.testing.expect(config.on_after_tool == null);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_output_bytes);
 }
 
 test "talu_agent_create null backend returns error" {
@@ -1257,5 +1483,90 @@ test "talu_agent_goal_count null returns 0" {
 
 test "talu_agent_set_context_inject null handle returns error" {
     const rc = talu_agent_set_context_inject(null, null, null);
+    try std.testing.expect(rc != 0);
+}
+
+// =============================================================================
+// Tool middleware + active receiver C API tests
+// =============================================================================
+
+test "CAgentCreateConfig zeroed has null tool middleware" {
+    const config = std.mem.zeroes(CAgentCreateConfig);
+    try std.testing.expect(config.on_before_tool == null);
+    try std.testing.expect(config.on_before_tool_data == null);
+    try std.testing.expect(config.on_after_tool == null);
+    try std.testing.expect(config.on_after_tool_data == null);
+}
+
+test "talu_agent_set_before_tool null handle returns error" {
+    const rc = talu_agent_set_before_tool(null, null, null);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_set_after_tool null handle returns error" {
+    const rc = talu_agent_set_after_tool(null, null, null);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_bus_set_notify null handle returns error" {
+    const rc = talu_agent_bus_set_notify(null, "agent", null, null);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_bus_set_notify null agent_id returns error" {
+    var bus_out: ?*TaluAgentBus = null;
+    _ = talu_agent_bus_create(&bus_out);
+    defer talu_agent_bus_free(bus_out);
+
+    const rc = talu_agent_bus_set_notify(bus_out, null, null, null);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_bus_set_notify on registered agent succeeds" {
+    var bus_out: ?*TaluAgentBus = null;
+    _ = talu_agent_bus_create(&bus_out);
+    defer talu_agent_bus_free(bus_out);
+
+    _ = talu_agent_bus_register(bus_out, "alice");
+
+    const DummyNotify = struct {
+        fn cb(_: [*:0]const u8, _: usize, _: ?*anyopaque) callconv(.c) void {}
+    };
+    const rc = talu_agent_bus_set_notify(bus_out, "alice", DummyNotify.cb, null);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+}
+
+test "talu_agent_wait_for_message null handle returns error" {
+    const rc = talu_agent_wait_for_message(null, 0, null);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_run_loop null handle returns error" {
+    const rc = talu_agent_run_loop(null, 0, null);
+    try std.testing.expect(rc != 0);
+}
+
+// =============================================================================
+// Vector Store RAG C API tests
+// =============================================================================
+
+test "CRagConfig zeroed is valid" {
+    const config = std.mem.zeroes(CRagConfig);
+    try std.testing.expectEqual(@as(u32, 0), config.top_k);
+    try std.testing.expectEqual(@as(f32, 0.0), config.min_score);
+    try std.testing.expect(config.on_embed == null);
+    try std.testing.expect(config.on_resolve == null);
+}
+
+test "talu_agent_set_vector_store null agent returns error" {
+    const rc = talu_agent_set_vector_store(null, null, null);
+    try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_set_vector_store null store returns error" {
+    // Use a dummy non-null value for agent handle to reach the store check.
+    var dummy: u8 = 0;
+    const fake_agent: *TaluAgent = @ptrCast(&dummy);
+    const rc = talu_agent_set_vector_store(fake_agent, null, null);
     try std.testing.expect(rc != 0);
 }

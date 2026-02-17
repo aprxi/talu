@@ -587,6 +587,18 @@ pub const talu_agent_goal_count = agent.talu_agent_goal_count;
 // Re-export Agent context injection C API.
 pub const talu_agent_set_context_inject = agent.talu_agent_set_context_inject;
 
+// Re-export Agent tool middleware C API.
+pub const talu_agent_set_before_tool = agent.talu_agent_set_before_tool;
+pub const talu_agent_set_after_tool = agent.talu_agent_set_after_tool;
+
+// Re-export Agent active receiver C API.
+pub const talu_agent_wait_for_message = agent.talu_agent_wait_for_message;
+pub const talu_agent_run_loop = agent.talu_agent_run_loop;
+
+// Re-export Agent vector store RAG C API.
+pub const talu_agent_set_vector_store = agent.talu_agent_set_vector_store;
+pub const CRagConfig = agent.CRagConfig;
+
 // Re-export MessageBus C API functions.
 pub const talu_agent_bus_create = agent.talu_agent_bus_create;
 pub const talu_agent_bus_free = agent.talu_agent_bus_free;
@@ -598,6 +610,7 @@ pub const talu_agent_bus_send = agent.talu_agent_bus_send;
 pub const talu_agent_bus_deliver = agent.talu_agent_bus_deliver;
 pub const talu_agent_bus_broadcast = agent.talu_agent_bus_broadcast;
 pub const talu_agent_bus_pending = agent.talu_agent_bus_pending;
+pub const talu_agent_bus_set_notify = agent.talu_agent_bus_set_notify;
 pub const TaluAgentBus = agent.TaluAgentBus;
 
 // ABI validation - comptime assertions ensure struct sizes match expected values.

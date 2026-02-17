@@ -51,6 +51,17 @@ pub const PeerInfo = struct {
     transport: PeerTransport,
 };
 
+/// Callback invoked when a message is enqueued into an agent's mailbox.
+///
+/// Called **outside** the bus mutex to avoid deadlocks with agent-side locking.
+/// Callers should not perform heavy work inside this callback; use it to
+/// signal a condition variable or set a flag.
+pub const OnMessageNotifyFn = *const fn (
+    agent_id: [*:0]const u8,
+    pending_count: usize,
+    user_data: ?*anyopaque,
+) callconv(.c) void;
+
 // =============================================================================
 // MessageQueue - FIFO queue for a single mailbox
 // =============================================================================
@@ -86,6 +97,21 @@ const MessageQueue = struct {
     }
 };
 
+/// Mailbox wraps a MessageQueue with an optional notification callback.
+const Mailbox = struct {
+    queue: MessageQueue,
+    on_notify: ?OnMessageNotifyFn = null,
+    on_notify_data: ?*anyopaque = null,
+
+    fn init() Mailbox {
+        return .{ .queue = MessageQueue.init() };
+    }
+
+    fn deinit(self: *Mailbox, allocator: Allocator) void {
+        self.queue.deinit(allocator);
+    }
+};
+
 /// Free the owned fields of a Message (but not the Message struct itself).
 fn freeMessageFields(allocator: Allocator, msg: Message) void {
     allocator.free(msg.from);
@@ -114,8 +140,8 @@ pub const MessageBus = struct {
     allocator: Allocator,
     mutex: std.Thread.Mutex,
 
-    /// Local mailboxes: agent_id -> FIFO queue of messages.
-    mailboxes: std.StringHashMapUnmanaged(MessageQueue),
+    /// Local mailboxes: agent_id -> mailbox (queue + notification callback).
+    mailboxes: std.StringHashMapUnmanaged(Mailbox),
 
     /// Remote peer registry: agent_id -> URL + transport.
     peers: std.StringHashMapUnmanaged(PeerInfo),
@@ -140,7 +166,7 @@ pub const MessageBus = struct {
         // Free all mailboxes and their keys
         var mb_it = self.mailboxes.iterator();
         while (mb_it.next()) |entry| {
-            entry.value_ptr.deinit(self.allocator);
+            entry.value_ptr.queue.deinit(self.allocator);
             self.allocator.free(entry.key_ptr.*);
         }
         self.mailboxes.deinit(self.allocator);
@@ -174,7 +200,7 @@ pub const MessageBus = struct {
         // Own the key
         gop.key_ptr.* = self.allocator.dupe(u8, agent_id) catch
             return BusError.OutOfMemory;
-        gop.value_ptr.* = MessageQueue.init();
+        gop.value_ptr.* = Mailbox.init();
     }
 
     /// Unregister a local agent and free its mailbox.
@@ -184,8 +210,8 @@ pub const MessageBus = struct {
         defer self.mutex.unlock();
 
         const entry = self.mailboxes.fetchRemove(agent_id) orelse return;
-        var queue = entry.value;
-        queue.deinit(self.allocator);
+        var mailbox = entry.value;
+        mailbox.queue.deinit(self.allocator);
         self.allocator.free(entry.key);
     }
 
@@ -230,6 +256,33 @@ pub const MessageBus = struct {
     }
 
     // =========================================================================
+    // Notification
+    // =========================================================================
+
+    /// Set or clear the notification callback for a local agent.
+    ///
+    /// The callback fires after a message is enqueued into the agent's
+    /// mailbox (via send/deliver/broadcast). It is called **outside** the
+    /// bus mutex to avoid deadlocks with caller-side locking.
+    ///
+    /// Pass null for on_notify to clear the callback.
+    pub fn setNotify(
+        self: *MessageBus,
+        agent_id: []const u8,
+        on_notify: ?OnMessageNotifyFn,
+        on_notify_data: ?*anyopaque,
+    ) BusError!void {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+
+        const mailbox = self.mailboxes.getPtr(agent_id) orelse
+            return BusError.AgentNotFound;
+
+        mailbox.on_notify = on_notify;
+        mailbox.on_notify_data = on_notify_data;
+    }
+
+    // =========================================================================
     // Messaging
     // =========================================================================
 
@@ -252,17 +305,36 @@ pub const MessageBus = struct {
         }
 
         // Try local mailbox first
+        var notify_fn: ?OnMessageNotifyFn = null;
+        var notify_data: ?*anyopaque = null;
+        var notify_count: usize = 0;
+        var found_local = false;
         {
             self.mutex.lock();
             defer self.mutex.unlock();
 
-            if (self.mailboxes.getPtr(to)) |queue| {
+            if (self.mailboxes.getPtr(to)) |mailbox| {
+                found_local = true;
                 const msg = self.createMessage(from, to, payload) catch
                     return BusError.OutOfMemory;
-                queue.enqueue(self.allocator, msg) catch
+                mailbox.queue.enqueue(self.allocator, msg) catch
                     return BusError.OutOfMemory;
-                return;
+
+                // Capture notification info under lock
+                if (mailbox.on_notify) |nfn| {
+                    notify_fn = nfn;
+                    notify_data = mailbox.on_notify_data;
+                    notify_count = mailbox.queue.count();
+                }
             }
+        }
+
+        if (found_local) {
+            // Fire notification outside lock
+            if (notify_fn) |nfn| {
+                self.fireNotify(nfn, to, notify_count, notify_data);
+            }
+            return;
         }
 
         // Try remote peer
@@ -287,8 +359,8 @@ pub const MessageBus = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const queue = self.mailboxes.getPtr(agent_id) orelse return null;
-        return queue.dequeue();
+        const mailbox = self.mailboxes.getPtr(agent_id) orelse return null;
+        return mailbox.queue.dequeue();
     }
 
     /// Deliver an incoming message into a local mailbox.
@@ -301,16 +373,32 @@ pub const MessageBus = struct {
         to: []const u8,
         payload: []const u8,
     ) BusError!void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+        var notify_fn: ?OnMessageNotifyFn = null;
+        var notify_data: ?*anyopaque = null;
+        var notify_count: usize = 0;
+        {
+            self.mutex.lock();
+            defer self.mutex.unlock();
 
-        const queue = self.mailboxes.getPtr(to) orelse
-            return BusError.AgentNotFound;
+            const mailbox = self.mailboxes.getPtr(to) orelse
+                return BusError.AgentNotFound;
 
-        const msg = self.createMessage(from, to, payload) catch
-            return BusError.OutOfMemory;
-        queue.enqueue(self.allocator, msg) catch
-            return BusError.OutOfMemory;
+            const msg = self.createMessage(from, to, payload) catch
+                return BusError.OutOfMemory;
+            mailbox.queue.enqueue(self.allocator, msg) catch
+                return BusError.OutOfMemory;
+
+            if (mailbox.on_notify) |nfn| {
+                notify_fn = nfn;
+                notify_data = mailbox.on_notify_data;
+                notify_count = mailbox.queue.count();
+            }
+        }
+
+        // Fire notification outside lock
+        if (notify_fn) |nfn| {
+            self.fireNotify(nfn, to, notify_count, notify_data);
+        }
     }
 
     /// Broadcast a message to all local mailboxes and remote peers.
@@ -321,7 +409,15 @@ pub const MessageBus = struct {
         from: []const u8,
         payload: []const u8,
     ) BusError!void {
-        // Collect local recipients under lock
+        // Collect local recipients + notifications under lock
+        const NotifyEntry = struct {
+            notify_fn: OnMessageNotifyFn,
+            agent_id: []const u8,
+            pending_count: usize,
+            data: ?*anyopaque,
+        };
+        var notifications = std.ArrayListUnmanaged(NotifyEntry){};
+        defer notifications.deinit(self.allocator);
         {
             self.mutex.lock();
             defer self.mutex.unlock();
@@ -333,9 +429,23 @@ pub const MessageBus = struct {
 
                 const msg = self.createMessage(from, entry.key_ptr.*, payload) catch
                     return BusError.OutOfMemory;
-                entry.value_ptr.enqueue(self.allocator, msg) catch
+                entry.value_ptr.queue.enqueue(self.allocator, msg) catch
                     return BusError.OutOfMemory;
+
+                if (entry.value_ptr.on_notify) |nfn| {
+                    notifications.append(self.allocator, .{
+                        .notify_fn = nfn,
+                        .agent_id = entry.key_ptr.*,
+                        .pending_count = entry.value_ptr.queue.count(),
+                        .data = entry.value_ptr.on_notify_data,
+                    }) catch {};
+                }
             }
+        }
+
+        // Fire notifications outside lock
+        for (notifications.items) |entry| {
+            self.fireNotify(entry.notify_fn, entry.agent_id, entry.pending_count, entry.data);
         }
 
         // Collect remote peers to send to (outside lock to avoid holding
@@ -375,13 +485,28 @@ pub const MessageBus = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
 
-        const queue = self.mailboxes.getPtr(agent_id) orelse return 0;
-        return queue.count();
+        const mailbox = self.mailboxes.getPtr(agent_id) orelse return 0;
+        return mailbox.queue.count();
     }
 
     // =========================================================================
     // Internal helpers
     // =========================================================================
+
+    /// Fire a notification callback with a null-terminated agent_id.
+    ///
+    /// Must be called **outside** the bus mutex.
+    fn fireNotify(
+        self: *MessageBus,
+        notify_fn: OnMessageNotifyFn,
+        agent_id: []const u8,
+        pending_count: usize,
+        notify_data: ?*anyopaque,
+    ) void {
+        const id_z = self.allocator.dupeZ(u8, agent_id) catch return;
+        defer self.allocator.free(id_z);
+        notify_fn(id_z.ptr, pending_count, notify_data);
+    }
 
     /// Create a Message with owned copies of all fields.
     /// Caller must hold mutex or ensure no concurrent access to allocator.
@@ -698,4 +823,131 @@ test "MessageBus unregister frees queued messages" {
 
 test "PeerTransport enum values" {
     try std.testing.expectEqual(@as(u8, 0), @intFromEnum(PeerTransport.http));
+}
+
+test "MessageBus setNotify fires on send" {
+    const allocator = std.testing.allocator;
+    var bus = MessageBus.init(allocator);
+    defer bus.deinit();
+
+    const Ctx = struct {
+        var call_count: usize = 0;
+        var last_pending: usize = 0;
+
+        fn notify(_: [*:0]const u8, pending_count: usize, _: ?*anyopaque) callconv(.c) void {
+            call_count += 1;
+            last_pending = pending_count;
+        }
+    };
+
+    try bus.register("alice");
+    try bus.register("bob");
+    try bus.setNotify("bob", Ctx.notify, null);
+
+    Ctx.call_count = 0;
+    try bus.send("alice", "bob", "hello");
+    try std.testing.expectEqual(@as(usize, 1), Ctx.call_count);
+    try std.testing.expectEqual(@as(usize, 1), Ctx.last_pending);
+
+    // Second message increases pending count
+    try bus.send("alice", "bob", "again");
+    try std.testing.expectEqual(@as(usize, 2), Ctx.call_count);
+    try std.testing.expectEqual(@as(usize, 2), Ctx.last_pending);
+}
+
+test "MessageBus setNotify fires on deliver" {
+    const allocator = std.testing.allocator;
+    var bus = MessageBus.init(allocator);
+    defer bus.deinit();
+
+    const Ctx = struct {
+        var call_count: usize = 0;
+
+        fn notify(_: [*:0]const u8, _: usize, _: ?*anyopaque) callconv(.c) void {
+            call_count += 1;
+        }
+    };
+
+    try bus.register("bob");
+    try bus.setNotify("bob", Ctx.notify, null);
+
+    Ctx.call_count = 0;
+    try bus.deliver("remote-alice", "bob", "hello from remote");
+    try std.testing.expectEqual(@as(usize, 1), Ctx.call_count);
+}
+
+test "MessageBus setNotify fires on broadcast" {
+    const allocator = std.testing.allocator;
+    var bus = MessageBus.init(allocator);
+    defer bus.deinit();
+
+    const Ctx = struct {
+        var call_count: usize = 0;
+
+        fn notify(_: [*:0]const u8, _: usize, _: ?*anyopaque) callconv(.c) void {
+            call_count += 1;
+        }
+    };
+
+    try bus.register("alice");
+    try bus.register("bob");
+    try bus.register("carol");
+    try bus.setNotify("bob", Ctx.notify, null);
+    try bus.setNotify("carol", Ctx.notify, null);
+
+    Ctx.call_count = 0;
+    try bus.send("alice", "*", "broadcast");
+    // Both bob and carol should be notified (alice is sender, excluded)
+    try std.testing.expectEqual(@as(usize, 2), Ctx.call_count);
+}
+
+test "MessageBus setNotify for unknown agent returns error" {
+    const allocator = std.testing.allocator;
+    var bus = MessageBus.init(allocator);
+    defer bus.deinit();
+
+    try std.testing.expectError(BusError.AgentNotFound, bus.setNotify("ghost", struct {
+        fn noop(_: [*:0]const u8, _: usize, _: ?*anyopaque) callconv(.c) void {}
+    }.noop, null));
+}
+
+test "MessageBus setNotify clear with null" {
+    const allocator = std.testing.allocator;
+    var bus = MessageBus.init(allocator);
+    defer bus.deinit();
+
+    const Ctx = struct {
+        var call_count: usize = 0;
+
+        fn notify(_: [*:0]const u8, _: usize, _: ?*anyopaque) callconv(.c) void {
+            call_count += 1;
+        }
+    };
+
+    try bus.register("alice");
+    try bus.register("bob");
+    try bus.setNotify("bob", Ctx.notify, null);
+
+    Ctx.call_count = 0;
+    try bus.send("alice", "bob", "first");
+    try std.testing.expectEqual(@as(usize, 1), Ctx.call_count);
+
+    // Clear notification
+    try bus.setNotify("bob", null, null);
+    try bus.send("alice", "bob", "second");
+    // Should NOT trigger notification
+    try std.testing.expectEqual(@as(usize, 1), Ctx.call_count);
+}
+
+test "MessageBus no notification without setNotify" {
+    const allocator = std.testing.allocator;
+    var bus = MessageBus.init(allocator);
+    defer bus.deinit();
+
+    try bus.register("alice");
+    try bus.register("bob");
+
+    // send without notification set — should not crash
+    try bus.send("alice", "bob", "hello");
+    try std.testing.expectEqual(@as(usize, 1), bus.pendingCount("bob"));
 }

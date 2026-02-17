@@ -18,6 +18,7 @@ const Allocator = std.mem.Allocator;
 
 const responses = @import("../responses/root.zig");
 const Conversation = responses.Conversation;
+const ContentPart = responses.ContentPart;
 const Item = responses.Item;
 const ItemType = responses.ItemType;
 const MessageRole = responses.MessageRole;
@@ -183,6 +184,117 @@ pub fn compactTurns(
     }
 
     return total_deleted;
+}
+
+// =============================================================================
+// Intra-turn truncation fallback
+// =============================================================================
+
+const truncation_marker = "\n...(content truncated by compaction)";
+
+/// Truncate the text in an ArrayListUnmanaged(u8) buffer.
+/// Removes at least `bytes_to_remove` bytes (or the marker length, whichever
+/// is larger) and appends the truncation marker.
+/// Returns the new text length, or null if the buffer was empty.
+fn truncateBuffer(buf: *std.ArrayListUnmanaged(u8), bytes_to_remove: usize) ?usize {
+    const text_len = buf.items.len;
+    if (text_len == 0) return null;
+
+    // Ensure we remove at least enough space for the marker itself.
+    const min_remove = @max(bytes_to_remove, truncation_marker.len);
+    const keep = if (min_remove >= text_len) 0 else text_len - min_remove;
+
+    buf.shrinkRetainingCapacity(keep);
+    buf.appendSliceAssumeCapacity(truncation_marker);
+
+    return buf.items.len;
+}
+
+/// Try to truncate the first text buffer found in a ContentPart.
+fn truncateContentPart(part: *ContentPart, bytes_to_remove: usize) ?usize {
+    switch (part.variant) {
+        .input_text => |*v| return truncateBuffer(&v.text, bytes_to_remove),
+        .output_text => |*v| return truncateBuffer(&v.text, bytes_to_remove),
+        .text => |*v| return truncateBuffer(&v.text, bytes_to_remove),
+        else => return null,
+    }
+}
+
+/// Try to truncate the first text buffer found in an item's payload.
+fn truncateItemText(item: *Item, bytes_to_remove: usize) ?usize {
+    switch (item.data) {
+        .message => |*msg| {
+            for (msg.content.items) |*part| {
+                if (truncateContentPart(part, bytes_to_remove)) |len| return len;
+            }
+        },
+        .function_call_output => |*fco| {
+            switch (fco.output) {
+                .text => |*buf| return truncateBuffer(buf, bytes_to_remove),
+                .parts => |*parts| {
+                    for (parts.items) |*part| {
+                        if (truncateContentPart(part, bytes_to_remove)) |len| return len;
+                    }
+                },
+            }
+        },
+        else => {},
+    }
+    return null;
+}
+
+/// Fallback: truncate text content of the largest non-pinned item when
+/// turn-level compaction can't reach the target.
+///
+/// Estimates bytes-to-tokens at 4:1. Updates item.input_tokens or
+/// item.output_tokens to the estimated value after truncation.
+/// Appends a truncation marker to the content.
+///
+/// Returns the estimated remaining tokens after truncation.
+pub fn truncateOversizedItem(
+    conv: *Conversation,
+    target_tokens: u64,
+    current_tokens: u64,
+) u64 {
+    if (current_tokens <= target_tokens) return current_tokens;
+
+    const count = conv.len();
+    if (count <= 1) return current_tokens; // only system prompt
+
+    // Find the non-pinned item (index > 0) with the highest token count.
+    var best_idx: ?usize = null;
+    var best_tokens: u64 = 0;
+
+    var i: usize = 1;
+    while (i < count) : (i += 1) {
+        const item = conv.getItem(i) orelse continue;
+        if (item.pinned) continue;
+        const tokens = itemTokens(item);
+        if (tokens > best_tokens) {
+            best_tokens = tokens;
+            best_idx = i;
+        }
+    }
+
+    const idx = best_idx orelse return current_tokens; // all pinned
+    const item = conv.getItemMut(idx) orelse return current_tokens;
+
+    const excess = current_tokens - target_tokens;
+    const bytes_to_remove: usize = @intCast(excess * 4);
+
+    const new_text_len = truncateItemText(item, bytes_to_remove) orelse
+        return current_tokens; // no text to truncate
+
+    // Update token estimate (4 bytes per token).
+    const estimated_tokens: u32 = @intCast(new_text_len / 4);
+    if (item.input_tokens > 0) {
+        item.input_tokens = estimated_tokens;
+    } else {
+        item.output_tokens = estimated_tokens;
+    }
+
+    const new_item_tokens: u64 = @as(u64, item.input_tokens) + @as(u64, item.output_tokens);
+    return current_tokens -| (best_tokens -| new_item_tokens);
 }
 
 // =============================================================================
@@ -435,4 +547,104 @@ test "identifyTurns accumulates token counts" {
 
     try std.testing.expectEqual(@as(usize, 1), turns.len);
     try std.testing.expectEqual(@as(u64, 200), turns[0].total_tokens);
+}
+
+test "truncateOversizedItem truncates massive user message" {
+    const allocator = std.testing.allocator;
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    _ = try conv.appendSystemMessage("System.");
+    // Create a message with large text content and high token count.
+    const big_msg = try conv.appendUserMessage("x" ** 2000);
+    big_msg.input_tokens = 500;
+
+    // current=500, target=100 → excess=400 → bytes_to_remove=1600
+    const remaining = truncateOversizedItem(conv, 100, 500);
+
+    // Item should now have truncated text with marker appended.
+    const item = conv.getItem(1).?;
+    const msg = item.asMessage().?;
+    const text = msg.getFirstText();
+    try std.testing.expect(text.len < 2000);
+    try std.testing.expect(std.mem.endsWith(u8, text, truncation_marker));
+    // Token estimate should be reduced.
+    try std.testing.expect(item.input_tokens < 500);
+    try std.testing.expect(remaining < 500);
+}
+
+test "truncateOversizedItem skips pinned items" {
+    const allocator = std.testing.allocator;
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    _ = try conv.appendSystemMessage("System.");
+    const pinned = try conv.appendUserMessage("x" ** 2000);
+    pinned.input_tokens = 500;
+    pinned.pinned = true;
+
+    // Only item is pinned — nothing to truncate.
+    const remaining = truncateOversizedItem(conv, 100, 500);
+    try std.testing.expectEqual(@as(u64, 500), remaining);
+
+    // Text unchanged.
+    const item = conv.getItem(1).?;
+    const msg = item.asMessage().?;
+    try std.testing.expectEqual(@as(usize, 2000), msg.getFirstText().len);
+}
+
+test "truncateOversizedItem no-op when under target" {
+    const allocator = std.testing.allocator;
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    _ = try conv.appendSystemMessage("System.");
+    const msg = try conv.appendUserMessage("Hello");
+    msg.input_tokens = 10;
+
+    const remaining = truncateOversizedItem(conv, 100, 50);
+    try std.testing.expectEqual(@as(u64, 50), remaining);
+}
+
+test "truncateOversizedItem truncates function_call_output" {
+    const allocator = std.testing.allocator;
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    _ = try conv.appendSystemMessage("System.");
+    const fco = try conv.appendFunctionCallOutput("call_1", "y" ** 2000);
+    fco.input_tokens = 500;
+
+    const remaining = truncateOversizedItem(conv, 100, 500);
+
+    const item = conv.getItem(1).?;
+    const output = item.asFunctionCallOutput().?;
+    const text = output.getOutputText();
+    try std.testing.expect(text.len < 2000);
+    try std.testing.expect(std.mem.endsWith(u8, text, truncation_marker));
+    try std.testing.expect(item.input_tokens < 500);
+    try std.testing.expect(remaining < 500);
+}
+
+test "truncateOversizedItem picks highest-token item" {
+    const allocator = std.testing.allocator;
+    const conv = try Conversation.init(allocator);
+    defer conv.deinit();
+
+    _ = try conv.appendSystemMessage("System.");
+    const small = try conv.appendUserMessage("small");
+    small.input_tokens = 50;
+    const big = try conv.appendUserMessage("z" ** 2000);
+    big.input_tokens = 400;
+
+    // current=450, target=200 → should truncate the big item (400 tokens)
+    const remaining = truncateOversizedItem(conv, 200, 450);
+
+    // Small item unchanged.
+    const item1 = conv.getItem(1).?;
+    try std.testing.expectEqual(@as(u32, 50), item1.input_tokens);
+    // Big item truncated.
+    const item2 = conv.getItem(2).?;
+    try std.testing.expect(item2.input_tokens < 400);
+    try std.testing.expect(remaining < 450);
 }

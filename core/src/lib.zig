@@ -413,6 +413,17 @@ comptime {
     // Agent context injection API
     _ = &capi.talu_agent_set_context_inject;
 
+    // Agent tool middleware API
+    _ = &capi.talu_agent_set_before_tool;
+    _ = &capi.talu_agent_set_after_tool;
+
+    // Agent active receiver API
+    _ = &capi.talu_agent_wait_for_message;
+    _ = &capi.talu_agent_run_loop;
+
+    // Agent vector store RAG API
+    _ = &capi.talu_agent_set_vector_store;
+
     // MessageBus API
     _ = &capi.talu_agent_bus_create;
     _ = &capi.talu_agent_bus_free;
@@ -424,4 +435,5 @@ comptime {
     _ = &capi.talu_agent_bus_deliver;
     _ = &capi.talu_agent_bus_broadcast;
     _ = &capi.talu_agent_bus_pending;
+    _ = &capi.talu_agent_bus_set_notify;
 }

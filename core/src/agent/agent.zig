@@ -40,12 +40,18 @@ const Conversation = responses.Conversation;
 const router = @import("../router/root.zig");
 const InferenceBackend = router.InferenceBackend;
 
+const db = @import("../db/root.zig");
+const VectorAdapter = db.VectorAdapter;
+const SearchResult = db.vector.store.SearchResult;
+
 const AgentLoopConfig = loop_mod.AgentLoopConfig;
 const AgentLoopResult = loop_mod.AgentLoopResult;
 const LoopStopReason = loop_mod.LoopStopReason;
 const OnTokenFn = loop_mod.OnTokenFn;
 const OnEventFn = loop_mod.OnEventFn;
 const OnSessionFn = loop_mod.OnSessionFn;
+const OnBeforeToolFn = loop_mod.OnBeforeToolFn;
+const OnAfterToolFn = loop_mod.OnAfterToolFn;
 const ToolRegistry = tool_mod.ToolRegistry;
 const Tool = tool_mod.Tool;
 const MessageBus = bus_mod.MessageBus;
@@ -57,16 +63,56 @@ const Message = bus_mod.Message;
 
 /// Called before each generation to allow context injection (e.g., RAG).
 ///
-/// Receives the most recent user message text (or null if none).
-/// Writes context to out_context/out_context_len. The agent copies the
-/// returned text before proceeding. Returns false to cancel the loop.
+/// Receives the agent's Chat as an opaque handle. The callback can inspect
+/// the full conversation via C API functions (talu_chat_get_messages, etc.)
+/// to construct a RAG query. Writes context to out_context/out_context_len.
+/// The agent copies the returned text before proceeding.
+/// Returns false to cancel the loop.
 pub const OnContextInjectFn = *const fn (
-    last_user_message: ?[*]const u8,
-    last_user_message_len: usize,
+    chat_handle: ?*anyopaque,
     out_context: *?[*]const u8,
     out_context_len: *usize,
     user_data: ?*anyopaque,
 ) callconv(.c) bool;
+
+/// Embed text into a float vector for RAG search.
+///
+/// Writes the vector pointer and dimension to out params. The agent copies the
+/// vector before returning. Returns false to skip RAG for this turn.
+pub const OnEmbedFn = *const fn (
+    text: [*]const u8,
+    text_len: usize,
+    out_vector: *?[*]const f32,
+    out_dim: *usize,
+    user_data: ?*anyopaque,
+) callconv(.c) bool;
+
+/// Resolve vector search results into context text.
+///
+/// Receives doc IDs and scores. Writes context text to out params. The agent
+/// copies the text before returning. Returns false to cancel the loop.
+pub const OnResolveDocFn = *const fn (
+    doc_ids: [*]const u64,
+    scores: [*]const f32,
+    count: usize,
+    out_context: *?[*]const u8,
+    out_context_len: *usize,
+    user_data: ?*anyopaque,
+) callconv(.c) bool;
+
+/// Configuration for built-in vector store RAG.
+pub const RagConfig = struct {
+    /// Maximum number of results to retrieve.
+    top_k: u32 = 5,
+    /// Minimum score threshold for results (0.0 = no filtering).
+    min_score: f32 = 0.0,
+    /// Callback to embed user text into a query vector.
+    on_embed: ?OnEmbedFn = null,
+    on_embed_data: ?*anyopaque = null,
+    /// Callback to resolve doc IDs + scores into context text.
+    on_resolve: ?OnResolveDocFn = null,
+    on_resolve_data: ?*anyopaque = null,
+};
 
 // =============================================================================
 // Configuration
@@ -86,6 +132,8 @@ pub const AgentConfig = struct {
     max_iterations_per_turn: usize = 10,
     /// Stop the loop when a tool execution returns an error.
     abort_on_tool_error: bool = false,
+    /// Maximum bytes for tool output. 0 = unlimited.
+    max_tool_output_bytes: usize = 0,
     /// Agent identifier. Null = auto-generate a random ID.
     agent_id: ?[]const u8 = null,
     /// Directory for agent state files (tools, skills, key-value).
@@ -102,6 +150,12 @@ pub const AgentConfig = struct {
     // Context injection callback (called at Agent level before each generation)
     on_context_inject: ?OnContextInjectFn = null,
     on_context_inject_data: ?*anyopaque = null,
+
+    // Tool middleware (forwarded to loop.run)
+    on_before_tool: ?OnBeforeToolFn = null,
+    on_before_tool_data: ?*anyopaque = null,
+    on_after_tool: ?OnAfterToolFn = null,
+    on_after_tool_data: ?*anyopaque = null,
 };
 
 // =============================================================================
@@ -137,6 +191,7 @@ pub const Agent = struct {
     retry_base_delay_ns: u64,
     max_iterations_per_turn: usize,
     abort_on_tool_error: bool,
+    max_tool_output_bytes: usize,
 
     // Runtime state
     stop_flag: std.atomic.Value(bool),
@@ -154,6 +209,21 @@ pub const Agent = struct {
     // Context injection callback
     on_context_inject: ?OnContextInjectFn,
     on_context_inject_data: ?*anyopaque,
+
+    // Tool middleware (forwarded to loop.run)
+    on_before_tool: ?OnBeforeToolFn,
+    on_before_tool_data: ?*anyopaque,
+    on_after_tool: ?OnAfterToolFn,
+    on_after_tool_data: ?*anyopaque,
+
+    // Built-in vector store RAG
+    vector_store: ?*VectorAdapter,
+    rag_config: RagConfig,
+
+    // Message notification (for waitForMessage / runLoop)
+    message_mutex: std.Thread.Mutex,
+    message_cond: std.Thread.Condition,
+    message_pending: bool,
 
     // Goals — persistent objectives that survive compaction
     goals: std.ArrayListUnmanaged([]const u8),
@@ -212,6 +282,7 @@ pub const Agent = struct {
             .retry_base_delay_ns = config.retry_base_delay_ns,
             .max_iterations_per_turn = config.max_iterations_per_turn,
             .abort_on_tool_error = config.abort_on_tool_error,
+            .max_tool_output_bytes = config.max_tool_output_bytes,
             .stop_flag = std.atomic.Value(bool).init(false),
             .total_iterations = 0,
             .total_tool_calls = 0,
@@ -223,6 +294,15 @@ pub const Agent = struct {
             .on_session_data = config.on_session_data,
             .on_context_inject = config.on_context_inject,
             .on_context_inject_data = config.on_context_inject_data,
+            .on_before_tool = config.on_before_tool,
+            .on_before_tool_data = config.on_before_tool_data,
+            .on_after_tool = config.on_after_tool,
+            .on_after_tool_data = config.on_after_tool_data,
+            .vector_store = null,
+            .rag_config = .{},
+            .message_mutex = .{},
+            .message_cond = .{},
+            .message_pending = false,
             .goals = .{},
             .base_system_prompt = null,
         };
@@ -262,9 +342,28 @@ pub const Agent = struct {
     }
 
     /// Connect to a MessageBus for inter-agent communication.
-    /// The bus must outlive the agent (caller-managed).
+    ///
+    /// The bus must outlive the agent (caller-managed). The agent must
+    /// already be registered on the bus. Registers a notification callback
+    /// so `waitForMessage()` and `runLoop()` can wake on message arrival.
     pub fn setBus(self: *Agent, bus: *MessageBus) void {
         self.bus = bus;
+        bus.setNotify(self.agent_id, onBusNotify, @ptrCast(self)) catch {};
+    }
+
+    /// Wire the agent to a vector store for built-in RAG.
+    ///
+    /// Before each generation, the agent will:
+    ///   1. Extract the last user message text
+    ///   2. Call on_embed to produce a query vector
+    ///   3. Search the vector store for top_k results
+    ///   4. Call on_resolve to turn (doc_ids, scores) into context text
+    ///   5. Inject the resolved text as a hidden developer message
+    ///
+    /// The store must outlive the agent (caller-managed).
+    pub fn setVectorStore(self: *Agent, store: *VectorAdapter, config: RagConfig) void {
+        self.vector_store = store;
+        self.rag_config = config;
     }
 
     // =========================================================================
@@ -321,8 +420,9 @@ pub const Agent = struct {
     /// 2. Sync goals into system prompt
     /// 3. Compact if approaching context limit (turn-aware)
     /// 4. Append user message
-    /// 5. Inject context (RAG callback)
-    /// 6. Run loop with retry
+    /// 5. Vector store RAG (embed → search → resolve → inject)
+    /// 6. Inject context (custom callback)
+    /// 7. Run loop with retry
     pub fn prompt(self: *Agent, message: []const u8) !AgentLoopResult {
         self.stop_flag.store(false, .release);
 
@@ -330,9 +430,8 @@ pub const Agent = struct {
         try self.syncSystemPromptWithGoals();
         self.compactIfNeeded();
         _ = try self.chat.conv.appendUserMessage(message);
-        if (!try self.injectContext()) {
-            return cancelledResult(self);
-        }
+        if (!try self.injectVectorContext()) return cancelledResult(self);
+        if (!try self.injectContext()) return cancelledResult(self);
 
         return self.runWithRetry();
     }
@@ -347,9 +446,8 @@ pub const Agent = struct {
         try self.drainInbox();
         try self.syncSystemPromptWithGoals();
         self.compactIfNeeded();
-        if (!try self.injectContext()) {
-            return cancelledResult(self);
-        }
+        if (!try self.injectVectorContext()) return cancelledResult(self);
+        if (!try self.injectContext()) return cancelledResult(self);
 
         return self.runWithRetry();
     }
@@ -367,17 +465,79 @@ pub const Agent = struct {
         _ = try self.chat.conv.appendDeveloperMessage(
             "Heartbeat: review pending work and act.",
         );
-        if (!try self.injectContext()) {
-            return cancelledResult(self);
-        }
+        if (!try self.injectVectorContext()) return cancelledResult(self);
+        if (!try self.injectContext()) return cancelledResult(self);
 
         return self.runWithRetry();
     }
 
     /// Request cancellation from another thread.
-    /// The loop checks this flag between iterations.
+    /// The loop checks this flag between iterations and `runLoop()` exits.
     pub fn abort(self: *Agent) void {
         self.stop_flag.store(true, .release);
+        // Wake waitForMessage/runLoop so they can observe the flag
+        self.message_mutex.lock();
+        self.message_cond.signal();
+        self.message_mutex.unlock();
+    }
+
+    /// Block until a message arrives in the bus mailbox or timeout elapses.
+    ///
+    /// Returns true if a message notification was received, false on timeout.
+    /// Thread-safe: can be called from any thread. Requires a bus to be set
+    /// via `setBus()`.
+    pub fn waitForMessage(self: *Agent, timeout_ns: u64) bool {
+        self.message_mutex.lock();
+        defer self.message_mutex.unlock();
+
+        if (self.message_pending) {
+            self.message_pending = false;
+            return true;
+        }
+
+        self.message_cond.timedWait(&self.message_mutex, timeout_ns) catch {
+            // Timeout — check if pending was set between check and wait
+            const result = self.message_pending;
+            self.message_pending = false;
+            return result;
+        };
+
+        const result = self.message_pending;
+        self.message_pending = false;
+        return result;
+    }
+
+    /// Autonomous message-driven loop.
+    ///
+    /// Runs `heartbeat()` when messages arrive, waits between iterations.
+    /// Stops on `abort()`, generation error, or non-recoverable stop reason
+    /// (tool_error, cancelled). Normal completion and max_iterations continue
+    /// the loop.
+    ///
+    /// `idle_timeout_ns` controls the maximum wait between message checks.
+    /// Use `abort()` from another thread to stop the loop.
+    pub fn runLoop(self: *Agent, idle_timeout_ns: u64) !AgentLoopResult {
+        self.stop_flag.store(false, .release);
+
+        while (!self.stop_flag.load(.acquire)) {
+            const has_messages = if (self.bus) |bus|
+                bus.pendingCount(self.agent_id) > 0
+            else
+                false;
+
+            if (has_messages) {
+                const result = try self.heartbeat();
+                switch (result.stop_reason) {
+                    .completed, .max_iterations => continue,
+                    else => return result,
+                }
+            }
+
+            // Wait for notification or timeout
+            _ = self.waitForMessage(idle_timeout_ns);
+        }
+
+        return cancelledResult(self);
     }
 
     // =========================================================================
@@ -455,36 +615,22 @@ pub const Agent = struct {
 
     /// Call the context injection hook if set.
     ///
-    /// Finds the most recent user message, passes its text to the callback,
-    /// and appends the returned context as a hidden developer message
-    /// (visible to LLM, excluded from UI).
+    /// Passes the agent's Chat as an opaque handle so the callback can
+    /// inspect the full conversation for RAG query construction. Appends
+    /// the returned context as a hidden developer message (visible to LLM,
+    /// excluded from UI).
     ///
     /// Returns false if the callback requested cancellation.
     fn injectContext(self: *Agent) !bool {
         const inject_fn = self.on_context_inject orelse return true;
 
-        // Find last user message text
-        var last_user_text: ?[]const u8 = null;
-        var scan_idx: usize = self.chat.conv.len();
-        while (scan_idx > 0) {
-            scan_idx -= 1;
-            const item = self.chat.conv.getItem(scan_idx) orelse continue;
-            const msg = item.asMessage() orelse continue;
-            if (msg.role == .user) {
-                last_user_text = msg.getFirstText();
-                break;
-            }
-        }
-
         var out_ctx: ?[*]const u8 = null;
         var out_len: usize = 0;
 
-        const user_ptr: ?[*]const u8 = if (last_user_text) |t| t.ptr else null;
-        const user_len: usize = if (last_user_text) |t| t.len else 0;
+        const chat_handle: ?*anyopaque = @ptrCast(self.chat);
 
         const should_continue = inject_fn(
-            user_ptr,
-            user_len,
+            chat_handle,
             &out_ctx,
             &out_len,
             self.on_context_inject_data,
@@ -504,6 +650,82 @@ pub const Agent = struct {
             }
         }
 
+        return true;
+    }
+
+    /// Embed → search → resolve → inject via the built-in vector store.
+    ///
+    /// Returns false if the resolve callback requested cancellation.
+    /// Silently no-ops if vector store, callbacks, or user message are absent.
+    fn injectVectorContext(self: *Agent) !bool {
+        const store = self.vector_store orelse return true;
+        const config = self.rag_config;
+        const embed_fn = config.on_embed orelse return true;
+        const resolve_fn = config.on_resolve orelse return true;
+
+        // 1. Extract last user message text.
+        var last_text: ?[]const u8 = null;
+        var idx: usize = self.chat.conv.len();
+        while (idx > 0) {
+            idx -= 1;
+            const item = self.chat.conv.getItem(idx) orelse continue;
+            const msg = item.asMessage() orelse continue;
+            if (msg.role == .user) {
+                last_text = msg.getFirstText();
+                break;
+            }
+        }
+        const text = last_text orelse return true;
+        if (text.len == 0) return true;
+
+        // 2. Embed.
+        var out_vec: ?[*]const f32 = null;
+        var out_dim: usize = 0;
+        if (!embed_fn(text.ptr, text.len, &out_vec, &out_dim, config.on_embed_data))
+            return true; // skip RAG this turn
+        const query = (out_vec orelse return true)[0..out_dim];
+        if (query.len == 0) return true;
+
+        // 3. Search.
+        var result = store.search(self.allocator, query, config.top_k) catch return true;
+        defer result.deinit(self.allocator);
+        if (result.ids.len == 0) return true;
+
+        // 4. Filter by min_score.
+        var count: usize = result.ids.len;
+        if (config.min_score > 0.0) {
+            count = 0;
+            for (result.scores) |s| {
+                if (s >= config.min_score) {
+                    count += 1;
+                } else break;
+            }
+        }
+        if (count == 0) return true;
+
+        // 5. Resolve doc IDs → context text.
+        var out_ctx: ?[*]const u8 = null;
+        var out_len: usize = 0;
+        if (!resolve_fn(
+            result.ids.ptr,
+            result.scores.ptr,
+            count,
+            &out_ctx,
+            &out_len,
+            config.on_resolve_data,
+        )) return false; // callback requested cancellation
+
+        // 6. Inject as hidden developer message.
+        if (out_ctx) |ctx| {
+            if (out_len > 0) {
+                _ = try self.chat.conv.appendMessageWithHidden(
+                    .developer,
+                    .input_text,
+                    ctx[0..out_len],
+                    true,
+                );
+            }
+        }
         return true;
     }
 
@@ -533,6 +755,14 @@ pub const Agent = struct {
         defer self.allocator.free(turns);
 
         _ = compaction_mod.compactTurns(self.chat.conv, turns, target, total_tokens);
+
+        // Fallback: if still over target after turn-level compaction,
+        // truncate the text content of the largest non-pinned item.
+        const info2 = loop_mod.computeContextInfo(self.chat.conv, 0);
+        const remaining = info2.total_input_tokens + info2.total_output_tokens;
+        if (remaining > target) {
+            _ = compaction_mod.truncateOversizedItem(self.chat.conv, target, remaining);
+        }
     }
 
     // =========================================================================
@@ -551,6 +781,11 @@ pub const Agent = struct {
             .on_event_data = self.on_event_data,
             .on_session = self.on_session,
             .on_session_data = self.on_session_data,
+            .on_before_tool = self.on_before_tool,
+            .on_before_tool_data = self.on_before_tool_data,
+            .on_after_tool = self.on_after_tool,
+            .on_after_tool_data = self.on_after_tool_data,
+            .max_tool_output_bytes = self.max_tool_output_bytes,
             .initial_iteration_count = self.total_iterations,
             .initial_tool_call_count = self.total_tool_calls,
         };
@@ -588,6 +823,23 @@ pub const Agent = struct {
     // Internal: helpers
     // =========================================================================
 
+    /// Bus notification callback — signals the condition variable.
+    ///
+    /// Called by the MessageBus **outside** its mutex when a message is
+    /// enqueued into this agent's mailbox. Wakes `waitForMessage()` /
+    /// `runLoop()`.
+    fn onBusNotify(
+        _: [*:0]const u8,
+        _: usize,
+        user_data: ?*anyopaque,
+    ) callconv(.c) void {
+        const agent: *Agent = @ptrCast(@alignCast(user_data));
+        agent.message_mutex.lock();
+        agent.message_pending = true;
+        agent.message_cond.signal();
+        agent.message_mutex.unlock();
+    }
+
     fn cancelledResult(self: *const Agent) AgentLoopResult {
         return .{
             .stop_reason = .cancelled,
@@ -621,6 +873,7 @@ test "AgentConfig defaults" {
     try std.testing.expectEqual(std.time.ns_per_s, config.retry_base_delay_ns);
     try std.testing.expectEqual(@as(usize, 10), config.max_iterations_per_turn);
     try std.testing.expect(!config.abort_on_tool_error);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_output_bytes);
     try std.testing.expect(config.agent_id == null);
     try std.testing.expect(config.state_dir == null);
     try std.testing.expect(config.on_token == null);
@@ -628,6 +881,10 @@ test "AgentConfig defaults" {
     try std.testing.expect(config.on_session == null);
     try std.testing.expect(config.on_context_inject == null);
     try std.testing.expect(config.on_context_inject_data == null);
+    try std.testing.expect(config.on_before_tool == null);
+    try std.testing.expect(config.on_before_tool_data == null);
+    try std.testing.expect(config.on_after_tool == null);
+    try std.testing.expect(config.on_after_tool_data == null);
 }
 
 test "generateId produces 16 hex chars" {
@@ -755,16 +1012,17 @@ test "syncSystemPromptWithGoals no goals passes base through" {
     try std.testing.expectEqualStrings(base, base_owned);
 }
 
-test "OnContextInjectFn callback type" {
-    // Verify the callback type compiles and can be assigned
+test "OnContextInjectFn callback receives chat handle" {
+    // Verify the callback type compiles and receives an opaque handle
     const TestData = struct {
         fn inject(
-            _: ?[*]const u8,
-            _: usize,
+            chat_handle: ?*anyopaque,
             out_ctx: *?[*]const u8,
             out_len: *usize,
             _: ?*anyopaque,
         ) callconv(.c) bool {
+            // Verify we received a non-null handle
+            if (chat_handle == null) return false;
             out_ctx.* = null;
             out_len.* = 0;
             return true;
@@ -772,10 +1030,84 @@ test "OnContextInjectFn callback type" {
     };
 
     const cb: OnContextInjectFn = &TestData.inject;
+    // Simulate passing a non-null chat handle
+    var dummy: u8 = 0;
     var out_ctx: ?[*]const u8 = null;
     var out_len: usize = 0;
-    const result = cb(null, 0, &out_ctx, &out_len, null);
+    const result = cb(@ptrCast(&dummy), &out_ctx, &out_len, null);
     try std.testing.expect(result);
     try std.testing.expect(out_ctx == null);
     try std.testing.expectEqual(@as(usize, 0), out_len);
+
+    // Null handle also works (callback returns false)
+    const result2 = cb(null, &out_ctx, &out_len, null);
+    try std.testing.expect(!result2);
+}
+
+test "waitForMessage returns false on timeout when no messages" {
+    const allocator = std.testing.allocator;
+    // Tests don't call generate() — backend is never used
+    var backend: InferenceBackend = undefined;
+    var agent = try Agent.init(allocator, &backend, .{});
+    defer agent.deinit();
+
+    // No bus set, should timeout immediately (10ms)
+    const got = agent.waitForMessage(10 * std.time.ns_per_ms);
+    try std.testing.expect(!got);
+}
+
+test "waitForMessage returns true after onBusNotify signal" {
+    const allocator = std.testing.allocator;
+    var backend: InferenceBackend = undefined;
+    var agent = try Agent.init(allocator, &backend, .{});
+    defer agent.deinit();
+
+    // Simulate bus notification directly
+    Agent.onBusNotify(@ptrCast("x\x00".ptr), 1, @ptrCast(agent));
+
+    // Should return true immediately (message_pending was set)
+    const got = agent.waitForMessage(10 * std.time.ns_per_ms);
+    try std.testing.expect(got);
+
+    // Second call should timeout (pending was cleared)
+    const got2 = agent.waitForMessage(10 * std.time.ns_per_ms);
+    try std.testing.expect(!got2);
+}
+
+test "onBusNotify callback signature matches OnMessageNotifyFn" {
+    // Verify onBusNotify is assignable to OnMessageNotifyFn
+    const notify_fn: bus_mod.OnMessageNotifyFn = Agent.onBusNotify;
+    _ = notify_fn;
+}
+
+test "setBus registers notification on bus" {
+    const allocator = std.testing.allocator;
+    var backend: InferenceBackend = undefined;
+    var agent = try Agent.init(allocator, &backend, .{ .agent_id = "test-agent" });
+    defer agent.deinit();
+
+    var bus = bus_mod.MessageBus.init(allocator);
+    defer bus.deinit();
+
+    try bus.register("test-agent");
+    try bus.register("sender");
+    agent.setBus(&bus);
+
+    // Send a message — should trigger notification on agent
+    try bus.send("sender", "test-agent", "hello");
+
+    // waitForMessage should return true because onBusNotify was called
+    const got = agent.waitForMessage(10 * std.time.ns_per_ms);
+    try std.testing.expect(got);
+}
+
+test "abort signals message condition" {
+    const allocator = std.testing.allocator;
+    var backend: InferenceBackend = undefined;
+    var agent = try Agent.init(allocator, &backend, .{});
+    defer agent.deinit();
+
+    // Abort should signal the condvar (prevents runLoop from hanging)
+    agent.abort();
+    try std.testing.expect(agent.stop_flag.load(.acquire));
 }
