@@ -194,11 +194,13 @@ pub const VisionRuntime = struct {
         const patch_proj_w_5d = try getTensorByCandidates(st, &.{
             "model.visual.patch_embed.proj.weight",
             "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
+            "model.vision_model.embeddings.patch_embedding.weight",
         });
         const patch_proj_weight = flattenPatchProjWeight(patch_proj_w_5d, vision_hidden_size, temporal_patch_size, patch_size);
         const patch_proj_bias_tensor = try getTensorByCandidates(st, &.{
             "model.visual.patch_embed.proj.bias",
             "model.vision_tower.vision_model.embeddings.patch_embedding.bias",
+            "model.vision_model.embeddings.patch_embedding.bias",
         });
         const patch_proj_bias = try tensorToOwnedF32(allocator, patch_proj_bias_tensor);
         errdefer allocator.free(patch_proj_bias);
@@ -206,6 +208,7 @@ pub const VisionRuntime = struct {
         const pos_embed_tensor = try getTensorByCandidates(st, &.{
             "model.visual.pos_embed.weight",
             "model.vision_tower.vision_model.embeddings.position_embedding.weight",
+            "model.vision_model.embeddings.position_embedding.weight",
         });
         const pos_embed_f32 = try tensorToOwnedF32(allocator, pos_embed_tensor);
         errdefer allocator.free(pos_embed_f32);
@@ -215,6 +218,7 @@ pub const VisionRuntime = struct {
         const post_norm_weight_tensor = getTensorByCandidates(st, &.{
             "model.visual.norm.weight",
             "model.vision_tower.vision_model.post_layernorm.weight",
+            "model.vision_model.post_layernorm.weight",
         }) catch |err| switch (err) {
             error.NotFound => null,
             else => return err,
@@ -224,6 +228,7 @@ pub const VisionRuntime = struct {
             vision_post_norm_bias = try tensorToOwnedF32(allocator, try getTensorByCandidates(st, &.{
                 "model.visual.norm.bias",
                 "model.vision_tower.vision_model.post_layernorm.bias",
+                "model.vision_model.post_layernorm.bias",
             }));
         }
         errdefer if (vision_post_norm_weight.len > 0) allocator.free(vision_post_norm_weight);
@@ -307,19 +312,23 @@ pub const VisionRuntime = struct {
             const ln1_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm1.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.weight",
+                "model.vision_model.encoder.layers.{d}.layer_norm1.weight",
             });
             const ln1_bias = try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm1.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.bias",
+                "model.vision_model.encoder.layers.{d}.layer_norm1.bias",
             });
 
             const ln2_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm2.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.weight",
+                "model.vision_model.encoder.layers.{d}.layer_norm2.weight",
             });
             const ln2_bias = try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm2.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.bias",
+                "model.vision_model.encoder.layers.{d}.layer_norm2.bias",
             });
 
             const fused_qkv_weight = getLayerTensorByTemplates(st, layer_idx, &.{
@@ -342,14 +351,17 @@ pub const VisionRuntime = struct {
             const qkv_bias_all = if (fused_qkv_bias_all) |bias| bias else blk: {
                 const q_bias = try tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
+                    "model.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
                 }));
                 errdefer allocator.free(q_bias);
                 const k_bias = try tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
+                    "model.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
                 }));
                 errdefer allocator.free(k_bias);
                 const v_bias = try tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
+                    "model.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
                 }));
                 errdefer allocator.free(v_bias);
 
@@ -368,18 +380,21 @@ pub const VisionRuntime = struct {
             const q_proj_weight = if (fused_qkv_weight == null)
                 try getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
+                    "model.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
                 })
             else
                 undefined;
             const k_proj_weight = if (fused_qkv_weight == null)
                 try getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
+                    "model.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
                 })
             else
                 undefined;
             const v_proj_weight = if (fused_qkv_weight == null)
                 try getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
+                    "model.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
                 })
             else
                 undefined;
@@ -387,29 +402,35 @@ pub const VisionRuntime = struct {
             const o_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.attn.proj.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
+                "model.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
             });
             const o_bias = try tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.attn.proj.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
+                "model.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
             }));
             errdefer allocator.free(o_bias);
 
             const fc1_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc1.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.weight",
+                "model.vision_model.encoder.layers.{d}.mlp.fc1.weight",
             });
             const fc1_bias = try tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc1.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.bias",
+                "model.vision_model.encoder.layers.{d}.mlp.fc1.bias",
             }));
             errdefer allocator.free(fc1_bias);
             const fc2_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc2.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.weight",
+                "model.vision_model.encoder.layers.{d}.mlp.fc2.weight",
             });
             const fc2_bias = try tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc2.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.bias",
+                "model.vision_model.encoder.layers.{d}.mlp.fc2.bias",
             }));
             errdefer allocator.free(fc2_bias);
 

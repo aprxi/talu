@@ -212,6 +212,9 @@ pub extern fn mlx_lazy_fused_attention(
     head_dim: usize,
     pos_offset: usize,
     rope_theta: f32,
+    runtime_rope_cos: ArrayHandle, // can be null
+    runtime_rope_sin: ArrayHandle, // can be null
+    runtime_rope_dim: usize, // 0 disables runtime RoPE
     rms_eps: f32,
     group_size: usize,
     bits: usize,
@@ -248,6 +251,9 @@ pub extern fn mlx_lazy_fused_attention_qkv_quantized_o_dense(
     head_dim: usize,
     pos_offset: usize,
     rope_theta: f32,
+    runtime_rope_cos: ArrayHandle, // can be null
+    runtime_rope_sin: ArrayHandle, // can be null
+    runtime_rope_dim: usize, // 0 disables runtime RoPE
     rms_eps: f32,
     group_size: usize,
     bits: usize,
@@ -297,6 +303,9 @@ pub extern fn mlx_lazy_fused_attention_bf16(
     head_dim: usize,
     pos_offset: usize,
     rope_theta: f32,
+    runtime_rope_cos: ArrayHandle, // can be null
+    runtime_rope_sin: ArrayHandle, // can be null
+    runtime_rope_dim: usize, // 0 disables runtime RoPE
     rms_eps: f32,
     query_pre_attn_scalar: f32, // 0 for default (head_dim), >0 for custom
     attention_multiplier: f32, // 0 for default, >0 uses this directly as scale

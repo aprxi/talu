@@ -291,6 +291,20 @@ pub fn loadModelWithHooks(
         else => return err,
     };
 
+    log.debug("load", "Vision config from loadConfig", .{
+        .vision_hidden_size = model_config.vision_hidden_size,
+        .vision_depth = model_config.vision_depth,
+        .vision_num_heads = model_config.vision_num_heads,
+        .vision_intermediate_size = model_config.vision_intermediate_size,
+        .projector_hidden_size = model_config.projector_hidden_size,
+        .vision_patch_size = model_config.vision_patch_size,
+        .vision_spatial_merge_size = model_config.vision_spatial_merge_size,
+        .vision_temporal_patch_size = model_config.vision_temporal_patch_size,
+        .vision_num_position_embeddings = model_config.vision_num_position_embeddings,
+        .vision_max_num_patches = model_config.vision_max_num_patches,
+        .image_token_id = model_config.image_token_id,
+    }, @src());
+
     // Some models omit MoE fields in config.json. Detect MoE from weights.
     if (@hasDecl(Hooks, "inferMoEFromWeights")) Hooks.inferMoEFromWeights(&safetensors_file, &model_config);
     log.trace("load", "Config loaded", .{

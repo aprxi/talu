@@ -60,6 +60,12 @@ pub const SchedulerSubmitOptions = inference.Scheduler.SubmitOptions;
 pub const SamplingStrategy = inference.SamplingStrategy;
 pub const SamplingConfig = inference.SamplingConfig;
 
+const GenerationPath = enum {
+    scheduler_cpu,
+    scheduler_metal_vision,
+    session_metal,
+};
+
 fn finishReasonToString(reason: FinishReason) [:0]const u8 {
     return switch (reason) {
         .eos_token => "stop",
@@ -656,20 +662,51 @@ pub const LocalEngine = struct {
                     use_tools,
                 );
             },
-            .metal => {
-                log.debug("inference", "Generation path", .{ .path = "session", .backend = "metal" }, @src());
-                return self.generateWithSession(
-                    chat,
-                    prompt,
-                    max_tokens,
-                    sampling_config,
-                    bos_token_id,
-                    opts,
-                    effective_grammar,
-                    use_tools,
-                );
+            .metal => |*metal_backend| {
+                const path = selectGenerationPath(.metal, countInputImageParts(chat) > 0);
+                switch (path) {
+                    .session_metal => {
+                        log.debug("inference", "Generation path", .{ .path = "session", .backend = "metal" }, @src());
+                        return self.generateWithSession(
+                            chat,
+                            prompt,
+                            max_tokens,
+                            sampling_config,
+                            bos_token_id,
+                            opts,
+                            effective_grammar,
+                            use_tools,
+                        );
+                    },
+                    .scheduler_metal_vision => {
+                        log.debug("inference", "Generation path", .{
+                            .path = "scheduler",
+                            .backend = "metal",
+                            .reason = "vision_multimodal",
+                        }, @src());
+                        return self.generateWithScheduler(
+                            chat,
+                            prompt,
+                            max_tokens,
+                            sampling_config,
+                            bos_token_id,
+                            opts,
+                            metal_backend,
+                            effective_grammar,
+                            use_tools,
+                        );
+                    },
+                    .scheduler_cpu => unreachable,
+                }
             },
         }
+    }
+
+    fn selectGenerationPath(backend_tag: std.meta.Tag(Backend), has_input_images: bool) GenerationPath {
+        return switch (backend_tag) {
+            .cpu => .scheduler_cpu,
+            .metal => if (has_input_images) .scheduler_metal_vision else .session_metal,
+        };
     }
 
     /// Generate using Scheduler (continuous batching path).
@@ -681,10 +718,13 @@ pub const LocalEngine = struct {
         sampling_config: sampler.SamplingConfig,
         bos_token_id: ?u32,
         opts: GenerateOptions,
-        cpu_backend: *backend_root.fused_cpu.FusedCpuBackend,
+        backend_state: anytype,
         grammar_sampler: ?*ConstrainedSampler,
         is_tool_generation: bool,
     ) !GenerationResult {
+        const BackendType = @TypeOf(backend_state.*);
+        const SchedulerType = inference.scheduler.GenericScheduler(BackendType);
+
         var vision_prompt = try self.collectVisionPromptInput(chat);
         defer if (vision_prompt) |*vp| vp.deinit(self.allocator);
 
@@ -724,7 +764,7 @@ pub const LocalEngine = struct {
         log.debug("inference", "Tokenization complete", .{ .prompt_tokens = prompt_len }, @src());
 
         // Create scheduler for this request
-        var scheduler = try Scheduler.init(self.allocator, cpu_backend, .{
+        var scheduler = try SchedulerType.init(self.allocator, backend_state, .{
             .default_eos_token_ids = self.gen_config.eos_token_ids,
             .default_sampling = sampling_config,
             .tokenizer = &self.tok,
@@ -755,9 +795,13 @@ pub const LocalEngine = struct {
             @ptrCast(&vp.prefill)
         else
             null;
+        log.debug("inference", "Scheduler request assembled", .{
+            .has_vision_input = @as(u8, @intFromBool(vision_input_ptr != null)),
+            .image_count = if (vision_prompt) |*vp| vp.prefill.images.len else 0,
+        }, @src());
 
         // Generate synchronously
-        var result = try scheduler.generateSync(prompt_tokens, max_tokens, .{
+        var result = scheduler.generateSync(prompt_tokens, max_tokens, .{
             .eos_token_ids = self.gen_config.eos_token_ids,
             .stop_sequences = opts.stop_sequences,
             .callback = if (opts.token_callback != null) CallbackWrapper.wrap else null,
@@ -766,7 +810,13 @@ pub const LocalEngine = struct {
             .grammar_sampler = grammar_sampler,
             .stop_flag = opts.stop_flag,
             .vision_input = vision_input_ptr,
-        });
+        }) catch |err| {
+            log.warn("inference", "Scheduler generation failed", .{
+                .err = @errorName(err),
+                .has_vision_input = @as(u8, @intFromBool(vision_input_ptr != null)),
+            });
+            return err;
+        };
         defer result.deinit(self.allocator);
 
         // Strip trailing EOS token if present
@@ -1841,4 +1891,17 @@ test "expandImagePadTokens rejects placeholder mismatch" {
         error.InvalidPromptImageTokens,
         LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts, .{}),
     );
+}
+
+test "selectGenerationPath selects scheduler_metal_vision for metal with image input" {
+    const path = LocalEngine.selectGenerationPath(.metal, true);
+    try std.testing.expectEqual(GenerationPath.scheduler_metal_vision, path);
+}
+
+test "selectGenerationPath keeps default path for non-vision requests" {
+    const cpu_path = LocalEngine.selectGenerationPath(.cpu, true);
+    try std.testing.expectEqual(GenerationPath.scheduler_cpu, cpu_path);
+
+    const metal_text_path = LocalEngine.selectGenerationPath(.metal, false);
+    try std.testing.expectEqual(GenerationPath.session_metal, metal_text_path);
 }

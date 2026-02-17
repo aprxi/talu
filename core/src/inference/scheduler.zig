@@ -684,6 +684,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             var prefill_timer = std.time.Timer.start() catch unreachable;
             // Prefill
+            log.debug("inference", "Scheduler fast-path prefill start", .{
+                .slot_index = slot_index,
+                .prompt_len = prompt_tokens.len,
+                .has_vision_input = @as(u8, @intFromBool(vision_input != null)),
+            }, @src());
             try self.prefillWithOptionalVision(slot_index, prompt_tokens, vision_input);
             const prefill_ns = prefill_timer.read();
             log.debug("scheduler", "Prefill complete", .{
@@ -1051,15 +1056,29 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             vision_input: ?*const anyopaque,
         ) !void {
             if (vision_input) |opaque_ptr| {
+                log.debug("inference", "Scheduler prefill dispatch", .{
+                    .slot_index = slot_index,
+                    .prompt_tokens = prompt_tokens.len,
+                    .has_prefill_with_vision = @as(u8, @intFromBool(@hasDecl(BackendType, "prefillSlotWithVision"))),
+                    .has_prefill_vision_type = @as(u8, @intFromBool(@hasDecl(BackendType, "PrefillVisionInput"))),
+                }, @src());
                 if (comptime @hasDecl(BackendType, "prefillSlotWithVision") and @hasDecl(BackendType, "PrefillVisionInput")) {
                     const typed_input: *const BackendType.PrefillVisionInput = @ptrCast(@alignCast(opaque_ptr));
-                    return self.backend.prefillSlotWithVision(
+                    try self.backend.prefillSlotWithVision(
                         slot_index,
                         prompt_tokens,
                         typed_input,
                         self.logits_buffer,
                     );
+                    log.debug("inference", "Scheduler prefill with vision completed", .{
+                        .slot_index = slot_index,
+                        .prompt_tokens = prompt_tokens.len,
+                    }, @src());
+                    return;
                 }
+                log.warn("inference", "Scheduler backend lacks vision prefill support", .{
+                    .slot_index = slot_index,
+                });
                 return error.UnsupportedContentType;
             }
 

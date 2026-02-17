@@ -19,6 +19,17 @@ const ArrayHandle = mlx_graph.ArrayHandle;
 pub const Cache = mlx_graph.Cache;
 pub const ShortConvCache = mlx_graph.ShortConvCache;
 
+pub const DeepstackAdditions = struct {
+    positions: []const usize,
+    layer_features: []const []const f32,
+};
+
+pub const RuntimeRoPEOverride = struct {
+    cos: []const f32,
+    sin: []const f32,
+    dim: usize,
+};
+
 pub const MLXError = error{
     UnsupportedDType,
     MLXNotAvailable,
@@ -1489,6 +1500,38 @@ pub const WeightHandles = struct {
 /// MLX-native transformer forward pass using the lazy graph API.
 /// Follows the test_mlx_single.py pattern.
 /// Returns a handle to the logits array (remains on GPU).
+pub fn gatherTokenEmbeddingsLazy(
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+) !ArrayHandle {
+    const sequence_len = input_ids.len;
+
+    var hidden: ArrayHandle = undefined; // Safe: both branches assign before use
+    if (weight_handles.embed_tokens_quantized) |quantized_weight| {
+        const indices_data = input_ids.ptr;
+        const indices_len = sequence_len;
+
+        const qw_rows = mlx_graph.mlx_lazy_embedding(quantized_weight.weights, indices_data, indices_len);
+        const scales_rows = mlx_graph.mlx_lazy_embedding(quantized_weight.scales, indices_data, indices_len);
+        const biases_rows = mlx_graph.mlx_lazy_embedding(quantized_weight.biases, indices_data, indices_len);
+        hidden = mlx_graph.mlx_lazy_dequantize(qw_rows, scales_rows, biases_rows, quantized_weight.group_size, quantized_weight.bits);
+    } else {
+        hidden = mlx_graph.mlx_lazy_embedding(
+            weight_handles.embed_tokens.?,
+            input_ids.ptr,
+            sequence_len,
+        );
+    }
+
+    if (weight_handles.embedding_multiplier != 1.0) {
+        hidden = mlx_graph.mlx_lazy_multiply_scalar(hidden, weight_handles.embedding_multiplier);
+    } else if (weight_handles.use_sqrt_embedding_scale) {
+        hidden = mlx_graph.mlx_scale_by_sqrt(hidden, @intCast(weight_handles.d_model));
+    }
+
+    return hidden;
+}
+
 pub fn transformerForwardLazy(
     allocator: std.mem.Allocator,
     weight_handles: *const WeightHandles,
@@ -1498,6 +1541,34 @@ pub fn transformerForwardLazy(
     shortconv_cache: ?ShortConvCache,
     pos_offset: usize,
     use_compiled: bool,
+) !ArrayHandle {
+    return transformerForwardLazyWithEmbeddingOverride(
+        allocator,
+        weight_handles,
+        input_ids,
+        config,
+        cache,
+        shortconv_cache,
+        pos_offset,
+        use_compiled,
+        null,
+        null,
+        null,
+    );
+}
+
+pub fn transformerForwardLazyWithEmbeddingOverride(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+    config: anytype,
+    cache: ?Cache,
+    shortconv_cache: ?ShortConvCache,
+    pos_offset: usize,
+    use_compiled: bool,
+    embedding_override: ?[]const f32,
+    deepstack: ?DeepstackAdditions,
+    runtime_rope: ?RuntimeRoPEOverride,
 ) !ArrayHandle {
     if (builtin.os.tag != .macos) {
         return error.MLXNotAvailable;
@@ -1520,39 +1591,38 @@ pub fn transformerForwardLazy(
     const layer_count: usize = @intCast(config.n_layers);
     const sequence_len = input_ids.len;
     const use_compiled_effective = use_compiled and !trace;
+    const hidden_dim = @as(usize, @intCast(weight_handles.d_model));
 
-    // >>> LAZY: embedding lookup
-    var hidden: ArrayHandle = undefined; // Safe: both branches assign before use
-    if (weight_handles.embed_tokens_quantized) |quantized_weight| {
-        // Quantized embedding lookup: take rows, then dequantize
-        // Create 1D indices array
-        const indices_data = input_ids.ptr;
-        const indices_len = sequence_len;
+    var runtime_rope_cos_handle: ArrayHandle = null;
+    var runtime_rope_sin_handle: ArrayHandle = null;
+    var runtime_rope_dim: usize = 0;
+    if (runtime_rope) |rr| {
+        if (rr.dim == 0 or rr.cos.len != rr.sin.len or (rr.cos.len % rr.dim) != 0) return error.InvalidShape;
+        const table_rows = rr.cos.len / rr.dim;
+        const rope_shape = [_]i64{ @intCast(table_rows), @intCast(rr.dim) };
+        runtime_rope_cos_handle = mlx_graph.createArrayF32(rr.cos, &rope_shape);
+        runtime_rope_sin_handle = mlx_graph.createArrayF32(rr.sin, &rope_shape);
+        runtime_rope_dim = rr.dim;
+    }
 
-        // 1. Take quantized weight rows
-        const qw_rows = mlx_graph.mlx_lazy_embedding(quantized_weight.weights, indices_data, indices_len);
-        // 2. Take corresponding scales
-        const scales_rows = mlx_graph.mlx_lazy_embedding(quantized_weight.scales, indices_data, indices_len);
-        // 3. Take corresponding biases
-        const biases_rows = mlx_graph.mlx_lazy_embedding(quantized_weight.biases, indices_data, indices_len);
-
-        // 4. Dequantize the rows
-        hidden = mlx_graph.mlx_lazy_dequantize(qw_rows, scales_rows, biases_rows, quantized_weight.group_size, quantized_weight.bits);
-    } else {
-        // F32 embedding lookup
-        hidden = mlx_graph.mlx_lazy_embedding(
-            weight_handles.embed_tokens.?,
-            input_ids.ptr,
+    var deepstack_layer_additions: []ArrayHandle = &.{};
+    defer if (deepstack_layer_additions.len > 0) allocator.free(deepstack_layer_additions);
+    if (deepstack) |ctx| {
+        deepstack_layer_additions = try buildDeepstackLayerAdditions(
+            allocator,
             sequence_len,
+            hidden_dim,
+            ctx.positions,
+            ctx.layer_features,
         );
     }
 
-    // Embedding scaling (architecture-specific)
-    if (weight_handles.embedding_multiplier != 1.0) {
-        hidden = mlx_graph.mlx_lazy_multiply_scalar(hidden, weight_handles.embedding_multiplier);
-    } else if (weight_handles.use_sqrt_embedding_scale) {
-        hidden = mlx_graph.mlx_scale_by_sqrt(hidden, @intCast(weight_handles.d_model));
-    }
+    // >>> LAZY: embedding lookup (or injected multimodal hidden states)
+    var hidden: ArrayHandle = if (embedding_override) |hidden_values| blk: {
+        if (hidden_values.len != sequence_len * weight_handles.d_model) return error.InvalidShape;
+        const hidden_shape = [_]i64{ 1, @intCast(sequence_len), @intCast(weight_handles.d_model) };
+        break :blk mlx_graph.createArrayF32(hidden_values, &hidden_shape);
+    } else try gatherTokenEmbeddingsLazy(weight_handles, input_ids);
 
     if (trace) {
         try traceLastHiddenVector(allocator, "metal", phase, null, hidden, sequence_len, @intCast(weight_handles.d_model));
@@ -1635,6 +1705,9 @@ pub fn transformerForwardLazy(
                         head_dim,
                         pos_offset,
                         config.rope_theta,
+                        runtime_rope_cos_handle,
+                        runtime_rope_sin_handle,
+                        runtime_rope_dim,
                         norm_eps,
                         q_proj.group_size,
                         q_proj.bits,
@@ -1668,6 +1741,9 @@ pub fn transformerForwardLazy(
                     head_dim,
                     pos_offset,
                     config.rope_theta,
+                    runtime_rope_cos_handle,
+                    runtime_rope_sin_handle,
+                    runtime_rope_dim,
                     norm_eps,
                     q_proj.group_size,
                     q_proj.bits,
@@ -1696,6 +1772,9 @@ pub fn transformerForwardLazy(
                     head_dim,
                     pos_offset,
                     config.rope_theta,
+                    runtime_rope_cos_handle,
+                    runtime_rope_sin_handle,
+                    runtime_rope_dim,
                     norm_eps,
                     config.query_pre_attn_scalar,
                     weight_handles.attention_multiplier,
@@ -1825,6 +1904,9 @@ pub fn transformerForwardLazy(
         else
             ffn_for_residual;
         hidden = mlx_graph.mlx_lazy_add(hidden_1, scaled_ffn);
+        if (layer_idx < deepstack_layer_additions.len) {
+            hidden = mlx_graph.mlx_lazy_add(hidden, deepstack_layer_additions[layer_idx]);
+        }
 
         if (trace) {
             try traceLastHiddenVector(allocator, "metal", phase, layer_idx, hidden, sequence_len, @intCast(weight_handles.d_model));
@@ -1870,6 +1952,42 @@ pub fn transformerForwardLazy(
     // Return handle - DON'T eval() yet, DON'T copy to CPU yet!
     // Caller will eval() and copy
     return scaled_logits;
+}
+
+fn buildDeepstackLayerAdditions(
+    allocator: std.mem.Allocator,
+    sequence_len: usize,
+    hidden_dim: usize,
+    positions: []const usize,
+    layer_features: []const []const f32,
+) ![]ArrayHandle {
+    if (positions.len == 0 or layer_features.len == 0) return &.{};
+
+    const handles = try allocator.alloc(ArrayHandle, layer_features.len);
+    errdefer allocator.free(handles);
+
+    for (layer_features, 0..) |features, layer_idx| {
+        if ((features.len % hidden_dim) != 0) return error.InvalidShape;
+
+        const dense_values = try allocator.alloc(f32, sequence_len * hidden_dim);
+        defer allocator.free(dense_values);
+        @memset(dense_values, 0);
+
+        const available_rows = features.len / hidden_dim;
+        const row_count = @min(positions.len, available_rows);
+        for (0..row_count) |row_idx| {
+            const token_pos = positions[row_idx];
+            if (token_pos >= sequence_len) continue;
+            const dst = dense_values[token_pos * hidden_dim ..][0..hidden_dim];
+            const src = features[row_idx * hidden_dim ..][0..hidden_dim];
+            for (dst, src) |*d, s| d.* += s;
+        }
+
+        const add_shape = [_]i64{ 1, @intCast(sequence_len), @intCast(hidden_dim) };
+        handles[layer_idx] = mlx_graph.createArrayF32(dense_values, &add_shape);
+    }
+
+    return handles;
 }
 
 fn traceLastHiddenVector(
@@ -2011,6 +2129,9 @@ pub fn transformerForwardFromGPUToken(
                         head_dim,
                         pos_offset,
                         config.rope_theta,
+                        null,
+                        null,
+                        0,
                         norm_eps,
                         q_proj.group_size,
                         q_proj.bits,
@@ -2044,6 +2165,9 @@ pub fn transformerForwardFromGPUToken(
                     head_dim,
                     pos_offset,
                     config.rope_theta,
+                    null,
+                    null,
+                    0,
                     norm_eps,
                     q_proj.group_size,
                     q_proj.bits,
@@ -2072,6 +2196,9 @@ pub fn transformerForwardFromGPUToken(
                     head_dim,
                     pos_offset,
                     config.rope_theta,
+                    null,
+                    null,
+                    0,
                     norm_eps,
                     config.query_pre_attn_scalar,
                     weight_handles.attention_multiplier,
@@ -2283,6 +2410,24 @@ test "resolveAttentionMixerLayout rejects mixed qkv dtypes" {
     try testing.expectError(
         error.InvalidTensorType,
         resolveAttentionMixerLayout(.grouped_affine_u4, .bf16, .grouped_affine_u4, .bf16),
+    );
+}
+
+test "buildDeepstackLayerAdditions rejects misaligned feature rows" {
+    const allocator = testing.allocator;
+    const positions = [_]usize{0};
+    const layer0 = [_]f32{ 1.0, 2.0, 3.0 };
+    const layer_features = [_][]const f32{layer0[0..]};
+
+    try testing.expectError(
+        error.InvalidShape,
+        buildDeepstackLayerAdditions(
+            allocator,
+            1,
+            2,
+            positions[0..],
+            layer_features[0..],
+        ),
     );
 }
 

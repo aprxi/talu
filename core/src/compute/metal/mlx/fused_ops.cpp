@@ -52,6 +52,40 @@ void* mlx_lazy_attention(const void* q, const void* k, const void* v, float scal
     ));
 }
 
+static array apply_runtime_rope_to_tensor(
+    const array& x, // [B, H, L, D]
+    const array& cos_rows, // [L, rope_dim]
+    const array& sin_rows, // [L, rope_dim]
+    int seq_len,
+    int head_dim,
+    int rope_dim
+) {
+    const int batch = x.shape(0);
+    const int heads = x.shape(1);
+    const int half = rope_dim / 2;
+
+    auto x_rot = slice(x, {0, 0, 0, 0}, {batch, heads, seq_len, rope_dim});
+    auto cos_view = reshape(cos_rows, {1, 1, seq_len, rope_dim});
+    auto sin_view = reshape(sin_rows, {1, 1, seq_len, rope_dim});
+
+    auto x_lo = slice(x_rot, {0, 0, 0, 0}, {batch, heads, seq_len, half});
+    auto x_hi = slice(x_rot, {0, 0, 0, half}, {batch, heads, seq_len, rope_dim});
+    auto cos_lo = slice(cos_view, {0, 0, 0, 0}, {1, 1, seq_len, half});
+    auto cos_hi = slice(cos_view, {0, 0, 0, half}, {1, 1, seq_len, rope_dim});
+    auto sin_lo = slice(sin_view, {0, 0, 0, 0}, {1, 1, seq_len, half});
+    auto sin_hi = slice(sin_view, {0, 0, 0, half}, {1, 1, seq_len, rope_dim});
+
+    auto rotated_lo = x_lo * cos_lo - x_hi * sin_lo;
+    auto rotated_hi = x_hi * cos_hi + x_lo * sin_hi;
+    auto rotated = concatenate({rotated_lo, rotated_hi}, 3);
+
+    if (rope_dim == head_dim) {
+        return rotated;
+    }
+    auto tail = slice(x, {0, 0, 0, rope_dim}, {batch, heads, seq_len, head_dim});
+    return concatenate({rotated, tail}, 3);
+}
+
 // ============================================================================
 // Fused Attention Block (Quantized)
 // ============================================================================
@@ -77,7 +111,9 @@ void* mlx_lazy_fused_attention(
     const void* attn_sinks,  // [n_heads]
     void* cache_ptr, size_t layer_idx,
     size_t n_heads, size_t n_kv_heads, size_t head_dim,
-    size_t pos_offset, float rope_theta, float rms_eps,
+    size_t pos_offset, float rope_theta,
+    const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
+    float rms_eps,
     size_t group_size, size_t bits,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier    // 0 for default, >0 uses this directly as scale
@@ -144,9 +180,34 @@ void* mlx_lazy_fused_attention(
     k = transpose(k, {0, 2, 1, 3});
     v = transpose(v, {0, 2, 1, 3});
 
-    // RoPE
-    q = fast::rope(q, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
-    k = fast::rope(k, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+    // RoPE (runtime table for multimodal prefill, otherwise standard RoPE)
+    bool use_runtime_rope = runtime_rope_cos != nullptr && runtime_rope_sin != nullptr;
+    const int rope_dim = static_cast<int>(runtime_rope_dim);
+    if (use_runtime_rope && (rope_dim <= 0 || rope_dim > static_cast<int>(head_dim) || (rope_dim % 2) != 0)) {
+        use_runtime_rope = false;
+    }
+    if (use_runtime_rope) {
+        const auto& cos_table = *static_cast<const array*>(runtime_rope_cos);
+        const auto& sin_table = *static_cast<const array*>(runtime_rope_sin);
+        const int seq_start = static_cast<int>(pos_offset);
+        const int seq_stop = seq_start + seq_len;
+        const bool valid_tables =
+            cos_table.ndim() == 2 && sin_table.ndim() == 2 &&
+            cos_table.shape(1) >= rope_dim && sin_table.shape(1) >= rope_dim &&
+            cos_table.shape(0) >= seq_stop && sin_table.shape(0) >= seq_stop;
+        if (valid_tables) {
+            auto cos_rows = slice(cos_table, {seq_start, 0}, {seq_stop, rope_dim});
+            auto sin_rows = slice(sin_table, {seq_start, 0}, {seq_stop, rope_dim});
+            q = apply_runtime_rope_to_tensor(q, cos_rows, sin_rows, seq_len, static_cast<int>(head_dim), rope_dim);
+            k = apply_runtime_rope_to_tensor(k, cos_rows, sin_rows, seq_len, static_cast<int>(head_dim), rope_dim);
+        } else {
+            use_runtime_rope = false;
+        }
+    }
+    if (!use_runtime_rope) {
+        q = fast::rope(q, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+        k = fast::rope(k, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+    }
 
     // Cache update
     array k_for_attn = k;
@@ -257,7 +318,9 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
     const void* attn_sinks,  // [n_heads]
     void* cache_ptr, size_t layer_idx,
     size_t n_heads, size_t n_kv_heads, size_t head_dim,
-    size_t pos_offset, float rope_theta, float rms_eps,
+    size_t pos_offset, float rope_theta,
+    const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
+    float rms_eps,
     size_t group_size, size_t bits,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier    // 0 for default, >0 uses this directly as scale
@@ -324,9 +387,34 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
     k = transpose(k, {0, 2, 1, 3});
     v = transpose(v, {0, 2, 1, 3});
 
-    // RoPE
-    q = fast::rope(q, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
-    k = fast::rope(k, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+    // RoPE (runtime table for multimodal prefill, otherwise standard RoPE)
+    bool use_runtime_rope = runtime_rope_cos != nullptr && runtime_rope_sin != nullptr;
+    const int rope_dim = static_cast<int>(runtime_rope_dim);
+    if (use_runtime_rope && (rope_dim <= 0 || rope_dim > static_cast<int>(head_dim) || (rope_dim % 2) != 0)) {
+        use_runtime_rope = false;
+    }
+    if (use_runtime_rope) {
+        const auto& cos_table = *static_cast<const array*>(runtime_rope_cos);
+        const auto& sin_table = *static_cast<const array*>(runtime_rope_sin);
+        const int seq_start = static_cast<int>(pos_offset);
+        const int seq_stop = seq_start + seq_len;
+        const bool valid_tables =
+            cos_table.ndim() == 2 && sin_table.ndim() == 2 &&
+            cos_table.shape(1) >= rope_dim && sin_table.shape(1) >= rope_dim &&
+            cos_table.shape(0) >= seq_stop && sin_table.shape(0) >= seq_stop;
+        if (valid_tables) {
+            auto cos_rows = slice(cos_table, {seq_start, 0}, {seq_stop, rope_dim});
+            auto sin_rows = slice(sin_table, {seq_start, 0}, {seq_stop, rope_dim});
+            q = apply_runtime_rope_to_tensor(q, cos_rows, sin_rows, seq_len, static_cast<int>(head_dim), rope_dim);
+            k = apply_runtime_rope_to_tensor(k, cos_rows, sin_rows, seq_len, static_cast<int>(head_dim), rope_dim);
+        } else {
+            use_runtime_rope = false;
+        }
+    }
+    if (!use_runtime_rope) {
+        q = fast::rope(q, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+        k = fast::rope(k, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+    }
 
     // Cache update
     array k_for_attn = k;
@@ -480,7 +568,9 @@ void* mlx_lazy_fused_attention_bf16(
     const void* attn_sinks,
     void* cache_ptr, size_t layer_idx,
     size_t n_heads, size_t n_kv_heads, size_t head_dim,
-    size_t pos_offset, float rope_theta, float rms_eps,
+    size_t pos_offset, float rope_theta,
+    const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
+    float rms_eps,
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier    // 0 for default, >0 uses this directly as scale
 ) {
@@ -538,9 +628,34 @@ void* mlx_lazy_fused_attention_bf16(
     k = transpose(k, {0, 2, 1, 3});
     v = transpose(v, {0, 2, 1, 3});
 
-    // RoPE
-    q = fast::rope(q, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
-    k = fast::rope(k, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+    // RoPE (runtime table for multimodal prefill, otherwise standard RoPE)
+    bool use_runtime_rope = runtime_rope_cos != nullptr && runtime_rope_sin != nullptr;
+    const int rope_dim = static_cast<int>(runtime_rope_dim);
+    if (use_runtime_rope && (rope_dim <= 0 || rope_dim > static_cast<int>(head_dim) || (rope_dim % 2) != 0)) {
+        use_runtime_rope = false;
+    }
+    if (use_runtime_rope) {
+        const auto& cos_table = *static_cast<const array*>(runtime_rope_cos);
+        const auto& sin_table = *static_cast<const array*>(runtime_rope_sin);
+        const int seq_start = static_cast<int>(pos_offset);
+        const int seq_stop = seq_start + seq_len;
+        const bool valid_tables =
+            cos_table.ndim() == 2 && sin_table.ndim() == 2 &&
+            cos_table.shape(1) >= rope_dim && sin_table.shape(1) >= rope_dim &&
+            cos_table.shape(0) >= seq_stop && sin_table.shape(0) >= seq_stop;
+        if (valid_tables) {
+            auto cos_rows = slice(cos_table, {seq_start, 0}, {seq_stop, rope_dim});
+            auto sin_rows = slice(sin_table, {seq_start, 0}, {seq_stop, rope_dim});
+            q = apply_runtime_rope_to_tensor(q, cos_rows, sin_rows, seq_len, static_cast<int>(head_dim), rope_dim);
+            k = apply_runtime_rope_to_tensor(k, cos_rows, sin_rows, seq_len, static_cast<int>(head_dim), rope_dim);
+        } else {
+            use_runtime_rope = false;
+        }
+    }
+    if (!use_runtime_rope) {
+        q = fast::rope(q, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+        k = fast::rope(k, static_cast<int>(head_dim), false, rope_theta, 1.0f, static_cast<int>(pos_offset));
+    }
 
     // Cache update (same as quantized version)
     array k_for_attn = k;
