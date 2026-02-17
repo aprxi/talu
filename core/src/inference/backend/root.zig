@@ -50,6 +50,11 @@ const pooling_mod = @import("pooling.zig");
 
 pub const fused_cpu = @import("cpu/fused.zig");
 
+/// Re-export types used by the scheduler interface
+pub const DecodeRequest = fused_cpu.DecodeRequest;
+pub const DecodeResult = fused_cpu.DecodeResult;
+pub const PrefillProgressFn = fused_cpu.FusedCpuBackend.PrefillProgressFn;
+
 /// Re-export pooling strategy for embedding extraction
 pub const PoolingStrategy = pooling_mod.PoolingStrategy;
 const has_metal = build_options.enable_metal and builtin.os.tag == .macos;
@@ -82,6 +87,26 @@ pub const Backend = union(enum) {
     cpu: fused_cpu.FusedCpuBackend,
     /// Metal GPU backend (macOS only)
     metal: if (has_metal) metal.MetalBackend else void,
+
+    /// Vision input type for prefillSlotWithVision (shared across backends)
+    pub const PrefillVisionInput = fused_cpu.FusedCpuBackend.PrefillVisionInput;
+
+    /// Which generation strategy to use for a given request.
+    pub const GenerationPath = enum {
+        /// Continuous batching via GenericScheduler
+        scheduler,
+        /// Legacy single-sequence session
+        session,
+    };
+
+    /// Select the generation path for this backend and request.
+    /// Encapsulates per-backend routing so callers stay architecture-agnostic.
+    pub fn generationPath(self: Backend, has_input_images: bool) GenerationPath {
+        return switch (self) {
+            .cpu => .scheduler,
+            .metal => if (has_input_images) .scheduler else .session,
+        };
+    }
 
     /// Initialize the appropriate backend based on platform and model format.
     /// Automatically selects FusedCpuBackend for CPU, Metal when available.
@@ -231,6 +256,85 @@ pub const Backend = union(enum) {
             .metal => |*b| if (has_metal) return b.d_model else unreachable,
         }
     }
+
+    // ---- Scheduler interface ----
+    // These methods allow GenericScheduler to work with Backend directly,
+    // keeping all architecture dispatch inside this module.
+
+    pub fn maxBatchSize(self: *const Backend) usize {
+        switch (self.*) {
+            .cpu => |*b| return b.max_batch_size,
+            .metal => |*b| if (has_metal) return b.max_batch_size else unreachable,
+        }
+    }
+
+    pub fn allocSlot(self: *Backend) ?usize {
+        switch (self.*) {
+            .cpu => |*b| return b.allocSlot(),
+            .metal => |*b| if (has_metal) return b.allocSlot() else unreachable,
+        }
+    }
+
+    pub fn freeSlot(self: *Backend, slot_index: usize) void {
+        switch (self.*) {
+            .cpu => |*b| b.freeSlot(slot_index),
+            .metal => |*b| if (has_metal) b.freeSlot(slot_index) else unreachable,
+        }
+    }
+
+    pub fn prefillSlot(
+        self: *Backend,
+        slot_index: usize,
+        tokens: []const u32,
+        logits_out: []f32,
+    ) !void {
+        switch (self.*) {
+            .cpu => |*b| try b.prefillSlot(slot_index, tokens, logits_out),
+            .metal => |*b| if (has_metal) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
+        }
+    }
+
+    pub fn prefillSlotWithVision(
+        self: *Backend,
+        slot_index: usize,
+        tokens: []const u32,
+        vision_input: ?*const PrefillVisionInput,
+        logits_out: []f32,
+    ) !void {
+        switch (self.*) {
+            .cpu => |*b| try b.prefillSlotWithVision(slot_index, tokens, vision_input, logits_out),
+            .metal => |*b| if (has_metal)
+                try b.prefillSlotWithVision(slot_index, tokens, vision_input, logits_out)
+            else
+                unreachable,
+        }
+    }
+
+    pub fn decodeBatch(
+        self: *Backend,
+        requests: []const DecodeRequest,
+        results: []DecodeResult,
+    ) !void {
+        switch (self.*) {
+            .cpu => |*b| try b.decodeBatch(requests, results),
+            .metal => |*b| if (has_metal) try b.decodeBatch(requests, results) else unreachable,
+        }
+    }
+
+    /// Set prefill progress callback. Backends that don't support it ignore silently.
+    pub fn setPrefillProgress(
+        self: *Backend,
+        progress_fn: ?PrefillProgressFn,
+        progress_ctx: ?*anyopaque,
+    ) void {
+        switch (self.*) {
+            .cpu => |*b| {
+                b.prefill_progress_fn = progress_fn;
+                b.prefill_progress_ctx = progress_ctx;
+            },
+            .metal => {},
+        }
+    }
 };
 
 fn isMetalSupported(config: *const ModelConfig, weight_dtype: DType, has_unsupported_blocks: bool) bool {
@@ -358,4 +462,17 @@ test "backend selection" {
     // Actual backend tests require model files
     const testing = std.testing;
     _ = testing;
+}
+
+test "generationPath: cpu always selects scheduler" {
+    const cpu_backend: Backend = .{ .cpu = undefined };
+    try std.testing.expectEqual(Backend.GenerationPath.scheduler, cpu_backend.generationPath(false));
+    try std.testing.expectEqual(Backend.GenerationPath.scheduler, cpu_backend.generationPath(true));
+}
+
+test "generationPath: metal selects scheduler for vision, session otherwise" {
+    if (!has_metal) return; // Metal variant is void on non-Metal platforms
+    const metal_backend: Backend = .{ .metal = undefined };
+    try std.testing.expectEqual(Backend.GenerationPath.scheduler, metal_backend.generationPath(true));
+    try std.testing.expectEqual(Backend.GenerationPath.session, metal_backend.generationPath(false));
 }

@@ -147,13 +147,13 @@ pub const SchedulerConfig = struct {
 /// any token boundary.
 ///
 /// The backend type must implement:
-/// - `max_batch_size: usize` - maximum concurrent slots
-/// - `vocab_size: usize` - vocabulary size for logits
-/// - `allocSlot() ?usize` - allocate a slot, returns null if full
-/// - `freeSlot(slot_index: usize) void` - release a slot
-/// - `prefillSlot(slot_index: usize, tokens: []const u32, logits_out: []f32) !void` - prefill
-/// - optional: `prefillSlotWithVision(slot_index, tokens, vision_input, logits_out) !void`
-/// - `decodeBatch(requests: []const DecodeRequest, results: []DecodeResult) !void` - batch decode
+/// - `maxBatchSize(*const T) usize` - maximum concurrent slots
+/// - `vocabSize(*const T) usize` - vocabulary size for logits
+/// - `allocSlot(*T) ?usize` - allocate a slot, returns null if full
+/// - `freeSlot(*T, usize) void` - release a slot
+/// - `prefillSlot(*T, usize, []const u32, []f32) !void` - prefill
+/// - optional: `prefillSlotWithVision(*T, usize, []const u32, ?*const PrefillVisionInput, []f32) !void`
+/// - `decodeBatch(*T, []const DecodeRequest, []DecodeResult) !void` - batch decode
 pub fn GenericScheduler(comptime BackendType: type) type {
     return struct {
         const Self = @This();
@@ -192,8 +192,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             backend: *BackendType,
             config: SchedulerConfig,
         ) !Self {
-            const requested_max_batch = config.max_concurrent orelse backend.max_batch_size;
-            const effective_batch_size = @min(requested_max_batch, backend.max_batch_size);
+            const max_batch = backend.maxBatchSize();
+            const vocab = backend.vocabSize();
+            const requested_max_batch = config.max_concurrent orelse max_batch;
+            const effective_batch_size = @min(requested_max_batch, max_batch);
 
             const decode_request_buffer = try allocator.alloc(DecodeRequest, effective_batch_size);
             errdefer allocator.free(decode_request_buffer);
@@ -205,12 +207,12 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             var sampler_instance = try sampling.Sampler.init(
                 allocator,
                 @intCast(std.time.milliTimestamp()),
-                backend.vocab_size,
+                vocab,
             );
             errdefer sampler_instance.deinit();
 
             // Allocate logits buffer for prefill
-            const logits_scratch = try allocator.alloc(f32, backend.vocab_size);
+            const logits_scratch = try allocator.alloc(f32, vocab);
             errdefer allocator.free(logits_scratch);
 
             return Self{
@@ -1901,6 +1903,14 @@ const MockBackend = struct {
     const DecodeCall = struct {
         requests: []const DecodeRequest,
     };
+
+    fn maxBatchSize(self: *const MockBackend) usize {
+        return self.max_batch_size;
+    }
+
+    fn vocabSize(self: *const MockBackend) usize {
+        return self.vocab_size;
+    }
 
     fn init(allocator: std.mem.Allocator, vocab_size: usize, max_batch_size: usize) !MockBackend {
         var slots_used = try std.DynamicBitSet.initEmpty(allocator, max_batch_size);

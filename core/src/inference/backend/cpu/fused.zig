@@ -128,6 +128,14 @@ pub const FusedCpuBackend = struct {
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
     pub const PrefillVisionInput = vision_runtime_mod.PrefillVisionInput;
 
+    pub fn maxBatchSize(self: *const FusedCpuBackend) usize {
+        return self.max_batch_size;
+    }
+
+    pub fn vocabSize(self: *const FusedCpuBackend) usize {
+        return self.vocab_size;
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         loaded: *loader.LoadedModel,

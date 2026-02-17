@@ -73,6 +73,14 @@ pub const MetalBackend = struct {
         return callback == null and (fused_model != null or dense_model != null);
     }
 
+    pub fn maxBatchSize(self: *const MetalBackend) usize {
+        return self.max_batch_size;
+    }
+
+    pub fn vocabSize(self: *const MetalBackend) usize {
+        return self.vocab_size;
+    }
+
     pub fn init(allocator: std.mem.Allocator, loaded: *loader.LoadedModel) !MetalBackend {
         // Load weights to GPU
         const weight_handles = try mlx_forward.loadWeightsToGPU(allocator, loaded);
