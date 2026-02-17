@@ -157,8 +157,7 @@ pub fn no_bucket_config() -> crate::server::common::ServerConfig {
 /// Seed a session with tags.
 ///
 /// Creates the session, then creates tag records and associates them with the session.
-/// This ensures tags are properly stored in both the tags table and conversation_tags table,
-/// allowing resolve_tags_for_session to return them.
+/// Creates a session and associates relational tags with it.
 pub fn seed_session_with_tags(
     db_path: &Path,
     session_id: &str,
@@ -171,14 +170,9 @@ pub fn seed_session_with_tags(
     chat.set_storage_db(db_str, session_id)
         .expect("set storage db");
 
-    // Build metadata_json with tags (for FTS filtering)
-    let tags_json: Vec<String> = tags.iter().map(|t| format!("\"{}\"", t)).collect();
-    let metadata_json = format!("{{\"tags\":[{}]}}", tags_json.join(","));
-
     let c_model = CString::new(model).expect("model cstr");
     let c_title = CString::new(title).expect("title cstr");
     let c_marker = CString::new("active").expect("marker cstr");
-    let c_metadata = CString::new(metadata_json).expect("metadata cstr");
     let rc = unsafe {
         talu_sys::talu_chat_notify_session_update(
             chat.as_ptr(),
@@ -189,25 +183,23 @@ pub fn seed_session_with_tags(
             c_marker.as_ptr(),
             std::ptr::null(), // parent_session_id
             std::ptr::null(), // group_id
-            c_metadata.as_ptr(),
+            std::ptr::null(), // metadata_json
             std::ptr::null(), // source_doc_id
         )
     };
-    assert_eq!(rc, 0, "notify_session_update with tags failed");
+    assert_eq!(rc, 0, "notify_session_update failed");
     chat.append_user_message("Hello, world!")
         .expect("append user message");
     drop(chat);
 
-    // Create tags and associate them with the session
+    // Create relational tags and associate with session.
     let c_db_path = CString::new(db_str).expect("db_path cstr");
     let c_session_id = CString::new(session_id).expect("session_id cstr");
     for tag_name in tags {
-        // Generate a tag_id from the name (use name as id for simplicity)
         let tag_id = format!("tag-{}", tag_name);
         let c_tag_id = CString::new(tag_id.as_str()).expect("tag_id cstr");
         let c_tag_name = CString::new(*tag_name).expect("tag_name cstr");
 
-        // Create the tag
         let rc = unsafe {
             talu_sys::talu_storage_create_tag(
                 c_db_path.as_ptr(),
@@ -220,7 +212,6 @@ pub fn seed_session_with_tags(
         };
         assert_eq!(rc, 0, "talu_storage_create_tag failed for {}", tag_name);
 
-        // Associate the tag with the session
         let rc = unsafe {
             talu_sys::talu_storage_add_conversation_tag(
                 c_db_path.as_ptr(),

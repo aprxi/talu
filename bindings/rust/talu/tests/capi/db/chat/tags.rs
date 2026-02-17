@@ -6,22 +6,19 @@ use crate::capi::db::common::TestContext;
 use std::ffi::CString;
 use std::ptr;
 use talu::ChatHandle;
-use talu_sys::{CSessionList, CSessionRecord};
+use talu_sys::CSessionList;
 
 /// Helper to seed a session with tags via C API.
+///
+/// Creates the session, then creates relational tags and associates them.
 fn seed_session_with_tags(ctx: &TestContext, session_id: &str, title: &str, tags: &[&str]) {
     let chat = ChatHandle::new(None).expect("ChatHandle::new failed");
     chat.set_storage_db(ctx.db_path(), session_id)
         .expect("set_storage_db failed");
 
-    // Build metadata_json with tags
-    let tags_json: Vec<String> = tags.iter().map(|t| format!("\"{}\"", t)).collect();
-    let metadata_json = format!("{{\"tags\":[{}]}}", tags_json.join(","));
-
     let c_model = CString::new("test-model").expect("model cstr");
     let c_title = CString::new(title).expect("title cstr");
     let c_marker = CString::new("active").expect("marker cstr");
-    let c_metadata = CString::new(metadata_json).expect("metadata cstr");
 
     let rc = unsafe {
         talu_sys::talu_chat_notify_session_update(
@@ -33,12 +30,44 @@ fn seed_session_with_tags(ctx: &TestContext, session_id: &str, title: &str, tags
             c_marker.as_ptr(),
             ptr::null(), // parent_session_id
             ptr::null(), // group_id
-            c_metadata.as_ptr(),
+            ptr::null(), // metadata_json
             ptr::null(), // source_doc_id
         )
     };
-    assert_eq!(rc, 0, "notify_session_update with tags failed");
-    // Drop flushes storage
+    assert_eq!(rc, 0, "notify_session_update failed");
+    drop(chat); // Flush storage
+
+    // Create relational tags and associate with session.
+    let c_db_path = CString::new(ctx.db_path()).expect("db_path cstr");
+    let c_session_id = CString::new(session_id).expect("session_id cstr");
+
+    for tag_name in tags {
+        let tag_id = format!("tag-{}", tag_name.to_lowercase());
+        let c_tag_id = CString::new(tag_id).expect("tag_id cstr");
+        let c_name = CString::new(*tag_name).expect("name cstr");
+
+        // Create tag (ignore error if already exists).
+        unsafe {
+            talu_sys::talu_storage_create_tag(
+                c_db_path.as_ptr(),
+                c_tag_id.as_ptr(),
+                c_name.as_ptr(),
+                ptr::null(), // color
+                ptr::null(), // description
+                ptr::null(), // group_id
+            );
+        }
+
+        // Associate tag with session.
+        let rc = unsafe {
+            talu_sys::talu_storage_add_conversation_tag(
+                c_db_path.as_ptr(),
+                c_session_id.as_ptr(),
+                c_tag_id.as_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "add_conversation_tag failed for tag '{}'", tag_name);
+    }
 }
 
 /// Helper to list sessions with tag filters via C API.
@@ -89,36 +118,6 @@ fn list_sessions_with_tags(
     }
 
     ids
-}
-
-/// Helper to get tags_text for a session via C API.
-fn get_session_tags_text(db_path: &str, session_id: &str) -> Option<String> {
-    let c_db_path = CString::new(db_path).expect("db_path cstr");
-    let c_session_id = CString::new(session_id).expect("session_id cstr");
-
-    let mut c_record = CSessionRecord::default();
-
-    let result = unsafe {
-        talu_sys::talu_storage_get_session_info(
-            c_db_path.as_ptr(),
-            c_session_id.as_ptr(),
-            &mut c_record,
-        )
-    };
-
-    if result != 0 {
-        return None;
-    }
-
-    if c_record.tags_text.is_null() {
-        None
-    } else {
-        Some(
-            unsafe { std::ffi::CStr::from_ptr(c_record.tags_text) }
-                .to_string_lossy()
-                .to_string(),
-        )
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -213,46 +212,6 @@ fn capi_tags_filter_any_single() {
     let ids = list_sessions_with_tags(ctx.db_path(), None, Some("work"));
     assert_eq!(ids.len(), 1);
     assert!(ids.contains(&"sess-a".to_string()));
-}
-
-// ---------------------------------------------------------------------------
-// tags_text field tests
-// ---------------------------------------------------------------------------
-
-/// Session with tags has tags_text populated.
-#[test]
-fn capi_session_tags_text_populated() {
-    let ctx = TestContext::new();
-
-    seed_session_with_tags(&ctx, "sess-t", "Tagged", &["rust", "python", "work"]);
-
-    let tags_text = get_session_tags_text(ctx.db_path(), "sess-t");
-    assert!(tags_text.is_some(), "tags_text should be populated");
-
-    let text = tags_text.unwrap();
-    assert!(text.contains("rust"), "should contain rust");
-    assert!(text.contains("python"), "should contain python");
-    assert!(text.contains("work"), "should contain work");
-}
-
-/// Session without tags has null tags_text.
-#[test]
-fn capi_session_tags_text_null_for_untagged() {
-    let ctx = TestContext::new();
-
-    // Seed session without tags
-    let chat = ChatHandle::new(None).expect("ChatHandle::new");
-    chat.set_storage_db(ctx.db_path(), "sess-u")
-        .expect("set_storage_db");
-    chat.notify_session_update(Some("model"), Some("Untagged"), Some("active"))
-        .expect("notify");
-    drop(chat);
-
-    let tags_text = get_session_tags_text(ctx.db_path(), "sess-u");
-    assert!(
-        tags_text.is_none(),
-        "untagged session should have null tags_text"
-    );
 }
 
 // ---------------------------------------------------------------------------

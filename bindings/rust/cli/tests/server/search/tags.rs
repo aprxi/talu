@@ -458,3 +458,105 @@ fn tag_filter_with_pagination() {
 
     assert_eq!(all_ids.len(), 5, "should find all 5 rust-tagged sessions");
 }
+
+// ---------------------------------------------------------------------------
+// Tags API vs. search index integration
+//
+// Search resolves tag filters via the relational `conversation_tags` table.
+// Tags added via the dedicated API are the single source of truth for both
+// search filtering and response display.
+// ---------------------------------------------------------------------------
+
+/// Tags added via the dedicated API must be searchable.
+#[test]
+fn tags_via_api_searchable() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "sess-api-tag", "API Tagged", "m");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    // Add tag via dedicated tags API
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/conversations/sess-api-tag/tags",
+        &json!({"tags": ["api-tag"]}),
+    );
+    assert_eq!(resp.status, 200, "add tag failed: {}", resp.body);
+
+    // Tag visible in conversation response
+    let resp = get(ctx.addr(), "/v1/conversations/sess-api-tag");
+    assert_eq!(resp.status, 200);
+    let conv = resp.json();
+    let tags = conv["tags"].as_array().expect("tags array");
+    assert_eq!(tags.len(), 1, "tag should appear in response");
+    assert_eq!(tags[0]["name"], "api-tag");
+
+    // Tag must also be findable via search
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "filters": {
+                "tags": ["api-tag"]
+            }
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert_eq!(
+        data.len(),
+        1,
+        "Tags added via the dedicated API must be searchable"
+    );
+    assert_eq!(data[0]["id"], "sess-api-tag");
+}
+
+/// Tags created via seed helper must be searchable and visible in responses.
+///
+/// Verifies that relational tags created by `seed_session_with_tags` are
+/// both filterable in search and visible in the conversation response.
+#[test]
+fn metadata_tags_visible_in_response() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_tags(
+        temp.path(),
+        "sess-meta",
+        "Metadata Tagged",
+        "m",
+        &["meta-tag"],
+    );
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    // Search finds it via relational tag table
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "filters": {
+                "tags": ["meta-tag"]
+            }
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert_eq!(data.len(), 1, "metadata tags must be searchable");
+    assert_eq!(data[0]["id"], "sess-meta");
+
+    // Tag must also appear in the conversation response tags array
+    let resp = get(ctx.addr(), "/v1/conversations/sess-meta");
+    assert_eq!(resp.status, 200);
+    let conv = resp.json();
+    let tags = conv["tags"].as_array().expect("tags array");
+    assert_eq!(
+        tags.len(),
+        1,
+        "Metadata tags must be visible in the response tags array"
+    );
+    assert_eq!(tags[0]["name"], "meta-tag");
+}

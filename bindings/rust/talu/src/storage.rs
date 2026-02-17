@@ -442,7 +442,6 @@ impl StorageHandle {
             head_item_id: c_record.head_item_id,
             ttl_ts: c_record.ttl_ts,
             metadata_json: optional_cstr_to_string(c_record.metadata_json),
-            tags_text: optional_cstr_to_string(c_record.tags_text),
             search_snippet: optional_cstr_to_string(c_record.search_snippet),
             source_doc_id: optional_cstr_to_string(c_record.source_doc_id),
             created_at: c_record.created_at_ms,
@@ -1305,9 +1304,6 @@ pub struct SessionRecordFull {
     pub head_item_id: u64,
     pub ttl_ts: i64,
     pub metadata_json: Option<String>,
-    /// Space-separated normalized tags extracted from metadata_json.tags.
-    /// Pre-computed at write time for efficient search. None for legacy sessions.
-    pub tags_text: Option<String>,
     pub search_snippet: Option<String>,
     /// Source document ID for lineage tracking.
     /// Links this session to the prompt/persona document that spawned it.
