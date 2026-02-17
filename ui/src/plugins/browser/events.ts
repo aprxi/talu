@@ -113,7 +113,8 @@ export function wireEvents(): void {
 
   // Tag sidebar clicks (delegated).
   dom.tagsEl.addEventListener("click", (e) => {
-    const btn = (e.target as HTMLElement).closest<HTMLElement>("[data-tag]");
+    if (!(e.target instanceof HTMLElement)) return;
+    const btn = e.target.closest<HTMLElement>("[data-tag]");
     if (!btn) return;
     const tag = btn.dataset["tag"]!;
     const isActive = btn.classList.contains("active");

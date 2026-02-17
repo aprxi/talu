@@ -4,7 +4,7 @@ import { fState } from "../../../src/plugins/files/state.ts";
 import { initFilesDom, getFilesDom } from "../../../src/plugins/files/dom.ts";
 import { initFilesDeps } from "../../../src/plugins/files/deps.ts";
 import { createDomRoot, FILES_DOM_IDS, FILES_DOM_EXTRAS, FILES_DOM_TAGS } from "../../helpers/dom.ts";
-import { mockControllableTimers } from "../../helpers/mocks.ts";
+import { mockControllableTimers, flushAsync } from "../../helpers/mocks.ts";
 
 /**
  * Tests for files event wiring — search debouncing, tab switching,
@@ -135,7 +135,7 @@ describe("Tab switching", () => {
   test("tab switch triggers loadFiles", async () => {
     wireFileEvents();
     getFilesDom().tabArchived.dispatchEvent(new Event("click"));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
     expect(apiCalls.some((c) => c.method === "listFiles")).toBe(true);
   });
 });
@@ -365,7 +365,7 @@ describe("Drag-and-drop", () => {
     });
 
     dom.mainDrop.dispatchEvent(dropEvent);
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(uploadCalls.length).toBe(1);
     expect(uploadCalls[0]!.file.name).toBe("dropped.txt");
@@ -422,7 +422,7 @@ describe("Rename interactions", () => {
 
     const event = new KeyboardEvent("keydown", { key: "Enter", bubbles: true });
     input.dispatchEvent(event);
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(apiCalls.some((c) => c.method === "updateFile")).toBe(true);
   });

@@ -24,5 +24,13 @@ marked.use({
 
 export function sanitizedMarkdown(text: string): string {
   const raw = marked(text, { async: false }) as string;
-  return DOMPurify.sanitize(raw);
+  const clean = DOMPurify.sanitize(raw);
+  // DOMPurify's parse→serialize round-trip decodes &lt;/&gt; in attribute
+  // values (they're valid in double-quoted HTML attributes).  Re-escape
+  // < and > inside data-code so the attribute stays safely encoded.
+  return clean.replace(
+    /data-code="([^"]*)"/g,
+    (_, val: string) =>
+      `data-code="${val.replace(/</g, "&lt;").replace(/>/g, "&gt;")}"`,
+  );
 }

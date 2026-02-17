@@ -33,7 +33,8 @@ export function initCodeBlockCopyHandler(
   moduleTimers = timers;
 
   root.addEventListener("click", ((e: Event) => {
-    const btn = (e.target as HTMLElement).closest(".code-block .code-copy");
+    if (!(e.target instanceof HTMLElement)) return;
+    const btn = e.target.closest(".code-block .code-copy");
     if (!btn) return;
 
     const block = btn.closest(".code-block") as HTMLElement | null;

@@ -46,9 +46,16 @@ describe("GlobalEventManager", () => {
     const mgr = new GlobalEventManager("test.plugin");
     mgr.onDocument("click", () => { throw new Error("handler boom"); });
     document.dispatchEvent(new Event("click"));
-    expect(spy).toHaveBeenCalled();
-    expect(spy.mock.calls[0][0]).toContain("test.plugin");
-    spy.mockRestore();
+    // Dispose ASAP — other test files share this document and their clicks
+    // would trigger our throwing handler in the parallel bun test runner.
     mgr.dispose();
+    expect(spy).toHaveBeenCalled();
+    // Cross-file console.error calls may precede ours in the spy log;
+    // search all calls instead of assuming index [0].
+    const found = spy.mock.calls.some(
+      (args) => typeof args[0] === "string" && args[0].includes("test.plugin"),
+    );
+    expect(found).toBe(true);
+    spy.mockRestore();
   });
 });

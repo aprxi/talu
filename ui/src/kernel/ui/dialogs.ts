@@ -177,7 +177,8 @@ function processQueue(): void {
   if (entry.type === "select") {
     const list = dialog.querySelector("#kernel-dialog-select-list");
     list?.addEventListener("click", (e) => {
-      const target = (e.target as HTMLElement).closest<HTMLElement>("[data-select-id]");
+      if (!(e.target instanceof HTMLElement)) return;
+      const target = e.target.closest<HTMLElement>("[data-select-id]");
       if (target) {
         document.removeEventListener("keydown", onKey);
         cleanup();

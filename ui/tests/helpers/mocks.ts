@@ -60,6 +60,18 @@ export function mockControllableTimers() {
   };
 }
 
+/**
+ * Drain the microtask queue so fire-and-forget async handlers complete.
+ *
+ * Event handlers that call async functions without `await` (e.g. `loadFiles()`,
+ * `uploadFiles()`) enqueue microtasks.  A single macrotask tick (`setTimeout 0`)
+ * guarantees all chained microtasks resolve before the test continues —
+ * without relying on a magic delay.
+ */
+export function flushAsync(): Promise<void> {
+  return new Promise((r) => setTimeout(r, 0));
+}
+
 /** Notifications that record messages for assertion. */
 export function mockNotifications(): {
   mock: Notifications & { success(msg: string): void };

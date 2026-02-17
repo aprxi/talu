@@ -347,6 +347,49 @@ describe("uploadFiles", () => {
     expect(notif.messages.some((m) => m.type === "success" && m.msg.includes("1 file"))).toBe(true);
   });
 
+  test("partial batch failure — succeeds around the failure", async () => {
+    let callIndex = 0;
+    initFilesDeps({
+      api: {
+        listFiles: async () => listFilesResult,
+        updateFile: async () => updateFileResult,
+        deleteFile: async () => deleteFileResult,
+      } as any,
+      notify: notif.mock as any,
+      dialogs: { confirm: async () => confirmResult } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      upload: {
+        upload: async (file: File) => {
+          const idx = callIndex++;
+          if (idx === 1) throw new Error("Disk full");
+          uploadCalls.push({ file, purpose: "assistants" });
+          return { id: `uploaded-${file.name}` };
+        },
+      } as any,
+      download: {} as any,
+      timers: mockTimers(),
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+    });
+
+    const files = makeFileList(
+      new File(["a"], "first.txt"),
+      new File(["b"], "second.txt"),
+      new File(["c"], "third.txt"),
+    );
+
+    await uploadFiles(files);
+
+    // 1st and 3rd succeed; 2nd fails.
+    expect(uploadCalls.length).toBe(2);
+    expect(uploadCalls[0]!.file.name).toBe("first.txt");
+    expect(uploadCalls[1]!.file.name).toBe("third.txt");
+
+    // Error notification for the failed upload.
+    expect(notif.messages.some((m) => m.type === "error" && m.msg.includes("Disk full"))).toBe(true);
+    // Success notification for the 2 that completed.
+    expect(notif.messages.some((m) => m.type === "success" && m.msg.includes("2 file"))).toBe(true);
+  });
+
   test("shows error when upload fails", async () => {
     initFilesDeps({
       api: {

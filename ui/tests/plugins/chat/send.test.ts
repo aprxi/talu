@@ -4,7 +4,7 @@ import { chatState } from "../../../src/plugins/chat/state.ts";
 import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
 import { createDomRoot, CHAT_DOM_IDS } from "../../helpers/dom.ts";
-import { mockTimers, mockNotifications } from "../../helpers/mocks.ts";
+import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 
 /**
  * Tests for chat input handling — keyboard events, auto-resize, send/cancel
@@ -261,7 +261,7 @@ describe("setupInputEvents — send button", () => {
 
     setupInputEvents();
     dom.inputSend.dispatchEvent(new Event("click"));
-    await new Promise((r) => setTimeout(r, 10));
+    await flushAsync();
 
     expect(apiCalls.length).toBe(0);
   });
@@ -309,6 +309,41 @@ describe("streamResponse", () => {
 
   test("clears streamAbort after completion", async () => {
     await streamResponse({ text: "Hello" });
+    expect(chatState.streamAbort).toBeNull();
+  });
+
+  test("passes streamAbort signal to createResponse", async () => {
+    let capturedSignal: AbortSignal | undefined;
+    initChatDeps({
+      api: {
+        createResponse: async (_body: any, signal?: AbortSignal) => {
+          capturedSignal = signal;
+          // Verify streamAbort is set during the call.
+          expect(chatState.streamAbort).not.toBeNull();
+          expect(chatState.streamAbort!.signal).toBe(signal);
+          return new Response(JSON.stringify({ error: { message: "err" } }), { status: 500 });
+        },
+        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        getConversation: async () => ({ ok: false, error: "not found" }),
+      } as any,
+      notifications: notif.mock as any,
+      services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      layout: { setTitle: () => {} } as any,
+      clipboard: { writeText: async () => {} } as any,
+      download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: { on: () => ({ dispose() {} }), run: async <T>(_: string, v: T) => v } as any,
+      timers: mockTimers(),
+      observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+    });
+
+    await streamResponse({ text: "Hello" });
+
+    // Signal was actually passed.
+    expect(capturedSignal).toBeInstanceOf(AbortSignal);
+    // After completion, streamAbort is cleaned up.
     expect(chatState.streamAbort).toBeNull();
   });
 

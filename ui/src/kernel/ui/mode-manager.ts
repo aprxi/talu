@@ -94,7 +94,8 @@ export class ModeManager {
   /** Install click handlers on activity bar buttons. Returns a Disposable for cleanup. */
   installActivityBarListeners(): Disposable {
     const handler = (e: Event) => {
-      const btn = (e.target as HTMLElement).closest<HTMLElement>(".activity-btn");
+      if (!(e.target instanceof HTMLElement)) return;
+      const btn = e.target.closest<HTMLElement>(".activity-btn");
       if (!btn) return;
       const mode = btn.getAttribute("data-mode");
       if (mode) {
