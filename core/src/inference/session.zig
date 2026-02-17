@@ -6,7 +6,7 @@
 const std = @import("std");
 const sampler = @import("sampling.zig");
 const tokenizer_mod = @import("../tokenizer/root.zig");
-const io = @import("../io/root.zig");
+const model_loader = @import("model_loader.zig");
 const backend_root = @import("backend/root.zig");
 const Backend = backend_root.Backend;
 const log = @import("../log.zig");
@@ -69,7 +69,7 @@ pub const InferenceState = struct {
 
 pub const Session = struct {
     allocator: std.mem.Allocator,
-    loaded: *io.LoadedModel,
+    loaded: *model_loader.LoadedModel,
     tok: tokenizer_mod.Tokenizer,
     samp: sampler.Sampler,
     backend: Backend,
@@ -80,7 +80,7 @@ pub const Session = struct {
     /// Includes debug timing/shape output when flags are enabled.
     fn buildFromComponents(
         allocator: std.mem.Allocator,
-        loaded_model: *io.LoadedModel,
+        loaded_model: *model_loader.LoadedModel,
         tokenizer: tokenizer_mod.Tokenizer,
         rng_seed: u64,
     ) !Session {
@@ -179,11 +179,11 @@ pub const Session = struct {
             alloc: std.mem.Allocator,
             config_path: []const u8,
             weights_path: []const u8,
-            result: ?io.LoadedModel = null,
+            result: ?model_loader.LoadedModel = null,
             err: ?anyerror = null,
 
             fn loadModel(self: *@This()) void {
-                self.result = io.loadModel(self.alloc, self.config_path, self.weights_path, backend_root.defaultModelLoadOptions(), progress_mod.ProgressContext.NONE) catch |e| {
+                self.result = model_loader.loadModel(self.alloc, self.config_path, self.weights_path, backend_root.defaultModelLoadOptions(), progress_mod.ProgressContext.NONE) catch |e| {
                     self.err = e;
                     return;
                 };
@@ -198,9 +198,9 @@ pub const Session = struct {
 
         const model_loader_thread = std.Thread.spawn(.{}, ModelLoaderThread.loadModel, .{&loader_thread_state}) catch {
             // Thread spawn failed - load synchronously instead
-            const loaded_model = try allocator.create(io.LoadedModel);
+            const loaded_model = try allocator.create(model_loader.LoadedModel);
             errdefer allocator.destroy(loaded_model);
-            loaded_model.* = try io.loadModel(allocator, config_path, weights_path, backend_root.defaultModelLoadOptions(), progress_mod.ProgressContext.NONE);
+            loaded_model.* = try model_loader.loadModel(allocator, config_path, weights_path, backend_root.defaultModelLoadOptions(), progress_mod.ProgressContext.NONE);
             errdefer loaded_model.deinit();
 
             var tokenizer_state = if (tokenizer_json) |json|
@@ -229,7 +229,7 @@ pub const Session = struct {
         model_loader_thread.join();
 
         if (loader_thread_state.err) |e| return e;
-        const loaded_model = try allocator.create(io.LoadedModel);
+        const loaded_model = try allocator.create(model_loader.LoadedModel);
         errdefer allocator.destroy(loaded_model);
         loaded_model.* = loader_thread_state.result.?;
         errdefer loaded_model.deinit();

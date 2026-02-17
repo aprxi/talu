@@ -16,10 +16,10 @@ const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
-const st_loader = @import("../safetensors/root.zig");
+const st_loader = @import("../../io/safetensors/root.zig");
 const inference_mod = @import("../../inference/root.zig");
 const transformer = inference_mod.backend.block_kernels;
-const graph = @import("../../graph/root.zig");
+const graph = @import("../root.zig");
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
 
@@ -688,7 +688,7 @@ fn readEnvFlag(allocator: std.mem.Allocator, name: []const u8, default_value: bo
     return default_value;
 }
 
-// MoE inference lives in `src/io/loader/moe.zig`.
+// MoE inference lives in `src/graph/loader/moe.zig`.
 
 // =============================================================================
 // Unit Tests
@@ -1187,7 +1187,7 @@ test "LoadedModel.deinit: cleanup with cpu_blocks" {
     model.deinit();
 }
 
-// NOTE: Tests for ensureCpuBlocks are skipped because they expose a memory leak in
+// Tests for ensureCpuBlocks are skipped because they expose a memory leak in
 // TransformerBlock that requires production code changes to fix. The buildBlocks function
 // allocates TransformerBlocks that have internal allocations, but LoadedModel.deinit only
 // frees the slice, not the individual block allocations.

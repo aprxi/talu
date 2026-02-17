@@ -13,6 +13,7 @@ const std = @import("std");
 // Import from lib module (added as dependency in build.zig)
 const lib = @import("lib");
 const io = lib.io;
+const graph = lib.graph;
 const tokenizer_mod = lib.tokenizer;
 const inference = lib.inference;
 const FusedCpuBackend = inference.backend.FusedCpuBackend;
@@ -229,7 +230,7 @@ pub fn main() !void {
     var model_bundle = try io.repository.resolve(allocator, args.model_path, .{});
     defer model_bundle.deinit();
 
-    var loaded = try io.loadModel(allocator, model_bundle.config_path(), model_bundle.weights_path() orelse return error.WeightsNotFound, .{}, progress_mod.ProgressContext.NONE);
+    var loaded = try graph.loadModel(allocator, model_bundle.config_path(), model_bundle.weights_path() orelse return error.WeightsNotFound, .{}, progress_mod.ProgressContext.NONE);
     defer loaded.deinit();
 
     // Initialize tokenizer

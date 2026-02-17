@@ -10,12 +10,12 @@ const dtype_mod = @import("../dtype.zig");
 const safetensors = @import("../io/safetensors/root.zig");
 const repository = @import("../io/repository/root.zig");
 const gaf_paths = @import("gaf_paths.zig");
-const config_loader = @import("../io/config/root.zig");
+const config_loader = @import("../graph/config/root.zig");
 const compute = @import("../compute/root.zig");
 const parallel = compute.parallel;
 const convert = @import("root.zig");
 const graph = @import("../graph/root.zig");
-const loader = @import("../io/loader/root.zig");
+const loader = @import("../graph/loader/root.zig");
 
 const Tensor = tensor.Tensor;
 const DType = dtype_mod.DType;

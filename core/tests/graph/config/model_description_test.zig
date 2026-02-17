@@ -1,4 +1,4 @@
-//! Integration tests for io.config.ModelDescription
+//! Integration tests for graph.config.ModelDescription
 //!
 //! ModelDescription is a C-compatible struct containing model metadata
 //! for C API introspection. It owns allocated architecture strings.
@@ -6,8 +6,8 @@
 const std = @import("std");
 const main = @import("main");
 
-const ModelDescription = main.io.config.ModelDescription;
-const QuantMethod = main.io.config.QuantMethod;
+const ModelDescription = main.graph.config.ModelDescription;
+const QuantMethod = main.graph.config.QuantMethod;
 
 // =============================================================================
 // Type Verification Tests

@@ -10,14 +10,15 @@
 //! Run `make graphs` to regenerate architecture definitions from Python models.
 
 const std = @import("std");
-const json = @import("../json/root.zig");
+const json = @import("../../io/json/root.zig");
 const tensor = @import("../../tensor.zig");
-const weights = @import("weights.zig");
+const weights_impl = @import("weights.zig");
 const moe = @import("moe.zig");
-const graph = @import("../../graph/root.zig");
+const graph = @import("../root.zig");
 const log = @import("../../log.zig");
 const embedded_graphs = @import("embedded_graphs");
 const progress_mod = @import("../../capi/progress.zig");
+const validation = @import("validation.zig");
 
 // Generic MoE hooks for models that use Mixture of Experts
 const moe_hooks = struct {
@@ -25,10 +26,12 @@ const moe_hooks = struct {
 };
 
 // Re-export types
-pub const LoadedModel = weights.LoadedModel;
+pub const weights = weights_impl;
+pub const LoadedModel = weights_impl.LoadedModel;
+pub const LoadOptions = weights_impl.LoadOptions;
+pub const validateLoadedModel = validation.validate;
 
 // Re-export validation types so check_coverage.sh --integration can verify test coverage
-const validation = @import("validation.zig");
 pub const Reporter = validation.Reporter;
 
 // =============================================================================
@@ -40,7 +43,7 @@ pub fn loadModel(
     backing_allocator: std.mem.Allocator,
     config_path: []const u8,
     weights_path: []const u8,
-    load_options: weights.LoadOptions,
+    load_options: weights_impl.LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
     // Ensure graph registry is initialized
@@ -174,14 +177,14 @@ fn loadSafeTensorsModel(
     backing_allocator: std.mem.Allocator,
     config_path: []const u8,
     weights_path: []const u8,
-    load_options: weights.LoadOptions,
+    load_options: weights_impl.LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
     // Detect model kind using graph registry (single source of truth)
     const model_kind = try detectModelKind(backing_allocator, config_path);
 
     // Load model using standard graph-driven loading with MoE support
-    var loaded_model = try weights.loadModelWithHooks(
+    var loaded_model = try weights_impl.loadModelWithHooks(
         moe_hooks,
         backing_allocator,
         config_path,

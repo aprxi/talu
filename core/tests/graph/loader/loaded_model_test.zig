@@ -1,10 +1,10 @@
-//! Integration tests for io.loader.LoadedModel
+//! Integration tests for graph.loader.LoadedModel
 //!
 //! LoadedModel contains the loaded model weights and configuration.
 
 const std = @import("std");
 const main = @import("main");
-const LoadedModel = main.io.loader.LoadedModel;
+const LoadedModel = main.graph.loader.LoadedModel;
 
 // =============================================================================
 // Type Verification Tests
@@ -72,15 +72,12 @@ test "LoadedModel has runtime architecture fields" {
     const fields = info.@"struct".fields;
 
     var has_runtime_arch = false;
-    var has_native_arch = false;
 
     inline for (fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "runtime_arch")) has_runtime_arch = true;
-        if (comptime std.mem.eql(u8, field.name, "native_arch")) has_native_arch = true;
     }
 
     try std.testing.expect(has_runtime_arch);
-    try std.testing.expect(has_native_arch);
 }
 
 test "LoadedModel has file metadata fields" {

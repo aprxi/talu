@@ -1,10 +1,10 @@
-//! Integration tests for io.config.GenerationConfig
+//! Integration tests for inference.config.GenerationConfig
 //!
 //! GenerationConfig contains generation parameters loaded from model directory.
 
 const std = @import("std");
 const main = @import("main");
-const GenerationConfig = main.io.config.GenerationConfig;
+const GenerationConfig = main.inference.config.GenerationConfig;
 
 // =============================================================================
 // Type Verification Tests

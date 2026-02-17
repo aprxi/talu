@@ -76,7 +76,7 @@ test "NamesError.NotFound exists" {
 // so their correctness is validated through:
 // 1. Static type checking (comptime options parameter ensures all are string literals)
 // 2. Integration tests with real SafeTensors files in higher-level model loading tests
-// 3. Production usage in core/src/io/config/*.zig files
+// 3. Production usage in core/src/graph/config/*.zig files
 
 test "selectNameLayer - name formatting logic" {
     // Test the formatting logic without needing a real UnifiedSafeTensors

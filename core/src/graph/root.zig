@@ -72,3 +72,14 @@ pub const layer_ops = @import("layer_ops.zig");
 pub const LayerOp = layer_ops.LayerOp;
 pub const BufferId = layer_ops.BufferId;
 pub const ResidualScale = layer_ops.ResidualScale;
+
+// Re-export graph-owned model config parsing.
+pub const config = @import("config/root.zig");
+
+// Re-export model loading from graph/loader.
+pub const loader = @import("loader/root.zig");
+pub const LoadedModel = loader.LoadedModel;
+pub const LoadOptions = loader.LoadOptions;
+pub const loadModel = loader.loadModel;
+pub const loadArchitectureDefinitions = loader.loadArchitectureDefinitions;
+pub const validateLoadedModel = loader.validateLoadedModel;

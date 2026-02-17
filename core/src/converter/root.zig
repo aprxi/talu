@@ -13,7 +13,7 @@ const tensor_mod = @import("../tensor.zig");
 const safetensors = @import("../io/safetensors/root.zig");
 const dtype_mod = @import("../dtype.zig");
 const graph = @import("../graph/root.zig");
-const loader = @import("../io/loader/root.zig");
+const loader = @import("../graph/loader/root.zig");
 
 pub const mapping = @import("mapping.zig");
 pub const grouped_affine = @import("grouped_affine.zig");

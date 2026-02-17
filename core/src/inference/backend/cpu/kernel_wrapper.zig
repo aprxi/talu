@@ -16,8 +16,8 @@
 
 const compute = @import("../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const graph_types = @import("../../../graph/types.zig");
-const OpType = graph_types.OpType;
+const graph_runtime = @import("../../graph_runtime/root.zig");
+const OpType = graph_runtime.OpType;
 
 const tensor = @import("../../../tensor.zig");
 const Tensor = tensor.Tensor;

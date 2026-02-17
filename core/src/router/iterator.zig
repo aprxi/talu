@@ -28,7 +28,7 @@ const ItemType = responses_mod.ItemType;
 const ContentType = responses_mod.ContentType;
 const session_mod = @import("../inference/session.zig");
 const FinishReason = session_mod.FinishReason;
-const gen_config_mod = @import("../io/config/generation.zig");
+const gen_config_mod = @import("../inference/config/generation.zig");
 const log = @import("../log.zig");
 
 /// Maximum length of a single decoded token in bytes.

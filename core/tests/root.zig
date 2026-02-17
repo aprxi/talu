@@ -74,22 +74,24 @@ pub const compute_dl_data_type = @import("compute/d_l_data_type_test.zig");
 pub const compute_dl_device = @import("compute/d_l_device_test.zig");
 pub const compute_ops_math_primitives_ro_p_e = @import("compute/ops/math_primitives/ro_p_e_test.zig");
 
-// io (TODO: io_loader is outdated)
+// io
 pub const io_safetensors = @import("io/safetensors/root.zig");
-// pub const io_loader = @import("io/loader/root.zig");
 pub const io_repository_bundle = @import("io/repository/bundle_test.zig");
 pub const io_repository_cached_model_list_c = @import("io/repository/cached_model_list_c_test.zig");
-pub const io_config_arch_check = @import("io/config/architecture_check_test.zig");
-pub const io_config_generation = @import("io/config/generation_config_test.zig");
-pub const io_config_model_description = @import("io/config/model_description_test.zig");
-pub const io_loaded_model = @import("io/loaded_model_test.zig");
 pub const io_json = @import("io/json_test.zig");
+
+// inference
+pub const inference_model_loader_arch_check = @import("inference/model_loader_architecture_check_test.zig");
+pub const inference_config_generation = @import("inference/config/generation_config_test.zig");
 
 // converter (top-level, not in io/)
 pub const converter = @import("converter/root.zig");
 
 // graph (compute graph types and registry)
 pub const graph = @import("graph/root.zig");
+pub const graph_loaded_model = @import("graph/loaded_model_test.zig");
+pub const graph_loader = @import("graph/loader/root.zig");
+pub const graph_config_model_description = @import("graph/config/model_description_test.zig");
 
 // db (TaluDB append-only columnar storage)
 pub const db = @import("db/root.zig");

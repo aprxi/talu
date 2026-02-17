@@ -7,7 +7,7 @@ const std = @import("std");
 const template_engine = @import("../template/root.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
-const gen_config_mod = @import("../io/config/generation.zig");
+const gen_config_mod = @import("../inference/config/generation.zig");
 
 /// C allocator for FFI lifetime management.
 const allocator = std.heap.c_allocator;

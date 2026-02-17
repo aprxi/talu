@@ -7,7 +7,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const common = @import("common.zig");
 const layers = @import("layers.zig");
-const types = @import("../../graph/root.zig").layer_ops;
+const graph_runtime = @import("../graph_runtime/root.zig");
+const types = graph_runtime.layer_ops;
 const compute = @import("../../compute/root.zig");
 const capi = @import("../../capi/error.zig");
 const ops = compute.ops;
@@ -27,7 +28,6 @@ const BatchedKVCache = kv_cache.BatchedKVCache;
 
 const cpu_forward = common.forward;
 
-const graph = @import("../../graph/root.zig");
 const BufferId = types.BufferId;
 const ResidualScale = types.ResidualScale;
 const LayerOp = types.LayerOp;
@@ -1112,7 +1112,7 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = graph.compiler.finalOutputBuffer(self.program);
+        const final_buf = graph_runtime.compiler.finalOutputBuffer(self.program);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
         }
@@ -1361,7 +1361,7 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = graph.compiler.finalOutputBuffer(self.program);
+        const final_buf = graph_runtime.compiler.finalOutputBuffer(self.program);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
         }

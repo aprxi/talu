@@ -4,7 +4,7 @@
 //! This is the SINGLE source of truth - used by both CLI and C API.
 
 const std = @import("std");
-const json = @import("../json/root.zig");
+const json = @import("../../io/json/root.zig");
 const template = @import("../../template/root.zig");
 const responses_mod = @import("../../responses/root.zig");
 const log = @import("../../log.zig");

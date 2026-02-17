@@ -14,7 +14,7 @@ pub const Block = @import("block.zig").Block;
 pub const Transformer = @import("model.zig").Transformer;
 
 // Re-export model types for convenience
-const ops = @import("../../graph/root.zig").layer_ops;
+const ops = @import("../graph_runtime/root.zig").layer_ops;
 pub const LayerOp = ops.LayerOp;
 pub const BufferId = ops.BufferId;
 

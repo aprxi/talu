@@ -38,8 +38,8 @@ pub const PoolingStrategy = backend_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const io = @import("../io/root.zig");
 const image_mod = @import("../image/root.zig");
-const io_weights = io.weights;
-const gen_config_mod = @import("../io/config/generation.zig");
+const model_loader = inference.model_loader;
+const gen_config_mod = @import("../inference/config/generation.zig");
 const validate_mod = @import("../validate/root.zig");
 const ConstrainedSampler = validate_mod.sampler.ConstrainedSampler;
 const GrammarConfig = validate_mod.sampler.GrammarConfig;
@@ -233,7 +233,7 @@ pub const LocalEngine = struct {
     allocator: std.mem.Allocator,
 
     /// Loaded model weights and config.
-    loaded: *io_weights.LoadedModel,
+    loaded: *model_loader.LoadedModel,
 
     /// Tokenizer for encoding/decoding.
     tok: tokenizer_mod.Tokenizer,
@@ -318,13 +318,13 @@ pub const LocalEngine = struct {
             alloc: std.mem.Allocator,
             config_path: []const u8,
             weights_path: []const u8,
-            load_options: io_weights.LoadOptions,
+            load_options: model_loader.LoadOptions,
             prog: progress_mod.ProgressContext,
-            loaded_model: ?io_weights.LoadedModel = null,
+            loaded_model: ?model_loader.LoadedModel = null,
             err: ?anyerror = null,
 
             fn loadModel(self: *@This()) void {
-                self.loaded_model = io.loadModel(self.alloc, self.config_path, self.weights_path, self.load_options, self.prog) catch |e| {
+                self.loaded_model = model_loader.loadModel(self.alloc, self.config_path, self.weights_path, self.load_options, self.prog) catch |e| {
                     self.err = e;
                     return;
                 };
@@ -361,12 +361,12 @@ pub const LocalEngine = struct {
             thread.join();
         } else {
             // Thread spawn failed - load synchronously
-            loader_thread_state.loaded_model = try io.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
+            loader_thread_state.loaded_model = try model_loader.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
         }
 
         if (loader_thread_state.err) |e| return e;
 
-        const loaded_model = try allocator.create(io_weights.LoadedModel);
+        const loaded_model = try allocator.create(model_loader.LoadedModel);
         errdefer allocator.destroy(loaded_model);
         loaded_model.* = loader_thread_state.loaded_model.?;
         errdefer loaded_model.deinit();
@@ -1846,4 +1846,3 @@ test "expandImagePadTokens rejects placeholder mismatch" {
         LocalEngine.expandImagePadTokens(allocator, &tokens, 99, &token_counts, .{}),
     );
 }
-

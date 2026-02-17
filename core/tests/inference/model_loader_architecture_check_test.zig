@@ -1,10 +1,10 @@
-//! Integration tests for io.config.ArchitectureCheck
+//! Integration tests for inference.model_loader.ArchitectureCheck
 //!
 //! ArchitectureCheck is the result of checking model architecture support.
 
 const std = @import("std");
 const main = @import("main");
-const ArchitectureCheck = main.io.config.ArchitectureCheck;
+const ArchitectureCheck = main.inference.model_loader.ArchitectureCheck;
 
 // =============================================================================
 // Type Verification Tests

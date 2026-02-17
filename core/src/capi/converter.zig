@@ -12,6 +12,7 @@
 const std = @import("std");
 const scheme_mod = @import("../converter/scheme.zig");
 const io = @import("../io/root.zig");
+const graph_config = @import("../graph/config/root.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const xray = @import("../xray/root.zig");
@@ -288,8 +289,8 @@ fn describeErrorResult(msg: [*:0]const u8) ModelInfo {
 }
 
 fn describeFromResolvedPath(resolved_path: []const u8) DescribeError!ModelInfo {
-    // Delegate to io.config.ModelDescription which handles all the logic
-    const desc = io.config.ModelDescription.fromDir(allocator, resolved_path) catch |err| {
+    // Delegate to graph.config.ModelDescription which handles all the logic
+    const desc = graph_config.ModelDescription.fromDir(allocator, resolved_path) catch |err| {
         return switch (err) {
             error.InvalidJson => error.InvalidJson,
             error.MissingField => error.MissingField,

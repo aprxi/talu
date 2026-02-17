@@ -8,7 +8,8 @@ const build_options = @import("build_options");
 const common = @import("common.zig");
 const layers = @import("layers.zig");
 const Block = @import("block.zig").Block;
-const types = @import("../../graph/root.zig").layer_ops;
+const graph_runtime = @import("../graph_runtime/root.zig");
+const types = graph_runtime.layer_ops;
 const trace = @import("../../xray/trace.zig");
 const dump = if (build_options.dump_tensors) @import("../../xray/dump/capture.zig") else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
@@ -30,9 +31,8 @@ const LayeredBatchedKVCache = kv_cache.LayeredBatchedKVCache;
 
 // For Transformer.build()
 const tensor = @import("../../tensor.zig");
-const io = @import("../../io/root.zig");
 const cpu_blocks = @import("../backend/cpu/block_kernels.zig");
-const LoadedModel = io.weights.LoadedModel;
+const LoadedModel = graph_runtime.LoadedModel;
 const ModelConfig = tensor.ModelConfig;
 const LayerOp = types.LayerOp;
 
@@ -581,7 +581,7 @@ pub const Transformer = struct {
         var mamba_layer_count: usize = 0;
         var shortconv_layer_count: usize = 0;
         for (blocks, 0..) |*block, layer_idx| {
-            const layer_program = try io.blockProgramForLayer(@constCast(loaded), layer_idx);
+            const layer_program = try graph_runtime.blockProgramForLayer(@constCast(loaded), layer_idx);
             const mamba_idx: ?usize = if (block.isMamba()) blk: {
                 const idx = mamba_layer_count;
                 mamba_layer_count += 1;

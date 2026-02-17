@@ -37,11 +37,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
-const io = @import("../../io/root.zig");
+const model_loader = @import("../model_loader.zig");
 const capi = @import("../../capi/error.zig");
 const log = @import("../../log.zig");
 const progress_mod = @import("../../capi/progress.zig");
-const loader = io.weights;
 const tensor = @import("../../tensor.zig");
 const ModelConfig = tensor.ModelConfig;
 const dtype_mod = @import("../../dtype.zig");
@@ -67,7 +66,7 @@ const DEFAULT_MAX_BATCH_SIZE: usize = 8;
 
 /// Compute model-load options before backend initialization.
 /// This keeps backend/platform policy out of io/ while preserving fast paths.
-pub fn defaultModelLoadOptions() loader.LoadOptions {
+pub fn defaultModelLoadOptions() model_loader.LoadOptions {
     return .{
         .preserve_native_norm_dtype = shouldPreserveNativeNormDType(),
     };
@@ -110,7 +109,7 @@ pub const Backend = union(enum) {
 
     /// Initialize the appropriate backend based on platform and model format.
     /// Automatically selects FusedCpuBackend for CPU, Metal when available.
-    pub fn init(allocator: std.mem.Allocator, loaded: *loader.LoadedModel, progress: progress_mod.ProgressContext) !Backend {
+    pub fn init(allocator: std.mem.Allocator, loaded: *model_loader.LoadedModel, progress: progress_mod.ProgressContext) !Backend {
         // Check for BACKEND override
         if (std.posix.getenv("BACKEND")) |backend_override| {
             return initFromOverride(allocator, loaded, backend_override, progress);
@@ -365,7 +364,7 @@ fn getMetalUnsupportedReason(config: *const ModelConfig, weight_dtype: DType, ha
     return "Unknown Metal incompatibility";
 }
 
-fn modelHasMetalUnsupportedBlocks(loaded: *const loader.LoadedModel) bool {
+fn modelHasMetalUnsupportedBlocks(loaded: *const model_loader.LoadedModel) bool {
     for (loaded.blocks) |block| {
         switch (block) {
             .mamba => return true,
@@ -377,7 +376,7 @@ fn modelHasMetalUnsupportedBlocks(loaded: *const loader.LoadedModel) bool {
 
 fn initFromOverride(
     allocator: std.mem.Allocator,
-    loaded: *loader.LoadedModel,
+    loaded: *model_loader.LoadedModel,
     backend_override: []const u8,
     progress: progress_mod.ProgressContext,
 ) !Backend {

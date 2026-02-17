@@ -5,7 +5,7 @@
 //! For tokenization, see tokenizer.zig.
 
 const std = @import("std");
-const gen_config_mod = @import("../io/config/generation.zig");
+const gen_config_mod = @import("../inference/config/generation.zig");
 const io = @import("../io/root.zig");
 const repository = io.repository;
 const transport = io.transport;

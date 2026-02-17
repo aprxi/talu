@@ -4,7 +4,7 @@
 //! Supports lazy graph execution for optimal GPU utilization.
 
 const std = @import("std");
-const loader = @import("../../../io/root.zig").weights;
+const model_loader = @import("../../model_loader.zig");
 const tensor = @import("../../../tensor.zig");
 const ModelConfig = tensor.ModelConfig;
 const log = @import("../../../log.zig");
@@ -81,7 +81,7 @@ pub const MetalBackend = struct {
         return self.vocab_size;
     }
 
-    pub fn init(allocator: std.mem.Allocator, loaded: *loader.LoadedModel) !MetalBackend {
+    pub fn init(allocator: std.mem.Allocator, loaded: *model_loader.LoadedModel) !MetalBackend {
         // Load weights to GPU
         const weight_handles = try mlx_forward.loadWeightsToGPU(allocator, loaded);
         errdefer mlx_forward.freeWeights(allocator, weight_handles);

@@ -1,10 +1,10 @@
-//! Integration tests for io.loader.Reporter
+//! Integration tests for graph.loader.Reporter
 //!
 //! Reporter is used for validation reporting during model loading.
 
 const std = @import("std");
 const main = @import("main");
-const Reporter = main.io.loader.Reporter;
+const Reporter = main.graph.loader.Reporter;
 
 // =============================================================================
 // Type Verification Tests

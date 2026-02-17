@@ -35,6 +35,9 @@
 pub const session = @import("session.zig");
 pub const sampling = @import("sampling.zig");
 pub const scheduler = @import("scheduler.zig");
+/// Boundary module: inference code should load models through this facade.
+pub const model_loader = @import("model_loader.zig");
+pub const config = @import("config/root.zig");
 
 // Re-export session types
 pub const Session = session.Session;
@@ -65,6 +68,8 @@ pub const SamplingWorkspace = sampling.Workspace;
 
 /// Executor - LayerOp bytecode execution
 pub const executor = @import("executor/root.zig");
+/// Boundary module: inference code should use this for graph bytecode/types.
+pub const graph_runtime = @import("graph_runtime/root.zig");
 
 /// Backend implementations
 pub const backend = struct {

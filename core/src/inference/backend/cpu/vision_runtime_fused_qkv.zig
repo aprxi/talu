@@ -13,15 +13,16 @@ const std = @import("std");
 const tensor = @import("../../../tensor.zig");
 const dtype_mod = @import("../../../dtype.zig");
 const io = @import("../../../io/root.zig");
+const graph_runtime = @import("../../graph_runtime/root.zig");
 const compute = @import("../../../compute/root.zig");
 const cpu_blocks = @import("block_kernels.zig");
 const exec_block = @import("../../executor/block.zig");
-const layer_ops = @import("../../../graph/root.zig").layer_ops;
+const layer_ops = graph_runtime.layer_ops;
 const image_mod = @import("../../../image/root.zig");
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
-const LoadedModel = io.weights.LoadedModel;
+const LoadedModel = graph_runtime.LoadedModel;
 const matmul = compute.ops.matmul;
 
 pub const PrefillVisionImage = struct {

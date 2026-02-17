@@ -6,7 +6,7 @@
 const std = @import("std");
 const compute = @import("../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const ops = @import("../../../graph/root.zig").layer_ops;
+const ops = @import("../../graph_runtime/root.zig").layer_ops;
 
 const attn = @import("kernels/attention.zig");
 const mla = @import("kernels/mla_attention.zig");

@@ -3,13 +3,9 @@
 //! Provides hooks for detecting Mixture of Experts configuration from weights
 //! when config.json doesn't specify num_experts/experts_per_token.
 //!
-//! NOTE: MoE weight loading is now handled by the graph-driven loader in
-//! block_kernels.zig via buildMoEWeightsFromMap(). This file only handles
-//! MoE config inference from weights.
-
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
-const st_loader = @import("../safetensors/root.zig");
+const st_loader = @import("../../io/safetensors/root.zig");
 const log = @import("../../log.zig");
 
 // MoE weight naming patterns for detection

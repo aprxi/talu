@@ -13,8 +13,8 @@ const compute = @import("../../../compute/root.zig");
 const matmul = compute.ops.matmul;
 const registry = compute.registry;
 const simd = compute.simd;
-const graph = @import("../../../graph/root.zig");
-const ops = graph.layer_ops;
+const graph_runtime = @import("../../graph_runtime/root.zig");
+const ops = graph_runtime.layer_ops;
 const fmt = @import("kernels/describe_fmt.zig");
 const scratch_mod = @import("scratch.zig");
 const kernel_wrapper = @import("kernel_wrapper.zig");
@@ -134,7 +134,7 @@ pub const AttentionMlpWeights = struct {
     is_causal: bool = true,
     /// Graph block ops for this layer (determines kernel list ordering).
     /// Empty means default pre-norm order: [norm, attention, norm, mlp].
-    block_ops: []const graph.Op = &.{},
+    block_ops: []const graph_runtime.Op = &.{},
 
     // === MLA (Multi-Latent Attention) weights ===
     // Used when mla_config is set. MLA uses compressed Q/KV projections.
@@ -195,7 +195,7 @@ pub const BlockMapContext = struct {
     rope: ?*rope.RoPE = null,
     sliding_window: usize = 0,
     is_causal: bool = true,
-    block_ops: []const graph.Op = &.{},
+    block_ops: []const graph_runtime.Op = &.{},
     mamba_config: ?mamba.MambaConfig = null,
     shortconv_config: ?shortconv.ShortConvConfig = null,
     mla_config: ?mla.MLAConfig = null,

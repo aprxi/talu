@@ -39,13 +39,13 @@ pub const nn = struct {
 };
 pub const io = @import("io/root.zig");
 pub const models = struct {
-    pub const dispatcher = @import("io/loader/root.zig");
+    pub const dispatcher = @import("graph/loader/root.zig");
 };
 pub const graph = @import("graph/root.zig");
 pub const inference = @import("inference/root.zig");
 pub const responses = @import("responses/root.zig");
 pub const router = @import("router/root.zig");
-pub const generation_config = @import("io/config/generation.zig");
+pub const generation_config = @import("inference/config/generation.zig");
 pub const converter = @import("converter/root.zig");
 pub const compute = @import("compute/root.zig");
 pub const xray = @import("xray/root.zig");

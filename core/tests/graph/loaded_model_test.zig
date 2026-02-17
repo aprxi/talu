@@ -1,17 +1,16 @@
-//! Integration tests for io.LoadedModel
+//! Integration tests for graph.LoadedModel
 //!
-//! LoadedModel is re-exported from io/root.zig for convenience.
-//! The full tests are in io/loader/loaded_model_test.zig.
+//! LoadedModel is re-exported from graph/root.zig.
 
 const std = @import("std");
 const main = @import("main");
-const LoadedModel = main.io.LoadedModel;
+const LoadedModel = main.graph.LoadedModel;
 
 // =============================================================================
 // Type Verification Tests
 // =============================================================================
 
-test "LoadedModel type is accessible from io" {
+test "LoadedModel type is accessible from graph" {
     const T = LoadedModel;
     _ = T;
 }

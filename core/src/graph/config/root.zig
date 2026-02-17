@@ -4,10 +4,9 @@
 //! RoPE scaling parameters, quantization settings, and tied embeddings.
 
 const std = @import("std");
-const json = @import("../json/root.zig");
+const json = @import("../../io/json/root.zig");
 const tensor = @import("../../tensor.zig");
-const graph = @import("../../graph/root.zig");
-const graph_types = graph.types;
+const graph_types = @import("../types.zig");
 
 const ModelConfig = tensor.ModelConfig;
 
@@ -92,13 +91,6 @@ fn getObjectFirstIntField(obj: std.json.ObjectMap, keys: []const []const u8) ?i3
     }
     return null;
 }
-
-// =============================================================================
-// Architecture Detection
-// =============================================================================
-// NOTE: Architecture detection is now handled exclusively by the graph registry.
-// Use graph.detectFromModelType() to look up architectures by model_type string.
-// The graph registry is populated from _graphs/*.json files at runtime.
 
 /// Quantization config - supports both MLX and MXFP4 formats
 const QuantConfig = struct {
@@ -255,83 +247,6 @@ const JsonConfig = struct {
     }
 };
 
-/// Result of checking model architecture support
-pub const ArchitectureCheck = struct {
-    supported: bool,
-    model_type_buf: [64]u8 = undefined,
-    model_type_len: usize = 0,
-    architecture_buf: [64]u8 = undefined,
-    architecture_len: usize = 0,
-
-    pub fn getModelType(self: *const @This()) ?[]const u8 {
-        if (self.model_type_len == 0) return null;
-        return self.model_type_buf[0..self.model_type_len];
-    }
-
-    pub fn getArchitecture(self: *const @This()) ?[]const u8 {
-        if (self.architecture_len == 0) return null;
-        return self.architecture_buf[0..self.architecture_len];
-    }
-};
-
-/// Check if a model's architecture is supported without fully loading.
-/// Checks against the runtime registry (populated from _graphs/*.json).
-pub fn checkArchitecture(allocator: std.mem.Allocator, path: []const u8) !ArchitectureCheck {
-    var arch_check = ArchitectureCheck{ .supported = false };
-
-    const config_bytes = std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024) catch {
-        // Can't read config - assume supported (might be older format)
-        arch_check.supported = true;
-        return arch_check;
-    };
-    defer allocator.free(config_bytes);
-
-    const parsed_config = json.parseStruct(allocator, JsonConfig, config_bytes, .{
-        .max_size_bytes = 256 * 1024,
-        .ignore_unknown_fields = true,
-    }) catch {
-        // Can't parse - assume supported
-        arch_check.supported = true;
-        return arch_check;
-    };
-    defer parsed_config.deinit();
-
-    const config_json = parsed_config.value;
-
-    // Copy model_type if present
-    if (config_json.model_type) |model_type| {
-        const len = @min(model_type.len, arch_check.model_type_buf.len);
-        @memcpy(arch_check.model_type_buf[0..len], model_type[0..len]);
-        arch_check.model_type_len = len;
-    }
-
-    // Copy architecture name if present
-    if (config_json.architectures) |architectures| {
-        if (architectures.len > 0) {
-            const architecture_name = architectures[0];
-            const len = @min(architecture_name.len, arch_check.architecture_buf.len);
-            @memcpy(arch_check.architecture_buf[0..len], architecture_name[0..len]);
-            arch_check.architecture_len = len;
-        }
-    }
-
-    // Check model_type against the runtime registry
-    // The registry is populated from bindings/python/talu/_graphs/*.json
-    if (config_json.model_type) |model_type| {
-        if (graph.detectFromModelType(model_type) != null) {
-            arch_check.supported = true;
-            return arch_check;
-        }
-        // model_type found but not in registry
-        arch_check.supported = false;
-        return arch_check;
-    }
-
-    // No model_type found - assume supported (older models)
-    arch_check.supported = true;
-    return arch_check;
-}
-
 /// Read just the model_type string from config.json.
 /// Returns null if model_type is not present.
 /// Caller owns the returned string.
@@ -372,6 +287,38 @@ pub fn readModelType(allocator: std.mem.Allocator, path: []const u8) !?[]const u
                     .string => |s| try allocator.dupe(u8, s),
                     else => null,
                 };
+            }
+        }
+    }
+    return null;
+}
+
+/// Read the first architecture entry from config.json architectures[].
+/// Returns null if architectures is absent or empty.
+/// Caller owns the returned string.
+pub fn readArchitectureName(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    const config_bytes = try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024);
+    defer allocator.free(config_bytes);
+
+    const raw_parsed = json.parseValue(allocator, config_bytes, .{ .max_size_bytes = 256 * 1024 }) catch |err| {
+        return switch (err) {
+            error.InputTooLarge => error.InvalidJson,
+            error.InputTooDeep => error.InvalidJson,
+            error.StringTooLong => error.InvalidJson,
+            error.InvalidJson => error.InvalidJson,
+            error.OutOfMemory => error.OutOfMemory,
+        };
+    };
+    defer raw_parsed.deinit();
+
+    if (raw_parsed.value != .object) return null;
+    const root_obj = raw_parsed.value.object;
+
+    if (root_obj.get("architectures")) |v| {
+        if (v == .array and v.array.items.len > 0) {
+            const first = v.array.items[0];
+            if (first == .string) {
+                return try allocator.dupe(u8, first.string);
             }
         }
     }
@@ -728,14 +675,6 @@ fn initialDff(config_json: JsonConfig) !i32 {
 // Directory-based helpers (handle config.json path joining)
 // =============================================================================
 
-/// Check model architecture from a model directory.
-/// This is a convenience wrapper that joins the directory with "config.json".
-pub fn checkArchitectureFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !ArchitectureCheck {
-    const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
-    defer allocator.free(config_path);
-    return checkArchitecture(allocator, config_path);
-}
-
 /// Load model configuration from a model directory.
 /// This is a convenience wrapper that joins the directory with "config.json".
 pub fn loadConfigFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
@@ -794,7 +733,15 @@ pub const ModelDescription = struct {
     /// Returns a C-compatible description with allocated strings.
     /// Caller must call deinit() to free the strings.
     pub fn fromDir(allocator: std.mem.Allocator, model_dir: []const u8) !Self {
-        const arch_probe = try checkArchitectureFromDir(allocator, model_dir);
+        const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
+        defer allocator.free(config_path);
+
+        const model_type_name = readModelType(allocator, config_path) catch null;
+        defer if (model_type_name) |name| allocator.free(name);
+
+        const architecture_name = readArchitectureName(allocator, config_path) catch null;
+        defer if (architecture_name) |name| allocator.free(name);
+
         const config = try loadConfigFromDir(allocator, model_dir);
 
         // Calculate quant bits from method
@@ -807,7 +754,7 @@ pub const ModelDescription = struct {
 
         // Allocate null-terminated strings for C interop
         var model_type: ?[:0]u8 = null;
-        if (arch_probe.getModelType()) |name| {
+        if (model_type_name) |name| {
             const buf = try allocator.allocSentinel(u8, name.len, 0);
             @memcpy(buf, name);
             model_type = buf;
@@ -815,7 +762,7 @@ pub const ModelDescription = struct {
 
         var architecture: ?[:0]u8 = null;
         errdefer if (model_type) |mt| allocator.free(mt);
-        if (arch_probe.getArchitecture()) |name| {
+        if (architecture_name) |name| {
             const buf = try allocator.allocSentinel(u8, name.len, 0);
             @memcpy(buf, name);
             architecture = buf;
@@ -861,10 +808,6 @@ pub const ModelDescription = struct {
 // =============================================================================
 // Tests
 // =============================================================================
-
-// NOTE: Tests for detectFromModelType and getMLXModelType have been removed.
-// Architecture detection is now handled by graph.detectFromModelType() in the graph registry.
-// See core/src/graph/registry.zig for architecture lookup tests.
 
 test "parseRopeScalingFromObject parses llama3 rope type" {
     var obj = std.json.ObjectMap.init(std.testing.allocator);
@@ -1132,42 +1075,6 @@ test "initialDff falls back to dense intermediate size when MoE is not configure
     try std.testing.expectEqual(@as(i32, 6144), result);
 }
 
-test "ArchitectureCheck.getModelType returns model type when present" {
-    var check = ArchitectureCheck{ .supported = true };
-    const model_type = "llama";
-    @memcpy(check.model_type_buf[0..model_type.len], model_type);
-    check.model_type_len = model_type.len;
-
-    const result = check.getModelType();
-    try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("llama", result.?);
-}
-
-test "ArchitectureCheck.getModelType returns null when not present" {
-    const check = ArchitectureCheck{ .supported = true };
-
-    const result = check.getModelType();
-    try std.testing.expect(result == null);
-}
-
-test "ArchitectureCheck.getArchitecture returns architecture when present" {
-    var check = ArchitectureCheck{ .supported = true };
-    const arch = "LlamaForCausalLM";
-    @memcpy(check.architecture_buf[0..arch.len], arch);
-    check.architecture_len = arch.len;
-
-    const result = check.getArchitecture();
-    try std.testing.expect(result != null);
-    try std.testing.expectEqualStrings("LlamaForCausalLM", result.?);
-}
-
-test "ArchitectureCheck.getArchitecture returns null when not present" {
-    const check = ArchitectureCheck{ .supported = true };
-
-    const result = check.getArchitecture();
-    try std.testing.expect(result == null);
-}
-
 test "readModelType falls back to root model_type when text_config omits it" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1330,12 +1237,3 @@ test "loadConfig parses generic vision fallback fields and image token aliases" 
     try std.testing.expectEqual(@as(i32, 1024), config.vision_max_num_patches);
     try std.testing.expectEqual(@as(i32, 396), config.image_token_id);
 }
-
-// Re-export behavioral types from generation.zig so check_coverage.sh --integration can verify test coverage
-const generation = @import("generation.zig");
-pub const GenerationConfig = generation.GenerationConfig;
-pub const loadGenerationConfig = generation.loadGenerationConfig;
-pub const applyChatTemplate = generation.applyChatTemplate;
-pub const getChatTemplateSource = generation.getChatTemplateSource;
-pub const isEosToken = generation.isEosToken;
-pub const addEosTokenId = generation.addEosTokenId;

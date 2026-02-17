@@ -8,13 +8,14 @@
 
 const std = @import("std");
 const io = @import("../../../io/root.zig");
+const graph_runtime = @import("../../graph_runtime/root.zig");
 const tensor = @import("../../../tensor.zig");
 const log = @import("../../../log.zig");
 
 const fused_qkv_runtime = @import("vision_runtime_fused_qkv.zig");
 const split_qkv_runtime = @import("vision_runtime_split_qkv.zig");
 
-const LoadedModel = io.weights.LoadedModel;
+const LoadedModel = graph_runtime.LoadedModel;
 const SafeTensors = io.safetensors.root.UnifiedSafeTensors;
 
 pub const PrefillVisionImage = fused_qkv_runtime.PrefillVisionImage;

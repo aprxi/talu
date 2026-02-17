@@ -5,8 +5,8 @@
 
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
-const st_loader = @import("../safetensors/root.zig");
-const graph_types = @import("../../graph/types.zig");
+const st_loader = @import("../../io/safetensors/root.zig");
+const graph_types = @import("../types.zig");
 const transforms = @import("transforms.zig");
 const inference_mod = @import("../../inference/root.zig");
 const log = @import("../../log.zig");

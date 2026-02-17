@@ -1,4 +1,4 @@
-//! io/loader integration test module
+//! graph/loader integration test module
 
 const std = @import("std");
 

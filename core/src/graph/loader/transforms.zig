@@ -1,7 +1,6 @@
 //! Weight transform helpers for the model loader.
 //!
 //! Shared routines for orienting weights, dequantizing, and fusing projections.
-//! Kept separate to reuse in both legacy and graph-driven loaders.
 
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
@@ -9,7 +8,7 @@ const dtype = @import("../../dtype.zig");
 const compute = @import("../../compute/root.zig");
 const matmul = compute.ops.matmul;
 const quant_rows = compute.quant.rows;
-const st_loader = @import("../safetensors/root.zig");
+const st_loader = @import("../../io/safetensors/root.zig");
 const log = @import("../../log.zig");
 
 const Tensor = tensor.Tensor;
@@ -976,7 +975,7 @@ test "convertToF32 returns error for empty tensor" {
 
 test "orientWeight transposes f32 weight when needed" {
     const allocator = std.testing.allocator;
-    const writer = @import("../safetensors/writer.zig");
+    const writer = @import("../../io/safetensors/writer.zig");
 
     const tmp_dir_path = "/tmp/test_orient_weight";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -1019,7 +1018,7 @@ test "orientWeight transposes f32 weight when needed" {
 
 test "orientWeight returns untransposed when rows equals expected_in" {
     const allocator = std.testing.allocator;
-    const writer = @import("../safetensors/writer.zig");
+    const writer = @import("../../io/safetensors/writer.zig");
 
     const tmp_dir_path = "/tmp/test_orient_weight_notr";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -1056,7 +1055,7 @@ test "orientWeight returns untransposed when rows equals expected_in" {
 
 test "orientEmbedding converts f16 embedding to f32" {
     const allocator = std.testing.allocator;
-    const writer = @import("../safetensors/writer.zig");
+    const writer = @import("../../io/safetensors/writer.zig");
 
     const tmp_dir_path = "/tmp/test_orient_embed";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -1100,7 +1099,7 @@ test "orientEmbedding converts f16 embedding to f32" {
 
 test "orientEmbedding passes through f32 embedding unchanged" {
     const allocator = std.testing.allocator;
-    const writer = @import("../safetensors/writer.zig");
+    const writer = @import("../../io/safetensors/writer.zig");
 
     const tmp_dir_path = "/tmp/test_orient_embed_f32";
     std.fs.cwd().makeDir(tmp_dir_path) catch {};
@@ -1131,4 +1130,3 @@ test "orientEmbedding passes through f32 embedding unchanged" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), out[3], 1e-6);
 }
-

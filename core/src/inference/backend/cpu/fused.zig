@@ -37,7 +37,7 @@ const Tensor = tensor.Tensor;
 const OwnedTensor = tensor.OwnedTensor;
 const compute = @import("../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const loader = @import("../../../io/root.zig").weights;
+const model_loader = @import("../../model_loader.zig");
 const executor = @import("../../executor/root.zig");
 const Transformer = executor.Transformer;
 const log = @import("../../../log.zig");
@@ -76,7 +76,7 @@ pub const DecodeResult = struct {
 /// Sequences can join/leave at any decode step.
 pub const FusedCpuBackend = struct {
     allocator: std.mem.Allocator,
-    loaded: *loader.LoadedModel,
+    loaded: *model_loader.LoadedModel,
 
     /// Unified transformer for forward pass
     model: executor.Transformer,
@@ -138,7 +138,7 @@ pub const FusedCpuBackend = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        loaded: *loader.LoadedModel,
+        loaded: *model_loader.LoadedModel,
         max_batch_size: usize,
         progress: progress_mod.ProgressContext,
     ) !FusedCpuBackend {

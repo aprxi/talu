@@ -8,7 +8,7 @@ const std = @import("std");
 const log = @import("../../../log.zig");
 const tensor_mod = @import("../../../tensor.zig");
 const Tensor = tensor_mod.Tensor;
-const loader = @import("../../../io/root.zig").weights;
+const model_loader = @import("../../model_loader.zig");
 const dtype_mod = @import("../../../dtype.zig");
 const compute = @import("../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
@@ -181,7 +181,7 @@ fn computeLlama3RopeFreqs(
 
 /// Load model weights as MLX array handles on GPU.
 /// Call once during initialization; reuse weight_handles for the session lifetime.
-pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *loader.LoadedModel) !*WeightHandles {
+pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *model_loader.LoadedModel) !*WeightHandles {
     if (builtin.os.tag != .macos) {
         return error.MLXNotAvailable;
     }
@@ -2573,7 +2573,7 @@ test "quantizedFusedLayout rejects mixed quantization layout" {
 
 /// Helper to create a minimal test LoadedModel with BF16 weights (non-quantized path)
 /// This creates a tiny 1-layer model for testing GPU weight loading
-fn createTestLoadedModel(allocator: std.mem.Allocator) !*loader.LoadedModel {
+fn createTestLoadedModel(allocator: std.mem.Allocator) !*model_loader.LoadedModel {
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_alloc = arena.allocator();
 
@@ -2678,7 +2678,7 @@ fn createTestLoadedModel(allocator: std.mem.Allocator) !*loader.LoadedModel {
     } };
 
     // Create LoadedModel
-    const loaded = try allocator.create(loader.LoadedModel);
+    const loaded = try allocator.create(model_loader.LoadedModel);
     loaded.* = .{
         .arena = arena,
         .config = .{
@@ -2704,7 +2704,7 @@ fn createTestLoadedModel(allocator: std.mem.Allocator) !*loader.LoadedModel {
     return loaded;
 }
 
-fn destroyTestLoadedModel(allocator: std.mem.Allocator, loaded: *loader.LoadedModel) void {
+fn destroyTestLoadedModel(allocator: std.mem.Allocator, loaded: *model_loader.LoadedModel) void {
     loaded.arena.deinit();
     allocator.destroy(loaded);
 }
