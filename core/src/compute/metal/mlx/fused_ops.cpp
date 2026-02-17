@@ -86,6 +86,35 @@ static array apply_runtime_rope_to_tensor(
     return concatenate({rotated, tail}, 3);
 }
 
+// Infer matmul RHS orientation from shape so fused dense ops remain robust across
+// model families and loader conventions.
+static array orient_matmul_rhs(
+    const array& weight,
+    int in_features,
+    std::optional<int> out_features = std::nullopt,
+    bool transpose_when_ambiguous = true
+) {
+    if (weight.ndim() != 2) {
+        throw std::invalid_argument("[dense] expected 2D weight for matmul rhs");
+    }
+    const int rows = weight.shape(0);
+    const int cols = weight.shape(1);
+
+    const bool direct = rows == in_features && (!out_features.has_value() || cols == out_features.value());
+    const bool transposed = cols == in_features && (!out_features.has_value() || rows == out_features.value());
+
+    if (direct && !transposed) {
+        return weight;
+    }
+    if (transposed && !direct) {
+        return transpose(weight);
+    }
+    if (direct && transposed) {
+        return transpose_when_ambiguous ? transpose(weight) : weight;
+    }
+    throw std::invalid_argument("[dense] weight orientation incompatible with matmul shape");
+}
+
 // ============================================================================
 // Fused Attention Block (Quantized)
 // ============================================================================
@@ -588,11 +617,14 @@ void* mlx_lazy_fused_attention_bf16(
             ? (1.0f / std::sqrt(query_pre_attn_scalar))
             : (1.0f / std::sqrt(static_cast<float>(head_dim)));
 
-    // Transpose weights for matmul: [out, in] -> [in, out]
-    auto q_wt = transpose(*static_cast<const array*>(q_w), {1, 0});
-    auto k_wt = transpose(*static_cast<const array*>(k_w), {1, 0});
-    auto v_wt = transpose(*static_cast<const array*>(v_w), {1, 0});
-    auto o_wt = transpose(*static_cast<const array*>(o_w), {1, 0});
+    const int hidden_dim = x.shape(2);
+    const int q_out = static_cast<int>(n_heads * head_dim);
+    const int kv_out = static_cast<int>(n_kv_heads * head_dim);
+
+    auto q_wt = orient_matmul_rhs(*static_cast<const array*>(q_w), hidden_dim, q_out, true);
+    auto k_wt = orient_matmul_rhs(*static_cast<const array*>(k_w), hidden_dim, kv_out, true);
+    auto v_wt = orient_matmul_rhs(*static_cast<const array*>(v_w), hidden_dim, kv_out, true);
+    auto o_wt = orient_matmul_rhs(*static_cast<const array*>(o_w), q_out, hidden_dim, true);
 
     // QKV projections
     auto q = matmul(x, q_wt);
@@ -747,10 +779,11 @@ void* mlx_lazy_fused_ffn_bf16(
     const void* gate_w, const void* up_w, const void* down_w
 ) {
     const auto& x = *static_cast<const array*>(input);
+    const int in_features = x.shape(2);
 
-    auto gate_wt = transpose(*static_cast<const array*>(gate_w), {1, 0});
-    auto up_wt = transpose(*static_cast<const array*>(up_w), {1, 0});
-    auto down_wt = transpose(*static_cast<const array*>(down_w), {1, 0});
+    auto gate_wt = orient_matmul_rhs(*static_cast<const array*>(gate_w), in_features, std::nullopt, true);
+    auto up_wt = orient_matmul_rhs(*static_cast<const array*>(up_w), in_features, gate_wt.shape(1), true);
+    auto down_wt = orient_matmul_rhs(*static_cast<const array*>(down_w), gate_wt.shape(1), in_features, true);
 
     auto gate = matmul(x, gate_wt);
     auto up = matmul(x, up_wt);

@@ -7,7 +7,8 @@ const std = @import("std");
 const sampler = @import("sampling.zig");
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const io = @import("../io/root.zig");
-const Backend = @import("backend/root.zig").Backend;
+const backend_root = @import("backend/root.zig");
+const Backend = backend_root.Backend;
 const log = @import("../log.zig");
 const progress_mod = @import("../capi/progress.zig");
 
@@ -182,7 +183,7 @@ pub const Session = struct {
             err: ?anyerror = null,
 
             fn loadModel(self: *@This()) void {
-                self.result = io.loadModel(self.alloc, self.config_path, self.weights_path, progress_mod.ProgressContext.NONE) catch |e| {
+                self.result = io.loadModel(self.alloc, self.config_path, self.weights_path, backend_root.defaultModelLoadOptions(), progress_mod.ProgressContext.NONE) catch |e| {
                     self.err = e;
                     return;
                 };
@@ -199,7 +200,7 @@ pub const Session = struct {
             // Thread spawn failed - load synchronously instead
             const loaded_model = try allocator.create(io.LoadedModel);
             errdefer allocator.destroy(loaded_model);
-            loaded_model.* = try io.loadModel(allocator, config_path, weights_path, progress_mod.ProgressContext.NONE);
+            loaded_model.* = try io.loadModel(allocator, config_path, weights_path, backend_root.defaultModelLoadOptions(), progress_mod.ProgressContext.NONE);
             errdefer loaded_model.deinit();
 
             var tokenizer_state = if (tokenizer_json) |json|

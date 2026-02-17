@@ -18,7 +18,7 @@ const WeightTransform = graph_types.WeightTransform;
 const WeightMap = inference_mod.backend.block_kernels.WeightMap;
 
 pub const LoadOptions = struct {
-    use_metal_norms: bool = false,
+    preserve_native_norm_dtype: bool = false,
     force_mamba_f32: bool = false,
 };
 
@@ -116,7 +116,7 @@ fn applySpecTransforms(
 
     const force_f32 = hasTransform(spec.transforms, .dtype_f32) or spec.layout == .conv1d_depthwise;
     if (force_f32 or (spec.layout == .none and !isNormModule(spec.module_type))) {
-        if (!(options.use_metal_norms and isNormModule(spec.module_type))) {
+        if (!(options.preserve_native_norm_dtype and isNormModule(spec.module_type))) {
             tensor_view = try transforms.ensureF32(allocator, tensor_view);
             if (spec.layout == .linear and tensor_view.dtype == .f32) {
                 // Grouped-affine weights are converted to F32 after orientWeight().

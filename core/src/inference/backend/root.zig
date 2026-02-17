@@ -60,6 +60,22 @@ pub const metal = if (has_metal) @import("metal/root.zig") else struct {
 /// Default batch size for FusedCpuBackend (supports up to N concurrent sequences)
 const DEFAULT_MAX_BATCH_SIZE: usize = 8;
 
+/// Compute model-load options before backend initialization.
+/// This keeps backend/platform policy out of io/ while preserving fast paths.
+pub fn defaultModelLoadOptions() loader.LoadOptions {
+    return .{
+        .preserve_native_norm_dtype = shouldPreserveNativeNormDType(),
+    };
+}
+
+fn shouldPreserveNativeNormDType() bool {
+    if (std.posix.getenv("BACKEND")) |backend_override| {
+        if (std.mem.eql(u8, backend_override, "cpu")) return false;
+        if (std.mem.eql(u8, backend_override, "metal")) return has_metal;
+    }
+    return has_metal;
+}
+
 /// Backend type - tagged union of available backends
 pub const Backend = union(enum) {
     /// Fused CPU backend for graph ops (production inference)
@@ -330,6 +346,11 @@ test "isMetalSupported rejects mamba models" {
     config.num_experts = 0;
 
     try std.testing.expect(!isMetalSupported(&config, .grouped_affine_u4, true));
+}
+
+test "defaultModelLoadOptions follows platform capability" {
+    const opts = defaultModelLoadOptions();
+    try std.testing.expectEqual(has_metal, opts.preserve_native_norm_dtype);
 }
 
 test "backend selection" {

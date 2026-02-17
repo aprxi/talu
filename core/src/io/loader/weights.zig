@@ -5,7 +5,6 @@
 //! components (QKV, gate/up projections).
 
 const std = @import("std");
-const builtin = @import("builtin");
 const tensor = @import("../../tensor.zig");
 const dtype = @import("../../dtype.zig");
 const compute = @import("../../compute/root.zig");
@@ -35,6 +34,12 @@ const orientWeightF32 = transforms.orientWeightF32;
 const orientWeightTyped = transforms.orientWeightTyped;
 
 const NoHooks = struct {};
+
+pub const LoadOptions = struct {
+    /// Keep native (bf16/f16) norm weight dtype instead of converting to f32.
+    /// The caller decides this policy based on selected runtime/backend.
+    preserve_native_norm_dtype: bool = false,
+};
 
 pub const LoadedModel = struct {
     arena: std.heap.ArenaAllocator,
@@ -113,23 +118,19 @@ pub fn loadModel(
     backing_allocator: std.mem.Allocator,
     config_path: []const u8,
     safetensors_path: []const u8,
+    load_options: LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
-    return loadModelWithHooks(NoHooks, backing_allocator, config_path, safetensors_path, null, progress);
+    return loadModelWithHooks(NoHooks, backing_allocator, config_path, safetensors_path, null, load_options, progress);
 }
 
 /// Environment flags collected once at load time to avoid repeated lookups.
 const LoaderEnvFlags = struct {
     enable_cpu_fusion: bool,
-    force_cpu_backend: bool,
-    use_metal_norms: bool,
 
     fn fromEnvironment(allocator: std.mem.Allocator) LoaderEnvFlags {
-        const force_cpu = if (std.posix.getenv("BACKEND")) |b| std.mem.eql(u8, b, "cpu") else false;
         return .{
             .enable_cpu_fusion = readEnvFlag(allocator, "TALU_CPU_FUSION", true),
-            .force_cpu_backend = force_cpu,
-            .use_metal_norms = builtin.os.tag == .macos and !force_cpu,
         };
     }
 };
@@ -264,6 +265,7 @@ pub fn loadModelWithHooks(
     config_path: []const u8,
     safetensors_path: []const u8,
     runtime_arch: ?*graph.Architecture,
+    model_load_options: LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
     // Collect environment flags once at the start
@@ -447,8 +449,8 @@ pub fn loadModelWithHooks(
             0;
         const layer_rope: ?*ops.RoPE = if (layer_window_size > 0 and rope_local != null) rope_local.? else rope_global;
 
-        const load_options = generic_weights.LoadOptions{
-            .use_metal_norms = env_flags.use_metal_norms,
+        const weight_load_options = generic_weights.LoadOptions{
+            .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
             .force_mamba_f32 = block_type == .mamba,
         };
         var weight_map = try generic_weights.loadWeightMap(
@@ -457,7 +459,7 @@ pub fn loadModelWithHooks(
             specs,
             layer_idx,
             &model_config,
-            load_options,
+            weight_load_options,
         );
 
         // On the first layer with FFN weights, infer d_ff from weight shapes.
@@ -577,7 +579,7 @@ pub fn loadModelWithHooks(
         arch.global_weights,
         0,
         &model_config,
-        .{ .use_metal_norms = env_flags.use_metal_norms },
+        .{ .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype },
     );
 
     const token_embedding_weights = if (global_map.get("token_embeddings")) |weight|

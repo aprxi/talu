@@ -314,17 +314,20 @@ pub const LocalEngine = struct {
         var generation_config = try gen_config_mod.loadGenerationConfig(allocator, resolved_model_path);
         errdefer generation_config.deinit(allocator);
 
+        const model_load_options = backend_root.defaultModelLoadOptions();
+
         // Start model loading in background thread
         const ModelLoaderThread = struct {
             alloc: std.mem.Allocator,
             config_path: []const u8,
             weights_path: []const u8,
+            load_options: io_weights.LoadOptions,
             prog: progress_mod.ProgressContext,
             loaded_model: ?io_weights.LoadedModel = null,
             err: ?anyerror = null,
 
             fn loadModel(self: *@This()) void {
-                self.loaded_model = io.loadModel(self.alloc, self.config_path, self.weights_path, self.prog) catch |e| {
+                self.loaded_model = io.loadModel(self.alloc, self.config_path, self.weights_path, self.load_options, self.prog) catch |e| {
                     self.err = e;
                     return;
                 };
@@ -335,6 +338,7 @@ pub const LocalEngine = struct {
             .alloc = allocator,
             .config_path = model_bundle.config_path(),
             .weights_path = wp,
+            .load_options = model_load_options,
             .prog = progress,
         };
 
@@ -360,7 +364,7 @@ pub const LocalEngine = struct {
             thread.join();
         } else {
             // Thread spawn failed - load synchronously
-            loader_thread_state.loaded_model = try io.loadModel(allocator, model_bundle.config_path(), wp, progress);
+            loader_thread_state.loaded_model = try io.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
         }
 
         if (loader_thread_state.err) |e| return e;

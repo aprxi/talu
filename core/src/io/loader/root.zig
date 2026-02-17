@@ -40,6 +40,7 @@ pub fn loadModel(
     backing_allocator: std.mem.Allocator,
     config_path: []const u8,
     weights_path: []const u8,
+    load_options: weights.LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
     // Ensure graph registry is initialized
@@ -48,7 +49,7 @@ pub fn loadModel(
     // Load architecture definitions from _graphs/ directory
     _ = loadArchitectureDefinitions(backing_allocator);
 
-    return loadSafeTensorsModel(backing_allocator, config_path, weights_path, progress);
+    return loadSafeTensorsModel(backing_allocator, config_path, weights_path, load_options, progress);
 }
 
 /// Thread-safe state for architecture loading.
@@ -173,6 +174,7 @@ fn loadSafeTensorsModel(
     backing_allocator: std.mem.Allocator,
     config_path: []const u8,
     weights_path: []const u8,
+    load_options: weights.LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
     // Detect model kind using graph registry (single source of truth)
@@ -185,6 +187,7 @@ fn loadSafeTensorsModel(
         config_path,
         weights_path,
         model_kind.runtime_arch,
+        load_options,
         progress,
     );
     errdefer loaded_model.deinit();

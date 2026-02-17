@@ -4,37 +4,30 @@
 //! optional format conversion for Metal native norms (BF16/F16 to F32).
 
 const std = @import("std");
-const builtin = @import("builtin");
 
 const tensor = @import("../../tensor.zig");
 const dtype = @import("../../dtype.zig");
 const st_loader = @import("root.zig");
 const st_names = @import("names.zig");
 
-fn shouldUseMetalNativeNorms(allocator: std.mem.Allocator) bool {
-    const force_cpu_backend = if (std.posix.getenv("BACKEND")) |b| std.mem.eql(u8, b, "cpu") else false;
-    _ = allocator;
-    return builtin.os.tag == .macos and !force_cpu_backend;
-}
-
 /// Try to load a 1D RMSNorm/QKNorm weight vector.
 /// Returns a heap-allocated `*tensor.Tensor` owned by the caller's allocator.
 ///
-/// - If `use_metal_norms` is true, returns the safetensors view (bf16/f16) directly.
+/// - If `preserve_native_norm_dtype` is true, returns the safetensors view (bf16/f16) directly.
 /// - Otherwise, converts bf16/f16 to f32 into an owned buffer for CPU kernels.
 fn tryLoadNormWeightLayer(
     allocator: std.mem.Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,
     layer_idx: usize,
     comptime options: anytype,
-    use_metal_norms: bool,
+    preserve_native_norm_dtype: bool,
 ) ?*tensor.Tensor {
     var name_buffer: [128]u8 = undefined;
     const tensor_name = st_names.selectNameLayer(safetensors, name_buffer[0..], layer_idx, options) catch return null;
     const tensor_view = safetensors.getTensor(tensor_name, null) catch return null;
 
     const tensor_ptr = allocator.create(tensor.Tensor) catch return null;
-    if (use_metal_norms) {
+    if (preserve_native_norm_dtype) {
         tensor_ptr.* = tensor_view;
         return tensor_ptr;
     }

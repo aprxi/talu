@@ -229,7 +229,7 @@ pub fn main() !void {
     var model_bundle = try io.repository.resolve(allocator, args.model_path, .{});
     defer model_bundle.deinit();
 
-    var loaded = try io.loadModel(allocator, model_bundle.config_path(), model_bundle.weights_path() orelse return error.WeightsNotFound, progress_mod.ProgressContext.NONE);
+    var loaded = try io.loadModel(allocator, model_bundle.config_path(), model_bundle.weights_path() orelse return error.WeightsNotFound, .{}, progress_mod.ProgressContext.NONE);
     defer loaded.deinit();
 
     // Initialize tokenizer

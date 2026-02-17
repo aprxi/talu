@@ -435,7 +435,14 @@ void mlx_dense_model_set_layer(
         auto q_t = orient_matmul_rhs(*static_cast<const array*>(q_proj), fused_model->hidden_dim, std::nullopt, true);
         auto k_t = orient_matmul_rhs(*static_cast<const array*>(k_proj), fused_model->hidden_dim, std::nullopt, true);
         auto v_t = orient_matmul_rhs(*static_cast<const array*>(v_proj), fused_model->hidden_dim, std::nullopt, true);
-        layer.o_proj = orient_matmul_rhs(*static_cast<const array*>(o_proj), fused_model->hidden_dim, std::nullopt, true);
+        // GQA models can have attention output width (n_heads * head_dim)
+        // different from hidden_dim. Orient o_proj using the actual Q width.
+        layer.o_proj = orient_matmul_rhs(
+            *static_cast<const array*>(o_proj),
+            q_t.shape(1),
+            fused_model->hidden_dim,
+            true
+        );
         q_t = to_fast_metal_dtype(q_t);
         k_t = to_fast_metal_dtype(k_t);
         v_t = to_fast_metal_dtype(v_t);
