@@ -1,6 +1,6 @@
 import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
-import { api, notifications, getModelsService } from "./deps.ts";
+import { api, notifications, getModelsService, menus } from "./deps.ts";
 import { renderTranscriptHeader, renderTranscript } from "../../render/transcript.ts";
 import { renderEmptyState, renderLoadingSpinner } from "../../render/common.ts";
 import { showInputBar, hideWelcome, hideInputBar } from "./welcome.ts";
@@ -50,6 +50,7 @@ export function renderChatView(chat: Conversation): void {
   dom.transcriptContainer.appendChild(header);
 
   setupHeaderEvents(header, chat.id);
+  activateMenuSlot(header);
 
   layout.setTitle(chat.title || "Untitled");
 
@@ -86,4 +87,11 @@ export function ensureChatHeader(chat: Conversation): void {
   const header = renderTranscriptHeader(chat, { displayModel });
   tc.insertBefore(header, tc.firstChild);
   setupHeaderEvents(header, chat.id);
+  activateMenuSlot(header);
+}
+
+/** Activate contributed menu items in the transcript header's slot anchor. */
+function activateMenuSlot(header: HTMLElement): void {
+  const slot = header.querySelector<HTMLElement>('[data-slot="chat:transcript-actions"]');
+  if (slot) menus.renderSlot("chat:transcript-actions", slot);
 }

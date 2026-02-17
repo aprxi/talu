@@ -17,6 +17,7 @@ import type {
   FormatAccess,
   UploadAccess,
   HookPipeline,
+  MenuAccess,
 } from "../../kernel/types.ts";
 
 export let api: ApiClient;
@@ -31,6 +32,7 @@ export let observe: ManagedObservers;
 export let format: FormatAccess;
 export let upload: UploadAccess;
 export let hooks: HookPipeline;
+export let menus: MenuAccess;
 
 export function initChatDeps(deps: {
   api: ApiClient;
@@ -45,6 +47,7 @@ export function initChatDeps(deps: {
   format: FormatAccess;
   upload: UploadAccess;
   hooks: HookPipeline;
+  menus: MenuAccess;
 }): void {
   api = deps.api;
   notifications = deps.notifications;
@@ -58,6 +61,7 @@ export function initChatDeps(deps: {
   format = deps.format;
   upload = deps.upload;
   hooks = deps.hooks;
+  menus = deps.menus;
 }
 
 export function getModelsService(): ModelsService | undefined {

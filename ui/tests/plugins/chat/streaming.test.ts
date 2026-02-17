@@ -101,6 +101,10 @@ beforeEach(() => {
     timers: mockTimers(),
     observe: {} as any,
     format: {} as any,
+    menus: {
+      registerItem: () => ({ dispose() {} }),
+      renderSlot: () => ({ dispose() {} }),
+    } as any,
   });
 });
 

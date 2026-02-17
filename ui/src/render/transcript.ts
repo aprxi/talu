@@ -280,6 +280,11 @@ export function renderTranscriptHeader(chat: Conversation, options?: HeaderOptio
   tuningBtn.dataset["action"] = "toggle-tuning";
   actions.appendChild(tuningBtn);
 
+  // Slot for contributed menu items.
+  const menuSlot = el("div", "menu-slot");
+  menuSlot.dataset["slot"] = "chat:transcript-actions";
+  actions.appendChild(menuSlot);
+
   row.appendChild(actions);
   container.appendChild(row);
 

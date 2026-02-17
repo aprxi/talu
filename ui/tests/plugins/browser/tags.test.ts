@@ -62,6 +62,10 @@ beforeEach(() => {
     } as any,
     download: {} as any,
     timers: mockTimers(),
+    menus: {
+      registerItem: () => ({ dispose() {} }),
+      renderSlot: () => ({ dispose() {} }),
+    } as any,
   });
 });
 

@@ -57,6 +57,10 @@ beforeEach(() => {
     } as any,
     download: {} as any,
     timers: ct.timers,
+    menus: {
+      registerItem: () => ({ dispose() {} }),
+      renderSlot: () => ({ dispose() {} }),
+    } as any,
   });
 });
 

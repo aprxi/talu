@@ -204,6 +204,39 @@ describe("validateManifest", () => {
     expect(result.errors.some((e) => e.includes("statusBarItems"))).toBe(true);
   });
 
+  test("empty menus id → error", () => {
+    const result = validateManifest(
+      builtinManifest({ contributes: { menus: [{ id: "", slot: "toolbar", label: "M", command: "cmd" }] } }),
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("menus") && e.includes("id"))).toBe(true);
+  });
+
+  test("empty menus slot → error", () => {
+    const result = validateManifest(
+      builtinManifest({ contributes: { menus: [{ id: "m", slot: "", label: "M", command: "cmd" }] } }),
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("menus") && e.includes("slot"))).toBe(true);
+  });
+
+  test("empty menus command → error", () => {
+    const result = validateManifest(
+      builtinManifest({ contributes: { menus: [{ id: "m", slot: "toolbar", label: "M", command: "" }] } }),
+    );
+    expect(result.valid).toBe(false);
+    expect(result.errors.some((e) => e.includes("menus") && e.includes("command"))).toBe(true);
+  });
+
+  test("valid menus contribution → OK", () => {
+    const result = validateManifest(
+      builtinManifest({
+        contributes: { menus: [{ id: "action", slot: "chat:toolbar", label: "Action", command: "p.run" }] },
+      }),
+    );
+    expect(result.valid).toBe(true);
+  });
+
   test("valid contributes → OK", () => {
     const result = validateManifest(
       builtinManifest({
@@ -212,6 +245,7 @@ describe("validateManifest", () => {
           commands: [{ id: "run", label: "Run" }],
           tools: [{ id: "calc", description: "Calculator" }],
           statusBarItems: [{ id: "status", label: "Status" }],
+          menus: [{ id: "action", slot: "toolbar", label: "Action", command: "run" }],
         },
       }),
     );

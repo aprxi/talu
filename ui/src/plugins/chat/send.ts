@@ -1,6 +1,6 @@
 import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
-import { api, notifications, getModelsService, getPromptsService } from "./deps.ts";
+import { api, hooks, notifications, getModelsService, getPromptsService } from "./deps.ts";
 import { getSamplingParams } from "./panel-params.ts";
 import { refreshSidebar } from "./sidebar-list.ts";
 import { setInputEnabled, showInputBar, hideWelcome } from "./welcome.ts";
@@ -75,7 +75,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   let userCancelled = false;
   let usageStats: UsageStats | null = null;
   try {
-    const requestBody: CreateResponseRequest = {
+    let requestBody: CreateResponseRequest = {
       model: getModelsService()?.getActiveModel() ?? "",
       input: opts.text,
       previous_response_id: chatState.lastResponseId,
@@ -83,6 +83,17 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       prompt_id: opts.promptId ?? undefined,
       ...getSamplingParams(),
     };
+
+    // Run chat.send.before hook — plugins can modify the request or block it.
+    const hookResult = await hooks.run<CreateResponseRequest>("chat.send.before", requestBody);
+    if (hookResult && typeof hookResult === "object" && "$block" in hookResult) {
+      notifications.warning((hookResult as { reason: string }).reason ?? "Send blocked by plugin");
+      chatState.isGenerating = false;
+      chatState.streamAbort = null;
+      setInputEnabled(true);
+      return;
+    }
+    requestBody = hookResult as CreateResponseRequest;
 
     const resp = await api.createResponse(requestBody, chatState.streamAbort.signal);
 
@@ -124,9 +135,14 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   if (chatState.activeSessionId) {
     const updated = await api.getConversation(chatState.activeSessionId);
     if (updated.ok && updated.data) {
-      chatState.activeChat = updated.data;
-      opts.afterResponse?.(updated.data);
-      addAssistantActionButtons(wrapper, updated.data, usageStats);
+      // Run chat.receive.after hook — plugins can inspect/transform the response.
+      const afterResult = await hooks.run<Conversation>("chat.receive.after", updated.data);
+      const conversation = (afterResult && typeof afterResult === "object" && "$block" in afterResult)
+        ? updated.data // Ignore $block on receive — the response already happened.
+        : afterResult as Conversation;
+      chatState.activeChat = conversation;
+      opts.afterResponse?.(conversation);
+      addAssistantActionButtons(wrapper, conversation, usageStats);
     }
   }
 

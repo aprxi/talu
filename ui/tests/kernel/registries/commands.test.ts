@@ -1,14 +1,18 @@
 import { describe, test, expect, spyOn, beforeEach, afterEach } from "bun:test";
 import { CommandRegistryImpl } from "../../../src/kernel/registries/commands.ts";
+import { ContextKeyService } from "../../../src/kernel/registries/context-keys.ts";
 
+let contextKeys: ContextKeyService;
 let registry: CommandRegistryImpl;
 
 beforeEach(() => {
-  registry = new CommandRegistryImpl();
+  contextKeys = new ContextKeyService();
+  registry = new CommandRegistryImpl(contextKeys);
 });
 
 afterEach(() => {
   registry.dispose();
+  contextKeys.dispose();
 });
 
 describe("CommandRegistryImpl", () => {
@@ -93,5 +97,35 @@ describe("CommandRegistryImpl", () => {
     registry.registerScoped("p", "p.b", () => {});
     registry.dispose();
     expect(registry.getAll()).toHaveLength(0);
+  });
+
+  test("when-clause: bare key truthy when context key is set", () => {
+    let called = false;
+    contextKeys.set("isEditing", true);
+    registry.registerScoped("p", "p.cmd", () => { called = true; }, {
+      when: "isEditing",
+    });
+    expect(registry.execute("p.cmd")).toBe(true);
+    expect(called).toBe(true);
+  });
+
+  test("when-clause: !key blocks when key is truthy", () => {
+    let called = false;
+    contextKeys.set("isEditing", true);
+    registry.registerScoped("p", "p.cmd", () => { called = true; }, {
+      when: "!isEditing",
+    });
+    expect(registry.execute("p.cmd")).toBe(false);
+    expect(called).toBe(false);
+  });
+
+  test("when-clause: arbitrary key == 'value' via context keys", () => {
+    let called = false;
+    contextKeys.set("activeMode", "dark");
+    registry.registerScoped("p", "p.cmd", () => { called = true; }, {
+      when: "activeMode == 'dark'",
+    });
+    expect(registry.execute("p.cmd")).toBe(true);
+    expect(called).toBe(true);
   });
 });

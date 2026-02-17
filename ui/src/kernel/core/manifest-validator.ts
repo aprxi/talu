@@ -25,6 +25,7 @@ export const KNOWN_PERMISSIONS = new Set([
   "upload",     // ctx.upload — file upload/download APIs
   "hooks",      // ctx.hooks — intercept/transform kernel operations
   "tools",      // ctx.tools — register LLM-callable tools
+  "menus",      // ctx.menus.registerItem — contribute UI actions to slots
 ]);
 
 const MAX_NAME = 64;
@@ -133,6 +134,16 @@ export function validateManifest(manifest: PluginManifest): ManifestValidationRe
     for (const item of manifest.contributes.statusBarItems) {
       if (!item.id) result.errors.push("contributes.statusBarItems[].id must be non-empty");
       checkString(item.label, `contributes.statusBarItems[${item.id}].label`, MAX_LABEL, false, result);
+    }
+  }
+
+  // Contributed menus.
+  if (manifest.contributes?.menus) {
+    for (const item of manifest.contributes.menus) {
+      if (!item.id) result.errors.push("contributes.menus[].id must be non-empty");
+      if (!item.slot) result.errors.push("contributes.menus[].slot must be non-empty");
+      if (!item.command) result.errors.push("contributes.menus[].command must be non-empty");
+      checkString(item.label, `contributes.menus[${item.id}].label`, MAX_LABEL, false, result);
     }
   }
 

@@ -84,6 +84,7 @@ export function mockNotifications(): {
       info: (msg: string) => messages.push({ type: "info", msg }),
       error: (msg: string) => messages.push({ type: "error", msg }),
       warn: (msg: string) => messages.push({ type: "warn", msg }),
+      warning: (msg: string) => messages.push({ type: "warning", msg }),
       success: (msg: string) => messages.push({ type: "success", msg }),
     } as Notifications & { success(msg: string): void },
   };

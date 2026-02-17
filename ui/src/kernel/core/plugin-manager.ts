@@ -29,6 +29,9 @@ import { partitionByActivation, topologicalSort, parseActivationEvent, type Plug
 import { verifyIntegrity } from "../security/integrity.ts";
 import { ModeManager } from "../ui/mode-manager.ts";
 import { NetworkConnectivity } from "../system/network.ts";
+import { ContextKeyService } from "../registries/context-keys.ts";
+import { MenuRegistry } from "../registries/menus.ts";
+import { installFocusTracking } from "../ui/focus.ts";
 import { restoreThemeSync } from "../../styles/theme.ts";
 import { BUILTIN_SCHEMES } from "../../styles/color-schemes.ts";
 import { setupThemePicker } from "../ui/theme-picker.ts";
@@ -162,6 +165,10 @@ class PluginManager {
     // Register manifest-declared status bar items.
     const statusBarDisposable = this.infra.statusBarManager.registerFromManifest(id, definition.manifest);
     disposables.track(statusBarDisposable);
+
+    // Register manifest-declared menu contributions.
+    const menuDisposable = this.infra.menuRegistry.registerFromManifest(id, definition.manifest);
+    disposables.track(menuDisposable);
 
     // Call register() in error boundary. Must be synchronous.
     const result = errorBoundary(id, () => definition.register(ctx));
@@ -408,7 +415,9 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
   const serviceRegistry = new ServiceRegistry(eventBus);
   const hookPipeline = new HookPipelineImpl();
   const toolRegistry = new ToolRegistryImpl(hookPipeline);
-  const commandRegistry = new CommandRegistryImpl();
+  const contextKeys = new ContextKeyService();
+  const commandRegistry = new CommandRegistryImpl(contextKeys);
+  const menuRegistry = new MenuRegistry(contextKeys, commandRegistry);
   const themeAccess = new ThemeAccessImpl();
   themeAccess.registerBuiltinSchemes(BUILTIN_SCHEMES);
   const popoverManager = new PopoverManager();
@@ -431,6 +440,8 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
     viewManager,
     modeManager,
     networkConnectivity,
+    contextKeys,
+    menuRegistry,
   };
 
   // Load persisted keybinding overrides before plugin registration.
@@ -442,12 +453,13 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
   kernelDisposables.track(installSensitiveApiInterception());
   kernelDisposables.track(freezeIntrinsics());
   kernelDisposables.track(installGlobalEscapeHandler());
+  kernelDisposables.track(installFocusTracking(contextKeys));
 
   // Kernel UI chrome.
   setupAccessibility();
   kernelDisposables.track(setupThemePicker(themeAccess));
   initProvenance();
-  const paletteHandle = installCommandPalette(commandRegistry);
+  const paletteHandle = installCommandPalette(commandRegistry, contextKeys);
   kernelDisposables.track(paletteHandle);
   setProvenanceAction(() => paletteHandle.open());
 

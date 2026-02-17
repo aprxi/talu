@@ -6,6 +6,8 @@ import { ServiceRegistry } from "../../../src/kernel/registries/services.ts";
 import { HookPipelineImpl } from "../../../src/kernel/registries/hooks.ts";
 import { ToolRegistryImpl } from "../../../src/kernel/registries/tools.ts";
 import { CommandRegistryImpl } from "../../../src/kernel/registries/commands.ts";
+import { ContextKeyService } from "../../../src/kernel/registries/context-keys.ts";
+import { MenuRegistry } from "../../../src/kernel/registries/menus.ts";
 import { ThemeAccessImpl } from "../../../src/kernel/ui/theme.ts";
 import { PopoverManager } from "../../../src/kernel/ui/popover.ts";
 import { RendererRegistryImpl } from "../../../src/kernel/registries/renderers.ts";
@@ -17,12 +19,16 @@ import type { PluginManifest } from "../../../src/kernel/types.ts";
 
 function makeInfra(): KernelInfrastructure {
   const eventBus = new EventBusImpl();
+  const contextKeys = new ContextKeyService();
+  const commandRegistry = new CommandRegistryImpl(contextKeys);
   return {
     eventBus,
     serviceRegistry: new ServiceRegistry(),
     hookPipeline: new HookPipelineImpl(),
     toolRegistry: new ToolRegistryImpl(),
-    commandRegistry: new CommandRegistryImpl(),
+    commandRegistry,
+    contextKeys,
+    menuRegistry: new MenuRegistry(contextKeys, commandRegistry),
     themeAccess: new ThemeAccessImpl(),
     popoverManager: new PopoverManager(),
     rendererRegistry: new RendererRegistryImpl(),
@@ -195,6 +201,25 @@ describe("createPluginContext — permission gates", () => {
     })).toThrow(/tools/);
   });
 
+  test("third-party without 'menus' permission → throws on registerItem", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
+    expect(() => ctx.menus.registerItem("toolbar", { id: "btn", label: "Btn", command: "cmd" })).toThrow(/menus/);
+  });
+
+  test("third-party with 'menus' permission → registerItem allowed", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest(["menus"]), document.createElement("div"), infra, disposables, new AbortController());
+    expect(() => ctx.menus.registerItem("toolbar", { id: "btn", label: "Btn", command: "cmd" })).not.toThrow();
+  });
+
+  test("third-party without 'menus' permission → renderSlot still allowed", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
+    const container = document.createElement("div");
+    expect(() => ctx.menus.renderSlot("toolbar", container)).not.toThrow();
+  });
+
   test("third-party without 'download' permission → throws on save", () => {
     const disposables = new DisposableStore();
     const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
@@ -333,5 +358,84 @@ describe("createPluginContext — subsystem wiring", () => {
     const disposables = new DisposableStore();
     const ctx = createPluginContext(builtinManifest(), document.createElement("div"), infra, disposables, new AbortController());
     expect(ctx.status.isBusy).toBe(false);
+  });
+});
+
+describe("createPluginContext — context access", () => {
+  let infra: KernelInfrastructure;
+
+  beforeEach(() => {
+    document.body.innerHTML = `<div id="status-bar"></div>`;
+    infra = makeInfra();
+  });
+
+  test("context.set namespaces key with plugin ID", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(builtinManifest({ id: "talu.chat" }), document.createElement("div"), infra, disposables, new AbortController());
+    ctx.context.set("isReady", true);
+    expect(infra.contextKeys.get("talu.chat.isReady")).toBe(true);
+  });
+
+  test("context.get reads any key unrestricted", () => {
+    const disposables = new DisposableStore();
+    infra.contextKeys.set("focusedView", "chat");
+    const ctx = createPluginContext(builtinManifest(), document.createElement("div"), infra, disposables, new AbortController());
+    expect(ctx.context.get("focusedView")).toBe("chat");
+  });
+
+  test("context.delete only deletes own-namespaced keys", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(builtinManifest({ id: "talu.chat" }), document.createElement("div"), infra, disposables, new AbortController());
+    ctx.context.set("flag", true);
+    expect(infra.contextKeys.has("talu.chat.flag")).toBe(true);
+    ctx.context.delete("flag");
+    expect(infra.contextKeys.has("talu.chat.flag")).toBe(false);
+  });
+
+  test("context.has checks key existence", () => {
+    const disposables = new DisposableStore();
+    infra.contextKeys.set("focusedView", "chat");
+    const ctx = createPluginContext(builtinManifest(), document.createElement("div"), infra, disposables, new AbortController());
+    expect(ctx.context.has("focusedView")).toBe(true);
+    expect(ctx.context.has("nonexistent")).toBe(false);
+  });
+
+  test("context.onChange subscribes to key changes", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(builtinManifest(), document.createElement("div"), infra, disposables, new AbortController());
+    let received: unknown;
+    ctx.context.onChange("focusedView", (_k, v) => { received = v; });
+    infra.contextKeys.set("focusedView", "files");
+    expect(received).toBe("files");
+  });
+});
+
+describe("createPluginContext — menus access", () => {
+  let infra: KernelInfrastructure;
+
+  beforeEach(() => {
+    document.body.innerHTML = `<div id="status-bar"></div>`;
+    infra = makeInfra();
+  });
+
+  test("menus.registerItem registers item with namespaced ID", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(builtinManifest({ id: "talu.chat" }), document.createElement("div"), infra, disposables, new AbortController());
+    // Register a command first.
+    infra.commandRegistry.registerScoped("talu.chat", "talu.chat.action", () => {});
+    ctx.menus.registerItem("chat:toolbar", { id: "action", label: "Action", command: "talu.chat.action" });
+    const items = infra.menuRegistry.getItems("chat:toolbar");
+    expect(items).toHaveLength(1);
+    expect(items[0].id).toBe("talu.chat.action");
+  });
+
+  test("menus.renderSlot renders items into container", () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(builtinManifest({ id: "talu.chat" }), document.createElement("div"), infra, disposables, new AbortController());
+    infra.commandRegistry.registerScoped("talu.chat", "talu.chat.run", () => {});
+    infra.menuRegistry.registerItem("talu.chat", { id: "run", slot: "test:slot", label: "Run", command: "talu.chat.run" });
+    const container = document.createElement("div");
+    ctx.menus.renderSlot("test:slot", container);
+    expect(container.querySelector(".menu-slot-btn")).not.toBeNull();
   });
 });

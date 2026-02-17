@@ -5,6 +5,9 @@
  * element across nested shadow boundaries.
  */
 
+import type { Disposable } from "../types.ts";
+import type { ContextKeyService } from "../registries/context-keys.ts";
+
 /**
  * Get the deepest actively focused element, traversing shadow roots.
  * Returns the innermost focused element, or null if nothing is focused.
@@ -96,4 +99,26 @@ export function restoreFocus(viewId: string, defaultSelector?: string): void {
     );
     first?.focus();
   }
+}
+
+/**
+ * Install push-based focus tracking. Updates the "focusedView" context key
+ * whenever focus moves between plugin views. Seeds the initial value at
+ * install time.
+ */
+export function installFocusTracking(contextKeys: ContextKeyService): Disposable {
+  const handler = () => {
+    const viewId = getFocusedViewId() ?? "";
+    contextKeys.set("focusedView", viewId);
+  };
+
+  // Seed initial value.
+  handler();
+
+  document.addEventListener("focusin", handler);
+  return {
+    dispose: () => {
+      document.removeEventListener("focusin", handler);
+    },
+  };
 }

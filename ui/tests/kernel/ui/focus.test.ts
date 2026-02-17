@@ -4,7 +4,9 @@ import {
   getFocusedViewId,
   saveFocus,
   restoreFocus,
+  installFocusTracking,
 } from "../../../src/kernel/ui/focus.ts";
+import { ContextKeyService } from "../../../src/kernel/registries/context-keys.ts";
 
 describe("getDeepActiveElement", () => {
   beforeEach(() => {
@@ -115,5 +117,30 @@ describe("saveFocus + restoreFocus", () => {
 
   test("restoreFocus does not throw for missing view", () => {
     expect(() => restoreFocus("nonexistent")).not.toThrow();
+  });
+});
+
+describe("installFocusTracking", () => {
+  let contextKeys: ContextKeyService;
+
+  beforeEach(() => {
+    document.body.innerHTML = "";
+    contextKeys = new ContextKeyService();
+  });
+
+  test("seeds focusedView on install", () => {
+    const d = installFocusTracking(contextKeys);
+    // No plugin host focused — should be "".
+    expect(contextKeys.get("focusedView")).toBe("");
+    d.dispose();
+  });
+
+  test("dispose removes the focusin listener", () => {
+    const d = installFocusTracking(contextKeys);
+    d.dispose();
+    // After dispose, manually set a value and dispatch focusin — should NOT overwrite.
+    contextKeys.set("focusedView", "manually-set");
+    document.dispatchEvent(new Event("focusin", { bubbles: true }));
+    expect(contextKeys.get("focusedView")).toBe("manually-set");
   });
 });

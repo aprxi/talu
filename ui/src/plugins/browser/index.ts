@@ -60,6 +60,7 @@ export const browserPlugin: PluginDefinition = {
       chatService,
       download: ctx.download,
       timers: ctx.timers,
+      menus: ctx.menus,
     });
 
     ctx.services.provide("talu.sessions", {
@@ -71,6 +72,12 @@ export const browserPlugin: PluginDefinition = {
     buildBrowserDOM(ctx.container);
     initBrowserDom(ctx.container);
     wireEvents();
+
+    // Activate contributed menu slot in the toolbar.
+    const toolbarSlot = ctx.container.querySelector<HTMLElement>('[data-slot="browser:toolbar"]');
+    if (toolbarSlot) {
+      ctx.subscriptions.add(ctx.menus.renderSlot("browser:toolbar", toolbarSlot));
+    }
 
     ctx.events.on<{ to: string }>("mode.changed", ({ to }) => {
       if (to === "conversations") {

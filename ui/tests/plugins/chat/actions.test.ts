@@ -118,6 +118,10 @@ beforeEach(() => {
       date: () => "", dateTime: () => "", relativeTime: () => "",
       duration: () => "", number: () => "",
     } as any,
+    menus: {
+      registerItem: () => ({ dispose() {} }),
+      renderSlot: () => ({ dispose() {} }),
+    } as any,
   });
 });
 
@@ -215,6 +219,10 @@ describe("handleChatCopy", () => {
       timers: { setTimeout: () => ({ dispose() {} }), setInterval: () => ({ dispose() {} }), requestAnimationFrame: (fn: () => void) => { fn(); return { dispose() {} }; } } as any,
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
     });
     await handleChatCopy();
     expect(notif.messages.some((m) => m.type === "error" && m.msg.includes("copy"))).toBe(true);

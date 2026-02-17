@@ -39,6 +39,15 @@ export interface PluginManifest {
       alignment?: "left" | "right";
       priority?: number;
     }[];
+    menus?: {
+      id: string;
+      slot: string;
+      label: string;
+      icon?: string;
+      command: string;
+      when?: string;
+      priority?: number;
+    }[];
     tools?: {
       id: string;
       description: string;
@@ -129,6 +138,8 @@ export interface PluginContext {
   readonly clipboard: ClipboardAccess;
   readonly download: DownloadAccess;
   readonly upload: UploadAccess;
+  readonly context: ContextAccess;
+  readonly menus: MenuAccess;
 
 }
 
@@ -388,4 +399,37 @@ export interface UploadAccess {
   get(fileId: string): Promise<UploadFileReference>;
   delete(fileId: string): Promise<void>;
   getContent(fileId: string): Promise<Blob>;
+}
+
+// --- Context Access ---
+
+export type ContextValue = string | boolean;
+
+export interface ContextAccess {
+  /** Set a context key (auto-namespaced with plugin ID for writes). */
+  set(key: string, value: ContextValue): Disposable;
+  /** Get any context key value (reads are unrestricted). */
+  get(key: string): ContextValue | undefined;
+  /** Delete a context key (only own-namespaced keys). */
+  delete(key: string): void;
+  /** Check if a context key exists. */
+  has(key: string): boolean;
+  /** Subscribe to changes on a specific key. */
+  onChange(key: string, callback: (key: string, value: ContextValue | undefined) => void): Disposable;
+}
+
+// --- Menu Access ---
+
+export interface MenuAccess {
+  /** Register a menu item into a named slot (id auto-namespaced with plugin ID). */
+  registerItem(slot: string, item: {
+    id: string;
+    label: string;
+    icon?: string;
+    command: string;
+    when?: string;
+    priority?: number;
+  }): Disposable;
+  /** Render contributed menu items for a slot. Re-renders reactively when items change. */
+  renderSlot(slot: string, container: HTMLElement): Disposable;
 }

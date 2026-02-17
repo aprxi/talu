@@ -8,6 +8,8 @@ import type {
   EventBus,
   StorageAccess,
   UploadAccess,
+  ContextAccess,
+  MenuAccess,
 } from "../types.ts";
 import type { DisposableStore } from "./disposable.ts";
 import type { EventBusImpl } from "../system/event-bus.ts";
@@ -36,6 +38,8 @@ import { resolveKeybinding } from "../registries/keybindings.ts";
 import type { StatusBarManager } from "../ui/status-bar.ts";
 import type { ViewManager } from "../ui/view-manager.ts";
 import type { ModeManager } from "../ui/mode-manager.ts";
+import type { ContextKeyService } from "../registries/context-keys.ts";
+import type { MenuRegistry } from "../registries/menus.ts";
 import { createApiClient } from "../../api.ts";
 
 /** Shared kernel infrastructure passed to all plugin contexts. */
@@ -52,6 +56,8 @@ export interface KernelInfrastructure {
   viewManager: ViewManager;
   modeManager: ModeManager;
   networkConnectivity: NetworkConnectivity;
+  contextKeys: ContextKeyService;
+  menuRegistry: MenuRegistry;
 }
 
 export function createPluginContext(
@@ -207,6 +213,23 @@ export function createPluginContext(
     },
   };
 
+  const context: ContextAccess = {
+    set: (key, value) => infra.contextKeys.set(namespacedId(pluginId, key), value),
+    get: (key) => infra.contextKeys.get(key),
+    delete: (key) => infra.contextKeys.delete(namespacedId(pluginId, key)),
+    has: (key) => infra.contextKeys.has(key),
+    onChange: (key, callback) => infra.contextKeys.onChange(key, callback),
+  };
+
+  const menus: MenuAccess = {
+    registerItem: (slot, item) => {
+      requirePermission("menus");
+      validateLocalId(pluginId, item.id, isBuiltin);
+      return infra.menuRegistry.registerItem(pluginId, { ...item, slot });
+    },
+    renderSlot: (slot, container) => infra.menuRegistry.renderSlot(slot, container),
+  };
+
   // --- Composed EventBus with global event support ---
 
   const events: EventBus = {
@@ -291,6 +314,8 @@ export function createPluginContext(
       },
     },
     upload: uploadAccess,
+    context,
+    menus,
   };
 
   return Object.freeze(ctx);

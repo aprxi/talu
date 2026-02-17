@@ -59,6 +59,7 @@ export function buildBrowserDOM(root: HTMLElement): void {
             <button id="bp-delete" class="btn btn-danger btn-sm" disabled>Delete</button>
           </div>
           <button id="bp-cancel" class="btn btn-ghost btn-sm hidden">Cancel</button>
+          <div data-slot="browser:toolbar" class="menu-slot"></div>
           <div class="flex-1"></div>
         </div>
 

@@ -90,6 +90,10 @@ beforeEach(() => {
       date: () => "", dateTime: () => "", relativeTime: () => "1h ago",
       duration: () => "", number: () => "",
     } as any,
+    menus: {
+      registerItem: () => ({ dispose() {} }),
+      renderSlot: () => ({ dispose() {} }),
+    } as any,
   });
 });
 
@@ -196,6 +200,10 @@ describe("loadSessions", () => {
       timers: { setTimeout(fn: () => void) { fn(); return { dispose() {} }; }, setInterval() { return { dispose() {} }; }, requestAnimationFrame(fn: () => void) { fn(); return { dispose() {} }; } } as any,
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
     });
 
     await loadSessions();

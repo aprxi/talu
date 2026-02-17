@@ -7,7 +7,7 @@
  */
 
 import type { Disposable, CommandRegistry } from "../types.ts";
-import { getFocusedViewId } from "../ui/focus.ts";
+import type { ContextKeyService } from "./context-keys.ts";
 import { resolveAlias } from "../core/alias.ts";
 
 interface CommandEntry {
@@ -22,8 +22,10 @@ interface CommandEntry {
 export class CommandRegistryImpl implements CommandRegistry {
   private commands = new Map<string, CommandEntry>();
   private keyHandler: ((e: KeyboardEvent) => void) | null = null;
+  private contextKeys: ContextKeyService;
 
-  constructor() {
+  constructor(contextKeys: ContextKeyService) {
+    this.contextKeys = contextKeys;
     this.installKeyHandler();
   }
 
@@ -108,26 +110,7 @@ export class CommandRegistryImpl implements CommandRegistry {
   }
 
   private matchesWhen(when?: string): boolean {
-    if (!when) return true;
-
-    const focusedView = getFocusedViewId() ?? "";
-
-    // Parse simple expressions: key == 'value' or key != 'value'
-    const eqMatch = when.match(/^(\w+)\s*==\s*'([^']*)'$/);
-    if (eqMatch) {
-      const [, key, value] = eqMatch;
-      if (key === "focusedView") return focusedView === value;
-      return false;
-    }
-
-    const neqMatch = when.match(/^(\w+)\s*!=\s*'([^']*)'$/);
-    if (neqMatch) {
-      const [, key, value] = neqMatch;
-      if (key === "focusedView") return focusedView !== value;
-      return false;
-    }
-
-    return true;
+    return this.contextKeys.evaluate(when);
   }
 
   private normalizeKeybinding(e: KeyboardEvent): string | null {

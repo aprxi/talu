@@ -6,9 +6,9 @@
  * Keyboard-only: arrow keys navigate, Enter executes, Escape dismisses.
  */
 
-import type { Disposable } from "../types.ts";
+import type { Disposable, ContextValue } from "../types.ts";
 import type { CommandRegistryImpl } from "../registries/commands.ts";
-import { getFocusedViewId } from "./focus.ts";
+import type { ContextKeyService } from "../registries/context-keys.ts";
 
 let paletteOverlay: HTMLElement | null = null;
 let isOpen = false;
@@ -21,7 +21,10 @@ export interface CommandPaletteHandle extends Disposable {
  * Install the command palette. Registers the Ctrl+P global keybinding.
  * Returns a handle with dispose() and open() for programmatic triggering.
  */
-export function installCommandPalette(commandRegistry: CommandRegistryImpl): CommandPaletteHandle {
+export function installCommandPalette(
+  commandRegistry: CommandRegistryImpl,
+  contextKeys: ContextKeyService,
+): CommandPaletteHandle {
   const onKey = (e: KeyboardEvent) => {
     // Ctrl+P or Cmd+P — don't trigger in editable elements.
     if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "p") {
@@ -35,7 +38,7 @@ export function installCommandPalette(commandRegistry: CommandRegistryImpl): Com
       if (isOpen) {
         closePalette();
       } else {
-        openPalette(commandRegistry);
+        openPalette(commandRegistry, contextKeys);
       }
     }
   };
@@ -44,7 +47,7 @@ export function installCommandPalette(commandRegistry: CommandRegistryImpl): Com
 
   return {
     open() {
-      if (!isOpen) openPalette(commandRegistry);
+      if (!isOpen) openPalette(commandRegistry, contextKeys);
     },
     dispose() {
       document.removeEventListener("keydown", onKey);
@@ -53,7 +56,7 @@ export function installCommandPalette(commandRegistry: CommandRegistryImpl): Com
   };
 }
 
-function openPalette(commandRegistry: CommandRegistryImpl): void {
+function openPalette(commandRegistry: CommandRegistryImpl, contextKeys: ContextKeyService): void {
   if (isOpen) return;
   isOpen = true;
 
@@ -87,22 +90,18 @@ function openPalette(commandRegistry: CommandRegistryImpl): void {
   paletteOverlay.appendChild(container);
   document.body.appendChild(paletteOverlay);
 
-  // Get commands filtered by current focus context.
-  const focusedView = getFocusedViewId() ?? "";
+  // Snapshot context at open time so palette filtering is stable
+  // (the palette input will steal focus, changing focusedView).
+  const snapshot = new Map<string, ContextValue>([
+    ["focusedView", contextKeys.get("focusedView") ?? ""],
+  ]);
   let selectedIndex = 0;
 
   function getFilteredCommands(): { id: string; label?: string; keybinding?: string; pluginId: string }[] {
     const query = input.value.toLowerCase();
     return commandRegistry.getAll()
       .filter((cmd) => {
-        // Filter by when clause.
-        if (cmd.when) {
-          const eqMatch = cmd.when.match(/^(\w+)\s*==\s*'([^']*)'$/);
-          if (eqMatch && eqMatch[1] === "focusedView" && eqMatch[2] !== focusedView) return false;
-          const neqMatch = cmd.when.match(/^(\w+)\s*!=\s*'([^']*)'$/);
-          if (neqMatch && neqMatch[1] === "focusedView" && neqMatch[2] === focusedView) return false;
-        }
-        // Filter by search query.
+        if (!contextKeys.evaluate(cmd.when, snapshot)) return false;
         if (!query) return true;
         const text = (cmd.label ?? cmd.id).toLowerCase();
         return text.includes(query);

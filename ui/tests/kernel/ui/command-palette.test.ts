@@ -1,43 +1,47 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { installCommandPalette, type CommandPaletteHandle } from "../../../src/kernel/ui/command-palette.ts";
 import { CommandRegistryImpl } from "../../../src/kernel/registries/commands.ts";
+import { ContextKeyService } from "../../../src/kernel/registries/context-keys.ts";
 
 describe("installCommandPalette", () => {
+  let contextKeys: ContextKeyService;
   let registry: CommandRegistryImpl;
   let handle: CommandPaletteHandle;
 
   beforeEach(() => {
     document.body.innerHTML = "";
-    registry = new CommandRegistryImpl();
+    contextKeys = new ContextKeyService();
+    registry = new CommandRegistryImpl(contextKeys);
     registry.registerScoped("talu.test", "talu.test.hello", () => {}, { label: "Hello" });
     registry.registerScoped("talu.test", "talu.test.world", () => {}, { label: "World" });
   });
 
   afterEach(() => {
     handle?.dispose();
+    contextKeys.dispose();
   });
 
   test("returns handle with open and dispose", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     expect(typeof handle.open).toBe("function");
     expect(typeof handle.dispose).toBe("function");
   });
 
   test("open creates overlay in DOM", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     expect(document.getElementById("command-palette-overlay")).not.toBeNull();
   });
 
   test("dispose removes overlay and listener", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     handle.dispose();
     expect(document.getElementById("command-palette-overlay")).toBeNull();
   });
 
   test("opening twice is idempotent", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     handle.open();
     const overlays = document.querySelectorAll("#command-palette-overlay");
@@ -45,7 +49,7 @@ describe("installCommandPalette", () => {
   });
 
   test("lists registered commands", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     const overlay = document.getElementById("command-palette-overlay")!;
     // The list is the second child of the container div (after input).
@@ -55,7 +59,7 @@ describe("installCommandPalette", () => {
   });
 
   test("has search input", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     const overlay = document.getElementById("command-palette-overlay")!;
     const input = overlay.querySelector("input");
@@ -64,7 +68,7 @@ describe("installCommandPalette", () => {
   });
 
   test("escape closes palette", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     const overlay = document.getElementById("command-palette-overlay")!;
     const input = overlay.querySelector("input")!;
@@ -73,7 +77,7 @@ describe("installCommandPalette", () => {
   });
 
   test("clicking overlay background closes palette", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     const overlay = document.getElementById("command-palette-overlay")!;
     // Simulate click on the overlay itself (not on the dialog).
@@ -84,7 +88,7 @@ describe("installCommandPalette", () => {
   test("clicking a command row executes the command and closes palette", () => {
     let executed = false;
     registry.registerScoped("talu.test", "talu.test.action", () => { executed = true; }, { label: "Action" });
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     const overlay = document.getElementById("command-palette-overlay")!;
     const container = overlay.firstElementChild!;
@@ -100,7 +104,7 @@ describe("installCommandPalette", () => {
   });
 
   test("search input filters commands", () => {
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     const overlay = document.getElementById("command-palette-overlay")!;
     const input = overlay.querySelector("input")!;
@@ -120,7 +124,7 @@ describe("installCommandPalette", () => {
   test("Enter key on selected command executes it", () => {
     let executed = false;
     registry.registerScoped("talu.test", "talu.test.enter", () => { executed = true; }, { label: "Enter Cmd" });
-    handle = installCommandPalette(registry);
+    handle = installCommandPalette(registry, contextKeys);
     handle.open();
     const overlay = document.getElementById("command-palette-overlay")!;
     const input = overlay.querySelector("input")!;

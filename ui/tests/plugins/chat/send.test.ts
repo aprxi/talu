@@ -117,6 +117,10 @@ beforeEach(() => {
       date: () => "", dateTime: () => "", relativeTime: () => "",
       duration: () => "", number: () => "",
     } as any,
+    menus: {
+      registerItem: () => ({ dispose() {} }),
+      renderSlot: () => ({ dispose() {} }),
+    } as any,
   });
 });
 
@@ -294,6 +298,10 @@ describe("streamResponse", () => {
       timers: mockTimers(),
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
     });
 
     await streamResponse({ text: "Hello" });
@@ -337,6 +345,10 @@ describe("streamResponse", () => {
       timers: mockTimers(),
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
     });
 
     await streamResponse({ text: "Hello" });
@@ -404,6 +416,10 @@ describe("streamResponse", () => {
       timers: mockTimers(),
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
     });
 
     await streamResponse({ text: "Hello", discoverSession: true });
@@ -445,6 +461,10 @@ describe("streamResponse", () => {
       timers: mockTimers(),
       observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
       format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
     });
 
     await streamResponse({ text: "Hello", discoverSession: true });
@@ -452,5 +472,253 @@ describe("streamResponse", () => {
     // discoverSessionId calls listConversations(null, 1); should NOT be called
     // when activeSessionId is already set.
     expect(apiCalls.some((c) => c.method === "listConversations" && c.args[1] === 1)).toBe(false);
+  });
+});
+
+// ── chat.send.before hook ─────────────────────────────────────────────────────
+
+describe("chat.send.before hook", () => {
+  function makeDepsWithHook(hookFn: (name: string, value: any) => any, overrides?: { createResponse?: any }) {
+    const now = Math.floor(Date.now() / 1000);
+    initChatDeps({
+      api: {
+        createResponse: overrides?.createResponse ?? (async (body: any) => {
+          apiCalls.push({ method: "createResponse", args: [body] });
+          return new Response(JSON.stringify({ error: { message: "mock" } }), { status: 500 });
+        }),
+        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        getConversation: async (id: string) => ({
+          ok: true, data: { id, title: "Test", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
+        }),
+      } as any,
+      notifications: notif.mock as any,
+      services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      layout: { setTitle: () => {} } as any,
+      clipboard: { writeText: async () => {} } as any,
+      download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: {
+        on: () => ({ dispose() {} }),
+        run: hookFn,
+      } as any,
+      timers: mockTimers(),
+      observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
+    });
+  }
+
+  test("modifies request body before API call", async () => {
+    let capturedBody: any;
+    makeDepsWithHook(
+      async (name: string, value: any) => {
+        if (name === "chat.send.before") {
+          return { ...value, model: "overridden-model" };
+        }
+        return value;
+      },
+      {
+        createResponse: async (body: any) => {
+          capturedBody = body;
+          return new Response(JSON.stringify({ error: { message: "err" } }), { status: 500 });
+        },
+      },
+    );
+
+    await streamResponse({ text: "Hello" });
+
+    expect(capturedBody.model).toBe("overridden-model");
+    expect(capturedBody.input).toBe("Hello");
+  });
+
+  test("blocks request when hook returns $block sentinel", async () => {
+    makeDepsWithHook(async (name: string, _value: any) => {
+      if (name === "chat.send.before") {
+        return { $block: true, reason: "Content policy violation" };
+      }
+      return _value;
+    });
+
+    await streamResponse({ text: "Hello" });
+
+    // API should not have been called.
+    expect(apiCalls.filter((c) => c.method === "createResponse").length).toBe(0);
+    // Warning notification should be shown.
+    expect(notif.messages.some((m) => m.type === "warning" && m.msg === "Content policy violation")).toBe(true);
+    // State should be reset.
+    expect(chatState.isGenerating).toBe(false);
+    expect(chatState.streamAbort).toBeNull();
+  });
+
+  test("passes through unchanged when no hook handlers registered", async () => {
+    let capturedBody: any;
+    makeDepsWithHook(
+      async (_name: string, value: any) => value, // pass-through
+      {
+        createResponse: async (body: any) => {
+          capturedBody = body;
+          return new Response(JSON.stringify({ error: { message: "err" } }), { status: 500 });
+        },
+      },
+    );
+
+    await streamResponse({ text: "Test message" });
+
+    expect(capturedBody.input).toBe("Test message");
+    expect(capturedBody.model).toBe("gpt-4");
+  });
+});
+
+// ── chat.receive.after hook ───────────────────────────────────────────────────
+
+describe("chat.receive.after hook", () => {
+  test("transforms conversation data after response", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const sseBody = "event: response.completed\ndata: {}\n\n";
+    let hookCalledWith: any = null;
+
+    chatState.activeSessionId = "sess-1";
+
+    initChatDeps({
+      api: {
+        createResponse: async () => new Response(sseBody, { status: 200 }),
+        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        getConversation: async (id: string) => ({
+          ok: true, data: { id, title: "Original Title", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
+        }),
+      } as any,
+      notifications: notif.mock as any,
+      services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      layout: { setTitle: () => {} } as any,
+      clipboard: { writeText: async () => {} } as any,
+      download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: {
+        on: () => ({ dispose() {} }),
+        run: async (name: string, value: any) => {
+          if (name === "chat.receive.after") {
+            hookCalledWith = value;
+            return { ...value, title: "Modified Title" };
+          }
+          return value;
+        },
+      } as any,
+      timers: mockTimers(),
+      observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
+    });
+
+    await streamResponse({ text: "Hello" });
+
+    // Hook was called with the original conversation data.
+    expect(hookCalledWith).not.toBeNull();
+    expect(hookCalledWith.title).toBe("Original Title");
+    // The modified title should be stored in state.
+    expect(chatState.activeChat!.title).toBe("Modified Title");
+  });
+
+  test("receives conversation via afterResponse callback", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const sseBody = "event: response.completed\ndata: {}\n\n";
+    let callbackConversation: any = null;
+
+    chatState.activeSessionId = "sess-2";
+
+    initChatDeps({
+      api: {
+        createResponse: async () => new Response(sseBody, { status: 200 }),
+        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        getConversation: async (id: string) => ({
+          ok: true, data: { id, title: "Chat", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
+        }),
+      } as any,
+      notifications: notif.mock as any,
+      services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      layout: { setTitle: () => {} } as any,
+      clipboard: { writeText: async () => {} } as any,
+      download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: {
+        on: () => ({ dispose() {} }),
+        run: async (name: string, value: any) => {
+          if (name === "chat.receive.after") {
+            return { ...value, title: "Hook-Modified" };
+          }
+          return value;
+        },
+      } as any,
+      timers: mockTimers(),
+      observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
+    });
+
+    await streamResponse({
+      text: "Hello",
+      afterResponse: (conv) => { callbackConversation = conv; },
+    });
+
+    // afterResponse callback should receive the hook-modified conversation.
+    expect(callbackConversation).not.toBeNull();
+    expect(callbackConversation.title).toBe("Hook-Modified");
+  });
+
+  test("ignores $block on receive — response already happened", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const sseBody = "event: response.completed\ndata: {}\n\n";
+
+    chatState.activeSessionId = "sess-3";
+
+    initChatDeps({
+      api: {
+        createResponse: async () => new Response(sseBody, { status: 200 }),
+        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        getConversation: async (id: string) => ({
+          ok: true, data: { id, title: "Original", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
+        }),
+      } as any,
+      notifications: notif.mock as any,
+      services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      layout: { setTitle: () => {} } as any,
+      clipboard: { writeText: async () => {} } as any,
+      download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: {
+        on: () => ({ dispose() {} }),
+        run: async (name: string, value: any) => {
+          if (name === "chat.receive.after") {
+            return { $block: true, reason: "Cannot block a response" };
+          }
+          return value;
+        },
+      } as any,
+      timers: mockTimers(),
+      observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
+    });
+
+    await streamResponse({ text: "Hello" });
+
+    // Should fall back to original data, not crash.
+    expect(chatState.activeChat).not.toBeNull();
+    expect(chatState.activeChat!.title).toBe("Original");
   });
 });
