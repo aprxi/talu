@@ -37,6 +37,7 @@ pub const plugins = @import("plugins.zig");
 pub const file_api = @import("file.zig");
 
 pub const router = @import("router.zig");
+pub const agent = @import("agent.zig");
 
 // Re-export Chat/session lifecycle APIs.
 pub const talu_chat_set_ttl_ts = responses.talu_chat_set_ttl_ts;
@@ -550,6 +551,45 @@ pub const talu_plugins_list_get = plugins.talu_plugins_list_get;
 pub const talu_plugins_list_free = plugins.talu_plugins_list_free;
 pub const CPluginInfo = plugins.CPluginInfo;
 pub const CPluginList = plugins.CPluginList;
+
+// Re-export Agent C API functions (tool registry + agent loop).
+pub const talu_agent_registry_create = agent.talu_agent_registry_create;
+pub const talu_agent_registry_free = agent.talu_agent_registry_free;
+pub const talu_agent_registry_add = agent.talu_agent_registry_add;
+pub const talu_agent_registry_count = agent.talu_agent_registry_count;
+pub const talu_agent_run = agent.talu_agent_run;
+pub const TaluToolRegistry = agent.TaluToolRegistry;
+pub const CAgentLoopConfig = agent.CAgentLoopConfig;
+pub const CAgentLoopResult = agent.CAgentLoopResult;
+pub const CToolExecuteFn = agent.CToolExecuteFn;
+
+// Re-export Stateful Agent C API functions.
+pub const talu_agent_create = agent.talu_agent_create;
+pub const talu_agent_free = agent.talu_agent_free;
+pub const talu_agent_set_system = agent.talu_agent_set_system;
+pub const talu_agent_register_tool = agent.talu_agent_register_tool;
+pub const talu_agent_set_bus = agent.talu_agent_set_bus;
+pub const talu_agent_prompt = agent.talu_agent_prompt;
+pub const talu_agent_continue = agent.talu_agent_continue;
+pub const talu_agent_heartbeat = agent.talu_agent_heartbeat;
+pub const talu_agent_abort = agent.talu_agent_abort;
+pub const talu_agent_get_chat = agent.talu_agent_get_chat;
+pub const talu_agent_get_id = agent.talu_agent_get_id;
+pub const TaluAgent = agent.TaluAgent;
+pub const CAgentCreateConfig = agent.CAgentCreateConfig;
+
+// Re-export MessageBus C API functions.
+pub const talu_agent_bus_create = agent.talu_agent_bus_create;
+pub const talu_agent_bus_free = agent.talu_agent_bus_free;
+pub const talu_agent_bus_register = agent.talu_agent_bus_register;
+pub const talu_agent_bus_unregister = agent.talu_agent_bus_unregister;
+pub const talu_agent_bus_add_peer = agent.talu_agent_bus_add_peer;
+pub const talu_agent_bus_remove_peer = agent.talu_agent_bus_remove_peer;
+pub const talu_agent_bus_send = agent.talu_agent_bus_send;
+pub const talu_agent_bus_deliver = agent.talu_agent_bus_deliver;
+pub const talu_agent_bus_broadcast = agent.talu_agent_bus_broadcast;
+pub const talu_agent_bus_pending = agent.talu_agent_bus_pending;
+pub const TaluAgentBus = agent.TaluAgentBus;
 
 // ABI validation - comptime assertions ensure struct sizes match expected values.
 // When struct layouts change, update abi.zig and bindings/python/talu/_abi.py.

@@ -53,6 +53,7 @@ pub const validate = @import("validate/root.zig");
 pub const db = @import("db/root.zig");
 pub const policy = @import("policy/root.zig");
 pub const dump = @import("xray/dump/root.zig");
+pub const agent = @import("agent/root.zig");
 
 // Force the linker to export these symbols by referencing them in a comptime block
 comptime {
@@ -382,4 +383,36 @@ comptime {
     _ = &capi.talu_blobs_stream_read;
     _ = &capi.talu_blobs_stream_total_size;
     _ = &capi.talu_blobs_stream_close;
+
+    // Agent API (tool registry + agent loop)
+    _ = &capi.talu_agent_registry_create;
+    _ = &capi.talu_agent_registry_free;
+    _ = &capi.talu_agent_registry_add;
+    _ = &capi.talu_agent_registry_count;
+    _ = &capi.talu_agent_run;
+
+    // Stateful Agent API
+    _ = &capi.talu_agent_create;
+    _ = &capi.talu_agent_free;
+    _ = &capi.talu_agent_set_system;
+    _ = &capi.talu_agent_register_tool;
+    _ = &capi.talu_agent_set_bus;
+    _ = &capi.talu_agent_prompt;
+    _ = &capi.talu_agent_continue;
+    _ = &capi.talu_agent_heartbeat;
+    _ = &capi.talu_agent_abort;
+    _ = &capi.talu_agent_get_chat;
+    _ = &capi.talu_agent_get_id;
+
+    // MessageBus API
+    _ = &capi.talu_agent_bus_create;
+    _ = &capi.talu_agent_bus_free;
+    _ = &capi.talu_agent_bus_register;
+    _ = &capi.talu_agent_bus_unregister;
+    _ = &capi.talu_agent_bus_add_peer;
+    _ = &capi.talu_agent_bus_remove_peer;
+    _ = &capi.talu_agent_bus_send;
+    _ = &capi.talu_agent_bus_deliver;
+    _ = &capi.talu_agent_bus_broadcast;
+    _ = &capi.talu_agent_bus_pending;
 }
