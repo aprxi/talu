@@ -4,7 +4,6 @@
 //! No dependencies on TableAdapter or scan logic.
 
 const std = @import("std");
-const json = @import("../../../io/json/root.zig");
 const kvbuf = @import("../../../io/kvbuf/root.zig");
 const responses = @import("../../../responses/root.zig");
 
@@ -55,9 +54,6 @@ pub const ScannedSessionRecord = struct {
     head_item_id: u64,
     ttl_ts: i64,
     metadata_json: ?[]const u8,
-    /// Space-separated normalized tags extracted from metadata_json.tags.
-    /// Only populated for Schema 5 records.
-    tags_text: ?[]const u8 = null,
     /// Text snippet around the matched search query in item content.
     /// Null when no search query or when matched by metadata only.
     search_snippet: ?[]const u8 = null,
@@ -79,7 +75,6 @@ pub fn freeScannedSessionRecord(alloc: Allocator, record: *ScannedSessionRecord)
     if (record.parent_session_id) |p| alloc.free(p);
     if (record.group_id) |g| alloc.free(g);
     if (record.metadata_json) |m| alloc.free(m);
-    if (record.tags_text) |t| alloc.free(t);
     if (record.search_snippet) |s| alloc.free(s);
     if (record.source_doc_id) |d| alloc.free(d);
     record.* = .{
@@ -94,7 +89,6 @@ pub fn freeScannedSessionRecord(alloc: Allocator, record: *ScannedSessionRecord)
         .head_item_id = 0,
         .ttl_ts = 0,
         .metadata_json = null,
-        .tags_text = null,
         .search_snippet = null,
         .source_doc_id = null,
         .created_at_ms = 0,
@@ -165,8 +159,7 @@ pub fn encodeSessionRecordMsgpack(allocator: Allocator, record: SessionRecord) !
 }
 
 /// Encode a SessionRecord as KvBuf (Schema 5).
-/// tags_text is the pre-extracted, normalized tags string (space-separated).
-pub fn encodeSessionRecordKvBuf(allocator: Allocator, record: SessionRecord, tags_text: ?[]const u8) ![]u8 {
+pub fn encodeSessionRecordKvBuf(allocator: Allocator, record: SessionRecord) ![]u8 {
     var w = kvbuf.KvBufWriter.init();
     errdefer w.deinit(allocator);
 
@@ -185,7 +178,6 @@ pub fn encodeSessionRecordKvBuf(allocator: Allocator, record: SessionRecord, tag
     try w.addOptionalString(allocator, SFIds.metadata_json, record.metadata_json);
     try w.addI64(allocator, SFIds.created_at_ms, record.created_at_ms);
     try w.addI64(allocator, SFIds.updated_at_ms, record.updated_at_ms);
-    try w.addOptionalString(allocator, SFIds.tags_text, tags_text);
     try w.addOptionalString(allocator, SFIds.source_doc_id, record.source_doc_id);
 
     return w.finish(allocator);
@@ -274,7 +266,6 @@ pub fn decodeSessionRecordKvBuf(alloc: Allocator, payload: []const u8) !ScannedS
         .head_item_id = 0,
         .ttl_ts = 0,
         .metadata_json = null,
-        .tags_text = null,
         .source_doc_id = null,
         .created_at_ms = 0,
         .updated_at_ms = 0,
@@ -294,7 +285,6 @@ pub fn decodeSessionRecordKvBuf(alloc: Allocator, payload: []const u8) !ScannedS
     if (reader.get(SFIds.parent_session_id)) |s| record.parent_session_id = try alloc.dupe(u8, s);
     if (reader.get(SFIds.group_id)) |s| record.group_id = try alloc.dupe(u8, s);
     if (reader.get(SFIds.metadata_json)) |s| record.metadata_json = try alloc.dupe(u8, s);
-    if (reader.get(SFIds.tags_text)) |s| record.tags_text = try alloc.dupe(u8, s);
     if (reader.get(SFIds.source_doc_id)) |s| record.source_doc_id = try alloc.dupe(u8, s);
 
     // Integer fields
@@ -304,96 +294,6 @@ pub fn decodeSessionRecordKvBuf(alloc: Allocator, payload: []const u8) !ScannedS
     record.updated_at_ms = reader.getI64(SFIds.updated_at_ms) orelse 0;
 
     return record;
-}
-
-/// Extract and normalize tags from metadata_json.
-/// Returns space-separated lowercase tags, or null if no tags present.
-/// Caller owns the returned string.
-///
-/// Input: `{"tags": ["Work", "URGENT", "project-x"], "other": "ignored"}`
-/// Output: `"work urgent project-x"`
-pub fn extractTagsFromMetadata(alloc: Allocator, metadata_json: ?[]const u8) !?[]const u8 {
-    const meta = metadata_json orelse return null;
-    if (meta.len == 0) return null;
-
-    // Parse the JSON (metadata is typically small, 64KB limit is generous)
-    const parsed = json.parseValue(alloc, meta, .{ .max_size_bytes = 64 * 1024 }) catch return null;
-    defer parsed.deinit();
-
-    // Get the "tags" array
-    const obj = switch (parsed.value) {
-        .object => |o| o,
-        else => return null,
-    };
-    const tags_value = obj.get("tags") orelse return null;
-    const tags_array = switch (tags_value) {
-        .array => |arr| arr.items,
-        else => return null,
-    };
-
-    if (tags_array.len == 0) return null;
-
-    // Build the space-separated string with normalization
-    var result = std.ArrayList(u8).empty;
-    errdefer result.deinit(alloc);
-
-    // Track seen tags for dedup (max 20 tags, use simple array)
-    const max_tags: usize = 20;
-    const max_tag_len: usize = 50;
-    var seen_tags: [max_tags][]const u8 = undefined; // lint:ignore undefined-usage - only seen_tags[0..seen_count] valid
-    var seen_count: usize = 0;
-
-    for (tags_array) |tag_value| {
-        if (seen_count >= max_tags) break;
-
-        const tag_str = switch (tag_value) {
-            .string => |s| s,
-            else => continue,
-        };
-
-        // Normalize: trim, lowercase, limit length
-        const trimmed = std.mem.trim(u8, tag_str, " \t\n\r");
-        if (trimmed.len == 0) continue;
-        if (trimmed.len > max_tag_len) continue;
-
-        // Convert to lowercase for dedup check and storage
-        var lower_buf: [max_tag_len]u8 = undefined;
-        const lower_len = @min(trimmed.len, max_tag_len);
-        for (trimmed[0..lower_len], 0..) |c, i| {
-            lower_buf[i] = std.ascii.toLower(c);
-        }
-        const lower = lower_buf[0..lower_len];
-
-        // Skip duplicates (linear scan is fine for max 20 items)
-        var is_dup = false;
-        for (seen_tags[0..seen_count]) |seen| {
-            if (std.mem.eql(u8, seen, lower)) {
-                is_dup = true;
-                break;
-            }
-        }
-        if (is_dup) continue;
-
-        // Add separator if not first
-        if (result.items.len > 0) {
-            try result.append(alloc, ' ');
-        }
-
-        // Add the normalized tag
-        try result.appendSlice(alloc, lower);
-
-        // Track as seen (pointer into result buffer)
-        const start = result.items.len - lower_len;
-        seen_tags[seen_count] = result.items[start..result.items.len];
-        seen_count += 1;
-    }
-
-    if (result.items.len == 0) {
-        result.deinit(alloc);
-        return null;
-    }
-
-    return try result.toOwnedSlice(alloc);
 }
 
 // ============================================================================
@@ -868,71 +768,6 @@ test "decodeSessionRecordMsgpack round-trips with encode" {
     try std.testing.expectEqual(@as(i64, 789012), decoded.updated_at_ms);
 }
 
-test "extractTagsFromMetadata basic" {
-    const alloc = std.testing.allocator;
-    const metadata = "{\"tags\":[\"work\",\"urgent\"]}";
-    const tags_text = try extractTagsFromMetadata(alloc, metadata);
-    defer if (tags_text) |t| alloc.free(t);
-    try std.testing.expectEqualStrings("work urgent", tags_text.?);
-}
-
-test "extractTagsFromMetadata normalizes case" {
-    const alloc = std.testing.allocator;
-    const metadata = "{\"tags\":[\"Work\",\"URGENT\",\"Project-X\"]}";
-    const tags_text = try extractTagsFromMetadata(alloc, metadata);
-    defer if (tags_text) |t| alloc.free(t);
-    try std.testing.expectEqualStrings("work urgent project-x", tags_text.?);
-}
-
-test "extractTagsFromMetadata deduplicates" {
-    const alloc = std.testing.allocator;
-    const metadata = "{\"tags\":[\"work\",\"Work\",\"WORK\"]}";
-    const tags_text = try extractTagsFromMetadata(alloc, metadata);
-    defer if (tags_text) |t| alloc.free(t);
-    try std.testing.expectEqualStrings("work", tags_text.?);
-}
-
-test "extractTagsFromMetadata trims whitespace" {
-    const alloc = std.testing.allocator;
-    const metadata = "{\"tags\":[\"  work  \",\"\\turgent\\n\"]}";
-    const tags_text = try extractTagsFromMetadata(alloc, metadata);
-    defer if (tags_text) |t| alloc.free(t);
-    try std.testing.expectEqualStrings("work urgent", tags_text.?);
-}
-
-test "extractTagsFromMetadata no tags returns null" {
-    const alloc = std.testing.allocator;
-    const metadata = "{\"custom\":\"value\"}";
-    const tags_text = try extractTagsFromMetadata(alloc, metadata);
-    try std.testing.expect(tags_text == null);
-}
-
-test "extractTagsFromMetadata empty tags returns null" {
-    const alloc = std.testing.allocator;
-    const metadata = "{\"tags\":[]}";
-    const tags_text = try extractTagsFromMetadata(alloc, metadata);
-    try std.testing.expect(tags_text == null);
-}
-
-test "extractTagsFromMetadata null input returns null" {
-    const alloc = std.testing.allocator;
-    const tags_text = try extractTagsFromMetadata(alloc, null);
-    try std.testing.expect(tags_text == null);
-}
-
-test "extractTagsFromMetadata respects max 20 tags" {
-    const alloc = std.testing.allocator;
-    const metadata = "{\"tags\":[\"t1\",\"t2\",\"t3\",\"t4\",\"t5\",\"t6\",\"t7\",\"t8\",\"t9\",\"t10\",\"t11\",\"t12\",\"t13\",\"t14\",\"t15\",\"t16\",\"t17\",\"t18\",\"t19\",\"t20\",\"t21\",\"t22\"]}";
-    const tags_text = try extractTagsFromMetadata(alloc, metadata);
-    defer if (tags_text) |t| alloc.free(t);
-    // Should only have 20 tags
-    var count: usize = 1;
-    for (tags_text.?) |c| {
-        if (c == ' ') count += 1;
-    }
-    try std.testing.expectEqual(@as(usize, 20), count);
-}
-
 test "encodeSessionRecordKvBuf round-trips with decode" {
     const alloc = std.testing.allocator;
 
@@ -952,8 +787,7 @@ test "encodeSessionRecordKvBuf round-trips with decode" {
         .updated_at_ms = 789012,
     };
 
-    const tags_text = "work urgent project-x";
-    const encoded = try encodeSessionRecordKvBuf(alloc, original, tags_text);
+    const encoded = try encodeSessionRecordKvBuf(alloc, original);
     defer alloc.free(encoded);
 
     // Verify it's KvBuf format
@@ -975,7 +809,6 @@ test "encodeSessionRecordKvBuf round-trips with decode" {
     try std.testing.expectEqual(@as(u64, 42), decoded.head_item_id);
     try std.testing.expectEqual(@as(i64, 1000), decoded.ttl_ts);
     try std.testing.expectEqualStrings("{\"custom\":1}", decoded.metadata_json.?);
-    try std.testing.expectEqualStrings("work urgent project-x", decoded.tags_text.?);
     try std.testing.expectEqual(@as(i64, 123456), decoded.created_at_ms);
     try std.testing.expectEqual(@as(i64, 789012), decoded.updated_at_ms);
 }
@@ -999,14 +832,13 @@ test "encodeSessionRecordKvBuf with null tags" {
         .updated_at_ms = 200,
     };
 
-    const encoded = try encodeSessionRecordKvBuf(alloc, original, null);
+    const encoded = try encodeSessionRecordKvBuf(alloc, original);
     defer alloc.free(encoded);
 
     var decoded = try decodeSessionRecordKvBuf(alloc, encoded);
     defer freeScannedSessionRecord(alloc, &decoded);
 
     try std.testing.expectEqualStrings("no-tags-test", decoded.session_id);
-    try std.testing.expect(decoded.tags_text == null);
 }
 
 // ============================================================================
@@ -1063,7 +895,6 @@ test "freeScannedSessionRecord frees all fields and zeroes struct" {
         .head_item_id = 42,
         .ttl_ts = 1000,
         .metadata_json = try alloc.dupe(u8, "{\"k\":1}"),
-        .tags_text = try alloc.dupe(u8, "tag1 tag2"),
         .search_snippet = try alloc.dupe(u8, "snippet here"),
         .source_doc_id = try alloc.dupe(u8, "doc-1"),
         .created_at_ms = 100,
@@ -1084,7 +915,6 @@ test "freeScannedSessionRecord frees all fields and zeroes struct" {
     try std.testing.expectEqual(@as(u64, 0), record.head_item_id);
     try std.testing.expectEqual(@as(i64, 0), record.ttl_ts);
     try std.testing.expect(record.metadata_json == null);
-    try std.testing.expect(record.tags_text == null);
     try std.testing.expect(record.search_snippet == null);
     try std.testing.expect(record.source_doc_id == null);
 }
@@ -1256,7 +1086,7 @@ test "decodeSessionRecordKvBuf decodes all fields" {
         .updated_at_ms = 666,
     };
 
-    const encoded = try encodeSessionRecordKvBuf(alloc, record, "alpha beta");
+    const encoded = try encodeSessionRecordKvBuf(alloc, record);
     defer alloc.free(encoded);
 
     var decoded = try decodeSessionRecordKvBuf(alloc, encoded);
@@ -1273,7 +1103,6 @@ test "decodeSessionRecordKvBuf decodes all fields" {
     try std.testing.expectEqual(@as(u64, 99), decoded.head_item_id);
     try std.testing.expectEqual(@as(i64, 7777), decoded.ttl_ts);
     try std.testing.expectEqualStrings("{\"key\":\"val\"}", decoded.metadata_json.?);
-    try std.testing.expectEqualStrings("alpha beta", decoded.tags_text.?);
     try std.testing.expectEqual(@as(i64, 555), decoded.created_at_ms);
     try std.testing.expectEqual(@as(i64, 666), decoded.updated_at_ms);
 }
@@ -1297,7 +1126,7 @@ test "decodeSessionRecordKvBuf minimal record with nulls" {
         .updated_at_ms = 0,
     };
 
-    const encoded = try encodeSessionRecordKvBuf(alloc, record, null);
+    const encoded = try encodeSessionRecordKvBuf(alloc, record);
     defer alloc.free(encoded);
 
     var decoded = try decodeSessionRecordKvBuf(alloc, encoded);
@@ -1306,5 +1135,4 @@ test "decodeSessionRecordKvBuf minimal record with nulls" {
     try std.testing.expectEqualStrings("kvbuf-minimal", decoded.session_id);
     try std.testing.expect(decoded.model == null);
     try std.testing.expect(decoded.title == null);
-    try std.testing.expect(decoded.tags_text == null);
 }

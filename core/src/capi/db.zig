@@ -212,10 +212,6 @@ pub const CSessionRecord = extern struct {
     /// Session metadata as JSON (null-terminated, may be null).
     metadata_json: ?[*:0]const u8,
 
-    /// Space-separated normalized tags extracted from metadata_json.tags.
-    /// Pre-computed at write time for efficient search. Null for legacy sessions.
-    tags_text: ?[*:0]const u8,
-
     /// Search snippet: text fragment around the matched search query in item content.
     /// Only populated when listing with a search_query that matched item content.
     /// Null when no search query or when matched by metadata only.
@@ -911,6 +907,33 @@ fn optSlice(s: ?[*:0]const u8) ?[]const u8 {
     return if (s) |p| std.mem.span(p) else null;
 }
 
+/// Convert session ID strings to session hashes and populate a hash set.
+fn populateHashSet(session_ids: []const []const u8, out: *std.AutoHashMap(u64, void)) void {
+    for (session_ids) |sid| {
+        out.put(db.table.sessions.computeSessionHash(sid), {}) catch continue;
+    }
+}
+
+/// Intersect: remove entries from `target` whose hashes are not in `session_ids`.
+fn intersectHashSet(target: *std.AutoHashMap(u64, void), session_ids: []const []const u8) void {
+    // Build temporary set from new session IDs.
+    var new_set = std.AutoHashMap(u64, void).init(allocator);
+    defer new_set.deinit();
+    for (session_ids) |sid| {
+        new_set.put(db.table.sessions.computeSessionHash(sid), {}) catch continue;
+    }
+    // Collect keys to remove (can't modify during iteration).
+    var removals = std.ArrayList(u64).empty;
+    defer removals.deinit(allocator);
+    var it = target.keyIterator();
+    while (it.next()) |k| {
+        if (!new_set.contains(k.*)) removals.append(allocator, k.*) catch continue;
+    }
+    for (removals.items) |k| {
+        _ = target.remove(k);
+    }
+}
+
 /// Build ScanParams from C arguments.
 fn buildSessionScanParams(
     limit: u32,
@@ -999,10 +1022,6 @@ fn buildSessionList(records: []db.table.sessions.ScannedSessionRecord) !*CSessio
         sessions_buf[i].ttl_ts = record.ttl_ts;
         sessions_buf[i].metadata_json = if (record.metadata_json) |m|
             (arena.dupeZ(u8, m) catch return error.OutOfMemory).ptr
-        else
-            null;
-        sessions_buf[i].tags_text = if (record.tags_text) |t|
-            (arena.dupeZ(u8, t) catch return error.OutOfMemory).ptr
         else
             null;
         sessions_buf[i].search_snippet = if (record.search_snippet) |s|
@@ -1224,10 +1243,9 @@ fn getTagConversationsImpl(db_path_slice: []const u8, tag_id_slice: []const u8, 
 ///   - search_query: Case-insensitive substring filter on session metadata
 ///     and item content (null = no filter)
 ///   - tags_filter: Space-separated tags for AND matching (null = no filter).
-///     Matches sessions whose tags_text contains ALL specified tags.
+///     Matches sessions that have ALL specified tags (via relational tag table).
 ///   - tags_filter_any: Space-separated tags for OR matching (null = no filter).
-///     Matches sessions whose tags_text contains ANY of the specified tags.
-///     Mutually exclusive with tags_filter (tags_filter takes precedence).
+///     Matches sessions that have ANY of the specified tags (via relational tag table).
 ///   - out_sessions: Output parameter to receive session list handle
 ///
 /// Returns: 0 on success, negative error code on failure.
@@ -1253,9 +1271,31 @@ pub export fn talu_storage_list_sessions(
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, group_id);
     params.search_query = optSlice(search_query);
-    params.tags_filter = optSlice(tags_filter);
-    params.tags_filter_any = optSlice(tags_filter_any);
     if (params.search_query != null) params.max_scan = 5000;
+
+    // Resolve tag filters to session hash sets.
+    var allowed_hashes = std.AutoHashMap(u64, void).init(allocator);
+    defer allowed_hashes.deinit();
+
+    const group_slice = optSlice(group_id);
+
+    if (optSlice(tags_filter)) |f| {
+        const sids = db.table.tags.resolveTagFilterSessionIds(allocator, db_path_slice, f, true, group_slice) catch |err| {
+            capi_error.setError(err, "failed to resolve tag filter", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer db.table.tags.freeStringSlice(allocator, sids);
+        populateHashSet(sids, &allowed_hashes);
+        params.allowed_session_hashes = &allowed_hashes;
+    } else if (optSlice(tags_filter_any)) |f| {
+        const sids = db.table.tags.resolveTagFilterSessionIds(allocator, db_path_slice, f, false, group_slice) catch |err| {
+            capi_error.setError(err, "failed to resolve tag filter", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer db.table.tags.freeStringSlice(allocator, sids);
+        populateHashSet(sids, &allowed_hashes);
+        params.allowed_session_hashes = &allowed_hashes;
+    }
 
     return listSessionsImpl(db_path_slice, params, out);
 }
@@ -1269,8 +1309,10 @@ pub export fn talu_storage_list_sessions(
 ///   - before_session_id: Cursor session ID component (null = no cursor)
 ///   - group_id: Filter by group (null = no filter)
 ///   - search_query: Case-insensitive substring filter (null = no filter)
-///   - tags_filter: Space-separated tags for AND matching (null = no filter)
-///   - tags_filter_any: Space-separated tags for OR matching (null = no filter)
+///   - tags_filter: Space-separated tags for AND matching (null = no filter).
+///     Resolved via relational tag table to session hash whitelist.
+///   - tags_filter_any: Space-separated tags for OR matching (null = no filter).
+///     Resolved via relational tag table to session hash whitelist.
 ///   - marker_filter: Exact marker match (null = no filter)
 ///   - marker_filter_any: Space-separated markers for OR matching (null = no filter)
 ///   - model_filter: Model filter with wildcard support (null = no filter)
@@ -1278,7 +1320,7 @@ pub export fn talu_storage_list_sessions(
 ///   - created_before_ms: Created before timestamp exclusive (0 = no filter)
 ///   - updated_after_ms: Updated after timestamp inclusive (0 = no filter)
 ///   - updated_before_ms: Updated before timestamp exclusive (0 = no filter)
-///   - has_tags: 0 = no filter, 1 = must have tags, -1 = must not have tags
+///   - has_tags: 1 = must have tags, 0 = must not have tags, -1 = no filter
 ///   - source_doc_id: Filter by source document ID (null = no filter)
 ///   - out_sessions: Output parameter to receive session list handle
 ///
@@ -1314,8 +1356,6 @@ pub export fn talu_storage_list_sessions_ex(
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, group_id);
     params.search_query = optSlice(search_query);
-    params.tags_filter = optSlice(tags_filter);
-    params.tags_filter_any = optSlice(tags_filter_any);
     params.marker_filter = optSlice(marker_filter);
     params.marker_filter_any = optSlice(marker_filter_any);
     params.model_filter = optSlice(model_filter);
@@ -1323,9 +1363,65 @@ pub export fn talu_storage_list_sessions_ex(
     params.created_before_ms = if (created_before_ms != 0) created_before_ms else null;
     params.updated_after_ms = if (updated_after_ms != 0) updated_after_ms else null;
     params.updated_before_ms = if (updated_before_ms != 0) updated_before_ms else null;
-    params.has_tags = if (has_tags == 1) true else if (has_tags == 0) false else null;
     params.source_doc_id = optSlice(source_doc_id);
     if (params.search_query != null) params.max_scan = 5000;
+
+    // Resolve tag-based filters to session hash sets.
+    var allowed_hashes = std.AutoHashMap(u64, void).init(allocator);
+    defer allowed_hashes.deinit();
+    var excluded_hashes = std.AutoHashMap(u64, void).init(allocator);
+    defer excluded_hashes.deinit();
+    var use_allowed = false;
+    var use_excluded = false;
+
+    const group_slice = optSlice(group_id);
+
+    if (optSlice(tags_filter)) |f| {
+        const sids = db.table.tags.resolveTagFilterSessionIds(allocator, db_path_slice, f, true, group_slice) catch |err| {
+            capi_error.setError(err, "failed to resolve tag filter", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer db.table.tags.freeStringSlice(allocator, sids);
+        populateHashSet(sids, &allowed_hashes);
+        use_allowed = true;
+    }
+
+    if (optSlice(tags_filter_any)) |f| {
+        const sids = db.table.tags.resolveTagFilterSessionIds(allocator, db_path_slice, f, false, group_slice) catch |err| {
+            capi_error.setError(err, "failed to resolve tag filter", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer db.table.tags.freeStringSlice(allocator, sids);
+        if (use_allowed) {
+            intersectHashSet(&allowed_hashes, sids);
+        } else {
+            populateHashSet(sids, &allowed_hashes);
+            use_allowed = true;
+        }
+    }
+
+    // has_tags: 1 = must have tags, 0 = must NOT have tags, -1 = no filter.
+    if (has_tags == 1 or has_tags == 0) {
+        const all_tagged = db.table.tags.collectAllTaggedSessionIds(allocator, db_path_slice) catch |err| {
+            capi_error.setError(err, "failed to collect tagged sessions", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer db.table.tags.freeStringSlice(allocator, all_tagged);
+        if (has_tags == 1) {
+            if (use_allowed) {
+                intersectHashSet(&allowed_hashes, all_tagged);
+            } else {
+                populateHashSet(all_tagged, &allowed_hashes);
+                use_allowed = true;
+            }
+        } else {
+            populateHashSet(all_tagged, &excluded_hashes);
+            use_excluded = true;
+        }
+    }
+
+    if (use_allowed) params.allowed_session_hashes = &allowed_hashes;
+    if (use_excluded) params.excluded_session_hashes = &excluded_hashes;
 
     return listSessionsImpl(db_path_slice, params, out);
 }
@@ -1446,7 +1542,6 @@ fn populateSessionRecord(out: *CSessionRecord, record: db.table.sessions.Scanned
         threadlocal var parent_session_id_buf: [256]u8 = .{0} ** 256;
         threadlocal var group_id_buf: [256]u8 = .{0} ** 256;
         threadlocal var metadata_json_buf: [4096]u8 = .{0} ** 4096;
-        threadlocal var tags_text_buf: [1024]u8 = .{0} ** 1024;
         threadlocal var search_snippet_buf: [4096]u8 = .{0} ** 4096;
         threadlocal var source_doc_id_buf: [256]u8 = .{0} ** 256;
     };
@@ -1461,7 +1556,6 @@ fn populateSessionRecord(out: *CSessionRecord, record: db.table.sessions.Scanned
     out.head_item_id = record.head_item_id;
     out.ttl_ts = record.ttl_ts;
     out.metadata_json = copyToStaticBufOpt(&S.metadata_json_buf, record.metadata_json);
-    out.tags_text = copyToStaticBufOpt(&S.tags_text_buf, record.tags_text);
     out.search_snippet = copyToStaticBufOpt(&S.search_snippet_buf, record.search_snippet);
     out.source_doc_id = copyToStaticBufOpt(&S.source_doc_id_buf, record.source_doc_id);
     out.created_at_ms = record.created_at_ms;

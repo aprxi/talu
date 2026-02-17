@@ -58,14 +58,12 @@ pub const ScanParams = struct {
     /// Maximum rows to decode before stopping (0 = unlimited).
     /// Prevents unbounded blocking on large DBs when search_query is selective.
     max_scan: u32 = 0,
-    /// Tags filter: space-separated tags for exact word matching on tags_text.
-    /// Matches sessions whose tags_text contains ALL specified tags (AND logic).
-    /// Use tags_filter_any for OR logic.
-    tags_filter: ?[]const u8 = null,
-    /// Tags filter: space-separated tags for OR matching.
-    /// Matches sessions whose tags_text contains ANY of the specified tags.
-    /// Mutually exclusive with tags_filter (tags_filter takes precedence).
-    tags_filter_any: ?[]const u8 = null,
+    /// Session hash whitelist: only include sessions whose hash is in this set.
+    /// Pre-computed externally (e.g., from tag filter resolution).
+    allowed_session_hashes: ?*const std.AutoHashMap(u64, void) = null,
+    /// Session hash blocklist: exclude sessions whose hash is in this set.
+    /// Pre-computed externally (e.g., for has_tags=false filtering).
+    excluded_session_hashes: ?*const std.AutoHashMap(u64, void) = null,
 
     // --- Additional filters for /v1/search ---
 
@@ -85,8 +83,6 @@ pub const ScanParams = struct {
     updated_after_ms: ?i64 = null,
     /// Updated before timestamp filter (exclusive, milliseconds).
     updated_before_ms: ?i64 = null,
-    /// Has tags filter: true = must have at least one tag, false = must have no tags.
-    has_tags: ?bool = null,
     /// Source document ID filter: exact match on source_doc_id field.
     /// Matches sessions that were created from this prompt document.
     source_doc_id: ?[]const u8 = null,
@@ -303,6 +299,16 @@ fn processBlock(
             if (row_gh != gh) continue;
         }
 
+        // Session hash whitelist (e.g., pre-computed from tag filters)
+        if (params.allowed_session_hashes) |whitelist| {
+            if (!whitelist.contains(hash)) continue;
+        }
+
+        // Session hash blocklist (e.g., has_tags=false exclusion)
+        if (params.excluded_session_hashes) |blocklist| {
+            if (blocklist.contains(hash)) continue;
+        }
+
         const gop = try seen.getOrPut(hash);
         if (!gop.found_existing) {
             try new_indices.append(alloc, row_idx);
@@ -357,8 +363,7 @@ fn processBlock(
                 const match_title = if (record.title) |t| search.textContainsInsensitive(t, query) else false;
                 const match_model = if (record.model) |m| search.textContainsInsensitive(m, query) else false;
                 const match_prompt = if (record.system_prompt) |s| search.textContainsInsensitive(s, query) else false;
-                const match_tags = if (record.tags_text) |t| search.textContainsInsensitive(t, query) else false;
-                if (!match_title and !match_model and !match_prompt and !match_tags) {
+                if (!match_title and !match_model and !match_prompt) {
                     codec.freeScannedSessionRecord(alloc, &record);
                     if (params.max_scan > 0 and scanned.* >= params.max_scan) return true;
                     continue;
@@ -367,24 +372,7 @@ fn processBlock(
             }
         }
 
-        // 8b. Tags filter: exact word matching (AND or OR logic)
-        if (params.tags_filter) |filter| {
-            const tags = record.tags_text orelse "";
-            if (!search.tagsMatchAll(tags, filter)) {
-                codec.freeScannedSessionRecord(alloc, &record);
-                if (params.max_scan > 0 and scanned.* >= params.max_scan) return true;
-                continue;
-            }
-        } else if (params.tags_filter_any) |filter| {
-            const tags = record.tags_text orelse "";
-            if (!search.tagsMatchAny(tags, filter)) {
-                codec.freeScannedSessionRecord(alloc, &record);
-                if (params.max_scan > 0 and scanned.* >= params.max_scan) return true;
-                continue;
-            }
-        }
-
-        // 8c. Marker filter: exact match or OR logic
+        // 8b. Marker filter: exact match or OR logic
         if (params.marker_filter) |filter| {
             const marker = record.marker orelse "";
             if (!std.mem.eql(u8, marker, filter)) {
@@ -441,17 +429,7 @@ fn processBlock(
             }
         }
 
-        // 8f. Has tags filter
-        if (params.has_tags) |want_tags| {
-            const has = if (record.tags_text) |t| t.len > 0 else false;
-            if (has != want_tags) {
-                codec.freeScannedSessionRecord(alloc, &record);
-                if (params.max_scan > 0 and scanned.* >= params.max_scan) return true;
-                continue;
-            }
-        }
-
-        // 8g. Source document ID filter: exact match
+        // 8e. Source document ID filter: exact match
         if (params.source_doc_id) |filter| {
             const doc_id = record.source_doc_id orelse "";
             if (!std.mem.eql(u8, doc_id, filter)) {

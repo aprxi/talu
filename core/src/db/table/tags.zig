@@ -1129,3 +1129,201 @@ pub fn freeTagRecords(alloc: Allocator, records: []TagRecord) void {
     }
     alloc.free(records);
 }
+
+/// Free a slice of owned strings (session IDs, tag IDs, etc.).
+pub fn freeStringSlice(alloc: Allocator, strings: [][]const u8) void {
+    for (strings) |s| alloc.free(s);
+    alloc.free(strings);
+}
+
+// =============================================================================
+// Tag Filter Resolution (domain logic for search)
+// =============================================================================
+
+/// Resolve a space-separated tag name filter to matching session IDs.
+///
+/// For AND logic (`is_and = true`): returns sessions that have ALL specified
+/// tags. For OR logic (`is_and = false`): returns sessions that have ANY of
+/// the specified tags.
+///
+/// Returns an empty slice if no tags match. Caller owns returned strings;
+/// free each with `alloc.free()`, then free the slice.
+pub fn resolveTagFilterSessionIds(
+    alloc: Allocator,
+    db_path: []const u8,
+    filter: []const u8,
+    is_and: bool,
+    group_id: ?[]const u8,
+) ![][]const u8 {
+    var adapter = try TagAdapter.initReadOnly(alloc, db_path);
+    defer adapter.deinitReadOnly();
+
+    // Scan all tags once for case-insensitive name matching.
+    const all_tags = try adapter.scanTags(alloc, group_id);
+    defer {
+        for (all_tags) |*t| {
+            var tag = t.*;
+            tag.deinit(alloc);
+        }
+        alloc.free(all_tags);
+    }
+
+    var result_set = std.StringHashMap(void).init(alloc);
+    defer result_set.deinit();
+
+    var first_tag = true;
+
+    var it = std.mem.tokenizeScalar(u8, filter, ' ');
+    while (it.next()) |tag_name| {
+        // Find tag by name (case-insensitive).
+        const tag_id = findTagIdByName(all_tags, tag_name) orelse {
+            if (is_and) {
+                // AND: unknown tag → intersection is empty.
+                clearStringHashMap(alloc, &result_set);
+                break;
+            }
+            continue; // OR: skip unknown tags.
+        };
+
+        // Get session IDs for this tag.
+        const session_ids = try adapter.getTagConversations(alloc, tag_id);
+        defer {
+            for (session_ids) |s| alloc.free(s);
+            alloc.free(session_ids);
+        }
+
+        if (is_and) {
+            if (first_tag) {
+                // First tag: seed the result set.
+                for (session_ids) |sid| {
+                    const key = try alloc.dupe(u8, sid);
+                    result_set.put(key, {}) catch {
+                        alloc.free(key);
+                        continue;
+                    };
+                }
+                first_tag = false;
+            } else {
+                // Subsequent tags: intersect.
+                var tag_set = std.StringHashMap(void).init(alloc);
+                defer tag_set.deinit();
+                for (session_ids) |sid| {
+                    tag_set.put(sid, {}) catch continue;
+                }
+
+                // Remove entries not in tag_set.
+                var to_remove = std.ArrayList([]const u8).empty;
+                defer to_remove.deinit(alloc);
+                var rit = result_set.keyIterator();
+                while (rit.next()) |key| {
+                    if (!tag_set.contains(key.*)) {
+                        to_remove.append(alloc, key.*) catch continue;
+                    }
+                }
+                for (to_remove.items) |key| {
+                    _ = result_set.remove(key);
+                    alloc.free(key);
+                }
+            }
+        } else {
+            // OR: union.
+            for (session_ids) |sid| {
+                if (!result_set.contains(sid)) {
+                    const key = try alloc.dupe(u8, sid);
+                    result_set.put(key, {}) catch {
+                        alloc.free(key);
+                        continue;
+                    };
+                }
+            }
+        }
+    }
+
+    // Convert HashMap keys to owned slice.
+    var results = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (results.items) |s| alloc.free(s);
+        results.deinit(alloc);
+    }
+
+    var kit = result_set.keyIterator();
+    while (kit.next()) |key| {
+        try results.append(alloc, key.*);
+    }
+    // Don't free keys — ownership transferred to results.
+    // Just deinit the map structure (not the keys).
+    result_set.clearRetainingCapacity();
+
+    return results.toOwnedSlice(alloc);
+}
+
+/// Collect all session IDs that have at least one tag.
+///
+/// Scans all tags and their conversation associations. Returns deduplicated
+/// session IDs. Caller owns returned strings; free each with `alloc.free()`.
+pub fn collectAllTaggedSessionIds(alloc: Allocator, db_path: []const u8) ![][]const u8 {
+    var adapter = try TagAdapter.initReadOnly(alloc, db_path);
+    defer adapter.deinitReadOnly();
+
+    // Get all tags.
+    const tags = try adapter.scanTags(alloc, null);
+    defer {
+        for (tags) |*t| {
+            var tag = t.*;
+            tag.deinit(alloc);
+        }
+        alloc.free(tags);
+    }
+
+    var session_set = std.StringHashMap(void).init(alloc);
+    defer session_set.deinit();
+
+    for (tags) |tag| {
+        const session_ids = try adapter.getTagConversations(alloc, tag.tag_id);
+        defer {
+            for (session_ids) |s| alloc.free(s);
+            alloc.free(session_ids);
+        }
+
+        for (session_ids) |sid| {
+            if (!session_set.contains(sid)) {
+                const key = try alloc.dupe(u8, sid);
+                session_set.put(key, {}) catch {
+                    alloc.free(key);
+                    continue;
+                };
+            }
+        }
+    }
+
+    // Convert to owned slice.
+    var results = std.ArrayList([]const u8).empty;
+    errdefer {
+        for (results.items) |s| alloc.free(s);
+        results.deinit(alloc);
+    }
+
+    var kit = session_set.keyIterator();
+    while (kit.next()) |key| {
+        try results.append(alloc, key.*);
+    }
+    session_set.clearRetainingCapacity();
+
+    return results.toOwnedSlice(alloc);
+}
+
+/// Clear a StringHashMap, freeing all owned keys.
+fn clearStringHashMap(alloc: Allocator, map: *std.StringHashMap(void)) void {
+    var it = map.keyIterator();
+    while (it.next()) |key| alloc.free(key.*);
+    map.clearRetainingCapacity();
+}
+
+/// Find a tag's ID by name (case-insensitive) from a pre-scanned list.
+/// Returns a borrowed slice valid for the lifetime of `tags`.
+fn findTagIdByName(tags: []const TagRecord, name: []const u8) ?[]const u8 {
+    for (tags) |tag| {
+        if (std.ascii.eqlIgnoreCase(tag.name, name)) return tag.tag_id;
+    }
+    return null;
+}
