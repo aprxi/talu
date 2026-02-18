@@ -40,6 +40,7 @@ const cpu_rowwise = compute.cpu.rowwise;
 const cpu_reduction = compute.cpu.reduction;
 const cpu_cache_store = compute.cpu.cache_store;
 const cpu_rotary = compute.cpu.rotary;
+const cpu_tensor_gather = compute.cpu.tensor_gather;
 const graph = @import("../../../graph/root.zig");
 const contract = @import("../contract.zig");
 const log = @import("../../../log.zig");
@@ -626,7 +627,7 @@ pub const FusedCpuBackend = struct {
             );
 
             if (encoded.deepstack_layer_embeddings.len > 0) {
-                image_token_positions = try collectTokenPositions(self.allocator, tokens, vi.image_token_id);
+                image_token_positions = try cpu_tensor_gather.collectPositionsU32(self.allocator, tokens, vi.image_token_id);
                 if (image_token_positions.len == 0) return error.InvalidPromptImageTokens;
                 const expected_values = image_token_positions.len * model_dim;
                 const layer0_values = if (encoded.deepstack_layer_embeddings.len > 0)
@@ -758,30 +759,6 @@ pub const FusedCpuBackend = struct {
             self.head_dim,
             seq_len,
         );
-    }
-
-    fn collectTokenPositions(
-        allocator: std.mem.Allocator,
-        token_ids: []const u32,
-        needle: u32,
-    ) ![]usize {
-        var count: usize = 0;
-        for (token_ids) |token| {
-            if (token == needle) count += 1;
-        }
-        if (count == 0) return &.{};
-
-        const positions = try allocator.alloc(usize, count);
-        errdefer allocator.free(positions);
-
-        var write_idx: usize = 0;
-        for (token_ids, 0..) |token, idx| {
-            if (token != needle) continue;
-            positions[write_idx] = idx;
-            write_idx += 1;
-        }
-        std.debug.assert(write_idx == count);
-        return positions;
     }
 
     fn setRuntimeRoPEForTextLayers(

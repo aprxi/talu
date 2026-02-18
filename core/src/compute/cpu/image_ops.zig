@@ -227,3 +227,75 @@ pub fn interpolatePosEmbeddings(
     }
 }
 
+/// Pack `[patch_tokens, hidden]` into `[merged_tokens, merge_units * hidden]`.
+///
+/// When `row_major_input` is false, source is expected in merge-block order.
+/// When `row_major_input` is true, source is expected in row-major order per frame.
+pub fn packMergedTokens(
+    hidden: []const f32,
+    grid_h: usize,
+    grid_w: usize,
+    grid_t: usize,
+    vision_hidden_size: usize,
+    spatial_merge_size: usize,
+    row_major_input: bool,
+    out: []f32,
+) !void {
+    if (spatial_merge_size == 0) return error.InvalidShape;
+    if ((grid_h % spatial_merge_size) != 0 or (grid_w % spatial_merge_size) != 0) return error.InvalidShape;
+
+    const merge_units = spatial_merge_size * spatial_merge_size;
+    const patch_count = grid_t * grid_h * grid_w;
+    const merged_h = grid_h / spatial_merge_size;
+    const merged_w = grid_w / spatial_merge_size;
+    const merged_tokens = grid_t * merged_h * merged_w;
+    const merged_width = vision_hidden_size * merge_units;
+
+    if (hidden.len != patch_count * vision_hidden_size) return error.InvalidShape;
+    if (out.len != merged_tokens * merged_width) return error.InvalidShape;
+
+    if (!row_major_input) {
+        for (0..merged_tokens) |dst_token| {
+            const dst_base = dst_token * merged_width;
+            for (0..merge_units) |unit_idx| {
+                const src_token = dst_token * merge_units + unit_idx;
+                const src_base = src_token * vision_hidden_size;
+                const dst_offset = dst_base + unit_idx * vision_hidden_size;
+                @memcpy(
+                    out[dst_offset..][0..vision_hidden_size],
+                    hidden[src_base..][0..vision_hidden_size],
+                );
+            }
+        }
+        return;
+    }
+
+    const patches_per_frame = grid_h * grid_w;
+    const merged_per_frame = merged_h * merged_w;
+
+    for (0..grid_t) |t_idx| {
+        const src_frame_base = t_idx * patches_per_frame;
+        const dst_frame_base = t_idx * merged_per_frame;
+        for (0..merged_h) |bh| {
+            for (0..merged_w) |bw| {
+                const dst_token = dst_frame_base + bh * merged_w + bw;
+                const dst_base = dst_token * merged_width;
+                var unit_idx: usize = 0;
+                for (0..spatial_merge_size) |ih| {
+                    for (0..spatial_merge_size) |iw| {
+                        const row = bh * spatial_merge_size + ih;
+                        const col = bw * spatial_merge_size + iw;
+                        const src_token = src_frame_base + row * grid_w + col;
+                        const src_base = src_token * vision_hidden_size;
+                        const dst_offset = dst_base + unit_idx * vision_hidden_size;
+                        @memcpy(
+                            out[dst_offset..][0..vision_hidden_size],
+                            hidden[src_base..][0..vision_hidden_size],
+                        );
+                        unit_idx += 1;
+                    }
+                }
+            }
+        }
+    }
+}

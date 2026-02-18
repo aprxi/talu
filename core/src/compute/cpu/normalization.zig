@@ -95,6 +95,27 @@ pub fn layerNormRow(
     }
 }
 
+/// LayerNorm over contiguous rows `[row_count, row_width]`.
+pub fn layerNormRows(
+    input: []const f32,
+    output: []f32,
+    row_count: usize,
+    row_width: usize,
+    weight: []const f32,
+    bias: []const f32,
+    eps: f32,
+) !void {
+    if (weight.len != row_width or bias.len != row_width) return error.InvalidShape;
+    if (input.len < row_count * row_width) return error.InvalidShape;
+    if (output.len < row_count * row_width) return error.InvalidShape;
+
+    for (0..row_count) |row_idx| {
+        const in_row = input[row_idx * row_width ..][0..row_width];
+        const out_row = output[row_idx * row_width ..][0..row_width];
+        layerNormRow(in_row, out_row, weight, bias, eps);
+    }
+}
+
 test "rmsnormInPlace keeps unit scale for ones" {
     var x = [_]f32{ 1, 1, 1, 1 };
     const w = [_]f32{ 1, 1, 1, 1 };

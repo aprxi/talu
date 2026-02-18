@@ -44,6 +44,61 @@ pub fn scatterAddRowsByPositions(
     }
 }
 
+/// Collect token positions matching `needle`.
+///
+/// Returns an owned slice; caller owns the result and must free it.
+pub fn collectPositionsU32(
+    allocator: std.mem.Allocator,
+    tokens: []const u32,
+    needle: u32,
+) ![]usize {
+    var count: usize = 0;
+    for (tokens) |token| {
+        if (token == needle) count += 1;
+    }
+    if (count == 0) return &.{};
+
+    const positions = try allocator.alloc(usize, count);
+    errdefer allocator.free(positions);
+
+    var write_idx: usize = 0;
+    for (tokens, 0..) |token, idx| {
+        if (token != needle) continue;
+        positions[write_idx] = idx;
+        write_idx += 1;
+    }
+    std.debug.assert(write_idx == count);
+    return positions;
+}
+
+/// Scatter embedding rows into hidden states at positions where token ID matches.
+pub fn scatterEmbeddingsByTokenId(
+    hidden_states: []f32,
+    seq_len: usize,
+    row_width: usize,
+    token_ids: []const u32,
+    token_id_match: u32,
+    embeddings: []const f32,
+) !void {
+    if (hidden_states.len != seq_len * row_width) return error.InvalidShape;
+    if (token_ids.len != seq_len) return error.InvalidShape;
+    if (embeddings.len % row_width != 0) return error.InvalidShape;
+
+    const embed_tokens = embeddings.len / row_width;
+    var embed_idx: usize = 0;
+
+    for (token_ids, 0..) |token_id, pos| {
+        if (token_id != token_id_match) continue;
+        if (embed_idx >= embed_tokens) return error.InvalidShape;
+        const src = embeddings[embed_idx * row_width ..][0..row_width];
+        const dst = hidden_states[pos * row_width ..][0..row_width];
+        @memcpy(dst, src);
+        embed_idx += 1;
+    }
+
+    if (embed_idx != embed_tokens) return error.InvalidShape;
+}
+
 test "gatherRowsF32 copies rows by index" {
     const src = [_]f32{
         1,   2,   3,

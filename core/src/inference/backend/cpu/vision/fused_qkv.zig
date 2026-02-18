@@ -11,7 +11,6 @@
 
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
-const dtype_mod = @import("../../../../dtype.zig");
 const io = @import("../../../../io/root.zig");
 const graph_runtime = @import("../graph.zig");
 const compute = @import("../../../../compute/root.zig");
@@ -20,14 +19,18 @@ const exec_block = @import("../executor/block.zig");
 const layer_ops = graph_runtime.layer_ops;
 const image_mod = @import("../../../../image/root.zig");
 const common_vision = @import("types.zig");
+const vision_tensor_convert = @import("tensor_convert.zig");
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const LoadedModel = graph_runtime.LoadedModel;
 const matmul = compute.ops.matmul;
+const cpu_common = compute.cpu.common;
 const cpu_image_ops = compute.cpu.image_ops;
 const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
+const cpu_rowwise = compute.cpu.rowwise;
+const cpu_tensor_gather = compute.cpu.tensor_gather;
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;
@@ -137,24 +140,24 @@ pub const VisionRuntime = struct {
         const patch_proj_w_5d = try st.getTensor("model.visual.patch_embed.proj.weight", null);
         const patch_proj_weight = flattenPatchProjWeight(patch_proj_w_5d, vision_hidden_size, temporal_patch_size, patch_size);
         const patch_proj_bias_tensor = try st.getTensor("model.visual.patch_embed.proj.bias", null);
-        const patch_proj_bias = try tensorToOwnedF32(allocator, patch_proj_bias_tensor);
+        const patch_proj_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, patch_proj_bias_tensor);
         errdefer allocator.free(patch_proj_bias);
 
         const pos_embed_tensor = try st.getTensor("model.visual.pos_embed.weight", null);
-        const pos_embed_f32 = try tensorToOwnedF32(allocator, pos_embed_tensor);
+        const pos_embed_f32 = try vision_tensor_convert.tensorToOwnedF32(allocator, pos_embed_tensor);
         errdefer allocator.free(pos_embed_f32);
 
-        const merger_norm_weight = try tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.norm.weight", null));
+        const merger_norm_weight = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.norm.weight", null));
         errdefer allocator.free(merger_norm_weight);
-        const merger_norm_bias = try tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.norm.bias", null));
+        const merger_norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.norm.bias", null));
         errdefer allocator.free(merger_norm_bias);
 
         const merger_fc1_weight = try st.getTensor("model.visual.merger.linear_fc1.weight", null);
-        const merger_fc1_bias = try tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.linear_fc1.bias", null));
+        const merger_fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.linear_fc1.bias", null));
         errdefer allocator.free(merger_fc1_bias);
 
         const merger_fc2_weight = try st.getTensor("model.visual.merger.linear_fc2.weight", null);
-        const merger_fc2_bias = try tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.linear_fc2.bias", null));
+        const merger_fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor("model.visual.merger.linear_fc2.bias", null));
         errdefer allocator.free(merger_fc2_bias);
         const deepstack_mergers = try loadDeepstackMergers(
             allocator,
@@ -206,24 +209,24 @@ pub const VisionRuntime = struct {
             const qkv_weight_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.attn.qkv.weight", .{layer_idx});
             const qkv_weight = try st.getTensor(qkv_weight_name, null);
             const qkv_bias_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.attn.qkv.bias", .{layer_idx});
-            const qkv_bias_all = try tensorToOwnedF32(allocator, try st.getTensor(qkv_bias_name, null));
+            const qkv_bias_all = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor(qkv_bias_name, null));
             errdefer allocator.free(qkv_bias_all);
 
             const o_weight_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.attn.proj.weight", .{layer_idx});
             const o_weight = try st.getTensor(o_weight_name, null);
             const o_bias_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.attn.proj.bias", .{layer_idx});
-            const o_bias = try tensorToOwnedF32(allocator, try st.getTensor(o_bias_name, null));
+            const o_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor(o_bias_name, null));
             errdefer allocator.free(o_bias);
 
             const fc1_weight_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.mlp.linear_fc1.weight", .{layer_idx});
             const fc1_weight = try st.getTensor(fc1_weight_name, null);
             const fc1_bias_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.mlp.linear_fc1.bias", .{layer_idx});
-            const fc1_bias = try tensorToOwnedF32(allocator, try st.getTensor(fc1_bias_name, null));
+            const fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor(fc1_bias_name, null));
             errdefer allocator.free(fc1_bias);
             const fc2_weight_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.mlp.linear_fc2.weight", .{layer_idx});
             const fc2_weight = try st.getTensor(fc2_weight_name, null);
             const fc2_bias_name = try std.fmt.bufPrint(&name_buf, "model.visual.blocks.{d}.mlp.linear_fc2.bias", .{layer_idx});
-            const fc2_bias = try tensorToOwnedF32(allocator, try st.getTensor(fc2_bias_name, null));
+            const fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor(fc2_bias_name, null));
             errdefer allocator.free(fc2_bias);
 
             layer_weights[layer_idx] = .{
@@ -480,17 +483,13 @@ pub const VisionRuntime = struct {
         var patch_input_view = Tensor.view2DSlice(patch_input, patch_count, patch_dim);
         var patch_hidden_view = Tensor.view2DSlice(patch_hidden, patch_count, self.vision_hidden_size);
         try matmul.matmulAuto(&patch_input_view, &self.patch_proj_weight, &patch_hidden_view, &self.scratch.matmul_scratch);
-
-        for (0..patch_count) |row| {
-            const row_slice = patch_hidden[row * self.vision_hidden_size ..][0..self.vision_hidden_size];
-            for (row_slice, self.patch_proj_bias) |*v, b| v.* += b;
-        }
+        cpu_common.addBiasRows(patch_hidden, self.patch_proj_bias, patch_count, self.vision_hidden_size);
 
         const pos_embeds = try self.allocator.alloc(f32, patch_count * self.vision_hidden_size);
         defer self.allocator.free(pos_embeds);
         try interpolatePosEmbeddings(self, image.grid, pos_embeds);
 
-        for (patch_hidden, pos_embeds) |*h, p| h.* += p;
+        cpu_rowwise.addScaledInPlace(patch_hidden, pos_embeds, 1.0);
 
         const hidden_a = try self.allocator.alloc(f32, patch_hidden.len);
         defer self.allocator.free(hidden_a);
@@ -605,7 +604,16 @@ pub const VisionRuntime = struct {
 
         const merged = try self.allocator.alloc(f32, merged_tokens * merged_width);
         defer self.allocator.free(merged);
-        try self.packMergedTokens(grid, hidden, merged_tokens, merged_width, merged);
+        try cpu_image_ops.packMergedTokens(
+            hidden,
+            @as(usize, @intCast(grid.height)),
+            @as(usize, @intCast(grid.width)),
+            @as(usize, @intCast(grid.temporal)),
+            self.vision_hidden_size,
+            self.spatial_merge_size,
+            false,
+            merged,
+        );
 
         if (merger.norm_weight.len != merged_width or merger.norm_bias.len != merged_width) {
             return error.InvalidShape;
@@ -613,11 +621,15 @@ pub const VisionRuntime = struct {
 
         const normed = try self.allocator.alloc(f32, merged.len);
         defer self.allocator.free(normed);
-        for (0..merged_tokens) |row| {
-            const in_row = merged[row * merged_width ..][0..merged_width];
-            const out_row = normed[row * merged_width ..][0..merged_width];
-            layerNormRow(in_row, out_row, merger.norm_weight, merger.norm_bias, 1e-6);
-        }
+        try cpu_norm.layerNormRows(
+            merged,
+            normed,
+            merged_tokens,
+            merged_width,
+            merger.norm_weight,
+            merger.norm_bias,
+            1e-6,
+        );
 
         const fc1_out = try self.allocator.alloc(f32, merged_tokens * merged_width);
         defer self.allocator.free(fc1_out);
@@ -626,10 +638,7 @@ pub const VisionRuntime = struct {
         var fc1_view = Tensor.view2DSlice(fc1_out, merged_tokens, merged_width);
         try matmul.matmulAuto(&normed_view, &merger.fc1_weight, &fc1_view, &self.scratch.matmul_scratch);
 
-        for (0..merged_tokens) |row| {
-            const row_slice = fc1_out[row * merged_width ..][0..merged_width];
-            for (row_slice, merger.fc1_bias) |*v, b| v.* += b;
-        }
+        cpu_common.addBiasRows(fc1_out, merger.fc1_bias, merged_tokens, merged_width);
 
         const tv = compute.ops.tensor_view;
         const activation = compute.ops.activation;
@@ -643,10 +652,7 @@ pub const VisionRuntime = struct {
         var out_view = Tensor.view2DSlice(out, merged_tokens, self.language_hidden_size);
         try matmul.matmulAuto(&fc1_view, &merger.fc2_weight, &out_view, &self.scratch.matmul_scratch);
 
-        for (0..merged_tokens) |row| {
-            const row_slice = out[row * self.language_hidden_size ..][0..self.language_hidden_size];
-            for (row_slice, merger.fc2_bias) |*v, b| v.* += b;
-        }
+        cpu_common.addBiasRows(out, merger.fc2_bias, merged_tokens, self.language_hidden_size);
 
         return out;
     }
@@ -659,12 +665,15 @@ pub const VisionRuntime = struct {
 
         const normed = try self.allocator.alloc(f32, hidden.len);
         defer self.allocator.free(normed);
-
-        for (0..patch_count) |row| {
-            const in_row = hidden[row * self.vision_hidden_size ..][0..self.vision_hidden_size];
-            const out_row = normed[row * self.vision_hidden_size ..][0..self.vision_hidden_size];
-            layerNormRow(in_row, out_row, self.merger_norm_weight, self.merger_norm_bias, 1e-6);
-        }
+        try cpu_norm.layerNormRows(
+            hidden,
+            normed,
+            patch_count,
+            self.vision_hidden_size,
+            self.merger_norm_weight,
+            self.merger_norm_bias,
+            1e-6,
+        );
 
         const merge_units = self.spatial_merge_size * self.spatial_merge_size;
         const merged_h = @as(usize, @intCast(grid.height)) / self.spatial_merge_size;
@@ -676,7 +685,16 @@ pub const VisionRuntime = struct {
         const merged = try self.allocator.alloc(f32, merged_tokens * merged_width);
         defer self.allocator.free(merged);
 
-        try self.packMergedTokens(grid, normed, merged_tokens, merged_width, merged);
+        try cpu_image_ops.packMergedTokens(
+            normed,
+            @as(usize, @intCast(grid.height)),
+            @as(usize, @intCast(grid.width)),
+            @as(usize, @intCast(grid.temporal)),
+            self.vision_hidden_size,
+            self.spatial_merge_size,
+            false,
+            merged,
+        );
 
         const fc1_out = try self.allocator.alloc(f32, merged_tokens * self.vision_intermediate_size);
         defer self.allocator.free(fc1_out);
@@ -685,10 +703,7 @@ pub const VisionRuntime = struct {
         var fc1_view = Tensor.view2DSlice(fc1_out, merged_tokens, self.vision_intermediate_size);
         try matmul.matmulAuto(&merged_view, &self.merger_fc1_weight, &fc1_view, &self.scratch.matmul_scratch);
 
-        for (0..merged_tokens) |row| {
-            const row_slice = fc1_out[row * self.vision_intermediate_size ..][0..self.vision_intermediate_size];
-            for (row_slice, self.merger_fc1_bias) |*v, b| v.* += b;
-        }
+        cpu_common.addBiasRows(fc1_out, self.merger_fc1_bias, merged_tokens, self.vision_intermediate_size);
 
         // In-place GELU
         const tv = compute.ops.tensor_view;
@@ -703,43 +718,9 @@ pub const VisionRuntime = struct {
         var out_view = Tensor.view2DSlice(out, merged_tokens, self.language_hidden_size);
         try matmul.matmulAuto(&fc1_view, &self.merger_fc2_weight, &out_view, &self.scratch.matmul_scratch);
 
-        for (0..merged_tokens) |row| {
-            const row_slice = out[row * self.language_hidden_size ..][0..self.language_hidden_size];
-            for (row_slice, self.merger_fc2_bias) |*v, b| v.* += b;
-        }
+        cpu_common.addBiasRows(out, self.merger_fc2_bias, merged_tokens, self.language_hidden_size);
 
         return out;
-    }
-
-    fn packMergedTokens(
-        self: *const VisionRuntime,
-        grid: image_mod.VisionGrid,
-        hidden: []const f32,
-        merged_tokens: usize,
-        merged_width: usize,
-        out: []f32,
-    ) !void {
-        const merge_units = self.spatial_merge_size * self.spatial_merge_size;
-        const patch_count: usize = @as(usize, @intCast(grid.temporal)) *
-            @as(usize, @intCast(grid.height)) *
-            @as(usize, @intCast(grid.width));
-
-        if (hidden.len != patch_count * self.vision_hidden_size) return error.InvalidShape;
-        if (out.len != merged_tokens * merged_width) return error.InvalidShape;
-        if (patch_count != merged_tokens * merge_units) return error.InvalidShape;
-
-        for (0..merged_tokens) |dst_token| {
-            const dst_base = dst_token * merged_width;
-            for (0..merge_units) |u| {
-                const src_token = dst_token * merge_units + u;
-                const src_base = src_token * self.vision_hidden_size;
-                const dst_offset = dst_base + u * self.vision_hidden_size;
-                @memcpy(
-                    out[dst_offset..][0..self.vision_hidden_size],
-                    hidden[src_base..][0..self.vision_hidden_size],
-                );
-            }
-        }
     }
 
     fn fillVisionRotaryTables(
@@ -770,23 +751,14 @@ pub fn scatterVisionEmbeddings(
     image_token_id: u32,
     embeddings: []const f32,
 ) !void {
-    if (hidden_states.len != seq_len * d_model) return error.InvalidShape;
-    if (token_ids.len != seq_len) return error.InvalidShape;
-    if (embeddings.len % d_model != 0) return error.InvalidShape;
-
-    const embed_tokens = embeddings.len / d_model;
-    var embed_idx: usize = 0;
-
-    for (token_ids, 0..) |tok, pos| {
-        if (tok != image_token_id) continue;
-        if (embed_idx >= embed_tokens) return error.InvalidShape;
-        const src = embeddings[embed_idx * d_model ..][0..d_model];
-        const dst = hidden_states[pos * d_model ..][0..d_model];
-        @memcpy(dst, src);
-        embed_idx += 1;
-    }
-
-    if (embed_idx != embed_tokens) return error.InvalidShape;
+    return cpu_tensor_gather.scatterEmbeddingsByTokenId(
+        hidden_states,
+        seq_len,
+        d_model,
+        token_ids,
+        image_token_id,
+        embeddings,
+    );
 }
 
 const vision_block_program = [_]layer_ops.LayerOp{
@@ -841,23 +813,23 @@ fn loadDeepstackMergers(
             error.TensorNotFound => break,
             else => return err,
         };
-        const norm_weight = try tensorToOwnedF32(allocator, norm_weight_tensor);
+        const norm_weight = try vision_tensor_convert.tensorToOwnedF32(allocator, norm_weight_tensor);
         errdefer allocator.free(norm_weight);
 
         const norm_bias_name = try std.fmt.bufPrint(&name_buf, "model.visual.deepstack_merger_list.{d}.norm.bias", .{merger_idx});
-        const norm_bias = try tensorToOwnedF32(allocator, try st.getTensor(norm_bias_name, null));
+        const norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor(norm_bias_name, null));
         errdefer allocator.free(norm_bias);
 
         const fc1_weight_name = try std.fmt.bufPrint(&name_buf, "model.visual.deepstack_merger_list.{d}.linear_fc1.weight", .{merger_idx});
         const fc1_weight = try st.getTensor(fc1_weight_name, null);
         const fc1_bias_name = try std.fmt.bufPrint(&name_buf, "model.visual.deepstack_merger_list.{d}.linear_fc1.bias", .{merger_idx});
-        const fc1_bias = try tensorToOwnedF32(allocator, try st.getTensor(fc1_bias_name, null));
+        const fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor(fc1_bias_name, null));
         errdefer allocator.free(fc1_bias);
 
         const fc2_weight_name = try std.fmt.bufPrint(&name_buf, "model.visual.deepstack_merger_list.{d}.linear_fc2.weight", .{merger_idx});
         const fc2_weight = try st.getTensor(fc2_weight_name, null);
         const fc2_bias_name = try std.fmt.bufPrint(&name_buf, "model.visual.deepstack_merger_list.{d}.linear_fc2.bias", .{merger_idx});
-        const fc2_bias = try tensorToOwnedF32(allocator, try st.getTensor(fc2_bias_name, null));
+        const fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try st.getTensor(fc2_bias_name, null));
         errdefer allocator.free(fc2_bias);
 
         if (norm_weight.len != merged_width or norm_bias.len != merged_width) return error.InvalidShape;
@@ -881,30 +853,6 @@ fn loadDeepstackMergers(
     }
 
     return allocator.realloc(mergers, loaded_count);
-}
-
-fn tensorToOwnedF32(allocator: std.mem.Allocator, t: Tensor) ![]f32 {
-    const n = t.numel;
-    var out = try allocator.alloc(f32, n);
-    errdefer allocator.free(out);
-
-    switch (t.dtype) {
-        .f32 => {
-            const src = t.asSlice(f32);
-            @memcpy(out, src[0..n]);
-        },
-        .bf16 => {
-            const src = t.asSliceUnaligned(u16);
-            for (0..n) |i| out[i] = dtype_mod.bf16ToF32(src[i]);
-        },
-        .f16 => {
-            const src = t.asSliceUnaligned(u16);
-            for (0..n) |i| out[i] = dtype_mod.fp16ToF32(src[i]);
-        },
-        else => return error.UnsupportedDType,
-    }
-
-    return out;
 }
 
 fn extractPatchInputReordered(
@@ -943,37 +891,6 @@ fn interpolatePosEmbeddings(
         false,
         out,
     );
-}
-
-fn bilinearPosRow(
-    self: *const VisionRuntime,
-    h_idx: usize,
-    w_idx: usize,
-    grid_h: usize,
-    grid_w: usize,
-    out_row: []f32,
-) !void {
-    return cpu_image_ops.bilinearPosRow(
-        self.pos_embed_f32,
-        self.num_grid_side,
-        self.vision_hidden_size,
-        h_idx,
-        w_idx,
-        grid_h,
-        grid_w,
-        false,
-        out_row,
-    );
-}
-
-fn layerNormRow(
-    input: []const f32,
-    output: []f32,
-    weight: []const f32,
-    bias: []const f32,
-    eps: f32,
-) void {
-    cpu_norm.layerNormRow(input, output, weight, bias, eps);
 }
 
 test "scatterVisionEmbeddings replaces image token rows" {
