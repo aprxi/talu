@@ -1,6 +1,7 @@
 import { getChatDom } from "./dom.ts";
 import { hooks, notifications, upload } from "./deps.ts";
 import { chatState, type ChatAttachment } from "./state.ts";
+import type { InputContentItem, InputContentPart } from "../../types.ts";
 
 interface ChatUploadBeforePayload {
   filename: string;
@@ -16,14 +17,6 @@ function escapeHtml(input: string): string {
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;")
     .replaceAll("'", "&#39;");
-}
-
-function escapeXmlAttr(input: string): string {
-  return input
-    .replaceAll("&", "&amp;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;");
 }
 
 function isBlocked(value: unknown): value is { $block: true; reason: string } {
@@ -215,26 +208,35 @@ export function clearAttachments(): void {
   renderAttachmentLists();
 }
 
-export function buildAttachmentReferencePrefix(attachments: ChatAttachment[]): string {
-  const lines = attachments.map((attachment) => {
-    const attrs = [
-      `id="${escapeXmlAttr(attachment.file.id)}"`,
-      `name="${escapeXmlAttr(attachment.file.filename)}"`,
-      `bytes="${attachment.file.bytes}"`,
-    ];
-    if (attachment.mimeType) {
-      attrs.push(`mime_type="${escapeXmlAttr(attachment.mimeType)}"`);
+/** Build structured input content parts from attachments. */
+function buildAttachmentContentParts(attachments: ChatAttachment[]): InputContentPart[] {
+  return attachments.map((attachment): InputContentPart => {
+    const mime = attachment.mimeType ?? "";
+    if (mime.startsWith("image/")) {
+      return { type: "input_image", image_url: attachment.file.id };
     }
-    return `<file_ref ${attrs.join(" ")} />`;
+    return {
+      type: "input_file",
+      file_url: attachment.file.id,
+      filename: attachment.file.filename,
+    };
   });
-  return `<attachments>\n${lines.join("\n")}\n</attachments>`;
 }
 
-export function composeUserInputWithAttachments(text: string): string {
+/**
+ * Build structured input for the /v1/responses endpoint.
+ *
+ * When attachments are present, returns an array of InputContentItem objects
+ * so the server can resolve file references into actual multimodal content.
+ * When no attachments exist, returns the plain text string.
+ */
+export function composeUserInput(text: string): string | InputContentItem[] {
   const trimmed = text.trim();
   if (chatState.attachments.length === 0) return trimmed;
 
-  const prefix = buildAttachmentReferencePrefix(chatState.attachments);
-  if (!trimmed) return `${prefix}\n\nPlease use the attached files above.`;
-  return `${prefix}\n\n${trimmed}`;
+  const parts: InputContentPart[] = buildAttachmentContentParts(chatState.attachments);
+  const textContent = trimmed || "Describe the attached file.";
+  parts.push({ type: "input_text", text: textContent });
+
+  return [{ type: "message", role: "user", content: parts }];
 }

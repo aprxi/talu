@@ -37,7 +37,7 @@ export async function doRerun(text: string, itemIndex: number): Promise<void> {
   renderChatView(forkedFull.data);
   showInputBar();
 
-  await streamResponse({ text, scrollAfterPlaceholder: true });
+  await streamResponse({ text, input: text, scrollAfterPlaceholder: true });
 }
 
 /** Find the last user message text from the conversation items. */

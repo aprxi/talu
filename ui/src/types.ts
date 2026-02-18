@@ -156,10 +156,23 @@ export interface FunctionCallOutputItem {
   output: string;
 }
 
+/** Structured input content item for multimodal requests. */
+export type InputContentItem = {
+  type: "message";
+  role: "user";
+  content: InputContentPart[];
+};
+
+/** A single content part within a structured input message. */
+export type InputContentPart =
+  | { type: "input_text"; text: string }
+  | { type: "input_image"; image_url: string }
+  | { type: "input_file"; file_url: string; filename?: string };
+
 /** Request body for POST /v1/responses. */
 export interface CreateResponseRequest {
   model: string;
-  input?: string;
+  input?: string | InputContentItem[];
   previous_response_id?: string | null;
   /** TaluDB session ID — used to continue an existing stored conversation. */
   session_id?: string | null;

@@ -9,11 +9,11 @@ import { readSSEStream } from "./streaming.ts";
 import { ensureChatHeader } from "./selection.ts";
 import {
   clearAttachments,
-  composeUserInputWithAttachments,
+  composeUserInput,
   hasAttachments,
   isAttachmentUploadInProgress,
 } from "./attachments.ts";
-import type { Conversation, CreateResponseRequest, UsageStats } from "../../types.ts";
+import type { Conversation, CreateResponseRequest, InputContentItem, UsageStats } from "../../types.ts";
 
 export function setupInputEvents(): void {
   const dom = getChatDom();
@@ -56,6 +56,7 @@ export function cancelGeneration(): void {
 
 export interface StreamOptions {
   text: string;
+  input: string | InputContentItem[];
   promptId?: string | null;
   scrollAfterPlaceholder?: boolean;
   discoverSession?: boolean;
@@ -77,7 +78,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   try {
     let requestBody: CreateResponseRequest = {
       model: getModelsService()?.getActiveModel() ?? "",
-      input: opts.text,
+      input: opts.input,
       previous_response_id: chatState.lastResponseId,
       session_id: chatState.activeSessionId,
       prompt_id: opts.promptId ?? undefined,
@@ -151,6 +152,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
 
 interface SendOptions {
   text: string;
+  input: string | InputContentItem[];
   promptId?: string | null;
   beforeSend?: () => void;
   afterResponse?: (chat: Conversation) => void;
@@ -166,6 +168,7 @@ async function sendAndStream(opts: SendOptions): Promise<void> {
   clearAttachments();
   await streamResponse({
     text: opts.text,
+    input: opts.input,
     promptId: opts.promptId,
     discoverSession: true,
     afterResponse: opts.afterResponse,
@@ -180,10 +183,12 @@ async function handleWelcomeSend(): Promise<void> {
   if (!text.trim() && !hasAttachments()) return;
 
   const promptId = getPromptsService()?.getSelectedPromptId() ?? null;
-  const composedText = composeUserInputWithAttachments(text);
+  const input = composeUserInput(text);
+  const displayText = typeof input === "string" ? input : text.trim() || "Describe the attached file.";
 
   await sendAndStream({
-    text: composedText,
+    text: displayText,
+    input,
     promptId,
     beforeSend() {
       hideWelcome();
@@ -200,7 +205,9 @@ async function handleSend(): Promise<void> {
   if (chatState.isGenerating || isAttachmentUploadInProgress()) return;
   if (!text.trim() && !hasAttachments()) return;
 
-  await sendAndStream({ text: composeUserInputWithAttachments(text) });
+  const input = composeUserInput(text);
+  const displayText = typeof input === "string" ? input : text.trim() || "Describe the attached file.";
+  await sendAndStream({ text: displayText, input });
 }
 
 /**

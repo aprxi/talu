@@ -19,6 +19,7 @@ use crate::provider;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::generated;
 use crate::server::state::{AppState, StoredResponse};
+use talu::blobs::BlobsHandle;
 use talu::documents::{DocumentError, DocumentsHandle};
 use talu::responses::{ContentType, ItemType};
 use talu::{ChatHandle, FinishReason};
@@ -269,6 +270,192 @@ pub async fn handle_models(
         .unwrap()
 }
 
+/// Encode bytes to base64 (standard alphabet with padding).
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut i = 0usize;
+    while i + 3 <= bytes.len() {
+        let b0 = bytes[i];
+        let b1 = bytes[i + 1];
+        let b2 = bytes[i + 2];
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        i += 3;
+    }
+    let rem = bytes.len() - i;
+    if rem == 1 {
+        let b0 = bytes[i];
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[((b0 & 0x03) << 4) as usize] as char);
+        out.push('=');
+        out.push('=');
+    } else if rem == 2 {
+        let b0 = bytes[i];
+        let b1 = bytes[i + 1];
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        out.push(TABLE[((b1 & 0x0f) << 2) as usize] as char);
+        out.push('=');
+    }
+    out
+}
+
+/// File document metadata (matches the JSON stored by the upload handler).
+#[derive(serde::Deserialize)]
+struct FileDocContent {
+    blob_ref: Option<String>,
+    mime_type: Option<String>,
+    kind: Option<String>,
+}
+
+/// Resolve file references in a structured input JSON array.
+///
+/// Scans the input for `input_image` or `input_file` items whose URLs look like
+/// file IDs (e.g. `file_abc123`). For each, loads the blob from storage, and:
+/// - For images: rewrites as `input_image` with a base64 data URI in `image_url`.
+/// - For other files: rewrites `input_file` with base64-encoded `file_data`.
+///
+/// Returns the (possibly modified) JSON string ready for `load_responses_json`.
+fn resolve_file_references(
+    input_json: &str,
+    storage_path: &std::path::Path,
+) -> Result<String> {
+    let mut items: serde_json::Value =
+        serde_json::from_str(input_json).context("failed to parse input JSON")?;
+
+    let arr = match items.as_array_mut() {
+        Some(a) => a,
+        None => return Ok(input_json.to_string()),
+    };
+
+    let mut needs_storage = false;
+    // Pre-scan: check if any content parts reference file IDs.
+    for item in arr.iter() {
+        if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
+            for part in content {
+                let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                match part_type {
+                    "input_image" => {
+                        if let Some(url) = part.get("image_url").and_then(|u| u.as_str()) {
+                            if url.starts_with("file_") {
+                                needs_storage = true;
+                            }
+                        }
+                    }
+                    "input_file" => {
+                        if let Some(url) = part.get("file_url").and_then(|u| u.as_str()) {
+                            if url.starts_with("file_") {
+                                needs_storage = true;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    if !needs_storage {
+        return Ok(input_json.to_string());
+    }
+
+    let docs = DocumentsHandle::open(storage_path)
+        .map_err(|e| anyhow!("failed to open documents for file resolution: {}", e))?;
+    let blobs = BlobsHandle::open(storage_path)
+        .map_err(|e| anyhow!("failed to open blobs for file resolution: {}", e))?;
+
+    for item in arr.iter_mut() {
+        let content = match item.get_mut("content").and_then(|c| c.as_array_mut()) {
+            Some(c) => c,
+            None => continue,
+        };
+
+        let mut replacements: Vec<(usize, serde_json::Value)> = Vec::new();
+
+        for (idx, part) in content.iter().enumerate() {
+            let part_type = part.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+            let file_id = match part_type {
+                "input_image" => part.get("image_url").and_then(|u| u.as_str()),
+                "input_file" => part.get("file_url").and_then(|u| u.as_str()),
+                _ => None,
+            };
+
+            let file_id = match file_id {
+                Some(id) if id.starts_with("file_") => id,
+                _ => continue,
+            };
+
+            // Look up document metadata.
+            let doc = match docs.get(file_id) {
+                Ok(Some(d)) if d.doc_type == "file" => d,
+                Ok(_) | Err(_) => continue,
+            };
+
+            let meta: FileDocContent =
+                serde_json::from_str(&doc.doc_json).unwrap_or(FileDocContent {
+                    blob_ref: None,
+                    mime_type: None,
+                    kind: None,
+                });
+
+            let blob_ref = match meta.blob_ref {
+                Some(ref r) if !r.is_empty() => r.as_str(),
+                _ => continue,
+            };
+
+            // Read the blob bytes.
+            let blob_bytes = match blobs.read_all(blob_ref) {
+                Ok(b) => b,
+                Err(e) => {
+                    log::warn!("failed to read blob for file {}: {}", file_id, e);
+                    continue;
+                }
+            };
+
+            let mime = meta.mime_type.as_deref().unwrap_or("application/octet-stream");
+            let is_image = meta.kind.as_deref() == Some("image") || mime.starts_with("image/");
+
+            if is_image {
+                // Convert to input_image with base64 data URI.
+                let data_url = format!("data:{};base64,{}", mime, base64_encode(&blob_bytes));
+                replacements.push((
+                    idx,
+                    json!({
+                        "type": "input_image",
+                        "image_url": data_url
+                    }),
+                ));
+            } else {
+                // Convert to input_file with base64 file_data.
+                let b64 = base64_encode(&blob_bytes);
+                let filename = part
+                    .get("filename")
+                    .and_then(|f| f.as_str())
+                    .unwrap_or(&doc.title);
+                replacements.push((
+                    idx,
+                    json!({
+                        "type": "input_file",
+                        "file_data": b64,
+                        "filename": filename
+                    }),
+                ));
+            }
+        }
+
+        // Apply replacements in reverse to preserve indices.
+        for (idx, new_part) in replacements.into_iter().rev() {
+            content[idx] = new_part;
+        }
+    }
+
+    serde_json::to_string(&items).context("failed to serialize resolved input")
+}
+
 async fn generate_response(
     state: Arc<AppState>,
     request: generated::CreateResponseBody,
@@ -426,6 +613,12 @@ async fn generate_response(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // File storage path for resolving file references (always available if bucket exists).
+    let file_storage_path = state.bucket_path.as_ref().map(|base| match auth_ctx {
+        Some(ctx) => base.join(&ctx.storage_prefix),
+        None => base.to_path_buf(),
+    });
+
     let session_id_for_task = session_id.clone();
     let bucket_for_task = bucket_path.clone();
     let model_id_for_task = model_id.clone();
@@ -457,9 +650,15 @@ async fn generate_response(
                     .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
             }
 
-            // Load input items into the conversation.
+            // Load input items into the conversation, resolving file references.
+            // The Zig protocol parser stores input_image parts in conversation
+            // items; the generate function extracts them for the vision encoder.
             if let Some(ref json) = input_json {
-                chat.load_responses_json(json)
+                let resolved = match file_storage_path.as_deref() {
+                    Some(sp) => resolve_file_references(json, sp)?,
+                    None => json.clone(),
+                };
+                chat.load_responses_json(&resolved)
                     .map_err(|e| anyhow!("failed to load input: {}", e))?;
             } else if let Some(ref text) = input_string {
                 chat.append_user_message(text)
@@ -480,7 +679,6 @@ async fn generate_response(
                 cfg.top_p = top_p as f32;
             }
 
-            // Generate with empty content — conversation already has the input.
             let result = talu::router::generate(&chat, &[], backend, &cfg)
                 .map_err(|e| anyhow!("generation failed: {}", e))?;
 
@@ -754,6 +952,15 @@ async fn stream_response(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    // File storage path for resolving file references (always available if bucket exists).
+    let file_storage_path = state
+        .bucket_path
+        .as_ref()
+        .map(|base| match auth_ctx.as_ref() {
+            Some(ctx) => base.join(&ctx.storage_prefix),
+            None => base.to_path_buf(),
+        });
+
     // Clones for the blocking task to store response after completion.
     let state_for_store = state.clone();
     let session_id_for_store = session_id.clone();
@@ -834,6 +1041,7 @@ async fn stream_response(
             top_p,
             system_prompt_from_doc,
             prompt_id,
+            file_storage_path,
             ctx,
             stop_flag_for_gen,
         );
@@ -890,6 +1098,7 @@ fn run_streaming_generation(
     top_p: Option<f64>,
     system_prompt: Option<String>,
     prompt_id: Option<String>,
+    file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
 ) -> Result<StreamGenResult> {
@@ -917,9 +1126,15 @@ fn run_streaming_generation(
             .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
     }
 
-    // Load input items into the conversation.
+    // Load input items into the conversation, resolving file references.
+    // The Zig protocol parser stores input_image parts in conversation
+    // items; the generate function extracts them for the vision encoder.
     if let Some(ref json) = input_json {
-        chat.load_responses_json(json)
+        let resolved = match file_storage_path.as_deref() {
+            Some(sp) => resolve_file_references(json, sp)?,
+            None => json.clone(),
+        };
+        chat.load_responses_json(&resolved)
             .map_err(|e| anyhow!("failed to load input: {}", e))?;
     } else if let Some(ref text) = input_string {
         chat.append_user_message(text)
@@ -951,7 +1166,6 @@ fn run_streaming_generation(
     // Record item count before generation to extract only new output items.
     let pre_gen_count = chat.item_count();
 
-    // Generate with empty content — conversation already has the input.
     let stream_result = talu::router::generate_stream(&chat, &[], backend, &cfg, callback)
         .map_err(|e| anyhow!("generation failed: {}", e))?;
 

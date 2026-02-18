@@ -18,6 +18,7 @@ const std = @import("std");
 const io = @import("../../io/root.zig");
 const responses_mod = @import("../../responses/root.zig");
 const Conversation = responses_mod.Conversation;
+const ContentType = responses_mod.ContentType;
 const MessageRole = responses_mod.MessageRole;
 
 /// Parse OpenResponses input JSON into a Conversation.
@@ -135,15 +136,38 @@ fn parseMessage(conv: *Conversation, obj: std.json.ObjectMap) !void {
                     else => return error.InvalidJson,
                 };
 
-                if (std.mem.eql(u8, part_type, "input_text") or std.mem.eql(u8, part_type, "output_text")) {
+                if (std.mem.eql(u8, part_type, "input_text")) {
                     const text = switch (part_obj.get("text") orelse return error.InvalidJson) {
                         .string => |s| s,
                         else => return error.InvalidJson,
                     };
-                    try conv.appendTextContent(msg, text);
+                    const part = try conv.addContentPart(msg, ContentType.input_text);
+                    try part.appendData(conv.allocator, text);
+                } else if (std.mem.eql(u8, part_type, "output_text")) {
+                    const text = switch (part_obj.get("text") orelse return error.InvalidJson) {
+                        .string => |s| s,
+                        else => return error.InvalidJson,
+                    };
+                    const part = try conv.addContentPart(msg, ContentType.output_text);
+                    try part.appendData(conv.allocator, text);
+                } else if (std.mem.eql(u8, part_type, "input_image")) {
+                    const image_url = switch (part_obj.get("image_url") orelse return error.InvalidJson) {
+                        .string => |s| s,
+                        else => return error.InvalidJson,
+                    };
+                    const part = try conv.addContentPart(msg, ContentType.input_image);
+                    try part.appendData(conv.allocator, image_url);
+                } else if (std.mem.eql(u8, part_type, "input_file")) {
+                    const part = try conv.addContentPart(msg, ContentType.input_file);
+                    if (part_obj.get("file_data")) |fd_val| {
+                        const file_data = switch (fd_val) {
+                            .string => |s| s,
+                            else => return error.InvalidJson,
+                        };
+                        try part.appendData(conv.allocator, file_data);
+                    }
                 }
-                // Other content part types (input_image, input_file, etc.)
-                // can be added here as core gains support for them.
+                // Unknown part types are silently skipped for forward compatibility.
             }
             conv.finalizeItem(msg);
         },
