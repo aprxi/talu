@@ -4,6 +4,9 @@
 
 import type { FileObject } from "../../types.ts";
 
+export type SortColumn = "name" | "kind" | "size" | "date";
+export type SortDir = "asc" | "desc";
+
 export const fState = {
   files: [] as FileObject[],
   isLoading: false,
@@ -12,4 +15,6 @@ export const fState = {
   editingFileId: null as string | null,
   selectedIds: new Set<string>(),
   tab: "all" as "all" | "archived",
+  sortBy: "name" as SortColumn,
+  sortDir: "asc" as SortDir,
 };

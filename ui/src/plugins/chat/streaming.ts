@@ -2,7 +2,7 @@ import { chatState } from "./state.ts";
 import { notifications, timers } from "./deps.ts";
 import { sanitizedMarkdown } from "../../render/markdown.ts";
 import { isThinkingExpanded } from "../../render/helpers.ts";
-import { scrollToBottom } from "./messages.ts";
+import { scrollToBottomIfNear } from "./messages.ts";
 import type { UsageStats } from "../../types.ts";
 import type { RendererRegistry, ContentPart } from "../../kernel/types.ts";
 
@@ -86,7 +86,7 @@ export async function readSSEStream(
         timers.requestAnimationFrame(() => {
           renderText(false);
           textRenderPending = false;
-          scrollToBottom();
+          scrollToBottomIfNear();
         });
       }
     },
@@ -98,7 +98,7 @@ export async function readSSEStream(
         timers.requestAnimationFrame(() => {
           reasoningBody!.innerHTML = sanitizedMarkdown(reasoningAccumulated);
           reasoningRenderPending = false;
-          scrollToBottom();
+          scrollToBottomIfNear();
         });
       }
     },

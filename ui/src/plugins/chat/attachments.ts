@@ -1,7 +1,8 @@
 import { getChatDom } from "./dom.ts";
 import { hooks, notifications, upload } from "./deps.ts";
 import { chatState, type ChatAttachment } from "./state.ts";
-import type { InputContentItem, InputContentPart } from "../../types.ts";
+import { openBlobPicker } from "./blob-picker.ts";
+import type { FileObject, InputContentItem, InputContentPart } from "../../types.ts";
 
 interface ChatUploadBeforePayload {
   filename: string;
@@ -184,6 +185,16 @@ export function setupAttachmentEvents(): void {
     dom.fileInput.click();
   });
 
+  dom.welcomeLibrary.addEventListener("click", () => {
+    if (chatState.isUploadingAttachments || chatState.isGenerating) return;
+    void openBlobPicker().then(addBlobAttachments);
+  });
+
+  dom.inputLibrary.addEventListener("click", () => {
+    if (chatState.isUploadingAttachments || chatState.isGenerating) return;
+    void openBlobPicker().then(addBlobAttachments);
+  });
+
   dom.fileInput.addEventListener("change", () => {
     if (!dom.fileInput.files) return;
     void uploadFiles(dom.fileInput.files);
@@ -192,6 +203,30 @@ export function setupAttachmentEvents(): void {
   dom.welcomeAttachmentList.addEventListener("click", onAttachmentClick);
   dom.inputAttachmentList.addEventListener("click", onAttachmentClick);
 
+  renderAttachmentLists();
+}
+
+/** Convert selected FileObjects from the blob picker into chat attachments. */
+function addBlobAttachments(files: FileObject[]): void {
+  if (files.length === 0) return;
+
+  for (const file of files) {
+    // Skip if already attached.
+    if (chatState.attachments.some((a) => a.file.id === file.id)) continue;
+
+    chatState.attachments.push({
+      file: {
+        id: file.id,
+        filename: file.filename,
+        bytes: file.bytes,
+        createdAt: file.created_at,
+        purpose: file.purpose,
+      },
+      mimeType: file.mime_type ?? null,
+    });
+  }
+
+  notifications.info(`Attached ${files.length} file${files.length === 1 ? "" : "s"}`);
   renderAttachmentLists();
 }
 

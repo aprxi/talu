@@ -12,9 +12,36 @@ import {
 } from "../../icons.ts";
 import { el } from "../../render/helpers.ts";
 import { format } from "./deps.ts";
-import { fState } from "./state.ts";
+import { fState, type SortColumn } from "./state.ts";
 import { getFilesDom } from "./dom.ts";
 import { getFilteredFiles } from "./data.ts";
+
+// -- Sort indicators ----------------------------------------------------------
+
+const SORT_ASC = " \u25b2";   // ▲
+const SORT_DESC = " \u25bc";  // ▼
+
+const SORT_LABELS: Record<SortColumn, string> = {
+  name: "Name",
+  kind: "Kind",
+  size: "Size",
+  date: "Date",
+};
+
+function updateSortIndicators(thead: HTMLTableSectionElement): void {
+  const headers = thead.querySelectorAll<HTMLElement>("[data-sort]");
+  for (const th of headers) {
+    const col = th.dataset["sort"] as SortColumn;
+    const label = SORT_LABELS[col] ?? col;
+    if (col === fState.sortBy) {
+      th.textContent = label + (fState.sortDir === "asc" ? SORT_ASC : SORT_DESC);
+      th.classList.add("files-th-sorted");
+    } else {
+      th.textContent = label;
+      th.classList.remove("files-th-sorted");
+    }
+  }
+}
 
 // -- Helpers ------------------------------------------------------------------
 
@@ -62,10 +89,6 @@ export function updateFilesToolbar(): void {
   const hasSelection = fState.selectedIds.size > 0;
   const files = getFilteredFiles();
 
-  // Show/hide toolbar.
-  const toolbar = dom.selectAllBtn.closest<HTMLElement>(".files-toolbar");
-  toolbar?.classList.toggle("hidden", !hasSelection && files.length === 0);
-
   dom.deleteBtn.disabled = !hasSelection;
   dom.archiveBtn.disabled = !hasSelection;
   dom.restoreBtn.disabled = !hasSelection;
@@ -85,6 +108,9 @@ export function renderFilesTable(): void {
 
   dom.tbody.innerHTML = "";
   dom.countEl.textContent = `${files.length} file${files.length !== 1 ? "s" : ""}`;
+
+  // Update sort indicators on column headers.
+  updateSortIndicators(dom.thead);
 
   if (files.length === 0 && !fState.isLoading) {
     const msg = fState.searchQuery

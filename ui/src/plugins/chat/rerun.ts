@@ -1,5 +1,6 @@
 import { chatState } from "./state.ts";
 import { api, notifications } from "./deps.ts";
+import { getChatDom } from "./dom.ts";
 import { showInputBar } from "./welcome.ts";
 import { streamResponse } from "./send.ts";
 import { renderChatView } from "./selection.ts";
@@ -19,13 +20,28 @@ export function handleRerunFromMessage(msgIndex: number): void {
   }
 }
 
-/** Execute re-run with given text, forking from the given item index. */
+/** Execute re-run with given text, forking from the given item index.
+ *  itemIndex is the target_item_id for the fork (inclusive).
+ *  -1 means "nothing to keep" — start a fresh conversation instead. */
 export async function doRerun(
   text: string,
   itemIndex: number,
   input?: string | InputContentItem[],
 ): Promise<void> {
   if (!chatState.activeSessionId || chatState.isGenerating) return;
+
+  if (itemIndex < 0) {
+    // First message in conversation — no prior context to keep.
+    // Clear session so streamResponse creates a new conversation.
+    chatState.activeSessionId = null;
+    chatState.lastResponseId = null;
+    chatState.activeChat = null;
+    const dom = getChatDom();
+    dom.transcriptContainer.innerHTML = "";
+    showInputBar();
+    await streamResponse({ text, input: input ?? text, scrollAfterPlaceholder: true, discoverSession: true });
+    return;
+  }
 
   const forkRes = await api.forkConversation(chatState.activeSessionId, { target_item_id: itemIndex });
   if (!forkRes.ok || !forkRes.data) {
@@ -105,7 +121,12 @@ export function findLastUserMessage(items: Item[]): { text: string; itemIndex: n
   return null;
 }
 
-/** Get user message info by display index (returns text, structured input, and fork point). */
+/**
+ * Get user message info by display index (returns text, structured input, and fork point).
+ *
+ * Must mirror the same promotion logic as normalizeItems() in transcript.ts so
+ * that DOM indices match: system+empty-user → merge, system before assistant → promote.
+ */
 export function getUserMessageInfo(
   msgIndex: number,
 ): { text: string; input: string | InputContentItem[]; forkBeforeIndex: number } | null {
@@ -120,6 +141,8 @@ export function getUserMessageInfo(
 
     if (item.role === "system" || item.role === "developer") {
       const next = items[i + 1];
+
+      // Pattern: system + empty user → merge content from both
       if (
         next?.type === "message" &&
         next.role === "user" &&
@@ -129,11 +152,21 @@ export function getUserMessageInfo(
           .filter((p): p is InputTextPart => p.type === "input_text")
           .map((p) => p.text)
           .join("\n");
-        // Merge content from both the system message and the user message
         const mergedContent = [...item.content, ...next.content];
         userMsgPositions.push({ itemIndex: i, text: sysText, content: mergedContent });
         i++; // Skip the empty user message
         continue;
+      }
+
+      // Pattern: system followed by assistant/non-user → user input stored as system
+      if (!next || next.type !== "message" || next.role !== "user") {
+        const sysText = item.content
+          .filter((p): p is InputTextPart => p.type === "input_text")
+          .map((p) => p.text)
+          .join("\n");
+        if (sysText.trim()) {
+          userMsgPositions.push({ itemIndex: i, text: sysText, content: item.content });
+        }
       }
       continue;
     }
@@ -152,7 +185,7 @@ export function getUserMessageInfo(
   const pos = userMsgPositions[msgIndex]!;
   if (!pos.text.trim()) return null;
 
-  const forkBeforeIndex = pos.itemIndex > 0 ? pos.itemIndex : 0;
+  const forkBeforeIndex = pos.itemIndex > 0 ? pos.itemIndex - 1 : -1;
   const input = buildInputFromParts(pos.content);
   return { text: pos.text, input, forkBeforeIndex };
 }

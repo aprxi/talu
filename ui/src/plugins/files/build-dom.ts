@@ -17,10 +17,10 @@ export function buildFilesDOM(root: HTMLElement): void {
       <!-- Left sidebar -->
       <div class="browser-sidebar">
         <div class="panel-section">
-          <button id="fp-upload" class="files-upload-btn">
-            ${ICON_UPLOAD} Upload File
-          </button>
-          <input id="fp-file-input" type="file" multiple style="display:none">
+          <div class="search-wrapper">
+            ${ICON_SEARCH}
+            <input id="fp-search" type="text" placeholder="Search files..." class="search-input">
+          </div>
         </div>
 
         <!-- Status tabs -->
@@ -50,16 +50,6 @@ export function buildFilesDOM(root: HTMLElement): void {
       <div class="browser-main files-main-drop">
         <!-- Top bar -->
         <div class="browser-header">
-          <div class="search-wrapper">
-            ${ICON_SEARCH}
-            <input id="fp-search" type="text" placeholder="Search files..." class="search-input">
-          </div>
-          <div class="flex-1"></div>
-          <span id="fp-count" class="files-count"></span>
-        </div>
-
-        <!-- Bulk action toolbar -->
-        <div id="fp-toolbar" class="browser-header files-toolbar hidden">
           <button id="fp-select-all" class="btn btn-ghost btn-sm">Select All</button>
           <div id="fp-bulk-actions" class="browser-bulk-actions">
             <button id="fp-archive" class="btn btn-ghost btn-sm" disabled>Archive</button>
@@ -68,18 +58,23 @@ export function buildFilesDOM(root: HTMLElement): void {
           </div>
           <button id="fp-cancel" class="btn btn-ghost btn-sm hidden">Cancel</button>
           <div class="flex-1"></div>
+          <span id="fp-count" class="files-count"></span>
+          <button id="fp-upload" class="btn btn-ghost btn-sm">
+            ${ICON_UPLOAD} Upload
+          </button>
+          <input id="fp-file-input" type="file" multiple style="display:none">
         </div>
 
         <!-- Table -->
         <div id="fp-table-container" class="files-table-container scroll-thin">
           <table class="files-table">
-            <thead class="files-thead">
+            <thead id="fp-thead" class="files-thead">
               <tr>
                 <th class="files-th files-th-check"></th>
-                <th class="files-th files-th-name">Name</th>
-                <th class="files-th files-th-kind">Kind</th>
-                <th class="files-th files-th-size">Size</th>
-                <th class="files-th files-th-date">Date</th>
+                <th class="files-th files-th-name" data-sort="name">Name</th>
+                <th class="files-th files-th-kind" data-sort="kind">Kind</th>
+                <th class="files-th files-th-size" data-sort="size">Size</th>
+                <th class="files-th files-th-date" data-sort="date">Date</th>
                 <th class="files-th files-th-actions"></th>
               </tr>
             </thead>

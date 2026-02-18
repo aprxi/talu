@@ -314,7 +314,12 @@ function renderTag(tag: string): HTMLElement {
 
 // -- Transcript messages ------------------------------------------------------
 
-/** Collapse system+empty-user pairs into a proper user message, skip remaining system/developer items. */
+/**
+ * Normalize conversation items for display:
+ * - system/developer messages containing user input → promote to user role
+ * - system+empty-user pairs → merge into one user message, skip the empty user
+ * - system/developer messages that are pure prompts (first item, before any user turn) → drop
+ */
 function normalizeItems(items: Item[]): Item[] {
   const result: Item[] = [];
   for (let i = 0; i < items.length; i++) {
@@ -324,17 +329,36 @@ function normalizeItems(items: Item[]): Item[] {
       continue;
     }
     if (item.role === "system" || item.role === "developer") {
-      // If followed by an empty user message, promote system text to user role
       const next = items[i + 1];
+
+      // Pattern: system + empty user → merge into one user message
       if (
         next?.type === "message" &&
         next.role === "user" &&
-        !next.content.some((p) => "text" in p && p.text.trim())
+        !next.content.some((p) => "text" in p && (p as { text: string }).text.trim())
       ) {
-        result.push({ ...item, role: "user" });
+        // Merge content from both (system text + user attachments)
+        const merged = { ...item, role: "user" as const, content: [...item.content, ...next.content] };
+        result.push(merged);
         i++; // skip the empty user message
+        continue;
       }
-      // Otherwise drop the system/developer message
+
+      // Pattern: system followed by assistant/reasoning/function_call → user input stored as system
+      if (
+        !next ||
+        next.type !== "message" ||
+        next.role !== "user"
+      ) {
+        // Has text content → treat as user input
+        const hasText = item.content.some((p) => "text" in p && (p as { text: string }).text.trim());
+        if (hasText) {
+          result.push({ ...item, role: "user" });
+          continue;
+        }
+      }
+
+      // Pure system/developer prompt with no user-visible text, or followed by user with text → drop
       continue;
     }
     result.push(item);
@@ -392,7 +416,7 @@ function renderItem(item: Item): HTMLElement {
  *   - file_* IDs → /v1/files/{id}/content
  *   - data: URIs and http(s) URLs → pass through
  */
-function imageUrlToSrc(url: string): string {
+export function imageUrlToSrc(url: string): string {
   if (url.startsWith("file://")) {
     const path = url.slice("file://".length);
     const parts = path.split("/");

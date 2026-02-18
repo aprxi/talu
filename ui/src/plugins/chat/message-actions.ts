@@ -3,7 +3,7 @@ import { chatState } from "./state.ts";
 import { notifications, clipboard } from "./deps.ts";
 import { getUserMessageInfo } from "./rerun.ts";
 import { doRerun } from "./rerun.ts";
-import type { InputTextPart, OutputTextPart } from "../../types.ts";
+import type { InputContentItem, InputTextPart, OutputTextPart } from "../../types.ts";
 
 /** Copy user message text to clipboard. */
 export function handleCopyUserMessage(msgIndex: number): void {
@@ -68,8 +68,14 @@ export function handleEditUserMessage(msgIndex: number): void {
 
   const originalContent = bubble.innerHTML;
 
-  // Replace bubble content with textarea
-  bubble.innerHTML = "";
+  // Keep images/files visible, only replace text nodes with textarea.
+  // Remove plain text divs (children that aren't .msg-image or .msg-file-pill).
+  for (const child of Array.from(bubble.children)) {
+    const el = child as HTMLElement;
+    if (!el.classList.contains("msg-image") && !el.classList.contains("msg-file-pill")) {
+      el.remove();
+    }
+  }
 
   const textarea = document.createElement("textarea");
   textarea.className = "edit-textarea";
@@ -115,7 +121,9 @@ export function handleEditUserMessage(msgIndex: number): void {
       return;
     }
     bubble.innerHTML = originalContent;
-    doRerun(newText, info.forkBeforeIndex);
+    // Replace text in the input with the edited version, preserving images/files.
+    const editedInput = replaceInputText(info.input, newText);
+    doRerun(newText, info.forkBeforeIndex, editedInput);
   });
 
   textarea.addEventListener("keydown", (e) => {
@@ -126,5 +134,18 @@ export function handleEditUserMessage(msgIndex: number): void {
       e.preventDefault();
       saveBtn.click();
     }
+  });
+}
+
+/** Replace text parts in structured input, preserving images/files. */
+function replaceInputText(
+  input: string | InputContentItem[],
+  newText: string,
+): string | InputContentItem[] {
+  if (typeof input === "string") return newText;
+  return input.map((item) => {
+    if (item.type !== "message" || item.role !== "user") return item;
+    const nonText = item.content.filter((p) => p.type !== "input_text");
+    return { ...item, content: [{ type: "input_text" as const, text: newText }, ...nonText] };
   });
 }

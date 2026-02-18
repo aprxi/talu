@@ -81,7 +81,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   chatState.isGenerating = true;
   setInputEnabled(false);
 
-  appendUserMessage(opts.text);
+  appendUserMessage(opts.text, opts.input);
   const { wrapper, body, textEl } = appendAssistantPlaceholder();
   if (opts.scrollAfterPlaceholder) scrollToBottom();
 

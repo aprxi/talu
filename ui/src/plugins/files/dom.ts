@@ -9,6 +9,7 @@ export interface FilesDom {
   searchClear: HTMLButtonElement;
   statsEl: HTMLElement;
   countEl: HTMLElement;
+  thead: HTMLTableSectionElement;
   tbody: HTMLTableSectionElement;
   tableContainer: HTMLElement;
   mainDrop: HTMLElement;
@@ -43,6 +44,7 @@ export function getFilesDom(): FilesDom {
     searchClear: q("#fp-search-clear") as HTMLButtonElement,
     statsEl: q("#fp-stats"),
     countEl: q("#fp-count"),
+    thead: q("#fp-thead") as HTMLTableSectionElement,
     tbody: q("#fp-tbody") as HTMLTableSectionElement,
     tableContainer: q("#fp-table-container"),
     mainDrop: q(".files-main-drop"),

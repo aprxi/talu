@@ -5,7 +5,7 @@
 
 import type { Disposable } from "../../kernel/types.ts";
 import { timers } from "./deps.ts";
-import { fState } from "./state.ts";
+import { fState, type SortColumn } from "./state.ts";
 import { getFilesDom } from "./dom.ts";
 import { renderFilesTable, renderPreview, syncFilesTabs, updateFilesToolbar } from "./render.ts";
 import { loadFiles, renameFile, deleteFile, uploadFiles, archiveFiles, restoreFiles, deleteFiles } from "./data.ts";
@@ -80,6 +80,21 @@ export function wireFileEvents(): void {
     fState.selectedFileId = null;
     renderFilesTable();
     renderPreview();
+  });
+
+  // -- Column sort (delegated on thead) ------------------------------------
+
+  dom.thead.addEventListener("click", (e) => {
+    const th = (e.target as HTMLElement).closest<HTMLElement>("[data-sort]");
+    if (!th) return;
+    const col = th.dataset["sort"] as SortColumn;
+    if (fState.sortBy === col) {
+      fState.sortDir = fState.sortDir === "asc" ? "desc" : "asc";
+    } else {
+      fState.sortBy = col;
+      fState.sortDir = "asc";
+    }
+    renderFilesTable();
   });
 
   // -- Table row clicks (delegated) ----------------------------------------

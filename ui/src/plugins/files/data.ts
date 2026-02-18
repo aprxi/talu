@@ -35,11 +35,33 @@ export async function loadFiles(): Promise<void> {
   renderPreview();
 }
 
-/** Return files filtered by the current search query (client-side). */
+/** Return files filtered by the current search query and sorted. */
 export function getFilteredFiles(): FileObject[] {
   const q = fState.searchQuery.toLowerCase().trim();
-  if (!q) return fState.files;
-  return fState.files.filter((f) => f.filename.toLowerCase().includes(q));
+  const filtered = q
+    ? fState.files.filter((f) => f.filename.toLowerCase().includes(q))
+    : [...fState.files];
+
+  const dir = fState.sortDir === "asc" ? 1 : -1;
+  filtered.sort((a, b) => {
+    switch (fState.sortBy) {
+      case "name":
+        return dir * a.filename.localeCompare(b.filename);
+      case "kind": {
+        const ak = a.kind ?? "";
+        const bk = b.kind ?? "";
+        return dir * ak.localeCompare(bk);
+      }
+      case "size":
+        return dir * (a.bytes - b.bytes);
+      case "date":
+        return dir * (a.created_at - b.created_at);
+      default:
+        return 0;
+    }
+  });
+
+  return filtered;
 }
 
 export async function renameFile(id: string, newName: string): Promise<void> {

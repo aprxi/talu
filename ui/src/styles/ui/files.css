@@ -36,6 +36,19 @@
 .files-th-date    { width: 130px; }
 .files-th-actions { width: 80px; }
 
+.files-th[data-sort] {
+  cursor: pointer;
+  user-select: none;
+}
+
+.files-th[data-sort]:hover {
+  color: var(--text);
+}
+
+.files-th-sorted {
+  color: var(--text);
+}
+
 /* Rows */
 .files-row {
   cursor: pointer;
@@ -146,27 +159,6 @@
   white-space: nowrap;
 }
 
-/* Upload button */
-.files-upload-btn {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 0.4rem;
-  width: 100%;
-  padding: 0.5rem 0.75rem;
-  font-size: 13px;
-  font-weight: 500;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
-  background: var(--accent);
-  color: white;
-  transition: opacity 0.15s;
-}
-
-.files-upload-btn:hover {
-  opacity: 0.85;
-}
 
 /* Drop overlay */
 .files-drop-overlay {
@@ -286,12 +278,3 @@
   box-shadow: inset 2px 0 0 var(--accent);
 }
 
-/* Toolbar */
-.files-toolbar {
-  gap: 0.5rem;
-  border-bottom: 1px solid var(--border);
-}
-
-.files-toolbar.hidden {
-  display: none;
-}
