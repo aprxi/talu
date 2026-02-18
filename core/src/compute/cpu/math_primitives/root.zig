@@ -7,7 +7,6 @@ pub const simd = @import("../../simd/root.zig");
 
 const _fast_math = @import("fast_math.zig");
 const _activations = @import("activations.zig");
-const _elementwise = @import("elementwise.zig");
 const _softmax = @import("softmax.zig");
 const _normalization = @import("normalization.zig");
 const _rope = @import("rope.zig");
@@ -23,12 +22,6 @@ pub const geluContiguous = _activations.geluContiguous;
 pub const reluContiguous = _activations.reluContiguous;
 pub const sigmoidContiguous = _activations.sigmoidContiguous;
 pub const tanhContiguous = _activations.tanhContiguous;
-
-// Element-wise ops
-pub const addContiguous = _elementwise.addContiguous;
-pub const subContiguous = _elementwise.subContiguous;
-pub const mulContiguous = _elementwise.mulContiguous;
-pub const divContiguous = _elementwise.divContiguous;
 
 // Softmax
 pub const softmaxContiguous = _softmax.softmaxContiguous;
@@ -48,7 +41,6 @@ pub const RoPE = _rope.RoPE;
 test {
     _ = _fast_math;
     _ = _activations;
-    _ = _elementwise;
     _ = _softmax;
     _ = _normalization;
     _ = _rope;

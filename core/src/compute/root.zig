@@ -5,7 +5,6 @@
 //!
 //! ## Public API
 //!
-//! - `ops` - Core tensor operations (matmul, attention, activations, etc.)
 //! - `simd` - SIMD vector primitives and architecture detection
 //! - `quant` - Quantization utilities (Q4, Q8, grouped-affine)
 //! - `device` - Device type definitions (CPU, CUDA, Metal)
@@ -20,9 +19,6 @@
 // =============================================================================
 // Public API
 // =============================================================================
-
-/// Core tensor operations.
-pub const ops = @import("ops/root.zig");
 
 /// SIMD vector primitives and architecture detection.
 pub const simd = @import("simd/root.zig");
@@ -55,8 +51,8 @@ pub const DLTensor = dlpack.DLTensor;
 pub const DLManagedTensor = dlpack.DLManagedTensor;
 
 // Re-export behavioral types so check_coverage.sh --integration can verify test coverage
-pub const MatmulScratch = ops.matmul.MatmulScratch;
-pub const TensorView = ops.tensor_view.TensorView;
+pub const MatmulScratch = cpu.matmul.MatmulScratch;
+pub const TensorView = cpu.tensor_view.TensorView;
 
 // =============================================================================
 // Internal API (for core/src/ only)

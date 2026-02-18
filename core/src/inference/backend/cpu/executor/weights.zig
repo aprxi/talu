@@ -10,7 +10,7 @@
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.ops.matmul;
+const matmul = compute.cpu.matmul;
 const registry = compute.registry;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_copy = compute.cpu.tensor_copy;
@@ -1186,7 +1186,7 @@ pub const TransformerBlock = struct {
         const kernel_name_v: ?[]const u8 = if (dk_v) |dk| dk.name else null;
         const kernel_name_qkv_fused: ?[]const u8 = if (dk_qkv_fused) |dk| dk.name else null;
 
-        const flash_attention_fn: ?compute.ops.simd.flash_attention.FlashAttentionFn = blk: {
+        const flash_attention_fn: ?compute.cpu.simd.flash_attention.FlashAttentionFn = blk: {
             const kernel_val = registry.selectFlashAttentionForHeadDim(head_dim) catch |err| switch (err) {
                 error.UnsupportedHeadDim => break :blk null,
                 else => return err,

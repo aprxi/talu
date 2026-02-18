@@ -3,8 +3,7 @@
 //! This module provides a comptime-checked interface that works with:
 //! - `Tensor` (from tensor.zig) - contiguous or strided tensors
 //!
-//! All compute/ops implementations use this interface, allowing capi/ops/* modules
-//! to be a thin FFI bridge that delegates here.
+//! CPU compute modules use this interface for stride-aware views.
 
 const std = @import("std");
 const tensor = @import("../../tensor.zig");

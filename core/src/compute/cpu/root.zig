@@ -4,6 +4,20 @@
 //! called from higher-level inference backend code.
 
 pub const common = @import("common.zig");
+pub const tensor_view = @import("tensor_view.zig");
+pub const activation_view = @import("activation_view.zig");
+pub const norm_primitives = @import("norm_primitives.zig");
+pub const transpose = @import("transpose.zig");
+pub const attn_primitives = @import("attn_primitives.zig");
+pub const matmul_primitives = @import("matmul_primitives.zig");
+pub const matmul_prefill = @import("matmul_prefill.zig");
+pub const mxfp4 = @import("mxfp4.zig");
+pub const math_primitives = @import("math_primitives/root.zig");
+pub const simd = @import("simd/root.zig");
+pub const matmul = matmul_primitives;
+pub const norm = norm_primitives;
+pub const attention = attn_primitives;
+pub const math = math_primitives;
 pub const activation = @import("activation.zig");
 pub const elementwise = @import("elementwise.zig");
 pub const broadcast = @import("broadcast.zig");
@@ -14,6 +28,8 @@ pub const masking = @import("masking.zig");
 pub const image_ops = @import("image_ops.zig");
 pub const tensor_copy = @import("tensor_copy.zig");
 pub const tensor_gather = @import("tensor_gather.zig");
+pub const padding = @import("padding.zig");
+pub const dot_product = @import("dot_product.zig");
 pub const quant_decode = @import("quant_decode.zig");
 pub const cache_layout = @import("cache_layout.zig");
 pub const cache_store = @import("cache_store.zig");
@@ -29,6 +45,20 @@ pub const sdpa_decode = @import("sdpa_decode.zig");
 
 test {
     _ = common;
+    _ = tensor_view;
+    _ = activation_view;
+    _ = norm_primitives;
+    _ = transpose;
+    _ = attn_primitives;
+    _ = matmul_primitives;
+    _ = matmul_prefill;
+    _ = mxfp4;
+    _ = math_primitives;
+    _ = simd;
+    _ = matmul;
+    _ = norm;
+    _ = attention;
+    _ = math;
     _ = activation;
     _ = elementwise;
     _ = broadcast;
@@ -39,6 +69,8 @@ test {
     _ = image_ops;
     _ = tensor_copy;
     _ = tensor_gather;
+    _ = padding;
+    _ = dot_product;
     _ = quant_decode;
     _ = cache_layout;
     _ = cache_store;

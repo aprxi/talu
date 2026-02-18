@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
-const matmul = @import("../ops/matmul_primitives.zig");
+const matmul = @import("matmul_primitives.zig");
 
 const Tensor = tensor.Tensor;
 const MatmulFn = matmul.MatmulFn;

@@ -7,7 +7,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const math = compute.ops.math;
+const math = compute.cpu.math;
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
@@ -150,11 +150,11 @@ pub fn layerNormForward(ln: *const LayerNorm, input: *const Tensor, output: *Ten
     std.debug.assert(input.shape[0] == output.shape[0] and input.shape[1] == output.shape[1] and input.shape[2] == output.shape[2]);
     std.debug.assert(input.shape[2] == ln.dim);
 
-    const tv = compute.ops.tensor_view;
+    const tv = compute.cpu.tensor_view;
     const input_view = tv.fromSimpleTensor(input) orelse unreachable;
     const output_view = tv.fromSimpleTensor(output) orelse unreachable;
     const weight_view = tv.fromSimpleTensor(ln.weight) orelse unreachable;
     const bias_view = if (ln.bias) |b| tv.fromSimpleTensor(b) orelse unreachable else null;
 
-    compute.ops.norm.layerNorm(output_view, input_view, weight_view, bias_view, ln.eps);
+    compute.cpu.norm.layerNorm(output_view, input_view, weight_view, bias_view, ln.eps);
 }

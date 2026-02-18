@@ -23,7 +23,7 @@ const Tensor = tensor.Tensor;
 const log = @import("../../../../log.zig");
 const compute = @import("../../../../compute/root.zig");
 const kernel = compute.kernel;
-const matmul = compute.ops.matmul;
+const matmul = compute.cpu.matmul;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_norm = compute.cpu.normalization;
 const cpu_state_space = compute.cpu.state_space;
@@ -493,7 +493,7 @@ test "MambaKernel.forward rejects batch > 1 for 3D input" {
         weights,
         matmul.matmulF32,
         matmul.matmulF32,
-        compute.ops.simd.ssm_scan.ssmScanF32,
+        compute.cpu.simd.ssm_scan.ssmScanF32,
     );
 
     var input_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 2, 3, 4 });

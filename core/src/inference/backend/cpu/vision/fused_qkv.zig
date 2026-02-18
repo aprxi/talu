@@ -24,7 +24,7 @@ const vision_tensor_convert = @import("tensor_convert.zig");
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const LoadedModel = graph_runtime.LoadedModel;
-const matmul = compute.ops.matmul;
+const matmul = compute.cpu.matmul;
 const cpu_common = compute.cpu.common;
 const cpu_image_ops = compute.cpu.image_ops;
 const cpu_norm = compute.cpu.normalization;
@@ -640,8 +640,8 @@ pub const VisionRuntime = struct {
 
         cpu_common.addBiasRows(fc1_out, merger.fc1_bias, merged_tokens, merged_width);
 
-        const tv = compute.ops.tensor_view;
-        const activation = compute.ops.activation;
+        const tv = compute.cpu.tensor_view;
+        const activation = compute.cpu.activation_view;
         var fc1_tensor = Tensor.view2DSlice(fc1_out, merged_tokens, merged_width);
         const fc1_tv = tv.fromSimpleTensor(&fc1_tensor) orelse return error.InvalidShape;
         activation.gelu(fc1_tv, fc1_tv);
@@ -706,8 +706,8 @@ pub const VisionRuntime = struct {
         cpu_common.addBiasRows(fc1_out, self.merger_fc1_bias, merged_tokens, self.vision_intermediate_size);
 
         // In-place GELU
-        const tv = compute.ops.tensor_view;
-        const activation = compute.ops.activation;
+        const tv = compute.cpu.tensor_view;
+        const activation = compute.cpu.activation_view;
         var fc1_tensor = Tensor.view2DSlice(fc1_out, merged_tokens, self.vision_intermediate_size);
         const fc1_tv = tv.fromSimpleTensor(&fc1_tensor) orelse return error.InvalidShape;
         activation.gelu(fc1_tv, fc1_tv);

@@ -248,7 +248,6 @@ pub fn matmulF32(
                 }
             }
         }
-
     };
 
     parallel.global().parallelFor(out_features, row_task.runRows, &context);
@@ -802,7 +801,7 @@ test "dequantize: partial block" {
     const allocator = testing.allocator;
 
     // Request only 3 values from a 16-byte block
-    const blocks = [_]u8{0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88};
+    const blocks = [_]u8{ 0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88 };
     const scales = [_]u8{127}; // scale = 1.0
 
     const output = try allocator.alloc(f32, 3);
@@ -1079,10 +1078,10 @@ test "matmulF32 matches scalar reference (fixed case)" {
     const n_groups: usize = 1;
 
     const input = [_]f32{
-        1.0, -2.0, 0.5, 0.0, 1.5, -1.0, 2.0, -0.5,
+        1.0,  -2.0,  0.5,  0.0,   1.5,  -1.0,  2.0, -0.5,
         0.25, -0.75, 1.25, -1.25, 0.75, -0.25, 0.1, -0.1,
-        0.6, -0.6, 0.9, -0.9, 1.1, -1.1, 1.3, -1.3,
-        1.4, -1.4, 1.6, -1.6, 1.8, -1.8, 2.2, -2.2,
+        0.6,  -0.6,  0.9,  -0.9,  1.1,  -1.1,  1.3, -1.3,
+        1.4,  -1.4,  1.6,  -1.6,  1.8,  -1.8,  2.2, -2.2,
     };
 
     const blocks = [_]u8{

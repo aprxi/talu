@@ -3,7 +3,7 @@
 //! Provides low-overhead lookup of optimized kernel implementations
 //! by ID, backend, and dtype.
 
-const ops = @import("ops/root.zig");
+const cpu = @import("cpu/root.zig");
 const kernel = @import("kernel.zig");
 const dtype_mod = @import("../dtype.zig");
 
@@ -22,20 +22,20 @@ pub fn selectKernel(id: KernelId, backend: Backend, dtype: DType) !Kernel {
 
 fn selectMatmul(backend: Backend, dtype: DType) !Kernel {
     if (backend != .cpu) return error.UnsupportedBackend;
-    const dk = try ops.matmul.matmulKernel(dtype);
+    const dk = try cpu.matmul.matmulKernel(dtype);
     return .{ .matmul = dk.func };
 }
 
 fn selectSsmScan(backend: Backend, dtype: DType) !Kernel {
     if (backend != .cpu) return error.UnsupportedBackend;
     if (dtype != .f32) return error.UnsupportedDType;
-    return .{ .ssm_scan = ops.simd.ssm_scan.ssmScanF32 };
+    return .{ .ssm_scan = cpu.simd.ssm_scan.ssmScanF32 };
 }
 
 pub fn selectFlashAttentionForHeadDim(head_dim: usize) !Kernel {
     return switch (head_dim) {
-        64 => .{ .flash_attention = ops.simd.flash_attention.flashAttentionF32_64 },
-        128 => .{ .flash_attention = ops.simd.flash_attention.flashAttentionF32_128 },
+        64 => .{ .flash_attention = cpu.simd.flash_attention.flashAttentionF32_64 },
+        128 => .{ .flash_attention = cpu.simd.flash_attention.flashAttentionF32_128 },
         else => error.UnsupportedHeadDim,
     };
 }
@@ -43,7 +43,7 @@ pub fn selectFlashAttentionForHeadDim(head_dim: usize) !Kernel {
 fn selectFlashAttention(backend: Backend, dtype: DType) !Kernel {
     if (backend != .cpu) return error.UnsupportedBackend;
     if (dtype != .f32) return error.UnsupportedDType;
-    return .{ .flash_attention = ops.simd.flash_attention.flashAttentionF32_128 };
+    return .{ .flash_attention = cpu.simd.flash_attention.flashAttentionF32_128 };
 }
 
 test "selectKernel returns matmul kernel for f32" {

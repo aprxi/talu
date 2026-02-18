@@ -1,7 +1,7 @@
 //! Softmax primitives used by CPU kernels.
 
 const std = @import("std");
-const fast_math = @import("../ops/math_primitives/fast_math.zig");
+const fast_math = @import("math_primitives/fast_math.zig");
 const simd = @import("../simd/root.zig");
 
 const VEC_LEN = simd.f32_vec_len;

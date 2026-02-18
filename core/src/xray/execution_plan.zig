@@ -219,7 +219,7 @@ pub const ExecutionPlan = struct {
         try writer.writeAll("╠══════════════════════════════════════════════════════════════╣\n");
 
         // List the actual source files/functions that will be hot
-        try writer.print("║ • {s:<56} ║\n", .{"compute/ops/matmul_primitives.zig"});
+        try writer.print("║ • {s:<56} ║\n", .{"compute/cpu/matmul_primitives.zig"});
         try writer.print("║   → {s:<54} ║\n", .{self.matmul_kernel.name()});
 
         try writer.print("║ • {s:<56} ║\n", .{"inference/backend/cpu/kernels/attention.zig"});

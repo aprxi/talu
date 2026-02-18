@@ -105,7 +105,6 @@ pub fn matmulKernel(weight_dtype: DType) !DispatchedKernel {
     };
 }
 
-
 /// Dispatches to the appropriate matmul kernel based on weight dtype.
 /// For hot paths, use `matmulKernel` to get a function pointer at load time instead.
 pub fn matmulAuto(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *MatmulScratch) !void {

@@ -8,7 +8,7 @@ const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const dtype = @import("../../dtype.zig");
 const compute = @import("../../compute/root.zig");
-const ops = compute.ops.math;
+const rope_math = compute.cpu.math;
 const log = @import("../../log.zig");
 const progress_mod = @import("../../capi/progress.zig");
 
@@ -74,8 +74,8 @@ pub const LoadedModel = struct {
 
     /// RoPE instances allocated with backing_allocator (not arena) to support realloc.
     /// These must be explicitly freed in deinit().
-    rope_global: ?*ops.RoPE = null,
-    rope_local: ?*ops.RoPE = null,
+    rope_global: ?*rope_math.RoPE = null,
+    rope_local: ?*rope_math.RoPE = null,
 
     pub fn ensureCpuBlocks(self: *LoadedModel, allocator: std.mem.Allocator, progress: progress_mod.ProgressContext) ![]const transformer.TransformerBlock {
         if (self.cpu_blocks) |b| return b;
@@ -345,12 +345,12 @@ pub fn loadModelWithHooks(
     }, @src());
 
     // Skip RoPE for models with absolute position embeddings (e.g., BERT/MiniLM).
-    const rope_global: ?*ops.RoPE = if (uses_absolute_positions) null else blk: {
-        const rg = try arena_allocator.create(ops.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
+    const rope_global: ?*rope_math.RoPE = if (uses_absolute_positions) null else blk: {
+        const rg = try arena_allocator.create(rope_math.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
         // Use backing_allocator for RoPE (not arena) because RoPE cache grows dynamically via realloc.
         // ArenaAllocator doesn't support true realloc - it allocates new memory without freeing old,
         // which can exhaust memory or crash when the arena's backing pages are fragmented.
-        rg.* = try ops.RoPE.initWithRopeScaling(
+        rg.* = try rope_math.RoPE.initWithRopeScaling(
             backing_allocator,
             rope_dim,
             @intCast(model_config.max_seq_len),
@@ -360,9 +360,9 @@ pub fn loadModelWithHooks(
         break :blk rg;
     };
 
-    const rope_local: ?*ops.RoPE = if (uses_absolute_positions or model_config.rope_local_theta <= 0 or model_config.sliding_window <= 0) null else blk: {
-        const local_rope = try arena_allocator.create(ops.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
-        local_rope.* = try ops.RoPE.initWithRopeScaling(
+    const rope_local: ?*rope_math.RoPE = if (uses_absolute_positions or model_config.rope_local_theta <= 0 or model_config.sliding_window <= 0) null else blk: {
+        const local_rope = try arena_allocator.create(rope_math.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
+        local_rope.* = try rope_math.RoPE.initWithRopeScaling(
             backing_allocator,
             rope_dim,
             @intCast(model_config.max_seq_len),
@@ -447,7 +447,7 @@ pub fn loadModelWithHooks(
             @intCast(model_config.sliding_window)
         else
             0;
-        const layer_rope: ?*ops.RoPE = if (layer_window_size > 0 and rope_local != null) rope_local.? else rope_global;
+        const layer_rope: ?*rope_math.RoPE = if (layer_window_size > 0 and rope_local != null) rope_local.? else rope_global;
 
         const weight_load_options = generic_weights.LoadOptions{
             .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,

@@ -10,9 +10,11 @@ const types = graph_runtime.layer_ops;
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const capi = @import("../../../../capi/error.zig");
-const ops = compute.ops;
-const matmul = compute.ops.matmul;
-const tv = ops.tensor_view;
+const matmul = compute.cpu.matmul;
+const tv = compute.cpu.tensor_view;
+const activation_ops = compute.cpu.activation_view;
+const transpose_ops = compute.cpu.transpose;
+const attention_ops = compute.cpu.attention;
 const cpu_broadcast = compute.cpu.broadcast;
 const cpu_elementwise = compute.cpu.elementwise;
 const cpu_reduction = compute.cpu.reduction;
@@ -424,7 +426,7 @@ pub const Block = struct {
 
                     const input_view = tv.fromTensor(Tensor, input_tensor);
                     const output_view = tv.fromTensor(Tensor, output_tensor);
-                    ops.activation.softmax(output_view, input_view);
+                    activation_ops.softmax(output_view, input_view);
                 },
 
                 .silu => |silu_op| {
@@ -434,7 +436,7 @@ pub const Block = struct {
 
                     const input_view = tv.fromTensor(Tensor, input_tensor);
                     const output_view = tv.fromTensor(Tensor, output_tensor);
-                    ops.activation.silu(output_view, input_view);
+                    activation_ops.silu(output_view, input_view);
                 },
 
                 .gelu => |gelu_op| {
@@ -444,7 +446,7 @@ pub const Block = struct {
 
                     const input_view = tv.fromTensor(Tensor, input_tensor);
                     const output_view = tv.fromTensor(Tensor, output_tensor);
-                    ops.activation.gelu(output_view, input_view);
+                    activation_ops.gelu(output_view, input_view);
                 },
 
                 .mul => |mul_op| {
@@ -705,7 +707,7 @@ pub const Block = struct {
                         .f32,
                     );
 
-                    ops.shape.transposeDispatch(out_view, in_view, dim0, dim1);
+                    transpose_ops.transposeDispatch(out_view, in_view, dim0, dim1);
 
                     // Convert back to i64 shape for output tensor
                     var out_shape_i64: [8]i64 = in_tensor.shape;
@@ -813,13 +815,13 @@ pub const Block = struct {
                     // Call the attention kernel
                     if (sdpa_op.is_causal) {
                         // Use causal version (no explicit mask needed)
-                        ops.attention.sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, scratch.allocator) catch |err| {
+                        attention_ops.sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, scratch.allocator) catch |err| {
                             capi.setContext("block={d}, op={d}, causal=true", .{ self.block_idx, op_index });
                             return err;
                         };
                     } else {
                         // Non-causal (no mask)
-                        ops.attention.sdpa(out_view, q_view, k_view, v_view, null, scale, scratch.allocator) catch |err| {
+                        attention_ops.sdpa(out_view, q_view, k_view, v_view, null, scale, scratch.allocator) catch |err| {
                             capi.setContext("block={d}, op={d}, causal=false", .{ self.block_idx, op_index });
                             return err;
                         };

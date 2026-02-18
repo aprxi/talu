@@ -701,7 +701,7 @@ test "sigmoid correctness" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0067), out_data[0], 1e-4); // sigmoid(-5)
     try std.testing.expectApproxEqAbs(@as(f32, 0.1192), out_data[1], 1e-4); // sigmoid(-2)
     try std.testing.expectApproxEqAbs(@as(f32, 0.2689), out_data[2], 1e-4); // sigmoid(-1)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[3], 1e-6);     // sigmoid(0)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[3], 1e-6); // sigmoid(0)
     try std.testing.expectApproxEqAbs(@as(f32, 0.7311), out_data[4], 1e-4); // sigmoid(1)
     try std.testing.expectApproxEqAbs(@as(f32, 0.8808), out_data[5], 1e-4); // sigmoid(2)
     try std.testing.expectApproxEqAbs(@as(f32, 0.9933), out_data[6], 1e-4); // sigmoid(5)
@@ -726,10 +726,10 @@ test "tanh correctness" {
     try std.testing.expectApproxEqAbs(@as(f32, -0.9999), out_data[0], 1e-4); // tanh(-5)
     try std.testing.expectApproxEqAbs(@as(f32, -0.9640), out_data[1], 1e-4); // tanh(-2)
     try std.testing.expectApproxEqAbs(@as(f32, -0.7616), out_data[2], 1e-4); // tanh(-1)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out_data[3], 1e-6);     // tanh(0)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.7616), out_data[4], 1e-4);  // tanh(1)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9640), out_data[5], 1e-4);  // tanh(2)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9999), out_data[6], 1e-4);  // tanh(5)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out_data[3], 1e-6); // tanh(0)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7616), out_data[4], 1e-4); // tanh(1)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9640), out_data[5], 1e-4); // tanh(2)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9999), out_data[6], 1e-4); // tanh(5)
 }
 // Test multi-dtype support for SiLU: f32, f16, bf16
 test "silu multi-dtype" {
@@ -825,11 +825,11 @@ test "rsqrt correctness" {
     rsqrt(out, input);
 
     // Verify 1/sqrt(x) values
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[0], 1e-6);    // 1/sqrt(1) = 1
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[1], 1e-6);    // 1/sqrt(4) = 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[0], 1e-6); // 1/sqrt(1) = 1
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[1], 1e-6); // 1/sqrt(4) = 0.5
     try std.testing.expectApproxEqAbs(@as(f32, 0.3333), out_data[2], 1e-4); // 1/sqrt(9) = 0.333...
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), out_data[3], 1e-6);   // 1/sqrt(16) = 0.25
-    try std.testing.expectApproxEqAbs(@as(f32, 0.2), out_data[4], 1e-6);    // 1/sqrt(25) = 0.2
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), out_data[3], 1e-6); // 1/sqrt(16) = 0.25
+    try std.testing.expectApproxEqAbs(@as(f32, 0.2), out_data[4], 1e-6); // 1/sqrt(25) = 0.2
 }
 
 // Test numerical accuracy of activations against reference implementations
@@ -924,7 +924,7 @@ test "sigmoid strided tensor" {
     // Verify correctness with strided access
     // Input logical layout: [[-2, 0, 2], [-1, 1, 3]]
     try std.testing.expectApproxEqAbs(@as(f32, 0.1192), out_data[0], 1e-4); // sigmoid(-2)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[1], 1e-6);     // sigmoid(0)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[1], 1e-6); // sigmoid(0)
     try std.testing.expectApproxEqAbs(@as(f32, 0.8808), out_data[2], 1e-4); // sigmoid(2)
     try std.testing.expectApproxEqAbs(@as(f32, 0.2689), out_data[3], 1e-4); // sigmoid(-1)
     try std.testing.expectApproxEqAbs(@as(f32, 0.7311), out_data[4], 1e-4); // sigmoid(1)
@@ -981,9 +981,9 @@ test "tanh strided tensor" {
     // Verify correctness with strided access
     // Input logical layout: [[-1, 1], [0, 2]]
     try std.testing.expectApproxEqAbs(@as(f32, -0.7616), out_data[0], 1e-4); // tanh(-1)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.7616), out_data[1], 1e-4);  // tanh(1)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out_data[2], 1e-6);     // tanh(0)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.9640), out_data[3], 1e-4);  // tanh(2)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.7616), out_data[1], 1e-4); // tanh(1)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out_data[2], 1e-6); // tanh(0)
+    try std.testing.expectApproxEqAbs(@as(f32, 0.9640), out_data[3], 1e-4); // tanh(2)
 }
 
 // Test rsqrt edge cases: very small and very large values
@@ -997,10 +997,10 @@ test "rsqrt edge cases" {
     rsqrt(out, input);
 
     // Verify 1/sqrt(x) for edge cases
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0), out_data[0], 1e-3);  // 1/sqrt(0.0001) = 100
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), out_data[1], 1e-3);   // 1/sqrt(0.01) = 10
-    try std.testing.expectApproxEqAbs(@as(f32, 0.1), out_data[2], 1e-6);    // 1/sqrt(100) = 0.1
-    try std.testing.expectApproxEqAbs(@as(f32, 0.01), out_data[3], 1e-6);   // 1/sqrt(10000) = 0.01
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0), out_data[0], 1e-3); // 1/sqrt(0.0001) = 100
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), out_data[1], 1e-3); // 1/sqrt(0.01) = 10
+    try std.testing.expectApproxEqAbs(@as(f32, 0.1), out_data[2], 1e-6); // 1/sqrt(100) = 0.1
+    try std.testing.expectApproxEqAbs(@as(f32, 0.01), out_data[3], 1e-6); // 1/sqrt(10000) = 0.01
 }
 
 // Test rsqrt with strided tensor
@@ -1031,10 +1031,10 @@ test "rsqrt strided tensor" {
 
     // Verify correctness with strided access
     // Input logical layout: [[1, 9], [4, 16]]
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[0], 1e-6);    // 1/sqrt(1) = 1
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[0], 1e-6); // 1/sqrt(1) = 1
     try std.testing.expectApproxEqAbs(@as(f32, 0.3333), out_data[1], 1e-4); // 1/sqrt(9) = 0.333...
-    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[2], 1e-6);    // 1/sqrt(4) = 0.5
-    try std.testing.expectApproxEqAbs(@as(f32, 0.25), out_data[3], 1e-6);   // 1/sqrt(16) = 0.25
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), out_data[2], 1e-6); // 1/sqrt(4) = 0.5
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), out_data[3], 1e-6); // 1/sqrt(16) = 0.25
 }
 
 // Test multi-dtype support for GELU

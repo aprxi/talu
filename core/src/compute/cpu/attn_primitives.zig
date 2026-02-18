@@ -458,7 +458,6 @@ pub fn sdpaCached(
         const sink_logit: ?f32 = if (sinks) |s| s[qh] else null;
 
         for (0..seq_q) |sq| {
-
             const q_pos = kv_offset + sq;
 
             // Determine attention window

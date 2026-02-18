@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.ops.matmul;
+const matmul = compute.cpu.matmul;
 const cpu_common = compute.cpu.common;
 const graph_runtime = @import("../graph.zig");
 const OpType = graph_runtime.OpType;
