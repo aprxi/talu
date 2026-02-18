@@ -60,6 +60,90 @@ pub fn dotPairScaled(
     return (dotRow(a0, b0) + dotRow(a1, b1)) * scale;
 }
 
+/// Maximum value in a non-empty vector.
+pub fn maxValue(values: []const f32) f32 {
+    std.debug.assert(values.len > 0);
+    var max_vec: F32Vec = @splat(values[0]);
+    var idx: usize = 0;
+    while (idx + VEC_LEN - 1 < values.len) : (idx += VEC_LEN) {
+        const vv: F32Vec = values[idx..][0..VEC_LEN].*;
+        max_vec = @max(max_vec, vv);
+    }
+    var max_value = @reduce(.Max, max_vec);
+    while (idx < values.len) : (idx += 1) {
+        max_value = @max(max_value, values[idx]);
+    }
+    return max_value;
+}
+
+/// Argmax index for a non-empty vector.
+pub fn argmaxIndex(values: []const f32) usize {
+    std.debug.assert(values.len > 0);
+    var best_idx: usize = 0;
+    var best_val: f32 = values[0];
+    for (values[1..], 1..) |v, i| {
+        if (v > best_val) {
+            best_val = v;
+            best_idx = i;
+        }
+    }
+    return best_idx;
+}
+
+/// Mean pool rows from contiguous `[row_count, row_width]` into `out`.
+pub fn meanPoolRows(values: []const f32, row_count: usize, row_width: usize, out: []f32) !void {
+    if (values.len < row_count * row_width) return error.InvalidShape;
+    if (out.len < row_width) return error.InvalidShape;
+    @memset(out[0..row_width], 0.0);
+
+    for (0..row_count) |row_idx| {
+        const row = values[row_idx * row_width ..][0..row_width];
+        for (0..row_width) |col_idx| {
+            out[col_idx] += row[col_idx];
+        }
+    }
+
+    const scale = 1.0 / @as(f32, @floatFromInt(row_count));
+    for (0..row_width) |col_idx| {
+        out[col_idx] *= scale;
+    }
+}
+
+/// L2-normalize one vector in-place. No-op for zero norm.
+pub fn l2NormalizeInPlace(values: []f32) void {
+    var norm_sq: f32 = 0.0;
+    for (values) |v| norm_sq += v * v;
+    if (norm_sq <= 0.0) return;
+    const inv_norm = 1.0 / @sqrt(norm_sq);
+    for (values) |*v| v.* *= inv_norm;
+}
+
+/// Mean over last dim for shape `[seq_len, hidden_size]`.
+pub fn meanLastDim3D(input_data: []const f32, seq_len: usize, hidden_size: usize, output: []f32) !void {
+    if (input_data.len < seq_len * hidden_size) return error.InvalidShape;
+    if (output.len < seq_len) return error.InvalidShape;
+    for (0..seq_len) |t| {
+        const base = t * hidden_size;
+        var sum: f32 = 0.0;
+        for (0..hidden_size) |h| sum += input_data[base + h];
+        output[t] = sum / @as(f32, @floatFromInt(hidden_size));
+    }
+}
+
+/// Mean over last dim for shape `[seq_len, head_count, hidden_size]`.
+pub fn meanLastDim4D(input_data: []const f32, seq_len: usize, head_count: usize, hidden_size: usize, output: []f32) !void {
+    if (input_data.len < seq_len * head_count * hidden_size) return error.InvalidShape;
+    if (output.len < seq_len * head_count) return error.InvalidShape;
+    for (0..seq_len) |t| {
+        for (0..head_count) |h| {
+            const base = (t * head_count + h) * hidden_size;
+            var sum: f32 = 0.0;
+            for (0..hidden_size) |d| sum += input_data[base + d];
+            output[t * head_count + h] = sum / @as(f32, @floatFromInt(hidden_size));
+        }
+    }
+}
+
 test "dotRow computes expected value" {
     const a = [_]f32{ 1, 2, 3 };
     const b = [_]f32{ 4, 5, 6 };

@@ -12,6 +12,8 @@ const tensor_mod = @import("../../../../tensor.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const matmul = compute.ops.matmul;
+const cpu_common = compute.cpu.common;
+const cpu_tensor_gather = compute.cpu.tensor_gather;
 const inspect = @import("../../../../xray/root.zig");
 const kernel_info = inspect.kernel_info;
 const perf_estimate = inspect.perf_estimate;
@@ -135,13 +137,7 @@ pub const Linear = struct {
         self.matmul_fn(&input_view, self.weight, &output_view, scratch);
 
         if (self.bias) |bias| {
-            const output_data = output_tensor.asSlice(f32);
-            for (0..row_count) |row_idx| {
-                const output_row = output_data[row_idx * self.out_features ..][0..self.out_features];
-                for (0..self.out_features) |col_idx| {
-                    output_row[col_idx] += bias[col_idx];
-                }
-            }
+            cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, row_count, self.out_features);
         }
     }
 
@@ -446,21 +442,13 @@ pub const Transformer = struct {
         features: []const f32,
     ) !void {
         if (positions.len == 0) return;
-
-        const hidden_flat = hidden.asSliceMut(f32);
-        if (hidden_flat.len < seq_len * hidden_size) return error.InvalidShape;
-
-        if (features.len % hidden_size != 0) return;
-        const available_rows = features.len / hidden_size;
-        const row_count = @min(positions.len, available_rows);
-
-        for (0..row_count) |row_idx| {
-            const token_pos = positions[row_idx];
-            if (token_pos >= seq_len) continue;
-            const dst = hidden_flat[token_pos * hidden_size ..][0..hidden_size];
-            const src = features[row_idx * hidden_size ..][0..hidden_size];
-            for (dst, src) |*d, s| d.* += s;
-        }
+        try cpu_tensor_gather.scatterAddRowsByPositions(
+            hidden.asSliceMut(f32),
+            seq_len,
+            hidden_size,
+            positions,
+            features,
+        );
     }
 
     pub fn describe(self: *const Transformer, writer: anytype, show_kernels: bool) !void {

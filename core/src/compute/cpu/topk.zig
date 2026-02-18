@@ -81,6 +81,57 @@ pub fn selectTopKNormalized(
     }
 }
 
+/// Comparator helper for descending `.value`.
+pub fn byValueDesc(_: void, a: anytype, b: @TypeOf(a)) bool {
+    return a.value > b.value;
+}
+
+/// Hoare partition (descending by `.value`) for entry slices.
+pub inline fn partition(entries: anytype, left_bound: usize, right_bound: usize) usize {
+    const middle = left_bound + (right_bound - left_bound) / 2;
+    const left_value = entries[left_bound].value;
+    const middle_value = entries[middle].value;
+    const right_value = entries[right_bound].value;
+    const pivot_index = if ((left_value >= middle_value) == (middle_value >= right_value))
+        middle
+    else if ((left_value >= middle_value) == (right_value >= left_value))
+        left_bound
+    else
+        right_bound;
+    const pivot_value = entries[pivot_index].value;
+
+    var left_index = left_bound;
+    var right_index = right_bound;
+
+    while (true) {
+        while (entries[left_index].value > pivot_value) left_index += 1;
+        while (entries[right_index].value < pivot_value) right_index -= 1;
+        if (left_index >= right_index) return right_index;
+        const swap_value = entries[left_index];
+        entries[left_index] = entries[right_index];
+        entries[right_index] = swap_value;
+        left_index += 1;
+        right_index -= 1;
+    }
+}
+
+/// Partial top-k selection for entry slices with `.value` fields.
+pub fn quickSelectTopK(entries: anytype, top_k: usize) void {
+    if (entries.len <= 1 or top_k == 0) return;
+    const target_count = @min(top_k, entries.len);
+
+    var left_index: usize = 0;
+    var right_index: usize = entries.len - 1;
+    while (left_index < right_index) {
+        const pivot_index = partition(entries, left_index, right_index);
+        if (pivot_index + 1 >= target_count) {
+            right_index = pivot_index;
+        } else {
+            left_index = pivot_index + 1;
+        }
+    }
+}
+
 test "selectTopKNormalized picks top logits and normalizes" {
     const logits = [_]f32{ 0.1, 1.0, 0.4, 2.0 };
     var indices = [_]u32{ 0, 0 };

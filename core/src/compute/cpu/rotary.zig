@@ -133,6 +133,141 @@ pub fn applyInterleavedInPlace(values: []f32, rope: anytype, pos: usize) void {
     rope.applyInterleavedInPlace(values, pos);
 }
 
+/// Fill vision rotary cos/sin tables over 2D spatial positions.
+pub fn fillVisionRotaryTables(
+    allocator: std.mem.Allocator,
+    grid_h: usize,
+    grid_w: usize,
+    grid_t: usize,
+    spatial_merge_size: usize,
+    vision_hidden_size: usize,
+    vision_num_heads: usize,
+    cos_out: []f32,
+    sin_out: []f32,
+) !void {
+    if ((grid_h % spatial_merge_size) != 0 or (grid_w % spatial_merge_size) != 0) return error.InvalidShape;
+
+    const merged_h = grid_h / spatial_merge_size;
+    const merged_w = grid_w / spatial_merge_size;
+    const token_count = grid_t * grid_h * grid_w;
+    const head_dim = vision_hidden_size / vision_num_heads;
+    if ((head_dim % 4) != 0) return error.InvalidShape;
+    if (cos_out.len != token_count * head_dim or sin_out.len != token_count * head_dim) return error.InvalidShape;
+
+    const half_dim = head_dim / 2;
+    const freq_dim = half_dim / 2;
+
+    const inv_freq = try allocator.alloc(f32, freq_dim);
+    defer allocator.free(inv_freq);
+    for (0..freq_dim) |idx| {
+        const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(half_dim));
+        inv_freq[idx] = 1.0 / std.math.pow(f32, 10000.0, exponent);
+    }
+
+    var token_idx: usize = 0;
+    for (0..grid_t) |_| {
+        for (0..merged_h) |bh| {
+            for (0..merged_w) |bw| {
+                for (0..spatial_merge_size) |ih| {
+                    for (0..spatial_merge_size) |iw| {
+                        const row = bh * spatial_merge_size + ih;
+                        const col = bw * spatial_merge_size + iw;
+                        const row_pos = @as(f32, @floatFromInt(row));
+                        const col_pos = @as(f32, @floatFromInt(col));
+                        const base = token_idx * head_dim;
+
+                        for (0..freq_dim) |f| {
+                            const row_angle = row_pos * inv_freq[f];
+                            const col_angle = col_pos * inv_freq[f];
+                            const row_cos = @cos(row_angle);
+                            const row_sin = @sin(row_angle);
+                            const col_cos = @cos(col_angle);
+                            const col_sin = @sin(col_angle);
+
+                            cos_out[base + f] = row_cos;
+                            sin_out[base + f] = row_sin;
+                            cos_out[base + freq_dim + f] = col_cos;
+                            sin_out[base + freq_dim + f] = col_sin;
+
+                            cos_out[base + half_dim + f] = row_cos;
+                            sin_out[base + half_dim + f] = row_sin;
+                            cos_out[base + half_dim + freq_dim + f] = col_cos;
+                            sin_out[base + half_dim + freq_dim + f] = col_sin;
+                        }
+                        token_idx += 1;
+                    }
+                }
+            }
+        }
+    }
+    if (token_idx != token_count) return error.InvalidState;
+}
+
+/// Apply RoPE over tensor layouts used by graph primitive execution.
+///
+/// Supported shapes:
+/// - 2D: `[seq, dim]`
+/// - 3D: `[seq, n_heads, head_dim]`
+/// - 4D: `[batch, n_heads, seq, head_dim]`
+pub fn applyRopeTensorInPlace(
+    input_data: []f32,
+    n_dims: usize,
+    shape: [8]i64,
+    rope_dim: usize,
+    pos_offset: usize,
+    rope: anytype,
+) !void {
+    if (n_dims == 2) {
+        const seq_len: usize = @intCast(shape[0]);
+        const dim: usize = @intCast(shape[1]);
+        const active_dim = @min(rope_dim, dim);
+        for (0..seq_len) |t| {
+            const pos = pos_offset + t;
+            const base = t * dim;
+            rope.applyInPlace(input_data[base .. base + active_dim], pos);
+        }
+        return;
+    }
+
+    if (n_dims == 3) {
+        const seq_len: usize = @intCast(shape[0]);
+        const n_heads: usize = @intCast(shape[1]);
+        const head_dim: usize = @intCast(shape[2]);
+        const active_dim = @min(rope_dim, head_dim);
+        const total_dim = n_heads * head_dim;
+        for (0..seq_len) |t| {
+            const pos = pos_offset + t;
+            for (0..n_heads) |h| {
+                const base = t * total_dim + h * head_dim;
+                rope.applyInPlace(input_data[base .. base + active_dim], pos);
+            }
+        }
+        return;
+    }
+
+    if (n_dims == 4) {
+        const batch: usize = @intCast(shape[0]);
+        const n_heads: usize = @intCast(shape[1]);
+        const seq_len: usize = @intCast(shape[2]);
+        const head_dim: usize = @intCast(shape[3]);
+        const active_dim = @min(rope_dim, head_dim);
+        const head_stride = seq_len * head_dim;
+        const batch_stride = n_heads * head_stride;
+        for (0..batch) |b| {
+            for (0..n_heads) |h| {
+                for (0..seq_len) |t| {
+                    const pos = pos_offset + t;
+                    const base = b * batch_stride + h * head_stride + t * head_dim;
+                    rope.applyInPlace(input_data[base .. base + active_dim], pos);
+                }
+            }
+        }
+        return;
+    }
+
+    return error.UnsupportedRopeShape;
+}
+
 fn applyFromCosSin(vec: []f32, cos: []const f32, sin: []const f32) void {
     const half = vec.len / 2;
     for (0..half) |idx| {

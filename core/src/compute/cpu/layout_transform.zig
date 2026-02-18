@@ -150,6 +150,36 @@ pub fn extractRowPrefixes(
     }
 }
 
+/// Split a `[seq_len, total_dim]` contiguous tensor across last dimension.
+pub fn splitLastDimContiguous(
+    input_data: []const f32,
+    seq_len: usize,
+    total_dim: usize,
+    split_sizes: []const usize,
+    out_slices: []const []f32,
+) !void {
+    if (split_sizes.len != out_slices.len) return error.InvalidShape;
+    if (input_data.len < seq_len * total_dim) return error.InvalidShape;
+
+    var sum_sizes: usize = 0;
+    for (split_sizes) |s| sum_sizes += s;
+    if (sum_sizes != total_dim) return error.InvalidShape;
+
+    for (split_sizes, out_slices) |split_size, out_slice| {
+        if (out_slice.len < seq_len * split_size) return error.InvalidShape;
+    }
+
+    var dim_offset: usize = 0;
+    for (split_sizes, out_slices) |split_size, out_slice| {
+        for (0..seq_len) |seq_idx| {
+            const src_base = seq_idx * total_dim + dim_offset;
+            const dst_base = seq_idx * split_size;
+            @memcpy(out_slice[dst_base..][0..split_size], input_data[src_base..][0..split_size]);
+        }
+        dim_offset += split_size;
+    }
+}
+
 test "projectQkv rearranges contiguous Q/K/V blocks" {
     const allocator = std.testing.allocator;
 

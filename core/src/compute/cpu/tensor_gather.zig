@@ -22,6 +22,28 @@ pub fn gatherRowsF32(
     }
 }
 
+/// Add feature rows into destination rows selected by token positions.
+pub fn scatterAddRowsByPositions(
+    dst_rows: []f32,
+    dst_row_count: usize,
+    row_width: usize,
+    positions: []const usize,
+    src_rows: []const f32,
+) !void {
+    if (dst_rows.len < dst_row_count * row_width) return error.InvalidShape;
+    if (src_rows.len % row_width != 0) return error.InvalidShape;
+
+    const available_rows = src_rows.len / row_width;
+    const row_count = @min(positions.len, available_rows);
+    for (0..row_count) |row_idx| {
+        const token_pos = positions[row_idx];
+        if (token_pos >= dst_row_count) continue;
+        const dst = dst_rows[token_pos * row_width ..][0..row_width];
+        const src = src_rows[row_idx * row_width ..][0..row_width];
+        for (dst, src) |*d, s| d.* += s;
+    }
+}
+
 test "gatherRowsF32 copies rows by index" {
     const src = [_]f32{
         1,   2,   3,

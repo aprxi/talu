@@ -31,13 +31,13 @@
 //! 6. Residual add (hidden += ffn_out * residual_multiplier)
 
 const std = @import("std");
-const math = std.math;
 const tensor = @import("../../../tensor.zig");
 const Tensor = tensor.Tensor;
 const OwnedTensor = tensor.OwnedTensor;
 const compute = @import("../../../compute/root.zig");
 const matmul = compute.ops.matmul;
 const cpu_rowwise = compute.cpu.rowwise;
+const cpu_reduction = compute.cpu.reduction;
 const cpu_cache_store = compute.cpu.cache_store;
 const cpu_rotary = compute.cpu.rotary;
 const graph = @import("../../../graph/root.zig");
@@ -459,14 +459,7 @@ pub const FusedCpuBackend = struct {
             try self.computeLogitsFromHidden(hidden_buffer, logits_buffer);
 
             // 5. Greedy sample next token
-            var max_logit_index: usize = 0;
-            var max_logit: f32 = logits_buffer[0];
-            for (logits_buffer[1..], 1..) |logit, logit_idx| {
-                if (logit > max_logit) {
-                    max_logit = logit;
-                    max_logit_index = logit_idx;
-                }
-            }
+            const max_logit_index = cpu_reduction.argmaxIndex(logits_buffer);
             const next_token: u32 = @intCast(max_logit_index);
 
             // Store token
@@ -1106,11 +1099,7 @@ pub const FusedCpuBackend = struct {
         if (self.loaded.position_embeddings) |pos_emb| {
             const pos_data = pos_emb.asSlice(f32);
             const emb_dim: usize = @intCast(pos_emb.shape[1]);
-            for (0..seq_len) |pos| {
-                const hidden_row = hidden_data[pos * model_dim ..][0..model_dim];
-                const pos_row = pos_data[pos * emb_dim ..][0..emb_dim];
-                for (hidden_row, pos_row) |*h, p| h.* += p;
-            }
+            try cpu_rowwise.addRowsInPlace(hidden_data, pos_data, seq_len, model_dim, emb_dim);
         }
         // Add token type embeddings if present (all zeros = type 0)
         if (self.loaded.token_type_embeddings) |tt_emb| {
@@ -1118,10 +1107,7 @@ pub const FusedCpuBackend = struct {
             const emb_dim: usize = @intCast(tt_emb.shape[1]);
             // Row 0 = type 0 (single-segment)
             const type0_row = tt_data[0..emb_dim];
-            for (0..seq_len) |pos| {
-                const hidden_row = hidden_data[pos * model_dim ..][0..model_dim];
-                for (hidden_row, type0_row) |*h, t| h.* += t;
-            }
+            try cpu_rowwise.addBroadcastRowInPlace(hidden_data, seq_len, model_dim, type0_row);
         }
         // Apply embedding LayerNorm if present (BERT-family models)
         if (self.loaded.embedding_norm_weight) |emb_norm_w| {
@@ -1168,32 +1154,13 @@ pub const FusedCpuBackend = struct {
                 @memcpy(embedding_out[0..model_dim], hidden_data[0..model_dim]);
             },
             .mean => {
-                @memset(embedding_out[0..model_dim], 0.0);
-                for (0..seq_len) |pos| {
-                    const offset = pos * model_dim;
-                    for (0..model_dim) |d| {
-                        embedding_out[d] += hidden_data[offset + d];
-                    }
-                }
-                const scale = 1.0 / @as(f32, @floatFromInt(seq_len));
-                for (embedding_out[0..model_dim]) |*v| {
-                    v.* *= scale;
-                }
+                try cpu_reduction.meanPoolRows(hidden_data, seq_len, model_dim, embedding_out[0..model_dim]);
             },
         }
 
         // 5. Optionally L2 normalize
         if (normalize) {
-            var norm_sq: f32 = 0.0;
-            for (embedding_out[0..model_dim]) |v| {
-                norm_sq += v * v;
-            }
-            if (norm_sq > 0.0) {
-                const inv_norm = 1.0 / math.sqrt(norm_sq);
-                for (embedding_out[0..model_dim]) |*v| {
-                    v.* *= inv_norm;
-                }
-            }
+            cpu_reduction.l2NormalizeInPlace(embedding_out[0..model_dim]);
         }
     }
 

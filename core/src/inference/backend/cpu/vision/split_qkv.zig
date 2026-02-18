@@ -25,6 +25,9 @@ const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const LoadedModel = graph_runtime.LoadedModel;
 const matmul = compute.ops.matmul;
+const cpu_image_ops = compute.cpu.image_ops;
+const cpu_norm = compute.cpu.normalization;
+const cpu_rotary = compute.cpu.rotary;
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;
@@ -999,66 +1002,17 @@ pub const VisionRuntime = struct {
         cos_out: []f32,
         sin_out: []f32,
     ) !void {
-        const grid_h = @as(usize, @intCast(grid.height));
-        const grid_w = @as(usize, @intCast(grid.width));
-        const grid_t = @as(usize, @intCast(grid.temporal));
-        const merge = self.spatial_merge_size;
-        if ((grid_h % merge) != 0 or (grid_w % merge) != 0) return error.InvalidShape;
-
-        const merged_h = grid_h / merge;
-        const merged_w = grid_w / merge;
-        const token_count = grid_t * grid_h * grid_w;
-        const head_dim = self.vision_hidden_size / self.vision_num_heads;
-        if ((head_dim % 4) != 0) return error.InvalidShape;
-        if (cos_out.len != token_count * head_dim or sin_out.len != token_count * head_dim) return error.InvalidShape;
-
-        const half_dim = head_dim / 2;
-        const freq_dim = half_dim / 2;
-
-        const inv_freq = try self.allocator.alloc(f32, freq_dim);
-        defer self.allocator.free(inv_freq);
-        for (0..freq_dim) |idx| {
-            const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(half_dim));
-            inv_freq[idx] = 1.0 / std.math.pow(f32, 10000.0, exponent);
-        }
-
-        var token_idx: usize = 0;
-        for (0..grid_t) |_| {
-            for (0..merged_h) |bh| {
-                for (0..merged_w) |bw| {
-                    for (0..merge) |ih| {
-                        for (0..merge) |iw| {
-                            const row = bh * merge + ih;
-                            const col = bw * merge + iw;
-                            const row_pos = @as(f32, @floatFromInt(row));
-                            const col_pos = @as(f32, @floatFromInt(col));
-                            const base = token_idx * head_dim;
-
-                            for (0..freq_dim) |f| {
-                                const row_angle = row_pos * inv_freq[f];
-                                const col_angle = col_pos * inv_freq[f];
-                                const row_cos = @cos(row_angle);
-                                const row_sin = @sin(row_angle);
-                                const col_cos = @cos(col_angle);
-                                const col_sin = @sin(col_angle);
-
-                                cos_out[base + f] = row_cos;
-                                sin_out[base + f] = row_sin;
-                                cos_out[base + freq_dim + f] = col_cos;
-                                sin_out[base + freq_dim + f] = col_sin;
-
-                                cos_out[base + half_dim + f] = row_cos;
-                                sin_out[base + half_dim + f] = row_sin;
-                                cos_out[base + half_dim + freq_dim + f] = col_cos;
-                                sin_out[base + half_dim + freq_dim + f] = col_sin;
-                            }
-                            token_idx += 1;
-                        }
-                    }
-                }
-            }
-        }
-        if (token_idx != token_count) return error.InvalidState;
+        return cpu_rotary.fillVisionRotaryTables(
+            self.allocator,
+            @as(usize, @intCast(grid.height)),
+            @as(usize, @intCast(grid.width)),
+            @as(usize, @intCast(grid.temporal)),
+            self.spatial_merge_size,
+            self.vision_hidden_size,
+            self.vision_num_heads,
+            cos_out,
+            sin_out,
+        );
     }
 };
 
@@ -1255,83 +1209,32 @@ fn extractPatchInput(
     image: PrefillVisionImage,
     out: []f32,
 ) !void {
-    const height = @as(usize, image.height);
-    const width = @as(usize, image.width);
-    const grid_h = @as(usize, image.grid.height);
-    const grid_w = @as(usize, image.grid.width);
-    const grid_t = @as(usize, image.grid.temporal);
-    const merge = self.spatial_merge_size;
-
-    const total_frames = image.pixels.len / (3 * height * width);
-    const patch_dim = 3 * self.temporal_patch_size * self.patch_size * self.patch_size;
-
-    var patch_idx: usize = 0;
     if (self.token_order == .row_major) {
-        for (0..grid_t) |t_block| {
-            const frame_base = t_block * self.temporal_patch_size;
-            for (0..grid_h) |patch_h| {
-                for (0..grid_w) |patch_w| {
-                    const y0 = patch_h * self.patch_size;
-                    const x0 = patch_w * self.patch_size;
-
-                    var dst = patch_idx * patch_dim;
-                    for (0..self.temporal_patch_size) |tp| {
-                        const frame_idx = frame_base + tp;
-                        if (frame_idx >= total_frames) return error.InvalidImageDimensions;
-                        for (0..self.patch_size) |py| {
-                            for (0..self.patch_size) |px| {
-                                const src_y = y0 + py;
-                                const src_x = x0 + px;
-                                for (0..3) |c| {
-                                    const src_idx = (((c * total_frames + frame_idx) * height + src_y) * width + src_x);
-                                    out[dst] = image.pixels[src_idx];
-                                    dst += 1;
-                                }
-                            }
-                        }
-                    }
-                    patch_idx += 1;
-                }
-            }
-        }
-        return;
+        return cpu_image_ops.extractPatchInputRowMajor(
+            image.pixels,
+            @as(usize, image.height),
+            @as(usize, image.width),
+            @as(usize, image.grid.height),
+            @as(usize, image.grid.width),
+            @as(usize, image.grid.temporal),
+            self.patch_size,
+            self.temporal_patch_size,
+            out,
+        );
     }
 
-    const merged_h = grid_h / merge;
-    const merged_w = grid_w / merge;
-    for (0..grid_t) |t_block| {
-        const frame_base = t_block * self.temporal_patch_size;
-        for (0..merged_h) |bh| {
-            for (0..merged_w) |bw| {
-                for (0..merge) |ih| {
-                    for (0..merge) |iw| {
-                        const patch_h = bh * merge + ih;
-                        const patch_w = bw * merge + iw;
-                        const y0 = patch_h * self.patch_size;
-                        const x0 = patch_w * self.patch_size;
-
-                        var dst = patch_idx * patch_dim;
-                        for (0..3) |c| {
-                            for (0..self.temporal_patch_size) |tp| {
-                                const frame_idx = frame_base + tp;
-                                if (frame_idx >= total_frames) return error.InvalidImageDimensions;
-                                for (0..self.patch_size) |py| {
-                                    for (0..self.patch_size) |px| {
-                                        const src_y = y0 + py;
-                                        const src_x = x0 + px;
-                                        const src_idx = (((c * total_frames + frame_idx) * height + src_y) * width + src_x);
-                                        out[dst] = image.pixels[src_idx];
-                                        dst += 1;
-                                    }
-                                }
-                            }
-                        }
-                        patch_idx += 1;
-                    }
-                }
-            }
-        }
-    }
+    return cpu_image_ops.extractPatchInputMerged(
+        image.pixels,
+        @as(usize, image.height),
+        @as(usize, image.width),
+        @as(usize, image.grid.height),
+        @as(usize, image.grid.width),
+        @as(usize, image.grid.temporal),
+        self.patch_size,
+        self.temporal_patch_size,
+        self.spatial_merge_size,
+        out,
+    );
 }
 
 fn interpolatePosEmbeddings(
@@ -1339,43 +1242,18 @@ fn interpolatePosEmbeddings(
     grid: image_mod.VisionGrid,
     out: []f32,
 ) !void {
-    const grid_h = @as(usize, grid.height);
-    const grid_w = @as(usize, grid.width);
-    const grid_t = @as(usize, grid.temporal);
-    const merge = self.spatial_merge_size;
-    const merged_h = grid_h / merge;
-    const merged_w = grid_w / merge;
-
-    const expected_tokens = grid_t * grid_h * grid_w;
-    if (out.len != expected_tokens * self.vision_hidden_size) return error.InvalidShape;
-
-    var dst_token: usize = 0;
-    if (self.token_order == .row_major) {
-        for (0..grid_t) |_| {
-            for (0..grid_h) |h_idx| {
-                for (0..grid_w) |w_idx| {
-                    try bilinearPosRow(self, h_idx, w_idx, grid_h, grid_w, out[dst_token * self.vision_hidden_size ..][0..self.vision_hidden_size]);
-                    dst_token += 1;
-                }
-            }
-        }
-        return;
-    }
-
-    for (0..grid_t) |_| {
-        for (0..merged_h) |bh| {
-            for (0..merged_w) |bw| {
-                for (0..merge) |ih| {
-                    for (0..merge) |iw| {
-                        const h_idx = bh * merge + ih;
-                        const w_idx = bw * merge + iw;
-                        try bilinearPosRow(self, h_idx, w_idx, grid_h, grid_w, out[dst_token * self.vision_hidden_size ..][0..self.vision_hidden_size]);
-                        dst_token += 1;
-                    }
-                }
-            }
-        }
-    }
+    return cpu_image_ops.interpolatePosEmbeddings(
+        self.pos_embed_f32,
+        self.num_grid_side,
+        self.vision_hidden_size,
+        @as(usize, grid.height),
+        @as(usize, grid.width),
+        @as(usize, grid.temporal),
+        self.spatial_merge_size,
+        self.token_order == .row_major,
+        self.token_order == .row_major,
+        out,
+    );
 }
 
 fn bilinearPosRow(
@@ -1386,51 +1264,17 @@ fn bilinearPosRow(
     grid_w: usize,
     out_row: []f32,
 ) !void {
-    const side_minus_1 = @as(f32, @floatFromInt(self.num_grid_side - 1));
-    const hf = if (self.token_order == .row_major) blk: {
-        if (grid_h <= 1) break :blk 0.0;
-        const scale = @as(f32, @floatFromInt(self.num_grid_side)) / @as(f32, @floatFromInt(grid_h));
-        const mapped = (@as(f32, @floatFromInt(h_idx)) + 0.5) * scale - 0.5;
-        break :blk std.math.clamp(mapped, 0.0, side_minus_1);
-    } else if (grid_h <= 1)
-        0.0
-    else
-        @as(f32, @floatFromInt(h_idx)) * side_minus_1 / @as(f32, @floatFromInt(grid_h - 1));
-
-    const wf = if (self.token_order == .row_major) blk: {
-        if (grid_w <= 1) break :blk 0.0;
-        const scale = @as(f32, @floatFromInt(self.num_grid_side)) / @as(f32, @floatFromInt(grid_w));
-        const mapped = (@as(f32, @floatFromInt(w_idx)) + 0.5) * scale - 0.5;
-        break :blk std.math.clamp(mapped, 0.0, side_minus_1);
-    } else if (grid_w <= 1)
-        0.0
-    else
-        @as(f32, @floatFromInt(w_idx)) * side_minus_1 / @as(f32, @floatFromInt(grid_w - 1));
-
-    const h0 = @as(usize, @intFromFloat(@floor(hf)));
-    const w0 = @as(usize, @intFromFloat(@floor(wf)));
-    const h1 = @min(self.num_grid_side - 1, h0 + 1);
-    const w1 = @min(self.num_grid_side - 1, w0 + 1);
-
-    const dh = hf - @as(f32, @floatFromInt(h0));
-    const dw = wf - @as(f32, @floatFromInt(w0));
-
-    const w00 = (1.0 - dh) * (1.0 - dw);
-    const w01 = (1.0 - dh) * dw;
-    const w10 = dh * (1.0 - dw);
-    const w11 = dh * dw;
-
-    const idx00 = (h0 * self.num_grid_side + w0) * self.vision_hidden_size;
-    const idx01 = (h0 * self.num_grid_side + w1) * self.vision_hidden_size;
-    const idx10 = (h1 * self.num_grid_side + w0) * self.vision_hidden_size;
-    const idx11 = (h1 * self.num_grid_side + w1) * self.vision_hidden_size;
-
-    for (0..self.vision_hidden_size) |d| {
-        out_row[d] = self.pos_embed_f32[idx00 + d] * w00 +
-            self.pos_embed_f32[idx01 + d] * w01 +
-            self.pos_embed_f32[idx10 + d] * w10 +
-            self.pos_embed_f32[idx11 + d] * w11;
-    }
+    return cpu_image_ops.bilinearPosRow(
+        self.pos_embed_f32,
+        self.num_grid_side,
+        self.vision_hidden_size,
+        h_idx,
+        w_idx,
+        grid_h,
+        grid_w,
+        self.token_order == .row_major,
+        out_row,
+    );
 }
 
 fn layerNormRow(
@@ -1440,21 +1284,7 @@ fn layerNormRow(
     bias: []const f32,
     eps: f32,
 ) void {
-    var mean: f32 = 0.0;
-    for (input) |v| mean += v;
-    mean /= @as(f32, @floatFromInt(input.len));
-
-    var var_sum: f32 = 0.0;
-    for (input) |v| {
-        const d = v - mean;
-        var_sum += d * d;
-    }
-    const variance = var_sum / @as(f32, @floatFromInt(input.len));
-    const inv_std = 1.0 / @sqrt(variance + eps);
-
-    for (0..input.len) |i| {
-        output[i] = (input[i] - mean) * inv_std * weight[i] + bias[i];
-    }
+    cpu_norm.layerNormRow(input, output, weight, bias, eps);
 }
 
 test "scatterVisionEmbeddings replaces image token rows" {

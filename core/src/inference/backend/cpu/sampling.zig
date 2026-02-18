@@ -5,13 +5,11 @@
 
 const std = @import("std");
 const compute = @import("../../../compute/root.zig");
-const ops = compute.ops.math;
-const simd = compute.simd;
 const validate = @import("../../../validate/root.zig");
-
-// Use comptime-detected SIMD width for all vector operations
-const VEC_LEN = simd.f32_vec_len;
-const F32Vec = simd.F32Vec;
+const cpu_softmax = compute.cpu.softmax;
+const cpu_sampling_ops = compute.cpu.sampling_ops;
+const cpu_topk = compute.cpu.topk;
+const cpu_reduction = compute.cpu.reduction;
 
 pub const SamplingStrategy = enum {
     greedy,
@@ -126,13 +124,13 @@ pub const Sampler = struct {
         // Apply repetition penalty if configured
         if (config.repetition_penalty != 1.0) {
             if (config.context_tokens) |tokens| {
-                applyRepetitionPenalty(logits, tokens, config.repetition_penalty);
+                cpu_sampling_ops.applyRepetitionPenalty(logits, tokens, config.repetition_penalty);
             }
         }
 
         // Apply logit bias if configured
         if (config.logit_bias) |bias_entries| {
-            applyLogitBias(logits, bias_entries);
+            cpu_sampling_ops.applyLogitBias(logits, bias_entries);
         }
 
         return self.sampleImpl(logits, config);
@@ -166,15 +164,7 @@ pub const Sampler = struct {
         if (config.min_p < 0 or config.min_p > 1.0) return error.InvalidMinP;
 
         if (config.strategy == .greedy) {
-            var best_token_index: usize = 0;
-            var best_logit_value: f32 = logits[0];
-            for (logits[1..], 1..) |logit, logit_index| {
-                if (logit > best_logit_value) {
-                    best_logit_value = logit;
-                    best_token_index = logit_index;
-                }
-            }
-            return best_token_index;
+            return cpu_reduction.argmaxIndex(logits);
         }
 
         // For non-greedy strategies, temperature must be positive
@@ -183,69 +173,13 @@ pub const Sampler = struct {
         // Use workspace buffers (no allocation per sample!)
         const probabilities = self.workspace.probabilities[0..logits.len];
 
-        // Find max using SIMD
-        var max_logit_vec: F32Vec = @splat(logits[0]);
-        var vec_index: usize = 0;
-        while (vec_index + VEC_LEN - 1 < logits.len) : (vec_index += VEC_LEN) {
-            const logit_vec: F32Vec = logits[vec_index..][0..VEC_LEN].*;
-            max_logit_vec = @max(max_logit_vec, logit_vec);
-        }
-        var max_logit_value = @reduce(.Max, max_logit_vec);
-        for (logits[vec_index..]) |logit| max_logit_value = @max(max_logit_value, logit);
-
-        // Compute exp and sum - SIMD version
-        const inverse_temperature = 1.0 / config.temperature;
-        const max_logit_splat: F32Vec = @splat(max_logit_value);
-        const inverse_temperature_vec: F32Vec = @splat(inverse_temperature);
-        var probability_sum_vec: F32Vec = @splat(0);
-
-        vec_index = 0;
-        while (vec_index + VEC_LEN - 1 < logits.len) : (vec_index += VEC_LEN) {
-            const logit_vec: F32Vec = logits[vec_index..][0..VEC_LEN].*;
-            const scaled = (logit_vec - max_logit_splat) * inverse_temperature_vec;
-            const prob_vec = ops.fastExp(scaled);
-            probabilities[vec_index..][0..VEC_LEN].* = prob_vec;
-            probability_sum_vec += prob_vec;
-        }
-        var probability_sum = @reduce(.Add, probability_sum_vec);
-        // Handle remainder
-        for (logits[vec_index..], probabilities[vec_index..]) |logit, *probability| {
-            probability.* = ops.fastExpScalar((logit - max_logit_value) * inverse_temperature);
-            probability_sum += probability.*;
-        }
-
-        // Normalize - SIMD
-        const inv_probability_sum = 1.0 / probability_sum;
-        const inv_probability_sum_vec: F32Vec = @splat(inv_probability_sum);
-        vec_index = 0;
-        while (vec_index + VEC_LEN - 1 < probabilities.len) : (vec_index += VEC_LEN) {
-            const prob_vec: F32Vec = probabilities[vec_index..][0..VEC_LEN].*;
-            probabilities[vec_index..][0..VEC_LEN].* = prob_vec * inv_probability_sum_vec;
-        }
-        for (probabilities[vec_index..]) |*probability| probability.* *= inv_probability_sum;
+        // Temperature softmax into workspace
+        for (logits, probabilities) |logit, *probability| probability.* = logit / config.temperature;
+        cpu_softmax.stableInPlace(probabilities);
 
         // Apply min_p filtering if configured
         // Tokens with probability < min_p * max_prob are zeroed out
-        if (config.min_p > 0.0) {
-            var max_probability: f32 = 0.0;
-            for (probabilities) |probability| max_probability = @max(max_probability, probability);
-
-            const min_probability_threshold = config.min_p * max_probability;
-            var filtered_probability_sum: f32 = 0.0;
-            for (probabilities) |*probability| {
-                if (probability.* < min_probability_threshold) {
-                    probability.* = 0.0;
-                } else {
-                    filtered_probability_sum += probability.*;
-                }
-            }
-
-            // Renormalize after filtering
-            if (filtered_probability_sum > 0) {
-                const inverse_filtered_sum = 1.0 / filtered_probability_sum;
-                for (probabilities) |*probability| probability.* *= inverse_filtered_sum;
-            }
-        }
+        cpu_sampling_ops.applyMinP(probabilities, config.min_p);
 
         if (config.strategy == .top_k) {
             // For top_k: use quick select O(N) to find top K, then sort only those K
@@ -257,7 +191,7 @@ pub const Sampler = struct {
             const top_k_count = @min(config.top_k, logits.len);
 
             // Quick select partitions so top K are in [0..k), rest are in [k..n)
-            quickSelectTopK(sorted_entries, top_k_count);
+            cpu_topk.quickSelectTopK(sorted_entries, top_k_count);
 
             // Sort only the top K elements (typically 40 vs 152K)
             std.sort.pdq(IndexValue, sorted_entries[0..top_k_count], {}, byProbabilityDesc);
@@ -269,7 +203,7 @@ pub const Sampler = struct {
             }
             if (top_k_prob_sum == 0) return error.InvalidInput;
 
-            renormalizeSubset(probabilities, sorted_entries[0..top_k_count], top_k_prob_sum);
+            cpu_sampling_ops.renormalizeSubset(probabilities, sorted_entries[0..top_k_count], top_k_prob_sum);
         } else if (config.strategy == .top_p) {
             // For top_p: we need full sort since we don't know cutoff ahead of time
             const sorted_entries = self.workspace.sorted_entries[0..logits.len];
@@ -290,7 +224,7 @@ pub const Sampler = struct {
             }
             if (cumulative_probability == 0) return error.InvalidInput;
 
-            renormalizeSubset(probabilities, sorted_entries[0..cutoff_len], cumulative_probability);
+            cpu_sampling_ops.renormalizeSubset(probabilities, sorted_entries[0..cutoff_len], cumulative_probability);
         }
 
         // Sample from multinomial
@@ -309,97 +243,7 @@ pub const Sampler = struct {
 };
 
 fn byProbabilityDesc(_: void, a: IndexValue, b: IndexValue) bool {
-    return a.value > b.value;
-}
-
-/// Zero all probs then write back a subset with renormalization.
-/// Used by both top_k and top_p after determining the cutoff set.
-inline fn renormalizeSubset(probabilities: []f32, sorted_entries: []const IndexValue, subset_sum: f32) void {
-    const inverse_sum = 1.0 / subset_sum;
-    @memset(probabilities, 0);
-    for (sorted_entries) |entry| probabilities[entry.index] = entry.value * inverse_sum;
-}
-
-/// Hoare partition (fewer swaps than Lomuto, descending order)
-inline fn partition(items: []IndexValue, left_bound: usize, right_bound: usize) usize {
-    // Median-of-three pivot selection
-    const middle = left_bound + (right_bound - left_bound) / 2;
-    const left_value = items[left_bound].value;
-    const middle_value = items[middle].value;
-    const right_value = items[right_bound].value;
-    const pivot_index = if ((left_value >= middle_value) == (middle_value >= right_value)) middle else if ((left_value >= middle_value) == (right_value >= left_value)) left_bound else right_bound;
-    const pivot_value = items[pivot_index].value;
-
-    var left_index = left_bound;
-    var right_index = right_bound;
-
-    while (true) {
-        // Find element smaller than pivot (wrong side for descending)
-        while (items[left_index].value > pivot_value) left_index += 1;
-        // Find element larger than pivot (wrong side for descending)
-        while (items[right_index].value < pivot_value) right_index -= 1;
-
-        if (left_index >= right_index) return right_index;
-
-        // Swap
-        const swap_value = items[left_index];
-        items[left_index] = items[right_index];
-        items[right_index] = swap_value;
-        left_index += 1;
-        right_index -= 1;
-    }
-}
-
-/// Quick select to partially sort so that the top K elements are in positions [0..k)
-/// Uses Hoare partition with median-of-three pivot selection
-fn quickSelectTopK(items: []IndexValue, top_k: usize) void {
-    if (items.len <= 1 or top_k == 0) return;
-    const target_count = @min(top_k, items.len);
-
-    var left_index: usize = 0;
-    var right_index: usize = items.len - 1;
-
-    while (left_index < right_index) {
-        const pivot_index = partition(items, left_index, right_index);
-
-        // Hoare partition: elements in [lo..p] are >= pivot, [p+1..hi] are <= pivot
-        if (pivot_index + 1 >= target_count) {
-            right_index = pivot_index;
-        } else {
-            left_index = pivot_index + 1;
-        }
-    }
-}
-
-/// Apply repetition penalty to logits for tokens that appear in context.
-/// Penalty > 1.0 discourages repetition, < 1.0 encourages it.
-/// Algorithm: if logit > 0, divide by penalty; if logit < 0, multiply by penalty.
-/// This ensures positive logits become less positive and negative become more negative.
-fn applyRepetitionPenalty(logits: []f32, context_tokens: []const u32, penalty: f32) void {
-    if (penalty == 1.0) return;
-
-    for (context_tokens) |token_id| {
-        if (token_id < logits.len) {
-            const token_logit = logits[token_id];
-            if (token_logit > 0) {
-                logits[token_id] = token_logit / penalty;
-            } else {
-                logits[token_id] = token_logit * penalty;
-            }
-        }
-    }
-}
-
-/// Apply logit bias to specific tokens.
-/// Adds bias value to each token's logit, modifying sampling probabilities.
-/// Positive bias increases probability, negative decreases it.
-/// Use large negative values (-100) to effectively ban tokens.
-fn applyLogitBias(logits: []f32, bias_entries: []const LogitBiasEntry) void {
-    for (bias_entries) |bias_entry| {
-        if (bias_entry.token_id < logits.len) {
-            logits[bias_entry.token_id] += bias_entry.bias;
-        }
-    }
+    return cpu_topk.byValueDesc({}, a, b);
 }
 
 test "sample greedy picks max" {
@@ -607,7 +451,7 @@ test "sample repetition penalty positive negative" {
     const context_tokens = [_]u32{ 0, 1 };
     const penalty: f32 = 2.0;
 
-    applyRepetitionPenalty(&logits, &context_tokens, penalty);
+    cpu_sampling_ops.applyRepetitionPenalty(&logits, &context_tokens, penalty);
 
     // Token 0: positive logit divided by penalty: 2.0 / 2.0 = 1.0
     try std.testing.expectApproxEqAbs(1.0, logits[0], 0.001);
@@ -627,7 +471,7 @@ test "sample repetition penalty 1.0 noop" {
     const context_tokens = [_]u32{ 0, 1, 2 };
     const penalty: f32 = 1.0;
 
-    applyRepetitionPenalty(&logits, &context_tokens, penalty);
+    cpu_sampling_ops.applyRepetitionPenalty(&logits, &context_tokens, penalty);
 
     // Logits should be unchanged
     for (logits, original_logits) |logit, original| {
@@ -681,7 +525,7 @@ test "sample logit bias modifies" {
         .{ .token_id = 2, .bias = -5.0 }, // Reduce token 2
     };
 
-    applyLogitBias(&logits, &bias_entries);
+    cpu_sampling_ops.applyLogitBias(&logits, &bias_entries);
 
     try std.testing.expectApproxEqAbs(@as(f32, 11.0), logits[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), logits[1], 0.001); // Unchanged
@@ -746,7 +590,7 @@ test "sample logit bias ignores out-of-bounds" {
         .{ .token_id = 999, .bias = -50.0 }, // Out of bounds
     };
 
-    applyLogitBias(&logits, &bias_entries);
+    cpu_sampling_ops.applyLogitBias(&logits, &bias_entries);
 
     // Logits should be unchanged (out-of-bounds ignored)
     for (logits, original_logits) |logit, original| {
@@ -1283,7 +1127,7 @@ test "Sampler.sample quickSelectTopK partitions" {
         .{ 4, 1.0 },
     });
 
-    quickSelectTopK(&items, 3);
+    cpu_topk.quickSelectTopK(&items, 3);
 
     // After quickSelect, top 3 elements should be in first 3 positions
     // (not necessarily sorted, but their values should be >= remaining elements)
@@ -1304,14 +1148,14 @@ test "Sampler.sample quickSelectTopK partitions" {
 
 test "Sampler.sample quickSelectTopK k=1" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 }, .{ 2, 1.0 }, .{ 3, 5.0 } });
-    quickSelectTopK(&items, 1);
+    cpu_topk.quickSelectTopK(&items, 1);
     try std.testing.expectEqual(@as(f32, 7.0), items[0].value);
 }
 
 test "Sampler.sample quickSelectTopK k=size" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 }, .{ 2, 1.0 } });
     const original_items = items;
-    quickSelectTopK(&items, 3);
+    cpu_topk.quickSelectTopK(&items, 3);
 
     // All elements should still be present (just partitioned)
     var found = [_]bool{false} ** 3;
@@ -1327,13 +1171,13 @@ test "Sampler.sample quickSelectTopK k=size" {
 
 test "Sampler.sample quickSelectTopK k=0" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 } });
-    quickSelectTopK(&items, 0);
+    cpu_topk.quickSelectTopK(&items, 0);
     try std.testing.expect(items.len == 2);
 }
 
 test "Sampler.sample quickSelectTopK single element" {
     var items = makeIndexValues(.{.{ 0, 5.0 }});
-    quickSelectTopK(&items, 1);
+    cpu_topk.quickSelectTopK(&items, 1);
     try std.testing.expectEqual(@as(f32, 5.0), items[0].value);
 }
 
@@ -1346,7 +1190,7 @@ test "Sampler.sample quickSelectTopK duplicates" {
         .{ 4, 1.0 },
     });
 
-    quickSelectTopK(&items, 3);
+    cpu_topk.quickSelectTopK(&items, 3);
 
     // Top 3 should all be value 5.0
     for (items[0..3]) |item| {
@@ -1356,19 +1200,19 @@ test "Sampler.sample quickSelectTopK duplicates" {
 
 test "Sampler.sample quickSelectTopK descending input" {
     var items = makeIndexValues(.{ .{ 0, 10.0 }, .{ 1, 9.0 }, .{ 2, 8.0 }, .{ 3, 7.0 }, .{ 4, 6.0 } });
-    quickSelectTopK(&items, 3);
+    cpu_topk.quickSelectTopK(&items, 3);
     for (items[0..3]) |item| try std.testing.expect(item.value >= 8.0);
 }
 
 test "Sampler.sample quickSelectTopK ascending input" {
     var items = makeIndexValues(.{ .{ 0, 1.0 }, .{ 1, 2.0 }, .{ 2, 3.0 }, .{ 3, 4.0 }, .{ 4, 5.0 } });
-    quickSelectTopK(&items, 2);
+    cpu_topk.quickSelectTopK(&items, 2);
     for (items[0..2]) |item| try std.testing.expect(item.value >= 4.0);
 }
 
 test "Sampler.sample quickSelectTopK large k" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 }, .{ 2, 1.0 } });
-    quickSelectTopK(&items, 100);
+    cpu_topk.quickSelectTopK(&items, 100);
     try std.testing.expect(items.len == 3);
 }
 
@@ -1379,7 +1223,7 @@ test "Sampler.sample quickSelectTopK large k" {
 test "Sampler.sample renormalizeSubset basic" {
     var probabilities = [_]f32{ 0.5, 0.3, 0.2, 0.1 };
     const sorted_subset = makeIndexValues(.{ .{ 0, 0.5 }, .{ 1, 0.3 } });
-    renormalizeSubset(&probabilities, &sorted_subset, 0.8);
+    cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 0.8);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5 / 0.8), probabilities[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.3 / 0.8), probabilities[1], 0.001);
     try std.testing.expectEqual(@as(f32, 0.0), probabilities[2]);
@@ -1389,7 +1233,7 @@ test "Sampler.sample renormalizeSubset basic" {
 test "Sampler.sample renormalizeSubset single" {
     var probabilities = [_]f32{ 0.5, 0.3, 0.2 };
     const sorted_subset = makeIndexValues(.{.{ 1, 0.3 }});
-    renormalizeSubset(&probabilities, &sorted_subset, 0.3);
+    cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 0.3);
     try std.testing.expectEqual(@as(f32, 0.0), probabilities[0]);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), probabilities[1], 0.001);
     try std.testing.expectEqual(@as(f32, 0.0), probabilities[2]);
@@ -1398,7 +1242,7 @@ test "Sampler.sample renormalizeSubset single" {
 test "Sampler.sample renormalizeSubset all" {
     var probabilities = [_]f32{ 0.4, 0.3, 0.2, 0.1 };
     const sorted_subset = makeIndexValues(.{ .{ 0, 0.4 }, .{ 1, 0.3 }, .{ 2, 0.2 }, .{ 3, 0.1 } });
-    renormalizeSubset(&probabilities, &sorted_subset, 1.0);
+    cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 1.0);
     var sum: f32 = 0.0;
     for (probabilities) |p| sum += p;
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), sum, 0.001);
@@ -1407,7 +1251,7 @@ test "Sampler.sample renormalizeSubset all" {
 test "Sampler.sample renormalizeSubset proportions" {
     var probabilities = [_]f32{ 0.6, 0.4, 0.2, 0.1 };
     const sorted_subset = makeIndexValues(.{ .{ 0, 0.6 }, .{ 1, 0.4 } });
-    renormalizeSubset(&probabilities, &sorted_subset, 1.0);
+    cpu_sampling_ops.renormalizeSubset(&probabilities, &sorted_subset, 1.0);
     const ratio = probabilities[0] / probabilities[1];
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), ratio, 0.001);
 }
@@ -1617,7 +1461,7 @@ test "Sampler.sample boundary out-of-bounds" {
     const context_tokens = [_]u32{ 0, 1, 100, 999 }; // Some out of bounds
     const penalty: f32 = 2.0;
 
-    applyRepetitionPenalty(&logits, &context_tokens, penalty);
+    cpu_sampling_ops.applyRepetitionPenalty(&logits, &context_tokens, penalty);
 
     // Only tokens 0 and 1 should be penalized
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[0], 0.001);
@@ -1634,21 +1478,21 @@ test "Sampler.sample boundary out-of-bounds" {
 
 test "Sampler.sample partition equal values" {
     var items = makeIndexValues(.{ .{ 0, 5.0 }, .{ 1, 5.0 }, .{ 2, 5.0 }, .{ 3, 5.0 } });
-    const pivot_idx = partition(&items, 0, items.len - 1);
+    const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     try std.testing.expect(pivot_idx < items.len);
     for (items) |item| try std.testing.expectEqual(@as(f32, 5.0), item.value);
 }
 
 test "Sampler.sample partition two elements" {
     var items = makeIndexValues(.{ .{ 0, 3.0 }, .{ 1, 7.0 } });
-    const pivot_idx = partition(&items, 0, 1);
+    const pivot_idx = cpu_topk.partition(&items, 0, 1);
     try std.testing.expect(items[0].value >= items[1].value);
     try std.testing.expect(pivot_idx <= 1);
 }
 
 test "Sampler.sample partition sorted descending" {
     var items = makeIndexValues(.{ .{ 0, 10.0 }, .{ 1, 8.0 }, .{ 2, 6.0 }, .{ 3, 4.0 }, .{ 4, 2.0 } });
-    const pivot_idx = partition(&items, 0, items.len - 1);
+    const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
     for (items[0..pivot_idx]) |item| try std.testing.expect(item.value >= pivot_val);
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
@@ -1656,7 +1500,7 @@ test "Sampler.sample partition sorted descending" {
 
 test "Sampler.sample partition sorted ascending" {
     var items = makeIndexValues(.{ .{ 0, 2.0 }, .{ 1, 4.0 }, .{ 2, 6.0 }, .{ 3, 8.0 }, .{ 4, 10.0 } });
-    const pivot_idx = partition(&items, 0, items.len - 1);
+    const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
     for (items[0..pivot_idx]) |item| try std.testing.expect(item.value >= pivot_val);
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
@@ -1664,7 +1508,7 @@ test "Sampler.sample partition sorted ascending" {
 
 test "Sampler.sample partition negative values" {
     var items = makeIndexValues(.{ .{ 0, -2.0 }, .{ 1, -8.0 }, .{ 2, -4.0 }, .{ 3, -1.0 } });
-    const pivot_idx = partition(&items, 0, items.len - 1);
+    const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
     for (items[0..pivot_idx]) |item| try std.testing.expect(item.value >= pivot_val);
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
@@ -1672,7 +1516,7 @@ test "Sampler.sample partition negative values" {
 
 test "Sampler.sample partition mixed values" {
     var items = makeIndexValues(.{ .{ 0, 5.0 }, .{ 1, -3.0 }, .{ 2, 2.0 }, .{ 3, -7.0 }, .{ 4, 0.0 } });
-    const pivot_idx = partition(&items, 0, items.len - 1);
+    const pivot_idx = cpu_topk.partition(&items, 0, items.len - 1);
     const pivot_val = items[pivot_idx].value;
     for (items[0..pivot_idx]) |item| try std.testing.expect(item.value >= pivot_val);
     for (items[pivot_idx + 1 ..]) |item| try std.testing.expect(item.value <= pivot_val);
@@ -1682,7 +1526,7 @@ test "Sampler.sample partition preserves elements" {
     var items = makeIndexValues(.{ .{ 0, 5.0 }, .{ 1, 10.0 }, .{ 2, 3.0 }, .{ 3, 8.0 } });
     const original_indices = [_]u32{ 0, 1, 2, 3 };
     const original_values = [_]f32{ 5.0, 10.0, 3.0, 8.0 };
-    _ = partition(&items, 0, items.len - 1);
+    _ = cpu_topk.partition(&items, 0, items.len - 1);
     for (original_indices, original_values) |orig_idx, orig_val| {
         var found = false;
         for (items) |item| {
@@ -1699,7 +1543,7 @@ test "Sampler.sample partition subrange" {
     var items = makeIndexValues(.{ .{ 0, 1.0 }, .{ 1, 9.0 }, .{ 2, 5.0 }, .{ 3, 3.0 }, .{ 4, 7.0 }, .{ 5, 2.0 } });
 
     // Partition only middle elements (indices 1-4)
-    const pivot_idx = partition(&items, 1, 4);
+    const pivot_idx = cpu_topk.partition(&items, 1, 4);
 
     // Pivot should be within the specified range
     try std.testing.expect(pivot_idx >= 1 and pivot_idx <= 4);

@@ -13,7 +13,12 @@ const capi = @import("../../../../capi/error.zig");
 const ops = compute.ops;
 const matmul = compute.ops.matmul;
 const tv = ops.tensor_view;
-const dtype_mod = @import("../../../../dtype.zig");
+const cpu_broadcast = compute.cpu.broadcast;
+const cpu_elementwise = compute.cpu.elementwise;
+const cpu_reduction = compute.cpu.reduction;
+const cpu_layout = compute.cpu.layout_transform;
+const cpu_masking = compute.cpu.masking;
+const cpu_rotary = compute.cpu.rotary;
 const runtime = @import("runtime.zig");
 const cpu_forward = @import("weights.zig");
 const attn_kernel = @import("../kernels/attention.zig");
@@ -123,143 +128,6 @@ pub const Block = struct {
             .residual, .norm_out, .branch_out => buffer_views[@intFromEnum(buffer_id)].asSlice(f32)[0..len],
             else => scratchTempSlice(scratch, buffer_id, len),
         };
-    }
-
-    fn readParamValue(param: *const Tensor, elem_idx: usize) f32 {
-        return switch (param.dtype) {
-            .f32 => param.asSlice(f32)[elem_idx],
-            .f16 => dtype_mod.fp16ToF32(param.asSlice(u16)[elem_idx]),
-            .bf16 => dtype_mod.bf16ToF32(param.asSlice(u16)[elem_idx]),
-            else => 0.0,
-        };
-    }
-
-    fn applyElementwiseBinaryOp(
-        left_tensor: Tensor,
-        right_tensor: Tensor,
-        output_slice: []f32,
-        binary_op: fn (f32, f32) f32,
-    ) !void {
-        const left_values = left_tensor.asSlice(f32);
-        const right_values = right_tensor.asSlice(f32);
-        const left_count = left_tensor.numel;
-        const right_count = right_tensor.numel;
-
-        if (left_count == right_count) {
-            for (0..left_count) |elem_idx| output_slice[elem_idx] = binary_op(left_values[elem_idx], right_values[elem_idx]);
-            return;
-        }
-
-        if (left_tensor.n_dims == 4 and right_tensor.n_dims == 4 and left_tensor.shape[1] == right_tensor.shape[1] and left_tensor.shape[2] == right_tensor.shape[2]) {
-            const seq_len: usize = @intCast(left_tensor.shape[1]);
-            const head_count: usize = @intCast(left_tensor.shape[2]);
-            const left_width: usize = @intCast(left_tensor.shape[3]);
-            const right_width: usize = @intCast(right_tensor.shape[3]);
-            if (left_width == 1 and right_width > 1) {
-                for (0..seq_len) |seq_index| {
-                    for (0..head_count) |head_index| {
-                        const base_offset = (seq_index * head_count + head_index) * right_width;
-                        const left_value = left_values[seq_index * head_count + head_index];
-                        for (0..right_width) |dim_index| {
-                            output_slice[base_offset + dim_index] = binary_op(left_value, right_values[base_offset + dim_index]);
-                        }
-                    }
-                }
-                return;
-            }
-            if (right_width == 1 and left_width > 1) {
-                for (0..seq_len) |seq_index| {
-                    for (0..head_count) |head_index| {
-                        const base_offset = (seq_index * head_count + head_index) * left_width;
-                        const right_value = right_values[seq_index * head_count + head_index];
-                        for (0..left_width) |dim_index| {
-                            output_slice[base_offset + dim_index] = binary_op(left_values[base_offset + dim_index], right_value);
-                        }
-                    }
-                }
-                return;
-            }
-        }
-
-        if (left_tensor.n_dims == 3 and right_tensor.n_dims == 3 and left_tensor.shape[1] == right_tensor.shape[1]) {
-            const seq_len: usize = @intCast(left_tensor.shape[1]);
-            if (left_tensor.shape[2] == 1 and right_tensor.shape[2] > 1) {
-                const right_hidden_size: usize = @intCast(right_tensor.shape[2]);
-                for (0..seq_len) |seq_index| {
-                    const left_value = left_values[seq_index];
-                    for (0..right_hidden_size) |hidden_index| {
-                        output_slice[seq_index * right_hidden_size + hidden_index] = binary_op(left_value, right_values[seq_index * right_hidden_size + hidden_index]);
-                    }
-                }
-                return;
-            }
-            if (right_tensor.shape[2] == 1 and left_tensor.shape[2] > 1) {
-                const left_hidden_size: usize = @intCast(left_tensor.shape[2]);
-                for (0..seq_len) |seq_index| {
-                    const right_value = right_values[seq_index];
-                    for (0..left_hidden_size) |hidden_index| {
-                        output_slice[seq_index * left_hidden_size + hidden_index] = binary_op(left_values[seq_index * left_hidden_size + hidden_index], right_value);
-                    }
-                }
-                return;
-            }
-        }
-
-        if (left_tensor.n_dims == 1 and right_tensor.n_dims == 3 and left_tensor.shape[0] == right_tensor.shape[2]) {
-            const seq_len: usize = @intCast(right_tensor.shape[1]);
-            const hidden_size: usize = @intCast(right_tensor.shape[2]);
-            for (0..seq_len) |seq_index| {
-                const base_offset = seq_index * hidden_size;
-                for (0..hidden_size) |hidden_index| {
-                    output_slice[base_offset + hidden_index] = binary_op(left_values[hidden_index], right_values[base_offset + hidden_index]);
-                }
-            }
-            return;
-        }
-
-        if (right_tensor.n_dims == 1 and left_tensor.n_dims == 3 and right_tensor.shape[0] == left_tensor.shape[2]) {
-            const seq_len: usize = @intCast(left_tensor.shape[1]);
-            const hidden_size: usize = @intCast(left_tensor.shape[2]);
-            for (0..seq_len) |seq_index| {
-                const base_offset = seq_index * hidden_size;
-                for (0..hidden_size) |hidden_index| {
-                    output_slice[base_offset + hidden_index] = binary_op(left_values[base_offset + hidden_index], right_values[hidden_index]);
-                }
-            }
-            return;
-        }
-
-        if (left_tensor.n_dims == 1 and right_tensor.n_dims == 4 and left_tensor.shape[0] == right_tensor.shape[3]) {
-            const seq_len: usize = @intCast(right_tensor.shape[1]);
-            const head_count: usize = @intCast(right_tensor.shape[2]);
-            const hidden_size: usize = @intCast(right_tensor.shape[3]);
-            for (0..seq_len) |seq_index| {
-                for (0..head_count) |head_index| {
-                    const base_offset = (seq_index * head_count + head_index) * hidden_size;
-                    for (0..hidden_size) |dim_index| {
-                        output_slice[base_offset + dim_index] = binary_op(left_values[dim_index], right_values[base_offset + dim_index]);
-                    }
-                }
-            }
-            return;
-        }
-
-        if (right_tensor.n_dims == 1 and left_tensor.n_dims == 4 and right_tensor.shape[0] == left_tensor.shape[3]) {
-            const seq_len: usize = @intCast(left_tensor.shape[1]);
-            const head_count: usize = @intCast(left_tensor.shape[2]);
-            const hidden_size: usize = @intCast(left_tensor.shape[3]);
-            for (0..seq_len) |seq_index| {
-                for (0..head_count) |head_index| {
-                    const base_offset = (seq_index * head_count + head_index) * hidden_size;
-                    for (0..hidden_size) |dim_index| {
-                        output_slice[base_offset + dim_index] = binary_op(left_values[base_offset + dim_index], right_values[dim_index]);
-                    }
-                }
-            }
-            return;
-        }
-
-        return error.InvalidBroadcast;
     }
 
     fn writeLayerOpDescription(self: *const Block, layer_op: LayerOp, writer: anytype, indent: usize) !void {
@@ -492,33 +360,30 @@ pub const Block = struct {
                         }
                     }
 
-                    // Calculate split sizes and copy data for each output
-                    // We need to copy because split creates non-contiguous views
-                    var dim_offset: usize = 0;
+                    var out_slices: [3][]f32 = undefined;
                     var split_idx: u8 = 0;
                     while (split_idx < split_op.num_outputs) : (split_idx += 1) {
                         const split_size: usize = actual_sizes[split_idx];
-
-                        // Allocate output buffer based on output index
-                        // tmp3, tmp4, tmp5, etc. for split outputs
                         const out_idx = @intFromEnum(split_op.out_start) + split_idx;
                         const out_elems = seq_len * split_size;
+                        out_slices[split_idx] = scratch.tmp[out_idx][0..out_elems];
+                    }
+                    try cpu_layout.splitLastDimContiguous(
+                        input_data,
+                        seq_len,
+                        total_dim,
+                        actual_sizes[0..split_op.num_outputs],
+                        out_slices[0..split_op.num_outputs],
+                    );
 
-                        // Use the output index as the scratch buffer selector.
-                        const out_slice = scratch.tmp[out_idx][0..out_elems];
-
-                        // Copy data: for each sequence position, copy the slice
-                        for (0..seq_len) |seq_idx| {
-                            const src_base = seq_idx * total_dim + dim_offset;
-                            const dst_base = seq_idx * split_size;
-                            @memcpy(out_slice[dst_base..][0..split_size], input_data[src_base..][0..split_size]);
-                        }
-
-                        const byte_size = out_elems * @sizeOf(f32);
+                    split_idx = 0;
+                    while (split_idx < split_op.num_outputs) : (split_idx += 1) {
+                        const split_size: usize = actual_sizes[split_idx];
+                        const out_idx = @intFromEnum(split_op.out_start) + split_idx;
+                        const out_slice = out_slices[split_idx];
+                        const byte_size = out_slice.len * @sizeOf(f32);
                         const out_bytes = std.mem.sliceAsBytes(out_slice)[0..byte_size];
                         buffer_views[out_idx] = Tensor.view(out_bytes.ptr, &.{ 1, seq_len, split_size }, .f32, null);
-
-                        dim_offset += split_size;
                     }
                 },
 
@@ -589,7 +454,7 @@ pub const Block = struct {
                     const output_len = @max(left_tensor.numel, right_tensor.numel);
 
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_op.out, output_len);
-                    try applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
+                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
                         fn multiply(a: f32, b: f32) f32 {
                             return a * b;
                         }
@@ -613,7 +478,7 @@ pub const Block = struct {
                     const output_len = @max(left_tensor.numel, right_tensor.numel);
 
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, add_tensor_op.out, output_len);
-                    try applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
+                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
                         fn addScalar(lhs: f32, rhs: f32) f32 {
                             return lhs + rhs;
                         }
@@ -636,9 +501,7 @@ pub const Block = struct {
                     const output_len = input_tensor.numel;
 
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, add_scalar_op.out, output_len);
-                    for (0..output_len) |elem_idx| {
-                        output_slice[elem_idx] = input_data[elem_idx] + add_scalar_op.scalar;
-                    }
+                    cpu_elementwise.addScalar(input_data, output_slice[0..output_len], add_scalar_op.scalar);
 
                     buffer_views[@intFromEnum(add_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
                 },
@@ -649,9 +512,7 @@ pub const Block = struct {
                     const output_len = input_tensor.numel;
 
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_scalar_op.out, output_len);
-                    for (0..output_len) |elem_idx| {
-                        output_slice[elem_idx] = input_data[elem_idx] * mul_scalar_op.scalar;
-                    }
+                    cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
 
                     buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
                 },
@@ -668,15 +529,7 @@ pub const Block = struct {
                         const hidden_size: usize = @intCast(input_tensor.shape[3]);
                         const output_len = mean_seq_len * head_count;
                         const output_slice = resolveOutputSlice(&buffer_views, scratch, mean_op.out, output_len);
-
-                        for (0..mean_seq_len) |t| {
-                            for (0..head_count) |h| {
-                                const base = (t * head_count + h) * hidden_size;
-                                var sum: f32 = 0.0;
-                                for (0..hidden_size) |d| sum += input_data[base + d];
-                                output_slice[t * head_count + h] = sum / @as(f32, @floatFromInt(hidden_size));
-                            }
-                        }
+                        try cpu_reduction.meanLastDim4D(input_data, mean_seq_len, head_count, hidden_size, output_slice[0..output_len]);
 
                         const mean_shape: [8]i64 = if (mean_op.keepdim) .{ 1, @as(i64, @intCast(mean_seq_len)), @as(i64, @intCast(head_count)), 1, 0, 0, 0, 0 } else .{ 1, @as(i64, @intCast(mean_seq_len)), @as(i64, @intCast(head_count)), 0, 0, 0, 0, 0 };
                         const mean_dims: i32 = if (mean_op.keepdim) 4 else 3;
@@ -688,13 +541,7 @@ pub const Block = struct {
                         const hidden_size: usize = @intCast(input_tensor.shape[2]);
                         const output_len = mean_seq_len_3d;
                         const output_slice = resolveOutputSlice(&buffer_views, scratch, mean_op.out, output_len);
-
-                        for (0..mean_seq_len_3d) |t| {
-                            const base = t * hidden_size;
-                            var sum: f32 = 0.0;
-                            for (0..hidden_size) |h| sum += input_data[base + h];
-                            output_slice[t] = sum / @as(f32, @floatFromInt(hidden_size));
-                        }
+                        try cpu_reduction.meanLastDim3D(input_data, mean_seq_len_3d, hidden_size, output_slice[0..output_len]);
 
                         const mean_shape_3d: [8]i64 = if (mean_op.keepdim) .{ 1, @as(i64, @intCast(mean_seq_len_3d)), 1, 0, 0, 0, 0, 0 } else .{ 1, @as(i64, @intCast(mean_seq_len_3d)), 0, 0, 0, 0, 0, 0 };
                         const mean_dims_3d: i32 = if (mean_op.keepdim) 3 else 2;
@@ -707,10 +554,7 @@ pub const Block = struct {
                     const input_data = input_tensor.asSlice(f32);
                     const output_len = input_tensor.numel;
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, pow_op.out, output_len);
-
-                    for (0..output_len) |elem_idx| {
-                        output_slice[elem_idx] = std.math.pow(f32, input_data[elem_idx], pow_op.exponent);
-                    }
+                    cpu_elementwise.powScalar(input_data, output_slice[0..output_len], pow_op.exponent);
 
                     buffer_views[@intFromEnum(pow_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
                 },
@@ -720,53 +564,18 @@ pub const Block = struct {
                     const input_data = input_tensor.asSlice(f32);
                     const output_len = input_tensor.numel;
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, rsqrt_op.out, output_len);
-
-                    for (0..output_len) |elem_idx| {
-                        output_slice[elem_idx] = 1.0 / std.math.sqrt(input_data[elem_idx]);
-                    }
+                    cpu_elementwise.rsqrt(input_data, output_slice[0..output_len]);
 
                     buffer_views[@intFromEnum(rsqrt_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
                 },
 
                 .add_param => |add_param_op| {
                     const input_tensor = buffer_views[@intFromEnum(add_param_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
                     const param = self.block.weight_registry.get(add_param_op.param_name) orelse return error.MissingParam;
 
                     const output_len = @max(input_tensor.numel, param.numel);
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, add_param_op.out, output_len);
-
-                    if (param.n_dims == 1 and input_tensor.n_dims == 4 and param.shape[0] == input_tensor.shape[3]) {
-                        const add_seq_len_4d: usize = @intCast(input_tensor.shape[1]);
-                        const head_count: usize = @intCast(input_tensor.shape[2]);
-                        const hidden_size: usize = @intCast(input_tensor.shape[3]);
-                        for (0..add_seq_len_4d) |token_idx| {
-                            for (0..head_count) |head_idx| {
-                                const row_base = (token_idx * head_count + head_idx) * hidden_size;
-                                for (0..hidden_size) |hidden_idx| {
-                                    output_slice[row_base + hidden_idx] = input_data[row_base + hidden_idx] + readParamValue(param, hidden_idx);
-                                }
-                            }
-                        }
-                    } else if (param.n_dims == 1 and input_tensor.n_dims == 3 and param.shape[0] == input_tensor.shape[2]) {
-                        const add_seq_len_3d: usize = @intCast(input_tensor.shape[1]);
-                        const hidden_size: usize = @intCast(input_tensor.shape[2]);
-                        for (0..add_seq_len_3d) |token_idx| {
-                            const row_base = token_idx * hidden_size;
-                            for (0..hidden_size) |hidden_idx| {
-                                output_slice[row_base + hidden_idx] = input_data[row_base + hidden_idx] + readParamValue(param, hidden_idx);
-                            }
-                        }
-                    } else {
-                        // Fallback: element-wise add requires matching sizes
-                        const p_len = param.numel;
-                        if (input_tensor.numel != p_len) {
-                            return error.InvalidBroadcast;
-                        }
-                        for (0..p_len) |elem_idx| {
-                            output_slice[elem_idx] = input_data[elem_idx] + readParamValue(param, elem_idx);
-                        }
-                    }
+                    try cpu_broadcast.addParam(input_tensor, param, output_slice[0..output_len]);
 
                     buffer_views[@intFromEnum(add_param_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
                 },
@@ -775,52 +584,18 @@ pub const Block = struct {
                     const param = self.block.weight_registry.get(add_param_scalar_op.param_name) orelse return error.MissingParam;
                     const p_len = param.numel;
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, add_param_scalar_op.out, p_len);
-                    for (0..p_len) |elem_idx| {
-                        output_slice[elem_idx] = readParamValue(param, elem_idx) + add_param_scalar_op.scalar;
-                    }
+                    cpu_broadcast.addParamScalar(param, output_slice[0..p_len], add_param_scalar_op.scalar);
 
                     buffer_views[@intFromEnum(add_param_scalar_op.out)] = tensorFromSlice(output_slice[0..p_len], param.shape, param.n_dims);
                 },
 
                 .mul_param => |mul_param_op| {
                     const input_tensor = buffer_views[@intFromEnum(mul_param_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
                     const param = self.block.weight_registry.get(mul_param_op.param_name) orelse return error.MissingParam;
 
                     const output_len = @max(input_tensor.numel, param.numel);
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_param_op.out, output_len);
-
-                    if (param.n_dims == 1 and input_tensor.n_dims == 4 and param.shape[0] == input_tensor.shape[3]) {
-                        const mul_seq_len_4d: usize = @intCast(input_tensor.shape[1]);
-                        const head_count: usize = @intCast(input_tensor.shape[2]);
-                        const hidden_size: usize = @intCast(input_tensor.shape[3]);
-                        for (0..mul_seq_len_4d) |token_idx| {
-                            for (0..head_count) |head_idx| {
-                                const row_base = (token_idx * head_count + head_idx) * hidden_size;
-                                for (0..hidden_size) |hidden_idx| {
-                                    output_slice[row_base + hidden_idx] = input_data[row_base + hidden_idx] * readParamValue(param, hidden_idx);
-                                }
-                            }
-                        }
-                    } else if (param.n_dims == 1 and input_tensor.n_dims == 3 and param.shape[0] == input_tensor.shape[2]) {
-                        const mul_seq_len_3d: usize = @intCast(input_tensor.shape[1]);
-                        const hidden_size: usize = @intCast(input_tensor.shape[2]);
-                        for (0..mul_seq_len_3d) |token_idx| {
-                            const row_base = token_idx * hidden_size;
-                            for (0..hidden_size) |hidden_idx| {
-                                output_slice[row_base + hidden_idx] = input_data[row_base + hidden_idx] * readParamValue(param, hidden_idx);
-                            }
-                        }
-                    } else {
-                        // Fallback: element-wise multiply requires matching sizes
-                        const p_len = param.numel;
-                        if (input_tensor.numel != p_len) {
-                            return error.InvalidBroadcast;
-                        }
-                        for (0..p_len) |elem_idx| {
-                            output_slice[elem_idx] = input_data[elem_idx] * readParamValue(param, elem_idx);
-                        }
-                    }
+                    try cpu_broadcast.mulParam(input_tensor, param, output_slice[0..output_len]);
 
                     buffer_views[@intFromEnum(mul_param_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
                 },
@@ -957,59 +732,19 @@ pub const Block = struct {
                         return error.MissingRopeConfig;
                     };
 
-                    // Infer layout from shape
-                    const ndim: usize = @intCast(in_tensor.n_dims);
-
                     // Get position offset from cache
                     const pos_offset = if (use_cache) attn_cache.cache_position else 0;
-
-                    if (ndim == 2) {
-                        // Shape [seq, dim] - apply rope to full dimension
-                        const rope_seq_len_2d: usize = @intCast(in_tensor.shape[0]);
-                        const dim: usize = @intCast(in_tensor.shape[1]);
-                        const rope_dim = @min(rope.dim, dim);
-                        for (0..rope_seq_len_2d) |t| {
-                            const pos = pos_offset + t;
-                            const base = t * dim;
-                            rope.applyInPlace(input_data[base .. base + rope_dim], pos);
-                        }
-                    } else if (ndim == 3) {
-                        // Shape [seq, n_heads, head_dim] - apply per head
-                        const rope_seq_len_3d: usize = @intCast(in_tensor.shape[0]);
-                        const n_heads: usize = @intCast(in_tensor.shape[1]);
-                        const head_dim: usize = @intCast(in_tensor.shape[2]);
-                        const rope_dim = @min(rope.dim, head_dim);
-                        const total_dim = n_heads * head_dim;
-                        for (0..rope_seq_len_3d) |t| {
-                            const pos = pos_offset + t;
-                            for (0..n_heads) |h| {
-                                const base = t * total_dim + h * head_dim;
-                                rope.applyInPlace(input_data[base .. base + rope_dim], pos);
-                            }
-                        }
-                    } else if (ndim == 4) {
-                        // Shape [batch, n_heads, seq, head_dim] - after transpose(1,2)
-                        // This is the standard layout after Q/K projection and transpose
-                        const batch: usize = @intCast(in_tensor.shape[0]);
-                        const n_heads: usize = @intCast(in_tensor.shape[1]);
-                        const rope_seq_len_4d: usize = @intCast(in_tensor.shape[2]);
-                        const head_dim: usize = @intCast(in_tensor.shape[3]);
-                        const rope_dim = @min(rope.dim, head_dim);
-                        const head_stride = rope_seq_len_4d * head_dim;
-                        const batch_stride = n_heads * head_stride;
-                        for (0..batch) |b| {
-                            for (0..n_heads) |h| {
-                                for (0..rope_seq_len_4d) |t| {
-                                    const pos = pos_offset + t;
-                                    const base = b * batch_stride + h * head_stride + t * head_dim;
-                                    rope.applyInPlace(input_data[base .. base + rope_dim], pos);
-                                }
-                            }
-                        }
-                    } else {
-                        capi.setContext("block={d}, op={d}, ndim={d}", .{ self.block_idx, op_index, ndim });
-                        return error.UnsupportedRopeShape;
-                    }
+                    cpu_rotary.applyRopeTensorInPlace(
+                        input_data,
+                        @intCast(in_tensor.n_dims),
+                        in_tensor.shape,
+                        rope.dim,
+                        pos_offset,
+                        rope,
+                    ) catch |err| {
+                        capi.setContext("block={d}, op={d}, ndim={d}", .{ self.block_idx, op_index, in_tensor.n_dims });
+                        return err;
+                    };
 
                     // Copy to output if different buffer
                     if (rope_op.in != rope_op.out) {
@@ -1032,20 +767,7 @@ pub const Block = struct {
                     const n_dims: usize = @intCast(in_tensor.n_dims);
                     const rows: usize = @intCast(in_tensor.shape[n_dims - 2]);
                     const cols: usize = @intCast(in_tensor.shape[n_dims - 1]);
-                    const neg_inf = -std.math.inf(f32);
-
-                    for (0..rows) |row| {
-                        for (0..cols) |col| {
-                            const elem_offset = row * cols + col;
-                            const signed_col: i64 = @intCast(col);
-                            const signed_row: i64 = @intCast(row);
-                            if (signed_col < signed_row + triu_op.diagonal) {
-                                out_data[elem_offset] = neg_inf;
-                            } else {
-                                out_data[elem_offset] = data[elem_offset];
-                            }
-                        }
-                    }
+                    cpu_masking.triu(data, out_data, rows, cols, triu_op.diagonal);
                 },
 
                 .sdpa => |sdpa_op| {
@@ -1331,9 +1053,7 @@ pub const Block = struct {
                     const output_len = input_tensor.numel;
 
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_scalar_op.out, output_len);
-                    for (0..output_len) |elem_idx| {
-                        output_slice[elem_idx] = input_data[elem_idx] * mul_scalar_op.scalar;
-                    }
+                    cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
 
                     buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
                 },
@@ -1343,7 +1063,7 @@ pub const Block = struct {
                     const output_len = @max(left_tensor.numel, right_tensor.numel);
 
                     const output_slice = resolveOutputSlice(&buffer_views, scratch, add_tensor_op.out, output_len);
-                    try applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
+                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
                         fn addScalar(lhs: f32, rhs: f32) f32 {
                             return lhs + rhs;
                         }

@@ -89,6 +89,41 @@ pub fn addIntoScaled(a: []const f32, b: []const f32, out: []f32, scale: f32) voi
     }
 }
 
+/// Add rows from source matrix into destination matrix in-place.
+///
+/// Destination and source are contiguous row-major buffers.
+pub fn addRowsInPlace(
+    dst: []f32,
+    src: []const f32,
+    row_count: usize,
+    row_width: usize,
+    src_row_stride: usize,
+) !void {
+    if (dst.len < row_count * row_width) return error.InvalidShape;
+    if (src.len < row_count * src_row_stride) return error.InvalidShape;
+
+    for (0..row_count) |row_idx| {
+        const dst_row = dst[row_idx * row_width ..][0..row_width];
+        const src_row = src[row_idx * src_row_stride ..][0..row_width];
+        addScaledInPlace(dst_row, src_row, 1.0);
+    }
+}
+
+/// Add one source row to every destination row in-place.
+pub fn addBroadcastRowInPlace(
+    dst: []f32,
+    row_count: usize,
+    row_width: usize,
+    src_row: []const f32,
+) !void {
+    if (dst.len < row_count * row_width) return error.InvalidShape;
+    if (src_row.len < row_width) return error.InvalidShape;
+    for (0..row_count) |row_idx| {
+        const dst_row = dst[row_idx * row_width ..][0..row_width];
+        addScaledInPlace(dst_row, src_row[0..row_width], 1.0);
+    }
+}
+
 test "addScaledInPlace with scale 1.0" {
     var dst = [_]f32{ 1, 2, 3, 4 };
     const src = [_]f32{ 0.5, 0.5, 0.5, 0.5 };

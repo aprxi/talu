@@ -12,17 +12,34 @@ const fastExpScalar = fast_math.fastExpScalar;
 
 /// Numerically-stable softmax in-place over one contiguous row.
 pub fn stableInPlace(values: []f32) void {
+    @setFloatMode(.optimized);
     if (values.len == 0) return;
 
-    var max_v = -std.math.inf(f32);
-    for (values) |v| {
-        if (v > max_v) max_v = v;
+    var max_vec: F32Vec = @splat(-std.math.inf(f32));
+    var vec_idx: usize = 0;
+    while (vec_idx + VEC_LEN - 1 < values.len) : (vec_idx += VEC_LEN) {
+        const value_vec: F32Vec = values[vec_idx..][0..VEC_LEN].*;
+        max_vec = @max(max_vec, value_vec);
+    }
+    var max_v = @reduce(.Max, max_vec);
+    while (vec_idx < values.len) : (vec_idx += 1) {
+        if (values[vec_idx] > max_v) max_v = values[vec_idx];
     }
 
-    var sum_exp: f32 = 0.0;
-    for (values) |*v| {
-        v.* = @exp(v.* - max_v);
-        sum_exp += v.*;
+    const max_vec_value: F32Vec = @splat(max_v);
+    var sum_vec: F32Vec = @splat(0);
+    vec_idx = 0;
+    while (vec_idx + VEC_LEN - 1 < values.len) : (vec_idx += VEC_LEN) {
+        const value_vec: F32Vec = values[vec_idx..][0..VEC_LEN].*;
+        const exp_vec = fastExp(value_vec - max_vec_value);
+        values[vec_idx..][0..VEC_LEN].* = exp_vec;
+        sum_vec += exp_vec;
+    }
+    var sum_exp = @reduce(.Add, sum_vec);
+    while (vec_idx < values.len) : (vec_idx += 1) {
+        const exp_scalar = fastExpScalar(values[vec_idx] - max_v);
+        values[vec_idx] = exp_scalar;
+        sum_exp += exp_scalar;
     }
 
     if (sum_exp <= 0.0 or !std.math.isFinite(sum_exp)) {
@@ -31,8 +48,15 @@ pub fn stableInPlace(values: []f32) void {
         return;
     }
 
-    for (values) |*v| {
-        v.* /= sum_exp;
+    const inv_sum = 1.0 / sum_exp;
+    const inv_sum_vec: F32Vec = @splat(inv_sum);
+    vec_idx = 0;
+    while (vec_idx + VEC_LEN - 1 < values.len) : (vec_idx += VEC_LEN) {
+        const value_vec: F32Vec = values[vec_idx..][0..VEC_LEN].*;
+        values[vec_idx..][0..VEC_LEN].* = value_vec * inv_sum_vec;
+    }
+    while (vec_idx < values.len) : (vec_idx += 1) {
+        values[vec_idx] *= inv_sum;
     }
 }
 

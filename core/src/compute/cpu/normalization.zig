@@ -66,6 +66,35 @@ pub fn rmsnormContiguousWeightTensor(
     }
 }
 
+/// LayerNorm over one contiguous row.
+pub fn layerNormRow(
+    input: []const f32,
+    output: []f32,
+    weight: []const f32,
+    bias: []const f32,
+    eps: f32,
+) void {
+    std.debug.assert(input.len == output.len);
+    std.debug.assert(weight.len == input.len);
+    std.debug.assert(bias.len == input.len);
+
+    var mean: f32 = 0.0;
+    for (input) |v| mean += v;
+    mean /= @as(f32, @floatFromInt(input.len));
+
+    var var_sum: f32 = 0.0;
+    for (input) |v| {
+        const d = v - mean;
+        var_sum += d * d;
+    }
+    const variance = var_sum / @as(f32, @floatFromInt(input.len));
+    const inv_std = 1.0 / @sqrt(variance + eps);
+
+    for (0..input.len) |i| {
+        output[i] = (input[i] - mean) * inv_std * weight[i] + bias[i];
+    }
+}
+
 test "rmsnormInPlace keeps unit scale for ones" {
     var x = [_]f32{ 1, 1, 1, 1 };
     const w = [_]f32{ 1, 1, 1, 1 };
