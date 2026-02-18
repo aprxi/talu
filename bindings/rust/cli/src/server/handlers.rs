@@ -19,7 +19,6 @@ use crate::provider;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::generated;
 use crate::server::state::{AppState, StoredResponse};
-use talu::blobs::BlobsHandle;
 use talu::documents::{DocumentError, DocumentsHandle};
 use talu::responses::{ContentType, ItemType};
 use talu::{ChatHandle, FinishReason};
@@ -270,37 +269,19 @@ pub async fn handle_models(
         .unwrap()
 }
 
-/// Encode bytes to base64 (standard alphabet with padding).
-fn base64_encode(bytes: &[u8]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    let mut i = 0usize;
-    while i + 3 <= bytes.len() {
-        let b0 = bytes[i];
-        let b1 = bytes[i + 1];
-        let b2 = bytes[i + 2];
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
-        out.push(TABLE[(b2 & 0x3f) as usize] as char);
-        i += 3;
+/// Compute the absolute blob file path for a sha256 blob ref.
+///
+/// Returns `Some(path)` for `sha256:<64hex>` refs, `None` for multipart or invalid refs.
+fn blob_ref_to_file_url(storage_path: &std::path::Path, blob_ref: &str) -> Option<String> {
+    let hex = blob_ref.strip_prefix("sha256:")?;
+    if hex.len() != 64 {
+        return None;
     }
-    let rem = bytes.len() - i;
-    if rem == 1 {
-        let b0 = bytes[i];
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[((b0 & 0x03) << 4) as usize] as char);
-        out.push('=');
-        out.push('=');
-    } else if rem == 2 {
-        let b0 = bytes[i];
-        let b1 = bytes[i + 1];
-        out.push(TABLE[(b0 >> 2) as usize] as char);
-        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
-        out.push(TABLE[((b1 & 0x0f) << 2) as usize] as char);
-        out.push('=');
-    }
-    out
+    let mut path = storage_path.to_path_buf();
+    path.push("blobs");
+    path.push(&hex[..2]);
+    path.push(hex);
+    Some(format!("file://{}", path.display()))
 }
 
 /// File document metadata (matches the JSON stored by the upload handler).
@@ -314,9 +295,8 @@ struct FileDocContent {
 /// Resolve file references in a structured input JSON array.
 ///
 /// Scans the input for `input_image` or `input_file` items whose URLs look like
-/// file IDs (e.g. `file_abc123`). For each, loads the blob from storage, and:
-/// - For images: rewrites as `input_image` with a base64 data URI in `image_url`.
-/// - For other files: rewrites `input_file` with base64-encoded `file_data`.
+/// file IDs (e.g. `file_abc123`). For each, rewrites the URL to a `file://` path
+/// pointing directly to the blob on disk, so the engine can read it zero-copy.
 ///
 /// Returns the (possibly modified) JSON string ready for `load_responses_json`.
 fn resolve_file_references(
@@ -364,8 +344,6 @@ fn resolve_file_references(
 
     let docs = DocumentsHandle::open(storage_path)
         .map_err(|e| anyhow!("failed to open documents for file resolution: {}", e))?;
-    let blobs = BlobsHandle::open(storage_path)
-        .map_err(|e| anyhow!("failed to open blobs for file resolution: {}", e))?;
 
     for item in arr.iter_mut() {
         let content = match item.get_mut("content").and_then(|c| c.as_array_mut()) {
@@ -407,43 +385,37 @@ fn resolve_file_references(
                 _ => continue,
             };
 
-            // Read the blob bytes.
-            let blob_bytes = match blobs.read_all(blob_ref) {
-                Ok(b) => b,
-                Err(e) => {
-                    log::warn!("failed to read blob for file {}: {}", file_id, e);
-                    continue;
-                }
-            };
-
             let mime = meta.mime_type.as_deref().unwrap_or("application/octet-stream");
             let is_image = meta.kind.as_deref() == Some("image") || mime.starts_with("image/");
 
             if is_image {
-                // Convert to input_image with base64 data URI.
-                let data_url = format!("data:{};base64,{}", mime, base64_encode(&blob_bytes));
-                replacements.push((
-                    idx,
-                    json!({
-                        "type": "input_image",
-                        "image_url": data_url
-                    }),
-                ));
+                // Zero-copy: pass file:// URL so the engine reads directly from disk.
+                if let Some(file_url) = blob_ref_to_file_url(storage_path, blob_ref) {
+                    replacements.push((
+                        idx,
+                        json!({
+                            "type": "input_image",
+                            "image_url": file_url
+                        }),
+                    ));
+                }
+                // Multipart blobs are unsupported for zero-copy; skip silently.
             } else {
-                // Convert to input_file with base64 file_data.
-                let b64 = base64_encode(&blob_bytes);
-                let filename = part
-                    .get("filename")
-                    .and_then(|f| f.as_str())
-                    .unwrap_or(&doc.title);
-                replacements.push((
-                    idx,
-                    json!({
-                        "type": "input_file",
-                        "file_data": b64,
-                        "filename": filename
-                    }),
-                ));
+                // Non-image files: pass file:// URL with metadata.
+                if let Some(file_url) = blob_ref_to_file_url(storage_path, blob_ref) {
+                    let filename = part
+                        .get("filename")
+                        .and_then(|f| f.as_str())
+                        .unwrap_or(&doc.title);
+                    replacements.push((
+                        idx,
+                        json!({
+                            "type": "input_file",
+                            "file_data": file_url,
+                            "filename": filename
+                        }),
+                    ));
+                }
             }
         }
 

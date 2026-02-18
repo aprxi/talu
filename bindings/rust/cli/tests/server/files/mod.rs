@@ -1,6 +1,7 @@
 //! Integration tests for `/v1/files` endpoint.
 
 mod read;
+mod resolve;
 mod upload;
 
 use crate::server::common::ServerConfig;
