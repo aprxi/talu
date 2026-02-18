@@ -92,7 +92,7 @@ function setUploadBusy(busy: boolean): void {
   }
 }
 
-async function uploadFiles(files: FileList): Promise<void> {
+export async function uploadFiles(files: FileList): Promise<void> {
   if (files.length === 0) return;
   if (chatState.isUploadingAttachments) return;
 

@@ -3,11 +3,38 @@
  */
 
 import { renderLoadingSpinner } from "../../render/common.ts";
-import type { SearchRequest } from "../../types.ts";
+import type { Conversation, SearchRequest } from "../../types.ts";
 import { api, chatService } from "./deps.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
 import { renderBrowserCards, renderBrowserTags } from "./render.ts";
+
+/**
+ * Fetch full conversation details in batches to avoid saturating the
+ * browser's per-origin connection pool (typically 6 connections).
+ */
+async function fetchConversationsBatched<T extends { id: string; metadata?: Record<string, unknown> }>(
+  items: T[],
+  enrichFn?: (full: Conversation, slim: T) => void,
+): Promise<Conversation[]> {
+  const BATCH_SIZE = 4;
+  const results: Conversation[] = [];
+  for (let i = 0; i < items.length; i += BATCH_SIZE) {
+    const batch = items.slice(i, i + BATCH_SIZE);
+    const resolved = await Promise.all(
+      batch.map(async (s) => {
+        const r = await api.getConversation(s.id);
+        if (r.ok && r.data) {
+          enrichFn?.(r.data, s);
+          return r.data;
+        }
+        return s as unknown as Conversation;
+      }),
+    );
+    results.push(...resolved);
+  }
+  return results;
+}
 
 export async function loadBrowserConversations(): Promise<void> {
   const dom = getBrowserDom();
@@ -32,49 +59,47 @@ export async function loadBrowserConversations(): Promise<void> {
       searchReq.filters = { tags_any: search.tagFilters };
     }
 
+    const gen = ++bState.loadGeneration;
     const result = await api.search(searchReq);
     search.isLoading = false;
+    if (gen !== bState.loadGeneration) return; // superseded
 
     if (result.ok && result.data) {
       const slim = result.data.data;
-      const full = await Promise.all(
-        slim.map(async (s) => {
-          const r = await api.getConversation(s.id);
-          if (r.ok && r.data) {
-            r.data.search_snippet = s.search_snippet;
-            if (!r.data.metadata || Object.keys(r.data.metadata).length === 0) {
-              r.data.metadata = s.metadata;
-            }
-            return r.data;
-          }
-          return s;
-        }),
-      );
+      const full = await fetchConversationsBatched(slim, (conv, s) => {
+        conv.search_snippet = (s as { search_snippet?: string }).search_snippet;
+        if (!conv.metadata || Object.keys(conv.metadata).length === 0) {
+          conv.metadata = s.metadata;
+        }
+      });
+      if (gen !== bState.loadGeneration) return; // superseded during batching
       search.results.push(...full);
       search.cursor = result.data.cursor ?? null;
       search.hasMore = result.data.has_more;
     }
     renderBrowserCards();
   } else {
+    if (bState.isLoading) return;
+    bState.isLoading = true;
+    const gen = ++bState.loadGeneration;
+
     dom.cardsEl.innerHTML = "";
     dom.cardsEl.appendChild(renderLoadingSpinner());
     const sessions = chatService.getSessions();
     if (sessions.length === 0) {
       await chatService.refreshSidebar();
     }
+    if (gen !== bState.loadGeneration) { bState.isLoading = false; return; }
+
     const currentSessions = chatService.getSessions();
-    const fullConversations = await Promise.all(
-      currentSessions.map(async (s) => {
-        const result = await api.getConversation(s.id);
-        if (result.ok && result.data) {
-          if (!result.data.metadata || Object.keys(result.data.metadata).length === 0) {
-            result.data.metadata = s.metadata;
-          }
-          return result.data;
-        }
-        return s;
-      }),
-    );
+    const fullConversations = await fetchConversationsBatched(currentSessions, (conv, s) => {
+      if (!conv.metadata || Object.keys(conv.metadata).length === 0) {
+        conv.metadata = s.metadata;
+      }
+    });
+
+    bState.isLoading = false;
+    if (gen !== bState.loadGeneration) return; // superseded
     bState.conversations = fullConversations;
     renderBrowserCards();
   }

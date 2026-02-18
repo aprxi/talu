@@ -14,13 +14,15 @@ import { loadFiles } from "./data.ts";
 import { wireFileEvents } from "./events.ts";
 
 function initFilesView(): void {
+  // If already loading, let the in-flight request finish; just re-render.
+  if (fState.isLoading) return;
+
   fState.files = [];
   fState.searchQuery = "";
   fState.selectedFileId = null;
   fState.editingFileId = null;
   fState.selectedIds.clear();
   fState.tab = "all";
-  fState.isLoading = false;
   syncFilesTabs();
   renderFilesTable();
   renderStats();

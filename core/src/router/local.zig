@@ -643,7 +643,7 @@ pub const LocalEngine = struct {
         self.backend.setPrefillProgress(opts.prefill_progress_fn, opts.prefill_progress_data);
         defer self.backend.setPrefillProgress(null, null);
 
-        switch (self.backend.generationPath(countInputImageParts(chat) > 0)) {
+        switch (self.backend.generationPath(countVisionParts(chat) > 0)) {
             .scheduler => {
                 log.debug("inference", "Generation path", .{ .path = "scheduler" }, @src());
                 return self.generateWithScheduler(
@@ -933,19 +933,19 @@ pub const LocalEngine = struct {
     };
 
     fn collectVisionPromptInput(self: *LocalEngine, chat: *Chat) !?VisionPromptInput {
-        const image_count = countInputImageParts(chat);
-        if (image_count == 0) return null;
+        const max_vision_count = countVisionParts(chat);
+        if (max_vision_count == 0) return null;
         if (self.loaded.config.image_token_id <= 0) return error.UnsupportedContentType;
 
         const preprocess_opts = try self.buildVisionPreprocessOptions();
 
         var written: usize = 0;
-        const images = try self.allocator.alloc(vision_runtime_mod.PrefillVisionImage, image_count);
+        const images = try self.allocator.alloc(vision_runtime_mod.PrefillVisionImage, max_vision_count);
         errdefer {
             for (images[0..written]) |*img| img.deinit(self.allocator);
             self.allocator.free(images);
         }
-        const token_counts = try self.allocator.alloc(usize, image_count);
+        const token_counts = try self.allocator.alloc(usize, max_vision_count);
         errdefer self.allocator.free(token_counts);
 
         for (0..chat.conv.len()) |item_index| {
@@ -954,15 +954,27 @@ pub const LocalEngine = struct {
 
             for (0..msg.partCount()) |part_index| {
                 const part = msg.getPart(part_index) orelse continue;
-                if (part.getContentType() != .input_image) continue;
+                const ct = part.getContentType();
+                if (ct != .input_image and ct != .input_file) continue;
 
-                const image_bytes = try loadImageBytes(self.allocator, part.getData());
+                const data = part.getData();
+                if (data.len == 0) continue;
+
+                const image_bytes = loadImageBytes(self.allocator, data) catch |err| {
+                    // input_file parts may reference non-image files; skip them.
+                    if (ct == .input_file) continue;
+                    return err;
+                };
                 defer self.allocator.free(image_bytes);
 
-                var decoded = try image_mod.decode(self.allocator, image_bytes, .{
+                var decoded = image_mod.decode(self.allocator, image_bytes, .{
                     .prefer_format = .rgb8,
                     .apply_orientation = true,
-                });
+                }) catch |err| {
+                    // input_file with unsupported format (e.g. plain text) — skip.
+                    if (ct == .input_file) continue;
+                    return err;
+                };
                 defer decoded.deinit(self.allocator);
 
                 var prep = try image_mod.preprocessImage(self.allocator, decoded, preprocess_opts);
@@ -983,25 +995,27 @@ pub const LocalEngine = struct {
             }
         }
 
-        if (written != image_count) return error.InvalidState;
+        if (written == 0) return null;
 
         return VisionPromptInput{
             .prefill = .{
-                .images = images,
+                .images = images[0..written],
                 .image_token_id = @intCast(self.loaded.config.image_token_id),
             },
-            .token_counts = token_counts,
+            .token_counts = token_counts[0..written],
         };
     }
 
-    fn countInputImageParts(chat: *Chat) usize {
+    /// Count parts that may contain visual content (images or files with image/PDF data).
+    fn countVisionParts(chat: *Chat) usize {
         var count: usize = 0;
         for (0..chat.conv.len()) |item_index| {
             const item = chat.conv.getItem(item_index) orelse continue;
             const msg = item.asMessage() orelse continue;
             for (0..msg.partCount()) |part_index| {
                 const part = msg.getPart(part_index) orelse continue;
-                if (part.getContentType() == .input_image) count += 1;
+                const ct = part.getContentType();
+                if (ct == .input_image or ct == .input_file) count += 1;
             }
         }
         return count;

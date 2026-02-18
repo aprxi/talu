@@ -88,7 +88,7 @@ export interface MessageItem {
   generation?: GenerationSettings;
 }
 
-export type ContentPart = InputTextPart | OutputTextPart;
+export type ContentPart = InputTextPart | OutputTextPart | InputImagePart | InputFilePart;
 
 export interface InputTextPart {
   type: "input_text";
@@ -101,6 +101,17 @@ export interface OutputTextPart {
   annotations?: unknown[];
   /** Code block metadata from core (talu_code_blocks). */
   talu_code_blocks?: CodeBlock[];
+}
+
+export interface InputImagePart {
+  type: "input_image";
+  image_url: string;
+}
+
+export interface InputFilePart {
+  type: "input_file";
+  file_data?: string;
+  filename?: string;
 }
 
 /** Code block metadata detected by core. Positions are byte offsets. */

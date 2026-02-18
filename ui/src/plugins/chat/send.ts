@@ -12,6 +12,7 @@ import {
   composeUserInput,
   hasAttachments,
   isAttachmentUploadInProgress,
+  uploadFiles,
 } from "./attachments.ts";
 import type { Conversation, CreateResponseRequest, InputContentItem, UsageStats } from "../../types.ts";
 
@@ -45,6 +46,17 @@ export function setupInputEvents(): void {
     dom.welcomeInput.style.height = "auto";
     dom.welcomeInput.style.height = Math.min(dom.welcomeInput.scrollHeight, 200) + "px";
   });
+
+  // Clipboard paste: upload pasted files/images as attachments.
+  const handlePaste = (e: ClipboardEvent) => {
+    const files = e.clipboardData?.files;
+    if (files && files.length > 0) {
+      e.preventDefault();
+      void uploadFiles(files);
+    }
+  };
+  dom.inputText.addEventListener("paste", handlePaste);
+  dom.welcomeInput.addEventListener("paste", handlePaste);
 }
 
 export function cancelGeneration(): void {

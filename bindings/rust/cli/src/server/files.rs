@@ -532,6 +532,88 @@ pub async fn handle_get_content(
     response_builder.body(body).unwrap()
 }
 
+/// GET /v1/blobs/:hash - Serve raw blob content by sha256 hex digest.
+///
+/// Used by the UI to display images from stored conversations where the
+/// `image_url` field contains a `file://` blob path.  The UI extracts the
+/// 64-char hex hash and fetches `/v1/blobs/{hash}`.
+pub async fn handle_get_blob(
+    state: Arc<AppState>,
+    _req: Request<Incoming>,
+    _auth: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let path = _req.uri().path();
+    let hash = path
+        .strip_prefix("/v1/blobs/")
+        .or_else(|| path.strip_prefix("/blobs/"))
+        .unwrap_or("");
+
+    if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "Expected 64-char hex sha256 digest",
+        );
+    }
+
+    let storage_path = match state.bucket_path.as_ref() {
+        Some(p) => p.clone(),
+        None => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "No file storage configured",
+            );
+        }
+    };
+
+    let blob_ref = format!("sha256:{hash}");
+    let blobs = match BlobsHandle::open(&storage_path) {
+        Ok(h) => h,
+        Err(e) => return blob_error_response(e),
+    };
+    let mut blob_stream = match blobs.open_stream(&blob_ref) {
+        Ok(s) => s,
+        Err(e) => return blob_error_response(e),
+    };
+    let total_size = match blob_stream.total_size() {
+        Ok(size) => size,
+        Err(e) => return blob_error_response(e),
+    };
+
+    let (tx, rx) = mpsc::unbounded_channel::<Bytes>();
+    tokio::task::spawn_blocking(move || {
+        const CHUNK_SIZE: usize = 64 * 1024;
+        let mut buf = [0u8; CHUNK_SIZE];
+        loop {
+            match blob_stream.read(&mut buf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if tx.send(Bytes::copy_from_slice(&buf[..n])).is_err() {
+                        break;
+                    }
+                }
+                Err(err) => {
+                    log::warn!("blob stream read failed for blob content: {err}");
+                    break;
+                }
+            }
+        }
+    });
+
+    let stream = UnboundedReceiverStream::new(rx)
+        .map(|chunk| Ok::<_, std::convert::Infallible>(Frame::data(chunk)));
+    let body = StreamBody::new(stream).boxed();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/octet-stream")
+        .header("content-length", total_size.to_string())
+        .header("cache-control", "public, max-age=31536000, immutable")
+        .body(body)
+        .unwrap()
+}
+
 /// DELETE /v1/files/:id - Delete file metadata (blob retained for CAS/GC lifecycle).
 pub async fn handle_delete(
     state: Arc<AppState>,

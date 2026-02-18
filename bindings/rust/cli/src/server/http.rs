@@ -287,6 +287,11 @@ impl Service<Request<Incoming>> for Router {
                             files::handle_list(state, req, auth).await
                         }
                         (Method::GET, p)
+                            if p.starts_with("/v1/blobs/") || p.starts_with("/blobs/") =>
+                        {
+                            files::handle_get_blob(state, req, auth).await
+                        }
+                        (Method::GET, p)
                             if (p.starts_with("/v1/files/") || p.starts_with("/files/"))
                                 && p.ends_with("/content") =>
                         {

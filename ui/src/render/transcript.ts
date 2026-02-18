@@ -7,6 +7,8 @@ import type {
   FunctionCallOutputItem,
   GenerationSettings,
   UsageStats,
+  InputImagePart,
+  InputFilePart,
 } from "../types.ts";
 import { el, isArchived, getTags, isThinkingExpanded, formatDate } from "./helpers.ts";
 import { sanitizedMarkdown, CODE_COPY_ICON, CODE_CHECK_ICON } from "./markdown.ts";
@@ -33,7 +35,7 @@ export function initCodeBlockCopyHandler(
   moduleTimers = timers;
 
   root.addEventListener("click", ((e: Event) => {
-    if (!(e.target instanceof HTMLElement)) return;
+    if (!(e.target instanceof Element)) return;
     const btn = e.target.closest(".code-block .code-copy");
     if (!btn) return;
 
@@ -382,24 +384,64 @@ function renderItem(item: Item): HTMLElement {
   }
 }
 
+/**
+ * Convert an image_url from the conversation to a browser-accessible src.
+ *
+ * Handles:
+ *   - file:// blob paths → /v1/blobs/{sha256hex}
+ *   - file_* IDs → /v1/files/{id}/content
+ *   - data: URIs and http(s) URLs → pass through
+ */
+function imageUrlToSrc(url: string): string {
+  if (url.startsWith("file://")) {
+    const path = url.slice("file://".length);
+    const parts = path.split("/");
+    const hash = parts[parts.length - 1] ?? "";
+    if (hash.length === 64) return `/v1/blobs/${hash}`;
+  }
+  if (url.startsWith("file_")) return `/v1/files/${url}/content`;
+  return url;
+}
+
+function renderImagePart(part: InputImagePart): HTMLElement {
+  const container = el("div", "msg-image");
+  const img = document.createElement("img");
+  img.src = imageUrlToSrc(part.image_url);
+  img.alt = "Uploaded image";
+  img.loading = "lazy";
+  container.appendChild(img);
+  return container;
+}
+
+function renderFilePart(part: InputFilePart): HTMLElement {
+  const pill = el("span", "msg-file-pill");
+  pill.textContent = part.filename ?? "Attached file";
+  return pill;
+}
+
+function renderContentParts(parts: MessageItem["content"], container: HTMLElement): void {
+  for (const part of parts) {
+    if (part.type === "input_text") {
+      const p = el("div");
+      p.textContent = part.text;
+      container.appendChild(p);
+    } else if (part.type === "output_text") {
+      container.appendChild(renderOutputText(part.text, part.talu_code_blocks));
+    } else if (part.type === "input_image") {
+      container.appendChild(renderImagePart(part));
+    } else if (part.type === "input_file") {
+      container.appendChild(renderFilePart(part));
+    }
+  }
+}
+
 function renderMessage(item: MessageItem): HTMLElement {
   const isUser = item.role === "user";
 
   if (isUser) {
     const wrapper = el("div", "user-msg");
-
     const bubble = el("div", "user-bubble");
-
-    for (const part of item.content) {
-      if (part.type === "input_text") {
-        const p = el("div");
-        p.textContent = part.text;
-        bubble.appendChild(p);
-      } else if (part.type === "output_text") {
-        bubble.appendChild(renderOutputText(part.text, part.talu_code_blocks));
-      }
-    }
-
+    renderContentParts(item.content, bubble);
     wrapper.appendChild(bubble);
     wrapper.appendChild(createUserActionButtons());
     return wrapper;
@@ -408,16 +450,7 @@ function renderMessage(item: MessageItem): HTMLElement {
   // Assistant: left-aligned, clean flow
   const wrapper = el("div", "assistant-msg");
   const body = el("div", "assistant-body");
-  for (const part of item.content) {
-    if (part.type === "input_text") {
-      const p = el("div");
-      p.textContent = part.text;
-      body.appendChild(p);
-    } else if (part.type === "output_text") {
-      body.appendChild(renderOutputText(part.text, part.talu_code_blocks));
-    }
-  }
-
+  renderContentParts(item.content, body);
   wrapper.appendChild(body);
   wrapper.appendChild(createAssistantActionButtons({ generation: item.generation }));
   return wrapper;

@@ -8,6 +8,10 @@ export const bState = {
   selectedIds: new Set<string>(),
   conversations: [] as Conversation[],
   tab: "all" as "all" | "archived",
+  /** Guard against overlapping non-search loads. */
+  isLoading: false,
+  /** Incremented on each load to detect stale completions. */
+  loadGeneration: 0,
 };
 
 export const search = {
