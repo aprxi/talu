@@ -26,8 +26,8 @@ const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const ItemType = responses_mod.ItemType;
 const ContentType = responses_mod.ContentType;
-const session_mod = @import("../inference/session.zig");
-const FinishReason = session_mod.FinishReason;
+const inference_types = @import("../inference/root.zig").types;
+const FinishReason = inference_types.FinishReason;
 const gen_config_mod = @import("../inference/config/generation.zig");
 const log = @import("../log.zig");
 

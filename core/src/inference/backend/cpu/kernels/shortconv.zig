@@ -16,7 +16,7 @@ const Tensor = tensor.Tensor;
 const log = @import("../../../../log.zig");
 const compute = @import("../../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const simd = @import("../../../../compute/simd/root.zig");
+const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 
@@ -142,6 +142,15 @@ pub const ShortConvScratch = struct {
 
 /// ShortConv kernel.
 pub const ShortConvKernel = struct {
+    /// Canonical kernel-call contract for backend parity checks.
+    pub const ForwardParams = struct {
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        state: *ShortConvState,
+        scratch: *ShortConvScratch,
+        matmul_scratch: *matmul.MatmulScratch,
+    };
+
     config: ShortConvConfig,
     weights: ShortConvWeights,
     matmul_in_proj: matmul.MatmulFn,
@@ -189,12 +198,7 @@ pub const ShortConvKernel = struct {
         const transposed = try allocator.alloc(f32, conv_dim * d_conv);
         errdefer allocator.free(transposed);
 
-        // Transpose: src[ch * d_conv + k] -> dst[k * conv_dim + ch]
-        for (0..conv_dim) |ch| {
-            for (0..d_conv) |k| {
-                transposed[k * conv_dim + ch] = src[ch * d_conv + k];
-            }
-        }
+        try cpu_conv1d.transposeChannelMajorToTimeMajor(src, transposed, conv_dim, d_conv);
 
         self.conv_weight_transposed = transposed;
         self.weight_allocator = allocator;
@@ -233,7 +237,12 @@ pub const ShortConvKernel = struct {
         const conv_dim: usize = cfg.conv_dim;
         const d_conv: usize = cfg.d_conv;
 
-        // Determine sequence length from input tensor shape
+        // Determine sequence length from input tensor shape.
+        // Supported inputs are (d_model,), (seq_len, d_model), or (1, seq_len, d_model).
+        const batch_size: usize = if (input.n_dims == 3) @intCast(input.shape[0]) else 1;
+        if (batch_size != 1) {
+            return error.InvalidShape;
+        }
         const seq_len: usize = if (input.n_dims == 3)
             @intCast(input.shape[1])
         else if (input.n_dims == 2)
@@ -272,7 +281,7 @@ pub const ShortConvKernel = struct {
             // State layout: [d_conv, conv_dim] - time-major for SIMD efficiency
             // Use transposed weights if available (fully contiguous access)
             if (self.conv_weight_transposed) |weight_t| {
-                depthwiseConvSimdTransposed(
+                cpu_conv1d.runTimeMajor(
                     B_gate,
                     x_proj,
                     conv_state,
@@ -284,7 +293,7 @@ pub const ShortConvKernel = struct {
                 );
             } else {
                 // Fallback: channel-major weights with strided access
-                depthwiseConvSimd(
+                cpu_conv1d.runChannelMajor(
                     B_gate,
                     x_proj,
                     conv_state,
@@ -297,13 +306,12 @@ pub const ShortConvKernel = struct {
             }
 
             // 4. Apply C gate: gated = C * conv_out (SIMD vectorized)
-            simdMul(C_gate, conv_out, gated_out, conv_dim);
+            cpu_conv1d.simdMul(C_gate, conv_out, gated_out, conv_dim);
 
             // 5. Output projection: (conv_dim) @ (conv_dim, d_model) -> (d_model)
             var gated_view = Tensor.view2DSlice(gated_out, 1, conv_dim);
             var out_view = Tensor.view2DSlice(output_data, 1, d_model);
             self.matmul_out_proj(&gated_view, w.out_proj, &out_view, matmul_scratch);
-
         }
 
         // Trace: emit intermediate and final outputs
@@ -360,265 +368,6 @@ pub const ShortConvKernel = struct {
         });
     }
 };
-
-// =============================================================================
-// SIMD-Optimized Primitives
-// =============================================================================
-
-const VEC = simd.f32_vec_len; // 8 for AVX2, 4 for NEON
-
-/// SIMD element-wise multiply: out = a * b
-/// Processes VEC elements per iteration for maximum throughput.
-fn simdMul(a: []const f32, b: []const f32, out: []f32, len: usize) void {
-    @setFloatMode(.optimized);
-    var i: usize = 0;
-
-    // Main SIMD loop
-    while (i + VEC <= len) : (i += VEC) {
-        const va: @Vector(VEC, f32) = a[i..][0..VEC].*;
-        const vb: @Vector(VEC, f32) = b[i..][0..VEC].*;
-        out[i..][0..VEC].* = va * vb;
-    }
-
-    // Scalar tail
-    while (i < len) : (i += 1) {
-        out[i] = a[i] * b[i];
-    }
-}
-
-/// High-performance SIMD depthwise 1D convolution with state management.
-///
-/// State layout: [d_conv, conv_dim] - time-major (each time slice is contiguous)
-/// Weight layout: [conv_dim, d_conv] - channel-major (from PyTorch depthwise conv)
-///
-/// Algorithm:
-/// 1. Shift state: move time slices 1..d_conv to 0..d_conv-1
-/// 2. Compute Bx = B * x and store in newest state position
-/// 3. Compute conv output: sum over d_conv weighted time slices
-/// 4. Add bias if present
-///
-/// The key optimization is processing entire time slices as contiguous vectors,
-/// enabling full SIMD utilization for the shift and accumulate operations.
-fn depthwiseConvSimd(
-    B_gate: []const f32,
-    x_proj: []const f32,
-    state: []f32,
-    weight: []const f32,
-    out: []f32,
-    bias: ?[]const f32,
-    conv_dim: usize,
-    d_conv: usize,
-) void {
-    @setFloatMode(.optimized);
-
-    // Step 1: Shift state left (drop oldest time slice, make room for new)
-    // State layout: [d_conv, conv_dim] -> row k is time position k
-    // We shift rows 1..d_conv-1 to positions 0..d_conv-2
-    // This is a bulk memory move of (d_conv-1) * conv_dim floats
-    if (d_conv > 1) {
-        const shift_src = state[conv_dim..]; // Start of row 1
-        const shift_dst = state[0 .. (d_conv - 1) * conv_dim]; // Rows 0..d_conv-2
-        @memcpy(shift_dst, shift_src[0..shift_dst.len]);
-    }
-
-    // Step 2: Compute Bx = B * x_proj and store in newest state position (row d_conv-1)
-    const newest_row = state[(d_conv - 1) * conv_dim ..][0..conv_dim];
-    simdMul(B_gate, x_proj, newest_row, conv_dim);
-
-    // Step 3: Compute convolution output
-    // out[ch] = sum_{k=0}^{d_conv-1} state[k, ch] * weight[ch, k]
-    //
-    // Weight is channel-major [conv_dim, d_conv], but state is time-major [d_conv, conv_dim].
-    // For each channel ch, we need weight[ch*d_conv + k] for k in 0..d_conv.
-    //
-    // Optimization: process d_conv time slices, accumulating weighted contributions.
-    // Each time slice is contiguous, enabling full SIMD vectorization.
-
-    // Initialize output to zero
-    @memset(out, 0);
-
-    // Accumulate weighted contributions from each time slice
-    // For d_conv=3 (typical), this is 3 passes over conv_dim elements
-    for (0..d_conv) |k| {
-        const state_row = state[k * conv_dim ..][0..conv_dim];
-
-        var i: usize = 0;
-        // Main SIMD loop with 2x unroll for better ILP
-        while (i + 2 * VEC <= conv_dim) : (i += 2 * VEC) {
-            // Load state vectors for this time slice
-            const s0: @Vector(VEC, f32) = state_row[i..][0..VEC].*;
-            const s1: @Vector(VEC, f32) = state_row[i + VEC ..][0..VEC].*;
-
-            // Load weight vectors - need to gather from channel-major layout
-            // weight[ch*d_conv + k] for channels i..i+VEC
-            var w0: @Vector(VEC, f32) = undefined;
-            var w1: @Vector(VEC, f32) = undefined;
-            inline for (0..VEC) |j| {
-                w0[j] = weight[(i + j) * d_conv + k];
-                w1[j] = weight[(i + VEC + j) * d_conv + k];
-            }
-
-            // Load current output
-            const o0: @Vector(VEC, f32) = out[i..][0..VEC].*;
-            const o1: @Vector(VEC, f32) = out[i + VEC ..][0..VEC].*;
-
-            // Fused multiply-add
-            out[i..][0..VEC].* = @mulAdd(@Vector(VEC, f32), s0, w0, o0);
-            out[i + VEC ..][0..VEC].* = @mulAdd(@Vector(VEC, f32), s1, w1, o1);
-        }
-
-        // Single vector iteration
-        while (i + VEC <= conv_dim) : (i += VEC) {
-            const s: @Vector(VEC, f32) = state_row[i..][0..VEC].*;
-            var w: @Vector(VEC, f32) = undefined;
-            inline for (0..VEC) |j| {
-                w[j] = weight[(i + j) * d_conv + k];
-            }
-            const o: @Vector(VEC, f32) = out[i..][0..VEC].*;
-            out[i..][0..VEC].* = @mulAdd(@Vector(VEC, f32), s, w, o);
-        }
-
-        // Scalar tail
-        while (i < conv_dim) : (i += 1) {
-            out[i] += state_row[i] * weight[i * d_conv + k];
-        }
-    }
-
-    // Step 4: Add bias if present
-    if (bias) |b| {
-        var i: usize = 0;
-        while (i + VEC <= conv_dim) : (i += VEC) {
-            const o: @Vector(VEC, f32) = out[i..][0..VEC].*;
-            const bv: @Vector(VEC, f32) = b[i..][0..VEC].*;
-            out[i..][0..VEC].* = o + bv;
-        }
-        while (i < conv_dim) : (i += 1) {
-            out[i] += b[i];
-        }
-    }
-}
-
-/// Maximum-performance SIMD depthwise convolution with transposed weights.
-///
-/// Both state and weight are time-major [d_conv, conv_dim], enabling
-/// fully contiguous vector loads with no gather operations.
-///
-/// This is ~2-3x faster than the channel-major weight version due to:
-/// - No scalar gather for weights (fully contiguous loads)
-/// - Better cache locality (sequential memory access)
-/// - Enables prefetching for next time slice
-fn depthwiseConvSimdTransposed(
-    B_gate: []const f32,
-    x_proj: []const f32,
-    state: []f32,
-    weight_t: []const f32, // Transposed: [d_conv, conv_dim]
-    out: []f32,
-    bias: ?[]const f32,
-    conv_dim: usize,
-    d_conv: usize,
-) void {
-    @setFloatMode(.optimized);
-
-    // Step 1: Shift state left using memmove (handles overlap correctly)
-    // State layout: [d_conv, conv_dim] -> row k is time position k
-    if (d_conv > 1) {
-        const shift_src = state[conv_dim..]; // Start of row 1
-        const shift_dst = state[0 .. (d_conv - 1) * conv_dim]; // Rows 0..d_conv-2
-        @memcpy(shift_dst, shift_src[0..shift_dst.len]);
-    }
-
-    // Step 2: Compute Bx = B * x_proj and store in newest state position
-    const newest_row = state[(d_conv - 1) * conv_dim ..][0..conv_dim];
-    simdMul(B_gate, x_proj, newest_row, conv_dim);
-
-    // Step 3: Compute convolution output with fully contiguous access
-    // Both state[k] and weight_t[k] are contiguous rows of conv_dim elements
-    //
-    // For maximum ILP, we use 4x unrolling on the outer loop when d_conv >= 4,
-    // processing multiple time slices per iteration to hide FMA latency.
-
-    // Initialize output to zero
-    @memset(out, 0);
-
-    // Process time slices with maximum unrolling based on d_conv
-    var k: usize = 0;
-
-    // 4x unrolled loop for d_conv >= 4 (processes 4 time slices per iteration)
-    while (k + 4 <= d_conv) : (k += 4) {
-        const s0 = state[k * conv_dim ..][0..conv_dim];
-        const s1 = state[(k + 1) * conv_dim ..][0..conv_dim];
-        const s2 = state[(k + 2) * conv_dim ..][0..conv_dim];
-        const s3 = state[(k + 3) * conv_dim ..][0..conv_dim];
-        const w0 = weight_t[k * conv_dim ..][0..conv_dim];
-        const w1 = weight_t[(k + 1) * conv_dim ..][0..conv_dim];
-        const w2 = weight_t[(k + 2) * conv_dim ..][0..conv_dim];
-        const w3 = weight_t[(k + 3) * conv_dim ..][0..conv_dim];
-
-        var i: usize = 0;
-        // Main SIMD loop - 4 FMAs per channel group for maximum ILP
-        while (i + VEC <= conv_dim) : (i += VEC) {
-            var acc: @Vector(VEC, f32) = out[i..][0..VEC].*;
-            acc = @mulAdd(@Vector(VEC, f32), s0[i..][0..VEC].*, w0[i..][0..VEC].*, acc);
-            acc = @mulAdd(@Vector(VEC, f32), s1[i..][0..VEC].*, w1[i..][0..VEC].*, acc);
-            acc = @mulAdd(@Vector(VEC, f32), s2[i..][0..VEC].*, w2[i..][0..VEC].*, acc);
-            acc = @mulAdd(@Vector(VEC, f32), s3[i..][0..VEC].*, w3[i..][0..VEC].*, acc);
-            out[i..][0..VEC].* = acc;
-        }
-        // Scalar tail
-        while (i < conv_dim) : (i += 1) {
-            out[i] += s0[i] * w0[i] + s1[i] * w1[i] + s2[i] * w2[i] + s3[i] * w3[i];
-        }
-    }
-
-    // 2x unrolled for remaining pairs
-    while (k + 2 <= d_conv) : (k += 2) {
-        const s0 = state[k * conv_dim ..][0..conv_dim];
-        const s1 = state[(k + 1) * conv_dim ..][0..conv_dim];
-        const w0 = weight_t[k * conv_dim ..][0..conv_dim];
-        const w1 = weight_t[(k + 1) * conv_dim ..][0..conv_dim];
-
-        var i: usize = 0;
-        while (i + VEC <= conv_dim) : (i += VEC) {
-            var acc: @Vector(VEC, f32) = out[i..][0..VEC].*;
-            acc = @mulAdd(@Vector(VEC, f32), s0[i..][0..VEC].*, w0[i..][0..VEC].*, acc);
-            acc = @mulAdd(@Vector(VEC, f32), s1[i..][0..VEC].*, w1[i..][0..VEC].*, acc);
-            out[i..][0..VEC].* = acc;
-        }
-        while (i < conv_dim) : (i += 1) {
-            out[i] += s0[i] * w0[i] + s1[i] * w1[i];
-        }
-    }
-
-    // Handle remaining single time slice
-    while (k < d_conv) : (k += 1) {
-        const state_row = state[k * conv_dim ..][0..conv_dim];
-        const weight_row = weight_t[k * conv_dim ..][0..conv_dim];
-
-        var i: usize = 0;
-        while (i + VEC <= conv_dim) : (i += VEC) {
-            const s: @Vector(VEC, f32) = state_row[i..][0..VEC].*;
-            const w: @Vector(VEC, f32) = weight_row[i..][0..VEC].*;
-            const o: @Vector(VEC, f32) = out[i..][0..VEC].*;
-            out[i..][0..VEC].* = @mulAdd(@Vector(VEC, f32), s, w, o);
-        }
-        while (i < conv_dim) : (i += 1) {
-            out[i] += state_row[i] * weight_row[i];
-        }
-    }
-
-    // Step 4: Add bias if present (fused into final pass for better cache use)
-    if (bias) |b| {
-        var i: usize = 0;
-        while (i + VEC <= conv_dim) : (i += VEC) {
-            const o: @Vector(VEC, f32) = out[i..][0..VEC].*;
-            const bv: @Vector(VEC, f32) = b[i..][0..VEC].*;
-            out[i..][0..VEC].* = o + bv;
-        }
-        while (i < conv_dim) : (i += 1) {
-            out[i] += b[i];
-        }
-    }
-}
 
 // =============================================================================
 // Unit Tests
@@ -710,4 +459,51 @@ test "ShortConvState conv_state size" {
     // Conv state should be batch * conv_dim * d_conv
     // = 2 * 768 * 3 = 4608
     try std.testing.expectEqual(@as(usize, 4608), state.conv_state.len);
+}
+
+test "ShortConvKernel.forward rejects batch > 1 for 3D input" {
+    const allocator = std.testing.allocator;
+
+    const config = ShortConvConfig{
+        .d_model = 4,
+        .d_conv = 2,
+        .conv_dim = 4,
+        .conv_dim_out = 4,
+    };
+
+    var dummy_weight_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 1 });
+    defer dummy_weight_owned.deinit();
+    var dummy_weight = dummy_weight_owned.view();
+
+    const weights = ShortConvWeights{
+        .in_proj = &dummy_weight,
+        .conv1d_weight = &dummy_weight,
+        .out_proj = &dummy_weight,
+    };
+
+    const kernel_inst = ShortConvKernel.init(
+        config,
+        weights,
+        matmul.matmulF32,
+        matmul.matmulF32,
+        "matmulF32",
+        "matmulF32",
+    );
+
+    var input_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 2, 3, 4 });
+    defer input_owned.deinit();
+    var output_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 2, 3, 4 });
+    defer output_owned.deinit();
+    var input = input_owned.view();
+    var output = output_owned.view();
+
+    var state = try ShortConvState.init(allocator, 1, config);
+    defer state.deinit();
+    var scratch = try ShortConvScratch.init(allocator, config);
+    defer scratch.deinit();
+    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    defer matmul_scratch.deinit();
+
+    const result = kernel_inst.forward(&input, &output, &state, &scratch, &matmul_scratch);
+    try std.testing.expectError(error.InvalidShape, result);
 }

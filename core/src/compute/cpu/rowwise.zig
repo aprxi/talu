@@ -1,0 +1,114 @@
+//! Row-wise and element-wise CPU primitives for inference backends.
+
+const std = @import("std");
+const simd = @import("../simd/root.zig");
+
+const VEC_LEN = simd.f32_vec_len;
+const F32Vec = simd.F32Vec;
+
+/// In-place row add: `dst += src * scale`.
+pub fn addScaledInPlace(dst: []f32, src: []const f32, scale: f32) void {
+    std.debug.assert(dst.len == src.len);
+    if (dst.len == 0) return;
+
+    if (scale == 1.0) {
+        var index: usize = 0;
+        while (index + VEC_LEN - 1 < dst.len) : (index += VEC_LEN) {
+            const d: F32Vec = dst[index..][0..VEC_LEN].*;
+            const s: F32Vec = src[index..][0..VEC_LEN].*;
+            dst[index..][0..VEC_LEN].* = d + s;
+        }
+        while (index < dst.len) : (index += 1) {
+            dst[index] += src[index];
+        }
+        return;
+    }
+
+    const scale_vec: F32Vec = @splat(scale);
+    var index: usize = 0;
+    while (index + VEC_LEN - 1 < dst.len) : (index += VEC_LEN) {
+        const d: F32Vec = dst[index..][0..VEC_LEN].*;
+        const s: F32Vec = src[index..][0..VEC_LEN].*;
+        dst[index..][0..VEC_LEN].* = @mulAdd(F32Vec, s, scale_vec, d);
+    }
+    while (index < dst.len) : (index += 1) {
+        dst[index] += src[index] * scale;
+    }
+}
+
+/// In-place multiply: `values *= scale`.
+pub fn scaleInPlace(values: []f32, scale: f32) void {
+    if (scale == 1.0) return;
+    const scale_vec: F32Vec = @splat(scale);
+    var index: usize = 0;
+    while (index + VEC_LEN - 1 < values.len) : (index += VEC_LEN) {
+        const v: F32Vec = values[index..][0..VEC_LEN].*;
+        values[index..][0..VEC_LEN].* = v * scale_vec;
+    }
+    while (index < values.len) : (index += 1) {
+        values[index] *= scale;
+    }
+}
+
+/// In-place divide using reciprocal multiply: `values /= divisor`.
+pub fn scaleInPlaceReciprocal(values: []f32, divisor: f32) void {
+    if (divisor == 1.0) return;
+    const recip = 1.0 / divisor;
+    scaleInPlace(values, recip);
+}
+
+/// Element-wise add into output: `out = a + b`.
+pub fn addInto(a: []const f32, b: []const f32, out: []f32) void {
+    std.debug.assert(a.len == b.len and a.len == out.len);
+
+    var index: usize = 0;
+    while (index + VEC_LEN - 1 < out.len) : (index += VEC_LEN) {
+        const va: F32Vec = a[index..][0..VEC_LEN].*;
+        const vb: F32Vec = b[index..][0..VEC_LEN].*;
+        out[index..][0..VEC_LEN].* = va + vb;
+    }
+    while (index < out.len) : (index += 1) {
+        out[index] = a[index] + b[index];
+    }
+}
+
+/// Element-wise scaled add into output: `out = a + b * scale`.
+pub fn addIntoScaled(a: []const f32, b: []const f32, out: []f32, scale: f32) void {
+    std.debug.assert(a.len == b.len and a.len == out.len);
+    if (scale == 1.0) return addInto(a, b, out);
+
+    const scale_vec: F32Vec = @splat(scale);
+    var index: usize = 0;
+    while (index + VEC_LEN - 1 < out.len) : (index += VEC_LEN) {
+        const va: F32Vec = a[index..][0..VEC_LEN].*;
+        const vb: F32Vec = b[index..][0..VEC_LEN].*;
+        out[index..][0..VEC_LEN].* = @mulAdd(F32Vec, vb, scale_vec, va);
+    }
+    while (index < out.len) : (index += 1) {
+        out[index] = a[index] + b[index] * scale;
+    }
+}
+
+test "addScaledInPlace with scale 1.0" {
+    var dst = [_]f32{ 1, 2, 3, 4 };
+    const src = [_]f32{ 0.5, 0.5, 0.5, 0.5 };
+    addScaledInPlace(&dst, &src, 1.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), dst[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4.5), dst[3], 1e-6);
+}
+
+test "addIntoScaled applies scale" {
+    const a = [_]f32{ 1, 2, 3, 4 };
+    const b = [_]f32{ 2, 2, 2, 2 };
+    var out = [_]f32{ 0, 0, 0, 0 };
+    addIntoScaled(&a, &b, &out, 0.5);
+    try std.testing.expectApproxEqAbs(@as(f32, 2), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 5), out[3], 1e-6);
+}
+
+test "scaleInPlaceReciprocal divides values" {
+    var values = [_]f32{ 2, 4, 8 };
+    scaleInPlaceReciprocal(&values, 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1), values[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 4), values[2], 1e-6);
+}

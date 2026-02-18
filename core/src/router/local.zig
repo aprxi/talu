@@ -28,11 +28,11 @@ const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const protocol = @import("protocol/root.zig");
 const sampler = inference.sampling;
-const session_mod = inference.session;
-const FinishReason = session_mod.FinishReason;
+const inference_types = inference.types;
+const FinishReason = inference_types.FinishReason;
 const backend_root = @import("../inference/backend/root.zig");
 const Backend = backend_root.Backend;
-const vision_runtime_mod = @import("../inference/backend/cpu/vision_runtime.zig");
+const vision_types = @import("../inference/backend/cpu/vision/types.zig");
 const log = @import("../log.zig");
 pub const PoolingStrategy = backend_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
@@ -60,8 +60,6 @@ pub const SchedulerTokenEvent = inference.TokenEvent;
 pub const SchedulerSubmitOptions = BackendScheduler.SubmitOptions;
 pub const SamplingStrategy = inference.SamplingStrategy;
 pub const SamplingConfig = inference.SamplingConfig;
-
-const GenerationPath = Backend.GenerationPath;
 
 fn finishReasonToString(reason: FinishReason) [:0]const u8 {
     return switch (reason) {
@@ -222,7 +220,7 @@ pub const GenerateOptions = struct {
 };
 
 /// Callback function type for streaming token output.
-pub const TokenCallback = session_mod.TokenCallback;
+pub const TokenCallback = inference_types.TokenCallback;
 
 /// Local inference engine for LLM generation.
 ///
@@ -643,34 +641,17 @@ pub const LocalEngine = struct {
         self.backend.setPrefillProgress(opts.prefill_progress_fn, opts.prefill_progress_data);
         defer self.backend.setPrefillProgress(null, null);
 
-        switch (self.backend.generationPath(countVisionParts(chat) > 0)) {
-            .scheduler => {
-                log.debug("inference", "Generation path", .{ .path = "scheduler" }, @src());
-                return self.generateWithScheduler(
-                    chat,
-                    prompt,
-                    max_tokens,
-                    sampling_config,
-                    bos_token_id,
-                    opts,
-                    effective_grammar,
-                    use_tools,
-                );
-            },
-            .session => {
-                log.debug("inference", "Generation path", .{ .path = "session" }, @src());
-                return self.generateWithSession(
-                    chat,
-                    prompt,
-                    max_tokens,
-                    sampling_config,
-                    bos_token_id,
-                    opts,
-                    effective_grammar,
-                    use_tools,
-                );
-            },
-        }
+        log.debug("inference", "Generation path", .{ .path = "scheduler" }, @src());
+        return self.generateWithScheduler(
+            chat,
+            prompt,
+            max_tokens,
+            sampling_config,
+            bos_token_id,
+            opts,
+            effective_grammar,
+            use_tools,
+        );
     }
 
     /// Generate using Scheduler (continuous batching path).
@@ -735,7 +716,7 @@ pub const LocalEngine = struct {
 
         // Wrap token callback if provided (Scheduler uses different signature)
         const CallbackWrapper = struct {
-            original_callback: ?session_mod.TokenCallback,
+            original_callback: ?inference_types.TokenCallback,
             original_data: ?*anyopaque,
 
             fn wrap(request_id: u64, token: u32, is_final: bool, user_data: ?*anyopaque) void {
@@ -917,7 +898,7 @@ pub const LocalEngine = struct {
     }
 
     const VisionPromptInput = struct {
-        prefill: vision_runtime_mod.PrefillVisionInput,
+        prefill: vision_types.PrefillVisionInput,
         token_counts: []usize,
 
         fn deinit(self: *VisionPromptInput, allocator: std.mem.Allocator) void {
@@ -933,19 +914,19 @@ pub const LocalEngine = struct {
     };
 
     fn collectVisionPromptInput(self: *LocalEngine, chat: *Chat) !?VisionPromptInput {
-        const max_vision_count = countVisionParts(chat);
-        if (max_vision_count == 0) return null;
+        const image_count = countInputImageParts(chat);
+        if (image_count == 0) return null;
         if (self.loaded.config.image_token_id <= 0) return error.UnsupportedContentType;
 
         const preprocess_opts = try self.buildVisionPreprocessOptions();
 
         var written: usize = 0;
-        const images = try self.allocator.alloc(vision_runtime_mod.PrefillVisionImage, max_vision_count);
+        const images = try self.allocator.alloc(vision_types.PrefillVisionImage, image_count);
         errdefer {
             for (images[0..written]) |*img| img.deinit(self.allocator);
             self.allocator.free(images);
         }
-        const token_counts = try self.allocator.alloc(usize, max_vision_count);
+        const token_counts = try self.allocator.alloc(usize, image_count);
         errdefer self.allocator.free(token_counts);
 
         for (0..chat.conv.len()) |item_index| {
@@ -954,27 +935,15 @@ pub const LocalEngine = struct {
 
             for (0..msg.partCount()) |part_index| {
                 const part = msg.getPart(part_index) orelse continue;
-                const ct = part.getContentType();
-                if (ct != .input_image and ct != .input_file) continue;
+                if (part.getContentType() != .input_image) continue;
 
-                const data = part.getData();
-                if (data.len == 0) continue;
-
-                const image_bytes = loadImageBytes(self.allocator, data) catch |err| {
-                    // input_file parts may reference non-image files; skip them.
-                    if (ct == .input_file) continue;
-                    return err;
-                };
+                const image_bytes = try decodeImageDataUrl(self.allocator, part.getData());
                 defer self.allocator.free(image_bytes);
 
-                var decoded = image_mod.decode(self.allocator, image_bytes, .{
+                var decoded = try image_mod.decode(self.allocator, image_bytes, .{
                     .prefer_format = .rgb8,
                     .apply_orientation = true,
-                }) catch |err| {
-                    // input_file with unsupported format (e.g. plain text) — skip.
-                    if (ct == .input_file) continue;
-                    return err;
-                };
+                });
                 defer decoded.deinit(self.allocator);
 
                 var prep = try image_mod.preprocessImage(self.allocator, decoded, preprocess_opts);
@@ -995,27 +964,25 @@ pub const LocalEngine = struct {
             }
         }
 
-        if (written == 0) return null;
+        if (written != image_count) return error.InvalidState;
 
         return VisionPromptInput{
             .prefill = .{
-                .images = images[0..written],
+                .images = images,
                 .image_token_id = @intCast(self.loaded.config.image_token_id),
             },
-            .token_counts = token_counts[0..written],
+            .token_counts = token_counts,
         };
     }
 
-    /// Count parts that may contain visual content (images or files with image/PDF data).
-    fn countVisionParts(chat: *Chat) usize {
+    fn countInputImageParts(chat: *Chat) usize {
         var count: usize = 0;
         for (0..chat.conv.len()) |item_index| {
             const item = chat.conv.getItem(item_index) orelse continue;
             const msg = item.asMessage() orelse continue;
             for (0..msg.partCount()) |part_index| {
                 const part = msg.getPart(part_index) orelse continue;
-                const ct = part.getContentType();
-                if (ct == .input_image or ct == .input_file) count += 1;
+                if (part.getContentType() == .input_image) count += 1;
             }
         }
         return count;
@@ -1052,22 +1019,6 @@ pub const LocalEngine = struct {
     fn requirePositiveConfigU32(value: i32) !u32 {
         if (value <= 0) return error.UnsupportedContentType;
         return std.math.cast(u32, value) orelse error.UnsupportedContentType;
-    }
-
-    /// Load raw image bytes from a URL (file:// or data: scheme).
-    fn loadImageBytes(allocator: std.mem.Allocator, image_url: []const u8) ![]u8 {
-        if (std.mem.startsWith(u8, image_url, "file://")) {
-            return loadImageFromFile(allocator, image_url["file://".len..]);
-        }
-        return decodeImageDataUrl(allocator, image_url);
-    }
-
-    /// Read image bytes directly from a local file path.
-    fn loadImageFromFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-        if (path.len == 0) return error.UnsupportedContentType;
-        const file = std.fs.openFileAbsolute(path, .{}) catch return error.UnsupportedContentType;
-        defer file.close();
-        return file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch return error.UnsupportedContentType;
     }
 
     fn decodeImageDataUrl(allocator: std.mem.Allocator, image_url: []const u8) ![]u8 {
@@ -1196,178 +1147,6 @@ pub const LocalEngine = struct {
         return null;
     }
 
-    /// Generate using legacy session.generate (for non-batching backends).
-    fn generateWithSession(
-        self: *LocalEngine,
-        chat: *Chat,
-        prompt: []const u8,
-        max_tokens: usize,
-        sampling_config: sampler.SamplingConfig,
-        bos_token_id: ?u32,
-        opts: GenerateOptions,
-        grammar_sampler: ?*ConstrainedSampler,
-        is_tool_generation: bool,
-    ) !GenerationResult {
-        // Reseed sampler if seed is provided (for deterministic generation)
-        if (opts.seed != 0) {
-            self.samp.reseed(opts.seed);
-        }
-
-        self.samp.grammar_sampler = grammar_sampler;
-        defer self.samp.grammar_sampler = null;
-
-        // Run generation
-        const session_state = try session_mod.generate(
-            self.allocator,
-            &self.tok,
-            &self.samp,
-            &self.backend,
-            prompt,
-            .{
-                .max_new_tokens = max_tokens,
-                .sampling = sampling_config,
-                .eos_token_ids = self.gen_config.eos_token_ids,
-                .bos_token_id = bos_token_id,
-                .token_callback = opts.token_callback,
-                .callback_data = opts.callback_data,
-                .stop_sequences = opts.stop_sequences,
-            },
-        );
-        defer self.allocator.free(session_state.final_logits);
-
-        // Decode generated tokens (skip prompt)
-        const generated_tokens = session_state.tokens[session_state.prompt_len..];
-        var tokens_to_decode = generated_tokens;
-
-        // Strip trailing EOS token if present
-        if (tokens_to_decode.len > 0) {
-            for (self.gen_config.eos_token_ids) |eos_id| {
-                if (tokens_to_decode[tokens_to_decode.len - 1] == eos_id) {
-                    tokens_to_decode = tokens_to_decode[0 .. tokens_to_decode.len - 1];
-                    break;
-                }
-            }
-        }
-
-        const generated_text = try self.tok.decode(tokens_to_decode);
-
-        // Create owned copy of generated tokens
-        const owned_tokens = try self.allocator.dupe(u32, generated_tokens);
-        errdefer self.allocator.free(owned_tokens);
-
-        // Free original tokens buffer
-        self.allocator.free(session_state.tokens);
-
-        // Check if this is a tool call (grammar completed with tool schema)
-        const is_tool_call = is_tool_generation and grammar_sampler != null and
-            grammar_sampler.?.state == .complete;
-
-        const finish_reason: FinishReason = if (is_tool_call) .tool_calls else session_state.finish_reason;
-        const finish_reason_str = finishReasonToString(finish_reason);
-
-        if (is_tool_call) {
-            // Local-only: parse grammar-constrained JSON into tool call fields
-            var parsed_call = tool_schema_mod.parseToolCall(self.allocator, generated_text) catch {
-                try commit_mod.commitGenerationResult(self.allocator, chat, .{
-                    .text = generated_text,
-                    .prompt_tokens = session_state.prompt_len,
-                    .completion_tokens = session_state.generated_len,
-                    .prefill_ns = session_state.prefill_ns,
-                    .generation_ns = session_state.decode_ns,
-                    .finish_reason = finishReasonToString(.eos_token),
-                });
-                return GenerationResult{
-                    .text = generated_text,
-                    .tokens = owned_tokens,
-                    .prompt_tokens = session_state.prompt_len,
-                    .generated_tokens = session_state.generated_len,
-                    .prefill_ns = session_state.prefill_ns,
-                    .decode_ns = session_state.decode_ns,
-                    .finish_reason = .eos_token,
-                };
-            };
-            defer parsed_call.deinit(self.allocator);
-
-            const call_id = try tool_schema_mod.generateCallId(self.allocator);
-            defer self.allocator.free(call_id);
-
-            const tc_input = [_]commit_mod.ToolCallInput{.{
-                .id = call_id,
-                .name = parsed_call.name,
-                .arguments = parsed_call.arguments,
-            }};
-
-            try commit_mod.commitGenerationResult(self.allocator, chat, .{
-                .text = generated_text,
-                .tool_calls = &tc_input,
-                .prompt_tokens = session_state.prompt_len,
-                .completion_tokens = session_state.generated_len,
-                .prefill_ns = session_state.prefill_ns,
-                .generation_ns = session_state.decode_ns,
-                .finish_reason = finish_reason_str,
-            });
-
-            // Build ToolCallRef for the caller
-            var tool_calls = try self.allocator.alloc(ToolCallRef, 1);
-            errdefer self.allocator.free(tool_calls);
-
-            tool_calls[0] = ToolCallRef{
-                .item_index = chat.conv.len() - 1,
-                .call_id = try self.allocator.dupe(u8, call_id),
-                .name = try self.allocator.dupe(u8, parsed_call.name),
-                .arguments = try self.allocator.dupe(u8, parsed_call.arguments),
-            };
-
-            return GenerationResult{
-                .text = generated_text,
-                .tokens = owned_tokens,
-                .prompt_tokens = session_state.prompt_len,
-                .generated_tokens = session_state.generated_len,
-                .prefill_ns = session_state.prefill_ns,
-                .decode_ns = session_state.decode_ns,
-                .finish_reason = .tool_calls,
-                .tool_calls = tool_calls,
-            };
-        }
-
-        // Text path: commit reasoning + assistant message via shared path
-        const generation_json = try self.buildGenerationJson(chat, opts, max_tokens);
-        defer self.allocator.free(generation_json);
-
-        try commit_mod.commitGenerationResult(self.allocator, chat, .{
-            .text = generated_text,
-            .prompt_tokens = session_state.prompt_len,
-            .completion_tokens = session_state.generated_len,
-            .prefill_ns = session_state.prefill_ns,
-            .generation_ns = session_state.decode_ns,
-            .finish_reason = finish_reason_str,
-            .reasoning_tag = opts.reasoning_tag,
-            .generation_json = generation_json,
-        });
-
-        // Return clean text (strip reasoning tags for caller)
-        var parser = try reasoning_parser_mod.ReasoningParser.init(self.allocator, opts.reasoning_tag);
-        defer parser.deinit();
-        try parser.processChunk(generated_text);
-        const parsed = try parser.finalize();
-
-        const result_text = if (opts.raw_output) generated_text else if (parsed.reasoning != null) blk: {
-            const duped = try self.allocator.dupe(u8, parsed.response orelse "");
-            self.allocator.free(generated_text);
-            break :blk duped;
-        } else generated_text;
-
-        return GenerationResult{
-            .text = result_text,
-            .tokens = owned_tokens,
-            .prompt_tokens = session_state.prompt_len,
-            .generated_tokens = session_state.generated_len,
-            .prefill_ns = session_state.prefill_ns,
-            .decode_ns = session_state.decode_ns,
-            .finish_reason = finish_reason,
-        };
-    }
-
     /// Encode text to token IDs.
     pub fn encode(self: *LocalEngine, text: []const u8) ![]u32 {
         return self.tok.encode(text);
@@ -1391,25 +1170,17 @@ pub const LocalEngine = struct {
     ///
     /// Unlike generate(), this does NOT apply chat templates - the prompt is
     /// used as-is. Use this when you've already formatted the prompt.
-    pub fn run(self: *LocalEngine, prompt: []const u8, config: session_mod.InferenceConfig) !session_mod.InferenceState {
-        switch (self.backend.generationPath(false)) {
-            .scheduler => {
-                log.debug("inference", "Generation path", .{ .path = "scheduler" }, @src());
-                return self.runWithScheduler(prompt, config);
-            },
-            .session => {
-                log.debug("inference", "Generation path", .{ .path = "session" }, @src());
-                return self.runWithSession(prompt, config);
-            },
-        }
+    pub fn run(self: *LocalEngine, prompt: []const u8, config: inference_types.InferenceConfig) !inference_types.InferenceState {
+        log.debug("inference", "Generation path", .{ .path = "scheduler" }, @src());
+        return self.runWithScheduler(prompt, config);
     }
 
     /// Run inference using Scheduler (continuous batching path).
     fn runWithScheduler(
         self: *LocalEngine,
         prompt: []const u8,
-        config: session_mod.InferenceConfig,
-    ) !session_mod.InferenceState {
+        config: inference_types.InferenceConfig,
+    ) !inference_types.InferenceState {
         // Tokenize prompt
         const encoded_tokens = try self.tok.encode(prompt);
         defer self.allocator.free(encoded_tokens);
@@ -1439,7 +1210,7 @@ pub const LocalEngine = struct {
 
         // Wrap token callback if provided (Scheduler uses different signature)
         const CallbackWrapper = struct {
-            original_callback: ?session_mod.TokenCallback,
+            original_callback: ?inference_types.TokenCallback,
             original_data: ?*anyopaque,
 
             fn wrap(request_id: u64, token: u32, is_final: bool, user_data: ?*anyopaque) void {
@@ -1466,6 +1237,7 @@ pub const LocalEngine = struct {
             .sampling = config.sampling,
             .stop_flag = config.stop_flag,
         });
+        errdefer result.deinit(self.allocator);
 
         // Capture timing from scheduler result
         const prefill_ns = result.prefill_ns;
@@ -1473,7 +1245,7 @@ pub const LocalEngine = struct {
 
         // Capture values before deinit
         const generated_len = result.tokens.len;
-        const finish_reason: session_mod.FinishReason = switch (result.finish_reason) {
+        const finish_reason: inference_types.FinishReason = switch (result.finish_reason) {
             .in_progress => .eos_token, // Shouldn't happen for sync
             .eos_token => .eos_token,
             .length => .length,
@@ -1483,33 +1255,27 @@ pub const LocalEngine = struct {
 
         // Build all_tokens = prompt + generated
         const all_tokens = try self.allocator.alloc(u32, prompt_len + generated_len);
+        errdefer self.allocator.free(all_tokens);
         @memcpy(all_tokens[0..prompt_len], prompt_tokens);
         @memcpy(all_tokens[prompt_len..], result.tokens);
+
+        // Preserve run() behavior: return logits for the final sequence position.
+        const final_logits = try self.allocator.alloc(f32, self.backend.vocabSize());
+        errdefer self.allocator.free(final_logits);
+        try self.backend.prefill(all_tokens, final_logits);
 
         // Free scheduler result tokens (we've copied them)
         result.deinit(self.allocator);
 
-        return session_mod.InferenceState{
+        return inference_types.InferenceState{
             .tokens = all_tokens,
-            .final_logits = try self.allocator.alloc(f32, 0), // Empty logits for scheduler path
+            .final_logits = final_logits,
             .prompt_len = prompt_len,
             .generated_len = generated_len,
             .prefill_ns = prefill_ns,
             .decode_ns = decode_ns,
             .finish_reason = finish_reason,
         };
-    }
-
-    /// Run inference using legacy session.generate (for non-batching backends).
-    fn runWithSession(self: *LocalEngine, prompt: []const u8, config: session_mod.InferenceConfig) !session_mod.InferenceState {
-        return session_mod.generate(
-            self.allocator,
-            &self.tok,
-            &self.samp,
-            &self.backend,
-            prompt,
-            config,
-        );
     }
 
     /// Create a scheduler for continuous batching.

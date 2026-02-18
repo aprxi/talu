@@ -8,9 +8,8 @@ const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const dtype = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
-const quant_rows = compute.quant.rows;
-const grouped_affine_quant = compute.quant.grouped_affine;
-const log = @import("../../../../log.zig");
+const cpu_quant_decode = compute.cpu.quant_decode;
+const cpu_tensor_gather = compute.cpu.tensor_gather;
 
 const Tensor = tensor.Tensor;
 
@@ -31,37 +30,27 @@ pub fn gatherEmbeddings(embedding_weights: *const Tensor, token_ids: []const u32
     switch (embedding_weights.dtype) {
         .f32 => {
             const embedding_weights_data = embedding_weights.asSlice(f32);
-            for (token_ids, 0..) |token_id, token_index| {
-                const vocab_idx: usize = @intCast(token_id);
-                if (vocab_idx >= vocab_size) return error.InvalidTokenId;
-                @memcpy(output_values[token_index * embed_dim ..][0..embed_dim], embedding_weights_data[vocab_idx * embed_dim ..][0..embed_dim]);
-            }
+            try cpu_tensor_gather.gatherRowsF32(embedding_weights_data, vocab_size, embed_dim, token_ids, output_values);
         },
         .f16 => {
-            // F16 embeddings - convert to f32 on the fly
             const embedding_weights_data = embedding_weights.asSliceUnaligned(u16);
-            for (token_ids, 0..) |token_id, token_index| {
-                const vocab_idx: usize = @intCast(token_id);
-                if (vocab_idx >= vocab_size) return error.InvalidTokenId;
-                const src_row = embedding_weights_data[vocab_idx * embed_dim ..][0..embed_dim];
-                const dst_row = output_values[token_index * embed_dim ..][0..embed_dim];
-                for (src_row, dst_row) |v, *d| {
-                    d.* = dtype.fp16ToF32(v);
-                }
-            }
+            try cpu_quant_decode.gatherDecodeF16Rows(
+                embedding_weights_data,
+                vocab_size,
+                embed_dim,
+                token_ids,
+                output_values,
+            );
         },
         .bf16 => {
-            // BF16 embeddings - convert to f32 on the fly
             const embedding_weights_data = embedding_weights.asSliceUnaligned(u16);
-            for (token_ids, 0..) |token_id, token_index| {
-                const vocab_idx: usize = @intCast(token_id);
-                if (vocab_idx >= vocab_size) return error.InvalidTokenId;
-                const src_row = embedding_weights_data[vocab_idx * embed_dim ..][0..embed_dim];
-                const dst_row = output_values[token_index * embed_dim ..][0..embed_dim];
-                for (src_row, dst_row) |v, *d| {
-                    d.* = dtype.bf16ToF32(v);
-                }
-            }
+            try cpu_quant_decode.gatherDecodeBf16Rows(
+                embedding_weights_data,
+                vocab_size,
+                embed_dim,
+                token_ids,
+                output_values,
+            );
         },
         .grouped_affine_u4 => {
             const gaffine_params = embedding_weights.gaffine orelse return error.InvalidShape;
@@ -70,47 +59,17 @@ pub fn gatherEmbeddings(embedding_weights: *const Tensor, token_ids: []const u32
             const scales: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine_params.scales.ptr))[0 .. gaffine_params.scales.len / 2];
             const biases: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine_params.biases.ptr))[0 .. gaffine_params.biases.len / 2];
             const packed_values: []align(1) const u32 = @as([*]align(1) const u32, @ptrCast(embedding_weights.data().ptr))[0 .. embedding_weights.data().len / 4];
-            const packed_row_stride = embed_dim / 8;
-            const group_row_stride = embed_dim / group_size;
-            const group_u32_count = group_size / 8;
-
-            var token_index: usize = 0;
-            while (token_index < token_ids.len) : (token_index += 1) {
-                const vocab_idx: usize = @intCast(token_ids[token_index]);
-                if (vocab_idx >= vocab_size) return error.InvalidTokenId;
-                const packed_row = packed_values.ptr + vocab_idx * packed_row_stride;
-                const scale_row = scales.ptr + vocab_idx * group_row_stride;
-                const bias_row = biases.ptr + vocab_idx * group_row_stride;
-                const out_row = output_values.ptr + token_index * embed_dim;
-
-                // Process by groups for SIMD efficiency
-                var group_idx: usize = 0;
-                while (group_idx < group_row_stride) : (group_idx += 1) {
-                    const scale = grouped_affine_quant.scaleBiasToF32(scales_dtype, scale_row[group_idx]);
-                    const bias = grouped_affine_quant.scaleBiasToF32(scales_dtype, bias_row[group_idx]);
-                    const scale_vec: @Vector(8, f32) = @splat(scale);
-                    const bias_vec: @Vector(8, f32) = @splat(bias);
-                    const weight_base = packed_row + group_idx * group_u32_count;
-                    const out_base = out_row + group_idx * group_size;
-
-                    // Process 32 elements (4 U32s) at a time using SIMD nibble extraction
-                    var pack_idx: usize = 0;
-                    while (pack_idx + 3 < group_u32_count) : (pack_idx += 4) {
-                        const nibs = grouped_affine_quant.extract32NibblesToFloat(weight_base + pack_idx);
-                        (out_base + pack_idx * 8)[0..8].* = @mulAdd(@Vector(8, f32), nibs.n0, scale_vec, bias_vec);
-                        (out_base + (pack_idx + 1) * 8)[0..8].* = @mulAdd(@Vector(8, f32), nibs.n1, scale_vec, bias_vec);
-                        (out_base + (pack_idx + 2) * 8)[0..8].* = @mulAdd(@Vector(8, f32), nibs.n2, scale_vec, bias_vec);
-                        (out_base + (pack_idx + 3) * 8)[0..8].* = @mulAdd(@Vector(8, f32), nibs.n3, scale_vec, bias_vec);
-                    }
-
-                    // Handle remainder
-                    while (pack_idx < group_u32_count) : (pack_idx += 1) {
-                        const word = weight_base[pack_idx];
-                        const nibble_values = grouped_affine_quant.extractNibbles(word);
-                        (out_base + pack_idx * 8)[0..8].* = @mulAdd(@Vector(8, f32), nibble_values, scale_vec, bias_vec);
-                    }
-                }
-            }
+            try cpu_quant_decode.gatherDecodeGroupedAffineU4Rows(
+                packed_values,
+                scales,
+                biases,
+                scales_dtype,
+                group_size,
+                vocab_size,
+                embed_dim,
+                token_ids,
+                output_values,
+            );
         },
         .grouped_affine_u8 => {
             const gaffine_params = embedding_weights.gaffine orelse return error.InvalidShape;
@@ -119,42 +78,39 @@ pub fn gatherEmbeddings(embedding_weights: *const Tensor, token_ids: []const u32
             const scales: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine_params.scales.ptr))[0 .. gaffine_params.scales.len / 2];
             const biases: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine_params.biases.ptr))[0 .. gaffine_params.biases.len / 2];
             const packed_values: []align(1) const u32 = @as([*]align(1) const u32, @ptrCast(embedding_weights.data().ptr))[0 .. embedding_weights.data().len / 4];
-            const packed_row_stride = embed_dim / 4; // 4 values per u32 for 8-bit
-            const group_row_stride = embed_dim / group_size;
-            const group_u32_count = group_size / 4;
-
-            var token_index: usize = 0;
-            while (token_index < token_ids.len) : (token_index += 1) {
-                const vocab_idx: usize = @intCast(token_ids[token_index]);
-                if (vocab_idx >= vocab_size) return error.InvalidTokenId;
-                const packed_row = packed_values.ptr + vocab_idx * packed_row_stride;
-                const scale_row = scales.ptr + vocab_idx * group_row_stride;
-                const bias_row = biases.ptr + vocab_idx * group_row_stride;
-                const out_row = output_values.ptr + token_index * embed_dim;
-
-                // Process by groups
-                var group_idx: usize = 0;
-                while (group_idx < group_row_stride) : (group_idx += 1) {
-                    const scale = grouped_affine_quant.scaleBiasToF32(scales_dtype, scale_row[group_idx]);
-                    const bias = grouped_affine_quant.scaleBiasToF32(scales_dtype, bias_row[group_idx]);
-                    const scale_vec: @Vector(4, f32) = @splat(scale);
-                    const bias_vec: @Vector(4, f32) = @splat(bias);
-                    const weight_base = packed_row + group_idx * group_u32_count;
-                    const out_base = out_row + group_idx * group_size;
-
-                    // Process 4 elements per u32
-                    var pack_idx: usize = 0;
-                    while (pack_idx < group_u32_count) : (pack_idx += 1) {
-                        const word = weight_base[pack_idx];
-                        const byte_values = grouped_affine_quant.extractBytes(word);
-                        (out_base + pack_idx * 4)[0..4].* = @mulAdd(@Vector(4, f32), byte_values, scale_vec, bias_vec);
-                    }
-                }
-            }
+            try cpu_quant_decode.gatherDecodeGroupedAffineU8Rows(
+                packed_values,
+                scales,
+                biases,
+                scales_dtype,
+                group_size,
+                vocab_size,
+                embed_dim,
+                token_ids,
+                output_values,
+            );
         },
         else => return error.InvalidDType,
     }
 }
+
+pub const EmbeddingLookup = struct {
+    /// Canonical kernel-call contract for backend parity checks.
+    pub const ForwardParams = struct {
+        token_ids: []const u32,
+        output_tensor: *Tensor,
+    };
+
+    embedding_weights: *const Tensor,
+
+    pub fn forward(
+        self: *const EmbeddingLookup,
+        token_ids: []const u32,
+        output_tensor: *Tensor,
+    ) !void {
+        return gatherEmbeddings(self.embedding_weights, token_ids, output_tensor);
+    }
+};
 
 // ============================================================================
 // Tests
@@ -323,6 +279,31 @@ test "gatherEmbeddings gaffine_u8" {
     // Grouped affine quantization requires complex setup with custom data buffers
     // Skipping for now to focus on standard formats
     // TODO: Add grouped_affine tests with proper buffer allocation lint:ignore no-todo
+}
+
+test "EmbeddingLookup.forward delegates to gatherEmbeddings" {
+    const allocator = std.testing.allocator;
+
+    var embed_tensor = try tensor.OwnedTensor.init(allocator, .f32, &.{ 3, 2 });
+    defer embed_tensor.deinit();
+    const data = embed_tensor.asSlice(f32);
+    data[0] = 1.0;
+    data[1] = 2.0;
+    data[2] = 3.0;
+    data[3] = 4.0;
+    data[4] = 5.0;
+    data[5] = 6.0;
+
+    var output_tensor = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 1, 2 });
+    defer output_tensor.deinit();
+
+    const token_ids = [_]u32{2};
+    var embed_view = embed_tensor.view();
+    var out_view = output_tensor.view();
+    const lookup = EmbeddingLookup{ .embedding_weights = &embed_view };
+    try lookup.forward(&token_ids, &out_view);
+
+    try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0 }, output_tensor.asSlice(f32));
 }
 
 test "gatherEmbeddings invalid token" {
@@ -840,4 +821,3 @@ test "gatherEmbeddings mismatched length" {
     const result = gatherEmbeddings(&embed_tensor.view(), &token_ids, &out_view);
     try std.testing.expectError(error.InvalidShape, result);
 }
-

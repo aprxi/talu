@@ -18,6 +18,12 @@ const Tensor = tensor.Tensor;
 
 /// RMS Normalization configuration.
 pub const RMSNorm = struct {
+    /// Canonical kernel-call contract for backend parity checks.
+    pub const ForwardParams = struct {
+        input: *const Tensor,
+        output: *Tensor,
+    };
+
     weight: *const Tensor,
     dim: usize,
     eps: f32,
@@ -51,7 +57,6 @@ pub const RMSNorm = struct {
             dump.recordGlobal(self.trace_point, self.layer_idx, output.data().ptr, .f32, shape, 3);
         }
     }
-
 };
 
 /// Layer Normalization configuration (with optional bias).

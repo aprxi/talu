@@ -254,7 +254,7 @@ test "Reporter.init: creates reporter with correct fields" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -277,7 +277,7 @@ test "Reporter.reportInfo: outputs formatted message when verbose" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -295,7 +295,7 @@ test "Reporter.reportInfo: suppresses output when not verbose" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -313,7 +313,7 @@ test "Reporter.reportInfo: handles multiple arguments" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -331,7 +331,7 @@ test "Reporter.reportInfo: handles empty format string" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -349,7 +349,7 @@ test "Reporter.reportError: returns ValidationFailed error" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -367,7 +367,7 @@ test "Reporter.reportError: outputs formatted error message" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -385,7 +385,7 @@ test "Reporter.reportError: includes prefix in output" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -408,7 +408,7 @@ test "Reporter.reportError: works with verbose and non-verbose modes" {
 
     var any_writer_verbose = std.io.AnyWriter{ .context = &buffer_verbose, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -416,7 +416,7 @@ test "Reporter.reportError: works with verbose and non-verbose modes" {
 
     var any_writer_quiet = std.io.AnyWriter{ .context = &buffer_quiet, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -441,7 +441,7 @@ test "Reporter.reportError: handles complex format strings" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -459,7 +459,7 @@ test "Reporter: error reporting" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -478,7 +478,7 @@ test "Reporter: verbose info reporting" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -496,7 +496,7 @@ test "Reporter: non-verbose info suppression" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -635,7 +635,7 @@ test "validateCommon: valid minimal model" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/block_kernels.zig");
+    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
 
     // Create mock block weights
     var blocks = [_]InferenceBackend.BlockWeights{
@@ -805,7 +805,7 @@ test "validateCommon: valid minimal model" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -836,7 +836,7 @@ test "validateCommon: token_embeddings wrong dimensions" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/block_kernels.zig");
+    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
             .dtype = .f32,
@@ -937,7 +937,7 @@ test "validateCommon: token_embeddings wrong dimensions" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -969,7 +969,7 @@ test "validateCommon: token_embeddings shape mismatch" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/block_kernels.zig");
+    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
             .dtype = .f32,
@@ -1070,7 +1070,7 @@ test "validateCommon: token_embeddings shape mismatch" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -1103,7 +1103,7 @@ test "validateCommon: blocks count mismatch" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/block_kernels.zig");
+    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
     // Only provide 1 block instead of 3
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
@@ -1205,7 +1205,7 @@ test "validateCommon: blocks count mismatch" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -1237,72 +1237,74 @@ test "validateCommon: layer ln1 shape mismatch" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/block_kernels.zig");
-    var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
-        .ln1_weight = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 1,
-            .shape = .{ 128, 0, 0, 0, 0, 0, 0, 0 }, // Wrong! Should be d_model=64
-            .data_ptr = null,
-            .data_size = 0,
+    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    var blocks = [_]InferenceBackend.BlockWeights{.{
+        .attention_mlp = .{
+            .ln1_weight = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 1,
+                .shape = .{ 128, 0, 0, 0, 0, 0, 0, 0 }, // Wrong! Should be d_model=64
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .ln2_weight = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 1,
+                .shape = .{ d_model, 0, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .q_proj = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ d_model, 64, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .k_proj = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ d_model, 64, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .v_proj = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ d_model, 64, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .o_proj = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ 64, d_model, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .w1 = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .w2 = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ 256, d_model, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .w3 = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
         },
-        .ln2_weight = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 1,
-            .shape = .{ d_model, 0, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .q_proj = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ d_model, 64, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .k_proj = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ d_model, 64, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .v_proj = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ d_model, 64, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .o_proj = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ 64, d_model, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .w1 = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .w2 = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ 256, d_model, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .w3 = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-    } }};
+    }};
 
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
@@ -1338,7 +1340,7 @@ test "validateCommon: layer ln1 shape mismatch" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -1370,55 +1372,57 @@ test "validateCommon: missing q/k/v without fused qkv" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/block_kernels.zig");
-    var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
-        .ln1_weight = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 1,
-            .shape = .{ d_model, 0, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
+    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    var blocks = [_]InferenceBackend.BlockWeights{.{
+        .attention_mlp = .{
+            .ln1_weight = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 1,
+                .shape = .{ d_model, 0, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .ln2_weight = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 1,
+                .shape = .{ d_model, 0, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .q_proj = null, // Missing!
+            .k_proj = null, // Missing!
+            .v_proj = null, // Missing!
+            .o_proj = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ 64, d_model, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .w1 = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .w2 = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ 256, d_model, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .w3 = &tensor.Tensor{
+                .dtype = .f32,
+                .n_dims = 2,
+                .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
+                .data_ptr = null,
+                .data_size = 0,
+            },
+            .fused = .{ .qkv_proj = null }, // No fused QKV either
         },
-        .ln2_weight = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 1,
-            .shape = .{ d_model, 0, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .q_proj = null, // Missing!
-        .k_proj = null, // Missing!
-        .v_proj = null, // Missing!
-        .o_proj = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ 64, d_model, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .w1 = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .w2 = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ 256, d_model, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .w3 = &tensor.Tensor{
-            .dtype = .f32,
-            .n_dims = 2,
-            .shape = .{ d_model, 256, 0, 0, 0, 0, 0, 0 },
-            .data_ptr = null,
-            .data_size = 0,
-        },
-        .fused = .{ .qkv_proj = null }, // No fused QKV either
-    } }};
+    }};
 
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
@@ -1454,7 +1458,7 @@ test "validateCommon: missing q/k/v without fused qkv" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }
@@ -1486,7 +1490,7 @@ test "validateCommon: lm_head not 2D" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/block_kernels.zig");
+    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
             .dtype = .f32,
@@ -1587,7 +1591,7 @@ test "validateCommon: lm_head not 2D" {
 
     var any_writer = std.io.AnyWriter{ .context = &buffer, .writeFn = struct {
         fn writeFn(context: *const anyopaque, bytes: []const u8) anyerror!usize {
-            const buf: *std.ArrayList(u8) = @constCast(@ptrCast(@alignCast(context)));
+            const buf: *std.ArrayList(u8) = @ptrCast(@alignCast(@constCast(context)));
             try buf.appendSlice(std.testing.allocator, bytes);
             return bytes.len;
         }

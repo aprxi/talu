@@ -175,9 +175,9 @@ pub const ParsedToolCall = tool_schema.ParsedToolCall;
 pub const ToolSchemaError = tool_schema.ToolSchemaError;
 
 // Inference types (for LocalEngine.run)
-pub const InferenceConfig = inference_mod.session.InferenceConfig;
-pub const InferenceState = inference_mod.session.InferenceState;
-pub const FinishReason = inference_mod.session.FinishReason;
+pub const InferenceConfig = inference_mod.types.InferenceConfig;
+pub const InferenceState = inference_mod.types.InferenceState;
+pub const FinishReason = inference_mod.types.FinishReason;
 
 // Scheduler exports (continuous batching via LocalEngine.createScheduler)
 pub const Scheduler = local.Scheduler;

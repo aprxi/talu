@@ -9,47 +9,13 @@ const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const math_ops = compute.ops.math;
-const ops = compute.ops;
-const tv = ops.tensor_view;
+const cpu_activation = compute.cpu.activation;
+const cpu_common = compute.cpu.common;
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
-
-// =============================================================================
-// SwiGLU Variant Activation (architecture-agnostic compute primitive)
-// =============================================================================
-
-/// SwiGLU variant with alpha=1.702, clipping, and (up+1) formulation:
-/// `swiglu(x_glu, x_linear) = (clip(x_glu,[-7,7]) * sigmoid(1.702*clip(x_glu))) * (clip(x_linear) + 1)`
-inline fn swigluVariantScalar(gate_value: f32, up_value: f32) f32 {
-    const alpha: f32 = 1.702;
-    const limit: f32 = 7.0;
-    const gate_clipped = if (gate_value > limit) limit else if (gate_value < -limit) -limit else gate_value;
-    const up_clipped = std.math.clamp(up_value, -limit, limit);
-    const sigmoid_value = 1.0 / (1.0 + @exp(-alpha * gate_clipped));
-    return (gate_clipped * sigmoid_value) * (up_clipped + 1.0);
-}
-
-/// Apply SwiGLU variant over interleaved `[glu0, lin0, glu1, lin1, ...]` buffer.
-fn swigluVariantFromInterleaved(gate_up_values: []const f32, hidden_output: []f32) void {
-    std.debug.assert(gate_up_values.len == hidden_output.len * 2);
-    for (0..hidden_output.len) |element_index| {
-        const gate_value = gate_up_values[element_index * 2];
-        const up_value = gate_up_values[element_index * 2 + 1];
-        hidden_output[element_index] = swigluVariantScalar(gate_value, up_value);
-    }
-}
-
-/// Apply SwiGLU variant over split gate/up buffers.
-fn swigluVariantFromSplit(gate_values: []const f32, up_values: []const f32, hidden_output: []f32) void {
-    std.debug.assert(gate_values.len == up_values.len and gate_values.len == hidden_output.len);
-    for (0..hidden_output.len) |element_index| {
-        hidden_output[element_index] = swigluVariantScalar(gate_values[element_index], up_values[element_index]);
-    }
-}
 
 const Tensor = tensor.Tensor;
 const MatmulFn = matmul.MatmulFn;
@@ -79,6 +45,14 @@ pub const FfnScratch = struct {
 /// SwiGLU Feed-Forward Network layer.
 /// Computes: output = (SiLU(x @ W1) * (x @ W3)) @ W2
 pub const SwiGLU = struct {
+    /// Canonical kernel-call contract for backend parity checks.
+    pub const ForwardParams = struct {
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        scratch: *FfnScratch,
+        matmul_scratch: *matmul.MatmulScratch,
+    };
+
     d_model: usize,
     d_ff: usize,
     use_gelu: bool = false,
@@ -120,18 +94,18 @@ pub const SwiGLU = struct {
 
         const gate_buffer_len = if (use_fused_gate_up) sequence_len * (2 * self.d_ff) else sequence_len * self.d_ff;
 
-        try ensureSlice(self.allocator, &scratch.gate, gate_buffer_len);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.gate, gate_buffer_len);
         if (!use_fused_gate_up) {
-            try ensureSlice(self.allocator, &scratch.gate_act, sequence_len * self.d_ff);
+            try cpu_common.ensureF32Slice(self.allocator, &scratch.gate_act, sequence_len * self.d_ff);
             if (!is_dense_only) {
-                try ensureSlice(self.allocator, &scratch.hidden, sequence_len * self.d_ff);
-                try ensureSlice(self.allocator, &scratch.up, sequence_len * self.d_ff);
+                try cpu_common.ensureF32Slice(self.allocator, &scratch.hidden, sequence_len * self.d_ff);
+                try cpu_common.ensureF32Slice(self.allocator, &scratch.up, sequence_len * self.d_ff);
             }
         } else {
             // For the common decode case (sequence_len=1) and concat layout, we can compute the
             // activation in-place into the gate half and avoid packing into `hidden`.
             if (!(sequence_len == 1 and self.fused_gate_up_layout == .concat)) {
-                try ensureSlice(self.allocator, &scratch.hidden, sequence_len * self.d_ff);
+                try cpu_common.ensureF32Slice(self.allocator, &scratch.hidden, sequence_len * self.d_ff);
             }
         }
 
@@ -149,7 +123,7 @@ pub const SwiGLU = struct {
             const gate_weight = self.w1 orelse return error.MissingFFNWeights;
             var gate_workspace = Tensor.view2DSlice(scratch.gate[0 .. sequence_len * self.d_ff], sequence_len, self.d_ff);
             self.matmul_gate(&input_view, gate_weight, &gate_workspace, matmul_scratch);
-            if (self.w1_bias) |bias| addBias(gate_workspace.asSlice(f32), bias, sequence_len, self.d_ff);
+            if (self.w1_bias) |bias| cpu_common.addBiasRows(gate_workspace.asSlice(f32), bias, sequence_len, self.d_ff);
             gate_output = gate_workspace;
 
             if (is_dense_only) {
@@ -199,7 +173,6 @@ pub const SwiGLU = struct {
 
         // Apply activation and elementwise multiply.
         const hidden_element_count = sequence_len * self.d_ff;
-        const vector_len = math_ops.simd.f32_vec_len;
         var hidden_output: Tensor = undefined; // Safe: both branches assign before use
         if (use_fused_gate_up) {
             const gate_up_output = gate_output.asSlice(f32);
@@ -209,18 +182,11 @@ pub const SwiGLU = struct {
                     const row = gate_up_output[token_index * (2 * self.d_ff) ..][0 .. 2 * self.d_ff];
                     const out_row = hidden_values[token_index * self.d_ff ..][0..self.d_ff];
                     if (self.use_swiglu_variant) {
-                        swigluVariantFromInterleaved(row, out_row);
+                        cpu_activation.swigluVariantInterleaved(row, out_row);
                     } else if (self.use_gelu) {
-                        for (0..self.d_ff) |elem_idx| {
-                            out_row[elem_idx] = geluApprox(row[elem_idx * 2]) * row[elem_idx * 2 + 1];
-                        }
+                        cpu_activation.geluMulInterleaved(row, out_row);
                     } else {
-                        for (0..self.d_ff) |elem_idx| {
-                            const gate_value = row[elem_idx * 2];
-                            const up_value = row[elem_idx * 2 + 1];
-                            const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-gate_value));
-                            out_row[elem_idx] = (gate_value * sigmoid) * up_value;
-                        }
+                        cpu_activation.siluMulInterleaved(row, out_row);
                     }
                 }
                 hidden_output = Tensor.view2DSlice(hidden_values, sequence_len, self.d_ff);
@@ -233,26 +199,11 @@ pub const SwiGLU = struct {
                     const gate_row = row[0..self.d_ff];
                     const up_row = row[self.d_ff .. 2 * self.d_ff];
                     if (self.use_swiglu_variant) {
-                        swigluVariantFromSplit(gate_row, up_row, gate_row);
+                        cpu_activation.swigluVariantSplit(gate_row, up_row, gate_row);
                     } else if (self.use_gelu) {
-                        for (0..self.d_ff) |elem_idx| {
-                            gate_row[elem_idx] = geluApprox(gate_row[elem_idx]) * up_row[elem_idx];
-                        }
+                        cpu_activation.geluMulSplit(gate_row, up_row, gate_row);
                     } else {
-                        const one: @Vector(vector_len, f32) = @splat(1.0);
-                        var vector_index: usize = 0;
-                        while (vector_index + vector_len - 1 < self.d_ff) : (vector_index += vector_len) {
-                            const gate_vec: @Vector(vector_len, f32) = gate_row[vector_index..][0..vector_len].*;
-                            const up_vec: @Vector(vector_len, f32) = up_row[vector_index..][0..vector_len].*;
-                            const exp_neg = math_ops.fastExp(-gate_vec);
-                            const sig = one / (one + exp_neg);
-                            gate_row[vector_index..][0..vector_len].* = (gate_vec * sig) * up_vec;
-                        }
-                        while (vector_index < self.d_ff) : (vector_index += 1) {
-                            const gate_value = gate_row[vector_index];
-                            const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-gate_value));
-                            gate_row[vector_index] = (gate_value * sigmoid) * up_row[vector_index];
-                        }
+                        cpu_activation.siluMulSplit(gate_row, up_row, gate_row);
                     }
                     hidden_output = Tensor.view2DSlice(gate_row, 1, self.d_ff);
                 } else {
@@ -263,26 +214,11 @@ pub const SwiGLU = struct {
                         const up_row = row[self.d_ff .. 2 * self.d_ff];
                         const out_row = hidden_values[token_index * self.d_ff ..][0..self.d_ff];
                         if (self.use_swiglu_variant) {
-                            swigluVariantFromSplit(gate_row, up_row, out_row);
+                            cpu_activation.swigluVariantSplit(gate_row, up_row, out_row);
                         } else if (self.use_gelu) {
-                            for (0..self.d_ff) |elem_idx| {
-                                out_row[elem_idx] = geluApprox(gate_row[elem_idx]) * up_row[elem_idx];
-                            }
+                            cpu_activation.geluMulSplit(gate_row, up_row, out_row);
                         } else {
-                            const one: @Vector(vector_len, f32) = @splat(1.0);
-                            var vector_index: usize = 0;
-                            while (vector_index + vector_len - 1 < self.d_ff) : (vector_index += vector_len) {
-                                const gate_vec: @Vector(vector_len, f32) = gate_row[vector_index..][0..vector_len].*;
-                                const up_vec: @Vector(vector_len, f32) = up_row[vector_index..][0..vector_len].*;
-                                const exp_neg = math_ops.fastExp(-gate_vec);
-                                const sig = one / (one + exp_neg);
-                                out_row[vector_index..][0..vector_len].* = (gate_vec * sig) * up_vec;
-                            }
-                            while (vector_index < self.d_ff) : (vector_index += 1) {
-                                const gate_value = gate_row[vector_index];
-                                const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-gate_value));
-                                out_row[vector_index] = (gate_value * sigmoid) * up_row[vector_index];
-                            }
+                            cpu_activation.siluMulSplit(gate_row, up_row, out_row);
                         }
                     }
                     hidden_output = Tensor.view2DSlice(hidden_values, sequence_len, self.d_ff);
@@ -293,13 +229,11 @@ pub const SwiGLU = struct {
             if (self.use_gelu) {
                 const gate_values = gate_output.asSlice(f32);
                 const gate_activation_values = gate_activation_view.asSlice(f32);
-                for (gate_values, gate_activation_values) |gate_value, *gate_activation_elem| {
-                    gate_activation_elem.* = geluApprox(gate_value);
-                }
+                cpu_activation.geluMap(gate_values, gate_activation_values);
             } else if (self.use_swiglu_variant) {
                 const gate = gate_output.asSlice(f32)[0..hidden_element_count];
                 const up = up_output.asSlice(f32)[0..hidden_element_count];
-                swigluVariantFromSplit(gate, up, scratch.hidden[0..hidden_element_count]);
+                cpu_activation.swigluVariantSplit(gate, up, scratch.hidden[0..hidden_element_count]);
                 hidden_output = Tensor.view2DSlice(scratch.hidden[0..hidden_element_count], sequence_len, self.d_ff);
                 if (trace.isEnabled()) {
                     trace.emit(
@@ -316,7 +250,7 @@ pub const SwiGLU = struct {
                 }
                 var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
                 self.matmul_down(&hidden_output, self.w2, &out_view, matmul_scratch);
-                if (self.w2_bias) |bias| addBias(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
+                if (self.w2_bias) |bias| cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
                 if (trace.isEnabled()) {
                     trace.emit(
                         .ffn_down,
@@ -337,9 +271,7 @@ pub const SwiGLU = struct {
                 }
                 return;
             } else {
-                const gate_tv = tv.fromTensor(Tensor, &gate_output);
-                const gate_activation_tv = tv.fromTensor(Tensor, &gate_activation_view);
-                ops.activation.silu(gate_activation_tv, gate_tv);
+                cpu_activation.siluMap(gate_output.asSlice(f32), gate_activation_view.asSlice(f32));
             }
 
             if (is_dense_only) {
@@ -349,16 +281,8 @@ pub const SwiGLU = struct {
                 // hidden = gate_act * up (SIMD)
                 const gate_activation_values = gate_activation_view.asSlice(f32);
                 const up_values = up_output.asSlice(f32);
-                const hidden_values = scratch.hidden;
-                var vector_index: usize = 0;
-                while (vector_index + vector_len - 1 < hidden_element_count) : (vector_index += vector_len) {
-                    const gate_vec: @Vector(vector_len, f32) = gate_activation_values[vector_index..][0..vector_len].*;
-                    const up_vec: @Vector(vector_len, f32) = up_values[vector_index..][0..vector_len].*;
-                    hidden_values[vector_index..][0..vector_len].* = gate_vec * up_vec;
-                }
-                while (vector_index < hidden_element_count) : (vector_index += 1) {
-                    hidden_values[vector_index] = gate_activation_values[vector_index] * up_values[vector_index];
-                }
+                const hidden_values = scratch.hidden[0..hidden_element_count];
+                cpu_activation.elementwiseMul(gate_activation_values, up_values, hidden_values);
                 hidden_output = Tensor.view2DSlice(hidden_values, sequence_len, self.d_ff);
             }
         }
@@ -379,7 +303,7 @@ pub const SwiGLU = struct {
 
         var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
         self.matmul_down(&hidden_output, self.w2, &out_view, matmul_scratch);
-        if (self.w2_bias) |bias| addBias(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
+        if (self.w2_bias) |bias| cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
         if (trace.isEnabled()) {
             trace.emit(
                 .ffn_down,
@@ -401,88 +325,54 @@ pub const SwiGLU = struct {
     }
 };
 
-fn geluApprox(x: f32) f32 {
-    // GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    const sqrt_2_over_pi: f32 = 0.7978845608;
-    const x3 = x * x * x;
-    const inner = sqrt_2_over_pi * (x + 0.044715 * x3);
-    return x * 0.5 * (1.0 + std.math.tanh(inner));
-}
-
-/// Add a 1-D bias vector to each row of a [tokens, dim] buffer.
-fn addBias(buf: []f32, bias: []const f32, token_count: usize, dim: usize) void {
-    std.debug.assert(bias.len == dim);
-    std.debug.assert(buf.len >= token_count * dim);
-    for (0..token_count) |t| {
-        const row = buf[t * dim ..][0..dim];
-        for (row, bias) |*val, b| val.* += b;
-    }
-}
-
-fn ensureSlice(allocator: std.mem.Allocator, storage: *[]f32, needed: usize) !void {
-    if (storage.*.len >= needed) return;
-    if (storage.*.len > 0) allocator.free(storage.*);
-    storage.* = try allocator.alloc(f32, needed);
-}
-
 // =============================================================================
 // Unit Tests
 // =============================================================================
 
 test "forward SiLU zero" {
     // silu(0) = 0 * sigmoid(0) = 0 * 0.5 = 0
-    const x: f32 = 0.0;
-    const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-x));
-    const result = x * sigmoid;
+    const result = cpu_activation.silu(0.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), result, 1e-4);
 }
 
 test "forward SiLU positive" {
     // silu(1) = 1 * sigmoid(1) ≈ 1 * 0.731 ≈ 0.731
-    const x: f32 = 1.0;
-    const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-x));
-    const result = x * sigmoid;
+    const result = cpu_activation.silu(1.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.731), result, 0.01);
 }
 
 test "forward SiLU negative" {
     // silu(-1) = -1 * sigmoid(-1) ≈ -1 * 0.269 ≈ -0.269
-    const x: f32 = -1.0;
-    const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-x));
-    const result = x * sigmoid;
+    const result = cpu_activation.silu(-1.0);
     try std.testing.expectApproxEqAbs(@as(f32, -0.269), result, 0.01);
 }
 
 test "forward SiLU large positive" {
     // silu(5) ≈ 5 * 0.993 ≈ 4.966
-    const x: f32 = 5.0;
-    const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-x));
-    const result = x * sigmoid;
+    const result = cpu_activation.silu(5.0);
     try std.testing.expectApproxEqAbs(@as(f32, 4.966), result, 0.01);
 }
 
 test "forward SiLU large negative" {
     // silu(-5) ≈ -5 * 0.0067 ≈ -0.033
-    const x: f32 = -5.0;
-    const sigmoid = 1.0 / (1.0 + math_ops.fastExpScalar(-x));
-    const result = x * sigmoid;
+    const result = cpu_activation.silu(-5.0);
     try std.testing.expectApproxEqAbs(@as(f32, -0.033), result, 0.01);
 }
 
 test "forward GELU zero" {
-    const result = geluApprox(0.0);
+    const result = cpu_activation.geluApprox(0.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), result, 1e-4);
 }
 
 test "forward GELU positive" {
     // GELU(1) ≈ 0.841
-    const result = geluApprox(1.0);
+    const result = cpu_activation.geluApprox(1.0);
     try std.testing.expectApproxEqAbs(@as(f32, 0.841), result, 0.01);
 }
 
 test "forward GELU negative" {
     // GELU(-1) ≈ -0.159
-    const result = geluApprox(-1.0);
+    const result = cpu_activation.geluApprox(-1.0);
     try std.testing.expectApproxEqAbs(@as(f32, -0.159), result, 0.01);
 }
 
@@ -490,7 +380,7 @@ test "forward SwiGLU scalar basic" {
     // Test within clip range
     const gate: f32 = 1.0;
     const up: f32 = 2.0;
-    const result = swigluVariantScalar(gate, up);
+    const result = cpu_activation.swigluVariantScalar(gate, up);
 
     // Expected: (1.0 * sigmoid(1.702 * 1.0)) * (2.0 + 1)
     const alpha: f32 = 1.702;
@@ -503,7 +393,7 @@ test "forward SwiGLU gate clipping positive" {
     // Test gate clipping at +7
     const gate: f32 = 10.0; // Should clip to 7.0
     const up: f32 = 1.0;
-    const result = swigluVariantScalar(gate, up);
+    const result = cpu_activation.swigluVariantScalar(gate, up);
 
     const alpha: f32 = 1.702;
     const gate_clipped: f32 = 7.0;
@@ -516,7 +406,7 @@ test "forward SwiGLU gate clipping negative" {
     // Test gate clipping at -7
     const gate: f32 = -10.0; // Should clip to -7.0
     const up: f32 = 1.0;
-    const result = swigluVariantScalar(gate, up);
+    const result = cpu_activation.swigluVariantScalar(gate, up);
 
     const alpha: f32 = 1.702;
     const gate_clipped: f32 = -7.0;
@@ -529,7 +419,7 @@ test "forward SwiGLU up clipping" {
     // Test up value clipping
     const gate: f32 = 1.0;
     const up: f32 = 10.0; // Should clip to 7.0
-    const result = swigluVariantScalar(gate, up);
+    const result = cpu_activation.swigluVariantScalar(gate, up);
 
     const alpha: f32 = 1.702;
     const up_clipped: f32 = 7.0;
@@ -546,11 +436,11 @@ test "forward SwiGLU interleaved" {
     const output = try allocator.alloc(f32, 2);
     defer allocator.free(output);
 
-    swigluVariantFromInterleaved(&interleaved, output);
+    cpu_activation.swigluVariantInterleaved(&interleaved, output);
 
     // Expected outputs
-    const expected0 = swigluVariantScalar(1.0, 2.0);
-    const expected1 = swigluVariantScalar(-1.0, 0.5);
+    const expected0 = cpu_activation.swigluVariantScalar(1.0, 2.0);
+    const expected1 = cpu_activation.swigluVariantScalar(-1.0, 0.5);
 
     try std.testing.expectApproxEqAbs(expected0, output[0], 1e-4);
     try std.testing.expectApproxEqAbs(expected1, output[1], 1e-4);
@@ -564,10 +454,10 @@ test "forward SwiGLU split" {
     const output = try allocator.alloc(f32, 3);
     defer allocator.free(output);
 
-    swigluVariantFromSplit(&gate, &up, output);
+    cpu_activation.swigluVariantSplit(&gate, &up, output);
 
     for (0..3) |i| {
-        const expected = swigluVariantScalar(gate[i], up[i]);
+        const expected = cpu_activation.swigluVariantScalar(gate[i], up[i]);
         try std.testing.expectApproxEqAbs(expected, output[i], 1e-4);
     }
 }
@@ -1035,10 +925,10 @@ test "FfnScratch deinit cleanup" {
     var scratch = FfnScratch{};
 
     // Allocate some buffers
-    try ensureSlice(allocator, &scratch.gate, 100);
-    try ensureSlice(allocator, &scratch.gate_act, 100);
-    try ensureSlice(allocator, &scratch.up, 100);
-    try ensureSlice(allocator, &scratch.hidden, 100);
+    try cpu_common.ensureF32Slice(allocator, &scratch.gate, 100);
+    try cpu_common.ensureF32Slice(allocator, &scratch.gate_act, 100);
+    try cpu_common.ensureF32Slice(allocator, &scratch.up, 100);
+    try cpu_common.ensureF32Slice(allocator, &scratch.hidden, 100);
 
     try std.testing.expect(scratch.gate.len == 100);
     try std.testing.expect(scratch.gate_act.len == 100);
@@ -1058,15 +948,15 @@ test "SwiGLU.forward ensureSlice buffer growth" {
 
     var storage: []f32 = &.{};
 
-    try ensureSlice(allocator, &storage, 10);
+    try cpu_common.ensureF32Slice(allocator, &storage, 10);
     try std.testing.expectEqual(@as(usize, 10), storage.len);
 
     // Request larger size - should reallocate
-    try ensureSlice(allocator, &storage, 20);
+    try cpu_common.ensureF32Slice(allocator, &storage, 20);
     try std.testing.expectEqual(@as(usize, 20), storage.len);
 
     // Request smaller size - should keep existing buffer
-    try ensureSlice(allocator, &storage, 15);
+    try cpu_common.ensureF32Slice(allocator, &storage, 15);
     try std.testing.expectEqual(@as(usize, 20), storage.len);
 
     allocator.free(storage);

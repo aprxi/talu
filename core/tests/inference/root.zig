@@ -1,7 +1,7 @@
 //! Integration tests for the inference module.
 //!
 //! Tests cover all exports from inference/root.zig:
-//! - Session, FinishReason, InferenceState
+//! - InferenceConfig, FinishReason, InferenceState
 //! - Sampler, SamplingConfig, SamplingStrategy, SamplingWorkspace
 //! - Scheduler, SchedulerConfig, RequestState, TokenEvent, Request
 //! - Backend types: FusedCpuBackend, MultiHeadAttention, SwiGLU, etc.
@@ -12,7 +12,7 @@ test {
     _ = @import("finish_reason_test.zig");
     _ = @import("sampler_test.zig");
     _ = @import("sampling_workspace_test.zig");
-    _ = @import("session_test.zig");
+    _ = @import("types_test.zig");
 
     // Scheduler types
     _ = @import("scheduler_test.zig");

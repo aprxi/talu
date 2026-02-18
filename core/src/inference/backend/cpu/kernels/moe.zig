@@ -7,10 +7,13 @@ const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const ops = compute.ops.math;
 const mxfp4 = compute.ops.mxfp4;
+const cpu_activation = compute.cpu.activation;
+const cpu_common = compute.cpu.common;
+const cpu_matvec = compute.cpu.matvec;
+const cpu_rowwise = compute.cpu.rowwise;
+const cpu_topk = compute.cpu.topk;
 const dtype_mod = @import("../../../../dtype.zig");
-const log = @import("../../../../log.zig");
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
@@ -68,6 +71,14 @@ pub const ExpertWeights = struct {
 /// Mixture of Experts FFN Layer
 /// Implements: output = sum(expert_weight[i] * expert[i](x)) for top-k experts
 pub const MoEFFN = struct {
+    /// Canonical kernel-call contract for backend parity checks.
+    pub const ForwardParams = struct {
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        scratch: *MoEScratch,
+        matmul_scratch: *matmul.MatmulScratch,
+    };
+
     allocator: std.mem.Allocator,
     d_model: usize,
     d_ff: usize,
@@ -106,12 +117,12 @@ pub const MoEFFN = struct {
             (router_rows == self.num_experts and router_cols == self.d_model));
 
         // Allocate scratch buffers
-        try ensureSlice(self.allocator, &scratch.router_logits, seq_len * self.num_experts);
-        try ensureSlice(self.allocator, &scratch.expert_weights, seq_len * self.experts_per_token);
-        try ensureSliceU32(self.allocator, &scratch.expert_indices, seq_len * self.experts_per_token);
-        try ensureSlice(self.allocator, &scratch.expert_outputs, seq_len * self.d_model * self.experts_per_token);
-        try ensureSlice(self.allocator, &scratch.gate_up_values, seq_len * 2 * self.d_ff);
-        try ensureSlice(self.allocator, &scratch.hidden_values, seq_len * self.d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.router_logits, seq_len * self.num_experts);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.expert_weights, seq_len * self.experts_per_token);
+        try cpu_common.ensureU32Slice(self.allocator, &scratch.expert_indices, seq_len * self.experts_per_token);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.expert_outputs, seq_len * self.d_model * self.experts_per_token);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.gate_up_values, seq_len * 2 * self.d_ff);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.hidden_values, seq_len * self.d_ff);
 
         const input_values = input_tensor.asSlice(f32);
         const output_values = output_tensor.asSlice(f32);
@@ -126,12 +137,12 @@ pub const MoEFFN = struct {
 
             // 1. Compute router logits: [num_experts]
             const router_logits = scratch.router_logits[0..self.num_experts];
-            computeRouterLogits(token_input, &self.router_weight, self.router_bias, router_logits);
+            cpu_matvec.denseLogits(token_input, &self.router_weight, self.router_bias, router_logits);
 
             // 2. Select top-k experts
             const selected_expert_indices = scratch.expert_indices[token_index * self.experts_per_token ..][0..self.experts_per_token];
             const selected_expert_weights = scratch.expert_weights[token_index * self.experts_per_token ..][0..self.experts_per_token];
-            try selectTopKExperts(router_logits, self.experts_per_token, selected_expert_indices, selected_expert_weights);
+            try cpu_topk.selectTopKNormalized(router_logits, self.experts_per_token, selected_expert_indices, selected_expert_weights);
 
             // 3. Run selected experts and combine outputs
             for (0..self.experts_per_token) |expert_selection| {
@@ -147,9 +158,7 @@ pub const MoEFFN = struct {
                 try self.runExpert(expert, token_input, expert_output, scratch, matmul_scratch);
 
                 // Accumulate weighted output
-                for (0..self.d_model) |elem_idx| {
-                    token_output[elem_idx] += weight * expert_output[elem_idx];
-                }
+                cpu_rowwise.addScaledInPlace(token_output, expert_output, weight);
             }
         }
 
@@ -220,7 +229,7 @@ pub const MoEFFN = struct {
                     );
                 }
                 if (expert.gate_bias) |bias| {
-                    for (0..self.d_ff) |elem_idx| gate_values[elem_idx] += bias[elem_idx];
+                    cpu_common.addBiasRows(gate_values, bias, 1, self.d_ff);
                 }
 
                 // MXFP4 dequantize and matmul for up_values
@@ -246,7 +255,7 @@ pub const MoEFFN = struct {
                     );
                 }
                 if (expert.up_bias) |bias| {
-                    for (0..self.d_ff) |elem_idx| up_values[elem_idx] += bias[elem_idx];
+                    cpu_common.addBiasRows(up_values, bias, 1, self.d_ff);
                 }
             } else {
                 // Standard matmul for gate_values
@@ -255,7 +264,7 @@ pub const MoEFFN = struct {
                 const gate_kernel = (matmul.matmulKernel(gate_proj.dtype) catch matmul.DispatchedKernel{ .func = matmul.matmulF32, .name = "matmulF32" }).func;
                 gate_kernel(&input_view, &gate_proj, &gate_output_view, matmul_scratch);
                 if (expert.gate_bias) |bias| {
-                    for (0..self.d_ff) |elem_idx| gate_values[elem_idx] += bias[elem_idx];
+                    cpu_common.addBiasRows(gate_values, bias, 1, self.d_ff);
                 }
 
                 // Standard matmul for up_values
@@ -263,7 +272,7 @@ pub const MoEFFN = struct {
                 const up_kernel = (matmul.matmulKernel(up_proj.dtype) catch matmul.DispatchedKernel{ .func = matmul.matmulF32, .name = "matmulF32" }).func;
                 up_kernel(&input_view, &up_proj, &up_output_view, matmul_scratch);
                 if (expert.up_bias) |bias| {
-                    for (0..self.d_ff) |elem_idx| up_values[elem_idx] += bias[elem_idx];
+                    cpu_common.addBiasRows(up_values, bias, 1, self.d_ff);
                 }
             }
         } else if (expert.gate_up_proj != null) {
@@ -296,7 +305,7 @@ pub const MoEFFN = struct {
                     );
                 }
                 if (expert.gate_up_bias) |bias| {
-                    for (0..2 * self.d_ff) |elem_idx| gate_up_values[elem_idx] += bias[elem_idx];
+                    cpu_common.addBiasRows(gate_up_values, bias, 1, 2 * self.d_ff);
                 }
                 // gate_values and up_values already point to gate_up_values[0..d_ff] and gate_up_values[d_ff..2*d_ff]
                 // so no additional work needed
@@ -308,7 +317,7 @@ pub const MoEFFN = struct {
                 matmul_kernel(&input_view, &gate_up_proj, &out_view, matmul_scratch);
 
                 if (expert.gate_up_bias) |bias| {
-                    for (0..2 * self.d_ff) |elem_idx| gate_up_values[elem_idx] += bias[elem_idx];
+                    cpu_common.addBiasRows(gate_up_values, bias, 1, 2 * self.d_ff);
                 }
             }
         } else {
@@ -316,36 +325,11 @@ pub const MoEFFN = struct {
         }
 
         if (self.use_swiglu_variant) {
-            // GPT-OSS SwiGLU variant:
-            // - Gate/up are INTERLEAVED in gate_up_values: [gate[0], up[0], gate[1], up[1], ...]
-            // - gate: clamp(max=7) only (NOT lower bound!)
-            // - up: clamp(-7, 7) both bounds
-            // - Formula: glu = gate * sigmoid(gate * 1.702); activated = (up + 1) * glu
-            const alpha: f32 = 1.702;
-            const limit: f32 = 7.0;
-
-            for (0..self.d_ff) |elem_idx| {
-                // Interleaved layout: gate at even indices, up at odd indices
-                const x_gate = gate_up_values[elem_idx * 2];
-                const x_up = gate_up_values[elem_idx * 2 + 1];
-
-                // Gate: clamp upper bound only (matches Python's clamp(max=LIMIT))
-                const x_gate_clipped = @min(x_gate, limit);
-                // Up: clamp both bounds
-                const x_up_clipped = std.math.clamp(x_up, -limit, limit);
-
-                const glu_scaled = alpha * x_gate_clipped;
-                const sig = 1.0 / (1.0 + @exp(-glu_scaled));
-                const out_glu = x_gate_clipped * sig;
-                hidden_values[elem_idx] = (x_up_clipped + 1.0) * out_glu;
-            }
+            // GPT-OSS path uses interleaved gate/up values.
+            cpu_activation.swigluVariantInterleaved(gate_up_values, hidden_values);
         } else {
-            // Standard SwiGLU: SiLU(gate_values) * up_values
-            for (0..self.d_ff) |elem_idx| {
-                const gate_value = gate_values[elem_idx];
-                const sigmoid = 1.0 / (1.0 + @exp(-gate_value));
-                hidden_values[elem_idx] = (gate_value * sigmoid) * up_values[elem_idx];
-            }
+            // Standard SwiGLU: SiLU(gate) * up.
+            cpu_activation.siluMulSplit(gate_values, up_values, hidden_values);
         }
 
         // Down projection
@@ -372,7 +356,7 @@ pub const MoEFFN = struct {
                 );
             }
             if (expert.down_bias) |bias| {
-                for (0..self.d_model) |elem_idx| output_vector[elem_idx] += bias[elem_idx];
+                cpu_common.addBiasRows(output_vector, bias, 1, self.d_model);
             }
         } else {
             var input_view = Tensor.view2DSlice(hidden_values, 1, self.d_ff);
@@ -381,182 +365,11 @@ pub const MoEFFN = struct {
             matmul_kernel(&input_view, &expert.down_proj, &out_view, matmul_scratch);
 
             if (expert.down_bias) |bias| {
-                for (0..self.d_model) |elem_idx| output_vector[elem_idx] += bias[elem_idx];
+                cpu_common.addBiasRows(output_vector, bias, 1, self.d_model);
             }
         }
     }
 };
-
-/// Compute router logits: input @ router_weight + router_bias
-fn computeRouterLogits(
-    input_vector: []const f32,
-    router_weight: *const Tensor,
-    router_bias: ?[]const f32,
-    logits_out: []f32,
-) void {
-    const input_dim = input_vector.len;
-    const num_experts = logits_out.len;
-
-    const rows: usize = @intCast(router_weight.shape[0]);
-    const cols: usize = @intCast(router_weight.shape[1]);
-    const weight_dtype = router_weight.dtype;
-
-    const readWeight = struct {
-        fn at(dtype: tensor.DType, data_ptr: [*]const u8, idx: usize) f32 {
-            return switch (dtype) {
-                .f32 => @as([*]const f32, @ptrCast(@alignCast(data_ptr)))[idx],
-                .bf16 => dtype_mod.bf16ToF32(@as([*]align(1) const u16, @ptrCast(data_ptr))[idx]),
-                .f16 => @floatCast(@as([*]align(1) const f16, @ptrCast(data_ptr))[idx]),
-                else => 0.0,
-            };
-        }
-    };
-    const weight_ptr: [*]const u8 = router_weight.data().ptr;
-
-    // Handle both router weight layouts:
-    // - [d_model, num_experts] (column-major by expert when read as rows)
-    // - [num_experts, d_model] (one contiguous row per expert)
-    if (rows == input_dim and cols == num_experts) {
-        for (0..num_experts) |expert_index| {
-            var sum: f32 = 0.0;
-            for (0..input_dim) |input_idx| {
-                const w = readWeight.at(weight_dtype, weight_ptr, input_idx * num_experts + expert_index);
-                sum += input_vector[input_idx] * w;
-            }
-            if (router_bias) |bias| {
-                sum += bias[expert_index];
-            }
-            logits_out[expert_index] = sum;
-        }
-        return;
-    }
-
-    if (rows == num_experts and cols == input_dim) {
-        for (0..num_experts) |expert_index| {
-            var sum: f32 = 0.0;
-            for (0..input_dim) |input_idx| {
-                const w = readWeight.at(weight_dtype, weight_ptr, expert_index * input_dim + input_idx);
-                sum += input_vector[input_idx] * w;
-            }
-            if (router_bias) |bias| {
-                sum += bias[expert_index];
-            }
-            logits_out[expert_index] = sum;
-        }
-        return;
-    }
-
-    // Invalid shape: preserve deterministic behavior instead of reading OOB.
-    // This path should be unreachable when loader/orientation is correct.
-    for (0..num_experts) |expert_index| {
-        logits_out[expert_index] = if (router_bias) |bias| bias[expert_index] else 0.0;
-    }
-}
-
-/// Maximum number of experts supported.
-/// Models with more experts than this will need the limit increased.
-const MAX_EXPERTS: usize = 256;
-
-/// Select top-k experts using partial sort and compute softmax weights.
-/// Returns error for invalid configurations instead of silently failing.
-fn selectTopKExperts(
-    logits: []const f32,
-    top_k: usize,
-    indices: []u32,
-    weights: []f32,
-) error{InvalidMoEConfig}!void {
-    const num_experts = logits.len;
-
-    // Guard: k == 0 is invalid (model must select at least one expert)
-    if (top_k == 0) return error.InvalidMoEConfig;
-
-    // Guard: k > n is invalid (can't select more experts than exist)
-    if (top_k > num_experts) return error.InvalidMoEConfig;
-
-    // Guard: n must fit in our bitset
-    if (num_experts > MAX_EXPERTS) return error.InvalidMoEConfig;
-
-    // Simple selection: find top-k by iterating k times
-    var used_mask = std.StaticBitSet(MAX_EXPERTS).initEmpty();
-
-    for (0..top_k) |rank_idx| {
-        var best_expert_index: usize = 0;
-        var best_logit: f32 = -std.math.inf(f32);
-        var found_finite = false;
-
-        for (0..num_experts) |expert_index| {
-            if (used_mask.isSet(expert_index)) continue;
-            const logit = logits[expert_index];
-            if (!std.math.isFinite(logit)) continue;
-            if (!found_finite or logit > best_logit) {
-                found_finite = true;
-                best_logit = logit;
-                best_expert_index = expert_index;
-            }
-        }
-
-        if (!found_finite) {
-            // No finite logits remain (e.g. all NaN/Inf). Fall back to deterministic
-            // unused expert with a logit of -inf; normalization below handles this case.
-            for (0..num_experts) |expert_index| {
-                if (!used_mask.isSet(expert_index)) {
-                    best_expert_index = expert_index;
-                    break;
-                }
-            }
-            best_logit = -std.math.inf(f32);
-        }
-
-        indices[rank_idx] = @intCast(best_expert_index);
-        weights[rank_idx] = best_logit;
-        used_mask.set(best_expert_index);
-    }
-
-    // Softmax over selected logits (k >= 1 guaranteed by guard above)
-    var max_logit: f32 = -std.math.inf(f32);
-    for (weights[0..top_k]) |w| {
-        if (std.math.isFinite(w) and w > max_logit) max_logit = w;
-    }
-
-    if (!std.math.isFinite(max_logit)) {
-        const uniform = 1.0 / @as(f32, @floatFromInt(top_k));
-        for (0..top_k) |weight_idx| weights[weight_idx] = uniform;
-        return;
-    }
-
-    var sum_exp: f32 = 0.0;
-    for (0..top_k) |weight_idx| {
-        const logit = weights[weight_idx];
-        if (std.math.isFinite(logit)) {
-            weights[weight_idx] = @exp(logit - max_logit);
-        } else {
-            weights[weight_idx] = 0.0;
-        }
-        sum_exp += weights[weight_idx];
-    }
-
-    if (!std.math.isFinite(sum_exp) or sum_exp <= 0.0) {
-        const uniform = 1.0 / @as(f32, @floatFromInt(top_k));
-        for (0..top_k) |weight_idx| weights[weight_idx] = uniform;
-        return;
-    }
-
-    for (0..top_k) |weight_idx| {
-        weights[weight_idx] /= sum_exp;
-    }
-}
-
-fn ensureSlice(allocator: std.mem.Allocator, storage: *[]f32, needed: usize) !void {
-    if (storage.*.len >= needed) return;
-    if (storage.*.len > 0) allocator.free(storage.*);
-    storage.* = try allocator.alloc(f32, needed);
-}
-
-fn ensureSliceU32(allocator: std.mem.Allocator, storage: *[]u32, needed: usize) !void {
-    if (storage.*.len >= needed) return;
-    if (storage.*.len > 0) allocator.free(storage.*);
-    storage.* = try allocator.alloc(u32, needed);
-}
 
 // ============================================================================
 // Tests
@@ -584,7 +397,7 @@ test "forward router scoring simple" {
     const logits = try alloc.alloc(f32, num_experts);
     defer alloc.free(logits);
 
-    computeRouterLogits(&input, &router_weight, null, logits);
+    cpu_matvec.denseLogits(&input, &router_weight, null, logits);
 
     // Expected: [1.0*1 + 2.0*0 + 1.0*0.5 + 0.5*0,
     //            1.0*0 + 2.0*1 + 1.0*0.5 + 0.5*0,
@@ -609,7 +422,7 @@ test "computeRouterLogits supports [num_experts, d_model] router layout" {
     const input = [_]f32{ 1.0, 2.0, 1.0, 0.5 };
     var logits = [_]f32{ 0.0, 0.0, 0.0 };
 
-    computeRouterLogits(&input, &router_weight, null, &logits);
+    cpu_matvec.denseLogits(&input, &router_weight, null, &logits);
 
     try std.testing.expectApproxEqAbs(1.5, logits[0], 1e-5);
     try std.testing.expectApproxEqAbs(2.5, logits[1], 1e-5);
@@ -631,7 +444,7 @@ test "computeRouterLogits supports BF16 router weights" {
     const input = [_]f32{ 1.0, 2.0, 1.0, 0.5 };
     var logits = [_]f32{ 0.0, 0.0, 0.0 };
 
-    computeRouterLogits(&input, &router_weight, null, &logits);
+    cpu_matvec.denseLogits(&input, &router_weight, null, &logits);
 
     try std.testing.expectApproxEqAbs(1.5, logits[0], 1e-5);
     try std.testing.expectApproxEqAbs(2.5, logits[1], 1e-5);
@@ -656,7 +469,7 @@ test "forward router scoring bias" {
     const logits = try alloc.alloc(f32, num_experts);
     defer alloc.free(logits);
 
-    computeRouterLogits(&input, &router_weight, &bias, logits);
+    cpu_matvec.denseLogits(&input, &router_weight, &bias, logits);
 
     // Expected: [1.0 + 0.1, 1.0 + 0.2, 1.0 + 0.3]
     try std.testing.expectApproxEqAbs(1.1, logits[0], 1e-5);
@@ -675,7 +488,7 @@ test "forward top-k highest" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Should select experts 1 (5.0) and 4 (4.0)
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -697,7 +510,7 @@ test "forward top-k single expert" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Should select expert 1 (highest score)
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -716,7 +529,7 @@ test "selectTopKExperts handles non-finite logits deterministically" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
     try std.testing.expectEqual(@as(u32, 3), indices[0]);
     try std.testing.expectEqual(@as(u32, 2), indices[1]);
     try std.testing.expect(std.math.isFinite(weights[0]));
@@ -735,7 +548,7 @@ test "forward top-k all experts" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Should select all in descending order: 1, 3, 2, 0
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -760,7 +573,7 @@ test "forward top-k equal scores" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Should select first k experts due to iteration order
     try std.testing.expectEqual(@as(u32, 0), indices[0]);
@@ -783,7 +596,7 @@ test "forward top-k dominant" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Should select expert 1 and 2
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -809,7 +622,7 @@ test "forward top-k zero error" {
     const weights = try alloc.alloc(f32, 1);
     defer alloc.free(weights);
 
-    const result = selectTopKExperts(&logits, k, indices, weights);
+    const result = cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
     try std.testing.expectError(error.InvalidMoEConfig, result);
 }
 
@@ -824,7 +637,7 @@ test "forward top-k exceeds error" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    const result = selectTopKExperts(&logits, k, indices, weights);
+    const result = cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
     try std.testing.expectError(error.InvalidMoEConfig, result);
 }
 
@@ -840,7 +653,7 @@ test "forward weight normalization" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Top 3: expert 1 (6.0), expert 4 (5.0), expert 5 (4.0)
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -869,7 +682,7 @@ test "forward determinism" {
     const weights1 = try alloc.alloc(f32, k);
     defer alloc.free(weights1);
 
-    try selectTopKExperts(&logits, k, indices1, weights1);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices1, weights1);
 
     // Second run
     const indices2 = try alloc.alloc(u32, k);
@@ -877,7 +690,7 @@ test "forward determinism" {
     const weights2 = try alloc.alloc(f32, k);
     defer alloc.free(weights2);
 
-    try selectTopKExperts(&logits, k, indices2, weights2);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices2, weights2);
 
     // Results should be identical
     for (0..k) |i| {
@@ -897,7 +710,7 @@ test "forward softmax negative" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Verify sum to 1.0 even with negative logits
     var weight_sum: f32 = 0.0;
@@ -922,7 +735,7 @@ test "forward softmax large diff" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Expert 1 (100.0) should dominate
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -997,8 +810,8 @@ test "forward SwiGLU standard" {
     var matmul_scratch = try matmul.MatmulScratch.init(alloc);
     defer matmul_scratch.deinit();
 
-    try ensureSlice(alloc, &scratch.gate_up_values, 2 * d_ff);
-    try ensureSlice(alloc, &scratch.hidden_values, d_ff);
+    try cpu_common.ensureF32Slice(alloc, &scratch.gate_up_values, 2 * d_ff);
+    try cpu_common.ensureF32Slice(alloc, &scratch.hidden_values, d_ff);
 
     try moe.runExpert(&expert, &input, output, &scratch, &matmul_scratch);
 
@@ -1052,17 +865,17 @@ test "forward scratch buffer" {
     try std.testing.expectEqual(@as(usize, 0), scratch.expert_weights.len);
 
     // Test allocation
-    try ensureSlice(alloc, &scratch.router_logits, 10);
+    try cpu_common.ensureF32Slice(alloc, &scratch.router_logits, 10);
     try std.testing.expectEqual(@as(usize, 10), scratch.router_logits.len);
 
     // Test no reallocation when sufficient
     const ptr = scratch.router_logits.ptr;
-    try ensureSlice(alloc, &scratch.router_logits, 5);
+    try cpu_common.ensureF32Slice(alloc, &scratch.router_logits, 5);
     try std.testing.expectEqual(@as(usize, 10), scratch.router_logits.len);
     try std.testing.expectEqual(ptr, scratch.router_logits.ptr);
 
     // Test reallocation when needed
-    try ensureSlice(alloc, &scratch.router_logits, 20);
+    try cpu_common.ensureF32Slice(alloc, &scratch.router_logits, 20);
     try std.testing.expectEqual(@as(usize, 20), scratch.router_logits.len);
 }
 
@@ -1077,7 +890,7 @@ test "forward top-k tie breaking" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Should select first 3 experts with score 5.0 (indices 1, 3, 5)
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -1109,7 +922,7 @@ test "forward router zero input" {
     const logits = try alloc.alloc(f32, num_experts);
     defer alloc.free(logits);
 
-    computeRouterLogits(&zero_input, &router_weight, &bias, logits);
+    cpu_matvec.denseLogits(&zero_input, &router_weight, &bias, logits);
 
     // With zero input, output should be just bias
     try std.testing.expectApproxEqAbs(0.5, logits[0], 1e-5);
@@ -1127,7 +940,7 @@ test "forward top-k small diff" {
     const weights = try alloc.alloc(f32, k);
     defer alloc.free(weights);
 
-    try selectTopKExperts(&logits, k, indices, weights);
+    try cpu_topk.selectTopKNormalized(&logits, k, indices, weights);
 
     // Should select experts 1 and 0 (highest values)
     try std.testing.expectEqual(@as(u32, 1), indices[0]);
@@ -1148,12 +961,12 @@ test "deinit frees scratch buffers" {
     var scratch = MoEScratch{};
 
     // Allocate all scratch buffers
-    try ensureSlice(alloc, &scratch.router_logits, 100);
-    try ensureSlice(alloc, &scratch.expert_weights, 50);
-    try ensureSliceU32(alloc, &scratch.expert_indices, 50);
-    try ensureSlice(alloc, &scratch.expert_outputs, 200);
-    try ensureSlice(alloc, &scratch.gate_up_values, 150);
-    try ensureSlice(alloc, &scratch.hidden_values, 75);
+    try cpu_common.ensureF32Slice(alloc, &scratch.router_logits, 100);
+    try cpu_common.ensureF32Slice(alloc, &scratch.expert_weights, 50);
+    try cpu_common.ensureU32Slice(alloc, &scratch.expert_indices, 50);
+    try cpu_common.ensureF32Slice(alloc, &scratch.expert_outputs, 200);
+    try cpu_common.ensureF32Slice(alloc, &scratch.gate_up_values, 150);
+    try cpu_common.ensureF32Slice(alloc, &scratch.hidden_values, 75);
 
     // Verify buffers are allocated
     try std.testing.expectEqual(@as(usize, 100), scratch.router_logits.len);

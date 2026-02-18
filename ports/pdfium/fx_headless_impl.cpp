@@ -68,6 +68,7 @@ class CHeadlessPlatform : public CFX_GEModule::PlatformIface {
   ~CHeadlessPlatform() override = default;
 
   void Init() override {}
+  void Terminate() override {}
 
   std::unique_ptr<SystemFontInfoIface> CreateDefaultSystemFontInfo() override {
     return std::make_unique<CHeadlessFontInfo>();

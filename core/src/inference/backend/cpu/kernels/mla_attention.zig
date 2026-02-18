@@ -14,17 +14,18 @@ const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const ops = compute.ops.math;
-const simd = compute.simd;
+const cpu_layout = compute.cpu.layout_transform;
+const cpu_norm = compute.cpu.normalization;
+const cpu_reduction = compute.cpu.reduction;
+const cpu_rotary = compute.cpu.rotary;
+const cpu_softmax = compute.cpu.softmax;
+const cpu_cache_store = compute.cpu.cache_store;
 const rope_kernel = @import("rope.zig");
 const trace = @import("../../../../xray/root.zig").trace;
 
 const Tensor = tensor.Tensor;
 const MatmulFn = matmul.MatmulFn;
 const RoPE = rope_kernel.RoPE;
-
-const VEC_LEN = simd.f32_vec_len;
-const F32Vec = simd.F32Vec;
 
 /// MLA-specific configuration derived from graph Op.
 pub const MLAConfig = struct {
@@ -70,6 +71,8 @@ pub const MLATemp = struct {
     q: []f32 = &.{},
     /// KV compressed: [seq_len, kv_lora_rank + qk_rope_head_dim]
     kv_compressed: []f32 = &.{},
+    /// KV nope-only compact rows: [seq_len, kv_lora_rank]
+    kv_nope: []f32 = &.{},
     /// KV nope after expansion: [seq_len, n_heads * (qk_nope_head_dim + v_head_dim)]
     kv_expanded: []f32 = &.{},
     /// Attention scores
@@ -81,6 +84,7 @@ pub const MLATemp = struct {
         if (self.q_compressed.len > 0) allocator.free(self.q_compressed);
         if (self.q.len > 0) allocator.free(self.q);
         if (self.kv_compressed.len > 0) allocator.free(self.kv_compressed);
+        if (self.kv_nope.len > 0) allocator.free(self.kv_nope);
         if (self.kv_expanded.len > 0) allocator.free(self.kv_expanded);
         if (self.scores.len > 0) allocator.free(self.scores);
         if (self.context.len > 0) allocator.free(self.context);
@@ -136,6 +140,11 @@ pub const MLAttention = struct {
         const seq_len: usize = @intCast(input_tensor.shape[1]);
         const cfg = self.config;
 
+        // Decode path appends one token per step into cache.
+        if (use_cache and seq_len != 1) {
+            return error.InvalidShape;
+        }
+
         try self.ensureTemp(scratch, seq_len, use_cache);
 
         // Flatten input for matmul
@@ -151,7 +160,14 @@ pub const MLAttention = struct {
         self.matmul_fn(&input_view, self.q_a_proj, &q_compressed_view, matmul_scratch);
 
         // Step 2: Apply Q norm (RMSNorm per token)
-        applyRMSNormTensor(scratch.q_compressed[0 .. seq_len * cfg.q_lora_rank], self.q_a_norm, cfg.q_lora_rank, self.norm_eps);
+        try cpu_norm.rmsnormContiguousWeightTensor(
+            scratch.q_compressed[0 .. seq_len * cfg.q_lora_rank],
+            seq_len,
+            cfg.q_lora_rank,
+            self.q_a_norm,
+            self.norm_eps,
+            0.0,
+        );
 
         // Step 3: q_lora_rank → n_heads * qk_head_dim
         var q_view = Tensor.view2DSlice(
@@ -179,25 +195,26 @@ pub const MLAttention = struct {
         // Note: norm is applied to [seq_len, kv_lora_rank], not the rope portion
         for (0..seq_len) |t| {
             const start = t * kv_compressed_dim;
-            applyRMSNormSliceTensor(
+            cpu_norm.rmsnormInPlaceWeightTensor(
                 kv_compressed_slice[start .. start + cfg.kv_lora_rank],
                 self.kv_a_norm,
                 self.norm_eps,
+                0.0,
             );
         }
 
         // Step 3: Expand kv_lora_rank → n_heads * (qk_nope_head_dim + v_head_dim)
         const kv_expanded_dim = self.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim);
 
-        // Create view of just the nope portion for expansion
-        // Need to extract non-contiguous slices - copy to temp buffer
-        var nope_temp = try self.allocator.alloc(f32, seq_len * cfg.kv_lora_rank);
-        defer self.allocator.free(nope_temp);
-        for (0..seq_len) |t| {
-            const src_start = t * kv_compressed_dim;
-            const dst_start = t * cfg.kv_lora_rank;
-            @memcpy(nope_temp[dst_start .. dst_start + cfg.kv_lora_rank], kv_compressed_slice[src_start .. src_start + cfg.kv_lora_rank]);
-        }
+        // Extract contiguous nope rows for expansion.
+        const nope_temp = scratch.kv_nope[0 .. seq_len * cfg.kv_lora_rank];
+        try cpu_layout.extractRowPrefixes(
+            kv_compressed_slice,
+            seq_len,
+            kv_compressed_dim,
+            cfg.kv_lora_rank,
+            nope_temp,
+        );
 
         var nope_view = Tensor.view2DSlice(nope_temp, seq_len, cfg.kv_lora_rank);
         var kv_expanded_view = Tensor.view2DSlice(
@@ -219,7 +236,11 @@ pub const MLAttention = struct {
                     // RoPE is applied to the LAST qk_rope_head_dim dimensions
                     const rope_start = head_offset + cfg.qk_nope_head_dim;
                     if (cfg.rope_interleave) {
-                        applyRopeInterleave(q_slice[rope_start .. rope_start + cfg.qk_rope_head_dim], rope, pos);
+                        cpu_rotary.applyInterleavedInPlace(
+                            q_slice[rope_start .. rope_start + cfg.qk_rope_head_dim],
+                            rope,
+                            pos,
+                        );
                     } else {
                         rope.applyInPlace(q_slice[rope_start .. rope_start + cfg.qk_rope_head_dim], pos);
                     }
@@ -231,7 +252,11 @@ pub const MLAttention = struct {
                 const pos = pos_offset + t;
                 const rope_start = t * kv_compressed_dim + cfg.kv_lora_rank;
                 if (cfg.rope_interleave) {
-                    applyRopeInterleave(kv_compressed_slice[rope_start .. rope_start + cfg.qk_rope_head_dim], rope, pos);
+                    cpu_rotary.applyInterleavedInPlace(
+                        kv_compressed_slice[rope_start .. rope_start + cfg.qk_rope_head_dim],
+                        rope,
+                        pos,
+                    );
                 } else {
                     rope.applyInPlace(kv_compressed_slice[rope_start .. rope_start + cfg.qk_rope_head_dim], pos);
                 }
@@ -244,10 +269,8 @@ pub const MLAttention = struct {
         const context_slice = scratch.context[0 .. seq_len * self.n_heads * cfg.v_head_dim];
         @memset(context_slice, 0);
 
-        // Note: Current implementation handles standard MLA attention.
-        // Full MLA with separate rope/nope KV portions, K reconstruction via
-        // concat(k_nope, k_rope.expand(n_heads)), and v_head_dim accumulation
-        // is handled in populateCache and computeAttentionForPosition below.
+        // Cache layout and per-position MLA composition are handled by
+        // populateCache/updateCacheGeneration and computeAttention.
 
         // Prefill: allocate cache memory (does not update cache_position)
         if (!use_cache) {
@@ -302,6 +325,12 @@ pub const MLAttention = struct {
             scratch.kv_compressed = try self.allocator.alloc(f32, kv_comp_size);
         }
 
+        const kv_nope_size = seq_len * cfg.kv_lora_rank;
+        if (scratch.kv_nope.len < kv_nope_size) {
+            if (scratch.kv_nope.len > 0) self.allocator.free(scratch.kv_nope);
+            scratch.kv_nope = try self.allocator.alloc(f32, kv_nope_size);
+        }
+
         const kv_exp_size = seq_len * self.n_heads * (cfg.qk_nope_head_dim + cfg.v_head_dim);
         if (scratch.kv_expanded.len < kv_exp_size) {
             if (scratch.kv_expanded.len > 0) self.allocator.free(scratch.kv_expanded);
@@ -349,39 +378,23 @@ pub const MLAttention = struct {
         }
         cache.kv_capacity = self.max_seq_len;
 
-        // Copy expanded KV to cache
         const kv_expanded = scratch.kv_expanded[0 .. seq_len * self.n_heads * kv_exp_dim];
-        const kv_comp_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
-
-        for (0..seq_len) |t| {
-            const cache_pos = cache.cache_position + t;
-
-            // Copy k_nope and v from expanded
-            for (0..self.n_heads) |h| {
-                const exp_offset = t * self.n_heads * kv_exp_dim + h * kv_exp_dim;
-                const k_cache_offset = h * self.max_seq_len * cfg.qk_head_dim + cache_pos * cfg.qk_head_dim;
-                const v_cache_offset = h * self.max_seq_len * cfg.v_head_dim + cache_pos * cfg.v_head_dim;
-
-                // Copy k_nope
-                @memcpy(
-                    cache.key_cache[k_cache_offset .. k_cache_offset + cfg.qk_nope_head_dim],
-                    kv_expanded[exp_offset .. exp_offset + cfg.qk_nope_head_dim],
-                );
-                // Copy v
-                @memcpy(
-                    cache.value_cache[v_cache_offset .. v_cache_offset + cfg.v_head_dim],
-                    kv_expanded[exp_offset + cfg.qk_nope_head_dim .. exp_offset + kv_exp_dim],
-                );
-            }
-
-            // Copy shared k_rope
-            const rope_src_offset = t * kv_comp_dim + cfg.kv_lora_rank;
-            const rope_cache_offset = cache_pos * cfg.qk_rope_head_dim;
-            @memcpy(
-                cache.rope_key_cache[rope_cache_offset .. rope_cache_offset + cfg.qk_rope_head_dim],
-                kv_compressed[rope_src_offset .. rope_src_offset + cfg.qk_rope_head_dim],
-            );
-        }
+        cpu_cache_store.populateMLACache(
+            cache.key_cache,
+            cache.value_cache,
+            cache.rope_key_cache,
+            self.max_seq_len,
+            self.n_heads,
+            cfg.qk_nope_head_dim,
+            cfg.qk_head_dim,
+            cfg.v_head_dim,
+            cfg.kv_lora_rank,
+            cfg.qk_rope_head_dim,
+            cache.cache_position,
+            kv_expanded,
+            kv_compressed,
+            seq_len,
+        );
         // Note: cache.cache_position is NOT updated here - caller is responsible
     }
 
@@ -393,40 +406,25 @@ pub const MLAttention = struct {
         kv_compressed: []const f32,
         cfg: MLAConfig,
     ) !void {
+        const cache_pos = cache.cache_position;
         const kv_exp_dim = cfg.qk_nope_head_dim + cfg.v_head_dim;
         const kv_comp_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
-
-        // seq_len is always 1 during generation
-        const t: usize = 0;
-        const cache_pos = cache.cache_position;
-
-        // Get expanded KV for current token
         const kv_expanded = scratch.kv_expanded[0 .. self.n_heads * kv_exp_dim];
-
-        // Copy k_nope and v for each head
-        for (0..self.n_heads) |h| {
-            const exp_offset = h * kv_exp_dim;
-            const k_cache_offset = h * self.max_seq_len * cfg.qk_head_dim + cache_pos * cfg.qk_head_dim;
-            const v_cache_offset = h * self.max_seq_len * cfg.v_head_dim + cache_pos * cfg.v_head_dim;
-
-            // Copy k_nope
-            @memcpy(
-                cache.key_cache[k_cache_offset .. k_cache_offset + cfg.qk_nope_head_dim],
-                kv_expanded[exp_offset .. exp_offset + cfg.qk_nope_head_dim],
-            );
-            // Copy v
-            @memcpy(
-                cache.value_cache[v_cache_offset .. v_cache_offset + cfg.v_head_dim],
-                kv_expanded[exp_offset + cfg.qk_nope_head_dim .. exp_offset + kv_exp_dim],
-            );
-        }
-
-        // Copy shared k_rope
-        const rope_src_offset = t * kv_comp_dim + cfg.kv_lora_rank;
-        const rope_cache_offset = cache_pos * cfg.qk_rope_head_dim;
-        @memcpy(
-            cache.rope_key_cache[rope_cache_offset .. rope_cache_offset + cfg.qk_rope_head_dim],
-            kv_compressed[rope_src_offset .. rope_src_offset + cfg.qk_rope_head_dim],
+        const kv_comp_token = kv_compressed[0..kv_comp_dim];
+        cpu_cache_store.appendMLAToken(
+            cache.key_cache,
+            cache.value_cache,
+            cache.rope_key_cache,
+            self.max_seq_len,
+            self.n_heads,
+            cfg.qk_nope_head_dim,
+            cfg.qk_head_dim,
+            cfg.v_head_dim,
+            cfg.kv_lora_rank,
+            cfg.qk_rope_head_dim,
+            cache_pos,
+            kv_expanded,
+            kv_comp_token,
         );
 
         cache.cache_position += 1;
@@ -457,11 +455,10 @@ pub const MLAttention = struct {
                 const q_rope = q_slice[q_offset + cfg.qk_nope_head_dim .. q_offset + cfg.qk_head_dim];
 
                 // Compute scores against all keys
-                var max_score: f32 = -std.math.inf(f32);
                 const effective_seq = if (use_cache) total_seq else q_pos + 1; // Causal
 
                 for (0..effective_seq) |k_pos| {
-                    var score: f32 = 0;
+                    var score: f32 = 0.0;
 
                     // Get k_nope from cache or current
                     const is_current = k_pos >= cache.cache_position;
@@ -472,32 +469,32 @@ pub const MLAttention = struct {
                         const rope_offset = curr_pos * kv_comp_dim + cfg.kv_lora_rank;
                         const k_rope = kv_compressed[rope_offset .. rope_offset + cfg.qk_rope_head_dim];
 
-                        // Dot product: q_nope @ k_nope + q_rope @ k_rope
-                        score = dotProduct(q_nope, k_nope) + dotProduct(q_rope, k_rope);
+                        score = cpu_reduction.dotPairScaled(
+                            q_nope,
+                            k_nope,
+                            q_rope,
+                            k_rope,
+                            self.scale,
+                        );
                     } else {
                         const k_cache_offset = h * self.max_seq_len * cfg.qk_head_dim + k_pos * cfg.qk_head_dim;
                         const k_nope = cache.key_cache[k_cache_offset .. k_cache_offset + cfg.qk_nope_head_dim];
                         const rope_cache_offset = k_pos * cfg.qk_rope_head_dim;
                         const k_rope = cache.rope_key_cache[rope_cache_offset .. rope_cache_offset + cfg.qk_rope_head_dim];
 
-                        score = dotProduct(q_nope, k_nope) + dotProduct(q_rope, k_rope);
+                        score = cpu_reduction.dotPairScaled(
+                            q_nope,
+                            k_nope,
+                            q_rope,
+                            k_rope,
+                            self.scale,
+                        );
                     }
-
-                    score *= self.scale;
                     scores_slice[h * total_seq + k_pos] = score;
-                    if (score > max_score) max_score = score;
                 }
 
-                // Softmax
-                var sum: f32 = 0;
-                for (0..effective_seq) |k_pos| {
-                    const idx = h * total_seq + k_pos;
-                    scores_slice[idx] = @exp(scores_slice[idx] - max_score);
-                    sum += scores_slice[idx];
-                }
-                for (0..effective_seq) |k_pos| {
-                    scores_slice[h * total_seq + k_pos] /= sum;
-                }
+                const head_scores = scores_slice[h * total_seq ..][0..effective_seq];
+                cpu_softmax.stableInPlace(head_scores);
 
                 // Accumulate weighted values
                 const ctx_offset = q_pos * self.n_heads * cfg.v_head_dim + h * cfg.v_head_dim;
@@ -509,15 +506,19 @@ pub const MLAttention = struct {
                         const curr_pos = k_pos - cache.cache_position;
                         const exp_offset = curr_pos * self.n_heads * kv_exp_dim + h * kv_exp_dim + cfg.qk_nope_head_dim;
                         const v = scratch.kv_expanded[exp_offset .. exp_offset + cfg.v_head_dim];
-                        for (0..cfg.v_head_dim) |d| {
-                            context_slice[ctx_offset + d] += weight * v[d];
-                        }
+                        cpu_reduction.weightedAccumulateRow(
+                            context_slice[ctx_offset .. ctx_offset + cfg.v_head_dim],
+                            v,
+                            weight,
+                        );
                     } else {
                         const v_cache_offset = h * self.max_seq_len * cfg.v_head_dim + k_pos * cfg.v_head_dim;
                         const v = cache.value_cache[v_cache_offset .. v_cache_offset + cfg.v_head_dim];
-                        for (0..cfg.v_head_dim) |d| {
-                            context_slice[ctx_offset + d] += weight * v[d];
-                        }
+                        cpu_reduction.weightedAccumulateRow(
+                            context_slice[ctx_offset .. ctx_offset + cfg.v_head_dim],
+                            v,
+                            weight,
+                        );
                     }
                 }
             }
@@ -525,60 +526,69 @@ pub const MLAttention = struct {
     }
 };
 
-// =============================================================================
-// Helper functions
-// =============================================================================
+test "MLAttention.forward rejects decode cache updates with seq_len > 1" {
+    const allocator = std.testing.allocator;
 
-/// Apply RMSNorm in-place to data. Handles both F32 and BF16 norm weights.
-fn applyRMSNormTensor(data: []f32, norm_weight: *const Tensor, dim: usize, eps: f32) void {
-    const n_tokens = data.len / dim;
-    const weight_dtype = norm_weight.dtype;
-    const weight_f32: ?[]const f32 = if (weight_dtype == .f32) norm_weight.asSlice(f32) else null;
-    const weight_u16: ?[]const u16 = if (weight_dtype == .bf16 or weight_dtype == .f16) norm_weight.asSlice(u16) else null;
+    const config = MLAConfig{
+        .q_lora_rank = 1,
+        .kv_lora_rank = 1,
+        .qk_head_dim = 2,
+        .qk_rope_head_dim = 1,
+        .qk_nope_head_dim = 1,
+        .v_head_dim = 1,
+        .rope_interleave = false,
+    };
 
-    // RMSNorm operates in-place: use data as both input and output
-    ops.rmsnormContiguous(
-        data,
-        data,
-        weight_f32,
-        weight_u16,
-        weight_dtype,
-        n_tokens,
-        dim,
-        eps,
-        0.0, // weight_offset
-    );
-}
+    var dummy_weight_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 1 });
+    defer dummy_weight_owned.deinit();
+    var dummy_norm_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{1});
+    defer dummy_norm_owned.deinit();
+    var dummy_weight = dummy_weight_owned.view();
+    var dummy_norm = dummy_norm_owned.view();
 
-/// Apply RMSNorm in-place to a single slice. Handles both F32 and BF16 norm weights.
-fn applyRMSNormSliceTensor(data: []f32, norm_weight: *const Tensor, eps: f32) void {
-    const weight_dtype = norm_weight.dtype;
-    const weight_f32: ?[]const f32 = if (weight_dtype == .f32) norm_weight.asSlice(f32) else null;
-    const weight_u16: ?[]const u16 = if (weight_dtype == .bf16 or weight_dtype == .f16) norm_weight.asSlice(u16) else null;
+    const test_matmul = struct {
+        fn noop(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *matmul.MatmulScratch) void {
+            _ = a;
+            _ = b;
+            _ = out;
+            _ = scratch;
+        }
+    }.noop;
 
-    ops.rmsnormContiguous(
-        data,
-        data,
-        weight_f32,
-        weight_u16,
-        weight_dtype,
-        1, // single token
-        data.len,
-        eps,
-        0.0,
-    );
-}
+    const layer = MLAttention{
+        .d_model = 4,
+        .n_heads = 1,
+        .max_seq_len = 8,
+        .config = config,
+        .allocator = allocator,
+        .q_a_proj = &dummy_weight,
+        .q_a_norm = &dummy_norm,
+        .q_b_proj = &dummy_weight,
+        .kv_a_proj = &dummy_weight,
+        .kv_a_norm = &dummy_norm,
+        .kv_b_proj = &dummy_weight,
+        .o_proj = &dummy_weight,
+        .rope = null,
+        .norm_eps = 1e-6,
+        .scale = 1.0,
+        .matmul_fn = test_matmul,
+        .layer_idx = 0,
+    };
 
-fn applyRopeInterleave(data: []f32, rope: *RoPE, pos: usize) void {
-    // Use the RoPE's built-in interleaved rotation method
-    rope.applyInterleavedInPlace(data, pos);
-}
+    var input_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 2, 4 });
+    defer input_owned.deinit();
+    var output_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 2, 4 });
+    defer output_owned.deinit();
+    var input = input_owned.view();
+    var output = output_owned.view();
 
-fn dotProduct(a: []const f32, b: []const f32) f32 {
-    std.debug.assert(a.len == b.len);
-    var sum: f32 = 0;
-    for (a, b) |x, y| {
-        sum += x * y;
-    }
-    return sum;
+    var cache = MLACache{};
+    defer cache.deinit(allocator);
+    var scratch = MLATemp{};
+    defer scratch.deinit(allocator);
+    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    defer matmul_scratch.deinit();
+
+    const result = layer.forward(&input, &output, &cache, &scratch, &matmul_scratch, true);
+    try std.testing.expectError(error.InvalidShape, result);
 }

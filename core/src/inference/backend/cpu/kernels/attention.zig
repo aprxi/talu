@@ -9,11 +9,14 @@ const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const matmul = compute.ops.matmul;
-const ops = compute.ops.math;
-const simd = compute.simd;
 const flash_attention = compute.ops.simd.flash_attention;
+const cpu_sdpa = compute.cpu.sdpa_decode;
+const cpu_common = compute.cpu.common;
+const cpu_layout = compute.cpu.layout_transform;
+const cpu_cache_layout = compute.cpu.cache_layout;
+const cpu_norm = compute.cpu.normalization;
+const cpu_rotary = compute.cpu.rotary;
 const rope_kernel = @import("rope.zig");
-const fused_attn = @import("fused_attention.zig");
 const fmt = @import("describe_fmt.zig");
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
@@ -25,10 +28,6 @@ const Tensor = tensor.Tensor;
 const MatmulFn = matmul.MatmulFn;
 const RoPE = rope_kernel.RoPE;
 const FlashAttentionFn = flash_attention.FlashAttentionFn;
-
-// Use comptime-detected SIMD width for all vector operations
-const VEC_LEN = simd.f32_vec_len;
-const F32Vec = simd.F32Vec;
 
 /// Threshold for using Flash Attention (prefill only).
 const FLASH_ATTENTION_THRESHOLD: usize = 512;
@@ -81,6 +80,16 @@ pub const MultiHeadAttention = struct {
         sin: []const f32,
         /// Rotary width applied to each head.
         dim: usize,
+    };
+
+    /// Canonical kernel-call contract for backend parity checks.
+    pub const ForwardParams = struct {
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        cache: *AttnCache,
+        scratch: *AttnTemp,
+        matmul_scratch: *matmul.MatmulScratch,
+        use_cache: bool,
     };
 
     d_model: usize,
@@ -192,7 +201,7 @@ pub const MultiHeadAttention = struct {
         if (use_fused_projection) {
             const fused_weights = self.fused_qkv.?;
             const fused_kernel = self.matmul_qkv_fused orelse self.matmul_qkv;
-            const views = fused_attn.projectQkv(&input_view, &fused_weights, scratch.qkv, sequence_len, query_dim, kv_total_dim, fused_kernel, matmul_scratch);
+            const views = cpu_layout.projectQkv(&input_view, &fused_weights, scratch.qkv, sequence_len, query_dim, kv_total_dim, fused_kernel, matmul_scratch);
             query_view = views.q;
             key_view = views.k;
             value_view = views.v;
@@ -218,48 +227,48 @@ pub const MultiHeadAttention = struct {
 
         // Apply attention biases if present
         if (self.q_bias) |bias| {
-            addBias(query_view.asSlice(f32), bias, sequence_len, query_dim);
+            cpu_common.addBiasRows(query_view.asSlice(f32), bias, sequence_len, query_dim);
         }
         if (self.k_bias) |bias| {
-            addBias(key_view.asSlice(f32), bias, sequence_len, kv_total_dim);
+            cpu_common.addBiasRows(key_view.asSlice(f32), bias, sequence_len, kv_total_dim);
         }
         if (self.v_bias) |bias| {
-            addBias(value_view.asSlice(f32), bias, sequence_len, kv_total_dim);
+            cpu_common.addBiasRows(value_view.asSlice(f32), bias, sequence_len, kv_total_dim);
         }
 
         // Apply QKNorm if present (optional per-head normalization)
         // Normalize each head's Q/K vectors independently
         // Note: weight tensors may be stored as BF16/F16 and may not be aligned
         if (self.q_norm) |qn| {
-            const q_slice = query_view.asSlice(f32);
-            var token_index: usize = 0;
-            while (token_index < sequence_len) : (token_index += 1) {
-                var head_index: usize = 0;
-                while (head_index < self.n_heads) : (head_index += 1) {
-                    const offset = token_index * query_dim + head_index * self.head_dim;
-                    applyQKNormInPlace(q_slice[offset .. offset + self.head_dim], qn, self.norm_eps, self.qk_norm_weight_offset);
-                }
-            }
+            cpu_norm.rmsnormHeadsInPlace(
+                query_view.asSlice(f32),
+                sequence_len,
+                self.n_heads,
+                self.head_dim,
+                query_dim,
+                qn,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
         }
         if (self.k_norm) |kn| {
-            const k_slice = key_view.asSlice(f32);
-            var token_index: usize = 0;
-            while (token_index < sequence_len) : (token_index += 1) {
-                var head_index: usize = 0;
-                while (head_index < self.n_kv_heads) : (head_index += 1) {
-                    const offset = token_index * kv_total_dim + head_index * self.head_dim;
-                    applyQKNormInPlace(k_slice[offset .. offset + self.head_dim], kn, self.norm_eps, self.qk_norm_weight_offset);
-                }
-            }
+            cpu_norm.rmsnormHeadsInPlace(
+                key_view.asSlice(f32),
+                sequence_len,
+                self.n_kv_heads,
+                self.head_dim,
+                kv_total_dim,
+                kn,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
         }
 
-        // Apply RoPE to Q/K per position/head
-        // pos_offset is the position in the sequence (accounting for cached tokens)
-        // Note: For partial rotary, rope.dim < head_dim. We only apply RoPE
-        // to the first rope.dim dimensions, leaving the rest unchanged.
+        // Apply RoPE to Q/K.
+        // pos_offset is the position in the sequence (accounting for cached tokens).
         const pos_offset = if (use_cache) cache.cache_position else 0;
         if (self.runtime_rope) |runtime_rope| {
-            try applyRuntimeRoPE(
+            try cpu_rotary.applyRuntimeQK(
                 query_view.asSlice(f32),
                 key_view.asSlice(f32),
                 sequence_len,
@@ -269,24 +278,24 @@ pub const MultiHeadAttention = struct {
                 query_dim,
                 kv_total_dim,
                 pos_offset,
-                runtime_rope,
+                runtime_rope.cos,
+                runtime_rope.sin,
+                runtime_rope.dim,
             );
         } else if (self.rope) |rope| {
-            const rope_dim = rope.dim;
-            var token_index: usize = 0;
-            while (token_index < sequence_len) : (token_index += 1) {
-                const pos = try applyPositionDelta(pos_offset + token_index, self.position_delta);
-                var head_index: usize = 0;
-                while (head_index < self.n_heads) : (head_index += 1) {
-                    const offset = token_index * query_dim + head_index * self.head_dim;
-                    rope.applyInPlace(query_view.asSlice(f32)[offset .. offset + rope_dim], pos);
-                }
-                head_index = 0;
-                while (head_index < self.n_kv_heads) : (head_index += 1) {
-                    const offset = token_index * kv_total_dim + head_index * self.head_dim;
-                    rope.applyInPlace(key_view.asSlice(f32)[offset .. offset + rope_dim], pos);
-                }
-            }
+            try cpu_rotary.applyStaticQK(
+                query_view.asSlice(f32),
+                key_view.asSlice(f32),
+                sequence_len,
+                self.n_heads,
+                self.n_kv_heads,
+                self.head_dim,
+                query_dim,
+                kv_total_dim,
+                pos_offset,
+                self.position_delta,
+                rope,
+            );
         }
 
         if (trace.isEnabled()) {
@@ -424,82 +433,23 @@ pub const MultiHeadAttention = struct {
                 while (head_index < q_head_end) : (head_index += 1) {
                     const query_head = query_values[head_index * head_dim ..][0..head_dim];
                     const scores_for_head = score_values[head_index * score_stride ..][0..kv_sequence_len];
-
-                    // Q·K dot products with inline SIMD
-                    var max_score: f32 = -std.math.inf(f32);
-                    var key_index: usize = 0;
-                    while (key_index < start_kv_index) : (key_index += 1) {
-                        scores_for_head[key_index] = -std.math.inf(f32);
-                    }
-                    while (key_index < kv_sequence_len) : (key_index += 1) {
-                        const k_row = k_cache_base[key_index * head_dim ..][0..head_dim];
-
-                        // Inline SIMD dot product
-                        var sum0: F32Vec = @splat(0);
-                        var sum1: F32Vec = @splat(0);
-                        var dimension_index: usize = 0;
-                        while (dimension_index + 2 * VEC_LEN - 1 < head_dim) : (dimension_index += 2 * VEC_LEN) {
-                            const q_vec0: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                            const k_vec0: F32Vec = k_row[dimension_index..][0..VEC_LEN].*;
-                            const q_vec1: F32Vec = query_head[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                            const k_vec1: F32Vec = k_row[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                            sum0 = @mulAdd(F32Vec, q_vec0, k_vec0, sum0);
-                            sum1 = @mulAdd(F32Vec, q_vec1, k_vec1, sum1);
-                        }
-                        while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                            const q_vec: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                            const k_vec: F32Vec = k_row[dimension_index..][0..VEC_LEN].*;
-                            sum0 = @mulAdd(F32Vec, q_vec, k_vec, sum0);
-                        }
-                        var dot = @reduce(.Add, sum0 + sum1);
-                        while (dimension_index < head_dim) : (dimension_index += 1) {
-                            dot += query_head[dimension_index] * k_row[dimension_index];
-                        }
-                        dot *= scale;
-                        scores_for_head[key_index] = dot;
-                        if (dot > max_score) max_score = dot;
-                    }
-
-                    // Attention sinks (MLX semantics): add an extra "sink" logit before softmax,
-                    // then discard its probability mass (do not renormalize).
-                    // This effectively dampens attention outputs by (1 - p_sink).
                     const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                    if (sink_logit) |sl| {
-                        if (sl > max_score) max_score = sl;
-                    }
-
-                    ops.softmaxMaskedInPlaceWithMax(
-                        scores_for_head,
-                        start_kv_index,
-                        kv_sequence_len,
-                        sink_logit,
-                        exact_softmax,
-                        max_score,
-                        null,
-                    );
-
-                    // Initialize context output for this head to zero
                     const context_for_head = context_values[head_index * head_dim ..][0..head_dim];
-                    @memset(context_for_head, 0);
-
-                    // Context accumulation
-                    var kv_index: usize = 0;
-                    while (kv_index < kv_sequence_len) : (kv_index += 1) {
-                        const attn_weight = scores_for_head[kv_index];
-                        const v_row = v_cache_base[kv_index * head_dim ..][0..head_dim];
-
-                        // SIMD accumulation with FMA
-                        const weight_vec: F32Vec = @splat(attn_weight);
-                        var dimension_index: usize = 0;
-                        while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                            const v_vec: F32Vec = v_row[dimension_index..][0..VEC_LEN].*;
-                            const out_slice = context_for_head[dimension_index..][0..VEC_LEN];
-                            out_slice.* = @mulAdd(F32Vec, weight_vec, v_vec, out_slice.*);
-                        }
-                        while (dimension_index < head_dim) : (dimension_index += 1) {
-                            context_for_head[dimension_index] += attn_weight * v_row[dimension_index];
-                        }
-                    }
+                    cpu_sdpa.decodeHeadScoresAndContext(
+                        query_head,
+                        k_cache_base,
+                        v_cache_base,
+                        scores_for_head,
+                        context_for_head,
+                        .{
+                            .start_kv_index = start_kv_index,
+                            .kv_sequence_len = kv_sequence_len,
+                            .head_dim = head_dim,
+                            .scale = scale,
+                            .sink_logit = sink_logit,
+                            .exact_softmax = exact_softmax,
+                        },
+                    );
                 }
             }
 
@@ -536,7 +486,7 @@ pub const MultiHeadAttention = struct {
             self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
             // Apply output bias if present
             if (self.o_bias) |bias| {
-                addBias(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
+                cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
             }
             if (trace.isEnabled()) {
                 const trace_position_out: u32 = @intCast(cache.cache_position);
@@ -626,7 +576,7 @@ pub const MultiHeadAttention = struct {
             var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
             self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
             if (self.o_bias) |bias| {
-                addBias(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
+                cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
             }
             if (trace.isEnabled()) {
                 trace.emit(
@@ -662,84 +612,29 @@ pub const MultiHeadAttention = struct {
                     end_kv_index - self.sliding_window
                 else
                     0;
-                var max_score: f32 = -std.math.inf(f32);
                 const query_head = query_values[query_index * query_dim + head_index * head_dim ..][0..head_dim];
                 const scores_for_query = score_values[head_index * sequence_len ..][0..sequence_len];
                 const context_for_head = context_values[(query_index * self.n_heads + head_index) * head_dim ..][0..head_dim];
-
-                var key_index: usize = 0;
-                while (key_index < start_kv_index) : (key_index += 1) {
-                    scores_for_query[key_index] = -std.math.inf(f32);
-                }
-                while (key_index < end_kv_index) : (key_index += 1) {
-                    const key_head = key_values[key_index * kv_total_dim + kv_head_idx * head_dim ..][0..head_dim];
-
-                    // SIMD dot product
-                    var sum0: F32Vec = @splat(0);
-                    var sum1: F32Vec = @splat(0);
-                    var dimension_index: usize = 0;
-                    while (dimension_index + 2 * VEC_LEN - 1 < head_dim) : (dimension_index += 2 * VEC_LEN) {
-                        const q_vec0: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                        const k_vec0: F32Vec = key_head[dimension_index..][0..VEC_LEN].*;
-                        const q_vec1: F32Vec = query_head[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                        const k_vec1: F32Vec = key_head[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                        sum0 = @mulAdd(F32Vec, q_vec0, k_vec0, sum0);
-                        sum1 = @mulAdd(F32Vec, q_vec1, k_vec1, sum1);
-                    }
-                    while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                        const q_vec: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                        const k_vec: F32Vec = key_head[dimension_index..][0..VEC_LEN].*;
-                        sum0 = @mulAdd(F32Vec, q_vec, k_vec, sum0);
-                    }
-                    var dot = @reduce(.Add, sum0 + sum1);
-                    while (dimension_index < head_dim) : (dimension_index += 1) {
-                        dot += query_head[dimension_index] * key_head[dimension_index];
-                    }
-                    dot *= scale;
-                    scores_for_query[key_index] = dot;
-                    if (dot > max_score) max_score = dot;
-                }
-                // Fill causal mask (only needed for causal models; bidirectional attends to all keys)
-                if (self.is_causal) {
-                    while (key_index < sequence_len) : (key_index += 1) scores_for_query[key_index] = -std.math.inf(f32);
-                }
-
-                // Attention sinks (MLX semantics): add an extra "sink" logit before softmax,
-                // then discard its probability mass (do not renormalize).
                 const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                if (sink_logit) |sl| {
-                    if (sl > max_score) max_score = sl;
-                }
-
-                ops.softmaxMaskedInPlaceWithMax(
+                cpu_sdpa.prefillHeadScoresAndContext(
+                    query_head,
+                    key_values,
+                    value_values,
                     scores_for_query,
-                    start_kv_index,
-                    end_kv_index,
-                    sink_logit,
-                    exact_softmax,
-                    max_score,
-                    null,
+                    context_for_head,
+                    .{
+                        .start_kv_index = start_kv_index,
+                        .end_kv_index = end_kv_index,
+                        .sequence_len = sequence_len,
+                        .kv_head_idx = kv_head_idx,
+                        .head_dim = head_dim,
+                        .kv_total_dim = kv_total_dim,
+                        .scale = scale,
+                        .sink_logit = sink_logit,
+                        .exact_softmax = exact_softmax,
+                        .is_causal = self.is_causal,
+                    },
                 );
-
-                // Context accumulation directly into output buffer (avoid storing full scores matrix)
-                @memset(context_for_head, 0);
-                var value_index: usize = start_kv_index;
-                while (value_index < end_kv_index) : (value_index += 1) {
-                    const attn_weight = scores_for_query[value_index];
-                    if (attn_weight == 0) continue;
-                    const value_head = value_values[value_index * kv_total_dim + kv_head_idx * head_dim ..][0..head_dim];
-                    const weight_vec: F32Vec = @splat(attn_weight);
-
-                    var dimension_index: usize = 0;
-                    while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                        const v_vec: F32Vec = value_head[dimension_index..][0..VEC_LEN].*;
-                        const out_slice = context_for_head[dimension_index..][0..VEC_LEN];
-                        out_slice.* = @mulAdd(F32Vec, weight_vec, v_vec, out_slice.*);
-                    }
-                    while (dimension_index < head_dim) : (dimension_index += 1) {
-                        context_for_head[dimension_index] += attn_weight * value_head[dimension_index];
-                    }
-                }
             }
         }
 
@@ -775,7 +670,7 @@ pub const MultiHeadAttention = struct {
         self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
         // Apply output bias if present
         if (self.o_bias) |bias| {
-            addBias(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
+            cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
         }
         if (trace.isEnabled()) {
             trace.emit(
@@ -799,19 +694,19 @@ pub const MultiHeadAttention = struct {
 
     pub fn ensureTemp(self: *const MultiHeadAttention, scratch: *AttnTemp, sequence_len: usize, use_cache: bool, query_dim: usize, kv_total_dim: usize, use_fused_projection: bool) !void {
         // Always allocate separate Q, K, V buffers
-        try ensureSlice(self.allocator, &scratch.q, sequence_len * query_dim);
-        try ensureSlice(self.allocator, &scratch.k, sequence_len * kv_total_dim);
-        try ensureSlice(self.allocator, &scratch.v, sequence_len * kv_total_dim);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.q, sequence_len * query_dim);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.k, sequence_len * kv_total_dim);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.v, sequence_len * kv_total_dim);
         if (use_fused_projection) {
             // Need buffer for fused matmul output + rearranged result (2x size)
             // First half: final rearranged Q/K/V
             // Second half: temporary matmul output before rearrangement
-            try ensureSlice(self.allocator, &scratch.qkv, 2 * sequence_len * (query_dim + 2 * kv_total_dim));
+            try cpu_common.ensureF32Slice(self.allocator, &scratch.qkv, 2 * sequence_len * (query_dim + 2 * kv_total_dim));
         }
         // Decode uses scores[head, max_seq_len] for current token; prefill reuses scores[head, sequence_len] per query.
         const scores_needed = if (use_cache) self.n_heads * self.max_seq_len else self.n_heads * sequence_len;
-        try ensureSlice(self.allocator, &scratch.scores, scores_needed);
-        try ensureSlice(self.allocator, &scratch.context_values, sequence_len * self.n_heads * self.head_dim);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.scores, scores_needed);
+        try cpu_common.ensureF32Slice(self.allocator, &scratch.context_values, sequence_len * self.n_heads * self.head_dim);
     }
 
     pub fn ensureKvCapacity(self: *const MultiHeadAttention, cache: *AttnCache, needed_seq: usize, kv_total_dim: usize) !void {
@@ -903,7 +798,7 @@ pub const MultiHeadAttention = struct {
         if (use_fused_projection) {
             const fused_weights = self.fused_qkv.?;
             const fused_kernel = self.matmul_qkv_fused orelse self.matmul_qkv;
-            const views = fused_attn.projectQkv(&input_view, &fused_weights, scratch.qkv, sequence_len, query_dim, kv_total_dim, fused_kernel, matmul_scratch);
+            const views = cpu_layout.projectQkv(&input_view, &fused_weights, scratch.qkv, sequence_len, query_dim, kv_total_dim, fused_kernel, matmul_scratch);
             query_view = views.q;
             key_view = views.k;
             value_view = views.v;
@@ -928,28 +823,34 @@ pub const MultiHeadAttention = struct {
         }
 
         // Apply biases if present
-        if (self.q_bias) |bias| addBias(query_view.asSlice(f32), bias, sequence_len, query_dim);
-        if (self.k_bias) |bias| addBias(key_view.asSlice(f32), bias, sequence_len, kv_total_dim);
-        if (self.v_bias) |bias| addBias(value_view.asSlice(f32), bias, sequence_len, kv_total_dim);
+        if (self.q_bias) |bias| cpu_common.addBiasRows(query_view.asSlice(f32), bias, sequence_len, query_dim);
+        if (self.k_bias) |bias| cpu_common.addBiasRows(key_view.asSlice(f32), bias, sequence_len, kv_total_dim);
+        if (self.v_bias) |bias| cpu_common.addBiasRows(value_view.asSlice(f32), bias, sequence_len, kv_total_dim);
 
         // Apply QKNorm if present (before RoPE)
         if (self.q_norm) |qn| {
-            const q_slice = query_view.asSlice(f32);
-            for (0..sequence_len) |token_index| {
-                for (0..n_heads) |head_index| {
-                    const offset = token_index * query_dim + head_index * head_dim;
-                    applyQKNormInPlace(q_slice[offset .. offset + head_dim], qn, self.norm_eps, self.qk_norm_weight_offset);
-                }
-            }
+            cpu_norm.rmsnormHeadsInPlace(
+                query_view.asSlice(f32),
+                sequence_len,
+                n_heads,
+                head_dim,
+                query_dim,
+                qn,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
         }
         if (self.k_norm) |kn| {
-            const k_slice = key_view.asSlice(f32);
-            for (0..sequence_len) |token_index| {
-                for (0..n_kv_heads) |head_index| {
-                    const offset = token_index * kv_total_dim + head_index * head_dim;
-                    applyQKNormInPlace(k_slice[offset .. offset + head_dim], kn, self.norm_eps, self.qk_norm_weight_offset);
-                }
-            }
+            cpu_norm.rmsnormHeadsInPlace(
+                key_view.asSlice(f32),
+                sequence_len,
+                n_kv_heads,
+                head_dim,
+                kv_total_dim,
+                kn,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
         }
 
         // Get current cache position for RoPE
@@ -958,7 +859,7 @@ pub const MultiHeadAttention = struct {
 
         // Apply RoPE (after QKNorm)
         if (self.runtime_rope) |runtime_rope| {
-            try applyRuntimeRoPE(
+            try cpu_rotary.applyRuntimeQK(
                 query_view.asSlice(f32),
                 key_view.asSlice(f32),
                 sequence_len,
@@ -968,21 +869,24 @@ pub const MultiHeadAttention = struct {
                 query_dim,
                 kv_total_dim,
                 pos_offset,
-                runtime_rope,
+                runtime_rope.cos,
+                runtime_rope.sin,
+                runtime_rope.dim,
             );
         } else if (self.rope) |rope| {
-            const rope_dim = rope.dim;
-            for (0..sequence_len) |token_index| {
-                const pos = try applyPositionDelta(pos_offset + token_index, self.position_delta);
-                for (0..n_heads) |head_index| {
-                    const offset = token_index * query_dim + head_index * head_dim;
-                    rope.applyInPlace(query_view.asSlice(f32)[offset .. offset + rope_dim], pos);
-                }
-                for (0..n_kv_heads) |head_index| {
-                    const offset = token_index * kv_total_dim + head_index * head_dim;
-                    rope.applyInPlace(key_view.asSlice(f32)[offset .. offset + rope_dim], pos);
-                }
-            }
+            try cpu_rotary.applyStaticQK(
+                query_view.asSlice(f32),
+                key_view.asSlice(f32),
+                sequence_len,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                query_dim,
+                kv_total_dim,
+                pos_offset,
+                self.position_delta,
+                rope,
+            );
         }
 
         // Trace Q/K/V after projections and RoPE
@@ -1033,63 +937,23 @@ pub const MultiHeadAttention = struct {
                 for (q_head_start..q_head_end) |head_index| {
                     const query_head = query_values[head_index * head_dim ..][0..head_dim];
                     const scores_for_head = score_values[head_index * score_stride ..][0..kv_sequence_len];
-
-                    // Q·K dot products
-                    var max_score: f32 = -std.math.inf(f32);
-                    for (0..start_kv_index) |key_index| {
-                        scores_for_head[key_index] = -std.math.inf(f32);
-                    }
-                    for (start_kv_index..kv_sequence_len) |key_index| {
-                        const k_row = k_cache_head[key_index * head_dim ..][0..head_dim];
-                        var sum0: F32Vec = @splat(0);
-                        var sum1: F32Vec = @splat(0);
-                        var dimension_index: usize = 0;
-                        while (dimension_index + 2 * VEC_LEN - 1 < head_dim) : (dimension_index += 2 * VEC_LEN) {
-                            const q_vec0: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                            const k_vec0: F32Vec = k_row[dimension_index..][0..VEC_LEN].*;
-                            const q_vec1: F32Vec = query_head[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                            const k_vec1: F32Vec = k_row[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                            sum0 = @mulAdd(F32Vec, q_vec0, k_vec0, sum0);
-                            sum1 = @mulAdd(F32Vec, q_vec1, k_vec1, sum1);
-                        }
-                        while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                            const q_vec: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                            const k_vec: F32Vec = k_row[dimension_index..][0..VEC_LEN].*;
-                            sum0 = @mulAdd(F32Vec, q_vec, k_vec, sum0);
-                        }
-                        var dot = @reduce(.Add, sum0 + sum1);
-                        while (dimension_index < head_dim) : (dimension_index += 1) {
-                            dot += query_head[dimension_index] * k_row[dimension_index];
-                        }
-                        dot *= scale;
-                        scores_for_head[key_index] = dot;
-                        if (dot > max_score) max_score = dot;
-                    }
-
-                    // Softmax with sink support
                     const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                    if (sink_logit) |sl| {
-                        if (sl > max_score) max_score = sl;
-                    }
-                    ops.softmaxMaskedInPlaceWithMax(scores_for_head, start_kv_index, kv_sequence_len, sink_logit, exact_softmax, max_score, null);
-
-                    // Context accumulation
                     const context_for_head = context_values[head_index * head_dim ..][0..head_dim];
-                    @memset(context_for_head, 0);
-                    for (0..kv_sequence_len) |kv_index| {
-                        const attn_weight = scores_for_head[kv_index];
-                        const v_row = v_cache_head[kv_index * head_dim ..][0..head_dim];
-                        const weight_vec: F32Vec = @splat(attn_weight);
-                        var dimension_index: usize = 0;
-                        while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                            const v_vec: F32Vec = v_row[dimension_index..][0..VEC_LEN].*;
-                            const out_slice = context_for_head[dimension_index..][0..VEC_LEN];
-                            out_slice.* = @mulAdd(F32Vec, weight_vec, v_vec, out_slice.*);
-                        }
-                        while (dimension_index < head_dim) : (dimension_index += 1) {
-                            context_for_head[dimension_index] += attn_weight * v_row[dimension_index];
-                        }
-                    }
+                    cpu_sdpa.decodeHeadScoresAndContext(
+                        query_head,
+                        k_cache_head,
+                        v_cache_head,
+                        scores_for_head,
+                        context_for_head,
+                        .{
+                            .start_kv_index = start_kv_index,
+                            .kv_sequence_len = kv_sequence_len,
+                            .head_dim = head_dim,
+                            .scale = scale,
+                            .sink_logit = sink_logit,
+                            .exact_softmax = exact_softmax,
+                        },
+                    );
                 }
             }
         } else {
@@ -1112,73 +976,29 @@ pub const MultiHeadAttention = struct {
                         end_kv_index - self.sliding_window
                     else
                         0;
-
-                    var max_score: f32 = -std.math.inf(f32);
                     const query_head = query_values[query_index * query_dim + head_index * head_dim ..][0..head_dim];
                     const scores_for_query = score_values[head_index * sequence_len ..][0..sequence_len];
                     const context_for_head = context_values[(query_index * n_heads + head_index) * head_dim ..][0..head_dim];
-
-                    // Compute scores for attended positions
-                    for (0..start_kv_index) |key_index| {
-                        scores_for_query[key_index] = -std.math.inf(f32);
-                    }
-                    for (start_kv_index..end_kv_index) |key_index| {
-                        const key_head = key_values[key_index * kv_total_dim + kv_head_idx * head_dim ..][0..head_dim];
-                        var sum0: F32Vec = @splat(0);
-                        var sum1: F32Vec = @splat(0);
-                        var dimension_index: usize = 0;
-                        while (dimension_index + 2 * VEC_LEN - 1 < head_dim) : (dimension_index += 2 * VEC_LEN) {
-                            const q_vec0: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                            const k_vec0: F32Vec = key_head[dimension_index..][0..VEC_LEN].*;
-                            const q_vec1: F32Vec = query_head[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                            const k_vec1: F32Vec = key_head[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                            sum0 = @mulAdd(F32Vec, q_vec0, k_vec0, sum0);
-                            sum1 = @mulAdd(F32Vec, q_vec1, k_vec1, sum1);
-                        }
-                        while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                            const q_vec: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                            const k_vec: F32Vec = key_head[dimension_index..][0..VEC_LEN].*;
-                            sum0 = @mulAdd(F32Vec, q_vec, k_vec, sum0);
-                        }
-                        var dot = @reduce(.Add, sum0 + sum1);
-                        while (dimension_index < head_dim) : (dimension_index += 1) {
-                            dot += query_head[dimension_index] * key_head[dimension_index];
-                        }
-                        dot *= scale;
-                        scores_for_query[key_index] = dot;
-                        if (dot > max_score) max_score = dot;
-                    }
-
-                    // Mask future positions (only for causal/decoder models)
-                    if (self.is_causal) {
-                        for (end_kv_index..sequence_len) |key_index| {
-                            scores_for_query[key_index] = -std.math.inf(f32);
-                        }
-                    }
-
-                    // Softmax
                     const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                    if (sink_logit) |sl| {
-                        if (sl > max_score) max_score = sl;
-                    }
-                    ops.softmaxMaskedInPlaceWithMax(scores_for_query, start_kv_index, end_kv_index, sink_logit, exact_softmax, max_score, null);
-
-                    // Context
-                    @memset(context_for_head, 0);
-                    for (0..end_kv_index) |key_index| {
-                        const attn_weight = scores_for_query[key_index];
-                        const value_head = value_values[key_index * kv_total_dim + kv_head_idx * head_dim ..][0..head_dim];
-                        const weight_vec: F32Vec = @splat(attn_weight);
-                        var dimension_index: usize = 0;
-                        while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                            const v_vec: F32Vec = value_head[dimension_index..][0..VEC_LEN].*;
-                            const out_slice = context_for_head[dimension_index..][0..VEC_LEN];
-                            out_slice.* = @mulAdd(F32Vec, weight_vec, v_vec, out_slice.*);
-                        }
-                        while (dimension_index < head_dim) : (dimension_index += 1) {
-                            context_for_head[dimension_index] += attn_weight * value_head[dimension_index];
-                        }
-                    }
+                    cpu_sdpa.prefillHeadScoresAndContext(
+                        query_head,
+                        key_values,
+                        value_values,
+                        scores_for_query,
+                        context_for_head,
+                        .{
+                            .start_kv_index = start_kv_index,
+                            .end_kv_index = end_kv_index,
+                            .sequence_len = sequence_len,
+                            .kv_head_idx = kv_head_idx,
+                            .head_dim = head_dim,
+                            .kv_total_dim = kv_total_dim,
+                            .scale = scale,
+                            .sink_logit = sink_logit,
+                            .exact_softmax = exact_softmax,
+                            .is_causal = self.is_causal,
+                        },
+                    );
                 }
             }
         }
@@ -1215,7 +1035,7 @@ pub const MultiHeadAttention = struct {
         const attn_view = Tensor.view2DSlice(context_values[0 .. sequence_len * query_dim], sequence_len, query_dim);
         var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), sequence_len, self.d_model);
         self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
-        if (self.o_bias) |bias| addBias(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
+        if (self.o_bias) |bias| cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, sequence_len, self.d_model);
 
         // Trace: emit attention output
         if (trace.isEnabled()) {
@@ -1327,86 +1147,6 @@ pub const MultiHeadAttention = struct {
         try self.forward(input_tensor, output_tensor, cache, scratch, matmul_scratch, use_cache);
     }
 };
-
-/// Apply QKNorm (RMS normalization) in-place with support for BF16/F16/F32 weight tensors.
-/// This handles the weight tensor dtype conversion for QKNorm weights which may be stored
-/// in various formats in safetensors files.
-fn applyQKNormInPlace(vec: []f32, weight_tensor: *const Tensor, eps: f32, weight_offset: f32) void {
-    ops.rmsnormInPlaceWeightTensor(vec, weight_tensor, eps, weight_offset);
-}
-
-fn ensureSlice(allocator: std.mem.Allocator, storage: *[]f32, needed: usize) !void {
-    if (storage.*.len >= needed) return;
-    if (storage.*.len > 0) allocator.free(storage.*);
-    storage.* = try allocator.alloc(f32, needed);
-}
-
-/// Add bias to output tensor (for attention with bias)
-/// data: [sequence_len, dim], bias: [dim]
-fn addBias(data: []f32, bias: []const f32, sequence_len: usize, dim: usize) void {
-    for (0..sequence_len) |token_index| {
-        const row = data[token_index * dim ..][0..dim];
-        var vec_idx: usize = 0;
-        while (vec_idx + VEC_LEN - 1 < dim) : (vec_idx += VEC_LEN) {
-            const row_vec: F32Vec = row[vec_idx..][0..VEC_LEN].*;
-            const bias_vec: F32Vec = bias[vec_idx..][0..VEC_LEN].*;
-            row[vec_idx..][0..VEC_LEN].* = row_vec + bias_vec;
-        }
-        while (vec_idx < dim) : (vec_idx += 1) {
-            row[vec_idx] += bias[vec_idx];
-        }
-    }
-}
-
-fn applyRuntimeRoPE(
-    query_values: []f32,
-    key_values: []f32,
-    sequence_len: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    query_dim: usize,
-    kv_total_dim: usize,
-    pos_offset: usize,
-    runtime_rope: MultiHeadAttention.RuntimeRoPE,
-) !void {
-    const rope_dim = runtime_rope.dim;
-    if (rope_dim == 0 or rope_dim > head_dim or (rope_dim % 2) != 0) return error.InvalidShape;
-
-    for (0..sequence_len) |token_index| {
-        const pos = pos_offset + token_index;
-        const base = pos * rope_dim;
-        if (base + rope_dim > runtime_rope.cos.len or base + rope_dim > runtime_rope.sin.len) return error.InvalidShape;
-        const cos = runtime_rope.cos[base .. base + rope_dim];
-        const sin = runtime_rope.sin[base .. base + rope_dim];
-
-        for (0..n_heads) |head_index| {
-            const offset = token_index * query_dim + head_index * head_dim;
-            applyRoPEFromCosSin(query_values[offset .. offset + rope_dim], cos, sin);
-        }
-        for (0..n_kv_heads) |head_index| {
-            const offset = token_index * kv_total_dim + head_index * head_dim;
-            applyRoPEFromCosSin(key_values[offset .. offset + rope_dim], cos, sin);
-        }
-    }
-}
-
-fn applyRoPEFromCosSin(vec: []f32, cos: []const f32, sin: []const f32) void {
-    const half = vec.len / 2;
-    for (0..half) |idx| {
-        const x1 = vec[idx];
-        const x2 = vec[idx + half];
-        vec[idx] = x1 * cos[idx] - x2 * sin[idx];
-        vec[idx + half] = x2 * cos[idx + half] + x1 * sin[idx + half];
-    }
-}
-
-fn applyPositionDelta(base_pos: usize, delta: isize) !usize {
-    if (delta == 0) return base_pos;
-    const shifted: i64 = @as(i64, @intCast(base_pos)) + @as(i64, delta);
-    if (shifted < 0) return error.InvalidShape;
-    return @as(usize, @intCast(shifted));
-}
 
 // =============================================================================
 // Batched Decode Support (for continuous batching)
@@ -1544,51 +1284,76 @@ fn forwardBatchedDecode(
         // Q projection
         var query_view = Tensor.view2DSlice(query_buffer, 1, query_dim);
         self.matmul_qkv(&input_view, self.q_proj.?, &query_view, matmul_scratch);
-        if (self.q_bias) |bias| addBias(query_buffer, bias, 1, query_dim);
+        if (self.q_bias) |bias| cpu_common.addBiasRows(query_buffer, bias, 1, query_dim);
 
         // K projection
         var key_view = Tensor.view2DSlice(key_buffer, 1, kv_total_dim);
         const matmul_k = self.matmul_k orelse self.matmul_qkv;
         matmul_k(&input_view, self.k_proj.?, &key_view, matmul_scratch);
-        if (self.k_bias) |bias| addBias(key_buffer, bias, 1, kv_total_dim);
+        if (self.k_bias) |bias| cpu_common.addBiasRows(key_buffer, bias, 1, kv_total_dim);
 
         // V projection
         var value_view = Tensor.view2DSlice(value_buffer, 1, kv_total_dim);
         const matmul_v = self.matmul_v orelse self.matmul_qkv;
         matmul_v(&input_view, self.v_proj.?, &value_view, matmul_scratch);
-        if (self.v_bias) |bias| addBias(value_buffer, bias, 1, kv_total_dim);
+        if (self.v_bias) |bias| cpu_common.addBiasRows(value_buffer, bias, 1, kv_total_dim);
 
         // Apply QKNorm if configured (must be before RoPE, same as in forward())
         if (self.q_norm) |q_norm_weights| {
-            for (0..n_heads) |h| {
-                applyQKNormInPlace(
-                    query_buffer[h * head_dim ..][0..head_dim],
-                    q_norm_weights,
-                    self.norm_eps,
-                    self.qk_norm_weight_offset,
-                );
-            }
+            cpu_norm.rmsnormHeadsInPlace(
+                query_buffer,
+                1,
+                n_heads,
+                head_dim,
+                query_dim,
+                q_norm_weights,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
         }
         if (self.k_norm) |k_norm_weights| {
-            for (0..n_kv_heads) |h| {
-                applyQKNormInPlace(
-                    key_buffer[h * head_dim ..][0..head_dim],
-                    k_norm_weights,
-                    self.norm_eps,
-                    self.qk_norm_weight_offset,
-                );
-            }
+            cpu_norm.rmsnormHeadsInPlace(
+                key_buffer,
+                1,
+                n_kv_heads,
+                head_dim,
+                kv_total_dim,
+                k_norm_weights,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
         }
 
-        // Apply RoPE if configured (after QKNorm)
-        if (self.rope) |rope_ptr| {
-            const rope_dim = rope_ptr.dim;
-            for (0..n_heads) |h| {
-                rope_ptr.applyInPlace(query_buffer[h * head_dim ..][0..rope_dim], cache_position);
-            }
-            for (0..n_kv_heads) |h| {
-                rope_ptr.applyInPlace(key_buffer[h * head_dim ..][0..rope_dim], cache_position);
-            }
+        // Apply RoPE if configured (after QKNorm).
+        if (self.runtime_rope) |runtime_rope| {
+            try cpu_rotary.applyRuntimeQK(
+                query_buffer,
+                key_buffer,
+                1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                query_dim,
+                kv_total_dim,
+                cache_position,
+                runtime_rope.cos,
+                runtime_rope.sin,
+                runtime_rope.dim,
+            );
+        } else if (self.rope) |rope_ptr| {
+            try cpu_rotary.applyStaticQK(
+                query_buffer,
+                key_buffer,
+                1,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                query_dim,
+                kv_total_dim,
+                cache_position,
+                self.position_delta,
+                rope_ptr,
+            );
         }
 
         // 2. Append K/V to cache
@@ -1615,67 +1380,23 @@ fn forwardBatchedDecode(
             for (q_head_start..q_head_end) |head_index| {
                 const query_head = query_buffer[head_index * head_dim ..][0..head_dim];
                 const scores_for_head = scores_base[head_index * max_seq_len ..][0..kv_sequence_len];
-
-                // Q·K dot products
-                var max_score: f32 = -std.math.inf(f32);
-                for (0..start_kv_index) |key_index| {
-                    scores_for_head[key_index] = -std.math.inf(f32);
-                }
-                for (start_kv_index..kv_sequence_len) |key_index| {
-                    const k_row = k_cache_head[key_index * head_dim ..][0..head_dim];
-
-                    // SIMD dot product
-                    var sum0: F32Vec = @splat(0);
-                    var sum1: F32Vec = @splat(0);
-                    var dimension_index: usize = 0;
-                    while (dimension_index + 2 * VEC_LEN - 1 < head_dim) : (dimension_index += 2 * VEC_LEN) {
-                        const q_vec0: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                        const k_vec0: F32Vec = k_row[dimension_index..][0..VEC_LEN].*;
-                        const q_vec1: F32Vec = query_head[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                        const k_vec1: F32Vec = k_row[dimension_index + VEC_LEN ..][0..VEC_LEN].*;
-                        sum0 = @mulAdd(F32Vec, q_vec0, k_vec0, sum0);
-                        sum1 = @mulAdd(F32Vec, q_vec1, k_vec1, sum1);
-                    }
-                    while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                        const q_vec: F32Vec = query_head[dimension_index..][0..VEC_LEN].*;
-                        const k_vec: F32Vec = k_row[dimension_index..][0..VEC_LEN].*;
-                        sum0 = @mulAdd(F32Vec, q_vec, k_vec, sum0);
-                    }
-                    var dot = @reduce(.Add, sum0 + sum1);
-                    while (dimension_index < head_dim) : (dimension_index += 1) {
-                        dot += query_head[dimension_index] * k_row[dimension_index];
-                    }
-                    dot *= scale;
-                    scores_for_head[key_index] = dot;
-                    if (dot > max_score) max_score = dot;
-                }
-
-                // Softmax
                 const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                if (sink_logit) |sl| {
-                    if (sl > max_score) max_score = sl;
-                }
-                ops.softmaxMaskedInPlaceWithMax(scores_for_head, start_kv_index, kv_sequence_len, sink_logit, false, max_score, null);
-
-                // Context accumulation
                 const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
-                @memset(context_for_head, 0);
-
-                for (0..kv_sequence_len) |kv_index| {
-                    const attn_weight = scores_for_head[kv_index];
-                    const v_row = v_cache_head[kv_index * head_dim ..][0..head_dim];
-
-                    const weight_vec: F32Vec = @splat(attn_weight);
-                    var dimension_index: usize = 0;
-                    while (dimension_index + VEC_LEN - 1 < head_dim) : (dimension_index += VEC_LEN) {
-                        const v_vec: F32Vec = v_row[dimension_index..][0..VEC_LEN].*;
-                        const out_slice = context_for_head[dimension_index..][0..VEC_LEN];
-                        out_slice.* = @mulAdd(F32Vec, weight_vec, v_vec, out_slice.*);
-                    }
-                    while (dimension_index < head_dim) : (dimension_index += 1) {
-                        context_for_head[dimension_index] += attn_weight * v_row[dimension_index];
-                    }
-                }
+                cpu_sdpa.decodeHeadScoresAndContext(
+                    query_head,
+                    k_cache_head,
+                    v_cache_head,
+                    scores_for_head,
+                    context_for_head,
+                    .{
+                        .start_kv_index = start_kv_index,
+                        .kv_sequence_len = kv_sequence_len,
+                        .head_dim = head_dim,
+                        .scale = scale,
+                        .sink_logit = sink_logit,
+                        .exact_softmax = false,
+                    },
+                );
             }
         }
 
@@ -1683,7 +1404,7 @@ fn forwardBatchedDecode(
         const context_view = Tensor.view2DSlice(context_base, 1, query_dim);
         var out_view = Tensor.view2DSlice(request.output_values, 1, self.d_model);
         self.matmul_o(&context_view, self.o_proj, &out_view, matmul_scratch);
-        if (self.o_bias) |bias| addBias(request.output_values, bias, 1, self.d_model);
+        if (self.o_bias) |bias| cpu_common.addBiasRows(request.output_values, bias, 1, self.d_model);
     }
 }
 
@@ -2224,7 +1945,7 @@ test "MultiHeadAttention.forward addBias single token" {
     var data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
     const bias = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
 
-    addBias(&data, &bias, sequence_len, dim);
+    cpu_common.addBiasRows(&data, &bias, sequence_len, dim);
 
     try std.testing.expectApproxEqAbs(@as(f32, 1.1), data[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 2.2), data[1], 1e-6);
@@ -2242,7 +1963,7 @@ test "MultiHeadAttention.forward addBias multiple tokens" {
     };
     const bias = [_]f32{ 0.5, 1.0, 1.5 };
 
-    addBias(&data, &bias, sequence_len, dim);
+    cpu_common.addBiasRows(&data, &bias, sequence_len, dim);
 
     // Token 0
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), data[0], 1e-6);
@@ -3024,10 +2745,10 @@ test "MultiHeadAttention.ensureKvCapacity: preserves cached data during growth" 
 }
 
 test "applyPositionDelta applies negative multimodal offset" {
-    try std.testing.expectEqual(@as(usize, 42), try applyPositionDelta(198, -156));
-    try std.testing.expectEqual(@as(usize, 43), try applyPositionDelta(199, -156));
+    try std.testing.expectEqual(@as(usize, 42), try cpu_cache_layout.offsetPosition(198, -156));
+    try std.testing.expectEqual(@as(usize, 43), try cpu_cache_layout.offsetPosition(199, -156));
 }
 
 test "applyPositionDelta rejects negative resulting positions" {
-    try std.testing.expectError(error.InvalidShape, applyPositionDelta(3, -4));
+    try std.testing.expectError(error.InvalidShape, cpu_cache_layout.offsetPosition(3, -4));
 }

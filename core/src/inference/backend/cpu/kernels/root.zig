@@ -4,13 +4,46 @@
 //! It is intentionally separate from `src/compute/backend/cpu/root.zig` (the backend
 //! object) to keep the backend API focused.
 
-const block_kernels = @import("../block_kernels.zig");
+pub const support = .{
+    .attention = true,
+    .describe_fmt = true,
+    .embedding = true,
+    .ffn = true,
+    .fused_attention = true,
+    .kv_cache = true,
+    .mamba = true,
+    .mla_attention = true,
+    .moe = true,
+    .norm = true,
+    .rope = true,
+    .shortconv = true,
+    .weights = true,
+};
+
+const block_kernels = @import("../executor/weights.zig");
 const moe_kernels = @import("moe.zig");
 pub const kv_cache = @import("kv_cache.zig");
+pub const attention = @import("attention.zig");
+pub const describe_fmt = @import("describe_fmt.zig");
+pub const embedding = @import("embedding.zig");
+pub const ffn = @import("ffn.zig");
+pub const fused_attention = @import("fused_attention.zig");
+pub const mamba = @import("mamba.zig");
+pub const mla_attention = @import("mla_attention.zig");
+pub const moe = @import("moe.zig");
+pub const norm = @import("norm.zig");
+pub const rope = @import("rope.zig");
+pub const shortconv = @import("shortconv.zig");
+pub const weights = @import("weights.zig");
 
 // Block containers + scratch
 pub const TransformerBlock = block_kernels.TransformerBlock;
 pub const ScratchBuffer = block_kernels.ScratchBuffer;
+pub const EmbeddingLookup = embedding.EmbeddingLookup;
+pub const KVCache = kv_cache.KVCache;
+pub const FusedAttention = fused_attention.FusedAttention;
+pub const RotaryEmbedding = rope.RotaryEmbedding;
+pub const WeightAccess = weights.WeightAccess;
 
 // Attention / FFN kernel structs and scratch
 pub const AttnTemp = block_kernels.AttnTemp;

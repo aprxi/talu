@@ -24,6 +24,9 @@ const log = @import("../../../../log.zig");
 const compute = @import("../../../../compute/root.zig");
 const kernel = compute.kernel;
 const matmul = compute.ops.matmul;
+const cpu_conv1d = compute.cpu.conv1d_depthwise;
+const cpu_norm = compute.cpu.normalization;
+const cpu_state_space = compute.cpu.state_space;
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 
@@ -179,8 +182,12 @@ pub const MambaKernel = struct {
         const d_head: usize = cfg.d_head;
         const n_groups: usize = cfg.n_groups;
 
-        // Determine sequence length from input tensor shape
-        // Input can be (d_model,) for single token or (1, seq_len, d_model) for batched
+        // Determine sequence length from input tensor shape.
+        // Supported inputs are (d_model,), (seq_len, d_model), or (1, seq_len, d_model).
+        const batch_size: usize = if (input.n_dims == 3) @intCast(input.shape[0]) else 1;
+        if (batch_size != 1) {
+            return error.InvalidShape;
+        }
         const seq_len: usize = if (input.n_dims == 3)
             @intCast(input.shape[1])
         else if (input.n_dims == 2)
@@ -205,8 +212,10 @@ pub const MambaKernel = struct {
 
         // Weight data (constant across tokens)
         const conv_weight = w.conv1d_weight.asSlice(f32);
+        const conv_bias = if (w.conv1d_bias) |bias| bias.asSlice(f32) else null;
         const A_log = w.A_log.asSlice(f32);
         const D_skip = w.D.asSlice(f32);
+        const dt_bias = if (w.dt_bias) |bias| bias.asSlice(f32) else null;
 
         // State arrays (updated across tokens)
         const conv_state = state.conv_state;
@@ -229,45 +238,13 @@ pub const MambaKernel = struct {
             const xBC = proj_out[d_inner .. d_inner + xBC_len];
             const dt_raw = proj_out[d_inner + xBC_len ..][0..n_heads];
 
-            // 2. Causal 1D convolution with state update
-            // Conv is applied to the FULL xBC (d_inner + 2*n_groups*d_state channels)
-            // Conv1d weight shape is [xBC_len, 1, d_conv] -> [1792, 1, 4]
-            // For each channel in xBC (not just d_inner!)
-            for (0..xBC_len) |ch| {
-                // Shift state left (drop oldest, keep d_conv-1 most recent)
-                const state_offset = ch * d_conv;
-                for (0..d_conv - 1) |i| {
-                    conv_state[state_offset + i] = conv_state[state_offset + i + 1];
-                }
-                // Append new input
-                conv_state[state_offset + d_conv - 1] = xBC[ch];
-
-                // Depthwise conv: sum over kernel
-                var sum: f32 = 0;
-                for (0..d_conv) |k| {
-                    sum += conv_state[state_offset + k] * conv_weight[ch * d_conv + k];
-                }
-
-                // Add bias if present
-                if (w.conv1d_bias) |bias| {
-                    sum += bias.asSlice(f32)[ch];
-                }
-
-                // Store in conv_out buffer (needs to be xBC_len size now!)
-                // But conv_out is only d_inner size... we need to use xBC directly
-                // Actually, conv output goes back into xBC in-place for the reference impl
-                // For now, let's write to the xBC buffer (it's already a slice)
-                // Wait, xBC is const. We need a mutable buffer.
-                // Let's use proj_out directly since we're done with the input proj part
-                proj_out[d_inner + ch] = sum;
-            }
+            // 2. Causal depthwise convolution with state update over xBC in-place.
+            try cpu_conv1d.stepDepthwiseState(xBC, conv_state, conv_weight, conv_bias, xBC_len, d_conv);
 
             // Apply SiLU to the ENTIRE xBC conv output before splitting
             // This matches HuggingFace: xBC_conv = F.silu(conv1d(xBC))
             const xBC_conv = proj_out[d_inner .. d_inner + xBC_len];
-            for (xBC_conv) |*v| {
-                v.* = silu(v.*);
-            }
+            cpu_state_space.siluInPlace(xBC_conv);
 
             // Now split the conv output after silu
             // xBC layout after conv+silu: [x_conv_out (d_inner) | B (n_groups*d_state) | C (n_groups*d_state)]
@@ -276,17 +253,12 @@ pub const MambaKernel = struct {
             const C_raw = xBC_conv[d_inner + n_groups * d_state ..][0 .. n_groups * d_state];
 
             // 3. Discretize dt: dt = softplus(dt_raw + dt_bias)
-            for (0..n_heads) |h| {
-                var dt_val = dt_raw[h];
-                if (w.dt_bias) |bias| {
-                    dt_val += bias.asSlice(f32)[h];
-                }
-                dt[h] = softplus(dt_val);
-            }
+            try cpu_state_space.discretizeDtSoftplus(dt, dt_raw, dt_bias);
 
             // 4. SSM scan: h_t = exp(A * dt) * h_{t-1} + B * x_t
             //              y_t = C * h_t + D * x_t
-            self.ssm_scan(
+            cpu_state_space.scanStep(
+                self.ssm_scan,
                 ssm_state,
                 ssm_out,
                 x_conv_out,
@@ -303,14 +275,12 @@ pub const MambaKernel = struct {
 
             // 5. Gating: y = y * silu(z)
             // NOTE: Gating happens BEFORE norm per HuggingFace reference
-            for (0..d_inner) |i| {
-                ssm_out[i] *= silu(z[i]);
-            }
+            try cpu_state_space.applySiluGateInPlace(ssm_out, z);
 
             // 6. Apply optional norm AFTER gating
             if (w.norm_weight) |norm_w| {
                 const norm_data = norm_w.asSlice(f32);
-                rmsnorm(ssm_out, norm_data, 1e-5);
+                cpu_norm.rmsnormInPlace(ssm_out, norm_data, 1e-5);
             }
 
             // 7. Output projection: (d_inner) @ (d_inner, d_model) -> (d_model)
@@ -407,38 +377,6 @@ pub const MambaScratch = struct {
 };
 
 // =============================================================================
-// Helper Functions
-// =============================================================================
-
-/// SiLU activation: x * sigmoid(x)
-inline fn silu(x: f32) f32 {
-    return x / (1.0 + @exp(-x));
-}
-
-/// Softplus activation: log(1 + exp(x))
-inline fn softplus(x: f32) f32 {
-    // Numerically stable version
-    if (x > 20.0) return x;
-    return @log(1.0 + @exp(x));
-}
-
-/// Simple RMSNorm in-place
-fn rmsnorm(x: []f32, weight: []const f32, eps: f32) void {
-    // Compute RMS
-    var sum_sq: f32 = 0;
-    for (x) |v| {
-        sum_sq += v * v;
-    }
-    const rms = @sqrt(sum_sq / @as(f32, @floatFromInt(x.len)) + eps);
-    const inv_rms = 1.0 / rms;
-
-    // Normalize and scale
-    for (x, 0..) |*v, i| {
-        v.* = v.* * inv_rms * weight[i];
-    }
-}
-
-// =============================================================================
 // Unit Tests
 // =============================================================================
 
@@ -527,24 +465,51 @@ test "MambaScratch init and deinit" {
     try std.testing.expectEqual(@as(usize, config.n_heads), dt.len);
 }
 
-test "silu activation" {
-    // silu(0) = 0
-    try std.testing.expectApproxEqAbs(@as(f32, 0), silu(0), 1e-6);
+test "MambaKernel.forward rejects batch > 1 for 3D input" {
+    const allocator = std.testing.allocator;
 
-    // silu(x) approaches x as x -> inf
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), silu(10.0), 0.01);
+    const config = MambaConfig{
+        .d_model = 4,
+        .d_state = 2,
+        .d_conv = 2,
+        .n_heads = 1,
+        .d_head = 4,
+    };
 
-    // silu(-x) approaches 0 as x -> inf
-    try std.testing.expectApproxEqAbs(@as(f32, 0), silu(-10.0), 0.01);
-}
+    var dummy_weight_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 1 });
+    defer dummy_weight_owned.deinit();
+    var dummy_weight = dummy_weight_owned.view();
 
-test "softplus activation" {
-    // softplus(0) = ln(2)
-    try std.testing.expectApproxEqAbs(@as(f32, 0.693147), softplus(0), 1e-4);
+    const weights = MambaWeights{
+        .in_proj = &dummy_weight,
+        .conv1d_weight = &dummy_weight,
+        .A_log = &dummy_weight,
+        .D = &dummy_weight,
+        .out_proj = &dummy_weight,
+    };
 
-    // softplus(x) approaches x for large x
-    try std.testing.expectApproxEqAbs(@as(f32, 25.0), softplus(25.0), 0.01);
+    const kernel_inst = MambaKernel.init(
+        config,
+        weights,
+        matmul.matmulF32,
+        matmul.matmulF32,
+        compute.ops.simd.ssm_scan.ssmScanF32,
+    );
 
-    // softplus(-x) approaches 0 for large negative x
-    try std.testing.expectApproxEqAbs(@as(f32, 0), softplus(-10.0), 0.001);
+    var input_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 2, 3, 4 });
+    defer input_owned.deinit();
+    var output_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 2, 3, 4 });
+    defer output_owned.deinit();
+    var input = input_owned.view();
+    var output = output_owned.view();
+
+    var state = try MambaState.init(allocator, 1, config);
+    defer state.deinit();
+    var scratch = try MambaScratch.init(allocator, config);
+    defer scratch.deinit();
+    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    defer matmul_scratch.deinit();
+
+    const result = kernel_inst.forward(&input, &output, &state, &scratch, &matmul_scratch);
+    try std.testing.expectError(error.InvalidShape, result);
 }

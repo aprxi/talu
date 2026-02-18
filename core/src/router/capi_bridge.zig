@@ -124,7 +124,7 @@ pub const CToolCallRef = extern struct {
     arguments: ?[*:0]const u8,
 };
 
-/// Finish reason enum values (matches FinishReason in session.zig).
+/// Finish reason enum values (matches inference/root.zig FinishReason).
 pub const CFinishReason = enum(u8) {
     /// Generation stopped due to EOS token.
     eos_token = 0,

@@ -11,6 +11,9 @@
 //! Slots are allocated/freed dynamically as requests arrive/complete.
 
 const std = @import("std");
+const compute = @import("../../../../compute/root.zig");
+const cpu_cache_layout = compute.cpu.cache_layout;
+const cpu_cache_store = compute.cpu.cache_store;
 
 /// Per-slot state tracking sequence position and activity.
 pub const SlotState = struct {
@@ -223,15 +226,18 @@ pub const BatchedKVCache = struct {
         std.debug.assert(k_data.len == kv_values_per_token);
         std.debug.assert(v_data.len == kv_values_per_token);
 
-        // Copy K/V for each head
-        for (0..self.n_kv_heads) |kv_head| {
-            const src_k = k_data[kv_head * self.head_dim ..][0..self.head_dim];
-            const src_v = v_data[kv_head * self.head_dim ..][0..self.head_dim];
-            const dst_k = self.getK(slot_index, kv_head, slot_position);
-            const dst_v = self.getV(slot_index, kv_head, slot_position);
-            @memcpy(dst_k, src_k);
-            @memcpy(dst_v, src_v);
-        }
+        cpu_cache_store.appendTokenKV(
+            self.key_cache,
+            self.value_cache,
+            self.slot_stride,
+            self.head_stride,
+            self.head_dim,
+            self.n_kv_heads,
+            slot_index,
+            slot_position,
+            k_data,
+            v_data,
+        );
 
         slot_state.position = slot_position + 1;
     }
@@ -255,17 +261,19 @@ pub const BatchedKVCache = struct {
 
         const start_position = slot_state.position;
 
-        // Copy K/V for each position and head
-        for (0..self.n_kv_heads) |kv_head| {
-            for (0..seq_len) |token_index| {
-                const src_k = k_data[token_index * kv_values_per_token + kv_head * self.head_dim ..][0..self.head_dim];
-                const src_v = v_data[token_index * kv_values_per_token + kv_head * self.head_dim ..][0..self.head_dim];
-                const dst_k = self.getK(slot_index, kv_head, start_position + token_index);
-                const dst_v = self.getV(slot_index, kv_head, start_position + token_index);
-                @memcpy(dst_k, src_k);
-                @memcpy(dst_v, src_v);
-            }
-        }
+        cpu_cache_store.appendBatchKV(
+            self.key_cache,
+            self.value_cache,
+            self.slot_stride,
+            self.head_stride,
+            self.head_dim,
+            self.n_kv_heads,
+            slot_index,
+            start_position,
+            k_data,
+            v_data,
+            seq_len,
+        );
 
         slot_state.position = start_position + seq_len;
     }
@@ -275,10 +283,37 @@ pub const BatchedKVCache = struct {
     // =========================================================================
 
     fn kvOffset(self: *const BatchedKVCache, slot_index: usize, kv_head: usize, position: usize) usize {
-        std.debug.assert(slot_index < self.max_batch_size);
-        std.debug.assert(kv_head < self.n_kv_heads);
-        std.debug.assert(position < self.max_seq_len);
-        return slot_index * self.slot_stride + kv_head * self.head_stride + position * self.head_dim;
+        return cpu_cache_layout.kvOffset(
+            slot_index,
+            kv_head,
+            position,
+            self.max_batch_size,
+            self.n_kv_heads,
+            self.max_seq_len,
+            self.slot_stride,
+            self.head_stride,
+            self.head_dim,
+        );
+    }
+};
+
+pub const KVCache = struct {
+    /// Canonical kernel-call contract for backend parity checks.
+    pub const ForwardParams = struct {
+        cache_index: usize,
+        key_input: []const f32,
+        value_input: []const f32,
+    };
+
+    cache: *BatchedKVCache,
+
+    pub fn forward(
+        self: *KVCache,
+        cache_index: usize,
+        key_input: []const f32,
+        value_input: []const f32,
+    ) !void {
+        return self.cache.appendKV(cache_index, key_input, value_input);
     }
 };
 
@@ -1786,4 +1821,18 @@ test "allocSlot freeSlot stress test" {
         }
     }
     try std.testing.expectEqual(@as(usize, 0), cache.activeCount());
+}
+
+test "KVCache.forward appends single token" {
+    const allocator = std.testing.allocator;
+    var cache = try BatchedKVCache.init(allocator, 2, 1, 4, 8);
+    defer cache.deinit();
+
+    const slot = cache.allocSlot().?;
+    var kernel = KVCache{ .cache = &cache };
+    try kernel.forward(slot, &.{ 1.0, 2.0, 3.0, 4.0 }, &.{ 5.0, 6.0, 7.0, 8.0 });
+
+    try std.testing.expectEqual(@as(usize, 1), cache.getPosition(slot));
+    try std.testing.expectEqualSlices(f32, &.{ 1.0, 2.0, 3.0, 4.0 }, cache.getK(slot, 0, 0));
+    try std.testing.expectEqualSlices(f32, &.{ 5.0, 6.0, 7.0, 8.0 }, cache.getV(slot, 0, 0));
 }
