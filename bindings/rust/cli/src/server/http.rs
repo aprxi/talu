@@ -82,7 +82,15 @@ impl Service<Request<Incoming>> for Router {
             let path = req.uri().path().to_string();
             let path_log = path.clone();
 
+            let content_length = req.headers().get("content-length")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-");
+            let content_type = req.headers().get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("-");
             log::info!(target: "server::http", "{} {}", method, path);
+            log::debug!(target: "server::http", "{} {} (content-length={}, content-type={})",
+                method, path, content_length, content_type);
 
             // Auth-exempt routes.
             let response = match (method.clone(), path.as_str()) {

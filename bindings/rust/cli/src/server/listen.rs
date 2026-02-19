@@ -72,6 +72,7 @@ async fn accept_tcp(listener: TcpListener, router: Router) {
             Ok(conn) => conn,
             Err(_) => continue,
         };
+        log::trace!(target: "server::listen", "TCP connection accepted");
         let router = router.clone();
         tokio::spawn(async move {
             if let Err(_err) = serve_tcp_connection(stream, router).await {
@@ -98,6 +99,7 @@ async fn accept_unix(listener: UnixListener, router: Router) {
             Ok(conn) => conn,
             Err(_) => continue,
         };
+        log::trace!(target: "server::listen", "UDS connection accepted");
         let router = router.clone();
         tokio::spawn(async move {
             if let Err(_err) = serve_unix_connection(stream, router).await {

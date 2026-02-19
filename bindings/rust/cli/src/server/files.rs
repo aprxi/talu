@@ -195,6 +195,7 @@ pub async fn handle_upload(
         None => bucket.to_path_buf(),
     };
 
+    log::trace!(target: "server::files", "BlobsHandle::open({:?})", storage_path);
     let blobs = match BlobsHandle::open(&storage_path) {
         Ok(h) => h,
         Err(e) => return blob_error_response(e),
@@ -211,15 +212,33 @@ pub async fn handle_upload(
         Err(UploadError::Blob(e)) => return blob_error_response(e),
     };
 
+    log::trace!(target: "server::files", "DocumentsHandle::open({:?})", storage_path);
     let docs = match DocumentsHandle::open(&storage_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
 
-    let file_id = format!("file_{}", uuid::Uuid::new_v4().simple());
     let purpose = upload.purpose.unwrap_or_else(|| "assistants".to_string());
-    let created_at = now_unix_seconds();
     let filename = sanitize_filename(&upload.filename).unwrap_or_else(|| "upload.bin".to_string());
+
+    log::debug!(target: "server::files", "upload: filename={} size={} mime={:?} blob_ref={}",
+        filename, upload.bytes, upload.mime_type, upload.blob_ref);
+
+    // Deterministic file ID from content hash — the blob_ref sha256 hex is
+    // already computed during streaming, so same content = same document ID.
+    // This makes uploads idempotent: docs.get() is an O(1) existence check.
+    let blob_hex = upload.blob_ref.strip_prefix("sha256:").unwrap_or(&upload.blob_ref);
+    let file_id = format!("file_{}", &blob_hex[..blob_hex.len().min(32)]);
+
+    // O(1) existence check: if this content already exists, return it.
+    if let Ok(Some(doc)) = docs.get(&file_id) {
+        log::debug!(target: "server::files", "idempotent: {} already exists", file_id);
+        if let Ok(descriptor) = descriptor_from_doc(doc) {
+            return json_response(StatusCode::OK, &to_file_object_response(descriptor));
+        }
+    }
+
+    let created_at = now_unix_seconds();
 
     // Fail-safe inspection: read blob back, inspect, store metadata.
     // Timeouts, panics, and errors are logged — upload always succeeds.
@@ -252,6 +271,7 @@ pub async fn handle_upload(
 
     if let Some(info) = inspection {
         let kind_str = map_file_kind(&info.kind);
+        log::debug!(target: "server::files", "inspection: kind={} mime={}", kind_str, info.mime);
         doc_content.kind = Some(kind_str.to_string());
         doc_content.description = Some(info.description);
 

@@ -141,6 +141,13 @@ pub async fn handle_responses(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
+    log::debug!(
+        target: "server::gen",
+        "model={} stream={} store={} session_id={:?} prompt_id={:?} prev_response_id={:?}",
+        request.model.as_deref().unwrap_or("(default)"),
+        stream, store, request_session_id, prompt_id, previous_response_id
+    );
+
     // Validate that input is present (string, array, or null with previous_response_id).
     if input_value.is_none() && previous_response_id.is_none() {
         return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Missing input");
@@ -605,12 +612,14 @@ async fn generate_response(
                 .as_mut()
                 .ok_or_else(|| anyhow!("no backend available"))?;
             // Create ChatHandle with system prompt if prompt_id was provided
+            log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt_for_task.is_some());
             let chat = ChatHandle::new(system_prompt_for_task.as_deref())?;
 
             // Enable storage persistence if store=true and bucket is configured.
             // set_storage_db auto-loads any existing items for this session.
             if let Some(ref bp) = bucket_for_task {
                 if let Some(bp_str) = bp.to_str() {
+                    log::trace!(target: "server::gen", "set_storage_db({:?}, {})", bp_str, session_id_for_task);
                     chat.set_storage_db(bp_str, &session_id_for_task)
                         .map_err(|e| anyhow!("failed to set storage: {}", e))?;
                 }
@@ -619,6 +628,7 @@ async fn generate_response(
             // Restore previous conversation from in-memory JSON (only when
             // storage is not active — set_storage_db already loaded items).
             if let Some(ref prev) = prev_json {
+                log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
                 chat.load_responses_json(prev)
                     .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
             }
@@ -627,13 +637,16 @@ async fn generate_response(
             // The Zig protocol parser stores input_image parts in conversation
             // items; the generate function extracts them for the vision encoder.
             if let Some(ref json) = input_json {
+                log::trace!(target: "server::gen", "resolve_file_references(input, {} bytes)", json.len());
                 let resolved = match file_storage_path.as_deref() {
                     Some(sp) => resolve_file_references(json, sp)?,
                     None => json.clone(),
                 };
+                log::trace!(target: "server::gen", "load_responses_json(input, {} bytes)", resolved.len());
                 chat.load_responses_json(&resolved)
                     .map_err(|e| anyhow!("failed to load input: {}", e))?;
             } else if let Some(ref text) = input_string {
+                log::trace!(target: "server::gen", "append_user_message({} chars)", text.len());
                 chat.append_user_message(text)
                     .map_err(|e| anyhow!("failed to append user message: {}", e))?;
             }
@@ -652,11 +665,17 @@ async fn generate_response(
                 cfg.top_p = top_p as f32;
             }
 
+            log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
+                model_id_for_task, max_output_tokens, temperature, top_p);
+            log::trace!(target: "server::gen", "generate(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
+                pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
             let result = talu::router::generate(&chat, &[], backend, &cfg)
                 .map_err(|e| anyhow!("generation failed: {}", e))?;
 
             let prompt_tokens = result.prompt_tokens();
             let completion_tokens = result.completion_tokens();
+            log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
+                prompt_tokens, completion_tokens);
 
             // Persist session metadata so the conversation appears in list_sessions.
             // A brand-new chat has at most 2 items before generation: an optional
@@ -1081,12 +1100,14 @@ fn run_streaming_generation(
         .as_mut()
         .ok_or_else(|| anyhow!("no backend available"))?;
     // Create ChatHandle with system prompt if prompt_id was provided
+    log::trace!(target: "server::gen", "ChatHandle::new(system_prompt={})", system_prompt.is_some());
     let chat = ChatHandle::new(system_prompt.as_deref())?;
 
     // Enable storage persistence if store=true and bucket is configured.
     // set_storage_db auto-loads any existing items for this session.
     if let Some(ref bp) = bucket_path {
         if let Some(bp_str) = bp.to_str() {
+            log::trace!(target: "server::gen", "set_storage_db({:?}, {})", bp_str, session_id);
             chat.set_storage_db(bp_str, &session_id)
                 .map_err(|e| anyhow!("failed to set storage: {}", e))?;
         }
@@ -1095,6 +1116,7 @@ fn run_streaming_generation(
     // Restore previous conversation from in-memory JSON (only when
     // storage is not active — set_storage_db already loaded items).
     if let Some(ref prev) = prev_json {
+        log::trace!(target: "server::gen", "load_responses_json(prev, {} bytes)", prev.len());
         chat.load_responses_json(prev)
             .map_err(|e| anyhow!("failed to load previous conversation: {}", e))?;
     }
@@ -1103,13 +1125,16 @@ fn run_streaming_generation(
     // The Zig protocol parser stores input_image parts in conversation
     // items; the generate function extracts them for the vision encoder.
     if let Some(ref json) = input_json {
+        log::trace!(target: "server::gen", "resolve_file_references(input, {} bytes)", json.len());
         let resolved = match file_storage_path.as_deref() {
             Some(sp) => resolve_file_references(json, sp)?,
             None => json.clone(),
         };
+        log::trace!(target: "server::gen", "load_responses_json(input, {} bytes)", resolved.len());
         chat.load_responses_json(&resolved)
             .map_err(|e| anyhow!("failed to load input: {}", e))?;
     } else if let Some(ref text) = input_string {
+        log::trace!(target: "server::gen", "append_user_message({} chars)", text.len());
         chat.append_user_message(text)
             .map_err(|e| anyhow!("failed to append user message: {}", e))?;
     }
@@ -1128,6 +1153,9 @@ fn run_streaming_generation(
     // Pass the stop flag for cooperative cancellation.
     cfg.stop_flag = Some(stop_flag);
 
+    log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
+        model_id, max_output_tokens, temperature, top_p);
+
     let ctx_clone = ctx.clone();
     let callback: talu::router::StreamCallback = Box::new(move |token| {
         if let Ok(mut guard) = ctx_clone.lock() {
@@ -1139,6 +1167,8 @@ fn run_streaming_generation(
     // Record item count before generation to extract only new output items.
     let pre_gen_count = chat.item_count();
 
+    log::trace!(target: "server::gen", "generate_stream(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
+        pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
     let stream_result = talu::router::generate_stream(&chat, &[], backend, &cfg, callback)
         .map_err(|e| anyhow!("generation failed: {}", e))?;
 
@@ -1167,6 +1197,9 @@ fn run_streaming_generation(
         .and_then(|v| v.as_array().map(|arr| arr[pre_gen_count..].to_vec()))
         .map(serde_json::Value::Array)
         .unwrap_or_else(|| json!([]));
+
+    log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
+        stream_result.prompt_tokens, stream_result.completion_tokens);
 
     Ok(StreamGenResult {
         output_items,
