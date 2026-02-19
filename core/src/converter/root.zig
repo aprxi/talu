@@ -12,8 +12,7 @@ const log = @import("../log.zig");
 const tensor_mod = @import("../tensor.zig");
 const safetensors = @import("../io/safetensors/root.zig");
 const dtype_mod = @import("../dtype.zig");
-const graph = @import("../graph/root.zig");
-const loader = @import("../graph/loader/root.zig");
+const op_types = @import("../models/op_types.zig");
 
 pub const mapping = @import("mapping.zig");
 pub const grouped_affine = @import("grouped_affine.zig");
@@ -105,13 +104,13 @@ pub fn shouldQuantizeTensor(info: mapping.TensorInfo, src_tensor: tensor_mod.Ten
 /// Maps full tensor names (e.g., "model.layers.0.self_attn.q_proj.weight") to their layout.
 pub const WeightLayoutMap = struct {
     allocator: std.mem.Allocator,
-    layouts: std.StringHashMap(graph.types.WeightLayout),
+    layouts: std.StringHashMap(op_types.WeightLayout),
     lm_head_names: std.StringHashMap(void),
 
     pub fn init(allocator: std.mem.Allocator) WeightLayoutMap {
         return .{
             .allocator = allocator,
-            .layouts = std.StringHashMap(graph.types.WeightLayout).init(allocator),
+            .layouts = std.StringHashMap(op_types.WeightLayout).init(allocator),
             .lm_head_names = std.StringHashMap(void).init(allocator),
         };
     }
@@ -153,7 +152,7 @@ pub const WeightLayoutMap = struct {
 /// This extracts layout information from the graph's weight specs.
 pub fn buildWeightLayoutMap(
     allocator: std.mem.Allocator,
-    arch: *const graph.Architecture,
+    arch: *const op_types.Architecture,
     num_layers: usize,
 ) !WeightLayoutMap {
     var layout_map = WeightLayoutMap.init(allocator);
@@ -197,7 +196,7 @@ pub fn buildWeightLayoutMap(
 }
 
 /// Get the weight specs for a given layer (handles heterogeneous models).
-fn getWeightsForLayer(arch: *const graph.Architecture, layer_idx: usize) []const graph.types.WeightSpec {
+fn getWeightsForLayer(arch: *const op_types.Architecture, layer_idx: usize) []const op_types.WeightSpec {
     if (arch.block_variants) |variants| {
         // Heterogeneous model - get weights from the appropriate variant
         const variant_idx = arch.getVariantIndex(layer_idx);
@@ -1206,7 +1205,7 @@ test "buildWeightLayoutMap uses weight candidates for block weights" {
     const qproj_candidates = [_][]const u8{
         "model.layers.{d}.self_attn.q_proj.weight",
     };
-    const block_weights = [_]graph.types.WeightSpec{
+    const block_weights = [_]op_types.WeightSpec{
         .{
             .id = "mixer.q_proj.weight",
             .candidates = &qproj_candidates,
@@ -1218,7 +1217,7 @@ test "buildWeightLayoutMap uses weight candidates for block weights" {
     };
     const model_types = [_][]const u8{"test"};
 
-    const arch = graph.types.Architecture{
+    const arch = op_types.Architecture{
         .name = "test_arch",
         .model_types = &model_types,
         .block_weights = &block_weights,

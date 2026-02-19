@@ -5,9 +5,9 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
+const models = @import("../../../../models/root.zig");
 const Block = @import("block.zig").Block;
-const graph_runtime = @import("../graph.zig");
-const types = graph_runtime.layer_ops;
+const layer_ops = @import("../../../../models/layer_ops.zig");
 const tensor_mod = @import("../../../../tensor.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
@@ -41,9 +41,10 @@ const cpu_blocks = block_kernels;
 const kv_cache = @import("../kernels/kv_cache.zig");
 const LayeredBatchedKVCache = kv_cache.LayeredBatchedKVCache;
 
-const LoadedModel = graph_runtime.LoadedModel;
+const LoadedModel = models.LoadedModel;
 const ModelConfig = tensor_mod.ModelConfig;
-const LayerOp = types.LayerOp;
+const LayerOp = layer_ops.LayerOp;
+const BlockKind = block_kernels.BlockType;
 
 pub fn formatLinearLike(
     writer: anytype,
@@ -751,13 +752,21 @@ pub const Transformer = struct {
         var block_layers = try allocator.alloc(Block, layer_count);
         errdefer allocator.free(block_layers);
 
+        const static_entry = detectStaticTopologyEntry(loaded);
+
         // Get block program for each layer (handles heterogeneous models)
         // For heterogeneous models, each layer may have a different program (e.g., Mamba vs Attention)
         // Track Mamba/ShortConv layer indices separately from global layer index
         var mamba_layer_count: usize = 0;
         var shortconv_layer_count: usize = 0;
         for (blocks, 0..) |*block, layer_idx| {
-            const layer_program = try graph_runtime.blockProgramForLayer(@constCast(loaded), layer_idx);
+            const block_kind = if (block.isMamba())
+                BlockKind.mamba
+            else if (block.isShortConv())
+                BlockKind.shortconv
+            else
+                BlockKind.attention_mlp;
+            const layer_program = try resolveLayerProgram(static_entry, block_kind);
             const mamba_idx: ?usize = if (block.isMamba()) blk: {
                 const idx = mamba_layer_count;
                 mamba_layer_count += 1;
@@ -796,9 +805,7 @@ pub const Transformer = struct {
             null;
 
         // Model type for debug output.
-        // All models now use .custom arch - actual architecture info is in the graph registry.
-        _ = model_config.model_arch;
-        const model_type: []const u8 = "TransformerModel";
+        const model_type: []const u8 = if (static_entry) |entry| entry.id else "TransformerModel";
 
         return .{
             .model_type = model_type,
@@ -833,6 +840,23 @@ pub const Transformer = struct {
             .mamba_layer_idx = mamba_layer_idx,
             .shortconv_layer_idx = shortconv_layer_idx,
         };
+    }
+
+    fn detectStaticTopologyEntry(loaded: *const LoadedModel) ?models.contract.ModelDescriptor {
+        if (loaded.runtime.architecture_id) |arch_id| {
+            return models.registry.detectByArchitectureId(arch_id);
+        }
+        return null;
+    }
+
+    fn resolveLayerProgram(
+        static_entry: ?models.contract.ModelDescriptor,
+        block_kind: BlockKind,
+    ) ![]const LayerOp {
+        if (static_entry) |entry| {
+            return models.registry.blockProgramFor(entry, block_kind) orelse error.UnsupportedModel;
+        }
+        return error.UnsupportedModel;
     }
 
     /// Free model allocated by build

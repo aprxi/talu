@@ -15,8 +15,8 @@ const registry = compute.registry;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_copy = compute.cpu.tensor_copy;
 const cpu_layout = compute.cpu.layout_transform;
-const graph_runtime = @import("../graph.zig");
-const ops = graph_runtime.layer_ops;
+const graph_types = @import("../../../../models/op_types.zig");
+const layer_ops = @import("../../../../models/layer_ops.zig");
 const fmt = @import("../kernels/describe_fmt.zig");
 const runtime_mod = @import("runtime.zig");
 const inspect = @import("../../../../xray/root.zig");
@@ -25,7 +25,7 @@ const log = @import("../../../../log.zig");
 const progress_mod = @import("../../../../capi/progress.zig");
 const topology = @import("../../topology.zig");
 
-pub const BufferId = ops.BufferId;
+pub const BufferId = layer_ops.BufferId;
 
 // Import CPU kernels
 const attn = @import("../kernels/attention.zig");
@@ -136,7 +136,7 @@ pub const AttentionMlpWeights = struct {
     is_causal: bool = true,
     /// Graph block ops for this layer (determines kernel list ordering).
     /// Empty means default pre-norm order: [norm, attention, norm, mlp].
-    block_ops: []const graph_runtime.Op = &.{},
+    block_ops: []const graph_types.Op = &.{},
 
     // === MLA (Multi-Latent Attention) weights ===
     // Used when mla_config is set. MLA uses compressed Q/KV projections.
@@ -197,7 +197,7 @@ pub const BlockMapContext = struct {
     rope: ?*rope.RoPE = null,
     sliding_window: usize = 0,
     is_causal: bool = true,
-    block_ops: []const graph_runtime.Op = &.{},
+    block_ops: []const graph_types.Op = &.{},
     mamba_config: ?mamba.MambaConfig = null,
     shortconv_config: ?shortconv.ShortConvConfig = null,
     mla_config: ?mla.MLAConfig = null,

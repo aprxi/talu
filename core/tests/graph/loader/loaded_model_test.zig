@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const main = @import("main");
-const LoadedModel = main.graph.loader.LoadedModel;
+const LoadedModel = main.models.dispatcher.LoadedModel;
 
 // =============================================================================
 // Type Verification Tests
@@ -67,7 +67,7 @@ test "LoadedModel has ensureCpuBlocks method" {
 // Optional Field Tests
 // =============================================================================
 
-test "LoadedModel has runtime architecture fields" {
+test "LoadedModel does not store runtime_arch pointer" {
     const info = @typeInfo(LoadedModel);
     const fields = info.@"struct".fields;
 
@@ -77,7 +77,12 @@ test "LoadedModel has runtime architecture fields" {
         if (comptime std.mem.eql(u8, field.name, "runtime_arch")) has_runtime_arch = true;
     }
 
-    try std.testing.expect(has_runtime_arch);
+    try std.testing.expect(!has_runtime_arch);
+}
+
+test "LoadedModel runtime metadata stores architecture id and qk norm mode" {
+    try std.testing.expect(@hasField(@FieldType(LoadedModel, "runtime"), "architecture_id"));
+    try std.testing.expect(@hasField(@FieldType(LoadedModel, "runtime"), "explicit_qk_norm_ops"));
 }
 
 test "LoadedModel has file metadata fields" {

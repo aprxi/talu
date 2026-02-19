@@ -7,7 +7,6 @@ const std = @import("std");
 const main = @import("main");
 const converter = main.converter;
 const WeightLayoutMap = converter.WeightLayoutMap;
-const graph = main.graph;
 
 // =============================================================================
 // Type Verification Tests

@@ -5,7 +5,6 @@
 //! - `executor`
 //! - `kernels`
 //! - `engine`
-//! - `graph`
 //! - `vision`
 //! - `scheduler`
 //! - `sampling`
@@ -18,7 +17,6 @@ pub const DecodeRequest = engine_mod.DecodeRequest;
 pub const DecodeResult = engine_mod.DecodeResult;
 
 pub const engine = engine_mod;
-pub const graph = @import("graph.zig");
 pub const vision = @import("vision/root.zig");
 pub const executor = @import("executor/root.zig");
 pub const kernels = @import("kernels/root.zig");

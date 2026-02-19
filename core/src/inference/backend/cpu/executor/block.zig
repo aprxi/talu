@@ -5,8 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const graph_runtime = @import("../graph.zig");
-const types = graph_runtime.layer_ops;
+const layer_ops = @import("../../../../models/layer_ops.zig");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const capi = @import("../../../../capi/error.zig");
@@ -35,13 +34,26 @@ const FFNLayer = cpu_forward.FfnLayer;
 const kv_cache = @import("../kernels/kv_cache.zig");
 const BatchedKVCache = kv_cache.BatchedKVCache;
 
-const BufferId = types.BufferId;
-const ResidualScale = types.ResidualScale;
-const LayerOp = types.LayerOp;
+const BufferId = layer_ops.BufferId;
+const ResidualScale = layer_ops.ResidualScale;
+const LayerOp = layer_ops.LayerOp;
 const KernelContext = runtime.KernelContext;
 
 const addIntoScaled = cpu_forward.addIntoScaled;
 const copyTensor = cpu_forward.copyTensor;
+
+/// Return the buffer that holds the final output of the block program.
+/// Pre-norm programs end on `.residual`; post-norm programs may end on `.norm_out`.
+fn finalOutputBuffer(program: []const LayerOp) BufferId {
+    if (program.len == 0) return .residual;
+    const last = program[program.len - 1];
+    return switch (last) {
+        .kernel => |k| k.out,
+        .add => .residual,
+        .add_tensor => |at| at.out,
+        else => .residual,
+    };
+}
 
 fn formatRmsNormLike(writer: anytype, dim: usize, eps: f32, weight_offset: f32) !void {
     if (weight_offset != 0.0) {
@@ -846,7 +858,7 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = graph_runtime.compiler.finalOutputBuffer(self.program);
+        const final_buf = finalOutputBuffer(self.program);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
         }
@@ -1093,7 +1105,7 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = graph_runtime.compiler.finalOutputBuffer(self.program);
+        const final_buf = finalOutputBuffer(self.program);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
         }

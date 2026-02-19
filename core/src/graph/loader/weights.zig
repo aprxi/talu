@@ -18,8 +18,8 @@ const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
 const st_loader = @import("../../io/safetensors/root.zig");
 const inference_mod = @import("../../inference/root.zig");
+const model_types = @import("../../models/op_types.zig");
 const transformer = inference_mod.backend.block_kernels;
-const graph = @import("../root.zig");
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
 
@@ -67,11 +67,6 @@ pub const LoadedModel = struct {
     cpu_blocks: ?[]transformer.TransformerBlock = null,
     cpu_blocks_allocator: ?std.mem.Allocator = null,
 
-    /// Runtime architecture from graph registry.
-    /// This is a pointer into the runtime registry, owned by the registry.
-    /// Contains compute graph ops and architecture properties (norm_weight_offset, etc.).
-    runtime_arch: ?*anyopaque = null,
-
     /// RoPE instances allocated with backing_allocator (not arena) to support realloc.
     /// These must be explicitly freed in deinit().
     rope_global: ?*rope_math.RoPE = null,
@@ -80,14 +75,11 @@ pub const LoadedModel = struct {
     pub fn ensureCpuBlocks(self: *LoadedModel, allocator: std.mem.Allocator, progress: progress_mod.ProgressContext) ![]const transformer.TransformerBlock {
         if (self.cpu_blocks) |b| return b;
         const cpu = try transformer.buildBlocks(allocator, self.config, self.runtime, self.blocks, progress);
-        if (self.runtime_arch) |runtime_arch_ptr| {
-            const arch: *graph.Architecture = @ptrCast(@alignCast(runtime_arch_ptr));
-            if (arch.explicit_qk_norm_ops) {
-                for (cpu) |*block| {
-                    if (block.getAttentionMut()) |attn_ptr| {
-                        attn_ptr.q_norm = null;
-                        attn_ptr.k_norm = null;
-                    }
+        if (self.runtime.explicit_qk_norm_ops) {
+            for (cpu) |*block| {
+                if (block.getAttentionMut()) |attn_ptr| {
+                    attn_ptr.q_norm = null;
+                    attn_ptr.k_norm = null;
                 }
             }
         }
@@ -135,7 +127,7 @@ const LoaderEnvFlags = struct {
     }
 };
 
-fn archHasBlockWeights(arch: *const graph.Architecture) bool {
+fn archHasBlockWeights(arch: *const model_types.Architecture) bool {
     if (arch.block_weights.len > 0) return true;
     if (arch.block_variants) |variants| {
         for (variants) |variant| {
@@ -145,7 +137,7 @@ fn archHasBlockWeights(arch: *const graph.Architecture) bool {
     return false;
 }
 
-fn archHasGlobalWeights(arch: *const graph.Architecture) bool {
+fn archHasGlobalWeights(arch: *const model_types.Architecture) bool {
     return arch.global_weights.len > 0;
 }
 
@@ -264,7 +256,7 @@ pub fn loadModelWithHooks(
     backing_allocator: std.mem.Allocator,
     config_path: []const u8,
     safetensors_path: []const u8,
-    runtime_arch: ?*graph.Architecture,
+    runtime_arch: ?*const model_types.Architecture,
     model_load_options: LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
@@ -329,7 +321,7 @@ pub fn loadModelWithHooks(
     // Detect whether the architecture uses absolute position embeddings (BERT-family).
     // Models with position_embeddings use absolute positions and don't need RoPE.
     const uses_absolute_positions = blk: {
-        const gw = if (runtime_arch) |ra| ra.global_weights else &[_]graph.types.WeightSpec{};
+        const gw = if (runtime_arch) |ra| ra.global_weights else &[_]model_types.WeightSpec{};
         for (gw) |spec| {
             if (std.mem.eql(u8, spec.id, "position_embeddings")) break :blk true;
         }
@@ -643,7 +635,6 @@ pub fn loadModelWithHooks(
         .original_weight_dtype = original_weight_dtype,
         .file_size = safetensors_file.fileSize(),
         .tensor_count = safetensors_file.tensorCount(),
-        .runtime_arch = arch,
         .rope_global = rope_global,
         .rope_local = rope_local,
     };

@@ -22,6 +22,7 @@ pub const BlockKind = enum {
             .{ "transformer", .attention_mlp },
             .{ "full_attention", .attention_mlp },
             .{ "sliding_attention", .attention_mlp },
+            .{ "linear_attention", .mamba },
             .{ "mamba", .mamba },
             .{ "mamba2", .mamba },
             .{ "ssm", .mamba },

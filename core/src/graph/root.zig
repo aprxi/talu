@@ -5,9 +5,7 @@
 //! ## Pipeline
 //!
 //! ```
-//! Python Models (bindings/python/talu/models/*.py)
-//!     ↓ trace via @architecture decorator
-//! JSON Graphs (bindings/python/talu/_graphs/*.json)
+//! JSON graph definitions (runtime/custom registration path)
 //!     ↓ parse (parser.zig)
 //! Op[] (intermediate representation)
 //!     ↓ compile (compiler.zig)

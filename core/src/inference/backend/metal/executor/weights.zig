@@ -7,7 +7,7 @@ const std = @import("std");
 const log = @import("../../../../log.zig");
 const tensor_mod = @import("../../../../tensor.zig");
 const Tensor = tensor_mod.Tensor;
-const graph_loader = @import("../../../../graph/root.zig");
+const models = @import("../../../../models/root.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
@@ -16,7 +16,7 @@ const mla_kernel = @import("../kernels/mla_attention.zig");
 const topology = @import("../../topology.zig");
 
 const builtin = @import("builtin");
-const LoadedModel = graph_loader.LoadedModel;
+const LoadedModel = models.LoadedModel;
 
 const ArrayHandle = mlx_graph.ArrayHandle;
 
@@ -771,7 +771,7 @@ const FusedDecodeModelKind = enum {
 
 fn classifyFusedDecodeModel(weight_handles: *const WeightHandles) FusedDecodeModelKind {
     // IMPORTANT: keep this selection fully data-driven from traced layer kinds and tensor dtypes.
-    // Do not branch on model names here. Naming belongs in tools/archs and traced graphs.
+    // Do not branch on model names here. Naming belongs in static model metadata.
     var all_layers_quantized = true;
     var all_layers_dense = true;
 

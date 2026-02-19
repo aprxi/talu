@@ -15,7 +15,7 @@
 const std = @import("std");
 const dtype_mod = @import("../dtype.zig");
 const kernel_info = @import("kernel_info.zig");
-const graph_registry = @import("../graph/registry.zig");
+const models_registry = @import("../models/registry.zig");
 
 const DType = dtype_mod.DType;
 
@@ -24,12 +24,10 @@ const DType = dtype_mod.DType;
 // =============================================================================
 
 /// Check if a model type is supported by talu's inference engine.
-/// This queries the actual graph registry - a model is supported if we have
-/// a graph definition for it.
+/// This queries the static models registry used by inference.
 pub fn isModelTypeSupported(model_type: ?[]const u8) bool {
     const mt = model_type orelse return false;
-    // Try to find architecture via registry's detectFromModelType
-    return graph_registry.detectFromModelType(mt) != null;
+    return models_registry.isSupportedModelType(mt);
 }
 
 /// Quantization method (matches capi/converter.zig)

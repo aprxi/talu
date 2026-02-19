@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const main = @import("main");
-const Reporter = main.graph.loader.Reporter;
+const Reporter = main.models.dispatcher.Reporter;
 
 // =============================================================================
 // Type Verification Tests

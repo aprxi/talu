@@ -1,4 +1,4 @@
-.PHONY: all deps build static clean clean-deps test graphs docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
+.PHONY: all deps build static clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
 
 # Detect platform-specific settings
 UNAME_S := $(shell uname -s)
@@ -297,17 +297,6 @@ test: deps
 	TALU_LOG_LEVEL=off zig build test $(ZIG_BUILD_FLAGS)
 	TALU_LOG_LEVEL=off zig build test-integration $(ZIG_BUILD_FLAGS)
 	./core/tests/check_signal_tests.sh
-
-
-# Compute graph files in tools/archs/_graphs/
-# Generated from readable Python models, embedded into binary at build time
-GRAPHS_DIR = tools/archs/_graphs
-
-graphs:
-	@echo "Generating graph files from Python models..."
-	cd tools/archs && uv run python -m trace --all
-	@echo ""
-	@ls -la $(GRAPHS_DIR)/*.json
 
 docs:
 	cd docs && uv run python scripts/build.py

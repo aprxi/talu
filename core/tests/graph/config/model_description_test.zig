@@ -6,8 +6,8 @@
 const std = @import("std");
 const main = @import("main");
 
-const ModelDescription = main.graph.config.ModelDescription;
-const QuantMethod = main.graph.config.QuantMethod;
+const ModelDescription = main.models.dispatcher.config.ModelDescription;
+const QuantMethod = main.models.dispatcher.config.QuantMethod;
 
 // =============================================================================
 // Type Verification Tests

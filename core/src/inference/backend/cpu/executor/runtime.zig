@@ -5,11 +5,10 @@
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
+const graph_types = @import("../../../../models/op_types.zig");
+const layer_ops = @import("../../../../models/layer_ops.zig");
 const matmul = compute.cpu.matmul;
 const cpu_common = compute.cpu.common;
-const graph_runtime = @import("../graph.zig");
-const OpType = graph_runtime.OpType;
-const ops = graph_runtime.layer_ops;
 const tensor = @import("../../../../tensor.zig");
 const Tensor = tensor.Tensor;
 
@@ -22,7 +21,8 @@ const shortconv = @import("../kernels/shortconv.zig");
 const norm = @import("../kernels/norm.zig");
 const kv_cache = @import("../kernels/kv_cache.zig");
 
-pub const BufferId = ops.BufferId;
+const OpType = graph_types.OpType;
+pub const BufferId = layer_ops.BufferId;
 
 pub const AttnCache = attn.AttnCache;
 pub const AttnTemp = attn.AttnTemp;

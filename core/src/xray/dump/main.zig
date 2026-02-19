@@ -13,7 +13,7 @@ const std = @import("std");
 // Import from lib module (added as dependency in build.zig)
 const lib = @import("lib");
 const io = lib.io;
-const graph = lib.graph;
+const graph = @import("../../graph/root.zig");
 const tokenizer_mod = lib.tokenizer;
 const inference = lib.inference;
 const FusedCpuBackend = inference.backend.FusedCpuBackend;
@@ -151,9 +151,8 @@ fn printHelp() void {
         \\    # Only FFN norms
         \\    talu-dump -m model --point ffn_norm -o /tmp/ffn_norms.npz
         \\
-        \\Then compare against PyTorch reference:
-        \\    cd tools/archs
-        \\    uv run python -m compare _reference/qwen3.npz /tmp/qwen.npz
+        \\Then compare against your PyTorch reference NPZ:
+        \\    uv run python -m talu.xray.compare _reference/qwen3.npz /tmp/qwen.npz
         \\
     , .{});
 }
@@ -305,6 +304,5 @@ pub fn main() !void {
 
     std.debug.print("Wrote {s}\n", .{args.output_path});
     std.debug.print("\nDone! Compare with:\n", .{});
-    std.debug.print("  cd tools/archs\n", .{});
-    std.debug.print("  uv run python -m compare _reference/<model>.npz {s}\n", .{args.output_path});
+    std.debug.print("  uv run python -m talu.xray.compare _reference/<model>.npz {s}\n", .{args.output_path});
 }

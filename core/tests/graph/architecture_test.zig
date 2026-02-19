@@ -2,8 +2,7 @@
 
 const std = @import("std");
 const main = @import("main");
-
-const graph = main.graph;
+const graph = main.models.dispatcher.op_types;
 const Architecture = graph.Architecture;
 const Op = graph.Op;
 
@@ -23,7 +22,7 @@ test "Architecture.isHeterogeneous returns false for homogeneous model" {
 }
 
 test "Architecture.isHeterogeneous returns true when block_variants set" {
-    var variants: [1]graph.types.BlockVariant = .{.{
+    var variants: [1]graph.BlockVariant = .{.{
         .name = "attention",
         .ops = &.{},
     }};

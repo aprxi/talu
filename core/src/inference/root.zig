@@ -9,7 +9,7 @@
 
 const std = @import("std");
 const json = @import("../io/json/root.zig");
-const graph = @import("../graph/root.zig");
+const models = @import("../models/root.zig");
 
 pub const sampling = @import("backend/cpu/sampling.zig");
 pub const scheduler = @import("backend/cpu/scheduler.zig");
@@ -74,11 +74,17 @@ pub const types = struct {
 
 /// Boundary module: inference code should load models through this facade.
 pub const model_loader = struct {
-    pub const LoadedModel = graph.LoadedModel;
-    pub const LoadOptions = graph.LoadOptions;
-    pub const weights = graph.loader.weights;
-    pub const loadModel = graph.loadModel;
-    pub const loadArchitectureDefinitions = graph.loadArchitectureDefinitions;
+    // Hard-switch guardrail: inference routes model topology through models root.
+    pub const LoadedModel = models.LoadedModel;
+    pub const LoadOptions = models.LoadOptions;
+    pub const weights = models.weights;
+    pub const loadModel = models.loadModel;
+    pub const loadArchitectureDefinitions = models.loadArchitectureDefinitions;
+    comptime {
+        if (@TypeOf(loadModel) != @TypeOf(models.loadModel)) {
+            @compileError("inference.model_loader must source loadModel from models.root");
+        }
+    }
 
     /// Result of checking model architecture support.
     pub const ArchitectureCheck = struct {
@@ -100,7 +106,7 @@ pub const model_loader = struct {
     };
 
     /// Check if a model's architecture is supported without fully loading.
-    /// Checks against the runtime graph registry.
+    /// Checks against static model registry metadata.
     pub fn checkArchitecture(allocator: std.mem.Allocator, config_path: []const u8) !ArchitectureCheck {
         var arch_check = ArchitectureCheck{ .supported = false };
 
@@ -148,9 +154,14 @@ pub const model_loader = struct {
         }
 
         if (arch_check.getModelType()) |model_type| {
-            graph.init(allocator);
-            _ = graph.loadArchitectureDefinitions(allocator);
-            arch_check.supported = graph.detectFromModelType(model_type) != null;
+            arch_check.supported = models.isSupportedModelType(model_type);
+            if (arch_check.supported and arch_check.architecture_len == 0) {
+                if (models.detectByModelType(model_type)) |entry| {
+                    const len = @min(entry.id.len, arch_check.architecture_buf.len);
+                    @memcpy(arch_check.architecture_buf[0..len], entry.id[0..len]);
+                    arch_check.architecture_len = len;
+                }
+            }
             return arch_check;
         }
 

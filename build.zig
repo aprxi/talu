@@ -289,104 +289,6 @@ fn addMetalSupport(
 }
 
 // =============================================================================
-// Embedded Graphs Generator
-// =============================================================================
-
-/// Generate embedded_graphs.zig module from JSON files in tools/archs/_graphs/
-/// This embeds architecture definitions directly into the binary for distribution.
-fn generateEmbeddedGraphs(b: *std.Build) *std.Build.Module {
-    const graphs_dir_path = "tools/archs/_graphs";
-
-    // Use WriteFiles to generate the embedded_graphs.zig source
-    const gen_step = b.addWriteFiles();
-
-    // Build the generated Zig source code using ArrayListUnmanaged
-    var code = std.ArrayListUnmanaged(u8){};
-
-    // Write module header
-    code.appendSlice(b.allocator,
-        \\//! Embedded Architecture Graphs
-        \\//!
-        \\//! Auto-generated from bindings/python/talu/_graphs/*.json
-        \\//! Do not edit manually - regenerate with `zig build`.
-        \\
-        \\const std = @import("std");
-        \\
-        \\/// Map of architecture names to their JSON definitions.
-        \\/// Use `get()` for O(1) lookups.
-        \\pub const graphs = std.StaticStringMap([]const u8).initComptime(.{
-        \\
-    ) catch @panic("OOM");
-
-    // Scan the _graphs directory and embed each JSON file
-    var graphs_found: usize = 0;
-    if (std.fs.cwd().openDir(graphs_dir_path, .{ .iterate = true })) |dir| {
-        var graphs_dir = dir;
-        defer graphs_dir.close();
-
-        var iter = graphs_dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
-
-            // Read the JSON file content
-            const json_content = graphs_dir.readFileAlloc(b.allocator, entry.name, 1024 * 1024) catch continue;
-
-            // Get the architecture name (filename without .json extension)
-            const arch_name = entry.name[0 .. entry.name.len - 5]; // strip ".json"
-
-            // Write the map entry with escaped JSON content using multiline string literal
-            const entry_start = std.fmt.allocPrint(b.allocator, "    .{{ \"{s}\", \n        \\\\", .{arch_name}) catch @panic("OOM");
-            code.appendSlice(b.allocator, entry_start) catch @panic("OOM");
-
-            // Write JSON content as Zig multiline string literal
-            // Only newlines need special handling - backslashes stay raw in multiline strings
-            for (json_content) |c| {
-                switch (c) {
-                    '\n' => code.appendSlice(b.allocator, "\n        \\\\") catch @panic("OOM"),
-                    else => code.append(b.allocator, c) catch @panic("OOM"),
-                }
-            }
-            code.appendSlice(b.allocator, "\n    },\n") catch @panic("OOM");
-            graphs_found += 1;
-        }
-    } else |_| {
-        // Directory doesn't exist - emit empty map (allows build without graphs)
-        std.debug.print("Warning: {s} not found, building without embedded graphs\n", .{graphs_dir_path});
-    }
-
-    // Close the map and add helper functions
-    code.appendSlice(b.allocator,
-        \\});
-        \\
-        \\/// Get an embedded graph by name.
-        \\pub fn get(name: []const u8) ?[]const u8 {
-        \\    return graphs.get(name);
-        \\}
-        \\
-        \\/// Returns true if any graphs are embedded.
-        \\pub fn hasGraphs() bool {
-        \\
-    ) catch @panic("OOM");
-
-    const has_graphs_str = if (graphs_found > 0) "    return true;\n" else "    return false;\n";
-    code.appendSlice(b.allocator, has_graphs_str) catch @panic("OOM");
-
-    code.appendSlice(b.allocator,
-        \\}
-        \\
-    ) catch @panic("OOM");
-
-    // Add the generated source to the WriteFiles step
-    const source_file = gen_step.add("embedded_graphs.zig", code.items);
-
-    // Create and return the module
-    return b.createModule(.{
-        .root_source_file = source_file,
-    });
-}
-
-// =============================================================================
 // Main build function
 // =============================================================================
 
@@ -468,11 +370,6 @@ pub fn build(b: *std.Build) void {
     const webp = webp_port.add(b, target, optimize);
 
     // ==========================================================================
-    // Generate embedded_graphs.zig from bindings/python/talu/_graphs/*.json
-    // ==========================================================================
-    const embedded_graphs_mod = generateEmbeddedGraphs(b);
-
-    // ==========================================================================
     // Native shared library
     // ==========================================================================
     const lib_mod = b.createModule(.{
@@ -482,7 +379,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     lib_mod.addOptions("build_options", build_options);
-    lib_mod.addImport("embedded_graphs", embedded_graphs_mod);
     addCDependencies(b, lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
     const lib = b.addLibrary(.{
@@ -525,7 +421,6 @@ pub fn build(b: *std.Build) void {
     });
 
     static_lib_mod.addOptions("build_options", build_options);
-    static_lib_mod.addImport("embedded_graphs", embedded_graphs_mod);
     addCDependencies(b, static_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
     const static_lib = b.addLibrary(.{
@@ -643,7 +538,6 @@ pub fn build(b: *std.Build) void {
             .link_libc = true,
         });
         dump_lib_mod.addOptions("build_options", dump_build_options);
-        dump_lib_mod.addImport("embedded_graphs", embedded_graphs_mod);
         addCDependencies(b, dump_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
         const dump_static_lib = b.addLibrary(.{
@@ -686,7 +580,6 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     test_mod.addOptions("build_options", build_options);
-    test_mod.addImport("embedded_graphs", embedded_graphs_mod);
     addCDependencies(b, test_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
 
     const tests = b.addTest(.{

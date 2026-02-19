@@ -8,7 +8,7 @@
 
 const std = @import("std");
 const io = @import("../../../../io/root.zig");
-const graph_runtime = @import("../graph.zig");
+const models = @import("../../../../models/root.zig");
 const tensor = @import("../../../../tensor.zig");
 const log = @import("../../../../log.zig");
 const common_vision = @import("types.zig");
@@ -16,7 +16,7 @@ const common_vision = @import("types.zig");
 const fused_qkv_runtime = @import("fused_qkv.zig");
 const split_qkv_runtime = @import("split_qkv.zig");
 
-const LoadedModel = graph_runtime.LoadedModel;
+const LoadedModel = models.LoadedModel;
 const SafeTensors = io.safetensors.root.UnifiedSafeTensors;
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;

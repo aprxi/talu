@@ -1,1 +1,0 @@
-# Youtu-VL architecture implementation

@@ -111,7 +111,6 @@ pub fn assertBackendModuleLayout(comptime M: type, comptime backend_name: []cons
         requireLayoutDecl(M, backend_name, "executor");
         requireLayoutDecl(M, backend_name, "kernels");
         requireLayoutDecl(M, backend_name, "engine");
-        requireLayoutDecl(M, backend_name, "graph");
         requireLayoutDecl(M, backend_name, "vision");
         requireLayoutDecl(M, backend_name, "scheduler");
         requireLayoutDecl(M, backend_name, "sampling");

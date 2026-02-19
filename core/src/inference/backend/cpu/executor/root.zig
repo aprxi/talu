@@ -21,9 +21,9 @@ pub const TransformerBlock = block.TransformerBlock;
 pub const Linear = layers.Linear;
 pub const Embedding = layers.Embedding;
 
-const ops = @import("../graph.zig").layer_ops;
-pub const LayerOp = ops.LayerOp;
-pub const BufferId = ops.BufferId;
+const layer_ops = @import("../../../../models/layer_ops.zig");
+pub const LayerOp = layer_ops.LayerOp;
+pub const BufferId = layer_ops.BufferId;
 
 const kernels = @import("../kernels/root.zig");
 pub const Attention = kernels.attention.MultiHeadAttention;

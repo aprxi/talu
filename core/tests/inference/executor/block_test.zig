@@ -14,11 +14,10 @@ const Tensor = main.core.Tensor;
 const DType = main.core.DType;
 
 // Re-exports for test helpers
-const graph = main.graph;
-const LayerOp = graph.LayerOp;
-const NormSlot = graph.NormSlot;
-const BufferId = graph.BufferId;
-const ResidualScale = graph.ResidualScale;
+const LayerOp = main.models.dispatcher.layer_ops.LayerOp;
+const NormSlot = main.models.dispatcher.layer_ops.NormSlot;
+const BufferId = main.models.dispatcher.layer_ops.BufferId;
+const ResidualScale = main.models.dispatcher.layer_ops.ResidualScale;
 
 // Backend kernel types
 const backend = main.inference.backend;

@@ -594,8 +594,11 @@ pub const ModelArch = enum {
 };
 
 pub const ModelRuntime = struct {
+    /// Canonical architecture id resolved at load time (e.g. "llama3", "granite_hybrid").
+    architecture_id: ?[]const u8 = null,
     weight_offset: f32 = 0.0,
     qk_norm_weight_offset: f32 = 0.0,
+    explicit_qk_norm_ops: bool = false,
     use_swiglu_variant: bool = false, // SwiGLU variant: alpha=1.702, clipping, (up+1) formulation
     use_transposed_mxfp4: bool = false,
 };

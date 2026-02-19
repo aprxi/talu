@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const main = @import("main");
-const LoadedModel = main.graph.LoadedModel;
+const LoadedModel = main.models.dispatcher.LoadedModel;
 
 // =============================================================================
 // Type Verification Tests

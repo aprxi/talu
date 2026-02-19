@@ -367,7 +367,7 @@ class Inspector:
         """Export captured tensors to NPZ file for offline comparison.
 
         This method exports all captured tensors to an NPZ file that can be
-        compared against a PyTorch reference NPZ (from tools/archs/capture.py)
+        compared against a PyTorch reference NPZ (from your reference pipeline)
         to find the first point of divergence.
 
         Requires CaptureMode.FULL to have actual tensor data.
@@ -385,8 +385,7 @@ class Inspector:
             ...     insp.export_npz("talu.npz")
 
         The exported NPZ can then be compared:
-            $ cd tools/archs
-            $ uv run python -m compare _reference/qwen3.npz /tmp/talu.npz
+            $ uv run python -m talu.xray.compare _reference/qwen3.npz /tmp/talu.npz
         """
         import numpy as np
 
@@ -424,7 +423,7 @@ class Inspector:
                 continue
 
             # Build key: "layer{N}.{point}" or just "{point}" for non-layer points
-            # This matches the format used by tools/archs/capture.py
+            # This matches the format expected by talu.xray.compare
             point_name = t.point_name
             if t.layer == 0xFFFF:
                 key = point_name

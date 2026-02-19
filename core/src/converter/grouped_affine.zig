@@ -14,8 +14,7 @@ const config_loader = @import("../graph/config/root.zig");
 const compute = @import("../compute/root.zig");
 const parallel = compute.parallel;
 const convert = @import("root.zig");
-const graph = @import("../graph/root.zig");
-const loader = @import("../graph/loader/root.zig");
+const models_registry = @import("../models/registry.zig");
 
 const Tensor = tensor.Tensor;
 const DType = dtype_mod.DType;
@@ -145,10 +144,7 @@ pub fn convertToGroupedAffine(
     var output_dir = try gaf_paths.GAFModelDir.init(allocator, output_dir_path);
     defer output_dir.deinit();
 
-    // 9. Build weight layout map from architecture graph (for graph-driven quantization)
-    // Initialize graph registry and load embedded architectures
-    graph.init(allocator);
-    _ = loader.loadArchitectureDefinitions(allocator);
+    // 9. Build weight layout map from static model architecture metadata.
 
     // Read model_type and look up architecture
     const model_type = try config_loader.readModelType(allocator, model_bundle.config_path());
@@ -158,16 +154,18 @@ pub fn convertToGroupedAffine(
     defer if (layout_map) |*lm| lm.deinit();
 
     if (model_type) |mt| {
-        if (graph.detectFromModelType(mt)) |arch| {
-            layout_map = convert.buildWeightLayoutMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
-                log.warn("converter", "Failed to build layout map", .{ .err = @errorName(err) });
-                break :blk null;
-            };
+        if (models_registry.detectByModelType(mt)) |entry| {
+            if (models_registry.runtimeArchitectureById(entry.id)) |arch| {
+                layout_map = convert.buildWeightLayoutMap(allocator, arch, @intCast(model_config.n_layers)) catch |err| blk: {
+                    log.warn("converter", "Failed to build layout map", .{ .err = @errorName(err) });
+                    break :blk null;
+                };
+            }
         }
     }
 
     // Quantized conversion requires architecture-driven layout metadata.
-    // This keeps name semantics in tools/archs graphs, not in converter internals.
+    // This keeps name semantics in static model graph metadata, not in converter internals.
     if (options.quant != null and layout_map == null) {
         return error.MissingArchitectureLayout;
     }

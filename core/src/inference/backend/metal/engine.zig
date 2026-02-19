@@ -4,7 +4,7 @@
 //! Supports lazy graph execution for optimal GPU utilization.
 
 const std = @import("std");
-const graph_loader = @import("../../../graph/root.zig");
+const models = @import("../../../models/root.zig");
 const contract = @import("../contract.zig");
 const tensor = @import("../../../tensor.zig");
 const common_mrope = @import("vision/mrope.zig");
@@ -15,7 +15,7 @@ const log = @import("../../../log.zig");
 const compute = @import("../../../compute/root.zig");
 const metal_compute = compute.metal;
 const graph = metal_compute.graph;
-const LoadedModel = graph_loader.LoadedModel;
+const LoadedModel = models.LoadedModel;
 
 // Internal orchestration modules
 const metal_executor = @import("executor/root.zig");

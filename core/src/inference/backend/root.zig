@@ -38,7 +38,7 @@ const builtin = @import("builtin");
 const build_options = @import("build_options");
 pub const contract = @import("contract.zig");
 
-const graph_mod = @import("../../graph/root.zig");
+const models = @import("../../models/root.zig");
 const capi = @import("../../capi/error.zig");
 const log = @import("../../log.zig");
 const progress_mod = @import("../../capi/progress.zig");
@@ -46,8 +46,8 @@ const tensor = @import("../../tensor.zig");
 const ModelConfig = tensor.ModelConfig;
 const dtype_mod = @import("../../dtype.zig");
 const DType = dtype_mod.DType;
-const LoadedModel = graph_mod.LoadedModel;
-const LoadOptions = graph_mod.LoadOptions;
+const LoadedModel = models.LoadedModel;
+const LoadOptions = models.LoadOptions;
 
 pub const cpu = @import("cpu/root.zig");
 pub const topology = @import("topology.zig");
