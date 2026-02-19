@@ -312,63 +312,76 @@ impl StorageHandle {
         Ok(count)
     }
 
-    /// List all sessions (full records), optionally filtered by group.
+    /// List sessions with offset-based pagination and total count.
     ///
-    /// Returns all matching sessions without pagination. Useful for
-    /// offset-based pagination where the caller slices the result.
-    pub fn list_all_sessions_full(
+    /// Pushes filtering, offset, and limit down to the Zig scan layer so
+    /// only the requested page crosses the FFI boundary.
+    pub fn list_sessions_batch(
         &self,
+        offset: usize,
+        limit: usize,
         group_id: Option<&str>,
-    ) -> Result<Vec<SessionRecordFull>, StorageError> {
-        let group_id_cstr = match group_id {
-            Some(g) => Some(CString::new(g).map_err(|_| {
-                StorageError::InvalidArgument("group_id contains null bytes".to_string())
-            })?),
-            None => None,
-        };
+        marker: Option<&str>,
+    ) -> Result<SessionBatchResult, StorageError> {
+        let limit = limit.clamp(1, 100);
 
-        let group_ptr = group_id_cstr
-            .as_ref()
-            .map_or(std::ptr::null(), |c| c.as_ptr());
+        let group_cstr = group_id
+            .map(|g| CString::new(g))
+            .transpose()
+            .map_err(|_| StorageError::InvalidArgument("group_id contains null bytes".into()))?;
+        let marker_cstr = marker
+            .map(|m| CString::new(m))
+            .transpose()
+            .map_err(|_| StorageError::InvalidArgument("marker contains null bytes".into()))?;
+
+        let group_ptr = group_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let marker_ptr = marker_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut c_list: *mut CSessionList = std::ptr::null_mut();
 
-        // SAFETY: path_cstr is valid, c_list is a valid output pointer
+        // SAFETY: path_cstr is valid, all pointers are valid or null
         let result = unsafe {
-            talu_sys::talu_storage_list_sessions(
+            talu_sys::talu_storage_list_sessions_batch(
                 self.path_cstr.as_ptr(),
-                0,     // no limit
-                0,     // no before_ts
-                std::ptr::null(), // no cursor
+                offset as u32,
+                limit as u32,
                 group_ptr,
-                std::ptr::null(), // no search_query
-                std::ptr::null(), // no tags_filter
-                std::ptr::null(), // no tags_filter_any
+                marker_ptr,
                 &mut c_list as *mut _ as *mut c_void,
             )
         };
 
         if result != ERROR_CODE_OK {
-            return Err(StorageError::from_code(
-                result,
-                &self.path.to_string_lossy(),
-            ));
+            return Err(StorageError::from_code(result, &self.path.to_string_lossy()));
         }
 
         if c_list.is_null() {
-            return Ok(Vec::new());
+            return Ok(SessionBatchResult {
+                sessions: Vec::new(),
+                total: 0,
+                has_more: false,
+            });
         }
 
-        // SAFETY: c_list is non-null and was returned by talu_storage_list_sessions
-        let records = unsafe { Self::convert_session_list_full(c_list) };
+        // SAFETY: c_list is non-null and was returned by talu_storage_list_sessions_batch
+        let (sessions, total) = unsafe {
+            let list = &*c_list;
+            let records = Self::convert_session_list_full(c_list);
+            (records, list.total)
+        };
 
         // Free C memory
-        // SAFETY: c_list was returned by talu_storage_list_sessions
+        // SAFETY: c_list was returned by talu_storage_list_sessions_batch
         unsafe { talu_sys::talu_storage_free_sessions(c_list) };
 
-        Ok(records)
-    }
+        let has_more = (offset + limit) < total;
 
+        Ok(SessionBatchResult {
+            sessions,
+            total,
+            has_more,
+        })
+    }
 
     /// Delete a session using Dual-Delete Protocol.
     ///
@@ -1387,6 +1400,17 @@ pub struct SessionListResult {
     pub sessions: Vec<SessionRecordFull>,
     pub has_more: bool,
     pub next_cursor: Option<SessionCursor>,
+}
+
+/// Batch list result with total count for offset-based pagination.
+#[derive(Debug)]
+pub struct SessionBatchResult {
+    /// Sessions in the current page.
+    pub sessions: Vec<SessionRecordFull>,
+    /// Total matching sessions (before offset/limit).
+    pub total: usize,
+    /// Whether there are more sessions after this page.
+    pub has_more: bool,
 }
 
 /// Partial update for PATCH semantics (top-level replacement, not deep merge).

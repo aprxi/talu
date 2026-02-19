@@ -238,6 +238,9 @@ pub const CSessionList = extern struct {
     /// Number of sessions in the array.
     count: usize,
 
+    /// Total matching records before offset/limit slicing.
+    total: usize,
+
     /// Internal: allocator used for cleanup.
     _allocator: ?*anyopaque,
 
@@ -1039,6 +1042,7 @@ fn buildSessionList(records: []db.table.sessions.ScannedSessionRecord) !*CSessio
     list.* = .{
         .sessions = if (records.len > 0) sessions_buf.ptr else null,
         .count = records.len,
+        .total = records.len,
         ._allocator = @ptrCast(allocator.ptr),
         ._arena = @ptrCast(arena_ptr),
     };
@@ -1462,6 +1466,70 @@ pub export fn talu_storage_list_sessions_by_source(
     params.source_doc_id = source_doc_slice;
 
     return listSessionsImpl(db_path_slice, params, out);
+}
+
+/// List sessions with offset-based pagination and total count.
+///
+/// Scans all matching sessions, computes the total, then returns only the
+/// page at [offset..offset+limit]. Only the page records are copied into
+/// the output CSessionList, keeping FFI overhead proportional to the page
+/// size rather than the total dataset.
+///
+/// Parameters:
+///   - db_path: Path to TaluDB storage directory (null-terminated)
+///   - offset: Number of matching records to skip (0 = first page)
+///   - limit: Maximum records in the returned page (0 = no limit)
+///   - group_id: Filter by group (null = no filter)
+///   - marker_filter: Exact marker match, e.g. "archived" (null = no filter)
+///   - out_sessions: Output parameter to receive session list handle
+///
+/// Returns: 0 on success, negative error code on failure.
+/// On success, CSessionList.total contains the total matching record count
+/// (before offset/limit). Caller must free with talu_storage_free_sessions().
+pub export fn talu_storage_list_sessions_batch(
+    db_path: ?[*:0]const u8,
+    offset: u32,
+    limit: u32,
+    group_id: ?[*:0]const u8,
+    marker_filter: ?[*:0]const u8,
+    out_sessions: ?*?*CSessionList,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_sessions orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_sessions is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = null;
+
+    const db_path_slice = validateDbPath(db_path) orelse
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+
+    // Build scan params: limit=0 to scan everything (needed for total count).
+    var params = db.table.sessions.TableAdapter.ScanParams{};
+    if (optSlice(group_id)) |gid| {
+        params.target_group_hash = db.table.sessions.computeGroupHash(gid);
+        params.target_group_id = gid;
+    }
+    params.marker_filter = optSlice(marker_filter);
+
+    const records = db.table.sessions.listSessions(allocator, db_path_slice, params) catch |err| {
+        capi_error.setError(err, "failed to scan sessions", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    defer db.table.sessions.freeScannedSessionRecords(allocator, records);
+
+    const total = records.len;
+    const start = @min(@as(usize, offset), total);
+    const end = if (limit > 0) @min(start + @as(usize, limit), total) else total;
+    const page = records[start..end];
+
+    const list = buildSessionList(page) catch |err| {
+        capi_error.setError(err, "failed to build session list", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    list.total = total;
+    out.* = list;
+    return 0;
 }
 
 /// Get detailed metadata for a specific session.

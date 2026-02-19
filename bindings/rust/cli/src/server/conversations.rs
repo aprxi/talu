@@ -291,7 +291,7 @@ pub(crate) fn resolve_tags_for_session(
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// GET /v1/conversations — list sessions with cursor pagination.
+/// GET /v1/conversations — list sessions with offset-based pagination.
 pub async fn handle_list(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -329,24 +329,15 @@ pub async fn handle_list(
         .map(|(_, v)| v.clone());
 
     let result = tokio::task::spawn_blocking(move || {
-        let all_sessions = storage.list_all_sessions_full(group_id.as_deref())?;
-
-        // Filter by marker if specified (e.g. "active" or "archived").
-        let filtered: Vec<&talu::storage::SessionRecordFull> = if let Some(ref m) = marker_filter {
-            all_sessions
-                .iter()
-                .filter(|s| s.marker.as_deref().unwrap_or("") == m.as_str())
-                .collect()
-        } else {
-            all_sessions.iter().collect()
-        };
-
-        let total = filtered.len();
-        let start = offset.min(total);
-        let end = (offset + limit).min(total);
+        let batch = storage.list_sessions_batch(
+            offset,
+            limit,
+            group_id.as_deref(),
+            marker_filter.as_deref(),
+        )?;
 
         // Only resolve tags and convert for the current page.
-        let page_data: Vec<serde_json::Value> = filtered[start..end]
+        let page_data: Vec<serde_json::Value> = batch.sessions
             .iter()
             .map(|session| {
                 let tags = resolve_tags_for_session(&storage, &session.session_id);
@@ -354,11 +345,12 @@ pub async fn handle_list(
             })
             .collect();
 
-        let has_more = (offset + limit) < total;
+        let has_more = batch.has_more;
+        let total = batch.total;
 
-        // Compute cursor from last session in page for backward compatibility
+        // Compute cursor from last session in page for backward compatibility.
         let next_cursor = if has_more {
-            filtered.get(end.saturating_sub(1)).map(|s| SessionCursor {
+            batch.sessions.last().map(|s| SessionCursor {
                 updated_at_ms: s.updated_at,
                 session_id: s.session_id.clone(),
             })

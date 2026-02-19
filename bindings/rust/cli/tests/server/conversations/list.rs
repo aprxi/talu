@@ -65,7 +65,7 @@ fn list_respects_limit() {
 }
 
 #[test]
-fn list_cursor_pagination_round_trip() {
+fn list_offset_pagination_round_trip() {
     let temp = TempDir::new().expect("temp dir");
     for i in 0..5 {
         seed_session(temp.path(), &format!("sess-{i}"), &format!("Chat {i}"), "m");
@@ -75,20 +75,17 @@ fn list_cursor_pagination_round_trip() {
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
 
-    // Page 1: limit=3
+    // Page 1: offset=0, limit=3
     let resp1 = get(ctx.addr(), "/v1/conversations?limit=3");
     assert_eq!(resp1.status, 200);
     let json1 = resp1.json();
     let page1 = json1["data"].as_array().expect("page1 data");
     assert_eq!(page1.len(), 3);
     assert_eq!(json1["has_more"], true);
-    let cursor = json1["cursor"].as_str().expect("cursor string");
+    assert_eq!(json1["total"], 5);
 
-    // Page 2: use cursor
-    let resp2 = get(
-        ctx.addr(),
-        &format!("/v1/conversations?limit=3&cursor={cursor}"),
-    );
+    // Page 2: offset=3, limit=3
+    let resp2 = get(ctx.addr(), "/v1/conversations?offset=3&limit=3");
     assert_eq!(resp2.status, 200);
     let json2 = resp2.json();
     let page2 = json2["data"].as_array().expect("page2 data");
@@ -237,12 +234,13 @@ fn list_sessions_have_expected_fields() {
 }
 
 #[test]
-fn list_invalid_cursor_ignored() {
+fn list_unknown_cursor_param_ignored() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    // Garbage cursor — should be treated as no cursor and return all results
+    // cursor param is no longer consumed (offset-based pagination);
+    // passing it should not cause errors.
     let resp = get(ctx.addr(), "/v1/conversations?cursor=not-valid-base64!!!");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
@@ -263,25 +261,23 @@ fn list_pagination_covers_all_sessions() {
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
     let mut collected_ids: Vec<String> = Vec::new();
-    let mut cursor: Option<String> = None;
 
-    // Walk all pages with limit=2
+    // Walk all pages with limit=2 using offset pagination
+    let mut offset = 0;
     for _ in 0..10 {
-        let url = match &cursor {
-            Some(c) => format!("/v1/conversations?limit=2&cursor={c}"),
-            None => "/v1/conversations?limit=2".to_string(),
-        };
+        let url = format!("/v1/conversations?limit=2&offset={offset}");
         let resp = get(ctx.addr(), &url);
         assert_eq!(resp.status, 200);
         let json = resp.json();
         let data = json["data"].as_array().expect("data");
+        assert_eq!(json["total"], 7, "total should always be 7");
         for item in data {
             collected_ids.push(item["id"].as_str().unwrap().to_string());
         }
+        offset += data.len();
         if json["has_more"] == false {
             break;
         }
-        cursor = Some(json["cursor"].as_str().expect("cursor").to_string());
     }
 
     // All 7 sessions should appear exactly once
@@ -344,28 +340,20 @@ fn list_float_limit_uses_default() {
 }
 
 #[test]
-fn list_empty_cursor_returns_all() {
+fn list_stale_cursor_param_ignored() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    // Empty cursor value — decode fails, treated as no cursor
+    // cursor param is no longer consumed; passing empty or stale values
+    // should have no effect on results.
     let resp = get(ctx.addr(), "/v1/conversations?cursor=");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
-}
 
-#[test]
-fn list_cursor_valid_base64_but_bad_format() {
-    let temp = TempDir::new().expect("temp dir");
-    seed_session(temp.path(), "sess-1", "Chat", "m");
-
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    // "hello" base64-encoded = "aGVsbG8=" — valid base64 but not "ts:session_id" format
     let resp = get(ctx.addr(), "/v1/conversations?cursor=aGVsbG8=");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
-    // Should treat as no cursor (decode_cursor fails on split_once(':'))
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
 }
@@ -529,12 +517,12 @@ fn list_group_id_with_pagination() {
     let page1 = json["data"].as_array().expect("data");
     assert_eq!(page1.len(), 3);
     assert_eq!(json["has_more"], true);
-    let cursor = json["cursor"].as_str().expect("cursor");
+    assert_eq!(json["total"], 5);
 
-    // Page 2
+    // Page 2: offset=3
     let resp = get(
         ctx.addr(),
-        &format!("/v1/conversations?group_id=paged-tenant&limit=3&cursor={cursor}"),
+        "/v1/conversations?group_id=paged-tenant&offset=3&limit=3",
     );
     assert_eq!(resp.status, 200);
     let json = resp.json();
@@ -609,13 +597,11 @@ fn list_ordering_stable_across_pages() {
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
     let mut all_timestamps: Vec<i64> = Vec::new();
-    let mut cursor: Option<String> = None;
 
+    // Walk pages with limit=2 using offset pagination
+    let mut offset = 0;
     for _ in 0..5 {
-        let url = match &cursor {
-            Some(c) => format!("/v1/conversations?limit=2&cursor={c}"),
-            None => "/v1/conversations?limit=2".to_string(),
-        };
+        let url = format!("/v1/conversations?limit=2&offset={offset}");
         let resp = get(ctx.addr(), &url);
         assert_eq!(resp.status, 200);
         let json = resp.json();
@@ -623,10 +609,10 @@ fn list_ordering_stable_across_pages() {
         for item in data {
             all_timestamps.push(item["updated_at"].as_i64().expect("updated_at"));
         }
+        offset += data.len();
         if json["has_more"] == false {
             break;
         }
-        cursor = Some(json["cursor"].as_str().expect("cursor").to_string());
     }
 
     assert_eq!(all_timestamps.len(), 6);
@@ -732,4 +718,145 @@ fn list_untagged_session_has_empty_tags() {
         tags.as_array().unwrap().is_empty(),
         "untagged session should have empty tags array"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Offset-based pagination and total field
+// ---------------------------------------------------------------------------
+
+#[test]
+fn list_total_field_present() {
+    let temp = TempDir::new().expect("temp dir");
+    for i in 0..5 {
+        seed_session(temp.path(), &format!("sess-tot-{i}"), &format!("Chat {i}"), "m");
+    }
+
+    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/conversations?limit=3");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(
+        json["total"].as_u64().expect("total should be a number"),
+        5,
+        "total should equal the number of seeded sessions"
+    );
+    assert_eq!(json["data"].as_array().unwrap().len(), 3);
+    assert_eq!(json["has_more"], true);
+}
+
+#[test]
+fn list_offset_skips_sessions() {
+    let temp = TempDir::new().expect("temp dir");
+    for i in 0..5 {
+        seed_session(
+            temp.path(),
+            &format!("sess-off-{i}"),
+            &format!("Chat {i}"),
+            "m",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+
+    // Full list (newest first) to know the expected order.
+    let resp_all = get(ctx.addr(), "/v1/conversations?limit=10");
+    assert_eq!(resp_all.status, 200);
+    let all_ids: Vec<String> = resp_all.json()["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(all_ids.len(), 5);
+
+    // Fetch with offset=2, limit=2 — should return 3rd and 4th items.
+    let resp = get(ctx.addr(), "/v1/conversations?offset=2&limit=2");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    let data = json["data"].as_array().unwrap();
+    assert_eq!(data.len(), 2);
+    assert_eq!(json["total"], 5, "total should remain 5");
+    assert_eq!(json["has_more"], true, "there is still 1 more after offset=2+limit=2");
+
+    let page_ids: Vec<String> = data
+        .iter()
+        .map(|v| v["id"].as_str().unwrap().to_string())
+        .collect();
+    assert_eq!(page_ids, &all_ids[2..4], "offset=2 should skip the first 2 items");
+}
+
+#[test]
+fn list_offset_beyond_total_returns_empty() {
+    let temp = TempDir::new().expect("temp dir");
+    for i in 0..3 {
+        seed_session(temp.path(), &format!("sess-bey-{i}"), &format!("Chat {i}"), "m");
+    }
+
+    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/conversations?offset=999&limit=10");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    let data = json["data"].as_array().unwrap();
+    assert!(data.is_empty(), "offset beyond total should return empty data");
+    assert_eq!(json["total"], 3, "total should still reflect all sessions");
+    assert_eq!(json["has_more"], false);
+}
+
+#[test]
+fn list_marker_filter_with_offset() {
+    let temp = TempDir::new().expect("temp dir");
+    for i in 0..5 {
+        seed_session(
+            temp.path(),
+            &format!("sess-mf-{i}"),
+            &format!("Chat {i}"),
+            "m",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+
+    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+
+    // Archive 2 sessions via PATCH.
+    let r1 = patch_json(
+        ctx.addr(),
+        "/v1/conversations/sess-mf-0",
+        &serde_json::json!({"marker": "archived"}),
+    );
+    assert_eq!(r1.status, 200);
+    let r2 = patch_json(
+        ctx.addr(),
+        "/v1/conversations/sess-mf-1",
+        &serde_json::json!({"marker": "archived"}),
+    );
+    assert_eq!(r2.status, 200);
+
+    // List archived: should see 2 total.
+    let resp = get(ctx.addr(), "/v1/conversations?marker=archived");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["total"], 2, "2 sessions archived");
+    assert_eq!(json["data"].as_array().unwrap().len(), 2);
+
+    // List archived with offset=1, limit=1: should see 1 item, total still 2.
+    let resp = get(ctx.addr(), "/v1/conversations?marker=archived&offset=1&limit=1");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["total"], 2, "total should be 2 archived");
+    assert_eq!(json["data"].as_array().unwrap().len(), 1);
+    assert_eq!(json["has_more"], false, "offset=1 + limit=1 covers all 2 archived");
+
+    // List active only (marker=active): should see 3.
+    let resp = get(ctx.addr(), "/v1/conversations?marker=active&limit=10");
+    assert_eq!(resp.status, 200);
+    let json = resp.json();
+    assert_eq!(json["total"], 3, "3 sessions have marker=active");
+    assert_eq!(json["data"].as_array().unwrap().len(), 3);
+
+    // List all (no marker filter): should see all 5.
+    let resp = get(ctx.addr(), "/v1/conversations?limit=10");
+    assert_eq!(resp.status, 200);
+    let json = resp.json();
+    assert_eq!(json["total"], 5, "all 5 sessions returned without marker filter");
 }
