@@ -4,10 +4,6 @@
  */
 
 import { api, notifications, format } from "./deps.ts";
-import {
-  CHECK_CIRCLE_ICON as ICON_CHECKED,
-  CIRCLE_ICON as ICON_UNCHECKED,
-} from "../../icons.ts";
 import type { FileObject } from "../../types.ts";
 
 // -- Helpers (matching file manager render.ts) --------------------------------
@@ -51,8 +47,8 @@ function kindLabel(kind?: string, mimeType?: string): string {
 /** Open the blob picker and return selected files (empty on cancel). */
 export function openBlobPicker(): Promise<FileObject[]> {
   return new Promise((resolve) => {
-    const selected = new Set<string>();
     let allFiles: FileObject[] = [];
+    let previewedFile: FileObject | null = null;
     let searchQuery = "";
     let sortBy: SortColumn = "name";
     let sortDir: SortDir = "asc";
@@ -80,11 +76,19 @@ export function openBlobPicker(): Promise<FileObject[]> {
 
     modal.appendChild(header);
 
-    // --- Body ---
+    // --- Body (table + preview side by side) ---
     const body = document.createElement("div");
     body.className = "blob-picker-body";
     body.innerHTML = '<div class="blob-picker-loading"><div class="spinner"></div></div>';
-    modal.appendChild(body);
+
+    const previewPane = document.createElement("div");
+    previewPane.className = "blob-picker-preview hidden";
+
+    const bodyWrap = document.createElement("div");
+    bodyWrap.className = "blob-picker-body-wrap";
+    bodyWrap.appendChild(body);
+    bodyWrap.appendChild(previewPane);
+    modal.appendChild(bodyWrap);
 
     // --- Footer ---
     const footer = document.createElement("div");
@@ -108,12 +112,10 @@ export function openBlobPicker(): Promise<FileObject[]> {
     cancelBtn.textContent = "Cancel";
 
     const addBtn = document.createElement("button");
-    addBtn.className = "btn btn-primary btn-sm";
+    addBtn.className = "btn btn-primary blob-picker-add-btn";
     addBtn.textContent = "Add";
-    addBtn.disabled = true;
 
     footer.appendChild(cancelBtn);
-    footer.appendChild(addBtn);
     modal.appendChild(footer);
     overlay.appendChild(modal);
 
@@ -143,10 +145,64 @@ export function openBlobPicker(): Promise<FileObject[]> {
       return filtered;
     }
 
-    function updateAddBtn() {
-      const n = selected.size;
-      addBtn.disabled = n === 0;
-      addBtn.textContent = n > 0 ? `Add (${n})` : "Add";
+    function isImageFile(f: FileObject): boolean {
+      return f.kind === "image" || (f.mime_type?.startsWith("image/") ?? false);
+    }
+
+    function showPreview(file: FileObject) {
+      previewedFile = file;
+      addBtn.disabled = false;
+      addBtn.textContent = "Add";
+
+      previewPane.innerHTML = "";
+
+      // Image preview
+      if (isImageFile(file)) {
+        const img = document.createElement("img");
+        img.className = "files-preview-img";
+        img.src = `/v1/files/${encodeURIComponent(file.id)}/content`;
+        img.alt = file.filename;
+        if (file.image) {
+          img.style.aspectRatio = `${file.image.width} / ${file.image.height}`;
+        }
+        previewPane.appendChild(img);
+      }
+
+      // Metadata (same layout as file manager)
+      const meta = document.createElement("dl");
+      meta.className = "files-preview-meta";
+      const addField = (label: string, value: string) => {
+        const dt = document.createElement("dt");
+        dt.textContent = label;
+        meta.appendChild(dt);
+        const dd = document.createElement("dd");
+        dd.textContent = value;
+        meta.appendChild(dd);
+      };
+      addField("Filename", file.filename);
+      addField("Size", formatSize(file.bytes));
+      addField("Kind", kindLabel(file.kind, file.mime_type));
+      if (file.mime_type) addField("MIME", file.mime_type);
+      if (file.image) {
+        addField("Dimensions", `${file.image.width}\u00d7${file.image.height}`);
+        addField("Format", file.image.format);
+      }
+      addField("Uploaded", format.dateTime(file.created_at * 1000));
+      previewPane.appendChild(meta);
+
+      previewPane.appendChild(addBtn);
+      previewPane.classList.remove("hidden");
+
+      // Highlight the active row
+      const rows = body.querySelectorAll<HTMLElement>(".files-row");
+      for (const r of rows) {
+        r.classList.toggle("files-row-selected", r.dataset["id"] === file.id);
+      }
+    }
+
+    function confirmFile(file: FileObject) {
+      cleanup();
+      resolve([file]);
     }
 
     function cleanup() {
@@ -160,8 +216,9 @@ export function openBlobPicker(): Promise<FileObject[]> {
     }
 
     function confirm() {
-      cleanup();
-      resolve(allFiles.filter((f) => selected.has(f.id)));
+      if (previewedFile) {
+        confirmFile(previewedFile);
+      }
     }
 
     function updateSortHeaders(thead: HTMLElement) {
@@ -205,7 +262,6 @@ export function openBlobPicker(): Promise<FileObject[]> {
       const thead = document.createElement("thead");
       thead.className = "files-thead";
       thead.innerHTML = `<tr>
-        <th class="files-th files-th-check"></th>
         <th class="files-th files-th-name" data-sort="name">Name</th>
         <th class="files-th files-th-kind" data-sort="kind">Kind</th>
         <th class="files-th files-th-size" data-sort="size">Size</th>
@@ -232,19 +288,9 @@ export function openBlobPicker(): Promise<FileObject[]> {
       const tbody = document.createElement("tbody");
 
       for (const file of filtered) {
-        const isSelected = selected.has(file.id);
         const row = document.createElement("tr");
-        row.className = `files-row${isSelected ? " files-row-selected" : ""}`;
+        row.className = `files-row${previewedFile?.id === file.id ? " files-row-selected" : ""}`;
         row.dataset["id"] = file.id;
-
-        // Checkbox
-        const checkCell = document.createElement("td");
-        checkCell.className = "files-cell files-cell-check";
-        const checkBtn = document.createElement("button");
-        checkBtn.className = "files-check-btn";
-        checkBtn.innerHTML = isSelected ? ICON_CHECKED : ICON_UNCHECKED;
-        checkCell.appendChild(checkBtn);
-        row.appendChild(checkCell);
 
         // Name
         const nameCell = document.createElement("td");
@@ -273,19 +319,8 @@ export function openBlobPicker(): Promise<FileObject[]> {
         dateCell.textContent = format.dateTime(file.created_at * 1000, "short");
         row.appendChild(dateCell);
 
-        // Row click → toggle selection
-        row.addEventListener("click", () => {
-          if (selected.has(file.id)) {
-            selected.delete(file.id);
-            row.classList.remove("files-row-selected");
-            checkBtn.innerHTML = ICON_UNCHECKED;
-          } else {
-            selected.add(file.id);
-            row.classList.add("files-row-selected");
-            checkBtn.innerHTML = ICON_CHECKED;
-          }
-          updateAddBtn();
-        });
+        // Click → preview
+        row.addEventListener("click", () => showPreview(file));
 
         tbody.appendChild(row);
       }
@@ -300,6 +335,10 @@ export function openBlobPicker(): Promise<FileObject[]> {
       if (e.key === "Escape") {
         e.preventDefault();
         dismiss();
+      }
+      if (e.key === "Enter" && previewedFile) {
+        e.preventDefault();
+        confirmFile(previewedFile);
       }
     };
     document.addEventListener("keydown", onKey);
@@ -323,6 +362,10 @@ export function openBlobPicker(): Promise<FileObject[]> {
       if (searchTimer) clearTimeout(searchTimer);
       searchTimer = setTimeout(() => {
         searchQuery = searchInput.value;
+        previewedFile = null;
+        previewPane.classList.add("hidden");
+        addBtn.disabled = true;
+        addBtn.textContent = "Add";
         renderTable();
       }, 150);
     });
@@ -331,7 +374,7 @@ export function openBlobPicker(): Promise<FileObject[]> {
     document.body.appendChild(overlay);
     searchInput.focus();
 
-    api.listFiles(100, "active").then((res) => {
+    api.listFiles({ limit: 100, marker: "active" }).then((res) => {
       if (!res.ok || !res.data) {
         notifications.error(res.error ?? "Failed to load files");
         dismiss();
