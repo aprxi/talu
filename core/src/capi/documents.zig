@@ -548,6 +548,115 @@ pub export fn talu_documents_delete(
 }
 
 // =============================================================================
+// Batch Operations API
+// =============================================================================
+
+/// Batch-delete multiple documents (soft delete by writing tombstones).
+/// Non-existent document IDs are silently skipped (idempotent batch semantics).
+///
+/// Parameters:
+///   - db_path: Path to TaluDB storage directory (null-terminated)
+///   - doc_ids: Array of null-terminated document ID strings
+///   - doc_ids_count: Number of elements in doc_ids array
+///   - out_deleted_count: Output parameter to receive the number of actually deleted documents (may be null)
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_documents_delete_batch(
+    db_path: ?[*:0]const u8,
+    doc_ids: ?[*]const ?[*:0]const u8,
+    doc_ids_count: usize,
+    doc_type: ?[*:0]const u8,
+    out_deleted_count: ?*usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const doc_type_slice = optSlice(doc_type);
+
+    if (doc_ids == null or doc_ids_count == 0) {
+        if (out_deleted_count) |out| out.* = 0;
+        return 0;
+    }
+
+    // Convert C string array to slices.
+    var id_slices = allocator.alloc([]const u8, doc_ids_count) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "Failed to allocate id slice array", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    defer allocator.free(id_slices);
+
+    const ids_ptr = doc_ids.?;
+    for (0..doc_ids_count) |i| {
+        const c_str = ids_ptr[i] orelse {
+            capi_error.setErrorWithCode(.invalid_argument, "doc_ids[{d}] is null", .{i});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        };
+        id_slices[i] = std.mem.sliceTo(c_str, 0);
+    }
+
+    const count = documents.deleteDocumentsBatch(allocator, db_path_slice, id_slices, doc_type_slice) catch |err| {
+        capi_error.setErrorWithCode(.storage_error, "Batch delete failed: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+
+    if (out_deleted_count) |out| out.* = count;
+    return 0;
+}
+
+/// Batch-update the marker field for multiple documents.
+/// Non-existent document IDs are silently skipped.
+///
+/// Parameters:
+///   - db_path: Path to TaluDB storage directory (null-terminated)
+///   - doc_ids: Array of null-terminated document ID strings
+///   - doc_ids_count: Number of elements in doc_ids array
+///   - marker: New marker value (null-terminated, e.g. "archived" or "active")
+///   - out_updated_count: Output parameter to receive the number of actually updated documents (may be null)
+///
+/// Returns: 0 on success, negative error code on failure.
+pub export fn talu_documents_set_marker_batch(
+    db_path: ?[*:0]const u8,
+    doc_ids: ?[*]const ?[*:0]const u8,
+    doc_ids_count: usize,
+    marker: ?[*:0]const u8,
+    doc_type: ?[*:0]const u8,
+    out_updated_count: ?*usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const marker_slice = validateRequiredArg(marker, "marker") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    const doc_type_slice = optSlice(doc_type);
+
+    if (doc_ids == null or doc_ids_count == 0) {
+        if (out_updated_count) |out| out.* = 0;
+        return 0;
+    }
+
+    // Convert C string array to slices.
+    var id_slices = allocator.alloc([]const u8, doc_ids_count) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "Failed to allocate id slice array", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    defer allocator.free(id_slices);
+
+    const ids_ptr = doc_ids.?;
+    for (0..doc_ids_count) |i| {
+        const c_str = ids_ptr[i] orelse {
+            capi_error.setErrorWithCode(.invalid_argument, "doc_ids[{d}] is null", .{i});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        };
+        id_slices[i] = std.mem.sliceTo(c_str, 0);
+    }
+
+    const count = documents.setMarkerBatch(allocator, db_path_slice, id_slices, marker_slice, doc_type_slice) catch |err| {
+        capi_error.setErrorWithCode(.storage_error, "Batch set marker failed: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+
+    if (out_updated_count) |out| out.* = count;
+    return 0;
+}
+
+// =============================================================================
 // Document Listing API
 // =============================================================================
 

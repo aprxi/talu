@@ -1,5 +1,7 @@
 //! Integration tests for `/v1/files` endpoint.
 
+mod batch;
+mod list;
 mod read;
 mod resolve;
 mod upload;

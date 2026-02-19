@@ -352,6 +352,8 @@ comptime {
     _ = &capi.talu_documents_get;
     _ = &capi.talu_documents_update;
     _ = &capi.talu_documents_delete;
+    _ = &capi.talu_documents_delete_batch;
+    _ = &capi.talu_documents_set_marker_batch;
     _ = &capi.talu_documents_list;
     _ = &capi.talu_documents_free_list;
     _ = &capi.talu_documents_search;

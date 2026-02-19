@@ -288,6 +288,11 @@ impl Service<Request<Incoming>> for Router {
                         | (Method::POST, "/file/transform") => {
                             file::handle_transform(state, req, auth).await
                         }
+                        // Batch must come before single-file routes
+                        (Method::POST, "/v1/files/batch")
+                        | (Method::POST, "/files/batch") => {
+                            files::handle_batch(state, req, auth).await
+                        }
                         (Method::POST, "/v1/files") | (Method::POST, "/files") => {
                             files::handle_upload(state, req, auth).await
                         }

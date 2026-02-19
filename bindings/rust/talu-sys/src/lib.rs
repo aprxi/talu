@@ -2979,6 +2979,23 @@ extern "C" {
     // core/src/capi/documents.zig
     pub fn talu_documents_delete(db_path: *const c_char, doc_id: *const c_char) -> c_int;
     // core/src/capi/documents.zig
+    pub fn talu_documents_delete_batch(
+        db_path: *const c_char,
+        doc_ids: *const *const c_char,
+        doc_ids_count: usize,
+        doc_type: *const c_char,
+        out_deleted_count: *mut usize,
+    ) -> c_int;
+    // core/src/capi/documents.zig
+    pub fn talu_documents_set_marker_batch(
+        db_path: *const c_char,
+        doc_ids: *const *const c_char,
+        doc_ids_count: usize,
+        marker: *const c_char,
+        doc_type: *const c_char,
+        out_updated_count: *mut usize,
+    ) -> c_int;
+    // core/src/capi/documents.zig
     pub fn talu_documents_free_changes(list: *mut CChangeList);
     // core/src/capi/documents.zig
     pub fn talu_documents_free_delta_chain(chain: *mut CDeltaChain);

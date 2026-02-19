@@ -306,6 +306,77 @@ impl DocumentsHandle {
         Ok(())
     }
 
+    /// Batch-delete multiple documents.
+    /// Non-existent document IDs are silently skipped (idempotent).
+    /// When `doc_type` is `Some`, only documents matching that type are deleted.
+    /// Returns the number of documents actually deleted.
+    pub fn delete_batch(
+        &self,
+        ids: &[&str],
+        doc_type: Option<&str>,
+    ) -> Result<usize, DocumentError> {
+        let c_strings: Vec<std::ffi::CString> = ids
+            .iter()
+            .map(|id| to_cstring(id))
+            .collect::<Result<_, _>>()?;
+        let c_ptrs: Vec<*const std::ffi::c_char> =
+            c_strings.iter().map(|s| s.as_ptr()).collect();
+        let doc_type_c = to_optional_cstring(doc_type)?;
+
+        let mut deleted_count: usize = 0;
+        let code = unsafe {
+            talu_sys::talu_documents_delete_batch(
+                self.path_cstr.as_ptr(),
+                c_ptrs.as_ptr(),
+                c_ptrs.len(),
+                opt_ptr(&doc_type_c),
+                &mut deleted_count,
+            )
+        };
+
+        if code != ERROR_CODE_OK {
+            return Err(DocumentError::from_code(code, "batch_delete"));
+        }
+        Ok(deleted_count)
+    }
+
+    /// Batch-update the marker for multiple documents.
+    /// Non-existent document IDs are silently skipped.
+    /// When `doc_type` is `Some`, only documents matching that type are updated.
+    /// Returns the number of documents actually updated.
+    pub fn set_marker_batch(
+        &self,
+        ids: &[&str],
+        marker: &str,
+        doc_type: Option<&str>,
+    ) -> Result<usize, DocumentError> {
+        let marker_c = to_cstring(marker)?;
+        let c_strings: Vec<std::ffi::CString> = ids
+            .iter()
+            .map(|id| to_cstring(id))
+            .collect::<Result<_, _>>()?;
+        let c_ptrs: Vec<*const std::ffi::c_char> =
+            c_strings.iter().map(|s| s.as_ptr()).collect();
+        let doc_type_c = to_optional_cstring(doc_type)?;
+
+        let mut updated_count: usize = 0;
+        let code = unsafe {
+            talu_sys::talu_documents_set_marker_batch(
+                self.path_cstr.as_ptr(),
+                c_ptrs.as_ptr(),
+                c_ptrs.len(),
+                marker_c.as_ptr(),
+                opt_ptr(&doc_type_c),
+                &mut updated_count,
+            )
+        };
+
+        if code != ERROR_CODE_OK {
+            return Err(DocumentError::from_code(code, "batch_set_marker"));
+        }
+        Ok(updated_count)
+    }
+
     /// List documents with optional filters.
     /// Returns summaries (not full records) for efficiency.
     pub fn list(

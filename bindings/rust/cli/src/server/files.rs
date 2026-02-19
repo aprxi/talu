@@ -30,7 +30,7 @@ use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 struct FileObjectResponse {
     id: String,
     object: String,
@@ -87,6 +87,15 @@ struct FileListResponse {
     object: String,
     data: Vec<FileObjectResponse>,
     has_more: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct FileBatchRequest {
+    action: String,
+    #[serde(default)]
+    ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -362,15 +371,19 @@ pub async fn handle_list(
         Err(e) => return document_error_response(e),
     };
 
+    let cursor = parse_query_param(query_str, "cursor");
+
     // Don't pass marker to the scan layer — it filters per-row before
     // deduplication, so old versions with the previous marker leak through
     // when a document's marker has been updated.  Filter after dedup instead.
-    let rows = match docs.list(Some("file"), None, None, None, limit) {
+    // Fetch all matching docs (u32::MAX) so we can filter + paginate in Rust.
+    let rows = match docs.list(Some("file"), None, None, None, u32::MAX) {
         Ok(v) => v,
         Err(e) => return document_error_response(e),
     };
 
-    let mut data = Vec::with_capacity(rows.len());
+    // Build full list filtered by marker, sorted by created_at DESC.
+    let mut all_files: Vec<FileObjectResponse> = Vec::with_capacity(rows.len());
     for row in rows {
         let doc = match docs.get(&row.doc_id) {
             Ok(Some(doc)) => doc,
@@ -384,17 +397,51 @@ pub async fn handle_list(
         let resp = to_file_object_response(descriptor);
         let effective_marker = resp.marker.as_deref().unwrap_or("active");
         if effective_marker == marker_filter {
-            data.push(resp);
+            all_files.push(resp);
         }
     }
 
-    let has_more = data.len() >= limit as usize;
+    // Sort by created_at descending (most recent first), tie-break by id.
+    all_files.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
+
+    // Apply cursor: skip items at or before the cursor point.
+    let start_idx = if let Some(encoded) = cursor {
+        if let Some((cursor_ts, cursor_id)) = decode_file_cursor(encoded) {
+            all_files
+                .iter()
+                .position(|f| {
+                    (f.created_at as i64) < cursor_ts
+                        || ((f.created_at as i64) == cursor_ts && f.id < cursor_id)
+                })
+                .unwrap_or(all_files.len())
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+
+    let remaining = &all_files[start_idx..];
+    let has_more = remaining.len() > limit as usize;
+    let page: Vec<FileObjectResponse> = remaining
+        .iter()
+        .take(limit as usize)
+        .cloned()
+        .collect();
+
+    let next_cursor = if has_more {
+        page.last().map(|f| encode_file_cursor(f.created_at as i64, &f.id))
+    } else {
+        None
+    };
+
     json_response(
         StatusCode::OK,
         &FileListResponse {
             object: "list".to_string(),
-            data,
+            data: page,
             has_more,
+            cursor: next_cursor,
         },
     )
 }
@@ -1018,6 +1065,157 @@ pub async fn handle_patch(
     };
 
     json_response(StatusCode::OK, &to_file_object_response(descriptor))
+}
+
+// ---------------------------------------------------------------------------
+// Cursor helpers (same pattern as conversations.rs)
+// ---------------------------------------------------------------------------
+
+fn encode_file_cursor(created_at_ms: i64, file_id: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let raw = format!("{}:{}", created_at_ms, file_id);
+    let input = raw.as_bytes();
+    let mut result = String::with_capacity((input.len() + 2) / 3 * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = chunk.get(1).copied().unwrap_or(0) as u32;
+        let b2 = chunk.get(2).copied().unwrap_or(0) as u32;
+        let n = (b0 << 16) | (b1 << 8) | b2;
+        result.push(ALPHABET[(n >> 18 & 0x3F) as usize] as char);
+        result.push(ALPHABET[(n >> 12 & 0x3F) as usize] as char);
+        if chunk.len() > 1 { result.push(ALPHABET[(n >> 6 & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 2 { result.push(ALPHABET[(n & 0x3F) as usize] as char); } else { result.push('='); }
+    }
+    result
+}
+
+fn decode_file_cursor(encoded: &str) -> Option<(i64, String)> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62), b'/' => Some(63), b'=' => Some(0),
+            _ => None,
+        }
+    }
+    let bytes = encoded.as_bytes();
+    if bytes.len() % 4 != 0 { return None; }
+    let mut result = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let a = val(chunk[0])?; let b = val(chunk[1])?;
+        let c = val(chunk[2])?; let d = val(chunk[3])?;
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        result.push((n >> 16) as u8);
+        if chunk[2] != b'=' { result.push((n >> 8 & 0xFF) as u8); }
+        if chunk[3] != b'=' { result.push((n & 0xFF) as u8); }
+    }
+    let s = std::str::from_utf8(&result).ok()?;
+    let (ts_str, file_id) = s.split_once(':')?;
+    let created_at = ts_str.parse::<i64>().ok()?;
+    Some((created_at, file_id.to_string()))
+}
+
+// ---------------------------------------------------------------------------
+// Batch handler
+// ---------------------------------------------------------------------------
+
+/// POST /v1/files/batch - Batch operations on files (delete, archive, unarchive).
+pub async fn handle_batch(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let bucket = match state.bucket_path.as_ref() {
+        Some(p) => p,
+        None => {
+            return json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "storage_unavailable",
+                "Storage not configured",
+            );
+        }
+    };
+
+    let body_bytes = match req.collect().await {
+        Ok(b) => b.to_bytes(),
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                &format!("Failed to read body: {e}"),
+            );
+        }
+    };
+
+    let batch_req: FileBatchRequest = match serde_json::from_slice(&body_bytes) {
+        Ok(r) => r,
+        Err(e) => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_json",
+                &format!("Invalid JSON: {e}"),
+            );
+        }
+    };
+
+    if batch_req.ids.is_empty() {
+        return json_error(StatusCode::BAD_REQUEST, "missing_ids", "ids must not be empty");
+    }
+    if batch_req.ids.len() > 100 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "batch_too_large",
+            &format!("Batch size {} exceeds limit of 100", batch_req.ids.len()),
+        );
+    }
+
+    let storage_path = match auth.as_ref() {
+        Some(ctx) => bucket.join(&ctx.storage_prefix),
+        None => bucket.to_path_buf(),
+    };
+
+    let docs = match DocumentsHandle::open(&storage_path) {
+        Ok(h) => h,
+        Err(e) => return document_error_response(e),
+    };
+
+    let action = batch_req.action.clone();
+    match action.as_str() {
+        "delete" | "archive" | "unarchive" => {}
+        _ => {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_action",
+                &format!("Unknown action: {action}"),
+            );
+        }
+    }
+
+    let ids = batch_req.ids;
+    let result = tokio::task::spawn_blocking(move || {
+        let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+        match action.as_str() {
+            "delete" => docs.delete_batch(&id_refs, Some("file")).map(|_| ()),
+            "archive" => docs.set_marker_batch(&id_refs, "archived", Some("file")).map(|_| ()),
+            "unarchive" => docs.set_marker_batch(&id_refs, "active", Some("file")).map(|_| ()),
+            _ => unreachable!(),
+        }
+    })
+    .await;
+
+    match result {
+        Ok(Ok(())) => Response::builder()
+            .status(StatusCode::NO_CONTENT)
+            .body(Full::new(Bytes::new()).boxed())
+            .unwrap(),
+        Ok(Err(e)) => document_error_response(e),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal_error",
+            &format!("Task failed: {e}"),
+        ),
+    }
 }
 
 fn parse_query_param<'a>(query: &'a str, name: &str) -> Option<&'a str> {

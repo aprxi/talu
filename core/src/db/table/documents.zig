@@ -3385,6 +3385,86 @@ pub fn deleteDocument(alloc: Allocator, db_path: []const u8, doc_id: []const u8)
     try adapter.flush();
 }
 
+/// Batch-delete multiple documents (soft delete by writing tombstones).
+/// Handles adapter lifecycle internally — opens once, writes all tombstones, flushes once.
+/// Non-existent document IDs are silently skipped (idempotent batch semantics).
+/// When `doc_type` is non-null, only documents matching that type are deleted;
+/// mismatched documents are silently skipped (same as non-existent).
+/// Returns the number of documents actually deleted.
+pub fn deleteDocumentsBatch(alloc: Allocator, db_path: []const u8, doc_ids: []const []const u8, doc_type: ?[]const u8) !usize {
+    var adapter = try DocumentAdapter.init(alloc, db_path);
+    defer adapter.deinit();
+
+    const now_ms = std.time.milliTimestamp();
+    var count: usize = 0;
+    for (doc_ids) |doc_id| {
+        var existing = try adapter.getDocument(alloc, doc_id) orelse continue;
+        defer existing.deinit(alloc);
+        if (doc_type) |dt| {
+            if (!std.mem.eql(u8, existing.doc_type, dt)) continue;
+        }
+        try adapter.deleteDocument(doc_id, now_ms);
+        count += 1;
+    }
+    try adapter.flush();
+    return count;
+}
+
+/// Batch-update the marker field for multiple documents.
+/// Handles adapter lifecycle internally — opens once, writes all updates, flushes once.
+/// Non-existent document IDs are silently skipped.
+/// When `doc_type` is non-null, only documents matching that type are updated;
+/// mismatched documents are silently skipped (same as non-existent).
+/// Returns the number of documents actually updated.
+pub fn setMarkerBatch(alloc: Allocator, db_path: []const u8, doc_ids: []const []const u8, marker: []const u8, doc_type: ?[]const u8) !usize {
+    var adapter = try DocumentAdapter.init(alloc, db_path);
+    defer adapter.deinit();
+
+    const now_ms = std.time.milliTimestamp();
+    var count: usize = 0;
+    for (doc_ids) |doc_id| {
+        var existing = try adapter.getDocument(alloc, doc_id) orelse continue;
+        defer existing.deinit(alloc);
+        if (doc_type) |dt| {
+            if (!std.mem.eql(u8, existing.doc_type, dt)) continue;
+        }
+
+        const updated = DocumentRecord{
+            .doc_id = existing.doc_id,
+            .doc_type = existing.doc_type,
+            .title = existing.title,
+            .tags_text = existing.tags_text,
+            .doc_json = existing.doc_json,
+            .parent_id = existing.parent_id,
+            .marker = marker,
+            .group_id = existing.group_id,
+            .owner_id = existing.owner_id,
+            .created_at_ms = existing.created_at_ms,
+            .updated_at_ms = now_ms,
+            .expires_at_ms = existing.expires_at_ms,
+            .content_hash = existing.content_hash,
+            .seq_num = existing.seq_num,
+            .meta_i1 = existing.meta_i1,
+            .meta_i2 = existing.meta_i2,
+            .meta_i3 = existing.meta_i3,
+            .meta_i4 = existing.meta_i4,
+            .meta_i5 = existing.meta_i5,
+            .meta_f1 = existing.meta_f1,
+            .meta_f2 = existing.meta_f2,
+            .meta_f3 = existing.meta_f3,
+            .meta_f4 = existing.meta_f4,
+            .meta_f5 = existing.meta_f5,
+            .version_type = existing.version_type,
+            .base_doc_id = existing.base_doc_id,
+        };
+
+        try adapter.writeDocument(updated);
+        count += 1;
+    }
+    try adapter.flush();
+    return count;
+}
+
 /// Get document version history.
 /// Handles adapter lifecycle internally.
 /// Caller owns returned records; free each with DocumentRecord.deinit().
