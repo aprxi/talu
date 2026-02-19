@@ -420,6 +420,7 @@
   color: var(--text);
   font-size: 15px;
   line-height: 1.5;
+  white-space: pre-wrap;
 }
 
 .user-msg-actions {
@@ -586,6 +587,26 @@
   max-height: 360px;
   border-radius: 8px;
   object-fit: contain;
+  cursor: pointer;
+}
+
+/* Image lightbox overlay */
+.image-lightbox {
+  position: fixed;
+  inset: 0;
+  z-index: 2000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.8);
+  cursor: pointer;
+}
+
+.image-lightbox img {
+  max-width: 90vw;
+  max-height: 90vh;
+  object-fit: contain;
+  border-radius: 8px;
 }
 
 /* File pill in message */

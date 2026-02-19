@@ -187,6 +187,31 @@ export function wireFileEvents(): void {
 
   dom.previewContent.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
+
+    // Image lightbox: click on preview image to expand
+    if (target.tagName === "IMG" && target.classList.contains("files-preview-img")) {
+      e.stopPropagation();
+      const src = (target as HTMLImageElement).src;
+      const overlay = document.createElement("div");
+      overlay.className = "image-lightbox";
+      const img = document.createElement("img");
+      img.src = src;
+      overlay.appendChild(img);
+
+      const dismiss = () => overlay.remove();
+      overlay.addEventListener("click", dismiss);
+      const onKey = (ev: KeyboardEvent) => {
+        if (ev.key === "Escape") {
+          dismiss();
+          document.removeEventListener("keydown", onKey);
+        }
+      };
+      document.addEventListener("keydown", onKey);
+
+      document.body.appendChild(overlay);
+      return;
+    }
+
     const actionBtn = target.closest<HTMLElement>("[data-action]");
     if (!actionBtn) return;
     const action = actionBtn.dataset["action"];

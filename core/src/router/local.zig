@@ -1022,14 +1022,35 @@ pub const LocalEngine = struct {
         const temporal_patch_size = try requirePositiveConfigU32(self.loaded.config.vision_temporal_patch_size);
         const spatial_merge_size = try requirePositiveConfigU32(self.loaded.config.vision_spatial_merge_size);
         const resize_factor = try std.math.mul(u32, patch_size, spatial_merge_size);
-        const fixed_pixels: u32 = blk: {
-            if (self.loaded.config.vision_num_position_embeddings <= 0) break :blk 0;
-            if (temporal_patch_size != 1 or spatial_merge_size != 1) break :blk 0;
-            const n_pos = std.math.cast(u64, self.loaded.config.vision_num_position_embeddings) orelse break :blk 0;
-            const patch_area = try std.math.mul(u64, patch_size, patch_size);
-            const pixels_u64 = try std.math.mul(u64, n_pos, patch_area);
-            break :blk std.math.cast(u32, pixels_u64) orelse return error.InvalidShape;
-        };
+
+        // Cap image pixels so the vision encoder stays tractable on CPU.
+        //
+        // The vision encoder uses O(n²) bidirectional attention (flash attention
+        // requires is_causal=true).  Without a cap, large images produce huge
+        // patch counts and make the encoder impractically slow.
+        //
+        // For simple models (temporal=1, spatial_merge=1) both min and max are
+        // set to the position-embedding pixel budget (exact resize).
+        // For dynamic-resolution models a conservative 512×512 default keeps
+        // encoding under ~2 s on CPU.  This will be superseded by values from
+        // preprocessor_config.json once that file is loaded (see story).
+        var min_pixels: u64 = 0;
+        var max_pixels: u64 = 0;
+        if (self.loaded.config.vision_num_position_embeddings > 0) {
+            const n_pos: u64 = std.math.cast(u64, self.loaded.config.vision_num_position_embeddings) orelse 0;
+            if (n_pos > 0) {
+                const base_pixels = n_pos * @as(u64, patch_size) * @as(u64, patch_size);
+                if (temporal_patch_size == 1 and spatial_merge_size == 1) {
+                    min_pixels = base_pixels;
+                    max_pixels = base_pixels;
+                } else {
+                    // Dynamic-resolution: conservative CPU default.
+                    // TODO(preprocessor_config): replace with values from
+                    // preprocessor_config.json when available.
+                    max_pixels = 512 * 512;
+                }
+            }
+        }
 
         return .{
             .normalize = .minus_one_to_one,
@@ -1039,8 +1060,8 @@ pub const LocalEngine = struct {
             .spatial_merge_size = spatial_merge_size,
             .smart_resize = .{
                 .factor = resize_factor,
-                .min_pixels = fixed_pixels,
-                .max_pixels = fixed_pixels,
+                .min_pixels = min_pixels,
+                .max_pixels = max_pixels,
             },
         };
     }

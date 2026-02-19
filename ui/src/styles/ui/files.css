@@ -197,6 +197,7 @@
   border-radius: 6px;
   background: var(--bg-code);
   margin-bottom: 0.75rem;
+  cursor: pointer;
 }
 
 .files-preview-code {
