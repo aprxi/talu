@@ -937,7 +937,7 @@ pub const LocalEngine = struct {
                 const part = msg.getPart(part_index) orelse continue;
                 if (part.getContentType() != .input_image) continue;
 
-                const image_bytes = try decodeImageDataUrl(self.allocator, part.getData());
+                const image_bytes = try loadImageBytes(self.allocator, part.getData());
                 defer self.allocator.free(image_bytes);
 
                 var decoded = try image_mod.decode(self.allocator, image_bytes, .{
@@ -1019,6 +1019,22 @@ pub const LocalEngine = struct {
     fn requirePositiveConfigU32(value: i32) !u32 {
         if (value <= 0) return error.UnsupportedContentType;
         return std.math.cast(u32, value) orelse error.UnsupportedContentType;
+    }
+
+    /// Load raw image bytes from a URL (file:// or data: scheme).
+    fn loadImageBytes(allocator: std.mem.Allocator, image_url: []const u8) ![]u8 {
+        if (std.mem.startsWith(u8, image_url, "file://")) {
+            return loadImageFromFile(allocator, image_url["file://".len..]);
+        }
+        return decodeImageDataUrl(allocator, image_url);
+    }
+
+    /// Read image bytes directly from a local file path.
+    fn loadImageFromFile(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+        if (path.len == 0) return error.UnsupportedContentType;
+        const file = std.fs.openFileAbsolute(path, .{}) catch return error.UnsupportedContentType;
+        defer file.close();
+        return file.readToEndAlloc(allocator, 100 * 1024 * 1024) catch return error.UnsupportedContentType;
     }
 
     fn decodeImageDataUrl(allocator: std.mem.Allocator, image_url: []const u8) ![]u8 {
