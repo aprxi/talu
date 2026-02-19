@@ -50,6 +50,7 @@ struct FusedDenseModel {
     int hidden_dim = 0;
     float rope_theta = 0.0f;
     float rms_eps = 0.0f;
+    bool topology_initialized = false;
 };
 
 // Global model pointer (for pipeline access)
@@ -65,6 +66,20 @@ static thread_local Shape g_dense_token_shape = {1, 1};
 static thread_local float g_dense_attn_scale = 0.0f;
 static thread_local int g_dense_n_kv_heads = 0;
 static thread_local int g_dense_head_dim = 0;
+
+static constexpr uint8_t kLayerKindAttentionMlp = 0;
+static constexpr uint8_t kLayerKindShortConv = 1;
+
+static FusedDenseModel::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
+    switch (kind_id) {
+        case kLayerKindAttentionMlp:
+            return FusedDenseModel::Layer::LayerKind::attention_mlp;
+        case kLayerKindShortConv:
+            return FusedDenseModel::Layer::LayerKind::shortconv;
+        default:
+            throw std::invalid_argument("Unsupported dense layer kind id");
+    }
+}
 
 // Keep fused dense kernels architecture-agnostic: weight orientation is inferred
 // from tensor shapes, never from parameter names or model-family heuristics.
@@ -355,6 +370,21 @@ void mlx_dense_model_set_final(void* model, const void* ln_w, const void* lm_hea
     eval(fused_model->lm_head);
 }
 
+void mlx_dense_model_set_topology(
+    void* model,
+    const uint8_t* layer_kinds,
+    size_t n_layer_kinds
+) {
+    auto* fused_model = static_cast<FusedDenseModel*>(model);
+    if (n_layer_kinds != fused_model->layers.size()) {
+        throw std::invalid_argument("dense topology length does not match layer count");
+    }
+    for (size_t idx = 0; idx < n_layer_kinds; idx++) {
+        fused_model->layers[idx].kind = decode_layer_kind(layer_kinds[idx]);
+    }
+    fused_model->topology_initialized = true;
+}
+
 void mlx_dense_model_set_layer(
     void* model, size_t layer_idx,
     const void* ln1_w,
@@ -362,7 +392,6 @@ void mlx_dense_model_set_layer(
     const void* ln2_w,
     const void* gate_proj, const void* up_proj, const void* down_proj,
     const void* q_norm, const void* k_norm,
-    int layer_kind,
     size_t shortconv_d_conv,
     size_t shortconv_conv_dim,
     const void* shortconv_in_proj,
@@ -371,10 +400,10 @@ void mlx_dense_model_set_layer(
     const void* shortconv_out_proj
 ) {
     auto* fused_model = static_cast<FusedDenseModel*>(model);
+    if (!fused_model->topology_initialized) {
+        throw std::invalid_argument("mlx_dense_model_set_topology must be called before mlx_dense_model_set_layer");
+    }
     auto& layer = fused_model->layers[layer_idx];
-    layer.kind = (layer_kind == 1)
-        ? FusedDenseModel::Layer::LayerKind::shortconv
-        : FusedDenseModel::Layer::LayerKind::attention_mlp;
 
     layer.ln1_w = *static_cast<const array*>(ln1_w);
     layer.ln2_w = *static_cast<const array*>(ln2_w);

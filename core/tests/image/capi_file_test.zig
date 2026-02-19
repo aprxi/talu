@@ -30,7 +30,8 @@ test "capi file inspect unknown bytes still reports mime/description" {
     try std.testing.expectEqual(@as(i32, 0), rc);
     defer capi.talu_file_info_free(&info);
 
-    try std.testing.expectEqual(@as(c_int, 0), info.kind);
+    // Plain ASCII bytes are classified as text (kind=5).
+    try std.testing.expectEqual(@as(c_int, 5), info.kind);
     try std.testing.expectEqual(@as(c_int, 0), img.format);
     try std.testing.expect(info.mime_len > 0 or info.description_len > 0);
 }

@@ -80,9 +80,24 @@ struct FusedModelWeights {
     // Compiled forward function for decode (eliminates graph rebuild overhead)
     std::function<std::vector<array>(const std::vector<array>&)> compiled_decode;
     bool is_compiled = false;
+    bool topology_initialized = false;
 };
 
 static FusedModelWeights* g_fused_weights = nullptr;
+
+static constexpr uint8_t kLayerKindAttentionMlp = 0;
+static constexpr uint8_t kLayerKindShortConv = 1;
+
+static FusedModelWeights::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
+    switch (kind_id) {
+        case kLayerKindAttentionMlp:
+            return FusedModelWeights::Layer::LayerKind::attention_mlp;
+        case kLayerKindShortConv:
+            return FusedModelWeights::Layer::LayerKind::shortconv;
+        default:
+            throw std::invalid_argument("Unsupported fused layer kind id");
+    }
+}
 
 // Pipeline state
 static thread_local std::optional<array> g_current_token;
@@ -429,6 +444,21 @@ void mlx_fused_model_set_scaling_config(
     fused_weights->logits_scaling = logits_scaling;
 }
 
+void mlx_fused_model_set_topology(
+    void* model,
+    const uint8_t* layer_kinds,
+    size_t n_layer_kinds
+) {
+    auto* fused_weights = static_cast<FusedModelWeights*>(model);
+    if (n_layer_kinds != fused_weights->layers.size()) {
+        throw std::invalid_argument("fused topology length does not match layer count");
+    }
+    for (size_t idx = 0; idx < n_layer_kinds; idx++) {
+        fused_weights->layers[idx].kind = decode_layer_kind(layer_kinds[idx]);
+    }
+    fused_weights->topology_initialized = true;
+}
+
 void mlx_fused_model_set_layer(
     void* model, size_t layer_idx,
     const void* ln1_w,
@@ -442,7 +472,6 @@ void mlx_fused_model_set_layer(
     const void* down_w, const void* down_s, const void* down_b,
     const void* q_norm, const void* k_norm,
     const void* pre_ffn_norm, const void* post_ffn_norm,
-    int layer_kind,
     size_t shortconv_d_conv,
     size_t shortconv_conv_dim,
     const void* shortconv_in_w, const void* shortconv_in_s, const void* shortconv_in_b,
@@ -450,11 +479,10 @@ void mlx_fused_model_set_layer(
     const void* shortconv_conv_w, const void* shortconv_conv_b
 ) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
+    if (!fused_weights->topology_initialized) {
+        throw std::invalid_argument("mlx_fused_model_set_topology must be called before mlx_fused_model_set_layer");
+    }
     auto& layer = fused_weights->layers[layer_idx];
-
-    layer.kind = (layer_kind == 1)
-        ? FusedModelWeights::Layer::LayerKind::shortconv
-        : FusedModelWeights::Layer::LayerKind::attention_mlp;
     layer.ln1_w = *static_cast<const array*>(ln1_w);
     if (q_w) layer.q_w = *static_cast<const array*>(q_w);
     if (q_s) layer.q_s = *static_cast<const array*>(q_s);

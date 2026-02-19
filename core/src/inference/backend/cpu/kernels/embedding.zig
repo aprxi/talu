@@ -4,6 +4,8 @@
 //! This module provides embedding lookup operations for CPU inference.
 //! Supports F32 and grouped-affine u4/u8 formats.
 
+pub const supported = true;
+
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const dtype = @import("../../../../dtype.zig");

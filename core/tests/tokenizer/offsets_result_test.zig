@@ -1,87 +1,72 @@
-//! Integration tests for tokenizer.OffsetsResult
+//! Integration tests for tokenizer offset-related types.
 //!
-//! OffsetsResult contains token offsets mapping each token back to its
-//! position in the original source text (UTF-8 byte indices).
+//! `OffsetsResult` was replaced by `tokenizer.Encoding`, which carries ids,
+//! offsets, and masks in one owner-managed struct.
 
 const std = @import("std");
 const main = @import("main");
 
-const OffsetsResult = main.tokenizer.OffsetsResult;
+const Encoding = main.tokenizer.Encoding;
 const TokenOffset = main.tokenizer.TokenOffset;
 
-// =============================================================================
-// Type Verification Tests
-// =============================================================================
-
-test "OffsetsResult type is accessible" {
-    const T = OffsetsResult;
+test "Encoding type is accessible" {
+    const T = Encoding;
     _ = T;
 }
 
-test "OffsetsResult is a struct" {
-    const info = @typeInfo(OffsetsResult);
-    try std.testing.expect(info == .@"struct");
-}
+test "Encoding has expected fields" {
+    const fields = @typeInfo(Encoding).@"struct".fields;
 
-test "OffsetsResult has expected fields" {
-    const info = @typeInfo(OffsetsResult);
-    const fields = info.@"struct".fields;
-
+    var has_ids = false;
     var has_offsets = false;
+    var has_attention_mask = false;
+    var has_special_tokens_mask = false;
     var has_allocator = false;
 
     inline for (fields) |field| {
+        if (comptime std.mem.eql(u8, field.name, "ids")) has_ids = true;
         if (comptime std.mem.eql(u8, field.name, "offsets")) has_offsets = true;
+        if (comptime std.mem.eql(u8, field.name, "attention_mask")) has_attention_mask = true;
+        if (comptime std.mem.eql(u8, field.name, "special_tokens_mask")) has_special_tokens_mask = true;
         if (comptime std.mem.eql(u8, field.name, "allocator")) has_allocator = true;
     }
 
+    try std.testing.expect(has_ids);
     try std.testing.expect(has_offsets);
+    try std.testing.expect(has_attention_mask);
+    try std.testing.expect(has_special_tokens_mask);
     try std.testing.expect(has_allocator);
 }
 
-// =============================================================================
-// Method Tests
-// =============================================================================
-
-test "OffsetsResult has deinit method" {
-    try std.testing.expect(@hasDecl(OffsetsResult, "deinit"));
+test "Encoding has deinit and truncate methods" {
+    try std.testing.expect(@hasDecl(Encoding, "deinit"));
+    try std.testing.expect(@hasDecl(Encoding, "truncate"));
 }
 
-// =============================================================================
-// deinit Tests
-// =============================================================================
-
-test "OffsetsResult.deinit is safe on default-initialized struct" {
-    const allocator = std.testing.allocator;
-    var result = OffsetsResult{
+test "Encoding.deinit is safe for empty slices" {
+    var encoding = Encoding{
+        .ids = &.{},
         .offsets = &.{},
-        .allocator = allocator,
+        .attention_mask = &.{},
+        .special_tokens_mask = &.{},
+        .allocator = std.testing.allocator,
     };
-    result.deinit();
+    encoding.deinit();
 }
-
-// =============================================================================
-// TokenOffset Tests
-// =============================================================================
 
 test "TokenOffset type is accessible" {
     const T = TokenOffset;
     _ = T;
 }
 
-test "TokenOffset is an extern struct" {
+test "TokenOffset is an extern struct with start/end" {
     const info = @typeInfo(TokenOffset);
     try std.testing.expect(info == .@"struct");
     try std.testing.expect(info.@"struct".layout == .@"extern");
-}
 
-test "TokenOffset has start and end fields" {
-    const info = @typeInfo(TokenOffset);
     const fields = info.@"struct".fields;
-
     var has_start = false;
     var has_end = false;
-
     inline for (fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "start")) has_start = true;
         if (comptime std.mem.eql(u8, field.name, "end")) has_end = true;

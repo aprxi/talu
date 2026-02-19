@@ -905,6 +905,14 @@ pub extern fn mlx_fused_model_set_scaling_config(
     logits_scaling: f32,
 ) void;
 
+/// Set canonical layer topology ids for fused model execution.
+/// Must be called once before `mlx_fused_model_set_layer`.
+pub extern fn mlx_fused_model_set_topology(
+    model: FusedModelHandle,
+    layer_kinds: [*]const u8,
+    n_layer_kinds: usize,
+) void;
+
 /// Set per-layer weights
 pub extern fn mlx_fused_model_set_layer(
     model: FusedModelHandle,
@@ -936,7 +944,6 @@ pub extern fn mlx_fused_model_set_layer(
     k_norm: ArrayHandle,
     pre_ffn_norm: ArrayHandle,
     post_ffn_norm: ArrayHandle,
-    layer_kind: c_int, // 0=attention_mlp, 1=shortconv
     shortconv_d_conv: usize,
     shortconv_conv_dim: usize,
     shortconv_in_w: ArrayHandle,
@@ -1049,6 +1056,14 @@ pub extern fn mlx_dense_model_set_final(
     lm_head: ArrayHandle,
 ) void;
 
+/// Set canonical layer topology ids for dense model execution.
+/// Must be called once before `mlx_dense_model_set_layer`.
+pub extern fn mlx_dense_model_set_topology(
+    model: DenseModelHandle,
+    layer_kinds: [*]const u8,
+    n_layer_kinds: usize,
+) void;
+
 /// Set dense model layer weights
 pub extern fn mlx_dense_model_set_layer(
     model: DenseModelHandle,
@@ -1064,7 +1079,6 @@ pub extern fn mlx_dense_model_set_layer(
     down_proj: ArrayHandle,
     q_norm: ArrayHandle, // null if not present
     k_norm: ArrayHandle, // null if not present
-    layer_kind: c_int, // 0=attention_mlp, 1=shortconv
     shortconv_d_conv: usize,
     shortconv_conv_dim: usize,
     shortconv_in_proj: ArrayHandle,

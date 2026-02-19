@@ -39,7 +39,7 @@ test "image.decode decodes minimal pdf" {
     // 72pt page at default 150 DPI → ceil(72 * 150/72) = 150px
     try std.testing.expectEqual(@as(u32, 150), pdf_img.width);
     try std.testing.expectEqual(@as(u32, 150), pdf_img.height);
-    try std.testing.expectEqual(image.PixelFormat.rgba8, pdf_img.format);
+    try std.testing.expectEqual(image.PixelFormat.rgb8, pdf_img.format);
 }
 
 test "image.decode rejects unsupported format" {

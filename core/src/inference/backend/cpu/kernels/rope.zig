@@ -2,6 +2,8 @@
 //!
 //! Re-exports RoPE via `compute/cpu/math_primitives` for backend-local imports.
 
+pub const supported = true;
+
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 

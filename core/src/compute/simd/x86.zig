@@ -617,6 +617,8 @@ test "mulSumU8I8WithYSum: algebraic identity verification" {
 // =============================================================================
 
 test "cvtph2ps: basic positive values" {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+
     // FP16 encoding for common values:
     // 1.0 = 0x3C00, 2.0 = 0x4000, 0.5 = 0x3800
     const fp16_input: @Vector(8, u16) = .{
@@ -643,6 +645,8 @@ test "cvtph2ps: basic positive values" {
 }
 
 test "cvtph2ps: negative values" {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+
     // Negative FP16: sign bit (0x8000) | magnitude
     const fp16_input: @Vector(8, u16) = .{
         0xBC00, // -1.0
@@ -668,10 +672,17 @@ test "cvtph2ps: negative values" {
 }
 
 test "cvtph2ps: zero values" {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+
     const fp16_input: @Vector(8, u16) = .{
         0x0000, // +0.0
         0x8000, // -0.0
-        0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000,
+        0x0000,
+        0x0000,
+        0x0000,
+        0x0000,
+        0x0000,
+        0x0000,
     };
 
     const result = cvtph2ps(fp16_input);
@@ -683,10 +694,17 @@ test "cvtph2ps: zero values" {
 }
 
 test "cvtph2ps: infinity" {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+
     const fp16_input: @Vector(8, u16) = .{
         0x7C00, // +Inf
         0xFC00, // -Inf
-        0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00,
+        0x3C00,
+        0x3C00,
+        0x3C00,
+        0x3C00,
+        0x3C00,
+        0x3C00,
     };
 
     const result = cvtph2ps(fp16_input);
@@ -696,12 +714,18 @@ test "cvtph2ps: infinity" {
 }
 
 test "cvtph2ps: NaN" {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+
     // FP16 NaN: exp=0x1F (all ones), mantissa != 0
     const fp16_input: @Vector(8, u16) = .{
         0x7E00, // NaN (quiet)
         0x7C01, // NaN (signaling)
         0xFE00, // -NaN
-        0x3C00, 0x3C00, 0x3C00, 0x3C00, 0x3C00,
+        0x3C00,
+        0x3C00,
+        0x3C00,
+        0x3C00,
+        0x3C00,
     };
 
     const result = cvtph2ps(fp16_input);
@@ -712,6 +736,8 @@ test "cvtph2ps: NaN" {
 }
 
 test "cvtph2ps: small normal values" {
+    if (comptime builtin.cpu.arch != .x86_64) return;
+
     // Test values near the edge of normal/subnormal range
     // Smallest normal FP16: 2^-14 ≈ 6.1e-5, encoded as exp=1, mant=0 = 0x0400
     const fp16_input: @Vector(8, u16) = .{
@@ -719,7 +745,10 @@ test "cvtph2ps: small normal values" {
         0x0401, // Slightly larger
         0x3555, // ~0.333 (1/3 approximation)
         0x3C00, // 1.0
-        0x0000, 0x0000, 0x0000, 0x0000,
+        0x0000,
+        0x0000,
+        0x0000,
+        0x0000,
     };
 
     const result = cvtph2ps(fp16_input);

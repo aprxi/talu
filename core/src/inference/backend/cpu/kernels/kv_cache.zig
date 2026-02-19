@@ -10,6 +10,8 @@
 //!
 //! Slots are allocated/freed dynamically as requests arrive/complete.
 
+pub const supported = true;
+
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const cpu_cache_layout = compute.cpu.cache_layout;

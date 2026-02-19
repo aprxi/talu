@@ -13,6 +13,7 @@ const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
 const mamba_kernel = @import("../kernels/mamba.zig");
 const mla_kernel = @import("../kernels/mla_attention.zig");
+const topology = @import("../../topology.zig");
 
 const builtin = @import("builtin");
 const LoadedModel = graph_loader.LoadedModel;
@@ -777,19 +778,17 @@ fn classifyFusedDecodeModel(weight_handles: *const WeightHandles) FusedDecodeMod
     for (weight_handles.layers) |layer| {
         switch (layer.kind) {
             .attention_mlp => {
-                const quantized_attention_complete = layer.q_proj != null and
-                    layer.k_proj != null and
-                    layer.v_proj != null and
-                    layer.o_proj != null;
-                const quantized_ffn_complete = layer.w1 != null and layer.w2 != null and layer.w3 != null;
-                const dense_attention_complete = layer.q_proj_bf16 != null and
-                    layer.k_proj_bf16 != null and
-                    layer.v_proj_bf16 != null and
-                    layer.o_proj_bf16 != null;
-                const dense_ffn_complete = layer.w1_bf16 != null and layer.w2_bf16 != null and layer.w3_bf16 != null;
+                const attention_storage = layer.attentionStorageKind();
+                const ffn_storage = layer.ffnStorageKind();
+                if (attention_storage == .invalid or
+                    attention_storage == .missing or
+                    attention_storage == .mixed_qkv_quantized_o_dense or
+                    ffn_storage == .invalid or
+                    ffn_storage == .missing or
+                    ffn_storage == .moe) return .none;
 
-                const layer_quantized = quantized_attention_complete and quantized_ffn_complete;
-                const layer_dense = dense_attention_complete and dense_ffn_complete;
+                const layer_quantized = attention_storage == .quantized and ffn_storage == .quantized;
+                const layer_dense = attention_storage == .dense and ffn_storage == .dense;
 
                 // Fused kernels only support one consistent representation across all layers.
                 if (layer_quantized == layer_dense) return .none;
@@ -798,18 +797,16 @@ fn classifyFusedDecodeModel(weight_handles: *const WeightHandles) FusedDecodeMod
                 if (!layer_dense) all_layers_dense = false;
             },
             .shortconv => {
-                const layer_quantized = layer.shortconv_in_proj != null and
-                    layer.shortconv_out_proj != null and
-                    layer.shortconv_conv_weight != null and
-                    layer.w1 != null and
-                    layer.w2 != null and
-                    layer.w3 != null;
-                const layer_dense = layer.shortconv_in_proj_bf16 != null and
-                    layer.shortconv_out_proj_bf16 != null and
-                    layer.shortconv_conv_weight != null and
-                    layer.w1_bf16 != null and
-                    layer.w2_bf16 != null and
-                    layer.w3_bf16 != null;
+                const shortconv_storage = layer.shortconvStorageKind();
+                const ffn_storage = layer.ffnStorageKind();
+                if (shortconv_storage == .invalid or
+                    shortconv_storage == .missing or
+                    ffn_storage == .invalid or
+                    ffn_storage == .missing or
+                    ffn_storage == .moe) return .none;
+
+                const layer_quantized = shortconv_storage == .quantized and ffn_storage == .quantized;
+                const layer_dense = shortconv_storage == .dense and ffn_storage == .dense;
 
                 // Fused kernels only support one consistent representation across all layers.
                 if (layer_quantized == layer_dense) return .none;
@@ -817,6 +814,7 @@ fn classifyFusedDecodeModel(weight_handles: *const WeightHandles) FusedDecodeMod
                 if (!layer_quantized) all_layers_quantized = false;
                 if (!layer_dense) all_layers_dense = false;
             },
+            .mamba => return .none,
         }
     }
 
@@ -836,8 +834,15 @@ fn quantizedFusedLayout(weight_handles: *const WeightHandles) ?QuantizedLayout {
 
     for (weight_handles.layers) |layer| {
         const candidate = switch (layer.kind) {
-            .attention_mlp => if (layer.q_proj) |q| q else continue,
-            .shortconv => if (layer.shortconv_in_proj) |sc| sc else continue,
+            .attention_mlp => blk: {
+                if (layer.attentionStorageKind() != .quantized) return null;
+                break :blk layer.q_proj orelse return null;
+            },
+            .shortconv => blk: {
+                if (layer.shortconvStorageKind() != .quantized) return null;
+                break :blk layer.shortconv_in_proj orelse return null;
+            },
+            .mamba => return null,
         };
         if (group_size_opt == null) {
             group_size_opt = candidate.group_size;
@@ -852,6 +857,20 @@ fn quantizedFusedLayout(weight_handles: *const WeightHandles) ?QuantizedLayout {
         .group_size = group_size_opt orelse return null,
         .bits = quant_bits_opt orelse return null,
     };
+}
+
+fn buildFusedLayerKindPlan(
+    allocator: std.mem.Allocator,
+    layers: []const WeightHandles.LayerWeights,
+) ![]u8 {
+    const plan = try allocator.alloc(u8, layers.len);
+    errdefer allocator.free(plan);
+
+    for (layers, 0..) |layer, idx| {
+        const kind_id = topology.fusedLayerKindId(layer.kind) orelse return error.NotImplemented;
+        plan[idx] = @intFromEnum(kind_id);
+    }
+    return plan;
 }
 
 pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHandles, config: anytype) !void {
@@ -900,6 +919,10 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
             return error.FusedModelRequiresQuantizedLMHead;
         }
 
+        const layer_kind_plan = try buildFusedLayerKindPlan(allocator, weight_handles.layers);
+        defer allocator.free(layer_kind_plan);
+        mlx_graph.mlx_fused_model_set_topology(fused, layer_kind_plan.ptr, layer_kind_plan.len);
+
         // Set per-layer weights
         for (weight_handles.layers, 0..) |*layer, layer_idx| {
             switch (layer.kind) {
@@ -934,7 +957,6 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         if (layer.k_norm) |kn| kn else null,
                         if (layer.pre_ffn_norm) |n| n else null,
                         if (layer.post_ffn_norm) |n| n else null,
-                        0, // attention_mlp
                         0,
                         0,
                         null,
@@ -980,7 +1002,6 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         null,
                         if (layer.pre_ffn_norm) |n| n else null,
                         if (layer.post_ffn_norm) |n| n else null,
-                        1, // shortconv
                         layer.shortconv_d_conv,
                         layer.shortconv_conv_dim,
                         sc_in.weights,
@@ -993,6 +1014,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         if (layer.shortconv_conv_bias) |b| b else null,
                     );
                 },
+                .mamba => unreachable, // filtered by classifyFusedDecodeModel()
             }
         }
 
@@ -1080,6 +1102,10 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
             return error.DenseModelRequiresLMHead;
         }
 
+        const layer_kind_plan = try buildFusedLayerKindPlan(allocator, weight_handles.layers);
+        defer allocator.free(layer_kind_plan);
+        mlx_graph.mlx_dense_model_set_topology(dense, layer_kind_plan.ptr, layer_kind_plan.len);
+
         // Set per-layer weights (BF16)
         for (weight_handles.layers, 0..) |*layer, layer_idx| {
             switch (layer.kind) {
@@ -1097,7 +1123,6 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                     layer.w2_bf16.?, // down
                     if (layer.q_norm) |qn| qn else null,
                     if (layer.k_norm) |kn| kn else null,
-                    0, // attention_mlp
                     0,
                     0,
                     null,
@@ -1135,7 +1160,6 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         layer.w2_bf16.?, // down
                         null,
                         null,
-                        1, // shortconv
                         layer.shortconv_d_conv,
                         layer.shortconv_conv_dim,
                         layer.shortconv_in_proj_bf16.?,
@@ -1144,6 +1168,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         layer.shortconv_out_proj_bf16.?,
                     );
                 },
+                .mamba => unreachable, // filtered by classifyFusedDecodeModel()
             }
         }
 
@@ -1424,9 +1449,26 @@ pub const WeightHandles = struct {
     };
 
     pub const LayerWeights = struct {
-        pub const LayerKind = enum {
-            attention_mlp,
-            shortconv,
+        pub const LayerKind = topology.BlockKind;
+        pub const AttentionStorageKind = enum {
+            quantized,
+            mixed_qkv_quantized_o_dense,
+            dense,
+            missing,
+            invalid,
+        };
+        pub const ShortConvStorageKind = enum {
+            quantized,
+            dense,
+            missing,
+            invalid,
+        };
+        pub const FfnStorageKind = enum {
+            quantized,
+            dense,
+            moe,
+            missing,
+            invalid,
         };
 
         kind: LayerKind = .attention_mlp,
@@ -1478,6 +1520,109 @@ pub const WeightHandles = struct {
         is_quantized: bool = true,
         // MoE weights (for MoE models, replaces w1/w2/w3)
         moe: ?*MoEWeights = null,
+
+        pub fn getLn1(self: *const LayerWeights) ArrayHandle {
+            return self.ln1_weight;
+        }
+
+        pub fn getLn2(self: *const LayerWeights) ArrayHandle {
+            return self.ln2_weight;
+        }
+
+        pub fn getPreFfnNorm(self: *const LayerWeights) ?ArrayHandle {
+            return self.pre_ffn_norm;
+        }
+
+        pub fn getPostFfnNorm(self: *const LayerWeights) ?ArrayHandle {
+            return self.post_ffn_norm;
+        }
+
+        pub fn attentionStorageKind(self: *const LayerWeights) AttentionStorageKind {
+            const quantized_attention_complete = self.q_proj != null and
+                self.k_proj != null and
+                self.v_proj != null and
+                self.o_proj != null and
+                self.q_proj_bf16 == null and
+                self.k_proj_bf16 == null and
+                self.v_proj_bf16 == null and
+                self.o_proj_bf16 == null;
+            const mixed_attention_complete = self.q_proj != null and
+                self.k_proj != null and
+                self.v_proj != null and
+                self.o_proj == null and
+                self.q_proj_bf16 == null and
+                self.k_proj_bf16 == null and
+                self.v_proj_bf16 == null and
+                self.o_proj_bf16 != null;
+            const dense_attention_complete = self.q_proj == null and
+                self.k_proj == null and
+                self.v_proj == null and
+                self.o_proj == null and
+                self.q_proj_bf16 != null and
+                self.k_proj_bf16 != null and
+                self.v_proj_bf16 != null and
+                self.o_proj_bf16 != null;
+
+            const mode_count: usize = @intFromBool(quantized_attention_complete) +
+                @intFromBool(mixed_attention_complete) +
+                @intFromBool(dense_attention_complete);
+            if (mode_count > 1) return .invalid;
+            if (quantized_attention_complete) return .quantized;
+            if (mixed_attention_complete) return .mixed_qkv_quantized_o_dense;
+            if (dense_attention_complete) return .dense;
+
+            const has_any_attention_field = self.q_proj != null or
+                self.k_proj != null or
+                self.v_proj != null or
+                self.o_proj != null or
+                self.q_proj_bf16 != null or
+                self.k_proj_bf16 != null or
+                self.v_proj_bf16 != null or
+                self.o_proj_bf16 != null;
+            return if (has_any_attention_field) .invalid else .missing;
+        }
+
+        pub fn shortconvStorageKind(self: *const LayerWeights) ShortConvStorageKind {
+            const quantized_shortconv_complete = self.shortconv_in_proj != null and
+                self.shortconv_out_proj != null and
+                self.shortconv_conv_weight != null and
+                self.shortconv_in_proj_bf16 == null and
+                self.shortconv_out_proj_bf16 == null;
+            const dense_shortconv_complete = self.shortconv_in_proj == null and
+                self.shortconv_out_proj == null and
+                self.shortconv_conv_weight != null and
+                self.shortconv_in_proj_bf16 != null and
+                self.shortconv_out_proj_bf16 != null;
+            if (quantized_shortconv_complete and dense_shortconv_complete) return .invalid;
+            if (quantized_shortconv_complete) return .quantized;
+            if (dense_shortconv_complete) return .dense;
+
+            const has_any_shortconv_field = self.shortconv_in_proj != null or
+                self.shortconv_out_proj != null or
+                self.shortconv_in_proj_bf16 != null or
+                self.shortconv_out_proj_bf16 != null or
+                self.shortconv_conv_weight != null;
+            return if (has_any_shortconv_field) .invalid else .missing;
+        }
+
+        pub fn ffnStorageKind(self: *const LayerWeights) FfnStorageKind {
+            const quantized_ffn_complete = self.w1 != null and self.w2 != null and self.w3 != null and
+                self.w1_bf16 == null and self.w2_bf16 == null and self.w3_bf16 == null;
+            const dense_ffn_complete = self.w1 == null and self.w2 == null and self.w3 == null and
+                self.w1_bf16 != null and self.w2_bf16 != null and self.w3_bf16 != null;
+
+            if (self.moe != null) {
+                if (quantized_ffn_complete or dense_ffn_complete) return .invalid;
+                return .moe;
+            }
+            if (quantized_ffn_complete and dense_ffn_complete) return .invalid;
+            if (quantized_ffn_complete) return .quantized;
+            if (dense_ffn_complete) return .dense;
+
+            const has_any_ffn_field = self.w1 != null or self.w2 != null or self.w3 != null or
+                self.w1_bf16 != null or self.w2_bf16 != null or self.w3_bf16 != null;
+            return if (has_any_ffn_field) .invalid else .missing;
+        }
     };
 
     pub const QuantizedWeight = struct {
@@ -1488,6 +1633,9 @@ pub const WeightHandles = struct {
         bits: usize,
     };
 };
+
+/// Canonical block-kind alias (kept symmetric with CPU weights module).
+pub const BlockType = WeightHandles.LayerWeights.LayerKind;
 
 // =============================================================================
 // Unit Tests
@@ -1542,6 +1690,57 @@ fn testQuantizedWeight(id_base: usize, group_size: usize, bits: usize) WeightHan
         .group_size = group_size,
         .bits = bits,
     };
+}
+
+test "LayerWeights storage helpers classify attention/ffn dense path" {
+    const layer = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(1),
+        .ln2_weight = testHandle(2),
+        .q_proj_bf16 = testHandle(10),
+        .k_proj_bf16 = testHandle(11),
+        .v_proj_bf16 = testHandle(12),
+        .o_proj_bf16 = testHandle(13),
+        .w1_bf16 = testHandle(14),
+        .w2_bf16 = testHandle(15),
+        .w3_bf16 = testHandle(16),
+    };
+    try testing.expectEqual(WeightHandles.LayerWeights.AttentionStorageKind.dense, layer.attentionStorageKind());
+    try testing.expectEqual(WeightHandles.LayerWeights.FfnStorageKind.dense, layer.ffnStorageKind());
+}
+
+test "LayerWeights storage helpers classify mixed attention path" {
+    const layer = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(1),
+        .ln2_weight = testHandle(2),
+        .q_proj = testQuantizedWeight(10, 64, 4),
+        .k_proj = testQuantizedWeight(20, 64, 4),
+        .v_proj = testQuantizedWeight(30, 64, 4),
+        .o_proj_bf16 = testHandle(40),
+    };
+    try testing.expectEqual(
+        WeightHandles.LayerWeights.AttentionStorageKind.mixed_qkv_quantized_o_dense,
+        layer.attentionStorageKind(),
+    );
+}
+
+test "LayerWeights storage helpers classify moe ffn path" {
+    var moe = WeightHandles.MoEWeights{
+        .router_w = testHandle(1),
+        .gate_w = testHandle(2),
+        .gate_s = testHandle(3),
+        .up_w = testHandle(4),
+        .up_s = testHandle(5),
+        .down_w = testHandle(6),
+        .down_s = testHandle(7),
+        .num_experts = 8,
+        .experts_per_token = 2,
+    };
+    const layer = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(10),
+        .ln2_weight = testHandle(11),
+        .moe = &moe,
+    };
+    try testing.expectEqual(WeightHandles.LayerWeights.FfnStorageKind.moe, layer.ffnStorageKind());
 }
 
 test "classifyFusedDecodeModel returns quantized for mixed attention/shortconv quantized layers" {

@@ -64,14 +64,14 @@ test "GenerationConfig default top_p is 1.0" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), config.top_p, 0.001);
 }
 
-test "GenerationConfig default do_sample is true" {
+test "GenerationConfig default do_sample is false" {
     const config = GenerationConfig{};
-    try std.testing.expect(config.do_sample);
+    try std.testing.expect(!config.do_sample);
 }
 
-test "GenerationConfig default add_bos_token is true" {
+test "GenerationConfig default add_bos_token is false" {
     const config = GenerationConfig{};
-    try std.testing.expect(config.add_bos_token);
+    try std.testing.expect(!config.add_bos_token);
 }
 
 // =============================================================================

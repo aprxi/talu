@@ -10,6 +10,8 @@
 //!
 //! This is simpler than Mamba - no SSM state, just conv state for causality.
 
+pub const supported = true;
+
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const Tensor = tensor.Tensor;

@@ -4,6 +4,7 @@
 //! This has zero runtime overhead: checks run at comptime only.
 
 const std = @import("std");
+const topology = @import("topology.zig");
 
 /// Pooling strategy for embedding extraction.
 pub const PoolingStrategy = enum(u8) {
@@ -66,6 +67,15 @@ fn requireStructField(comptime S: type, comptime owner_name: []const u8, comptim
     }
 }
 
+fn requireBoolField(comptime S: type, comptime owner_name: []const u8, comptime field_name: []const u8) void {
+    if (!@hasField(S, field_name)) {
+        @compileError("Contract for '" ++ owner_name ++ "' missing required bool field '" ++ field_name ++ "'");
+    }
+    if (@TypeOf(@field(@as(S, undefined), field_name)) != bool) {
+        @compileError("Contract for '" ++ owner_name ++ "' field '" ++ field_name ++ "' must be bool");
+    }
+}
+
 fn requireMethodArity(comptime M: type, comptime owner_name: []const u8, comptime name: []const u8, comptime arity: usize) void {
     requireCallableDecl(M, owner_name, name);
     const decl = @field(M, name);
@@ -73,6 +83,22 @@ fn requireMethodArity(comptime M: type, comptime owner_name: []const u8, comptim
     if (fn_info.params.len != arity) {
         @compileError("Contract for '" ++ owner_name ++ "." ++ name ++ "' must have arity " ++ std.fmt.comptimePrint("{}", .{arity}));
     }
+}
+
+fn requireTypeAliasEq(comptime actual: type, comptime expected: type, comptime alias_name: []const u8) void {
+    if (actual != expected) {
+        @compileError("Contract type alias mismatch for '" ++ alias_name ++ "'");
+    }
+}
+
+fn requireEnumTag(comptime E: type, comptime owner_name: []const u8, comptime tag_name: []const u8) void {
+    if (@typeInfo(E) != .@"enum") {
+        @compileError("Contract for '" ++ owner_name ++ "' requires enum type");
+    }
+    inline for (@typeInfo(E).@"enum".fields) |field| {
+        if (std.mem.eql(u8, field.name, tag_name)) return;
+    }
+    @compileError("Contract for '" ++ owner_name ++ "' missing enum tag '" ++ tag_name ++ "'");
 }
 
 /// Assert module layout symmetry for backends.
@@ -85,8 +111,34 @@ pub fn assertBackendModuleLayout(comptime M: type, comptime backend_name: []cons
         requireLayoutDecl(M, backend_name, "executor");
         requireLayoutDecl(M, backend_name, "kernels");
         requireLayoutDecl(M, backend_name, "engine");
+        requireLayoutDecl(M, backend_name, "graph");
+        requireLayoutDecl(M, backend_name, "vision");
         requireLayoutDecl(M, backend_name, "scheduler");
         requireLayoutDecl(M, backend_name, "sampling");
+    }
+}
+
+/// Assert scheduler module layout symmetry.
+pub fn assertSchedulerModuleLayout(comptime S: type, comptime backend_name: []const u8) void {
+    comptime {
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "RequestState");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "Request");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "FinishReason");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "TokenEvent");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "SchedulerConfig");
+        requireCallableDecl(S, backend_name ++ ".scheduler", "GenericScheduler");
+        requireLayoutDecl(S, backend_name ++ ".scheduler", "Scheduler");
+    }
+}
+
+/// Assert sampling module layout symmetry.
+pub fn assertSamplingModuleLayout(comptime S: type, comptime backend_name: []const u8) void {
+    comptime {
+        requireLayoutDecl(S, backend_name ++ ".sampling", "SamplingStrategy");
+        requireLayoutDecl(S, backend_name ++ ".sampling", "LogitBiasEntry");
+        requireLayoutDecl(S, backend_name ++ ".sampling", "SamplingConfig");
+        requireLayoutDecl(S, backend_name ++ ".sampling", "Workspace");
+        requireLayoutDecl(S, backend_name ++ ".sampling", "Sampler");
     }
 }
 
@@ -105,10 +157,36 @@ pub fn assertExecutorModuleLayout(comptime E: type, comptime backend_name: []con
 /// Assert executor symbol symmetry (type + method names) across backends.
 pub fn assertExecutorSymbolLayout(comptime E: type, comptime backend_name: []const u8) void {
     comptime {
+        requireLayoutDecl(E, backend_name ++ ".executor", "Model");
+        requireLayoutDecl(E, backend_name ++ ".executor", "Transformer");
+        requireLayoutDecl(E, backend_name ++ ".executor", "Block");
+        requireLayoutDecl(E, backend_name ++ ".executor", "TransformerBlock");
+        requireLayoutDecl(E, backend_name ++ ".executor", "BlockKind");
+        requireLayoutDecl(E, backend_name ++ ".executor", "Attention");
+        requireLayoutDecl(E, backend_name ++ ".executor", "RMSNorm");
+        requireLayoutDecl(E, backend_name ++ ".executor", "FFNLayer");
+        requireLayoutDecl(E, backend_name ++ ".executor", "AttnTemp");
+        requireLayoutDecl(E, backend_name ++ ".executor", "AttnCache");
+        requireLayoutDecl(E, backend_name ++ ".executor", "ScratchBuffer");
+
+        requireTypeAliasEq(E.Model, E.model.Model, backend_name ++ ".executor.Model");
+        requireTypeAliasEq(E.Transformer, E.model.Model, backend_name ++ ".executor.Transformer");
+        requireTypeAliasEq(E.Block, E.block.TransformerBlock, backend_name ++ ".executor.Block");
+        requireTypeAliasEq(E.TransformerBlock, E.block.TransformerBlock, backend_name ++ ".executor.TransformerBlock");
+
         requireLayoutDecl(E.model, backend_name ++ ".executor.model", "Model");
         requireLayoutDecl(E.block, backend_name ++ ".executor.block", "TransformerBlock");
+        requireLayoutDecl(E.weights, backend_name ++ ".executor.weights", "BlockType");
         requireCallableDecl(E.model.Model, backend_name ++ ".executor.model.Model", "forward");
         requireCallableDecl(E.block.TransformerBlock, backend_name ++ ".executor.block.TransformerBlock", "forward");
+        requireCallableDecl(E.Model, backend_name ++ ".executor.Model", "forward");
+        requireCallableDecl(E.TransformerBlock, backend_name ++ ".executor.TransformerBlock", "forward");
+        requireTypeAliasEq(E.BlockKind, topology.BlockKind, backend_name ++ ".executor.BlockKind");
+        requireTypeAliasEq(E.BlockKind, E.weights.BlockType, backend_name ++ ".executor.BlockKind");
+
+        requireEnumTag(E.BlockKind, backend_name ++ ".executor.BlockKind", "attention_mlp");
+        requireEnumTag(E.BlockKind, backend_name ++ ".executor.BlockKind", "mamba");
+        requireEnumTag(E.BlockKind, backend_name ++ ".executor.BlockKind", "shortconv");
     }
 }
 
@@ -141,32 +219,50 @@ pub fn assertKernelSupportMap(comptime K: type, comptime backend_name: []const u
     comptime {
         requireLayoutDecl(K, backend_name, "support");
         const S = @TypeOf(K.support);
-        if (!@hasField(S, "attention")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'attention'");
-        if (@TypeOf(K.support.attention) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'attention' must be bool");
-        if (!@hasField(S, "describe_fmt")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'describe_fmt'");
-        if (@TypeOf(K.support.describe_fmt) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'describe_fmt' must be bool");
-        if (!@hasField(S, "embedding")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'embedding'");
-        if (@TypeOf(K.support.embedding) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'embedding' must be bool");
-        if (!@hasField(S, "ffn")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'ffn'");
-        if (@TypeOf(K.support.ffn) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'ffn' must be bool");
-        if (!@hasField(S, "fused_attention")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'fused_attention'");
-        if (@TypeOf(K.support.fused_attention) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'fused_attention' must be bool");
-        if (!@hasField(S, "kv_cache")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'kv_cache'");
-        if (@TypeOf(K.support.kv_cache) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'kv_cache' must be bool");
-        if (!@hasField(S, "mamba")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'mamba'");
-        if (@TypeOf(K.support.mamba) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'mamba' must be bool");
-        if (!@hasField(S, "mla_attention")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'mla_attention'");
-        if (@TypeOf(K.support.mla_attention) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'mla_attention' must be bool");
-        if (!@hasField(S, "moe")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'moe'");
-        if (@TypeOf(K.support.moe) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'moe' must be bool");
-        if (!@hasField(S, "norm")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'norm'");
-        if (@TypeOf(K.support.norm) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'norm' must be bool");
-        if (!@hasField(S, "rope")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'rope'");
-        if (@TypeOf(K.support.rope) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'rope' must be bool");
-        if (!@hasField(S, "shortconv")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'shortconv'");
-        if (@TypeOf(K.support.shortconv) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'shortconv' must be bool");
-        if (!@hasField(S, "weights")) @compileError("Kernel support map for '" ++ backend_name ++ "' missing 'weights'");
-        if (@TypeOf(K.support.weights) != bool) @compileError("Kernel support map for '" ++ backend_name ++ "' field 'weights' must be bool");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "attention");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "describe_fmt");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "embedding");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "ffn");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "fused_attention");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "kv_cache");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "mamba");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "mla_attention");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "moe");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "norm");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "rope");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "shortconv");
+        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "weights");
+
+        assertKernelSupportDeclMatches(K.attention, backend_name, "attention", K.support.attention);
+        assertKernelSupportDeclMatches(K.describe_fmt, backend_name, "describe_fmt", K.support.describe_fmt);
+        assertKernelSupportDeclMatches(K.embedding, backend_name, "embedding", K.support.embedding);
+        assertKernelSupportDeclMatches(K.ffn, backend_name, "ffn", K.support.ffn);
+        assertKernelSupportDeclMatches(K.fused_attention, backend_name, "fused_attention", K.support.fused_attention);
+        assertKernelSupportDeclMatches(K.kv_cache, backend_name, "kv_cache", K.support.kv_cache);
+        assertKernelSupportDeclMatches(K.mamba, backend_name, "mamba", K.support.mamba);
+        assertKernelSupportDeclMatches(K.mla_attention, backend_name, "mla_attention", K.support.mla_attention);
+        assertKernelSupportDeclMatches(K.moe, backend_name, "moe", K.support.moe);
+        assertKernelSupportDeclMatches(K.norm, backend_name, "norm", K.support.norm);
+        assertKernelSupportDeclMatches(K.rope, backend_name, "rope", K.support.rope);
+        assertKernelSupportDeclMatches(K.shortconv, backend_name, "shortconv", K.support.shortconv);
+        assertKernelSupportDeclMatches(K.weights, backend_name, "weights", K.support.weights);
+    }
+}
+
+fn assertKernelSupportDeclMatches(
+    comptime Module: type,
+    comptime backend_name: []const u8,
+    comptime kernel_name: []const u8,
+    comptime expected: bool,
+) void {
+    if (!@hasDecl(Module, "supported")) {
+        @compileError("Kernel module '" ++ backend_name ++ ".kernels." ++ kernel_name ++ "' missing decl 'supported'");
+    }
+    if (@TypeOf(Module.supported) != bool) {
+        @compileError("Kernel module '" ++ backend_name ++ ".kernels." ++ kernel_name ++ "' decl `supported` must be bool");
+    }
+    if (Module.supported != expected) {
+        @compileError("Kernel module '" ++ backend_name ++ ".kernels." ++ kernel_name ++ "' has `supported` mismatch with support map");
     }
 }
 
@@ -261,11 +357,44 @@ fn assertUnsupportedKernelModule(comptime M: type, comptime backend_name: []cons
 /// Assert unsupported-kernel modules expose explicit typed failures.
 pub fn assertUnsupportedKernelPolicy(comptime K: type, comptime backend_name: []const u8) void {
     comptime {
+        if (!K.support.attention) {
+            assertUnsupportedKernelModule(K.attention, backend_name, "attention");
+        }
+        if (!K.support.describe_fmt) {
+            assertUnsupportedKernelModule(K.describe_fmt, backend_name, "describe_fmt");
+        }
+        if (!K.support.embedding) {
+            assertUnsupportedKernelModule(K.embedding, backend_name, "embedding");
+        }
+        if (!K.support.ffn) {
+            assertUnsupportedKernelModule(K.ffn, backend_name, "ffn");
+        }
+        if (!K.support.fused_attention) {
+            assertUnsupportedKernelModule(K.fused_attention, backend_name, "fused_attention");
+        }
+        if (!K.support.kv_cache) {
+            assertUnsupportedKernelModule(K.kv_cache, backend_name, "kv_cache");
+        }
         if (!K.support.mamba) {
             assertUnsupportedKernelModule(K.mamba, backend_name, "mamba");
         }
         if (!K.support.mla_attention) {
             assertUnsupportedKernelModule(K.mla_attention, backend_name, "mla_attention");
+        }
+        if (!K.support.moe) {
+            assertUnsupportedKernelModule(K.moe, backend_name, "moe");
+        }
+        if (!K.support.norm) {
+            assertUnsupportedKernelModule(K.norm, backend_name, "norm");
+        }
+        if (!K.support.rope) {
+            assertUnsupportedKernelModule(K.rope, backend_name, "rope");
+        }
+        if (!K.support.shortconv) {
+            assertUnsupportedKernelModule(K.shortconv, backend_name, "shortconv");
+        }
+        if (!K.support.weights) {
+            assertUnsupportedKernelModule(K.weights, backend_name, "weights");
         }
     }
 }

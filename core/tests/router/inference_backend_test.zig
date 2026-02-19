@@ -97,7 +97,7 @@ test "createInferenceBackend succeeds for valid OpenAI spec" {
     defer canonical.deinit(std.testing.allocator);
 
     // Then create backend
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical);
+    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
     defer backend.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(BackendType.OpenAICompatible, backend.backend_type);
@@ -126,7 +126,7 @@ test "createInferenceBackend OpenAI backend has no LocalEngine" {
     var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
     defer canonical.deinit(std.testing.allocator);
 
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical);
+    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
     defer backend.deinit(std.testing.allocator);
 
     // OpenAI backend should not have a LocalEngine
@@ -144,7 +144,7 @@ test "createInferenceBackend fails for Unspecified backend type" {
     @memcpy(canonical.ref[0..4], "test");
     defer std.testing.allocator.free(canonical.ref);
 
-    const result = spec.createInferenceBackend(std.testing.allocator, &canonical);
+    const result = spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
     try std.testing.expectError(error.InvalidArgument, result);
 }
 
@@ -175,7 +175,7 @@ test "InferenceBackend backend_type matches canonical backend_type" {
     var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
     defer canonical.deinit(std.testing.allocator);
 
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical);
+    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
     defer backend.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(canonical.backend_type, backend.backend_type);
@@ -208,7 +208,7 @@ test "InferenceBackend deinit is safe to call" {
     var canonical = try spec.canonicalizeSpec(std.testing.allocator, &c_spec);
     defer canonical.deinit(std.testing.allocator);
 
-    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical);
+    var backend = try spec.createInferenceBackend(std.testing.allocator, &canonical, main.capi.progress.ProgressContext.NONE);
 
     // deinit should free all owned strings without crash
     backend.deinit(std.testing.allocator);

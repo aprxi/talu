@@ -4,6 +4,8 @@
 //! This module provides the core attention computation for CPU inference.
 //! It supports both prefill (multiple tokens) and decode (single token with KV cache) modes.
 
+pub const supported = true;
+
 const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");

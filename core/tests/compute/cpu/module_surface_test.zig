@@ -1,5 +1,5 @@
 const std = @import("std");
-const compute = @import("../../../src/compute/root.zig");
+const compute = @import("main").compute;
 
 test "compute.cpu exposes primitive-first modules" {
     _ = compute.cpu.common;
@@ -22,6 +22,8 @@ test "compute.cpu exposes primitive-first modules" {
 }
 
 test "compute.cpu transitional modules remain available during migration" {
+    _ = compute.cpu.matmul;
+    _ = compute.cpu.norm;
     _ = compute.cpu.attention;
-    _ = compute.cpu.ffn;
+    _ = compute.cpu.math;
 }

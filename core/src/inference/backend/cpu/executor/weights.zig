@@ -23,6 +23,7 @@ const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 const log = @import("../../../../log.zig");
 const progress_mod = @import("../../../../capi/progress.zig");
+const topology = @import("../../topology.zig");
 
 pub const BufferId = ops.BufferId;
 
@@ -869,34 +870,8 @@ pub const FfnLayer = union(enum) {
 // Block Type System for Heterogeneous Models
 // =============================================================================
 
-/// Block types for heterogeneous models (e.g., Granite Hybrid with Mamba + Attention).
-/// Used to determine which kernel implementation to use for each layer.
-pub const BlockType = enum {
-    /// Standard transformer block with attention and FFN (Llama, Qwen, Granite, etc.)
-    attention_mlp,
-    /// Mamba2 SSM block (State Space Duality)
-    mamba,
-    /// ShortConv block (gated convolution)
-    shortconv,
-
-    /// Convert a variant name string to BlockType.
-    /// Returns null for unknown variants (caller must handle error).
-    pub fn fromVariantName(name: []const u8) ?BlockType {
-        const known = std.StaticStringMap(BlockType).initComptime(.{
-            .{ "attention", .attention_mlp },
-            .{ "attention_mlp", .attention_mlp },
-            .{ "transformer", .attention_mlp },
-            .{ "full_attention", .attention_mlp }, // GPT-OSS global attention
-            .{ "sliding_attention", .attention_mlp }, // GPT-OSS sliding window
-            .{ "mamba", .mamba },
-            .{ "mamba2", .mamba },
-            .{ "ssm", .mamba },
-            .{ "shortconv", .shortconv },
-            .{ "conv", .shortconv },
-        });
-        return known.get(name);
-    }
-};
+/// Canonical block kinds are shared across backends.
+pub const BlockType = topology.BlockKind;
 
 /// Kernel container for a single transformer block.
 /// Holds the kernel structs (attention, FFN) that the transformer engine references.

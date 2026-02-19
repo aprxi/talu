@@ -1,5 +1,7 @@
 //! CPU weight/container kernel surface.
 
+pub const supported = true;
+
 const impl = @import("../executor/weights.zig");
 
 pub const TransformerBlock = impl.TransformerBlock;

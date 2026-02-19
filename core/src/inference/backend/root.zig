@@ -50,6 +50,7 @@ const LoadedModel = graph_mod.LoadedModel;
 const LoadOptions = graph_mod.LoadOptions;
 
 pub const cpu = @import("cpu/root.zig");
+pub const topology = @import("topology.zig");
 
 /// Re-export types used by the scheduler interface
 pub const DecodeRequest = contract.DecodeRequest;
@@ -71,6 +72,8 @@ comptime {
     contract.assertKernelSupportMap(cpu.kernels, "cpu");
     contract.assertKernelSymbolLayout(cpu.kernels, "cpu");
     contract.assertUnsupportedKernelPolicy(cpu.kernels, "cpu");
+    contract.assertSchedulerModuleLayout(cpu.scheduler, "cpu");
+    contract.assertSamplingModuleLayout(cpu.sampling, "cpu");
     contract.assertBackendType(cpu.BackendType);
     if (has_metal) {
         contract.assertBackendModuleLayout(metal, "metal");
@@ -80,6 +83,8 @@ comptime {
         contract.assertKernelSupportMap(metal.kernels, "metal");
         contract.assertKernelSymbolLayout(metal.kernels, "metal");
         contract.assertUnsupportedKernelPolicy(metal.kernels, "metal");
+        contract.assertSchedulerModuleLayout(metal.scheduler, "metal");
+        contract.assertSamplingModuleLayout(metal.sampling, "metal");
         contract.assertBackendType(metal.BackendType);
     }
 }

@@ -3,6 +3,8 @@
 //!
 //! This module provides normalization operations for CPU inference.
 
+pub const supported = true;
+
 const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");

@@ -29,6 +29,7 @@ const kernels = @import("../kernels/root.zig");
 pub const Attention = kernels.attention.MultiHeadAttention;
 pub const RMSNorm = kernels.norm.RMSNorm;
 pub const FFNLayer = weights.FfnLayer;
+pub const BlockKind = weights.BlockType;
 pub const AttnTemp = runtime.AttnTemp;
 pub const AttnCache = runtime.AttnCache;
 pub const ScratchBuffer = runtime.ScratchBuffer;

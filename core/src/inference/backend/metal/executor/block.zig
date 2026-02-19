@@ -6,6 +6,7 @@
 const compute = @import("../../../../compute/root.zig");
 const attention_kernel = @import("../kernels/attention.zig");
 const ffn_kernel = @import("../kernels/ffn.zig");
+const mamba_kernel = @import("../kernels/mamba.zig");
 const moe_kernel = @import("../kernels/moe.zig");
 const norm_kernel = @import("../kernels/norm.zig");
 const shortconv_kernel = @import("../kernels/shortconv.zig");
@@ -33,9 +34,12 @@ pub const TransformerBlock = struct {
         const kv_head_count: usize = @intCast(config.n_kv_groups);
         const head_dim: usize = @intCast(config.head_dim);
         const lw = layer_weights.*;
+        const attention_storage = lw.attentionStorageKind();
+        const shortconv_storage = lw.shortconvStorageKind();
+        const ffn_storage = lw.ffnStorageKind();
 
         const attn_norm = norm_kernel.RMSNorm{
-            .weight = lw.ln1_weight,
+            .weight = lw.getLn1(),
             .eps = norm_eps,
         };
         var normed: mlx_graph.ArrayHandle = undefined;
@@ -43,6 +47,8 @@ pub const TransformerBlock = struct {
 
         const mixer_out = switch (lw.kind) {
             .attention_mlp => blk: {
+                if (attention_storage == .invalid) return error.InvalidTensorType;
+                if (attention_storage == .missing) return error.MissingField;
                 const attention = attention_kernel.MultiHeadAttention{
                     .n_heads = head_count,
                     .n_kv_heads = kv_head_count,
@@ -90,6 +96,8 @@ pub const TransformerBlock = struct {
                 break :blk attn_out;
             },
             .shortconv => blk: {
+                if (shortconv_storage == .invalid) return error.InvalidTensorType;
+                if (shortconv_storage == .missing) return error.MissingField;
                 const conv_weight = lw.shortconv_conv_weight orelse return error.MissingField;
                 const shortconv = shortconv_kernel.ShortConvKernel{
                     .in_proj = if (lw.shortconv_in_proj) |w| w else null,
@@ -117,11 +125,12 @@ pub const TransformerBlock = struct {
                 );
                 break :blk shortconv_out;
             },
+            .mamba => return mamba_kernel.unsupported(),
         };
 
         const attn_for_residual = if (weight_handles.use_post_attn_norm) blk: {
             const post_attn_norm = norm_kernel.RMSNorm{
-                .weight = lw.ln2_weight,
+                .weight = lw.getLn2(),
                 .eps = norm_eps,
             };
             var normed_attn: mlx_graph.ArrayHandle = undefined;
@@ -134,10 +143,10 @@ pub const TransformerBlock = struct {
             attn_for_residual;
         const hidden_1 = mlx_graph.mlx_lazy_add(hidden, scaled_attn);
 
-        const ffn_norm_weight = if (weight_handles.use_post_attn_norm and lw.pre_ffn_norm != null)
-            lw.pre_ffn_norm.?
+        const ffn_norm_weight = if (weight_handles.use_post_attn_norm and lw.getPreFfnNorm() != null)
+            lw.getPreFfnNorm().?
         else
-            lw.ln2_weight;
+            lw.getLn2();
         const ffn_norm = norm_kernel.RMSNorm{
             .weight = ffn_norm_weight,
             .eps = norm_eps,
@@ -145,41 +154,47 @@ pub const TransformerBlock = struct {
         var normed_2: mlx_graph.ArrayHandle = undefined;
         ffn_norm.forward(hidden_1, &normed_2);
 
-        const ffn_out = if (lw.moe) |moe| blk: {
-            const ffn_moe = moe_kernel.MoEFFN{ .weights = moe };
-            var moe_scratch = moe_kernel.MoEScratch{};
-            var moe_matmul_scratch = moe_kernel.MatmulScratch{};
-            var moe_out: mlx_graph.ArrayHandle = undefined;
-            try ffn_moe.forward(
-                normed_2,
-                &moe_out,
-                &moe_scratch,
-                &moe_matmul_scratch,
-            );
-            break :blk moe_out;
-        } else blk: {
-            const swiglu = ffn_kernel.SwiGLU{
-                .use_gelu = weight_handles.use_gelu,
-                .w1 = lw.w1,
-                .w2 = lw.w2,
-                .w3 = lw.w3,
-                .w1_bf16 = lw.w1_bf16,
-                .w2_bf16 = lw.w2_bf16,
-                .w3_bf16 = lw.w3_bf16,
-            };
-            var ffn_scratch = ffn_kernel.FfnScratch{};
-            var ffn_matmul_scratch = ffn_kernel.MatmulScratch{};
-            var ffn_result: mlx_graph.ArrayHandle = undefined;
-            try swiglu.forward(
-                normed_2,
-                &ffn_result,
-                &ffn_scratch,
-                &ffn_matmul_scratch,
-            );
-            break :blk ffn_result;
+        const ffn_out = switch (ffn_storage) {
+            .moe => blk: {
+                const moe = lw.moe orelse return error.MissingField;
+                const ffn_moe = moe_kernel.MoEFFN{ .weights = moe };
+                var moe_scratch = moe_kernel.MoEScratch{};
+                var moe_matmul_scratch = moe_kernel.MatmulScratch{};
+                var moe_out: mlx_graph.ArrayHandle = undefined;
+                try ffn_moe.forward(
+                    normed_2,
+                    &moe_out,
+                    &moe_scratch,
+                    &moe_matmul_scratch,
+                );
+                break :blk moe_out;
+            },
+            .quantized, .dense => blk: {
+                const swiglu = ffn_kernel.SwiGLU{
+                    .use_gelu = weight_handles.use_gelu,
+                    .w1 = lw.w1,
+                    .w2 = lw.w2,
+                    .w3 = lw.w3,
+                    .w1_bf16 = lw.w1_bf16,
+                    .w2_bf16 = lw.w2_bf16,
+                    .w3_bf16 = lw.w3_bf16,
+                };
+                var ffn_scratch = ffn_kernel.FfnScratch{};
+                var ffn_matmul_scratch = ffn_kernel.MatmulScratch{};
+                var ffn_result: mlx_graph.ArrayHandle = undefined;
+                try swiglu.forward(
+                    normed_2,
+                    &ffn_result,
+                    &ffn_scratch,
+                    &ffn_matmul_scratch,
+                );
+                break :blk ffn_result;
+            },
+            .missing => return error.MissingField,
+            .invalid => return error.InvalidTensorType,
         };
 
-        const ffn_for_residual = if (lw.post_ffn_norm) |post_ffn| blk: {
+        const ffn_for_residual = if (lw.getPostFfnNorm()) |post_ffn| blk: {
             const post_norm = norm_kernel.RMSNorm{
                 .weight = post_ffn,
                 .eps = norm_eps,

@@ -361,5 +361,5 @@ test "Tokenizer: decode rejects out-of-range token ID" {
     // 0xFFFFFFFF is too large to fit in i32
     const ids = [_]u32{0xFFFFFFFF};
     const result = tok.decode(&ids);
-    try std.testing.expectError(TokenizerError.DecodeFailed, result);
+    try std.testing.expectError(TokenizerError.InvalidTokenId, result);
 }

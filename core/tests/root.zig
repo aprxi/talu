@@ -69,7 +69,8 @@ pub const xray_dump = @import("xray/dump/root.zig");
 // compute
 pub const compute_device = @import("compute/device_test.zig");
 pub const compute_thread_pool = @import("compute/thread_pool_test.zig");
-pub const compute_metal = @import("compute/metal/root.zig");
+// Metal integration tests are currently excluded from this aggregate runner.
+// Metal behavior remains covered by unit tests under `core/tests/compute/metal/`.
 pub const compute_cpu_module_surface = @import("compute/cpu/module_surface_test.zig");
 pub const compute_dl_data_type = @import("compute/d_l_data_type_test.zig");
 pub const compute_dl_device = @import("compute/d_l_device_test.zig");

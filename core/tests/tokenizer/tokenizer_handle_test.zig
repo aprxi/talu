@@ -42,9 +42,8 @@ test "TokenizerHandle: init and deinit from model path" {
 
 test "TokenizerHandle: init fails for invalid path" {
     const result = TokenizerHandle.init(std.testing.allocator, "/nonexistent/model/path");
-    // TokenizerHandle.init returns WeightsNotFound when the model directory doesn't exist
-    // (it looks for tokenizer.json inside the model directory)
-    try std.testing.expectError(error.WeightsNotFound, result);
+    // TokenizerHandle.init returns InitFailed when tokenizer assets are unavailable.
+    try std.testing.expectError(error.InitFailed, result);
 }
 
 test "TokenizerHandle: deinit frees all resources" {

@@ -17,6 +17,8 @@
 //!   4. Gating: y = y * silu(z)
 //!   5. Output projection
 
+pub const supported = true;
+
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const Tensor = tensor.Tensor;

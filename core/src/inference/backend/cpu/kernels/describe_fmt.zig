@@ -2,6 +2,8 @@
 //! This file contains no imports that would create circular dependencies,
 //! so kernel files can import it directly.
 
+pub const supported = true;
+
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const inspect = @import("../../../../xray/root.zig");

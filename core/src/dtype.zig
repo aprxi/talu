@@ -633,6 +633,8 @@ test "fp16x8ToF32 - vectorized conversion" {
 }
 
 test "fp16x8ToF32Bits - vectorized bit manipulation conversion" {
+    if (comptime @import("builtin").cpu.arch != .x86_64) return;
+
     // Test with the same values as fp16x8ToF32 to verify equivalence
     const fp16_vec = @Vector(8, u16){
         f32ToFp16(1.0),
@@ -658,6 +660,8 @@ test "fp16x8ToF32Bits - vectorized bit manipulation conversion" {
 }
 
 test "fp16x8ToF32Bits - special values" {
+    if (comptime @import("builtin").cpu.arch != .x86_64) return;
+
     // Test infinity, negative infinity, NaN, negative zero
     const fp16_vec = @Vector(8, u16){
         0x7C00, // +infinity
@@ -683,6 +687,8 @@ test "fp16x8ToF32Bits - special values" {
 }
 
 test "fp16x8ToF32Bits - subnormal values" {
+    if (comptime @import("builtin").cpu.arch != .x86_64) return;
+
     // FP16 subnormals: exp=0, mant!=0
     // Smallest positive subnormal: 0x0001 = 2^-24
     // Largest subnormal: 0x03FF = 1023 * 2^-24
@@ -713,11 +719,13 @@ test "fp16x8ToF32Bits - subnormal values" {
 }
 
 test "fp16x8ToF32Bits matches fp16x8ToF32 for normal values" {
+    if (comptime @import("builtin").cpu.arch != .x86_64) return;
+
     // Exhaustive test for a range of normal values
     const test_values = [_]f32{
-        1.0,   -1.0,  2.0,   -2.0,   0.5,    -0.5,   4.0,    -4.0,
-        0.25,  -0.25, 8.0,   -8.0,   0.125,  -0.125, 16.0,   -16.0,
-        3.14,  -2.71, 100.0, -100.0, 0.001,  -0.001, 1000.0, -1000.0,
+        1.0,  -1.0,  2.0,   -2.0,   0.5,   -0.5,   4.0,    -4.0,
+        0.25, -0.25, 8.0,   -8.0,   0.125, -0.125, 16.0,   -16.0,
+        3.14, -2.71, 100.0, -100.0, 0.001, -0.001, 1000.0, -1000.0,
     };
 
     var i: usize = 0;

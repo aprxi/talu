@@ -4,6 +4,8 @@
 //! This module provides the feed-forward network computation for CPU inference.
 //! Uses SwiGLU activation: output = (SiLU(x @ W1) * (x @ W3)) @ W2
 
+pub const supported = true;
+
 const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");

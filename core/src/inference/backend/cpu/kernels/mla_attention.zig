@@ -10,6 +10,8 @@
 //! - RoPE only applied to qk_rope_head_dim dimensions
 //! - V has separate dimension (v_head_dim) from K (qk_nope_head_dim)
 
+pub const supported = true;
+
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");

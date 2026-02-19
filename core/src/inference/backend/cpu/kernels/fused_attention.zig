@@ -2,6 +2,8 @@
 //!
 //! Low-level layout work lives in `compute/cpu/layout_transform.zig`.
 
+pub const supported = true;
+
 const compute = @import("../../../../compute/root.zig");
 const attention = @import("attention.zig");
 
