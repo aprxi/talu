@@ -11,15 +11,6 @@ interface ChatUploadBeforePayload {
   purpose: string;
 }
 
-function escapeHtml(input: string): string {
-  return input
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#39;");
-}
-
 function isBlocked(value: unknown): value is { $block: true; reason: string } {
   return Boolean(
     value
@@ -59,19 +50,58 @@ function renderAttachmentList(container: HTMLElement): void {
     return;
   }
 
-  const chips = chatState.attachments.map((attachment) => {
-    const name = escapeHtml(attachment.file.filename);
-    const bytes = attachment.file.bytes.toLocaleString();
-    return `
-      <span class="attachment-pill" title="${name}">
-        <span class="attachment-name">${name}</span>
-        <span class="attachment-meta">${bytes} bytes</span>
-        <button class="attachment-remove" data-remove-attachment="${attachment.file.id}" title="Remove attachment">×</button>
-      </span>
-    `;
-  }).join("");
+  container.innerHTML = "";
+  const inner = document.createElement("div");
+  inner.className = "attachment-list-inner";
 
-  container.innerHTML = `<div class="attachment-list-inner">${chips}</div>`;
+  for (const attachment of chatState.attachments) {
+    const isImage = attachment.mimeType?.startsWith("image/") ?? false;
+
+    if (isImage) {
+      const thumb = document.createElement("div");
+      thumb.className = "attachment-thumb";
+
+      const img = document.createElement("img");
+      img.src = `/v1/files/${encodeURIComponent(attachment.file.id)}/content`;
+      img.alt = attachment.file.filename;
+      img.draggable = false;
+      thumb.appendChild(img);
+
+      const removeBtn = document.createElement("button");
+      removeBtn.className = "attachment-thumb-remove";
+      removeBtn.dataset["removeAttachment"] = attachment.file.id;
+      removeBtn.title = "Remove";
+      removeBtn.textContent = "\u00d7";
+      thumb.appendChild(removeBtn);
+
+      inner.appendChild(thumb);
+    } else {
+      const pill = document.createElement("span");
+      pill.className = "attachment-pill";
+      pill.title = attachment.file.filename;
+
+      const nameSpan = document.createElement("span");
+      nameSpan.className = "attachment-name";
+      nameSpan.textContent = attachment.file.filename;
+      pill.appendChild(nameSpan);
+
+      const metaSpan = document.createElement("span");
+      metaSpan.className = "attachment-meta";
+      metaSpan.textContent = `${attachment.file.bytes.toLocaleString()} bytes`;
+      pill.appendChild(metaSpan);
+
+      const removeBtn = document.createElement("button");
+      removeBtn.className = "attachment-remove";
+      removeBtn.dataset["removeAttachment"] = attachment.file.id;
+      removeBtn.title = "Remove attachment";
+      removeBtn.textContent = "\u00d7";
+      pill.appendChild(removeBtn);
+
+      inner.appendChild(pill);
+    }
+  }
+
+  container.appendChild(inner);
   container.classList.remove("hidden");
 }
 
