@@ -8,8 +8,7 @@ import { timers } from "./deps.ts";
 import { fState, type SortColumn } from "./state.ts";
 import { getFilesDom } from "./dom.ts";
 import { renderFilesTable, renderPreview, syncFilesTabs, updateFilesToolbar } from "./render.ts";
-import { loadFiles, renameFile, deleteFile, uploadFiles, archiveFiles, restoreFiles, deleteFiles } from "./data.ts";
-import { getFilteredFiles } from "./data.ts";
+import { loadFiles, refreshFiles, renameFile, deleteFile, uploadFiles, archiveFiles, restoreFiles, deleteFiles } from "./data.ts";
 
 export function wireFileEvents(): void {
   const dom = getFilesDom();
@@ -22,7 +21,7 @@ export function wireFileEvents(): void {
     fState.selectedIds.clear();
     fState.selectedFileId = null;
     syncFilesTabs();
-    loadFiles();
+    refreshFiles();
   });
 
   dom.tabArchived.addEventListener("click", () => {
@@ -31,18 +30,17 @@ export function wireFileEvents(): void {
     fState.selectedIds.clear();
     fState.selectedFileId = null;
     syncFilesTabs();
-    loadFiles();
+    refreshFiles();
   });
 
   // -- Bulk actions ---------------------------------------------------------
 
   dom.selectAllBtn.addEventListener("click", () => {
-    const files = getFilteredFiles();
-    const allSelected = fState.selectedIds.size === files.length && files.length > 0;
+    const allSelected = fState.selectedIds.size === fState.files.length && fState.files.length > 0;
     if (allSelected) {
       fState.selectedIds.clear();
     } else {
-      for (const f of files) fState.selectedIds.add(f.id);
+      for (const f of fState.files) fState.selectedIds.add(f.id);
     }
     renderFilesTable();
   });
@@ -66,8 +64,7 @@ export function wireFileEvents(): void {
       if (query === fState.searchQuery) return;
       fState.searchQuery = query;
       fState.selectedFileId = null;
-      renderFilesTable();
-      renderPreview();
+      loadFiles(1);
     }, 200);
     const hasText = dom.searchInput.value.trim().length > 0;
     dom.searchClear.classList.toggle("hidden", !hasText);
@@ -78,8 +75,7 @@ export function wireFileEvents(): void {
     dom.searchClear.classList.add("hidden");
     fState.searchQuery = "";
     fState.selectedFileId = null;
-    renderFilesTable();
-    renderPreview();
+    loadFiles(1);
   });
 
   // -- Column sort (delegated on thead) ------------------------------------
@@ -94,7 +90,7 @@ export function wireFileEvents(): void {
       fState.sortBy = col;
       fState.sortDir = "asc";
     }
-    renderFilesTable();
+    loadFiles(1);
   });
 
   // -- Table row clicks (delegated) ----------------------------------------
@@ -275,4 +271,5 @@ export function wireFileEvents(): void {
       uploadFiles(e.dataTransfer.files);
     }
   });
+
 }

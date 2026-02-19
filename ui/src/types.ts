@@ -33,6 +33,7 @@ export interface ConversationList {
   data: Conversation[];
   has_more: boolean;
   cursor: string | null;
+  total: number;
 }
 
 /** Patch body for PATCH /v1/conversations/{id}. */
@@ -430,6 +431,14 @@ export interface FileList {
   object: "list";
   data: FileObject[];
   has_more: boolean;
+  cursor: string | null;
+  total: number;
+}
+
+/** Batch operation request for POST /v1/files/batch. */
+export interface FileBatchRequest {
+  action: "delete" | "archive" | "unarchive";
+  ids: string[];
 }
 
 // ---------------------------------------------------------------------------

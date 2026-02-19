@@ -4,14 +4,16 @@
 
 import { renderLoadingSpinner } from "../../render/common.ts";
 import type { Conversation, SearchRequest } from "../../types.ts";
-import { api, chatService } from "./deps.ts";
+import { api } from "./deps.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
-import { renderBrowserCards, renderBrowserTags } from "./render.ts";
+import { renderBrowserCards, renderBrowserTags, renderBrowserPagination } from "./render.ts";
 
 /**
  * Fetch full conversation details in batches to avoid saturating the
  * browser's per-origin connection pool (typically 6 connections).
+ *
+ * Only used for search results (which return slim data without tags/metadata).
  */
 async function fetchConversationsBatched<T extends { id: string; metadata?: Record<string, unknown> }>(
   items: T[],
@@ -36,7 +38,7 @@ async function fetchConversationsBatched<T extends { id: string; metadata?: Reco
   return results;
 }
 
-export async function loadBrowserConversations(): Promise<void> {
+export async function loadBrowserConversations(page?: number): Promise<void> {
   const dom = getBrowserDom();
   const isSearching = search.query.trim().length > 0 || search.tagFilters.length > 0;
 
@@ -83,25 +85,28 @@ export async function loadBrowserConversations(): Promise<void> {
     bState.isLoading = true;
     const gen = ++bState.loadGeneration;
 
+    if (page !== undefined) bState.pagination.currentPage = page;
+
     dom.cardsEl.innerHTML = "";
     dom.cardsEl.appendChild(renderLoadingSpinner());
-    const sessions = chatService.getSessions();
-    if (sessions.length === 0) {
-      await chatService.refreshSidebar();
-    }
-    if (gen !== bState.loadGeneration) { bState.isLoading = false; return; }
 
-    const currentSessions = chatService.getSessions();
-    const fullConversations = await fetchConversationsBatched(currentSessions, (conv, s) => {
-      if (!conv.metadata || Object.keys(conv.metadata).length === 0) {
-        conv.metadata = s.metadata;
-      }
+    const offset = (bState.pagination.currentPage - 1) * bState.pagination.pageSize;
+    const marker = bState.tab === "archived" ? "archived" : "";
+    const result = await api.listConversations({
+      offset,
+      limit: bState.pagination.pageSize,
+      marker,
     });
 
     bState.isLoading = false;
     if (gen !== bState.loadGeneration) return; // superseded
-    bState.conversations = fullConversations;
+
+    if (result.ok && result.data) {
+      bState.conversations = result.data.data;
+      bState.pagination.totalItems = result.data.total;
+    }
     renderBrowserCards();
+    renderBrowserPagination();
   }
 }
 

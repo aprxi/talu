@@ -10,7 +10,7 @@ import { fState } from "./state.ts";
 import { initFilesDom } from "./dom.ts";
 import { buildFilesDOM } from "./build-dom.ts";
 import { renderFilesTable, renderStats, renderPreview, syncFilesTabs } from "./render.ts";
-import { loadFiles } from "./data.ts";
+import { refreshFiles } from "./data.ts";
 import { wireFileEvents } from "./events.ts";
 
 function initFilesView(): void {
@@ -27,7 +27,7 @@ function initFilesView(): void {
   renderFilesTable();
   renderStats();
   renderPreview();
-  loadFiles();
+  refreshFiles();
 }
 
 export const filesPlugin: PluginDefinition = {

@@ -310,10 +310,11 @@ pub async fn handle_list(
         .unwrap_or(20)
         .clamp(1, 100);
 
-    let cursor = query
+    let offset = query
         .iter()
-        .find(|(k, _)| k == "cursor")
-        .and_then(|(_, v)| decode_cursor(v));
+        .find(|(k, _)| k == "offset")
+        .and_then(|(_, v)| v.parse::<usize>().ok())
+        .unwrap_or(0);
 
     // group_id: query param takes precedence, then auth header.
     let group_id: Option<String> = query
@@ -322,21 +323,30 @@ pub async fn handle_list(
         .map(|(_, v)| v.clone())
         .or_else(|| auth.and_then(|a| a.group_id));
 
-    // Search/filter params removed - use POST /v1/search instead
+    let marker_filter: Option<String> = query
+        .iter()
+        .find(|(k, _)| k == "marker")
+        .map(|(_, v)| v.clone());
 
     let result = tokio::task::spawn_blocking(move || {
-        let list_result = storage.list_sessions_paginated(
-            limit,
-            cursor.as_ref(),
-            group_id.as_deref(),
-            None, // search_query - removed, use /v1/search
-            None, // tags_filter - removed, use /v1/search
-            None, // tags_filter_any - removed, use /v1/search
-        )?;
+        let all_sessions = storage.list_all_sessions_full(group_id.as_deref())?;
 
-        // Resolve tags for each session
-        let data: Vec<serde_json::Value> = list_result
-            .sessions
+        // Filter by marker if specified (e.g. "active" or "archived").
+        let filtered: Vec<&talu::storage::SessionRecordFull> = if let Some(ref m) = marker_filter {
+            all_sessions
+                .iter()
+                .filter(|s| s.marker.as_deref().unwrap_or("") == m.as_str())
+                .collect()
+        } else {
+            all_sessions.iter().collect()
+        };
+
+        let total = filtered.len();
+        let start = offset.min(total);
+        let end = (offset + limit).min(total);
+
+        // Only resolve tags and convert for the current page.
+        let page_data: Vec<serde_json::Value> = filtered[start..end]
             .iter()
             .map(|session| {
                 let tags = resolve_tags_for_session(&storage, &session.session_id);
@@ -344,11 +354,23 @@ pub async fn handle_list(
             })
             .collect();
 
-        Ok((data, list_result.has_more, list_result.next_cursor))
+        let has_more = (offset + limit) < total;
+
+        // Compute cursor from last session in page for backward compatibility
+        let next_cursor = if has_more {
+            filtered.get(end.saturating_sub(1)).map(|s| SessionCursor {
+                updated_at_ms: s.updated_at,
+                session_id: s.session_id.clone(),
+            })
+        } else {
+            None
+        };
+
+        Ok((page_data, has_more, next_cursor, total))
     })
     .await;
 
-    let (data, has_more, next_cursor) = match result {
+    let (data, has_more, next_cursor, total) = match result {
         Ok(Ok(r)) => r,
         Ok(Err(e)) => return storage_error_response(e),
         Err(e) => {
@@ -364,6 +386,7 @@ pub async fn handle_list(
         "object": "list",
         "data": data,
         "has_more": has_more,
+        "total": total,
     });
 
     if let Some(ref cursor) = next_cursor {

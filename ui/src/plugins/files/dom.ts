@@ -24,6 +24,7 @@ export interface FilesDom {
   deleteBtn: HTMLButtonElement;
   cancelBtn: HTMLButtonElement;
   bulkActions: HTMLElement;
+  paginationContainer: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -59,6 +60,7 @@ export function getFilesDom(): FilesDom {
     deleteBtn: q("#fp-delete") as HTMLButtonElement,
     cancelBtn: q("#fp-cancel") as HTMLButtonElement,
     bulkActions: q("#fp-bulk-actions"),
+    paginationContainer: q("#fp-pagination"),
   };
   return cached;
 }

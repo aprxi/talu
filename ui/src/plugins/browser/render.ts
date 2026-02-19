@@ -5,9 +5,11 @@
 import { renderBrowserCard } from "../../render/browser.ts";
 import { renderEmptyState } from "../../render/common.ts";
 import { isArchived } from "../../render/helpers.ts";
+import { computePagination, renderPagination } from "../../render/pagination.ts";
 import { TAG_ICON as ICON_TAG } from "../../icons.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
+import { loadBrowserConversations } from "./data.ts";
 
 export function syncBrowserTabs(): void {
   const dom = getBrowserDom();
@@ -44,19 +46,15 @@ export function renderBrowserCards(): void {
     ? search.results
     : bState.conversations;
 
-  let conversations: typeof baseConversations;
-  if (hasTagFilter) {
-    conversations = [...baseConversations].sort((a, b) => {
-      const aArchived = isArchived(a) ? 1 : 0;
-      const bArchived = isArchived(b) ? 1 : 0;
-      return aArchived - bArchived;
-    });
-  } else {
-    conversations = baseConversations.filter((c) => {
-      if (bState.tab === "archived") return isArchived(c);
-      return !isArchived(c);
-    });
-  }
+  // In non-search mode, the backend already filters by marker — no client
+  // filtering needed. For tag-filter mode, sort archived to the end.
+  const conversations: typeof baseConversations = hasTagFilter
+    ? [...baseConversations].sort((a, b) => {
+        const aArchived = isArchived(a) ? 1 : 0;
+        const bArchived = isArchived(b) ? 1 : 0;
+        return aArchived - bArchived;
+      })
+    : baseConversations;
 
   if (conversations.length === 0 && !search.isLoading) {
     const emptyMsg = isSearching
@@ -153,12 +151,7 @@ export function updateBrowserToolbar(): void {
   dom.cancelBtn.classList.toggle("hidden", !hasSelection);
 
   const isSearching = search.query.trim().length > 0 || hasTagFilter;
-  const base = isSearching ? search.results : bState.conversations;
-  const visible = hasTagFilter
-    ? base
-    : base.filter((c) =>
-        bState.tab === "archived" ? isArchived(c) : !isArchived(c)
-      );
+  const visible = isSearching ? search.results : bState.conversations;
   const allSelected =
     bState.selectedIds.size === visible.length && visible.length > 0;
   dom.selectAllBtn.textContent = allSelected ? "Deselect All" : "Select All";
@@ -167,4 +160,17 @@ export function updateBrowserToolbar(): void {
   dom.tabAll.classList.toggle("pointer-events-none", hasTagFilter);
   dom.tabArchived.classList.toggle("opacity-40", hasTagFilter);
   dom.tabArchived.classList.toggle("pointer-events-none", hasTagFilter);
+}
+
+export function renderBrowserPagination(): void {
+  const dom = getBrowserDom();
+  dom.paginationEl.innerHTML = "";
+
+  const { totalItems, pageSize, currentPage } = bState.pagination;
+  if (totalItems <= pageSize) return;
+
+  const state = computePagination(totalItems, pageSize, currentPage);
+  dom.paginationEl.appendChild(
+    renderPagination(state, (page) => loadBrowserConversations(page)),
+  );
 }

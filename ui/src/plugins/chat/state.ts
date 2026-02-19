@@ -24,7 +24,7 @@ export interface ChatState {
   isGenerating: boolean;
   streamAbort: AbortController | null;
   pagination: {
-    cursor: string | null;
+    offset: number;
     hasMore: boolean;
     isLoading: boolean;
   };
@@ -40,7 +40,7 @@ export const chatState: ChatState = {
   isGenerating: false,
   streamAbort: null,
   pagination: {
-    cursor: null,
+    offset: 0,
     hasMore: true,
     isLoading: false,
   },

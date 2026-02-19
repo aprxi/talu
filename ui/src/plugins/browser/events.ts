@@ -3,7 +3,6 @@
  */
 
 import type { Disposable } from "../../kernel/types.ts";
-import { isArchived } from "../../render/helpers.ts";
 import { pluginEvents, pluginTimers, chatService } from "./deps.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
@@ -20,33 +19,29 @@ export function wireEvents(): void {
     if (search.tagFilters.length > 0) return;
     if (bState.tab !== "all") {
       bState.tab = "all";
+      bState.pagination.currentPage = 1;
       bState.selectedIds.clear();
       syncBrowserTabs();
       updateBrowserToolbar();
-      renderBrowserCards();
+      loadBrowserConversations(1);
     }
   });
   dom.tabArchived.addEventListener("click", () => {
     if (search.tagFilters.length > 0) return;
     if (bState.tab !== "archived") {
       bState.tab = "archived";
+      bState.pagination.currentPage = 1;
       bState.selectedIds.clear();
       syncBrowserTabs();
       updateBrowserToolbar();
-      renderBrowserCards();
+      loadBrowserConversations(1);
     }
   });
 
   // Select All / Deselect All.
   dom.selectAllBtn.addEventListener("click", () => {
     const isSearching = search.query.trim().length > 0 || search.tagFilters.length > 0;
-    const hasTagFilter = search.tagFilters.length > 0;
-    const base = isSearching ? search.results : bState.conversations;
-    const visible = hasTagFilter
-      ? base
-      : base.filter((c) =>
-          bState.tab === "archived" ? isArchived(c) : !isArchived(c)
-        );
+    const visible = isSearching ? search.results : bState.conversations;
     const allSelected =
       bState.selectedIds.size === visible.length && visible.length > 0;
     if (allSelected) {

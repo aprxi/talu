@@ -9,7 +9,7 @@ export async function loadSessions(): Promise<void> {
   if (chatState.pagination.isLoading || !chatState.pagination.hasMore) return;
   chatState.pagination.isLoading = true;
 
-  const result = await api.listConversations(chatState.pagination.cursor, 100);
+  const result = await api.listConversations({ offset: chatState.pagination.offset, limit: 100 });
   chatState.pagination.isLoading = false;
 
   if (!result.ok || !result.data) {
@@ -19,7 +19,7 @@ export async function loadSessions(): Promise<void> {
 
   const list = result.data;
   chatState.sessions.push(...list.data);
-  chatState.pagination.cursor = list.cursor;
+  chatState.pagination.offset += list.data.length;
   chatState.pagination.hasMore = list.has_more;
 
   renderSidebar();
@@ -74,7 +74,7 @@ export function renderSidebar(): void {
 export async function refreshSidebar(): Promise<void> {
   // Reset pagination and reload from scratch to pick up new conversations
   chatState.sessions = [];
-  chatState.pagination.cursor = null;
+  chatState.pagination.offset = 0;
   chatState.pagination.hasMore = true;
   chatState.pagination.isLoading = false;
   await loadSessions();

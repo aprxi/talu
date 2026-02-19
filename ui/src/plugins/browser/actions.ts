@@ -5,7 +5,8 @@
 import { api, notify, dialogs, chatService, pluginDownload } from "./deps.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
-import { updateBrowserToolbar, renderBrowserCards } from "./render.ts";
+import { updateBrowserToolbar } from "./render.ts";
+import { loadBrowserConversations } from "./data.ts";
 
 export async function handleBrowserDelete(): Promise<void> {
   if (bState.selectedIds.size === 0) return;
@@ -28,21 +29,19 @@ export async function handleBrowserDelete(): Promise<void> {
     ids: idsToDelete,
   });
 
+  dom.deleteBtn.textContent = "Delete";
+  dom.deleteBtn.disabled = false;
+
   if (result.ok) {
-    const deleted = new Set(idsToDelete);
-    bState.conversations = bState.conversations.filter((c) => !deleted.has(c.id));
-    search.results = search.results.filter((c) => !deleted.has(c.id));
+    search.results = search.results.filter((c) => !bState.selectedIds.has(c.id));
     notify.info(`Deleted ${idsToDelete.length} conversation(s)`);
   } else {
     notify.error(result.error ?? "Failed to delete conversations");
   }
 
-  dom.deleteBtn.textContent = "Delete";
-  dom.deleteBtn.disabled = false;
-
   bState.selectedIds.clear();
   updateBrowserToolbar();
-  renderBrowserCards();
+  await loadBrowserConversations();
   await chatService.refreshSidebar();
 }
 
@@ -66,13 +65,12 @@ export async function handleCardRestore(id: string): Promise<void> {
     return;
   }
 
-  const conv = bState.conversations.find((c) => c.id === id);
-  if (conv) conv.marker = "";
   const searchConv = search.results.find((c) => c.id === id);
   if (searchConv) searchConv.marker = "";
 
   notify.info("Restored conversation");
 
+  await loadBrowserConversations();
   await chatService.selectChat(id);
   await chatService.refreshSidebar();
 }
@@ -90,10 +88,11 @@ export async function handleBrowserArchive(): Promise<void> {
     ids: idsToArchive,
   });
 
+  dom.archiveBtn.textContent = "Archive";
+  dom.archiveBtn.disabled = false;
+
   if (result.ok) {
     for (const id of idsToArchive) {
-      const conv = bState.conversations.find((c) => c.id === id);
-      if (conv) conv.marker = "archived";
       const searchConv = search.results.find((c) => c.id === id);
       if (searchConv) searchConv.marker = "archived";
     }
@@ -102,12 +101,9 @@ export async function handleBrowserArchive(): Promise<void> {
     notify.error(result.error ?? "Failed to archive conversations");
   }
 
-  dom.archiveBtn.textContent = "Archive";
-  dom.archiveBtn.disabled = false;
-
   bState.selectedIds.clear();
   updateBrowserToolbar();
-  renderBrowserCards();
+  await loadBrowserConversations();
   await chatService.refreshSidebar();
 }
 
@@ -124,10 +120,11 @@ export async function handleBrowserBulkRestore(): Promise<void> {
     ids: idsToRestore,
   });
 
+  dom.restoreBtn.textContent = "Restore";
+  dom.restoreBtn.disabled = false;
+
   if (result.ok) {
     for (const id of idsToRestore) {
-      const conv = bState.conversations.find((c) => c.id === id);
-      if (conv) conv.marker = "";
       const searchConv = search.results.find((c) => c.id === id);
       if (searchConv) searchConv.marker = "";
     }
@@ -136,11 +133,8 @@ export async function handleBrowserBulkRestore(): Promise<void> {
     notify.error(result.error ?? "Failed to restore conversations");
   }
 
-  dom.restoreBtn.textContent = "Restore";
-  dom.restoreBtn.disabled = false;
-
   bState.selectedIds.clear();
   updateBrowserToolbar();
-  renderBrowserCards();
+  await loadBrowserConversations();
   await chatService.refreshSidebar();
 }

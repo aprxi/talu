@@ -12,6 +12,11 @@ export const bState = {
   isLoading: false,
   /** Incremented on each load to detect stale completions. */
   loadGeneration: 0,
+  pagination: {
+    currentPage: 1,
+    pageSize: 20,
+    totalItems: 0,
+  },
 };
 
 export const search = {

@@ -17,4 +17,9 @@ export const fState = {
   tab: "all" as "all" | "archived",
   sortBy: "name" as SortColumn,
   sortDir: "asc" as SortDir,
+  pagination: {
+    currentPage: 1,
+    pageSize: 50,
+    totalItems: 0,
+  },
 };

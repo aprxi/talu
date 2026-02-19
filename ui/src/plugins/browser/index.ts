@@ -32,6 +32,8 @@ function initConversationsBrowser(): void {
   search.cursor = null;
   search.hasMore = true;
   bState.tab = "all";
+  bState.pagination.currentPage = 1;
+  bState.pagination.totalItems = 0;
   syncBrowserTabs();
   dom.clearBtn.classList.add("hidden");
   updateBrowserToolbar();

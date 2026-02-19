@@ -7,61 +7,50 @@ import { renderLoadingSpinner } from "../../render/common.ts";
 import { api, notify, dialogs, upload } from "./deps.ts";
 import { fState } from "./state.ts";
 import { getFilesDom } from "./dom.ts";
-import { renderFilesTable, renderStats, renderPreview, updateFilesToolbar } from "./render.ts";
+import { renderFilesTable, renderStats, renderPreview, renderFilesPagination, updateFilesToolbar } from "./render.ts";
 
-export async function loadFiles(): Promise<void> {
+/** Load a page of files from the server. */
+export async function loadFiles(page: number = 1): Promise<void> {
+  fState.pagination.currentPage = page;
   const dom = getFilesDom();
+
   fState.isLoading = true;
   dom.tbody.innerHTML = "";
   dom.tableContainer.prepend(renderLoadingSpinner());
 
+  const offset = (page - 1) * fState.pagination.pageSize;
   const marker = fState.tab === "archived" ? "archived" : "active";
-  const result = await api.listFiles(100, marker);
-  fState.isLoading = false;
+  const result = await api.listFiles({
+    limit: fState.pagination.pageSize,
+    marker,
+    offset,
+    sort: fState.sortBy,
+    order: fState.sortDir,
+    search: fState.searchQuery || undefined,
+  });
 
-  // Remove spinner.
+  fState.isLoading = false;
   const spinner = dom.tableContainer.querySelector(".empty-state");
   spinner?.remove();
 
   if (result.ok && result.data) {
     fState.files = result.data.data;
+    fState.pagination.totalItems = result.data.total;
   } else {
     notify.error(result.ok ? "No data returned" : result.error);
-    fState.files = [];
   }
 
   renderFilesTable();
+  renderFilesPagination();
   renderStats();
   renderPreview();
 }
 
-/** Return files filtered by the current search query and sorted. */
-export function getFilteredFiles(): FileObject[] {
-  const q = fState.searchQuery.toLowerCase().trim();
-  const filtered = q
-    ? fState.files.filter((f) => f.filename.toLowerCase().includes(q))
-    : [...fState.files];
-
-  const dir = fState.sortDir === "asc" ? 1 : -1;
-  filtered.sort((a, b) => {
-    switch (fState.sortBy) {
-      case "name":
-        return dir * a.filename.localeCompare(b.filename);
-      case "kind": {
-        const ak = a.kind ?? "";
-        const bk = b.kind ?? "";
-        return dir * ak.localeCompare(bk);
-      }
-      case "size":
-        return dir * (a.bytes - b.bytes);
-      case "date":
-        return dir * (a.created_at - b.created_at);
-      default:
-        return 0;
-    }
-  });
-
-  return filtered;
+/** Reset to page 1 and reload from scratch. */
+export async function refreshFiles(): Promise<void> {
+  fState.files = [];
+  fState.pagination.currentPage = 1;
+  await loadFiles();
 }
 
 export async function renameFile(id: string, newName: string): Promise<void> {
@@ -119,7 +108,7 @@ export async function uploadFiles(files: globalThis.FileList): Promise<void> {
   }
   if (count > 0) {
     notify.success(`Uploaded ${count} file${count > 1 ? "s" : ""}`);
-    await loadFiles();
+    await refreshFiles();
   }
 }
 
@@ -129,32 +118,34 @@ export async function archiveFiles(): Promise<void> {
   const ids = [...fState.selectedIds];
   if (ids.length === 0) return;
 
-  let count = 0;
-  for (const id of ids) {
-    const result = await api.updateFile(id, { marker: "archived" });
-    if (result.ok) count++;
-  }
-
+  const result = await api.batchFiles({ action: "archive", ids });
   fState.selectedIds.clear();
   fState.selectedFileId = null;
-  notify.success(`Archived ${count} file${count > 1 ? "s" : ""}`);
-  await loadFiles();
+
+  if (result.ok) {
+    notify.success(`Archived ${ids.length} file${ids.length > 1 ? "s" : ""}`);
+  } else {
+    notify.error(result.error ?? "Archive failed");
+  }
+
+  await refreshFiles();
 }
 
 export async function restoreFiles(): Promise<void> {
   const ids = [...fState.selectedIds];
   if (ids.length === 0) return;
 
-  let count = 0;
-  for (const id of ids) {
-    const result = await api.updateFile(id, { marker: "active" });
-    if (result.ok) count++;
-  }
-
+  const result = await api.batchFiles({ action: "unarchive", ids });
   fState.selectedIds.clear();
   fState.selectedFileId = null;
-  notify.success(`Restored ${count} file${count > 1 ? "s" : ""}`);
-  await loadFiles();
+
+  if (result.ok) {
+    notify.success(`Restored ${ids.length} file${ids.length > 1 ? "s" : ""}`);
+  } else {
+    notify.error(result.error ?? "Restore failed");
+  }
+
+  await refreshFiles();
 }
 
 export async function deleteFiles(): Promise<void> {
@@ -168,14 +159,15 @@ export async function deleteFiles(): Promise<void> {
   });
   if (!ok) return;
 
-  let count = 0;
-  for (const id of ids) {
-    const result = await api.deleteFile(id);
-    if (result.ok) count++;
-  }
-
+  const result = await api.batchFiles({ action: "delete", ids });
   fState.selectedIds.clear();
   fState.selectedFileId = null;
-  notify.success(`Deleted ${count} file${count > 1 ? "s" : ""}`);
-  await loadFiles();
+
+  if (result.ok) {
+    notify.success(`Deleted ${ids.length} file${ids.length > 1 ? "s" : ""}`);
+  } else {
+    notify.error(result.error ?? "Delete failed");
+  }
+
+  await refreshFiles();
 }

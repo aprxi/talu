@@ -11,10 +11,11 @@ import {
   CIRCLE_ICON as ICON_UNCHECKED,
 } from "../../icons.ts";
 import { el } from "../../render/helpers.ts";
+import { computePagination, renderPagination } from "../../render/pagination.ts";
 import { format } from "./deps.ts";
 import { fState, type SortColumn } from "./state.ts";
 import { getFilesDom } from "./dom.ts";
-import { getFilteredFiles } from "./data.ts";
+import { loadFiles } from "./data.ts";
 
 // -- Sort indicators ----------------------------------------------------------
 
@@ -87,7 +88,6 @@ export function syncFilesTabs(): void {
 export function updateFilesToolbar(): void {
   const dom = getFilesDom();
   const hasSelection = fState.selectedIds.size > 0;
-  const files = getFilteredFiles();
 
   dom.deleteBtn.disabled = !hasSelection;
   dom.archiveBtn.disabled = !hasSelection;
@@ -96,7 +96,7 @@ export function updateFilesToolbar(): void {
   dom.bulkActions.classList.toggle("active", hasSelection);
   dom.cancelBtn.classList.toggle("hidden", !hasSelection);
 
-  const allSelected = fState.selectedIds.size === files.length && files.length > 0;
+  const allSelected = fState.selectedIds.size === fState.files.length && fState.files.length > 0;
   dom.selectAllBtn.textContent = allSelected ? "Deselect All" : "Select All";
 }
 
@@ -104,15 +104,16 @@ export function updateFilesToolbar(): void {
 
 export function renderFilesTable(): void {
   const dom = getFilesDom();
-  const files = getFilteredFiles();
+  const files = fState.files;
+  const total = fState.pagination.totalItems;
 
   dom.tbody.innerHTML = "";
-  dom.countEl.textContent = `${files.length} file${files.length !== 1 ? "s" : ""}`;
+  dom.countEl.textContent = `${total} file${total !== 1 ? "s" : ""}`;
 
   // Update sort indicators on column headers.
   updateSortIndicators(dom.thead);
 
-  if (files.length === 0 && !fState.isLoading) {
+  if (total === 0 && !fState.isLoading) {
     const msg = fState.searchQuery
       ? "No matching files"
       : fState.tab === "archived"
@@ -204,15 +205,35 @@ export function renderFilesTable(): void {
     dom.tbody.appendChild(row);
   }
 
+  renderFilesPagination();
   updateFilesToolbar();
+}
+
+// -- Pagination ---------------------------------------------------------------
+
+export function renderFilesPagination(): void {
+  const dom = getFilesDom();
+  dom.paginationContainer.innerHTML = "";
+
+  const { totalItems, pageSize, currentPage } = fState.pagination;
+  if (totalItems <= pageSize) return;
+
+  const state = computePagination(totalItems, pageSize, currentPage);
+  fState.pagination.currentPage = state.currentPage;
+
+  const paginationEl = renderPagination(state, (page) => {
+    loadFiles(page);
+  });
+  dom.paginationContainer.appendChild(paginationEl);
 }
 
 // -- Stats rendering ----------------------------------------------------------
 
 export function renderStats(): void {
   const dom = getFilesDom();
-  const totalBytes = fState.files.reduce((sum, f) => sum + f.bytes, 0);
-  dom.statsEl.textContent = `${fState.files.length} files \u00b7 ${formatSize(totalBytes)}`;
+  const pageBytes = fState.files.reduce((sum, f) => sum + f.bytes, 0);
+  const total = fState.pagination.totalItems;
+  dom.statsEl.textContent = `${total} files \u00b7 ${formatSize(pageBytes)}`;
 }
 
 // -- Preview panel rendering --------------------------------------------------

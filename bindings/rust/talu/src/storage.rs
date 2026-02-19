@@ -312,6 +312,64 @@ impl StorageHandle {
         Ok(count)
     }
 
+    /// List all sessions (full records), optionally filtered by group.
+    ///
+    /// Returns all matching sessions without pagination. Useful for
+    /// offset-based pagination where the caller slices the result.
+    pub fn list_all_sessions_full(
+        &self,
+        group_id: Option<&str>,
+    ) -> Result<Vec<SessionRecordFull>, StorageError> {
+        let group_id_cstr = match group_id {
+            Some(g) => Some(CString::new(g).map_err(|_| {
+                StorageError::InvalidArgument("group_id contains null bytes".to_string())
+            })?),
+            None => None,
+        };
+
+        let group_ptr = group_id_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
+
+        let mut c_list: *mut CSessionList = std::ptr::null_mut();
+
+        // SAFETY: path_cstr is valid, c_list is a valid output pointer
+        let result = unsafe {
+            talu_sys::talu_storage_list_sessions(
+                self.path_cstr.as_ptr(),
+                0,     // no limit
+                0,     // no before_ts
+                std::ptr::null(), // no cursor
+                group_ptr,
+                std::ptr::null(), // no search_query
+                std::ptr::null(), // no tags_filter
+                std::ptr::null(), // no tags_filter_any
+                &mut c_list as *mut _ as *mut c_void,
+            )
+        };
+
+        if result != ERROR_CODE_OK {
+            return Err(StorageError::from_code(
+                result,
+                &self.path.to_string_lossy(),
+            ));
+        }
+
+        if c_list.is_null() {
+            return Ok(Vec::new());
+        }
+
+        // SAFETY: c_list is non-null and was returned by talu_storage_list_sessions
+        let records = unsafe { Self::convert_session_list_full(c_list) };
+
+        // Free C memory
+        // SAFETY: c_list was returned by talu_storage_list_sessions
+        unsafe { talu_sys::talu_storage_free_sessions(c_list) };
+
+        Ok(records)
+    }
+
+
     /// Delete a session using Dual-Delete Protocol.
     ///
     /// Writes both:

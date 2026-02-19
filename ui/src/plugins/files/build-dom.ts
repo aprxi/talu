@@ -81,6 +81,7 @@ export function buildFilesDOM(root: HTMLElement): void {
             <tbody id="fp-tbody"></tbody>
           </table>
         </div>
+        <div id="fp-pagination"></div>
 
         <!-- Drop overlay (hidden by default, shown via CSS) -->
         <div id="fp-drop-overlay" class="files-drop-overlay hidden">Drop files to upload</div>

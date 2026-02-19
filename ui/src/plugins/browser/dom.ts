@@ -18,6 +18,7 @@ export interface BrowserDom {
   cancelBtn: HTMLButtonElement;
   bulkActions: HTMLElement;
   toolbarEl: HTMLElement;
+  paginationEl: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -47,6 +48,7 @@ export function getBrowserDom(): BrowserDom {
     cancelBtn: q("#bp-cancel") as HTMLButtonElement,
     bulkActions: q("#bp-bulk-actions"),
     toolbarEl: q("#bp-toolbar"),
+    paginationEl: q("#bp-pagination"),
   };
   return cached;
 }

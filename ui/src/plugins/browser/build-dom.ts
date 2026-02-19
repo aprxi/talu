@@ -65,6 +65,9 @@ export function buildBrowserDOM(root: HTMLElement): void {
 
         <!-- Cards grid -->
         <div id="bp-cards" class="card-grid browser-cards scroll-thin"></div>
+
+        <!-- Pagination -->
+        <div id="bp-pagination"></div>
       </div>
     </div>
   `;

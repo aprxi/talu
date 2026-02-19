@@ -89,6 +89,7 @@ struct FileListResponse {
     has_more: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor: Option<String>,
+    total: usize,
 }
 
 #[derive(Debug, Deserialize)]
@@ -357,9 +358,16 @@ pub async fn handle_list(
 
     let query_str = req.uri().query().unwrap_or("");
     let limit = parse_query_param(query_str, "limit")
-        .and_then(|v| v.parse::<u32>().ok())
-        .unwrap_or(100);
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(100)
+        .clamp(1, 1000);
+    let offset = parse_query_param(query_str, "offset")
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(0);
     let marker_filter = parse_query_param(query_str, "marker").unwrap_or("active");
+    let sort = parse_query_param(query_str, "sort").unwrap_or("date");
+    let order = parse_query_param(query_str, "order").unwrap_or("desc");
+    let search = parse_query_param(query_str, "search");
 
     let storage_path = match auth.as_ref() {
         Some(ctx) => bucket.join(&ctx.storage_prefix),
@@ -371,21 +379,50 @@ pub async fn handle_list(
         Err(e) => return document_error_response(e),
     };
 
-    let cursor = parse_query_param(query_str, "cursor");
-
     // Don't pass marker to the scan layer — it filters per-row before
     // deduplication, so old versions with the previous marker leak through
     // when a document's marker has been updated.  Filter after dedup instead.
-    // Fetch all matching docs (u32::MAX) so we can filter + paginate in Rust.
     let rows = match docs.list(Some("file"), None, None, None, u32::MAX) {
         Ok(v) => v,
         Err(e) => return document_error_response(e),
     };
 
-    // Build full list filtered by marker, sorted by created_at DESC.
-    let mut all_files: Vec<FileObjectResponse> = Vec::with_capacity(rows.len());
-    for row in rows {
-        let doc = match docs.get(&row.doc_id) {
+    // Filter summaries by marker (post-dedup marker is accurate).
+    let mut filtered: Vec<_> = rows
+        .into_iter()
+        .filter(|r| r.marker.as_deref().unwrap_or("active") == marker_filter)
+        .collect();
+
+    // Apply search filter on title (filename).
+    if let Some(ref q) = search {
+        let q_lower = q.to_lowercase();
+        filtered.retain(|r| r.title.to_lowercase().contains(&q_lower));
+    }
+
+    // Sort on summaries (avoids fetching full documents).
+    let desc = order == "desc";
+    filtered.sort_by(|a, b| {
+        let cmp = match sort {
+            "name" => a.title.to_lowercase().cmp(&b.title.to_lowercase()),
+            "size" => std::cmp::Ordering::Equal, // size not in summary, fall back to date
+            "date" | _ => a.created_at_ms.cmp(&b.created_at_ms),
+        };
+        let cmp = if desc { cmp.reverse() } else { cmp };
+        cmp.then_with(|| b.doc_id.cmp(&a.doc_id))
+    });
+
+    let total = filtered.len();
+
+    // Apply offset + limit to get the page of summaries.
+    let start = offset.min(total);
+    let end = (offset + limit).min(total);
+    let page_summaries = &filtered[start..end];
+    let has_more = end < total;
+
+    // Only fetch full documents for the current page (avoids N+1 for all files).
+    let mut page: Vec<FileObjectResponse> = Vec::with_capacity(page_summaries.len());
+    for summary in page_summaries {
+        let doc = match docs.get(&summary.doc_id) {
             Ok(Some(doc)) => doc,
             Ok(None) => continue,
             Err(e) => return document_error_response(e),
@@ -394,43 +431,13 @@ pub async fn handle_list(
             Ok(d) => d,
             Err(resp) => return resp,
         };
-        let resp = to_file_object_response(descriptor);
-        let effective_marker = resp.marker.as_deref().unwrap_or("active");
-        if effective_marker == marker_filter {
-            all_files.push(resp);
-        }
+        page.push(to_file_object_response(descriptor));
     }
 
-    // Sort by created_at descending (most recent first), tie-break by id.
-    all_files.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| b.id.cmp(&a.id)));
-
-    // Apply cursor: skip items at or before the cursor point.
-    let start_idx = if let Some(encoded) = cursor {
-        if let Some((cursor_ts, cursor_id)) = decode_file_cursor(encoded) {
-            all_files
-                .iter()
-                .position(|f| {
-                    (f.created_at as i64) < cursor_ts
-                        || ((f.created_at as i64) == cursor_ts && f.id < cursor_id)
-                })
-                .unwrap_or(all_files.len())
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-
-    let remaining = &all_files[start_idx..];
-    let has_more = remaining.len() > limit as usize;
-    let page: Vec<FileObjectResponse> = remaining
-        .iter()
-        .take(limit as usize)
-        .cloned()
-        .collect();
-
+    // Cursor from last item for backward compatibility.
     let next_cursor = if has_more {
-        page.last().map(|f| encode_file_cursor(f.created_at as i64, &f.id))
+        page.last()
+            .map(|f| encode_file_cursor(f.created_at as i64, &f.id))
     } else {
         None
     };
@@ -442,6 +449,7 @@ pub async fn handle_list(
             data: page,
             has_more,
             cursor: next_cursor,
+            total,
         },
     )
 }
@@ -1087,33 +1095,6 @@ fn encode_file_cursor(created_at_ms: i64, file_id: &str) -> String {
         if chunk.len() > 2 { result.push(ALPHABET[(n & 0x3F) as usize] as char); } else { result.push('='); }
     }
     result
-}
-
-fn decode_file_cursor(encoded: &str) -> Option<(i64, String)> {
-    fn val(c: u8) -> Option<u32> {
-        match c {
-            b'A'..=b'Z' => Some((c - b'A') as u32),
-            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
-            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
-            b'+' => Some(62), b'/' => Some(63), b'=' => Some(0),
-            _ => None,
-        }
-    }
-    let bytes = encoded.as_bytes();
-    if bytes.len() % 4 != 0 { return None; }
-    let mut result = Vec::with_capacity(bytes.len() / 4 * 3);
-    for chunk in bytes.chunks(4) {
-        let a = val(chunk[0])?; let b = val(chunk[1])?;
-        let c = val(chunk[2])?; let d = val(chunk[3])?;
-        let n = (a << 18) | (b << 12) | (c << 6) | d;
-        result.push((n >> 16) as u8);
-        if chunk[2] != b'=' { result.push((n >> 8 & 0xFF) as u8); }
-        if chunk[3] != b'=' { result.push((n & 0xFF) as u8); }
-    }
-    let s = std::str::from_utf8(&result).ok()?;
-    let (ts_str, file_id) = s.split_once(':')?;
-    let created_at = ts_str.parse::<i64>().ok()?;
-    Some((created_at, file_id.to_string()))
 }
 
 // ---------------------------------------------------------------------------

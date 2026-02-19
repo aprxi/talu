@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileInspection } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection } from "./types.ts";
 
 const BASE = "";
 
@@ -10,7 +10,7 @@ const BASE = "";
 type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface ApiClient {
-  listConversations(cursor?: string | null, limit?: number): Promise<ApiResult<ConversationList>>;
+  listConversations(opts?: { offset?: number; limit?: number; marker?: string }): Promise<ApiResult<ConversationList>>;
   search(req: SearchRequest): Promise<ApiResult<SearchResponse>>;
   getConversation(id: string): Promise<ApiResult<Conversation>>;
   patchConversation(id: string, patch: ConversationPatch): Promise<ApiResult<Conversation>>;
@@ -28,7 +28,8 @@ export interface ApiClient {
   createDocument(doc: CreateDocumentRequest): Promise<ApiResult<Document>>;
   updateDocument(id: string, doc: UpdateDocumentRequest): Promise<ApiResult<Document>>;
   deleteDocument(id: string): Promise<ApiResult<void>>;
-  listFiles(limit?: number, marker?: string): Promise<ApiResult<FileList>>;
+  listFiles(opts?: { limit?: number; marker?: string; offset?: number; sort?: string; order?: string; search?: string }): Promise<ApiResult<FileList>>;
+  batchFiles(req: FileBatchRequest): Promise<ApiResult<void>>;
   uploadFile(file: File, purpose?: string): Promise<ApiResult<FileObject>>;
   getFile(id: string): Promise<ApiResult<FileObject>>;
   updateFile(id: string, patch: { filename?: string; marker?: string }): Promise<ApiResult<FileObject>>;
@@ -106,9 +107,10 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
   }
 
   return {
-    listConversations(cursor?: string | null, limit = 20) {
-      const params = new URLSearchParams({ limit: String(limit) });
-      if (cursor) params.set("cursor", cursor);
+    listConversations(opts?: { offset?: number; limit?: number; marker?: string }) {
+      const params = new URLSearchParams({ limit: String(opts?.limit ?? 20) });
+      if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
+      if (opts?.marker) params.set("marker", opts.marker);
       return requestJson<ConversationList>("GET", `/v1/conversations?${params}`);
     },
     search: (req) => requestJson<SearchResponse>("POST", "/v1/search", req),
@@ -138,11 +140,17 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     createDocument: (doc) => requestJson<Document>("POST", "/v1/documents", doc),
     updateDocument: (id, doc) => requestJson<Document>("PATCH", `/v1/documents/${encodeURIComponent(id)}`, doc),
     deleteDocument: (id) => requestJson<void>("DELETE", `/v1/documents/${encodeURIComponent(id)}`),
-    listFiles: (limit = 100, marker?: string) => {
-      const params = new URLSearchParams({ limit: String(limit) });
-      if (marker) params.set("marker", marker);
+    listFiles: (opts?: { limit?: number; marker?: string; offset?: number; sort?: string; order?: string; search?: string }) => {
+      const params = new URLSearchParams();
+      params.set("limit", String(opts?.limit ?? 100));
+      if (opts?.marker) params.set("marker", opts.marker);
+      if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
+      if (opts?.sort) params.set("sort", opts.sort);
+      if (opts?.order) params.set("order", opts.order);
+      if (opts?.search) params.set("search", opts.search);
       return requestJson<FileList>("GET", `/v1/files?${params}`);
     },
+    batchFiles: (req) => requestJson<void>("POST", "/v1/files/batch", req),
     uploadFile: (file, purpose = "assistants") => {
       const form = new FormData();
       form.append("file", file, file.name);
