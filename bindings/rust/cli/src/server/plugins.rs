@@ -49,7 +49,7 @@ pub async fn handle_list(
         match talu::plugins::scan_plugins(Some(&plugins_dir)) {
             Ok(list) => list,
             Err(e) => {
-                log::warn!("plugin scan failed: {}", e);
+                log::warn!(target: "server::plugins", "plugin scan failed: {}", e);
                 return json_error(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "scan_error",

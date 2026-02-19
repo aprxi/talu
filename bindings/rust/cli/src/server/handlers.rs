@@ -88,6 +88,7 @@ pub async fn handle_responses(
     let (_parts, body) = req.into_parts();
     if let Some(ctx) = auth_ctx.as_ref() {
         log::info!(
+            target: "server::gen",
             "Authenticated tenant: {}, prefix: {}",
             ctx.tenant_id,
             ctx.storage_prefix
@@ -815,7 +816,7 @@ async fn stream_response(
     // Ensure storage directory exists.
     if let Some(ref bp) = bucket_path {
         if let Err(e) = std::fs::create_dir_all(bp) {
-            log::warn!("failed to create storage directory: {}", e);
+            log::warn!(target: "server::gen", "failed to create storage directory: {}", e);
         }
     }
 
@@ -1523,12 +1524,13 @@ impl StreamCtx {
         if let Some(tenant_id) = self.tenant_id.as_deref() {
             if let Some(user_id) = self.user_id.as_deref() {
                 log::info!(
+                    target: "server::gen",
                     "[tenant={}] [user={}] Generation completed",
                     tenant_id,
                     user_id
                 );
             } else {
-                log::info!("[tenant={}] Generation completed", tenant_id);
+                log::info!(target: "server::gen", "[tenant={}] Generation completed", tenant_id);
             }
         }
     }
@@ -1730,7 +1732,7 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
         }
     }
 
-    log::info!("loading backend for model {}", model_id);
+    log::info!(target: "server::gen", "loading backend for model {}", model_id);
     let model = model_id.to_string();
     let backend =
         tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model)).await??;
@@ -1744,12 +1746,13 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
 fn log_generation_completed(ctx: &AuthContext) {
     if let Some(user_id) = ctx.user_id.as_deref() {
         log::info!(
+            target: "server::gen",
             "[tenant={}] [user={}] Generation completed",
             ctx.tenant_id,
             user_id
         );
     } else {
-        log::info!("[tenant={}] Generation completed", ctx.tenant_id);
+        log::info!(target: "server::gen", "[tenant={}] Generation completed", ctx.tenant_id);
     }
 }
 

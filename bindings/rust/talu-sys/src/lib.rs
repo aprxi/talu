@@ -3662,6 +3662,8 @@ extern "C" {
     // core/src/capi/responses.zig
     pub fn talu_session_id_new(out_session_id: *mut c_void) -> c_int;
     // core/src/capi/log.zig
+    pub fn talu_set_log_filter(ptr: *const u8, len: usize);
+    // core/src/capi/log.zig
     pub fn talu_set_log_format(format: c_int);
     // core/src/capi/log.zig
     pub fn talu_set_log_level(level: c_int);

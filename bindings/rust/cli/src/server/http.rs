@@ -82,7 +82,7 @@ impl Service<Request<Incoming>> for Router {
             let path = req.uri().path().to_string();
             let path_log = path.clone();
 
-            log::info!("{} {}", method, path);
+            log::info!(target: "server::http", "{} {}", method, path);
 
             // Auth-exempt routes.
             let response = match (method.clone(), path.as_str()) {
@@ -139,7 +139,7 @@ impl Service<Request<Incoming>> for Router {
                         Err(resp) => {
                             let status = resp.status();
                             if status.is_client_error() {
-                                log::warn!("{} {} -> {}", method_log, path_log, status);
+                                log::warn!(target: "server::http", "{} {} -> {}", method_log, path_log, status);
                             }
                             return Ok(resp);
                         }
@@ -370,7 +370,7 @@ impl Service<Request<Incoming>> for Router {
                         }
                         _ => {
                             if is_known_path(&path) {
-                                log::warn!("unimplemented endpoint: {} {}", method_log, path_log);
+                                log::warn!(target: "server::http", "unimplemented endpoint: {} {}", method_log, path_log);
                                 json_error(
                                     StatusCode::NOT_IMPLEMENTED,
                                     "not_implemented",
@@ -389,9 +389,9 @@ impl Service<Request<Incoming>> for Router {
 
             let status = response.status();
             if status.is_client_error() {
-                log::warn!("{} {} -> {}", method_log, path_log, status);
+                log::warn!(target: "server::http", "{} {} -> {}", method_log, path_log, status);
             } else if status.is_server_error() {
-                log::error!("{} {} -> {}", method_log, path_log, status);
+                log::error!(target: "server::http", "{} {} -> {}", method_log, path_log, status);
             }
 
             Ok(response)

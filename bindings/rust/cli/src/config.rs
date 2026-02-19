@@ -148,7 +148,7 @@ pub fn ensure_bucket(bucket_path: &Path) -> Result<()> {
     let manifest = r#"{"version": 1, "segments": [], "last_compaction_ts": 0}"#;
     std::fs::write(&manifest_path, manifest)?;
 
-    log::info!("Initialized storage bucket at: {}", bucket_path.display());
+    log::info!(target: "cli::config", "Initialized storage bucket at: {}", bucket_path.display());
     Ok(())
 }
 

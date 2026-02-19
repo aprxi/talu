@@ -102,6 +102,10 @@ var level_initialized: bool = false; // Single-threaded: set once at startup
 var cached_format: Format = .human; // Single-threaded: set once at startup via getLogFormat()
 var format_initialized: bool = false; // Single-threaded: set once at startup
 
+/// Cached log filter - empty means no filter (pass all)
+var filter_buf: [256]u8 = undefined;
+var cached_filter: []const u8 = &[_]u8{};
+
 /// Get the current log level (cached after first call)
 pub fn getLogLevel() Level {
     if (level_initialized) return cached_level;
@@ -144,6 +148,30 @@ pub fn setLogLevel(level: Level) void {
 pub fn setLogFormat(format: Format) void {
     cached_format = format;
     format_initialized = true;
+}
+
+/// Set scope filter (glob pattern matched against "core::<scope>").
+/// Empty string or "*" disables filtering. Supports trailing `*` for prefix match.
+pub fn setLogFilter(filter: []const u8) void {
+    if (filter.len > filter_buf.len) return;
+    @memcpy(filter_buf[0..filter.len], filter);
+    cached_filter = filter_buf[0..filter.len];
+}
+
+/// Check if a prefixed scope matches the current filter.
+fn matchesFilter(prefixed_scope: []const u8) bool {
+    if (cached_filter.len == 0) return true;
+    if (cached_filter.len == 1 and cached_filter[0] == '*') return true;
+
+    // Trailing * = prefix match
+    if (cached_filter[cached_filter.len - 1] == '*') {
+        const prefix = cached_filter[0 .. cached_filter.len - 1];
+        return prefixed_scope.len >= prefix.len and
+            std.mem.eql(u8, prefixed_scope[0..prefix.len], prefix);
+    }
+
+    // Exact match
+    return std.mem.eql(u8, prefixed_scope, cached_filter);
 }
 
 fn getVersion() []const u8 {
@@ -248,9 +276,13 @@ fn writeJsonRecord(
     try writer.writeAll("\",\"body\":");
     try writeJsonString(writer, body);
 
-    // Attributes
+    // Attributes (scope prefixed with domain)
     try writer.writeAll(",\"attributes\":{\"scope\":");
-    try writeJsonString(writer, scope);
+    {
+        var scope_buf: [128]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&scope_buf, "core::{s}", .{scope}) catch scope;
+        try writeJsonString(writer, prefixed);
+    }
 
     // Custom attributes from struct
     const AttrType = @TypeOf(attrs);
@@ -345,9 +377,9 @@ fn writeHumanRecord(
         try writer.print("{s: <5} ", .{level_str});
     }
 
-    // Scope
+    // Scope (prefixed with domain)
     if (use_colors) try writer.writeAll(Color.cyan);
-    try writer.print("[{s}] ", .{scope});
+    try writer.print("[core::{s}] ", .{scope});
     if (use_colors) try writer.writeAll(Color.reset);
 
     // Body
@@ -460,6 +492,13 @@ fn writeLogImpl(
     src: ?SourceLocation,
     attrs: anytype,
 ) void {
+    // Apply scope filter (against prefixed scope "core::<scope>")
+    if (cached_filter.len > 0) {
+        var scope_buf2: [128]u8 = undefined;
+        const prefixed = std.fmt.bufPrint(&scope_buf2, "core::{s}", .{scope}) catch scope;
+        if (!matchesFilter(prefixed)) return;
+    }
+
     const stderr = std.fs.File.stderr();
     const format = getLogFormat();
 

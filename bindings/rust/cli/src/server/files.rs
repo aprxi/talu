@@ -499,7 +499,7 @@ pub async fn handle_get_content(
                     }
                 }
                 Err(err) => {
-                    log::warn!("blob stream read failed for file content: {err}");
+                    log::warn!(target: "server::files", "blob stream read failed for file content: {err}");
                     break;
                 }
             }
@@ -594,7 +594,7 @@ pub async fn handle_get_blob(
                     }
                 }
                 Err(err) => {
-                    log::warn!("blob stream read failed for blob content: {err}");
+                    log::warn!(target: "server::files", "blob stream read failed for blob content: {err}");
                     break;
                 }
             }
@@ -812,19 +812,19 @@ async fn inspect_blob_failsafe(
     match result {
         Ok(Ok(Ok(Ok(info)))) => Some(info),
         Ok(Ok(Ok(Err(e)))) => {
-            log::warn!("file inspection error (non-fatal): {e}");
+            log::warn!(target: "server::files", "file inspection error (non-fatal): {e}");
             None
         }
         Ok(Ok(Err(_panic))) => {
-            log::warn!("file inspection panicked (non-fatal)");
+            log::warn!(target: "server::files", "file inspection panicked (non-fatal)");
             None
         }
         Ok(Err(e)) => {
-            log::warn!("file inspection task join error (non-fatal): {e}");
+            log::warn!(target: "server::files", "file inspection task join error (non-fatal): {e}");
             None
         }
         Err(_timeout) => {
-            log::warn!("file inspection timed out (non-fatal)");
+            log::warn!(target: "server::files", "file inspection timed out (non-fatal)");
             None
         }
     }

@@ -4,7 +4,7 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::Args;
-use simplelog::{Config, LevelFilter, SimpleLogger};
+use log::LevelFilter;
 use talu::blobs::BlobsHandle;
 
 pub mod auth_gateway;
@@ -16,6 +16,7 @@ pub mod generated;
 pub mod handlers;
 pub mod http;
 pub mod listen;
+mod logger;
 pub mod plugins;
 pub mod proxy;
 pub mod search;
@@ -75,8 +76,18 @@ pub struct ServerArgs {
     pub max_file_inspect_bytes: u64,
 }
 
-pub fn run_server(args: ServerArgs) -> Result<()> {
-    let _ = SimpleLogger::init(LevelFilter::Info, Config::default());
+pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Result<()> {
+    let level = match verbose {
+        0 | 1 => LevelFilter::Info,
+        2 => LevelFilter::Debug,
+        _ => LevelFilter::Trace,
+    };
+    logger::init(level, log_filter);
+
+    // Pass filter to Zig core logging as well.
+    if let Some(filter) = log_filter {
+        talu::logging::set_log_filter(filter);
+    }
     if args.max_file_upload_bytes == 0 {
         bail!("--max-file-upload-bytes must be greater than zero");
     }
@@ -129,7 +140,7 @@ pub fn run_server(args: ServerArgs) -> Result<()> {
     };
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
-    log::info!("talu server starting");
+    log::info!(target: "server::init", "talu server starting");
     if let Some(ref bucket) = state.bucket_path {
         let bucket_for_gc = bucket.clone();
         std::thread::spawn(move || {
@@ -137,6 +148,7 @@ pub fn run_server(args: ServerArgs) -> Result<()> {
             {
                 Ok(stats) => {
                     log::info!(
+                        target: "server::init",
                         "startup blob gc: referenced={}, total={}, deleted={}, reclaimed_bytes={}",
                         stats.referenced_blob_count,
                         stats.total_blob_files,
@@ -145,19 +157,19 @@ pub fn run_server(args: ServerArgs) -> Result<()> {
                     );
                 }
                 Err(err) => {
-                    log::warn!("startup blob gc skipped: {err}");
+                    log::warn!(target: "server::init", "startup blob gc skipped: {err}");
                 }
             }
         });
 
-        log::info!("profile: {}", profile);
-        log::info!("bucket: {}", bucket.display());
+        log::info!(target: "server::init", "profile: {}", profile);
+        log::info!(target: "server::init", "bucket: {}", bucket.display());
     } else {
-        log::info!("storage disabled (--no-bucket)");
+        log::info!(target: "server::init", "storage disabled (--no-bucket)");
     }
-    log::info!("console: http://{}/", addr);
-    log::info!("listening on http://{}", addr);
-    log::info!("listening on unix://{}", socket_path.display());
+    log::info!(target: "server::init", "console: http://{}/", addr);
+    log::info!(target: "server::init", "listening on http://{}", addr);
+    log::info!(target: "server::init", "listening on unix://{}", socket_path.display());
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;

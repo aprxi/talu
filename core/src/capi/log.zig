@@ -66,3 +66,14 @@ pub export fn talu_get_log_level() callconv(.c) c_int {
 pub export fn talu_get_log_format() callconv(.c) c_int {
     return @intFromEnum(log.getLogFormat());
 }
+
+/// Set a scope filter pattern (glob-style).
+///
+/// The filter is matched against the fully-qualified scope (e.g. "core::inference").
+/// Supports trailing `*` for prefix match: "core::*" matches all core scopes.
+/// Empty string or "*" disables filtering (shows all).
+///
+/// Note: this only filters Zig core logs. Rust server logs have their own filter.
+pub export fn talu_set_log_filter(ptr: [*]const u8, len: usize) callconv(.c) void {
+    log.setLogFilter(ptr[0..len]);
+}

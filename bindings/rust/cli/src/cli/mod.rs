@@ -45,6 +45,10 @@ pub(super) struct Cli {
     #[arg(long, value_enum, global = true)]
     pub log_format: Option<CliLogFormat>,
 
+    /// Filter log output by scope (glob pattern, e.g. "core::*", "server::*", "core::inference")
+    #[arg(long, global = true)]
+    pub log_filter: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -535,7 +539,7 @@ pub(super) struct XrayArgs {
 }
 
 /// Configure log level based on verbosity flags
-fn configure_logging(verbose: u8, log_format: Option<CliLogFormat>) {
+fn configure_logging(verbose: u8, log_format: Option<CliLogFormat>, log_filter: Option<&str>) {
     // Set log level based on -v count
     let level = match verbose {
         0 => LogLevel::Warn,  // Default - silent for normal operation
@@ -552,6 +556,11 @@ fn configure_logging(verbose: u8, log_format: Option<CliLogFormat>) {
             CliLogFormat::Human => LogFormat::Human,
         };
         talu::logging::set_log_format(talu_format);
+    }
+
+    // Set log filter for Zig core logs
+    if let Some(filter) = log_filter {
+        talu::logging::set_log_filter(filter);
     }
 }
 
@@ -608,7 +617,7 @@ fn run_inner() -> Result<()> {
     };
 
     // Configure logging before any operations
-    configure_logging(parsed.verbose, parsed.log_format);
+    configure_logging(parsed.verbose, parsed.log_format, parsed.log_filter.as_deref());
 
     match parsed.command {
         None => {
@@ -620,7 +629,7 @@ fn run_inner() -> Result<()> {
             Ok(())
         }
         Some(Commands::Ask(args)) => ask::cmd_ask(args, stdin_is_pipe, parsed.verbose),
-        Some(Commands::Serve(args)) => run_server(args),
+        Some(Commands::Serve(args)) => run_server(args, parsed.verbose, parsed.log_filter.as_deref()),
         Some(Commands::Tokenize(args)) => convert::cmd_tokenize(args),
         Some(Commands::Convert(args)) => convert::cmd_convert(args),
         Some(Commands::Ls(args)) => models::cmd_ls(args),

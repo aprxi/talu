@@ -48,6 +48,16 @@ pub fn set_log_level(level: LogLevel) {
     unsafe { talu_sys::talu_set_log_level(level as i32) };
 }
 
+/// Sets a scope filter for the talu library logs.
+///
+/// The filter is matched against the fully-qualified scope (e.g. "core::inference").
+/// Supports trailing `*` for prefix match: "core::*" matches all core scopes.
+/// Empty string or "*" disables filtering.
+pub fn set_log_filter(filter: &str) {
+    // SAFETY: talu_set_log_filter copies the data internally.
+    unsafe { talu_sys::talu_set_log_filter(filter.as_ptr(), filter.len()) };
+}
+
 /// Sets the global log format for the talu library.
 pub fn set_log_format(format: LogFormat) {
     // SAFETY: talu_set_log_format is a simple setter with no preconditions.

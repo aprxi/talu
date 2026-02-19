@@ -24,7 +24,7 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
     let tcp_listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind TCP listener at {}", addr))?;
-    log::info!("TCP listener bound at {}", addr);
+    log::info!(target: "server::listen", "TCP listener bound at {}", addr);
     let tcp_task = tokio::spawn(accept_tcp(tcp_listener, router.clone()));
 
     #[cfg(unix)]
@@ -34,7 +34,7 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
         let listener = UnixListener::bind(&socket)
             .with_context(|| format!("Failed to bind UDS listener at {}", socket.display()))?;
         let _ = std::fs::set_permissions(&socket, std::fs::Permissions::from_mode(0o600));
-        log::info!("UDS listener bound at {}", socket.display());
+        log::info!(target: "server::listen", "UDS listener bound at {}", socket.display());
         tokio::spawn(accept_unix(listener, router))
     };
 

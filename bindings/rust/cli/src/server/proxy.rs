@@ -201,7 +201,7 @@ pub async fn handle_proxy(
     let upstream = match outbound.send().await {
         Ok(resp) => resp,
         Err(e) => {
-            log::warn!("proxy request to {} failed: {}", proxy_req.url, e);
+            log::warn!(target: "server::proxy", "proxy request to {} failed: {}", proxy_req.url, e);
             return json_error(
                 StatusCode::BAD_GATEWAY,
                 "upstream_error",
