@@ -39,6 +39,7 @@ const allocator = std.heap.c_allocator;
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 const signal_guard = @import("signal_guard.zig");
+const log = @import("../log.zig");
 
 // =============================================================================
 // Signal-Safe Memory Validation
@@ -1654,6 +1655,7 @@ pub export fn talu_chat_create(
     if (options) |opt| {
         chat_state.resolution_config = .{ .offline = opt.offline };
     }
+    log.debug("chat", "Chat created", .{ .handle = @intFromPtr(chat_state) }, @src());
     return @ptrCast(chat_state);
 }
 
@@ -1668,7 +1670,8 @@ pub export fn talu_chat_create_with_system(
         capi_error.setError(error.OutOfMemory, "failed to allocate Chat", .{});
         return null;
     };
-    chat_state.* = Chat.initWithSystem(allocator, std.mem.sliceTo(system, 0)) catch {
+    const system_slice = std.mem.sliceTo(system, 0);
+    chat_state.* = Chat.initWithSystem(allocator, system_slice) catch {
         allocator.destroy(chat_state);
         capi_error.setError(error.OutOfMemory, "failed to initialize Chat with system prompt", .{});
         return null;
@@ -1676,6 +1679,10 @@ pub export fn talu_chat_create_with_system(
     if (options) |opt| {
         chat_state.resolution_config = .{ .offline = opt.offline };
     }
+    log.debug("chat", "Chat created with system prompt", .{
+        .handle = @intFromPtr(chat_state),
+        .system_len = system_slice.len,
+    }, @src());
     return @ptrCast(chat_state);
 }
 
@@ -1700,6 +1707,10 @@ pub export fn talu_chat_create_with_session(
     if (options) |opt| {
         chat_state.resolution_config = .{ .offline = opt.offline };
     }
+    log.debug("chat", "Chat created with session", .{
+        .handle = @intFromPtr(chat_state),
+        .has_session_id = @as(u8, @intFromBool(sid != null)),
+    }, @src());
     return @ptrCast(chat_state);
 }
 
@@ -1726,6 +1737,11 @@ pub export fn talu_chat_create_with_system_and_session(
     if (options) |opt| {
         chat_state.resolution_config = .{ .offline = opt.offline };
     }
+    log.debug("chat", "Chat created with system and session", .{
+        .handle = @intFromPtr(chat_state),
+        .system_len = system_slice.len,
+        .has_session_id = @as(u8, @intFromBool(sid != null)),
+    }, @src());
     return @ptrCast(chat_state);
 }
 
@@ -1733,6 +1749,10 @@ pub export fn talu_chat_create_with_system_and_session(
 pub export fn talu_chat_free(handle: ?*ChatHandle) callconv(.c) void {
     if (handle) |chat_handle| {
         const chat_state: *Chat = @ptrCast(@alignCast(chat_handle));
+        log.debug("chat", "Chat free", .{
+            .handle = @intFromPtr(chat_state),
+            .items = chat_state.conv.len(),
+        }, @src());
         chat_state.deinit();
         allocator.destroy(chat_state);
     }

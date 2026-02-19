@@ -227,6 +227,11 @@ pub const TokenIterator = struct {
         // Start worker thread
         self.worker_thread = try std.Thread.spawn(.{}, workerThread, .{self});
 
+        log.debug("router", "TokenIterator created (local)", .{
+            .handle = @intFromPtr(self),
+            .is_tool_gen = @as(u8, @intFromBool(is_tool_gen)),
+        }, @src());
+
         return self;
     }
 
@@ -306,6 +311,11 @@ pub const TokenIterator = struct {
 
         // Start worker thread
         self.worker_thread = try std.Thread.spawn(.{}, workerThread, .{self});
+
+        log.debug("router", "TokenIterator created (http)", .{
+            .handle = @intFromPtr(self),
+            .is_tool_gen = @as(u8, @intFromBool(is_tool_gen)),
+        }, @src());
 
         return self;
     }
@@ -426,6 +436,11 @@ pub const TokenIterator = struct {
     /// Waits for the worker thread to complete (cancels if still running),
     /// then frees all resources. Must only be called once.
     pub fn deinit(self: *TokenIterator) void {
+        log.debug("router", "TokenIterator deinit", .{
+            .handle = @intFromPtr(self),
+            .prompt_tokens = self.prompt_tokens.load(.acquire),
+            .completion_tokens = self.completion_tokens.load(.acquire),
+        }, @src());
         // Signal cancellation if not already done
         self.cancelled.store(true, .release);
 

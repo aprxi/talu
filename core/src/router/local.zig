@@ -641,7 +641,10 @@ pub const LocalEngine = struct {
         self.backend.setPrefillProgress(opts.prefill_progress_fn, opts.prefill_progress_data);
         defer self.backend.setPrefillProgress(null, null);
 
-        log.debug("inference", "Generation path", .{ .path = "scheduler" }, @src());
+        log.debug("router", "Generation params", .{
+            .max_tokens = max_tokens,
+            .use_tools = @as(u8, @intFromBool(use_tools)),
+        }, @src());
         return self.generateWithScheduler(
             chat,
             prompt,
@@ -668,15 +671,20 @@ pub const LocalEngine = struct {
     ) !GenerationResult {
         const SchedulerType = inference.scheduler.GenericScheduler(Backend);
 
+        log.debug("router", "Collecting vision input", .{}, @src());
         var vision_prompt = try self.collectVisionPromptInput(chat);
         defer if (vision_prompt) |*vp| vp.deinit(self.allocator);
 
         // Tokenize prompt
-        log.debug("inference", "Tokenizing prompt", .{ .prompt_bytes = prompt.len }, @src());
+        log.debug("router", "Tokenizing prompt", .{ .prompt_bytes = prompt.len }, @src());
         const encoded_tokens = try self.tok.encode(prompt);
         defer self.allocator.free(encoded_tokens);
 
         const vision_boundaries = if (vision_prompt != null) self.resolveVisionBoundaryTokens() else VisionBoundaryTokens{};
+        log.debug("router", "Expanding image pad tokens", .{
+            .encoded_len = encoded_tokens.len,
+            .has_vision = @as(u8, @intFromBool(vision_prompt != null)),
+        }, @src());
         const prompt_tokens_no_bos = if (vision_prompt) |*vp|
             try expandImagePadTokens(
                 self.allocator,
@@ -707,6 +715,7 @@ pub const LocalEngine = struct {
         log.debug("inference", "Tokenization complete", .{ .prompt_tokens = prompt_len }, @src());
 
         // Create scheduler for this request
+        log.debug("router", "Creating scheduler", .{}, @src());
         var scheduler = try SchedulerType.init(self.allocator, &self.backend, .{
             .default_eos_token_ids = self.gen_config.eos_token_ids,
             .default_sampling = sampling_config,
@@ -744,6 +753,10 @@ pub const LocalEngine = struct {
         }, @src());
 
         // Generate synchronously
+        log.debug("router", "generateSync starting", .{
+            .prompt_tokens = prompt_tokens.len,
+            .max_tokens = max_tokens,
+        }, @src());
         var result = scheduler.generateSync(prompt_tokens, max_tokens, .{
             .eos_token_ids = self.gen_config.eos_token_ids,
             .stop_sequences = opts.stop_sequences,
@@ -886,6 +899,13 @@ pub const LocalEngine = struct {
             break :blk duped;
         } else generated_text;
 
+        log.debug("router", "Generation complete", .{
+            .prompt_tokens = prompt_len,
+            .generated_tokens = result.tokens.len,
+            .prefill_ns = result.prefill_ns,
+            .decode_ns = result.decode_ns,
+        }, @src());
+
         return GenerationResult{
             .text = result_text,
             .tokens = owned_tokens,
@@ -916,6 +936,7 @@ pub const LocalEngine = struct {
     fn collectVisionPromptInput(self: *LocalEngine, chat: *Chat) !?VisionPromptInput {
         const image_count = countInputImageParts(chat);
         if (image_count == 0) return null;
+        log.debug("router", "Vision input detected", .{ .images = image_count }, @src());
         if (self.loaded.config.image_token_id <= 0) return error.UnsupportedContentType;
 
         const preprocess_opts = try self.buildVisionPreprocessOptions();
@@ -937,6 +958,10 @@ pub const LocalEngine = struct {
                 const part = msg.getPart(part_index) orelse continue;
                 if (part.getContentType() != .input_image) continue;
 
+                log.trace("router", "Loading image", .{
+                    .index = written,
+                    .data_len = part.getData().len,
+                }, @src());
                 const image_bytes = try loadImageBytes(self.allocator, part.getData());
                 defer self.allocator.free(image_bytes);
 
@@ -946,6 +971,10 @@ pub const LocalEngine = struct {
                 });
                 defer decoded.deinit(self.allocator);
 
+                log.trace("router", "Preprocessing image", .{
+                    .index = written,
+                    .bytes = image_bytes.len,
+                }, @src());
                 var prep = try image_mod.preprocessImage(self.allocator, decoded, preprocess_opts);
                 errdefer prep.deinit(self.allocator);
 

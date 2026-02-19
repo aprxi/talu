@@ -150,28 +150,63 @@ pub fn setLogFormat(format: Format) void {
     format_initialized = true;
 }
 
-/// Set scope filter (glob pattern matched against "core::<scope>").
-/// Empty string or "*" disables filtering. Supports trailing `*` for prefix match.
+/// Set scope filter (comma-separated patterns matched against "core::<scope>").
+/// Empty string or "*" disables filtering. Supports trailing `*` for prefix match
+/// and `!` prefix for negation.  Examples:
+///   "core::*"                    — only core scopes
+///   "!core::inference"           — everything except core::inference
+///   "core::*,server::gen"        — core scopes OR server::gen
+///   "!core::inference,!server::*" — exclude both
 pub fn setLogFilter(filter: []const u8) void {
     if (filter.len > filter_buf.len) return;
     @memcpy(filter_buf[0..filter.len], filter);
     cached_filter = filter_buf[0..filter.len];
 }
 
+/// Match a single glob pattern against a scope (trailing * = prefix match).
+fn globMatch(pattern: []const u8, scope: []const u8) bool {
+    if (pattern.len == 0) return false;
+    if (pattern.len == 1 and pattern[0] == '*') return true;
+    if (pattern[pattern.len - 1] == '*') {
+        const prefix = pattern[0 .. pattern.len - 1];
+        return scope.len >= prefix.len and
+            std.mem.eql(u8, scope[0..prefix.len], prefix);
+    }
+    return std.mem.eql(u8, scope, pattern);
+}
+
 /// Check if a prefixed scope matches the current filter.
+/// Supports comma-separated patterns with `!` negation.
 fn matchesFilter(prefixed_scope: []const u8) bool {
     if (cached_filter.len == 0) return true;
     if (cached_filter.len == 1 and cached_filter[0] == '*') return true;
 
-    // Trailing * = prefix match
-    if (cached_filter[cached_filter.len - 1] == '*') {
-        const prefix = cached_filter[0 .. cached_filter.len - 1];
-        return prefixed_scope.len >= prefix.len and
-            std.mem.eql(u8, prefixed_scope[0..prefix.len], prefix);
+    var has_positive = false;
+    var positive_match = false;
+
+    // Iterate comma-separated segments.
+    var rest = cached_filter;
+    while (rest.len > 0) {
+        // Find next comma (or end of string).
+        var end: usize = 0;
+        while (end < rest.len and rest[end] != ',') : (end += 1) {}
+        const segment = std.mem.trim(u8, rest[0..end], " ");
+        rest = if (end < rest.len) rest[end + 1 ..] else rest[rest.len..];
+
+        if (segment.len == 0) continue;
+
+        if (segment[0] == '!') {
+            // Negation: if scope matches this pattern, exclude it.
+            if (globMatch(segment[1..], prefixed_scope)) return false;
+        } else {
+            has_positive = true;
+            if (globMatch(segment, prefixed_scope)) positive_match = true;
+        }
     }
 
-    // Exact match
-    return std.mem.eql(u8, prefixed_scope, cached_filter);
+    // If there were positive patterns, scope must have matched at least one.
+    // If only negations, everything not excluded passes.
+    return if (has_positive) positive_match else true;
 }
 
 fn getVersion() []const u8 {

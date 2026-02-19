@@ -104,8 +104,8 @@ fn non_image_upload_blob_is_resolvable_to_file_url() {
     assert_eq!(on_disk, b"some text content");
 }
 
-/// When the user re-attaches the same image, both file_ids must resolve to
-/// the same blob on disk (content-addressable dedup).
+/// When the user re-attaches the same image, the upload is idempotent:
+/// same content = same file_id, same blob on disk.
 #[test]
 fn duplicate_uploads_resolve_to_same_blob_path() {
     let temp = TempDir::new().expect("temp dir");
@@ -114,15 +114,13 @@ fn duplicate_uploads_resolve_to_same_blob_path() {
     let (id_a, ref_a) = upload_file(&ctx, "a.jpg", "image/jpeg", "same-image-data");
     let (id_b, ref_b) = upload_file(&ctx, "b.jpg", "image/jpeg", "same-image-data");
 
-    // Each upload gets a unique file_id (the UI tracks them independently).
-    assert_ne!(id_a, id_b);
+    // Same content produces the same file_id (content-addressed).
+    assert_eq!(id_a, id_b, "same content should produce same file_id");
 
-    // But they share the same blob (content-addressable storage).
+    // And the same blob.
     assert_eq!(ref_a, ref_b, "same content should produce same blob_ref");
 
-    // Both resolve to the same file:// path.
+    // Resolves to a single blob path.
     let path_a = blob_path_from_ref(temp.path(), &ref_a);
-    let path_b = blob_path_from_ref(temp.path(), &ref_b);
-    assert_eq!(path_a, path_b);
     assert!(path_a.exists());
 }

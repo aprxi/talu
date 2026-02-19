@@ -614,8 +614,17 @@ pub const FusedCpuBackend = struct {
                 rt
             else
                 return error.UnsupportedContentType;
+            log.debug("scheduler", "Vision encode start", .{
+                .images = vi.images.len,
+                .image_token_id = vi.image_token_id,
+            }, @src());
             encoded_vision_output = try vision.encodeImages(vi.images);
             const encoded = &encoded_vision_output.?;
+            log.debug("scheduler", "Vision encode done", .{
+                .merged_len = encoded.merged_embeddings.len,
+                .deepstack_layers = encoded.deepstack_layer_embeddings.len,
+                .prefill_buf_len = prefill_buffer.len,
+            }, @src());
 
             try vision_runtime_mod.scatterVisionEmbeddings(
                 prefill_buffer,
@@ -646,6 +655,8 @@ pub const FusedCpuBackend = struct {
                 };
             }
 
+            log.debug("scheduler", "Vision scatter done", .{}, @src());
+
             const mrope_section = resolveMropeSection(&self.loaded.config, self.head_dim);
             const mrope_total = mrope_section[0] + mrope_section[1] + mrope_section[2];
             if (mrope_total > 0) {
@@ -663,6 +674,13 @@ pub const FusedCpuBackend = struct {
                 text_mrope_cos = tables.cos;
                 text_mrope_sin = tables.sin;
                 self.slot_rope_position_deltas[slot_index] = tables.position_delta;
+                log.debug("scheduler", "MRoPE tables built", .{
+                    .cos_len = text_mrope_cos.len,
+                    .sin_len = text_mrope_sin.len,
+                    .head_dim = self.head_dim,
+                    .prompt_len = prompt_len,
+                    .expected_len = prompt_len * self.head_dim,
+                }, @src());
                 try self.setRuntimeRoPEForTextLayers(text_mrope_cos, text_mrope_sin, self.head_dim);
                 text_mrope_enabled = true;
                 log.debug("inference", "Text MRoPE prepared", .{
@@ -702,6 +720,11 @@ pub const FusedCpuBackend = struct {
             self.model.prefill_progress_ctx = null;
         }
 
+        log.debug("scheduler", "Transformer forward start", .{
+            .prompt_len = prompt_len,
+            .has_deepstack = @as(u8, @intFromBool(deepstack_ctx != null)),
+            .has_mrope = @as(u8, @intFromBool(text_mrope_enabled)),
+        }, @src());
         if (deepstack_ctx) |*ctx| {
             try self.model.forwardWithBatchedCacheWithDeepstack(
                 &prefill_view_3d,

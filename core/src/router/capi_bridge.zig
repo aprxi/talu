@@ -53,6 +53,7 @@ fn contentTypeFromGeneratePart(raw: u8) ContentType {
 }
 
 fn appendUserMessageFromParts(chat: *Chat, parts: []const GenerateContentPart) !void {
+    log.trace("router", "Appending user message", .{ .parts = parts.len }, @src());
     const msg = try chat.conv.appendEmptyMessage(.user);
     for (parts) |c_part| {
         const content_type = contentTypeFromGeneratePart(c_part.content_type);
@@ -408,6 +409,16 @@ pub fn generateWithBackend(
     backend: *InferenceBackend,
     config: ?*const CGenerateConfig,
 ) GenerateResult {
+    log.debug("router", "generateWithBackend", .{
+        .parts = parts.len,
+        .conv_items = chat.conv.len(),
+        .backend = @as(u8, switch (backend.backend) {
+            .Local => 0,
+            .OpenAICompatible => 1,
+            .Unspecified => 2,
+        }),
+    }, @src());
+
     // If parts are provided, append a new user message.
     // If parts are empty, continue from the current conversation state
     // (used by agent loops after appending tool call outputs).
@@ -445,11 +456,21 @@ fn generateWithLocalEngine(
     var built = buildOptions(allocator, config, local_engine) catch return .{ .error_code = @intFromEnum(error_codes.ErrorCode.out_of_memory) };
     defer built.deinit(allocator);
 
+    log.debug("router", "LocalEngine generate", .{
+        .max_tokens = built.options.max_tokens orelse 0,
+        .has_tools = @as(u8, @intFromBool(built.options.tools_json != null)),
+    }, @src());
+
     // Generate
     var result = local_engine.generate(chat, built.options) catch |err| {
         capi_error.setError(err, "generate error: {s}", .{@errorName(err)});
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
     };
+    log.debug("router", "LocalEngine generate completed", .{
+        .prompt_tokens = result.prompt_tokens,
+        .completion_tokens = result.generated_tokens,
+    }, @src());
+
     // Transfer tool_calls ownership to the returned GenerateResult before deinit
     // frees them. Null out the field so deinit skips freeing the transferred data.
     const tool_calls = result.tool_calls;
@@ -807,6 +828,16 @@ pub fn createIterator(
     backend_ptr: *InferenceBackend,
     config: ?*const CGenerateConfig,
 ) CreateIteratorError!*iterator_mod.TokenIterator {
+    log.debug("router", "createIterator", .{
+        .parts = content_parts.len,
+        .conv_items = chat.conv.len(),
+        .backend = @as(u8, switch (backend_ptr.backend) {
+            .Local => 0,
+            .OpenAICompatible => 1,
+            .Unspecified => 2,
+        }),
+    }, @src());
+
     if (content_parts.len > 0) {
         appendUserMessageFromParts(chat, content_parts) catch {
             return error.OutOfMemory;

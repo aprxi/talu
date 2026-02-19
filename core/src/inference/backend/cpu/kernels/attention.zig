@@ -716,7 +716,10 @@ pub const MultiHeadAttention = struct {
 
         const current = cache.kv_capacity;
         const grow_to = if (current == 0) needed_seq else @max(needed_seq, current * 2);
-        const target_seq = @min(self.max_seq_len, grow_to);
+        // Ensure at least needed_seq capacity. The max_seq_len cap applies to the
+        // doubling growth strategy but must not shrink below what the caller requires
+        // (e.g. vision encoders can exceed num_pos_embeddings via interpolation).
+        const target_seq = @max(needed_seq, @min(self.max_seq_len, grow_to));
         const total = target_seq * kv_total_dim;
         const new_k = try self.allocator.alloc(f32, total);
         errdefer self.allocator.free(new_k);
@@ -2664,7 +2667,7 @@ test "MultiHeadAttention.ensureKvCapacity: grows capacity exponentially" {
     try std.testing.expect(second_capacity >= 25);
 }
 
-test "MultiHeadAttention.ensureKvCapacity: respects max_seq_len limit" {
+test "MultiHeadAttention.ensureKvCapacity: allocates at least needed_seq even beyond max_seq_len" {
     const allocator = std.testing.allocator;
 
     var o_proj_data = [_]f32{0} ** 16;
@@ -2687,11 +2690,67 @@ test "MultiHeadAttention.ensureKvCapacity: respects max_seq_len limit" {
     var cache = AttnCache{};
     defer cache.deinit(allocator);
 
-    // Request size larger than max - should cap at max
+    // Request size larger than max - must still allocate enough to prevent overflow.
+    // Vision encoders can exceed num_pos_embeddings via interpolation.
     try mha.ensureKvCapacity(&cache, 1000, 8);
 
-    // Capacity should not exceed max_seq_len
-    try std.testing.expect(cache.kv_capacity <= max_seq);
+    // Capacity must be at least the requested size
+    try std.testing.expect(cache.kv_capacity >= 1000);
+}
+
+test "MultiHeadAttention.ensureKvCapacity: vision-like prefill writes within bounds when exceeding max_seq_len" {
+    // Regression test: vision encoder patch_count (2368) can exceed
+    // num_pos_embeddings (2304) via interpolation. The KV cache must be
+    // large enough for the actual sequence_len to prevent heap overflow.
+    const allocator = std.testing.allocator;
+
+    var o_proj_data = [_]f32{0} ** 16;
+    const o_proj = Tensor.view2DSlice(&o_proj_data, 4, 4);
+
+    const max_seq = 2304; // typical num_pos_embeddings
+    const n_kv_heads = 2;
+    const head_dim = 4;
+    const kv_total_dim = n_kv_heads * head_dim;
+    const mha = MultiHeadAttention{
+        .d_model = 8,
+        .n_heads = 2,
+        .n_kv_heads = n_kv_heads,
+        .head_dim = head_dim,
+        .max_seq_len = max_seq,
+        .scale = 0.5,
+        .o_proj = &o_proj,
+        .allocator = allocator,
+        .matmul_qkv = undefined,
+        .matmul_o = undefined,
+    };
+
+    var cache = AttnCache{};
+    defer cache.deinit(allocator);
+
+    const patch_count = 2368; // exceeds max_seq
+    try mha.ensureKvCapacity(&cache, patch_count, kv_total_dim);
+
+    // Must have enough capacity for all patches
+    try std.testing.expect(cache.kv_capacity >= patch_count);
+
+    // Simulate the prefill write loop (attention.zig:368-378).
+    // This would overflow if capacity < patch_count.
+    const kv_stride = cache.kv_capacity;
+    for (0..n_kv_heads) |kv_h| {
+        for (0..patch_count) |pos| {
+            const k_offset = kv_h * kv_stride * head_dim + pos * head_dim;
+            const v_offset = kv_h * kv_stride * head_dim + pos * head_dim;
+            // Verify these writes are in bounds
+            try std.testing.expect(k_offset + head_dim <= cache.key_cache.len);
+            try std.testing.expect(v_offset + head_dim <= cache.value_cache.len);
+            // Write to confirm no crash
+            for (0..head_dim) |d| {
+                cache.key_cache[k_offset + d] = 1.0;
+                cache.value_cache[v_offset + d] = 1.0;
+            }
+        }
+    }
+    cache.cache_position = patch_count;
 }
 
 test "MultiHeadAttention.ensureKvCapacity: preserves cached data during growth" {

@@ -81,6 +81,11 @@ pub fn commitGenerationResult(
 ) !void {
     // --- Tool call path ---
     if (params.tool_calls.len > 0) {
+        log.debug("router", "Commit: tool calls", .{
+            .count = params.tool_calls.len,
+            .prompt_tokens = params.prompt_tokens,
+            .completion_tokens = params.completion_tokens,
+        }, @src());
         for (params.tool_calls) |tc| {
             const policy_denied = try firewall.checkFirewall(
                 allocator,
@@ -88,6 +93,11 @@ pub fn commitGenerationResult(
                 tc.name,
                 tc.arguments,
             );
+            log.trace("router", "Tool call committed", .{
+                .name_len = tc.name.len,
+                .args_len = tc.arguments.len,
+                .denied = @as(u8, @intFromBool(policy_denied)),
+            }, @src());
 
             const item = try chat.conv.appendFunctionCall(tc.id, tc.name);
             try chat.conv.setFunctionCallArguments(item, tc.arguments);
@@ -110,6 +120,12 @@ pub fn commitGenerationResult(
     }
 
     // --- Text path: parse reasoning tags, create items ---
+    log.debug("router", "Commit: text", .{
+        .text_len = params.text.len,
+        .prompt_tokens = params.prompt_tokens,
+        .completion_tokens = params.completion_tokens,
+    }, @src());
+
     var parser = try reasoning_parser_mod.ReasoningParser.init(
         allocator,
         params.reasoning_tag,

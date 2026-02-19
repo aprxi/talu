@@ -1127,6 +1127,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             vision_input: ?*const anyopaque,
         ) !void {
             if (vision_input) |opaque_ptr| {
+                log.debug("scheduler", "Prefill dispatch (vision)", .{
+                    .slot_index = slot_index,
+                    .prompt_tokens = prompt_tokens.len,
+                }, @src());
                 log.debug("inference", "Scheduler prefill dispatch", .{
                     .slot_index = slot_index,
                     .prompt_tokens = prompt_tokens.len,

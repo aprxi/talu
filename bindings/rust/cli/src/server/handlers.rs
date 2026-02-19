@@ -85,7 +85,7 @@ pub async fn handle_responses(
     req: Request<Incoming>,
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    let (_parts, body) = req.into_parts();
+    let (parts, body) = req.into_parts();
     if let Some(ctx) = auth_ctx.as_ref() {
         log::info!(
             target: "server::gen",
@@ -99,6 +99,19 @@ pub async fn handle_responses(
         Ok(body) => body.to_bytes(),
         Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Invalid body"),
     };
+
+    // Log reproducible curl command at DEBUG for replay/debugging.
+    if log::log_enabled!(target: "server::gen", log::Level::Debug) {
+        let host = parts.headers.get("host")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("localhost:8258");
+        let body_str = String::from_utf8_lossy(&body_bytes);
+        log::debug!(
+            target: "server::gen",
+            "curl -s http://{}{} -H 'content-type: application/json' -d '{}'",
+            host, parts.uri.path(), body_str.replace('\'', "'\\''")
+        );
+    }
 
     let request: generated::CreateResponseBody = match serde_json::from_slice(&body_bytes) {
         Ok(val) => val,

@@ -31,6 +31,7 @@ const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_tensor_gather = compute.cpu.tensor_gather;
+const log = @import("../../../../log.zig");
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;
@@ -470,6 +471,15 @@ pub const VisionRuntime = struct {
             @as(usize, @intCast(image.grid.width));
         if (patch_count == 0) return error.InvalidImageDimensions;
 
+        log.debug("scheduler", "encodeSingleImage start", .{
+            .patch_count = patch_count,
+            .grid_t = @as(usize, image.grid.temporal),
+            .grid_h = @as(usize, image.grid.height),
+            .grid_w = @as(usize, image.grid.width),
+            .vision_hidden = self.vision_hidden_size,
+            .max_pos = self.num_pos_embeddings,
+        }, @src());
+
         const patch_dim = 3 * self.temporal_patch_size * self.patch_size * self.patch_size;
         const patch_input = try self.allocator.alloc(f32, patch_count * patch_dim);
         defer self.allocator.free(patch_input);
@@ -570,6 +580,12 @@ pub const VisionRuntime = struct {
             }
         }
 
+        log.debug("scheduler", "Vision transformer done", .{
+            .layers = self.vision_depth,
+            .patch_count = patch_count,
+            .hidden_len = current.len,
+        }, @src());
+
         return .{
             .merged_embeddings = try self.runMerger(image.grid, current),
             .deepstack_layer_embeddings = deepstack_layer_embeddings,
@@ -663,6 +679,18 @@ pub const VisionRuntime = struct {
             @as(usize, @intCast(grid.width));
         if (hidden.len != patch_count * self.vision_hidden_size) return error.InvalidShape;
 
+        const merge_units_log = self.spatial_merge_size * self.spatial_merge_size;
+        const merged_tokens_log = (@as(usize, @intCast(grid.temporal))) *
+            (@as(usize, @intCast(grid.height)) / self.spatial_merge_size) *
+            (@as(usize, @intCast(grid.width)) / self.spatial_merge_size);
+        log.debug("scheduler", "runMerger", .{
+            .patch_count = patch_count,
+            .merged_tokens = merged_tokens_log,
+            .merged_width = self.vision_hidden_size * merge_units_log,
+            .fc1_out_dim = self.vision_intermediate_size,
+            .fc2_out_dim = self.language_hidden_size,
+        }, @src());
+
         const normed = try self.allocator.alloc(f32, hidden.len);
         defer self.allocator.free(normed);
         try cpu_norm.layerNormRows(
@@ -719,6 +747,10 @@ pub const VisionRuntime = struct {
         try matmul.matmulAuto(&fc1_view, &self.merger_fc2_weight, &out_view, &self.scratch.matmul_scratch);
 
         cpu_common.addBiasRows(out, self.merger_fc2_bias, merged_tokens, self.language_hidden_size);
+
+        log.debug("scheduler", "runMerger done", .{
+            .out_len = out.len,
+        }, @src());
 
         return out;
     }
