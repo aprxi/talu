@@ -322,6 +322,8 @@ impl StorageHandle {
         limit: usize,
         group_id: Option<&str>,
         marker: Option<&str>,
+        search: Option<&str>,
+        tags_any: Option<&str>,
     ) -> Result<SessionBatchResult, StorageError> {
         let limit = limit.clamp(1, 100);
 
@@ -333,9 +335,19 @@ impl StorageHandle {
             .map(|m| CString::new(m))
             .transpose()
             .map_err(|_| StorageError::InvalidArgument("marker contains null bytes".into()))?;
+        let search_cstr = search
+            .map(|s| CString::new(s))
+            .transpose()
+            .map_err(|_| StorageError::InvalidArgument("search contains null bytes".into()))?;
+        let tags_cstr = tags_any
+            .map(|t| CString::new(t))
+            .transpose()
+            .map_err(|_| StorageError::InvalidArgument("tags_any contains null bytes".into()))?;
 
         let group_ptr = group_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let marker_ptr = marker_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let search_ptr = search_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let tags_ptr = tags_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut c_list: *mut CSessionList = std::ptr::null_mut();
 
@@ -347,6 +359,8 @@ impl StorageHandle {
                 limit as u32,
                 group_ptr,
                 marker_ptr,
+                search_ptr,
+                tags_ptr,
                 &mut c_list as *mut _ as *mut c_void,
             )
         };

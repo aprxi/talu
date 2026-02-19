@@ -131,9 +131,9 @@ fn list_has_more_false_when_exact_limit() {
 }
 
 #[test]
-fn list_default_limit_is_20() {
+fn list_default_limit_is_50() {
     let temp = TempDir::new().expect("temp dir");
-    for i in 0..25 {
+    for i in 0..55 {
         seed_session(
             temp.path(),
             &format!("sess-{i:02}"),
@@ -144,12 +144,12 @@ fn list_default_limit_is_20() {
     }
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    // No limit= param — should default to 20
+    // No limit= param — should default to 50
     let resp = get(ctx.addr(), "/v1/conversations");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
-    assert_eq!(data.len(), 20, "default limit should be 20");
+    assert_eq!(data.len(), 50, "default limit should be 50");
     assert_eq!(json["has_more"], true);
 }
 

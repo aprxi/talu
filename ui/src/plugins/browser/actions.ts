@@ -3,7 +3,7 @@
  */
 
 import { api, notify, dialogs, chatService, pluginDownload } from "./deps.ts";
-import { bState, search } from "./state.ts";
+import { bState } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
 import { updateBrowserToolbar } from "./render.ts";
 import { loadBrowserConversations } from "./data.ts";
@@ -33,7 +33,6 @@ export async function handleBrowserDelete(): Promise<void> {
   dom.deleteBtn.disabled = false;
 
   if (result.ok) {
-    search.results = search.results.filter((c) => !bState.selectedIds.has(c.id));
     notify.info(`Deleted ${idsToDelete.length} conversation(s)`);
   } else {
     notify.error(result.error ?? "Failed to delete conversations");
@@ -48,10 +47,7 @@ export async function handleBrowserDelete(): Promise<void> {
 export function handleBrowserExport(): void {
   if (bState.selectedIds.size === 0) return;
 
-  const source = search.query.trim()
-    ? search.results
-    : bState.conversations;
-  const selected = source.filter((c) => bState.selectedIds.has(c.id));
+  const selected = bState.conversations.filter((c) => bState.selectedIds.has(c.id));
   const data = JSON.stringify(selected, null, 2);
   const blob = new Blob([data], { type: "application/json" });
   pluginDownload.save(blob, `talu-export-${selected.length}-conversations.json`);
@@ -64,9 +60,6 @@ export async function handleCardRestore(id: string): Promise<void> {
     notify.error(result.error ?? "Failed to restore");
     return;
   }
-
-  const searchConv = search.results.find((c) => c.id === id);
-  if (searchConv) searchConv.marker = "";
 
   notify.info("Restored conversation");
 
@@ -92,10 +85,6 @@ export async function handleBrowserArchive(): Promise<void> {
   dom.archiveBtn.disabled = false;
 
   if (result.ok) {
-    for (const id of idsToArchive) {
-      const searchConv = search.results.find((c) => c.id === id);
-      if (searchConv) searchConv.marker = "archived";
-    }
     notify.info(`Archived ${idsToArchive.length} conversation(s)`);
   } else {
     notify.error(result.error ?? "Failed to archive conversations");
@@ -124,10 +113,6 @@ export async function handleBrowserBulkRestore(): Promise<void> {
   dom.restoreBtn.disabled = false;
 
   if (result.ok) {
-    for (const id of idsToRestore) {
-      const searchConv = search.results.find((c) => c.id === id);
-      if (searchConv) searchConv.marker = "";
-    }
     notify.info(`Restored ${idsToRestore.length} conversation(s)`);
   } else {
     notify.error(result.error ?? "Failed to restore conversations");

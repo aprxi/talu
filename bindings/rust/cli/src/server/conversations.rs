@@ -307,7 +307,7 @@ pub async fn handle_list(
         .iter()
         .find(|(k, _)| k == "limit")
         .and_then(|(_, v)| v.parse::<usize>().ok())
-        .unwrap_or(20)
+        .unwrap_or(50)
         .clamp(1, 100);
 
     let offset = query
@@ -328,12 +328,26 @@ pub async fn handle_list(
         .find(|(k, _)| k == "marker")
         .map(|(_, v)| v.clone());
 
+    let search_query: Option<String> = query
+        .iter()
+        .find(|(k, _)| k == "search")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty());
+
+    let tags_any: Option<String> = query
+        .iter()
+        .find(|(k, _)| k == "tags_any")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty());
+
     let result = tokio::task::spawn_blocking(move || {
         let batch = storage.list_sessions_batch(
             offset,
             limit,
             group_id.as_deref(),
             marker_filter.as_deref(),
+            search_query.as_deref(),
+            tags_any.as_deref(),
         )?;
 
         // Only resolve tags and convert for the current page.

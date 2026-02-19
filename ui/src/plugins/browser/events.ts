@@ -40,14 +40,12 @@ export function wireEvents(): void {
 
   // Select All / Deselect All.
   dom.selectAllBtn.addEventListener("click", () => {
-    const isSearching = search.query.trim().length > 0 || search.tagFilters.length > 0;
-    const visible = isSearching ? search.results : bState.conversations;
     const allSelected =
-      bState.selectedIds.size === visible.length && visible.length > 0;
+      bState.selectedIds.size === bState.conversations.length && bState.conversations.length > 0;
     if (allSelected) {
       bState.selectedIds.clear();
     } else {
-      for (const c of visible) bState.selectedIds.add(c.id);
+      for (const c of bState.conversations) bState.selectedIds.add(c.id);
     }
     updateBrowserToolbar();
     renderBrowserCards();
@@ -64,14 +62,9 @@ export function wireEvents(): void {
     renderBrowserCards();
   });
 
-  // Card clicks + "Load more" (delegated).
+  // Card clicks (delegated).
   dom.cardsEl.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
-
-    if (target.closest("#browser-load-more")) {
-      loadBrowserConversations();
-      return;
-    }
 
     const tagChip = target.closest<HTMLElement>(".tag-chip");
     if (tagChip?.dataset["tag"]) {
@@ -130,12 +123,8 @@ export function wireEvents(): void {
       if (query === search.query) return;
 
       search.query = query;
-      search.results = [];
-      search.cursor = null;
-      search.hasMore = true;
-      search.isLoading = false;
-
-      await loadBrowserConversations();
+      bState.pagination.currentPage = 1;
+      await loadBrowserConversations(1);
     }, 300);
     const hasText = dom.searchInput.value.trim().length > 0;
     dom.clearBtn.classList.toggle("hidden", !hasText);

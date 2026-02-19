@@ -330,7 +330,7 @@ impl DocumentsHandle {
                 c_ptrs.as_ptr(),
                 c_ptrs.len(),
                 opt_ptr(&doc_type_c),
-                &mut deleted_count,
+                &mut deleted_count as *mut usize as *mut std::ffi::c_void,
             )
         };
 
@@ -367,7 +367,7 @@ impl DocumentsHandle {
                 c_ptrs.len(),
                 marker_c.as_ptr(),
                 opt_ptr(&doc_type_c),
-                &mut updated_count,
+                &mut updated_count as *mut usize as *mut std::ffi::c_void,
             )
         };
 

@@ -21,16 +21,12 @@ function initConversationsBrowser(): void {
   // Cancel any in-flight load so it won't overwrite state.
   bState.loadGeneration++;
   bState.isLoading = false;
-  search.isLoading = false;
 
   const dom = getBrowserDom();
   bState.selectedIds.clear();
   dom.searchInput.value = "";
   search.query = "";
   search.tagFilters = [];
-  search.results = [];
-  search.cursor = null;
-  search.hasMore = true;
   bState.tab = "all";
   bState.pagination.currentPage = 1;
   bState.pagination.totalItems = 0;

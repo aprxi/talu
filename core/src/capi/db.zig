@@ -1481,6 +1481,10 @@ pub export fn talu_storage_list_sessions_by_source(
 ///   - limit: Maximum records in the returned page (0 = no limit)
 ///   - group_id: Filter by group (null = no filter)
 ///   - marker_filter: Exact marker match, e.g. "archived" (null = no filter)
+///   - search_query: Case-insensitive substring filter on session metadata
+///     and item content (null = no filter)
+///   - tags_filter_any: Space-separated tag names for OR matching (null = no filter).
+///     Resolved via relational tag table to session hash whitelist.
 ///   - out_sessions: Output parameter to receive session list handle
 ///
 /// Returns: 0 on success, negative error code on failure.
@@ -1492,6 +1496,8 @@ pub export fn talu_storage_list_sessions_batch(
     limit: u32,
     group_id: ?[*:0]const u8,
     marker_filter: ?[*:0]const u8,
+    search_query: ?[*:0]const u8,
+    tags_filter_any: ?[*:0]const u8,
     out_sessions: ?*?*CSessionList,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -1511,6 +1517,23 @@ pub export fn talu_storage_list_sessions_batch(
         params.target_group_id = gid;
     }
     params.marker_filter = optSlice(marker_filter);
+    params.search_query = optSlice(search_query);
+    if (params.search_query != null) params.max_scan = 5000;
+
+    // Resolve tag filter to session hash whitelist.
+    var allowed_hashes = std.AutoHashMap(u64, void).init(allocator);
+    defer allowed_hashes.deinit();
+
+    if (optSlice(tags_filter_any)) |f| {
+        const group_slice = optSlice(group_id);
+        const sids = db.table.tags.resolveTagFilterSessionIds(allocator, db_path_slice, f, false, group_slice) catch |err| {
+            capi_error.setError(err, "failed to resolve tag filter", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer db.table.tags.freeStringSlice(allocator, sids);
+        populateHashSet(sids, &allowed_hashes);
+        params.allowed_session_hashes = &allowed_hashes;
+    }
 
     const records = db.table.sessions.listSessions(allocator, db_path_slice, params) catch |err| {
         capi_error.setError(err, "failed to scan sessions", .{});

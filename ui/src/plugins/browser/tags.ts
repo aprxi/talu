@@ -20,18 +20,14 @@ export function filterByTag(tag: string): void {
     search.tagFilters.push(tag);
   }
 
-  search.results = [];
-  search.cursor = null;
-  search.hasMore = true;
-  search.isLoading = false;
-
   renderBrowserTags();
   bState.selectedIds.clear();
+  bState.pagination.currentPage = 1;
 
   updateBrowserTagFilter();
   syncBrowserTabs();
   updateBrowserToolbar();
-  loadBrowserConversations();
+  loadBrowserConversations(1);
 }
 
 export function removeTagFilter(tag: string): void {
@@ -40,34 +36,23 @@ export function removeTagFilter(tag: string): void {
     search.tagFilters.splice(idx, 1);
   }
 
-  search.results = [];
-  search.cursor = null;
-  search.hasMore = true;
-  search.isLoading = false;
-
+  bState.pagination.currentPage = 1;
   renderBrowserTags();
   updateBrowserTagFilter();
   syncBrowserTabs();
   updateBrowserToolbar();
-  if (search.tagFilters.length > 0) {
-    loadBrowserConversations();
-  } else {
-    renderBrowserCards();
-  }
+  loadBrowserConversations(1);
 }
 
 export function clearTagFilter(): void {
   search.tagFilters = [];
-  search.results = [];
-  search.cursor = null;
-  search.hasMore = true;
-  search.isLoading = false;
+  bState.pagination.currentPage = 1;
 
   updateBrowserTagFilter();
   renderBrowserTags();
   syncBrowserTabs();
   updateBrowserToolbar();
-  renderBrowserCards();
+  loadBrowserConversations(1);
 }
 
 export function updateBrowserTagFilter(): void {

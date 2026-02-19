@@ -4,7 +4,6 @@
 
 import { renderBrowserCard } from "../../render/browser.ts";
 import { renderEmptyState } from "../../render/common.ts";
-import { isArchived } from "../../render/helpers.ts";
 import { computePagination, renderPagination } from "../../render/pagination.ts";
 import { TAG_ICON as ICON_TAG } from "../../icons.ts";
 import { bState, search } from "./state.ts";
@@ -41,22 +40,9 @@ export function renderBrowserCards(): void {
   dom.cardsEl.innerHTML = "";
   const isSearching = search.query.trim().length > 0 || search.tagFilters.length > 0;
   const hasTagFilter = search.tagFilters.length > 0;
+  const conversations = bState.conversations;
 
-  const baseConversations = isSearching
-    ? search.results
-    : bState.conversations;
-
-  // In non-search mode, the backend already filters by marker — no client
-  // filtering needed. For tag-filter mode, sort archived to the end.
-  const conversations: typeof baseConversations = hasTagFilter
-    ? [...baseConversations].sort((a, b) => {
-        const aArchived = isArchived(a) ? 1 : 0;
-        const bArchived = isArchived(b) ? 1 : 0;
-        return aArchived - bArchived;
-      })
-    : baseConversations;
-
-  if (conversations.length === 0 && !search.isLoading) {
+  if (conversations.length === 0) {
     const emptyMsg = isSearching
       ? "No matching conversations"
       : bState.tab === "archived"
@@ -85,17 +71,6 @@ export function renderBrowserCards(): void {
         hasTagFilter,
       ),
     );
-  }
-
-  if (isSearching && search.hasMore) {
-    const loadMore = document.createElement("div");
-    loadMore.className = "load-more-container";
-    const btn = document.createElement("button");
-    btn.id = "browser-load-more";
-    btn.className = "btn btn-ghost";
-    btn.textContent = "Load more";
-    loadMore.appendChild(btn);
-    dom.cardsEl.appendChild(loadMore);
   }
 }
 
@@ -150,10 +125,8 @@ export function updateBrowserToolbar(): void {
   dom.bulkActions.classList.toggle("active", hasSelection);
   dom.cancelBtn.classList.toggle("hidden", !hasSelection);
 
-  const isSearching = search.query.trim().length > 0 || hasTagFilter;
-  const visible = isSearching ? search.results : bState.conversations;
   const allSelected =
-    bState.selectedIds.size === visible.length && visible.length > 0;
+    bState.selectedIds.size === bState.conversations.length && bState.conversations.length > 0;
   dom.selectAllBtn.textContent = allSelected ? "Deselect All" : "Select All";
 
   dom.tabAll.classList.toggle("opacity-40", hasTagFilter);

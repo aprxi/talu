@@ -218,18 +218,22 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
     if (std.mem.startsWith(u8, zig_type, "[*]") or
         std.mem.startsWith(u8, zig_type, "?[*]"))
     {
-        // Check for sentinel-terminated pointers
-        if (std.mem.indexOf(u8, zig_type, ":0]") != null) {
+        // Check if the OUTER pointer is sentinel-terminated (e.g. [*:0]u8, ?[*:0]u8).
+        // Must not match inner sentinels in types like ?[*]const ?[*:0]const u8.
+        const is_outer_sentinel = std.mem.startsWith(u8, zig_type, "[*:0]") or
+            std.mem.startsWith(u8, zig_type, "?[*:0]");
+        if (is_outer_sentinel) {
             // String pointer
             if (std.mem.indexOf(u8, zig_type, "u8") != null) {
                 return "*const c_char";
             }
         }
-        // Array of strings
-        if (std.mem.indexOf(u8, zig_type, "[*][*:0]u8") != null or
-            std.mem.indexOf(u8, zig_type, "?[*][*:0]u8") != null)
-        {
-            return "*const *const c_char";
+        // Array of strings: outer [*] pointing to inner string pointers [*:0]u8.
+        // Handles patterns like ?[*]const ?[*:0]const u8, [*][*:0]u8, etc.
+        if (!is_outer_sentinel and std.mem.indexOf(u8, zig_type, "[*:0]") != null) {
+            if (std.mem.indexOf(u8, zig_type, "u8") != null) {
+                return "*const *const c_char";
+            }
         }
 
         // Check element type
@@ -696,6 +700,10 @@ pub fn main() !void {
                     // Embedded struct, use Default::default()
                     try writer.print("            {s}: {s}::default(),\n", .{ field_name, rust_type });
                 }
+            } else if (std.mem.startsWith(u8, rust_type, "*const ")) {
+                try writer.print("            {s}: std::ptr::null(),\n", .{field_name});
+            } else if (std.mem.startsWith(u8, rust_type, "*mut ")) {
+                try writer.print("            {s}: std::ptr::null_mut(),\n", .{field_name});
             } else {
                 // Numeric types default to 0
                 try writer.print("            {s}: 0,\n", .{field_name});

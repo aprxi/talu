@@ -14,7 +14,7 @@ export const bState = {
   loadGeneration: 0,
   pagination: {
     currentPage: 1,
-    pageSize: 20,
+    pageSize: 50,
     totalItems: 0,
   },
 };
@@ -22,9 +22,5 @@ export const bState = {
 export const search = {
   query: "",
   tagFilters: [] as string[],
-  results: [] as Conversation[],
-  cursor: null as string | null,
-  hasMore: true,
-  isLoading: false,
   availableTags: [] as { name: string; count: number }[],
 };
