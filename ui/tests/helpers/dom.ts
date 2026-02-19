@@ -30,8 +30,8 @@ export function createDomRoot(
 /** Element IDs expected by getChatDom(). */
 export const CHAT_DOM_IDS = [
   "sidebar-list", "loader-sentinel", "new-conversation", "transcript",
-  "welcome-state", "welcome-input", "welcome-send", "welcome-attach", "welcome-attachment-list", "welcome-model", "welcome-prompt",
-  "input-bar", "input-text", "input-send", "input-attach", "input-attachment-list", "chat-file-input",
+  "welcome-state", "welcome-input", "welcome-send", "welcome-attach", "welcome-library", "welcome-attachment-list", "welcome-model", "welcome-prompt",
+  "input-bar", "input-text", "input-send", "input-attach", "input-library", "input-attachment-list", "chat-file-input",
   "right-panel", "close-right-panel", "panel-model",
   "panel-temperature", "panel-top-p", "panel-top-k", "panel-min-p",
   "panel-max-output-tokens", "panel-repetition-penalty", "panel-seed",
@@ -39,13 +39,51 @@ export const CHAT_DOM_IDS = [
   "panel-chat-info", "panel-info-created", "panel-info-forked-row", "panel-info-forked",
 ];
 
+/** Tag overrides for chat DOM elements that need specific types. */
+export const CHAT_DOM_TAGS: Record<string, string> = {
+  "welcome-input": "textarea",
+  "welcome-send": "button",
+  "welcome-attach": "button",
+  "welcome-library": "button",
+  "welcome-model": "select",
+  "welcome-prompt": "select",
+  "new-conversation": "button",
+  "input-text": "textarea",
+  "input-send": "button",
+  "input-attach": "button",
+  "input-library": "button",
+  "chat-file-input": "input",
+  "close-right-panel": "button",
+  "panel-model": "select",
+  "panel-temperature": "input",
+  "panel-top-p": "input",
+  "panel-top-k": "input",
+  "panel-min-p": "input",
+  "panel-max-output-tokens": "input",
+  "panel-repetition-penalty": "input",
+  "panel-seed": "input",
+};
+
 /** Element IDs expected by getBrowserDom(). */
 export const BROWSER_DOM_IDS = [
   "bp-cards", "bp-search", "bp-tab-all", "bp-tab-archived",
   "bp-tags", "bp-tags-section", "bp-select-all", "bp-delete",
   "bp-export", "bp-archive", "bp-restore", "bp-cancel",
-  "bp-bulk-actions", "bp-toolbar",
+  "bp-bulk-actions", "bp-toolbar", "bp-pagination",
 ];
+
+/** Tag overrides for browser DOM elements that need specific types. */
+export const BROWSER_DOM_TAGS: Record<string, string> = {
+  "bp-search": "input",
+  "bp-tab-all": "button",
+  "bp-tab-archived": "button",
+  "bp-select-all": "button",
+  "bp-delete": "button",
+  "bp-export": "button",
+  "bp-archive": "button",
+  "bp-restore": "button",
+  "bp-cancel": "button",
+};
 
 /** Extra class-based elements for getBrowserDom(). */
 export const BROWSER_DOM_EXTRAS: { tag: string; className: string }[] = [
