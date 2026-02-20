@@ -354,3 +354,63 @@ fn upload_unrecognizable_binary_succeeds() {
         assert!(!kind.is_empty(), "if kind is present, it should not be empty");
     }
 }
+
+/// When a file exceeds `max_file_inspect_bytes`, `inspect_blob_failsafe`
+/// returns None (early return at files.rs:861), skipping metadata detection.
+/// The upload still succeeds — inspection is non-fatal.
+#[test]
+fn upload_exceeding_inspect_limit_skips_metadata() {
+    let temp = TempDir::new().expect("temp dir");
+
+    // Configure a very small inspection limit (50 bytes).
+    let mut config = files_config(temp.path());
+    config.env_vars.push((
+        "TALU_MAX_FILE_INSPECT_BYTES".to_string(),
+        "50".to_string(),
+    ));
+    let ctx = ServerTestContext::new(config);
+
+    let boundary = "----talu-inspect-limit";
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let headers = [("Content-Type", content_type.as_str())];
+
+    // Upload 1: text file > 50 bytes — inspection skipped.
+    let large_payload = "A".repeat(80); // 80 bytes > 50 byte limit
+    let large_body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"large.txt\"\r\nContent-Type: text/plain\r\n\r\n{payload}\r\n--{b}--\r\n",
+        b = boundary,
+        payload = large_payload,
+    );
+    let resp = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&large_body));
+    assert_eq!(
+        resp.status, 200,
+        "upload exceeding inspect limit should succeed, body: {}",
+        resp.body
+    );
+    let json = resp.json();
+    assert_eq!(json["object"], "file");
+    assert_eq!(json["status"], "processed");
+    // kind should be absent — inspection was skipped because file > max_inspect_bytes.
+    assert!(
+        json["kind"].is_null(),
+        "kind should be absent when file exceeds inspect limit, got: {:?}",
+        json["kind"]
+    );
+
+    // Upload 2: tiny text file (< 50 bytes) — inspection runs.
+    let small_body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"tiny.txt\"\r\nContent-Type: text/plain\r\n\r\nhi\r\n--{b}--\r\n",
+        b = boundary,
+    );
+    let resp2 = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&small_body));
+    assert_eq!(resp2.status, 200, "body: {}", resp2.body);
+    let json2 = resp2.json();
+    assert_eq!(json2["object"], "file");
+    assert_eq!(json2["status"], "processed");
+    // kind should be present — file fits within inspect limit.
+    assert!(
+        json2["kind"].as_str().is_some(),
+        "kind should be present when file fits within inspect limit, got: {:?}",
+        json2["kind"]
+    );
+}

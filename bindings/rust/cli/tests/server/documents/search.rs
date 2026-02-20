@@ -300,3 +300,68 @@ fn search_with_group_id_filter() {
         }
     }
 }
+
+/// Expired documents still appear in search results (known inconsistency:
+/// direct GET filters by TTL via the Zig layer, but search does not).
+///
+/// If this assertion starts failing (i.e. the search returns no results),
+/// TTL filtering was added to the search path — update to assert absence.
+#[test]
+fn expired_document_still_appears_in_search() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    // Create an ephemeral document with a unique searchable term.
+    let ephemeral = post_json(
+        ctx.addr(),
+        "/v1/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "Ephemeral Search Target",
+            "content": {"text": "alpha_kappa_search_term_unique"},
+            "ttl_seconds": 1
+        }),
+    );
+    assert_eq!(ephemeral.status, 201, "body: {}", ephemeral.body);
+    let ephemeral_id = ephemeral.json()["id"].as_str().unwrap().to_string();
+
+    // Create a permanent document with different content.
+    let permanent = post_json(
+        ctx.addr(),
+        "/v1/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "Permanent Search Doc",
+            "content": {"text": "beta_lambda_unrelated_term"}
+        }),
+    );
+    assert_eq!(permanent.status, 201, "body: {}", permanent.body);
+
+    // Wait for TTL to expire.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Direct GET should return 404 (Zig layer filters by TTL).
+    let get_expired = get(ctx.addr(), &format!("/v1/documents/{}", ephemeral_id));
+    assert_eq!(
+        get_expired.status, 404,
+        "expired doc should return 404 on direct GET"
+    );
+
+    // Search for the ephemeral document's unique content.
+    let search_resp = post_json(
+        ctx.addr(),
+        "/v1/documents/search",
+        &serde_json::json!({"query": "alpha_kappa_search_term_unique"}),
+    );
+    assert_eq!(search_resp.status, 200, "body: {}", search_resp.body);
+
+    let data = search_resp.json()["data"]
+        .as_array()
+        .expect("data array")
+        .clone();
+    let ids: Vec<&str> = data.iter().filter_map(|d| d["id"].as_str()).collect();
+    assert!(
+        ids.contains(&ephemeral_id.as_str()),
+        "expired doc still appears in search (known inconsistency: search does not filter by TTL)"
+    );
+}

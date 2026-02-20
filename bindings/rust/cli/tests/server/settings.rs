@@ -597,3 +597,50 @@ fn settings_tenant_isolation() {
         "acme's model should be unchanged after globex patch"
     );
 }
+
+/// PATCH with an empty `model_overrides` object `{}` is a no-op — existing
+/// overrides are preserved because no keys are processed.
+#[test]
+fn patch_empty_model_overrides_is_noop() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    // Set model and overrides.
+    patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"model": "test-model"}),
+    );
+    patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"model_overrides": {"temperature": 0.5}}),
+    );
+
+    // Send empty overrides object — should be a no-op.
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"model_overrides": {}}),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    // Verify overrides survived by reading the TOML file directly.
+    // The GET/PATCH response doesn't include raw overrides — only
+    // `available_models[].overrides` which requires a real managed model.
+    let toml_path = temp.path().join("settings.toml");
+    let toml_str = std::fs::read_to_string(&toml_path)
+        .expect("settings.toml should exist after PATCH");
+    let parsed: toml::Value =
+        toml::from_str(&toml_str).expect("settings.toml should be valid TOML");
+    let temp_val = parsed
+        .get("models")
+        .and_then(|m| m.get("test-model"))
+        .and_then(|m| m.get("temperature"))
+        .and_then(|t| t.as_float())
+        .expect("temperature override should still be present");
+    assert!(
+        (temp_val - 0.5).abs() < 0.001,
+        "temperature override should be 0.5 after empty overrides patch, got: {temp_val}"
+    );
+}
