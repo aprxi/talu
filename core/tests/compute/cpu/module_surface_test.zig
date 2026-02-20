@@ -9,9 +9,9 @@ test "compute.cpu exposes primitive-first modules" {
     _ = compute.cpu.layout.transform;
     _ = compute.cpu.memory.copy;
     _ = compute.cpu.memory.gather;
+    _ = compute.cpu.memory.slotted;
     _ = compute.cpu.quant_decode;
-    _ = compute.cpu.cache.layout;
-    _ = compute.cpu.cache.store;
+    _ = compute.cpu.indexing;
     _ = compute.cpu.rotary;
     _ = compute.cpu.conv1d_depthwise;
     _ = compute.cpu.linalg.matvec;

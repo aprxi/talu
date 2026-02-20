@@ -7,10 +7,9 @@ pub const PrimitiveCapabilities = struct {
     softmax: bool = true,
     layout: bool = true,
     memory: bool = true,
-    cache: bool = true,
+    indexing: bool = true,
     quant_decode: bool = true,
     state_space: bool = false,
 };
 
 pub const support: PrimitiveCapabilities = .{};
-

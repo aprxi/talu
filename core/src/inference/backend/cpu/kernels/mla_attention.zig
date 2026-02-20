@@ -21,7 +21,6 @@ const cpu_norm = compute.cpu.normalization;
 const cpu_reduction = compute.cpu.reduction;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_softmax = compute.cpu.softmax;
-const cpu_cache_store = compute.cpu.cache.store;
 const rope_kernel = @import("rope.zig");
 const trace = @import("../../../../xray/root.zig").trace;
 
@@ -381,22 +380,33 @@ pub const MLAttention = struct {
         cache.kv_capacity = self.max_seq_len;
 
         const kv_expanded = scratch.kv_expanded[0 .. seq_len * self.n_heads * kv_exp_dim];
-        cpu_cache_store.populateMLACache(
-            cache.key_cache,
-            cache.value_cache,
-            cache.rope_key_cache,
-            self.max_seq_len,
-            self.n_heads,
-            cfg.qk_nope_head_dim,
-            cfg.qk_head_dim,
-            cfg.v_head_dim,
-            cfg.kv_lora_rank,
-            cfg.qk_rope_head_dim,
-            cache.cache_position,
-            kv_expanded,
-            kv_compressed,
-            seq_len,
-        );
+        for (0..seq_len) |token_idx| {
+            const cache_pos = cache.cache_position + token_idx;
+            std.debug.assert(cache_pos < self.max_seq_len);
+
+            for (0..self.n_heads) |head_idx| {
+                const exp_offset = token_idx * self.n_heads * kv_exp_dim + head_idx * kv_exp_dim;
+                const k_cache_offset = head_idx * self.max_seq_len * cfg.qk_head_dim + cache_pos * cfg.qk_head_dim;
+                const v_cache_offset = head_idx * self.max_seq_len * cfg.v_head_dim + cache_pos * cfg.v_head_dim;
+
+                @memcpy(
+                    cache.key_cache[k_cache_offset .. k_cache_offset + cfg.qk_nope_head_dim],
+                    kv_expanded[exp_offset .. exp_offset + cfg.qk_nope_head_dim],
+                );
+                @memcpy(
+                    cache.value_cache[v_cache_offset .. v_cache_offset + cfg.v_head_dim],
+                    kv_expanded[exp_offset + cfg.qk_nope_head_dim .. exp_offset + kv_exp_dim],
+                );
+            }
+
+            const kv_comp_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
+            const rope_src_offset = token_idx * kv_comp_dim + cfg.kv_lora_rank;
+            const rope_cache_offset = cache_pos * cfg.qk_rope_head_dim;
+            @memcpy(
+                cache.rope_key_cache[rope_cache_offset .. rope_cache_offset + cfg.qk_rope_head_dim],
+                kv_compressed[rope_src_offset .. rope_src_offset + cfg.qk_rope_head_dim],
+            );
+        }
         // Note: cache.cache_position is NOT updated here - caller is responsible
     }
 
@@ -413,20 +423,26 @@ pub const MLAttention = struct {
         const kv_comp_dim = cfg.kv_lora_rank + cfg.qk_rope_head_dim;
         const kv_expanded = scratch.kv_expanded[0 .. self.n_heads * kv_exp_dim];
         const kv_comp_token = kv_compressed[0..kv_comp_dim];
-        cpu_cache_store.appendMLAToken(
-            cache.key_cache,
-            cache.value_cache,
-            cache.rope_key_cache,
-            self.max_seq_len,
-            self.n_heads,
-            cfg.qk_nope_head_dim,
-            cfg.qk_head_dim,
-            cfg.v_head_dim,
-            cfg.kv_lora_rank,
-            cfg.qk_rope_head_dim,
-            cache_pos,
-            kv_expanded,
-            kv_comp_token,
+        std.debug.assert(cache_pos < self.max_seq_len);
+        for (0..self.n_heads) |head_idx| {
+            const exp_offset = head_idx * kv_exp_dim;
+            const k_cache_offset = head_idx * self.max_seq_len * cfg.qk_head_dim + cache_pos * cfg.qk_head_dim;
+            const v_cache_offset = head_idx * self.max_seq_len * cfg.v_head_dim + cache_pos * cfg.v_head_dim;
+
+            @memcpy(
+                cache.key_cache[k_cache_offset .. k_cache_offset + cfg.qk_nope_head_dim],
+                kv_expanded[exp_offset .. exp_offset + cfg.qk_nope_head_dim],
+            );
+            @memcpy(
+                cache.value_cache[v_cache_offset .. v_cache_offset + cfg.v_head_dim],
+                kv_expanded[exp_offset + cfg.qk_nope_head_dim .. exp_offset + kv_exp_dim],
+            );
+        }
+        const rope_src_offset = cfg.kv_lora_rank;
+        const rope_cache_offset = cache_pos * cfg.qk_rope_head_dim;
+        @memcpy(
+            cache.rope_key_cache[rope_cache_offset .. rope_cache_offset + cfg.qk_rope_head_dim],
+            kv_comp_token[rope_src_offset .. rope_src_offset + cfg.qk_rope_head_dim],
         );
 
         cache.cache_position += 1;

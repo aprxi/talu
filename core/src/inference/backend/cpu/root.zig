@@ -10,6 +10,7 @@
 //! - `sampling`
 
 const engine_mod = @import("engine.zig");
+const compute = @import("../../../compute/root.zig");
 
 pub const BackendType = engine_mod.FusedCpuBackend;
 pub const FusedCpuBackend = engine_mod.FusedCpuBackend;
@@ -22,3 +23,4 @@ pub const executor = @import("executor/root.zig");
 pub const kernels = @import("kernels/root.zig");
 pub const scheduler = @import("scheduler.zig");
 pub const sampling = @import("sampling.zig");
+pub const primitive_capabilities = compute.cpu.capabilities.support;

@@ -15,7 +15,7 @@ const flash_attention = compute.cpu.simd.flash_attention;
 const cpu_sdpa = compute.cpu.sdpa_decode;
 const cpu_common = compute.cpu.common;
 const cpu_layout = compute.cpu.layout.transform;
-const cpu_cache_layout = compute.cpu.cache.layout;
+const cpu_indexing = compute.cpu.indexing;
 const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
 const rope_kernel = @import("rope.zig");
@@ -2806,10 +2806,10 @@ test "MultiHeadAttention.ensureKvCapacity: preserves cached data during growth" 
 }
 
 test "applyPositionDelta applies negative multimodal offset" {
-    try std.testing.expectEqual(@as(usize, 42), try cpu_cache_layout.offsetPosition(198, -156));
-    try std.testing.expectEqual(@as(usize, 43), try cpu_cache_layout.offsetPosition(199, -156));
+    try std.testing.expectEqual(@as(usize, 42), try cpu_indexing.offsetSigned(198, -156));
+    try std.testing.expectEqual(@as(usize, 43), try cpu_indexing.offsetSigned(199, -156));
 }
 
 test "applyPositionDelta rejects negative resulting positions" {
-    try std.testing.expectError(error.InvalidShape, cpu_cache_layout.offsetPosition(3, -4));
+    try std.testing.expectError(error.InvalidShape, cpu_indexing.offsetSigned(3, -4));
 }

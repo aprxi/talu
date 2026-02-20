@@ -14,8 +14,8 @@ pub const supported = true;
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
-const cpu_cache_layout = compute.cpu.cache.layout;
-const cpu_cache_store = compute.cpu.cache.store;
+const cpu_indexing = compute.cpu.indexing;
+const cpu_slotted = compute.cpu.memory.slotted;
 
 /// Per-slot state tracking sequence position and activity.
 pub const SlotState = struct {
@@ -228,7 +228,7 @@ pub const BatchedKVCache = struct {
         std.debug.assert(k_data.len == kv_values_per_token);
         std.debug.assert(v_data.len == kv_values_per_token);
 
-        cpu_cache_store.appendTokenKV(
+        cpu_slotted.appendRowToSlotted4D(
             self.key_cache,
             self.value_cache,
             self.slot_stride,
@@ -263,7 +263,7 @@ pub const BatchedKVCache = struct {
 
         const start_position = slot_state.position;
 
-        cpu_cache_store.appendBatchKV(
+        cpu_slotted.appendRowsToSlotted4D(
             self.key_cache,
             self.value_cache,
             self.slot_stride,
@@ -285,13 +285,13 @@ pub const BatchedKVCache = struct {
     // =========================================================================
 
     fn kvOffset(self: *const BatchedKVCache, slot_index: usize, kv_head: usize, position: usize) usize {
-        return cpu_cache_layout.kvOffset(
+        std.debug.assert(slot_index < self.max_batch_size);
+        std.debug.assert(kv_head < self.n_kv_heads);
+        std.debug.assert(position < self.max_seq_len);
+        return cpu_indexing.flatOffset4D(
             slot_index,
             kv_head,
             position,
-            self.max_batch_size,
-            self.n_kv_heads,
-            self.max_seq_len,
             self.slot_stride,
             self.head_stride,
             self.head_dim,

@@ -38,7 +38,7 @@ const compute = @import("../../../compute/root.zig");
 const matmul = compute.cpu.linalg.matmul;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_reduction = compute.cpu.reduction;
-const cpu_cache_store = compute.cpu.cache.store;
+const cpu_slotted = compute.cpu.memory.slotted;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_tensor_gather = compute.cpu.memory.gather;
 const models = @import("../../../models/root.zig");
@@ -769,7 +769,7 @@ pub const FusedCpuBackend = struct {
         source_cache: *const kernels.AttnCache,
         seq_len: usize,
     ) !void {
-        cpu_cache_store.copyFromSingleCache(
+        cpu_slotted.copy3DToSlotted4D(
             layer_cache.key_cache,
             layer_cache.value_cache,
             layer_cache.slot_stride,
@@ -778,9 +778,9 @@ pub const FusedCpuBackend = struct {
             source_cache.key_cache,
             source_cache.value_cache,
             source_cache.kv_capacity,
-            self.n_kv_heads,
-            self.head_dim,
-            seq_len,
+            self.n_kv_heads, // axis1_count
+            self.head_dim, // axis3_width
+            seq_len, // axis2_len
         );
     }
 

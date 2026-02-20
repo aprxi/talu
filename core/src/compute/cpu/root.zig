@@ -17,8 +17,8 @@ pub const capabilities = @import("capabilities.zig");
 pub const linalg = @import("linalg.zig");
 pub const layout = @import("layout.zig");
 pub const memory = @import("memory.zig");
-pub const cache = @import("cache.zig");
 pub const recurrence = @import("recurrence.zig");
+pub const indexing = @import("indexing.zig");
 
 pub const activation = @import("activation.zig");
 pub const elementwise = @import("elementwise.zig");
@@ -47,8 +47,8 @@ test {
     _ = linalg;
     _ = layout;
     _ = memory;
-    _ = cache;
     _ = recurrence;
+    _ = indexing;
     _ = activation;
     _ = elementwise;
     _ = normalization;

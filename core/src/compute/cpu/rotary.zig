@@ -1,7 +1,7 @@
 //! Rotary-position table primitives for CPU.
 
 const std = @import("std");
-const cache_layout = @import("cache_layout.zig");
+const indexing = @import("indexing.zig");
 
 /// Fill inverse-frequency table for RoPE.
 ///
@@ -114,7 +114,7 @@ pub fn applyStaticQK(
     const rope_dim = rope.dim;
     if (rope_dim == 0 or rope_dim > head_dim) return error.InvalidShape;
     for (0..sequence_len) |token_idx| {
-        const pos = try cache_layout.offsetPosition(pos_offset + token_idx, position_delta);
+        const pos = try indexing.offsetSigned(pos_offset + token_idx, position_delta);
         for (0..n_heads) |head_idx| {
             const off = token_idx * query_dim + head_idx * head_dim;
             rope.applyInPlace(query_values[off .. off + rope_dim], pos);
