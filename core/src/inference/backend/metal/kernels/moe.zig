@@ -2,11 +2,10 @@
 
 pub const supported = true;
 
-const compute = @import("../../../../compute/root.zig");
 const weights = @import("../executor/weights.zig");
+const mlx_fused = @import("../mlx/ffi.zig");
 
-const mlx_graph = compute.metal.graph;
-const ArrayHandle = mlx_graph.ArrayHandle;
+const ArrayHandle = mlx_fused.ArrayHandle;
 
 pub const WeightHandles = weights.WeightHandles;
 
@@ -34,7 +33,7 @@ pub const MoEFFN = struct {
         _ = scratch;
         _ = matmul_scratch;
         const moe = self.weights;
-        output_tensor.* = mlx_graph.mlx_lazy_fused_moe_ffn_mxfp4(
+        output_tensor.* = mlx_fused.mlx_lazy_fused_moe_ffn_mxfp4(
             input_tensor,
             moe.router_w,
             if (moe.router_s) |rs| rs else null,

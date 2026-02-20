@@ -2,12 +2,11 @@
 
 pub const supported = true;
 
-const compute = @import("../../../../compute/root.zig");
 const weights = @import("../executor/weights.zig");
 const cache_executor = @import("../executor/runtime.zig");
+const mlx_fused = @import("../mlx/ffi.zig");
 
-const mlx_graph = compute.metal.graph;
-const ArrayHandle = mlx_graph.ArrayHandle;
+const ArrayHandle = mlx_fused.ArrayHandle;
 
 pub const WeightHandles = weights.WeightHandles;
 pub const ShortConvCache = cache_executor.ShortConvCache;
@@ -57,7 +56,7 @@ pub const ShortConvKernel = struct {
         if (self.in_proj != null and self.out_proj != null) {
             const in_proj = self.in_proj.?;
             const out_proj = self.out_proj.?;
-            output_tensor.* = mlx_graph.mlx_lazy_shortconv_mixer_quantized(
+            output_tensor.* = mlx_fused.mlx_lazy_shortconv_mixer_quantized(
                 input_tensor,
                 in_proj.weights,
                 in_proj.scales,
@@ -78,7 +77,7 @@ pub const ShortConvKernel = struct {
         }
 
         if (self.in_proj_bf16 != null and self.out_proj_bf16 != null) {
-            output_tensor.* = mlx_graph.mlx_lazy_shortconv_mixer_bf16(
+            output_tensor.* = mlx_fused.mlx_lazy_shortconv_mixer_bf16(
                 input_tensor,
                 self.in_proj_bf16.?,
                 self.conv_weight,

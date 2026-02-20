@@ -810,7 +810,7 @@ pub const VisionRuntime = struct {
 
         const merged = try self.allocator.alloc(f32, merged_tokens * merged_width);
         defer self.allocator.free(merged);
-        try cpu_image_ops.packMergedTokens(
+        try cpu_image_ops.packMergedGridTokens(
             hidden,
             @as(usize, @intCast(grid.height)),
             @as(usize, @intCast(grid.width)),
@@ -899,7 +899,7 @@ pub const VisionRuntime = struct {
 
         const merged = try self.allocator.alloc(f32, merged_tokens * merged_width);
         defer self.allocator.free(merged);
-        try cpu_image_ops.packMergedTokens(
+        try cpu_image_ops.packMergedGridTokens(
             pack_input,
             @as(usize, @intCast(grid.height)),
             @as(usize, @intCast(grid.width)),
@@ -955,7 +955,7 @@ pub const VisionRuntime = struct {
         cos_out: []f32,
         sin_out: []f32,
     ) !void {
-        return cpu_rotary.fillVisionRotaryTables(
+        return cpu_rotary.fillSpatialRotaryTables(
             self.allocator,
             @as(usize, @intCast(grid.height)),
             @as(usize, @intCast(grid.width)),
@@ -1130,7 +1130,7 @@ fn extractPatchInput(
     out: []f32,
 ) !void {
     if (self.token_order == .row_major) {
-        return cpu_image_ops.extractPatchInputRowMajor(
+        return cpu_image_ops.extractGridBlocksRowMajor(
             image.pixels,
             @as(usize, image.height),
             @as(usize, image.width),
@@ -1143,7 +1143,7 @@ fn extractPatchInput(
         );
     }
 
-    return cpu_image_ops.extractPatchInputMerged(
+    return cpu_image_ops.extractGridBlocksMerged(
         image.pixels,
         @as(usize, image.height),
         @as(usize, image.width),
@@ -1162,7 +1162,7 @@ fn interpolatePosEmbeddings(
     grid: image_mod.VisionGrid,
     out: []f32,
 ) !void {
-    return cpu_image_ops.interpolatePosEmbeddings(
+    return cpu_image_ops.interpolateGridEmbeddings(
         self.pos_embed_f32,
         self.num_grid_side,
         self.vision_hidden_size,

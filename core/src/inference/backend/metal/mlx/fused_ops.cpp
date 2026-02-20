@@ -9,48 +9,235 @@
 extern "C" {
 
 // ============================================================================
-// MLX Fast Kernels
+// ShortConv macro operations (inference-owned)
 // ============================================================================
-// These wrap MLX's optimized Metal implementations.
 
-void* mlx_lazy_rms_norm(const void* input, const void* weight, float eps) {
-    return pool_array(fast::rms_norm(
-        *static_cast<const array*>(input),
-        *static_cast<const array*>(weight),
-        eps
-    ));
+void* mlx_lazy_shortconv_mixer_bf16(
+    const void* input,
+    const void* in_proj,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* out_proj,
+    void* shortconv_cache_ptr,
+    size_t layer_idx,
+    size_t d_conv,
+    size_t conv_dim
+) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& in_proj_arr = *static_cast<const array*>(in_proj);
+    const auto& conv_weight_arr = *static_cast<const array*>(conv_weight);
+    const auto& out_proj_arr = *static_cast<const array*>(out_proj);
+    const auto* conv_bias_arr = static_cast<const array*>(conv_bias);
+
+    const int seq_len = input_arr.shape(1);
+    const int d_conv_i = static_cast<int>(d_conv);
+    const int conv_dim_i = static_cast<int>(conv_dim);
+
+    // in_proj is stored as [3*conv_dim, d_model], so transpose for [d_model, 3*conv_dim].
+    array bcx = matmul(input_arr, transpose(in_proj_arr));
+    bcx = astype(bcx, float32);
+
+    array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
+    array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
+    array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
+    array bx = b_gate * x_proj;
+
+    array conv_kernel = conv_weight_arr;
+    if (conv_kernel.ndim() == 3) {
+        // [conv_dim, 1, d_conv] -> [conv_dim, d_conv]
+        conv_kernel = reshape(conv_kernel, {conv_kernel.shape(0), conv_kernel.shape(2)});
+    }
+    // [conv_dim, d_conv] -> [d_conv, conv_dim] for contiguous time-major access.
+    array conv_kernel_t = astype(transpose(conv_kernel), float32);
+    const array conv_kernel_broadcast = reshape(conv_kernel_t, {1, d_conv_i, conv_dim_i});
+
+    std::optional<array> conv_bias_row;
+    if (conv_bias_arr != nullptr) {
+        conv_bias_row = reshape(astype(*conv_bias_arr, float32), {1, conv_dim_i});
+    }
+
+    auto* state_cache = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    ShortConvLayer* layer_state = nullptr;
+    if (state_cache != nullptr && layer_idx < state_cache->layers.size()) {
+        layer_state = &state_cache->layers[layer_idx];
+    }
+
+    array conv_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(1) != d_conv_i ||
+            layer_state->conv_state->shape(2) != conv_dim_i;
+        if (need_init) {
+            delete layer_state->conv_state;
+            layer_state->conv_state = new array(zeros({1, d_conv_i, conv_dim_i}, float32));
+        }
+        conv_state = *layer_state->conv_state;
+    } else {
+        conv_state = zeros({1, d_conv_i, conv_dim_i}, float32);
+    }
+
+    const array out_proj_t = transpose(out_proj_arr);
+    std::vector<array> token_outputs;
+    token_outputs.reserve(seq_len);
+
+    for (int token_idx = 0; token_idx < seq_len; token_idx++) {
+        const array bx_t = slice(bx, {0, token_idx, 0}, {1, token_idx + 1, conv_dim_i});
+
+        if (d_conv_i > 1) {
+            const array state_tail = slice(conv_state, {0, 1, 0}, {1, d_conv_i, conv_dim_i});
+            conv_state = concatenate({state_tail, bx_t}, 1);
+        } else {
+            conv_state = bx_t;
+        }
+
+        // Vectorized depthwise convolution over history window:
+        // [1, d_conv, conv_dim] * [1, d_conv, conv_dim] -> sum(axis=1) => [1, conv_dim].
+        array conv_t = sum(conv_state * conv_kernel_broadcast, 1);
+        if (conv_bias_row) {
+            conv_t = conv_t + *conv_bias_row;
+        }
+
+        const array c_t = reshape(slice(c_gate, {0, token_idx, 0}, {1, token_idx + 1, conv_dim_i}), {1, conv_dim_i});
+        const array gated = reshape(conv_t * c_t, {1, 1, conv_dim_i});
+        token_outputs.push_back(matmul(gated, out_proj_t));
+    }
+
+    if (layer_state != nullptr) {
+        *layer_state->conv_state = conv_state;
+    }
+
+    if (token_outputs.size() == 1) {
+        return pool_array(token_outputs[0]);
+    }
+    return pool_array(concatenate(token_outputs, 1));
 }
 
-// Add 1 to weight for (1 + weight) style RMSNorm: (1 + weight) * normalized
-void* mlx_add_one(const void* arr) {
-    return pool_array(1.0f + *static_cast<const array*>(arr));
-}
+void* mlx_lazy_shortconv_mixer_quantized(
+    const void* input,
+    const void* in_w,
+    const void* in_s,
+    const void* in_b,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* out_w,
+    const void* out_s,
+    const void* out_b,
+    size_t group_size,
+    size_t bits,
+    void* shortconv_cache_ptr,
+    size_t layer_idx,
+    size_t d_conv,
+    size_t conv_dim
+) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& in_w_arr = *static_cast<const array*>(in_w);
+    const auto& in_s_arr = *static_cast<const array*>(in_s);
+    const auto& in_b_arr = *static_cast<const array*>(in_b);
+    const auto& conv_weight_arr = *static_cast<const array*>(conv_weight);
+    const auto* conv_bias_arr = static_cast<const array*>(conv_bias);
+    const auto& out_w_arr = *static_cast<const array*>(out_w);
+    const auto& out_s_arr = *static_cast<const array*>(out_s);
+    const auto& out_b_arr = *static_cast<const array*>(out_b);
 
-// Scale array by sqrt(d_model) for embedding scaling
-void* mlx_scale_by_sqrt(const void* arr, size_t d_model) {
-    float scale = std::sqrt(static_cast<float>(d_model));
-    return pool_array(*static_cast<const array*>(arr) * scale);
-}
+    const int seq_len = input_arr.shape(1);
+    const int d_conv_i = static_cast<int>(d_conv);
+    const int conv_dim_i = static_cast<int>(conv_dim);
+    const int group_size_i = static_cast<int>(group_size);
+    const int bits_i = static_cast<int>(bits);
 
-void* mlx_lazy_rope(const void* input, size_t head_dim, size_t offset, float rope_base) {
-    return pool_array(fast::rope(
-        *static_cast<const array*>(input),
-        static_cast<int>(head_dim),
-        false,  // traditional = false
-        rope_base,
-        1.0f,   // scale = 1.0
-        static_cast<int>(offset)
-    ));
-}
+    array bcx = quantized_matmul(
+        input_arr,
+        in_w_arr,
+        in_s_arr,
+        in_b_arr,
+        true,
+        group_size_i,
+        bits_i,
+        "affine"
+    );
+    bcx = astype(bcx, float32);
 
-void* mlx_lazy_attention(const void* q, const void* k, const void* v, float scale, bool causal) {
-    return pool_array(fast::scaled_dot_product_attention(
-        *static_cast<const array*>(q),
-        *static_cast<const array*>(k),
-        *static_cast<const array*>(v),
-        scale,
-        causal ? "causal" : ""
-    ));
+    array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
+    array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
+    array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
+    array bx = b_gate * x_proj;
+
+    array conv_kernel = conv_weight_arr;
+    if (conv_kernel.ndim() == 3) {
+        conv_kernel = reshape(conv_kernel, {conv_kernel.shape(0), conv_kernel.shape(2)});
+    }
+    array conv_kernel_t = astype(transpose(conv_kernel), float32);
+    const array conv_kernel_broadcast = reshape(conv_kernel_t, {1, d_conv_i, conv_dim_i});
+
+    std::optional<array> conv_bias_row;
+    if (conv_bias_arr != nullptr) {
+        conv_bias_row = reshape(astype(*conv_bias_arr, float32), {1, conv_dim_i});
+    }
+
+    auto* state_cache = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    ShortConvLayer* layer_state = nullptr;
+    if (state_cache != nullptr && layer_idx < state_cache->layers.size()) {
+        layer_state = &state_cache->layers[layer_idx];
+    }
+
+    array conv_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(1) != d_conv_i ||
+            layer_state->conv_state->shape(2) != conv_dim_i;
+        if (need_init) {
+            delete layer_state->conv_state;
+            layer_state->conv_state = new array(zeros({1, d_conv_i, conv_dim_i}, float32));
+        }
+        conv_state = *layer_state->conv_state;
+    } else {
+        conv_state = zeros({1, d_conv_i, conv_dim_i}, float32);
+    }
+
+    std::vector<array> token_outputs;
+    token_outputs.reserve(seq_len);
+
+    for (int token_idx = 0; token_idx < seq_len; token_idx++) {
+        const array bx_t = slice(bx, {0, token_idx, 0}, {1, token_idx + 1, conv_dim_i});
+
+        if (d_conv_i > 1) {
+            const array state_tail = slice(conv_state, {0, 1, 0}, {1, d_conv_i, conv_dim_i});
+            conv_state = concatenate({state_tail, bx_t}, 1);
+        } else {
+            conv_state = bx_t;
+        }
+
+        // Vectorized depthwise convolution over history window:
+        // [1, d_conv, conv_dim] * [1, d_conv, conv_dim] -> sum(axis=1) => [1, conv_dim].
+        array conv_t = sum(conv_state * conv_kernel_broadcast, 1);
+        if (conv_bias_row) {
+            conv_t = conv_t + *conv_bias_row;
+        }
+
+        const array c_t = reshape(slice(c_gate, {0, token_idx, 0}, {1, token_idx + 1, conv_dim_i}), {1, conv_dim_i});
+        const array gated = reshape(conv_t * c_t, {1, 1, conv_dim_i});
+        token_outputs.push_back(quantized_matmul(
+            gated,
+            out_w_arr,
+            out_s_arr,
+            out_b_arr,
+            true,
+            group_size_i,
+            bits_i,
+            "affine"
+        ));
+    }
+
+    if (layer_state != nullptr) {
+        *layer_state->conv_state = conv_state;
+    }
+
+    if (token_outputs.size() == 1) {
+        return pool_array(token_outputs[0]);
+    }
+    return pool_array(concatenate(token_outputs, 1));
 }
 
 static array apply_runtime_rope_to_tensor(

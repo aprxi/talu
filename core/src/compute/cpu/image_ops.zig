@@ -1,9 +1,9 @@
-//! Image and vision preprocessing primitives for CPU compute path.
+//! Spatial tensor preprocessing/layout primitives for CPU compute path.
 
 const std = @import("std");
 
-/// Extract patch input in row-major token order.
-pub fn extractPatchInputRowMajor(
+/// Extract fixed-size spatial blocks in row-major traversal order.
+pub fn extractGridBlocksRowMajor(
     pixels: []const f32,
     height: usize,
     width: usize,
@@ -47,8 +47,8 @@ pub fn extractPatchInputRowMajor(
     }
 }
 
-/// Extract patch input in merged-block token order.
-pub fn extractPatchInputMerged(
+/// Extract fixed-size spatial blocks in merged traversal order.
+pub fn extractGridBlocksMerged(
     pixels: []const f32,
     height: usize,
     width: usize,
@@ -101,11 +101,11 @@ pub fn extractPatchInputMerged(
     }
 }
 
-/// Bilinear interpolate one positional embedding row.
-pub fn bilinearPosRow(
+/// Bilinear interpolate one feature row from a 2D reference grid.
+pub fn bilinearGridRow(
     pos_embed_f32: []const f32,
     num_grid_side: usize,
-    vision_hidden_size: usize,
+    feature_width: usize,
     h_idx: usize,
     w_idx: usize,
     grid_h: usize,
@@ -147,12 +147,12 @@ pub fn bilinearPosRow(
     const w10 = dh * (1.0 - dw);
     const w11 = dh * dw;
 
-    const idx00 = (h0 * num_grid_side + w0) * vision_hidden_size;
-    const idx01 = (h0 * num_grid_side + w1) * vision_hidden_size;
-    const idx10 = (h1 * num_grid_side + w0) * vision_hidden_size;
-    const idx11 = (h1 * num_grid_side + w1) * vision_hidden_size;
+    const idx00 = (h0 * num_grid_side + w0) * feature_width;
+    const idx01 = (h0 * num_grid_side + w1) * feature_width;
+    const idx10 = (h1 * num_grid_side + w0) * feature_width;
+    const idx11 = (h1 * num_grid_side + w1) * feature_width;
 
-    for (0..vision_hidden_size) |d| {
+    for (0..feature_width) |d| {
         out_row[d] = pos_embed_f32[idx00 + d] * w00 +
             pos_embed_f32[idx01 + d] * w01 +
             pos_embed_f32[idx10 + d] * w10 +
@@ -160,11 +160,11 @@ pub fn bilinearPosRow(
     }
 }
 
-/// Interpolate position embeddings over token traversal order.
-pub fn interpolatePosEmbeddings(
+/// Interpolate position features over traversal order.
+pub fn interpolateGridEmbeddings(
     pos_embed_f32: []const f32,
     num_grid_side: usize,
-    vision_hidden_size: usize,
+    feature_width: usize,
     grid_h: usize,
     grid_w: usize,
     grid_t: usize,
@@ -176,23 +176,23 @@ pub fn interpolatePosEmbeddings(
     const merged_h = grid_h / spatial_merge_size;
     const merged_w = grid_w / spatial_merge_size;
     const expected_tokens = grid_t * grid_h * grid_w;
-    if (out.len != expected_tokens * vision_hidden_size) return error.InvalidShape;
+    if (out.len != expected_tokens * feature_width) return error.InvalidShape;
 
     var dst_token: usize = 0;
     if (row_major_order) {
         for (0..grid_t) |_| {
             for (0..grid_h) |h_idx| {
                 for (0..grid_w) |w_idx| {
-                    try bilinearPosRow(
+                    try bilinearGridRow(
                         pos_embed_f32,
                         num_grid_side,
-                        vision_hidden_size,
+                        feature_width,
                         h_idx,
                         w_idx,
                         grid_h,
                         grid_w,
                         row_major_mapping,
-                        out[dst_token * vision_hidden_size ..][0..vision_hidden_size],
+                        out[dst_token * feature_width ..][0..feature_width],
                     );
                     dst_token += 1;
                 }
@@ -208,16 +208,16 @@ pub fn interpolatePosEmbeddings(
                     for (0..spatial_merge_size) |iw| {
                         const h_idx = bh * spatial_merge_size + ih;
                         const w_idx = bw * spatial_merge_size + iw;
-                        try bilinearPosRow(
+                        try bilinearGridRow(
                             pos_embed_f32,
                             num_grid_side,
-                            vision_hidden_size,
+                            feature_width,
                             h_idx,
                             w_idx,
                             grid_h,
                             grid_w,
                             row_major_mapping,
-                            out[dst_token * vision_hidden_size ..][0..vision_hidden_size],
+                            out[dst_token * feature_width ..][0..feature_width],
                         );
                         dst_token += 1;
                     }
@@ -231,12 +231,12 @@ pub fn interpolatePosEmbeddings(
 ///
 /// When `row_major_input` is false, source is expected in merge-block order.
 /// When `row_major_input` is true, source is expected in row-major order per frame.
-pub fn packMergedTokens(
+pub fn packMergedGridTokens(
     hidden: []const f32,
     grid_h: usize,
     grid_w: usize,
     grid_t: usize,
-    vision_hidden_size: usize,
+    feature_width: usize,
     spatial_merge_size: usize,
     row_major_input: bool,
     out: []f32,
@@ -249,9 +249,9 @@ pub fn packMergedTokens(
     const merged_h = grid_h / spatial_merge_size;
     const merged_w = grid_w / spatial_merge_size;
     const merged_tokens = grid_t * merged_h * merged_w;
-    const merged_width = vision_hidden_size * merge_units;
+    const merged_width = feature_width * merge_units;
 
-    if (hidden.len != patch_count * vision_hidden_size) return error.InvalidShape;
+    if (hidden.len != patch_count * feature_width) return error.InvalidShape;
     if (out.len != merged_tokens * merged_width) return error.InvalidShape;
 
     if (!row_major_input) {
@@ -259,11 +259,11 @@ pub fn packMergedTokens(
             const dst_base = dst_token * merged_width;
             for (0..merge_units) |unit_idx| {
                 const src_token = dst_token * merge_units + unit_idx;
-                const src_base = src_token * vision_hidden_size;
-                const dst_offset = dst_base + unit_idx * vision_hidden_size;
+                const src_base = src_token * feature_width;
+                const dst_offset = dst_base + unit_idx * feature_width;
                 @memcpy(
-                    out[dst_offset..][0..vision_hidden_size],
-                    hidden[src_base..][0..vision_hidden_size],
+                    out[dst_offset..][0..feature_width],
+                    hidden[src_base..][0..feature_width],
                 );
             }
         }
@@ -286,11 +286,11 @@ pub fn packMergedTokens(
                         const row = bh * spatial_merge_size + ih;
                         const col = bw * spatial_merge_size + iw;
                         const src_token = src_frame_base + row * grid_w + col;
-                        const src_base = src_token * vision_hidden_size;
-                        const dst_offset = dst_base + unit_idx * vision_hidden_size;
+                        const src_base = src_token * feature_width;
+                        const dst_offset = dst_base + unit_idx * feature_width;
                         @memcpy(
-                            out[dst_offset..][0..vision_hidden_size],
-                            hidden[src_base..][0..vision_hidden_size],
+                            out[dst_offset..][0..feature_width],
+                            hidden[src_base..][0..feature_width],
                         );
                         unit_idx += 1;
                     }

@@ -4,28 +4,6 @@ const std = @import("std");
 const reduction = @import("reduction.zig");
 const softmax = @import("softmax.zig");
 
-pub const DecodeHeadConfig = struct {
-    start_kv_index: usize,
-    kv_sequence_len: usize,
-    head_dim: usize,
-    scale: f32,
-    sink_logit: ?f32 = null,
-    exact_softmax: bool,
-};
-
-pub const PrefillHeadConfig = struct {
-    start_kv_index: usize,
-    end_kv_index: usize,
-    sequence_len: usize,
-    kv_head_idx: usize,
-    head_dim: usize,
-    kv_total_dim: usize,
-    scale: f32,
-    sink_logit: ?f32 = null,
-    exact_softmax: bool,
-    is_causal: bool,
-};
-
 /// Compute decode attention for one head against cached K/V and write context.
 pub fn decodeHeadScoresAndContext(
     query_head: []const f32,
@@ -33,46 +11,51 @@ pub fn decodeHeadScoresAndContext(
     v_cache_head: []const f32,
     scores_for_head: []f32,
     context_for_head: []f32,
-    cfg: DecodeHeadConfig,
+    start_kv_index: usize,
+    kv_sequence_len: usize,
+    feature_width: usize,
+    scale: f32,
+    sink_logit: ?f32,
+    exact_softmax: bool,
 ) void {
-    std.debug.assert(query_head.len >= cfg.head_dim);
-    std.debug.assert(scores_for_head.len >= cfg.kv_sequence_len);
-    std.debug.assert(context_for_head.len >= cfg.head_dim);
-    std.debug.assert(k_cache_head.len >= cfg.kv_sequence_len * cfg.head_dim);
-    std.debug.assert(v_cache_head.len >= cfg.kv_sequence_len * cfg.head_dim);
-    std.debug.assert(cfg.start_kv_index <= cfg.kv_sequence_len);
+    std.debug.assert(query_head.len >= feature_width);
+    std.debug.assert(scores_for_head.len >= kv_sequence_len);
+    std.debug.assert(context_for_head.len >= feature_width);
+    std.debug.assert(k_cache_head.len >= kv_sequence_len * feature_width);
+    std.debug.assert(v_cache_head.len >= kv_sequence_len * feature_width);
+    std.debug.assert(start_kv_index <= kv_sequence_len);
 
     var max_score: f32 = -std.math.inf(f32);
     var key_index: usize = 0;
-    while (key_index < cfg.start_kv_index) : (key_index += 1) {
+    while (key_index < start_kv_index) : (key_index += 1) {
         scores_for_head[key_index] = -std.math.inf(f32);
     }
-    while (key_index < cfg.kv_sequence_len) : (key_index += 1) {
-        const k_row = k_cache_head[key_index * cfg.head_dim ..][0..cfg.head_dim];
-        const dot = reduction.dotRow(query_head[0..cfg.head_dim], k_row) * cfg.scale;
+    while (key_index < kv_sequence_len) : (key_index += 1) {
+        const k_row = k_cache_head[key_index * feature_width ..][0..feature_width];
+        const dot = reduction.dotRow(query_head[0..feature_width], k_row) * scale;
         scores_for_head[key_index] = dot;
         if (dot > max_score) max_score = dot;
     }
 
-    if (cfg.sink_logit) |sink| {
+    if (sink_logit) |sink| {
         if (sink > max_score) max_score = sink;
     }
     softmax.maskedInPlaceWithMax(
         scores_for_head,
-        cfg.start_kv_index,
-        cfg.kv_sequence_len,
-        cfg.sink_logit,
-        cfg.exact_softmax,
+        start_kv_index,
+        kv_sequence_len,
+        sink_logit,
+        exact_softmax,
         max_score,
         null,
     );
 
-    @memset(context_for_head[0..cfg.head_dim], 0);
+    @memset(context_for_head[0..feature_width], 0);
     var kv_index: usize = 0;
-    while (kv_index < cfg.kv_sequence_len) : (kv_index += 1) {
+    while (kv_index < kv_sequence_len) : (kv_index += 1) {
         const attn_weight = scores_for_head[kv_index];
-        const v_row = v_cache_head[kv_index * cfg.head_dim ..][0..cfg.head_dim];
-        reduction.weightedAccumulateRow(context_for_head[0..cfg.head_dim], v_row, attn_weight);
+        const v_row = v_cache_head[kv_index * feature_width ..][0..feature_width];
+        reduction.weightedAccumulateRow(context_for_head[0..feature_width], v_row, attn_weight);
     }
 }
 
@@ -83,52 +66,61 @@ pub fn prefillHeadScoresAndContext(
     value_values: []const f32,
     scores_for_query: []f32,
     context_for_head: []f32,
-    cfg: PrefillHeadConfig,
+    start_kv_index: usize,
+    end_kv_index: usize,
+    sequence_len: usize,
+    kv_head_index: usize,
+    feature_width: usize,
+    kv_total_width: usize,
+    scale: f32,
+    sink_logit: ?f32,
+    exact_softmax: bool,
+    causal_mask: bool,
 ) void {
-    std.debug.assert(query_head.len >= cfg.head_dim);
-    std.debug.assert(scores_for_query.len >= cfg.sequence_len);
-    std.debug.assert(context_for_head.len >= cfg.head_dim);
-    std.debug.assert(cfg.start_kv_index <= cfg.end_kv_index and cfg.end_kv_index <= cfg.sequence_len);
-    std.debug.assert(key_values.len >= cfg.sequence_len * cfg.kv_total_dim);
-    std.debug.assert(value_values.len >= cfg.sequence_len * cfg.kv_total_dim);
-    std.debug.assert((cfg.kv_head_idx + 1) * cfg.head_dim <= cfg.kv_total_dim);
+    std.debug.assert(query_head.len >= feature_width);
+    std.debug.assert(scores_for_query.len >= sequence_len);
+    std.debug.assert(context_for_head.len >= feature_width);
+    std.debug.assert(start_kv_index <= end_kv_index and end_kv_index <= sequence_len);
+    std.debug.assert(key_values.len >= sequence_len * kv_total_width);
+    std.debug.assert(value_values.len >= sequence_len * kv_total_width);
+    std.debug.assert((kv_head_index + 1) * feature_width <= kv_total_width);
 
     var max_score: f32 = -std.math.inf(f32);
 
-    for (0..cfg.start_kv_index) |key_index| {
+    for (0..start_kv_index) |key_index| {
         scores_for_query[key_index] = -std.math.inf(f32);
     }
-    for (cfg.start_kv_index..cfg.end_kv_index) |key_index| {
-        const key_head = key_values[key_index * cfg.kv_total_dim + cfg.kv_head_idx * cfg.head_dim ..][0..cfg.head_dim];
-        const dot = reduction.dotRow(query_head[0..cfg.head_dim], key_head) * cfg.scale;
+    for (start_kv_index..end_kv_index) |key_index| {
+        const key_head = key_values[key_index * kv_total_width + kv_head_index * feature_width ..][0..feature_width];
+        const dot = reduction.dotRow(query_head[0..feature_width], key_head) * scale;
         scores_for_query[key_index] = dot;
         if (dot > max_score) max_score = dot;
     }
 
-    if (cfg.is_causal) {
-        for (cfg.end_kv_index..cfg.sequence_len) |key_index| {
+    if (causal_mask) {
+        for (end_kv_index..sequence_len) |key_index| {
             scores_for_query[key_index] = -std.math.inf(f32);
         }
     }
 
-    if (cfg.sink_logit) |sink| {
+    if (sink_logit) |sink| {
         if (sink > max_score) max_score = sink;
     }
     softmax.maskedInPlaceWithMax(
         scores_for_query,
-        cfg.start_kv_index,
-        cfg.end_kv_index,
-        cfg.sink_logit,
-        cfg.exact_softmax,
+        start_kv_index,
+        end_kv_index,
+        sink_logit,
+        exact_softmax,
         max_score,
         null,
     );
 
-    @memset(context_for_head[0..cfg.head_dim], 0);
-    for (0..cfg.end_kv_index) |key_index| {
+    @memset(context_for_head[0..feature_width], 0);
+    for (0..end_kv_index) |key_index| {
         const attn_weight = scores_for_query[key_index];
-        const value_head = value_values[key_index * cfg.kv_total_dim + cfg.kv_head_idx * cfg.head_dim ..][0..cfg.head_dim];
-        reduction.weightedAccumulateRow(context_for_head[0..cfg.head_dim], value_head, attn_weight);
+        const value_head = value_values[key_index * kv_total_width + kv_head_index * feature_width ..][0..feature_width];
+        reduction.weightedAccumulateRow(context_for_head[0..feature_width], value_head, attn_weight);
     }
 }
 
@@ -151,13 +143,12 @@ test "decodeHeadScoresAndContext computes expected context" {
         &v_cache,
         &scores,
         &context,
-        .{
-            .start_kv_index = 0,
-            .kv_sequence_len = 2,
-            .head_dim = 2,
-            .scale = 1.0,
-            .exact_softmax = false,
-        },
+        0,
+        2,
+        2,
+        1.0,
+        null,
+        false,
     );
 
     try std.testing.expectApproxEqAbs(@as(f32, 15.379), context[0], 0.01);
@@ -188,17 +179,16 @@ test "prefillHeadScoresAndContext computes causal row" {
         &value_values,
         &scores,
         &ctx,
-        .{
-            .start_kv_index = 0,
-            .end_kv_index = 2,
-            .sequence_len = sequence_len,
-            .kv_head_idx = 0,
-            .head_dim = head_dim,
-            .kv_total_dim = kv_total_dim,
-            .scale = 1.0,
-            .exact_softmax = false,
-            .is_causal = true,
-        },
+        0,
+        2,
+        sequence_len,
+        0,
+        head_dim,
+        kv_total_dim,
+        1.0,
+        null,
+        false,
+        true,
     );
 
     try std.testing.expect(scores[0] > scores[1]);

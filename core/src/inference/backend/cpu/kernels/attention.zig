@@ -443,14 +443,12 @@ pub const MultiHeadAttention = struct {
                         v_cache_base,
                         scores_for_head,
                         context_for_head,
-                        .{
-                            .start_kv_index = start_kv_index,
-                            .kv_sequence_len = kv_sequence_len,
-                            .head_dim = head_dim,
-                            .scale = scale,
-                            .sink_logit = sink_logit,
-                            .exact_softmax = exact_softmax,
-                        },
+                        start_kv_index,
+                        kv_sequence_len,
+                        head_dim,
+                        scale,
+                        sink_logit,
+                        exact_softmax,
                     );
                 }
             }
@@ -624,18 +622,16 @@ pub const MultiHeadAttention = struct {
                     value_values,
                     scores_for_query,
                     context_for_head,
-                    .{
-                        .start_kv_index = start_kv_index,
-                        .end_kv_index = end_kv_index,
-                        .sequence_len = sequence_len,
-                        .kv_head_idx = kv_head_idx,
-                        .head_dim = head_dim,
-                        .kv_total_dim = kv_total_dim,
-                        .scale = scale,
-                        .sink_logit = sink_logit,
-                        .exact_softmax = exact_softmax,
-                        .is_causal = self.is_causal,
-                    },
+                    start_kv_index,
+                    end_kv_index,
+                    sequence_len,
+                    kv_head_idx,
+                    head_dim,
+                    kv_total_dim,
+                    scale,
+                    sink_logit,
+                    exact_softmax,
+                    self.is_causal,
                 );
             }
         }
@@ -950,14 +946,12 @@ pub const MultiHeadAttention = struct {
                         v_cache_head,
                         scores_for_head,
                         context_for_head,
-                        .{
-                            .start_kv_index = start_kv_index,
-                            .kv_sequence_len = kv_sequence_len,
-                            .head_dim = head_dim,
-                            .scale = scale,
-                            .sink_logit = sink_logit,
-                            .exact_softmax = exact_softmax,
-                        },
+                        start_kv_index,
+                        kv_sequence_len,
+                        head_dim,
+                        scale,
+                        sink_logit,
+                        exact_softmax,
                     );
                 }
             }
@@ -991,18 +985,16 @@ pub const MultiHeadAttention = struct {
                         value_values,
                         scores_for_query,
                         context_for_head,
-                        .{
-                            .start_kv_index = start_kv_index,
-                            .end_kv_index = end_kv_index,
-                            .sequence_len = sequence_len,
-                            .kv_head_idx = kv_head_idx,
-                            .head_dim = head_dim,
-                            .kv_total_dim = kv_total_dim,
-                            .scale = scale,
-                            .sink_logit = sink_logit,
-                            .exact_softmax = exact_softmax,
-                            .is_causal = self.is_causal,
-                        },
+                        start_kv_index,
+                        end_kv_index,
+                        sequence_len,
+                        kv_head_idx,
+                        head_dim,
+                        kv_total_dim,
+                        scale,
+                        sink_logit,
+                        exact_softmax,
+                        self.is_causal,
                     );
                 }
             }
@@ -1393,14 +1385,12 @@ fn forwardBatchedDecode(
                     v_cache_head,
                     scores_for_head,
                     context_for_head,
-                    .{
-                        .start_kv_index = start_kv_index,
-                        .kv_sequence_len = kv_sequence_len,
-                        .head_dim = head_dim,
-                        .scale = scale,
-                        .sink_logit = sink_logit,
-                        .exact_softmax = false,
-                    },
+                    start_kv_index,
+                    kv_sequence_len,
+                    head_dim,
+                    scale,
+                    sink_logit,
+                    false,
                 );
             }
         }

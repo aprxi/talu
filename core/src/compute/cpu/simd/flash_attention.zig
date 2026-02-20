@@ -263,7 +263,7 @@ test "flashAttentionF32 matches sdpaCausal" {
     const q_view = tv.TensorView.initContiguous(@ptrCast(q[0..].ptr), &.{ 1, n_heads, seq_len, head_dim }, .f32);
     const k_view = tv.TensorView.initContiguous(@ptrCast(k[0..].ptr), &.{ 1, n_heads, seq_len, head_dim }, .f32);
     const v_view = tv.TensorView.initContiguous(@ptrCast(v[0..].ptr), &.{ 1, n_heads, seq_len, head_dim }, .f32);
-    try @import("../attn_primitives.zig").sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, allocator);
+    try @import("../linalg_sdpa.zig").sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, allocator);
 
     for (out_flash, out_sdpa) |f, s| {
         try std.testing.expectApproxEqAbs(s, f, 1e-4);
@@ -495,7 +495,7 @@ test "flashAttentionF32 single token matches reference" {
     const q_view = tv.TensorView.initContiguous(@ptrCast(q[0..].ptr), &.{ 1, n_heads, seq_len, head_dim }, .f32);
     const k_view = tv.TensorView.initContiguous(@ptrCast(k[0..].ptr), &.{ 1, n_heads, seq_len, head_dim }, .f32);
     const v_view = tv.TensorView.initContiguous(@ptrCast(v[0..].ptr), &.{ 1, n_heads, seq_len, head_dim }, .f32);
-    try @import("../attn_primitives.zig").sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, null);
+    try @import("../linalg_sdpa.zig").sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, null);
 
     for (out_simd, out_sdpa) |simd_val, sdpa_val| {
         try std.testing.expectApproxEqAbs(sdpa_val, simd_val, 1e-6);

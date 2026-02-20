@@ -2,11 +2,10 @@
 
 pub const supported = true;
 
-const compute = @import("../../../../compute/root.zig");
 const weights = @import("../executor/weights.zig");
+const mlx_fused = @import("../mlx/ffi.zig");
 
-const mlx_graph = compute.metal.graph;
-const ArrayHandle = mlx_graph.ArrayHandle;
+const ArrayHandle = mlx_fused.ArrayHandle;
 
 pub const WeightHandles = weights.WeightHandles;
 
@@ -45,7 +44,7 @@ pub const SwiGLU = struct {
             const w1 = self.w1.?;
             const w2 = self.w2.?;
             const w3 = self.w3.?;
-            output_tensor.* = mlx_graph.mlx_lazy_fused_ffn(
+            output_tensor.* = mlx_fused.mlx_lazy_fused_ffn(
                 input_tensor,
                 w1.weights,
                 w1.scales,
@@ -63,7 +62,7 @@ pub const SwiGLU = struct {
             return;
         }
         if (self.w1_bf16 != null and self.w2_bf16 != null and self.w3_bf16 != null) {
-            output_tensor.* = mlx_graph.mlx_lazy_fused_ffn_bf16(
+            output_tensor.* = mlx_fused.mlx_lazy_fused_ffn_bf16(
                 input_tensor,
                 self.w1_bf16.?,
                 self.w3_bf16.?,

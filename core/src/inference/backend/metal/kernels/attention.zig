@@ -2,12 +2,11 @@
 
 pub const supported = true;
 
-const compute = @import("../../../../compute/root.zig");
 const cache_executor = @import("../executor/runtime.zig");
 const weights = @import("../executor/weights.zig");
+const mlx_fused = @import("../mlx/ffi.zig");
 
-const mlx_graph = compute.metal.graph;
-const ArrayHandle = mlx_graph.ArrayHandle;
+const ArrayHandle = mlx_fused.ArrayHandle;
 
 pub const Cache = cache_executor.Cache;
 
@@ -89,7 +88,7 @@ pub const MultiHeadAttention = struct {
             const k_proj = self.k_proj.?;
             const v_proj = self.v_proj.?;
             if (self.o_proj) |o_proj| {
-                output_tensor.* = mlx_graph.mlx_lazy_fused_attention(
+                output_tensor.* = mlx_fused.mlx_lazy_fused_attention(
                     input_tensor,
                     q_proj.weights,
                     q_proj.scales,
@@ -130,7 +129,7 @@ pub const MultiHeadAttention = struct {
             }
             const o_proj_bf16 = if (self.o_proj_bf16) |h| h else null;
             if (o_proj_bf16 == null) return error.MissingField;
-            output_tensor.* = mlx_graph.mlx_lazy_fused_attention_qkv_quantized_o_dense(
+            output_tensor.* = mlx_fused.mlx_lazy_fused_attention_qkv_quantized_o_dense(
                 input_tensor,
                 q_proj.weights,
                 q_proj.scales,
@@ -176,7 +175,7 @@ pub const MultiHeadAttention = struct {
             return error.MissingField;
         }
 
-        output_tensor.* = mlx_graph.mlx_lazy_fused_attention_bf16(
+        output_tensor.* = mlx_fused.mlx_lazy_fused_attention_bf16(
             input_tensor,
             q_proj_bf16,
             k_proj_bf16,

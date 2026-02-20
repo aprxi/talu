@@ -6,7 +6,7 @@
 pub const common = @import("common.zig");
 pub const tensor_view = @import("tensor_view.zig");
 pub const activation_view = @import("activation_view.zig");
-pub const attn_primitives = @import("attn_primitives.zig");
+pub const linalg_sdpa = @import("linalg_sdpa.zig");
 pub const mxfp4 = @import("mxfp4.zig");
 pub const math = @import("math.zig");
 pub const simd = @import("simd/root.zig");
@@ -38,7 +38,7 @@ test {
     _ = common;
     _ = tensor_view;
     _ = activation_view;
-    _ = attn_primitives;
+    _ = linalg_sdpa;
     _ = mxfp4;
     _ = math;
     _ = simd;

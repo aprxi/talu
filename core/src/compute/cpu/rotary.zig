@@ -133,24 +133,24 @@ pub fn applyInterleavedInPlace(values: []f32, rope: anytype, pos: usize) void {
     rope.applyInterleavedInPlace(values, pos);
 }
 
-/// Fill vision rotary cos/sin tables over 2D spatial positions.
-pub fn fillVisionRotaryTables(
+/// Fill rotary cos/sin tables over 2D spatial positions.
+pub fn fillSpatialRotaryTables(
     allocator: std.mem.Allocator,
-    grid_h: usize,
-    grid_w: usize,
-    grid_t: usize,
-    spatial_merge_size: usize,
-    vision_hidden_size: usize,
-    vision_num_heads: usize,
+    height_blocks: usize,
+    width_blocks: usize,
+    frame_blocks: usize,
+    merge_factor: usize,
+    feature_width: usize,
+    head_count: usize,
     cos_out: []f32,
     sin_out: []f32,
 ) !void {
-    if ((grid_h % spatial_merge_size) != 0 or (grid_w % spatial_merge_size) != 0) return error.InvalidShape;
+    if ((height_blocks % merge_factor) != 0 or (width_blocks % merge_factor) != 0) return error.InvalidShape;
 
-    const merged_h = grid_h / spatial_merge_size;
-    const merged_w = grid_w / spatial_merge_size;
-    const token_count = grid_t * grid_h * grid_w;
-    const head_dim = vision_hidden_size / vision_num_heads;
+    const merged_h = height_blocks / merge_factor;
+    const merged_w = width_blocks / merge_factor;
+    const token_count = frame_blocks * height_blocks * width_blocks;
+    const head_dim = feature_width / head_count;
     if ((head_dim % 4) != 0) return error.InvalidShape;
     if (cos_out.len != token_count * head_dim or sin_out.len != token_count * head_dim) return error.InvalidShape;
 
@@ -165,13 +165,13 @@ pub fn fillVisionRotaryTables(
     }
 
     var token_idx: usize = 0;
-    for (0..grid_t) |_| {
+    for (0..frame_blocks) |_| {
         for (0..merged_h) |bh| {
             for (0..merged_w) |bw| {
-                for (0..spatial_merge_size) |ih| {
-                    for (0..spatial_merge_size) |iw| {
-                        const row = bh * spatial_merge_size + ih;
-                        const col = bw * spatial_merge_size + iw;
+                for (0..merge_factor) |ih| {
+                    for (0..merge_factor) |iw| {
+                        const row = bh * merge_factor + ih;
+                        const col = bw * merge_factor + iw;
                         const row_pos = @as(f32, @floatFromInt(row));
                         const col_pos = @as(f32, @floatFromInt(col));
                         const base = token_idx * head_dim;
