@@ -410,8 +410,8 @@ pub(super) struct LsArgs {
     #[arg(short = 'H', long, conflicts_with = "quantized_only")]
     pub hub_only: bool,
 
-    /// Show pinned models for the active profile
-    #[arg(short = 'P', long, conflicts_with_all = ["quantized_only", "hub_only"])]
+    /// Show only pinned models for the active profile
+    #[arg(short = 'P', long)]
     pub pinned: bool,
 
     /// Storage profile name for pinned model metadata
@@ -1087,13 +1087,27 @@ mod tests {
     }
 
     #[test]
-    fn reject_ls_pinned_with_quantized_flag() {
-        assert!(parse(&["talu", "ls", "-P", "-Q"]).is_err());
+    fn parse_ls_pinned_with_quantized_flag() {
+        let cli = parse(&["talu", "ls", "-P", "-Q"]).expect("parse should succeed");
+        match cli.command {
+            Some(Commands::Ls(args)) => {
+                assert!(args.pinned);
+                assert!(args.quantized_only);
+            }
+            _ => panic!("expected ls command"),
+        }
     }
 
     #[test]
-    fn reject_ls_pinned_with_hub_flag() {
-        assert!(parse(&["talu", "ls", "-P", "-H"]).is_err());
+    fn parse_ls_pinned_with_hub_flag() {
+        let cli = parse(&["talu", "ls", "-P", "-H"]).expect("parse should succeed");
+        match cli.command {
+            Some(Commands::Ls(args)) => {
+                assert!(args.pinned);
+                assert!(args.hub_only);
+            }
+            _ => panic!("expected ls command"),
+        }
     }
 
     #[test]

@@ -498,3 +498,102 @@ fn bare_path_delete() {
     let resp = delete(ctx.addr(), "/settings/models/some-model");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 }
+
+// ---------------------------------------------------------------------------
+// Multi-tenant settings isolation
+// ---------------------------------------------------------------------------
+
+/// Settings are scoped per tenant via storage_prefix.
+///
+/// Each tenant's settings.toml lives at `<bucket>/<storage_prefix>/settings.toml`,
+/// so Tenant A's PATCH should never affect Tenant B's GET.
+#[test]
+fn settings_tenant_isolation() {
+    let temp = TempDir::new().expect("temp dir");
+    // Pre-create tenant storage directories so save_bucket_settings can write.
+    std::fs::create_dir_all(temp.path().join("acme")).expect("create acme dir");
+    std::fs::create_dir_all(temp.path().join("globex")).expect("create globex dir");
+
+    let mut config = ServerConfig::new();
+    config.gateway_secret = Some("secret".to_string());
+    config.bucket = Some(temp.path().to_path_buf());
+    config.tenants = vec![
+        TenantSpec {
+            id: "acme".to_string(),
+            storage_prefix: "acme".to_string(),
+            allowed_models: vec![],
+        },
+        TenantSpec {
+            id: "globex".to_string(),
+            storage_prefix: "globex".to_string(),
+            allowed_models: vec![],
+        },
+    ];
+
+    let ctx = ServerTestContext::new(config);
+
+    // Acme sets a model.
+    let resp = send_request(
+        ctx.addr(),
+        "PATCH",
+        "/v1/settings",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+            ("Content-Type", "application/json"),
+        ],
+        Some(r#"{"model": "acme-model"}"#),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.json()["model"], "acme-model");
+
+    // Globex should still see defaults (null model).
+    let resp = send_request(
+        ctx.addr(),
+        "GET",
+        "/v1/settings",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "globex"),
+        ],
+        None,
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert!(
+        resp.json()["model"].is_null(),
+        "globex should have null model, got: {}",
+        resp.json()["model"]
+    );
+
+    // Globex sets its own model.
+    let resp = send_request(
+        ctx.addr(),
+        "PATCH",
+        "/v1/settings",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "globex"),
+            ("Content-Type", "application/json"),
+        ],
+        Some(r#"{"model": "globex-model"}"#),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.json()["model"], "globex-model");
+
+    // Acme's model should be unchanged.
+    let resp = send_request(
+        ctx.addr(),
+        "GET",
+        "/v1/settings",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+        ],
+        None,
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(
+        resp.json()["model"], "acme-model",
+        "acme's model should be unchanged after globex patch"
+    );
+}

@@ -547,3 +547,319 @@ fn auth_cross_tenant_patch_returns_404() {
     let json = resp.json();
     assert_eq!(json["title"], "Original Title", "title should be unchanged");
 }
+
+// ---------------------------------------------------------------------------
+// Auth gateway: group_id injection into documents
+// ---------------------------------------------------------------------------
+
+/// When creating a document with X-Talu-Group-Id but no group_id in the body,
+/// the auth group_id should be injected as the document's group_id.
+#[test]
+fn auth_group_id_injected_into_created_document() {
+    let temp = TempDir::new().expect("temp dir");
+
+    let mut config = ServerConfig::new();
+    config.gateway_secret = Some("secret".to_string());
+    config.bucket = Some(temp.path().to_path_buf());
+    config.tenants = vec![TenantSpec {
+        id: "acme".to_string(),
+        storage_prefix: "acme".to_string(),
+        allowed_models: vec![],
+    }];
+
+    let ctx = ServerTestContext::new(config);
+
+    // Create a document with auth group_id header but no group_id in body.
+    let doc_body = serde_json::json!({
+        "type": "note",
+        "title": "Group-injected doc",
+        "content": {"text": "test"}
+    });
+    let json_str = serde_json::to_string(&doc_body).unwrap();
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/documents",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+            ("X-Talu-Group-Id", "team-x"),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&json_str),
+    );
+    assert_eq!(resp.status, 201, "body: {}", resp.body);
+
+    let create_json = resp.json();
+    let doc_id = create_json["id"].as_str().expect("doc id");
+
+    // GET the document and verify group_id was injected.
+    let get_resp = send_request(
+        ctx.addr(),
+        "GET",
+        &format!("/v1/documents/{}", doc_id),
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+        ],
+        None,
+    );
+    assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
+    let doc_json = get_resp.json();
+    assert_eq!(
+        doc_json["group_id"].as_str(),
+        Some("team-x"),
+        "group_id should be injected from auth header"
+    );
+}
+
+/// Documents are isolated between tenants.
+#[test]
+fn auth_tenant_document_isolation() {
+    let temp = TempDir::new().expect("temp dir");
+
+    let mut config = ServerConfig::new();
+    config.gateway_secret = Some("secret".to_string());
+    config.bucket = Some(temp.path().to_path_buf());
+    config.tenants = vec![
+        TenantSpec {
+            id: "acme".to_string(),
+            storage_prefix: "acme".to_string(),
+            allowed_models: vec![],
+        },
+        TenantSpec {
+            id: "globex".to_string(),
+            storage_prefix: "globex".to_string(),
+            allowed_models: vec![],
+        },
+    ];
+
+    let ctx = ServerTestContext::new(config);
+
+    // Acme creates a document.
+    let doc_body = serde_json::json!({
+        "type": "note",
+        "title": "Acme secret doc",
+        "content": {"text": "confidential"}
+    });
+    let json_str = serde_json::to_string(&doc_body).unwrap();
+    let create_resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/documents",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&json_str),
+    );
+    assert_eq!(create_resp.status, 201, "body: {}", create_resp.body);
+    let doc_id = create_resp.json()["id"].as_str().unwrap().to_string();
+
+    // Globex cannot see acme's document via GET.
+    let get_resp = send_request(
+        ctx.addr(),
+        "GET",
+        &format!("/v1/documents/{}", doc_id),
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "globex"),
+        ],
+        None,
+    );
+    assert_eq!(
+        get_resp.status, 404,
+        "globex should not see acme's document"
+    );
+
+    // Globex list should not include acme's document.
+    let list_resp = send_request(
+        ctx.addr(),
+        "GET",
+        "/v1/documents",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "globex"),
+        ],
+        None,
+    );
+    assert_eq!(list_resp.status, 200, "body: {}", list_resp.body);
+    let list_json = list_resp.json();
+    let data = list_json["data"].as_array().expect("data array");
+    assert!(
+        !data.iter().any(|d| d["id"] == doc_id.as_str()),
+        "globex document list should not contain acme's document"
+    );
+
+    // Acme can see its own document.
+    let acme_get = send_request(
+        ctx.addr(),
+        "GET",
+        &format!("/v1/documents/{}", doc_id),
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+        ],
+        None,
+    );
+    assert_eq!(acme_get.status, 200, "acme should see its own document");
+    assert_eq!(acme_get.json()["title"], "Acme secret doc");
+}
+
+/// X-Talu-User-Id does NOT automatically inject into document owner_id.
+///
+/// The code at documents.rs:377 is `plugin_owner_id.or(create_req.owner_id)`.
+/// Auth `user_id` is intentionally NOT used as a fallback for regular documents
+/// (only plugin_storage forces owner_id from the token's plugin_id).
+#[test]
+fn auth_user_id_does_not_inject_owner_id() {
+    let temp = TempDir::new().expect("temp dir");
+
+    let mut config = ServerConfig::new();
+    config.gateway_secret = Some("secret".to_string());
+    config.bucket = Some(temp.path().to_path_buf());
+    config.tenants = vec![TenantSpec {
+        id: "acme".to_string(),
+        storage_prefix: "acme".to_string(),
+        allowed_models: vec![],
+    }];
+
+    let ctx = ServerTestContext::new(config);
+
+    // Create a document with X-Talu-User-Id but no owner_id in the body.
+    let doc_body = serde_json::json!({
+        "type": "note",
+        "title": "User-id test doc",
+        "content": {"text": "test"}
+    });
+    let json_str = serde_json::to_string(&doc_body).unwrap();
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/documents",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+            ("X-Talu-User-Id", "user-42"),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&json_str),
+    );
+    assert_eq!(resp.status, 201, "body: {}", resp.body);
+
+    let create_json = resp.json();
+    let doc_id = create_json["id"].as_str().expect("doc id");
+
+    // GET the document and verify owner_id was NOT set from user_id.
+    let get_resp = send_request(
+        ctx.addr(),
+        "GET",
+        &format!("/v1/documents/{}", doc_id),
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+        ],
+        None,
+    );
+    assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
+    let doc_json = get_resp.json();
+    assert!(
+        doc_json["owner_id"].is_null(),
+        "owner_id should be null (user_id is NOT injected), got: {}",
+        doc_json["owner_id"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Auth gateway: cross-tenant tag isolation
+// ---------------------------------------------------------------------------
+
+/// Tags are scoped by group_id.  Tags created under one group_id should
+/// not be visible when listing with a different group_id.
+///
+/// The tags handler uses `StorageHandle::open(bucket)` (shared bucket) and
+/// filters via `list_tags(group_id)`.  Isolation depends on group_id, not
+/// storage_prefix.
+#[test]
+fn auth_cross_tenant_tag_isolation() {
+    let temp = TempDir::new().expect("temp dir");
+
+    let mut config = ServerConfig::new();
+    config.gateway_secret = Some("secret".to_string());
+    config.bucket = Some(temp.path().to_path_buf());
+    config.tenants = vec![
+        TenantSpec {
+            id: "acme".to_string(),
+            storage_prefix: "acme".to_string(),
+            allowed_models: vec![],
+        },
+        TenantSpec {
+            id: "globex".to_string(),
+            storage_prefix: "globex".to_string(),
+            allowed_models: vec![],
+        },
+    ];
+
+    let ctx = ServerTestContext::new(config);
+
+    // Acme creates a tag with group_id "acme-group".
+    let body = serde_json::json!({"name": "acme-tag"});
+    let json_str = serde_json::to_string(&body).unwrap();
+    let create_resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/tags",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+            ("X-Talu-Group-Id", "acme-group"),
+            ("Content-Type", "application/json"),
+        ],
+        Some(&json_str),
+    );
+    assert_eq!(create_resp.status, 201, "body: {}", create_resp.body);
+
+    // Globex lists tags with group_id "globex-group" — should be empty.
+    let list_resp = send_request(
+        ctx.addr(),
+        "GET",
+        "/v1/tags",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "globex"),
+            ("X-Talu-Group-Id", "globex-group"),
+        ],
+        None,
+    );
+    assert_eq!(list_resp.status, 200, "body: {}", list_resp.body);
+    let globex_data = list_resp.json()["data"]
+        .as_array()
+        .expect("data array")
+        .clone();
+    assert!(
+        globex_data.is_empty(),
+        "globex-group should not see acme-group's tags, got {} tags",
+        globex_data.len()
+    );
+
+    // Acme lists tags with its own group_id — should see its own tag.
+    let acme_list = send_request(
+        ctx.addr(),
+        "GET",
+        "/v1/tags",
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "acme"),
+            ("X-Talu-Group-Id", "acme-group"),
+        ],
+        None,
+    );
+    assert_eq!(acme_list.status, 200, "body: {}", acme_list.body);
+    let acme_data = acme_list.json()["data"]
+        .as_array()
+        .expect("data array")
+        .clone();
+    assert_eq!(acme_data.len(), 1, "acme should see its own tag");
+    assert_eq!(acme_data[0]["name"], "acme-tag");
+}

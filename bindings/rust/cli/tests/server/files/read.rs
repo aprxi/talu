@@ -1,7 +1,7 @@
 //! `/v1/files` retrieval/list/error-path tests.
 
-use super::files_config;
-use crate::server::common::{delete, get, post_json, send_request, ServerTestContext};
+use super::{files_config, no_bucket_config};
+use crate::server::common::{delete, get, patch_json, post_json, send_request, ServerTestContext};
 use tempfile::TempDir;
 
 fn upload_text_file(ctx: &ServerTestContext, filename: &str, mime: &str, payload: &str) -> String {
@@ -233,5 +233,232 @@ fn upload_requires_multipart_content_type_header() {
     assert_eq!(
         bad_header_resp.json()["error"]["code"],
         "invalid_content_type"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// GET /v1/blobs/:hash — blob serving
+// ---------------------------------------------------------------------------
+
+/// Upload a file, extract blob_ref via document API, then GET the blob by hash.
+#[test]
+fn get_blob_returns_uploaded_content() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let payload = "blob content for serving test";
+    let file_id = upload_text_file(&ctx, "blob-test.txt", "text/plain", payload);
+
+    // blob_ref lives in the underlying document content, not in the files API response.
+    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{}", file_id));
+    assert_eq!(doc_resp.status, 200, "body: {}", doc_resp.body);
+    let doc_json = doc_resp.json();
+    let blob_ref = doc_json["content"]["blob_ref"]
+        .as_str()
+        .expect("should have blob_ref in document content");
+
+    // Extract hex hash from "sha256:<64hex>".
+    let hash = blob_ref.strip_prefix("sha256:").expect("sha256: prefix");
+    assert_eq!(hash.len(), 64, "hash should be 64 chars");
+
+    let blob_resp = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    assert_eq!(blob_resp.status, 200, "body: {}", blob_resp.body);
+
+    let ct = blob_resp.header("content-type").unwrap_or("");
+    assert!(
+        ct.contains("application/octet-stream"),
+        "expected octet-stream, got: {ct}"
+    );
+    let cc = blob_resp.header("cache-control").unwrap_or("");
+    assert!(cc.contains("immutable"), "should have immutable cache-control");
+    assert_eq!(blob_resp.body, payload, "blob content should match uploaded payload");
+}
+
+/// Invalid (too-short) hash returns 400.
+#[test]
+fn get_blob_invalid_hash_returns_400() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let resp = get(ctx.addr(), "/v1/blobs/tooshort");
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+/// Non-existent but valid-format hash returns error.
+#[test]
+fn get_blob_nonexistent_hash_returns_error() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    // 64 valid hex chars, but no such blob exists.
+    let fake_hash = "a".repeat(64);
+    let resp = get(ctx.addr(), &format!("/v1/blobs/{}", fake_hash));
+    // Expect 404 or another non-200 error.
+    assert_ne!(resp.status, 200, "non-existent blob should not return 200");
+}
+
+/// Blob endpoint returns 404 when no bucket is configured.
+#[test]
+fn get_blob_no_bucket_returns_404() {
+    let ctx = ServerTestContext::new(no_bucket_config());
+
+    let hash = "b".repeat(64);
+    let resp = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
+}
+
+// ---------------------------------------------------------------------------
+// PATCH /v1/files/:id — file renaming and metadata update
+// ---------------------------------------------------------------------------
+
+/// PATCH with filename renames the file.
+#[test]
+fn patch_file_renames_filename() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let file_id = upload_text_file(&ctx, "original.txt", "text/plain", "rename me");
+
+    let resp = patch_json(
+        ctx.addr(),
+        &format!("/v1/files/{}", file_id),
+        &serde_json::json!({"filename": "renamed.txt"}),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["filename"], "renamed.txt");
+
+    // Verify rename persists on subsequent GET.
+    let get_resp = get(ctx.addr(), &format!("/v1/files/{}", file_id));
+    assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
+    assert_eq!(get_resp.json()["filename"], "renamed.txt");
+}
+
+/// PATCH sanitizes path-like filenames.
+#[test]
+fn patch_file_sanitizes_filename() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let file_id = upload_text_file(&ctx, "safe.txt", "text/plain", "content");
+
+    let resp = patch_json(
+        ctx.addr(),
+        &format!("/v1/files/{}", file_id),
+        &serde_json::json!({"filename": "../../etc/passwd"}),
+    );
+    // Should either sanitize to "passwd" or reject — not allow path traversal.
+    if resp.status == 200 {
+        let json = resp.json();
+        let name = json["filename"].as_str().unwrap_or("");
+        assert!(
+            !name.contains(".."),
+            "filename should be sanitized, got: {name}"
+        );
+        assert_eq!(name, "passwd", "path components should be stripped");
+    } else {
+        // 400 is also acceptable for an empty/invalid result after sanitization.
+        assert_eq!(resp.status, 400);
+    }
+}
+
+/// PATCH with invalid marker returns 400.
+#[test]
+fn patch_file_invalid_marker_returns_400() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let file_id = upload_text_file(&ctx, "marker.txt", "text/plain", "test");
+
+    let resp = patch_json(
+        ctx.addr(),
+        &format!("/v1/files/{}", file_id),
+        &serde_json::json!({"marker": "invalid_status"}),
+    );
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+/// PATCH with empty body returns current state (no-op).
+#[test]
+fn patch_file_no_changes_returns_current_state() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let file_id = upload_text_file(&ctx, "noop.txt", "text/plain", "unchanged");
+
+    let resp = patch_json(
+        ctx.addr(),
+        &format!("/v1/files/{}", file_id),
+        &serde_json::json!({}),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["id"], file_id);
+    assert_eq!(json["filename"], "noop.txt");
+}
+
+// ---------------------------------------------------------------------------
+// Delete lifecycle: metadata removed, content inaccessible
+// ---------------------------------------------------------------------------
+
+/// After deleting a file, both metadata GET and content GET return 404.
+///
+/// The storage layer performs metadata-only deletion (CAS blob retained for GC),
+/// so subsequent lookups fail at the metadata stage before reaching the blob.
+#[test]
+fn deleted_file_returns_404_for_metadata_and_content() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let payload = "content that will be deleted";
+    let file_id = upload_text_file(&ctx, "doomed.txt", "text/plain", payload);
+
+    // Content is accessible before deletion.
+    let content_resp = get(ctx.addr(), &format!("/v1/files/{}/content", file_id));
+    assert_eq!(content_resp.status, 200, "content should be accessible before delete");
+    assert_eq!(content_resp.body, payload);
+
+    // Delete the file.
+    let del_resp = delete(ctx.addr(), &format!("/v1/files/{}", file_id));
+    assert_eq!(del_resp.status, 200, "body: {}", del_resp.body);
+
+    // Metadata GET → 404.
+    let meta_resp = get(ctx.addr(), &format!("/v1/files/{}", file_id));
+    assert_eq!(
+        meta_resp.status, 404,
+        "metadata GET should return 404 after delete, body: {}",
+        meta_resp.body
+    );
+
+    // Content GET → 404.
+    let content_resp = get(ctx.addr(), &format!("/v1/files/{}/content", file_id));
+    assert_eq!(
+        content_resp.status, 404,
+        "content GET should return 404 after delete, body: {}",
+        content_resp.body
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Range: inverted start > end
+// ---------------------------------------------------------------------------
+
+/// Inverted byte range (start > end) returns 416 Range Not Satisfiable.
+#[test]
+fn content_range_inverted_start_end_returns_416() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let payload = "0123456789";
+    let file_id = upload_text_file(&ctx, "range-invert.txt", "text/plain", payload);
+    let path = format!("/v1/files/{}/content", file_id);
+
+    // bytes=5-2 is inverted (start=5 > end=2).
+    let resp = get_with_headers(&ctx, &path, &[("Range", "bytes=5-2")]);
+    assert_eq!(resp.status, 416, "body: {}", resp.body);
+    assert_eq!(
+        resp.header("content-range"),
+        Some("bytes */10"),
+        "should include Content-Range with total size"
     );
 }

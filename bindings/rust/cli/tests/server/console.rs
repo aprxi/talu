@@ -155,3 +155,66 @@ fn get_assets_root_returns_404() {
     let resp = get(ctx.addr(), "/assets/");
     assert_eq!(resp.status, 404);
 }
+
+// ---------------------------------------------------------------------------
+// --html-dir overrides bundled assets
+// ---------------------------------------------------------------------------
+
+fn html_dir_config(dir: &std::path::Path) -> ServerConfig {
+    let mut config = ServerConfig::new();
+    config.html_dir = Some(dir.to_path_buf());
+    config
+}
+
+#[test]
+fn html_dir_serves_custom_index() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let custom_html = "<html><body>Custom Console</body></html>";
+    std::fs::write(temp.path().join("index.html"), custom_html).expect("write index.html");
+
+    let ctx = ServerTestContext::new(html_dir_config(temp.path()));
+    let resp = get(ctx.addr(), "/");
+    assert_eq!(resp.status, 200);
+
+    let ct = resp.header("content-type").expect("content-type header");
+    assert!(ct.contains("text/html"), "expected text/html, got: {ct}");
+    assert!(
+        resp.body.contains("Custom Console"),
+        "should serve custom index.html"
+    );
+    assert!(
+        !resp.body.contains("Talu Console"),
+        "should NOT serve bundled index"
+    );
+}
+
+#[test]
+fn html_dir_serves_custom_assets() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    // Write minimal index so the server starts cleanly.
+    std::fs::write(temp.path().join("index.html"), "<html></html>").expect("write index");
+    std::fs::write(temp.path().join("style.css"), "body { color: red; }").expect("write css");
+    std::fs::write(temp.path().join("main.js"), "console.log('custom');").expect("write js");
+
+    let ctx = ServerTestContext::new(html_dir_config(temp.path()));
+
+    let css_resp = get(ctx.addr(), "/assets/style.css");
+    assert_eq!(css_resp.status, 200);
+    assert!(css_resp.body.contains("color: red"));
+
+    let js_resp = get(ctx.addr(), "/assets/main.js");
+    assert_eq!(js_resp.status, 200);
+    assert!(js_resp.body.contains("custom"));
+}
+
+#[test]
+fn html_dir_missing_file_returns_404() {
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    // Only write index.html — no main.js.
+    std::fs::write(temp.path().join("index.html"), "<html></html>").expect("write index");
+
+    let ctx = ServerTestContext::new(html_dir_config(temp.path()));
+
+    let resp = get(ctx.addr(), "/assets/main.js");
+    assert_eq!(resp.status, 404, "missing asset should return 404");
+}

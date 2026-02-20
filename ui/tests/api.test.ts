@@ -34,22 +34,40 @@ beforeEach(() => {
 // ── URL construction & HTTP methods ─────────────────────────────────────────
 
 describe("ApiClient — URL paths and methods", () => {
-  test("listConversations → GET /v1/conversations with limit", async () => {
+  test("listConversations → GET /v1/conversations with default limit", async () => {
     await client.listConversations();
     expect(calls[0]!.url).toContain("/v1/conversations?");
-    expect(calls[0]!.url).toContain("limit=20");
+    expect(calls[0]!.url).toContain("limit=50");
     expect(calls[0]!.init?.method).toBe("GET");
   });
 
-  test("listConversations with cursor and custom limit", async () => {
-    await client.listConversations("abc123", 50);
-    expect(calls[0]!.url).toContain("cursor=abc123");
-    expect(calls[0]!.url).toContain("limit=50");
+  test("listConversations with offset and custom limit", async () => {
+    await client.listConversations({ offset: 20, limit: 10 });
+    expect(calls[0]!.url).toContain("offset=20");
+    expect(calls[0]!.url).toContain("limit=10");
   });
 
-  test("listConversations without cursor omits cursor param", async () => {
-    await client.listConversations(null);
-    expect(calls[0]!.url).not.toContain("cursor");
+  test("listConversations with marker filter", async () => {
+    await client.listConversations({ marker: "archived" });
+    expect(calls[0]!.url).toContain("marker=archived");
+  });
+
+  test("listConversations with search query", async () => {
+    await client.listConversations({ search: "hello" });
+    expect(calls[0]!.url).toContain("search=hello");
+  });
+
+  test("listConversations with tags_any filter", async () => {
+    await client.listConversations({ tags_any: "rust python" });
+    expect(calls[0]!.url).toContain("tags_any=rust+python");
+  });
+
+  test("listConversations without optional params omits them", async () => {
+    await client.listConversations();
+    expect(calls[0]!.url).not.toContain("offset");
+    expect(calls[0]!.url).not.toContain("marker");
+    expect(calls[0]!.url).not.toContain("search");
+    expect(calls[0]!.url).not.toContain("tags_any");
   });
 
   test("search → POST /v1/search with body", async () => {
@@ -171,6 +189,69 @@ describe("ApiClient — URL paths and methods", () => {
     await client.getFileContent("file_123");
     expect(calls[0]!.url).toBe("/v1/files/file_123/content");
     expect(calls[0]!.init?.method).toBe("GET");
+  });
+
+  test("inspectFile → POST /v1/file/inspect with FormData", async () => {
+    const file = new File(["img-data"], "photo.png", { type: "image/png" });
+    await client.inspectFile(file);
+    expect(calls[0]!.url).toBe("/v1/file/inspect");
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(calls[0]!.init?.body).toBeInstanceOf(FormData);
+  });
+
+  test("transformFile → POST /v1/file/transform with FormData", async () => {
+    mockResponse = new Response("resized-blob", { status: 200 });
+    const file = new File(["img-data"], "photo.png", { type: "image/png" });
+    await client.transformFile(file, { resize: "256x256", fit: "cover", format: "webp", quality: 80 });
+    expect(calls[0]!.url).toBe("/v1/file/transform");
+    expect(calls[0]!.init?.method).toBe("POST");
+    const form = calls[0]!.init?.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    expect(form.get("resize")).toBe("256x256");
+    expect(form.get("fit")).toBe("cover");
+    expect(form.get("format")).toBe("webp");
+    expect(form.get("quality")).toBe("80");
+  });
+
+  test("transformFile omits unset options", async () => {
+    mockResponse = new Response("blob", { status: 200 });
+    const file = new File(["img"], "photo.png", { type: "image/png" });
+    await client.transformFile(file);
+    const form = calls[0]!.init?.body as FormData;
+    expect(form.get("resize")).toBeNull();
+    expect(form.get("fit")).toBeNull();
+    expect(form.get("format")).toBeNull();
+    expect(form.get("quality")).toBeNull();
+  });
+
+  test("transformFile returns blob on success", async () => {
+    mockResponse = new Response("resized-bytes", { status: 200 });
+    const file = new File(["img"], "photo.png", { type: "image/png" });
+    const result = await client.transformFile(file);
+    expect(result.ok).toBe(true);
+    expect(result.data).toBeInstanceOf(Blob);
+  });
+
+  test("transformFile returns error on failure", async () => {
+    mockResponse = jsonResponse({ error: { message: "Invalid format" } }, 400);
+    const file = new File(["img"], "photo.png", { type: "image/png" });
+    const result = await client.transformFile(file);
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("Invalid format");
+  });
+
+  test("addConversationTags → POST /v1/conversations/:id/tags", async () => {
+    await client.addConversationTags("conv-1", ["rust", "wasm"]);
+    expect(calls[0]!.url).toBe("/v1/conversations/conv-1/tags");
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ tags: ["rust", "wasm"] });
+  });
+
+  test("removeConversationTags → DELETE /v1/conversations/:id/tags", async () => {
+    await client.removeConversationTags("conv-1", ["rust"]);
+    expect(calls[0]!.url).toBe("/v1/conversations/conv-1/tags");
+    expect(calls[0]!.init?.method).toBe("DELETE");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ tags: ["rust"] });
   });
 });
 

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::io::{self, IsTerminal};
 
@@ -8,9 +9,7 @@ use talu::{InferenceBackend, QuantMethod};
 use crate::pin_store::PinStore;
 use crate::provider::{get_provider, is_provider_prefix, provider_from_prefix};
 
-use super::repo::{
-    repo_get_cached_path, repo_list_files, repo_list_models, resolve_model_for_inference,
-};
+use super::repo::{repo_list_files, repo_list_models, resolve_model_for_inference};
 use super::util::{capitalize_first, format_date, format_size, truncate_str};
 use super::{DescribeArgs, LsArgs};
 
@@ -42,22 +41,32 @@ impl LocalSourceFilter {
 }
 
 pub(super) fn cmd_ls(args: LsArgs) -> Result<()> {
-    if args.pinned {
-        if args.target.is_some() {
-            bail!("'-P/--pinned' does not accept a target");
-        }
-        return cmd_ls_pinned(&args);
-    }
-
     let source_filter = LocalSourceFilter::from_ls_args(&args);
     let endpoint_url_override = args.endpoint_url;
 
+    // Resolve pinned model set when -P is active.
+    let pinned_set = if args.pinned {
+        let pin_bucket = if let Some(explicit) = args.bucket.clone() {
+            explicit
+        } else {
+            crate::config::resolve_and_ensure_bucket(&args.profile)?
+        };
+        let pin_store = PinStore::open(&pin_bucket.join("meta.sqlite"))?;
+        Some(pin_store.list_pinned()?.into_iter().collect::<HashSet<_>>())
+    } else {
+        None
+    };
+
     // No target: list local cached models
     if args.target.is_none() {
-        return cmd_ls_local_models(source_filter);
+        return cmd_ls_local_models(source_filter, pinned_set.as_ref());
     }
 
     let target = args.target.as_ref().unwrap();
+
+    if args.pinned {
+        bail!("'-P/--pinned' is only supported for local cache listings");
+    }
 
     // Check if target is a provider prefix (e.g., "vllm::")
     if is_provider_prefix(target) {
@@ -106,42 +115,6 @@ pub(super) fn cmd_ls(args: LsArgs) -> Result<()> {
     cmd_ls_prefix_filter(target, source_filter)
 }
 
-fn cmd_ls_pinned(args: &LsArgs) -> Result<()> {
-    let pin_bucket = if let Some(explicit) = args.bucket.clone() {
-        explicit
-    } else {
-        crate::config::resolve_and_ensure_bucket(&args.profile)?
-    };
-    let pin_store = PinStore::open(&pin_bucket.join("meta.sqlite"))?;
-    let entries = pin_store.list_pinned_entries()?;
-    if entries.is_empty() {
-        println!("No pinned models for profile '{}'.", args.profile);
-        return Ok(());
-    }
-
-    println!("{:>6}  MODEL", "CACHED");
-    let mut cached_count = 0usize;
-    for entry in &entries {
-        let cached = repo_get_cached_path(&entry.model_uri).is_some();
-        if cached {
-            cached_count += 1;
-        }
-        println!(
-            "{:>6}  {}",
-            if cached { "yes" } else { "no" },
-            entry.model_uri
-        );
-    }
-    println!(
-        "\nPinned: {} (cached: {}, missing: {}, profile: {})",
-        entries.len(),
-        cached_count,
-        entries.len().saturating_sub(cached_count),
-        args.profile
-    );
-    Ok(())
-}
-
 /// Abbreviate a path by replacing $HOME prefix with ~.
 fn abbreviate_home(path: &str) -> String {
     if let Ok(home) = env::var("HOME") {
@@ -153,17 +126,28 @@ fn abbreviate_home(path: &str) -> String {
 }
 
 /// List cached models, grouped by source (managed first, then hub).
-fn cmd_ls_local_models(source_filter: LocalSourceFilter) -> Result<()> {
+fn cmd_ls_local_models(
+    source_filter: LocalSourceFilter,
+    pinned_set: Option<&HashSet<String>>,
+) -> Result<()> {
     let list = repo_list_models(false)?;
+
+    let is_pinned = |id: &str| pinned_set.map_or(true, |s| s.contains(id));
 
     let local_models: Vec<_> = list
         .iter()
-        .filter(|(_, _, s)| source_filter.allows_managed() && *s == talu::CacheOrigin::Managed)
+        .filter(|(id, _, s)| {
+            source_filter.allows_managed()
+                && *s == talu::CacheOrigin::Managed
+                && is_pinned(id)
+        })
         .map(|(id, path, _)| (id.clone(), path.clone()))
         .collect();
     let hub_models: Vec<_> = list
         .iter()
-        .filter(|(_, _, s)| source_filter.allows_hub() && *s == talu::CacheOrigin::Hub)
+        .filter(|(id, _, s)| {
+            source_filter.allows_hub() && *s == talu::CacheOrigin::Hub && is_pinned(id)
+        })
         .map(|(id, path, _)| (id.clone(), path.clone()))
         .collect();
 
@@ -210,7 +194,11 @@ fn cmd_ls_local_models(source_filter: LocalSourceFilter) -> Result<()> {
 
     let total = local_models.len() + hub_models.len();
     if total == 0 {
-        println!("\nNo models found. Download one with: talu get Org/Model");
+        if pinned_set.is_some() {
+            println!("\nNo pinned models found in cache. Pin one with: talu pin Org/Model");
+        } else {
+            println!("\nNo models found. Download one with: talu get Org/Model");
+        }
     }
 
     Ok(())
