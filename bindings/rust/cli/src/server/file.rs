@@ -12,6 +12,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::Serialize;
+use utoipa::ToSchema;
 use talu::file::{
     self, FileKind, FitMode, ImageFormat, OutputFormat, ResizeOptions, TransformOptions,
 };
@@ -25,8 +26,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infalli
 // Response types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize)]
-struct FileInspectResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct FileInspectResponse {
     kind: String,
     mime: String,
     description: String,
@@ -35,8 +36,8 @@ struct FileInspectResponse {
     image: Option<ImageMetadata>,
 }
 
-#[derive(Debug, Serialize)]
-struct ImageMetadata {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ImageMetadata {
     format: String,
     width: u32,
     height: u32,
@@ -155,6 +156,18 @@ async fn read_multipart_buffered(
 // Handlers
 // ---------------------------------------------------------------------------
 
+/// Documentation-only schema for file inspect upload.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct FileInspectForm {
+    /// The file binary data.
+    #[schema(format = Binary)]
+    file: Vec<u8>,
+}
+
+#[utoipa::path(post, path = "/v1/file/inspect", tag = "File",
+    request_body(content_type = "multipart/form-data", content = inline(FileInspectForm)),
+    responses((status = 200, body = FileInspectResponse)))]
 /// POST /v1/file/inspect - Detect file type, MIME, and image metadata.
 pub async fn handle_inspect(
     state: Arc<AppState>,
@@ -223,6 +236,26 @@ pub async fn handle_inspect(
     json_response(StatusCode::OK, &response)
 }
 
+/// Documentation-only schema for file transform upload.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct FileTransformForm {
+    /// The image binary data.
+    #[schema(format = Binary)]
+    file: Vec<u8>,
+    /// Target format (e.g. "jpeg", "png", "webp").
+    format: Option<String>,
+    /// Target width in pixels.
+    width: Option<u32>,
+    /// Target height in pixels.
+    height: Option<u32>,
+    /// Fit mode: "cover", "contain", "fill", "inside", "outside".
+    fit: Option<String>,
+}
+
+#[utoipa::path(post, path = "/v1/file/transform", tag = "File",
+    request_body(content_type = "multipart/form-data", content = inline(FileTransformForm)),
+    responses((status = 200, description = "Transformed image bytes")))]
 /// POST /v1/file/transform - Resize/re-encode an image.
 pub async fn handle_transform(
     state: Arc<AppState>,

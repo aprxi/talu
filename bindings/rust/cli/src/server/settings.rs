@@ -5,7 +5,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
+use serde::Serialize;
 use serde_json::json;
+use utoipa::ToSchema;
 
 use crate::bucket_settings::{self, ModelOverrides};
 use crate::server::auth_gateway::AuthContext;
@@ -13,7 +15,19 @@ use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
+/// Documentation-only type for the settings GET response shape.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct SettingsResponse {
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub max_output_tokens: Option<u32>,
+    pub context_length: Option<u32>,
+    pub available_models: Vec<ModelEntry>,
+}
+
 /// GET /v1/settings — return current bucket settings + enriched model list.
+#[utoipa::path(get, path = "/v1/settings", tag = "Settings",
+    responses((status = 200, body = SettingsResponse)))]
 pub async fn handle_get(
     state: Arc<AppState>,
     _req: Request<Incoming>,
@@ -59,6 +73,8 @@ pub async fn handle_get(
 /// Accepts top-level `model`, `system_prompt`, and per-model generation
 /// overrides under `model_overrides: { temperature, top_p, top_k, … }`.
 /// The overrides are stored under `[models."<active-model>"]` in the TOML.
+#[utoipa::path(patch, path = "/v1/settings", tag = "Settings",
+    responses((status = 200, body = SettingsResponse)))]
 pub async fn handle_patch(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -158,6 +174,9 @@ pub async fn handle_patch(
 }
 
 /// DELETE /v1/settings/models/{model_id} — reset a model's overrides to defaults.
+#[utoipa::path(delete, path = "/v1/settings/models/{model_id}", tag = "Settings",
+    params(("model_id" = String, Path, description = "Model ID")),
+    responses((status = 200, body = SettingsResponse)))]
 pub async fn handle_reset_model(
     state: Arc<AppState>,
     _req: Request<Incoming>,
@@ -222,8 +241,8 @@ fn resolve_bucket(state: &AppState, auth_ctx: Option<&AuthContext>) -> Option<st
 ///
 /// Each model carries its `generation_config.json` defaults so the UI can
 /// show placeholders, plus any user overrides from the bucket settings.
-#[derive(serde::Serialize)]
-struct ModelEntry {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ModelEntry {
     id: String,
     /// Model origin: "managed" (managed by Talu) or "hub" (HuggingFace cache).
     source: &'static str,
@@ -233,16 +252,16 @@ struct ModelEntry {
     overrides: OverridesJson,
 }
 
-#[derive(serde::Serialize)]
-struct ModelDefaults {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ModelDefaults {
     temperature: f32,
     top_k: usize,
     top_p: f32,
     do_sample: bool,
 }
 
-#[derive(serde::Serialize)]
-struct OverridesJson {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct OverridesJson {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]

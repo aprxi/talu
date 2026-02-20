@@ -20,6 +20,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use talu::documents::DocumentsHandle;
 use talu::storage::{SearchParams, SessionRecordFull, StorageError, StorageHandle};
@@ -35,7 +36,7 @@ use crate::server::state::AppState;
 // ---------------------------------------------------------------------------
 
 /// Search request body.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SearchRequest {
     /// Scope of search: "conversations" or "items"
     pub scope: String,
@@ -78,7 +79,7 @@ pub struct SearchRequest {
 }
 
 /// Vector search options.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct VectorSearch {
     /// Text to embed and search
     pub text: Option<String>,
@@ -91,7 +92,7 @@ pub struct VectorSearch {
 }
 
 /// Structured filters for search.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, ToSchema)]
 pub struct SearchFilters {
     /// Tags (AND logic) - must have ALL
     #[serde(default)]
@@ -139,7 +140,7 @@ pub struct SearchFilters {
 }
 
 /// Search response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResponse {
     pub data: Vec<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -156,6 +157,9 @@ pub struct SearchResponse {
 // ---------------------------------------------------------------------------
 
 /// POST /v1/search - Unified search endpoint.
+#[utoipa::path(post, path = "/v1/search", tag = "Search",
+    request_body = SearchRequest,
+    responses((status = 200, body = SearchResponse)))]
 pub async fn handle_search(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -601,8 +605,8 @@ fn compute_markers_aggregation(sessions: &[SessionRecordFull]) -> serde_json::Va
 use talu::responses::{ItemType, ResponsesView};
 
 /// Search result for an individual item/message.
-#[derive(Debug, Serialize)]
-struct ItemSearchResult {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct ItemSearchResult {
     conversation_id: String,
     item_id: u64,
     role: String,

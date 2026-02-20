@@ -9,6 +9,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use talu::documents::DocumentsHandle;
 use talu::storage::{StorageError, StorageHandle, TagCreate, TagRecord, TagUpdate};
 
@@ -21,8 +22,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infalli
 // Request/Response types
 // =============================================================================
 
-#[derive(Debug, Serialize)]
-struct TagResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TagResponse {
     id: String,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -34,16 +35,16 @@ struct TagResponse {
 }
 
 /// Tag usage statistics.
-#[derive(Debug, Serialize)]
-struct TagUsage {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TagUsage {
     conversations: usize,
     documents: usize,
     total: usize,
 }
 
 /// Tag response with usage statistics (for GET /v1/tags/:id).
-#[derive(Debug, Serialize)]
-struct TagResponseWithUsage {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TagResponseWithUsage {
     id: String,
     name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,13 +69,13 @@ impl From<TagRecord> for TagResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct TagListResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct TagListResponse {
     data: Vec<TagResponse>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateTagRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreateTagRequest {
     name: String,
     #[serde(default)]
     color: Option<String>,
@@ -82,8 +83,8 @@ struct CreateTagRequest {
     description: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct UpdateTagRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct UpdateTagRequest {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
@@ -96,6 +97,8 @@ struct UpdateTagRequest {
 // Handlers
 // =============================================================================
 
+#[utoipa::path(get, path = "/v1/tags", tag = "Tags",
+    responses((status = 200, body = TagListResponse)))]
 /// GET /v1/tags - List all tags
 pub async fn handle_list(
     state: Arc<AppState>,
@@ -138,6 +141,9 @@ pub async fn handle_list(
     json_response(StatusCode::OK, &response)
 }
 
+#[utoipa::path(get, path = "/v1/tags/{tag_id}", tag = "Tags",
+    params(("tag_id" = String, Path, description = "Tag ID")),
+    responses((status = 200, body = TagResponseWithUsage)))]
 /// GET /v1/tags/:id - Get a specific tag with usage statistics
 pub async fn handle_get(
     state: Arc<AppState>,
@@ -206,6 +212,9 @@ pub async fn handle_get(
     json_response(StatusCode::OK, &response)
 }
 
+#[utoipa::path(post, path = "/v1/tags", tag = "Tags",
+    request_body = CreateTagRequest,
+    responses((status = 201, body = TagResponse)))]
 /// POST /v1/tags - Create a new tag
 pub async fn handle_create(
     state: Arc<AppState>,
@@ -269,6 +278,10 @@ pub async fn handle_create(
     json_response(StatusCode::CREATED, &TagResponse::from(tag))
 }
 
+#[utoipa::path(patch, path = "/v1/tags/{tag_id}", tag = "Tags",
+    params(("tag_id" = String, Path, description = "Tag ID")),
+    request_body = UpdateTagRequest,
+    responses((status = 200, body = TagResponse)))]
 /// PATCH /v1/tags/:id - Update a tag
 pub async fn handle_patch(
     state: Arc<AppState>,
@@ -329,6 +342,9 @@ pub async fn handle_patch(
     json_response(StatusCode::OK, &TagResponse::from(tag))
 }
 
+#[utoipa::path(delete, path = "/v1/tags/{tag_id}", tag = "Tags",
+    params(("tag_id" = String, Path, description = "Tag ID")),
+    responses((status = 204)))]
 /// DELETE /v1/tags/:id - Delete a tag
 pub async fn handle_delete(
     state: Arc<AppState>,

@@ -14,12 +14,16 @@ use once_cell::sync::Lazy;
 use serde_json::Value;
 use tower_service::Service;
 
+use serde::Serialize;
+use utoipa::ToSchema;
+
 use crate::server::auth_gateway::AuthContext;
 use crate::server::conversations;
 use crate::server::documents;
 use crate::server::file;
 use crate::server::files;
 use crate::server::handlers;
+use crate::server::openapi;
 use crate::server::plugins;
 use crate::server::proxy;
 use crate::server::search;
@@ -29,10 +33,35 @@ use crate::server::tags;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
-const OPENAPI_JSON: &[u8] = include_bytes!(concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/src/server/openapi.json"
-));
+/// Structured error response returned by all endpoints.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorResponse {
+    pub error: ErrorBody,
+}
+
+/// Error details.
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ErrorBody {
+    pub code: String,
+    pub message: String,
+}
+
+static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(openapi::build_openapi_json);
+
+const SWAGGER_UI_HTML: &[u8] = br##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Talu API</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+</head>
+<body>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>SwaggerUIBundle({url:"/openapi.json",dom_id:"#swagger-ui"});</script>
+</body>
+</html>
+"##;
 
 // Console UI assets — only compiled in when `make ui` has been run.
 // build.rs sets cfg(bundled_ui) when ui/dist/ contains the required files.
@@ -45,7 +74,7 @@ const CONSOLE_JS: &[u8] = include_bytes!("../../../../../ui/dist/main.js");
 
 static KNOWN_PATHS: Lazy<HashSet<String>> = Lazy::new(|| {
     let mut paths = HashSet::new();
-    let parsed: Value = serde_json::from_slice(OPENAPI_JSON).unwrap_or(Value::Null);
+    let parsed: Value = serde_json::from_slice(&OPENAPI_SPEC).unwrap_or(Value::Null);
     if let Some(obj) = parsed.get("paths").and_then(|val| val.as_object()) {
         for key in obj.keys() {
             paths.insert(key.to_string());
@@ -100,7 +129,12 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/openapi.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from_static(OPENAPI_JSON)).boxed())
+                    .body(Full::new(Bytes::from(OPENAPI_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/docs") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "text/html; charset=utf-8")
+                    .body(Full::new(Bytes::from_static(SWAGGER_UI_HTML)).boxed())
                     .unwrap(),
                 // Console UI (auth-exempt)
                 (Method::GET, "/") => {

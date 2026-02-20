@@ -14,6 +14,7 @@ use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
@@ -24,8 +25,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 // Request/Response types
 // =============================================================================
 
-#[derive(Deserialize)]
-struct ProxyRequest {
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ProxyRequest {
     url: String,
     #[serde(default = "default_method")]
     method: String,
@@ -39,8 +40,8 @@ fn default_method() -> String {
     "GET".to_string()
 }
 
-#[derive(Serialize)]
-struct ProxyResponse {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ProxyResponse {
     status: u16,
     headers: std::collections::HashMap<String, String>,
     body: String,
@@ -50,6 +51,9 @@ struct ProxyResponse {
 // Handler
 // =============================================================================
 
+#[utoipa::path(post, path = "/v1/proxy", tag = "Proxy",
+    request_body = ProxyRequest,
+    responses((status = 200, body = ProxyResponse)))]
 pub async fn handle_proxy(
     state: Arc<AppState>,
     req: Request<Incoming>,

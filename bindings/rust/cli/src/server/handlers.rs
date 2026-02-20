@@ -17,7 +17,7 @@ use tokio_stream::StreamExt;
 use crate::bucket_settings;
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
-use crate::server::generated;
+use crate::server::responses_types;
 use crate::server::state::{AppState, StoredResponse};
 use talu::documents::{DocumentError, DocumentsHandle};
 use talu::responses::{ContentType, ItemType};
@@ -80,6 +80,9 @@ impl From<anyhow::Error> for ResponseError {
     }
 }
 
+#[utoipa::path(post, path = "/v1/responses", tag = "Responses",
+    request_body = responses_types::CreateResponseBody,
+    responses((status = 200, body = responses_types::ResponseResource)))]
 pub async fn handle_responses(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -113,7 +116,7 @@ pub async fn handle_responses(
         );
     }
 
-    let request: generated::CreateResponseBody = match serde_json::from_slice(&body_bytes) {
+    let request: responses_types::CreateResponseBody = match serde_json::from_slice(&body_bytes) {
         Ok(val) => val,
         Err(err) => {
             return json_error(
@@ -221,6 +224,8 @@ pub async fn handle_responses(
         .unwrap()
 }
 
+#[utoipa::path(get, path = "/v1/models", tag = "Models",
+    responses((status = 200, description = "List of available models")))]
 pub async fn handle_models(
     state: Arc<AppState>,
     _req: Request<Incoming>,
@@ -451,7 +456,7 @@ fn resolve_file_references(
 
 async fn generate_response(
     state: Arc<AppState>,
-    request: generated::CreateResponseBody,
+    request: responses_types::CreateResponseBody,
     input_value: Option<serde_json::Value>,
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
@@ -778,7 +783,7 @@ async fn generate_response(
 
 async fn stream_response(
     state: Arc<AppState>,
-    request: generated::CreateResponseBody,
+    request: responses_types::CreateResponseBody,
     input_value: Option<serde_json::Value>,
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
@@ -1697,7 +1702,7 @@ fn build_response_resource_value(
 }
 
 fn normalize_response_value(value: serde_json::Value) -> serde_json::Value {
-    match serde_json::from_value::<generated::ResponseResource>(value.clone()) {
+    match serde_json::from_value::<responses_types::ResponseResource>(value.clone()) {
         Ok(val) => serde_json::to_value(val).unwrap_or(value),
         Err(_) => value,
     }

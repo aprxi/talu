@@ -12,6 +12,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::Serialize;
+use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::{AppState, PluginTokenEntry};
@@ -22,8 +23,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 // Discovery endpoint: GET /v1/plugins
 // =============================================================================
 
-#[derive(Serialize)]
-struct PluginEntry {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PluginEntry {
     id: String,
     manifest: serde_json::Value,
     #[serde(rename = "entryUrl")]
@@ -31,11 +32,13 @@ struct PluginEntry {
     token: String,
 }
 
-#[derive(Serialize)]
-struct PluginListResponse {
+#[derive(Serialize, ToSchema)]
+pub(crate) struct PluginListResponse {
     data: Vec<PluginEntry>,
 }
 
+#[utoipa::path(get, path = "/v1/plugins", tag = "Plugins",
+    responses((status = 200, body = PluginListResponse)))]
 pub async fn handle_list(
     state: Arc<AppState>,
     _req: Request<Incoming>,

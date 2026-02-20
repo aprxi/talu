@@ -7,7 +7,9 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
+use serde::Serialize;
 use serde_json::json;
+use utoipa::ToSchema;
 
 use talu::responses::ResponsesView;
 use talu::storage::{SessionCursor, SessionUpdate, StorageError, StorageHandle};
@@ -16,6 +18,56 @@ use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+/// Documentation-only: shape returned by conversation list/get endpoints.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ConversationResponse {
+    pub id: String,
+    pub title: Option<String>,
+    pub model: Option<String>,
+    pub marker: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub tags: Vec<String>,
+    /// Conversation items (messages). Present on single-get, absent on list.
+    #[schema(value_type = Option<Vec<Object>>)]
+    pub items: Option<Vec<serde_json::Value>>,
+}
+
+/// Documentation-only: shape returned by GET /v1/conversations.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ConversationListResponse {
+    pub data: Vec<ConversationResponse>,
+    pub has_more: bool,
+    pub cursor: Option<String>,
+}
+
+/// Request body for PATCH /v1/conversations/:id.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ConversationPatchRequest {
+    pub title: Option<String>,
+    pub marker: Option<String>,
+    pub pinned: Option<bool>,
+}
+
+/// Request body for POST /v1/conversations/batch.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct BatchRequest {
+    pub action: String,
+    pub ids: Vec<String>,
+}
+
+/// Request body for POST /v1/conversations/:id/fork.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ForkRequest {
+    pub after_item: Option<u64>,
+}
+
+/// Request body for tag operations on conversations.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct TagsRequest {
+    pub tags: Vec<String>,
+}
 
 /// Open a StorageHandle from the app state, returning 503 if no bucket configured.
 ///
@@ -291,6 +343,16 @@ pub(crate) fn resolve_tags_for_session(
 // Handlers
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/v1/conversations", tag = "Conversations",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max items to return (default 50, max 100)"),
+        ("offset" = Option<usize>, Query, description = "Number of items to skip"),
+        ("group_id" = Option<String>, Query, description = "Filter by group ID"),
+        ("marker" = Option<String>, Query, description = "Filter by marker value"),
+        ("search" = Option<String>, Query, description = "Full-text search on titles"),
+        ("tags_any" = Option<String>, Query, description = "Comma-separated tag IDs (OR filter)"),
+    ),
+    responses((status = 200, body = ConversationListResponse)))]
 /// GET /v1/conversations — list sessions with offset-based pagination.
 pub async fn handle_list(
     state: Arc<AppState>,
@@ -404,6 +466,9 @@ pub async fn handle_list(
     json_response(StatusCode::OK, &payload)
 }
 
+#[utoipa::path(get, path = "/v1/conversations/{conversation_id}", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    responses((status = 200, body = ConversationResponse)))]
 /// GET /v1/conversations/{id} — retrieve full conversation.
 pub async fn handle_get(
     state: Arc<AppState>,
@@ -471,6 +536,9 @@ pub async fn handle_get(
     json_response(StatusCode::OK, &conversation)
 }
 
+#[utoipa::path(delete, path = "/v1/conversations/{conversation_id}", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    responses((status = 204)))]
 /// DELETE /v1/conversations/{id} — delete session (idempotent).
 pub async fn handle_delete(
     state: Arc<AppState>,
@@ -514,6 +582,10 @@ pub async fn handle_delete(
     }
 }
 
+#[utoipa::path(patch, path = "/v1/conversations/{conversation_id}", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    request_body = ConversationPatchRequest,
+    responses((status = 200, body = ConversationResponse)))]
 /// PATCH /v1/conversations/{id} — update session metadata.
 pub async fn handle_patch(
     state: Arc<AppState>,
@@ -598,6 +670,10 @@ pub async fn handle_patch(
     json_response(StatusCode::OK, &conversation)
 }
 
+#[utoipa::path(post, path = "/v1/conversations/{conversation_id}/fork", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    request_body = ForkRequest,
+    responses((status = 200, body = ConversationResponse)))]
 /// POST /v1/conversations/{id}/fork — fork conversation at item.
 pub async fn handle_fork(
     state: Arc<AppState>,
@@ -738,6 +814,9 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody
 // Conversation Tag Handlers
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(get, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    responses((status = 200)))]
 /// GET /v1/conversations/:id/tags - Get tags for a conversation
 pub async fn handle_get_tags(
     state: Arc<AppState>,
@@ -780,6 +859,10 @@ pub async fn handle_get_tags(
     json_response(StatusCode::OK, &json!({ "tags": tags }))
 }
 
+#[utoipa::path(post, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    request_body = TagsRequest,
+    responses((status = 200)))]
 /// POST /v1/conversations/:id/tags - Add tags to a conversation
 pub async fn handle_add_tags(
     state: Arc<AppState>,
@@ -872,6 +955,10 @@ pub async fn handle_add_tags(
     json_response(StatusCode::OK, &json!({ "tags": tags }))
 }
 
+#[utoipa::path(delete, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    request_body = TagsRequest,
+    responses((status = 200)))]
 /// DELETE /v1/conversations/:id/tags - Remove tags from a conversation
 pub async fn handle_remove_tags(
     state: Arc<AppState>,
@@ -938,6 +1025,10 @@ pub async fn handle_remove_tags(
     json_response(StatusCode::OK, &json!({ "tags": tags }))
 }
 
+#[utoipa::path(put, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
+    params(("conversation_id" = String, Path, description = "Conversation ID")),
+    request_body = TagsRequest,
+    responses((status = 200)))]
 /// PUT /v1/conversations/:id/tags - Replace all tags on a conversation
 pub async fn handle_set_tags(
     state: Arc<AppState>,
@@ -1053,6 +1144,9 @@ async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, String> {
 // Batch Operations Handler
 // ---------------------------------------------------------------------------
 
+#[utoipa::path(post, path = "/v1/conversations/batch", tag = "Conversations",
+    request_body = BatchRequest,
+    responses((status = 200)))]
 /// POST /v1/conversations/batch - Perform batch operations on conversations.
 ///
 /// Supported actions:

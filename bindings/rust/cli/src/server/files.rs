@@ -18,6 +18,7 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, StatusCode};
 use serde::Deserialize;
 use serde::Serialize;
+use utoipa::ToSchema;
 use talu::blobs::{BlobError, BlobsHandle};
 use talu::documents::{DocumentError, DocumentRecord, DocumentsHandle};
 use talu::file;
@@ -30,8 +31,8 @@ use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
-#[derive(Debug, Clone, Serialize)]
-struct FileObjectResponse {
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub(crate) struct FileObjectResponse {
     id: String,
     object: String,
     bytes: u64,
@@ -50,8 +51,8 @@ struct FileObjectResponse {
     marker: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct FileImageMetadata {
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub(crate) struct FileImageMetadata {
     format: String,
     width: u32,
     height: u32,
@@ -75,15 +76,15 @@ enum UploadError {
     Blob(BlobError),
 }
 
-#[derive(Debug, Serialize)]
-struct FileDeleteResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct FileDeleteResponse {
     id: String,
     object: String,
     deleted: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct FileListResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct FileListResponse {
     object: String,
     data: Vec<FileObjectResponse>,
     has_more: bool,
@@ -92,8 +93,8 @@ struct FileListResponse {
     total: usize,
 }
 
-#[derive(Debug, Deserialize)]
-struct FileBatchRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct FileBatchRequest {
     action: String,
     #[serde(default)]
     ids: Vec<String>,
@@ -139,7 +140,23 @@ enum ContentRangeRequest {
     Partial { start: u64, end: u64 },
 }
 
+/// Documentation-only schema for multipart file uploads.
+#[derive(ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct FileUploadForm {
+    /// The file binary data.
+    #[schema(format = Binary)]
+    file: Vec<u8>,
+    /// Upload purpose (defaults to "assistants").
+    purpose: Option<String>,
+    /// Override filename (defaults to multipart filename).
+    filename: Option<String>,
+}
+
 /// POST /v1/files - Upload a file as blob + metadata document.
+#[utoipa::path(post, path = "/v1/files", tag = "Files",
+    request_body(content_type = "multipart/form-data", content = inline(FileUploadForm)),
+    responses((status = 200, body = FileObjectResponse)))]
 pub async fn handle_upload(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -340,6 +357,17 @@ pub async fn handle_upload(
 }
 
 /// GET /v1/files - List file metadata entries.
+#[utoipa::path(get, path = "/v1/files", tag = "Files",
+    params(
+        ("limit" = Option<usize>, Query, description = "Max items to return (default 100, max 1000)"),
+        ("offset" = Option<usize>, Query, description = "Number of items to skip"),
+        ("cursor" = Option<String>, Query, description = "Pagination cursor (overrides offset)"),
+        ("marker" = Option<String>, Query, description = "Filter by marker (default \"active\")"),
+        ("sort" = Option<String>, Query, description = "Sort field: date | name (default \"date\")"),
+        ("order" = Option<String>, Query, description = "Sort order: asc | desc (default \"desc\")"),
+        ("search" = Option<String>, Query, description = "Filter by filename substring"),
+    ),
+    responses((status = 200, body = FileListResponse)))]
 pub async fn handle_list(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -464,6 +492,9 @@ pub async fn handle_list(
 }
 
 /// GET /v1/files/:id - Return file metadata.
+#[utoipa::path(get, path = "/v1/files/{file_id}", tag = "Files",
+    params(("file_id" = String, Path, description = "File ID")),
+    responses((status = 200, body = FileObjectResponse)))]
 pub async fn handle_get(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -495,6 +526,9 @@ pub async fn handle_get(
 }
 
 /// GET /v1/files/:id/content - Return raw file bytes.
+#[utoipa::path(get, path = "/v1/files/{file_id}/content", tag = "Files",
+    params(("file_id" = String, Path, description = "File ID")),
+    responses((status = 200, description = "File content bytes")))]
 pub async fn handle_get_content(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -621,6 +655,9 @@ pub async fn handle_get_content(
 /// Used by the UI to display images from stored conversations where the
 /// `image_url` field contains a `file://` blob path.  The UI extracts the
 /// 64-char hex hash and fetches `/v1/blobs/{hash}`.
+#[utoipa::path(get, path = "/v1/blobs/{blob_ref}", tag = "Files",
+    params(("blob_ref" = String, Path, description = "Blob reference")),
+    responses((status = 200, description = "Raw blob bytes")))]
 pub async fn handle_get_blob(
     state: Arc<AppState>,
     _req: Request<Incoming>,
@@ -699,6 +736,9 @@ pub async fn handle_get_blob(
 }
 
 /// DELETE /v1/files/:id - Delete file metadata (blob retained for CAS/GC lifecycle).
+#[utoipa::path(delete, path = "/v1/files/{file_id}", tag = "Files",
+    params(("file_id" = String, Path, description = "File ID")),
+    responses((status = 200, body = FileDeleteResponse)))]
 pub async fn handle_delete(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -938,8 +978,8 @@ fn image_format_str(f: file::ImageFormat) -> String {
 // PATCH handler
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
-struct FilePatchRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct FilePatchRequest {
     #[serde(default)]
     filename: Option<String>,
     #[serde(default)]
@@ -947,6 +987,10 @@ struct FilePatchRequest {
 }
 
 /// PATCH /v1/files/:id - Rename a file (update metadata).
+#[utoipa::path(patch, path = "/v1/files/{file_id}", tag = "Files",
+    params(("file_id" = String, Path, description = "File ID")),
+    request_body = FilePatchRequest,
+    responses((status = 200, body = FileObjectResponse)))]
 pub async fn handle_patch(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1155,6 +1199,9 @@ fn encode_file_cursor(created_at_ms: i64, file_id: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// POST /v1/files/batch - Batch operations on files (delete, archive, unarchive).
+#[utoipa::path(post, path = "/v1/files/batch", tag = "Files",
+    request_body = FileBatchRequest,
+    responses((status = 200)))]
 pub async fn handle_batch(
     state: Arc<AppState>,
     req: Request<Incoming>,

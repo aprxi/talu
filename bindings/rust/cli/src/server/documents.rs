@@ -9,6 +9,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
+use utoipa::ToSchema;
 use talu::documents::{
     DocumentError, DocumentRecord, DocumentSummary, DocumentsHandle, SearchResult,
 };
@@ -22,8 +23,8 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infalli
 // Request/Response types
 // =============================================================================
 
-#[derive(Debug, Serialize)]
-struct DocumentResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DocumentResponse {
     id: String,
     #[serde(rename = "type")]
     doc_type: String,
@@ -74,8 +75,8 @@ impl From<DocumentRecord> for DocumentResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct DocumentSummaryResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DocumentSummaryResponse {
     id: String,
     #[serde(rename = "type")]
     doc_type: String,
@@ -99,14 +100,14 @@ impl From<DocumentSummary> for DocumentSummaryResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct DocumentListResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DocumentListResponse {
     data: Vec<DocumentSummaryResponse>,
     has_more: bool,
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResultResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct SearchResultResponse {
     id: String,
     #[serde(rename = "type")]
     doc_type: String,
@@ -125,13 +126,13 @@ impl From<SearchResult> for SearchResultResponse {
     }
 }
 
-#[derive(Debug, Serialize)]
-struct SearchResponse {
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct DocumentSearchResponse {
     data: Vec<SearchResultResponse>,
 }
 
-#[derive(Debug, Deserialize)]
-struct CreateDocumentRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CreateDocumentRequest {
     #[serde(default)]
     id: Option<String>,
     #[serde(rename = "type")]
@@ -154,8 +155,8 @@ struct CreateDocumentRequest {
     ttl_seconds: Option<u64>,
 }
 
-#[derive(Debug, Deserialize)]
-struct UpdateDocumentRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct UpdateDocumentRequest {
     #[serde(default)]
     title: Option<String>,
     #[serde(default)]
@@ -166,8 +167,8 @@ struct UpdateDocumentRequest {
     marker: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct SearchRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct DocumentSearchRequest {
     query: String,
     #[serde(default)]
     limit: Option<u32>,
@@ -175,8 +176,8 @@ struct SearchRequest {
     doc_type: Option<String>,
 }
 
-#[derive(Debug, Deserialize)]
-struct TagsRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct DocumentTagsRequest {
     tags: Vec<String>,
 }
 
@@ -184,6 +185,15 @@ struct TagsRequest {
 // Handlers
 // =============================================================================
 
+#[utoipa::path(get, path = "/v1/documents", tag = "Documents",
+    params(
+        ("limit" = Option<u32>, Query, description = "Max items to return (default 100)"),
+        ("type" = Option<String>, Query, description = "Filter by document type"),
+        ("marker" = Option<String>, Query, description = "Filter by marker value"),
+        ("group_id" = Option<String>, Query, description = "Filter by group ID"),
+        ("owner_id" = Option<String>, Query, description = "Filter by owner ID"),
+    ),
+    responses((status = 200, body = DocumentListResponse)))]
 /// GET /v1/documents - List documents
 pub async fn handle_list(
     state: Arc<AppState>,
@@ -261,6 +271,9 @@ pub async fn handle_list(
     json_response(StatusCode::OK, &response)
 }
 
+#[utoipa::path(get, path = "/v1/documents/{doc_id}", tag = "Documents",
+    params(("doc_id" = String, Path, description = "Document ID")),
+    responses((status = 200, body = DocumentResponse)))]
 /// GET /v1/documents/:id - Get a document
 pub async fn handle_get(
     state: Arc<AppState>,
@@ -306,6 +319,9 @@ pub async fn handle_get(
     json_response(StatusCode::OK, &DocumentResponse::from(doc))
 }
 
+#[utoipa::path(post, path = "/v1/documents", tag = "Documents",
+    request_body = CreateDocumentRequest,
+    responses((status = 201, body = DocumentResponse)))]
 /// POST /v1/documents - Create a document
 pub async fn handle_create(
     state: Arc<AppState>,
@@ -413,6 +429,10 @@ pub async fn handle_create(
     json_response(StatusCode::CREATED, &DocumentResponse::from(doc))
 }
 
+#[utoipa::path(patch, path = "/v1/documents/{doc_id}", tag = "Documents",
+    params(("doc_id" = String, Path, description = "Document ID")),
+    request_body = UpdateDocumentRequest,
+    responses((status = 200, body = DocumentResponse)))]
 /// PATCH /v1/documents/:id - Update a document
 pub async fn handle_update(
     state: Arc<AppState>,
@@ -481,6 +501,9 @@ pub async fn handle_update(
     json_response(StatusCode::OK, &DocumentResponse::from(doc))
 }
 
+#[utoipa::path(delete, path = "/v1/documents/{doc_id}", tag = "Documents",
+    params(("doc_id" = String, Path, description = "Document ID")),
+    responses((status = 204)))]
 /// DELETE /v1/documents/:id - Delete a document
 pub async fn handle_delete(
     state: Arc<AppState>,
@@ -521,6 +544,9 @@ pub async fn handle_delete(
         .unwrap()
 }
 
+#[utoipa::path(post, path = "/v1/documents/search", tag = "Documents",
+    request_body = DocumentSearchRequest,
+    responses((status = 200, body = DocumentSearchResponse)))]
 /// POST /v1/documents/search - Search documents
 pub async fn handle_search(
     state: Arc<AppState>,
@@ -543,7 +569,7 @@ pub async fn handle_search(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_body", &e),
     };
 
-    let search_req: SearchRequest = match serde_json::from_slice(&body) {
+    let search_req: DocumentSearchRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
     };
@@ -564,7 +590,7 @@ pub async fn handle_search(
         Err(e) => return document_error_response(e),
     };
 
-    let response = SearchResponse {
+    let response = DocumentSearchResponse {
         data: results
             .into_iter()
             .map(SearchResultResponse::from)
@@ -574,6 +600,9 @@ pub async fn handle_search(
     json_response(StatusCode::OK, &response)
 }
 
+#[utoipa::path(get, path = "/v1/documents/{doc_id}/tags", tag = "Documents",
+    params(("doc_id" = String, Path, description = "Document ID")),
+    responses((status = 200)))]
 /// GET /v1/documents/:id/tags - Get document tags
 pub async fn handle_get_tags(
     state: Arc<AppState>,
@@ -612,6 +641,10 @@ pub async fn handle_get_tags(
     json_response(StatusCode::OK, &serde_json::json!({ "tags": tags }))
 }
 
+#[utoipa::path(post, path = "/v1/documents/{doc_id}/tags", tag = "Documents",
+    params(("doc_id" = String, Path, description = "Document ID")),
+    request_body = DocumentTagsRequest,
+    responses((status = 200)))]
 /// POST /v1/documents/:id/tags - Add tags to document
 pub async fn handle_add_tags(
     state: Arc<AppState>,
@@ -637,7 +670,7 @@ pub async fn handle_add_tags(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_body", &e),
     };
 
-    let tags_req: TagsRequest = match serde_json::from_slice(&body) {
+    let tags_req: DocumentTagsRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
     };
@@ -669,6 +702,10 @@ pub async fn handle_add_tags(
     json_response(StatusCode::OK, &serde_json::json!({ "tags": tags }))
 }
 
+#[utoipa::path(delete, path = "/v1/documents/{doc_id}/tags", tag = "Documents",
+    params(("doc_id" = String, Path, description = "Document ID")),
+    request_body = DocumentTagsRequest,
+    responses((status = 200)))]
 /// DELETE /v1/documents/:id/tags - Remove tags from document
 pub async fn handle_remove_tags(
     state: Arc<AppState>,
@@ -694,7 +731,7 @@ pub async fn handle_remove_tags(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_body", &e),
     };
 
-    let tags_req: TagsRequest = match serde_json::from_slice(&body) {
+    let tags_req: DocumentTagsRequest = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
     };
