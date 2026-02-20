@@ -3,7 +3,8 @@
 //! All handler paths and schema types are registered in `ApiDoc`.
 //! `build_openapi_json()` produces the JSON spec served at `/openapi.json`.
 
-use utoipa::OpenApi;
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 
 use crate::server::{
     conversations, documents, file, files, handlers, http, plugins, proxy, responses_types, search,
@@ -16,6 +17,23 @@ use crate::server::{
         title = "Talu API",
         version = env!("TALU_VERSION"),
         description = "Local-first LLM inference and knowledge management API"
+    ),
+    tags(
+        (name = "Responses", description = "LLM inference (chat completions)"),
+        (name = "Models", description = "Available model listing"),
+        (name = "Conversations", description = "Chat session management"),
+        (name = "Documents", description = "Structured document storage"),
+        (name = "Files", description = "Binary file upload and management"),
+        (name = "File", description = "Stateless file inspect/transform"),
+        (name = "Tags", description = "Tag CRUD and assignment"),
+        (name = "Search", description = "Full-text and vector search"),
+        (name = "Settings", description = "Server and model configuration"),
+        (name = "Plugins", description = "Plugin discovery"),
+        (name = "Proxy", description = "Plugin outbound HTTP proxy"),
+    ),
+    security(
+        ("gateway_secret" = []),
+        ("tenant_id" = []),
     ),
     paths(
         // Models + Responses
@@ -87,10 +105,12 @@ use crate::server::{
         tags::UpdateTagRequest,
         // Settings
         settings::SettingsResponse,
+        settings::SettingsPatchRequest,
         settings::ModelEntry,
         settings::ModelDefaults,
         settings::OverridesJson,
         // Conversations (doc-only)
+        conversations::ConversationTag,
         conversations::ConversationResponse,
         conversations::ConversationListResponse,
         conversations::ConversationPatchRequest,
@@ -132,6 +152,24 @@ use crate::server::{
 )]
 pub struct ApiDoc;
 
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        let components = openapi.components.as_mut().unwrap();
+        components.add_security_scheme(
+            "gateway_secret",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("x-talu-gateway-secret"))),
+        );
+        components.add_security_scheme(
+            "tenant_id",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("x-talu-tenant-id"))),
+        );
+    }
+}
+
 pub fn build_openapi_json() -> Vec<u8> {
-    serde_json::to_vec_pretty(&ApiDoc::openapi()).unwrap()
+    let mut doc = ApiDoc::openapi();
+    SecurityAddon.modify(&mut doc);
+    serde_json::to_vec_pretty(&doc).unwrap()
 }

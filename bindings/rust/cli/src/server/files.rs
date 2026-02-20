@@ -27,6 +27,7 @@ use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::server::auth_gateway::AuthContext;
+use crate::server::http;
 use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
@@ -156,7 +157,11 @@ pub(crate) struct FileUploadForm {
 /// POST /v1/files - Upload a file as blob + metadata document.
 #[utoipa::path(post, path = "/v1/files", tag = "Files",
     request_body(content_type = "multipart/form-data", content = inline(FileUploadForm)),
-    responses((status = 200, body = FileObjectResponse)))]
+    responses(
+        (status = 200, body = FileObjectResponse),
+        (status = 400, body = http::ErrorResponse, description = "Invalid multipart upload"),
+        (status = 413, body = http::ErrorResponse, description = "Payload too large"),
+    ))]
 pub async fn handle_upload(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -494,7 +499,10 @@ pub async fn handle_list(
 /// GET /v1/files/:id - Return file metadata.
 #[utoipa::path(get, path = "/v1/files/{file_id}", tag = "Files",
     params(("file_id" = String, Path, description = "File ID")),
-    responses((status = 200, body = FileObjectResponse)))]
+    responses(
+        (status = 200, body = FileObjectResponse),
+        (status = 404, body = http::ErrorResponse, description = "File not found"),
+    ))]
 pub async fn handle_get(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -738,7 +746,10 @@ pub async fn handle_get_blob(
 /// DELETE /v1/files/:id - Delete file metadata (blob retained for CAS/GC lifecycle).
 #[utoipa::path(delete, path = "/v1/files/{file_id}", tag = "Files",
     params(("file_id" = String, Path, description = "File ID")),
-    responses((status = 200, body = FileDeleteResponse)))]
+    responses(
+        (status = 200, body = FileDeleteResponse),
+        (status = 404, body = http::ErrorResponse, description = "File not found"),
+    ))]
 pub async fn handle_delete(
     state: Arc<AppState>,
     req: Request<Incoming>,

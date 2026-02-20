@@ -15,6 +15,7 @@ use talu::documents::{
 };
 
 use crate::server::auth_gateway::AuthContext;
+use crate::server::http;
 use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
@@ -273,7 +274,10 @@ pub async fn handle_list(
 
 #[utoipa::path(get, path = "/v1/documents/{doc_id}", tag = "Documents",
     params(("doc_id" = String, Path, description = "Document ID")),
-    responses((status = 200, body = DocumentResponse)))]
+    responses(
+        (status = 200, body = DocumentResponse),
+        (status = 404, body = http::ErrorResponse, description = "Document not found"),
+    ))]
 /// GET /v1/documents/:id - Get a document
 pub async fn handle_get(
     state: Arc<AppState>,
@@ -321,7 +325,10 @@ pub async fn handle_get(
 
 #[utoipa::path(post, path = "/v1/documents", tag = "Documents",
     request_body = CreateDocumentRequest,
-    responses((status = 201, body = DocumentResponse)))]
+    responses(
+        (status = 201, body = DocumentResponse),
+        (status = 400, body = http::ErrorResponse, description = "Invalid request body"),
+    ))]
 /// POST /v1/documents - Create a document
 pub async fn handle_create(
     state: Arc<AppState>,

@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 use crate::bucket_settings;
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
+use crate::server::http;
 use crate::server::responses_types;
 use crate::server::state::{AppState, StoredResponse};
 use talu::documents::{DocumentError, DocumentsHandle};
@@ -82,7 +83,11 @@ impl From<anyhow::Error> for ResponseError {
 
 #[utoipa::path(post, path = "/v1/responses", tag = "Responses",
     request_body = responses_types::CreateResponseBody,
-    responses((status = 200, body = responses_types::ResponseResource)))]
+    responses(
+        (status = 200, body = responses_types::ResponseResource),
+        (status = 400, body = http::ErrorResponse, description = "Invalid request"),
+        (status = 500, body = http::ErrorResponse, description = "Generation failed"),
+    ))]
 pub async fn handle_responses(
     state: Arc<AppState>,
     req: Request<Incoming>,

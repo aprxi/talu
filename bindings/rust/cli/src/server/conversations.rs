@@ -15,9 +15,18 @@ use talu::responses::ResponsesView;
 use talu::storage::{SessionCursor, SessionUpdate, StorageError, StorageHandle};
 
 use crate::server::auth_gateway::AuthContext;
+use crate::server::http;
 use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+/// Tag object embedded in conversation responses.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct ConversationTag {
+    pub id: String,
+    pub name: String,
+    pub color: Option<String>,
+}
 
 /// Documentation-only: shape returned by conversation list/get endpoints.
 #[derive(Serialize, ToSchema)]
@@ -28,7 +37,7 @@ pub(crate) struct ConversationResponse {
     pub marker: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub tags: Vec<String>,
+    pub tags: Vec<ConversationTag>,
     /// Conversation items (messages). Present on single-get, absent on list.
     #[schema(value_type = Option<Vec<Object>>)]
     pub items: Option<Vec<serde_json::Value>>,
@@ -37,9 +46,11 @@ pub(crate) struct ConversationResponse {
 /// Documentation-only: shape returned by GET /v1/conversations.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ConversationListResponse {
+    pub object: String,
     pub data: Vec<ConversationResponse>,
     pub has_more: bool,
     pub cursor: Option<String>,
+    pub total: usize,
 }
 
 /// Request body for PATCH /v1/conversations/:id.
@@ -468,7 +479,10 @@ pub async fn handle_list(
 
 #[utoipa::path(get, path = "/v1/conversations/{conversation_id}", tag = "Conversations",
     params(("conversation_id" = String, Path, description = "Conversation ID")),
-    responses((status = 200, body = ConversationResponse)))]
+    responses(
+        (status = 200, body = ConversationResponse),
+        (status = 404, body = http::ErrorResponse, description = "Conversation not found"),
+    ))]
 /// GET /v1/conversations/{id} — retrieve full conversation.
 pub async fn handle_get(
     state: Arc<AppState>,

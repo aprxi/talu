@@ -68,12 +68,24 @@ pub async fn handle_get(
     json_response(StatusCode::OK, &payload)
 }
 
+/// Request body for PATCH /v1/settings.
+#[derive(Serialize, ToSchema)]
+#[allow(dead_code)]
+pub(crate) struct SettingsPatchRequest {
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub max_output_tokens: Option<u32>,
+    pub context_length: Option<u32>,
+    pub model_overrides: Option<OverridesJson>,
+}
+
 /// PATCH /v1/settings — merge partial update into bucket settings.
 ///
 /// Accepts top-level `model`, `system_prompt`, and per-model generation
 /// overrides under `model_overrides: { temperature, top_p, top_k, … }`.
 /// The overrides are stored under `[models."<active-model>"]` in the TOML.
 #[utoipa::path(patch, path = "/v1/settings", tag = "Settings",
+    request_body = SettingsPatchRequest,
     responses((status = 200, body = SettingsResponse)))]
 pub async fn handle_patch(
     state: Arc<AppState>,

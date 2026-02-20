@@ -245,12 +245,12 @@ pub(crate) struct FileTransformForm {
     file: Vec<u8>,
     /// Target format (e.g. "jpeg", "png", "webp").
     format: Option<String>,
-    /// Target width in pixels.
-    width: Option<u32>,
-    /// Target height in pixels.
-    height: Option<u32>,
+    /// Resize dimensions as "WxH" (e.g. "1024x1024").
+    resize: Option<String>,
     /// Fit mode: "cover", "contain", "fill", "inside", "outside".
     fit: Option<String>,
+    /// Output quality (1-100).
+    quality: Option<u8>,
 }
 
 #[utoipa::path(post, path = "/v1/file/transform", tag = "File",

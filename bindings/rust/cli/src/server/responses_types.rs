@@ -9,6 +9,8 @@ use utoipa::ToSchema;
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct CreateResponseBody {
     pub model: Option<String>,
+    /// The prompt. Can be a plain string or an array of structured messages.
+    #[schema(example = "What is the capital of France?")]
     pub input: serde_json::Value,
     pub stream: Option<bool>,
     pub store: Option<bool>,
@@ -20,6 +22,10 @@ pub struct CreateResponseBody {
     pub max_output_tokens: Option<i64>,
     pub temperature: Option<f64>,
     pub top_p: Option<f64>,
+    pub top_k: Option<u32>,
+    pub min_p: Option<f64>,
+    pub repetition_penalty: Option<f64>,
+    pub seed: Option<u32>,
 }
 
 /// Canonical response shape for POST /v1/responses (non-streaming).
