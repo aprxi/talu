@@ -89,7 +89,7 @@ pub const inference_config_generation = @import("inference/config/generation_con
 // converter (top-level, not in io/)
 pub const converter = @import("converter/root.zig");
 
-// graph (compute graph types and registry)
+// model metadata/types (legacy test path name retained)
 pub const graph = @import("graph/root.zig");
 pub const graph_loaded_model = @import("graph/loaded_model_test.zig");
 pub const graph_loader = @import("graph/loader/root.zig");

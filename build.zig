@@ -592,18 +592,37 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
 
+    // Build integration tests against a separate copy of core/src/lib.zig.
+    // Keep integration on CPU-only to avoid MLX/Metal runtime coupling and
+    // ensure deterministic behavior across host GPU setups.
+    const integration_build_options = b.addOptions();
+    integration_build_options.addOption(bool, "enable_metal", false);
+    integration_build_options.addOption(bool, "debug_matmul", debug_matmul);
+    integration_build_options.addOption(bool, "dump_tensors", dump_tensors);
+    integration_build_options.addOption([]const u8, "version", version);
+
+    const integration_main_mod = b.createModule(.{
+        .root_source_file = b.path("core/src/lib.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    integration_main_mod.addOptions("build_options", integration_build_options);
+    addCDependencies(b, integration_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp);
+
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("core/tests/root.zig"),
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "main", .module = test_mod },
+            .{ .name = "main", .module = integration_main_mod },
         },
     });
 
     const integration_tests = b.addTest(.{
         .root_module = integration_test_mod,
     });
+    linkCDependencies(b, integration_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, false);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run integration tests");

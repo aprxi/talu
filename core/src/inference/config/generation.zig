@@ -65,7 +65,8 @@ fn loadDirectoryGenerationConfig(allocator: std.mem.Allocator, model_dir: []cons
 
     const config_bytes = std.fs.cwd().readFileAlloc(allocator, config_path, 4 * 1024 * 1024) catch |err| {
         if (err == error.FileNotFound or err == error.NotDir) {
-            log.warn("load", "No generation_config.json found, using neutral defaults", .{});
+            // generation_config.json is optional; missing file is a normal path.
+            log.info("load", "No generation_config.json found, using neutral defaults", .{});
             var gen_config = GenerationConfig{};
             // Fall back to config.json for special token ids (some models omit from generation_config)
             try fillTokenIdsFromModelConfig(allocator, model_dir, &gen_config);

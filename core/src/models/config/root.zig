@@ -6,7 +6,7 @@
 const std = @import("std");
 const json = @import("../../io/json/root.zig");
 const tensor = @import("../../tensor.zig");
-const graph_types = @import("../types.zig");
+const model_types = @import("../op_types.zig");
 
 const ModelConfig = tensor.ModelConfig;
 
@@ -270,7 +270,7 @@ pub fn readModelType(allocator: std.mem.Allocator, path: []const u8) !?[]const u
     const root_obj = raw_parsed.value.object;
 
     // Prefer root-level model_type. This is the primary architecture identifier
-    // for model bundles and conversion graphs.
+    // for model bundles and conversion.
     if (root_obj.get("model_type")) |v| {
         return switch (v) {
             .string => |s| try allocator.dupe(u8, s),
@@ -331,12 +331,12 @@ pub fn readArchitectureName(allocator: std.mem.Allocator, path: []const u8) !?[]
 /// This allows different model sizes of the same architecture to have different
 /// layer arrangements. Matching order: exact variant name match first, then
 /// alias match. Aliases handle models that use different strings for the same
-/// variant (e.g., "conv" in config matching "shortconv" in the graph).
+/// variant (e.g., "conv" in config matching "shortconv" in static model metadata).
 pub fn parseLayerTypes(
     allocator: std.mem.Allocator,
     config_path: []const u8,
     variant_names: []const []const u8,
-    variant_aliases: ?[]const graph_types.VariantAlias,
+    variant_aliases: ?[]const model_types.VariantAlias,
 ) !?[]const u8 {
     const config_bytes = std.fs.cwd().readFileAlloc(allocator, config_path, 256 * 1024) catch return null;
     defer allocator.free(config_bytes);
@@ -536,9 +536,9 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
     else
         false;
 
-    // Model architecture is now driven by the graph registry.
+    // Model architecture is now driven by the static models registry.
     // loadConfig doesn't detect architecture - that's done by detectModelKind in loader.
-    // We always use .custom here; the actual architecture comes from the graph registry.
+    // We always use .custom here; the actual architecture comes from models metadata.
     _ = config_json.model_type; // Acknowledged but not used for arch detection
 
     // Calculate rope_dim from head_dim and partial_rotary_factor
@@ -612,7 +612,7 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         .attention_bias = config_json.attention_bias orelse false,
         .quant_method = quant_method_kind,
         .rope_scaling = rope_scaling_params,
-        // Model arch is always .custom - actual architecture comes from graph registry.
+        // Model arch is always .custom - actual architecture comes from models metadata.
         .model_arch = .custom,
         .use_gelu = use_gelu_activation,
         .use_qk_norm = config_json.use_qk_norm orelse false,

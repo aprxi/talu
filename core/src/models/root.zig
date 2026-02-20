@@ -11,7 +11,7 @@ pub const contract = @import("contract.zig");
 pub const registry = @import("registry.zig");
 pub const layer_ops = @import("layer_ops.zig");
 pub const op_types = @import("op_types.zig");
-pub const config = @import("../graph/config/root.zig");
+pub const config = @import("config/root.zig");
 
 pub const common = struct {
     pub const types = @import("common/types.zig");

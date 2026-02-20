@@ -159,16 +159,6 @@ comptime {
     _ = &capi.talu_describe;
     _ = &capi.talu_model_info_free;
 
-    // Architecture API
-    _ = &capi.talu_arch_init;
-    _ = &capi.talu_arch_deinit;
-    _ = &capi.talu_arch_register;
-    _ = &capi.talu_arch_exists;
-    _ = &capi.talu_arch_count;
-    _ = &capi.talu_arch_list;
-    _ = &capi.talu_arch_free_string;
-    _ = &capi.talu_arch_detect;
-
     // Convert API
     _ = &capi.talu_convert;
     _ = &capi.talu_convert_free_string;

@@ -25,8 +25,9 @@ test "LocalEngine is exported from router" {
 test "LocalEngine has expected fields" {
     const fields = @typeInfo(LocalEngine).@"struct".fields;
 
-    // Should have allocator, loaded, tok, samp, backend, gen_config, model_path
-    try std.testing.expectEqual(@as(usize, 7), fields.len);
+    // Should have allocator, loaded, tok, samp, backend, gen_config,
+    // preproc_config, model_path.
+    try std.testing.expectEqual(@as(usize, 8), fields.len);
 
     var has_allocator = false;
     var has_loaded = false;
@@ -34,6 +35,7 @@ test "LocalEngine has expected fields" {
     var has_samp = false;
     var has_backend = false;
     var has_gen_config = false;
+    var has_preproc_config = false;
     var has_model_path = false;
 
     inline for (fields) |field| {
@@ -43,6 +45,7 @@ test "LocalEngine has expected fields" {
         if (comptime std.mem.eql(u8, field.name, "samp")) has_samp = true;
         if (comptime std.mem.eql(u8, field.name, "backend")) has_backend = true;
         if (comptime std.mem.eql(u8, field.name, "gen_config")) has_gen_config = true;
+        if (comptime std.mem.eql(u8, field.name, "preproc_config")) has_preproc_config = true;
         if (comptime std.mem.eql(u8, field.name, "model_path")) has_model_path = true;
     }
 
@@ -52,6 +55,7 @@ test "LocalEngine has expected fields" {
     try std.testing.expect(has_samp);
     try std.testing.expect(has_backend);
     try std.testing.expect(has_gen_config);
+    try std.testing.expect(has_preproc_config);
     try std.testing.expect(has_model_path);
 }
 

@@ -1,20 +1,20 @@
-//! Generic graph-driven weight loader.
+//! Generic architecture-driven weight loader.
 //!
-//! Loads tensors using weight specifications from graph metadata and
+//! Loads tensors using weight specifications from static model metadata and
 //! applies transforms/layout handling without model-specific hardcoding.
 
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const st_loader = @import("../../io/safetensors/root.zig");
-const graph_types = @import("../types.zig");
+const model_types = @import("../op_types.zig");
 const transforms = @import("transforms.zig");
 const inference_mod = @import("../../inference/root.zig");
 const log = @import("../../log.zig");
 
 const Tensor = tensor.Tensor;
 const Allocator = std.mem.Allocator;
-const WeightSpec = graph_types.WeightSpec;
-const WeightTransform = graph_types.WeightTransform;
+const WeightSpec = model_types.WeightSpec;
+const WeightTransform = model_types.WeightTransform;
 const WeightMap = inference_mod.backend.block_kernels.WeightMap;
 
 pub const LoadOptions = struct {

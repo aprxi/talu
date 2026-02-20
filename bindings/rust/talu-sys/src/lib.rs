@@ -434,29 +434,31 @@ impl From<u32> for Platform {
 // Structures
 // =============================================================================
 
-/// Source: core/src/capi/documents.zig
+/// Source: core/src/capi/db.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CCompactionStats {
-    pub total_documents: usize,
-    pub active_documents: usize,
-    pub expired_documents: usize,
-    pub deleted_documents: usize,
-    pub tombstone_count: usize,
-    pub delta_versions: usize,
-    pub estimated_garbage_bytes: u64,
+pub struct CTagRecord {
+    pub tag_id: *const c_char,
+    pub name: *const c_char,
+    pub color: *const c_char,
+    pub description: *const c_char,
+    pub group_id: *const c_char,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub _reserved: [u8; 8],
 }
 
-impl Default for CCompactionStats {
+impl Default for CTagRecord {
     fn default() -> Self {
         Self {
-            total_documents: 0,
-            active_documents: 0,
-            expired_documents: 0,
-            deleted_documents: 0,
-            tombstone_count: 0,
-            delta_versions: 0,
-            estimated_garbage_bytes: 0,
+            tag_id: std::ptr::null(),
+            name: std::ptr::null(),
+            color: std::ptr::null(),
+            description: std::ptr::null(),
+            group_id: std::ptr::null(),
+            created_at_ms: 0,
+            updated_at_ms: 0,
+            _reserved: [0; 8],
         }
     }
 }
@@ -701,6 +703,35 @@ impl Default for TokenizeBytesResult {
 /// Source: core/src/capi/file.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
+pub struct TaluModelBuffer {
+    pub data: *const u8,
+    pub len: usize,
+    pub width: u32,
+    pub height: u32,
+    pub channels: u8,
+    pub layout: c_int,
+    pub dtype: c_int,
+    pub _reserved: [u8; 6],
+}
+
+impl Default for TaluModelBuffer {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null(),
+            len: 0,
+            width: 0,
+            height: 0,
+            channels: 0,
+            layout: 0,
+            dtype: 0,
+            _reserved: [0; 6],
+        }
+    }
+}
+
+/// Source: core/src/capi/file.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
 pub struct TaluModelInputSpec {
     pub width: u32,
     pub height: u32,
@@ -737,35 +768,6 @@ impl Default for TaluModelInputSpec {
             max_dimension: 0,
             max_pixels: 0,
             max_output_bytes: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/file.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TaluModelBuffer {
-    pub data: *const u8,
-    pub len: usize,
-    pub width: u32,
-    pub height: u32,
-    pub channels: u8,
-    pub layout: c_int,
-    pub dtype: c_int,
-    pub _reserved: [u8; 6],
-}
-
-impl Default for TaluModelBuffer {
-    fn default() -> Self {
-        Self {
-            data: std::ptr::null(),
-            len: 0,
-            width: 0,
-            height: 0,
-            channels: 0,
-            layout: 0,
-            dtype: 0,
-            _reserved: [0; 6],
         }
     }
 }
@@ -952,6 +954,48 @@ impl Default for TensorStats {
     }
 }
 
+/// Source: core/src/capi/tokenizer.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EosTokenResult {
+    pub tokens: *const u32,
+    pub num_tokens: usize,
+}
+
+impl Default for EosTokenResult {
+    fn default() -> Self {
+        Self {
+            tokens: std::ptr::null(),
+            num_tokens: 0,
+        }
+    }
+}
+
+/// Source: core/src/capi/tokenizer.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct EncodeOptions {
+    pub add_bos: u8,
+    pub add_eos: u8,
+    pub truncation: u8,
+    pub truncation_side: u8,
+    pub _padding: [u8; 4],
+    pub max_length: usize,
+}
+
+impl Default for EncodeOptions {
+    fn default() -> Self {
+        Self {
+            add_bos: 0,
+            add_eos: 0,
+            truncation: 0,
+            truncation_side: 0,
+            _padding: [0; 4],
+            max_length: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/converter.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1001,48 +1045,6 @@ impl Default for ModelInfo {
             num_experts: 0,
             experts_per_token: 0,
             error_msg: std::ptr::null(),
-        }
-    }
-}
-
-/// Source: core/src/capi/tokenizer.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EncodeOptions {
-    pub add_bos: u8,
-    pub add_eos: u8,
-    pub truncation: u8,
-    pub truncation_side: u8,
-    pub _padding: [u8; 4],
-    pub max_length: usize,
-}
-
-impl Default for EncodeOptions {
-    fn default() -> Self {
-        Self {
-            add_bos: 0,
-            add_eos: 0,
-            truncation: 0,
-            truncation_side: 0,
-            _padding: [0; 4],
-            max_length: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/tokenizer.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct EosTokenResult {
-    pub tokens: *const u32,
-    pub num_tokens: usize,
-}
-
-impl Default for EosTokenResult {
-    fn default() -> Self {
-        Self {
-            tokens: std::ptr::null(),
-            num_tokens: 0,
         }
     }
 }
@@ -1322,65 +1324,23 @@ impl Default for OpenAICompatibleConfig {
     }
 }
 
-/// Source: core/src/capi/db.zig
+/// Source: core/src/capi/documents.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CStorageRecord {
-    pub item_id: u64,
-    pub session_id: *const c_char,
-    pub item_type: u8,
-    pub role: u8,
-    pub status: u8,
-    pub hidden: bool,
-    pub pinned: bool,
-    pub json_valid: bool,
-    pub schema_valid: bool,
-    pub repaired: bool,
-    pub parent_item_id: u64,
-    pub has_parent: bool,
-    pub origin_item_id: u64,
-    pub has_origin: bool,
-    pub origin_session_id: *const c_char,
-    pub finish_reason: *const c_char,
-    pub prefill_ns: u64,
-    pub generation_ns: u64,
-    pub input_tokens: u32,
-    pub output_tokens: u32,
-    pub ttl_ts: i64,
-    pub created_at_ms: i64,
-    pub content_json: *const c_char,
-    pub metadata_json: *const c_char,
-    pub _reserved: [u8; 13],
+pub struct CDocumentList {
+    pub items: *mut CDocumentSummary,
+    pub count: usize,
+    pub has_more: bool,
+    pub _arena: *mut c_void,
 }
 
-impl Default for CStorageRecord {
+impl Default for CDocumentList {
     fn default() -> Self {
         Self {
-            item_id: 0,
-            session_id: std::ptr::null(),
-            item_type: 0,
-            role: 0,
-            status: 0,
-            hidden: false,
-            pinned: false,
-            json_valid: false,
-            schema_valid: false,
-            repaired: false,
-            parent_item_id: 0,
-            has_parent: false,
-            origin_item_id: 0,
-            has_origin: false,
-            origin_session_id: std::ptr::null(),
-            finish_reason: std::ptr::null(),
-            prefill_ns: 0,
-            generation_ns: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            ttl_ts: 0,
-            created_at_ms: 0,
-            content_json: std::ptr::null(),
-            metadata_json: std::ptr::null(),
-            _reserved: [0; 13],
+            items: std::ptr::null_mut(),
+            count: 0,
+            has_more: false,
+            _arena: std::ptr::null_mut(),
         }
     }
 }
@@ -1419,11 +1379,11 @@ impl Default for CItemReferenceItem {
     }
 }
 
-/// Source: core/src/capi/documents.zig
+/// Source: core/src/capi/db.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CStringList {
-    pub items: *const *const c_char,
+    pub strings: *const *const c_char,
     pub count: usize,
     pub _arena: *mut c_void,
 }
@@ -1431,7 +1391,7 @@ pub struct CStringList {
 impl Default for CStringList {
     fn default() -> Self {
         Self {
-            items: std::ptr::null(),
+            strings: std::ptr::null(),
             count: 0,
             _arena: std::ptr::null_mut(),
         }
@@ -1511,23 +1471,65 @@ impl Default for SpecialTokensResult {
     }
 }
 
-/// Source: core/src/capi/documents.zig
+/// Source: core/src/capi/db.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CDocumentList {
-    pub items: *mut CDocumentSummary,
-    pub count: usize,
-    pub has_more: bool,
-    pub _arena: *mut c_void,
+pub struct CStorageRecord {
+    pub item_id: u64,
+    pub session_id: *const c_char,
+    pub item_type: u8,
+    pub role: u8,
+    pub status: u8,
+    pub hidden: bool,
+    pub pinned: bool,
+    pub json_valid: bool,
+    pub schema_valid: bool,
+    pub repaired: bool,
+    pub parent_item_id: u64,
+    pub has_parent: bool,
+    pub origin_item_id: u64,
+    pub has_origin: bool,
+    pub origin_session_id: *const c_char,
+    pub finish_reason: *const c_char,
+    pub prefill_ns: u64,
+    pub generation_ns: u64,
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub ttl_ts: i64,
+    pub created_at_ms: i64,
+    pub content_json: *const c_char,
+    pub metadata_json: *const c_char,
+    pub _reserved: [u8; 13],
 }
 
-impl Default for CDocumentList {
+impl Default for CStorageRecord {
     fn default() -> Self {
         Self {
-            items: std::ptr::null_mut(),
-            count: 0,
-            has_more: false,
-            _arena: std::ptr::null_mut(),
+            item_id: 0,
+            session_id: std::ptr::null(),
+            item_type: 0,
+            role: 0,
+            status: 0,
+            hidden: false,
+            pinned: false,
+            json_valid: false,
+            schema_valid: false,
+            repaired: false,
+            parent_item_id: 0,
+            has_parent: false,
+            origin_item_id: 0,
+            has_origin: false,
+            origin_session_id: std::ptr::null(),
+            finish_reason: std::ptr::null(),
+            prefill_ns: 0,
+            generation_ns: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            ttl_ts: 0,
+            created_at_ms: 0,
+            content_json: std::ptr::null(),
+            metadata_json: std::ptr::null(),
+            _reserved: [0; 13],
         }
     }
 }
@@ -1592,28 +1594,18 @@ impl Default for LocalConfig {
 /// Source: core/src/capi/db.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CTagRecord {
-    pub tag_id: *const c_char,
-    pub name: *const c_char,
-    pub color: *const c_char,
-    pub description: *const c_char,
-    pub group_id: *const c_char,
-    pub created_at_ms: i64,
-    pub updated_at_ms: i64,
-    pub _reserved: [u8; 8],
+pub struct CTagList {
+    pub tags: *mut CTagRecord,
+    pub count: usize,
+    pub _arena: *mut c_void,
 }
 
-impl Default for CTagRecord {
+impl Default for CTagList {
     fn default() -> Self {
         Self {
-            tag_id: std::ptr::null(),
-            name: std::ptr::null(),
-            color: std::ptr::null(),
-            description: std::ptr::null(),
-            group_id: std::ptr::null(),
-            created_at_ms: 0,
-            updated_at_ms: 0,
-            _reserved: [0; 8],
+            tags: std::ptr::null_mut(),
+            count: 0,
+            _arena: std::ptr::null_mut(),
         }
     }
 }
@@ -1902,6 +1894,25 @@ impl Default for CChangeList {
     }
 }
 
+/// Source: core/src/capi/plugins.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CPluginList {
+    pub items: *mut CPluginInfo,
+    pub count: usize,
+    pub _arena: *mut c_void,
+}
+
+impl Default for CPluginList {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
 /// Source: core/src/capi/session.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1925,25 +1936,6 @@ impl Default for SamplingParams {
             min_p: 0.0,
             repetition_penalty: 0.0,
             seed: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/plugins.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct CPluginList {
-    pub items: *mut CPluginInfo,
-    pub count: usize,
-    pub _arena: *mut c_void,
-}
-
-impl Default for CPluginList {
-    fn default() -> Self {
-        Self {
-            items: std::ptr::null_mut(),
-            count: 0,
-            _arena: std::ptr::null_mut(),
         }
     }
 }
@@ -2594,21 +2586,29 @@ impl Default for CGenerateResult {
     }
 }
 
-/// Source: core/src/capi/db.zig
+/// Source: core/src/capi/documents.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub struct CTagList {
-    pub tags: *mut CTagRecord,
-    pub count: usize,
-    pub _arena: *mut c_void,
+pub struct CCompactionStats {
+    pub total_documents: usize,
+    pub active_documents: usize,
+    pub expired_documents: usize,
+    pub deleted_documents: usize,
+    pub tombstone_count: usize,
+    pub delta_versions: usize,
+    pub estimated_garbage_bytes: u64,
 }
 
-impl Default for CTagList {
+impl Default for CCompactionStats {
     fn default() -> Self {
         Self {
-            tags: std::ptr::null_mut(),
-            count: 0,
-            _arena: std::ptr::null_mut(),
+            total_documents: 0,
+            active_documents: 0,
+            expired_documents: 0,
+            deleted_documents: 0,
+            tombstone_count: 0,
+            delta_versions: 0,
+            estimated_garbage_bytes: 0,
         }
     }
 }
@@ -2871,22 +2871,6 @@ extern "C" {
     pub fn talu_apply_chat_template(model_path: *const c_char, messages_json: *const c_char, add_generation_prompt: c_int, out_prompt: *mut c_void) -> c_int;
     // core/src/capi/session.zig
     pub fn talu_apply_chat_template_string(template_ptr: *const u8, template_len: usize, messages_json: *const c_char, add_generation_prompt: c_int, bos_token: *const c_char, eos_token: *const c_char, out_prompt: *mut c_void) -> c_int;
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_count() -> usize;
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_deinit();
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_detect(model_type_cstr: *const c_char, out_name: *mut c_void) -> c_int;
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_exists(name_cstr: *const c_char) -> bool;
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_free_string(ptr: *const c_char);
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_init();
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_list(out_json: *mut c_void) -> c_int;
-    // core/src/capi/architecture.zig
-    pub fn talu_arch_register(json_cstr: *const c_char) -> c_int;
     // core/src/capi/router.zig
     pub fn talu_backend_create_from_canonical(canon: *mut c_void, options: BackendCreateOptions, out_backend: *mut c_void) -> c_int;
     // core/src/capi/router.zig

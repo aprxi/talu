@@ -936,10 +936,9 @@ fn extract_string_list(list: *mut talu_sys::CStringList) -> Vec<String> {
     unsafe {
         let l = &*list;
         let mut result = Vec::with_capacity(l.count);
-        if !l.items.is_null() {
-            // CStringList.items is a pointer to array of null-terminated strings
-            // Cast to correct type: array of c_char pointers
-            let items_ptr = l.items as *const *const c_char;
+        if !l.strings.is_null() {
+            // CStringList.strings points to an array of null-terminated strings.
+            let items_ptr = l.strings;
             for i in 0..l.count {
                 let item = *items_ptr.add(i);
                 if !item.is_null() {

@@ -18,7 +18,7 @@ const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
 const st_loader = @import("../../io/safetensors/root.zig");
 const inference_mod = @import("../../inference/root.zig");
-const model_types = @import("../../models/op_types.zig");
+const model_types = @import("../op_types.zig");
 const transformer = inference_mod.backend.block_kernels;
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
@@ -679,7 +679,7 @@ fn readEnvFlag(allocator: std.mem.Allocator, name: []const u8, default_value: bo
     return default_value;
 }
 
-// MoE inference lives in `src/graph/loader/moe.zig`.
+// MoE inference lives in `src/models/load/moe.zig`.
 
 // =============================================================================
 // Unit Tests

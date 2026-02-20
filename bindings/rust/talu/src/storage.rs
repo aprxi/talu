@@ -1334,12 +1334,12 @@ impl StorageHandle {
         }
 
         let list = &*c_list;
-        if list.items.is_null() || list.count == 0 {
+        if list.strings.is_null() || list.count == 0 {
             return Vec::new();
         }
 
         let mut result = Vec::with_capacity(list.count);
-        let strings_ptr = list.items as *const *const c_char;
+        let strings_ptr = list.strings;
         for i in 0..list.count {
             let str_ptr = *strings_ptr.add(i);
             if !str_ptr.is_null() {

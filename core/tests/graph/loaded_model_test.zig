@@ -1,6 +1,6 @@
 //! Integration tests for graph.LoadedModel
 //!
-//! LoadedModel is re-exported from graph/root.zig.
+//! LoadedModel is exported from models root (`main.models.dispatcher`).
 
 const std = @import("std");
 const main = @import("main");

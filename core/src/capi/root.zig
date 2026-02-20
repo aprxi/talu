@@ -16,7 +16,6 @@ pub const session = @import("session.zig");
 pub const template = @import("template.zig");
 pub const tokenizer = @import("tokenizer.zig");
 pub const dlpack = @import("dlpack.zig");
-pub const arch = @import("architecture.zig");
 pub const converter = @import("converter.zig");
 pub const repo = @import("repository.zig");
 pub const err = @import("error.zig");
@@ -129,16 +128,6 @@ pub const ExecutionPlanInfo = converter.ExecutionPlanInfo;
 
 // Re-export template C API functions.
 pub const talu_template_render = template.talu_template_render;
-
-// Re-export architecture C API functions.
-pub const talu_arch_init = arch.talu_arch_init;
-pub const talu_arch_deinit = arch.talu_arch_deinit;
-pub const talu_arch_register = arch.talu_arch_register;
-pub const talu_arch_exists = arch.talu_arch_exists;
-pub const talu_arch_count = arch.talu_arch_count;
-pub const talu_arch_list = arch.talu_arch_list;
-pub const talu_arch_free_string = arch.talu_arch_free_string;
-pub const talu_arch_detect = arch.talu_arch_detect;
 
 // Re-export convert C API functions.
 pub const talu_convert = converter.talu_convert;
