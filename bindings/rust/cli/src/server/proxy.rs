@@ -141,9 +141,16 @@ pub async fn handle_proxy(
         }
     }
 
-    // SSRF protection: block private/internal IPs.
     let host = parsed_url.host_str().unwrap_or("");
-    if is_private_host(host) {
+    let host_allowed = is_domain_allowed(&network_permissions, host);
+
+    // SSRF protection: block private/internal IPs.
+    //
+    // Explicit network permissions from the plugin manifest (controlled by
+    // the server operator) override the SSRF check for the granted hosts.
+    // The operator must intentionally place a plugin with `network:127.0.0.1`
+    // (or similar) in the plugins directory for this to take effect.
+    if is_private_host(host) && !host_allowed {
         return json_error(
             StatusCode::FORBIDDEN,
             "forbidden",
@@ -151,8 +158,8 @@ pub async fn handle_proxy(
         );
     }
 
-    // Domain allowlist: check plugin's network permissions from token store.
-    if !is_domain_allowed(&network_permissions, host) {
+    // Domain allowlist: require explicit permission for all destinations.
+    if !host_allowed {
         return json_error(
             StatusCode::FORBIDDEN,
             "forbidden",

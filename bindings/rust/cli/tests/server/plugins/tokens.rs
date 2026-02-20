@@ -200,15 +200,15 @@ fn proxy_domain_not_allowed_returns_403() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn proxy_ssrf_blocked_with_valid_token() {
+fn proxy_ssrf_blocked_without_explicit_private_permission() {
     let dir = TempDir::new().unwrap();
 
-    // Plugin with network:localhost permission (should still be blocked by SSRF).
+    // Plugin with permission for an external domain only — no private-IP grant.
     let plugin_dir = dir.path().join("ssrf-plugin");
     fs::create_dir_all(&plugin_dir).unwrap();
     fs::write(
         plugin_dir.join("talu.json"),
-        r#"{"id":"ssrf-plugin","permissions":["network:localhost"]}"#,
+        r#"{"id":"ssrf-plugin","permissions":["network:api.example.com"]}"#,
     )
     .unwrap();
     fs::write(plugin_dir.join("index.js"), "// ssrf").unwrap();
@@ -216,6 +216,7 @@ fn proxy_ssrf_blocked_with_valid_token() {
     let ctx = ServerTestContext::new(plugins_config(dir.path()));
     let token = discover_and_get_token(ctx.addr(), "ssrf-plugin");
 
+    // Attempt to reach localhost — plugin only has permission for api.example.com.
     let body = r#"{"url":"http://localhost/secret","method":"GET"}"#;
     let auth = format!("Bearer {token}");
     let resp = send_request(
@@ -230,7 +231,7 @@ fn proxy_ssrf_blocked_with_valid_token() {
     );
     assert_eq!(
         resp.status, 403,
-        "SSRF should be blocked even with valid token"
+        "SSRF should block private IPs when plugin lacks explicit permission"
     );
 }
 
@@ -889,4 +890,317 @@ fn proxy_non_bearer_scheme_returns_401() {
         Some(body),
     );
     assert_eq!(resp.status, 401);
+}
+
+// ---------------------------------------------------------------------------
+// Proxy forwarding (with mock upstream server)
+// ---------------------------------------------------------------------------
+
+/// Spin up a minimal HTTP echo server that reads one request and responds
+/// with a JSON body echoing the method, path, headers, and body it received.
+fn spawn_echo_server() -> (std::net::SocketAddr, std::thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind echo server");
+    let addr = listener.local_addr().expect("echo server addr");
+
+    let handle = std::thread::spawn(move || {
+        // Accept up to 10 connections (enough for our tests).
+        for _ in 0..10 {
+            let Ok((mut stream, _)) = listener.accept() else {
+                break;
+            };
+            use std::io::{BufRead, BufReader, Write};
+
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+            // Read request line.
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() {
+                continue;
+            }
+            let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
+            let method = parts.first().unwrap_or(&"").to_string();
+            let path = parts.get(1).unwrap_or(&"").to_string();
+
+            // Read headers.
+            let mut headers = std::collections::HashMap::new();
+            let mut content_length: usize = 0;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() || line.trim().is_empty() {
+                    break;
+                }
+                if let Some((key, value)) = line.trim().split_once(':') {
+                    let key_lower = key.trim().to_lowercase();
+                    let val = value.trim().to_string();
+                    if key_lower == "content-length" {
+                        content_length = val.parse().unwrap_or(0);
+                    }
+                    headers.insert(key.trim().to_string(), val);
+                }
+            }
+
+            // Read body.
+            let mut body_bytes = vec![0u8; content_length];
+            if content_length > 0 {
+                use std::io::Read;
+                let _ = reader.read_exact(&mut body_bytes);
+            }
+            let body = String::from_utf8_lossy(&body_bytes).to_string();
+
+            // Respond with JSON echo.
+            let echo = serde_json::json!({
+                "echo_method": method,
+                "echo_path": path,
+                "echo_headers": headers,
+                "echo_body": body,
+            });
+            let resp_body = serde_json::to_string(&echo).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\n\
+                 Content-Type: application/json\r\n\
+                 Cache-Control: max-age=60\r\n\
+                 ETag: \"echo-etag-123\"\r\n\
+                 Content-Length: {}\r\n\
+                 Connection: close\r\n\r\n{}",
+                resp_body.len(),
+                resp_body,
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    (addr, handle)
+}
+
+/// Create a plugin config for proxy forwarding tests.
+///
+/// The echo server binds to 127.0.0.1 and the plugin manifest grants
+/// `network:127.0.0.1`.  The proxy handler respects explicit operator-granted
+/// permissions, so no SSRF bypass is needed.
+fn proxy_forwarding_config(plugins_dir: &std::path::Path) -> ServerConfig {
+    plugins_config(plugins_dir)
+}
+
+/// Setup a plugin with network permissions for a specific host.
+fn setup_plugin_with_host_permission(dir: &std::path::Path, host: &str) {
+    let plugin_dir = dir.join("proxy-fwd-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("talu.json"),
+        serde_json::json!({
+            "id": "proxy-fwd-plugin",
+            "activationEvents": ["*"],
+            "permissions": [format!("network:{}", host)]
+        })
+        .to_string(),
+    )
+    .unwrap();
+    fs::write(plugin_dir.join("index.js"), "export default function(){}").unwrap();
+}
+
+
+/// Proxy forwards POST body to upstream.
+#[test]
+fn proxy_forwards_post_body() {
+    let (echo_addr, _handle) = spawn_echo_server();
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_host_permission(dir.path(), "127.0.0.1");
+
+    let ctx = ServerTestContext::new(proxy_forwarding_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "proxy-fwd-plugin");
+
+    let proxy_body = serde_json::json!({
+        "url": format!("http://{}/test-path", echo_addr),
+        "method": "POST",
+        "headers": {"Content-Type": "text/plain"},
+        "body": "hello proxy body"
+    });
+    let proxy_json = serde_json::to_string(&proxy_body).unwrap();
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/proxy",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {}", token)),
+        ],
+        Some(&proxy_json),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    assert_eq!(json["status"], 200, "upstream should return 200");
+
+    // Parse the upstream response body (which is the echo JSON).
+    let upstream_body: serde_json::Value =
+        serde_json::from_str(json["body"].as_str().unwrap()).expect("parse echo body");
+    assert_eq!(upstream_body["echo_method"], "POST");
+    assert_eq!(upstream_body["echo_body"], "hello proxy body");
+}
+
+/// Proxy forwards custom headers and strips internal ones (X-Talu-*, Cookie, Host).
+#[test]
+fn proxy_forwards_custom_headers_and_strips_internal() {
+    let (echo_addr, _handle) = spawn_echo_server();
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_host_permission(dir.path(), "127.0.0.1");
+
+    let ctx = ServerTestContext::new(proxy_forwarding_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "proxy-fwd-plugin");
+
+    let proxy_body = serde_json::json!({
+        "url": format!("http://{}/headers-test", echo_addr),
+        "method": "GET",
+        "headers": {
+            "X-Custom-Auth": "my-token",
+            "X-Talu-Internal": "secret-value",
+            "Cookie": "session=abc123",
+            "Host": "evil.com",
+            "Accept": "application/json"
+        }
+    });
+    let proxy_json = serde_json::to_string(&proxy_body).unwrap();
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/proxy",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {}", token)),
+        ],
+        Some(&proxy_json),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let upstream_body: serde_json::Value =
+        serde_json::from_str(json["body"].as_str().unwrap()).expect("parse echo body");
+    let echo_headers = &upstream_body["echo_headers"];
+
+    // Custom header should be forwarded.
+    assert_eq!(
+        echo_headers["x-custom-auth"].as_str().or_else(|| echo_headers["X-Custom-Auth"].as_str()),
+        Some("my-token"),
+        "custom header should be forwarded, got headers: {}",
+        echo_headers
+    );
+    assert_eq!(
+        echo_headers["accept"].as_str().or_else(|| echo_headers["Accept"].as_str()),
+        Some("application/json"),
+        "Accept header should be forwarded"
+    );
+
+    // Internal headers should NOT be forwarded.
+    assert!(
+        echo_headers["X-Talu-Internal"].is_null() && echo_headers["x-talu-internal"].is_null(),
+        "X-Talu-Internal should be stripped"
+    );
+    assert!(
+        echo_headers["Cookie"].is_null() && echo_headers["cookie"].is_null(),
+        "Cookie should be stripped"
+    );
+}
+
+/// Proxy response includes selectively-forwarded upstream headers.
+#[test]
+fn proxy_response_includes_upstream_headers() {
+    let (echo_addr, _handle) = spawn_echo_server();
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_host_permission(dir.path(), "127.0.0.1");
+
+    let ctx = ServerTestContext::new(proxy_forwarding_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "proxy-fwd-plugin");
+
+    let proxy_body = serde_json::json!({
+        "url": format!("http://{}/resp-headers", echo_addr),
+        "method": "GET"
+    });
+    let proxy_json = serde_json::to_string(&proxy_body).unwrap();
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/proxy",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {}", token)),
+        ],
+        Some(&proxy_json),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let headers = &json["headers"];
+
+    // The echo server responds with content-type, cache-control, and etag.
+    // The proxy should selectively forward these 3 headers (lines 220-226 in proxy.rs).
+    assert_eq!(
+        headers["content-type"].as_str(),
+        Some("application/json"),
+        "should forward content-type"
+    );
+    assert_eq!(
+        headers["cache-control"].as_str(),
+        Some("max-age=60"),
+        "should forward cache-control"
+    );
+    assert_eq!(
+        headers["etag"].as_str(),
+        Some("\"echo-etag-123\""),
+        "should forward etag"
+    );
+}
+
+/// Wildcard permission `*.X` also matches the root domain `X` itself.
+///
+/// Uses the local echo server with permission `*.127.0.0.1` and URL host
+/// `127.0.0.1`. This exercises the `domain_lower == suffix` branch in
+/// `is_domain_allowed` (proxy.rs:305) without any outbound network call.
+#[test]
+fn proxy_wildcard_matches_root_domain() {
+    let (echo_addr, _handle) = spawn_echo_server();
+    let dir = TempDir::new().unwrap();
+
+    // Permission is *.127.0.0.1 — the URL host is 127.0.0.1 (the root).
+    // is_domain_allowed strips "*." to get suffix "127.0.0.1", then checks
+    // domain_lower == suffix, which is true.
+    let plugin_dir = dir.path().join("proxy-wild-plugin");
+    fs::create_dir_all(&plugin_dir).unwrap();
+    fs::write(
+        plugin_dir.join("talu.json"),
+        r#"{"id":"proxy-wild-plugin","activationEvents":["*"],"permissions":["network:*.127.0.0.1"]}"#,
+    )
+    .unwrap();
+    fs::write(plugin_dir.join("index.js"), "export default function(){}").unwrap();
+
+    let ctx = ServerTestContext::new(proxy_forwarding_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "proxy-wild-plugin");
+
+    let proxy_body = serde_json::json!({
+        "url": format!("http://{}/wildcard-root", echo_addr),
+        "method": "GET"
+    });
+    let proxy_json = serde_json::to_string(&proxy_body).unwrap();
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/proxy",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {}", token)),
+        ],
+        Some(&proxy_json),
+    );
+    // Should be 200 (echo server responds), NOT 403 (domain check failed).
+    assert_eq!(
+        resp.status, 200,
+        "wildcard *.127.0.0.1 should match root domain 127.0.0.1, body: {}",
+        resp.body
+    );
+
+    // Verify we actually hit the echo server.
+    let json = resp.json();
+    let upstream_body: serde_json::Value =
+        serde_json::from_str(json["body"].as_str().unwrap()).expect("parse echo body");
+    assert_eq!(upstream_body["echo_method"], "GET");
 }

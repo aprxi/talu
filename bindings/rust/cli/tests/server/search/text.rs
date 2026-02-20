@@ -2,7 +2,8 @@
 
 use super::{
     no_bucket_config, search_config, seed_session, seed_session_with_group,
-    seed_session_with_messages, seed_session_with_system_prompt,
+    seed_session_with_marker, seed_session_with_messages, seed_session_with_system_prompt,
+    seed_session_with_tags,
 };
 use crate::server::common::*;
 use serde_json::json;
@@ -1141,4 +1142,468 @@ fn validation_invalid_json_returns_400() {
         }),
     );
     assert_eq!(resp.status, 400, "invalid type for scope should return 400");
+}
+
+// ---------------------------------------------------------------------------
+// Federated search (scope: "all")
+// ---------------------------------------------------------------------------
+
+/// Federated search returns both conversation and document results.
+#[test]
+fn federated_search_returns_both_conversations_and_documents() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "sess-fed-1", "Quantum computing basics", "gpt-4");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    // Create a document with "Quantum" in the title so both backends match.
+    let doc_resp = post_json(
+        ctx.addr(),
+        "/v1/documents",
+        &json!({
+            "type": "prompt",
+            "title": "Quantum physics notes",
+            "content": {"text": "Quantum entanglement"}
+        }),
+    );
+    assert_eq!(doc_resp.status, 201, "body: {}", doc_resp.body);
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "all",
+            "text": "Quantum"
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert!(data.len() >= 2, "should have results from both backends, got {}", data.len());
+
+    let has_conversation = data.iter().any(|d| d["object"] == "conversation");
+    let has_document = data.iter().any(|d| d["object"] == "document");
+    assert!(has_conversation, "should include conversation results");
+    assert!(has_document, "should include document results");
+}
+
+/// Federated search requires text field.
+#[test]
+fn federated_search_requires_text() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "sess-fed-2", "Chat", "m");
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "all"
+        }),
+    );
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "missing_text");
+}
+
+/// Federated search respects limit.
+#[test]
+fn federated_search_respects_limit() {
+    let temp = TempDir::new().expect("temp dir");
+    // Seed several conversations with matching keyword.
+    for i in 0..5 {
+        seed_session(
+            temp.path(),
+            &format!("sess-fed-lim-{}", i),
+            &format!("Federated topic {}", i),
+            "gpt-4",
+        );
+    }
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    // Also create documents matching.
+    for i in 0..5 {
+        post_json(
+            ctx.addr(),
+            "/v1/documents",
+            &json!({
+                "type": "note",
+                "title": format!("Federated note {}", i),
+                "content": {}
+            }),
+        );
+    }
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "all",
+            "text": "Federated",
+            "limit": 3
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert!(data.len() <= 3, "should respect limit, got {}", data.len());
+    assert_eq!(json["has_more"], true);
+}
+
+/// Federated search works when only conversations match (no documents).
+#[test]
+fn federated_search_graceful_without_documents() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "sess-fed-only", "Unique conversation topic", "gpt-4");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "all",
+            "text": "Unique conversation"
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert!(!data.is_empty(), "should still return conversation results");
+    assert!(data.iter().any(|d| d["object"] == "conversation"));
+}
+
+// ---------------------------------------------------------------------------
+// Aggregations
+// ---------------------------------------------------------------------------
+
+/// Models aggregation returns counts grouped by model.
+#[test]
+fn aggregations_models_returns_counts() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "agg-m1", "Chat 1", "gpt-4");
+    seed_session(temp.path(), "agg-m2", "Chat 2", "gpt-4");
+    seed_session(temp.path(), "agg-m3", "Chat 3", "claude-3");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "aggregations": ["models"]
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let aggs = &json["aggregations"];
+    assert!(aggs.is_object(), "aggregations should be an object");
+
+    let models = aggs["models"].as_array().expect("models array");
+    assert!(!models.is_empty(), "should have model entries");
+
+    // Each entry should have value and count.
+    for entry in models {
+        assert!(entry["value"].is_string(), "model entry should have 'value'");
+        assert!(entry["count"].is_number(), "model entry should have 'count'");
+    }
+
+    // Find gpt-4 entry — should have count 2.
+    let gpt4 = models.iter().find(|e| e["value"] == "gpt-4");
+    assert!(gpt4.is_some(), "should have gpt-4 entry");
+    assert_eq!(gpt4.unwrap()["count"], 2);
+
+    // Models should be sorted by count descending.
+    let counts: Vec<u64> = models.iter().map(|e| e["count"].as_u64().unwrap()).collect();
+    let mut sorted = counts.clone();
+    sorted.sort_by(|a, b| b.cmp(a));
+    assert_eq!(counts, sorted, "models should be sorted by count desc");
+}
+
+/// Markers aggregation returns counts grouped by marker.
+#[test]
+fn aggregations_markers_returns_counts() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_marker(temp.path(), "agg-mk1", "Chat A", "m", "active");
+    seed_session_with_marker(temp.path(), "agg-mk2", "Chat B", "m", "active");
+    seed_session_with_marker(temp.path(), "agg-mk3", "Chat C", "m", "archived");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "aggregations": ["markers"]
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let markers = json["aggregations"]["markers"]
+        .as_array()
+        .expect("markers array");
+    assert!(!markers.is_empty(), "should have marker entries");
+
+    for entry in markers {
+        assert!(entry["value"].is_string());
+        assert!(entry["count"].is_number());
+    }
+
+    let active = markers.iter().find(|e| e["value"] == "active");
+    assert!(active.is_some(), "should have active marker entry");
+    assert_eq!(active.unwrap()["count"], 2);
+}
+
+/// Tags aggregation returns counts with id, name, count.
+#[test]
+fn aggregations_tags_returns_counts() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_tags(temp.path(), "agg-t1", "Chat T1", "m", &["work"]);
+    seed_session_with_tags(temp.path(), "agg-t2", "Chat T2", "m", &["work"]);
+    seed_session_with_tags(temp.path(), "agg-t3", "Chat T3", "m", &["personal"]);
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "aggregations": ["tags"]
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let tags = json["aggregations"]["tags"].as_array().expect("tags array");
+    assert!(!tags.is_empty(), "should have tag entries");
+
+    for entry in tags {
+        assert!(entry["id"].is_string(), "tag entry should have 'id'");
+        assert!(entry["name"].is_string(), "tag entry should have 'name'");
+        assert!(entry["count"].is_number(), "tag entry should have 'count'");
+    }
+
+    let work = tags.iter().find(|e| e["name"] == "work");
+    assert!(work.is_some(), "should have 'work' tag entry");
+    assert_eq!(work.unwrap()["count"], 2);
+}
+
+/// Empty aggregations array returns no aggregations field.
+#[test]
+fn aggregations_empty_array_returns_no_aggregations() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "agg-e1", "Chat", "m");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "aggregations": []
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    assert!(
+        json["aggregations"].is_null(),
+        "empty aggregation array should yield null aggregations"
+    );
+}
+
+/// Unknown aggregation type is silently skipped.
+#[test]
+fn aggregations_unknown_type_skipped() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "agg-u1", "Chat", "m");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "aggregations": ["nonexistent_type"]
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let aggs = &json["aggregations"];
+    // Should be an object but without the unknown key.
+    assert!(aggs.is_object(), "aggregations should be an object");
+    assert!(
+        aggs["nonexistent_type"].is_null(),
+        "unknown type should not appear"
+    );
+}
+
+/// Tags aggregation returns an empty array when no sessions have tags.
+#[test]
+fn aggregations_tags_empty_when_no_tags() {
+    let temp = TempDir::new().expect("temp dir");
+    // Seed sessions WITHOUT any tags.
+    seed_session(temp.path(), "agg-no-tags-1", "Chat A", "m");
+    seed_session(temp.path(), "agg-no-tags-2", "Chat B", "m");
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "conversations",
+            "aggregations": ["tags"]
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let tags = &json["aggregations"]["tags"];
+    assert!(
+        tags.is_array(),
+        "tags aggregation should be an array even when empty, got: {tags}"
+    );
+    assert_eq!(
+        tags.as_array().unwrap().len(),
+        0,
+        "tags array should be empty when no sessions have tags"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Unicode: multi-byte characters in the search query itself
+// ---------------------------------------------------------------------------
+
+/// Search query containing multi-byte Unicode characters (German ß).
+///
+/// The `find_case_insensitive` function in search.rs uses character-by-character
+/// matching. This test verifies that multi-byte chars in the *query* (not just
+/// the corpus) don't cause byte-boundary panics or incorrect results.
+#[test]
+fn search_query_with_multibyte_unicode_chars() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_messages(
+        temp.path(),
+        "sess-german",
+        "German Chat",
+        "m",
+        &["The German word Straße means street"],
+    );
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    // Search with a query containing ß (U+00DF, 2 bytes in UTF-8).
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "items",
+            "text": "Straße",
+            "highlight": true
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert_eq!(data.len(), 1, "should find the message containing 'Straße'");
+
+    let snippet = data[0]["snippet"].as_str().unwrap();
+    assert!(
+        snippet.contains("**Straße**"),
+        "snippet should contain highlighted **Straße**, got: {snippet}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Items search: cursor parameter handling
+// ---------------------------------------------------------------------------
+
+/// Items search ignores cursor parameter (not yet supported).
+///
+/// The handler at search.rs:764 returns `cursor: None` regardless of input.
+/// Passing a bogus cursor should not cause an error.
+#[test]
+fn items_search_cursor_param_ignored() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_messages(
+        temp.path(),
+        "sess-cursor-test",
+        "Cursor Chat",
+        "m",
+        &["findable content for cursor test"],
+    );
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "items",
+            "text": "findable",
+            "cursor": "some-opaque-cursor-value"
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert_eq!(data.len(), 1, "should still return the matching item");
+
+    // Cursor should be null (items search doesn't support it).
+    assert!(
+        json["cursor"].is_null(),
+        "items search cursor should be null, got: {}",
+        json["cursor"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Items search: has_more set correctly with limit
+// ---------------------------------------------------------------------------
+
+/// Items search sets `has_more` when more results exist than the limit.
+#[test]
+fn items_search_has_more_with_limit() {
+    let temp = TempDir::new().expect("temp dir");
+    // Seed 3 sessions each with a message containing the search term.
+    for i in 0..3 {
+        seed_session_with_messages(
+            temp.path(),
+            &format!("sess-hm-{i}"),
+            &format!("HasMore Chat {i}"),
+            "m",
+            &[&format!("HASMORE_KEYWORD content {i}")],
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+
+    // Limit to 1 result.
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "items",
+            "text": "HASMORE_KEYWORD",
+            "limit": 1
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert_eq!(data.len(), 1, "should respect limit=1");
+    assert_eq!(
+        json["has_more"], true,
+        "has_more should be true when more results exist"
+    );
 }

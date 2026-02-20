@@ -2,7 +2,7 @@
 
 use super::tags_config;
 use crate::server::common::*;
-use crate::server::conversations::seed_session;
+use crate::server::conversations::{seed_session, seed_session_with_tags};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------
@@ -444,4 +444,71 @@ fn tag_usage_counts_conversations() {
         "expected 3 tagged conversations"
     );
     assert_eq!(json["usage"]["total"], 3);
+}
+
+// ---------------------------------------------------------------------------
+// Orphan handling: tag deleted after being assigned to a conversation
+// ---------------------------------------------------------------------------
+
+/// Deleting a tag removes it from resolved tags on conversations.
+///
+/// `resolve_tags_for_session` calls `get_tag()` for each tag reference;
+/// if the tag is deleted, `get_tag()` returns `None` and the reference is
+/// silently skipped.
+///
+/// **Known issue**: `talu_storage_delete_tag` (Zig core) returns error 999
+/// (internal_error) when the tag has conversation associations, even though
+/// `deleteTagAndAssociations` is designed to cascade-remove them.  Verified
+/// the failure reproduces via direct FFI (no HTTP handler involved).
+/// This test is `#[ignore]`d until the storage bug is fixed; once
+/// `DELETE /v1/tags/:id` returns 204, remove the `#[ignore]` attribute.
+#[test]
+#[ignore = "storage bug: talu_storage_delete_tag returns 999 for tags with conversation associations"]
+fn deleted_tag_silently_dropped_from_conversation() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_tags(
+        temp.path(),
+        "sess-orphan",
+        "Orphan Test Chat",
+        "model",
+        &["keep-me", "remove-me"],
+    );
+
+    let ctx = ServerTestContext::new(tags_config(temp.path()));
+
+    // Verify both tags are visible on the conversation.
+    let before = get(ctx.addr(), "/v1/conversations/sess-orphan");
+    assert_eq!(before.status, 200, "body: {}", before.body);
+    let before_tags = before.json()["tags"].as_array().expect("tags").clone();
+    assert_eq!(before_tags.len(), 2, "should start with 2 tags");
+
+    // Delete "remove-me" tag via the tags CRUD endpoint.
+    let del_resp = delete(ctx.addr(), "/v1/tags/tag-remove-me");
+    assert_eq!(del_resp.status, 204, "body: {}", del_resp.body);
+
+    // GET single conversation — only "keep-me" should appear.
+    let get_resp = get(ctx.addr(), "/v1/conversations/sess-orphan");
+    assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
+    let resolved_tags = get_resp.json()["tags"].as_array().expect("tags array").clone();
+    let names: Vec<&str> = resolved_tags
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(names, vec!["keep-me"], "deleted tag should be silently dropped");
+
+    // LIST conversations — same assertion.
+    let list_resp = get(ctx.addr(), "/v1/conversations");
+    assert_eq!(list_resp.status, 200, "body: {}", list_resp.body);
+    let data = list_resp.json()["data"].as_array().expect("data").clone();
+    let sess = data
+        .iter()
+        .find(|s| s["id"] == "sess-orphan")
+        .expect("session in list");
+    let list_names: Vec<&str> = sess["tags"]
+        .as_array()
+        .expect("tags")
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert_eq!(list_names, vec!["keep-me"], "deleted tag dropped from list too");
 }

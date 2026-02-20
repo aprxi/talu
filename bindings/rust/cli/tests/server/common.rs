@@ -25,6 +25,8 @@ pub struct ServerConfig {
     pub tenants: Vec<TenantSpec>,
     pub bucket: Option<PathBuf>,
     pub no_bucket: bool,
+    /// Serve console UI from this directory instead of bundled assets.
+    pub html_dir: Option<PathBuf>,
     /// Extra environment variables to set on the server process.
     pub env_vars: Vec<(String, String)>,
 }
@@ -37,6 +39,7 @@ impl ServerConfig {
             tenants: Vec::new(),
             bucket: None,
             no_bucket: false,
+            html_dir: None,
             env_vars: Vec::new(),
         }
     }
@@ -93,6 +96,10 @@ impl ServerTestContext {
             command.arg("--no-bucket");
         } else if let Some(ref bucket) = config.bucket {
             command.arg("--bucket").arg(bucket);
+        }
+
+        if let Some(ref html_dir) = config.html_dir {
+            command.arg("--html-dir").arg(html_dir);
         }
 
         for (key, value) in &config.env_vars {

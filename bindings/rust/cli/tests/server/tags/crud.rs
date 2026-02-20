@@ -367,3 +367,76 @@ fn bare_tags_path() {
     let data = list_json["data"].as_array().unwrap();
     assert_eq!(data.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// Tag usage.documents count
+// ---------------------------------------------------------------------------
+
+/// Tag usage.documents count reflects tagged documents.
+#[test]
+fn tag_usage_counts_documents() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(tags_config(temp.path()));
+
+    // Create a tag.
+    let tag_resp = post_json(
+        ctx.addr(),
+        "/v1/tags",
+        &serde_json::json!({"name": "doc-usage"}),
+    );
+    assert_eq!(tag_resp.status, 201);
+    let tag_id = tag_resp.json()["id"].as_str().unwrap().to_string();
+
+    // Initially usage.documents should be 0.
+    let resp = get(ctx.addr(), &format!("/v1/tags/{}", tag_id));
+    let json = resp.json();
+    assert_eq!(json["usage"]["documents"], 0);
+    assert_eq!(json["usage"]["total"], 0);
+
+    // Create two documents.
+    let doc1_resp = post_json(
+        ctx.addr(),
+        "/v1/documents",
+        &serde_json::json!({
+            "type": "prompt",
+            "title": "Doc One",
+            "content": {}
+        }),
+    );
+    assert_eq!(doc1_resp.status, 201);
+    let doc1_id = doc1_resp.json()["id"].as_str().unwrap().to_string();
+
+    let doc2_resp = post_json(
+        ctx.addr(),
+        "/v1/documents",
+        &serde_json::json!({
+            "type": "prompt",
+            "title": "Doc Two",
+            "content": {}
+        }),
+    );
+    assert_eq!(doc2_resp.status, 201);
+    let doc2_id = doc2_resp.json()["id"].as_str().unwrap().to_string();
+
+    // Tag both documents.
+    let tag_body = serde_json::json!({"tags": [&tag_id]});
+    post_json(
+        ctx.addr(),
+        &format!("/v1/documents/{}/tags", doc1_id),
+        &tag_body,
+    );
+    post_json(
+        ctx.addr(),
+        &format!("/v1/documents/{}/tags", doc2_id),
+        &tag_body,
+    );
+
+    // Usage should now reflect 2 documents.
+    let resp = get(ctx.addr(), &format!("/v1/tags/{}", tag_id));
+    let json = resp.json();
+    assert_eq!(
+        json["usage"]["documents"], 2,
+        "expected 2 tagged documents"
+    );
+    assert_eq!(json["usage"]["total"], 2);
+}

@@ -529,3 +529,68 @@ fn fork_content_type_is_json() {
     assert_eq!(resp.status, 201);
     assert_eq!(resp.header("content-type"), Some("application/json"));
 }
+
+// ---------------------------------------------------------------------------
+// Fork content accuracy: strict item count assertion
+// ---------------------------------------------------------------------------
+
+/// Forking at a mid-point produces strictly fewer items than the source.
+///
+/// Strengthens the `fork_preserves_items_subset` test which used a weak `<=`
+/// assertion.  Forking at `target_item_id: 1` from a 3-message source should
+/// truncate after item 1, producing a strict subset.
+#[test]
+fn fork_at_mid_item_has_fewer_items_than_source() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_messages(
+        temp.path(),
+        "sess-fork-mid",
+        "Multi-msg",
+        "model",
+        &["msg-0", "msg-1", "msg-2"],
+    );
+
+    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+
+    // Get source items count.
+    let source_resp = get(ctx.addr(), "/v1/conversations/sess-fork-mid");
+    assert_eq!(source_resp.status, 200);
+    let source_json = source_resp.json();
+    let source_items = source_json["items"].as_array().expect("source items");
+    let source_count = source_items.len();
+    assert!(
+        source_count >= 3,
+        "source should have at least 3 items, got: {}",
+        source_count
+    );
+
+    // Fork at item 1 (should include items 0 and 1, truncating item 2+).
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/conversations/sess-fork-mid/fork",
+        &json!({"target_item_id": 1}),
+    );
+    assert_eq!(resp.status, 201);
+    let new_id = resp.json()["id"].as_str().expect("id").to_string();
+
+    let fork_resp = get(ctx.addr(), &format!("/v1/conversations/{new_id}"));
+    assert_eq!(fork_resp.status, 200);
+    let fork_json = fork_resp.json();
+    let fork_items = fork_json["items"].as_array().expect("fork items");
+    let fork_count = fork_items.len();
+
+    // Strictly fewer items than source.
+    assert!(
+        fork_count < source_count,
+        "forked session should have strictly fewer items: fork={} source={}",
+        fork_count,
+        source_count,
+    );
+
+    // At least items 0 and 1 should be retained.
+    assert!(
+        fork_count >= 2,
+        "fork at item 1 should retain at least 2 items, got: {}",
+        fork_count,
+    );
+}
