@@ -8,7 +8,7 @@
 const std = @import("std");
 const simd = @import("arch/root.zig");
 
-pub const SsmScanFn = *const fn (
+pub const StateScanFn = *const fn (
     ssm_state: []f32,
     ssm_out: []f32,
     x_conv_out: []const f32,
@@ -23,7 +23,7 @@ pub const SsmScanFn = *const fn (
     n_groups: usize,
 ) void;
 
-pub fn ssmScanF32(
+pub fn stateScanF32(
     ssm_state: []f32,
     ssm_out: []f32,
     x_conv_out: []const f32,
@@ -89,7 +89,7 @@ pub fn ssmScanF32(
     }
 }
 
-test "ssmScanF32 preserves zero state with zero inputs" {
+test "stateScanF32 preserves zero state with zero inputs" {
     var ssm_state: [8]f32 = .{0} ** 8;
     var ssm_out: [2]f32 = .{0} ** 2;
     const x: [2]f32 = .{0, 0};
@@ -99,8 +99,7 @@ test "ssmScanF32 preserves zero state with zero inputs" {
     const d_skip: [1]f32 = .{0};
     const dt: [1]f32 = .{0};
 
-    ssmScanF32(&ssm_state, &ssm_out, &x, &b, &c, &a_log, &d_skip, &dt, 2, 4, 1, 1);
+    stateScanF32(&ssm_state, &ssm_out, &x, &b, &c, &a_log, &d_skip, &dt, 2, 4, 1, 1);
     try std.testing.expectEqual(@as(f32, 0), ssm_out[0]);
     try std.testing.expectEqual(@as(f32, 0), ssm_out[1]);
 }
-

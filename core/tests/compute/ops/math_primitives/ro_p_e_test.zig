@@ -9,7 +9,6 @@ const std = @import("std");
 const main = @import("main");
 
 const RoPE = main.compute.cpu.math.RoPE;
-const RopeScaling = main.core.tensor.RopeScaling;
 
 // ===== init / deinit =====
 
@@ -175,63 +174,46 @@ test "RoPE: applyInterleavedInPlace preserves pair magnitudes" {
     try std.testing.expectApproxEqRel(mag1, new_mag1, 1e-4);
 }
 
-// ===== initWithRopeScaling =====
+// ===== initFromInvFreq =====
 
-test "RoPE: initWithRopeScaling with linear scaling" {
-    var rope = try RoPE.initWithRopeScaling(
-        std.testing.allocator,
-        8,
-        4096,
-        10000.0,
-        .{ .rope_type = .linear, .factor = 2.0 },
-    );
+test "RoPE: initFromInvFreq with explicit table initializes successfully" {
+    const inv_freq = [_]f32{ 1.0, 0.5, 0.25, 0.125 };
+    var rope = try RoPE.initFromInvFreq(std.testing.allocator, 8, 4096, &inv_freq, 1.0);
     defer rope.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 8), rope.dim);
     try std.testing.expectEqual(@as(f32, 1.0), rope.attention_scaling);
 }
 
-test "RoPE: initWithRopeScaling with llama3 scaling" {
-    var rope = try RoPE.initWithRopeScaling(
-        std.testing.allocator,
-        16,
-        8192,
-        500000.0,
-        .{
-            .rope_type = .llama3,
-            .factor = 8.0,
-            .low_freq_factor = 1.0,
-            .high_freq_factor = 4.0,
-            .original_max_position_embeddings = 8192,
-        },
-    );
+test "RoPE: initFromInvFreq applies attention scaling to cached tables" {
+    const inv_freq = [_]f32{ 1.0, 0.5 };
+    var rope = try RoPE.initFromInvFreq(std.testing.allocator, 4, 512, &inv_freq, 1.25);
     defer rope.deinit(std.testing.allocator);
 
-    // Should be able to apply rotation without error
-    var vec: [16]f32 = .{ 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0 };
-    rope.applyInPlace(&vec, 5);
-
-    try std.testing.expect(vec[0] != 1.0 or vec[8] != 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.25), rope.freqs_cos[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), rope.freqs_sin[0], 1e-6);
 }
 
-test "RoPE: initWithRopeScaling with none type is equivalent to default" {
+test "RoPE: initFromInvFreq with standard table is equivalent to default init" {
     var rope_default = try RoPE.init(std.testing.allocator, 8, 512, 10000.0, 1.0);
     defer rope_default.deinit(std.testing.allocator);
 
-    var rope_none = try RoPE.initWithRopeScaling(
-        std.testing.allocator,
-        8,
-        512,
-        10000.0,
-        .{ .rope_type = .none },
-    );
-    defer rope_none.deinit(std.testing.allocator);
+    const theta: f32 = 10000.0;
+    const dim: usize = 8;
+    const half_dim = dim / 2;
+    var inv_freq: [half_dim]f32 = undefined;
+    for (0..half_dim) |idx| {
+        const exponent = @as(f64, @floatFromInt(2 * idx)) / @as(f64, @floatFromInt(dim));
+        inv_freq[idx] = @floatCast(1.0 / std.math.pow(f64, @as(f64, theta), exponent));
+    }
+    var rope_from_table = try RoPE.initFromInvFreq(std.testing.allocator, dim, 512, &inv_freq, 1.0);
+    defer rope_from_table.deinit(std.testing.allocator);
 
     // Both should produce the same cos/sin values
     const cos_default = rope_default.getCos(3);
-    const cos_none = rope_none.getCos(3);
+    const cos_from_table = rope_from_table.getCos(3);
 
-    for (cos_default, cos_none) |d, n| {
+    for (cos_default, cos_from_table) |d, n| {
         try std.testing.expectApproxEqRel(d, n, 1e-5);
     }
 }

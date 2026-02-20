@@ -270,7 +270,7 @@ pub const MultiHeadAttention = struct {
         // pos_offset is the position in the sequence (accounting for cached tokens).
         const pos_offset = if (use_cache) cache.cache_position else 0;
         if (self.runtime_rope) |runtime_rope| {
-            try cpu_rotary.applyRuntimeQK(
+            try cpu_rotary.applyRuntimeTablesToPair(
                 query_view.asSlice(f32),
                 key_view.asSlice(f32),
                 sequence_len,
@@ -285,7 +285,7 @@ pub const MultiHeadAttention = struct {
                 runtime_rope.dim,
             );
         } else if (self.rope) |rope| {
-            try cpu_rotary.applyStaticQK(
+            try cpu_rotary.applyStaticTablesToPair(
                 query_view.asSlice(f32),
                 key_view.asSlice(f32),
                 sequence_len,
@@ -860,7 +860,7 @@ pub const MultiHeadAttention = struct {
 
         // Apply RoPE (after QKNorm)
         if (self.runtime_rope) |runtime_rope| {
-            try cpu_rotary.applyRuntimeQK(
+            try cpu_rotary.applyRuntimeTablesToPair(
                 query_view.asSlice(f32),
                 key_view.asSlice(f32),
                 sequence_len,
@@ -875,7 +875,7 @@ pub const MultiHeadAttention = struct {
                 runtime_rope.dim,
             );
         } else if (self.rope) |rope| {
-            try cpu_rotary.applyStaticQK(
+            try cpu_rotary.applyStaticTablesToPair(
                 query_view.asSlice(f32),
                 key_view.asSlice(f32),
                 sequence_len,
@@ -1323,7 +1323,7 @@ fn forwardBatchedDecode(
 
         // Apply RoPE if configured (after QKNorm).
         if (self.runtime_rope) |runtime_rope| {
-            try cpu_rotary.applyRuntimeQK(
+            try cpu_rotary.applyRuntimeTablesToPair(
                 query_buffer,
                 key_buffer,
                 1,
@@ -1338,7 +1338,7 @@ fn forwardBatchedDecode(
                 runtime_rope.dim,
             );
         } else if (self.rope) |rope_ptr| {
-            try cpu_rotary.applyStaticQK(
+            try cpu_rotary.applyStaticTablesToPair(
                 query_buffer,
                 key_buffer,
                 1,

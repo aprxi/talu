@@ -1450,7 +1450,7 @@ pub const TransformerBlock = struct {
     ) !TransformerBlock {
         const matmul_in_proj = (try cpu_linalg.matmulKernel(weights.weights.in_proj.dtype)).func;
         const matmul_out_proj = (try cpu_linalg.matmulKernel(weights.weights.out_proj.dtype)).func;
-        const ssm_scan = compute.cpu.simd.ssm_scan.ssmScanF32;
+        const ssm_scan = compute.cpu.simd.ssm_scan.stateScanF32;
 
         const ln1_ptr = try createNormKernel(allocator, weights.ln1_weight, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_attn_norm);
         errdefer allocator.destroy(ln1_ptr);
@@ -2920,7 +2920,7 @@ test "TransformerBlock: mamba block type accessors" {
     };
     const matmul_in_proj = (try cpu_linalg.matmulKernel(.f32)).func;
     const matmul_out_proj = (try cpu_linalg.matmulKernel(.f32)).func;
-    const ssm_scan = compute.cpu.simd.ssm_scan.ssmScanF32;
+    const ssm_scan = compute.cpu.simd.ssm_scan.stateScanF32;
     const mamba_kernel = mamba.MambaKernel.init(
         mamba_config,
         mamba_weights,

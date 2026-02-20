@@ -39,7 +39,7 @@ pub fn applySiluGateInPlace(values: []f32, gates: []const f32) !void {
 
 /// Run one SSM scan/update step using the selected backend kernel implementation.
 pub fn scanStep(
-    ssm_scan: ssm_scan_mod.SsmScanFn,
+    ssm_scan: ssm_scan_mod.StateScanFn,
     ssm_state: []f32,
     ssm_out: []f32,
     x_conv_out: []const f32,

@@ -873,7 +873,7 @@ pub const FusedCpuBackend = struct {
         const sin = try allocator.alloc(f32, seq_len * head_dim);
         errdefer allocator.free(sin);
 
-        try cpu_rotary.buildCosSinTablesFromPositions(
+        try cpu_rotary.buildCosSinTablesFromAxisTriples(
             cos,
             sin,
             pos_t,

@@ -32,8 +32,8 @@ pub fn applyMinP(probabilities: []f32, min_p: f32) void {
     }
 }
 
-/// Apply repetition penalty to logits for tokens that appear in context.
-pub fn applyRepetitionPenalty(logits: []f32, context_tokens: []const u32, penalty: f32) void {
+/// Apply multiplicative penalty for selected indices in a score vector.
+pub fn applyIndexPenalty(logits: []f32, context_tokens: []const u32, penalty: f32) void {
     if (penalty == 1.0) return;
 
     for (context_tokens) |token_id| {
@@ -48,12 +48,11 @@ pub fn applyRepetitionPenalty(logits: []f32, context_tokens: []const u32, penalt
     }
 }
 
-/// Apply additive token biases to logits.
-pub fn applyLogitBias(logits: []f32, bias_entries: anytype) void {
+/// Apply additive bias entries to a score vector.
+pub fn applyIndexBias(logits: []f32, bias_entries: anytype) void {
     for (bias_entries) |bias_entry| {
         if (bias_entry.token_id < logits.len) {
             logits[bias_entry.token_id] += bias_entry.bias;
         }
     }
 }
-

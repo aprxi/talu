@@ -977,7 +977,7 @@ pub fn scatterVisionEmbeddings(
     image_token_id: u32,
     embeddings: []const f32,
 ) !void {
-    return cpu_memory.scatterEmbeddingsByTokenId(
+    return cpu_memory.scatterRowsByMatchedId(
         hidden_states,
         seq_len,
         d_model,

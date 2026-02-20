@@ -16,6 +16,7 @@ const compute = @import("../../../compute/root.zig");
 const metal_compute = compute.metal;
 const graph = metal_compute.graph;
 const model_runtime = @import("model_runtime.zig");
+const runtime_graph_mod = @import("runtime_graph.zig");
 const LoadedModel = models.LoadedModel;
 
 // Internal orchestration modules
@@ -33,7 +34,7 @@ pub const Forward = runtime_trait;
 pub const Device = metal_compute.Device;
 pub const Buffer = metal_compute.Buffer;
 pub const isAvailable = metal_compute.isAvailable;
-pub const Cache = metal_compute.Cache;
+pub const Cache = runtime_graph_mod.Cache;
 pub const WeightHandles = weights_trait.WeightHandles;
 /// Metal backend for GPU-accelerated transformer inference
 pub const MetalBackend = struct {
@@ -51,8 +52,8 @@ pub const MetalBackend = struct {
     config: ModelConfig,
     weights: *weights_trait.WeightHandles,
     /// Slot 0 state (single-sequence compatibility path).
-    cache: graph.Cache,
-    shortconv_cache: graph.ShortConvCache,
+    cache: runtime_graph_mod.Cache,
+    shortconv_cache: runtime_graph_mod.ShortConvCache,
     vocab_size: usize,
     d_model: usize,
     has_shortconv: bool,
@@ -72,8 +73,8 @@ pub const MetalBackend = struct {
     dense_model: ?*anyopaque,
 
     const SlotState = struct {
-        cache: graph.Cache,
-        shortconv_cache: graph.ShortConvCache,
+        cache: runtime_graph_mod.Cache,
+        shortconv_cache: runtime_graph_mod.ShortConvCache,
         in_use: bool = false,
         position: usize = 0,
         rope_position_delta: isize = 0,
@@ -172,13 +173,13 @@ pub const MetalBackend = struct {
         return extraSlotIndexFor(slot_index, self.max_batch_size);
     }
 
-    fn slotCache(self: *MetalBackend, slot_index: usize) !*graph.Cache {
+    fn slotCache(self: *MetalBackend, slot_index: usize) !*runtime_graph_mod.Cache {
         if (slot_index == 0) return &self.cache;
         const extra_idx = try self.toExtraSlotIndex(slot_index);
         return &self.extra_slots[extra_idx].cache;
     }
 
-    fn slotShortConvCache(self: *MetalBackend, slot_index: usize) !*graph.ShortConvCache {
+    fn slotShortConvCache(self: *MetalBackend, slot_index: usize) !*runtime_graph_mod.ShortConvCache {
         if (slot_index == 0) return &self.shortconv_cache;
         const extra_idx = try self.toExtraSlotIndex(slot_index);
         return &self.extra_slots[extra_idx].shortconv_cache;
@@ -203,7 +204,7 @@ pub const MetalBackend = struct {
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
         slot_cache.deinit();
-        slot_cache.* = graph.Cache.init(@intCast(self.config.n_layers), true);
+        slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
         slot_shortconv_cache.reset();
         slot_position.* = 0;
         slot_rope_delta.* = 0;
@@ -221,7 +222,7 @@ pub const MetalBackend = struct {
 
         // Reset cache for new sequence in this scheduler slot.
         slot_cache.deinit();
-        slot_cache.* = graph.Cache.init(@intCast(self.config.n_layers), true);
+        slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
         slot_shortconv_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazy(
@@ -353,8 +354,8 @@ pub const MetalBackend = struct {
 
         // Initialize slot 0 cache (single-sequence compatibility path).
         const layer_count: usize = @intCast(loaded.config.n_layers);
-        const kv_cache = graph.Cache.init(layer_count, true);
-        const shortconv_cache = graph.ShortConvCache.init(layer_count);
+        const kv_cache = runtime_graph_mod.Cache.init(layer_count, true);
+        const shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count);
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
@@ -365,8 +366,8 @@ pub const MetalBackend = struct {
         errdefer allocator.free(extra_slots);
         for (extra_slots) |*slot| {
             slot.* = .{
-                .cache = graph.Cache.init(layer_count, true),
-                .shortconv_cache = graph.ShortConvCache.init(layer_count),
+                .cache = runtime_graph_mod.Cache.init(layer_count, true),
+                .shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count),
                 .in_use = false,
                 .position = 0,
                 .rope_position_delta = 0,
@@ -582,7 +583,7 @@ pub const MetalBackend = struct {
 
         // Reset selected slot cache for new sequence.
         slot_cache.deinit();
-        slot_cache.* = graph.Cache.init(@intCast(self.config.n_layers), true);
+        slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
         slot_shortconv_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(

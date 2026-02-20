@@ -1,12 +1,13 @@
 //! Inference-owned MLX macro-op FFI surface for Metal backend kernels.
 
 const compute = @import("../../../../compute/root.zig");
+const runtime_graph = @import("../runtime_graph.zig");
 
 const mlx_graph = compute.metal.graph;
 
 pub const ArrayHandle = mlx_graph.ArrayHandle;
-pub const CacheHandle = mlx_graph.CacheHandle;
-pub const ShortConvCacheHandle = mlx_graph.ShortConvCacheHandle;
+pub const CacheHandle = runtime_graph.CacheHandle;
+pub const ShortConvCacheHandle = runtime_graph.ShortConvCacheHandle;
 
 pub extern fn mlx_lazy_shortconv_mixer_bf16(
     input: ArrayHandle,

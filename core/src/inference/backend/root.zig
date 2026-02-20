@@ -586,7 +586,7 @@ test "kernel parity: kv cache cpu vs metal" {
     const value_values = [_]f32{ 5.0, 6.0, 7.0, 8.0 };
     try cpu_kernel.forward(slot_index, &key_values, &value_values);
 
-    var metal_cache = graph.Cache.init(1, true);
+    var metal_cache = metal.runtime_graph.Cache.init(1, true);
     defer metal_cache.deinit();
     var metal_kernel = metal.kernels.kv_cache.KVCache{ .cache = &metal_cache };
 

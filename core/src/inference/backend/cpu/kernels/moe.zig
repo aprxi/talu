@@ -139,7 +139,7 @@ pub const MoEFFN = struct {
 
             // 1. Compute router logits: [num_experts]
             const router_logits = scratch.router_logits[0..self.num_experts];
-            cpu_matvec.denseLogits(token_input, &self.router_weight, self.router_bias, router_logits);
+            cpu_matvec.matVecDense(token_input, &self.router_weight, self.router_bias, router_logits);
 
             // 2. Select top-k experts
             const selected_expert_indices = scratch.expert_indices[token_index * self.experts_per_token ..][0..self.experts_per_token];
@@ -399,7 +399,7 @@ test "forward router scoring simple" {
     const logits = try alloc.alloc(f32, num_experts);
     defer alloc.free(logits);
 
-    cpu_matvec.denseLogits(&input, &router_weight, null, logits);
+    cpu_matvec.matVecDense(&input, &router_weight, null, logits);
 
     // Expected: [1.0*1 + 2.0*0 + 1.0*0.5 + 0.5*0,
     //            1.0*0 + 2.0*1 + 1.0*0.5 + 0.5*0,
@@ -424,7 +424,7 @@ test "computeRouterLogits supports [num_experts, d_model] router layout" {
     const input = [_]f32{ 1.0, 2.0, 1.0, 0.5 };
     var logits = [_]f32{ 0.0, 0.0, 0.0 };
 
-    cpu_matvec.denseLogits(&input, &router_weight, null, &logits);
+    cpu_matvec.matVecDense(&input, &router_weight, null, &logits);
 
     try std.testing.expectApproxEqAbs(1.5, logits[0], 1e-5);
     try std.testing.expectApproxEqAbs(2.5, logits[1], 1e-5);
@@ -446,7 +446,7 @@ test "computeRouterLogits supports BF16 router weights" {
     const input = [_]f32{ 1.0, 2.0, 1.0, 0.5 };
     var logits = [_]f32{ 0.0, 0.0, 0.0 };
 
-    cpu_matvec.denseLogits(&input, &router_weight, null, &logits);
+    cpu_matvec.matVecDense(&input, &router_weight, null, &logits);
 
     try std.testing.expectApproxEqAbs(1.5, logits[0], 1e-5);
     try std.testing.expectApproxEqAbs(2.5, logits[1], 1e-5);
@@ -471,7 +471,7 @@ test "forward router scoring bias" {
     const logits = try alloc.alloc(f32, num_experts);
     defer alloc.free(logits);
 
-    cpu_matvec.denseLogits(&input, &router_weight, &bias, logits);
+    cpu_matvec.matVecDense(&input, &router_weight, &bias, logits);
 
     // Expected: [1.0 + 0.1, 1.0 + 0.2, 1.0 + 0.3]
     try std.testing.expectApproxEqAbs(1.1, logits[0], 1e-5);
@@ -924,7 +924,7 @@ test "forward router zero input" {
     const logits = try alloc.alloc(f32, num_experts);
     defer alloc.free(logits);
 
-    cpu_matvec.denseLogits(&zero_input, &router_weight, &bias, logits);
+    cpu_matvec.matVecDense(&zero_input, &router_weight, &bias, logits);
 
     // With zero input, output should be just bias
     try std.testing.expectApproxEqAbs(0.5, logits[0], 1e-5);

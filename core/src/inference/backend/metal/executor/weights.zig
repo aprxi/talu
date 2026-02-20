@@ -11,6 +11,7 @@ const models = @import("../../../../models/root.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
+const runtime_graph = @import("../runtime_graph.zig");
 const model_runtime = @import("../model_runtime.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
 const mla_kernel = @import("../kernels/mla_attention.zig");
@@ -1324,12 +1325,12 @@ fn compileLayersForFusion(allocator: std.mem.Allocator, weight_handles: *WeightH
     const norm_epsilon = config.norm_eps;
     const rope_theta = config.rope_theta;
 
-    const compiled_layers = try allocator.alloc(mlx_graph.CompiledLayer, weight_handles.layers.len);
+    const compiled_layers = try allocator.alloc(model_runtime.CompiledLayer, weight_handles.layers.len);
     errdefer allocator.free(compiled_layers);
 
     for (weight_handles.layers, 0..) |*layer, layer_idx| {
         if (layer.kind != .attention_mlp) return;
-        const compiled_handle = mlx_graph.mlx_compile_layer(
+        const compiled_handle = model_runtime.mlx_compile_layer(
             layer.q_proj.?.weights,
             layer.q_proj.?.scales,
             layer.q_proj.?.biases,
@@ -1380,7 +1381,7 @@ pub const WeightHandles = struct {
     layers: []LayerWeights,
 
     // Compiled layer functions (for fusion optimization)
-    compiled_layers: ?[]mlx_graph.CompiledLayer,
+    compiled_layers: ?[]model_runtime.CompiledLayer,
 
     // Fully fused model (all layers in one C++ call - ZERO FFI overhead)
     fused_model: model_runtime.FusedModelHandle,
@@ -2122,7 +2123,7 @@ test "Model.forward produces logits from input tokens" {
     defer freeWeights(testing.allocator, weight_handles);
 
     // Create KV cache
-    const cache = mlx_graph.Cache.init(1, true);
+    const cache = runtime_graph.Cache.init(1, true);
     defer cache.deinit();
 
     // Run forward pass with single token
@@ -2165,7 +2166,7 @@ test "Model.forwardFromGPUToken produces logits from GPU token" {
     defer freeWeights(testing.allocator, weight_handles);
 
     // Create KV cache
-    const cache = mlx_graph.Cache.init(1, true);
+    const cache = runtime_graph.Cache.init(1, true);
     defer cache.deinit();
 
     // First do a prefill to populate cache and get a token

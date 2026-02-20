@@ -22,6 +22,7 @@ const model_types = @import("../op_types.zig");
 const transformer = inference_mod.backend.block_kernels;
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
+const rope_scaling = @import("rope_scaling.zig");
 
 const maybeConcatGateUpWeights = transforms.maybeConcatGateUpWeights;
 const maybeConcatQkvWeights = transforms.maybeConcatQkvWeights;
@@ -339,27 +340,41 @@ pub fn loadModelWithHooks(
     // Skip RoPE for models with absolute position embeddings (e.g., BERT/MiniLM).
     const rope_global: ?*rope_math.RoPE = if (uses_absolute_positions) null else blk: {
         const rg = try arena_allocator.create(rope_math.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
+        var global_rope = try rope_scaling.materializeInverseFrequencies(
+            backing_allocator,
+            rope_dim,
+            model_config.rope_theta,
+            model_config.rope_scaling,
+        );
+        defer global_rope.deinit(backing_allocator);
         // Use backing_allocator for RoPE (not arena) because RoPE cache grows dynamically via realloc.
         // ArenaAllocator doesn't support true realloc - it allocates new memory without freeing old,
         // which can exhaust memory or crash when the arena's backing pages are fragmented.
-        rg.* = try rope_math.RoPE.initWithRopeScaling(
+        rg.* = try rope_math.RoPE.initFromInvFreq(
             backing_allocator,
             rope_dim,
             @intCast(model_config.max_seq_len),
-            model_config.rope_theta,
-            model_config.rope_scaling,
+            global_rope.inv_freq,
+            global_rope.attention_scaling,
         );
         break :blk rg;
     };
 
     const rope_local: ?*rope_math.RoPE = if (uses_absolute_positions or model_config.rope_local_theta <= 0 or model_config.sliding_window <= 0) null else blk: {
         const local_rope = try arena_allocator.create(rope_math.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
-        local_rope.* = try rope_math.RoPE.initWithRopeScaling(
+        var local_rope_scaling = try rope_scaling.materializeInverseFrequencies(
+            backing_allocator,
+            rope_dim,
+            model_config.rope_local_theta,
+            model_config.rope_scaling,
+        );
+        defer local_rope_scaling.deinit(backing_allocator);
+        local_rope.* = try rope_math.RoPE.initFromInvFreq(
             backing_allocator,
             rope_dim,
             @intCast(model_config.max_seq_len),
-            model_config.rope_local_theta,
-            model_config.rope_scaling,
+            local_rope_scaling.inv_freq,
+            local_rope_scaling.attention_scaling,
         );
         break :blk local_rope;
     };

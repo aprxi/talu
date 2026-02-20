@@ -7,13 +7,14 @@
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
+const runtime_graph = @import("../runtime_graph.zig");
 const model_executor = @import("model.zig");
 const weights_executor = @import("weights.zig");
 
 const ArrayHandle = compute.metal.graph.ArrayHandle;
 
-pub const Cache = compute.metal.graph.Cache;
-pub const ShortConvCache = compute.metal.graph.ShortConvCache;
+pub const Cache = runtime_graph.Cache;
+pub const ShortConvCache = runtime_graph.ShortConvCache;
 
 pub const DeepstackAdditions = model_executor.DeepstackAdditions;
 pub const RuntimeRoPEOverride = model_executor.RuntimeRoPEOverride;

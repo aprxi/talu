@@ -13,6 +13,18 @@ fn isComputePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/compute/");
 }
 
+fn isInferencePath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/src/inference/");
+}
+
+fn importTargetsCompute(target: []const u8) bool {
+    return std.mem.indexOf(u8, target, "compute/") != null;
+}
+
+fn isComputeRootImport(target: []const u8) bool {
+    return std.mem.endsWith(u8, target, "compute/root.zig");
+}
+
 fn isOldTopLevelSimdOrQuantImport(target: []const u8) bool {
     if (std.mem.startsWith(u8, target, "../simd/") and !std.mem.startsWith(u8, target, "../simd/arch/")) return true;
     if (std.mem.startsWith(u8, target, "../../simd/") and !std.mem.startsWith(u8, target, "../../simd/arch/")) return true;
@@ -91,7 +103,187 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
                 std.debug.print("{s}:{d}: forbidden legacy compute import path: \"{s}\"\n", .{ file_path, line, target });
             }
         }
+
+        if (isInferencePath(file_path) and importTargetsCompute(target) and !isComputeRootImport(target)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}:{d}: inference must import compute via compute/root.zig only: \"{s}\"\n", .{ file_path, line, target });
+            }
+        }
     }
+
+    return violations;
+}
+
+fn collectZigBasenames(
+    allocator: std.mem.Allocator,
+    dir_path: []const u8,
+) !std.StringHashMap(void) {
+    var out = std.StringHashMap(void).init(allocator);
+    errdefer {
+        var it = out.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+        out.deinit();
+    }
+
+    var dir = try std.fs.cwd().openDir(dir_path, .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        const owned = try allocator.dupe(u8, entry.name);
+        try out.put(owned, {});
+    }
+    return out;
+}
+
+fn freeNameSet(allocator: std.mem.Allocator, set: *std.StringHashMap(void)) void {
+    var it = set.iterator();
+    while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+    set.deinit();
+}
+
+fn sourceHasPubConst(source: []const u8, name: []const u8) bool {
+    var buf: [128]u8 = undefined;
+    const needle = std.fmt.bufPrint(&buf, "pub const {s}", .{name}) catch return false;
+    return std.mem.indexOf(u8, source, needle) != null;
+}
+
+fn checkRequiredPubConsts(
+    file_path: []const u8,
+    source: []const u8,
+    required: []const []const u8,
+    emit: bool,
+) usize {
+    var violations: usize = 0;
+    for (required) |name| {
+        if (!sourceHasPubConst(source, name)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}: missing required pub const `{s}` for backend symmetry\n", .{ file_path, name });
+            }
+        }
+    }
+    return violations;
+}
+
+fn lintBackendParity(allocator: std.mem.Allocator, emit: bool) !usize {
+    var violations: usize = 0;
+
+    const executor_cpu = "core/src/inference/backend/cpu/executor";
+    const executor_metal = "core/src/inference/backend/metal/executor";
+    const kernels_cpu = "core/src/inference/backend/cpu/kernels";
+    const kernels_metal = "core/src/inference/backend/metal/kernels";
+
+    var exec_cpu_set = try collectZigBasenames(allocator, executor_cpu);
+    defer freeNameSet(allocator, &exec_cpu_set);
+    var exec_metal_set = try collectZigBasenames(allocator, executor_metal);
+    defer freeNameSet(allocator, &exec_metal_set);
+    var kern_cpu_set = try collectZigBasenames(allocator, kernels_cpu);
+    defer freeNameSet(allocator, &kern_cpu_set);
+    var kern_metal_set = try collectZigBasenames(allocator, kernels_metal);
+    defer freeNameSet(allocator, &kern_metal_set);
+
+    var it_exec_cpu = exec_cpu_set.iterator();
+    while (it_exec_cpu.next()) |entry| {
+        if (!exec_metal_set.contains(entry.key_ptr.*)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("backend parity: missing metal executor file `{s}`\n", .{entry.key_ptr.*});
+            }
+        }
+    }
+    var it_exec_metal = exec_metal_set.iterator();
+    while (it_exec_metal.next()) |entry| {
+        if (!exec_cpu_set.contains(entry.key_ptr.*)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("backend parity: missing cpu executor file `{s}`\n", .{entry.key_ptr.*});
+            }
+        }
+    }
+
+    var it_kern_cpu = kern_cpu_set.iterator();
+    while (it_kern_cpu.next()) |entry| {
+        if (!kern_metal_set.contains(entry.key_ptr.*)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("backend parity: missing metal kernel file `{s}`\n", .{entry.key_ptr.*});
+            }
+        }
+    }
+    var it_kern_metal = kern_metal_set.iterator();
+    while (it_kern_metal.next()) |entry| {
+        if (!kern_cpu_set.contains(entry.key_ptr.*)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("backend parity: missing cpu kernel file `{s}`\n", .{entry.key_ptr.*});
+            }
+        }
+    }
+
+    const kernel_root_required = [_][]const u8{
+        "support",
+        "TransformerBlock",
+        "MultiHeadAttention",
+        "SwiGLU",
+        "RMSNorm",
+        "ShortConvKernel",
+        "MoEFFN",
+        "EmbeddingLookup",
+        "KVCache",
+        "FusedAttention",
+        "RotaryEmbedding",
+        "WeightAccess",
+    };
+    const executor_root_required = [_][]const u8{
+        "weights",
+        "runtime",
+        "model",
+        "block",
+        "Model",
+        "Transformer",
+        "Block",
+        "TransformerBlock",
+        "BlockKind",
+        "Attention",
+        "RMSNorm",
+        "FFNLayer",
+        "AttnTemp",
+        "AttnCache",
+        "ScratchBuffer",
+    };
+
+    const kernel_root_cpu = try std.fs.cwd().readFileAlloc(
+        allocator,
+        "core/src/inference/backend/cpu/kernels/root.zig",
+        1024 * 1024,
+    );
+    defer allocator.free(kernel_root_cpu);
+    const kernel_root_metal = try std.fs.cwd().readFileAlloc(
+        allocator,
+        "core/src/inference/backend/metal/kernels/root.zig",
+        1024 * 1024,
+    );
+    defer allocator.free(kernel_root_metal);
+    const executor_root_cpu = try std.fs.cwd().readFileAlloc(
+        allocator,
+        "core/src/inference/backend/cpu/executor/root.zig",
+        1024 * 1024,
+    );
+    defer allocator.free(executor_root_cpu);
+    const executor_root_metal = try std.fs.cwd().readFileAlloc(
+        allocator,
+        "core/src/inference/backend/metal/executor/root.zig",
+        1024 * 1024,
+    );
+    defer allocator.free(executor_root_metal);
+
+    violations += checkRequiredPubConsts("core/src/inference/backend/cpu/kernels/root.zig", kernel_root_cpu, &kernel_root_required, emit);
+    violations += checkRequiredPubConsts("core/src/inference/backend/metal/kernels/root.zig", kernel_root_metal, &kernel_root_required, emit);
+    violations += checkRequiredPubConsts("core/src/inference/backend/cpu/executor/root.zig", executor_root_cpu, &executor_root_required, emit);
+    violations += checkRequiredPubConsts("core/src/inference/backend/metal/executor/root.zig", executor_root_metal, &executor_root_required, emit);
 
     return violations;
 }
@@ -129,7 +321,8 @@ pub fn main() !void {
     defer std.process.argsFree(allocator, args);
 
     const root_path = if (args.len >= 2) args[1] else "core/src";
-    const violations = try lintTree(allocator, root_path);
+    var violations = try lintTree(allocator, root_path);
+    violations += try lintBackendParity(allocator, true);
     if (violations != 0) {
         std.debug.print("lint: found {d} violation(s)\n", .{violations});
         return error.LintFailed;
@@ -162,4 +355,22 @@ test "lintSource allows new cpu simd arch path" {
         \\const simd = @import("simd/arch/root.zig");
     ;
     try std.testing.expectEqual(@as(usize, 0), try lintSource(std.testing.allocator, "core/src/compute/cpu/reduction.zig", src, false));
+}
+
+test "lintSource rejects deep compute import from inference" {
+    const src =
+        \\const bad = @import("../../../compute/cpu/memory.zig");
+    ;
+    try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/engine.zig", src, false));
+}
+
+test "lintSource allows compute root import from inference" {
+    const src =
+        \\const ok = @import("../../../compute/root.zig");
+    ;
+    try std.testing.expectEqual(@as(usize, 0), try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/engine.zig", src, false));
+}
+
+test "backend cpu/metal parity checks pass" {
+    try std.testing.expectEqual(@as(usize, 0), try lintBackendParity(std.testing.allocator, false));
 }

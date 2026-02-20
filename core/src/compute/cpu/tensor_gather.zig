@@ -71,8 +71,8 @@ pub fn collectPositionsU32(
     return positions;
 }
 
-/// Scatter embedding rows into hidden states at positions where token ID matches.
-pub fn scatterEmbeddingsByTokenId(
+/// Scatter source rows into destination rows selected by matched identifier.
+pub fn scatterRowsByMatchedId(
     hidden_states: []f32,
     seq_len: usize,
     row_width: usize,

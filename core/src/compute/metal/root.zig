@@ -19,7 +19,6 @@ pub const capabilities = @import("capabilities.zig");
 pub const Device = device.Device;
 pub const Buffer = device.Buffer;
 pub const isAvailable = device.isAvailable;
-pub const Cache = graph.Cache;
 
 // Re-export grouped-affine matmul functions (MLX backend).
 pub const matmulGaffineU4 = mlx.matmulGaffineU4;

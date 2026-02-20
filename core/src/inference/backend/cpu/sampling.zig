@@ -124,13 +124,13 @@ pub const Sampler = struct {
         // Apply repetition penalty if configured
         if (config.repetition_penalty != 1.0) {
             if (config.context_tokens) |tokens| {
-                cpu_sampling_ops.applyRepetitionPenalty(logits, tokens, config.repetition_penalty);
+                cpu_sampling_ops.applyIndexPenalty(logits, tokens, config.repetition_penalty);
             }
         }
 
         // Apply logit bias if configured
         if (config.logit_bias) |bias_entries| {
-            cpu_sampling_ops.applyLogitBias(logits, bias_entries);
+            cpu_sampling_ops.applyIndexBias(logits, bias_entries);
         }
 
         return self.sampleImpl(logits, config);
@@ -451,7 +451,7 @@ test "sample repetition penalty positive negative" {
     const context_tokens = [_]u32{ 0, 1 };
     const penalty: f32 = 2.0;
 
-    cpu_sampling_ops.applyRepetitionPenalty(&logits, &context_tokens, penalty);
+    cpu_sampling_ops.applyIndexPenalty(&logits, &context_tokens, penalty);
 
     // Token 0: positive logit divided by penalty: 2.0 / 2.0 = 1.0
     try std.testing.expectApproxEqAbs(1.0, logits[0], 0.001);
@@ -471,7 +471,7 @@ test "sample repetition penalty 1.0 noop" {
     const context_tokens = [_]u32{ 0, 1, 2 };
     const penalty: f32 = 1.0;
 
-    cpu_sampling_ops.applyRepetitionPenalty(&logits, &context_tokens, penalty);
+    cpu_sampling_ops.applyIndexPenalty(&logits, &context_tokens, penalty);
 
     // Logits should be unchanged
     for (logits, original_logits) |logit, original| {
@@ -525,7 +525,7 @@ test "sample logit bias modifies" {
         .{ .token_id = 2, .bias = -5.0 }, // Reduce token 2
     };
 
-    cpu_sampling_ops.applyLogitBias(&logits, &bias_entries);
+    cpu_sampling_ops.applyIndexBias(&logits, &bias_entries);
 
     try std.testing.expectApproxEqAbs(@as(f32, 11.0), logits[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), logits[1], 0.001); // Unchanged
@@ -590,7 +590,7 @@ test "sample logit bias ignores out-of-bounds" {
         .{ .token_id = 999, .bias = -50.0 }, // Out of bounds
     };
 
-    cpu_sampling_ops.applyLogitBias(&logits, &bias_entries);
+    cpu_sampling_ops.applyIndexBias(&logits, &bias_entries);
 
     // Logits should be unchanged (out-of-bounds ignored)
     for (logits, original_logits) |logit, original| {
@@ -1461,7 +1461,7 @@ test "Sampler.sample boundary out-of-bounds" {
     const context_tokens = [_]u32{ 0, 1, 100, 999 }; // Some out of bounds
     const penalty: f32 = 2.0;
 
-    cpu_sampling_ops.applyRepetitionPenalty(&logits, &context_tokens, penalty);
+    cpu_sampling_ops.applyIndexPenalty(&logits, &context_tokens, penalty);
 
     // Only tokens 0 and 1 should be penalized
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[0], 0.001);

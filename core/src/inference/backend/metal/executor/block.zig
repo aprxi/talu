@@ -4,6 +4,7 @@
 //! can delegate layer work through a stable `TransformerBlock.forward` surface.
 
 const compute = @import("../../../../compute/root.zig");
+const runtime_graph = @import("../runtime_graph.zig");
 const attention_kernel = @import("../kernels/attention.zig");
 const ffn_kernel = @import("../kernels/ffn.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
@@ -12,8 +13,8 @@ const norm_kernel = @import("../kernels/norm.zig");
 const shortconv_kernel = @import("../kernels/shortconv.zig");
 const mlx_graph = compute.metal.graph;
 
-pub const Cache = mlx_graph.Cache;
-pub const ShortConvCache = mlx_graph.ShortConvCache;
+pub const Cache = runtime_graph.Cache;
+pub const ShortConvCache = runtime_graph.ShortConvCache;
 
 pub const TransformerBlock = struct {
     pub fn forward(

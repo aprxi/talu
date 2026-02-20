@@ -6,13 +6,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compute = @import("../../../../compute/root.zig");
+const runtime_graph = @import("../runtime_graph.zig");
 const block_executor = @import("block.zig");
 
 const ArrayHandle = compute.metal.graph.ArrayHandle;
 const mlx_graph = compute.metal.graph;
 
-pub const Cache = mlx_graph.Cache;
-pub const ShortConvCache = mlx_graph.ShortConvCache;
+pub const Cache = runtime_graph.Cache;
+pub const ShortConvCache = runtime_graph.ShortConvCache;
 
 pub const DeepstackAdditions = struct {
     positions: []const usize,

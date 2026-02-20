@@ -21,7 +21,7 @@ pub fn fillInverseFrequency(inv_freq: []f32, head_dim: usize, rope_theta: f32) !
 /// position components.
 ///
 /// Writes `cos` and `sin` as `[seq_len, head_dim]` flattened contiguous buffers.
-pub fn buildCosSinTablesFromPositions(
+pub fn buildCosSinTablesFromAxisTriples(
     cos: []f32,
     sin: []f32,
     pos_t: []const u32,
@@ -60,7 +60,7 @@ pub fn buildCosSinTablesFromPositions(
 }
 
 /// Apply precomputed runtime RoPE tables over Q/K buffers in-place.
-pub fn applyRuntimeQK(
+pub fn applyRuntimeTablesToPair(
     query_values: []f32,
     key_values: []f32,
     sequence_len: usize,
@@ -98,7 +98,7 @@ pub fn applyRuntimeQK(
 /// `rope` must expose:
 /// - `dim: usize`
 /// - `applyInPlace(vec: []f32, pos: usize) void`
-pub fn applyStaticQK(
+pub fn applyStaticTablesToPair(
     query_values: []f32,
     key_values: []f32,
     sequence_len: usize,
@@ -278,7 +278,7 @@ fn applyFromCosSin(vec: []f32, cos: []const f32, sin: []const f32) void {
     }
 }
 
-test "buildCosSinTablesFromPositions fills duplicated halves" {
+test "buildCosSinTablesFromAxisTriples fills duplicated halves" {
     const head_dim: usize = 4;
     const seq_len: usize = 2;
     const inv_freq = [_]f32{ 1.0, 0.5 };
@@ -288,7 +288,7 @@ test "buildCosSinTablesFromPositions fills duplicated halves" {
     var cos = [_]f32{0} ** (seq_len * head_dim);
     var sin = [_]f32{0} ** (seq_len * head_dim);
 
-    try buildCosSinTablesFromPositions(
+    try buildCosSinTablesFromAxisTriples(
         &cos,
         &sin,
         &pos_t,
@@ -313,19 +313,19 @@ test "fillInverseFrequency computes expected first element" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), inv[0], 1e-6);
 }
 
-test "applyRuntimeQK rotates one token" {
+test "applyRuntimeTablesToPair rotates one token" {
     var q = [_]f32{ 1, 2, 3, 4 };
     var k = [_]f32{ 5, 6, 7, 8 };
     const cos = [_]f32{ 1, 1, 1, 1 };
     const sin = [_]f32{ 0, 0, 0, 0 };
 
-    try applyRuntimeQK(&q, &k, 1, 1, 1, 4, 4, 4, 0, &cos, &sin, 4);
+    try applyRuntimeTablesToPair(&q, &k, 1, 1, 1, 4, 4, 4, 0, &cos, &sin, 4);
 
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 3, 4 }, &q);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 5, 6, 7, 8 }, &k);
 }
 
-test "applyStaticQK applies position offset to each head slice" {
+test "applyStaticTablesToPair applies position offset to each head slice" {
     const MockRope = struct {
         dim: usize = 2,
         pub fn applyInPlace(_: *@This(), vec: []f32, pos: usize) void {
@@ -338,7 +338,7 @@ test "applyStaticQK applies position offset to each head slice" {
     var q = [_]f32{ 1, 2, 3, 4 };
     var k = [_]f32{ 5, 6, 7, 8 };
 
-    try applyStaticQK(&q, &k, 1, 2, 2, 2, 4, 4, 3, 0, &rope);
+    try applyStaticTablesToPair(&q, &k, 1, 2, 2, 2, 4, 4, 3, 0, &rope);
 
     try std.testing.expectEqualSlices(f32, &[_]f32{ 4, 5, 6, 7 }, &q);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 8, 9, 10, 11 }, &k);

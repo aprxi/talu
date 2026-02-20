@@ -135,7 +135,7 @@ pub const MambaKernel = struct {
     weights: MambaWeights,
     matmul_in_proj: cpu_linalg.MatmulFn,
     matmul_out_proj: cpu_linalg.MatmulFn,
-    ssm_scan: ssm_scan_mod.SsmScanFn,
+    ssm_scan: ssm_scan_mod.StateScanFn,
     layer_idx: u16 = trace.TraceEmission.NO_LAYER,
 
     /// Initialize from configuration and weights.
@@ -144,7 +144,7 @@ pub const MambaKernel = struct {
         weights: MambaWeights,
         matmul_in_proj: cpu_linalg.MatmulFn,
         matmul_out_proj: cpu_linalg.MatmulFn,
-        ssm_scan: ssm_scan_mod.SsmScanFn,
+        ssm_scan: ssm_scan_mod.StateScanFn,
     ) MambaKernel {
         return .{
             .config = config,
@@ -495,7 +495,7 @@ test "MambaKernel.forward rejects batch > 1 for 3D input" {
         weights,
         cpu_linalg.matmulF32,
         cpu_linalg.matmulF32,
-        compute.cpu.simd.ssm_scan.ssmScanF32,
+        compute.cpu.simd.ssm_scan.stateScanF32,
     );
 
     var input_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 2, 3, 4 });

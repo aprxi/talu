@@ -6,9 +6,8 @@ const dtype_mod = @import("../../dtype.zig");
 
 const Tensor = tensor.Tensor;
 
-/// Compute router logits for MoE routing:
-/// `logits = input_vector @ router_weight (+ bias)`.
-pub fn denseLogits(
+/// Dense matrix-vector product with optional output bias.
+pub fn matVecDense(
     input_vector: []const f32,
     router_weight: *const Tensor,
     router_bias: ?[]const f32,
@@ -65,7 +64,7 @@ pub fn denseLogits(
     }
 }
 
-test "denseLogits computes logits for [experts, input_dim] layout" {
+test "matVecDense computes logits for [experts, input_dim] layout" {
     const allocator = std.testing.allocator;
     var weight = try tensor.OwnedTensor.init(allocator, .f32, &.{ 2, 3 });
     defer weight.deinit();
@@ -79,7 +78,7 @@ test "denseLogits computes logits for [experts, input_dim] layout" {
     var logits = [_]f32{ 0, 0 };
     var w_view = weight.view();
 
-    denseLogits(&input, &w_view, &bias, &logits);
+    matVecDense(&input, &w_view, &bias, &logits);
 
     try std.testing.expectApproxEqAbs(@as(f32, 3.5), logits[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 7.0), logits[1], 1e-6);

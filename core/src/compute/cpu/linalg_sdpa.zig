@@ -422,7 +422,7 @@ fn sdpaCausalTyped(
 /// - sinks: optional per-head sink logits (null if not used)
 /// - sliding_window: 0 = disabled, >0 = only attend to last N positions
 /// - allocator: optional allocator for large sequences (>8192). If null, large sequences will error.
-pub fn sdpaCached(
+fn sdpaCached(
     out_data: [*]f32,
     out_strides: [4]usize,
     q_data: [*]const f32,
@@ -509,7 +509,7 @@ pub fn sdpaCached(
 
 /// Parameters for KV cache attention, pre-validated.
 /// Use validateKVCacheParams() to construct.
-pub const KVCacheAttentionParams = struct {
+const KVCacheAttentionParams = struct {
     n_heads: usize,
     n_kv_heads: usize,
     seq_len: usize,
@@ -523,7 +523,7 @@ pub const KVCacheAttentionParams = struct {
 };
 
 /// Validation error for KV cache parameters.
-pub const KVCacheValidationError = error{
+const KVCacheValidationError = error{
     LayerIndexOutOfBounds,
     InvalidTensorDims,
     CacheShapeMismatch,
@@ -534,7 +534,7 @@ pub const KVCacheValidationError = error{
 };
 
 /// Convert i64 strides to usize array (4D).
-pub fn stridesToUsize4D(strides: *const [8]i64) [4]usize {
+fn stridesToUsize4D(strides: *const [8]i64) [4]usize {
     return .{
         @intCast(strides[0]),
         @intCast(strides[1]),
@@ -545,7 +545,7 @@ pub fn stridesToUsize4D(strides: *const [8]i64) [4]usize {
 
 /// Update KV cache with new K/V values (stride-aware copy)
 /// Used by attention_with_kv_cache to update the cache before computing attention.
-pub fn updateKVCache(
+fn updateKVCache(
     k_cache: []f32,
     v_cache: []f32,
     k_data: [*]const f32,
