@@ -24,7 +24,7 @@ const tensor = @import("../../../../tensor.zig");
 const Tensor = tensor.Tensor;
 const log = @import("../../../../log.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_norm = compute.cpu.normalization;
 const cpu_state_space = compute.cpu.recurrence.state_space;
@@ -133,8 +133,8 @@ pub const MambaState = struct {
 pub const MambaKernel = struct {
     config: MambaConfig,
     weights: MambaWeights,
-    matmul_in_proj: matmul.MatmulFn,
-    matmul_out_proj: matmul.MatmulFn,
+    matmul_in_proj: cpu_linalg.MatmulFn,
+    matmul_out_proj: cpu_linalg.MatmulFn,
     ssm_scan: ssm_scan_mod.SsmScanFn,
     layer_idx: u16 = trace.TraceEmission.NO_LAYER,
 
@@ -142,8 +142,8 @@ pub const MambaKernel = struct {
     pub fn init(
         config: MambaConfig,
         weights: MambaWeights,
-        matmul_in_proj: matmul.MatmulFn,
-        matmul_out_proj: matmul.MatmulFn,
+        matmul_in_proj: cpu_linalg.MatmulFn,
+        matmul_out_proj: cpu_linalg.MatmulFn,
         ssm_scan: ssm_scan_mod.SsmScanFn,
     ) MambaKernel {
         return .{
@@ -171,7 +171,7 @@ pub const MambaKernel = struct {
         output: *Tensor,
         state: *MambaState,
         scratch: *MambaScratch,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
     ) !void {
         const cfg = self.config;
         const w = self.weights;
@@ -493,8 +493,8 @@ test "MambaKernel.forward rejects batch > 1 for 3D input" {
     const kernel_inst = MambaKernel.init(
         config,
         weights,
-        matmul.matmulF32,
-        matmul.matmulF32,
+        cpu_linalg.matmulF32,
+        cpu_linalg.matmulF32,
         compute.cpu.simd.ssm_scan.ssmScanF32,
     );
 
@@ -509,7 +509,7 @@ test "MambaKernel.forward rejects batch > 1 for 3D input" {
     defer state.deinit();
     var scratch = try MambaScratch.init(allocator, config);
     defer scratch.deinit();
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     const result = kernel_inst.forward(&input, &output, &state, &scratch, &matmul_scratch);

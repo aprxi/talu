@@ -8,7 +8,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const mxfp4 = compute.cpu.mxfp4;
 const cpu_activation = compute.cpu.activation;
 const cpu_common = compute.cpu.common;
@@ -23,7 +23,7 @@ const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capt
 };
 
 const Tensor = tensor.Tensor;
-const MatmulFn = matmul.MatmulFn;
+const MatmulFn = cpu_linalg.MatmulFn;
 
 pub const MoEError = error{
     MissingMoEWeights,
@@ -78,7 +78,7 @@ pub const MoEFFN = struct {
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         scratch: *MoEScratch,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
     };
 
     allocator: std.mem.Allocator,
@@ -106,7 +106,7 @@ pub const MoEFFN = struct {
     /// Kernel name for trace emission (identifies MoE implementation)
     kernel_name: ?[]const u8 = null,
 
-    pub fn forward(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *matmul.MatmulScratch) !void {
+    pub fn forward(self: *const MoEFFN, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *MoEScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
         std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
         const seq_len: usize = @intCast(input_tensor.shape[1]);
@@ -191,7 +191,7 @@ pub const MoEFFN = struct {
         input_vector: []const f32,
         output_vector: []f32,
         scratch: *MoEScratch,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
     ) !void {
         const gate_up_values = scratch.gate_up_values[0 .. 2 * self.d_ff];
         const hidden_values = scratch.hidden_values[0..self.d_ff];
@@ -263,7 +263,7 @@ pub const MoEFFN = struct {
                 // Standard matmul for gate_values
                 var input_view = Tensor.view2DSlice(@constCast(input_vector), 1, self.d_model);
                 var gate_output_view = Tensor.view2DSlice(gate_values, 1, self.d_ff);
-                const gate_kernel = (matmul.matmulKernel(gate_proj.dtype) catch matmul.DispatchedKernel{ .func = matmul.matmulF32, .name = "matmulF32" }).func;
+                const gate_kernel = (cpu_linalg.matmulKernel(gate_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
                 gate_kernel(&input_view, &gate_proj, &gate_output_view, matmul_scratch);
                 if (expert.gate_bias) |bias| {
                     cpu_common.addBiasRows(gate_values, bias, 1, self.d_ff);
@@ -271,7 +271,7 @@ pub const MoEFFN = struct {
 
                 // Standard matmul for up_values
                 var up_output_view = Tensor.view2DSlice(up_values, 1, self.d_ff);
-                const up_kernel = (matmul.matmulKernel(up_proj.dtype) catch matmul.DispatchedKernel{ .func = matmul.matmulF32, .name = "matmulF32" }).func;
+                const up_kernel = (cpu_linalg.matmulKernel(up_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
                 up_kernel(&input_view, &up_proj, &up_output_view, matmul_scratch);
                 if (expert.up_bias) |bias| {
                     cpu_common.addBiasRows(up_values, bias, 1, self.d_ff);
@@ -315,7 +315,7 @@ pub const MoEFFN = struct {
                 // Standard F32/F16/BF16 matmul
                 var input_view = Tensor.view2DSlice(@constCast(input_vector), 1, self.d_model);
                 var out_view = Tensor.view2DSlice(gate_up_values, 1, 2 * self.d_ff);
-                const matmul_kernel = (matmul.matmulKernel(gate_up_proj.dtype) catch matmul.DispatchedKernel{ .func = matmul.matmulF32, .name = "matmulF32" }).func;
+                const matmul_kernel = (cpu_linalg.matmulKernel(gate_up_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
                 matmul_kernel(&input_view, &gate_up_proj, &out_view, matmul_scratch);
 
                 if (expert.gate_up_bias) |bias| {
@@ -363,7 +363,7 @@ pub const MoEFFN = struct {
         } else {
             var input_view = Tensor.view2DSlice(hidden_values, 1, self.d_ff);
             var out_view = Tensor.view2DSlice(output_vector, 1, self.d_model);
-            const matmul_kernel = (matmul.matmulKernel(expert.down_proj.dtype) catch matmul.DispatchedKernel{ .func = matmul.matmulF32, .name = "matmulF32" }).func;
+            const matmul_kernel = (cpu_linalg.matmulKernel(expert.down_proj.dtype) catch cpu_linalg.DispatchedKernel{ .func = cpu_linalg.matmulF32, .name = "matmulF32" }).func;
             matmul_kernel(&input_view, &expert.down_proj, &out_view, matmul_scratch);
 
             if (expert.down_bias) |bias| {
@@ -809,7 +809,7 @@ test "forward SwiGLU standard" {
 
     var scratch = MoEScratch{};
     defer scratch.deinit(alloc);
-    var matmul_scratch = try matmul.MatmulScratch.init(alloc);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(alloc);
     defer matmul_scratch.deinit();
 
     try cpu_common.ensureF32Slice(alloc, &scratch.gate_up_values, 2 * d_ff);

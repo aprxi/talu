@@ -7,7 +7,7 @@ const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const graph_types = @import("../../../../models/op_types.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
 const tensor = @import("../../../../tensor.zig");
 const Tensor = tensor.Tensor;
@@ -60,7 +60,7 @@ pub const ScratchBuffer = struct {
     attn_scratch: attn.AttnTemp = .{},
     ffn_scratch: ffn.FfnScratch = .{},
     moe_scratch: moe.MoEScratch = .{}, // For MoE layers
-    matmul_scratch: matmul.MatmulScratch,
+    matmul_scratch: cpu_linalg.MatmulScratch,
 
     // Mamba state/scratch for heterogeneous models (null for homogeneous attention-only)
     mamba_states: ?[]mamba.MambaState = null,
@@ -101,7 +101,7 @@ pub const ScratchBuffer = struct {
         const attn_cache_buffer = try allocator.alloc(attn.AttnCache, n_layers);
         errdefer allocator.free(attn_cache_buffer);
         for (attn_cache_buffer) |*cache| cache.* = .{};
-        var matmul_workspace = try matmul.MatmulScratch.init(allocator);
+        var matmul_workspace = try cpu_linalg.MatmulScratch.init(allocator);
         errdefer matmul_workspace.deinit();
         return .{
             .allocator = allocator,
@@ -318,7 +318,7 @@ const BatchedKVCache = kv_cache.BatchedKVCache;
 /// Runtime resources needed by kernels during execution.
 pub const KernelContext = struct {
     scratch: *ScratchBuffer,
-    matmul_scratch: *matmul.MatmulScratch,
+    matmul_scratch: *cpu_linalg.MatmulScratch,
     attn_cache: ?*AttnCache = null,
     mla_cache: ?*MLACache = null,
     mla_scratch: ?*MLATemp = null,

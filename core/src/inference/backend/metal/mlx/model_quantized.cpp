@@ -3,7 +3,8 @@
 // Full transformer implementation using 4-bit quantized weights.
 // Uses MLX's quantized_matmul for 8x memory bandwidth savings.
 
-#include "common.h"
+#include "compute_common.h"
+#include "model_state.h"
 
 // ============================================================================
 // Quantized Model Structure

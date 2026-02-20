@@ -11,9 +11,9 @@ const layer_ops = @import("../../../../models/layer_ops.zig");
 const tensor_mod = @import("../../../../tensor.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
-const cpu_tensor_gather = compute.cpu.memory.gather;
+const cpu_memory = compute.cpu.memory;
 const inspect = @import("../../../../xray/root.zig");
 const kernel_info = inspect.kernel_info;
 const perf_estimate = inspect.perf_estimate;
@@ -32,7 +32,7 @@ const FFNLayer = block_kernels.FfnLayer;
 const RMSNorm = norm_kernel.RMSNorm;
 const ScratchBuffer = @import("runtime.zig").ScratchBuffer;
 const PerfEstimate = perf_estimate.PerfEstimate;
-const MatmulFn = matmul.MatmulFn;
+const MatmulFn = cpu_linalg.MatmulFn;
 const KernelOp = kernel_info.KernelOp;
 
 const block_kernels = @import("weights.zig");
@@ -109,7 +109,7 @@ pub const Linear = struct {
             .f32 => @intCast(weight.shape[1]),
             else => @intCast(weight.shape[0]),
         };
-        const dk = try matmul.matmulKernel(weight.dtype);
+        const dk = try cpu_linalg.matmulKernel(weight.dtype);
         return .{
             .weight = weight,
             .bias = bias,
@@ -120,7 +120,7 @@ pub const Linear = struct {
     }
 
     pub fn initWithDims(weight: *const Tensor, bias: ?[]const f32, in_features: usize, out_features: usize) !Linear {
-        const dk = try matmul.matmulKernel(weight.dtype);
+        const dk = try cpu_linalg.matmulKernel(weight.dtype);
         return .{
             .weight = weight,
             .bias = bias,
@@ -130,7 +130,7 @@ pub const Linear = struct {
         };
     }
 
-    pub inline fn forward(self: *const Linear, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *matmul.MatmulScratch) void {
+    pub inline fn forward(self: *const Linear, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *cpu_linalg.MatmulScratch) void {
         const row_count: usize = if (input_tensor.n_dims == 3) @intCast(input_tensor.shape[0] * input_tensor.shape[1]) else @intCast(input_tensor.shape[0]);
         const input_view = Tensor.view2D(input_tensor.data(), row_count, self.in_features);
         var output_view = Tensor.view2DSlice(output_tensor.asSlice(f32), row_count, self.out_features);
@@ -443,7 +443,7 @@ pub const Transformer = struct {
         features: []const f32,
     ) !void {
         if (positions.len == 0) return;
-        try cpu_tensor_gather.scatterAddRowsByPositions(
+        try cpu_memory.scatterAddRowsByPositions(
             hidden.asSliceMut(f32),
             seq_len,
             hidden_size,

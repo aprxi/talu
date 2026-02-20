@@ -4,7 +4,8 @@
 // All operations are "lazy" - they build a computation graph without executing.
 // Call mlx_eval() to execute the graph.
 
-#include "common.h"
+#include "compute_common.h"
+#include "model_state.h"
 
 extern "C" {
 

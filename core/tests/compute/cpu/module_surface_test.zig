@@ -25,5 +25,5 @@ test "compute.cpu transitional modules remain available during migration" {
     _ = compute.cpu.linalg.matmul;
     _ = compute.cpu.normalization;
     _ = compute.cpu.attn_primitives;
-    _ = compute.cpu.math_primitives;
+    _ = compute.cpu.math;
 }

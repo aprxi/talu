@@ -1,8 +1,8 @@
 //! Activation functions: SiLU, GELU, ReLU, sigmoid, tanh.
 
 const std = @import("std");
-const fast_math = @import("fast_math.zig");
-const simd = @import("../simd/arch/root.zig");
+const fast_math = @import("math_fast.zig");
+const simd = @import("simd/arch/root.zig");
 
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;

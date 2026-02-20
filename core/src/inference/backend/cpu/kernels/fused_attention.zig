@@ -1,13 +1,13 @@
 //! Transitional fused-attention compatibility wrapper.
 //!
-//! Low-level layout work lives in `compute.cpu.layout.transform.zig`.
+//! Low-level layout work lives in `compute.cpu.layout`.
 
 pub const supported = true;
 
 const compute = @import("../../../../compute/root.zig");
 const attention = @import("attention.zig");
 
-const layout = compute.cpu.layout.transform;
+const layout = compute.cpu.layout;
 
 pub const QkvViews = layout.QkvViews;
 pub const projectQkv = layout.projectQkv;

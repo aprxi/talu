@@ -9,7 +9,7 @@ const layer_ops = @import("../../../../models/layer_ops.zig");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const capi = @import("../../../../capi/error.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const tv = compute.cpu.tensor_view;
 const activation_ops = compute.cpu.activation_view;
 const transpose_ops = compute.cpu.layout.transpose;
@@ -17,7 +17,7 @@ const attention_ops = compute.cpu.attn_primitives;
 const cpu_broadcast = compute.cpu.layout.broadcast;
 const cpu_elementwise = compute.cpu.elementwise;
 const cpu_reduction = compute.cpu.reduction;
-const cpu_layout = compute.cpu.layout.transform;
+const cpu_layout = compute.cpu.layout;
 const cpu_masking = compute.cpu.layout.masking;
 const cpu_rotary = compute.cpu.rotary;
 const runtime = @import("runtime.zig");
@@ -322,7 +322,7 @@ pub const Block = struct {
                     var output_view = Tensor.view2D(std.mem.sliceAsBytes(output_slice), seq_len, output_features);
 
                     // Use the appropriate matmul kernel based on weight dtype
-                    const dk = matmul.matmulKernel(weight.dtype) catch |err| {
+                    const dk = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
                         capi.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
                         return err;
                     };
@@ -424,7 +424,7 @@ pub const Block = struct {
                     const a_view = Tensor.view2D(left_input.data(), @intCast(left_input.shape[1]), @intCast(left_input.shape[2]));
                     const b_view = Tensor.view2D(right_input.data(), @intCast(right_input.shape[1]), @intCast(right_input.shape[2]));
 
-                    try matmul.matmulAuto(&a_view, &b_view, &output_view, &scratch.matmul_scratch);
+                    try cpu_linalg.matmulAuto(&a_view, &b_view, &output_view, &scratch.matmul_scratch);
 
                     // Store result in buffer
                     const out_bytes = std.mem.sliceAsBytes(out_slice)[0..out_byte_size];
@@ -882,7 +882,7 @@ pub const Block = struct {
                         return error.MissingWeight;
                     }
                     const weight = self.block.weight_registry.get(linear_op.weight_name).?;
-                    _ = matmul.matmulKernel(weight.dtype) catch |err| {
+                    _ = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
                         capi.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
                         return err;
                     };

@@ -11,7 +11,7 @@ const tensor = @import("../../../../tensor.zig");
 const dtype = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_quant_decode = compute.cpu.quant_decode;
-const cpu_tensor_gather = compute.cpu.memory.gather;
+const cpu_memory = compute.cpu.memory;
 
 const Tensor = tensor.Tensor;
 
@@ -32,7 +32,7 @@ pub fn gatherEmbeddings(embedding_weights: *const Tensor, token_ids: []const u32
     switch (embedding_weights.dtype) {
         .f32 => {
             const embedding_weights_data = embedding_weights.asSlice(f32);
-            try cpu_tensor_gather.gatherRowsF32(embedding_weights_data, vocab_size, embed_dim, token_ids, output_values);
+            try cpu_memory.gatherRowsF32(embedding_weights_data, vocab_size, embed_dim, token_ids, output_values);
         },
         .f16 => {
             const embedding_weights_data = embedding_weights.asSliceUnaligned(u16);

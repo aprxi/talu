@@ -3,7 +3,7 @@
 // Implements KV cache for transformer inference, matching Python mlx-lm behavior.
 // Uses pre-allocated buffers with slice_update for efficiency.
 
-#include "common.h"
+#include "model_state.h"
 
 extern "C" {
 

@@ -3,7 +3,8 @@
 // High-level operations that combine multiple MLX calls for efficiency.
 // Uses MLX fast:: kernels which are highly optimized Metal implementations.
 
-#include "common.h"
+#include "compute_common.h"
+#include "model_state.h"
 
 extern "C" {
 

@@ -10,10 +10,10 @@
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_copy = compute.cpu.memory.copy;
-const cpu_layout = compute.cpu.layout.transform;
+const cpu_layout = compute.cpu.layout;
 const graph_types = @import("../../../../models/op_types.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const fmt = @import("../kernels/describe_fmt.zig");
@@ -1137,22 +1137,22 @@ pub const TransformerBlock = struct {
         else
             return error.MissingAttentionWeights;
 
-        const dk_qkv = try matmul.matmulKernel(qkv_weight_dtype);
-        const dk_o = try matmul.matmulKernel(weights.o_proj.dtype);
+        const dk_qkv = try cpu_linalg.matmulKernel(qkv_weight_dtype);
+        const dk_o = try cpu_linalg.matmulKernel(weights.o_proj.dtype);
 
         // Check if K/V have different dtypes than Q (some models mix different dtypes)
         // Only relevant when using separate projections
-        const dk_k: ?matmul.DispatchedKernel = if (has_split_qkv and weights.k_proj.?.dtype != weights.q_proj.?.dtype)
-            try matmul.matmulKernel(weights.k_proj.?.dtype)
+        const dk_k: ?cpu_linalg.DispatchedKernel = if (has_split_qkv and weights.k_proj.?.dtype != weights.q_proj.?.dtype)
+            try cpu_linalg.matmulKernel(weights.k_proj.?.dtype)
         else
             null;
-        const dk_v: ?matmul.DispatchedKernel = if (has_split_qkv and weights.v_proj.?.dtype != weights.q_proj.?.dtype)
-            try matmul.matmulKernel(weights.v_proj.?.dtype)
+        const dk_v: ?cpu_linalg.DispatchedKernel = if (has_split_qkv and weights.v_proj.?.dtype != weights.q_proj.?.dtype)
+            try cpu_linalg.matmulKernel(weights.v_proj.?.dtype)
         else
             null;
 
-        const dk_qkv_fused: ?matmul.DispatchedKernel = if (weights.fused.qkv_proj) |fq|
-            try matmul.matmulKernel(fq.dtype)
+        const dk_qkv_fused: ?cpu_linalg.DispatchedKernel = if (weights.fused.qkv_proj) |fq|
+            try cpu_linalg.matmulKernel(fq.dtype)
         else
             null;
 
@@ -1309,10 +1309,10 @@ pub const TransformerBlock = struct {
             }
 
             const matmul_gate_dtype = if (weights.w1) |w1| w1.dtype else if (fused_gate_up) |fg| fg.dtype else return error.MissingFFNWeights;
-            const dk_gate = try matmul.matmulKernel(matmul_gate_dtype);
-            const dk_down = try matmul.matmulKernel(w2.dtype);
-            const dk_gate_up: ?matmul.DispatchedKernel = if (fused_gate_up) |fg|
-                try matmul.matmulKernel(fg.dtype)
+            const dk_gate = try cpu_linalg.matmulKernel(matmul_gate_dtype);
+            const dk_down = try cpu_linalg.matmulKernel(w2.dtype);
+            const dk_gate_up: ?cpu_linalg.DispatchedKernel = if (fused_gate_up) |fg|
+                try cpu_linalg.matmulKernel(fg.dtype)
             else
                 null;
             const w1_bias_slice: ?[]const f32 = if (weights.w1_bias) |b| blk: {
@@ -1448,8 +1448,8 @@ pub const TransformerBlock = struct {
         use_gelu: bool,
         block_idx: usize,
     ) !TransformerBlock {
-        const matmul_in_proj = (try matmul.matmulKernel(weights.weights.in_proj.dtype)).func;
-        const matmul_out_proj = (try matmul.matmulKernel(weights.weights.out_proj.dtype)).func;
+        const matmul_in_proj = (try cpu_linalg.matmulKernel(weights.weights.in_proj.dtype)).func;
+        const matmul_out_proj = (try cpu_linalg.matmulKernel(weights.weights.out_proj.dtype)).func;
         const ssm_scan = compute.cpu.simd.ssm_scan.ssmScanF32;
 
         const ln1_ptr = try createNormKernel(allocator, weights.ln1_weight, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_attn_norm);
@@ -1481,8 +1481,8 @@ pub const TransformerBlock = struct {
             if (fused.gate_up) |gate_up| {
                 fused_gate_up_storage = gate_up;
                 const down_proj = weights.down_proj orelse return error.InvalidConfiguration;
-                const dk_gate_up = try matmul.matmulKernel(gate_up.dtype);
-                const dk_down = try matmul.matmulKernel(down_proj.dtype);
+                const dk_gate_up = try cpu_linalg.matmulKernel(gate_up.dtype);
+                const dk_down = try cpu_linalg.matmulKernel(down_proj.dtype);
                 const ffn_layer_ptr = try allocator.create(FfnLayer);
                 errdefer allocator.destroy(ffn_layer_ptr);
                 ffn_layer_ptr.* = .{
@@ -1555,8 +1555,8 @@ pub const TransformerBlock = struct {
         use_gelu: bool,
         block_idx: usize,
     ) !TransformerBlock {
-        const dk_in_proj = try matmul.matmulKernel(weights.weights.in_proj.dtype);
-        const dk_out_proj = try matmul.matmulKernel(weights.weights.out_proj.dtype);
+        const dk_in_proj = try cpu_linalg.matmulKernel(weights.weights.in_proj.dtype);
+        const dk_out_proj = try cpu_linalg.matmulKernel(weights.weights.out_proj.dtype);
 
         const ln1_ptr = try createNormKernel(allocator, weights.ln1_weight, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_attn_norm);
         errdefer allocator.destroy(ln1_ptr);
@@ -1592,8 +1592,8 @@ pub const TransformerBlock = struct {
             if (fused.gate_up) |gate_up| {
                 fused_gate_up_storage = gate_up;
                 const down_proj = weights.w2 orelse return error.InvalidConfiguration;
-                const dk_gate_up = try matmul.matmulKernel(gate_up.dtype);
-                const dk_down = try matmul.matmulKernel(down_proj.dtype);
+                const dk_gate_up = try cpu_linalg.matmulKernel(gate_up.dtype);
+                const dk_down = try cpu_linalg.matmulKernel(down_proj.dtype);
                 const ffn_layer_ptr = try allocator.create(FfnLayer);
                 errdefer allocator.destroy(ffn_layer_ptr);
                 ffn_layer_ptr.* = .{ .swiglu = .{
@@ -1628,8 +1628,8 @@ pub const TransformerBlock = struct {
                 fused_gate_up_storage = fused_tensor;
                 fused_gate_up_owned = true; // We allocated this, need to free it
 
-                const dk_gate_up = try matmul.matmulKernel(w1.dtype);
-                const dk_down = try matmul.matmulKernel(w2.dtype);
+                const dk_gate_up = try cpu_linalg.matmulKernel(w1.dtype);
+                const dk_down = try cpu_linalg.matmulKernel(w2.dtype);
                 const ffn_layer_ptr = try allocator.create(FfnLayer);
                 errdefer allocator.destroy(ffn_layer_ptr);
                 ffn_layer_ptr.* = .{ .swiglu = .{
@@ -1653,8 +1653,8 @@ pub const TransformerBlock = struct {
                 ffn_ptr = ffn_layer_ptr;
             } else {
                 // Quantized types - use separate w1/w3 matmuls
-                const dk_gate = try matmul.matmulKernel(w1.dtype);
-                const dk_down = try matmul.matmulKernel(w2.dtype);
+                const dk_gate = try cpu_linalg.matmulKernel(w1.dtype);
+                const dk_down = try cpu_linalg.matmulKernel(w2.dtype);
                 const ffn_layer_ptr = try allocator.create(FfnLayer);
                 errdefer allocator.destroy(ffn_layer_ptr);
                 ffn_layer_ptr.* = .{ .swiglu = .{
@@ -2326,7 +2326,7 @@ test "TransformerBlock: getDModel from SwiGLU FFN" {
     var w2_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 1 });
     defer w2_owned.deinit();
     var w2_tensor = w2_owned.view();
-    const dk = try matmul.matmulKernel(.f32);
+    const dk = try cpu_linalg.matmulKernel(.f32);
 
     var ln1_data = [_]f32{0};
     var ln2_data = [_]f32{0};
@@ -2815,7 +2815,7 @@ test "TransformerBlock: attention_mlp block type accessors" {
     var w2_owned = try tensor.OwnedTensor.init(allocator, .f32, &.{ 1, 1 });
     defer w2_owned.deinit();
     var w2_tensor = w2_owned.view();
-    const dk = try matmul.matmulKernel(.f32);
+    const dk = try cpu_linalg.matmulKernel(.f32);
 
     var ln1_data = [_]f32{0};
     var ln2_data = [_]f32{0};
@@ -2918,8 +2918,8 @@ test "TransformerBlock: mamba block type accessors" {
         .A_log = &A_log,
         .D = &D,
     };
-    const matmul_in_proj = (try matmul.matmulKernel(.f32)).func;
-    const matmul_out_proj = (try matmul.matmulKernel(.f32)).func;
+    const matmul_in_proj = (try cpu_linalg.matmulKernel(.f32)).func;
+    const matmul_out_proj = (try cpu_linalg.matmulKernel(.f32)).func;
     const ssm_scan = compute.cpu.simd.ssm_scan.ssmScanF32;
     const mamba_kernel = mamba.MambaKernel.init(
         mamba_config,

@@ -35,12 +35,11 @@ const tensor = @import("../../../tensor.zig");
 const Tensor = tensor.Tensor;
 const OwnedTensor = tensor.OwnedTensor;
 const compute = @import("../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_reduction = compute.cpu.reduction;
-const cpu_slotted = compute.cpu.memory.slotted;
+const cpu_memory = compute.cpu.memory;
 const cpu_rotary = compute.cpu.rotary;
-const cpu_tensor_gather = compute.cpu.memory.gather;
 const models = @import("../../../models/root.zig");
 const contract = @import("../contract.zig");
 const log = @import("../../../log.zig");
@@ -636,7 +635,7 @@ pub const FusedCpuBackend = struct {
             );
 
             if (encoded.deepstack_layer_embeddings.len > 0) {
-                image_token_positions = try cpu_tensor_gather.collectPositionsU32(self.allocator, tokens, vi.image_token_id);
+                image_token_positions = try cpu_memory.collectPositionsU32(self.allocator, tokens, vi.image_token_id);
                 if (image_token_positions.len == 0) return error.InvalidPromptImageTokens;
                 const expected_values = image_token_positions.len * model_dim;
                 const layer0_values = if (encoded.deepstack_layer_embeddings.len > 0)
@@ -769,7 +768,7 @@ pub const FusedCpuBackend = struct {
         source_cache: *const kernels.AttnCache,
         seq_len: usize,
     ) !void {
-        cpu_slotted.copy3DToSlotted4D(
+        cpu_memory.copy3DToSlotted4D(
             layer_cache.key_cache,
             layer_cache.value_cache,
             layer_cache.slot_stride,
@@ -1018,7 +1017,7 @@ pub const FusedCpuBackend = struct {
         const lm_head_ptr = &(self.loaded.lm_head orelse return error.MissingLmHead);
         var hidden_view = Tensor.view2DSlice(@constCast(hidden_slice), 1, self.d_model);
         var logits_view = Tensor.view2DSlice(logits_buffer, 1, self.vocab_size);
-        try matmul.matmulAuto(&hidden_view, lm_head_ptr, &logits_view, &self.scratch.matmul_scratch);
+        try cpu_linalg.matmulAuto(&hidden_view, lm_head_ptr, &logits_view, &self.scratch.matmul_scratch);
 
         // Emit trace point for logits before scaling (if handler installed)
         trace.emitFinal(

@@ -1,9 +1,9 @@
 //! Softmax convenience wrappers for CPU kernels.
 //!
-//! Canonical SIMD/math implementation lives in `math_primitives/softmax.zig`.
+//! Canonical SIMD/math implementation lives in `math_softmax.zig`.
 
 const std = @import("std");
-const softmax_impl = @import("math_primitives/softmax.zig");
+const softmax_impl = @import("math_softmax.zig");
 
 /// Numerically-stable softmax in-place over one contiguous row.
 pub fn stableInPlace(values: []f32) void {

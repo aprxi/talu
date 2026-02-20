@@ -251,6 +251,7 @@ fn addMetalSupport(
 
     mod.addIncludePath(b.path("core/src/compute/metal"));
     mod.addIncludePath(b.path("core/src/compute/metal/mlx"));
+    mod.addIncludePath(b.path("core/src/inference/backend/metal/mlx"));
     mod.addIncludePath(b.path("deps/mlx/include"));
 
     artifact.linkFramework("Metal");

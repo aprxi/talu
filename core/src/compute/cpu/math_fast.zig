@@ -1,7 +1,7 @@
 //! Fast exp approximations with SIMD acceleration.
 
 const std = @import("std");
-const simd = @import("../simd/arch/root.zig");
+const simd = @import("simd/arch/root.zig");
 
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;

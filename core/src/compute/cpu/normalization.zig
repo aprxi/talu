@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
-const math_ops = @import("math_primitives/root.zig");
+const math_ops = @import("math.zig");
 const tv = @import("tensor_view.zig");
 const norm_view = @import("norm_primitives.zig");
 

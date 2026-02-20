@@ -3,7 +3,7 @@
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const tv = @import("tensor_view.zig");
-const math = @import("math_primitives/root.zig");
+const math = @import("math.zig");
 
 const TensorView = tv.TensorView;
 const DType = tv.DType;

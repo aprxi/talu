@@ -10,7 +10,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const cpu_activation = compute.cpu.activation;
 const cpu_common = compute.cpu.common;
 const inspect = @import("../../../../xray/root.zig");
@@ -20,7 +20,7 @@ const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capt
 };
 
 const Tensor = tensor.Tensor;
-const MatmulFn = matmul.MatmulFn;
+const MatmulFn = cpu_linalg.MatmulFn;
 
 pub const GateUpLayout = enum {
     concat,
@@ -52,7 +52,7 @@ pub const SwiGLU = struct {
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         scratch: *FfnScratch,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
     };
 
     d_model: usize,
@@ -76,7 +76,7 @@ pub const SwiGLU = struct {
     kernel_name_gate_up: ?[]const u8 = null,
     kernel_name_down: ?[]const u8 = null,
 
-    pub fn forward(self: *const SwiGLU, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *FfnScratch, matmul_scratch: *matmul.MatmulScratch) !void {
+    pub fn forward(self: *const SwiGLU, input_tensor: *const Tensor, output_tensor: *Tensor, scratch: *FfnScratch, matmul_scratch: *cpu_linalg.MatmulScratch) !void {
         // Internal invariants: tensor shapes must match model config
         std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1); // Only batch=1 supported
@@ -514,14 +514,14 @@ test "forward SwiGLU basic split" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -579,14 +579,14 @@ test "forward SwiGLU GELU" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -643,14 +643,14 @@ test "forward SwiGLU variant" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -703,14 +703,14 @@ test "forward SwiGLU fused concat" {
         .fused_gate_up = fused,
         .fused_gate_up_layout = .concat,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -763,14 +763,14 @@ test "forward SwiGLU fused interleaved" {
         .fused_gate_up = fused,
         .fused_gate_up_layout = .interleaved,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -832,14 +832,14 @@ test "forward SwiGLU multi-token" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -897,14 +897,14 @@ test "forward SwiGLU scratch reuse" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     // Run forward twice to test scratch buffer reuse
@@ -1013,14 +1013,14 @@ test "forward numerical stability" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1086,14 +1086,14 @@ test "SwiGLU forward - known weights produce expected output" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1153,14 +1153,14 @@ test "SwiGLU forward - different hidden dimensions" {
             .w3 = &w3,
             .fused_gate_up = null,
             .allocator = allocator,
-            .matmul_gate = matmul.matmulF32,
-            .matmul_down = matmul.matmulF32,
+            .matmul_gate = cpu_linalg.matmulF32,
+            .matmul_down = cpu_linalg.matmulF32,
         };
 
         var scratch = FfnScratch{};
         defer scratch.deinit(allocator);
 
-        var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+        var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
         defer matmul_scratch.deinit();
 
         try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1223,14 +1223,14 @@ test "SwiGLU forward - large sequence length" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1281,14 +1281,14 @@ test "SwiGLU forward - missing weights error" {
         .w3 = null, // Missing!
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     // Should return error.MissingFFNWeights
@@ -1334,14 +1334,14 @@ test "SwiGLU forward - fused concat with GELU" {
         .fused_gate_up = fused,
         .fused_gate_up_layout = .concat,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1393,14 +1393,14 @@ test "SwiGLU forward - fused interleaved with variant" {
         .fused_gate_up = fused,
         .fused_gate_up_layout = .interleaved,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1456,14 +1456,14 @@ test "SwiGLU forward - fused concat multi-token" {
         .fused_gate_up = fused,
         .fused_gate_up_layout = .concat,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1524,14 +1524,14 @@ test "SwiGLU forward - zero input produces valid output" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);
@@ -1587,14 +1587,14 @@ test "SwiGLU forward - extreme weight values" {
         .w3 = &w3,
         .fused_gate_up = null,
         .allocator = allocator,
-        .matmul_gate = matmul.matmulF32,
-        .matmul_down = matmul.matmulF32,
+        .matmul_gate = cpu_linalg.matmulF32,
+        .matmul_down = cpu_linalg.matmulF32,
     };
 
     var scratch = FfnScratch{};
     defer scratch.deinit(allocator);
 
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     try swiglu.forward(&input, &output, &scratch, &matmul_scratch);

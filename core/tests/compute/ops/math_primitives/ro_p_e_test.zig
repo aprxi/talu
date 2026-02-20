@@ -8,7 +8,7 @@
 const std = @import("std");
 const main = @import("main");
 
-const RoPE = main.compute.cpu.math_primitives.RoPE;
+const RoPE = main.compute.cpu.math.RoPE;
 const RopeScaling = main.core.tensor.RopeScaling;
 
 // ===== init / deinit =====

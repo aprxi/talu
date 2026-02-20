@@ -6,7 +6,8 @@
 //   - Pre-transposed weights (avoid per-call transpose)
 //   - Pipelined decode (async_eval overlaps with graph building)
 
-#include "common.h"
+#include "compute_common.h"
+#include "model_state.h"
 
 // ============================================================================
 // Dense Model Structure

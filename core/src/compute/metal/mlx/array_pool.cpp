@@ -3,7 +3,7 @@
 // Provides array object pooling to eliminate per-token heap allocations.
 // Also handles MLX initialization and memory cache management.
 
-#include "common.h"
+#include "compute_common.h"
 
 // ============================================================================
 // Global state

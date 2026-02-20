@@ -10,11 +10,11 @@ const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const flash_attention = compute.cpu.simd.flash_attention;
 const cpu_sdpa = compute.cpu.sdpa_decode;
 const cpu_common = compute.cpu.common;
-const cpu_layout = compute.cpu.layout.transform;
+const cpu_layout = compute.cpu.layout;
 const cpu_indexing = compute.cpu.indexing;
 const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
@@ -27,7 +27,7 @@ const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capt
 };
 
 const Tensor = tensor.Tensor;
-const MatmulFn = matmul.MatmulFn;
+const MatmulFn = cpu_linalg.MatmulFn;
 const RoPE = rope_kernel.RoPE;
 const FlashAttentionFn = flash_attention.FlashAttentionFn;
 
@@ -90,7 +90,7 @@ pub const MultiHeadAttention = struct {
         output_tensor: *Tensor,
         cache: *AttnCache,
         scratch: *AttnTemp,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     };
 
@@ -172,7 +172,7 @@ pub const MultiHeadAttention = struct {
         output_tensor: *Tensor, // [1, sequence_len, d_model]
         cache: *AttnCache,
         scratch: *AttnTemp,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
         const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
@@ -766,7 +766,7 @@ pub const MultiHeadAttention = struct {
         cache: *BatchedKVCache,
         slot_index: usize,
         scratch: *AttnTemp,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
         const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
@@ -1146,7 +1146,7 @@ pub const MultiHeadAttention = struct {
         output_tensor: *Tensor,
         cache: *AttnCache,
         scratch: *AttnTemp,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
         try self.forward(input_tensor, output_tensor, cache, scratch, matmul_scratch, use_cache);
@@ -1261,7 +1261,7 @@ fn forwardBatchedDecode(
     requests: []const BatchedDecodeRequest,
     cache: *BatchedKVCache,
     scratch: *BatchedAttnTemp,
-    matmul_scratch: *matmul.MatmulScratch,
+    matmul_scratch: *cpu_linalg.MatmulScratch,
 ) !void {
     const batch_size = requests.len;
     if (batch_size == 0) return;

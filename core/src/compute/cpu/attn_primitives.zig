@@ -4,7 +4,7 @@
 
 const std = @import("std");
 const tv = @import("tensor_view.zig");
-const math = @import("math_primitives/root.zig");
+const math = @import("math.zig");
 
 /// Maximum sequence length for stack-allocated score buffers.
 /// Sequences longer than this will use heap allocation.
@@ -170,12 +170,12 @@ fn applyRopeTyped(
     }
 }
 
-/// Scaled Dot-Product Attention
-/// Q: [batch, heads, seq_q, head_dim]
-/// K: [batch, heads, seq_k, head_dim]
-/// V: [batch, heads, seq_k, head_dim]
-/// mask: optional [1, 1, seq_q, seq_k] or compatible broadcast shape
-/// out: [batch, heads, seq_q, head_dim]
+/// Scaled Dot-Product Attention over 4D tensors.
+/// Q: [batch, groups, query_steps, feature_width]
+/// K: [batch, groups, key_steps, feature_width]
+/// V: [batch, groups, key_steps, feature_width]
+/// mask: optional [1, 1, query_steps, key_steps] or compatible broadcast shape
+/// out: [batch, groups, query_steps, feature_width]
 /// allocator: optional allocator for large sequences (>8192). If null, large sequences will error.
 pub fn sdpa(
     out: TensorView,
@@ -214,70 +214,70 @@ fn sdpaTyped(
     const v_data = @as([*]const T, @ptrCast(@alignCast(v.data)));
 
     const batch = q.shape[0];
-    const num_heads = q.shape[1];
-    const seq_q = q.shape[2];
-    const head_dim = q.shape[3];
-    const seq_k = k.shape[2];
+    const group_count = q.shape[1];
+    const query_steps = q.shape[2];
+    const feature_width = q.shape[3];
+    const key_steps = k.shape[2];
 
     // Allocate scores buffer - use stack for small sequences, heap for large
-    var stack_scores: [MAX_STACK_SEQ]f32 = undefined; // Safe: only scores[0..seq_k] used, written before read
-    const heap_scores: ?[]f32 = if (seq_k > MAX_STACK_SEQ) blk: {
+    var stack_scores: [MAX_STACK_SEQ]f32 = undefined; // Safe: only scores[0..key_steps] used, written before read
+    const heap_scores: ?[]f32 = if (key_steps > MAX_STACK_SEQ) blk: {
         const alloc = allocator orelse return error.SequenceTooLong;
-        break :blk alloc.alloc(f32, seq_k) catch return error.OutOfMemory;
+        break :blk alloc.alloc(f32, key_steps) catch return error.OutOfMemory;
     } else null;
     defer if (heap_scores) |hs| allocator.?.free(hs);
-    const scores = if (heap_scores) |hs| hs else stack_scores[0..seq_k];
+    const scores = if (heap_scores) |hs| hs else stack_scores[0..key_steps];
 
     // For each batch and head
     for (0..batch) |b| {
-        for (0..num_heads) |h| {
+        for (0..group_count) |h| {
             // For each query position
-            for (0..seq_q) |sq| {
+            for (0..query_steps) |query_idx| {
 
                 // Q @ K^T
-                for (0..seq_k) |sk| {
+                for (0..key_steps) |key_idx| {
                     var dot: f32 = 0;
-                    for (0..head_dim) |d| {
+                    for (0..feature_width) |d| {
                         const q_idx = b * @as(usize, @intCast(q.strides[0])) +
                             h * @as(usize, @intCast(q.strides[1])) +
-                            sq * @as(usize, @intCast(q.strides[2])) +
+                            query_idx * @as(usize, @intCast(q.strides[2])) +
                             d * @as(usize, @intCast(q.strides[3]));
                         const k_idx = b * @as(usize, @intCast(k.strides[0])) +
                             h * @as(usize, @intCast(k.strides[1])) +
-                            sk * @as(usize, @intCast(k.strides[2])) +
+                            key_idx * @as(usize, @intCast(k.strides[2])) +
                             d * @as(usize, @intCast(k.strides[3]));
                         dot += toF32(q_data[q_idx]) * toF32(k_data[k_idx]);
                     }
-                    scores[sk] = dot * scale;
+                    scores[key_idx] = dot * scale;
 
                     // Apply mask if provided
                     if (mask) |m| {
                         const m_data = @as([*]const f32, @ptrCast(@alignCast(m.data)));
                         // Broadcast mask: handle different shapes
-                        const m_idx = (sq % m.shape[m.ndim - 2]) * @as(usize, @intCast(m.strides[m.ndim - 2])) +
-                            (sk % m.shape[m.ndim - 1]) * @as(usize, @intCast(m.strides[m.ndim - 1]));
-                        scores[sk] += m_data[m_idx];
+                        const m_idx = (query_idx % m.shape[m.ndim - 2]) * @as(usize, @intCast(m.strides[m.ndim - 2])) +
+                            (key_idx % m.shape[m.ndim - 1]) * @as(usize, @intCast(m.strides[m.ndim - 1]));
+                        scores[key_idx] += m_data[m_idx];
                     }
                 }
 
                 // Softmax
                 var max_score: f32 = -std.math.inf(f32);
-                for (scores[0..seq_k]) |s| max_score = @max(max_score, s);
-                math.softmaxMaskedInPlaceWithMax(scores[0..seq_k], 0, seq_k, null, false, max_score, -std.math.inf(f32) + 1.0);
+                for (scores[0..key_steps]) |s| max_score = @max(max_score, s);
+                math.softmaxMaskedInPlaceWithMax(scores[0..key_steps], 0, key_steps, null, false, max_score, -std.math.inf(f32) + 1.0);
 
                 // Weighted sum of values
-                for (0..head_dim) |d| {
+                for (0..feature_width) |d| {
                     var acc: f32 = 0;
-                    for (0..seq_k) |sk| {
+                    for (0..key_steps) |key_idx| {
                         const v_idx = b * @as(usize, @intCast(v.strides[0])) +
                             h * @as(usize, @intCast(v.strides[1])) +
-                            sk * @as(usize, @intCast(v.strides[2])) +
+                            key_idx * @as(usize, @intCast(v.strides[2])) +
                             d * @as(usize, @intCast(v.strides[3]));
-                        acc += scores[sk] * toF32(v_data[v_idx]);
+                        acc += scores[key_idx] * toF32(v_data[v_idx]);
                     }
                     const out_idx = b * @as(usize, @intCast(out.strides[0])) +
                         h * @as(usize, @intCast(out.strides[1])) +
-                        sq * @as(usize, @intCast(out.strides[2])) +
+                        query_idx * @as(usize, @intCast(out.strides[2])) +
                         d * @as(usize, @intCast(out.strides[3]));
                     out_data[out_idx] = fromF32(acc);
                 }
@@ -288,11 +288,11 @@ fn sdpaTyped(
 
 /// Scaled Dot-Product Attention with causal mask (optimized path)
 /// This version doesn't require an explicit mask tensor - causal masking is applied implicitly.
-/// Q: [batch, heads, seq_q, head_dim]
-/// K: [batch, heads, seq_k, head_dim]
-/// V: [batch, heads, seq_k, head_dim]
-/// out: [batch, heads, seq_q, head_dim]
-/// kv_offset: offset for causal mask (e.g., cache length for decode step)
+/// Q: [batch, groups, query_steps, feature_width]
+/// K: [batch, groups, key_steps, feature_width]
+/// V: [batch, groups, key_steps, feature_width]
+/// out: [batch, groups, query_steps, feature_width]
+/// causal_mask_shift: offset applied to query position in causal masking.
 /// allocator: optional allocator for large sequences (>8192). If null, large sequences will error.
 pub fn sdpaCausal(
     out: TensorView,
@@ -300,13 +300,13 @@ pub fn sdpaCausal(
     k: TensorView,
     v: TensorView,
     scale: f32,
-    kv_offset: usize,
+    causal_mask_shift: usize,
     allocator: ?std.mem.Allocator,
 ) AttentionError!void {
     switch (out.dtype) {
-        .f32 => try sdpaCausalTyped(f32, f32Identity, f32Identity, out, q, k, v, scale, kv_offset, allocator),
-        .f16 => try sdpaCausalTyped(u16, fp16ToF32, f32ToFp16, out, q, k, v, scale, kv_offset, allocator),
-        .bf16 => try sdpaCausalTyped(u16, bf16ToF32, f32ToBf16, out, q, k, v, scale, kv_offset, allocator),
+        .f32 => try sdpaCausalTyped(f32, f32Identity, f32Identity, out, q, k, v, scale, causal_mask_shift, allocator),
+        .f16 => try sdpaCausalTyped(u16, fp16ToF32, f32ToFp16, out, q, k, v, scale, causal_mask_shift, allocator),
+        .bf16 => try sdpaCausalTyped(u16, bf16ToF32, f32ToBf16, out, q, k, v, scale, causal_mask_shift, allocator),
         else => unreachable,
     }
 }
@@ -320,7 +320,7 @@ fn sdpaCausalTyped(
     k: TensorView,
     v: TensorView,
     scale: f32,
-    kv_offset: usize,
+    causal_mask_shift: usize,
     allocator: ?std.mem.Allocator,
 ) AttentionError!void {
     std.debug.assert(q.ndim == 4);
@@ -352,7 +352,7 @@ fn sdpaCausalTyped(
             for (0..seq_q) |sq| {
 
                 // The query position in the full sequence
-                const q_pos = kv_offset + sq;
+                const q_pos = causal_mask_shift + sq;
 
                 // Q @ K^T with causal masking
                 for (0..seq_k) |sk| {

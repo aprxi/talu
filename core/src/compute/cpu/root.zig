@@ -8,7 +8,7 @@ pub const tensor_view = @import("tensor_view.zig");
 pub const activation_view = @import("activation_view.zig");
 pub const attn_primitives = @import("attn_primitives.zig");
 pub const mxfp4 = @import("mxfp4.zig");
-pub const math_primitives = @import("math_primitives/root.zig");
+pub const math = @import("math.zig");
 pub const simd = @import("simd/root.zig");
 pub const quant = @import("quant/root.zig");
 pub const capabilities = @import("capabilities.zig");
@@ -40,7 +40,7 @@ test {
     _ = activation_view;
     _ = attn_primitives;
     _ = mxfp4;
-    _ = math_primitives;
+    _ = math;
     _ = simd;
     _ = quant;
     _ = capabilities;

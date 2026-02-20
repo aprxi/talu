@@ -15,7 +15,7 @@ pub const supported = true;
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const cpu_indexing = compute.cpu.indexing;
-const cpu_slotted = compute.cpu.memory.slotted;
+const cpu_memory = compute.cpu.memory;
 
 /// Per-slot state tracking sequence position and activity.
 pub const SlotState = struct {
@@ -228,7 +228,7 @@ pub const BatchedKVCache = struct {
         std.debug.assert(k_data.len == kv_values_per_token);
         std.debug.assert(v_data.len == kv_values_per_token);
 
-        cpu_slotted.appendRowToSlotted4D(
+        cpu_memory.appendRowToSlotted4D(
             self.key_cache,
             self.value_cache,
             self.slot_stride,
@@ -263,7 +263,7 @@ pub const BatchedKVCache = struct {
 
         const start_position = slot_state.position;
 
-        cpu_slotted.appendRowsToSlotted4D(
+        cpu_memory.appendRowsToSlotted4D(
             self.key_cache,
             self.value_cache,
             self.slot_stride,

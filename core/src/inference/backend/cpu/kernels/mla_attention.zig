@@ -15,8 +15,8 @@ pub const supported = true;
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
-const cpu_layout = compute.cpu.layout.transform;
+const cpu_linalg = compute.cpu.linalg;
+const cpu_layout = compute.cpu.layout;
 const cpu_norm = compute.cpu.normalization;
 const cpu_reduction = compute.cpu.reduction;
 const cpu_rotary = compute.cpu.rotary;
@@ -25,7 +25,7 @@ const rope_kernel = @import("rope.zig");
 const trace = @import("../../../../xray/root.zig").trace;
 
 const Tensor = tensor.Tensor;
-const MatmulFn = matmul.MatmulFn;
+const MatmulFn = cpu_linalg.MatmulFn;
 const RoPE = rope_kernel.RoPE;
 
 /// MLA-specific configuration derived from graph Op.
@@ -135,7 +135,7 @@ pub const MLAttention = struct {
         output_tensor: *Tensor,
         cache: *MLACache,
         scratch: *MLATemp,
-        matmul_scratch: *matmul.MatmulScratch,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
         use_cache: bool,
     ) !void {
         const seq_len: usize = @intCast(input_tensor.shape[1]);
@@ -565,7 +565,7 @@ test "MLAttention.forward rejects decode cache updates with seq_len > 1" {
     var dummy_norm = dummy_norm_owned.view();
 
     const test_matmul = struct {
-        fn noop(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *matmul.MatmulScratch) void {
+        fn noop(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *cpu_linalg.MatmulScratch) void {
             _ = a;
             _ = b;
             _ = out;
@@ -604,7 +604,7 @@ test "MLAttention.forward rejects decode cache updates with seq_len > 1" {
     defer cache.deinit(allocator);
     var scratch = MLATemp{};
     defer scratch.deinit(allocator);
-    var matmul_scratch = try matmul.MatmulScratch.init(allocator);
+    var matmul_scratch = try cpu_linalg.MatmulScratch.init(allocator);
     defer matmul_scratch.deinit();
 
     const result = layer.forward(&input, &output, &cache, &scratch, &matmul_scratch, true);

@@ -1,9 +1,9 @@
 //! Rotary Position Embedding (RoPE) with lazy cache expansion.
 
 const std = @import("std");
-const tensor = @import("../../../tensor.zig");
-const simd = @import("../simd/arch/root.zig");
-const log = @import("../../../log.zig");
+const tensor = @import("../../tensor.zig");
+const simd = @import("simd/arch/root.zig");
+const log = @import("../../log.zig");
 
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;

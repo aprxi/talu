@@ -5,8 +5,6 @@
 
 const std = @import("std");
 
-const IMPORT_PREFIX = "@import(";
-
 fn lineNumberForOffset(source: []const u8, offset: usize) usize {
     return 1 + std.mem.count(u8, source[0..offset], "\n");
 }
@@ -29,23 +27,54 @@ fn isOldTopLevelSimdOrQuantImport(target: []const u8) bool {
     return false;
 }
 
-fn lintSource(file_path: []const u8, source: []const u8, emit: bool) usize {
-    var violations: usize = 0;
-    var search_from: usize = 0;
+fn extractImportTarget(
+    allocator: std.mem.Allocator,
+    tree: std.zig.Ast,
+    arg_node: std.zig.Ast.Node.Index,
+) !?[]u8 {
+    return switch (tree.nodeTag(arg_node)) {
+        .string_literal => blk: {
+            const tok = tree.firstToken(arg_node);
+            const raw = tree.tokenSlice(tok);
+            break :blk try std.zig.string_literal.parseAlloc(allocator, raw);
+        },
+        else => null,
+    };
+}
 
-    while (std.mem.indexOfPos(u8, source, search_from, IMPORT_PREFIX)) |import_start| {
-        var cursor = import_start + IMPORT_PREFIX.len;
-        while (cursor < source.len and std.ascii.isWhitespace(source[cursor])) : (cursor += 1) {}
-        if (cursor >= source.len or source[cursor] != '"') {
-            search_from = import_start + 1;
-            continue;
+fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []const u8, emit: bool) !usize {
+    const source_z = try allocator.dupeZ(u8, source);
+    defer allocator.free(source_z);
+    var tree = try std.zig.Ast.parse(allocator, source_z, .zig);
+    defer tree.deinit(allocator);
+
+    var violations: usize = 0;
+
+    var builtin_params_buf: [2]std.zig.Ast.Node.Index = undefined;
+    for (0..tree.nodes.len) |node_idx_raw| {
+        const node: std.zig.Ast.Node.Index = @enumFromInt(node_idx_raw);
+        const tag = tree.nodeTag(node);
+        switch (tag) {
+            .builtin_call,
+            .builtin_call_comma,
+            .builtin_call_two,
+            .builtin_call_two_comma,
+            => {},
+            else => continue,
         }
 
-        const target_start = cursor + 1;
-        const target_end = std.mem.indexOfScalarPos(u8, source, target_start, '"') orelse break;
-        const target = source[target_start..target_end];
-        const line = lineNumberForOffset(source, target_start);
+        const main_tok = tree.nodeMainToken(node);
+        if (!std.mem.eql(u8, tree.tokenSlice(main_tok), "@import")) continue;
 
+        const params = tree.builtinCallParams(&builtin_params_buf, node) orelse continue;
+        if (params.len == 0) continue;
+
+        const arg_node = params[0];
+        const target_owned = try extractImportTarget(allocator, tree, arg_node);
+        defer if (target_owned) |target| allocator.free(target);
+        const target = target_owned orelse continue;
+
+        const line = lineNumberForOffset(source, tree.tokenStart(tree.firstToken(arg_node)));
         if (isComputePath(file_path) and
             (std.mem.indexOf(u8, target, "inference/") != null or
                 std.mem.indexOf(u8, target, "models/") != null))
@@ -62,8 +91,6 @@ fn lintSource(file_path: []const u8, source: []const u8, emit: bool) usize {
                 std.debug.print("{s}:{d}: forbidden legacy compute import path: \"{s}\"\n", .{ file_path, line, target });
             }
         }
-
-        search_from = target_end + 1;
     }
 
     return violations;
@@ -87,7 +114,7 @@ fn lintTree(allocator: std.mem.Allocator, root_path: []const u8) !usize {
         const source = try std.fs.cwd().readFileAlloc(allocator, full_path, 32 * 1024 * 1024);
         defer allocator.free(source);
 
-        total_violations += lintSource(full_path, source, true);
+        total_violations += try lintSource(allocator, full_path, source, true);
     }
 
     return total_violations;
@@ -113,26 +140,26 @@ test "lintSource rejects inference import in compute" {
     const src =
         \\const bad = @import("../../inference/root.zig");
     ;
-    try std.testing.expectEqual(@as(usize, 1), lintSource("core/src/compute/cpu/foo.zig", src, false));
+    try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/cpu/foo.zig", src, false));
 }
 
 test "lintSource rejects models import in compute" {
     const src =
         \\const bad = @import("../../models/root.zig");
     ;
-    try std.testing.expectEqual(@as(usize, 1), lintSource("core/src/compute/cpu/bar.zig", src, false));
+    try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/cpu/bar.zig", src, false));
 }
 
 test "lintSource rejects legacy top-level simd import path" {
     const src =
         \\const simd = @import("../simd/root.zig");
     ;
-    try std.testing.expectEqual(@as(usize, 1), lintSource("core/src/compute/cpu/reduction.zig", src, false));
+    try std.testing.expectEqual(@as(usize, 1), try lintSource(std.testing.allocator, "core/src/compute/cpu/reduction.zig", src, false));
 }
 
 test "lintSource allows new cpu simd arch path" {
     const src =
         \\const simd = @import("simd/arch/root.zig");
     ;
-    try std.testing.expectEqual(@as(usize, 0), lintSource("core/src/compute/cpu/reduction.zig", src, false));
+    try std.testing.expectEqual(@as(usize, 0), try lintSource(std.testing.allocator, "core/src/compute/cpu/reduction.zig", src, false));
 }

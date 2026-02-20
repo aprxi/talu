@@ -24,13 +24,13 @@ const vision_tensor_convert = @import("tensor_convert.zig");
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const LoadedModel = models.LoadedModel;
-const matmul = compute.cpu.linalg.matmul;
+const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
 const cpu_image_ops = compute.cpu.image_ops;
 const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_rowwise = compute.cpu.rowwise;
-const cpu_tensor_gather = compute.cpu.memory.gather;
+const cpu_memory = compute.cpu.memory;
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;
@@ -666,7 +666,7 @@ pub const VisionRuntime = struct {
         // patch projection: [patch_count, patch_dim] @ [vision_hidden, patch_dim]^T -> [patch_count, vision_hidden]
         var patch_input_view = Tensor.view2DSlice(patch_input, patch_count, patch_dim);
         var patch_hidden_view = Tensor.view2DSlice(patch_hidden, patch_count, self.vision_hidden_size);
-        try matmul.matmulAuto(&patch_input_view, &self.patch_proj_weight, &patch_hidden_view, &self.scratch.matmul_scratch);
+        try cpu_linalg.matmulAuto(&patch_input_view, &self.patch_proj_weight, &patch_hidden_view, &self.scratch.matmul_scratch);
         cpu_common.addBiasRows(patch_hidden, self.patch_proj_bias, patch_count, self.vision_hidden_size);
 
         const pos_embeds = try self.allocator.alloc(f32, patch_count * self.vision_hidden_size);
@@ -842,7 +842,7 @@ pub const VisionRuntime = struct {
 
         var normed_view = Tensor.view2DSlice(normed, merged_tokens, merged_width);
         var fc1_view = Tensor.view2DSlice(fc1_out, merged_tokens, merged_width);
-        try matmul.matmulAuto(&normed_view, &merger.fc1_weight, &fc1_view, &self.scratch.matmul_scratch);
+        try cpu_linalg.matmulAuto(&normed_view, &merger.fc1_weight, &fc1_view, &self.scratch.matmul_scratch);
 
         cpu_common.addBiasRows(fc1_out, merger.fc1_bias, merged_tokens, merged_width);
 
@@ -856,7 +856,7 @@ pub const VisionRuntime = struct {
         errdefer self.allocator.free(out);
 
         var out_view = Tensor.view2DSlice(out, merged_tokens, self.language_hidden_size);
-        try matmul.matmulAuto(&fc1_view, &merger.fc2_weight, &out_view, &self.scratch.matmul_scratch);
+        try cpu_linalg.matmulAuto(&fc1_view, &merger.fc2_weight, &out_view, &self.scratch.matmul_scratch);
 
         cpu_common.addBiasRows(out, merger.fc2_bias, merged_tokens, self.language_hidden_size);
 
@@ -927,7 +927,7 @@ pub const VisionRuntime = struct {
 
         var merged_view = Tensor.view2DSlice(merged, merged_tokens, merged_width);
         var fc1_view = Tensor.view2DSlice(fc1_out, merged_tokens, self.merger_intermediate_size);
-        try matmul.matmulAuto(&merged_view, &self.merger_fc1_weight, &fc1_view, &self.scratch.matmul_scratch);
+        try cpu_linalg.matmulAuto(&merged_view, &self.merger_fc1_weight, &fc1_view, &self.scratch.matmul_scratch);
 
         cpu_common.addBiasRows(fc1_out, self.merger_fc1_bias, merged_tokens, self.merger_intermediate_size);
 
@@ -942,7 +942,7 @@ pub const VisionRuntime = struct {
         errdefer self.allocator.free(out);
 
         var out_view = Tensor.view2DSlice(out, merged_tokens, self.language_hidden_size);
-        try matmul.matmulAuto(&fc1_view, &self.merger_fc2_weight, &out_view, &self.scratch.matmul_scratch);
+        try cpu_linalg.matmulAuto(&fc1_view, &self.merger_fc2_weight, &out_view, &self.scratch.matmul_scratch);
 
         cpu_common.addBiasRows(out, self.merger_fc2_bias, merged_tokens, self.language_hidden_size);
 
@@ -977,7 +977,7 @@ pub fn scatterVisionEmbeddings(
     image_token_id: u32,
     embeddings: []const f32,
 ) !void {
-    return cpu_tensor_gather.scatterEmbeddingsByTokenId(
+    return cpu_memory.scatterEmbeddingsByTokenId(
         hidden_states,
         seq_len,
         d_model,
