@@ -42,6 +42,11 @@ pub(super) fn cmd_file(args: FileArgs) -> Result<()> {
         } else {
             print_file_info(args.path.as_deref().unwrap(), &info);
         }
+        if info.kind == talu::file::FileKind::Document && info.mime == "application/pdf" {
+            if let Ok(pages) = talu::file::pdf_page_count(&bytes) {
+                println!("Pages: {pages}");
+            }
+        }
         return Ok(());
     }
 
@@ -76,11 +81,27 @@ pub(super) fn cmd_file(args: FileArgs) -> Result<()> {
         limits: talu::file::Limits::default(),
     };
 
-    let result = talu::file::transform_image_bytes(&bytes, opts)?;
-    fs::write(&output_path, &result.bytes)
-        .with_context(|| format!("Error: failed to write {}", output_path.display()))?;
+    // Check if input is PDF — if so, render each page as a separate image.
+    let info = talu::file::inspect_bytes(&bytes)?;
+    if info.kind == talu::file::FileKind::Document && info.mime == "application/pdf" {
+        let page_count = talu::file::pdf_page_count(&bytes)?;
+        if page_count == 0 {
+            bail!("Error: PDF has no pages.");
+        }
+        for page in 0..page_count {
+            let result = talu::file::pdf_transform_page(&bytes, page, 150, opts)?;
+            let page_path = numbered_output_path(&output_path, page, page_count);
+            fs::write(&page_path, &result.bytes)
+                .with_context(|| format!("Error: failed to write {}", page_path.display()))?;
+            println!("{}", page_path.display());
+        }
+    } else {
+        let result = talu::file::transform_image_bytes(&bytes, opts)?;
+        fs::write(&output_path, &result.bytes)
+            .with_context(|| format!("Error: failed to write {}", output_path.display()))?;
+        println!("{}", output_path.display());
+    }
 
-    println!("{}", output_path.display());
     Ok(())
 }
 
@@ -219,6 +240,25 @@ fn ensure_not_in_place(input: &Path, output: &Path) -> Result<()> {
     Ok(())
 }
 
+/// For multi-page output, insert a page number before the extension.
+/// Single-page PDFs write to `path` unchanged; multi-page PDFs produce
+/// `stem_1.ext`, `stem_2.ext`, ... (1-indexed for user clarity).
+fn numbered_output_path(base: &Path, page_index: u32, total_pages: u32) -> PathBuf {
+    if total_pages <= 1 {
+        return base.to_path_buf();
+    }
+    let stem = base
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("page");
+    let ext = base
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("png");
+    let parent = base.parent().unwrap_or_else(|| Path::new("."));
+    parent.join(format!("{stem}_{}.{ext}", page_index + 1))
+}
+
 fn format_from_extension(path: &Path) -> Option<talu::file::OutputFormat> {
     let ext = path.extension()?.to_str()?.to_ascii_lowercase();
     match ext.as_str() {
@@ -269,5 +309,19 @@ mod tests {
         let input = Path::new("in.webp");
         let fmt = infer_output_format(None, None, input).expect("format");
         assert_eq!(fmt, talu::file::OutputFormat::Png);
+    }
+
+    #[test]
+    fn numbered_output_single_page() {
+        let base = Path::new("/tmp/out.png");
+        assert_eq!(numbered_output_path(base, 0, 1), PathBuf::from("/tmp/out.png"));
+    }
+
+    #[test]
+    fn numbered_output_multi_page() {
+        let base = Path::new("/tmp/pages.jpg");
+        assert_eq!(numbered_output_path(base, 0, 3), PathBuf::from("/tmp/pages_1.jpg"));
+        assert_eq!(numbered_output_path(base, 1, 3), PathBuf::from("/tmp/pages_2.jpg"));
+        assert_eq!(numbered_output_path(base, 2, 3), PathBuf::from("/tmp/pages_3.jpg"));
     }
 }

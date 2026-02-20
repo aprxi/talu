@@ -158,7 +158,7 @@ fn latest_visible_text(chat: &ChatHandle, include_reasoning: bool) -> Result<Opt
 #[derive(Debug)]
 struct ParsedStdin {
     text: Option<String>,
-    image: Option<talu::router::ContentPart>,
+    images: Vec<talu::router::ContentPart>,
 }
 
 fn map_stdin_image_mime(info: &talu::file::FileInfo) -> String {
@@ -217,7 +217,7 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
     if stdin_buf.is_empty() {
         return Ok(ParsedStdin {
             text: None,
-            image: None,
+            images: vec![],
         });
     }
 
@@ -227,10 +227,35 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
             let data_url = format!("data:{};base64,{}", mime, encode_base64(&stdin_buf));
             return Ok(ParsedStdin {
                 text: None,
-                image: Some(talu::router::ContentPart::ImageUrl {
+                images: vec![talu::router::ContentPart::ImageUrl {
                     url: data_url,
                     mime: Some(mime),
-                }),
+                }],
+            });
+        }
+
+        // Auto-convert PDF pages to images for VLM consumption.
+        if info.kind == talu::file::FileKind::Document && info.mime == "application/pdf" {
+            let count = talu::file::pdf_page_count(&stdin_buf)
+                .map_err(|e| anyhow!("Failed to get PDF page count: {e}"))?;
+            let mut images = Vec::with_capacity(count as usize);
+            for i in 0..count {
+                let opts = talu::file::TransformOptions {
+                    output_format: Some(talu::file::OutputFormat::Png),
+                    ..Default::default()
+                };
+                let rendered = talu::file::pdf_transform_page(&stdin_buf, i, 150, opts)
+                    .map_err(|e| anyhow!("Failed to render PDF page {}: {e}", i + 1))?;
+                let data_url =
+                    format!("data:image/png;base64,{}", encode_base64(&rendered.bytes));
+                images.push(talu::router::ContentPart::ImageUrl {
+                    url: data_url,
+                    mime: Some("image/png".into()),
+                });
+            }
+            return Ok(ParsedStdin {
+                text: None,
+                images,
             });
         }
 
@@ -250,7 +275,7 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
     if stdin_buf.is_empty() {
         return Ok(ParsedStdin {
             text: None,
-            image: None,
+            images: vec![],
         });
     }
     let text = String::from_utf8_lossy(&stdin_buf).to_string();
@@ -259,7 +284,7 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
     }
     Ok(ParsedStdin {
         text: Some(text),
-        image: None,
+        images: vec![],
     })
 }
 
@@ -274,7 +299,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     let hide_thinking = args.hide_thinking;
     let mut system_msg = args.system.clone();
     let mut prompt_parts = args.prompt.clone();
-    let mut stdin_image_part: Option<talu::router::ContentPart> = None;
+    let mut stdin_image_parts: Vec<talu::router::ContentPart> = Vec::new();
     let endpoint_url_override = args.endpoint_url.clone();
     let seed = args.seed.unwrap_or(0);
     let db_path =
@@ -349,11 +374,11 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             if let Some(text) = parsed.text {
                 prompt_parts.push(text);
             }
-            stdin_image_part = parsed.image;
+            stdin_image_parts = parsed.images;
         }
     }
 
-    if stdin_image_part.is_some() && prompt_parts.is_empty() {
+    if !stdin_image_parts.is_empty() && prompt_parts.is_empty() {
         prompt_parts.push(DEFAULT_STDIN_IMAGE_PROMPT.to_string());
     }
 
@@ -527,7 +552,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
 
     // Handle remote providers
     if let ModelTarget::Remote { provider, model } = target {
-        if stdin_image_part.is_some() {
+        if !stdin_image_parts.is_empty() {
             bail!("Error: piped image input is currently supported only for local models.");
         }
         return cmd_ask_remote(
@@ -602,7 +627,7 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
     }
 
     let mut content = Vec::new();
-    if let Some(image_part) = stdin_image_part {
+    for image_part in stdin_image_parts {
         content.push(image_part);
     }
     if !prompt.is_empty() {
@@ -1059,7 +1084,7 @@ mod tests {
     fn parse_stdin_content_text_trims_trailing_whitespace() {
         let parsed = parse_stdin_content(b"hello world\n".to_vec()).expect("parse text stdin");
         assert_eq!(parsed.text.as_deref(), Some("hello world"));
-        assert!(parsed.image.is_none());
+        assert!(parsed.images.is_empty());
     }
 
     #[test]
@@ -1067,10 +1092,26 @@ mod tests {
         let jpeg = include_bytes!("../../../../../core/tests/image/corpus/1x1_red.jpg");
         let parsed = parse_stdin_content(jpeg.to_vec()).expect("parse jpeg stdin");
         assert!(parsed.text.is_none());
-        match parsed.image {
-            Some(talu::router::ContentPart::ImageUrl { url, mime }) => {
+        assert_eq!(parsed.images.len(), 1);
+        match &parsed.images[0] {
+            talu::router::ContentPart::ImageUrl { url, mime } => {
                 assert_eq!(mime.as_deref(), Some("image/jpeg"));
                 assert!(url.starts_with("data:image/jpeg;base64,"));
+            }
+            _ => panic!("expected image url content part"),
+        }
+    }
+
+    #[test]
+    fn parse_stdin_content_pdf_converts_to_images() {
+        let pdf = include_bytes!("../../../../../deps/pdfium/testing/resources/hello_world.pdf");
+        let parsed = parse_stdin_content(pdf.to_vec()).expect("parse pdf stdin");
+        assert!(parsed.text.is_none());
+        assert_eq!(parsed.images.len(), 1); // hello_world.pdf is a single page
+        match &parsed.images[0] {
+            talu::router::ContentPart::ImageUrl { url, mime } => {
+                assert_eq!(mime.as_deref(), Some("image/png"));
+                assert!(url.starts_with("data:image/png;base64,"));
             }
             _ => panic!("expected image url content part"),
         }

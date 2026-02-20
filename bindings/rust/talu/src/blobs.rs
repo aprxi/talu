@@ -427,8 +427,8 @@ fn extract_string_list(list: *mut talu_sys::CStringList) -> Vec<String> {
     unsafe {
         let l = &*list;
         let mut out = Vec::with_capacity(l.count);
-        if !l.strings.is_null() {
-            let items_ptr = l.strings;
+        if !l.items.is_null() {
+            let items_ptr = l.items;
             for i in 0..l.count {
                 let item = *items_ptr.add(i);
                 if !item.is_null() {

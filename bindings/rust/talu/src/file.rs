@@ -277,6 +277,78 @@ fn to_c_transform_options(opts: TransformOptions) -> talu_sys::TaluFileTransform
     out
 }
 
+/// Return the number of pages in a PDF document.
+pub fn pdf_page_count(bytes: &[u8]) -> Result<u32> {
+    if bytes.is_empty() {
+        return Err(crate::error::Error::generic("bytes cannot be empty"));
+    }
+
+    let mut count: u32 = 0;
+    // SAFETY: bytes pointer/len are valid; out_count is a valid writable pointer.
+    let rc = unsafe {
+        talu_sys::talu_pdf_page_count(
+            bytes.as_ptr(),
+            bytes.len(),
+            (&mut count as *mut u32).cast::<c_void>(),
+        )
+    };
+    if rc != 0 {
+        return Err(error_from_last_or("Failed to get PDF page count"));
+    }
+
+    Ok(count)
+}
+
+/// Render a single PDF page, optionally resize, and encode to an image.
+pub fn pdf_transform_page(
+    bytes: &[u8],
+    page_index: u32,
+    dpi: u32,
+    opts: TransformOptions,
+) -> Result<TransformResult> {
+    if bytes.is_empty() {
+        return Err(crate::error::Error::generic("bytes cannot be empty"));
+    }
+
+    let mut c_out_ptr: *const u8 = std::ptr::null();
+    let mut c_out_len: usize = 0;
+    let mut c_image = talu_sys::TaluImageInfo::default();
+    let c_opts = to_c_transform_options(opts);
+
+    // SAFETY: bytes pointer/len are valid; output pointers are valid writable out-params.
+    let rc = unsafe {
+        talu_sys::talu_pdf_transform_page(
+            bytes.as_ptr(),
+            bytes.len(),
+            page_index,
+            dpi,
+            &c_opts,
+            (&mut c_out_ptr as *mut *const u8).cast::<c_void>(),
+            (&mut c_out_len as *mut usize).cast::<c_void>(),
+            &mut c_image,
+        )
+    };
+    if rc != 0 {
+        return Err(error_from_last_or("Failed to transform PDF page"));
+    }
+
+    let out_bytes = if c_out_ptr.is_null() || c_out_len == 0 {
+        Vec::new()
+    } else {
+        // SAFETY: pointer/len were produced by the C API and are valid for copy.
+        let slice = unsafe { std::slice::from_raw_parts(c_out_ptr, c_out_len) };
+        slice.to_vec()
+    };
+
+    // SAFETY: out buffer was allocated by C API and must be freed once copied.
+    unsafe { talu_sys::talu_file_bytes_free(c_out_ptr, c_out_len) };
+
+    Ok(TransformResult {
+        bytes: out_bytes,
+        image: image_info_from_c(&c_image),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

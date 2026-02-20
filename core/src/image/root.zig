@@ -129,6 +129,7 @@ pub fn toModelInput(
 
 pub const encode = encode_mod.encode;
 pub const codecs_internal = codecs;
+pub const pdf = codecs.pdf;
 
 pub const TransformSpec = struct {
     limits: Limits = .{},
@@ -180,6 +181,49 @@ pub fn transformImage(
         .jpeg => EncodeFormat.jpeg,
         .png, .webp, .pdf => EncodeFormat.png,
     };
+    const encoded = try encode_mod.encode(allocator, final_img, .{
+        .format = out_format,
+        .jpeg_quality = spec.jpeg_quality,
+    });
+
+    return .{
+        .data = encoded,
+        .width = final_img.width,
+        .height = final_img.height,
+        .encode_format = out_format,
+    };
+}
+
+/// Render a single PDF page, optionally resize, and encode to output format.
+/// Combines renderPage → convert(rgba→rgb + resize) → encode in one pipeline.
+/// Caller owns the returned data.
+pub fn transformPdfPage(
+    allocator: std.mem.Allocator,
+    bytes: []const u8,
+    page_index: u32,
+    dpi: u32,
+    spec: TransformSpec,
+) !TransformResult {
+    var decoded = try codecs.pdf.renderPage(
+        allocator,
+        bytes,
+        page_index,
+        if (dpi == 0) 150 else dpi,
+        spec.limits,
+    );
+    defer decoded.deinit(allocator);
+
+    // Convert RGBA→RGB + optional resize.
+    var final_img = try convert_mod.convert(allocator, decoded, .{
+        .format = .rgb8,
+        .resize = spec.resize,
+        .alpha = .composite,
+        .alpha_background = spec.pad_color,
+        .limits = spec.limits,
+    });
+    defer final_img.deinit(allocator);
+
+    const out_format = spec.output_format orelse EncodeFormat.png;
     const encoded = try encode_mod.encode(allocator, final_img, .{
         .format = out_format,
         .jpeg_quality = spec.jpeg_quality,

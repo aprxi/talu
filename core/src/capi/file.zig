@@ -1005,3 +1005,62 @@ pub export fn talu_pdf_page_count(
     out.* = count;
     return 0;
 }
+
+/// Render a single PDF page, optionally resize, and encode to an output image.
+/// Combines render → convert → optional resize → encode in a single pipeline.
+pub export fn talu_pdf_transform_page(
+    bytes: ?[*]const u8,
+    bytes_len: usize,
+    page_index: u32,
+    dpi: u32,
+    opts: ?*const TaluFileTransformOptions,
+    out_bytes: ?*?[*]u8,
+    out_len: ?*usize,
+    out_image: ?*TaluImageInfo,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const out_ptr = out_bytes orelse {
+        capi_error.setError(error.InvalidArgument, "out_bytes is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const out_n = out_len orelse {
+        capi_error.setError(error.InvalidArgument, "out_len is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out_ptr.* = null;
+    out_n.* = 0;
+    if (out_image) |img| img.* = std.mem.zeroes(TaluImageInfo);
+
+    if (bytes == null or bytes_len == 0) {
+        capi_error.setError(error.InvalidArgument, "bytes is null or empty", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }
+
+    const input = bytes.?[0..bytes_len];
+    const transform_opts = parseFileTransformOptions(opts) catch |err| {
+        capi_error.setError(err, "invalid file transform options", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    const result = image.transformPdfPage(allocator, input, page_index, dpi, .{
+        .limits = transform_opts.limits,
+        .resize = transform_opts.resize,
+        .output_format = transform_opts.output_format,
+        .jpeg_quality = transform_opts.jpeg_quality,
+        .pad_color = transform_opts.pad_color,
+    }) catch |err| {
+        capi_error.setError(err, "PDF page transform failed: {s}", .{@errorName(err)});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out_ptr.* = if (result.data.len == 0) null else result.data.ptr;
+    out_n.* = result.data.len;
+    if (out_image) |img| {
+        img.format = switch (result.encode_format) { .jpeg => 1, .png => 2 };
+        img.width = result.width;
+        img.height = result.height;
+        img.orientation = 1;
+    }
+    return 0;
+}
