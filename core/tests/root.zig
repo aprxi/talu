@@ -89,11 +89,11 @@ pub const inference_config_generation = @import("inference/config/generation_con
 // converter (top-level, not in io/)
 pub const converter = @import("converter/root.zig");
 
-// model metadata/types (legacy test path name retained)
-pub const graph = @import("graph/root.zig");
-pub const graph_loaded_model = @import("graph/loaded_model_test.zig");
-pub const graph_loader = @import("graph/loader/root.zig");
-pub const graph_config_model_description = @import("graph/config/model_description_test.zig");
+// models (static architecture/types/loader/config metadata)
+pub const models = @import("models/root.zig");
+pub const models_loaded_model = @import("models/loaded_model_test.zig");
+pub const models_loader = @import("models/loader/root.zig");
+pub const models_config_model_description = @import("models/config/model_description_test.zig");
 
 // db (TaluDB append-only columnar storage)
 pub const db = @import("db/root.zig");

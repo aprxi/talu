@@ -97,7 +97,6 @@ const granite_hybrid_post_block_ops = [_]types.Op{
 const granite_hybrid_block_ops = [_]types.Op{};
 const granite_hybrid_block_weights = [_]types.WeightSpec{};
 const granite_hybrid_layer_map = [_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0 };
-const granite_hybrid_variant_aliases = [_]types.VariantAlias{};
 const granite_hybrid_mamba_ops = [_]types.Op{
     .{ .op_type = .norm, .name = "input_layernorm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "input_layernorm.weight" } }, .outputs = &.{"_t0"} },
     .{ .op_type = .mamba_mixer, .name = "mixer", .inputs = &.{.{ .tensor = "_t0" }}, .outputs = &.{"_t1"}, .d_state = 128, .d_conv = 4, .n_heads = 48, .d_head = 32, .n_groups = 1, .d_inner = 1536 },
@@ -143,8 +142,8 @@ const granite_hybrid_attention_weights = [_]types.WeightSpec{
     .{ .id = "mlp.output_linear.weight", .candidates = &.{ "model.layers.{d}.shared_mlp.output_linear.weight", "model.layers.{d}.mlp.output_linear.weight", "layers.{d}.mlp.output_linear.weight", "transformer.h.{d}.mlp.output_linear.weight", "backbone.layers.{d}.mlp.output_linear.weight", "language_model.model.layers.{d}.mlp.output_linear.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
 };
 var granite_hybrid_block_variants = [_]types.BlockVariant{
-    .{ .name = "mamba", .ops = &granite_hybrid_mamba_ops, .weights = &granite_hybrid_mamba_weights, .compiled_program = null },
-    .{ .name = "attention", .ops = &granite_hybrid_attention_ops, .weights = &granite_hybrid_attention_weights, .compiled_program = null },
+    .{ .name = "mamba", .ops = &granite_hybrid_mamba_ops, .weights = &granite_hybrid_mamba_weights },
+    .{ .name = "attention", .ops = &granite_hybrid_attention_ops, .weights = &granite_hybrid_attention_weights },
 };
 const granite_hybrid_global_weights = [_]types.WeightSpec{
     .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
@@ -159,8 +158,7 @@ pub var arch: types.Architecture = .{
     .post_block_ops = &granite_hybrid_post_block_ops,
     .block_variants = &granite_hybrid_block_variants,
     .layer_map = &granite_hybrid_layer_map,
-    .variant_aliases = if (granite_hybrid_variant_aliases.len == 0) null else &granite_hybrid_variant_aliases,
-    .weight_map = null,
+    .variant_aliases = null,
     .block_weights = &granite_hybrid_block_weights,
     .global_weights = &granite_hybrid_global_weights,
     .weight_prefixes = &granite_hybrid_weight_prefixes,
@@ -177,5 +175,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 12.0,
-    .compiled_program = null,
 };

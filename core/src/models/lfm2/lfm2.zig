@@ -137,8 +137,8 @@ const lfm2_attention_weights = [_]types.WeightSpec{
     .{ .id = "feed_forward.w3.weight", .candidates = &.{ "model.layers.{d}.feed_forward.w3.weight", "model.language_model.layers.{d}.feed_forward.w3.weight", "layers.{d}.feed_forward.w3.weight", "transformer.h.{d}.feed_forward.w3.weight", "backbone.layers.{d}.feed_forward.w3.weight", "language_model.model.layers.{d}.feed_forward.w3.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
 };
 var lfm2_block_variants = [_]types.BlockVariant{
-    .{ .name = "shortconv", .ops = &lfm2_shortconv_ops, .weights = &lfm2_shortconv_weights, .compiled_program = null },
-    .{ .name = "attention", .ops = &lfm2_attention_ops, .weights = &lfm2_attention_weights, .compiled_program = null },
+    .{ .name = "shortconv", .ops = &lfm2_shortconv_ops, .weights = &lfm2_shortconv_weights },
+    .{ .name = "attention", .ops = &lfm2_attention_ops, .weights = &lfm2_attention_weights },
 };
 const lfm2_global_weights = [_]types.WeightSpec{
     .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "model.language_model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
@@ -153,8 +153,7 @@ pub var arch: types.Architecture = .{
     .post_block_ops = &lfm2_post_block_ops,
     .block_variants = &lfm2_block_variants,
     .layer_map = &lfm2_layer_map,
-    .variant_aliases = if (lfm2_variant_aliases.len == 0) null else &lfm2_variant_aliases,
-    .weight_map = null,
+    .variant_aliases = null,
     .block_weights = &lfm2_block_weights,
     .global_weights = &lfm2_global_weights,
     .weight_prefixes = &lfm2_weight_prefixes,
@@ -171,5 +170,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
-    .compiled_program = null,
 };

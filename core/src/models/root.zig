@@ -1,7 +1,9 @@
 //! Static models subsystem root.
 //!
-//! Phase 1 exposes a registry-driven model boundary for inference while
-//! preserving the existing loader API surface.
+//! Module boundary:
+//! - `models/` is the only owner of architecture metadata, config parsing,
+//!   and model weight-loading contracts.
+//! - Inference and converter code consume this module instead of legacy paths.
 
 const std = @import("std");
 const loader = @import("loader.zig");

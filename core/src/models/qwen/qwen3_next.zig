@@ -141,7 +141,6 @@ const qwen3_next_post_block_ops = [_]types.Op{
 const qwen3_next_block_ops = [_]types.Op{};
 const qwen3_next_block_weights = [_]types.WeightSpec{};
 const qwen3_next_layer_map = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-const qwen3_next_variant_aliases = [_]types.VariantAlias{};
 
 const qwen3_next_linear_attention_ops = [_]types.Op{
     .{ .op_type = .norm, .name = "input_layernorm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "input_layernorm.weight" } }, .outputs = &.{"_t0"}, .weight_offset = 1.0 },
@@ -197,8 +196,8 @@ const qwen3_next_full_attention_common_weights = [_]types.WeightSpec{
 const qwen3_next_full_attention_weights = qwen3_next_full_attention_common_weights ++ qwen3_next_expert_weights ++ qwen3_next_shared_expert_weights;
 
 var qwen3_next_block_variants = [_]types.BlockVariant{
-    .{ .name = "linear_attention", .ops = &qwen3_next_linear_attention_ops, .weights = &qwen3_next_linear_attention_weights, .compiled_program = null },
-    .{ .name = "full_attention", .ops = &qwen3_next_full_attention_ops, .weights = &qwen3_next_full_attention_weights, .compiled_program = null },
+    .{ .name = "linear_attention", .ops = &qwen3_next_linear_attention_ops, .weights = &qwen3_next_linear_attention_weights },
+    .{ .name = "full_attention", .ops = &qwen3_next_full_attention_ops, .weights = &qwen3_next_full_attention_weights },
 };
 
 const qwen3_next_global_weights = [_]types.WeightSpec{
@@ -215,8 +214,7 @@ pub var arch: types.Architecture = .{
     .post_block_ops = &qwen3_next_post_block_ops,
     .block_variants = &qwen3_next_block_variants,
     .layer_map = &qwen3_next_layer_map,
-    .variant_aliases = if (qwen3_next_variant_aliases.len == 0) null else &qwen3_next_variant_aliases,
-    .weight_map = null,
+    .variant_aliases = null,
     .block_weights = &qwen3_next_block_weights,
     .global_weights = &qwen3_next_global_weights,
     .weight_prefixes = &qwen3_next_weight_prefixes,
@@ -233,5 +231,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 1.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
-    .compiled_program = null,
 };

@@ -1,4 +1,4 @@
-//! Integration tests for graph.loader.LoadedModel
+//! Integration tests for models.loader.LoadedModel
 //!
 //! LoadedModel contains the loaded model weights and configuration.
 

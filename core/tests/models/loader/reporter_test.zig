@@ -1,4 +1,4 @@
-//! Integration tests for graph.loader.Reporter
+//! Integration tests for models.loader.Reporter
 //!
 //! Reporter is used for validation reporting during model loading.
 

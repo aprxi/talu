@@ -81,9 +81,6 @@ const qwen3_block_weights = [_]types.WeightSpec{
     .{ .id = "mlp.up_proj.weight", .candidates = &.{ "model.layers.{d}.mlp.up_proj.weight", "model.language_model.layers.{d}.mlp.up_proj.weight", "layers.{d}.mlp.up_proj.weight", "transformer.h.{d}.mlp.up_proj.weight", "backbone.layers.{d}.mlp.up_proj.weight", "language_model.model.layers.{d}.mlp.up_proj.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
     .{ .id = "mlp.down_proj.weight", .candidates = &.{ "model.layers.{d}.mlp.down_proj.weight", "model.language_model.layers.{d}.mlp.down_proj.weight", "layers.{d}.mlp.down_proj.weight", "transformer.h.{d}.mlp.down_proj.weight", "backbone.layers.{d}.mlp.down_proj.weight", "language_model.model.layers.{d}.mlp.down_proj.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
 };
-const qwen3_layer_map = [_]u8{};
-const qwen3_variant_aliases = [_]types.VariantAlias{};
-var qwen3_block_variants = [_]types.BlockVariant{};
 const qwen3_global_weights = [_]types.WeightSpec{
     .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "model.language_model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
     .{ .id = "ln_final", .candidates = &.{ "model.norm.weight", "model.language_model.norm.weight", "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
@@ -98,7 +95,6 @@ pub var arch: types.Architecture = .{
     .block_variants = null,
     .layer_map = null,
     .variant_aliases = null,
-    .weight_map = null,
     .block_weights = &qwen3_block_weights,
     .global_weights = &qwen3_global_weights,
     .weight_prefixes = &qwen3_weight_prefixes,
@@ -115,5 +111,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
-    .compiled_program = null,
 };

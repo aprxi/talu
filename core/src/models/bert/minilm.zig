@@ -86,9 +86,6 @@ const minilm_block_weights = [_]types.WeightSpec{
     .{ .id = "post_attention_layernorm.weight", .candidates = &.{ "bert.encoder.layer.{d}.output.LayerNorm.weight", "encoder.layer.{d}.output.LayerNorm.weight" }, .module_type = "LayerNorm", .layout = .none, .dtype = "float32", .required = true },
     .{ .id = "post_attention_layernorm.bias", .candidates = &.{ "bert.encoder.layer.{d}.output.LayerNorm.bias", "encoder.layer.{d}.output.LayerNorm.bias" }, .module_type = "LayerNorm", .layout = .none, .dtype = "float32", .required = true },
 };
-const minilm_layer_map = [_]u8{};
-const minilm_variant_aliases = [_]types.VariantAlias{};
-var minilm_block_variants = [_]types.BlockVariant{};
 const minilm_global_weights = [_]types.WeightSpec{
     .{ .id = "token_embeddings", .candidates = &.{ "bert.embeddings.word_embeddings.weight", "embeddings.word_embeddings.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
     .{ .id = "position_embeddings", .candidates = &.{ "bert.embeddings.position_embeddings.weight", "embeddings.position_embeddings.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
@@ -105,7 +102,6 @@ pub var arch: types.Architecture = .{
     .block_variants = null,
     .layer_map = null,
     .variant_aliases = null,
-    .weight_map = null,
     .block_weights = &minilm_block_weights,
     .global_weights = &minilm_global_weights,
     .weight_prefixes = &minilm_weight_prefixes,
@@ -122,5 +118,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
-    .compiled_program = null,
 };

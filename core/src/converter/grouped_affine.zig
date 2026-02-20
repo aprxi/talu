@@ -165,7 +165,7 @@ pub fn convertToGroupedAffine(
     }
 
     // Quantized conversion requires architecture-driven layout metadata.
-    // This keeps name semantics in static model graph metadata, not in converter internals.
+    // This keeps name semantics in static model metadata, not in converter internals.
     if (options.quant != null and layout_map == null) {
         return error.MissingArchitectureLayout;
     }
@@ -284,7 +284,7 @@ fn writeQuantizedWeights(
 
         const source_tensor = try source_tensors.getTensor(tensor_name, null);
 
-        // Use graph-driven layout to determine if tensor should be quantized.
+        // Use architecture-driven layout to determine if tensor should be quantized.
         // Unknown tensors are kept in source precision.
         if (convert.shouldQuantizeTensorByLayout(layout_map, tensor_name, source_tensor)) {
             try quantizeGroupedAffineTensor(allocator, source_tensors, &tensor_builder, tensor_name, source_tensor, quant_config);

@@ -1,4 +1,4 @@
-//! Integration tests for graph.LoadedModel
+//! Integration tests for models.LoadedModel
 //!
 //! LoadedModel is exported from models root (`main.models.dispatcher`).
 
@@ -10,7 +10,7 @@ const LoadedModel = main.models.dispatcher.LoadedModel;
 // Type Verification Tests
 // =============================================================================
 
-test "LoadedModel type is accessible from graph" {
+test "LoadedModel type is accessible from models" {
     const T = LoadedModel;
     _ = T;
 }

@@ -484,7 +484,7 @@ pub fn loadModelWithHooks(
             .mamba_config = null,
             .shortconv_config = null,
             .mla_config = null,
-            // MoE configuration (graph-driven loading)
+            // MoE configuration (architecture-driven loading)
             .num_experts = if (model_config.num_experts > 0) @intCast(model_config.num_experts) else 0,
             .experts_per_token = if (model_config.experts_per_token > 0) @intCast(model_config.experts_per_token) else 0,
             .allocator = arena_allocator,
@@ -562,7 +562,7 @@ pub fn loadModelWithHooks(
         start_time_ns = now;
     }
 
-    // Global weights (embeddings, final norm, lm_head) are loaded via graph metadata.
+    // Global weights (embeddings, final norm, lm_head) are loaded via architecture metadata.
     if (!archHasGlobalWeights(arch)) return error.MissingArchitecture;
 
     var global_map = try generic_weights.loadWeightMap(

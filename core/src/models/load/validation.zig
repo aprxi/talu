@@ -88,7 +88,7 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
                 const is_mla = block.q_a_proj != null;
                 if (is_mla) {
                     // MLA has compressed Q/KV projections - skip standard Q/K/V validation
-                    // Shape validation for MLA weights is model-specific (handled by expected_shape in graph)
+                    // Shape validation for MLA weights is model-specific (handled by expected_shape in architecture metadata)
                 } else if (block.fused.qkv_proj) |qkv| {
                     const qkv_out: usize = q_out + 2 * kv_out;
                     if (!is2DShapeMatch(&qkv, d_model, qkv_out))

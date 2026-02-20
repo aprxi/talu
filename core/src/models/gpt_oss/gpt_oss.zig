@@ -60,7 +60,6 @@ const gpt_oss_post_block_ops = [_]types.Op{
 const gpt_oss_block_ops = [_]types.Op{};
 const gpt_oss_block_weights = [_]types.WeightSpec{};
 const gpt_oss_layer_map = [_]u8{ 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1, 0, 1 };
-const gpt_oss_variant_aliases = [_]types.VariantAlias{};
 const gpt_oss_sliding_attention_ops = [_]types.Op{
     .{ .op_type = .norm, .name = "input_layernorm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "input_layernorm.weight" } }, .outputs = &.{"_t0"} },
     .{ .op_type = .multihead_attention, .inputs = &.{.{ .tensor = "_t0" }}, .outputs = &.{"_t1"}, .sliding_window = 128 },
@@ -120,8 +119,8 @@ const gpt_oss_full_attention_weights = [_]types.WeightSpec{
     .{ .id = "mlp.experts.down_proj_bias", .candidates = &.{ "model.layers.{d}.mlp.experts.down_proj_bias", "layers.{d}.mlp.experts.down_proj_bias", "transformer.h.{d}.mlp.experts.down_proj_bias", "backbone.layers.{d}.mlp.experts.down_proj_bias", "language_model.model.layers.{d}.mlp.experts.down_proj_bias" }, .module_type = "_Experts", .layout = .none, .dtype = "float32", .required = true },
 };
 var gpt_oss_block_variants = [_]types.BlockVariant{
-    .{ .name = "sliding_attention", .ops = &gpt_oss_sliding_attention_ops, .weights = &gpt_oss_sliding_attention_weights, .compiled_program = null },
-    .{ .name = "full_attention", .ops = &gpt_oss_full_attention_ops, .weights = &gpt_oss_full_attention_weights, .compiled_program = null },
+    .{ .name = "sliding_attention", .ops = &gpt_oss_sliding_attention_ops, .weights = &gpt_oss_sliding_attention_weights },
+    .{ .name = "full_attention", .ops = &gpt_oss_full_attention_ops, .weights = &gpt_oss_full_attention_weights },
 };
 const gpt_oss_global_weights = [_]types.WeightSpec{
     .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
@@ -136,8 +135,7 @@ pub var arch: types.Architecture = .{
     .post_block_ops = &gpt_oss_post_block_ops,
     .block_variants = &gpt_oss_block_variants,
     .layer_map = &gpt_oss_layer_map,
-    .variant_aliases = if (gpt_oss_variant_aliases.len == 0) null else &gpt_oss_variant_aliases,
-    .weight_map = null,
+    .variant_aliases = null,
     .block_weights = &gpt_oss_block_weights,
     .global_weights = &gpt_oss_global_weights,
     .weight_prefixes = &gpt_oss_weight_prefixes,
@@ -154,5 +152,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
-    .compiled_program = null,
 };

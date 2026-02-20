@@ -1,10 +1,10 @@
-//! Integration tests for graph.Architecture
+//! Integration tests for models Architecture metadata.
 
 const std = @import("std");
 const main = @import("main");
-const graph = main.models.dispatcher.op_types;
-const Architecture = graph.Architecture;
-const Op = graph.Op;
+const model_types = main.models.dispatcher.op_types;
+const Architecture = model_types.Architecture;
+const Op = model_types.Op;
 
 test "Architecture type is accessible" {
     _ = Architecture;
@@ -22,7 +22,7 @@ test "Architecture.isHeterogeneous returns false for homogeneous model" {
 }
 
 test "Architecture.isHeterogeneous returns true when block_variants set" {
-    var variants: [1]graph.BlockVariant = .{.{
+    var variants: [1]model_types.BlockVariant = .{.{
         .name = "attention",
         .ops = &.{},
     }};

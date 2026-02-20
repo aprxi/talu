@@ -186,7 +186,7 @@ pub fn blockProgramFor(entry: Entry, block_kind: topology.BlockKind) ?[]const la
 
 pub fn loadArchitectureDefinitions(allocator: std.mem.Allocator) bool {
     _ = allocator;
-    // Static models are compile-time metadata; no runtime graph loading needed.
+    // Static models are compile-time metadata; no runtime architecture loading needed.
     return true;
 }
 

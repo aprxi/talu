@@ -1,10 +1,7 @@
-//! Graph Types
+//! Model Architecture Types
 //!
-//! Core types for representing compute graphs from Python model definitions.
-//! These types bridge Python's traced operations to Zig's execution engine.
-
-const std = @import("std");
-const ops_mod = @import("layer_ops.zig");
+//! Static model metadata contracts shared by model definitions, loader logic,
+//! and inference runtime wiring.
 
 /// Input to an operation - either a tensor reference or a scalar value.
 pub const OpInput = union(enum) {
@@ -12,7 +9,7 @@ pub const OpInput = union(enum) {
     scalar: f32, // Scalar value (e.g., 1.0)
 };
 
-/// Operation types that can appear in a compute graph.
+/// Operation types that can appear in model block metadata.
 /// High-level ops (norm, multihead_attention, mlp) are preferred.
 /// Low-level ops (linear, split, etc.) are used with TALU_PRIMITIVES_ONLY=1.
 pub const OpType = enum {
@@ -46,8 +43,7 @@ pub const OpType = enum {
     scaled_dot_product_attention,
 };
 
-/// A single operation in the compute graph.
-/// Parsed from graph definitions and compiled to LayerOp for execution.
+/// A single operation in static model metadata.
 pub const Op = struct {
     op_type: OpType,
     name: ?[]const u8 = null, // For norm: "input_layernorm", etc.
@@ -117,7 +113,7 @@ pub const WeightTransform = enum {
     dtype_f32,
 };
 
-/// Declarative weight specification for graph-driven loading.
+/// Declarative weight specification for architecture-driven loading.
 pub const WeightSpec = struct {
     /// Internal ID for lookup (relative path from block).
     id: []const u8,
@@ -148,17 +144,15 @@ pub const BlockVariant = struct {
     name: []const u8,
     ops: []const Op,
     weights: []const WeightSpec = &.{},
-    /// Compiled LayerOp program for this variant (lazily created)
-    compiled_program: ?[]const ops_mod.LayerOp = null,
 };
 
 /// A registered architecture definition.
-/// Contains the compute graph and metadata derived from analyzing it.
+/// Contains static operation metadata and weight contracts.
 pub const Architecture = struct {
     name: []const u8,
     model_types: []const []const u8,
 
-    // Compute graph ops (homogeneous models use block_ops, heterogeneous use block_variants)
+    // Static op metadata (homogeneous models use block_ops, heterogeneous use block_variants)
     block_ops: []const Op = &.{},
     pre_block_ops: []const Op = &.{},
     post_block_ops: []const Op = &.{},
@@ -169,11 +163,9 @@ pub const Architecture = struct {
     /// Maps layer index to variant index (e.g., [0,0,0,1,0,0,1,...] for Mamba=0, Attention=1)
     layer_map: ?[]const u8 = null,
     /// Maps alternate config.json layer_type strings to variant indices.
-    /// E.g., config uses "conv" but graph variant is "shortconv" at index 0.
+    /// E.g., config uses "conv" but architecture variant is "shortconv" at index 0.
     variant_aliases: ?[]const VariantAlias = null,
 
-    // Weight name mapping (optional)
-    weight_map: ?std.StringHashMapUnmanaged([]const u8) = null,
     // Weight specs for homogeneous blocks.
     block_weights: []const WeightSpec = &.{},
     // Global weights (embeddings, final norm, lm_head).
@@ -199,9 +191,6 @@ pub const Architecture = struct {
     // Pre-block flags
     embedding_multiplier: f32 = 1.0, // Scaling factor after embedding (e.g., sqrt(hidden_size))
 
-    /// Compiled LayerOp program (lazily created on first use) - for homogeneous models
-    compiled_program: ?[]const ops_mod.LayerOp = null,
-
     /// Check if this is a heterogeneous model (multiple block variants)
     pub fn isHeterogeneous(self: *const Architecture) bool {
         return self.block_variants != null;
@@ -209,7 +198,7 @@ pub const Architecture = struct {
 
     /// Get the variant index for a given layer (returns 0 for homogeneous models).
     /// If layer_types_override is provided (from model's config.json), it takes precedence
-    /// over the graph's hardcoded layer_map.
+    /// over the architecture's layer_map.
     pub fn getVariantIndex(self: *const Architecture, layer_idx: usize) u8 {
         return self.getVariantIndexWithOverride(layer_idx, null);
     }
@@ -224,7 +213,7 @@ pub const Architecture = struct {
                 return override[layer_idx];
             }
         }
-        // Priority 2: Fall back to graph's hardcoded layer_map
+        // Priority 2: Fall back to architecture layer_map
         if (self.layer_map) |map| {
             if (layer_idx < map.len) {
                 return map[layer_idx];

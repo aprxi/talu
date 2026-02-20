@@ -1,4 +1,4 @@
-//! Integration tests for graph.config.ModelDescription
+//! Integration tests for models.config.ModelDescription
 //!
 //! ModelDescription is a C-compatible struct containing model metadata
 //! for C API introspection. It owns allocated architecture strings.

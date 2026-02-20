@@ -92,7 +92,6 @@ const lfm2_5_post_block_ops = [_]types.Op{
 const lfm2_5_block_ops = [_]types.Op{};
 const lfm2_5_block_weights = [_]types.WeightSpec{};
 const lfm2_5_layer_map = [_]u8{ 0, 0, 1, 0, 0, 1, 0, 0, 1, 0, 1, 0, 1, 0, 1, 0 };
-const lfm2_5_variant_aliases = [_]types.VariantAlias{};
 const lfm2_5_conv_ops = [_]types.Op{
     .{ .op_type = .norm, .name = "operator_norm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "operator_norm.weight" } }, .outputs = &.{"_t0"} },
     .{ .op_type = .shortconv, .name = "conv", .inputs = &.{.{ .tensor = "_t0" }}, .outputs = &.{"_t1"}, .d_conv = 3, .conv_dim = 2048, .conv_dim_out = 2048 },
@@ -133,8 +132,8 @@ const lfm2_5_full_attention_weights = [_]types.WeightSpec{
     .{ .id = "feed_forward.w3.weight", .candidates = &.{ "model.layers.{d}.feed_forward.w3.weight", "layers.{d}.feed_forward.w3.weight", "transformer.h.{d}.feed_forward.w3.weight", "backbone.layers.{d}.feed_forward.w3.weight", "language_model.model.layers.{d}.feed_forward.w3.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
 };
 var lfm2_5_block_variants = [_]types.BlockVariant{
-    .{ .name = "conv", .ops = &lfm2_5_conv_ops, .weights = &lfm2_5_conv_weights, .compiled_program = null },
-    .{ .name = "full_attention", .ops = &lfm2_5_full_attention_ops, .weights = &lfm2_5_full_attention_weights, .compiled_program = null },
+    .{ .name = "conv", .ops = &lfm2_5_conv_ops, .weights = &lfm2_5_conv_weights },
+    .{ .name = "full_attention", .ops = &lfm2_5_full_attention_ops, .weights = &lfm2_5_full_attention_weights },
 };
 const lfm2_5_global_weights = [_]types.WeightSpec{
     .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
@@ -149,8 +148,7 @@ pub var arch: types.Architecture = .{
     .post_block_ops = &lfm2_5_post_block_ops,
     .block_variants = &lfm2_5_block_variants,
     .layer_map = &lfm2_5_layer_map,
-    .variant_aliases = if (lfm2_5_variant_aliases.len == 0) null else &lfm2_5_variant_aliases,
-    .weight_map = null,
+    .variant_aliases = null,
     .block_weights = &lfm2_5_block_weights,
     .global_weights = &lfm2_5_global_weights,
     .weight_prefixes = &lfm2_5_weight_prefixes,
@@ -167,5 +165,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
-    .compiled_program = null,
 };

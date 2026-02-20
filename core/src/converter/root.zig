@@ -74,9 +74,9 @@ fn isQuantizedDtype(dtype: dtype_mod.DType) bool {
     };
 }
 
-/// DEPRECATED: Use shouldQuantizeTensorByLayout for graph-driven quantization.
+/// DEPRECATED: Use shouldQuantizeTensorByLayout for architecture-driven quantization.
 /// Check if a tensor should be quantized based on name-derived role.
-/// Only used as fallback when architecture graph is not available.
+/// Only used as fallback when architecture metadata is not available.
 pub fn shouldQuantizeTensor(info: mapping.TensorInfo, src_tensor: tensor_mod.Tensor) bool {
     // Role-based check first
     if (!mapping.shouldQuantize(info.role)) return false;
@@ -97,10 +97,10 @@ pub fn shouldQuantizeTensor(info: mapping.TensorInfo, src_tensor: tensor_mod.Ten
 }
 
 // =============================================================================
-// Graph-Driven Quantization
+// Architecture-Driven Quantization
 // =============================================================================
 
-/// Weight layout map for graph-driven quantization decisions.
+/// Weight layout map for architecture-driven quantization decisions.
 /// Maps full tensor names (e.g., "model.layers.0.self_attn.q_proj.weight") to their layout.
 pub const WeightLayoutMap = struct {
     allocator: std.mem.Allocator,
@@ -142,14 +142,14 @@ pub const WeightLayoutMap = struct {
         return null; // Unknown tensor
     }
 
-    /// Check whether a tensor name is an lm_head candidate from the graph.
+    /// Check whether a tensor name is an lm_head candidate from architecture metadata.
     pub fn isLmHead(self: *const WeightLayoutMap, tensor_name: []const u8) bool {
         return self.lm_head_names.contains(tensor_name);
     }
 };
 
-/// Build a weight layout map from the architecture graph.
-/// This extracts layout information from the graph's weight specs.
+/// Build a weight layout map from architecture metadata.
+/// This extracts layout information from the architecture's weight specs.
 pub fn buildWeightLayoutMap(
     allocator: std.mem.Allocator,
     arch: *const op_types.Architecture,
@@ -181,7 +181,7 @@ pub fn buildWeightLayoutMap(
         const weights = getWeightsForLayer(arch, layer_idx);
 
         for (weights) |weight_spec| {
-            // Use graph-provided candidates as the source of truth.
+            // Use architecture-provided candidates as the source of truth.
             // Candidates may be generated from weight_prefixes+id or explicitly overridden
             // for architecture-specific naming (e.g., Granite mamba/self_attn aliases).
             for (weight_spec.candidates) |candidate_template| {
@@ -233,7 +233,7 @@ fn expandLayerPlaceholder(allocator: std.mem.Allocator, template: []const u8, la
     return try result.toOwnedSlice(allocator);
 }
 
-/// Check if a tensor should be quantized using graph-driven layout information.
+/// Check if a tensor should be quantized using architecture-driven layout information.
 /// If the tensor is not present in the layout map, it is not quantized.
 pub fn shouldQuantizeTensorByLayout(
     layout_map: ?*const WeightLayoutMap,
@@ -242,7 +242,7 @@ pub fn shouldQuantizeTensorByLayout(
 ) bool {
     const map = layout_map orelse return false;
 
-    // Graph is the source of truth. Unknown tensors are kept in source precision.
+    // Architecture metadata is the source of truth. Unknown tensors are kept in source precision.
     const should_quantize = map.shouldQuantize(tensor_name) orelse return false;
     if (!should_quantize) return false;
 
@@ -264,7 +264,7 @@ pub fn shouldQuantizeTensorByLayout(
 }
 
 /// Check if a tensor should be skipped due to tied embeddings.
-/// Uses graph-derived lm_head aliases when available.
+/// Uses architecture-derived lm_head aliases when available.
 pub fn shouldSkipForTiedEmbeddingsByName(
     layout_map: ?*const WeightLayoutMap,
     tensor_name: []const u8,
@@ -584,7 +584,7 @@ test "f32ToF16 preserves sign" {
     try std.testing.expect((negative & 0x8000) != 0);
 }
 
-test "shouldSkipForTiedEmbeddingsByName uses graph lm_head aliases" {
+test "shouldSkipForTiedEmbeddingsByName uses architecture lm_head aliases" {
     const allocator = std.testing.allocator;
     var layout_map = WeightLayoutMap.init(allocator);
     defer layout_map.deinit();
@@ -1231,7 +1231,7 @@ test "buildWeightLayoutMap uses weight candidates for block weights" {
     try std.testing.expectEqual(@as(?bool, null), layout_map.shouldQuantize("model.layers.0.mixer.q_proj.weight"));
 }
 
-test "shouldQuantizeTensorByLayout uses graph layout for quantization policy" {
+test "shouldQuantizeTensorByLayout uses architecture layout for quantization policy" {
     const allocator = std.testing.allocator;
 
     var layout_map = WeightLayoutMap.init(allocator);

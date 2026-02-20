@@ -139,7 +139,6 @@ pub var arch: types.Architecture = .{
     .block_variants = null,
     .layer_map = null,
     .variant_aliases = null,
-    .weight_map = null,
     .block_weights = &qwen3_moe_block_weights,
     .global_weights = &qwen3_moe_global_weights,
     .weight_prefixes = &qwen3_moe_weight_prefixes,
@@ -156,5 +155,4 @@ pub var arch: types.Architecture = .{
     .norm_weight_offset = 0.0,
     .explicit_qk_norm_ops = false,
     .embedding_multiplier = 1.0,
-    .compiled_program = null,
 };
