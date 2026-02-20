@@ -308,7 +308,6 @@ set(PDFIUM_SOURCES
     core/fpdfapi/parser/object_tree_traversal_util.cpp
 
     # fpdfapi/render
-    core/fpdfapi/render/charposlist.cpp
     core/fpdfapi/render/cpdf_devicebuffer.cpp
     core/fpdfapi/render/cpdf_docrenderdata.cpp
     core/fpdfapi/render/cpdf_imagerenderer.cpp

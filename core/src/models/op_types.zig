@@ -47,7 +47,7 @@ pub const OpType = enum {
 };
 
 /// A single operation in the compute graph.
-/// Parsed from JSON (_graphs/*.json) and compiled to LayerOp for execution.
+/// Parsed from graph definitions and compiled to LayerOp for execution.
 pub const Op = struct {
     op_type: OpType,
     name: ?[]const u8 = null, // For norm: "input_layernorm", etc.

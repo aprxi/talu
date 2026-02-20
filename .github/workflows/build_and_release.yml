@@ -175,8 +175,6 @@ jobs:
           mkdir -p bindings/python/vendor/talu/bindings
           cp -r core build.zig VERSION Makefile ports bindings/python/vendor/talu/
           cp -r bindings/rust bindings/python/vendor/talu/bindings/
-          mkdir -p bindings/python/vendor/talu/tools/archs
-          cp -r tools/archs/_graphs bindings/python/vendor/talu/tools/archs/
           # Include pre-built UI assets so wheel build bundles the console UI
           mkdir -p bindings/python/vendor/talu/ui
           cp -r ui/dist bindings/python/vendor/talu/ui/

@@ -1,6 +1,6 @@
 //! Graph Compiler
 //!
-//! Compiles graph ops (from JSON) to LayerOp bytecode for the Zig executor.
+//! Compiles graph ops to LayerOp bytecode for the Zig executor.
 //! This is the core "JIT" that bridges Python's declarative model definitions
 //! to Zig's high-performance execution engine.
 //!

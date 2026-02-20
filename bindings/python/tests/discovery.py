@@ -108,8 +108,6 @@ def get_source_modules() -> list[tuple[str, Path]]:
             continue
         if subdir.name.startswith("__"):
             continue
-        if subdir.name == "_graphs":
-            continue  # Data directory
         if (subdir / "__init__.py").exists():
             modules.append((subdir.name, subdir))
 

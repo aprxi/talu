@@ -1,8 +1,8 @@
 //! Architecture Registry
 //!
-//! Global registry for model architectures. Architectures are loaded from:
-//! - JSON files (_graphs/*.json) placed in model directories
-//! - Python registration via C API
+//! Global registry for model architectures. Architectures are registered from:
+//! - Static compile-time definitions
+//! - Runtime registration via C API (Python @architecture decorator)
 //!
 //! The registry maps architecture names and model_types to their compute graphs.
 

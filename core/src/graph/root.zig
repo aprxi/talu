@@ -22,8 +22,8 @@
 //! // Initialize registry
 //! graph.init(allocator);
 //!
-//! // Load architecture from JSON file
-//! try graph.loadFromFile("path/to/architecture.json");
+//! // Load architecture from JSON string
+//! try graph.loadFromJson(json_string);
 //!
 //! // Get architecture by model_type
 //! if (graph.detectFromModelType("model_type")) |arch| {
