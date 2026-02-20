@@ -635,7 +635,7 @@ test "validateCommon: valid minimal model" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    const InferenceBackend = weights.transformer;
 
     // Create mock block weights
     var blocks = [_]InferenceBackend.BlockWeights{
@@ -836,7 +836,7 @@ test "validateCommon: token_embeddings wrong dimensions" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    const InferenceBackend = weights.transformer;
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
             .dtype = .f32,
@@ -969,7 +969,7 @@ test "validateCommon: token_embeddings shape mismatch" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    const InferenceBackend = weights.transformer;
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
             .dtype = .f32,
@@ -1103,7 +1103,7 @@ test "validateCommon: blocks count mismatch" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    const InferenceBackend = weights.transformer;
     // Only provide 1 block instead of 3
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
@@ -1237,7 +1237,7 @@ test "validateCommon: layer ln1 shape mismatch" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    const InferenceBackend = weights.transformer;
     var blocks = [_]InferenceBackend.BlockWeights{.{
         .attention_mlp = .{
             .ln1_weight = &tensor.Tensor{
@@ -1372,7 +1372,7 @@ test "validateCommon: missing q/k/v without fused qkv" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    const InferenceBackend = weights.transformer;
     var blocks = [_]InferenceBackend.BlockWeights{.{
         .attention_mlp = .{
             .ln1_weight = &tensor.Tensor{
@@ -1490,7 +1490,7 @@ test "validateCommon: lm_head not 2D" {
         .gaffine_group_size = 128,
     };
 
-    const InferenceBackend = @import("../../inference/backend/cpu/executor/weights.zig");
+    const InferenceBackend = weights.transformer;
     var blocks = [_]InferenceBackend.BlockWeights{.{ .attention_mlp = .{
         .ln1_weight = &tensor.Tensor{
             .dtype = .f32,

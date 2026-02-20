@@ -3,6 +3,8 @@
 //! Static model metadata contracts shared by model definitions, loader logic,
 //! and inference runtime wiring.
 
+const std = @import("std");
+
 /// Input to an operation - either a tensor reference or a scalar value.
 pub const OpInput = union(enum) {
     tensor: []const u8, // Tensor name (e.g., "weight", "x")
@@ -146,6 +148,98 @@ pub const BlockVariant = struct {
     weights: []const WeightSpec = &.{},
 };
 
+/// Vision probing metadata consumed by inference vision runtime.
+/// This keeps tensor-name conventions in the models contract instead of
+/// inference-owned hardcoded string templates.
+pub const VisionMetadata = struct {
+    /// Probe tensors used to classify fused/split attention layouts.
+    fused_qkv_probe_candidates: []const []const u8 = &.{
+        "model.visual.blocks.0.attn.qkv.weight",
+    },
+    split_qkv_probe_candidates: []const []const u8 = &.{
+        "model.visual.blocks.0.attn.q_proj.weight",
+        "model.visual.blocks.0.self_attn.q_proj.weight",
+        "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+        "model.vision_model.encoder.layers.0.self_attn.q_proj.weight",
+    },
+
+    /// Candidate tensors used for config hydration.
+    patch_embed_candidates: []const []const u8 = &.{
+        "model.visual.patch_embed.proj.weight",
+        "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
+        "model.vision_model.embeddings.patch_embedding.weight",
+    },
+    position_embed_candidates: []const []const u8 = &.{
+        "model.visual.pos_embed.weight",
+        "model.vision_tower.vision_model.embeddings.position_embedding.weight",
+        "model.vision_model.embeddings.position_embedding.weight",
+    },
+    merger_fc1_candidates: []const []const u8 = &.{
+        "model.visual.merger.linear_fc1.weight",
+        "model.multi_modal_projector.linear_1.weight",
+    },
+
+    /// Layer templates used to infer depth/intermediate size.
+    depth_split_qproj_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.q_proj.weight",
+        "model.visual.blocks.{d}.self_attn.q_proj.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
+        "model.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
+    },
+    depth_fused_qkv_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.qkv.weight",
+    },
+    intermediate_fc1_templates: []const []const u8 = &.{
+        "model.visual.blocks.0.mlp.linear_fc1.weight",
+        "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight",
+        "model.vision_model.encoder.layers.0.mlp.fc1.weight",
+    },
+};
+
+/// Canonical block kinds for heterogeneous model topologies.
+pub const BlockKind = enum {
+    /// Standard transformer block with attention and FFN.
+    attention_mlp,
+    /// Mamba2 state-space mixer block.
+    mamba,
+    /// ShortConv gated convolution block.
+    shortconv,
+
+    /// Convert a variant name string to canonical block kind.
+    pub fn fromVariantName(name: []const u8) ?BlockKind {
+        const known = std.StaticStringMap(BlockKind).initComptime(.{
+            .{ "attention", .attention_mlp },
+            .{ "attention_mlp", .attention_mlp },
+            .{ "transformer", .attention_mlp },
+            .{ "full_attention", .attention_mlp },
+            .{ "sliding_attention", .attention_mlp },
+            .{ "linear_attention", .mamba },
+            .{ "mamba", .mamba },
+            .{ "mamba2", .mamba },
+            .{ "ssm", .mamba },
+            .{ "shortconv", .shortconv },
+            .{ "conv", .shortconv },
+        });
+        return known.get(name);
+    }
+};
+
+/// Fused-model layer kind identifiers for Metal compute bindings.
+pub const FusedLayerKindId = enum(u8) {
+    attention_mlp = 0,
+    shortconv = 1,
+};
+
+/// Returns the fused-model layer id for kinds supported by fused Metal decode.
+/// `null` means the kind is not supported by fused Metal execution.
+pub fn fusedLayerKindId(kind: BlockKind) ?FusedLayerKindId {
+    return switch (kind) {
+        .attention_mlp => .attention_mlp,
+        .shortconv => .shortconv,
+        .mamba => null,
+    };
+}
+
 /// A registered architecture definition.
 /// Contains static operation metadata and weight contracts.
 pub const Architecture = struct {
@@ -190,6 +284,9 @@ pub const Architecture = struct {
 
     // Pre-block flags
     embedding_multiplier: f32 = 1.0, // Scaling factor after embedding (e.g., sqrt(hidden_size))
+
+    // Vision metadata contract for runtime probing.
+    vision: VisionMetadata = .{},
 
     /// Check if this is a heterogeneous model (multiple block variants)
     pub fn isHeterogeneous(self: *const Architecture) bool {

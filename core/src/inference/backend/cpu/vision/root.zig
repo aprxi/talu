@@ -18,6 +18,7 @@ const split_qkv_runtime = @import("split_qkv.zig");
 
 const LoadedModel = models.LoadedModel;
 const SafeTensors = io.safetensors.root.UnifiedSafeTensors;
+const VisionMetadata = models.op_types.VisionMetadata;
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;
@@ -166,18 +167,12 @@ fn detectVisionAttentionLayout(loaded: *LoadedModel) VisionAttentionLayout {
     if (loaded.st == null) return .unknown;
 
     const st = &loaded.st.?;
-    if (hasAnyTensor(st, &.{
-        "model.visual.blocks.0.attn.qkv.weight",
-    })) {
+    const vision_metadata = resolveVisionMetadata(loaded);
+    if (hasAnyTensor(st, vision_metadata.fused_qkv_probe_candidates)) {
         return .fused_qkv;
     }
 
-    if (hasAnyTensor(st, &.{
-        "model.visual.blocks.0.attn.q_proj.weight",
-        "model.visual.blocks.0.self_attn.q_proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
-        "model.vision_model.encoder.layers.0.self_attn.q_proj.weight",
-    })) {
+    if (hasAnyTensor(st, vision_metadata.split_qkv_probe_candidates)) {
         return .split_qkv;
     }
 
@@ -192,10 +187,20 @@ fn hasAnyTensor(st: *SafeTensors, candidates: []const []const u8) bool {
     return false;
 }
 
+fn resolveVisionMetadata(loaded: *const LoadedModel) VisionMetadata {
+    if (loaded.runtime.architecture_id) |arch_id| {
+        if (models.registry.runtimeArchitectureById(arch_id)) |arch| {
+            return arch.vision;
+        }
+    }
+    return .{};
+}
+
 fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     if (loaded.st == null) return;
 
     var cfg = &loaded.config;
+    const vision_metadata = resolveVisionMetadata(loaded);
     const needs_hydration = cfg.vision_hidden_size <= 0 or
         cfg.vision_depth <= 0 or
         cfg.vision_num_heads <= 0 or
@@ -209,17 +214,9 @@ fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     if (!needs_hydration) return;
 
     const st = &loaded.st.?;
-    if (!hasAnyTensor(st, &.{
-        "model.visual.patch_embed.proj.weight",
-        "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
-        "model.vision_model.embeddings.patch_embedding.weight",
-    })) return;
+    if (!hasAnyTensor(st, vision_metadata.patch_embed_candidates)) return;
 
-    const patch_tensor = getTensorByCandidates(st, &.{
-        "model.visual.patch_embed.proj.weight",
-        "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
-        "model.vision_model.embeddings.patch_embedding.weight",
-    }) catch |err| switch (err) {
+    const patch_tensor = getTensorByCandidates(st, vision_metadata.patch_embed_candidates) catch |err| switch (err) {
         error.NotFound => return,
         else => return err,
     };
@@ -239,11 +236,7 @@ fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     }
     if (cfg.vision_patch_size <= 0) cfg.vision_patch_size = 16;
 
-    const pos_tensor = getTensorByCandidates(st, &.{
-        "model.visual.pos_embed.weight",
-        "model.vision_tower.vision_model.embeddings.position_embedding.weight",
-        "model.vision_model.embeddings.position_embedding.weight",
-    }) catch |err| switch (err) {
+    const pos_tensor = getTensorByCandidates(st, vision_metadata.position_embed_candidates) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
@@ -255,10 +248,7 @@ fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
         }
     }
 
-    const merger_fc1_weight = getTensorByCandidates(st, &.{
-        "model.visual.merger.linear_fc1.weight",
-        "model.multi_modal_projector.linear_1.weight",
-    }) catch |err| switch (err) {
+    const merger_fc1_weight = getTensorByCandidates(st, vision_metadata.merger_fc1_candidates) catch |err| switch (err) {
         error.NotFound => null,
         else => return err,
     };
@@ -281,7 +271,7 @@ fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     }
 
     if (cfg.vision_depth <= 0) {
-        cfg.vision_depth = @intCast(try inferVisionDepth(st));
+        cfg.vision_depth = @intCast(try inferVisionDepth(st, &vision_metadata));
     }
 
     if (cfg.vision_num_heads <= 0 and cfg.vision_hidden_size > 0) {
@@ -289,7 +279,7 @@ fn hydrateVisionConfigFromWeights(loaded: *LoadedModel) !void {
     }
 
     if (cfg.vision_intermediate_size <= 0 and cfg.vision_hidden_size > 0) {
-        if (try inferVisionIntermediateSize(st, @intCast(cfg.vision_hidden_size))) |intermediate| {
+        if (try inferVisionIntermediateSize(st, @intCast(cfg.vision_hidden_size), &vision_metadata)) |intermediate| {
             cfg.vision_intermediate_size = intermediate;
         }
     }
@@ -421,18 +411,11 @@ fn inferProjectorHiddenSize(
     return null;
 }
 
-fn inferVisionDepth(st: *SafeTensors) !usize {
-    const split_depth = try countLayerDepth(st, &.{
-        "model.visual.blocks.{d}.attn.q_proj.weight",
-        "model.visual.blocks.{d}.self_attn.q_proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
-        "model.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
-    });
+fn inferVisionDepth(st: *SafeTensors, vision_metadata: *const VisionMetadata) !usize {
+    const split_depth = try countLayerDepth(st, vision_metadata.depth_split_qproj_templates);
     if (split_depth > 0) return split_depth;
 
-    const fused_depth = try countLayerDepth(st, &.{
-        "model.visual.blocks.{d}.attn.qkv.weight",
-    });
+    const fused_depth = try countLayerDepth(st, vision_metadata.depth_fused_qkv_templates);
     return fused_depth;
 }
 
@@ -457,12 +440,12 @@ fn inferVisionHeads(vision_hidden_size: usize) usize {
     return 1;
 }
 
-fn inferVisionIntermediateSize(st: *SafeTensors, vision_hidden_size: usize) !?i32 {
-    const fc1 = getLayerTensorByTemplates(st, 0, &.{
-        "model.visual.blocks.0.mlp.linear_fc1.weight",
-        "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight",
-        "model.vision_model.encoder.layers.0.mlp.fc1.weight",
-    }) catch |err| switch (err) {
+fn inferVisionIntermediateSize(
+    st: *SafeTensors,
+    vision_hidden_size: usize,
+    vision_metadata: *const VisionMetadata,
+) !?i32 {
+    const fc1 = getLayerTensorByTemplates(st, 0, vision_metadata.intermediate_fc1_templates) catch |err| switch (err) {
         error.NotFound => return null,
         else => return err,
     };

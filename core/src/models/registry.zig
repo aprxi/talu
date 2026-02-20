@@ -7,7 +7,6 @@ const contract = @import("contract.zig");
 const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
 const runtime_architectures = @import("runtime_architectures.zig");
-const topology = @import("../inference/backend/topology.zig");
 const minilm = @import("bert/minilm.zig");
 const gemma3 = @import("gemma/gemma3.zig");
 const gpt_oss = @import("gpt_oss/gpt_oss.zig");
@@ -139,7 +138,7 @@ pub fn detectByArchitectureId(arch_id: []const u8) ?Entry {
     return null;
 }
 
-pub fn blockProgramFor(entry: Entry, block_kind: topology.BlockKind) ?[]const layer_ops.LayerOp {
+pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const layer_ops.LayerOp {
     if (std.mem.eql(u8, entry.id, qwen3_next.id)) {
         return switch (block_kind) {
             .attention_mlp => qwen3_next.attention_mlp_program,

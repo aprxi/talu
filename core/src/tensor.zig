@@ -596,6 +596,11 @@ pub const ModelArch = enum {
 pub const ModelRuntime = struct {
     /// Canonical architecture id resolved at load time (e.g. "llama3", "granite_hybrid").
     architecture_id: ?[]const u8 = null,
+    /// Architecture capability flags copied from static model metadata.
+    has_moe: bool = false,
+    has_mamba: bool = false,
+    has_shortconv: bool = false,
+    has_mla: bool = false,
     weight_offset: f32 = 0.0,
     qk_norm_weight_offset: f32 = 0.0,
     explicit_qk_norm_ops: bool = false,

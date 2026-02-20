@@ -152,13 +152,13 @@ pub const Backend = union(enum) {
         }
 
         // Check if we should use Metal backend (macOS + quantized/bf16 model)
-        const has_unsupported_blocks = modelHasMetalUnsupportedBlocks(loaded);
-        if (has_metal and isMetalSupported(&loaded.config, loaded.original_weight_dtype, has_unsupported_blocks)) {
+        const has_unsupported_runtime_features = runtimeHasMetalUnsupportedFeatures(&loaded.runtime);
+        if (has_metal and isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
             const metal_backend_state = metal.BackendType.init(allocator, loaded) catch |err| {
                 if (err == error.MoENotSupported or err == error.MLXNotAvailable or err == error.UnsupportedDType or err == error.ShortConvNotSupportedOnMetal or err == error.MambaNotSupportedOnMetal or err == error.MLANotSupportedOnMetal or err == error.InvalidTensorType) {
                     log.info("inference", "Metal backend unavailable, using CPU", .{
                         .reason = @errorName(err),
-                        .detail = getMetalUnsupportedReason(&loaded.config, loaded.original_weight_dtype, has_unsupported_blocks),
+                        .detail = getMetalUnsupportedReason(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features),
                     });
                     const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
                     return .{ .cpu = cpu_backend_state };
@@ -381,18 +381,29 @@ pub const Backend = union(enum) {
     }
 };
 
-fn isMetalSupported(config: *const ModelConfig, weight_dtype: DType, has_unsupported_blocks: bool) bool {
+fn isMetalSupported(
+    config: *const ModelConfig,
+    runtime: *const tensor.ModelRuntime,
+    weight_dtype: DType,
+    has_unsupported_runtime_features: bool,
+) bool {
     const dtype_supported = switch (weight_dtype) {
         .grouped_affine_u4, .grouped_affine_u8, .bf16 => true,
         else => false,
     };
     if (!dtype_supported) return false;
-    if (config.num_experts > 0) return false;
-    if (has_unsupported_blocks) return false;
+    // Prefer static architecture metadata flags; keep config fallback for safety.
+    if (runtime.has_moe or config.num_experts > 0) return false;
+    if (has_unsupported_runtime_features) return false;
     return true;
 }
 
-fn getMetalUnsupportedReason(config: *const ModelConfig, weight_dtype: DType, has_unsupported_blocks: bool) []const u8 {
+fn getMetalUnsupportedReason(
+    config: *const ModelConfig,
+    runtime: *const tensor.ModelRuntime,
+    weight_dtype: DType,
+    has_unsupported_runtime_features: bool,
+) []const u8 {
     const dtype_supported = switch (weight_dtype) {
         .grouped_affine_u4, .grouped_affine_u8, .bf16 => true,
         else => false,
@@ -400,24 +411,17 @@ fn getMetalUnsupportedReason(config: *const ModelConfig, weight_dtype: DType, ha
     if (!dtype_supported) {
         return "Weight dtype not supported by Metal (requires Q4/U8/BF16)";
     }
-    if (config.num_experts > 0) {
+    if (runtime.has_moe or config.num_experts > 0) {
         return "MoE models not supported by Metal backend";
     }
-    if (has_unsupported_blocks) {
+    if (has_unsupported_runtime_features) {
         return "Mamba/MLA models not supported by Metal backend";
     }
     return "Unknown Metal incompatibility";
 }
 
-fn modelHasMetalUnsupportedBlocks(loaded: *const LoadedModel) bool {
-    for (loaded.blocks) |block| {
-        switch (block) {
-            .mamba => return true,
-            .attention_mlp => |attn| if (attn.isMLA()) return true,
-            .shortconv => {},
-        }
-    }
-    return false;
+fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool {
+    return runtime.has_mamba or runtime.has_mla;
 }
 
 fn initFromOverride(
@@ -452,49 +456,58 @@ fn initFromOverride(
 
 test "isMetalSupported supports quantized and bf16" {
     var config = std.mem.zeroes(ModelConfig);
+    var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 0;
 
-    try std.testing.expect(isMetalSupported(&config, .grouped_affine_u4, false));
-    try std.testing.expect(isMetalSupported(&config, .grouped_affine_u8, false));
-    try std.testing.expect(isMetalSupported(&config, .bf16, false));
+    try std.testing.expect(isMetalSupported(&config, &runtime, .grouped_affine_u4, false));
+    try std.testing.expect(isMetalSupported(&config, &runtime, .grouped_affine_u8, false));
+    try std.testing.expect(isMetalSupported(&config, &runtime, .bf16, false));
 }
 
 test "isMetalSupported rejects unsupported dtypes" {
     var config = std.mem.zeroes(ModelConfig);
+    var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 0;
 
-    try std.testing.expect(!isMetalSupported(&config, .f32, false));
-    try std.testing.expect(!isMetalSupported(&config, .f16, false));
+    try std.testing.expect(!isMetalSupported(&config, &runtime, .f32, false));
+    try std.testing.expect(!isMetalSupported(&config, &runtime, .f16, false));
 }
 
 test "isMetalSupported rejects moe models" {
     var config = std.mem.zeroes(ModelConfig);
+    var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 4;
+    runtime.has_moe = true;
 
-    try std.testing.expect(!isMetalSupported(&config, .grouped_affine_u4, false));
+    try std.testing.expect(!isMetalSupported(&config, &runtime, .grouped_affine_u4, false));
 }
 
 test "getMetalUnsupportedReason mentions dtype" {
     var config = std.mem.zeroes(ModelConfig);
+    var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 0;
 
-    const reason = getMetalUnsupportedReason(&config, .f32, false);
+    const reason = getMetalUnsupportedReason(&config, &runtime, .f32, false);
     try std.testing.expect(std.mem.indexOf(u8, reason, "dtype") != null);
 }
 
 test "getMetalUnsupportedReason mentions moe" {
     var config = std.mem.zeroes(ModelConfig);
+    var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 8;
+    runtime.has_moe = true;
 
-    const reason = getMetalUnsupportedReason(&config, .grouped_affine_u4, false);
+    const reason = getMetalUnsupportedReason(&config, &runtime, .grouped_affine_u4, false);
     try std.testing.expect(std.mem.indexOf(u8, reason, "MoE") != null);
 }
 
 test "isMetalSupported rejects mamba models" {
     var config = std.mem.zeroes(ModelConfig);
+    var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 0;
+    runtime.has_mamba = true;
 
-    try std.testing.expect(!isMetalSupported(&config, .grouped_affine_u4, true));
+    try std.testing.expect(!isMetalSupported(&config, &runtime, .grouped_affine_u4, true));
 }
 
 test "defaultModelLoadOptions follows platform capability" {

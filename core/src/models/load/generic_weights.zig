@@ -8,14 +8,13 @@ const tensor = @import("../../tensor.zig");
 const st_loader = @import("../../io/safetensors/root.zig");
 const model_types = @import("../op_types.zig");
 const transforms = @import("transforms.zig");
-const inference_mod = @import("../../inference/root.zig");
 const log = @import("../../log.zig");
 
 const Tensor = tensor.Tensor;
 const Allocator = std.mem.Allocator;
 const WeightSpec = model_types.WeightSpec;
 const WeightTransform = model_types.WeightTransform;
-const WeightMap = inference_mod.backend.block_kernels.WeightMap;
+const WeightMap = std.StringHashMapUnmanaged(*const Tensor);
 
 pub const LoadOptions = struct {
     preserve_native_norm_dtype: bool = false,

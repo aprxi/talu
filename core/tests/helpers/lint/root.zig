@@ -17,12 +17,26 @@ fn isInferencePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/inference/");
 }
 
+fn isModelsPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/src/models/");
+}
+
+fn isCpuVisionSelectorPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/inference/backend/cpu/vision/root.zig");
+}
+
 fn importTargetsCompute(target: []const u8) bool {
     return std.mem.indexOf(u8, target, "compute/") != null;
 }
 
 fn isComputeRootImport(target: []const u8) bool {
     return std.mem.endsWith(u8, target, "compute/root.zig");
+}
+
+fn isAllowedModelsToInferenceImport(path: []const u8, target: []const u8) bool {
+    // Explicit transitional coupling while block contracts are still inference-owned.
+    return std.mem.eql(u8, path, "core/src/models/load/weights.zig") and
+        std.mem.indexOf(u8, target, "inference/root.zig") != null;
 }
 
 fn isOldTopLevelSimdOrQuantImport(target: []const u8) bool {
@@ -108,6 +122,32 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
             violations += 1;
             if (emit) {
                 std.debug.print("{s}:{d}: inference must import compute via compute/root.zig only: \"{s}\"\n", .{ file_path, line, target });
+            }
+        }
+
+        if (isModelsPath(file_path) and std.mem.indexOf(u8, target, "inference/") != null and !isAllowedModelsToInferenceImport(file_path, target)) {
+            violations += 1;
+            if (emit) {
+                std.debug.print("{s}:{d}: models must not import inference internals: \"{s}\"\n", .{ file_path, line, target });
+            }
+        }
+    }
+
+    // The CPU vision selector/hydrator must consume model metadata and must not
+    // carry hardcoded model tensor naming templates.
+    if (isCpuVisionSelectorPath(file_path)) {
+        const forbidden = [_][]const u8{
+            "model.visual.",
+            "vision_tower.vision_model",
+            "model.vision_model.",
+            "model.multi_modal_projector.",
+        };
+        for (forbidden) |token| {
+            if (std.mem.indexOf(u8, source, token) != null) {
+                violations += 1;
+                if (emit) {
+                    std.debug.print("{s}: forbidden hardcoded vision tensor template token: \"{s}\"\n", .{ file_path, token });
+                }
             }
         }
     }
@@ -369,6 +409,46 @@ test "lintSource allows compute root import from inference" {
         \\const ok = @import("../../../compute/root.zig");
     ;
     try std.testing.expectEqual(@as(usize, 0), try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/engine.zig", src, false));
+}
+
+test "lintSource rejects models importing inference internals" {
+    const src =
+        \\const bad = @import("../../inference/backend/topology.zig");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/models/registry.zig", src, false),
+    );
+}
+
+test "lintSource allows temporary models/load/weights inference root import" {
+    const src =
+        \\const inference_mod = @import("../../inference/root.zig");
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/models/load/weights.zig", src, false),
+    );
+}
+
+test "lintSource rejects hardcoded vision tensor templates in selector" {
+    const src =
+        \\const bad = "model.visual.blocks.0.attn.q_proj.weight";
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/vision/root.zig", src, false),
+    );
+}
+
+test "lintSource allows metadata-driven selector without hardcoded names" {
+    const src =
+        \\const candidates = vision_metadata.split_qkv_probe_candidates;
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/vision/root.zig", src, false),
+    );
 }
 
 test "backend cpu/metal parity checks pass" {
