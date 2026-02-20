@@ -6,8 +6,7 @@ const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const dtype = @import("../../dtype.zig");
 const compute = @import("../../compute/root.zig");
-const matmul = compute.cpu.matmul;
-const quant_rows = compute.quant.rows;
+const matmul = compute.cpu.linalg.matmul;
 const st_loader = @import("../../io/safetensors/root.zig");
 const log = @import("../../log.zig");
 

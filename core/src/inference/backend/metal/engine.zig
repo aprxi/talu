@@ -15,6 +15,7 @@ const log = @import("../../../log.zig");
 const compute = @import("../../../compute/root.zig");
 const metal_compute = compute.metal;
 const graph = metal_compute.graph;
+const model_runtime = @import("model_runtime.zig");
 const LoadedModel = models.LoadedModel;
 
 // Internal orchestration modules
@@ -272,7 +273,7 @@ pub const MetalBackend = struct {
         switch (mode) {
             .fused_quantized => {
                 const fused = self.fused_model orelse return error.InvalidArgument;
-                const logits_handle = graph.mlx_fused_decode_step_logits(
+                const logits_handle = model_runtime.mlx_fused_decode_step_logits(
                     fused,
                     slot_cache.handle,
                     slot_shortconv_cache.handle,
@@ -285,7 +286,7 @@ pub const MetalBackend = struct {
             },
             .fused_dense => {
                 const dense = self.dense_model orelse return error.InvalidArgument;
-                const logits_handle = graph.mlx_dense_decode_step_logits(
+                const logits_handle = model_runtime.mlx_dense_decode_step_logits(
                     dense,
                     slot_cache.handle,
                     slot_shortconv_cache.handle,
@@ -675,7 +676,7 @@ pub const MetalBackend = struct {
             const generated_count = switch (decode_plan.path) {
                 .batch_fused_quantized => blk: {
                     const fused = self.fused_model orelse return error.InvalidArgument;
-                    break :blk graph.mlx_fused_decode_batch(
+                    break :blk model_runtime.mlx_fused_decode_batch(
                         fused,
                         self.cache.handle,
                         self.shortconv_cache.handle,
@@ -689,7 +690,7 @@ pub const MetalBackend = struct {
                 },
                 .batch_fused_dense => blk: {
                     const dense = self.dense_model orelse return error.InvalidArgument;
-                    break :blk graph.mlx_dense_decode_batch(
+                    break :blk model_runtime.mlx_dense_decode_batch(
                         dense,
                         self.cache.handle,
                         self.shortconv_cache.handle,
@@ -762,7 +763,7 @@ pub const MetalBackend = struct {
         switch (mode) {
             .fused_quantized => {
                 const fused = self.fused_model orelse return error.InvalidArgument;
-                graph.mlx_pipeline_prime(
+                model_runtime.mlx_pipeline_prime(
                     fused,
                     self.cache.handle,
                     self.shortconv_cache.handle,
@@ -772,7 +773,7 @@ pub const MetalBackend = struct {
             },
             .fused_dense => {
                 const dense = self.dense_model orelse return error.InvalidArgument;
-                graph.mlx_dense_pipeline_prime(
+                model_runtime.mlx_dense_pipeline_prime(
                     dense,
                     self.cache.handle,
                     self.shortconv_cache.handle,
@@ -793,7 +794,7 @@ pub const MetalBackend = struct {
                 switch (mode) {
                     .fused_quantized => {
                         const fused = self.fused_model orelse return error.InvalidArgument;
-                        sampled_token_id = graph.mlx_pipeline_step(
+                        sampled_token_id = model_runtime.mlx_pipeline_step(
                             fused,
                             self.cache.handle,
                             self.shortconv_cache.handle,
@@ -802,7 +803,7 @@ pub const MetalBackend = struct {
                     },
                     .fused_dense => {
                         const dense = self.dense_model orelse return error.InvalidArgument;
-                        sampled_token_id = graph.mlx_dense_pipeline_step(
+                        sampled_token_id = model_runtime.mlx_dense_pipeline_step(
                             dense,
                             self.cache.handle,
                             self.shortconv_cache.handle,
@@ -814,8 +815,8 @@ pub const MetalBackend = struct {
             } else {
                 // Last iteration: flush
                 sampled_token_id = switch (mode) {
-                    .fused_quantized => graph.mlx_pipeline_flush(),
-                    .fused_dense => graph.mlx_dense_pipeline_flush(),
+                    .fused_quantized => model_runtime.mlx_pipeline_flush(),
+                    .fused_dense => model_runtime.mlx_dense_pipeline_flush(),
                     .non_fused => return error.InvalidArgument,
                 };
             }

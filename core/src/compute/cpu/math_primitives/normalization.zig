@@ -3,7 +3,7 @@
 const std = @import("std");
 const tensor = @import("../../../tensor.zig");
 const dtype_mod = @import("../../../dtype.zig");
-const simd = @import("../../simd/root.zig");
+const simd = @import("../simd/arch/root.zig");
 
 const VEC_LEN = simd.f32_vec_len;
 const F32Vec = simd.F32Vec;

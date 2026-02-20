@@ -9,7 +9,7 @@ const db_reader = @import("../../reader.zig");
 const db_blob_store = @import("../../blob/store.zig");
 const block_reader = @import("../../block_reader.zig");
 const types = @import("../../types.zig");
-const parallel = @import("../../../compute/parallel.zig");
+const parallel = @import("../../../system/parallel.zig");
 
 const codec = @import("codec.zig");
 const search = @import("search.zig");

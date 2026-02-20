@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const tensor = @import("../../../tensor.zig");
-const simd = @import("../../simd/root.zig");
+const simd = @import("../simd/arch/root.zig");
 const log = @import("../../../log.zig");
 
 const VEC_LEN = simd.f32_vec_len;

@@ -11,8 +11,7 @@ const safetensors = @import("../io/safetensors/root.zig");
 const repository = @import("../io/repository/root.zig");
 const gaf_paths = @import("gaf_paths.zig");
 const config_loader = @import("../models/config/root.zig");
-const compute = @import("../compute/root.zig");
-const parallel = compute.parallel;
+const parallel = @import("../system/parallel.zig");
 const convert = @import("root.zig");
 const models_registry = @import("../models/registry.zig");
 

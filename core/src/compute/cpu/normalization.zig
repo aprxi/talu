@@ -3,8 +3,20 @@
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const math_ops = @import("math_primitives/root.zig");
+const tv = @import("tensor_view.zig");
+const norm_view = @import("norm_primitives.zig");
 
 const Tensor = tensor.Tensor;
+
+/// TensorView RMSNorm wrapper for strided/typed inputs.
+pub fn rmsNorm(out: tv.TensorView, input: tv.TensorView, weight: tv.TensorView, eps: f32) void {
+    norm_view.rmsNorm(out, input, weight, eps);
+}
+
+/// TensorView LayerNorm wrapper for strided/typed inputs.
+pub fn layerNorm(out: tv.TensorView, input: tv.TensorView, weight: tv.TensorView, bias: ?tv.TensorView, eps: f32) void {
+    norm_view.layerNorm(out, input, weight, bias, eps);
+}
 
 /// RMSNorm in-place on f32 slices with f32 weights.
 pub fn rmsnormInPlace(x: []f32, weight: []const f32, eps: f32) void {

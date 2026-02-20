@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const dtype = @import("../../dtype.zig");
-const grouped_affine_quant = @import("../quant/grouped_affine_quant.zig");
+const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
 
 /// Decode one FP16 row to f32.
 pub fn decodeF16Row(src: []align(1) const u16, dst: []f32) void {

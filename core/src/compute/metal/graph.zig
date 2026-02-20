@@ -849,7 +849,9 @@ pub const CompiledLayer = struct {
 // FULLY FUSED MODEL: All layers in ONE C++ call (ZERO FFI overhead)
 // ============================================================================
 
-/// Opaque handle to fused model
+/// Opaque handle to fused model.
+/// Inference ownership note: callsites should import these via
+/// `inference/backend/metal/model_runtime.zig` rather than directly.
 pub const FusedModelHandle = ?*anyopaque;
 
 /// Create fused model structure
@@ -1029,7 +1031,9 @@ pub extern fn mlx_fused_model_optimize(model: FusedModelHandle) void;
 // FUSED DENSE MODEL - BFloat16 weights (non-quantized)
 // ===========================================================================
 
-/// Opaque handle to dense (BF16) fused model
+/// Opaque handle to dense (BF16) fused model.
+/// Inference ownership note: callsites should import these via
+/// `inference/backend/metal/model_runtime.zig` rather than directly.
 pub const DenseModelHandle = ?*anyopaque;
 
 /// Create dense model for BFloat16 weights

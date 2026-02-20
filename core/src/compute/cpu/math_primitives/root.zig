@@ -3,7 +3,7 @@
 //! Provides optimized implementations of activation functions (SiLU, GELU, ReLU),
 //! normalization (RMSNorm, LayerNorm), softmax, and RoPE position encoding.
 
-pub const simd = @import("../../simd/root.zig");
+pub const simd = @import("../simd/arch/root.zig");
 
 const _fast_math = @import("fast_math.zig");
 const _activations = @import("activations.zig");

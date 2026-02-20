@@ -13,6 +13,7 @@ pub const mlx = @import("mlx.zig");
 pub const matmul = @import("matmul.zig");
 pub const graph = @import("graph.zig");
 pub const device = @import("device.zig");
+pub const capabilities = @import("capabilities.zig");
 
 // Re-export commonly used types.
 pub const Device = device.Device;

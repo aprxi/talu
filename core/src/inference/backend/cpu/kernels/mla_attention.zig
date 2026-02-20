@@ -15,13 +15,13 @@ pub const supported = true;
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.matmul;
-const cpu_layout = compute.cpu.layout_transform;
+const matmul = compute.cpu.linalg.matmul;
+const cpu_layout = compute.cpu.layout.transform;
 const cpu_norm = compute.cpu.normalization;
 const cpu_reduction = compute.cpu.reduction;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_softmax = compute.cpu.softmax;
-const cpu_cache_store = compute.cpu.cache_store;
+const cpu_cache_store = compute.cpu.cache.store;
 const rope_kernel = @import("rope.zig");
 const trace = @import("../../../../xray/root.zig").trace;
 

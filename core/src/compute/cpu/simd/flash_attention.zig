@@ -4,7 +4,7 @@
 //! and online softmax normalization.
 
 const std = @import("std");
-const simd = @import("../../simd/root.zig");
+const simd = @import("arch/root.zig");
 
 /// Configuration for Flash Attention kernel.
 pub const FlashAttentionConfig = struct {

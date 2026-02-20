@@ -1,8 +1,8 @@
 //! State-space recurrence primitives for CPU Mamba-style kernels.
 
 const std = @import("std");
-const kernel = @import("../kernel.zig");
 const activation = @import("activation.zig");
+const ssm_scan_mod = @import("simd/ssm_scan.zig");
 
 /// Discretize delta-time values with optional bias and Softplus nonlinearity.
 ///
@@ -39,7 +39,7 @@ pub fn applySiluGateInPlace(values: []f32, gates: []const f32) !void {
 
 /// Run one SSM scan/update step using the selected backend kernel implementation.
 pub fn scanStep(
-    ssm_scan: kernel.SsmScanFn,
+    ssm_scan: ssm_scan_mod.SsmScanFn,
     ssm_state: []f32,
     ssm_out: []f32,
     x_conv_out: []const f32,

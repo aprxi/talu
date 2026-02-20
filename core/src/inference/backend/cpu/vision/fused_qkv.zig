@@ -24,13 +24,13 @@ const vision_tensor_convert = @import("tensor_convert.zig");
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const LoadedModel = models.LoadedModel;
-const matmul = compute.cpu.matmul;
+const matmul = compute.cpu.linalg.matmul;
 const cpu_common = compute.cpu.common;
 const cpu_image_ops = compute.cpu.image_ops;
 const cpu_norm = compute.cpu.normalization;
 const cpu_rotary = compute.cpu.rotary;
 const cpu_rowwise = compute.cpu.rowwise;
-const cpu_tensor_gather = compute.cpu.tensor_gather;
+const cpu_tensor_gather = compute.cpu.memory.gather;
 const log = @import("../../../../log.zig");
 
 pub const PrefillVisionImage = common_vision.PrefillVisionImage;

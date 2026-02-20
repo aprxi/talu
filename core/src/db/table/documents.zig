@@ -16,7 +16,7 @@ const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
 const db_blob_store = @import("../blob/store.zig");
 const types = @import("../types.zig");
-const parallel = @import("../../compute/parallel.zig");
+const parallel = @import("../../system/parallel.zig");
 
 const Allocator = std.mem.Allocator;
 const ColumnValue = db_writer.ColumnValue;

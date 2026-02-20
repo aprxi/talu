@@ -8,7 +8,7 @@ const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const dtype = @import("../../dtype.zig");
 const compute = @import("../../compute/root.zig");
-const rope_math = compute.cpu.math;
+const rope_math = compute.cpu.math_primitives;
 const log = @import("../../log.zig");
 const progress_mod = @import("../../capi/progress.zig");
 

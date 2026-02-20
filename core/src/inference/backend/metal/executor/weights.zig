@@ -11,6 +11,7 @@ const models = @import("../../../../models/root.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
+const model_runtime = @import("../model_runtime.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
 const mla_kernel = @import("../kernels/mla_attention.zig");
 const topology = @import("../../topology.zig");
@@ -893,7 +894,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
         // QUANTIZED PATH: Use FusedModelWeights with quantized_matmul
         const quant_layout = quantizedFusedLayout(weight_handles) orelse return;
 
-        const fused = mlx_graph.mlx_fused_model_create(
+        const fused = model_runtime.mlx_fused_model_create(
             layer_count,
             head_count,
             kv_head_count,
@@ -907,27 +908,27 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
 
         // Set embeddings (must be quantized for fused model)
         if (weight_handles.embed_tokens_quantized) |quantized_weight| {
-            mlx_graph.mlx_fused_model_set_embeddings(fused, quantized_weight.weights, quantized_weight.scales, quantized_weight.biases);
+            model_runtime.mlx_fused_model_set_embeddings(fused, quantized_weight.weights, quantized_weight.scales, quantized_weight.biases);
         } else {
             return error.FusedModelRequiresQuantizedEmbeddings;
         }
 
         // Set final weights
         if (weight_handles.lm_head_quantized) |quantized_weight| {
-            mlx_graph.mlx_fused_model_set_final(fused, weight_handles.ln_final, quantized_weight.weights, quantized_weight.scales, quantized_weight.biases);
+            model_runtime.mlx_fused_model_set_final(fused, weight_handles.ln_final, quantized_weight.weights, quantized_weight.scales, quantized_weight.biases);
         } else {
             return error.FusedModelRequiresQuantizedLMHead;
         }
 
         const layer_kind_plan = try buildFusedLayerKindPlan(allocator, weight_handles.layers);
         defer allocator.free(layer_kind_plan);
-        mlx_graph.mlx_fused_model_set_topology(fused, layer_kind_plan.ptr, layer_kind_plan.len);
+        model_runtime.mlx_fused_model_set_topology(fused, layer_kind_plan.ptr, layer_kind_plan.len);
 
         // Set per-layer weights
         for (weight_handles.layers, 0..) |*layer, layer_idx| {
             switch (layer.kind) {
                 .attention_mlp => {
-                    mlx_graph.mlx_fused_model_set_layer(
+                    model_runtime.mlx_fused_model_set_layer(
                         fused,
                         layer_idx,
                         layer.ln1_weight,
@@ -972,7 +973,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                 .shortconv => {
                     const sc_in = layer.shortconv_in_proj orelse return;
                     const sc_out = layer.shortconv_out_proj orelse return;
-                    mlx_graph.mlx_fused_model_set_layer(
+                    model_runtime.mlx_fused_model_set_layer(
                         fused,
                         layer_idx,
                         layer.ln1_weight,
@@ -1022,7 +1023,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
 
         // Set architecture-specific config for fused model
         if (weight_handles.has_norm_weight_offset or config.use_gelu or config.query_pre_attn_scalar != 0) {
-            mlx_graph.mlx_fused_model_set_arch_config(
+            model_runtime.mlx_fused_model_set_arch_config(
                 fused,
                 weight_handles.has_norm_weight_offset,
                 config.use_gelu,
@@ -1036,7 +1037,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
             config.residual_multiplier != 1.0 or
             config.logits_scaling != 1.0;
         if (has_custom_scaling) {
-            mlx_graph.mlx_fused_model_set_scaling_config(
+            model_runtime.mlx_fused_model_set_scaling_config(
                 fused,
                 config.embedding_multiplier,
                 config.attention_multiplier,
@@ -1071,14 +1072,14 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                 .last = freqs[freqs.len - 1],
             });
             const freqs_array = mlx_graph.createArrayF32(freqs, &[_]i64{@intCast(freqs.len)});
-            mlx_graph.mlx_fused_model_set_rope_freqs(fused, freqs_array);
+            model_runtime.mlx_fused_model_set_rope_freqs(fused, freqs_array);
         }
 
         // Pre-evaluate all weights to ensure GPU transfer happens upfront
-        mlx_graph.mlx_fused_model_optimize(fused);
+        model_runtime.mlx_fused_model_optimize(fused);
     } else {
         // DENSE PATH: Use FusedDenseModel with dense matmul (BF16)
-        const dense = mlx_graph.mlx_dense_model_create(
+        const dense = model_runtime.mlx_dense_model_create(
             layer_count,
             head_count,
             kv_head_count,
@@ -1090,26 +1091,26 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
 
         // Set embeddings (BF16)
         if (weight_handles.embed_tokens) |embedding_handle| {
-            mlx_graph.mlx_dense_model_set_embeddings(dense, embedding_handle);
+            model_runtime.mlx_dense_model_set_embeddings(dense, embedding_handle);
         } else {
             return error.DenseModelRequiresEmbeddings;
         }
 
         // Set final weights (BF16)
         if (weight_handles.lm_head) |lm_head_handle| {
-            mlx_graph.mlx_dense_model_set_final(dense, weight_handles.ln_final, lm_head_handle);
+            model_runtime.mlx_dense_model_set_final(dense, weight_handles.ln_final, lm_head_handle);
         } else {
             return error.DenseModelRequiresLMHead;
         }
 
         const layer_kind_plan = try buildFusedLayerKindPlan(allocator, weight_handles.layers);
         defer allocator.free(layer_kind_plan);
-        mlx_graph.mlx_dense_model_set_topology(dense, layer_kind_plan.ptr, layer_kind_plan.len);
+        model_runtime.mlx_dense_model_set_topology(dense, layer_kind_plan.ptr, layer_kind_plan.len);
 
         // Set per-layer weights (BF16)
         for (weight_handles.layers, 0..) |*layer, layer_idx| {
             switch (layer.kind) {
-                .attention_mlp => mlx_graph.mlx_dense_model_set_layer(
+                .attention_mlp => model_runtime.mlx_dense_model_set_layer(
                     dense,
                     layer_idx,
                     layer.ln1_weight,
@@ -1146,7 +1147,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         .d_conv = layer.shortconv_d_conv,
                         .conv_dim = layer.shortconv_conv_dim,
                     }, @src());
-                    mlx_graph.mlx_dense_model_set_layer(
+                    model_runtime.mlx_dense_model_set_layer(
                         dense,
                         layer_idx,
                         layer.ln1_weight,
@@ -1237,11 +1238,11 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
 
     // Free fused model if created
     if (weight_handles.fused_model) |fm| {
-        mlx_graph.mlx_fused_model_free(fm);
+        model_runtime.mlx_fused_model_free(fm);
     }
     // Free dense model if created
     if (weight_handles.dense_model) |dm| {
-        mlx_graph.mlx_dense_model_free(dm);
+        model_runtime.mlx_dense_model_free(dm);
     }
 
     allocator.destroy(weight_handles);
@@ -1382,9 +1383,9 @@ pub const WeightHandles = struct {
     compiled_layers: ?[]mlx_graph.CompiledLayer,
 
     // Fully fused model (all layers in one C++ call - ZERO FFI overhead)
-    fused_model: mlx_graph.FusedModelHandle,
+    fused_model: model_runtime.FusedModelHandle,
     // Dense model for BF16 weights (non-quantized)
-    dense_model: mlx_graph.DenseModelHandle = null,
+    dense_model: model_runtime.DenseModelHandle = null,
 
     // Final
     ln_final: ArrayHandle,

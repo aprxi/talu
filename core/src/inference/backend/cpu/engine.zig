@@ -35,12 +35,12 @@ const tensor = @import("../../../tensor.zig");
 const Tensor = tensor.Tensor;
 const OwnedTensor = tensor.OwnedTensor;
 const compute = @import("../../../compute/root.zig");
-const matmul = compute.cpu.matmul;
+const matmul = compute.cpu.linalg.matmul;
 const cpu_rowwise = compute.cpu.rowwise;
 const cpu_reduction = compute.cpu.reduction;
-const cpu_cache_store = compute.cpu.cache_store;
+const cpu_cache_store = compute.cpu.cache.store;
 const cpu_rotary = compute.cpu.rotary;
-const cpu_tensor_gather = compute.cpu.tensor_gather;
+const cpu_tensor_gather = compute.cpu.memory.gather;
 const models = @import("../../../models/root.zig");
 const contract = @import("../contract.zig");
 const log = @import("../../../log.zig");
@@ -1111,7 +1111,7 @@ pub const FusedCpuBackend = struct {
         }
         // Apply embedding LayerNorm if present (BERT-family models)
         if (self.loaded.embedding_norm_weight) |emb_norm_w| {
-            const norm_ops = compute.cpu.norm;
+            const norm_ops = compute.cpu.normalization;
             const tv = compute.cpu.tensor_view;
             const emb_norm_bias = self.loaded.embedding_norm_bias;
             for (0..seq_len) |pos| {

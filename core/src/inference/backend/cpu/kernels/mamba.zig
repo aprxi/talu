@@ -24,11 +24,11 @@ const tensor = @import("../../../../tensor.zig");
 const Tensor = tensor.Tensor;
 const log = @import("../../../../log.zig");
 const compute = @import("../../../../compute/root.zig");
-const kernel = compute.kernel;
-const matmul = compute.cpu.matmul;
+const matmul = compute.cpu.linalg.matmul;
 const cpu_conv1d = compute.cpu.conv1d_depthwise;
 const cpu_norm = compute.cpu.normalization;
-const cpu_state_space = compute.cpu.state_space;
+const cpu_state_space = compute.cpu.recurrence.state_space;
+const ssm_scan_mod = compute.cpu.simd.ssm_scan;
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 
@@ -135,7 +135,7 @@ pub const MambaKernel = struct {
     weights: MambaWeights,
     matmul_in_proj: matmul.MatmulFn,
     matmul_out_proj: matmul.MatmulFn,
-    ssm_scan: kernel.SsmScanFn,
+    ssm_scan: ssm_scan_mod.SsmScanFn,
     layer_idx: u16 = trace.TraceEmission.NO_LAYER,
 
     /// Initialize from configuration and weights.
@@ -144,7 +144,7 @@ pub const MambaKernel = struct {
         weights: MambaWeights,
         matmul_in_proj: matmul.MatmulFn,
         matmul_out_proj: matmul.MatmulFn,
-        ssm_scan: kernel.SsmScanFn,
+        ssm_scan: ssm_scan_mod.SsmScanFn,
     ) MambaKernel {
         return .{
             .config = config,

@@ -1,15 +1,14 @@
-//! Compute Subsystem - tensor operations, SIMD, parallelization, and device management.
+//! Compute subsystem boundary map.
 //!
 //! This is the single entry point for the compute module. All external code should
 //! import from here.
 //!
 //! ## Public API
 //!
-//! - `simd` - SIMD vector primitives and architecture detection
-//! - `quant` - Quantization utilities (Q4, Q8, grouped-affine)
 //! - `device` - Device type definitions (CPU, CUDA, Metal)
-//! - `parallel` - Thread pool and parallel execution
+//! - `parallel` - Thread pool and parallel execution (shared system primitive)
 //! - `dlpack` - DLPack tensor exchange protocol types
+//! - `mmap_policy` - file mapping policy helpers
 //!
 //! ## Internal API (for core/src/ only)
 //!
@@ -20,24 +19,17 @@
 // Public API
 // =============================================================================
 
-/// SIMD vector primitives and architecture detection.
-pub const simd = @import("simd/root.zig");
-
-/// Quantization utilities.
-pub const quant = @import("quant/root.zig");
-
 /// Device type definitions (DLPack-compatible).
 pub const device = @import("device.zig");
 
 /// Thread pool and parallel execution.
-pub const parallel = @import("parallel.zig");
+pub const parallel = @import("../system/parallel.zig");
 
 /// DLPack tensor exchange protocol types.
 pub const dlpack = @import("dlpack.zig");
 
-/// Kernel interface and registry.
-pub const kernel = @import("kernel.zig");
-pub const registry = @import("registry.zig");
+/// Memory mapping policy.
+pub const mmap_policy = @import("mmap_policy.zig");
 
 // Re-export commonly used types
 pub const Device = device.Device;

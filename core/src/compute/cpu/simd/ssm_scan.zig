@@ -6,7 +6,7 @@
 //! using SIMD over the state dimension.
 
 const std = @import("std");
-const simd = @import("../../simd/root.zig");
+const simd = @import("arch/root.zig");
 
 pub const SsmScanFn = *const fn (
     ssm_state: []f32,

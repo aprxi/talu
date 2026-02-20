@@ -5,7 +5,7 @@
 
 const std = @import("std");
 const api_mod = @import("api.zig");
-const parallel = @import("../compute/parallel.zig");
+const parallel = @import("../system/parallel.zig");
 
 // =============================================================================
 // Batch Encoding

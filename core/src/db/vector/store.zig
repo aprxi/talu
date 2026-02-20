@@ -9,8 +9,8 @@ const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
 const types = @import("../types.zig");
 const tensor_mod = @import("../../tensor.zig");
-const dot_product = @import("../../compute/cpu/dot_product.zig");
-const parallel = @import("../../compute/parallel.zig");
+const dot_product = @import("../../compute/cpu/linalg.zig").dot;
+const parallel = @import("../../system/parallel.zig");
 
 const Allocator = std.mem.Allocator;
 

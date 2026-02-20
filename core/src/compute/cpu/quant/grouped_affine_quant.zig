@@ -1,8 +1,8 @@
 //! Shared grouped-affine quantization helpers for 4-bit and 8-bit decode paths.
 
 const std = @import("std");
-const dtype = @import("../../dtype.zig");
-const simd = @import("../simd/root.zig");
+const dtype = @import("../../../dtype.zig");
+const simd = @import("../simd/arch/root.zig");
 
 pub const DType = dtype.DType;
 

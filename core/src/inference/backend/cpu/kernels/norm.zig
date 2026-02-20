@@ -9,7 +9,7 @@ const std = @import("std");
 const build_options = @import("build_options");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const math = compute.cpu.math;
+const math = compute.cpu.math_primitives;
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
@@ -158,5 +158,5 @@ pub fn layerNormForward(ln: *const LayerNorm, input: *const Tensor, output: *Ten
     const weight_view = tv.fromSimpleTensor(ln.weight) orelse unreachable;
     const bias_view = if (ln.bias) |b| tv.fromSimpleTensor(b) orelse unreachable else null;
 
-    compute.cpu.norm.layerNorm(output_view, input_view, weight_view, bias_view, ln.eps);
+    compute.cpu.normalization.layerNorm(output_view, input_view, weight_view, bias_view, ln.eps);
 }

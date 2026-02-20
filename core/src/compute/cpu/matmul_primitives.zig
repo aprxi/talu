@@ -5,11 +5,11 @@
 
 const std = @import("std");
 const build_options = @import("build_options");
-const parallel = @import("../parallel.zig");
+const parallel = @import("../../system/parallel.zig");
 const tensor_mod = @import("../../tensor.zig");
 const dtype_mod = @import("../../dtype.zig");
-const simd = @import("../simd/root.zig");
-const grouped_affine_quant = @import("../quant/grouped_affine_quant.zig");
+const simd = @import("simd/arch/root.zig");
+const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
 const prefill = @import("matmul_prefill.zig");
 const log = @import("../../log.zig");
 

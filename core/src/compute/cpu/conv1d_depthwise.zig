@@ -1,7 +1,7 @@
 //! Depthwise 1D convolution primitives for CPU shortconv-style kernels.
 
 const std = @import("std");
-const simd = @import("../simd/root.zig");
+const simd = @import("simd/arch/root.zig");
 
 const VEC = simd.f32_vec_len;
 

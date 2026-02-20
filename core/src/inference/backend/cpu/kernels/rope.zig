@@ -8,7 +8,7 @@ const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 
 // Re-export RoPE via compute/cpu ops facade.
-pub const RoPE = compute.cpu.math.RoPE;
+pub const RoPE = compute.cpu.math_primitives.RoPE;
 
 pub const RotaryEmbedding = struct {
     /// Canonical kernel-call contract for backend parity checks.

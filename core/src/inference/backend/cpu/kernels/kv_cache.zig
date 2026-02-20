@@ -14,8 +14,8 @@ pub const supported = true;
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
-const cpu_cache_layout = compute.cpu.cache_layout;
-const cpu_cache_store = compute.cpu.cache_store;
+const cpu_cache_layout = compute.cpu.cache.layout;
+const cpu_cache_store = compute.cpu.cache.store;
 
 /// Per-slot state tracking sequence position and activity.
 pub const SlotState = struct {

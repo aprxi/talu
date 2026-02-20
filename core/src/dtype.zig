@@ -179,7 +179,7 @@ pub inline fn fp16x8ToF32(fp16_bits: @Vector(8, u16)) @Vector(8, f32) {
 /// F16 format: 1 sign + 5 exp (bias 15) + 10 mantissa
 /// F32 format: 1 sign + 8 exp (bias 127) + 23 mantissa
 pub inline fn fp16x8ToF32Bits(comptime VEC: comptime_int, h: @Vector(VEC, u16)) @Vector(VEC, f32) {
-    const simd = @import("compute/simd/root.zig");
+    const simd = @import("compute/cpu/simd/arch/root.zig");
 
     // For 8-element vectors on x86 with F16C, use hardware instruction
     if (comptime VEC == 8) {

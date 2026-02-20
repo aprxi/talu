@@ -11,7 +11,7 @@ const tensor = @import("../../../../tensor.zig");
 const dtype = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_quant_decode = compute.cpu.quant_decode;
-const cpu_tensor_gather = compute.cpu.tensor_gather;
+const cpu_tensor_gather = compute.cpu.memory.gather;
 
 const Tensor = tensor.Tensor;
 

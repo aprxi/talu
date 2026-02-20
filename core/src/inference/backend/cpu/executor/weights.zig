@@ -10,11 +10,10 @@
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const matmul = compute.cpu.matmul;
-const registry = compute.registry;
+const matmul = compute.cpu.linalg.matmul;
 const cpu_rowwise = compute.cpu.rowwise;
-const cpu_copy = compute.cpu.tensor_copy;
-const cpu_layout = compute.cpu.layout_transform;
+const cpu_copy = compute.cpu.memory.copy;
+const cpu_layout = compute.cpu.layout.transform;
 const graph_types = @import("../../../../models/op_types.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const fmt = @import("../kernels/describe_fmt.zig");
@@ -1161,15 +1160,10 @@ pub const TransformerBlock = struct {
         const kernel_name_v: ?[]const u8 = if (dk_v) |dk| dk.name else null;
         const kernel_name_qkv_fused: ?[]const u8 = if (dk_qkv_fused) |dk| dk.name else null;
 
-        const flash_attention_fn: ?compute.cpu.simd.flash_attention.FlashAttentionFn = blk: {
-            const kernel_val = registry.selectFlashAttentionForHeadDim(head_dim) catch |err| switch (err) {
-                error.UnsupportedHeadDim => break :blk null,
-                else => return err,
-            };
-            switch (kernel_val) {
-                .flash_attention => |fn_ptr| break :blk fn_ptr,
-                else => return error.InvalidKernel,
-            }
+        const flash_attention_fn: ?compute.cpu.simd.flash_attention.FlashAttentionFn = switch (head_dim) {
+            64 => compute.cpu.simd.flash_attention.flashAttentionF32_64,
+            128 => compute.cpu.simd.flash_attention.flashAttentionF32_128,
+            else => null,
         };
 
         const ln1_ptr = try createNormKernel(allocator, weights.ln1_weight, weights.ln1_bias, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_attn_norm);
@@ -1454,22 +1448,9 @@ pub const TransformerBlock = struct {
         use_gelu: bool,
         block_idx: usize,
     ) !TransformerBlock {
-        const in_proj_kernel = try registry.selectKernel(.matmul, .cpu, weights.weights.in_proj.dtype);
-        const out_proj_kernel = try registry.selectKernel(.matmul, .cpu, weights.weights.out_proj.dtype);
-        const ssm_kernel = try registry.selectKernel(.ssm_scan, .cpu, .f32);
-
-        const matmul_in_proj = switch (in_proj_kernel) {
-            .matmul => |fn_ptr| fn_ptr,
-            else => return error.InvalidKernel,
-        };
-        const matmul_out_proj = switch (out_proj_kernel) {
-            .matmul => |fn_ptr| fn_ptr,
-            else => return error.InvalidKernel,
-        };
-        const ssm_scan = switch (ssm_kernel) {
-            .ssm_scan => |fn_ptr| fn_ptr,
-            else => return error.InvalidKernel,
-        };
+        const matmul_in_proj = (try matmul.matmulKernel(weights.weights.in_proj.dtype)).func;
+        const matmul_out_proj = (try matmul.matmulKernel(weights.weights.out_proj.dtype)).func;
+        const ssm_scan = compute.cpu.simd.ssm_scan.ssmScanF32;
 
         const ln1_ptr = try createNormKernel(allocator, weights.ln1_weight, null, d_model, norm_eps, runtime.weight_offset, @intCast(block_idx), .layer_attn_norm);
         errdefer allocator.destroy(ln1_ptr);
@@ -2937,21 +2918,9 @@ test "TransformerBlock: mamba block type accessors" {
         .A_log = &A_log,
         .D = &D,
     };
-    const in_kernel = try registry.selectKernel(.matmul, .cpu, .f32);
-    const out_kernel = try registry.selectKernel(.matmul, .cpu, .f32);
-    const ssm_kernel = try registry.selectKernel(.ssm_scan, .cpu, .f32);
-    const matmul_in_proj = switch (in_kernel) {
-        .matmul => |fn_ptr| fn_ptr,
-        else => return error.InvalidKernel,
-    };
-    const matmul_out_proj = switch (out_kernel) {
-        .matmul => |fn_ptr| fn_ptr,
-        else => return error.InvalidKernel,
-    };
-    const ssm_scan = switch (ssm_kernel) {
-        .ssm_scan => |fn_ptr| fn_ptr,
-        else => return error.InvalidKernel,
-    };
+    const matmul_in_proj = (try matmul.matmulKernel(.f32)).func;
+    const matmul_out_proj = (try matmul.matmulKernel(.f32)).func;
+    const ssm_scan = compute.cpu.simd.ssm_scan.ssmScanF32;
     const mamba_kernel = mamba.MambaKernel.init(
         mamba_config,
         mamba_weights,
