@@ -440,6 +440,59 @@ fn deleted_file_returns_404_for_metadata_and_content() {
 }
 
 // ---------------------------------------------------------------------------
+// CAS blob retention after metadata deletion
+// ---------------------------------------------------------------------------
+
+/// After deleting file metadata, the CAS blob is still accessible via
+/// `GET /v1/blobs/:hash`.
+///
+/// `DELETE /v1/files/:id` removes the metadata document only. The blob
+/// store uses content-addressed storage and retains blobs for GC, not
+/// deleting them with metadata.
+#[test]
+fn deleted_file_blob_still_accessible_via_blob_endpoint() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    let payload = "blob survives deletion";
+    let file_id = upload_text_file(&ctx, "cas-test.txt", "text/plain", payload);
+
+    // Extract blob_ref from the underlying document.
+    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{}", file_id));
+    assert_eq!(doc_resp.status, 200, "body: {}", doc_resp.body);
+    let doc_json = doc_resp.json();
+    let blob_ref = doc_json["content"]["blob_ref"]
+        .as_str()
+        .expect("should have blob_ref in document content");
+    let hash = blob_ref.strip_prefix("sha256:").expect("sha256: prefix");
+
+    // Blob is accessible before deletion.
+    let blob_before = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    assert_eq!(blob_before.status, 200, "blob should exist before delete");
+    assert_eq!(blob_before.body, payload);
+
+    // Delete the file metadata.
+    let del_resp = delete(ctx.addr(), &format!("/v1/files/{}", file_id));
+    assert_eq!(del_resp.status, 200, "body: {}", del_resp.body);
+
+    // File metadata is gone.
+    let meta_resp = get(ctx.addr(), &format!("/v1/files/{}", file_id));
+    assert_eq!(meta_resp.status, 404, "metadata should be 404 after delete");
+
+    // Blob is still accessible (CAS retention).
+    let blob_after = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    assert_eq!(
+        blob_after.status, 200,
+        "CAS blob should survive file deletion, body: {}",
+        blob_after.body
+    );
+    assert_eq!(
+        blob_after.body, payload,
+        "blob content should match original upload"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Range: inverted start > end
 // ---------------------------------------------------------------------------
 

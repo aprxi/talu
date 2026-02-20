@@ -677,6 +677,84 @@ fn expired_document_returns_404_on_get() {
 }
 
 // =============================================================================
+// TTL: list inconsistency
+// =============================================================================
+
+/// Expired documents still appear in list results even though direct GET
+/// returns 404.
+///
+/// `getDocument` in the Zig storage layer filters by TTL (returns null for
+/// expired docs), but `listDocuments` does NOT apply TTL filtering.
+/// This test locks in the current behavior for future resolution.
+///
+/// The sleep is inherent to testing time-based expiration, not a
+/// synchronization hack — see policy §5.
+#[test]
+fn expired_document_still_appears_in_list() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    // Create a document with 1-second TTL.
+    let ephemeral = post_json(
+        ctx.addr(),
+        "/v1/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "Ephemeral in list",
+            "content": {"text": "will expire"},
+            "ttl_seconds": 1
+        }),
+    );
+    assert_eq!(ephemeral.status, 201, "body: {}", ephemeral.body);
+    let ephemeral_id = ephemeral.json()["id"].as_str().unwrap().to_string();
+
+    // Create a permanent document.
+    let permanent = post_json(
+        ctx.addr(),
+        "/v1/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "Permanent in list",
+            "content": {"text": "stays forever"}
+        }),
+    );
+    assert_eq!(permanent.status, 201, "body: {}", permanent.body);
+    let permanent_id = permanent.json()["id"].as_str().unwrap().to_string();
+
+    // Wait for TTL to lapse.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Direct GET of expired doc → 404.
+    let get_expired = get(ctx.addr(), &format!("/v1/documents/{}", ephemeral_id));
+    assert_eq!(
+        get_expired.status, 404,
+        "expired doc should return 404 on direct GET"
+    );
+
+    // Permanent doc still accessible.
+    let get_permanent = get(ctx.addr(), &format!("/v1/documents/{}", permanent_id));
+    assert_eq!(get_permanent.status, 200);
+
+    // List returns both — expired doc is NOT filtered from list results.
+    // NOTE: If this assertion starts failing, TTL filtering was added to
+    // list — update to assert the expired doc is absent instead.
+    let list_resp = get(ctx.addr(), "/v1/documents");
+    assert_eq!(list_resp.status, 200, "body: {}", list_resp.body);
+    let data = list_resp.json()["data"].as_array().expect("data array").clone();
+    let ids: Vec<&str> = data.iter().filter_map(|d| d["id"].as_str()).collect();
+
+    assert!(
+        ids.contains(&permanent_id.as_str()),
+        "permanent doc should appear in list"
+    );
+    assert!(
+        ids.contains(&ephemeral_id.as_str()),
+        "expired doc still appears in list (known inconsistency: \
+         list does not filter by TTL)"
+    );
+}
+
+// =============================================================================
 // PATCH edge cases
 // =============================================================================
 

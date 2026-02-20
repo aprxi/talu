@@ -146,6 +146,33 @@ fn bare_models_path() {
     assert_eq!(v1_data.len(), bare_data.len(), "same number of models");
 }
 
+/// Default `presence_penalty`, `frequency_penalty`, and `top_logprobs` fields
+/// are reflected as 0.0, 0.0, and 0 respectively (hardcoded in handlers.rs).
+#[test]
+fn default_penalty_and_logprobs_fields() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
+    let json = generate_with(&ctx, &model, serde_json::json!({}));
+    assert_eq!(
+        json["presence_penalty"].as_f64(),
+        Some(0.0),
+        "default presence_penalty should be 0.0, got: {:?}",
+        json["presence_penalty"]
+    );
+    assert_eq!(
+        json["frequency_penalty"].as_f64(),
+        Some(0.0),
+        "default frequency_penalty should be 0.0, got: {:?}",
+        json["frequency_penalty"]
+    );
+    assert_eq!(
+        json["top_logprobs"].as_i64(),
+        Some(0),
+        "default top_logprobs should be 0, got: {:?}",
+        json["top_logprobs"]
+    );
+}
+
 /// Streaming with bare /responses path works.
 #[test]
 fn bare_responses_streaming() {

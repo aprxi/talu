@@ -244,3 +244,39 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
     }
     events
 }
+
+/// Object-form `tool_choice` (e.g. `{"type":"function","function":{"name":"get_weather"}}`)
+/// is echoed back as an object in the response, not coerced to a string.
+#[test]
+fn object_tool_choice_echo_in_response() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
+    let body = serde_json::json!({
+        "model": model,
+        "input": "Hello",
+        "max_output_tokens": 10,
+        "tools": tool_definition(),
+        "tool_choice": {
+            "type": "function",
+            "function": { "name": "get_weather" }
+        },
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    let tc = &json["tool_choice"];
+    assert!(
+        tc.is_object(),
+        "object tool_choice should be echoed as an object, got: {tc}"
+    );
+    assert_eq!(
+        tc["type"].as_str(),
+        Some("function"),
+        "tool_choice.type should be 'function'"
+    );
+    assert_eq!(
+        tc["function"]["name"].as_str(),
+        Some("get_weather"),
+        "tool_choice.function.name should be 'get_weather'"
+    );
+}

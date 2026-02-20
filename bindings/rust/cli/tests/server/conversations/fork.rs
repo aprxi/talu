@@ -587,10 +587,10 @@ fn fork_at_mid_item_has_fewer_items_than_source() {
         source_count,
     );
 
-    // At least items 0 and 1 should be retained.
-    assert!(
-        fork_count >= 2,
-        "fork at item 1 should retain at least 2 items, got: {}",
+    // Items 0 and 1 should be retained — exactly 2 items.
+    assert_eq!(
+        fork_count, 2,
+        "fork at item 1 should retain exactly 2 items (0 and 1), got: {}",
         fork_count,
     );
 }

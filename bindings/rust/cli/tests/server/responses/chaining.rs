@@ -5,7 +5,10 @@
 //! chaining scenarios: unknown IDs, streaming chains, continue-generating,
 //! and session metadata preservation.
 
-use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
+use crate::server::common::{
+    model_config, post_json, require_model, send_request, ServerConfig, ServerTestContext,
+    TenantSpec,
+};
 
 /// Parse SSE events from a raw body string (same helper as streaming.rs).
 fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
@@ -204,5 +207,97 @@ fn streaming_continue_has_session_metadata() {
     assert_eq!(
         session_id, continue_session,
         "continue should preserve the same session_id",
+    );
+}
+
+/// Cross-tenant `response_store` leak: the store is a global `HashMap` with no
+/// tenant scoping, so Tenant B can chain off Tenant A's `response_id` and
+/// inherit Tenant A's `session_id`.
+///
+/// If this assertion starts failing (i.e. the sessions differ or the request
+/// returns an error), tenant isolation was added to `response_store` — update
+/// this test to assert that cross-tenant chaining is correctly rejected.
+#[test]
+fn cross_tenant_chaining_inherits_session_id() {
+    let model = require_model!();
+    let temp = tempfile::TempDir::new().expect("temp dir");
+    let bucket = temp.path().join("bucket");
+    std::fs::create_dir_all(&bucket).expect("create bucket");
+
+    let mut config = ServerConfig::new();
+    config.model = Some(model.clone());
+    config.bucket = Some(bucket);
+    config.gateway_secret = Some("secret".to_string());
+    config.tenants = vec![
+        TenantSpec {
+            id: "alpha".to_string(),
+            storage_prefix: "alpha".to_string(),
+            allowed_models: vec![],
+        },
+        TenantSpec {
+            id: "beta".to_string(),
+            storage_prefix: "beta".to_string(),
+            allowed_models: vec![],
+        },
+    ];
+    let ctx = ServerTestContext::new(config);
+
+    // Tenant Alpha: generate with store=true.
+    let body_a = serde_json::json!({
+        "model": &model,
+        "input": "Hello from alpha",
+        "max_output_tokens": 10,
+        "store": true,
+    });
+    let body_a_str = serde_json::to_string(&body_a).unwrap();
+    let resp_a = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/responses",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "alpha"),
+        ],
+        Some(&body_a_str),
+    );
+    assert_eq!(resp_a.status, 200, "alpha request failed: {}", resp_a.body);
+    let json_a = resp_a.json();
+    let alpha_response_id = json_a["id"].as_str().expect("alpha should have id");
+    let alpha_session_id = json_a["metadata"]["session_id"]
+        .as_str()
+        .expect("alpha should have session_id");
+
+    // Tenant Beta: chain off Alpha's response_id.
+    let body_b = serde_json::json!({
+        "model": &model,
+        "input": "Hello from beta",
+        "max_output_tokens": 10,
+        "previous_response_id": alpha_response_id,
+        "store": true,
+    });
+    let body_b_str = serde_json::to_string(&body_b).unwrap();
+    let resp_b = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/responses",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "beta"),
+        ],
+        Some(&body_b_str),
+    );
+    assert_eq!(resp_b.status, 200, "beta request failed: {}", resp_b.body);
+    let json_b = resp_b.json();
+    let beta_session_id = json_b["metadata"]["session_id"]
+        .as_str()
+        .expect("beta should have session_id");
+
+    // Documents known vulnerability: Beta inherits Alpha's session_id because
+    // response_store has no tenant scoping.
+    assert_eq!(
+        alpha_session_id, beta_session_id,
+        "cross-tenant chaining leaks session_id (known: response_store is global)"
     );
 }

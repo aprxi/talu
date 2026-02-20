@@ -1204,3 +1204,46 @@ fn proxy_wildcard_matches_root_domain() {
         serde_json::from_str(json["body"].as_str().unwrap()).expect("parse echo body");
     assert_eq!(upstream_body["echo_method"], "GET");
 }
+
+/// Plugin tokens work independently of tenant auth — no gateway_secret is
+/// configured and no `X-Talu-*` headers are sent.  Documents that
+/// `PluginTokenEntry` has no tenant context and the proxy handler ignores
+/// `_auth`.
+#[test]
+fn plugin_token_works_without_tenant_auth() {
+    let (echo_addr, _handle) = spawn_echo_server();
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_host_permission(dir.path(), "127.0.0.1");
+
+    // No gateway_secret → no tenant auth required.
+    let ctx = ServerTestContext::new(proxy_forwarding_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "proxy-fwd-plugin");
+
+    let proxy_body = serde_json::json!({
+        "url": format!("http://{}/no-tenant", echo_addr),
+        "method": "GET"
+    });
+    let proxy_json = serde_json::to_string(&proxy_body).unwrap();
+
+    // Deliberately omit all X-Talu-* headers — only Authorization.
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/proxy",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &format!("Bearer {}", token)),
+        ],
+        Some(&proxy_json),
+    );
+    assert_eq!(
+        resp.status, 200,
+        "plugin token should work without any tenant auth headers, body: {}",
+        resp.body
+    );
+
+    let json = resp.json();
+    let upstream_body: serde_json::Value =
+        serde_json::from_str(json["body"].as_str().unwrap()).expect("parse echo body");
+    assert_eq!(upstream_body["echo_method"], "GET");
+}

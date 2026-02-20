@@ -309,3 +309,48 @@ fn upload_rejects_payload_over_configured_limit() {
     let upload_json = upload_resp.json();
     assert_eq!(upload_json["error"]["code"], "payload_too_large");
 }
+
+// ---------------------------------------------------------------------------
+// Failsafe: unrecognizable binary
+// ---------------------------------------------------------------------------
+
+/// Uploading bytes that don't match any known file signature succeeds.
+///
+/// `inspect_blob_failsafe` in files.rs wraps `file::inspect_bytes` in a
+/// 2-second timeout + `catch_unwind`. Upload always succeeds regardless
+/// of inspection outcome. When inspection returns no useful info, the
+/// `kind` field may be absent from the response JSON.
+#[test]
+fn upload_unrecognizable_binary_succeeds() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(files_config(temp.path()));
+
+    // Payload that doesn't match any known file magic bytes.
+    let garbage = "ZZZZ_not_a_file_format_0xDEADBEEF_".repeat(8);
+
+    let boundary = "----talu-upload-garbage";
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"garbage.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n{payload}\r\n--{b}--\r\n",
+        b = boundary,
+        payload = garbage,
+    );
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    let headers = [("Content-Type", content_type.as_str())];
+
+    let resp = send_request(ctx.addr(), "POST", "/v1/files", &headers, Some(&body));
+    assert_eq!(
+        resp.status, 200,
+        "upload of unrecognizable binary should succeed, body: {}",
+        resp.body
+    );
+
+    let json = resp.json();
+    assert_eq!(json["object"], "file");
+    assert_eq!(json["filename"], "garbage.bin");
+    assert_eq!(json["status"], "processed");
+    // `kind` may be present (e.g. "binary"/"text") or absent (inspection
+    // returned None → skip_serializing_if). Either is acceptable.
+    if let Some(kind) = json["kind"].as_str() {
+        assert!(!kind.is_empty(), "if kind is present, it should not be empty");
+    }
+}
