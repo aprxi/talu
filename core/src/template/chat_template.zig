@@ -56,9 +56,9 @@ pub fn renderWithContext(
 
     // Parse messages JSON array
     const parsed_messages = io.json.parseValue(allocator, messages_json, .{
-        .max_size_bytes = 10 * 1024 * 1024,
-        .max_value_bytes = 10 * 1024 * 1024,
-        .max_string_bytes = 1 * 1024 * 1024,
+        .max_size_bytes = 50 * 1024 * 1024,
+        .max_value_bytes = 50 * 1024 * 1024,
+        .max_string_bytes = 50 * 1024 * 1024,
     }) catch |err| {
         return switch (err) {
             error.InputTooLarge => error.InvalidMessages,
@@ -86,9 +86,9 @@ pub fn renderWithContext(
     // Parse and merge extra context if provided
     if (extra_context_json) |extra_json| {
         const parsed_extra = io.json.parseValue(allocator, extra_json, .{
-            .max_size_bytes = 10 * 1024 * 1024,
-            .max_value_bytes = 10 * 1024 * 1024,
-            .max_string_bytes = 1 * 1024 * 1024,
+            .max_size_bytes = 50 * 1024 * 1024,
+            .max_value_bytes = 50 * 1024 * 1024,
+            .max_string_bytes = 50 * 1024 * 1024,
         }) catch |err| {
             return switch (err) {
                 error.InputTooLarge => error.InvalidMessages,

@@ -369,6 +369,16 @@ pub const Backend = union(enum) {
             .metal => {},
         }
     }
+
+    /// Maximum pixel count the vision encoder can handle efficiently.
+    ///
+    /// Today all backends use the CPU vision encoder (O(n²) serial attention),
+    /// so they all return 512².  When a backend gains a flash-attention vision
+    /// encoder, it raises its own value here.
+    pub fn visionMaxPixels(self: *const Backend) u64 {
+        _ = self;
+        return 512 * 512;
+    }
 };
 
 fn isMetalSupported(config: *const ModelConfig, weight_dtype: DType, has_unsupported_blocks: bool) bool {

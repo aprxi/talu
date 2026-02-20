@@ -463,7 +463,10 @@ fn generateWithLocalEngine(
 
     // Generate
     var result = local_engine.generate(chat, built.options) catch |err| {
-        capi_error.setError(err, "generate error: {s}", .{@errorName(err)});
+        if (err == error.UnsupportedContentType)
+            capi_error.setError(err, "This model does not support images. Use a vision-language model (e.g. LFM2-VL-450M).", .{})
+        else
+            capi_error.setError(err, "generate error: {s}", .{@errorName(err)});
         return .{ .error_code = @intFromEnum(error_codes.ErrorCode.generation_failed) };
     };
     log.debug("router", "LocalEngine generate completed", .{

@@ -10,3 +10,7 @@ pub const applyChatTemplate = generation.applyChatTemplate;
 pub const getChatTemplateSource = generation.getChatTemplateSource;
 pub const isEosToken = generation.isEosToken;
 pub const addEosTokenId = generation.addEosTokenId;
+
+const preprocessor = @import("preprocessor.zig");
+pub const PreprocessorConfig = preprocessor.PreprocessorConfig;
+pub const loadPreprocessorConfig = preprocessor.loadPreprocessorConfig;

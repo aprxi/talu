@@ -40,6 +40,7 @@ const io = @import("../io/root.zig");
 const image_mod = @import("../image/root.zig");
 const model_loader = inference.model_loader;
 const gen_config_mod = @import("../inference/config/generation.zig");
+const preproc_mod = @import("../inference/config/preprocessor.zig");
 const validate_mod = @import("../validate/root.zig");
 const ConstrainedSampler = validate_mod.sampler.ConstrainedSampler;
 const GrammarConfig = validate_mod.sampler.GrammarConfig;
@@ -245,6 +246,9 @@ pub const LocalEngine = struct {
     /// Generation config from model (EOS tokens, etc).
     gen_config: gen_config_mod.GenerationConfig,
 
+    /// Preprocessor config for vision (pixel limits from preprocessor_config.json).
+    preproc_config: preproc_mod.PreprocessorConfig,
+
     /// Path to the model directory.
     model_path: []const u8,
 
@@ -308,6 +312,9 @@ pub const LocalEngine = struct {
         // Load generation config
         var generation_config = try gen_config_mod.loadGenerationConfig(allocator, resolved_model_path);
         errdefer generation_config.deinit(allocator);
+
+        // Load preprocessor config (pixel limits for vision smart resize)
+        const preproc_config = preproc_mod.loadPreprocessorConfig(allocator, resolved_model_path);
 
         const model_load_options = backend_root.defaultModelLoadOptions();
 
@@ -415,6 +422,7 @@ pub const LocalEngine = struct {
             .samp = sampler_instance,
             .backend = compute_backend,
             .gen_config = generation_config,
+            .preproc_config = preproc_config,
             .model_path = resolved_model_path,
         };
     }
@@ -1023,20 +1031,39 @@ pub const LocalEngine = struct {
         const spatial_merge_size = try requirePositiveConfigU32(self.loaded.config.vision_spatial_merge_size);
         const resize_factor = try std.math.mul(u32, patch_size, spatial_merge_size);
 
-        // Cap image pixels so the vision encoder stays tractable on CPU.
+        // Cross-check patch_size if preprocessor_config provided one.
+        if (self.preproc_config.patch_size > 0 and
+            self.preproc_config.patch_size != patch_size)
+        {
+            log.warn("load", "preprocessor_config.json patch_size differs from config.json vision_patch_size; using config.json", .{
+                .preprocessor = self.preproc_config.patch_size,
+                .config = patch_size,
+            });
+        }
+
+        const encoder_max = self.backend.visionMaxPixels();
+
+        // Determine pixel limits for smart resize.
         //
-        // The vision encoder uses O(n²) bidirectional attention (flash attention
-        // requires is_causal=true).  Without a cap, large images produce huge
-        // patch counts and make the encoder impractically slow.
-        //
-        // For simple models (temporal=1, spatial_merge=1) both min and max are
-        // set to the position-embedding pixel budget (exact resize).
-        // For dynamic-resolution models a conservative 512×512 default keeps
-        // encoding under ~2 s on CPU.  This will be superseded by values from
-        // preprocessor_config.json once that file is loaded (see story).
+        // Priority: preprocessor_config.json values (clamped to encoder limit),
+        // then config.json-based defaults.
         var min_pixels: u64 = 0;
         var max_pixels: u64 = 0;
-        if (self.loaded.config.vision_num_position_embeddings > 0) {
+        if (self.preproc_config.max_pixels > 0) {
+            // Honour preprocessor_config.json, clamped to backend's vision encoder limit.
+            max_pixels = self.preproc_config.max_pixels;
+            min_pixels = self.preproc_config.min_pixels;
+            if (max_pixels > encoder_max) {
+                log.warn("load", "preprocessor_config.json max_pixels exceeds vision encoder limit; clamping", .{
+                    .requested = max_pixels,
+                    .limit = encoder_max,
+                });
+                max_pixels = encoder_max;
+            }
+            // Ensure min does not exceed clamped max.
+            if (min_pixels > max_pixels) min_pixels = 0;
+        } else if (self.loaded.config.vision_num_position_embeddings > 0) {
+            // Fallback when preprocessor_config.json absent or has no pixel limits.
             const n_pos: u64 = std.math.cast(u64, self.loaded.config.vision_num_position_embeddings) orelse 0;
             if (n_pos > 0) {
                 const base_pixels = n_pos * @as(u64, patch_size) * @as(u64, patch_size);
@@ -1044,10 +1071,8 @@ pub const LocalEngine = struct {
                     min_pixels = base_pixels;
                     max_pixels = base_pixels;
                 } else {
-                    // Dynamic-resolution: conservative CPU default.
-                    // TODO(preprocessor_config): replace with values from
-                    // preprocessor_config.json when available.
-                    max_pixels = 512 * 512;
+                    // Dynamic-resolution without preprocessor_config: conservative default.
+                    max_pixels = encoder_max;
                 }
             }
         }

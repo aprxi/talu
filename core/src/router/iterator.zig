@@ -479,7 +479,10 @@ pub const TokenIterator = struct {
         self.runGeneration() catch |err| {
             // Store error for caller to retrieve (use -1 as generic error code)
             self.error_code.store(-1, .release);
-            self.error_msg = std.fmt.allocPrint(self.allocator, "Generation failed: {s}", .{@errorName(err)}) catch null;
+            self.error_msg = (if (err == error.UnsupportedContentType)
+                std.fmt.allocPrint(self.allocator, "This model does not support images. Use a vision-language model (e.g. LFM2-VL-450M).", .{})
+            else
+                std.fmt.allocPrint(self.allocator, "Generation failed: {s}", .{@errorName(err)})) catch null;
         };
 
         // Signal completion - order matters for correctness:

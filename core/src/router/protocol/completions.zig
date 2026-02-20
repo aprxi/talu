@@ -669,9 +669,9 @@ pub fn parse(
 
     // Parse JSON
     const parsed = io.json.parseValue(conv.allocator, json, .{
-        .max_size_bytes = 10 * 1024 * 1024,
-        .max_value_bytes = 10 * 1024 * 1024,
-        .max_string_bytes = 1 * 1024 * 1024,
+        .max_size_bytes = 50 * 1024 * 1024,
+        .max_value_bytes = 50 * 1024 * 1024,
+        .max_string_bytes = 50 * 1024 * 1024,
     }) catch |err| {
         return switch (err) {
             error.InputTooLarge => error.InvalidJson,
