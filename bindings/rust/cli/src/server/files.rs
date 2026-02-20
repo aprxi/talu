@@ -361,9 +361,10 @@ pub async fn handle_list(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(100)
         .clamp(1, 1000);
-    let offset = parse_query_param(query_str, "offset")
+    let mut offset = parse_query_param(query_str, "offset")
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(0);
+    let cursor_param = parse_query_param(query_str, "cursor");
     let marker_filter = parse_query_param(query_str, "marker").unwrap_or("active");
     let sort = parse_query_param(query_str, "sort").unwrap_or("date");
     let order = parse_query_param(query_str, "order").unwrap_or("desc");
@@ -379,19 +380,12 @@ pub async fn handle_list(
         Err(e) => return document_error_response(e),
     };
 
-    // Don't pass marker to the scan layer — it filters per-row before
-    // deduplication, so old versions with the previous marker leak through
-    // when a document's marker has been updated.  Filter after dedup instead.
-    let rows = match docs.list(Some("file"), None, None, None, u32::MAX) {
+    let rows = match docs.list(Some("file"), None, None, Some(marker_filter), u32::MAX) {
         Ok(v) => v,
         Err(e) => return document_error_response(e),
     };
 
-    // Filter summaries by marker (post-dedup marker is accurate).
-    let mut filtered: Vec<_> = rows
-        .into_iter()
-        .filter(|r| r.marker.as_deref().unwrap_or("active") == marker_filter)
-        .collect();
+    let mut filtered: Vec<_> = rows;
 
     // Apply search filter on title (filename).
     if let Some(ref q) = search {
@@ -410,6 +404,19 @@ pub async fn handle_list(
         let cmp = if desc { cmp.reverse() } else { cmp };
         cmp.then_with(|| b.doc_id.cmp(&a.doc_id))
     });
+
+    // If a cursor was provided, find the cursor item in the sorted list
+    // and start from the next item (cursor takes precedence over offset).
+    if let Some(cursor_str) = cursor_param {
+        if let Some((cursor_ts, cursor_id)) = decode_file_cursor(cursor_str) {
+            if let Some(pos) = filtered
+                .iter()
+                .position(|r| r.created_at_ms == cursor_ts && r.doc_id == cursor_id)
+            {
+                offset = pos + 1;
+            }
+        }
+    }
 
     let total = filtered.len();
 
@@ -434,10 +441,12 @@ pub async fn handle_list(
         page.push(to_file_object_response(descriptor));
     }
 
-    // Cursor from last item for backward compatibility.
+    // Cursor from last summary (uses created_at_ms so decode matches the
+    // lookup against summaries on the next request).
     let next_cursor = if has_more {
-        page.last()
-            .map(|f| encode_file_cursor(f.created_at as i64, &f.id))
+        page_summaries
+            .last()
+            .map(|s| encode_file_cursor(s.created_at_ms, &s.doc_id))
     } else {
         None
     };
@@ -1078,6 +1087,50 @@ pub async fn handle_patch(
 // ---------------------------------------------------------------------------
 // Cursor helpers (same pattern as conversations.rs)
 // ---------------------------------------------------------------------------
+
+/// Decode a base64 file cursor back to `(created_at_ms, file_id)`.
+fn decode_file_cursor(encoded: &str) -> Option<(i64, String)> {
+    let decoded = base64_decode(encoded)?;
+    let s = std::str::from_utf8(&decoded).ok()?;
+    let (ts_str, file_id) = s.split_once(':')?;
+    let ts = ts_str.parse::<i64>().ok()?;
+    Some((ts, file_id.to_string()))
+}
+
+/// Simple base64 decode (standard alphabet, with padding).
+fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    fn val(c: u8) -> Option<u32> {
+        match c {
+            b'A'..=b'Z' => Some((c - b'A') as u32),
+            b'a'..=b'z' => Some((c - b'a' + 26) as u32),
+            b'0'..=b'9' => Some((c - b'0' + 52) as u32),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0),
+            _ => None,
+        }
+    }
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return None;
+    }
+    let mut result = Vec::with_capacity(bytes.len() / 4 * 3);
+    for chunk in bytes.chunks(4) {
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        let c = val(chunk[2])?;
+        let d = val(chunk[3])?;
+        let n = (a << 18) | (b << 12) | (c << 6) | d;
+        result.push((n >> 16) as u8);
+        if chunk[2] != b'=' {
+            result.push((n >> 8 & 0xFF) as u8);
+        }
+        if chunk[3] != b'=' {
+            result.push((n & 0xFF) as u8);
+        }
+    }
+    Some(result)
+}
 
 fn encode_file_cursor(created_at_ms: i64, file_id: &str) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";

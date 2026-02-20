@@ -509,14 +509,6 @@ pub const DocumentAdapter = struct {
                     }
                 }
 
-                // Filter by marker if specified
-                if (target_marker_hash) |target| {
-                    if (marker_bytes) |mb| {
-                        const row_marker = readU64At(mb, row_idx) catch continue;
-                        if (row_marker != target) continue;
-                    }
-                }
-
                 const payload = payload_buffers.sliceForRow(row_idx) catch continue;
                 const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
                 if (record_opt) |record| {
@@ -535,6 +527,29 @@ pub const DocumentAdapter = struct {
                         r.deinit(allocator);
                         continue;
                     };
+                }
+            }
+        }
+
+        // Post-dedup marker filter: the latest map now has the true newest
+        // version of each document.  Filter by marker here so that stale
+        // marker states from older rows never leak through.
+        if (target_marker_hash) |target| {
+            var to_remove = std.ArrayList(u64).empty;
+            defer to_remove.deinit(allocator);
+            {
+                var it2 = latest.iterator();
+                while (it2.next()) |entry| {
+                    const rm: u64 = if (entry.value_ptr.marker) |m| computeHash(m) else 0;
+                    if (rm != target) {
+                        try to_remove.append(allocator, entry.key_ptr.*);
+                    }
+                }
+            }
+            for (to_remove.items) |key| {
+                if (latest.fetchRemove(key)) |kv| {
+                    var r = kv.value;
+                    r.deinit(allocator);
                 }
             }
         }
