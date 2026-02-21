@@ -8,6 +8,7 @@ const db_writer = @import("../writer.zig");
 const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
 const types = @import("../types.zig");
+const json = @import("../../io/json/root.zig");
 const tensor_mod = @import("../../tensor.zig");
 const dot_product = @import("../../compute/cpu/linalg.zig").dot;
 const parallel = @import("../../system/parallel.zig");
@@ -19,6 +20,9 @@ const schema_embeddings: u16 = 10;
 const col_doc_id: u32 = 1;
 const col_ts: u32 = 2;
 const col_embedding: u32 = 10;
+const state_file_name = "state.json";
+const state_version: u32 = 1;
+const max_state_json_bytes: usize = 64 * 1024 * 1024;
 
 pub const VectorBatch = struct {
     ids: []u64,
@@ -64,8 +68,107 @@ pub const SearchBatchResult = struct {
     }
 };
 
+pub const DeleteResult = struct {
+    deleted_count: usize,
+    not_found_count: usize,
+};
+
+pub const FetchResult = struct {
+    ids: []u64,
+    vectors: []f32,
+    missing_ids: []u64,
+    dims: u32,
+    include_values: bool,
+
+    pub fn deinit(self: *FetchResult, allocator: Allocator) void {
+        allocator.free(self.ids);
+        allocator.free(self.vectors);
+        allocator.free(self.missing_ids);
+    }
+};
+
+pub const StatsResult = struct {
+    visible_count: usize,
+    tombstone_count: usize,
+    segment_count: usize,
+    total_count: usize,
+};
+
+pub const CompactResult = struct {
+    kept_count: usize,
+    removed_tombstones: usize,
+};
+
+pub const ChangeOp = enum(u8) {
+    append = 1,
+    upsert = 2,
+    delete = 3,
+    compact = 4,
+};
+
+pub const ChangeEvent = struct {
+    seq: u64,
+    op: ChangeOp,
+    id: u64,
+    timestamp: i64,
+};
+
+pub const ChangesResult = struct {
+    events: []ChangeEvent,
+    has_more: bool,
+    next_since: u64,
+
+    pub fn deinit(self: *ChangesResult, allocator: Allocator) void {
+        allocator.free(self.events);
+    }
+};
+
 pub const ScoreCallback = *const fn (ctx: *anyopaque, id: u64, score: f32) void;
 pub const ScoreCallbackC = *const fn (ctx: ?*anyopaque, id: u64, score: f32) callconv(.c) void;
+
+const PointState = struct {
+    id: u64,
+    values: []f32,
+    deleted: bool,
+    updated_at: i64,
+    seq: u64,
+};
+
+const MutationState = struct {
+    next_seq: u64 = 1,
+    points: std.ArrayListUnmanaged(PointState) = .{},
+    changes: std.ArrayListUnmanaged(ChangeEvent) = .{},
+
+    fn deinit(self: *MutationState, allocator: Allocator) void {
+        for (self.points.items) |point| {
+            allocator.free(point.values);
+        }
+        self.points.deinit(allocator);
+        self.changes.deinit(allocator);
+    }
+};
+
+const PersistedPointState = struct {
+    id: u64,
+    values: []f32,
+    deleted: bool,
+    updated_at: i64,
+    seq: u64,
+};
+
+const PersistedChangeEvent = struct {
+    seq: u64,
+    op: []const u8,
+    id: u64,
+    timestamp: i64,
+};
+
+const PersistedMutationState = struct {
+    version: u32 = state_version,
+    next_seq: u64 = 1,
+    points: []PersistedPointState = &.{},
+    changes: []PersistedChangeEvent = &.{},
+};
 
 const ScratchBuffers = struct {
     id_buf: []u8 = &[_]u8{},
@@ -115,11 +218,15 @@ const ScratchBuffers = struct {
 /// See also: `create` / `destroy` for heap-allocated lifecycle.
 pub const VectorAdapter = struct {
     allocator: Allocator,
+    db_root: []u8,
     fs_writer: *db_writer.Writer,
     fs_reader: *db_reader.Reader,
 
     /// Initialize vector TaluDB backend for the "vector" namespace.
     pub fn init(allocator: Allocator, db_root: []const u8) !VectorAdapter {
+        const db_root_copy = try allocator.dupe(u8, db_root);
+        errdefer allocator.free(db_root_copy);
+
         var writer_ptr = try allocator.create(db_writer.Writer);
         errdefer allocator.destroy(writer_ptr);
         writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "vector");
@@ -132,6 +239,7 @@ pub const VectorAdapter = struct {
 
         return .{
             .allocator = allocator,
+            .db_root = db_root_copy,
             .fs_writer = writer_ptr,
             .fs_reader = reader_ptr,
         };
@@ -139,6 +247,246 @@ pub const VectorAdapter = struct {
 
     /// Append a batch of embeddings.
     pub fn appendBatch(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32) !void {
+        try self.appendBatchRaw(doc_ids, vectors, dims);
+        try self.recordPointMutations(doc_ids, vectors, dims, .append);
+    }
+
+    /// Upsert a batch of embeddings.
+    ///
+    /// Physical storage remains append-only; upsert visibility is resolved
+    /// through persisted mutation state.
+    pub fn upsertBatch(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32) !void {
+        try self.appendBatchRaw(doc_ids, vectors, dims);
+        try self.recordPointMutations(doc_ids, vectors, dims, .upsert);
+    }
+
+    /// Delete vectors by ID using tombstone semantics.
+    pub fn deleteIds(self: *VectorAdapter, ids: []const u64) !DeleteResult {
+        var state = try self.loadMutationState();
+        defer state.deinit(self.allocator);
+
+        const now = std.time.milliTimestamp();
+        var deleted: usize = 0;
+        var not_found: usize = 0;
+
+        for (ids) |id| {
+            if (findPointIndex(state.points.items, id)) |idx| {
+                if (!state.points.items[idx].deleted) {
+                    const seq = nextSeq(&state);
+                    state.points.items[idx].deleted = true;
+                    state.points.items[idx].updated_at = now;
+                    state.points.items[idx].seq = seq;
+                    try state.changes.append(self.allocator, .{
+                        .seq = seq,
+                        .op = .delete,
+                        .id = id,
+                        .timestamp = now,
+                    });
+                    deleted += 1;
+                } else {
+                    not_found += 1;
+                }
+            } else {
+                not_found += 1;
+            }
+        }
+
+        try self.saveMutationState(&state);
+        return .{
+            .deleted_count = deleted,
+            .not_found_count = not_found,
+        };
+    }
+
+    /// Fetch vectors by ID from the current visible state.
+    pub fn fetchByIds(self: *VectorAdapter, allocator: Allocator, ids: []const u64, include_values: bool) !FetchResult {
+        var state = try self.loadMutationState();
+        defer state.deinit(self.allocator);
+
+        var dims: ?u32 = null;
+        var found_count: usize = 0;
+        var missing_count: usize = 0;
+        for (ids) |id| {
+            if (findPointIndex(state.points.items, id)) |idx| {
+                const point = state.points.items[idx];
+                if (!point.deleted) {
+                    const point_dims: u32 = @intCast(point.values.len);
+                    if (dims) |expected| {
+                        if (expected != point_dims) return error.InvalidColumnData;
+                    } else {
+                        dims = point_dims;
+                    }
+                    found_count += 1;
+                } else {
+                    missing_count += 1;
+                }
+            } else {
+                missing_count += 1;
+            }
+        }
+
+        const dims_value: u32 = dims orelse 0;
+        const found_ids = try allocator.alloc(u64, found_count);
+        errdefer allocator.free(found_ids);
+        // Keep allocation length coupled to (found_count * dims) so the C API
+        // free path can deterministically release the returned buffer.
+        const found_vectors = try allocator.alloc(f32, found_count * @as(usize, dims_value));
+        errdefer allocator.free(found_vectors);
+        const missing_ids = try allocator.alloc(u64, missing_count);
+        errdefer allocator.free(missing_ids);
+
+        var found_idx: usize = 0;
+        var missing_idx: usize = 0;
+        for (ids) |id| {
+            if (findPointIndex(state.points.items, id)) |idx| {
+                const point = state.points.items[idx];
+                if (!point.deleted) {
+                    found_ids[found_idx] = id;
+                    if (include_values and dims_value > 0) {
+                        const base = found_idx * @as(usize, dims_value);
+                        std.mem.copyForwards(f32, found_vectors[base .. base + @as(usize, dims_value)], point.values);
+                    }
+                    found_idx += 1;
+                } else {
+                    missing_ids[missing_idx] = id;
+                    missing_idx += 1;
+                }
+            } else {
+                missing_ids[missing_idx] = id;
+                missing_idx += 1;
+            }
+        }
+
+        return .{
+            .ids = found_ids,
+            .vectors = found_vectors,
+            .missing_ids = missing_ids,
+            .dims = dims_value,
+            .include_values = include_values,
+        };
+    }
+
+    /// Return vector mutation statistics from persisted state.
+    pub fn stats(self: *VectorAdapter) !StatsResult {
+        var state = try self.loadMutationState();
+        defer state.deinit(self.allocator);
+
+        var visible: usize = 0;
+        var tombstones: usize = 0;
+        for (state.points.items) |point| {
+            if (point.deleted) {
+                tombstones += 1;
+            } else {
+                visible += 1;
+            }
+        }
+
+        return .{
+            .visible_count = visible,
+            .tombstone_count = tombstones,
+            .segment_count = try self.countVectorSegments(),
+            .total_count = visible + tombstones,
+        };
+    }
+
+    /// Compact vector storage by rebuilding physical segments from visible rows.
+    pub fn compact(self: *VectorAdapter, dims: u32) !CompactResult {
+        if (dims == 0) return error.InvalidColumnData;
+
+        var state = try self.loadMutationState();
+        defer state.deinit(self.allocator);
+
+        var kept_count: usize = 0;
+        var removed_tombstones: usize = 0;
+        for (state.points.items) |point| {
+            if (point.deleted) {
+                removed_tombstones += 1;
+            } else {
+                if (point.values.len != @as(usize, dims)) return error.InvalidColumnData;
+                kept_count += 1;
+            }
+        }
+
+        const ids = try self.allocator.alloc(u64, kept_count);
+        defer self.allocator.free(ids);
+        const vectors = try self.allocator.alloc(f32, kept_count * @as(usize, dims));
+        defer self.allocator.free(vectors);
+
+        var write_idx: usize = 0;
+        for (state.points.items) |point| {
+            if (point.deleted) continue;
+            ids[write_idx] = point.id;
+            const base = write_idx * @as(usize, dims);
+            std.mem.copyForwards(f32, vectors[base .. base + @as(usize, dims)], point.values);
+            write_idx += 1;
+        }
+
+        try self.rebuildVectorNamespace(ids, vectors, dims);
+
+        // Remove tombstones and emit a compact event.
+        var compact_points = std.ArrayListUnmanaged(PointState){};
+        defer compact_points.deinit(self.allocator);
+        for (state.points.items) |point| {
+            if (point.deleted) {
+                self.allocator.free(point.values);
+                continue;
+            }
+            try compact_points.append(self.allocator, point);
+        }
+        state.points.deinit(self.allocator);
+        state.points = compact_points;
+        compact_points = .{};
+
+        const seq = nextSeq(&state);
+        const now = std.time.milliTimestamp();
+        try state.changes.append(self.allocator, .{
+            .seq = seq,
+            .op = .compact,
+            .id = 0,
+            .timestamp = now,
+        });
+
+        try self.saveMutationState(&state);
+        return .{
+            .kept_count = kept_count,
+            .removed_tombstones = removed_tombstones,
+        };
+    }
+
+    /// Read mutation events with cursor pagination.
+    pub fn readChanges(self: *VectorAdapter, allocator: Allocator, since: u64, limit: usize) !ChangesResult {
+        var state = try self.loadMutationState();
+        defer state.deinit(self.allocator);
+
+        const clamped_limit = @max(@as(usize, 1), @min(limit, 1000));
+
+        var matched_total: usize = 0;
+        for (state.changes.items) |change| {
+            if (change.seq > since) matched_total += 1;
+        }
+
+        const out_count = @min(matched_total, clamped_limit);
+        const out = try allocator.alloc(ChangeEvent, out_count);
+        errdefer allocator.free(out);
+
+        var write_idx: usize = 0;
+        for (state.changes.items) |change| {
+            if (change.seq <= since) continue;
+            if (write_idx >= out_count) break;
+            out[write_idx] = change;
+            write_idx += 1;
+        }
+
+        const has_more = matched_total > out_count;
+        const next_since = if (out_count > 0) out[out_count - 1].seq else since;
+        return .{
+            .events = out,
+            .has_more = has_more,
+            .next_since = next_since,
+        };
+    }
+
+    fn appendBatchRaw(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32) !void {
         if (dims == 0) return error.InvalidColumnData;
         if (doc_ids.len == 0) return;
         if (vectors.len != doc_ids.len * @as(usize, dims)) return error.InvalidColumnData;
@@ -180,6 +528,183 @@ pub const VectorAdapter = struct {
         };
 
         try self.fs_writer.appendBatch(schema_embeddings, @intCast(doc_ids.len), &columns);
+    }
+
+    fn recordPointMutations(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32, op: ChangeOp) !void {
+        if (doc_ids.len == 0) return;
+        var state = try self.loadMutationState();
+        defer state.deinit(self.allocator);
+
+        const now = std.time.milliTimestamp();
+        for (doc_ids, 0..) |doc_id, idx| {
+            const base = idx * @as(usize, dims);
+            const row_values = vectors[base .. base + @as(usize, dims)];
+            const seq = nextSeq(&state);
+            if (findPointIndex(state.points.items, doc_id)) |point_idx| {
+                self.allocator.free(state.points.items[point_idx].values);
+                state.points.items[point_idx].values = try self.allocator.dupe(f32, row_values);
+                state.points.items[point_idx].deleted = false;
+                state.points.items[point_idx].updated_at = now;
+                state.points.items[point_idx].seq = seq;
+            } else {
+                try state.points.append(self.allocator, .{
+                    .id = doc_id,
+                    .values = try self.allocator.dupe(f32, row_values),
+                    .deleted = false,
+                    .updated_at = now,
+                    .seq = seq,
+                });
+            }
+            try state.changes.append(self.allocator, .{
+                .seq = seq,
+                .op = op,
+                .id = doc_id,
+                .timestamp = now,
+            });
+        }
+
+        try self.saveMutationState(&state);
+    }
+
+    fn loadMutationState(self: *VectorAdapter) !MutationState {
+        const state_path = try self.stateFilePath(self.allocator);
+        defer self.allocator.free(state_path);
+
+        const data = std.fs.cwd().readFileAlloc(self.allocator, state_path, max_state_json_bytes) catch |err| switch (err) {
+            error.FileNotFound => return .{},
+            else => return err,
+        };
+        defer self.allocator.free(data);
+
+        var parsed = json.parseStruct(self.allocator, PersistedMutationState, data, .{
+            .max_size_bytes = max_state_json_bytes,
+            .ignore_unknown_fields = false,
+        }) catch return error.InvalidColumnData;
+        defer parsed.deinit();
+
+        var state = MutationState{ .next_seq = if (parsed.value.next_seq == 0) 1 else parsed.value.next_seq };
+        errdefer state.deinit(self.allocator);
+
+        for (parsed.value.points) |point| {
+            try state.points.append(self.allocator, .{
+                .id = point.id,
+                .values = try self.allocator.dupe(f32, point.values),
+                .deleted = point.deleted,
+                .updated_at = point.updated_at,
+                .seq = point.seq,
+            });
+        }
+
+        for (parsed.value.changes) |change| {
+            try state.changes.append(self.allocator, .{
+                .seq = change.seq,
+                .op = try parseChangeOp(change.op),
+                .id = change.id,
+                .timestamp = change.timestamp,
+            });
+        }
+        return state;
+    }
+
+    fn saveMutationState(self: *VectorAdapter, state: *const MutationState) !void {
+        const vector_dir = try self.vectorDirPath(self.allocator);
+        defer self.allocator.free(vector_dir);
+        try std.fs.cwd().makePath(vector_dir);
+
+        var arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena.deinit();
+        const arena_alloc = arena.allocator();
+
+        const persisted_points = try arena_alloc.alloc(PersistedPointState, state.points.items.len);
+        for (state.points.items, 0..) |point, idx| {
+            persisted_points[idx] = .{
+                .id = point.id,
+                .values = point.values,
+                .deleted = point.deleted,
+                .updated_at = point.updated_at,
+                .seq = point.seq,
+            };
+        }
+
+        const persisted_changes = try arena_alloc.alloc(PersistedChangeEvent, state.changes.items.len);
+        for (state.changes.items, 0..) |change, idx| {
+            persisted_changes[idx] = .{
+                .seq = change.seq,
+                .op = changeOpString(change.op),
+                .id = change.id,
+                .timestamp = change.timestamp,
+            };
+        }
+
+        const persisted = PersistedMutationState{
+            .version = state_version,
+            .next_seq = if (state.next_seq == 0) 1 else state.next_seq,
+            .points = persisted_points,
+            .changes = persisted_changes,
+        };
+
+        const json_bytes = try std.json.Stringify.valueAlloc(arena_alloc, persisted, .{ .whitespace = .indent_2 });
+        const state_path = try self.stateFilePath(arena_alloc);
+        const tmp_path = try std.fmt.allocPrint(arena_alloc, "{s}.tmp", .{state_path});
+
+        var tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        defer tmp_file.close();
+        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+
+        try tmp_file.writeAll(json_bytes);
+        try tmp_file.sync();
+        try std.fs.cwd().rename(tmp_path, state_path);
+    }
+
+    fn stateFilePath(self: *VectorAdapter, allocator: Allocator) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.db_root, "vector", state_file_name });
+    }
+
+    fn vectorDirPath(self: *VectorAdapter, allocator: Allocator) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.db_root, "vector" });
+    }
+
+    fn countVectorSegments(self: *VectorAdapter) !usize {
+        const vector_dir = try self.vectorDirPath(self.allocator);
+        defer self.allocator.free(vector_dir);
+
+        var dir = std.fs.cwd().openDir(vector_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer dir.close();
+
+        var iter = dir.iterate();
+        var count: usize = 0;
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".talu")) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn rebuildVectorNamespace(self: *VectorAdapter, ids: []const u64, vectors: []const f32, dims: u32) !void {
+        self.fs_writer.flushBlock() catch {};
+        self.fs_writer.deinit();
+        self.allocator.destroy(self.fs_writer);
+        self.fs_reader.deinit();
+        self.allocator.destroy(self.fs_reader);
+
+        const vector_dir = try self.vectorDirPath(self.allocator);
+        defer self.allocator.free(vector_dir);
+        try std.fs.cwd().deleteTree(vector_dir);
+
+        self.fs_writer = try self.allocator.create(db_writer.Writer);
+        errdefer self.allocator.destroy(self.fs_writer);
+        self.fs_writer.* = try db_writer.Writer.open(self.allocator, self.db_root, "vector");
+
+        self.fs_reader = try self.allocator.create(db_reader.Reader);
+        errdefer self.allocator.destroy(self.fs_reader);
+        self.fs_reader.* = try db_reader.Reader.open(self.allocator, self.db_root, "vector");
+
+        try self.appendBatchRaw(ids, vectors, dims);
     }
 
     /// Load all stored embeddings.
@@ -757,6 +1282,7 @@ pub const VectorAdapter = struct {
         self.allocator.destroy(self.fs_writer);
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.allocator.free(self.db_root);
     }
 
     /// Simulates a process crash for testing.
@@ -768,6 +1294,7 @@ pub const VectorAdapter = struct {
         self.allocator.destroy(self.fs_writer);
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.allocator.free(self.db_root);
     }
 };
 
@@ -783,6 +1310,36 @@ pub fn create(allocator: Allocator, db_root: []const u8) !*VectorAdapter {
 pub fn destroy(allocator: Allocator, backend: *VectorAdapter) void {
     backend.deinit();
     allocator.destroy(backend);
+}
+
+fn findPointIndex(points: []const PointState, id: u64) ?usize {
+    for (points, 0..) |point, idx| {
+        if (point.id == id) return idx;
+    }
+    return null;
+}
+
+fn nextSeq(state: *MutationState) u64 {
+    const seq = state.next_seq;
+    state.next_seq = if (seq == std.math.maxInt(u64)) std.math.maxInt(u64) else seq + 1;
+    return seq;
+}
+
+fn parseChangeOp(op: []const u8) !ChangeOp {
+    if (std.mem.eql(u8, op, "append")) return .append;
+    if (std.mem.eql(u8, op, "upsert")) return .upsert;
+    if (std.mem.eql(u8, op, "delete")) return .delete;
+    if (std.mem.eql(u8, op, "compact")) return .compact;
+    return error.InvalidColumnData;
+}
+
+fn changeOpString(op: ChangeOp) []const u8 {
+    return switch (op) {
+        .append => "append",
+        .upsert => "upsert",
+        .delete => "delete",
+        .compact => "compact",
+    };
 }
 
 fn findColumn(descs: []const types.ColumnDesc, column_id: u32) ?types.ColumnDesc {

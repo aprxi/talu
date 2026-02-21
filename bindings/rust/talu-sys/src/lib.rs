@@ -3700,9 +3700,25 @@ extern "C" {
     // core/src/capi/db.zig
     pub fn talu_vector_store_append(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32) -> c_int;
     // core/src/capi/db.zig
+    pub fn talu_vector_store_upsert(handle: *mut c_void, ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32) -> c_int;
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_delete(handle: *mut c_void, ids_ptr: *mut c_void, count: usize, out_deleted_count: *mut c_void, out_not_found_count: *mut c_void) -> c_int;
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_fetch(handle: *mut c_void, ids_ptr: *mut c_void, count: usize, include_values: bool, out_ids: *mut c_void, out_vectors: *mut c_void, out_found_count: *mut c_void, out_dims: *mut c_void, out_missing_ids: *mut c_void, out_missing_count: *mut c_void) -> c_int;
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_stats(handle: *mut c_void, out_visible_count: *mut c_void, out_tombstone_count: *mut c_void, out_segment_count: *mut c_void, out_total_count: *mut c_void) -> c_int;
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_compact(handle: *mut c_void, dims: u32, out_kept_count: *mut c_void, out_removed_tombstones: *mut c_void) -> c_int;
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_changes(handle: *mut c_void, since: u64, limit: usize, out_seqs: *mut c_void, out_ops: *mut c_void, out_ids: *mut c_void, out_timestamps: *mut c_void, out_count: *mut c_void, out_has_more: *mut c_void, out_next_since: *mut c_void) -> c_int;
+    // core/src/capi/db.zig
     pub fn talu_vector_store_free(handle: *mut c_void);
     // core/src/capi/db.zig
     pub fn talu_vector_store_free_load(ids_ptr: *mut c_void, vectors_ptr: *const f32, count: usize, dims: u32);
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_free_fetch(ids_ptr: *mut c_void, vectors_ptr: *const f32, found_count: usize, dims: u32, missing_ids_ptr: *mut c_void, missing_count: usize);
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_free_changes(seqs_ptr: *mut c_void, ops_ptr: *mut c_void, ids_ptr: *mut c_void, timestamps_ptr: *mut c_void, count: usize);
     // core/src/capi/db.zig
     pub fn talu_vector_store_free_search(ids_ptr: *mut c_void, scores_ptr: *const f32, count: usize);
     // core/src/capi/db.zig
