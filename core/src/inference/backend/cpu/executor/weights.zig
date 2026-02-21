@@ -21,7 +21,7 @@ const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 const log = @import("../../../../log.zig");
 const progress_mod = @import("../../../../capi/progress.zig");
-const runtime_blocks = @import("../../../../models/load/runtime_blocks.zig");
+const runtime_blocks = @import("../../../../models/runtime_blocks.zig");
 const topology = @import("../../../../models/op_types.zig");
 
 pub const BufferId = layer_ops.BufferId;
@@ -84,6 +84,12 @@ pub const ShortConvBlockWeights = runtime_blocks.ShortConvBlockWeights;
 pub const BlockWeights = runtime_blocks.BlockWeights;
 pub const WeightMap = runtime_blocks.WeightMap;
 pub const BlockMapContext = runtime_blocks.BlockMapContext;
+
+comptime {
+    if (cpu_linalg.matmul.MAX_GROUPS != topology.MAX_SUPPORTED_GAFFINE_GROUPS) {
+        @compileError("Grouped-affine max groups mismatch between model loader and CPU matmul kernels");
+    }
+}
 
 /// Initialization context for building TransformerBlock instances from a weight map.
 pub const BlockInitContext = struct {
@@ -191,11 +197,6 @@ inline fn toKernelMlaConfig(cfg: runtime_blocks.MLAConfig) mla.MLAConfig {
         .v_head_dim = cfg.v_head_dim,
         .rope_interleave = cfg.rope_interleave,
     };
-}
-
-inline fn toKernelRope(ptr: ?*anyopaque) ?*rope.RoPE {
-    if (ptr) |p| return @ptrCast(@alignCast(p));
-    return null;
 }
 
 inline fn toKernelMambaConfig(cfg: runtime_blocks.MambaConfig) mamba.MambaConfig {
@@ -738,7 +739,7 @@ pub const TransformerBlock = struct {
                 .kv_a_norm = weights.kv_a_norm.?,
                 .kv_b_proj = weights.kv_b_proj.?,
                 .o_proj = weights.o_proj,
-                .rope = toKernelRope(weights.rope),
+                .rope = null,
                 .norm_eps = norm_eps,
                 .scale = mla_scale,
                 .matmul_fn = dk_qkv.func,
@@ -764,7 +765,7 @@ pub const TransformerBlock = struct {
                 .v_proj = weights.v_proj,
                 .o_proj = weights.o_proj,
                 .fused_qkv = weights.fused.qkv_proj,
-                .rope = toKernelRope(weights.rope),
+                .rope = null,
                 .q_norm = weights.q_norm,
                 .k_norm = weights.k_norm,
                 .norm_eps = norm_eps,
@@ -2602,7 +2603,7 @@ test "blockWeightsFromMap maps attention weights" {
     try map.put(allocator, "mlp.up_proj.weight", &w3);
     try map.put(allocator, "mlp.down_proj.weight", &w2);
 
-    const ctx = BlockMapContext{ .rope = null, .sliding_window = 0 };
+    const ctx = BlockMapContext{ .sliding_window = 0 };
     const weights = try blockWeightsFromMap(&map, .attention_mlp, ctx);
     switch (weights) {
         .attention_mlp => |w| {
@@ -2659,7 +2660,7 @@ test "blockWeightsFromMap maps attention weights from mixer alias" {
     try map.put(allocator, "mlp.up_proj.weight", &w3);
     try map.put(allocator, "mlp.down_proj.weight", &w2);
 
-    const ctx = BlockMapContext{ .rope = null, .sliding_window = 0 };
+    const ctx = BlockMapContext{ .sliding_window = 0 };
     const weights = try blockWeightsFromMap(&map, .attention_mlp, ctx);
     switch (weights) {
         .attention_mlp => |w| {
@@ -2730,7 +2731,7 @@ test "TransformerBlock.fromMap builds attention block" {
         .attention_scale = 1.0,
         .use_gelu = false,
         .block_idx = 0,
-        .map_context = .{ .rope = null, .sliding_window = 0 },
+        .map_context = .{ .sliding_window = 0 },
     };
 
     var block = try TransformerBlock.fromMap(context, .attention_mlp, &map);

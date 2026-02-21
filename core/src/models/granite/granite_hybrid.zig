@@ -163,6 +163,7 @@ pub var arch: types.Architecture = .{
     .global_weights = &granite_hybrid_global_weights,
     .weight_prefixes = &granite_hybrid_weight_prefixes,
     .d_ff_source_weight_ids = &.{"mlp.input_linear.weight"},
+    .resolve_d_ff_from_weights = true,
     .has_qk_norm = false,
     .has_moe = false,
     .has_mamba = true,

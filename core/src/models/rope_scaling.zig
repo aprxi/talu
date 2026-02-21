@@ -4,7 +4,7 @@
 //! plain numeric inverse-frequency tables consumed by compute primitives.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
+const tensor = @import("../tensor.zig");
 
 pub const MaterializedRope = struct {
     inv_freq: []f32,

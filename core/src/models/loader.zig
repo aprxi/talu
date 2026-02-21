@@ -10,7 +10,7 @@ const op_types = @import("op_types.zig");
 const weights_impl = @import("load/weights.zig");
 const models_registry = @import("registry.zig");
 const log = @import("../log.zig");
-const progress_mod = @import("../capi/progress.zig");
+const progress_mod = @import("../progress.zig");
 const validation = @import("load/validation.zig");
 
 // Re-export types
@@ -36,7 +36,7 @@ pub fn loadModel(
     config_path: []const u8,
     weights_path: []const u8,
     load_options: weights_impl.LoadOptions,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) !LoadedModel {
     _ = loadArchitectureDefinitions(backing_allocator);
     return loadSafeTensorsModel(backing_allocator, config_path, weights_path, load_options, progress);
@@ -54,7 +54,7 @@ fn loadSafeTensorsModel(
     config_path: []const u8,
     weights_path: []const u8,
     load_options: weights_impl.LoadOptions,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) !LoadedModel {
     // Detect model kind using static model metadata.
     const model_kind = try resolveModelKindForConfig(backing_allocator, config_path);

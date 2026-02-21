@@ -11,18 +11,18 @@
 
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
-const io = @import("../../../../io/root.zig");
 const models = @import("../../../../models/root.zig");
 const compute = @import("../../../../compute/root.zig");
 const image_mod = @import("../../../../image/root.zig");
-const common_vision = @import("../../cpu/vision/types.zig");
-const vision_tensor_convert = @import("../../cpu/vision/tensor_convert.zig");
+const common_vision = @import("../../../vision_types.zig");
+const vision_tensor_convert = @import("../../../vision_tensor_convert.zig");
 const mlx_fused = @import("../mlx/ffi.zig");
 const graph = compute.metal.graph;
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const LoadedModel = models.LoadedModel;
+const vision_load = models.vision;
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
 const cpu_image_ops = compute.cpu.image_ops;
@@ -189,13 +189,13 @@ pub const VisionRuntime = struct {
 
         const st = &loaded.st.?;
 
-        const patch_proj_w_5d = try getTensorByCandidates(st, &.{
+        const patch_proj_w_5d = try vision_load.getTensorByCandidates(st, &.{
             "model.visual.patch_embed.proj.weight",
             "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
             "model.vision_model.embeddings.patch_embedding.weight",
         });
         const patch_proj_weight = flattenPatchProjWeight(patch_proj_w_5d, vision_hidden_size, temporal_patch_size, patch_size);
-        const patch_proj_bias_tensor = try getTensorByCandidates(st, &.{
+        const patch_proj_bias_tensor = try vision_load.getTensorByCandidates(st, &.{
             "model.visual.patch_embed.proj.bias",
             "model.vision_tower.vision_model.embeddings.patch_embedding.bias",
             "model.vision_model.embeddings.patch_embedding.bias",
@@ -203,7 +203,7 @@ pub const VisionRuntime = struct {
         const patch_proj_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, patch_proj_bias_tensor);
         errdefer allocator.free(patch_proj_bias);
 
-        const pos_embed_tensor = try getTensorByCandidates(st, &.{
+        const pos_embed_tensor = try vision_load.getTensorByCandidates(st, &.{
             "model.visual.pos_embed.weight",
             "model.vision_tower.vision_model.embeddings.position_embedding.weight",
             "model.vision_model.embeddings.position_embedding.weight",
@@ -213,7 +213,7 @@ pub const VisionRuntime = struct {
 
         var vision_post_norm_weight: []f32 = &.{};
         var vision_post_norm_bias: []f32 = &.{};
-        const post_norm_weight_tensor = getTensorByCandidates(st, &.{
+        const post_norm_weight_tensor = vision_load.getTensorByCandidates(st, &.{
             "model.visual.norm.weight",
             "model.vision_tower.vision_model.post_layernorm.weight",
             "model.vision_model.post_layernorm.weight",
@@ -223,7 +223,7 @@ pub const VisionRuntime = struct {
         };
         if (post_norm_weight_tensor) |tensor_weight| {
             vision_post_norm_weight = try vision_tensor_convert.tensorToOwnedF32(allocator, tensor_weight);
-            vision_post_norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getTensorByCandidates(st, &.{
+            vision_post_norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(st, &.{
                 "model.visual.norm.bias",
                 "model.vision_tower.vision_model.post_layernorm.bias",
                 "model.vision_model.post_layernorm.bias",
@@ -234,7 +234,7 @@ pub const VisionRuntime = struct {
 
         var merger_norm_weight: []f32 = &.{};
         var merger_norm_bias: []f32 = &.{};
-        const merger_norm_tensor = getTensorByCandidates(st, &.{
+        const merger_norm_tensor = vision_load.getTensorByCandidates(st, &.{
             "model.visual.merger.norm.weight",
             "model.multi_modal_projector.layer_norm.weight",
         }) catch |err| switch (err) {
@@ -243,7 +243,7 @@ pub const VisionRuntime = struct {
         };
         if (merger_norm_tensor) |tensor_weight| {
             merger_norm_weight = try vision_tensor_convert.tensorToOwnedF32(allocator, tensor_weight);
-            merger_norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getTensorByCandidates(st, &.{
+            merger_norm_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(st, &.{
                 "model.visual.merger.norm.bias",
                 "model.multi_modal_projector.layer_norm.bias",
             }));
@@ -251,21 +251,21 @@ pub const VisionRuntime = struct {
         errdefer if (merger_norm_weight.len > 0) allocator.free(merger_norm_weight);
         errdefer if (merger_norm_bias.len > 0) allocator.free(merger_norm_bias);
 
-        const merger_fc1_weight = try getTensorByCandidates(st, &.{
+        const merger_fc1_weight = try vision_load.getTensorByCandidates(st, &.{
             "model.visual.merger.linear_fc1.weight",
             "model.multi_modal_projector.linear_1.weight",
         });
-        const merger_fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getTensorByCandidates(st, &.{
+        const merger_fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(st, &.{
             "model.visual.merger.linear_fc1.bias",
             "model.multi_modal_projector.linear_1.bias",
         }));
         errdefer allocator.free(merger_fc1_bias);
 
-        const merger_fc2_weight = try getTensorByCandidates(st, &.{
+        const merger_fc2_weight = try vision_load.getTensorByCandidates(st, &.{
             "model.visual.merger.linear_fc2.weight",
             "model.multi_modal_projector.linear_2.weight",
         });
-        const merger_fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getTensorByCandidates(st, &.{
+        const merger_fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getTensorByCandidates(st, &.{
             "model.visual.merger.linear_fc2.bias",
             "model.multi_modal_projector.linear_2.bias",
         }));
@@ -297,29 +297,29 @@ pub const VisionRuntime = struct {
         }
 
         for (0..vision_depth) |layer_idx| {
-            const ln1_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
+            const ln1_weight = try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm1.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.weight",
                 "model.vision_model.encoder.layers.{d}.layer_norm1.weight",
             });
-            const ln1_bias = try getLayerTensorByTemplates(st, layer_idx, &.{
+            const ln1_bias = try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm1.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.bias",
                 "model.vision_model.encoder.layers.{d}.layer_norm1.bias",
             });
 
-            const ln2_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
+            const ln2_weight = try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm2.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.weight",
                 "model.vision_model.encoder.layers.{d}.layer_norm2.weight",
             });
-            const ln2_bias = try getLayerTensorByTemplates(st, layer_idx, &.{
+            const ln2_bias = try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.norm2.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.bias",
                 "model.vision_model.encoder.layers.{d}.layer_norm2.bias",
             });
 
-            const fused_qkv_weight = getLayerTensorByTemplates(st, layer_idx, &.{
+            const fused_qkv_weight = vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.attn.qkv.weight",
             }) catch |err| switch (err) {
                 error.NotFound => null,
@@ -331,23 +331,23 @@ pub const VisionRuntime = struct {
                 saw_split_qkv = true;
             }
             const fused_qkv_bias_all = if (fused_qkv_weight != null)
-                try vision_tensor_convert.tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
+                try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.visual.blocks.{d}.attn.qkv.bias",
                 }))
             else
                 null;
             const qkv_bias_all = if (fused_qkv_bias_all) |bias| bias else blk: {
-                const q_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
+                const q_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
                     "model.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
                 }));
                 errdefer allocator.free(q_bias);
-                const k_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
+                const k_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
                     "model.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
                 }));
                 errdefer allocator.free(k_bias);
-                const v_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
+                const v_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
                     "model.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
                 }));
@@ -366,56 +366,56 @@ pub const VisionRuntime = struct {
             errdefer allocator.free(qkv_bias_all);
 
             const q_proj_weight = if (fused_qkv_weight == null)
-                try getLayerTensorByTemplates(st, layer_idx, &.{
+                try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
                     "model.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
                 })
             else
                 undefined;
             const k_proj_weight = if (fused_qkv_weight == null)
-                try getLayerTensorByTemplates(st, layer_idx, &.{
+                try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
                     "model.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
                 })
             else
                 undefined;
             const v_proj_weight = if (fused_qkv_weight == null)
-                try getLayerTensorByTemplates(st, layer_idx, &.{
+                try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                     "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
                     "model.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
                 })
             else
                 undefined;
 
-            const o_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
+            const o_weight = try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.attn.proj.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
                 "model.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
             });
-            const o_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
+            const o_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.attn.proj.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
                 "model.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
             }));
             errdefer allocator.free(o_bias);
 
-            const fc1_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
+            const fc1_weight = try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc1.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.weight",
                 "model.vision_model.encoder.layers.{d}.mlp.fc1.weight",
             });
-            const fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
+            const fc1_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc1.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.bias",
                 "model.vision_model.encoder.layers.{d}.mlp.fc1.bias",
             }));
             errdefer allocator.free(fc1_bias);
-            const fc2_weight = try getLayerTensorByTemplates(st, layer_idx, &.{
+            const fc2_weight = try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc2.weight",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.weight",
                 "model.vision_model.encoder.layers.{d}.mlp.fc2.weight",
             });
-            const fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try getLayerTensorByTemplates(st, layer_idx, &.{
+            const fc2_bias = try vision_tensor_convert.tensorToOwnedF32(allocator, try vision_load.getLayerTensorByTemplates(st, layer_idx, &.{
                 "model.visual.blocks.{d}.mlp.linear_fc2.bias",
                 "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.bias",
                 "model.vision_model.encoder.layers.{d}.mlp.fc2.bias",
@@ -1056,52 +1056,9 @@ fn flattenPatchProjWeight(
     );
 }
 
-fn getTensorByCandidates(st: *io.safetensors.root.UnifiedSafeTensors, candidates: []const []const u8) !Tensor {
-    for (candidates) |name| {
-        const t = st.getTensor(name, null) catch |err| switch (err) {
-            error.NotFound => continue,
-            else => return err,
-        };
-        return t;
-    }
-    return error.NotFound;
-}
-
-fn getLayerTensorByTemplates(
-    st: *io.safetensors.root.UnifiedSafeTensors,
-    layer_idx: usize,
-    templates: []const []const u8,
-) !Tensor {
-    var name_buf: [192]u8 = undefined;
-    for (templates) |template| {
-        const name = try expandLayerTemplate(name_buf[0..], template, layer_idx);
-        const t = st.getTensor(name, null) catch |err| switch (err) {
-            error.NotFound => continue,
-            else => return err,
-        };
-        return t;
-    }
-    return error.NotFound;
-}
-
-fn expandLayerTemplate(buf: []u8, template: []const u8, layer_idx: usize) ![]const u8 {
-    const marker = "{d}";
-    if (std.mem.indexOf(u8, template, marker)) |idx| {
-        return std.fmt.bufPrint(buf, "{s}{d}{s}", .{
-            template[0..idx],
-            layer_idx,
-            template[idx + marker.len ..],
-        });
-    }
-    return if (template.len <= buf.len) blk: {
-        @memcpy(buf[0..template.len], template);
-        break :blk buf[0..template.len];
-    } else error.NoSpaceLeft;
-}
-
 fn loadDeepstackMergers(
     allocator: std.mem.Allocator,
-    st: *io.safetensors.root.UnifiedSafeTensors,
+    st: *vision_load.SafeTensors,
     vision_hidden_size: usize,
     language_hidden_size: usize,
     spatial_merge_size: usize,

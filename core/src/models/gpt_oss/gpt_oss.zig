@@ -140,6 +140,7 @@ pub var arch: types.Architecture = .{
     .global_weights = &gpt_oss_global_weights,
     .weight_prefixes = &gpt_oss_weight_prefixes,
     .d_ff_source_weight_ids = &.{"mlp.experts.gate_up_proj_blocks"},
+    .resolve_d_ff_from_weights = true,
     .has_qk_norm = false,
     .has_moe = true,
     .has_mamba = false,

@@ -92,6 +92,7 @@ pub var arch: types.Architecture = .{
     .global_weights = &phi_global_weights,
     .weight_prefixes = &phi_weight_prefixes,
     .d_ff_source_weight_ids = &.{"mlp.gate_up_proj.weight"},
+    .resolve_d_ff_from_weights = true,
     .has_qk_norm = false,
     .has_moe = false,
     .has_mamba = false,

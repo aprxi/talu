@@ -7,11 +7,14 @@
 
 const std = @import("std");
 const loader = @import("loader.zig");
-const progress_mod = @import("../capi/progress.zig");
+const progress_mod = @import("../progress.zig");
 
 pub const registry = @import("registry.zig");
 pub const layer_ops = @import("layer_ops.zig");
 pub const op_types = @import("op_types.zig");
+pub const runtime_blocks = @import("runtime_blocks.zig");
+pub const rope_scaling = @import("rope_scaling.zig");
+pub const vision = @import("vision.zig");
 pub const config = @import("config/root.zig");
 pub const common = struct {
     pub const types = @import("common/types.zig");
@@ -29,7 +32,7 @@ pub fn loadModel(
     config_path: []const u8,
     safetensors_path: []const u8,
     load_options: LoadOptions,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) !LoadedModel {
     return loader.loadModel(allocator, config_path, safetensors_path, load_options, progress);
 }

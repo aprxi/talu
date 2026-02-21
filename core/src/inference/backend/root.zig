@@ -137,8 +137,8 @@ pub const Backend = union(enum) {
 
     /// Whether scheduler should use backend decodeStreaming fast path.
     ///
-    /// This is currently enabled only for Metal to preserve the legacy
-    /// text-only performance path while removing session routing.
+    /// This is currently enabled only for Metal where fused decode streaming
+    /// remains the fastest scheduler-compatible path.
     pub fn supportsSchedulerStreamingFastPath(self: *const Backend) bool {
         return switch (self.*) {
             .cpu => false,

@@ -106,6 +106,7 @@ pub var arch: types.Architecture = .{
     .global_weights = &minilm_global_weights,
     .weight_prefixes = &minilm_weight_prefixes,
     .d_ff_source_weight_ids = &.{"mlp.dense_in.weight"},
+    .resolve_d_ff_from_weights = true,
     .has_qk_norm = false,
     .has_moe = false,
     .has_mamba = false,

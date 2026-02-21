@@ -12,7 +12,7 @@ Use this checklist when adding or updating model architecture metadata.
    - `force_f32` and transform flags on `WeightSpec` where required.
 4. Keep runtime orchestration model-agnostic:
    - Avoid model-family logic in `core/src/inference/*`.
-   - Use models-owned contracts (`core/src/models/op_types.zig`, `core/src/models/load/runtime_blocks.zig`).
+   - Use models-owned contracts (`core/src/models/op_types.zig`, `core/src/models/runtime_blocks.zig`).
 
 ## Required Tests
 

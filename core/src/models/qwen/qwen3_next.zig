@@ -227,6 +227,7 @@ pub var arch: types.Architecture = .{
     .global_weights = &qwen3_next_global_weights,
     .weight_prefixes = &qwen3_next_weight_prefixes,
     .d_ff_source_weight_ids = &.{"mlp.experts.0.gate_proj.weight"},
+    .resolve_d_ff_from_weights = true,
     .has_qk_norm = false,
     .has_moe = true,
     .has_mamba = true,

@@ -11,7 +11,6 @@
 
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
-const io = @import("../../../../io/root.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const models = @import("../../../../models/root.zig");
 const compute = @import("../../../../compute/root.zig");
@@ -24,6 +23,7 @@ const vision_tensor_convert = @import("tensor_convert.zig");
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const LoadedModel = models.LoadedModel;
+const vision_load = models.vision;
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
 const cpu_image_ops = compute.cpu.image_ops;
@@ -265,7 +265,6 @@ pub const VisionRuntime = struct {
                 .w3 = null,
                 .w1_bias = &layer_weights[layer_idx].fc1_bias_tensor,
                 .w2_bias = &layer_weights[layer_idx].fc2_bias_tensor,
-                .rope = null,
                 .sliding_window = 0,
                 .fused = .{ .qkv_proj = layer_weights[layer_idx].qkv_weight },
                 .q_norm = null,
@@ -819,7 +818,7 @@ fn flattenPatchProjWeight(
 
 fn loadDeepstackMergers(
     allocator: std.mem.Allocator,
-    st: *io.safetensors.root.UnifiedSafeTensors,
+    st: *vision_load.SafeTensors,
     vision_hidden_size: usize,
     language_hidden_size: usize,
     spatial_merge_size: usize,

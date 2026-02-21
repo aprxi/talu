@@ -226,6 +226,9 @@ pub const BlockKind = enum {
     }
 };
 
+/// Loader/backend contract: maximum grouped-affine groups supported by runtime kernels.
+pub const MAX_SUPPORTED_GAFFINE_GROUPS: usize = 1024;
+
 /// Fused-model layer kind identifiers for Metal compute bindings.
 pub const FusedLayerKindId = enum(u8) {
     attention_mlp = 0,
@@ -272,9 +275,16 @@ pub const Architecture = struct {
     // Weight IDs used to infer d_ff from actual loaded tensors when config
     // fields are inconsistent with checkpoint shapes.
     d_ff_source_weight_ids: []const []const u8 = &.{},
+    // Explicit opt-in for weight-driven d_ff resolution during loading.
+    resolve_d_ff_from_weights: bool = false,
     // Optional shortconv depthwise weight id used for shape-driven dimension
     // inference when config omits conv_dim/conv_dim_out/d_conv.
     shortconv_dims_source_weight_id: ?[]const u8 = null,
+    // Explicit opt-in for weight-driven shortconv dim resolution during loading.
+    resolve_shortconv_dims_from_weights: bool = false,
+    // Optional weight IDs used to probe original checkpoint dtype. When empty,
+    // loader falls back to d_ff_source_weight_ids, then metadata order.
+    weight_dtype_source_weight_ids: []const []const u8 = &.{},
 
     // Flags derived from analyzing block_ops
     has_qk_norm: bool = false,

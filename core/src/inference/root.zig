@@ -8,9 +8,10 @@
 
 const std = @import("std");
 
-pub const sampling = @import("backend/cpu/sampling.zig");
-pub const scheduler = @import("backend/cpu/scheduler.zig");
+pub const sampling = @import("sampling.zig");
+pub const scheduler = @import("scheduler.zig");
 pub const config = @import("config/root.zig");
+pub const vision_types = @import("vision_types.zig");
 
 /// Generation request/response types.
 pub const types = struct {

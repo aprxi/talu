@@ -764,8 +764,8 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
             }
 
-            // Preserve legacy metal text-only throughput path by using
-            // backend streaming decode when safe and available.
+            // Use backend-provided streaming decode when safe and available
+            // (currently metal fast path inside scheduler generation).
             if (vision_input == null and self.shouldUseBackendStreamingDecode(sampling_config, stop_sequences, grammar_sampler)) {
                 const remaining_token_budget = max_tokens - generated.items.len;
                 const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);

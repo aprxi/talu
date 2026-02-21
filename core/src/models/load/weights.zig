@@ -7,11 +7,9 @@
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const dtype = @import("../../dtype.zig");
-const compute = @import("../../compute/root.zig");
-const rope_math = compute.cpu.math;
 const log = @import("../../log.zig");
-const progress_mod = @import("../../capi/progress.zig");
-const runtime_blocks = @import("runtime_blocks.zig");
+const progress_mod = @import("../../progress.zig");
+const runtime_blocks = @import("../runtime_blocks.zig");
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
@@ -21,7 +19,6 @@ const st_loader = @import("../../io/safetensors/root.zig");
 const model_types = @import("../op_types.zig");
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
-const rope_scaling = @import("rope_scaling.zig");
 
 pub const blocks = runtime_blocks;
 
@@ -64,16 +61,7 @@ pub const LoadedModel = struct {
     /// Total tensor count (for display)
     tensor_count: usize = 0,
 
-    /// RoPE instances allocated with backing_allocator (not arena) to support realloc.
-    /// These must be explicitly freed in deinit().
-    rope_global: ?*rope_math.RoPE = null,
-    rope_local: ?*rope_math.RoPE = null,
-
     pub fn deinit(self: *LoadedModel) void {
-        // Free RoPE instances (allocated with backing_allocator, not arena)
-        if (self.rope_global) |rope| rope.deinit(rope.allocator);
-        if (self.rope_local) |rope| rope.deinit(rope.allocator);
-
         if (self.st) |*st| st.deinit();
         self.arena.deinit();
         self.* = undefined;
@@ -85,7 +73,7 @@ pub fn loadModel(
     config_path: []const u8,
     safetensors_path: []const u8,
     load_options: LoadOptions,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) !LoadedModel {
     return loadModelWithArchitecture(backing_allocator, config_path, safetensors_path, null, load_options, progress);
 }
@@ -115,33 +103,48 @@ fn archHasGlobalWeights(arch: *const model_types.Architecture) bool {
     return arch.global_weights.len > 0;
 }
 
-fn hasOpTypeIn(ops: []const model_types.Op, tag: model_types.OpType) bool {
-    for (ops) |op| {
-        if (op.op_type == tag) return true;
-    }
-    return false;
-}
-
-fn hasOpType(arch: *const model_types.Architecture, tag: model_types.OpType) bool {
-    if (hasOpTypeIn(arch.block_ops, tag)) return true;
-    if (arch.block_variants) |variants| {
-        for (variants) |variant| {
-            if (hasOpTypeIn(variant.ops, tag)) return true;
-        }
-    }
-    return false;
-}
-
 fn requireArchitectureMetadata(arch: *const model_types.Architecture) !void {
-    const has_mlp_or_moe = hasOpType(arch, .mlp) or hasOpType(arch, .moe);
-    const has_shortconv_feature = arch.has_shortconv or hasOpType(arch, .shortconv);
-
-    if (has_mlp_or_moe and arch.d_ff_source_weight_ids.len == 0) {
+    if (arch.resolve_d_ff_from_weights and arch.d_ff_source_weight_ids.len == 0) {
         return error.MissingDffSourceWeightIds;
     }
-    if (has_shortconv_feature and arch.shortconv_dims_source_weight_id == null) {
+    if (arch.resolve_shortconv_dims_from_weights and arch.shortconv_dims_source_weight_id == null) {
         return error.MissingShortConvSourceWeightId;
     }
+    const has_dtype_probe_ids = arch.weight_dtype_source_weight_ids.len > 0 or arch.d_ff_source_weight_ids.len > 0;
+    if (!has_dtype_probe_ids) return error.MissingWeightDTypeSourceWeightIds;
+}
+
+fn findWeightSpecById(specs: []const model_types.WeightSpec, id: []const u8) ?*const model_types.WeightSpec {
+    for (specs) |*spec| {
+        if (std.mem.eql(u8, spec.id, id)) return spec;
+    }
+    return null;
+}
+
+fn detectOriginalWeightDType(
+    arch: *const model_types.Architecture,
+    layer_types: ?[]const u8,
+    safetensors_file: *st_loader.UnifiedSafeTensors,
+) !DType {
+    const specs = if (arch.getVariantWithOverride(0, layer_types)) |v| v.weights else arch.block_weights;
+    const probe_weight_ids = if (arch.weight_dtype_source_weight_ids.len > 0)
+        arch.weight_dtype_source_weight_ids
+    else
+        arch.d_ff_source_weight_ids;
+
+    if (probe_weight_ids.len == 0) return error.MissingWeightDTypeSourceWeightIds;
+    var name_buf: [256]u8 = undefined;
+
+    for (probe_weight_ids) |id| {
+        const spec = findWeightSpecById(specs, id) orelse continue;
+        for (spec.candidates) |candidate| {
+            const name = generic_weights.expandLayerTemplate(name_buf[0..], candidate, 0) catch continue;
+            const t = safetensors_file.getTensor(name, null) catch continue;
+            return t.dtype;
+        }
+    }
+
+    return error.MissingWeightDTypeSourceWeight;
 }
 
 fn maybeAddFusedWeights(
@@ -321,7 +324,7 @@ pub fn loadModelWithArchitecture(
     safetensors_path: []const u8,
     runtime_arch: ?*const model_types.Architecture,
     model_load_options: LoadOptions,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) !LoadedModel {
     // Collect environment flags once at the start
     const env_flags = LoaderEnvFlags.fromEnvironment(backing_allocator);
@@ -373,76 +376,6 @@ pub fn loadModelWithArchitecture(
 
     var block_weights = try arena_allocator.alloc(runtime_blocks.BlockWeights, layer_count);
 
-    // Detect whether the architecture uses absolute position embeddings (BERT-family).
-    // Models with position_embeddings use absolute positions and don't need RoPE.
-    const uses_absolute_positions = blk: {
-        const gw = if (runtime_arch) |ra| ra.global_weights else &[_]model_types.WeightSpec{};
-        for (gw) |spec| {
-            if (std.mem.eql(u8, spec.id, "position_embeddings")) break :blk true;
-        }
-        break :blk false;
-    };
-
-    // Use rope_dim if set (e.g., Phi with partial_rotary_factor), otherwise use head_dim
-    const rope_dim: usize = if (model_config.rope_dim > 0) @intCast(model_config.rope_dim) else @intCast(model_config.head_dim);
-    log.trace("load", "RoPE config", .{
-        .config_rope_dim = model_config.rope_dim,
-        .config_head_dim = model_config.head_dim,
-        .rope_dim = rope_dim,
-    }, @src());
-
-    // Skip RoPE for models with absolute position embeddings (e.g., BERT/MiniLM).
-    const rope_global: ?*rope_math.RoPE = if (uses_absolute_positions) null else blk: {
-        const rg = try arena_allocator.create(rope_math.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
-        var global_rope = try rope_scaling.materializeInverseFrequencies(
-            backing_allocator,
-            rope_dim,
-            model_config.rope_theta,
-            model_config.rope_scaling,
-        );
-        defer global_rope.deinit(backing_allocator);
-        // Use backing_allocator for RoPE (not arena) because RoPE cache grows dynamically via realloc.
-        // ArenaAllocator doesn't support true realloc - it allocates new memory without freeing old,
-        // which can exhaust memory or crash when the arena's backing pages are fragmented.
-        rg.* = try rope_math.RoPE.initFromInvFreq(
-            backing_allocator,
-            rope_dim,
-            @intCast(model_config.max_seq_len),
-            global_rope.inv_freq,
-            global_rope.attention_scaling,
-        );
-        break :blk rg;
-    };
-
-    const rope_local: ?*rope_math.RoPE = if (uses_absolute_positions or model_config.rope_local_theta <= 0 or model_config.sliding_window <= 0) null else blk: {
-        const local_rope = try arena_allocator.create(rope_math.RoPE); // lint:ignore errdefer-alloc - arena freed atomically
-        var local_rope_scaling = try rope_scaling.materializeInverseFrequencies(
-            backing_allocator,
-            rope_dim,
-            model_config.rope_local_theta,
-            model_config.rope_scaling,
-        );
-        defer local_rope_scaling.deinit(backing_allocator);
-        local_rope.* = try rope_math.RoPE.initFromInvFreq(
-            backing_allocator,
-            rope_dim,
-            @intCast(model_config.max_seq_len),
-            local_rope_scaling.inv_freq,
-            local_rope_scaling.attention_scaling,
-        );
-        break :blk local_rope;
-    };
-    {
-        const now = std.time.nanoTimestamp();
-        const duration_ms = @as(f64, @floatFromInt(now - start_time_ns)) / 1_000_000.0;
-        log.debug("load", "RoPE initialized", .{
-            .max_seq_len = model_config.max_seq_len,
-            .head_dim = model_config.head_dim,
-            .duration_ms = duration_ms,
-        }, @src());
-        start_time_ns = now;
-    }
-
     // Graph metadata is now required for weight loading.
     // Legacy hardcoded loader has been removed - all models need architecture definitions.
     const arch = runtime_arch orelse return error.MissingArchitecture;
@@ -464,23 +397,9 @@ pub fn loadModelWithArchitecture(
         }
     }
 
-    // Detect original weight dtype from first layer's attention weights (before conversion to f32).
+    // Detect original weight dtype from declarative architecture metadata.
     // This is used to determine if model is BF16 for MLX GPU path.
-    const original_weight_dtype = blk: {
-        const specs = if (arch.getVariantWithOverride(0, model_config.layer_types)) |v| v.weights else arch.block_weights;
-        for (specs) |spec| {
-            // Look for attention weight to detect dtype
-            if (std.mem.indexOf(u8, spec.id, "proj.weight") != null) {
-                var name_buf: [256]u8 = undefined;
-                for (spec.candidates) |candidate| {
-                    const name = generic_weights.expandLayerTemplate(name_buf[0..], candidate, 0) catch continue;
-                    const t = safetensors_file.getTensor(name, null) catch continue;
-                    break :blk t.dtype;
-                }
-            }
-        }
-        break :blk DType.f32;
-    };
+    const original_weight_dtype = try detectOriginalWeightDType(arch, model_config.layer_types, &safetensors_file);
 
     var block_time_ns: i128 = 0;
 
@@ -510,8 +429,6 @@ pub fn loadModelWithArchitecture(
             @intCast(model_config.sliding_window)
         else
             0;
-        const layer_rope: ?*rope_math.RoPE = if (layer_window_size > 0 and rope_local != null) rope_local.? else rope_global;
-
         const weight_load_options = generic_weights.LoadOptions{
             .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
         };
@@ -524,10 +441,8 @@ pub fn loadModelWithArchitecture(
             weight_load_options,
         );
 
-        // On the first layer with FFN weights, infer d_ff from weight shapes.
-        // This corrects config mismatches where intermediate_size != actual weight dim
-        // (e.g., LFM2.5 where config says 12288 but actual gate weight output is 8192).
-        if (layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {
+        // Optional weight-driven d_ff correction, explicitly enabled by architecture metadata.
+        if (arch.resolve_d_ff_from_weights and layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {
             try inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids);
         }
 
@@ -547,7 +462,6 @@ pub fn loadModelWithArchitecture(
         };
 
         var map_context = runtime_blocks.BlockMapContext{
-            .rope = if (block_type == .attention_mlp and layer_rope != null) @ptrCast(layer_rope.?) else null,
             .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
             .is_causal = layer_is_causal,
             .block_ops = layer_block_ops,
@@ -596,9 +510,15 @@ pub fn loadModelWithArchitecture(
                 .conv_dim_out = @intCast(model_config.shortconv_conv_dim_out),
                 .has_bias = model_config.shortconv_has_bias,
             };
-            // Infer missing shortconv dimensions from weight tensor shapes.
-            // Config files may not specify all dimensions (e.g., LFM2.5 omits conv_dim_out).
-            try inferShortConvDims(&map_context.shortconv_config.?, &weight_map, arch.shortconv_dims_source_weight_id);
+            if (arch.resolve_shortconv_dims_from_weights) {
+                // Optional weight-driven shortconv dim correction, explicitly enabled by metadata.
+                try inferShortConvDims(&map_context.shortconv_config.?, &weight_map, arch.shortconv_dims_source_weight_id);
+            } else {
+                const cfg = &map_context.shortconv_config.?;
+                if (cfg.conv_dim == 0 or cfg.conv_dim_out == 0 or cfg.d_conv == 0) {
+                    return error.InvalidShortConvConfig;
+                }
+            }
         }
 
         block_weights[layer_idx] = try runtime_blocks.blockWeightsFromMap(&weight_map, block_type, map_context);
@@ -705,8 +625,6 @@ pub fn loadModelWithArchitecture(
         .original_weight_dtype = original_weight_dtype,
         .file_size = safetensors_file.fileSize(),
         .tensor_count = safetensors_file.tensorCount(),
-        .rope_global = rope_global,
-        .rope_local = rope_local,
     };
 }
 
@@ -770,6 +688,7 @@ test "requireArchitectureMetadata rejects missing d_ff metadata for mlp architec
         .model_types = &.{},
         .block_ops = &ops,
         .global_weights = &.{},
+        .resolve_d_ff_from_weights = true,
         .d_ff_source_weight_ids = &.{},
     };
 
@@ -785,6 +704,7 @@ test "requireArchitectureMetadata rejects missing shortconv source id" {
         .model_types = &.{},
         .block_ops = &ops,
         .global_weights = &.{},
+        .resolve_shortconv_dims_from_weights = true,
         .d_ff_source_weight_ids = &.{"mlp.gate_proj.weight"},
         .shortconv_dims_source_weight_id = null,
     };

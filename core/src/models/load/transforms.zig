@@ -5,14 +5,17 @@
 const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const dtype = @import("../../dtype.zig");
-const compute = @import("../../compute/root.zig");
-const matmul = compute.cpu.linalg.matmul;
 const st_loader = @import("../../io/safetensors/root.zig");
 const log = @import("../../log.zig");
+const op_types = @import("../op_types.zig");
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const DType = dtype.DType;
+
+/// Loader-side safety bound for grouped-affine metadata.
+/// Shared contract constant also asserted by CPU inference backend.
+pub const MAX_SUPPORTED_GAFFINE_GROUPS: usize = op_types.MAX_SUPPORTED_GAFFINE_GROUPS;
 
 pub fn maybeConcatQkvWeights(allocator: std.mem.Allocator, q: Tensor, k: Tensor, v: Tensor) ?Tensor {
     // Only support F32 fusion - BF16 weights have different layout ([out, in] vs [in, out])
@@ -156,13 +159,13 @@ fn applyGaffineParams(t: *Tensor, params: GaffineInferResult, name: []const u8) 
     // Validate number of groups is within kernel limits
     const k_unpacked = params.shape_override[1];
     const n_groups_actual = k_unpacked / params.group_size;
-    if (n_groups_actual > matmul.MAX_GROUPS) {
+    if (n_groups_actual > MAX_SUPPORTED_GAFFINE_GROUPS) {
         log.err("load", "Too many groups in tensor", .{
             .name = name,
             .n_groups = n_groups_actual,
             .k = k_unpacked,
             .group_size = params.group_size,
-            .max_groups = matmul.MAX_GROUPS,
+            .max_groups = MAX_SUPPORTED_GAFFINE_GROUPS,
         }, @src());
         return error.TooManyGroups;
     }

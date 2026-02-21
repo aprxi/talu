@@ -36,6 +36,7 @@ const cpu_reduction = compute.cpu.reduction;
 const cpu_memory = compute.cpu.memory;
 const cpu_rotary = compute.cpu.rotary;
 const models = @import("../../../models/root.zig");
+const rope_scaling = models.rope_scaling;
 const contract = @import("../contract.zig");
 const log = @import("../../../log.zig");
 const progress_mod = @import("../../../capi/progress.zig");
@@ -81,6 +82,9 @@ pub const FusedCpuBackend = struct {
 
     /// CPU kernel blocks
     blocks: []cpu_blocks.TransformerBlock,
+    /// Runtime RoPE objects owned by CPU backend (model loader stays data-only).
+    rope_global: ?*cpu_blocks.RoPE = null,
+    rope_local: ?*cpu_blocks.RoPE = null,
 
     /// Batched KV cache (replaces per-layer AttnCache)
     kv_cache: LayeredBatchedKVCache,
@@ -140,6 +144,113 @@ pub const FusedCpuBackend = struct {
         return self.vocab_size;
     }
 
+    const RuntimeRopeHandles = struct {
+        global: ?*cpu_blocks.RoPE = null,
+        local: ?*cpu_blocks.RoPE = null,
+    };
+
+    fn deinitRuntimeRopeHandles(
+        allocator: std.mem.Allocator,
+        handles: *RuntimeRopeHandles,
+    ) void {
+        if (handles.local) |local_rope| {
+            local_rope.deinit(allocator);
+            allocator.destroy(local_rope);
+        }
+        if (handles.global) |global_rope| {
+            global_rope.deinit(allocator);
+            allocator.destroy(global_rope);
+        }
+        handles.* = .{};
+    }
+
+    fn initRuntimeRopeHandles(
+        allocator: std.mem.Allocator,
+        loaded: *LoadedModel,
+    ) !RuntimeRopeHandles {
+        if (loaded.position_embeddings != null) return .{};
+
+        const rope_dim: usize = if (loaded.config.rope_dim > 0)
+            @intCast(loaded.config.rope_dim)
+        else
+            @intCast(loaded.config.head_dim);
+        if (rope_dim == 0) return .{};
+
+        var handles: RuntimeRopeHandles = .{};
+        errdefer deinitRuntimeRopeHandles(allocator, &handles);
+
+        var global_freqs = try rope_scaling.materializeInverseFrequencies(
+            allocator,
+            rope_dim,
+            loaded.config.rope_theta,
+            loaded.config.rope_scaling,
+        );
+        defer global_freqs.deinit(allocator);
+
+        const global_rope = try allocator.create(cpu_blocks.RoPE);
+        errdefer allocator.destroy(global_rope);
+        global_rope.* = try cpu_blocks.RoPE.initFromInvFreq(
+            allocator,
+            rope_dim,
+            @intCast(loaded.config.max_seq_len),
+            global_freqs.inv_freq,
+            global_freqs.attention_scaling,
+        );
+        handles.global = global_rope;
+
+        if (loaded.config.rope_local_theta > 0 and loaded.config.sliding_window > 0) {
+            var local_freqs = try rope_scaling.materializeInverseFrequencies(
+                allocator,
+                rope_dim,
+                loaded.config.rope_local_theta,
+                loaded.config.rope_scaling,
+            );
+            defer local_freqs.deinit(allocator);
+
+            const local_rope = try allocator.create(cpu_blocks.RoPE);
+            errdefer allocator.destroy(local_rope);
+            local_rope.* = try cpu_blocks.RoPE.initFromInvFreq(
+                allocator,
+                rope_dim,
+                @intCast(loaded.config.max_seq_len),
+                local_freqs.inv_freq,
+                local_freqs.attention_scaling,
+            );
+            handles.local = local_rope;
+        }
+
+        return handles;
+    }
+
+    fn assignRuntimeRoPEToExecutorBlocks(
+        blocks: []cpu_blocks.TransformerBlock,
+        handles: RuntimeRopeHandles,
+    ) void {
+        for (blocks) |*block| {
+            if (block.getAttentionMut()) |attn| {
+                const selected = if (attn.sliding_window > 0 and handles.local != null)
+                    handles.local
+                else
+                    handles.global;
+                attn.rope = selected;
+            }
+            if (block.getMLAAttentionMut()) |mla_attn| {
+                mla_attn.rope = handles.global;
+            }
+        }
+    }
+
+    fn clearRuntimeRoPEOnExecutorBlocks(blocks: []cpu_blocks.TransformerBlock) void {
+        for (blocks) |*block| {
+            if (block.getAttentionMut()) |attn| {
+                attn.rope = null;
+            }
+            if (block.getMLAAttentionMut()) |mla_attn| {
+                mla_attn.rope = null;
+            }
+        }
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
@@ -158,6 +269,9 @@ pub const FusedCpuBackend = struct {
         const progress_total: u64 = @intCast(layer_total + 3);
         progress.addLine(1, "Preparing", progress_total, null, null);
 
+        var runtime_rope = try initRuntimeRopeHandles(allocator, loaded);
+        errdefer deinitRuntimeRopeHandles(allocator, &runtime_rope);
+
         const cpu_block_set = try cpu_blocks.buildBlocks(
             allocator,
             loaded.config,
@@ -173,6 +287,7 @@ pub const FusedCpuBackend = struct {
                 }
             }
         }
+        assignRuntimeRoPEToExecutorBlocks(cpu_block_set, runtime_rope);
 
         // Build batched KV cache
         var kv_cache = try LayeredBatchedKVCache.init(
@@ -315,6 +430,8 @@ pub const FusedCpuBackend = struct {
             .loaded = loaded,
             .model = model,
             .blocks = cpu_block_set,
+            .rope_global = runtime_rope.global,
+            .rope_local = runtime_rope.local,
             .kv_cache = kv_cache,
             .batched_attn_scratch = batched_attn_scratch,
             .scratch = scratch,
@@ -339,6 +456,13 @@ pub const FusedCpuBackend = struct {
     }
 
     pub fn deinit(self: *FusedCpuBackend) void {
+        clearRuntimeRoPEOnExecutorBlocks(self.blocks);
+        var runtime_rope = RuntimeRopeHandles{
+            .global = self.rope_global,
+            .local = self.rope_local,
+        };
+        deinitRuntimeRopeHandles(self.allocator, &runtime_rope);
+
         if (self.vision_runtime) |*vision| {
             vision.deinit();
         }

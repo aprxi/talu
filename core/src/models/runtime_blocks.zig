@@ -4,8 +4,8 @@
 //! It intentionally stays data-only and does not depend on inference executors.
 
 const std = @import("std");
-const tensor = @import("../../tensor.zig");
-const graph_types = @import("../op_types.zig");
+const tensor = @import("../tensor.zig");
+const graph_types = @import("op_types.zig");
 
 const Tensor = tensor.Tensor;
 
@@ -103,8 +103,6 @@ pub const AttentionMlpWeights = struct {
     w3: ?*const Tensor = null,
     w1_bias: ?*const Tensor = null,
     w2_bias: ?*const Tensor = null,
-    // Opaque runtime pointer owned by loader/runtime init.
-    rope: ?*anyopaque = null,
     sliding_window: usize = 0,
     fused: FusedBlockWeights = .{},
     q_norm: ?*const Tensor = null,
@@ -162,7 +160,6 @@ pub const BlockWeights = union(BlockKind) {
 pub const WeightMap = std.StringHashMapUnmanaged(*const Tensor);
 
 pub const BlockMapContext = struct {
-    rope: ?*anyopaque = null,
     sliding_window: usize = 0,
     is_causal: bool = true,
     block_ops: []const graph_types.Op = &.{},
@@ -449,7 +446,6 @@ pub fn blockWeightsFromMap(
                     .w3 = w3,
                     .w1_bias = w1_bias,
                     .w2_bias = w2_bias,
-                    .rope = context.rope,
                     .sliding_window = context.sliding_window,
                     .fused = fused,
                     .q_norm = q_norm,
