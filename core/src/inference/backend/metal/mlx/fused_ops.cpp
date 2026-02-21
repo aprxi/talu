@@ -368,6 +368,541 @@ static array apply_optional_runtime_rope(
     return apply_runtime_rope_to_tensor(x, cos_rows, sin_rows, seq_len, head_dim, rope_dim);
 }
 
+static array dense_linear_no_bias(
+    const array& input,
+    const array& weight,
+    std::optional<int> out_features = std::nullopt
+) {
+    const int in_features = input.shape(input.ndim() - 1);
+    const auto rhs = orient_matmul_rhs(weight, in_features, out_features, true);
+    return matmul(input, rhs);
+}
+
+static array quantized_linear_no_bias(
+    const array& input,
+    const array& weights,
+    const array& scales,
+    const array& biases,
+    int group_size,
+    int bits
+) {
+    return quantized_matmul(
+        input,
+        weights,
+        scales,
+        biases,
+        true,
+        group_size,
+        bits,
+        "affine"
+    );
+}
+
+static array resolve_mamba_conv_kernel(
+    const array& conv_weight,
+    int d_conv,
+    int xbc_len
+) {
+    array kernel = conv_weight;
+    if (kernel.ndim() == 3) {
+        // [xbc_len, 1, d_conv] -> [xbc_len, d_conv]
+        kernel = reshape(kernel, {kernel.shape(0), kernel.shape(2)});
+    }
+    if (kernel.ndim() != 2) {
+        throw std::invalid_argument("[mamba] conv1d_weight must be rank-2 or rank-3");
+    }
+
+    if (kernel.shape(0) == xbc_len and kernel.shape(1) == d_conv) {
+        kernel = transpose(kernel);
+    } else if (!(kernel.shape(0) == d_conv and kernel.shape(1) == xbc_len)) {
+        throw std::invalid_argument("[mamba] conv1d_weight shape incompatible with xbc_len/d_conv");
+    }
+
+    kernel = astype(kernel, float32);
+    return reshape(kernel, {1, d_conv, xbc_len});
+}
+
+static array mamba_forward_core(
+    const array& input, // [1, L, d_model]
+    const array& ln1_weight,
+    const std::function<array(const array&)>& in_proj_fn,
+    const array& conv_kernel_broadcast, // [1, d_conv, xbc_len]
+    const std::optional<array>& conv_bias_row, // [1, xbc_len]
+    const array& a_log, // [n_heads]
+    const array& d_skip, // [n_heads]
+    const std::optional<array>& dt_bias_row, // [1, n_heads]
+    const std::optional<array>& norm_weight, // [d_inner]
+    const std::function<array(const array&)>& out_proj_fn,
+    const std::optional<array>& ln2_weight,
+    const std::function<array(const array&)>& gate_up_fn,
+    const std::function<array(const array&)>& down_proj_fn,
+    bool has_ffn,
+    bool use_gelu,
+    float residual_multiplier,
+    float norm_eps,
+    int d_state,
+    int d_conv,
+    int n_heads,
+    int d_head,
+    int n_groups,
+    uint8_t gate_up_layout,
+    array& conv_state,
+    array& ssm_state
+) {
+    const int seq_len = input.shape(1);
+    const int d_model = input.shape(2);
+    const int d_inner = n_heads * d_head;
+    const int bc_len = n_groups * d_state;
+    const int xbc_len = d_inner + 2 * bc_len;
+    if (n_heads <= 0 or d_head <= 0 or d_state <= 0 or d_conv <= 0 or n_groups <= 0) {
+        throw std::invalid_argument("[mamba] invalid config dims");
+    }
+    if ((n_heads % n_groups) != 0) {
+        throw std::invalid_argument("[mamba] n_heads must be divisible by n_groups");
+    }
+
+    const array a_log_row = reshape(a_log, {1, n_heads, 1, 1});
+    const array d_skip_row = reshape(d_skip, {1, n_heads, 1});
+    const int heads_per_group = n_heads / n_groups;
+
+    std::vector<array> token_outputs;
+    token_outputs.reserve(static_cast<size_t>(seq_len));
+
+    for (int token_idx = 0; token_idx < seq_len; token_idx++) {
+        const array token = slice(input, {0, token_idx, 0}, {1, token_idx + 1, d_model});
+        const array norm1 = fast::rms_norm(token, ln1_weight, norm_eps);
+
+        array proj = astype(in_proj_fn(norm1), float32);
+        const int proj_dim = proj.shape(2);
+        if (proj_dim < (2 * d_inner + 2 * bc_len + n_heads)) {
+            throw std::invalid_argument("[mamba] in_proj output too small");
+        }
+        const array z = slice(proj, {0, 0, 0}, {1, 1, d_inner});
+        const array xbc = slice(proj, {0, 0, d_inner}, {1, 1, d_inner + xbc_len});
+        const array dt_raw = slice(proj, {0, 0, d_inner + xbc_len}, {1, 1, d_inner + xbc_len + n_heads});
+
+        const array xbc_row = reshape(xbc, {1, xbc_len});
+        const array xbc_new = reshape(xbc_row, {1, 1, xbc_len});
+        if (d_conv > 1) {
+            const array state_tail = slice(conv_state, {0, 1, 0}, {1, d_conv, xbc_len});
+            conv_state = concatenate({state_tail, xbc_new}, 1);
+        } else {
+            conv_state = xbc_new;
+        }
+
+        array conv_t = sum(conv_state * conv_kernel_broadcast, 1);
+        if (conv_bias_row) {
+            conv_t = conv_t + *conv_bias_row;
+        }
+        const array xbc_conv = conv_t * sigmoid(conv_t);
+
+        const array x_conv = slice(xbc_conv, {0, 0}, {1, d_inner});
+        const array b_raw = slice(xbc_conv, {0, d_inner}, {1, d_inner + bc_len});
+        const array c_raw = slice(xbc_conv, {0, d_inner + bc_len}, {1, d_inner + 2 * bc_len});
+
+        array dt = reshape(dt_raw, {1, n_heads});
+        if (dt_bias_row) {
+            dt = dt + *dt_bias_row;
+        }
+        dt = log(1.0f + exp(dt));
+
+        const array x_heads = reshape(x_conv, {1, n_heads, d_head});
+        array b_heads = reshape(b_raw, {1, n_groups, d_state});
+        array c_heads = reshape(c_raw, {1, n_groups, d_state});
+        if (heads_per_group > 1) {
+            b_heads = repeat(b_heads, heads_per_group, 1);
+            c_heads = repeat(c_heads, heads_per_group, 1);
+        }
+
+        const array dt4 = reshape(dt, {1, n_heads, 1, 1});
+        const array dA = exp((-exp(a_log_row)) * dt4);
+
+        const array x_term = dt4 *
+            reshape(x_heads, {1, n_heads, d_head, 1}) *
+            reshape(b_heads, {1, n_heads, 1, d_state});
+
+        ssm_state = dA * ssm_state + x_term;
+
+        array y = sum(ssm_state * reshape(c_heads, {1, n_heads, 1, d_state}), 3);
+        y = y + d_skip_row * x_heads;
+
+        array ssm_out = reshape(y, {1, 1, d_inner});
+        ssm_out = ssm_out * (z * sigmoid(z));
+        if (norm_weight) {
+            ssm_out = fast::rms_norm(ssm_out, *norm_weight, 1e-5f);
+        }
+
+        array mixer_out = astype(out_proj_fn(ssm_out), float32);
+        array hidden_1 = token + mixer_out * residual_multiplier;
+
+        array token_out = hidden_1;
+        if (has_ffn) {
+            if (!ln2_weight.has_value()) {
+                throw std::invalid_argument("[mamba] missing ln2 weight for FFN path");
+            }
+            const array norm2 = fast::rms_norm(hidden_1, *ln2_weight, norm_eps);
+            const array gate_up = astype(gate_up_fn(norm2), float32);
+            const int gate_up_dim = gate_up.shape(2);
+            if ((gate_up_dim % 2) != 0) {
+                throw std::invalid_argument("[mamba] fused gate_up must have even width");
+            }
+            const int d_ff = gate_up_dim / 2;
+
+            const array mid = [&]() -> array {
+                if (gate_up_layout == 1) {
+                    const array reshaped = reshape(gate_up, {1, 1, d_ff, 2});
+                    const array gate = reshape(
+                        slice(reshaped, {0, 0, 0, 0}, {1, 1, d_ff, 1}),
+                        {1, 1, d_ff}
+                    );
+                    const array up = reshape(
+                        slice(reshaped, {0, 0, 0, 1}, {1, 1, d_ff, 2}),
+                        {1, 1, d_ff}
+                    );
+                    const array activated = use_gelu ? gelu_approx(gate) : (gate * sigmoid(gate));
+                    return activated * up;
+                }
+
+                const array gate = slice(gate_up, {0, 0, 0}, {1, 1, d_ff});
+                const array up = slice(gate_up, {0, 0, d_ff}, {1, 1, 2 * d_ff});
+                const array activated = use_gelu ? gelu_approx(gate) : (gate * sigmoid(gate));
+                return activated * up;
+            }();
+
+            const array ffn_out = astype(down_proj_fn(mid), float32);
+            token_out = hidden_1 + ffn_out * residual_multiplier;
+        }
+
+        token_outputs.push_back(token_out);
+    }
+
+    if (token_outputs.size() == 1) {
+        return token_outputs[0];
+    }
+    return concatenate(token_outputs, 1);
+}
+
+void* mlx_lazy_mamba_block_bf16(
+    const void* input,
+    const void* ln1_weight,
+    const void* in_proj,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* d_skip,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* out_proj,
+    const void* ln2_weight,
+    const void* gate_up,
+    const void* down_proj,
+    bool use_gelu,
+    float residual_multiplier,
+    float norm_eps,
+    void* mamba_cache_ptr,
+    size_t layer_idx,
+    size_t d_state,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head,
+    size_t n_groups,
+    uint8_t gate_up_layout
+) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& ln1_w = *static_cast<const array*>(ln1_weight);
+    const auto& in_proj_w = *static_cast<const array*>(in_proj);
+    const auto& conv_w = *static_cast<const array*>(conv_weight);
+    const auto* conv_b = static_cast<const array*>(conv_bias);
+    const auto& a_log_arr = astype(*static_cast<const array*>(a_log), float32);
+    const auto& d_skip_arr = astype(*static_cast<const array*>(d_skip), float32);
+    const auto* dt_b = static_cast<const array*>(dt_bias);
+    const auto* norm_w = static_cast<const array*>(norm_weight);
+    const auto& out_proj_w = *static_cast<const array*>(out_proj);
+    const auto* ln2_w = static_cast<const array*>(ln2_weight);
+    const auto* gate_up_w = static_cast<const array*>(gate_up);
+    const auto* down_proj_w = static_cast<const array*>(down_proj);
+
+    const int d_state_i = static_cast<int>(d_state);
+    const int d_conv_i = static_cast<int>(d_conv);
+    const int n_heads_i = static_cast<int>(n_heads);
+    const int d_head_i = static_cast<int>(d_head);
+    const int n_groups_i = static_cast<int>(n_groups);
+    const int d_inner = n_heads_i * d_head_i;
+    const int xbc_len = d_inner + 2 * n_groups_i * d_state_i;
+
+    const array conv_kernel_broadcast = resolve_mamba_conv_kernel(conv_w, d_conv_i, xbc_len);
+    const std::optional<array> conv_bias_row = (conv_b != nullptr)
+        ? std::optional<array>(reshape(astype(*conv_b, float32), {1, xbc_len}))
+        : std::nullopt;
+    const std::optional<array> dt_bias_row = (dt_b != nullptr)
+        ? std::optional<array>(reshape(astype(*dt_b, float32), {1, n_heads_i}))
+        : std::nullopt;
+    const std::optional<array> norm_weight_arr = (norm_w != nullptr)
+        ? std::optional<array>(astype(*norm_w, float32))
+        : std::nullopt;
+    const std::optional<array> ln2_weight_arr = (ln2_w != nullptr)
+        ? std::optional<array>(astype(*ln2_w, float32))
+        : std::nullopt;
+
+    auto* cache = static_cast<MLXMambaCache*>(mamba_cache_ptr);
+    MambaLayer* layer_state = nullptr;
+    if (cache != nullptr && layer_idx < cache->layers.size()) {
+        layer_state = &cache->layers[layer_idx];
+    }
+
+    array conv_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(1) != d_conv_i ||
+            layer_state->conv_state->shape(2) != xbc_len;
+        if (need_init) {
+            delete layer_state->conv_state;
+            layer_state->conv_state = new array(zeros({1, d_conv_i, xbc_len}, float32));
+        }
+        conv_state = *layer_state->conv_state;
+    } else {
+        conv_state = zeros({1, d_conv_i, xbc_len}, float32);
+    }
+
+    array ssm_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->ssm_state == nullptr ||
+            layer_state->ssm_state->shape(1) != n_heads_i ||
+            layer_state->ssm_state->shape(2) != d_head_i ||
+            layer_state->ssm_state->shape(3) != d_state_i;
+        if (need_init) {
+            delete layer_state->ssm_state;
+            layer_state->ssm_state = new array(zeros({1, n_heads_i, d_head_i, d_state_i}, float32));
+        }
+        ssm_state = *layer_state->ssm_state;
+    } else {
+        ssm_state = zeros({1, n_heads_i, d_head_i, d_state_i}, float32);
+    }
+
+    const auto in_proj_fn = [&in_proj_w](const array& x) -> array {
+        return dense_linear_no_bias(x, in_proj_w, std::nullopt);
+    };
+    const auto out_proj_fn = [&out_proj_w](const array& x) -> array {
+        return dense_linear_no_bias(x, out_proj_w, std::nullopt);
+    };
+    const bool has_ffn = gate_up_w != nullptr && down_proj_w != nullptr && ln2_w != nullptr;
+    const auto gate_up_fn = [&gate_up_w](const array& x) -> array {
+        return dense_linear_no_bias(x, *gate_up_w, std::nullopt);
+    };
+    const auto down_proj_fn = [&down_proj_w](const array& x) -> array {
+        return dense_linear_no_bias(x, *down_proj_w, std::nullopt);
+    };
+
+    array out = mamba_forward_core(
+        input_arr,
+        ln1_w,
+        in_proj_fn,
+        conv_kernel_broadcast,
+        conv_bias_row,
+        a_log_arr,
+        d_skip_arr,
+        dt_bias_row,
+        norm_weight_arr,
+        out_proj_fn,
+        ln2_weight_arr,
+        gate_up_fn,
+        down_proj_fn,
+        has_ffn,
+        use_gelu,
+        residual_multiplier,
+        norm_eps,
+        d_state_i,
+        d_conv_i,
+        n_heads_i,
+        d_head_i,
+        n_groups_i,
+        gate_up_layout,
+        conv_state,
+        ssm_state
+    );
+
+    if (layer_state != nullptr) {
+        *layer_state->conv_state = conv_state;
+        *layer_state->ssm_state = ssm_state;
+    }
+
+    return pool_array(out);
+}
+
+void* mlx_lazy_mamba_block_quantized(
+    const void* input,
+    const void* ln1_weight,
+    const void* in_w,
+    const void* in_s,
+    const void* in_b,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* d_skip,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* out_w,
+    const void* out_s,
+    const void* out_b,
+    const void* ln2_weight,
+    const void* gate_up_w,
+    const void* gate_up_s,
+    const void* gate_up_b,
+    const void* down_w,
+    const void* down_s,
+    const void* down_b,
+    size_t group_size,
+    size_t bits,
+    bool use_gelu,
+    float residual_multiplier,
+    float norm_eps,
+    void* mamba_cache_ptr,
+    size_t layer_idx,
+    size_t d_state,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head,
+    size_t n_groups,
+    uint8_t gate_up_layout
+) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    const auto& ln1_w = *static_cast<const array*>(ln1_weight);
+    const auto& in_proj_w = *static_cast<const array*>(in_w);
+    const auto& in_proj_s = *static_cast<const array*>(in_s);
+    const auto& in_proj_b = *static_cast<const array*>(in_b);
+    const auto& conv_w = *static_cast<const array*>(conv_weight);
+    const auto* conv_b = static_cast<const array*>(conv_bias);
+    const auto& a_log_arr = astype(*static_cast<const array*>(a_log), float32);
+    const auto& d_skip_arr = astype(*static_cast<const array*>(d_skip), float32);
+    const auto* dt_b = static_cast<const array*>(dt_bias);
+    const auto* norm_w = static_cast<const array*>(norm_weight);
+    const auto& out_proj_w = *static_cast<const array*>(out_w);
+    const auto& out_proj_s = *static_cast<const array*>(out_s);
+    const auto& out_proj_b = *static_cast<const array*>(out_b);
+    const auto* ln2_w = static_cast<const array*>(ln2_weight);
+    const auto* gate_up_w_arr = static_cast<const array*>(gate_up_w);
+    const auto* gate_up_s_arr = static_cast<const array*>(gate_up_s);
+    const auto* gate_up_b_arr = static_cast<const array*>(gate_up_b);
+    const auto* down_w_arr = static_cast<const array*>(down_w);
+    const auto* down_s_arr = static_cast<const array*>(down_s);
+    const auto* down_b_arr = static_cast<const array*>(down_b);
+
+    const int d_state_i = static_cast<int>(d_state);
+    const int d_conv_i = static_cast<int>(d_conv);
+    const int n_heads_i = static_cast<int>(n_heads);
+    const int d_head_i = static_cast<int>(d_head);
+    const int n_groups_i = static_cast<int>(n_groups);
+    const int d_inner = n_heads_i * d_head_i;
+    const int xbc_len = d_inner + 2 * n_groups_i * d_state_i;
+    const int group_size_i = static_cast<int>(group_size);
+    const int bits_i = static_cast<int>(bits);
+
+    const array conv_kernel_broadcast = resolve_mamba_conv_kernel(conv_w, d_conv_i, xbc_len);
+    const std::optional<array> conv_bias_row = (conv_b != nullptr)
+        ? std::optional<array>(reshape(astype(*conv_b, float32), {1, xbc_len}))
+        : std::nullopt;
+    const std::optional<array> dt_bias_row = (dt_b != nullptr)
+        ? std::optional<array>(reshape(astype(*dt_b, float32), {1, n_heads_i}))
+        : std::nullopt;
+    const std::optional<array> norm_weight_arr = (norm_w != nullptr)
+        ? std::optional<array>(astype(*norm_w, float32))
+        : std::nullopt;
+    const std::optional<array> ln2_weight_arr = (ln2_w != nullptr)
+        ? std::optional<array>(astype(*ln2_w, float32))
+        : std::nullopt;
+
+    auto* cache = static_cast<MLXMambaCache*>(mamba_cache_ptr);
+    MambaLayer* layer_state = nullptr;
+    if (cache != nullptr && layer_idx < cache->layers.size()) {
+        layer_state = &cache->layers[layer_idx];
+    }
+
+    array conv_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->conv_state == nullptr ||
+            layer_state->conv_state->shape(1) != d_conv_i ||
+            layer_state->conv_state->shape(2) != xbc_len;
+        if (need_init) {
+            delete layer_state->conv_state;
+            layer_state->conv_state = new array(zeros({1, d_conv_i, xbc_len}, float32));
+        }
+        conv_state = *layer_state->conv_state;
+    } else {
+        conv_state = zeros({1, d_conv_i, xbc_len}, float32);
+    }
+
+    array ssm_state(0.0f, float32);
+    if (layer_state != nullptr) {
+        const bool need_init =
+            layer_state->ssm_state == nullptr ||
+            layer_state->ssm_state->shape(1) != n_heads_i ||
+            layer_state->ssm_state->shape(2) != d_head_i ||
+            layer_state->ssm_state->shape(3) != d_state_i;
+        if (need_init) {
+            delete layer_state->ssm_state;
+            layer_state->ssm_state = new array(zeros({1, n_heads_i, d_head_i, d_state_i}, float32));
+        }
+        ssm_state = *layer_state->ssm_state;
+    } else {
+        ssm_state = zeros({1, n_heads_i, d_head_i, d_state_i}, float32);
+    }
+
+    const auto in_proj_fn = [&in_proj_w, &in_proj_s, &in_proj_b, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, in_proj_w, in_proj_s, in_proj_b, group_size_i, bits_i);
+    };
+    const auto out_proj_fn = [&out_proj_w, &out_proj_s, &out_proj_b, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, out_proj_w, out_proj_s, out_proj_b, group_size_i, bits_i);
+    };
+    const bool has_ffn =
+        gate_up_w_arr != nullptr && gate_up_s_arr != nullptr && gate_up_b_arr != nullptr &&
+        down_w_arr != nullptr && down_s_arr != nullptr && down_b_arr != nullptr &&
+        ln2_w != nullptr;
+    const auto gate_up_fn = [&gate_up_w_arr, &gate_up_s_arr, &gate_up_b_arr, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, *gate_up_w_arr, *gate_up_s_arr, *gate_up_b_arr, group_size_i, bits_i);
+    };
+    const auto down_proj_fn = [&down_w_arr, &down_s_arr, &down_b_arr, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, *down_w_arr, *down_s_arr, *down_b_arr, group_size_i, bits_i);
+    };
+
+    array out = mamba_forward_core(
+        input_arr,
+        ln1_w,
+        in_proj_fn,
+        conv_kernel_broadcast,
+        conv_bias_row,
+        a_log_arr,
+        d_skip_arr,
+        dt_bias_row,
+        norm_weight_arr,
+        out_proj_fn,
+        ln2_weight_arr,
+        gate_up_fn,
+        down_proj_fn,
+        has_ffn,
+        use_gelu,
+        residual_multiplier,
+        norm_eps,
+        d_state_i,
+        d_conv_i,
+        n_heads_i,
+        d_head_i,
+        n_groups_i,
+        gate_up_layout,
+        conv_state,
+        ssm_state
+    );
+
+    if (layer_state != nullptr) {
+        *layer_state->conv_state = conv_state;
+        *layer_state->ssm_state = ssm_state;
+    }
+
+    return pool_array(out);
+}
+
 void* mlx_lazy_vision_block_fused_qkv_bf16(
     const void* input,
     const void* ln1_weight,

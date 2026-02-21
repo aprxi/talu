@@ -41,3 +41,17 @@ struct ShortConvLayer {
 struct MLXShortConvCache {
     std::vector<ShortConvLayer> layers;
 };
+
+// ============================================================================
+// Mamba Cache - per-layer recurrent state (conv + SSM state tensors).
+// ============================================================================
+struct MambaLayer {
+    // Convolution state layout: [1, d_conv, xbc_len]
+    array* conv_state = nullptr;
+    // SSM state layout: [1, n_heads, d_head, d_state]
+    array* ssm_state = nullptr;
+};
+
+struct MLXMambaCache {
+    std::vector<MambaLayer> layers;
+};

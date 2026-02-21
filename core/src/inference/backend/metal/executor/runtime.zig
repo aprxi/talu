@@ -12,6 +12,7 @@ const ArrayHandle = compute.metal.graph.ArrayHandle;
 
 pub const Cache = runtime_graph.Cache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
+pub const MambaCache = runtime_graph.MambaCache;
 
 pub const DeepstackAdditions = model_executor.DeepstackAdditions;
 pub const RuntimeRoPEOverride = model_executor.RuntimeRoPEOverride;
@@ -32,6 +33,7 @@ pub fn transformerForwardLazy(
     config: anytype,
     cache: ?Cache,
     shortconv_cache: ?ShortConvCache,
+    mamba_cache: ?MambaCache,
     pos_offset: usize,
     use_compiled: bool,
 ) !ArrayHandle {
@@ -42,6 +44,7 @@ pub fn transformerForwardLazy(
         config,
         cache,
         shortconv_cache,
+        mamba_cache,
         pos_offset,
         use_compiled,
     );
@@ -54,6 +57,7 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
     config: anytype,
     cache: ?Cache,
     shortconv_cache: ?ShortConvCache,
+    mamba_cache: ?MambaCache,
     pos_offset: usize,
     use_compiled: bool,
     embedding_override: ?[]const f32,
@@ -67,6 +71,7 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
         config,
         cache,
         shortconv_cache,
+        mamba_cache,
         pos_offset,
         use_compiled,
         embedding_override,
@@ -82,6 +87,7 @@ pub fn transformerForwardFromGPUToken(
     config: anytype,
     cache: ?Cache,
     shortconv_cache: ?ShortConvCache,
+    mamba_cache: ?MambaCache,
     pos_offset: usize,
 ) !ArrayHandle {
     return model_executor.Model.forwardFromGPUToken(
@@ -91,6 +97,7 @@ pub fn transformerForwardFromGPUToken(
         config,
         cache,
         shortconv_cache,
+        mamba_cache,
         pos_offset,
     );
 }

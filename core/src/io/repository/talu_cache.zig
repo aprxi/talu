@@ -399,6 +399,21 @@ test "getTaluCachedPath returns null when model exists but has no weights" {
 
 test "deleteTaluCachedModel removes model directory" {
     const allocator = std.testing.allocator;
+    const old_talu_home = std.posix.getenv("TALU_HOME");
+    defer {
+        if (old_talu_home) |prev| {
+            Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
+        } else {
+            Env.unsetEnvVar(allocator, "TALU_HOME") catch {};
+        }
+    }
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    const temp_path = temp_dir.dir.realpathAlloc(allocator, ".") catch return error.OutOfMemory;
+    defer allocator.free(temp_path);
+    try Env.setEnvVar(allocator, "TALU_HOME", temp_path);
+
     const models_dir = try getTaluModelsDir(allocator);
     defer allocator.free(models_dir);
 
@@ -418,6 +433,21 @@ test "deleteTaluCachedModel removes model directory" {
 
 test "taluModelDirExists returns true when directory exists" {
     const allocator = std.testing.allocator;
+    const old_talu_home = std.posix.getenv("TALU_HOME");
+    defer {
+        if (old_talu_home) |prev| {
+            Env.setEnvVar(allocator, "TALU_HOME", std.mem.sliceTo(prev, 0)) catch {};
+        } else {
+            Env.unsetEnvVar(allocator, "TALU_HOME") catch {};
+        }
+    }
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    const temp_path = temp_dir.dir.realpathAlloc(allocator, ".") catch return error.OutOfMemory;
+    defer allocator.free(temp_path);
+    try Env.setEnvVar(allocator, "TALU_HOME", temp_path);
+
     const models_dir = try getTaluModelsDir(allocator);
     defer allocator.free(models_dir);
 

@@ -15,6 +15,7 @@ const mlx_graph = compute.metal.graph;
 
 pub const Cache = runtime_graph.Cache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
+pub const MambaCache = runtime_graph.MambaCache;
 
 pub const TransformerBlock = struct {
     pub fn forward(
@@ -25,6 +26,7 @@ pub const TransformerBlock = struct {
         weight_handles: anytype,
         cache: ?Cache,
         shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
         pos_offset: usize,
         runtime_rope_cos_handle: mlx_graph.ArrayHandle,
         runtime_rope_sin_handle: mlx_graph.ArrayHandle,
@@ -38,6 +40,54 @@ pub const TransformerBlock = struct {
         const attention_storage = lw.attentionStorageKind();
         const shortconv_storage = lw.shortconvStorageKind();
         const ffn_storage = lw.ffnStorageKind();
+
+        if (lw.kind == .mamba) {
+            const conv_weight = lw.mamba_conv_weight orelse return error.MissingField;
+            const a_log = lw.mamba_a_log orelse return error.MissingField;
+            const d_skip = lw.mamba_d_skip orelse return error.MissingField;
+            const mamba = mamba_kernel.MambaKernel{
+                .d_state = lw.mamba_d_state,
+                .d_conv = lw.mamba_d_conv,
+                .n_heads = lw.mamba_n_heads,
+                .d_head = lw.mamba_d_head,
+                .n_groups = lw.mamba_n_groups,
+                .use_gelu = weight_handles.use_gelu,
+                .residual_multiplier = weight_handles.residual_multiplier,
+                .norm_eps = norm_eps,
+                .gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
+                .ln1_weight = lw.getLn1(),
+                .in_proj = lw.mamba_in_proj,
+                .in_proj_bf16 = lw.mamba_in_proj_bf16,
+                .conv_weight = conv_weight,
+                .conv_bias = lw.mamba_conv_bias,
+                .a_log = a_log,
+                .d_skip = d_skip,
+                .dt_bias = lw.mamba_dt_bias,
+                .norm_weight = lw.mamba_norm_weight,
+                .out_proj = lw.mamba_out_proj,
+                .out_proj_bf16 = lw.mamba_out_proj_bf16,
+                .ln2_weight = lw.getLn2(),
+                .gate_up = lw.mamba_gate_up,
+                .gate_up_bf16 = lw.mamba_gate_up_bf16,
+                .down_proj = lw.mamba_down_proj,
+                .down_proj_bf16 = lw.mamba_down_proj_bf16,
+            };
+            var m_state = mamba_kernel.MambaState{
+                .cache = mamba_cache,
+                .layer_idx = layer_idx,
+            };
+            var m_scratch = mamba_kernel.MambaScratch{};
+            var m_matmul = mamba_kernel.MatmulScratch{};
+            var m_out: mlx_graph.ArrayHandle = undefined;
+            try mamba.forward(
+                hidden,
+                &m_out,
+                &m_state,
+                &m_scratch,
+                &m_matmul,
+            );
+            return m_out;
+        }
 
         const attn_norm = norm_kernel.RMSNorm{
             .weight = lw.getLn1(),
@@ -126,7 +176,7 @@ pub const TransformerBlock = struct {
                 );
                 break :blk shortconv_out;
             },
-            .mamba => return mamba_kernel.unsupported(),
+            .mamba => return error.InvalidState,
         };
 
         const attn_for_residual = if (weight_handles.use_post_attn_norm) blk: {

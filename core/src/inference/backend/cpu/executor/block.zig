@@ -70,7 +70,7 @@ fn formatRmsNormLike(writer: anytype, dim: usize, eps: f32, weight_offset: f32) 
 /// Model files (src/models/*.zig) define block_program to create the op sequence.
 pub const Block = struct {
     /// The "program" - sequence of operations defining block execution.
-    /// Typically points to a static table like `models/llama.zig:block_program`.
+    /// Typically points to a static table in `core/src/models/*`.
     program: []const LayerOp,
 
     /// CPU kernel container for this layer (single source of truth).

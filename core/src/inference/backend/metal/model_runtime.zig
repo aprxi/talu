@@ -1,5 +1,6 @@
 //! Inference-owned fused/dense model runtime FFI surface for Metal backend.
 
+const std = @import("std");
 const compute = @import("../../../compute/root.zig");
 const runtime_graph = @import("runtime_graph.zig");
 
@@ -61,6 +62,29 @@ pub fn decodeStepLogits(
     return mlx_decode_model_step_logits(model.handle, cache, shortconv_cache, token_id, pos_offset);
 }
 
+pub fn decodeStepLogitsBatch(
+    model: DecodeModel,
+    caches: []const CacheHandle,
+    shortconv_caches: []const ShortConvCacheHandle,
+    token_ids: []const u32,
+    pos_offsets: []const usize,
+    out_logits: []ArrayHandle,
+) void {
+    std.debug.assert(caches.len == shortconv_caches.len);
+    std.debug.assert(caches.len == token_ids.len);
+    std.debug.assert(caches.len == pos_offsets.len);
+    std.debug.assert(caches.len == out_logits.len);
+    mlx_decode_model_step_logits_batch(
+        model.handle,
+        caches.ptr,
+        shortconv_caches.ptr,
+        token_ids.ptr,
+        pos_offsets.ptr,
+        out_logits.ptr,
+        out_logits.len,
+    );
+}
+
 pub fn decodeBatch(
     model: DecodeModel,
     cache: CacheHandle,
@@ -108,6 +132,15 @@ pub extern fn mlx_decode_model_step_logits(
     token_id: u32,
     pos_offset: usize,
 ) ArrayHandle;
+pub extern fn mlx_decode_model_step_logits_batch(
+    model: *anyopaque,
+    caches: [*]const CacheHandle,
+    shortconv_caches: [*]const ShortConvCacheHandle,
+    token_ids: [*]const u32,
+    pos_offsets: [*]const usize,
+    out_logits: [*]ArrayHandle,
+    count: usize,
+) void;
 pub extern fn mlx_decode_model_decode_batch(
     model: *anyopaque,
     cache: CacheHandle,
@@ -241,6 +274,23 @@ pub extern fn mlx_fused_model_set_layer(
     shortconv_out_b: ArrayHandle,
     shortconv_conv_w: ArrayHandle,
     shortconv_conv_b: ArrayHandle,
+    moe_router_w: ArrayHandle,
+    moe_router_s: ArrayHandle,
+    moe_router_b: ArrayHandle,
+    moe_router_bias: ArrayHandle,
+    moe_gate_w: ArrayHandle,
+    moe_gate_s: ArrayHandle,
+    moe_up_w: ArrayHandle,
+    moe_up_s: ArrayHandle,
+    moe_down_w: ArrayHandle,
+    moe_down_s: ArrayHandle,
+    moe_gate_bias: ArrayHandle,
+    moe_up_bias: ArrayHandle,
+    moe_down_bias: ArrayHandle,
+    moe_num_experts: usize,
+    moe_experts_per_token: usize,
+    moe_router_group_size: usize,
+    moe_expert_group_size: usize,
 ) void;
 pub extern fn mlx_fused_model_optimize(model: FusedModelHandle) void;
 pub extern fn mlx_fused_model_free(model: FusedModelHandle) void;

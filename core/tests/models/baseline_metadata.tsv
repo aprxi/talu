@@ -1,0 +1,16 @@
+id	ok	has_mlp_or_moe	d_ff_source_configured	d_ff_source_ids_exist	has_shortconv_feature	shortconv_source_configured	shortconv_source_exists	moe_params_declared
+gemma3	1	1	1	1	0	0	1	1
+gpt_oss	1	1	1	1	0	0	1	1
+granite3	1	1	1	1	0	0	1	1
+granite_hybrid	1	1	1	1	0	0	1	1
+lfm2	1	1	1	1	1	1	1	1
+lfm2_5	1	1	1	1	1	1	1	1
+llama2	1	1	1	1	0	0	1	1
+llama3	1	1	1	1	0	0	1	1
+minilm	1	1	1	1	0	0	1	1
+ministral3	1	1	1	1	0	0	1	1
+phi	1	1	1	1	0	0	1	1
+qwen3	1	1	1	1	0	0	1	1
+qwen3_moe	1	1	1	1	0	0	1	1
+qwen3_next	1	1	1	1	0	0	1	1
+youtu_vl	1	1	1	1	0	0	1	1

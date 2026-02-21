@@ -22,6 +22,7 @@ pub const LoadedModel = loader.LoadedModel;
 pub const LoadOptions = loader.LoadOptions;
 pub const weights = loader.weights;
 pub const Reporter = loader.Reporter;
+pub const ResolvedModelKind = loader.ResolvedModelKind;
 
 pub fn loadModel(
     allocator: std.mem.Allocator,
@@ -35,6 +36,27 @@ pub fn loadModel(
 
 pub fn loadArchitectureDefinitions(allocator: std.mem.Allocator) bool {
     return registry.loadArchitectureDefinitions(allocator);
+}
+
+pub fn resolveModelKindForConfig(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+) !ResolvedModelKind {
+    return loader.resolveModelKindForConfig(allocator, config_path);
+}
+
+pub fn runtimeArchitectureForConfig(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+) !*const op_types.Architecture {
+    return loader.runtimeArchitectureForConfig(allocator, config_path);
+}
+
+pub fn applyRuntimeArchitectureMetadata(
+    loaded_model: *LoadedModel,
+    runtime_architecture: *const op_types.Architecture,
+) void {
+    loader.applyRuntimeArchitectureMetadata(loaded_model, runtime_architecture);
 }
 
 pub fn detectByModelType(model_type: []const u8) ?ModelDescriptor {

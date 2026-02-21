@@ -21,6 +21,10 @@ pub const validateLoadedModel = validation.validate;
 
 // Re-export validation types so check_coverage.sh --integration can verify test coverage
 pub const Reporter = validation.Reporter;
+pub const ResolvedModelKind = struct {
+    descriptor: models_registry.Entry,
+    runtime_arch: *const op_types.Architecture,
+};
 
 // =============================================================================
 // Model Loading
@@ -53,7 +57,7 @@ fn loadSafeTensorsModel(
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
     // Detect model kind using static model metadata.
-    const model_kind = try detectModelKind(backing_allocator, config_path);
+    const model_kind = try resolveModelKindForConfig(backing_allocator, config_path);
 
     // Load model using architecture-driven metadata with MoE support.
     var loaded_model = try weights_impl.loadModelWithArchitecture(
@@ -66,11 +70,26 @@ fn loadSafeTensorsModel(
     );
     errdefer loaded_model.deinit();
 
+    applyRuntimeArchitectureMetadata(&loaded_model, model_kind.runtime_arch);
+
+    // Validate weight shapes against config after all inference hooks (inferDff, inferMoE,
+    // etc.) have corrected config values. This catches config-vs-weight mismatches at load
+    // time rather than producing silent corruption during inference.
+    try validation.validate(&loaded_model);
+
+    return loaded_model;
+}
+
+// =============================================================================
+// Model Detection
+// =============================================================================
+
+pub fn applyRuntimeArchitectureMetadata(
+    loaded_model: *LoadedModel,
+    runtime_architecture: *const op_types.Architecture,
+) void {
     // All architectures are now .custom - actual behavior comes from runtime_arch
     loaded_model.config.model_arch = .custom;
-
-    // runtime_arch is guaranteed to exist (detectModelKind errors if not found)
-    const runtime_architecture = model_kind.runtime_arch orelse unreachable;
 
     // Apply architecture properties from static metadata.
     if (runtime_architecture.has_qk_norm) loaded_model.config.use_qk_norm = true;
@@ -121,29 +140,22 @@ fn loadSafeTensorsModel(
     if (runtime_architecture.use_swiglu_oss) {
         loaded_model.runtime.use_swiglu_variant = true;
     }
-
-    // Validate weight shapes against config after all inference hooks (inferDff, inferMoE,
-    // etc.) have corrected config values. This catches config-vs-weight mismatches at load
-    // time rather than producing silent corruption during inference.
-    try validation.validate(&loaded_model);
-
-    return loaded_model;
 }
 
-// =============================================================================
-// Model Detection
-// =============================================================================
-
-/// Result of model kind detection.
-/// Architecture is always .custom - actual behavior comes from runtime_arch.
-const ModelKind = struct {
-    arch: tensor.ModelArch = .custom,
-    runtime_arch: ?*const op_types.Architecture = null,
-};
+pub fn runtimeArchitectureForConfig(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+) !*const op_types.Architecture {
+    const resolved = try resolveModelKindForConfig(allocator, config_path);
+    return resolved.runtime_arch;
+}
 
 /// Detect model kind using the static model registry for model_type mapping,
 /// then resolve the canonical static architecture payload.
-fn detectModelKind(allocator: std.mem.Allocator, config_path: []const u8) !ModelKind {
+pub fn resolveModelKindForConfig(
+    allocator: std.mem.Allocator,
+    config_path: []const u8,
+) !ResolvedModelKind {
     const config_bytes = try std.fs.cwd().readFileAlloc(allocator, config_path, 256 * 1024);
     defer allocator.free(config_bytes);
 
@@ -182,7 +194,7 @@ fn detectModelKind(allocator: std.mem.Allocator, config_path: []const u8) !Model
             }, @src());
 
             return .{
-                .arch = .custom,
+                .descriptor = entry,
                 .runtime_arch = detected_arch,
             };
         }

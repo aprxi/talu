@@ -36,6 +36,21 @@ struct FusedModelWeights {
         array gate_w = array(0.0f, float32), gate_s = array(0.0f, float32), gate_b = array(0.0f, float32);
         array up_w = array(0.0f, float32), up_s = array(0.0f, float32), up_b = array(0.0f, float32);
         array down_w = array(0.0f, float32), down_s = array(0.0f, float32), down_b = array(0.0f, float32);
+        bool use_moe = false;
+        array moe_router_w = array(0.0f, float32);
+        std::optional<array> moe_router_s;
+        std::optional<array> moe_router_b;
+        std::optional<array> moe_router_bias;
+        array moe_gate_w = array(0.0f, float32), moe_gate_s = array(0.0f, float32);
+        array moe_up_w = array(0.0f, float32), moe_up_s = array(0.0f, float32);
+        array moe_down_w = array(0.0f, float32), moe_down_s = array(0.0f, float32);
+        std::optional<array> moe_gate_bias;
+        std::optional<array> moe_up_bias;
+        std::optional<array> moe_down_bias;
+        int moe_num_experts = 0;
+        int moe_experts_per_token = 0;
+        int moe_router_group_size = 0;
+        int moe_expert_group_size = 0;
         std::optional<array> q_norm;
         std::optional<array> k_norm;
         // Optional extra FFN norms (4 norms per block)
@@ -103,6 +118,26 @@ static FusedModelWeights::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
 // Pipeline state
 static thread_local std::optional<array> g_current_token;
 static thread_local std::optional<array> g_pending_token;
+
+extern "C" void* mlx_lazy_fused_moe_ffn_mxfp4(
+    const void* input,
+    const void* router_w,
+    const void* router_s,
+    const void* router_b,
+    const void* router_bias,
+    const void* gate_w,
+    const void* gate_s,
+    const void* up_w,
+    const void* up_s,
+    const void* down_w,
+    const void* down_s,
+    const void* gate_bias,
+    const void* up_bias,
+    const void* down_bias,
+    size_t num_experts,
+    size_t experts_per_token,
+    size_t router_group_size,
+    size_t expert_group_size);
 
 // ============================================================================
 // Forward Pass Implementation
@@ -314,31 +349,55 @@ static array fused_forward_logits_from_token(
             ? fast::rms_norm(hidden_1, *l.pre_ffn_norm, fused_weights->rms_eps)
             : fast::rms_norm(hidden_1, l.ln2_w, fused_weights->rms_eps);
 
-        array gate(0.0f), up(0.0f);
-        if (l.use_fused_gate_up && l.gate_up_w) {
-            // Fused gate/up: single matmul then split
-            array gate_up = quantized_matmul(normed_2, *l.gate_up_w, *l.gate_up_s, *l.gate_up_b, true, group_size, bit_width, "affine");
-            int d_ff = l.gate_w.shape(0);  // FFN intermediate size
-            gate = slice(gate_up, {0, 0, 0}, {1, 1, d_ff});
-            up = slice(gate_up, {0, 0, d_ff}, {1, 1, 2 * d_ff});
+        array down(0.0f, float32);
+        if (l.use_moe) {
+            auto* moe_out = static_cast<const array*>(mlx_lazy_fused_moe_ffn_mxfp4(
+                &normed_2,
+                &l.moe_router_w,
+                l.moe_router_s ? &*l.moe_router_s : nullptr,
+                l.moe_router_b ? &*l.moe_router_b : nullptr,
+                l.moe_router_bias ? &*l.moe_router_bias : nullptr,
+                &l.moe_gate_w,
+                &l.moe_gate_s,
+                &l.moe_up_w,
+                &l.moe_up_s,
+                &l.moe_down_w,
+                &l.moe_down_s,
+                l.moe_gate_bias ? &*l.moe_gate_bias : nullptr,
+                l.moe_up_bias ? &*l.moe_up_bias : nullptr,
+                l.moe_down_bias ? &*l.moe_down_bias : nullptr,
+                static_cast<size_t>(l.moe_num_experts),
+                static_cast<size_t>(l.moe_experts_per_token),
+                static_cast<size_t>(l.moe_router_group_size),
+                static_cast<size_t>(l.moe_expert_group_size)));
+            down = *moe_out;
         } else {
-            gate = quantized_matmul(normed_2, l.gate_w, l.gate_s, l.gate_b, true, group_size, bit_width, "affine");
-            up = quantized_matmul(normed_2, l.up_w, l.up_s, l.up_b, true, group_size, bit_width, "affine");
-        }
-
-        // Activation: GELU or SiLU based on model config
-        array mid = [&]() -> array {
-            if (fused_weights->use_gelu) {
-                // GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-                const float sqrt_2_over_pi = 0.7978845608f;
-                array x3 = gate * gate * gate;
-                array inner = sqrt_2_over_pi * (gate + 0.044715f * x3);
-                return gate * 0.5f * (1.0f + tanh(inner)) * up;
+            array gate(0.0f), up(0.0f);
+            if (l.use_fused_gate_up && l.gate_up_w) {
+                // Fused gate/up: single matmul then split
+                array gate_up = quantized_matmul(normed_2, *l.gate_up_w, *l.gate_up_s, *l.gate_up_b, true, group_size, bit_width, "affine");
+                int d_ff = l.gate_w.shape(0);  // FFN intermediate size
+                gate = slice(gate_up, {0, 0, 0}, {1, 1, d_ff});
+                up = slice(gate_up, {0, 0, d_ff}, {1, 1, 2 * d_ff});
             } else {
-                return (gate * sigmoid(gate)) * up;
+                gate = quantized_matmul(normed_2, l.gate_w, l.gate_s, l.gate_b, true, group_size, bit_width, "affine");
+                up = quantized_matmul(normed_2, l.up_w, l.up_s, l.up_b, true, group_size, bit_width, "affine");
             }
-        }();
-        array down = quantized_matmul(mid, l.down_w, l.down_s, l.down_b, true, group_size, bit_width, "affine");
+
+            // Activation: GELU or SiLU based on model config
+            array mid = [&]() -> array {
+                if (fused_weights->use_gelu) {
+                    // GELU approximation: x * 0.5 * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+                    const float sqrt_2_over_pi = 0.7978845608f;
+                    array x3 = gate * gate * gate;
+                    array inner = sqrt_2_over_pi * (gate + 0.044715f * x3);
+                    return gate * 0.5f * (1.0f + tanh(inner)) * up;
+                } else {
+                    return (gate * sigmoid(gate)) * up;
+                }
+            }();
+            down = quantized_matmul(mid, l.down_w, l.down_s, l.down_b, true, group_size, bit_width, "affine");
+        }
 
         // Apply post-FFN norm if present
         if (l.post_ffn_norm) {
@@ -477,7 +536,14 @@ void mlx_fused_model_set_layer(
     size_t shortconv_conv_dim,
     const void* shortconv_in_w, const void* shortconv_in_s, const void* shortconv_in_b,
     const void* shortconv_out_w, const void* shortconv_out_s, const void* shortconv_out_b,
-    const void* shortconv_conv_w, const void* shortconv_conv_b
+    const void* shortconv_conv_w, const void* shortconv_conv_b,
+    const void* moe_router_w, const void* moe_router_s, const void* moe_router_b, const void* moe_router_bias,
+    const void* moe_gate_w, const void* moe_gate_s,
+    const void* moe_up_w, const void* moe_up_s,
+    const void* moe_down_w, const void* moe_down_s,
+    const void* moe_gate_bias, const void* moe_up_bias, const void* moe_down_bias,
+    size_t moe_num_experts, size_t moe_experts_per_token,
+    size_t moe_router_group_size, size_t moe_expert_group_size
 ) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     if (!fused_weights->topology_initialized) {
@@ -498,19 +564,40 @@ void mlx_fused_model_set_layer(
     if (o_s) layer.o_s = *static_cast<const array*>(o_s);
     if (o_b) layer.o_b = *static_cast<const array*>(o_b);
     layer.ln2_w = *static_cast<const array*>(ln2_w);
-    layer.gate_w = *static_cast<const array*>(gate_w);
-    layer.gate_s = *static_cast<const array*>(gate_s);
-    layer.gate_b = *static_cast<const array*>(gate_b);
-    layer.up_w = *static_cast<const array*>(up_w);
-    layer.up_s = *static_cast<const array*>(up_s);
-    layer.up_b = *static_cast<const array*>(up_b);
-    layer.down_w = *static_cast<const array*>(down_w);
-    layer.down_s = *static_cast<const array*>(down_s);
-    layer.down_b = *static_cast<const array*>(down_b);
+    if (gate_w) layer.gate_w = *static_cast<const array*>(gate_w);
+    if (gate_s) layer.gate_s = *static_cast<const array*>(gate_s);
+    if (gate_b) layer.gate_b = *static_cast<const array*>(gate_b);
+    if (up_w) layer.up_w = *static_cast<const array*>(up_w);
+    if (up_s) layer.up_s = *static_cast<const array*>(up_s);
+    if (up_b) layer.up_b = *static_cast<const array*>(up_b);
+    if (down_w) layer.down_w = *static_cast<const array*>(down_w);
+    if (down_s) layer.down_s = *static_cast<const array*>(down_s);
+    if (down_b) layer.down_b = *static_cast<const array*>(down_b);
     if (q_norm) layer.q_norm = *static_cast<const array*>(q_norm);
     if (k_norm) layer.k_norm = *static_cast<const array*>(k_norm);
     if (pre_ffn_norm) layer.pre_ffn_norm = *static_cast<const array*>(pre_ffn_norm);
     if (post_ffn_norm) layer.post_ffn_norm = *static_cast<const array*>(post_ffn_norm);
+
+    if (moe_router_w) {
+        layer.use_moe = true;
+        layer.moe_router_w = *static_cast<const array*>(moe_router_w);
+        layer.moe_router_s = moe_router_s ? std::make_optional(*static_cast<const array*>(moe_router_s)) : std::nullopt;
+        layer.moe_router_b = moe_router_b ? std::make_optional(*static_cast<const array*>(moe_router_b)) : std::nullopt;
+        layer.moe_router_bias = moe_router_bias ? std::make_optional(*static_cast<const array*>(moe_router_bias)) : std::nullopt;
+        layer.moe_gate_w = *static_cast<const array*>(moe_gate_w);
+        layer.moe_gate_s = *static_cast<const array*>(moe_gate_s);
+        layer.moe_up_w = *static_cast<const array*>(moe_up_w);
+        layer.moe_up_s = *static_cast<const array*>(moe_up_s);
+        layer.moe_down_w = *static_cast<const array*>(moe_down_w);
+        layer.moe_down_s = *static_cast<const array*>(moe_down_s);
+        layer.moe_gate_bias = moe_gate_bias ? std::make_optional(*static_cast<const array*>(moe_gate_bias)) : std::nullopt;
+        layer.moe_up_bias = moe_up_bias ? std::make_optional(*static_cast<const array*>(moe_up_bias)) : std::nullopt;
+        layer.moe_down_bias = moe_down_bias ? std::make_optional(*static_cast<const array*>(moe_down_bias)) : std::nullopt;
+        layer.moe_num_experts = static_cast<int>(moe_num_experts);
+        layer.moe_experts_per_token = static_cast<int>(moe_experts_per_token);
+        layer.moe_router_group_size = static_cast<int>(moe_router_group_size);
+        layer.moe_expert_group_size = static_cast<int>(moe_expert_group_size);
+    }
 
     if (layer.kind == FusedModelWeights::Layer::LayerKind::shortconv) {
         layer.shortconv_d_conv = static_cast<int>(shortconv_d_conv);
@@ -604,15 +691,31 @@ void mlx_fused_model_optimize(void* model) {
             to_eval.push_back(layer.o_b);
         }
         to_eval.push_back(layer.ln2_w);
-        to_eval.push_back(layer.gate_w);
-        to_eval.push_back(layer.gate_s);
-        to_eval.push_back(layer.gate_b);
-        to_eval.push_back(layer.up_w);
-        to_eval.push_back(layer.up_s);
-        to_eval.push_back(layer.up_b);
-        to_eval.push_back(layer.down_w);
-        to_eval.push_back(layer.down_s);
-        to_eval.push_back(layer.down_b);
+        if (layer.use_moe) {
+            to_eval.push_back(layer.moe_router_w);
+            if (layer.moe_router_s) to_eval.push_back(*layer.moe_router_s);
+            if (layer.moe_router_b) to_eval.push_back(*layer.moe_router_b);
+            if (layer.moe_router_bias) to_eval.push_back(*layer.moe_router_bias);
+            to_eval.push_back(layer.moe_gate_w);
+            to_eval.push_back(layer.moe_gate_s);
+            to_eval.push_back(layer.moe_up_w);
+            to_eval.push_back(layer.moe_up_s);
+            to_eval.push_back(layer.moe_down_w);
+            to_eval.push_back(layer.moe_down_s);
+            if (layer.moe_gate_bias) to_eval.push_back(*layer.moe_gate_bias);
+            if (layer.moe_up_bias) to_eval.push_back(*layer.moe_up_bias);
+            if (layer.moe_down_bias) to_eval.push_back(*layer.moe_down_bias);
+        } else {
+            to_eval.push_back(layer.gate_w);
+            to_eval.push_back(layer.gate_s);
+            to_eval.push_back(layer.gate_b);
+            to_eval.push_back(layer.up_w);
+            to_eval.push_back(layer.up_s);
+            to_eval.push_back(layer.up_b);
+            to_eval.push_back(layer.down_w);
+            to_eval.push_back(layer.down_s);
+            to_eval.push_back(layer.down_b);
+        }
     }
     eval(to_eval);
 }
@@ -630,7 +733,7 @@ void mlx_fused_model_compile(void* model) {
     // Keep shortconv models on the direct fused_forward_from_token path, which
     // correctly updates both KV cache and shortconv conv-state cache.
     for (const auto& layer : fused_weights->layers) {
-        if (layer.kind == FusedModelWeights::Layer::LayerKind::shortconv) {
+        if (layer.kind == FusedModelWeights::Layer::LayerKind::shortconv || layer.use_moe) {
             return;
         }
     }

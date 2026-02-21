@@ -103,6 +103,33 @@ array mlx_decode_model_step_logits(
     return mlx_dense_decode_step_logits(wrapper->impl, cache, shortconv_cache, token_id, pos_offset);
 }
 
+void mlx_decode_model_step_logits_batch(
+    void* model,
+    void* const* caches,
+    void* const* shortconv_caches,
+    const uint32_t* token_ids,
+    const size_t* pos_offsets,
+    void** out_logits,
+    size_t count) {
+    auto* wrapper = as_wrapper(model);
+    std::vector<array> pending_eval;
+    pending_eval.reserve(count);
+
+    for (size_t idx = 0; idx < count; idx++) {
+        const uint32_t token_id = token_ids[idx];
+        const size_t pos_offset = pos_offsets[idx];
+        array logits = (wrapper->flavor == DecodeModelFlavor::quantized)
+            ? mlx_fused_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], token_id, pos_offset)
+            : mlx_dense_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], token_id, pos_offset);
+        out_logits[idx] = pool_array(std::move(logits));
+        pending_eval.push_back(*static_cast<array*>(out_logits[idx]));
+    }
+
+    if (!pending_eval.empty()) {
+        eval(pending_eval);
+    }
+}
+
 uint32_t mlx_decode_model_decode_batch(
     void* model,
     void* cache,

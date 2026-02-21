@@ -17,8 +17,23 @@ fn isInferencePath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/inference/");
 }
 
+fn isInferenceBackendPath(path: []const u8) bool {
+    return std.mem.startsWith(u8, path, "core/src/inference/backend/");
+}
+
+fn isInferenceBackendVisionPath(path: []const u8) bool {
+    if (!isInferenceBackendPath(path)) return false;
+    if (std.mem.indexOf(u8, path, "/vision/") != null) return true;
+    return std.mem.endsWith(u8, path, "/vision.zig");
+}
+
 fn isModelsPath(path: []const u8) bool {
     return std.mem.startsWith(u8, path, "core/src/models/");
+}
+
+fn isModelsGenericLoaderPath(path: []const u8) bool {
+    return std.mem.eql(u8, path, "core/src/models/load/weights.zig") or
+        std.mem.eql(u8, path, "core/src/models/load/generic_weights.zig");
 }
 
 fn isCpuVisionSelectorPath(path: []const u8) bool {
@@ -141,6 +156,51 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
                 violations += 1;
                 if (emit) {
                     std.debug.print("{s}: forbidden hardcoded vision tensor template token: \"{s}\"\n", .{ file_path, token });
+                }
+            }
+        }
+    }
+
+    // Generic loader files must remain metadata-driven and must not reintroduce
+    // model-family string heuristics for core shape/feature decisions.
+    if (isModelsGenericLoaderPath(file_path)) {
+        const forbidden = [_][]const u8{
+            "mlp.experts.0.gate_proj.weight",
+            "mixer.conv1d.weight",
+            "inferMoEFromWeights",
+            "maybeForceMambaF32",
+        };
+        for (forbidden) |token| {
+            if (std.mem.indexOf(u8, source, token) != null) {
+                violations += 1;
+                if (emit) {
+                    std.debug.print("{s}: forbidden loader heuristic token: \"{s}\"\n", .{ file_path, token });
+                }
+            }
+        }
+    }
+
+    // Non-vision inference backend modules must stay model-family agnostic.
+    // Model naming conventions belong to models metadata contracts.
+    if (isInferenceBackendPath(file_path) and !isInferenceBackendVisionPath(file_path)) {
+        const forbidden = [_][]const u8{
+            "\"llama\"",
+            "\"llama2\"",
+            "\"llama3\"",
+            "\"qwen\"",
+            "\"granite\"",
+            "\"gemma\"",
+            "\"mistral\"",
+            "\"phi\"",
+            "\"gpt_oss\"",
+            "\"lfm2\"",
+            "\"youtu\"",
+        };
+        for (forbidden) |token| {
+            if (std.mem.indexOf(u8, source, token) != null) {
+                violations += 1;
+                if (emit) {
+                    std.debug.print("{s}: forbidden model-family literal in inference backend: \"{s}\"\n", .{ file_path, token });
                 }
             }
         }
@@ -436,6 +496,46 @@ test "lintSource allows metadata-driven selector without hardcoded names" {
     try std.testing.expectEqual(
         @as(usize, 0),
         try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/vision/root.zig", src, false),
+    );
+}
+
+test "lintSource rejects loader heuristic token in generic loader" {
+    const src =
+        \\const bad = "mlp.experts.0.gate_proj.weight";
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/models/load/weights.zig", src, false),
+    );
+}
+
+test "lintSource allows metadata-driven loader without forbidden heuristics" {
+    const src =
+        \\const ok = arch.d_ff_source_weight_ids;
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/models/load/weights.zig", src, false),
+    );
+}
+
+test "lintSource rejects model-family literal in non-vision inference backend" {
+    const src =
+        \\const bad = "llama3";
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/executor/model.zig", src, false),
+    );
+}
+
+test "lintSource allows model-family literal in vision backend path" {
+    const src =
+        \\const ok = "llama3";
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 0),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/vision/split_qkv.zig", src, false),
     );
 }
 

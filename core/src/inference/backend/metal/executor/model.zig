@@ -14,6 +14,7 @@ const mlx_graph = compute.metal.graph;
 
 pub const Cache = runtime_graph.Cache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
+pub const MambaCache = runtime_graph.MambaCache;
 
 pub const DeepstackAdditions = struct {
     positions: []const usize,
@@ -151,6 +152,7 @@ pub const Model = struct {
         config: anytype,
         cache: ?Cache,
         shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
         pos_offset: usize,
         use_compiled: bool,
     ) !ArrayHandle {
@@ -161,6 +163,7 @@ pub const Model = struct {
             config,
             cache,
             shortconv_cache,
+            mamba_cache,
             pos_offset,
             use_compiled,
             null,
@@ -176,6 +179,7 @@ pub const Model = struct {
         config: anytype,
         cache: ?Cache,
         shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
         pos_offset: usize,
         use_compiled: bool,
         embedding_override: ?[]const f32,
@@ -262,6 +266,7 @@ pub const Model = struct {
                 weight_handles,
                 cache,
                 shortconv_cache,
+                mamba_cache,
                 pos_offset,
                 runtime_rope_cos_handle,
                 runtime_rope_sin_handle,
@@ -286,6 +291,7 @@ pub const Model = struct {
         config: anytype,
         cache: ?Cache,
         shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
         pos_offset: usize,
     ) !ArrayHandle {
         if (builtin.os.tag != .macos) {
@@ -317,6 +323,7 @@ pub const Model = struct {
                 weight_handles,
                 cache,
                 shortconv_cache,
+                mamba_cache,
                 pos_offset,
                 null,
                 null,

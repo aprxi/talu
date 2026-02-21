@@ -8,6 +8,7 @@ const mlx_graph = compute.metal.graph;
 pub const ArrayHandle = mlx_graph.ArrayHandle;
 pub const CacheHandle = runtime_graph.CacheHandle;
 pub const ShortConvCacheHandle = runtime_graph.ShortConvCacheHandle;
+pub const MambaCacheHandle = runtime_graph.MambaCacheHandle;
 
 pub extern fn mlx_lazy_shortconv_mixer_bf16(
     input: ArrayHandle,
@@ -37,6 +38,70 @@ pub extern fn mlx_lazy_shortconv_mixer_quantized(
     layer_idx: usize,
     d_conv: usize,
     conv_dim: usize,
+) ArrayHandle;
+
+pub extern fn mlx_lazy_mamba_block_bf16(
+    input: ArrayHandle,
+    ln1_weight: ArrayHandle,
+    in_proj: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    d_skip: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_proj: ArrayHandle,
+    ln2_weight: ArrayHandle,
+    gate_up: ArrayHandle,
+    down_proj: ArrayHandle,
+    use_gelu: bool,
+    residual_multiplier: f32,
+    norm_eps: f32,
+    mamba_cache: MambaCacheHandle,
+    layer_idx: usize,
+    d_state: usize,
+    d_conv: usize,
+    n_heads: usize,
+    d_head: usize,
+    n_groups: usize,
+    gate_up_layout: u8,
+) ArrayHandle;
+
+pub extern fn mlx_lazy_mamba_block_quantized(
+    input: ArrayHandle,
+    ln1_weight: ArrayHandle,
+    in_w: ArrayHandle,
+    in_s: ArrayHandle,
+    in_b: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    d_skip: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_w: ArrayHandle,
+    out_s: ArrayHandle,
+    out_b: ArrayHandle,
+    ln2_weight: ArrayHandle,
+    gate_up_w: ArrayHandle,
+    gate_up_s: ArrayHandle,
+    gate_up_b: ArrayHandle,
+    down_w: ArrayHandle,
+    down_s: ArrayHandle,
+    down_b: ArrayHandle,
+    group_size: usize,
+    bits: usize,
+    use_gelu: bool,
+    residual_multiplier: f32,
+    norm_eps: f32,
+    mamba_cache: MambaCacheHandle,
+    layer_idx: usize,
+    d_state: usize,
+    d_conv: usize,
+    n_heads: usize,
+    d_head: usize,
+    n_groups: usize,
+    gate_up_layout: u8,
 ) ArrayHandle;
 
 pub extern fn mlx_lazy_fused_attention(

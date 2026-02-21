@@ -20,6 +20,7 @@
 #include <deque>
 #include <chrono>
 #include <algorithm>
+#include <functional>
 
 using namespace mlx::core;
 

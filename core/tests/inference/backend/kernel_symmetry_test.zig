@@ -121,10 +121,9 @@ test "metal kernel symbols expose symmetric struct names" {
     try std.testing.expect(@hasDecl(backend.metal.kernels.ffn.SwiGLU, "forward"));
 }
 
-test "metal unsupported kernels are typed and explicit" {
+test "metal unsupported kernel declarations stay explicit" {
     if (comptime !has_metal) return;
-    try std.testing.expect(!backend.metal.kernels.mamba.supported);
+    try std.testing.expect(backend.metal.kernels.mamba.supported);
     try std.testing.expect(!backend.metal.kernels.mla_attention.supported);
-    try std.testing.expectError(error.MambaNotSupportedOnMetal, backend.metal.kernels.mamba.unsupported());
     try std.testing.expectError(error.MLANotSupportedOnMetal, backend.metal.kernels.mla_attention.unsupported());
 }

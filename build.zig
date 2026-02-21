@@ -299,6 +299,36 @@ fn addMetalSupport(
     artifact.linkLibCpp();
 }
 
+/// Link only the minimal Metal primitives used by compute-level sanity tools.
+/// This intentionally excludes MLX C++ sources to avoid eager MLX runtime init.
+fn addMetalCoreSupport(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    artifact: *std.Build.Step.Compile,
+    enable_metal: bool,
+) void {
+    if (artifact.rootModuleTarget().os.tag != .macos) return;
+    if (!enable_metal) return;
+
+    mod.addIncludePath(b.path("core/src/compute/metal"));
+
+    artifact.linkFramework("Metal");
+    artifact.linkFramework("MetalPerformanceShaders");
+    artifact.linkFramework("Foundation");
+
+    artifact.addCSourceFiles(.{
+        .files = &.{
+            "core/src/compute/metal/device.m",
+            "core/src/compute/metal/matmul.m",
+        },
+        .flags = &.{
+            "-std=c11",
+            "-fobjc-arc",
+            "-fno-objc-exceptions",
+        },
+    });
+}
+
 // =============================================================================
 // Main build function
 // =============================================================================
@@ -585,20 +615,27 @@ pub fn build(b: *std.Build) void {
     // ==========================================================================
     // Tests
     // ==========================================================================
+    // Keep default unit tests CPU-only to avoid MLX/Metal runtime coupling in
+    // aggregate runners. Metal coverage is exercised via targeted Metal tests.
+    const unit_test_build_options = b.addOptions();
+    unit_test_build_options.addOption(bool, "enable_metal", false);
+    unit_test_build_options.addOption(bool, "debug_matmul", debug_matmul);
+    unit_test_build_options.addOption(bool, "dump_tensors", dump_tensors);
+    unit_test_build_options.addOption([]const u8, "version", version);
+
     const test_mod = b.createModule(.{
         .root_source_file = b.path("core/src/lib.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
-    test_mod.addOptions("build_options", build_options);
+    test_mod.addOptions("build_options", unit_test_build_options);
     addCDependencies(b, test_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
 
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
     linkCDependencies(b, tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
-    addMetalSupport(b, test_mod, tests, enable_metal);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
@@ -639,6 +676,36 @@ pub fn build(b: *std.Build) void {
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run integration tests");
     integration_test_step.dependOn(&run_integration_tests.step);
+
+    // Models metadata report command:
+    //   zig build models-report -- registry
+    //   zig build models-report -- metadata
+    const models_report_path = "core/tests/models/report.zig";
+    if (std.fs.cwd().access(models_report_path, .{})) |_| {
+        const models_report_mod = b.createModule(.{
+            .root_source_file = b.path(models_report_path),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        const models_report_exe = b.addExecutable(.{
+            .name = "models_report",
+            .root_module = models_report_mod,
+        });
+        linkCDependencies(b, models_report_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+        const run_models_report = b.addRunArtifact(models_report_exe);
+        if (b.args) |args| {
+            for (args) |arg| run_models_report.addArg(arg);
+        } else {
+            run_models_report.addArg("registry");
+        }
+        const models_report_step = b.step("models-report", "Print deterministic models metadata reports");
+        models_report_step.dependOn(&run_models_report.step);
+    } else |_| {
+        // report helper not present - skip
+    }
 
     // ==========================================================================
     // Compliance (only if tests directory exists)
@@ -710,6 +777,100 @@ pub fn build(b: *std.Build) void {
         lint_test_step.dependOn(&run_lint_tests.step);
     } else |_| {
         // lint module not present - skip
+    }
+
+    // ==========================================================================
+    // Model change policy checker (core/tests/helpers/model_policy/)
+    // ==========================================================================
+    const model_policy_path = "core/tests/helpers/model_policy/root.zig";
+    if (std.fs.cwd().access(model_policy_path, .{})) |_| {
+        const host_target = b.resolveTargetQuery(.{});
+
+        const policy_mod = b.createModule(.{
+            .root_source_file = b.path(model_policy_path),
+            .target = host_target,
+            .optimize = .ReleaseFast,
+        });
+        const policy_exe = b.addExecutable(.{
+            .name = "model_policy",
+            .root_module = policy_mod,
+        });
+        b.installArtifact(policy_exe);
+
+        const run_policy = b.addRunArtifact(policy_exe);
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_policy.addArg(arg);
+            }
+        }
+        const policy_step = b.step("model-policy", "Run model-change policy checks");
+        policy_step.dependOn(&run_policy.step);
+
+        const policy_tests = b.addTest(.{
+            .root_module = policy_mod,
+        });
+        const run_policy_tests = b.addRunArtifact(policy_tests);
+        const policy_test_step = b.step("test-model-policy", "Run model-change policy tests");
+        policy_test_step.dependOn(&run_policy_tests.step);
+    } else |_| {
+        // model policy checker not present - skip
+    }
+
+    // ==========================================================================
+    // Perf/lifecycle sanity checker (core/tests/helpers/perf_sanity/)
+    // ==========================================================================
+    const perf_sanity_path = "core/tests/helpers/perf_sanity/root.zig";
+    if (std.fs.cwd().access(perf_sanity_path, .{})) |_| {
+        const host_target = b.resolveTargetQuery(.{});
+        const perf_exe_build_options = b.addOptions();
+        perf_exe_build_options.addOption(bool, "enable_metal", enable_metal);
+
+        const perf_exe_mod = b.createModule(.{
+            .root_source_file = b.path(perf_sanity_path),
+            .target = host_target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        perf_exe_mod.addOptions("build_options", perf_exe_build_options);
+        const perf_exe = b.addExecutable(.{
+            .name = "perf_sanity",
+            .root_module = perf_exe_mod,
+        });
+        addMetalCoreSupport(b, perf_exe_mod, perf_exe, enable_metal);
+        b.installArtifact(perf_exe);
+
+        const run_perf = b.addRunArtifact(perf_exe);
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_perf.addArg(arg);
+            }
+        }
+        const perf_step = b.step("perf-sanity", "Run perf/lifecycle sanity checks");
+        perf_step.dependOn(&run_perf.step);
+
+        const perf_test_build_options = b.addOptions();
+        perf_test_build_options.addOption(bool, "enable_metal", false);
+
+        const perf_test_mod = b.createModule(.{
+            .root_source_file = b.path(perf_sanity_path),
+            .target = host_target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        perf_test_mod.addOptions("build_options", perf_test_build_options);
+
+        const perf_tests = b.addTest(.{
+            .root_module = perf_test_mod,
+        });
+        const run_perf_tests = b.addRunArtifact(perf_tests);
+        const perf_test_step = b.step("test-perf-sanity", "Run perf/lifecycle sanity tests");
+        perf_test_step.dependOn(&run_perf_tests.step);
+    } else |_| {
+        // perf sanity checker not present - skip
     }
 
     // ==========================================================================

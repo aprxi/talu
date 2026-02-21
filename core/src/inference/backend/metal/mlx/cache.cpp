@@ -229,3 +229,42 @@ void mlx_shortconv_cache_free(void* cache_ptr) {
 }
 
 } // extern "C"
+
+extern "C" {
+
+// ============================================================================
+// Mamba Cache Lifecycle
+// ============================================================================
+
+void* mlx_mamba_cache_create(size_t n_layers) {
+    auto* cache_state = new MLXMambaCache();
+    cache_state->layers.resize(n_layers);
+    return cache_state;
+}
+
+void mlx_mamba_cache_reset(void* cache_ptr) {
+    auto* cache_state = static_cast<MLXMambaCache*>(cache_ptr);
+    if (cache_state == nullptr) return;
+    for (auto& layer : cache_state->layers) {
+        if (layer.conv_state != nullptr) {
+            const auto shape = layer.conv_state->shape();
+            *layer.conv_state = zeros(shape, float32);
+        }
+        if (layer.ssm_state != nullptr) {
+            const auto shape = layer.ssm_state->shape();
+            *layer.ssm_state = zeros(shape, float32);
+        }
+    }
+}
+
+void mlx_mamba_cache_free(void* cache_ptr) {
+    auto* cache_state = static_cast<MLXMambaCache*>(cache_ptr);
+    if (cache_state == nullptr) return;
+    for (auto& layer : cache_state->layers) {
+        delete layer.conv_state;
+        delete layer.ssm_state;
+    }
+    delete cache_state;
+}
+
+} // extern "C"

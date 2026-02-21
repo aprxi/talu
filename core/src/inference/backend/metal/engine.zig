@@ -54,6 +54,7 @@ pub const MetalBackend = struct {
     /// Slot 0 state (single-sequence compatibility path).
     cache: runtime_graph_mod.Cache,
     shortconv_cache: runtime_graph_mod.ShortConvCache,
+    mamba_cache: runtime_graph_mod.MambaCache,
     vocab_size: usize,
     d_model: usize,
     has_shortconv: bool,
@@ -62,6 +63,11 @@ pub const MetalBackend = struct {
     /// Slots 1..N-1 for scheduler-managed multi-slot decode.
     extra_slots: []SlotState,
     slot_logits_buffer: []f32,
+    decode_batch_cache_handles: []runtime_graph_mod.CacheHandle,
+    decode_batch_shortconv_handles: []runtime_graph_mod.ShortConvCacheHandle,
+    decode_batch_tokens: []u32,
+    decode_batch_positions: []usize,
+    decode_batch_logits_handles: []graph.ArrayHandle,
     vision_runtime: ?vision_runtime_mod.VisionRuntime = null,
     slot_rope_position_delta: isize,
 
@@ -74,6 +80,7 @@ pub const MetalBackend = struct {
     const SlotState = struct {
         cache: runtime_graph_mod.Cache,
         shortconv_cache: runtime_graph_mod.ShortConvCache,
+        mamba_cache: runtime_graph_mod.MambaCache,
         in_use: bool = false,
         position: usize = 0,
         rope_position_delta: isize = 0,
@@ -174,6 +181,12 @@ pub const MetalBackend = struct {
         return &self.extra_slots[extra_idx].shortconv_cache;
     }
 
+    fn slotMambaCache(self: *MetalBackend, slot_index: usize) !*runtime_graph_mod.MambaCache {
+        if (slot_index == 0) return &self.mamba_cache;
+        const extra_idx = try self.toExtraSlotIndex(slot_index);
+        return &self.extra_slots[extra_idx].mamba_cache;
+    }
+
     fn slotPositionPtr(self: *MetalBackend, slot_index: usize) !*usize {
         if (slot_index == 0) return &self.current_position;
         const extra_idx = try self.toExtraSlotIndex(slot_index);
@@ -189,12 +202,14 @@ pub const MetalBackend = struct {
     fn resetSlotState(self: *MetalBackend, slot_index: usize) !void {
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
+        const slot_mamba_cache = try self.slotMambaCache(slot_index);
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
         slot_cache.deinit();
         slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
         slot_shortconv_cache.reset();
+        slot_mamba_cache.reset();
         slot_position.* = 0;
         slot_rope_delta.* = 0;
     }
@@ -205,6 +220,7 @@ pub const MetalBackend = struct {
 
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
+        const slot_mamba_cache = try self.slotMambaCache(slot_index);
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         slot_rope_delta.* = 0;
@@ -221,6 +237,7 @@ pub const MetalBackend = struct {
             self.config,
             slot_cache.*,
             slot_shortconv_cache.*,
+            slot_mamba_cache.*,
             0, // pos_offset
             false, // use_compiled (prefill must use manual path)
         );
@@ -254,6 +271,7 @@ pub const MetalBackend = struct {
     ) !void {
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
+        const slot_mamba_cache = try self.slotMambaCache(slot_index);
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
@@ -285,6 +303,7 @@ pub const MetalBackend = struct {
             self.config,
             slot_cache.*,
             slot_shortconv_cache.*,
+            slot_mamba_cache.*,
             effective_position,
             false,
         );
@@ -333,6 +352,8 @@ pub const MetalBackend = struct {
         const layer_count: usize = @intCast(loaded.config.n_layers);
         const kv_cache = runtime_graph_mod.Cache.init(layer_count, true);
         const shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count);
+        const mamba_cache = runtime_graph_mod.MambaCache.init(layer_count);
+        errdefer mamba_cache.deinit();
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
@@ -345,6 +366,7 @@ pub const MetalBackend = struct {
             slot.* = .{
                 .cache = runtime_graph_mod.Cache.init(layer_count, true),
                 .shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count),
+                .mamba_cache = runtime_graph_mod.MambaCache.init(layer_count),
                 .in_use = false,
                 .position = 0,
                 .rope_position_delta = 0,
@@ -353,10 +375,21 @@ pub const MetalBackend = struct {
         errdefer for (extra_slots) |slot| {
             slot.cache.deinit();
             slot.shortconv_cache.deinit();
+            slot.mamba_cache.deinit();
         };
 
         const slot_logits_buffer = try allocator.alloc(f32, max_batch_size * @as(usize, @intCast(loaded.config.vocab_size)));
         errdefer allocator.free(slot_logits_buffer);
+        const decode_batch_cache_handles = try allocator.alloc(runtime_graph_mod.CacheHandle, max_batch_size);
+        errdefer allocator.free(decode_batch_cache_handles);
+        const decode_batch_shortconv_handles = try allocator.alloc(runtime_graph_mod.ShortConvCacheHandle, max_batch_size);
+        errdefer allocator.free(decode_batch_shortconv_handles);
+        const decode_batch_tokens = try allocator.alloc(u32, max_batch_size);
+        errdefer allocator.free(decode_batch_tokens);
+        const decode_batch_positions = try allocator.alloc(usize, max_batch_size);
+        errdefer allocator.free(decode_batch_positions);
+        const decode_batch_logits_handles = try allocator.alloc(graph.ArrayHandle, max_batch_size);
+        errdefer allocator.free(decode_batch_logits_handles);
 
         return MetalBackend{
             .allocator = allocator,
@@ -364,6 +397,7 @@ pub const MetalBackend = struct {
             .weights = weight_handles,
             .cache = kv_cache,
             .shortconv_cache = shortconv_cache,
+            .mamba_cache = mamba_cache,
             .vocab_size = @intCast(loaded.config.vocab_size),
             .d_model = @intCast(loaded.config.d_model),
             .has_shortconv = weight_handles.has_shortconv,
@@ -371,6 +405,11 @@ pub const MetalBackend = struct {
             .slot_in_use = false,
             .extra_slots = extra_slots,
             .slot_logits_buffer = slot_logits_buffer,
+            .decode_batch_cache_handles = decode_batch_cache_handles,
+            .decode_batch_shortconv_handles = decode_batch_shortconv_handles,
+            .decode_batch_tokens = decode_batch_tokens,
+            .decode_batch_positions = decode_batch_positions,
+            .decode_batch_logits_handles = decode_batch_logits_handles,
             .vision_runtime = vision_runtime,
             .slot_rope_position_delta = 0,
             .current_position = 0,
@@ -380,14 +419,21 @@ pub const MetalBackend = struct {
 
     pub fn deinit(self: *MetalBackend) void {
         if (self.vision_runtime) |*rt| rt.deinit();
+        self.allocator.free(self.decode_batch_logits_handles);
+        self.allocator.free(self.decode_batch_positions);
+        self.allocator.free(self.decode_batch_tokens);
+        self.allocator.free(self.decode_batch_shortconv_handles);
+        self.allocator.free(self.decode_batch_cache_handles);
         self.allocator.free(self.slot_logits_buffer);
         for (self.extra_slots) |slot| {
             slot.cache.deinit();
             slot.shortconv_cache.deinit();
+            slot.mamba_cache.deinit();
         }
         self.allocator.free(self.extra_slots);
         self.cache.deinit();
         self.shortconv_cache.deinit();
+        self.mamba_cache.deinit();
         weights_trait.freeWeights(self.allocator, self.weights);
         self.* = undefined;
     }
@@ -466,6 +512,7 @@ pub const MetalBackend = struct {
         if (sequence_len == 0) return;
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
+        const slot_mamba_cache = try self.slotMambaCache(slot_index);
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
@@ -561,6 +608,7 @@ pub const MetalBackend = struct {
         slot_cache.deinit();
         slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
         slot_shortconv_cache.reset();
+        slot_mamba_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,
@@ -569,6 +617,7 @@ pub const MetalBackend = struct {
             self.config,
             slot_cache.*,
             slot_shortconv_cache.*,
+            slot_mamba_cache.*,
             0,
             false,
             hidden_values,
@@ -600,6 +649,46 @@ pub const MetalBackend = struct {
     pub fn decodeBatch(self: *MetalBackend, requests: []const contract.DecodeRequest, results: []contract.DecodeResult) !void {
         if (requests.len == 0) return;
         if (results.len < requests.len) return error.InvalidArgument;
+
+        const mode = self.decodeExecutionMode(false);
+        if (mode == .fused and self.decode_model != null and requests.len > 1 and requests.len <= self.max_batch_size) {
+            const decode_model = self.decode_model.?;
+            for (requests, 0..) |request, idx| {
+                const logits = try self.slotLogits(request.slot_index);
+                const slot_cache = try self.slotCache(request.slot_index);
+                const slot_shortconv_cache = try self.slotShortConvCache(request.slot_index);
+                const slot_position = try self.slotPositionPtr(request.slot_index);
+                const slot_rope_delta = try self.slotRopeDeltaPtr(request.slot_index);
+                const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
+
+                self.decode_batch_cache_handles[idx] = slot_cache.handle;
+                self.decode_batch_shortconv_handles[idx] = slot_shortconv_cache.handle;
+                self.decode_batch_tokens[idx] = request.token;
+                self.decode_batch_positions[idx] = effective_position;
+                self.decode_batch_logits_handles[idx] = null;
+
+                results[idx] = .{
+                    .slot_index = request.slot_index,
+                    .logits = logits,
+                };
+            }
+
+            model_runtime.decodeStepLogitsBatch(
+                decode_model,
+                self.decode_batch_cache_handles[0..requests.len],
+                self.decode_batch_shortconv_handles[0..requests.len],
+                self.decode_batch_tokens[0..requests.len],
+                self.decode_batch_positions[0..requests.len],
+                self.decode_batch_logits_handles[0..requests.len],
+            );
+
+            for (requests, 0..) |request, idx| {
+                graph.copyToHost(self.decode_batch_logits_handles[idx], results[idx].logits);
+                const slot_position = try self.slotPositionPtr(request.slot_index);
+                slot_position.* += 1;
+            }
+            return;
+        }
 
         for (requests, 0..) |request, index| {
             const logits = try self.slotLogits(request.slot_index);
@@ -813,6 +902,7 @@ pub const MetalBackend = struct {
             self.config,
             self.cache,
             self.shortconv_cache,
+            self.mamba_cache,
             effective_start_position,
             false,
         );
@@ -834,6 +924,7 @@ pub const MetalBackend = struct {
                     self.config,
                     self.cache,
                     self.shortconv_cache,
+                    self.mamba_cache,
                     effective_position,
                 );
                 const next_logits_last = graph.mlx_lazy_slice_last(next_logits_handle);

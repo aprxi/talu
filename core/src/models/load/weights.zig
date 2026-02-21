@@ -115,6 +115,35 @@ fn archHasGlobalWeights(arch: *const model_types.Architecture) bool {
     return arch.global_weights.len > 0;
 }
 
+fn hasOpTypeIn(ops: []const model_types.Op, tag: model_types.OpType) bool {
+    for (ops) |op| {
+        if (op.op_type == tag) return true;
+    }
+    return false;
+}
+
+fn hasOpType(arch: *const model_types.Architecture, tag: model_types.OpType) bool {
+    if (hasOpTypeIn(arch.block_ops, tag)) return true;
+    if (arch.block_variants) |variants| {
+        for (variants) |variant| {
+            if (hasOpTypeIn(variant.ops, tag)) return true;
+        }
+    }
+    return false;
+}
+
+fn requireArchitectureMetadata(arch: *const model_types.Architecture) !void {
+    const has_mlp_or_moe = hasOpType(arch, .mlp) or hasOpType(arch, .moe);
+    const has_shortconv_feature = arch.has_shortconv or hasOpType(arch, .shortconv);
+
+    if (has_mlp_or_moe and arch.d_ff_source_weight_ids.len == 0) {
+        return error.MissingDffSourceWeightIds;
+    }
+    if (has_shortconv_feature and arch.shortconv_dims_source_weight_id == null) {
+        return error.MissingShortConvSourceWeightId;
+    }
+}
+
 fn maybeAddFusedWeights(
     allocator: std.mem.Allocator,
     map: *runtime_blocks.WeightMap,
@@ -153,21 +182,27 @@ fn inferShortConvDims(
     config: *runtime_blocks.ShortConvConfig,
     weight_map: *const runtime_blocks.WeightMap,
     source_weight_id: ?[]const u8,
-) void {
+) !void {
     if (config.conv_dim != 0 and config.conv_dim_out != 0 and config.d_conv != 0) return;
 
-    if (source_weight_id) |id| {
-        if (weight_map.get(id)) |conv_w| {
-            if (config.conv_dim == 0) config.conv_dim = @intCast(conv_w.shape[0]);
-            const d_idx: usize = if (conv_w.n_dims == 3) 2 else 1;
-            if (config.d_conv == 0) config.d_conv = @intCast(conv_w.shape[d_idx]);
-        }
+    const needs_source = config.conv_dim == 0 or config.d_conv == 0;
+    if (needs_source) {
+        const id = source_weight_id orelse return error.MissingShortConvSourceWeightId;
+        const conv_w = weight_map.get(id) orelse return error.MissingShortConvSourceWeight;
+        if (conv_w.n_dims != 2 and conv_w.n_dims != 3) return error.InvalidShortConvSourceWeightShape;
+        if (config.conv_dim == 0) config.conv_dim = @intCast(conv_w.shape[0]);
+        const d_idx: usize = if (conv_w.n_dims == 3) 2 else 1;
+        if (config.d_conv == 0) config.d_conv = @intCast(conv_w.shape[d_idx]);
     }
 
     // conv_dim_out is typically equal to conv_dim for known architectures.
     // Cannot reliably infer from out_proj since it may be quantized (packed shape).
     if (config.conv_dim_out == 0 and config.conv_dim != 0) {
         config.conv_dim_out = config.conv_dim;
+    }
+
+    if (config.conv_dim == 0 or config.conv_dim_out == 0 or config.d_conv == 0) {
+        return error.InvalidShortConvConfig;
     }
 }
 
@@ -189,12 +224,16 @@ fn inferDff(
     model_config: *ModelConfig,
     weight_map: *const runtime_blocks.WeightMap,
     source_weight_ids: []const []const u8,
-) void {
+) !void {
+    if (source_weight_ids.len == 0) return error.MissingDffSourceWeightIds;
+
     const d_model: usize = @intCast(model_config.d_model);
     const config_d_ff: usize = @intCast(model_config.d_ff);
+    var found_source_weight = false;
 
     for (source_weight_ids) |id| {
         if (weight_map.get(id)) |w| {
+            found_source_weight = true;
             if (inferDffFromWeight(w.*, d_model)) |inferred| {
                 if (inferred != config_d_ff) {
                     log.info("load", "Corrected d_ff from weight shape", .{
@@ -206,8 +245,17 @@ fn inferDff(
                 }
                 return;
             }
+
+            // Square case (d_model == d_ff): no correction needed when config
+            // already matches d_model.
+            if (w.n_dims == 2 and w.shape[0] == d_model and w.shape[1] == d_model and config_d_ff == d_model) {
+                return;
+            }
         }
     }
+
+    if (!found_source_weight) return error.MissingDffSourceWeight;
+    return error.InvalidDffSourceWeightShape;
 }
 
 /// Extract d_ff from a gate projection weight tensor shape.
@@ -398,6 +446,7 @@ pub fn loadModelWithArchitecture(
     // Graph metadata is now required for weight loading.
     // Legacy hardcoded loader has been removed - all models need architecture definitions.
     const arch = runtime_arch orelse return error.MissingArchitecture;
+    try requireArchitectureMetadata(arch);
     if (!archHasBlockWeights(arch)) return error.MissingArchitecture;
     inferMoEFromArchitecture(arch, &model_config);
 
@@ -479,7 +528,7 @@ pub fn loadModelWithArchitecture(
         // This corrects config mismatches where intermediate_size != actual weight dim
         // (e.g., LFM2.5 where config says 12288 but actual gate weight output is 8192).
         if (layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {
-            inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids);
+            try inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids);
         }
 
         if (env_flags.enable_cpu_fusion) {
@@ -549,7 +598,7 @@ pub fn loadModelWithArchitecture(
             };
             // Infer missing shortconv dimensions from weight tensor shapes.
             // Config files may not specify all dimensions (e.g., LFM2.5 omits conv_dim_out).
-            inferShortConvDims(&map_context.shortconv_config.?, &weight_map, arch.shortconv_dims_source_weight_id);
+            try inferShortConvDims(&map_context.shortconv_config.?, &weight_map, arch.shortconv_dims_source_weight_id);
         }
 
         block_weights[layer_idx] = try runtime_blocks.blockWeightsFromMap(&weight_map, block_type, map_context);
@@ -710,6 +759,148 @@ fn freeAlignedTensorData(allocator: std.mem.Allocator, t: Tensor) void {
         const aligned_ptr: [*]align(32) u8 = @alignCast(ptr);
         allocator.free(aligned_ptr[0..t.data_size]);
     }
+}
+
+test "requireArchitectureMetadata rejects missing d_ff metadata for mlp architectures" {
+    const ops = [_]model_types.Op{
+        .{ .op_type = .mlp },
+    };
+    const arch = model_types.Architecture{
+        .name = "test_mlp",
+        .model_types = &.{},
+        .block_ops = &ops,
+        .global_weights = &.{},
+        .d_ff_source_weight_ids = &.{},
+    };
+
+    try std.testing.expectError(error.MissingDffSourceWeightIds, requireArchitectureMetadata(&arch));
+}
+
+test "requireArchitectureMetadata rejects missing shortconv source id" {
+    const ops = [_]model_types.Op{
+        .{ .op_type = .shortconv },
+    };
+    const arch = model_types.Architecture{
+        .name = "test_shortconv",
+        .model_types = &.{},
+        .block_ops = &ops,
+        .global_weights = &.{},
+        .d_ff_source_weight_ids = &.{"mlp.gate_proj.weight"},
+        .shortconv_dims_source_weight_id = null,
+    };
+
+    try std.testing.expectError(error.MissingShortConvSourceWeightId, requireArchitectureMetadata(&arch));
+}
+
+test "inferDff returns missing source list error" {
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 128;
+    cfg.d_ff = 256;
+    cfg.vocab_size = 1000;
+    cfg.n_layers = 1;
+    cfg.n_heads = 4;
+    cfg.n_kv_groups = 4;
+    cfg.head_dim = 32;
+    cfg.max_seq_len = 128;
+    cfg.rope_theta = 10000.0;
+    cfg.norm_eps = 1e-5;
+    cfg.gaffine_group_size = 128;
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.MissingDffSourceWeightIds, inferDff(&cfg, &map, &.{}));
+}
+
+test "inferDff returns missing source weight error when ids do not resolve" {
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 128;
+    cfg.d_ff = 256;
+    cfg.vocab_size = 1000;
+    cfg.n_layers = 1;
+    cfg.n_heads = 4;
+    cfg.n_kv_groups = 4;
+    cfg.head_dim = 32;
+    cfg.max_seq_len = 128;
+    cfg.rope_theta = 10000.0;
+    cfg.norm_eps = 1e-5;
+    cfg.gaffine_group_size = 128;
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.MissingDffSourceWeight,
+        inferDff(&cfg, &map, &.{"mlp.gate_proj.weight"}),
+    );
+}
+
+test "inferDff updates config from source weight shape" {
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 128;
+    cfg.d_ff = 256;
+    cfg.vocab_size = 1000;
+    cfg.n_layers = 1;
+    cfg.n_heads = 4;
+    cfg.n_kv_groups = 4;
+    cfg.head_dim = 32;
+    cfg.max_seq_len = 128;
+    cfg.rope_theta = 10000.0;
+    cfg.norm_eps = 1e-5;
+    cfg.gaffine_group_size = 128;
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    var gate_weight = Tensor{
+        .dtype = .f32,
+        .n_dims = 2,
+        .shape = .{ 128, 320, 0, 0, 0, 0, 0, 0 },
+        .data_ptr = null,
+        .data_size = 0,
+    };
+    try map.put(std.testing.allocator, "mlp.gate_proj.weight", &gate_weight);
+
+    try inferDff(&cfg, &map, &.{"mlp.gate_proj.weight"});
+    try std.testing.expectEqual(@as(i32, 320), cfg.d_ff);
+}
+
+test "inferShortConvDims rejects missing source id when dims are incomplete" {
+    var cfg = runtime_blocks.ShortConvConfig{
+        .d_model = 128,
+        .d_conv = 0,
+        .conv_dim = 0,
+        .conv_dim_out = 0,
+    };
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.MissingShortConvSourceWeightId, inferShortConvDims(&cfg, &map, null));
+}
+
+test "inferShortConvDims infers missing dimensions from source weight" {
+    var cfg = runtime_blocks.ShortConvConfig{
+        .d_model = 128,
+        .d_conv = 0,
+        .conv_dim = 0,
+        .conv_dim_out = 0,
+    };
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    var conv_weight = Tensor{
+        .dtype = .f32,
+        .n_dims = 3,
+        .shape = .{ 512, 1, 4, 0, 0, 0, 0, 0 },
+        .data_ptr = null,
+        .data_size = 0,
+    };
+    try map.put(std.testing.allocator, "conv.conv.weight", &conv_weight);
+
+    try inferShortConvDims(&cfg, &map, "conv.conv.weight");
+    try std.testing.expectEqual(@as(u32, 512), cfg.conv_dim);
+    try std.testing.expectEqual(@as(u32, 512), cfg.conv_dim_out);
+    try std.testing.expectEqual(@as(u32, 4), cfg.d_conv);
 }
 
 test "orientWeightF32: transpose [out, in] to [in, out]" {
