@@ -843,6 +843,146 @@ test "buildImportContext resolves crate:: in use statement" {
     try std.testing.expectEqualStrings("::utils::Helper", ctx[0].canonical_path);
 }
 
+fn freeCallSites(allocator: std.mem.Allocator, calls: []CallSiteDetail) void {
+    for (calls) |cs| {
+        for (cs.potential_resolved_paths) |rp| allocator.free(rp);
+        allocator.free(cs.potential_resolved_paths);
+        allocator.free(cs.arguments);
+    }
+    allocator.free(calls);
+}
+
+/// Find the body block of the first function_item in the root.
+/// extractCallSites is designed to be called on a function body (it stops
+/// recursing at function_item boundaries to avoid crossing definer scopes).
+fn firstFunctionBody(root: Node) ?Node {
+    var i: u32 = 0;
+    while (i < root.childCount()) : (i += 1) {
+        const ch = root.child(i) orelse continue;
+        if (std.mem.eql(u8, ch.kind(), "function_item")) {
+            return ch.childByFieldName("body");
+        }
+    }
+    return null;
+}
+
+test "extractCallSites finds simple Rust function call" {
+    var p = try parser_mod.Parser.init(.rust);
+    defer p.deinit();
+    const source = "fn main() { foo(1, 2); }";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const body = firstFunctionBody(tree.rootNode()) orelse return error.SkipZigTest;
+    const calls = try extractCallSites(std.testing.allocator, body, source, "::test::main", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("foo", calls[0].raw_target_name);
+    try std.testing.expectEqualStrings("::test::main", calls[0].definer_callable_fqn);
+    try std.testing.expectEqual(@as(usize, 2), calls[0].arguments.len);
+}
+
+test "extractCallSites finds qualified path call" {
+    var p = try parser_mod.Parser.init(.rust);
+    defer p.deinit();
+    const source = "fn main() { HashMap::new(); }";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const imports = &[_]ImportEntry{
+        .{ .local_name = "HashMap", .canonical_path = "::std::collections::HashMap" },
+    };
+    const body = firstFunctionBody(tree.rootNode()) orelse return error.SkipZigTest;
+    const calls = try extractCallSites(std.testing.allocator, body, source, "::mod::main", imports);
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("HashMap::new", calls[0].raw_target_name);
+    // naive + import-resolved
+    try std.testing.expect(calls[0].potential_resolved_paths.len >= 2);
+    try std.testing.expectEqualStrings("::HashMap::new", calls[0].potential_resolved_paths[0]);
+    try std.testing.expectEqualStrings("::std::collections::HashMap::new", calls[0].potential_resolved_paths[1]);
+}
+
+test "extractCallSites finds macro invocation" {
+    var p = try parser_mod.Parser.init(.rust);
+    defer p.deinit();
+    const source = "fn main() { println!(\"hello\"); }";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const body = firstFunctionBody(tree.rootNode()) orelse return error.SkipZigTest;
+    const calls = try extractCallSites(std.testing.allocator, body, source, "::mod::main", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    // macro_invocation child(0) is the macro name identifier
+    try std.testing.expect(
+        std.mem.eql(u8, calls[0].raw_target_name, "println!") or
+            std.mem.eql(u8, calls[0].raw_target_name, "println"),
+    );
+}
+
+test "extractCallSites classifies Rust argument types" {
+    var p = try parser_mod.Parser.init(.rust);
+    defer p.deinit();
+    const source = "fn main() { process(42, \"hi\", x, other()); }";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const body = firstFunctionBody(tree.rootNode()) orelse return error.SkipZigTest;
+    const calls = try extractCallSites(std.testing.allocator, body, source, "::m::main", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    // Find the "process" call (not "other")
+    var process_call: ?CallSiteDetail = null;
+    for (calls) |cs| {
+        if (std.mem.eql(u8, cs.raw_target_name, "process")) {
+            process_call = cs;
+            break;
+        }
+    }
+    try std.testing.expect(process_call != null);
+    const args = process_call.?.arguments;
+    try std.testing.expectEqual(@as(usize, 4), args.len);
+    try std.testing.expectEqual(ArgumentSource.literal, args[0].source); // 42
+    try std.testing.expectEqual(ArgumentSource.literal, args[1].source); // "hi"
+    try std.testing.expectEqual(ArgumentSource.variable, args[2].source); // x
+    try std.testing.expectEqual(ArgumentSource.function_call, args[3].source); // other()
+}
+
+test "extractCallSites captures let-binding result variable" {
+    var p = try parser_mod.Parser.init(.rust);
+    defer p.deinit();
+    const source = "fn main() { let result = compute(); }";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const body = firstFunctionBody(tree.rootNode()) orelse return error.SkipZigTest;
+    const calls = try extractCallSites(std.testing.allocator, body, source, "::m::main", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("compute", calls[0].raw_target_name);
+    try std.testing.expect(calls[0].result_usage_variable != null);
+    try std.testing.expectEqualStrings("result", calls[0].result_usage_variable.?);
+}
+
+test "extractCallSites returns empty for source with no calls" {
+    var p = try parser_mod.Parser.init(.rust);
+    defer p.deinit();
+    const source = "fn main() { let x = 42; }";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const body = firstFunctionBody(tree.rootNode()) orelse return error.SkipZigTest;
+    const calls = try extractCallSites(std.testing.allocator, body, source, "::m::main", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 0), calls.len);
+}
+
 test "generateResolutionPaths resolves crate:: prefix" {
     const resolved = try generateResolutionPaths(
         std.testing.allocator,

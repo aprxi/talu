@@ -26,6 +26,8 @@ pub const ImportEntry = types.ImportEntry;
 // Re-export top-level functions
 pub const extractCallablesAndAliases = extract.extractCallablesAndAliases;
 pub const extractCallSites = extract.extractCallSites;
+pub const extractCallablesToJson = extract.extractCallablesToJson;
+pub const extractCallSitesToJson = extract.extractCallSitesToJson;
 pub const callablesToJson = json_output.callablesToJson;
 pub const callSitesToJson = json_output.callSitesToJson;
 pub const aliasesToJson = json_output.aliasesToJson;

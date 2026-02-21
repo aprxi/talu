@@ -807,47 +807,15 @@ pub export fn talu_treesitter_extract_callables(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
 
-    const source_slice = source[0..source_len];
-    const file_path_str = std.mem.span(file_path);
-    const project_root_str = std.mem.span(project_root);
-
-    const extraction = graph_mod.extractCallablesAndAliases(
+    const json = graph_mod.extractCallablesToJson(
         allocator,
-        source_slice,
+        source[0..source_len],
         language,
-        file_path_str,
-        project_root_str,
+        std.mem.span(file_path),
+        std.mem.span(project_root),
     ) catch {
         capi_error.setError(error.Unexpected, "Callable extraction failed for {s}", .{lang_str});
         return @intFromEnum(error_codes.ErrorCode.internal_error);
-    };
-    defer {
-        for (extraction.callables) |c| {
-            allocator.free(c.fqn);
-            allocator.free(c.parameters);
-        }
-        allocator.free(extraction.callables);
-        for (extraction.aliases) |a| {
-            allocator.free(a.alias_fqn);
-        }
-        allocator.free(extraction.aliases);
-    }
-
-    const callables_json = graph_mod.callablesToJson(allocator, extraction.callables) catch {
-        capi_error.setError(error.OutOfMemory, "JSON serialization failed", .{});
-        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    };
-    defer allocator.free(callables_json);
-
-    const aliases_json = graph_mod.aliasesToJson(allocator, extraction.aliases) catch {
-        capi_error.setError(error.OutOfMemory, "Alias JSON serialization failed", .{});
-        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    };
-    defer allocator.free(aliases_json);
-
-    const json = graph_mod.extractionToJson(allocator, callables_json, aliases_json) catch {
-        capi_error.setError(error.OutOfMemory, "Envelope JSON serialization failed", .{});
-        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
     };
 
     out.* = json.ptr;
@@ -892,33 +860,16 @@ pub export fn talu_treesitter_extract_call_sites(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
 
-    const source_slice = source[0..source_len];
-    const definer_fqn_str = std.mem.span(definer_fqn);
-    const file_path_str = std.mem.span(file_path);
-    const project_root_str = std.mem.span(project_root);
-
-    const call_sites = graph_mod.extractCallSites(
+    const json = graph_mod.extractCallSitesToJson(
         allocator,
-        source_slice,
+        source[0..source_len],
         language,
-        definer_fqn_str,
-        file_path_str,
-        project_root_str,
+        std.mem.span(definer_fqn),
+        std.mem.span(file_path),
+        std.mem.span(project_root),
     ) catch {
         capi_error.setError(error.Unexpected, "Call site extraction failed for {s}", .{lang_str});
         return @intFromEnum(error_codes.ErrorCode.internal_error);
-    };
-    defer {
-        for (call_sites) |cs| {
-            allocator.free(cs.potential_resolved_paths);
-            allocator.free(cs.arguments);
-        }
-        allocator.free(call_sites);
-    }
-
-    const json = graph_mod.callSitesToJson(allocator, call_sites) catch {
-        capi_error.setError(error.OutOfMemory, "JSON serialization failed", .{});
-        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
     };
 
     out.* = json.ptr;
@@ -949,6 +900,7 @@ test "fuzz talu_treesitter_parse" {
 test "fuzz talu_treesitter_highlight" {
     try std.testing.fuzz({}, struct {
         fn testOne(_: void, input: []const u8) !void {
+            // Overwritten by talu_treesitter_highlight via out-param on success.
             var out_json: [*:0]u8 = undefined;
             const rc = talu_treesitter_highlight(
                 input.ptr,
@@ -982,6 +934,7 @@ test "fuzz talu_treesitter_query_exec" {
             if (query_rc != 0) return;
             defer talu_treesitter_query_free(query);
 
+            // Overwritten by talu_treesitter_query_exec via out-param on success.
             var out_json: [*:0]u8 = undefined;
             const rc = talu_treesitter_query_exec(
                 query,

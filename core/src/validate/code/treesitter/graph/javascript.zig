@@ -221,7 +221,7 @@ fn extractArrowFunctions(
     language: Language,
     callables: *std.ArrayList(CallableDefinitionInfo),
 ) ExtractError!void {
-    // const foo = (x) => { ... } or const foo = () => expr
+    // Matches arrow function declarations: `foo = (x) => { ... }` or `foo = () => expr`
     var i: u32 = 0;
     const count = node.childCount();
     while (i < count) : (i += 1) {
@@ -424,12 +424,14 @@ fn extractNamedImports(
 
             // target = module_canonical + "::" + original_name
             const target = try allocator.alloc(u8, module_canonical.len + 2 + original_name.len);
+            errdefer allocator.free(target);
             @memcpy(target[0..module_canonical.len], module_canonical);
             target[module_canonical.len] = ':';
             target[module_canonical.len + 1] = ':';
             @memcpy(target[module_canonical.len + 2 ..], original_name);
 
             const alias_fqn = try paths.buildFqn(allocator, &.{ module_path, local_name });
+            errdefer allocator.free(alias_fqn);
             try aliases.append(allocator, .{
                 .alias_fqn = alias_fqn,
                 .target_path_guess = target,
@@ -742,7 +744,7 @@ fn extractArguments(
 }
 
 fn getResultVariable(call_node: Node, source: []const u8) ?[]const u8 {
-    // const x = foo() or let x = foo()
+    // Matches variable binding: `x = foo()` or `y = bar()`
     const parent_node = call_node.parent() orelse return null;
     if (!std.mem.eql(u8, parent_node.kind(), "variable_declarator")) return null;
 
@@ -841,6 +843,124 @@ test "generateResolutionPaths resolves JS dotted call" {
     try std.testing.expectEqual(@as(usize, 2), resolved.len);
     try std.testing.expectEqualStrings("::React::createElement", resolved[0]);
     try std.testing.expectEqualStrings("::react::createElement", resolved[1]);
+}
+
+fn freeCallSites(allocator: std.mem.Allocator, calls: []CallSiteDetail) void {
+    for (calls) |cs| {
+        for (cs.potential_resolved_paths) |rp| allocator.free(rp);
+        allocator.free(cs.potential_resolved_paths);
+        allocator.free(cs.arguments);
+    }
+    allocator.free(calls);
+}
+
+test "extractCallSites finds simple function call" {
+    var p = try parser_mod.Parser.init(.javascript);
+    defer p.deinit();
+    const source = "foo(1, 2)";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const calls = try extractCallSites(std.testing.allocator, tree.rootNode(), source, "::test::main", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("foo", calls[0].raw_target_name);
+    try std.testing.expectEqualStrings("::test::main", calls[0].definer_callable_fqn);
+    try std.testing.expectEqual(@as(usize, 2), calls[0].arguments.len);
+}
+
+test "extractCallSites finds method call with dotted target" {
+    var p = try parser_mod.Parser.init(.javascript);
+    defer p.deinit();
+    const source = "obj.method()";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const calls = try extractCallSites(std.testing.allocator, tree.rootNode(), source, "::mod::fn", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("obj.method", calls[0].raw_target_name);
+}
+
+test "extractCallSites classifies argument types" {
+    var p = try parser_mod.Parser.init(.javascript);
+    defer p.deinit();
+    const source = "foo(42, \"hello\", x, bar())";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const calls = try extractCallSites(std.testing.allocator, tree.rootNode(), source, "::m::f", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    // foo(...) is the outer call; bar() is nested inside it
+    // Find the outer call (the one targeting "foo")
+    var foo_call: ?CallSiteDetail = null;
+    for (calls) |cs| {
+        if (std.mem.eql(u8, cs.raw_target_name, "foo")) {
+            foo_call = cs;
+            break;
+        }
+    }
+    try std.testing.expect(foo_call != null);
+    const args = foo_call.?.arguments;
+    try std.testing.expectEqual(@as(usize, 4), args.len);
+    try std.testing.expectEqual(ArgumentSource.literal, args[0].source);
+    try std.testing.expectEqualStrings("42", args[0].text);
+    try std.testing.expectEqual(ArgumentSource.literal, args[1].source);
+    try std.testing.expectEqual(ArgumentSource.variable, args[2].source);
+    try std.testing.expectEqual(ArgumentSource.function_call, args[3].source);
+}
+
+test "extractCallSites captures result variable" {
+    var p = try parser_mod.Parser.init(.javascript);
+    defer p.deinit();
+    const source = "const result = getValue()";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const calls = try extractCallSites(std.testing.allocator, tree.rootNode(), source, "::m::f", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("getValue", calls[0].raw_target_name);
+    try std.testing.expect(calls[0].result_usage_variable != null);
+    try std.testing.expectEqualStrings("result", calls[0].result_usage_variable.?);
+}
+
+test "extractCallSites resolves dotted call via imports" {
+    var p = try parser_mod.Parser.init(.javascript);
+    defer p.deinit();
+    const source = "React.createElement('div')";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const imports = &[_]ImportEntry{
+        .{ .local_name = "React", .canonical_path = "::react" },
+    };
+    const calls = try extractCallSites(std.testing.allocator, tree.rootNode(), source, "::app::render", imports);
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("React.createElement", calls[0].raw_target_name);
+    // Should have naive + resolved paths
+    try std.testing.expect(calls[0].potential_resolved_paths.len >= 2);
+    try std.testing.expectEqualStrings("::React::createElement", calls[0].potential_resolved_paths[0]);
+    try std.testing.expectEqualStrings("::react::createElement", calls[0].potential_resolved_paths[1]);
+}
+
+test "extractCallSites returns empty for source with no calls" {
+    var p = try parser_mod.Parser.init(.javascript);
+    defer p.deinit();
+    const source = "const x = 42";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const calls = try extractCallSites(std.testing.allocator, tree.rootNode(), source, "::m::f", &.{});
+    defer freeCallSites(std.testing.allocator, calls);
+
+    try std.testing.expectEqual(@as(usize, 0), calls.len);
 }
 
 test "generateResolutionPaths adds current-module candidate for simple JS name" {

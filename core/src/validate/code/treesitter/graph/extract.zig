@@ -9,6 +9,7 @@ const std = @import("std");
 const Language = @import("../language.zig").Language;
 const parser_mod = @import("../parser.zig");
 const types = @import("types.zig");
+const json_output = @import("json_output.zig");
 const python = @import("python.zig");
 const rust_lang = @import("rust_lang.zig");
 const javascript = @import("javascript.zig");
@@ -85,9 +86,87 @@ pub fn extractCallSites(
     };
 }
 
+/// Extract callables and aliases, then serialize to envelope JSON.
+///
+/// Combines extraction with JSON serialization and result cleanup.
+/// Returns NUL-terminated JSON: `{"callables":[...], "aliases":[...]}`.
+/// Caller owns the returned slice.
+pub fn extractCallablesToJson(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    language: Language,
+    file_path: []const u8,
+    project_root: []const u8,
+) ![:0]u8 {
+    const extraction = try extractCallablesAndAliases(allocator, source, language, file_path, project_root);
+    defer {
+        for (extraction.callables) |c| {
+            allocator.free(c.fqn);
+            allocator.free(c.parameters);
+        }
+        allocator.free(extraction.callables);
+        for (extraction.aliases) |a| {
+            allocator.free(a.alias_fqn);
+        }
+        allocator.free(extraction.aliases);
+    }
+
+    const callables_json = try json_output.callablesToJson(allocator, extraction.callables);
+    defer allocator.free(callables_json);
+
+    const aliases_json = try json_output.aliasesToJson(allocator, extraction.aliases);
+    defer allocator.free(aliases_json);
+
+    return json_output.extractionToJson(allocator, callables_json, aliases_json);
+}
+
+/// Extract call sites with import resolution, then serialize to JSON.
+///
+/// Combines extraction with JSON serialization and result cleanup.
+/// Returns NUL-terminated JSON array of call site objects.
+/// Caller owns the returned slice.
+pub fn extractCallSitesToJson(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    language: Language,
+    definer_fqn: []const u8,
+    file_path: []const u8,
+    project_root: []const u8,
+) ![:0]u8 {
+    const call_sites = try extractCallSites(allocator, source, language, definer_fqn, file_path, project_root);
+    defer {
+        for (call_sites) |cs| {
+            allocator.free(cs.potential_resolved_paths);
+            allocator.free(cs.arguments);
+        }
+        allocator.free(call_sites);
+    }
+
+    return json_output.callSitesToJson(allocator, call_sites);
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "extractCallablesToJson produces envelope JSON" {
+    const source = "def foo(): pass\n";
+    const json = try extractCallablesToJson(std.testing.allocator, source, .python, "test.py", "");
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"callables\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"aliases\":[") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"fqn\":\"") != null);
+}
+
+test "extractCallSitesToJson produces JSON array" {
+    const source = "foo(1)\n";
+    const json = try extractCallSitesToJson(std.testing.allocator, source, .python, "::test::main", "test.py", "");
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(json[0] == '[');
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"raw_target_name\":\"foo\"") != null);
+}
 
 test "extractCallablesAndAliases works for Python" {
     const source = "def foo(): pass\ndef bar(): pass\n";
