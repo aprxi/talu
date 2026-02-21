@@ -12,6 +12,7 @@ import type {
 } from "../types.ts";
 import { el, isArchived, getTags, isThinkingExpanded, formatDate } from "./helpers.ts";
 import { sanitizedMarkdown, CODE_COPY_ICON, CODE_CHECK_ICON } from "./markdown.ts";
+import { highlightCodeBlocks } from "./highlight.ts";
 import { RERUN_ICON, EDIT_ICON, COPY_ICON, EXPORT_ICON, ARCHIVE_ICON, UNARCHIVE_ICON, FORK_ICON, THINKING_ICON, SETTINGS_ICON, STATS_ICON, PLUS_ICON, CLOSE_SMALL_ICON } from "../icons.ts";
 import type { ClipboardAccess, ManagedTimers } from "../kernel/types.ts";
 
@@ -91,6 +92,7 @@ function renderCodeBlock(language: string, code: string, complete: boolean): HTM
 
   const pre = document.createElement("pre");
   const codeEl = document.createElement("code");
+  if (language) codeEl.className = `language-${language}`;
   codeEl.textContent = code;
   pre.appendChild(codeEl);
   container.appendChild(pre);
@@ -110,6 +112,7 @@ export function renderOutputText(
 
   if (!codeBlocks || codeBlocks.length === 0) {
     container.innerHTML = sanitizedMarkdown(text);
+    highlightCodeBlocks(container);
     return container;
   }
 
@@ -144,6 +147,7 @@ export function renderOutputText(
     }
   }
 
+  highlightCodeBlocks(container);
   return container;
 }
 

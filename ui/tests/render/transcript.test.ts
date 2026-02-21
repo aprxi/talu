@@ -222,6 +222,23 @@ describe("renderOutputText", () => {
     // Should have prose + code block + prose
     expect(el.children.length).toBeGreaterThanOrEqual(2);
   });
+
+  test("code element has language-* class for highlighting", () => {
+    const text = "```python\nprint('hi')\n```";
+    const codeBlocks: CodeBlock[] = [{
+      fence_start: 0,
+      fence_end: text.length,
+      language_start: 3,
+      language_end: 9,
+      content_start: 10,
+      content_end: 21,
+      complete: true,
+    }];
+    const el = renderOutputText(text, codeBlocks);
+    const code = el.querySelector("code");
+    expect(code).not.toBeNull();
+    expect(code!.className).toBe("language-python");
+  });
 });
 
 // ── renderTranscript ─────────────────────────────────────────────────────────

@@ -172,6 +172,31 @@ pre code {
 }
 
 /* -----------------------------------------------------------------------------
+   Runtime Syntax Token Classes (syntax-*)
+   Applied by tree-sitter highlight API at runtime in the chat UI.
+   ----------------------------------------------------------------------------- */
+
+.syntax-comment { color: var(--syntax-comment); font-style: italic; }
+.syntax-keyword { color: var(--syntax-keyword); font-weight: 500; }
+.syntax-string { color: var(--syntax-string); }
+.syntax-number { color: var(--syntax-number, var(--syntax-function)); }
+
+.syntax-function,
+.syntax-function-call { color: var(--syntax-function); }
+
+.syntax-operator { color: var(--syntax-operator, var(--text)); }
+.syntax-punctuation { color: var(--syntax-punctuation, var(--text)); }
+
+.syntax-type { color: var(--syntax-type-name, var(--syntax-type, var(--syntax-function))); }
+.syntax-property { color: var(--syntax-property, var(--text)); }
+.syntax-builtin { color: var(--syntax-builtin, var(--syntax-function)); }
+.syntax-decorator { color: var(--syntax-decorator, var(--syntax-keyword)); }
+.syntax-literal { color: var(--syntax-number, var(--syntax-function)); }
+.syntax-string-interpolation { color: var(--syntax-string); }
+.syntax-attribute { color: var(--syntax-decorator, var(--syntax-keyword)); }
+.syntax-regex { color: var(--syntax-string); }
+
+/* -----------------------------------------------------------------------------
    Copy Button (docs style)
    ----------------------------------------------------------------------------- */
 

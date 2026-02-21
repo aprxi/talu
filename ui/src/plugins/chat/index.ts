@@ -13,6 +13,7 @@ import type { PluginDefinition, PluginContext } from "../../kernel/types.ts";
 import type { ModelEntry } from "../../types.ts";
 import { createApiClient } from "../../api.ts";
 import { sanitizedMarkdown } from "../../render/markdown.ts";
+import { highlightCodeBlocks } from "../../render/highlight.ts";
 import { initCodeBlockCopyHandler } from "../../render/transcript.ts";
 import { initThinkingState, populateModelSelect } from "../../render/helpers.ts";
 import { initChatDeps } from "./deps.ts";
@@ -79,10 +80,12 @@ export const chatPlugin: PluginDefinition = {
       mount(container, part) {
         const text = part.type === "text" ? part.text : "";
         container.innerHTML = sanitizedMarkdown(text);
+        highlightCodeBlocks(container);
         return {
-          update(p, _isFinal) {
+          update(p, isFinal) {
             const t = p.type === "text" ? p.text : "";
             container.innerHTML = sanitizedMarkdown(t);
+            if (isFinal) highlightCodeBlocks(container);
           },
           unmount() {
             container.innerHTML = "";
