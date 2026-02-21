@@ -619,3 +619,40 @@ test "mlx_lazy_softmax computes softmax along axis" {
     try std.testing.expect(output[1] < output[2]);
     try std.testing.expect(output[2] < output[3]);
 }
+
+test "asyncEval starts evaluation without blocking API contract" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const shape = [_]i64{4};
+    const a = createArrayF32(&data, &shape);
+    defer freeArray(a);
+    const doubled = mlx_lazy_multiply_scalar(a, 2.0);
+    defer freeArray(doubled);
+
+    var handles = [_]ArrayHandle{doubled};
+    asyncEval(&handles);
+    // Force completion and validate result.
+    eval(&handles);
+    var output: [4]f32 = undefined;
+    copyToHost(doubled, &output);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0), output[0], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 8.0), output[3], 0.01);
+}
+
+test "getShape returns ndim and shape entries" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const shape = [_]i64{ 2, 2 };
+    const handle = createArrayF32(&data, &shape);
+    defer freeArray(handle);
+
+    var out_shape = [_]usize{ 0, 0, 0, 0 };
+    const ndim = getShape(handle, &out_shape);
+    try std.testing.expectEqual(@as(usize, 2), ndim);
+    try std.testing.expectEqual(@as(usize, 2), out_shape[0]);
+    try std.testing.expectEqual(@as(usize, 2), out_shape[1]);
+}

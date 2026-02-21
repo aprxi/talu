@@ -299,3 +299,69 @@ pub fn packMergedGridTokens(
         }
     }
 }
+
+test "extractGridBlocksRowMajor extracts single patch in RGB order per pixel" {
+    const pixels = [_]f32{
+        1, 2, 3, 4, // C0
+        5, 6, 7, 8, // C1
+        9, 10, 11, 12, // C2
+    };
+    var out = [_]f32{0} ** 12;
+    try extractGridBlocksRowMajor(&pixels, 2, 2, 1, 1, 1, 2, 1, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        1, 5, 9,
+        2, 6, 10,
+        3, 7, 11,
+        4, 8, 12,
+    }, &out);
+}
+
+test "extractGridBlocksMerged extracts merged traversal patches" {
+    const pixels = [_]f32{
+        1, 2, 3, 4, // C0
+        5, 6, 7, 8, // C1
+        9, 10, 11, 12, // C2
+    };
+    var out = [_]f32{0} ** (4 * 3);
+    try extractGridBlocksMerged(&pixels, 2, 2, 2, 2, 1, 1, 1, 2, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        1, 5, 9,
+        2, 6, 10,
+        3, 7, 11,
+        4, 8, 12,
+    }, &out);
+}
+
+test "bilinearGridRow returns exact corner value on aligned grid" {
+    const pos = [_]f32{
+        1, 2,
+        3, 4,
+    };
+    var out = [_]f32{0};
+    try bilinearGridRow(&pos, 2, 1, 1, 0, 2, 2, false, &out);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[0], 1e-6);
+}
+
+test "interpolateGridEmbeddings writes row-major sequence" {
+    const pos = [_]f32{
+        1, 2,
+        3, 4,
+    };
+    var out = [_]f32{0} ** 4;
+    try interpolateGridEmbeddings(&pos, 2, 1, 2, 2, 1, 1, true, false, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 3, 4 }, &out);
+}
+
+test "packMergedGridTokens packs row-major tokens into merged width" {
+    const hidden = [_]f32{
+        1, 10, // row0 col0
+        2, 20, // row0 col1
+        3, 30, // row1 col0
+        4, 40, // row1 col1
+    };
+    var out = [_]f32{0} ** (1 * 8);
+    try packMergedGridTokens(&hidden, 2, 2, 1, 2, 2, true, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        1, 10, 2, 20, 3, 30, 4, 40,
+    }, &out);
+}

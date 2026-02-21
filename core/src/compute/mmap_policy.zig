@@ -35,3 +35,16 @@ test "shouldPopulatePages threshold policy" {
     try std.testing.expect(!shouldPopulatePages((512 * 1024 * 1024) + 1));
 }
 
+test "applyReadOnlyMapPolicy toggles MAP_POPULATE according to policy" {
+    if (builtin.os.tag != .linux) return;
+
+    var flags: std.posix.MAP = undefined;
+    @memset(std.mem.asBytes(&flags), 0);
+    applyReadOnlyMapPolicy(&flags, 1);
+
+    if (shouldPopulatePages(1)) {
+        try std.testing.expect(@field(flags, "POPULATE"));
+    } else {
+        try std.testing.expect(!@field(flags, "POPULATE"));
+    }
+}

@@ -210,3 +210,71 @@ pub fn resolveModelKindForConfig(
     log.err("load", "Missing model_type in config.json", .{}, @src());
     return error.UnsupportedModel;
 }
+
+test "loadArchitectureDefinitions returns true for static metadata" {
+    try std.testing.expect(loadArchitectureDefinitions(std.testing.allocator));
+}
+
+test "resolveModelKindForConfig and runtimeArchitectureForConfig detect known model_type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = "{\"model_type\":\"llama3\"}" });
+    const config_path = try tmp.dir.realpathAlloc(allocator, "config.json");
+    defer allocator.free(config_path);
+
+    const resolved = try resolveModelKindForConfig(allocator, config_path);
+    try std.testing.expectEqualStrings("llama3", resolved.descriptor.id);
+    try std.testing.expectEqualStrings("llama3", resolved.runtime_arch.name);
+
+    const runtime_arch = try runtimeArchitectureForConfig(allocator, config_path);
+    try std.testing.expectEqualStrings("llama3", runtime_arch.name);
+}
+
+test "applyRuntimeArchitectureMetadata copies runtime flags from architecture" {
+    var loaded = LoadedModel{
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .config = .{
+            .vocab_size = 16,
+            .d_model = 8,
+            .n_layers = 1,
+            .n_heads = 1,
+            .n_kv_groups = 1,
+            .d_ff = 16,
+            .max_seq_len = 64,
+            .head_dim = 8,
+            .rope_theta = 10000.0,
+            .norm_eps = 1e-5,
+            .gaffine_group_size = 128,
+        },
+        .token_embeddings = .{
+            .dtype = .f32,
+            .n_dims = 2,
+            .shape = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+            .data_ptr = null,
+            .data_size = 0,
+            .numel = 1,
+            .strides = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+        },
+        .blocks = &.{},
+        .original_weight_dtype = .f32,
+    };
+    defer loaded.arena.deinit();
+
+    const arch = models_registry.runtimeArchitectureById("granite_hybrid") orelse return error.TestUnexpectedResult;
+    applyRuntimeArchitectureMetadata(&loaded, arch);
+    try std.testing.expect(loaded.runtime.architecture_id != null);
+    try std.testing.expectEqualStrings("granite_hybrid", loaded.runtime.architecture_id.?);
+    try std.testing.expect(loaded.runtime.has_mamba);
+}
+
+test "loadModel returns FileNotFound for missing config path" {
+    const err_result = loadModel(
+        std.testing.allocator,
+        "/tmp/talu_missing_model_config.json",
+        "/tmp/talu_missing_weights.safetensors",
+        .{},
+        progress_mod.Context.NONE,
+    );
+    try std.testing.expectError(error.FileNotFound, err_result);
+}

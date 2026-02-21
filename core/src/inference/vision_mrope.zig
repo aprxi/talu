@@ -111,3 +111,61 @@ pub fn buildMultimodalMropePositions(
     if (write_pos != tokens.len) return error.InvalidPromptImageTokens;
 }
 
+test "applyPositionDelta shifts base position and rejects negative result" {
+    try std.testing.expectEqual(@as(usize, 7), try applyPositionDelta(5, 2));
+    try std.testing.expectEqual(@as(usize, 3), try applyPositionDelta(5, -2));
+    try std.testing.expectError(error.InvalidShape, applyPositionDelta(1, -3));
+}
+
+test "resolveMropeSection returns configured section only when valid" {
+    var cfg = tensor.ModelConfig{
+        .vocab_size = 10,
+        .d_model = 8,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_groups = 1,
+        .d_ff = 16,
+        .max_seq_len = 16,
+        .head_dim = 8,
+        .rope_theta = 10000.0,
+        .norm_eps = 1e-5,
+        .gaffine_group_size = 128,
+    };
+    cfg.rope_scaling.mrope_section = .{ 1, 1, 2 }; // sum=4 == head_dim/2
+    try std.testing.expectEqual([3]usize{ 1, 1, 2 }, resolveMropeSection(&cfg, 8));
+
+    cfg.rope_scaling.mrope_section = .{ 1, 0, 3 }; // invalid (middle section zero)
+    try std.testing.expectEqual([3]usize{ 0, 0, 0 }, resolveMropeSection(&cfg, 8));
+}
+
+test "computePositionDelta computes max-position offset" {
+    const pos_t = [_]u32{ 0, 1, 1 };
+    const pos_h = [_]u32{ 0, 2, 1 };
+    const pos_w = [_]u32{ 0, 1, 3 };
+    const delta = try computePositionDelta(&pos_t, &pos_h, &pos_w);
+    // max component = 3, len=3 => (3+1)-3 = 1
+    try std.testing.expectEqual(@as(isize, 1), delta);
+}
+
+test "buildMultimodalMropePositions writes text and image coordinates" {
+    const tokens = [_]u32{ 101, 999, 999, 102 };
+    const images = [_]PrefillVisionImage{
+        .{
+            .pixels = &.{},
+            .width = 1,
+            .height = 1,
+            .grid = .{ .temporal = 1, .height = 1, .width = 2 },
+            .token_count = 2,
+        },
+    };
+    var pos_t = [_]u32{0} ** tokens.len;
+    var pos_h = [_]u32{0} ** tokens.len;
+    var pos_w = [_]u32{0} ** tokens.len;
+
+    try buildMultimodalMropePositions(&tokens, &images, 999, 1, &pos_t, &pos_h, &pos_w);
+    try std.testing.expectEqual(@as(u32, 0), pos_t[0]); // leading text
+    try std.testing.expectEqual(@as(u32, 1), pos_t[1]); // image token 0
+    try std.testing.expectEqual(@as(u32, 1), pos_h[1]);
+    try std.testing.expectEqual(@as(u32, 2), pos_w[2]); // image token 1 increments W
+    try std.testing.expectEqual(@as(u32, 3), pos_t[3]); // trailing text
+}

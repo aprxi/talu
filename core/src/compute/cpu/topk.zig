@@ -143,3 +143,41 @@ test "selectTopKNormalized picks top logits and normalizes" {
     try std.testing.expectEqual(@as(u32, 1), indices[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), weights[0] + weights[1], 1e-6);
 }
+
+test "byValueDesc orders entries by descending value" {
+    const Entry = struct { value: f32 };
+    try std.testing.expect(byValueDesc({}, Entry{ .value = 3.0 }, Entry{ .value = 2.0 }));
+    try std.testing.expect(!byValueDesc({}, Entry{ .value = 1.0 }, Entry{ .value = 2.0 }));
+}
+
+test "partition places larger values before pivot boundary" {
+    const Entry = struct { value: f32 };
+    var entries = [_]Entry{
+        .{ .value = 1.0 },
+        .{ .value = 5.0 },
+        .{ .value = 2.0 },
+        .{ .value = 4.0 },
+        .{ .value = 3.0 },
+    };
+    const pivot = partition(entries[0..], 0, entries.len - 1);
+    for (0..pivot + 1) |i| {
+        for (pivot + 1..entries.len) |j| {
+            try std.testing.expect(entries[i].value >= entries[j].value);
+        }
+    }
+}
+
+test "quickSelectTopK keeps top-k prefix candidates" {
+    const Entry = struct { value: f32 };
+    var entries = [_]Entry{
+        .{ .value = 0.1 },
+        .{ .value = 0.9 },
+        .{ .value = 0.5 },
+        .{ .value = 0.8 },
+        .{ .value = 0.2 },
+    };
+    quickSelectTopK(entries[0..], 3);
+    var min_prefix = entries[0].value;
+    for (entries[0..3]) |e| min_prefix = @min(min_prefix, e.value);
+    for (entries[3..]) |e| try std.testing.expect(min_prefix >= e.value);
+}

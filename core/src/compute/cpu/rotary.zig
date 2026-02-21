@@ -357,3 +357,34 @@ test "applyInterleavedInPlace delegates to rope implementation" {
     applyInterleavedInPlace(&values, &rope, 3);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 4.0, 5.0 }, &values);
 }
+
+test "fillSpatialRotaryTables writes expected first-token values" {
+    const allocator = std.testing.allocator;
+    var cos = [_]f32{0} ** (4 * 4); // token_count=4, head_dim=4
+    var sin = [_]f32{0} ** (4 * 4);
+
+    try fillSpatialRotaryTables(allocator, 2, 2, 1, 1, 4, 1, &cos, &sin);
+    // First token at row=0,col=0 should have angle 0 for both channels.
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), cos[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), sin[0], 1e-6);
+}
+
+test "applyRopeTensorInPlace applies rope across 2D shape" {
+    const MockRope = struct {
+        pub fn applyInPlace(_: *@This(), vec: []f32, pos: usize) void {
+            const p: f32 = @floatFromInt(pos);
+            for (vec) |*v| v.* += p;
+        }
+    };
+    var rope = MockRope{};
+
+    var data = [_]f32{
+        1, 2, // row0
+        3, 4, // row1
+    };
+    const shape: [8]i64 = .{ 2, 2, 0, 0, 0, 0, 0, 0 };
+    try applyRopeTensorInPlace(&data, 2, shape, 2, 1, &rope);
+
+    // pos_offset=1 => row0 +1, row1 +2
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 2, 3, 5, 6 }, &data);
+}

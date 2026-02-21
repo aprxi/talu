@@ -290,3 +290,35 @@ test "stepDepthwiseState updates state and writes output in place" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.5), state[2], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4.0), state[3], 1e-6);
 }
+
+test "runChannelMajor computes depthwise output with bias" {
+    const B_gate = [_]f32{ 1.0, 1.0 };
+    const x_proj = [_]f32{ 1.0, 2.0 };
+    var state = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    const weight = [_]f32{
+        0.0, 1.0, // ch0: k0,k1
+        0.0, 1.0, // ch1: k0,k1
+    };
+    const bias = [_]f32{ 0.5, -0.5 };
+    var out = [_]f32{ 0.0, 0.0 };
+
+    runChannelMajor(&B_gate, &x_proj, &state, &weight, &out, &bias, 2, 2);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), out[1], 1e-6);
+}
+
+test "runTimeMajor computes depthwise output with transposed weights" {
+    const B_gate = [_]f32{ 1.0, 1.0 };
+    const x_proj = [_]f32{ 1.0, 2.0 };
+    var state = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    const weight_t = [_]f32{
+        0.0, 0.0, // k0 over channels
+        1.0, 1.0, // k1 over channels
+    };
+    const bias = [_]f32{ 0.5, -0.5 };
+    var out = [_]f32{ 0.0, 0.0 };
+
+    runTimeMajor(&B_gate, &x_proj, &state, &weight_t, &out, &bias, 2, 2);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.5), out[1], 1e-6);
+}

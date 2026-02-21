@@ -1,5 +1,6 @@
 //! Tensor broadcast primitives for CPU compute path.
 
+const std = @import("std");
 const tensor = @import("../../tensor.zig");
 const dtype_mod = @import("../../dtype.zig");
 
@@ -225,3 +226,67 @@ pub fn addParamScalar(param: *const Tensor, output_slice: []f32, scalar: f32) vo
     }
 }
 
+test "applyElementwiseBinaryOp applies binary op for equal shapes" {
+    var left_data = [_]f32{ 1, 2, 3, 4 };
+    var right_data = [_]f32{ 10, 20, 30, 40 };
+    const left = Tensor.view2DSlice(&left_data, 2, 2);
+    const right = Tensor.view2DSlice(&right_data, 2, 2);
+    var out = [_]f32{0} ** 4;
+
+    const addOp = struct {
+        fn call(a: f32, b: f32) f32 {
+            return a + b;
+        }
+    }.call;
+
+    try applyElementwiseBinaryOp(left, right, &out, addOp);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 11, 22, 33, 44 }, &out);
+}
+
+test "addParam and mulParam broadcast row parameter over 3D input" {
+    var input_data = [_]f32{
+        1, 2, 3,
+        4, 5, 6,
+    };
+    const input = Tensor.view3DSlice(&input_data, 2, 3);
+    var param_data = [_]f32{ 10, 20, 30 };
+    const param = Tensor{
+        .dtype = .f32,
+        .n_dims = 1,
+        .shape = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+        .data_ptr = @ptrCast(param_data[0..].ptr),
+        .data_size = param_data.len * @sizeOf(f32),
+        .numel = param_data.len,
+        .strides = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+    };
+
+    var add_out = [_]f32{0} ** 6;
+    try addParam(input, &param, &add_out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        11, 22, 33,
+        14, 25, 36,
+    }, &add_out);
+
+    var mul_out = [_]f32{0} ** 6;
+    try mulParam(input, &param, &mul_out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        10, 40,  90,
+        40, 100, 180,
+    }, &mul_out);
+}
+
+test "addParamScalar adds constant to parameter tensor" {
+    var param_data = [_]f32{ 1, 2, 3 };
+    const param = Tensor{
+        .dtype = .f32,
+        .n_dims = 1,
+        .shape = .{ 3, 0, 0, 0, 0, 0, 0, 0 },
+        .data_ptr = @ptrCast(param_data[0..].ptr),
+        .data_size = param_data.len * @sizeOf(f32),
+        .numel = param_data.len,
+        .strides = .{ 1, 0, 0, 0, 0, 0, 0, 0 },
+    };
+    var out = [_]f32{ 0, 0, 0 };
+    addParamScalar(&param, &out, 0.5);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1.5, 2.5, 3.5 }, &out);
+}

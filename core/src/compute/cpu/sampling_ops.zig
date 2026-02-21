@@ -64,3 +64,47 @@ pub fn applyIndexBias(logits: []f32, bias_entries: anytype) void {
         }
     }
 }
+
+test "renormalizeSubset zeroes non-selected probabilities" {
+    const Entry = struct { index: usize, value: f32 };
+    var probs = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    const entries = [_]Entry{
+        .{ .index = 3, .value = 0.4 },
+        .{ .index = 1, .value = 0.2 },
+    };
+    renormalizeSubset(&probs, entries[0..], 0.6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probs[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probs[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.0 / 3.0), probs[3], 1e-6);
+}
+
+test "applyMinP filters and renormalizes probabilities" {
+    var probs = [_]f32{ 0.6, 0.25, 0.1, 0.05 };
+    applyMinP(&probs, 0.5); // threshold=0.3 -> only first survives
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), probs[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probs[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probs[2], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), probs[3], 1e-6);
+}
+
+test "applyIndexPenalty applies multiplicative sign-aware penalty" {
+    var logits = [_]f32{ 2.0, -2.0, 1.0, 0.5 };
+    const indices = [_]u32{ 0, 1, 9 };
+    applyIndexPenalty(&logits, &indices, 2.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -4.0), logits[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[2], 1e-6);
+}
+
+test "applyIndexBias supports index and token_id entry shapes" {
+    const BiasByIndex = struct { index: usize, bias: f32 };
+    const BiasByToken = struct { token_id: usize, bias: f32 };
+    var logits = [_]f32{ 0.0, 0.0, 0.0 };
+    const by_index = [_]BiasByIndex{.{ .index = 1, .bias = 0.75 }};
+    const by_token = [_]BiasByToken{.{ .token_id = 2, .bias = -0.25 }};
+    applyIndexBias(&logits, by_index[0..]);
+    applyIndexBias(&logits, by_token[0..]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), logits[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), logits[1], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, -0.25), logits[2], 1e-6);
+}

@@ -225,3 +225,23 @@ test "registry finds entry by architecture id" {
     try std.testing.expect(entry != null);
     try std.testing.expectEqualStrings("llama3", entry.?.id);
 }
+
+test "blockProgramFor returns program for known block kinds" {
+    const entry = detectByArchitectureId("lfm2") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(blockProgramFor(entry, .attention_mlp) != null);
+    try std.testing.expect(blockProgramFor(entry, .shortconv) != null);
+}
+
+test "loadArchitectureDefinitions returns true for static registry" {
+    try std.testing.expect(loadArchitectureDefinitions(std.testing.allocator));
+}
+
+test "runtimeArchitectureById and runtimeArchitectureByModelType resolve payloads" {
+    const by_id = runtimeArchitectureById("llama3");
+    try std.testing.expect(by_id != null);
+    try std.testing.expectEqualStrings("llama3", by_id.?.name);
+
+    const by_model_type = runtimeArchitectureByModelType("llama3");
+    try std.testing.expect(by_model_type != null);
+    try std.testing.expectEqualStrings("llama3", by_model_type.?.name);
+}

@@ -464,3 +464,58 @@ pub fn assertBackendType(comptime T: type) void {
         }
     }
 }
+
+test "assertBackendModuleLayout validates CPU backend module layout" {
+    const cpu = @import("cpu/root.zig");
+    assertBackendModuleLayout(cpu, "cpu");
+}
+
+test "assertVisionModuleLayout validates CPU vision module layout" {
+    const cpu = @import("cpu/root.zig");
+    assertVisionModuleLayout(cpu.vision, "cpu");
+}
+
+test "assertSchedulerModuleLayout validates CPU scheduler module layout" {
+    const cpu = @import("cpu/root.zig");
+    assertSchedulerModuleLayout(cpu.scheduler, "cpu");
+}
+
+test "assertSamplingModuleLayout validates CPU sampling module layout" {
+    const cpu = @import("cpu/root.zig");
+    assertSamplingModuleLayout(cpu.sampling, "cpu");
+}
+
+test "assertExecutorModuleLayout validates CPU executor module layout" {
+    const cpu = @import("cpu/root.zig");
+    assertExecutorModuleLayout(cpu.executor, "cpu");
+}
+
+test "assertExecutorSymbolLayout validates CPU executor symbols" {
+    const cpu = @import("cpu/root.zig");
+    assertExecutorSymbolLayout(cpu.executor, "cpu");
+}
+
+test "assertKernelModuleLayout validates CPU kernel module layout" {
+    const cpu = @import("cpu/root.zig");
+    assertKernelModuleLayout(cpu.kernels, "cpu");
+}
+
+test "assertKernelSupportMap validates CPU kernel support map" {
+    const cpu = @import("cpu/root.zig");
+    assertKernelSupportMap(cpu.kernels, "cpu");
+}
+
+test "assertKernelSymbolLayout validates CPU kernel symbols" {
+    const cpu = @import("cpu/root.zig");
+    assertKernelSymbolLayout(cpu.kernels, "cpu");
+}
+
+test "assertUnsupportedKernelPolicy validates unsupported-kernel contract" {
+    const cpu = @import("cpu/root.zig");
+    assertUnsupportedKernelPolicy(cpu.kernels, "cpu");
+}
+
+test "assertBackendType validates backend trait contract" {
+    const cpu = @import("cpu/root.zig");
+    assertBackendType(cpu.BackendType);
+}

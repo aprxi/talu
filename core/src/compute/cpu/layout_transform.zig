@@ -276,3 +276,48 @@ test "extractRowPrefixes copies contiguous row heads" {
     try extractRowPrefixes(&src, 2, 4, 2, &dst);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2, 5, 6 }, &dst);
 }
+
+test "fuseTwoProjectionWeights concatenates f32 rows by columns" {
+    const allocator = std.testing.allocator;
+    var w1_data = [_]f32{
+        1, 2,
+        3, 4,
+    };
+    var w3_data = [_]f32{
+        10, 20,
+        30, 40,
+    };
+    var w1 = Tensor.view2DSlice(&w1_data, 2, 2);
+    var w3 = Tensor.view2DSlice(&w3_data, 2, 2);
+
+    const fused_opt = try fuseTwoProjectionWeights(allocator, &w1, &w3);
+    try std.testing.expect(fused_opt != null);
+    var fused = fused_opt.?;
+    defer allocator.free(fused.data());
+
+    try std.testing.expectEqual(@as(i64, 2), fused.shape[0]);
+    try std.testing.expectEqual(@as(i64, 4), fused.shape[1]);
+    const data = fused.asSlice(f32);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        1, 2, 10, 20,
+        3, 4, 30, 40,
+    }, data[0..8]);
+}
+
+test "splitLastDimContiguous splits per-row contiguous segments" {
+    const input = [_]f32{
+        1, 2, 3, 4,
+        5, 6, 7, 8,
+    };
+    var out_a = [_]f32{0} ** 2; // seq_len * 1
+    var out_b = [_]f32{0} ** 6; // seq_len * 3
+    try splitLastDimContiguous(
+        &input,
+        2,
+        4,
+        &.{ 1, 3 },
+        &.{ out_a[0..], out_b[0..] },
+    );
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 5 }, &out_a);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 2, 3, 4, 6, 7, 8 }, &out_b);
+}

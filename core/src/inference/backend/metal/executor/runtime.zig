@@ -101,3 +101,24 @@ pub fn transformerForwardFromGPUToken(
         pos_offset,
     );
 }
+
+test "transformerForwardLazy exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardLazy)).@"fn";
+    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    const f = transformerForwardLazy;
+    _ = f;
+}
+
+test "transformerForwardLazyWithEmbeddingOverride exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardLazyWithEmbeddingOverride)).@"fn";
+    try std.testing.expectEqual(@as(usize, 13), fn_info.params.len);
+    const f = transformerForwardLazyWithEmbeddingOverride;
+    _ = f;
+}
+
+test "transformerForwardFromGPUToken exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardFromGPUToken)).@"fn";
+    try std.testing.expectEqual(@as(usize, 9), fn_info.params.len);
+    const f = transformerForwardFromGPUToken;
+    _ = f;
+}

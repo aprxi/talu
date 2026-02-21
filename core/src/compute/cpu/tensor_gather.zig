@@ -120,3 +120,52 @@ test "gatherRowsF32 returns InvalidTokenId for OOB index" {
 
     try std.testing.expectError(error.InvalidTokenId, gatherRowsF32(&src, 2, 2, &idx, &out));
 }
+
+test "scatterAddRowsByPositions accumulates selected rows" {
+    var dst = [_]f32{
+        1, 1,
+        2, 2,
+        3, 3,
+    };
+    const positions = [_]usize{ 2, 0 };
+    const src = [_]f32{
+        10, 20,
+        30, 40,
+    };
+    try scatterAddRowsByPositions(&dst, 3, 2, &positions, &src);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        31, 41,
+        2,  2,
+        13, 23,
+    }, &dst);
+}
+
+test "collectPositionsU32 returns matching indexes" {
+    const allocator = std.testing.allocator;
+    const tokens = [_]u32{ 5, 9, 5, 7, 5 };
+    const positions = try collectPositionsU32(allocator, &tokens, 5);
+    defer if (positions.len > 0) allocator.free(positions);
+    try std.testing.expectEqual(@as(usize, 3), positions.len);
+    try std.testing.expectEqual(@as(usize, 0), positions[0]);
+    try std.testing.expectEqual(@as(usize, 2), positions[1]);
+    try std.testing.expectEqual(@as(usize, 4), positions[2]);
+}
+
+test "scatterRowsByMatchedId copies embeddings for matched tokens" {
+    var hidden = [_]f32{
+        0, 0,
+        0, 0,
+        0, 0,
+    };
+    const token_ids = [_]u32{ 7, 1, 7 };
+    const embeds = [_]f32{
+        10, 11,
+        20, 21,
+    };
+    try scatterRowsByMatchedId(&hidden, 3, 2, &token_ids, 7, &embeds);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        10, 11,
+        0,  0,
+        20, 21,
+    }, &hidden);
+}

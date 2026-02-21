@@ -166,3 +166,52 @@ test "dotPairScaled combines two dot products and scale" {
     // (11 + 83) * 0.5 = 47
     try std.testing.expectApproxEqAbs(@as(f32, 47.0), got, 1e-6);
 }
+
+test "maxValue returns largest element" {
+    const values = [_]f32{ -1.0, 4.5, 2.0, 3.0 };
+    try std.testing.expectApproxEqAbs(@as(f32, 4.5), maxValue(&values), 1e-6);
+}
+
+test "argmaxIndex returns index of first max" {
+    const values = [_]f32{ 1.0, 9.0, 9.0, 2.0 };
+    try std.testing.expectEqual(@as(usize, 1), argmaxIndex(&values));
+}
+
+test "meanPoolRows averages rows" {
+    const values = [_]f32{
+        1, 2, 3,
+        4, 5, 6,
+    };
+    var out = [_]f32{ 0, 0, 0 };
+    try meanPoolRows(&values, 2, 3, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 2.5, 3.5, 4.5 }, &out);
+}
+
+test "l2NormalizeInPlace normalizes vector norm to one" {
+    var values = [_]f32{ 3.0, 4.0 };
+    l2NormalizeInPlace(&values);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.6), values[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.8), values[1], 1e-6);
+}
+
+test "meanLastDim3D computes per-row mean" {
+    const input = [_]f32{
+        1, 2, 3,
+        4, 5, 6,
+    };
+    var out = [_]f32{ 0, 0 };
+    try meanLastDim3D(&input, 2, 3, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 2.0, 5.0 }, &out);
+}
+
+test "meanLastDim4D computes per-head mean" {
+    const input = [_]f32{
+        1, 3, // t0 h0
+        2, 4, // t0 h1
+        5, 7, // t1 h0
+        6, 8, // t1 h1
+    };
+    var out = [_]f32{ 0, 0, 0, 0 };
+    try meanLastDim4D(&input, 2, 2, 2, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 2.0, 3.0, 6.0, 7.0 }, &out);
+}

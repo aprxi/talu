@@ -91,3 +91,58 @@ test "applySiluGateInPlace multiplies values by silu(gate)" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0) * activation.silu(1.0), values[1], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, -1.0) * activation.silu(-1.0), values[2], 1e-6);
 }
+
+test "siluInPlace applies silu activation per element" {
+    var values = [_]f32{ -1.0, 0.0, 1.0 };
+    siluInPlace(&values);
+    try std.testing.expectApproxEqAbs(activation.silu(-1.0), values[0], 1e-6);
+    try std.testing.expectApproxEqAbs(activation.silu(0.0), values[1], 1e-6);
+    try std.testing.expectApproxEqAbs(activation.silu(1.0), values[2], 1e-6);
+}
+
+test "scanStep delegates to provided scan function" {
+    const Mock = struct {
+        fn scan(
+            ssm_state: []f32,
+            ssm_out: []f32,
+            x_conv_out: []const f32,
+            b_raw: []const f32,
+            c_raw: []const f32,
+            a_log: []const f32,
+            d_skip: []const f32,
+            dt: []const f32,
+            d_head: usize,
+            d_state: usize,
+            n_heads: usize,
+            n_groups: usize,
+        ) void {
+            _ = x_conv_out;
+            _ = b_raw;
+            _ = c_raw;
+            _ = a_log;
+            _ = d_skip;
+            _ = dt;
+            _ = d_head;
+            _ = d_state;
+            _ = n_heads;
+            _ = n_groups;
+            for (ssm_state) |*v| v.* = 42.0;
+            for (ssm_out) |*v| v.* = 7.0;
+        }
+    };
+
+    var state = [_]f32{ 0, 0, 0, 0 };
+    var out = [_]f32{ 0, 0 };
+    const x = [_]f32{ 1, 1 };
+    const b = [_]f32{ 1, 1 };
+    const c = [_]f32{ 1, 1 };
+    const a_log = [_]f32{0};
+    const d_skip = [_]f32{0};
+    const dt = [_]f32{1};
+
+    scanStep(Mock.scan, &state, &out, &x, &b, &c, &a_log, &d_skip, &dt, 2, 2, 1, 1);
+    try std.testing.expectEqual(@as(f32, 42.0), state[0]);
+    try std.testing.expectEqual(@as(f32, 42.0), state[3]);
+    try std.testing.expectEqual(@as(f32, 7.0), out[0]);
+    try std.testing.expectEqual(@as(f32, 7.0), out[1]);
+}

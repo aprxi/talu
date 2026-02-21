@@ -55,3 +55,15 @@ pub fn detectByModelType(model_type: []const u8) ?*const types.Architecture {
     }
     return null;
 }
+
+test "byId returns known architecture payload" {
+    const arch = byId("llama3");
+    try std.testing.expect(arch != null);
+    try std.testing.expectEqualStrings("llama3", arch.?.name);
+}
+
+test "detectByModelType resolves architecture from model_type alias" {
+    const arch = detectByModelType("qwen3_moe");
+    try std.testing.expect(arch != null);
+    try std.testing.expect(std.mem.eql(u8, arch.?.name, "qwen3_moe"));
+}

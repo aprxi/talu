@@ -1,5 +1,6 @@
 //! TensorView transpose helper for CPU inference graph execution.
 
+const std = @import("std");
 const tv = @import("tensor_view.zig");
 
 const TensorView = tv.TensorView;
@@ -38,4 +39,22 @@ pub fn transposeDispatch(out: TensorView, input: TensorView, dim0: usize, dim1: 
         .i32 => transposeTyped(i32, out, input, dim0, dim1),
         .i64 => transposeTyped(i64, out, input, dim0, dim1),
     }
+}
+
+test "transposeDispatch swaps 2D axes for f32 views" {
+    var input_data = [_]f32{
+        1, 2, 3,
+        4, 5, 6,
+    };
+    var out_data = [_]f32{0} ** 6;
+
+    const input = TensorView.initContiguous(@ptrCast(&input_data), &.{ 2, 3 }, .f32);
+    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 3, 2 }, .f32);
+    transposeDispatch(out, input, 0, 1);
+
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        1, 4,
+        2, 5,
+        3, 6,
+    }, &out_data);
 }

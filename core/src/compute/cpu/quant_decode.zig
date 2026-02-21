@@ -253,3 +253,55 @@ test "gatherDecodeBf16Rows rejects out-of-bounds token index" {
 
     try std.testing.expectError(error.InvalidTokenId, gatherDecodeBf16Rows(&src, 2, 2, &idx, &out));
 }
+
+test "decodeGroupedAffineU4Row applies scale and bias" {
+    const packed_values = [_]u32{0x01234567};
+    const scales = [_]u16{0x0000}; // 0.0 f16
+    const biases = [_]u16{0x3C00}; // 1.0 f16
+    var out = [_]f32{0} ** 8;
+    decodeGroupedAffineU4Row(&packed_values, &scales, &biases, .f16, 8, 1, &out);
+    for (out) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, 1.0), v, 1e-6);
+    }
+}
+
+test "decodeGroupedAffineU8Row applies scale and bias" {
+    const packed_values = [_]u32{0x04030201};
+    const scales = [_]u16{0x0000}; // 0.0 f16
+    const biases = [_]u16{0x4000}; // 2.0 f16
+    var out = [_]f32{0} ** 4;
+    decodeGroupedAffineU8Row(&packed_values, &scales, &biases, .f16, 4, 1, &out);
+    for (out) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), v, 1e-6);
+    }
+}
+
+test "gatherDecodeGroupedAffineU4Rows decodes selected row" {
+    const packed_values = [_]u32{
+        0x00000000, // row0
+        0xFFFFFFFF, // row1
+    };
+    const scales = [_]u16{ 0x0000, 0x0000 }; // both zero scale
+    const biases = [_]u16{ 0x3C00, 0x4000 }; // row0=>1 row1=>2
+    const idx = [_]u32{1};
+    var out = [_]f32{0} ** 8;
+    try gatherDecodeGroupedAffineU4Rows(&packed_values, &scales, &biases, .f16, 8, 2, 8, &idx, &out);
+    for (out) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, 2.0), v, 1e-6);
+    }
+}
+
+test "gatherDecodeGroupedAffineU8Rows decodes selected row" {
+    const packed_values = [_]u32{
+        0x00000000, // row0
+        0x11111111, // row1
+    };
+    const scales = [_]u16{ 0x0000, 0x0000 }; // both zero scale
+    const biases = [_]u16{ 0x3C00, 0x4200 }; // row0=>1 row1=>3
+    const idx = [_]u32{1};
+    var out = [_]f32{0} ** 4;
+    try gatherDecodeGroupedAffineU8Rows(&packed_values, &scales, &biases, .f16, 4, 2, 4, &idx, &out);
+    for (out) |v| {
+        try std.testing.expectApproxEqAbs(@as(f32, 3.0), v, 1e-6);
+    }
+}

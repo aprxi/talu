@@ -7,6 +7,7 @@ const std = @import("std");
 const tensor = @import("../tensor.zig");
 const op_types = @import("op_types.zig");
 const registry = @import("registry.zig");
+const st_writer = @import("../io/safetensors/writer.zig");
 const generic_weights = @import("load/generic_weights.zig");
 const weights = @import("load/weights.zig");
 
@@ -308,4 +309,107 @@ test "inferSpatialMergeSize infers square merge units from merger input width" {
     var data: [8]f32 = [_]f32{0} ** 8;
     const weight = tensor.Tensor.view2DSlice(data[0..], 2, 4);
     try std.testing.expectEqual(@as(?i32, 2), inferSpatialMergeSize(weight, 1));
+}
+
+fn makeLoadedModelForTests() LoadedModel {
+    return .{
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .config = .{
+            .vocab_size = 16,
+            .d_model = 8,
+            .n_layers = 1,
+            .n_heads = 1,
+            .n_kv_groups = 1,
+            .d_ff = 16,
+            .max_seq_len = 32,
+            .head_dim = 8,
+            .rope_theta = 10000.0,
+            .norm_eps = 1e-5,
+            .gaffine_group_size = 128,
+        },
+        .token_embeddings = .{
+            .dtype = .f32,
+            .n_dims = 2,
+            .shape = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+            .data_ptr = null,
+            .data_size = 0,
+            .numel = 1,
+            .strides = .{ 1, 1, 0, 0, 0, 0, 0, 0 },
+        },
+        .blocks = &.{},
+        .original_weight_dtype = .f32,
+    };
+}
+
+test "resolveVisionMetadata returns empty metadata when architecture is unset" {
+    var loaded = makeLoadedModelForTests();
+    defer loaded.arena.deinit();
+    const meta = resolveVisionMetadata(&loaded);
+    try std.testing.expect(std.meta.eql(VisionMetadata{}, meta));
+}
+
+test "hasAnyTensor and getTensorByCandidates find existing tensor" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f32_values = [_]f32{ 1.0, 2.0 };
+    const shape = [_]usize{2};
+    const entries = [_]st_writer.TensorEntry{
+        .{
+            .name = "foo.weight",
+            .dtype = .f32,
+            .shape = &shape,
+            .data = std.mem.sliceAsBytes(&f32_values),
+        },
+    };
+    var out_file = try tmp.dir.createFile("vision_test.safetensors", .{});
+    defer out_file.close();
+    try st_writer.writeToFile(allocator, out_file, &entries);
+    const path = try tmp.dir.realpathAlloc(allocator, "vision_test.safetensors");
+    defer allocator.free(path);
+
+    var st = try SafeTensors.load(allocator, path);
+    defer st.deinit();
+    try std.testing.expect(hasAnyTensor(&st, &.{ "missing", "foo.weight" }));
+    const tensor_view = try getTensorByCandidates(&st, &.{ "missing", "foo.weight" });
+    try std.testing.expectEqual(@as(usize, 2), tensor_view.numel);
+}
+
+test "getLayerTensorByTemplates resolves layer template name" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var f32_values = [_]f32{ 1.0, 2.0 };
+    const shape = [_]usize{2};
+    const entries = [_]st_writer.TensorEntry{
+        .{
+            .name = "layers.0.weight",
+            .dtype = .f32,
+            .shape = &shape,
+            .data = std.mem.sliceAsBytes(&f32_values),
+        },
+    };
+    var out_file = try tmp.dir.createFile("vision_layer_test.safetensors", .{});
+    defer out_file.close();
+    try st_writer.writeToFile(allocator, out_file, &entries);
+    const path = try tmp.dir.realpathAlloc(allocator, "vision_layer_test.safetensors");
+    defer allocator.free(path);
+
+    var st = try SafeTensors.load(allocator, path);
+    defer st.deinit();
+    const t = try getLayerTensorByTemplates(&st, 0, &.{"layers.{d}.weight"});
+    try std.testing.expectEqual(@as(usize, 2), t.numel);
+}
+
+test "detectVisionAttentionLayout returns unknown when tensors are absent" {
+    var loaded = makeLoadedModelForTests();
+    defer loaded.arena.deinit();
+    try std.testing.expectEqual(AttentionLayout.unknown, detectVisionAttentionLayout(&loaded));
+}
+
+test "hydrateVisionConfigFromWeights is no-op without loaded tensors" {
+    var loaded = makeLoadedModelForTests();
+    defer loaded.arena.deinit();
+    try hydrateVisionConfigFromWeights(&loaded);
+    try std.testing.expectEqual(@as(i32, 0), loaded.config.vision_hidden_size);
 }

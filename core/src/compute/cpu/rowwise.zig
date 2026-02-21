@@ -147,3 +147,46 @@ test "scaleInPlaceReciprocal divides values" {
     try std.testing.expectApproxEqAbs(@as(f32, 1), values[0], 1e-6);
     try std.testing.expectApproxEqAbs(@as(f32, 4), values[2], 1e-6);
 }
+
+test "scaleInPlace multiplies in place" {
+    var values = [_]f32{ 1.0, -2.0, 3.0 };
+    scaleInPlace(&values, 0.5);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 0.5, -1.0, 1.5 }, &values);
+}
+
+test "addInto sums vectors into output" {
+    const a = [_]f32{ 1, 2, 3 };
+    const b = [_]f32{ 4, 5, 6 };
+    var out = [_]f32{ 0, 0, 0 };
+    addInto(&a, &b, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 5, 7, 9 }, &out);
+}
+
+test "addRowsInPlace adds row-wise with source stride" {
+    var dst = [_]f32{
+        1, 2,
+        3, 4,
+    };
+    const src = [_]f32{
+        10, 20, 99,
+        30, 40, 88,
+    };
+    try addRowsInPlace(&dst, &src, 2, 2, 3);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        11, 22,
+        33, 44,
+    }, &dst);
+}
+
+test "addBroadcastRowInPlace adds one row to all rows" {
+    var dst = [_]f32{
+        1, 2, 3,
+        4, 5, 6,
+    };
+    const src_row = [_]f32{ 10, 20, 30 };
+    try addBroadcastRowInPlace(&dst, 2, 3, &src_row);
+    try std.testing.expectEqualSlices(f32, &[_]f32{
+        11, 22, 33,
+        14, 25, 36,
+    }, &dst);
+}

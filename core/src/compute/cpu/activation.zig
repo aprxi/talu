@@ -156,3 +156,67 @@ test "swigluVariantInterleaved matches scalar helper" {
     try std.testing.expectApproxEqAbs(swigluVariantScalar(1.0, 2.0), out[0], 1e-6);
     try std.testing.expectApproxEqAbs(swigluVariantScalar(-1.0, 0.5), out[1], 1e-6);
 }
+
+test "geluApprox matches zero crossing" {
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), geluApprox(0.0), 1e-6);
+}
+
+test "siluMap maps source into destination" {
+    const src = [_]f32{ -1.0, 0.0, 1.0 };
+    var dst = [_]f32{ 0.0, 0.0, 0.0 };
+    siluMap(&src, &dst);
+    try std.testing.expectApproxEqAbs(silu(-1.0), dst[0], 1e-6);
+    try std.testing.expectApproxEqAbs(silu(0.0), dst[1], 1e-6);
+    try std.testing.expectApproxEqAbs(silu(1.0), dst[2], 1e-6);
+}
+
+test "geluMap maps source into destination" {
+    const src = [_]f32{ -1.0, 0.0, 1.0 };
+    var dst = [_]f32{ 0.0, 0.0, 0.0 };
+    geluMap(&src, &dst);
+    try std.testing.expectApproxEqAbs(geluApprox(-1.0), dst[0], 1e-6);
+    try std.testing.expectApproxEqAbs(geluApprox(0.0), dst[1], 1e-6);
+    try std.testing.expectApproxEqAbs(geluApprox(1.0), dst[2], 1e-6);
+}
+
+test "elementwiseMul multiplies element pairs" {
+    const a = [_]f32{ 1, 2, 3 };
+    const b = [_]f32{ 4, 5, 6 };
+    var out = [_]f32{ 0, 0, 0 };
+    elementwiseMul(&a, &b, &out);
+    try std.testing.expectEqualSlices(f32, &[_]f32{ 4, 10, 18 }, &out);
+}
+
+test "geluMulSplit computes gelu gate times up" {
+    const gate = [_]f32{ 0.0, 1.0 };
+    const up = [_]f32{ 3.0, 4.0 };
+    var out = [_]f32{ 0.0, 0.0 };
+    geluMulSplit(&gate, &up, &out);
+    try std.testing.expectApproxEqAbs(geluApprox(0.0) * 3.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(geluApprox(1.0) * 4.0, out[1], 1e-6);
+}
+
+test "swigluVariantSplit matches scalar helper" {
+    const gate = [_]f32{ 1.0, -1.0 };
+    const up = [_]f32{ 2.0, 0.5 };
+    var out = [_]f32{ 0.0, 0.0 };
+    swigluVariantSplit(&gate, &up, &out);
+    try std.testing.expectApproxEqAbs(swigluVariantScalar(gate[0], up[0]), out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(swigluVariantScalar(gate[1], up[1]), out[1], 1e-6);
+}
+
+test "geluMulInterleaved consumes interleaved gate-up rows" {
+    const interleaved = [_]f32{ 0.0, 3.0, 1.0, 4.0 };
+    var out = [_]f32{ 0.0, 0.0 };
+    geluMulInterleaved(&interleaved, &out);
+    try std.testing.expectApproxEqAbs(geluApprox(0.0) * 3.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(geluApprox(1.0) * 4.0, out[1], 1e-6);
+}
+
+test "siluMulInterleaved consumes interleaved gate-up rows" {
+    const interleaved = [_]f32{ 0.0, 3.0, 1.0, 4.0 };
+    var out = [_]f32{ 0.0, 0.0 };
+    siluMulInterleaved(&interleaved, &out);
+    try std.testing.expectApproxEqAbs(silu(0.0) * 3.0, out[0], 1e-6);
+    try std.testing.expectApproxEqAbs(silu(1.0) * 4.0, out[1], 1e-6);
+}

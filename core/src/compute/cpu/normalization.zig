@@ -195,3 +195,57 @@ test "rmsnormContiguousWeightTensor normalizes each row" {
     try std.testing.expect(std.math.isFinite(values[2]));
     try std.testing.expect(std.math.isFinite(values[3]));
 }
+
+test "rmsNorm wrapper runs TensorView RMSNorm" {
+    var input_data = [_]f32{ 1.0, 2.0 };
+    var out_data = [_]f32{ 0.0, 0.0 };
+    var weight_data = [_]f32{ 1.0, 1.0 };
+
+    const input = tv.TensorView.initContiguous(@ptrCast(&input_data), &.{ 1, 2 }, .f32);
+    const out = tv.TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 2 }, .f32);
+    const weight = tv.TensorView.initContiguous(@ptrCast(&weight_data), &.{2}, .f32);
+    rmsNorm(out, input, weight, 1e-6);
+
+    try std.testing.expect(std.math.isFinite(out_data[0]));
+    try std.testing.expect(std.math.isFinite(out_data[1]));
+}
+
+test "layerNorm wrapper runs TensorView LayerNorm with bias" {
+    var input_data = [_]f32{ 1.0, 2.0 };
+    var out_data = [_]f32{ 0.0, 0.0 };
+    var weight_data = [_]f32{ 1.0, 1.0 };
+    var bias_data = [_]f32{ 0.0, 0.0 };
+
+    const input = tv.TensorView.initContiguous(@ptrCast(&input_data), &.{ 1, 2 }, .f32);
+    const out = tv.TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 2 }, .f32);
+    const weight = tv.TensorView.initContiguous(@ptrCast(&weight_data), &.{2}, .f32);
+    const bias = tv.TensorView.initContiguous(@ptrCast(&bias_data), &.{2}, .f32);
+    layerNorm(out, input, weight, bias, 1e-6);
+
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0), out_data[0], 0.01);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[1], 0.01);
+}
+
+test "layerNormRow normalizes one row" {
+    const input = [_]f32{ 1.0, 2.0, 3.0 };
+    var out = [_]f32{ 0.0, 0.0, 0.0 };
+    const weight = [_]f32{ 1.0, 1.0, 1.0 };
+    const bias = [_]f32{ 0.0, 0.0, 0.0 };
+    layerNormRow(&input, &out, &weight, &bias, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[1], 1e-5);
+    try std.testing.expect(out[0] < 0.0);
+    try std.testing.expect(out[2] > 0.0);
+}
+
+test "layerNormRows normalizes each row independently" {
+    const input = [_]f32{
+        1.0, 2.0,
+        3.0, 4.0,
+    };
+    var out = [_]f32{ 0.0, 0.0, 0.0, 0.0 };
+    const weight = [_]f32{ 1.0, 1.0 };
+    const bias = [_]f32{ 0.0, 0.0 };
+    try layerNormRows(&input, &out, 2, 2, &weight, &bias, 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[0] + out[1], 1e-4);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[2] + out[3], 1e-4);
+}
