@@ -4,7 +4,7 @@
 //! - `types` - generation request/result types
 //! - `sampling` - token sampling policies
 //! - `scheduler` - continuous batching runtime
-//! - `backend` - CPU/Metal inference backends
+//! - `backend` - CPU/Metal/CUDA inference backends
 
 const std = @import("std");
 
@@ -106,6 +106,7 @@ pub const SamplingWorkspace = sampling.Workspace;
 pub const backend = struct {
     pub const cpu = @import("backend/cpu/root.zig");
     pub const metal = @import("backend/metal/root.zig");
+    pub const cuda = @import("backend/cuda/root.zig");
     // Re-export inference behavioral type used by dump/xray tooling.
     pub const FusedCpuBackend = cpu.FusedCpuBackend;
 };

@@ -391,12 +391,14 @@ pub fn build(b: *std.Build) void {
     }
 
     const enable_metal = b.option(bool, "metal", "Enable Metal GPU support (macOS only)") orelse true;
+    const enable_cuda = b.option(bool, "cuda", "Enable CUDA backend scaffold (Linux/Windows)") orelse true;
     const debug_matmul = b.option(bool, "debug-matmul", "Enable matmul debug instrumentation (slow)") orelse false;
     const dump_tensors = b.option(bool, "dump-tensors", "Enable full tensor dump (for debugging, produces talu-dump binary)") orelse false;
     const version = getVersion(b);
 
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_metal", enable_metal);
+    build_options.addOption(bool, "enable_cuda", enable_cuda);
     build_options.addOption(bool, "debug_matmul", debug_matmul);
     build_options.addOption(bool, "dump_tensors", dump_tensors);
     build_options.addOption([]const u8, "version", version);
@@ -568,6 +570,7 @@ pub fn build(b: *std.Build) void {
         // Create separate build_options with dump_tensors=true
         const dump_build_options = b.addOptions();
         dump_build_options.addOption(bool, "enable_metal", enable_metal);
+        dump_build_options.addOption(bool, "enable_cuda", enable_cuda);
         dump_build_options.addOption(bool, "debug_matmul", debug_matmul);
         dump_build_options.addOption(bool, "dump_tensors", true); // Always true for dump binary
         dump_build_options.addOption([]const u8, "version", version);
@@ -619,6 +622,7 @@ pub fn build(b: *std.Build) void {
     // aggregate runners. Metal coverage is exercised via targeted Metal tests.
     const unit_test_build_options = b.addOptions();
     unit_test_build_options.addOption(bool, "enable_metal", false);
+    unit_test_build_options.addOption(bool, "enable_cuda", enable_cuda);
     unit_test_build_options.addOption(bool, "debug_matmul", debug_matmul);
     unit_test_build_options.addOption(bool, "dump_tensors", dump_tensors);
     unit_test_build_options.addOption([]const u8, "version", version);
@@ -646,6 +650,7 @@ pub fn build(b: *std.Build) void {
     // ensure deterministic behavior across host GPU setups.
     const integration_build_options = b.addOptions();
     integration_build_options.addOption(bool, "enable_metal", false);
+    integration_build_options.addOption(bool, "enable_cuda", enable_cuda);
     integration_build_options.addOption(bool, "debug_matmul", debug_matmul);
     integration_build_options.addOption(bool, "dump_tensors", dump_tensors);
     integration_build_options.addOption([]const u8, "version", version);
@@ -824,6 +829,7 @@ pub fn build(b: *std.Build) void {
         const host_target = b.resolveTargetQuery(.{});
         const perf_exe_build_options = b.addOptions();
         perf_exe_build_options.addOption(bool, "enable_metal", enable_metal);
+        perf_exe_build_options.addOption(bool, "enable_cuda", enable_cuda);
 
         const perf_exe_mod = b.createModule(.{
             .root_source_file = b.path(perf_sanity_path),
@@ -853,6 +859,7 @@ pub fn build(b: *std.Build) void {
 
         const perf_test_build_options = b.addOptions();
         perf_test_build_options.addOption(bool, "enable_metal", false);
+        perf_test_build_options.addOption(bool, "enable_cuda", enable_cuda);
 
         const perf_test_mod = b.createModule(.{
             .root_source_file = b.path(perf_sanity_path),

@@ -1,16 +1,18 @@
 //! Backend abstraction for inference execution.
 //!
-//! Supports multiple backends: CPU (x86/ARM), Metal (macOS GPU).
+//! Supports multiple backends: CPU, Metal, CUDA.
 //! Provides a unified interface for running transformer inference
 //! across different hardware backends with automatic selection.
 //!
 //! ## Auto-Selection Logic
 //!
 //! Backend is automatically selected based on:
-//! 1. Platform (macOS prefers Metal if available)
-//! 2. Model dtype (Metal requires Q4/U8/BF16)
-//! 3. Model runtime features (MLA remains unsupported on Metal)
-//! 4. Build configuration (`enable_metal` flag)
+//! 1. Environment override (`BACKEND=cpu|metal|cuda|auto`) when selection is `.auto`
+//! 2. Build flags (`enable_cuda`, `enable_metal`)
+//! 3. Platform (CUDA on Linux/Windows, Metal on macOS)
+//! 4. Model compatibility checks (for Metal)
+//!
+//! Note: CUDA is opt-in only for now. Auto-selection does not choose CUDA.
 //!
 //! ## Supported Backends
 //!
@@ -18,6 +20,7 @@
 //! |---------|------|------------|
 //! | `cpu`   | Batched (FusedCpuBackend) | Production graph-based inference |
 //! | `metal` | Lazy graph (MetalBackend) | Production GPU inference (macOS) |
+//! | `cuda`  | Stub (CudaBackend) | Experimental backend scaffold |
 //!
 //! ## Legacy Path (Removed)
 //!
@@ -34,6 +37,7 @@ const models = @import("../../models/root.zig");
 const log = @import("../../log.zig");
 const progress_mod = @import("../../progress.zig");
 const tensor = @import("../../tensor.zig");
+const compute = @import("../../compute/root.zig");
 const ModelConfig = tensor.ModelConfig;
 const dtype_mod = @import("../../dtype.zig");
 const DType = dtype_mod.DType;
@@ -50,7 +54,11 @@ pub const PrefillProgressFn = cpu.BackendType.PrefillProgressFn;
 /// Re-export pooling strategy for embedding extraction
 pub const PoolingStrategy = contract.PoolingStrategy;
 const has_metal = build_options.enable_metal and builtin.os.tag == .macos;
+const has_cuda = build_options.enable_cuda and (builtin.os.tag == .linux or builtin.os.tag == .windows);
 pub const metal = if (has_metal) @import("metal/root.zig") else struct {
+    pub const BackendType = void;
+};
+pub const cuda = if (has_cuda) @import("cuda/root.zig") else struct {
     pub const BackendType = void;
 };
 
@@ -79,6 +87,19 @@ comptime {
         contract.assertSamplingModuleLayout(metal.sampling, "metal");
         contract.assertBackendType(metal.BackendType);
     }
+    if (has_cuda) {
+        contract.assertBackendModuleLayout(cuda, "cuda");
+        contract.assertVisionModuleLayout(cuda.vision, "cuda");
+        contract.assertExecutorModuleLayout(cuda.executor, "cuda");
+        contract.assertExecutorSymbolLayout(cuda.executor, "cuda");
+        contract.assertKernelModuleLayout(cuda.kernels, "cuda");
+        contract.assertKernelSupportMap(cuda.kernels, "cuda");
+        contract.assertKernelSymbolLayout(cuda.kernels, "cuda");
+        contract.assertUnsupportedKernelPolicy(cuda.kernels, "cuda");
+        contract.assertSchedulerModuleLayout(cuda.scheduler, "cuda");
+        contract.assertSamplingModuleLayout(cuda.sampling, "cuda");
+        contract.assertBackendType(cuda.BackendType);
+    }
 }
 
 /// Default batch size for FusedCpuBackend (supports up to N concurrent sequences)
@@ -96,6 +117,7 @@ pub const Selection = enum {
     auto,
     cpu,
     metal,
+    cuda,
 };
 
 /// Backend initialization options selected at startup/config layer.
@@ -108,7 +130,44 @@ fn shouldPreserveNativeNormDType(selection: Selection) bool {
         .auto => has_metal,
         .cpu => false,
         .metal => has_metal,
+        .cuda => false,
     };
+}
+
+fn parseSelectionToken(raw: []const u8) ?Selection {
+    const token = std.mem.trim(u8, raw, " \t\r\n");
+    if (token.len == 0) return null;
+    if (std.ascii.eqlIgnoreCase(token, "auto")) return .auto;
+    if (std.ascii.eqlIgnoreCase(token, "cpu")) return .cpu;
+    if (std.ascii.eqlIgnoreCase(token, "metal")) return .metal;
+    if (std.ascii.eqlIgnoreCase(token, "cuda")) return .cuda;
+    return null;
+}
+
+fn selectionOverrideFromEnv(allocator: std.mem.Allocator) ?Selection {
+    const raw = std.process.getEnvVarOwned(allocator, "BACKEND") catch return null;
+    defer allocator.free(raw);
+    return parseSelectionToken(raw);
+}
+
+fn selectionName(selection: Selection) []const u8 {
+    return @tagName(selection);
+}
+
+fn optionalSelectionName(selection: ?Selection) []const u8 {
+    if (selection) |value| return selectionName(value);
+    return "unset";
+}
+
+const CudaProbe = compute.cuda.Probe;
+
+fn cudaProbeName(probe: CudaProbe) []const u8 {
+    return @tagName(probe);
+}
+
+fn probeCudaRuntime() CudaProbe {
+    if (!has_cuda) return .disabled;
+    return compute.cuda.probeRuntime();
 }
 
 /// Backend type - tagged union of available backends
@@ -117,6 +176,8 @@ pub const Backend = union(enum) {
     cpu: cpu.BackendType,
     /// Metal GPU backend (macOS only)
     metal: if (has_metal) metal.BackendType else void,
+    /// CUDA backend (Linux/Windows, experimental scaffold)
+    cuda: if (has_cuda) cuda.BackendType else void,
 
     /// Vision input type for prefillSlotWithVision (shared across backends)
     pub const PrefillVisionInput = cpu.BackendType.PrefillVisionInput;
@@ -143,20 +204,42 @@ pub const Backend = union(enum) {
         return switch (self.*) {
             .cpu => false,
             .metal => true,
+            .cuda => false,
         };
     }
 
     /// Initialize the appropriate backend based on platform and model format.
-    /// Automatically selects FusedCpuBackend for CPU, Metal when available.
+    /// Auto order: Metal (if supported) -> CPU.
+    /// CUDA is selected only when explicitly configured.
     pub fn init(
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
         init_options: InitOptions,
         progress: progress_mod.Context,
     ) !Backend {
-        switch (init_options.selection) {
+        const env_override = if (init_options.selection == .auto)
+            selectionOverrideFromEnv(allocator)
+        else
+            null;
+        const selected = if (init_options.selection == .auto)
+            (env_override orelse .auto)
+        else
+            init_options.selection;
+        const cuda_probe = probeCudaRuntime();
+
+        log.info("inference", "Backend init policy", .{
+            .requested = selectionName(init_options.selection),
+            .env_override = optionalSelectionName(env_override),
+            .effective = selectionName(selected),
+            .cuda_runtime = cudaProbeName(cuda_probe),
+            .build_cuda = @as(u8, @intFromBool(build_options.enable_cuda)),
+            .build_metal = @as(u8, @intFromBool(build_options.enable_metal)),
+        });
+
+        switch (selected) {
             .cpu => return initCpu(allocator, loaded, "configured", progress),
             .metal => return initMetal(allocator, loaded, "configured"),
+            .cuda => return initCuda(allocator, loaded, "configured", cuda_probe),
             .auto => {},
         }
 
@@ -173,7 +256,7 @@ pub const Backend = union(enum) {
                 }
                 return err;
             };
-            log.debug("inference", "Backend selected", .{ .backend = "metal", .reason = "auto" }, @src());
+            log.info("inference", "Backend selected: metal", .{ .reason = "auto" });
             return .{ .metal = metal_backend_state };
         }
 
@@ -186,6 +269,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| b.deinit(),
             .metal => |*b| if (has_metal) b.deinit() else unreachable,
+            .cuda => |*b| if (has_cuda) b.deinit() else unreachable,
         }
     }
 
@@ -195,6 +279,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| try b.prefill(tokens, logits_out),
             .metal => |*b| if (has_metal) try b.prefill(tokens, logits_out) else unreachable,
+            .cuda => |*b| if (has_cuda) try b.prefill(tokens, logits_out) else unreachable,
         }
     }
 
@@ -204,6 +289,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| try b.decode(token, position, logits_out),
             .metal => |*b| if (has_metal) try b.decode(token, position, logits_out) else unreachable,
+            .cuda => |*b| if (has_cuda) try b.decode(token, position, logits_out) else unreachable,
         }
     }
 
@@ -245,6 +331,7 @@ pub const Backend = union(enum) {
                     callback_data,
                 );
             } else unreachable,
+            .cuda => return error.CudaNotImplemented,
         }
     }
 
@@ -253,6 +340,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| return b.vocab_size,
             .metal => |*b| if (has_metal) return b.vocab_size else unreachable,
+            .cuda => |*b| if (has_cuda) return b.vocab_size else unreachable,
         }
     }
 
@@ -262,6 +350,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| try b.warmup(),
             .metal => {}, // Metal doesn't need warmup (GPU has own memory)
+            .cuda => {},
         }
     }
 
@@ -286,6 +375,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| try b.embed(tokens, pooling, normalize, embedding_buffer),
             .metal => return error.EmbeddingNotSupported, // Metal backend doesn't support embedding yet
+            .cuda => return error.EmbeddingNotSupported,
         }
     }
 
@@ -294,6 +384,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| return b.embeddingDim(),
             .metal => |*b| if (has_metal) return b.d_model else unreachable,
+            .cuda => |*b| if (has_cuda) return b.d_model else unreachable,
         }
     }
 
@@ -305,6 +396,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| return b.max_batch_size,
             .metal => |*b| if (has_metal) return b.max_batch_size else unreachable,
+            .cuda => |*b| if (has_cuda) return b.max_batch_size else unreachable,
         }
     }
 
@@ -312,6 +404,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| return b.allocSlot(),
             .metal => |*b| if (has_metal) return b.allocSlot() else unreachable,
+            .cuda => |*b| if (has_cuda) return b.allocSlot() else unreachable,
         }
     }
 
@@ -319,6 +412,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| b.freeSlot(slot_index),
             .metal => |*b| if (has_metal) b.freeSlot(slot_index) else unreachable,
+            .cuda => |*b| if (has_cuda) b.freeSlot(slot_index) else unreachable,
         }
     }
 
@@ -331,6 +425,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| try b.prefillSlot(slot_index, tokens, logits_out),
             .metal => |*b| if (has_metal) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
+            .cuda => |*b| if (has_cuda) try b.prefillSlot(slot_index, tokens, logits_out) else unreachable,
         }
     }
 
@@ -347,6 +442,10 @@ pub const Backend = union(enum) {
                 try b.prefillSlotWithVision(slot_index, tokens, vision_input, logits_out)
             else
                 unreachable,
+            .cuda => |*b| if (has_cuda)
+                try b.prefillSlotWithVision(slot_index, tokens, vision_input, logits_out)
+            else
+                unreachable,
         }
     }
 
@@ -358,6 +457,7 @@ pub const Backend = union(enum) {
         switch (self.*) {
             .cpu => |*b| try b.decodeBatch(requests, results),
             .metal => |*b| if (has_metal) try b.decodeBatch(requests, results) else unreachable,
+            .cuda => |*b| if (has_cuda) try b.decodeBatch(requests, results) else unreachable,
         }
     }
 
@@ -373,6 +473,7 @@ pub const Backend = union(enum) {
                 b.prefill_progress_ctx = progress_ctx;
             },
             .metal => {},
+            .cuda => {},
         }
     }
 
@@ -381,6 +482,7 @@ pub const Backend = union(enum) {
         return switch (self.*) {
             .cpu => cpu.vision.maxPixels(),
             .metal => if (has_metal) metal.vision.maxPixels() else unreachable,
+            .cuda => if (has_cuda) cuda.vision.maxPixels() else unreachable,
         };
     }
 };
@@ -434,7 +536,7 @@ fn initCpu(
     progress: progress_mod.Context,
 ) !Backend {
     const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
-    log.debug("inference", "Backend selected", .{ .backend = "cpu", .reason = reason }, @src());
+    log.info("inference", "Backend selected: cpu", .{ .reason = reason });
     return .{ .cpu = cpu_backend_state };
 }
 
@@ -447,8 +549,26 @@ fn initMetal(
         return error.MetalNotEnabled;
     }
     const metal_backend_state = try metal.BackendType.init(allocator, loaded);
-    log.debug("inference", "Backend selected", .{ .backend = "metal", .reason = reason }, @src());
+    log.info("inference", "Backend selected: metal", .{ .reason = reason });
     return .{ .metal = metal_backend_state };
+}
+
+fn initCuda(
+    allocator: std.mem.Allocator,
+    loaded: *LoadedModel,
+    reason: []const u8,
+    probe: CudaProbe,
+) !Backend {
+    if (!has_cuda) {
+        return error.CudaNotEnabled;
+    }
+    if (probe != .available) {
+        log.info("inference", "CUDA runtime unavailable", .{ .reason = cudaProbeName(probe) });
+        return error.CudaUnavailable;
+    }
+    const cuda_backend_state = try cuda.BackendType.init(allocator, loaded);
+    log.info("inference", "Backend selected: cuda", .{ .reason = reason });
+    return .{ .cuda = cuda_backend_state };
 }
 
 // ============================================================================
@@ -511,6 +631,41 @@ test "defaultModelLoadOptions honors explicit CPU selection" {
     try std.testing.expectEqual(false, opts.preserve_native_norm_dtype);
 }
 
+test "defaultModelLoadOptions honors explicit CUDA selection" {
+    const opts = defaultModelLoadOptions(.{ .selection = .cuda });
+    try std.testing.expectEqual(false, opts.preserve_native_norm_dtype);
+}
+
+test "parseSelectionToken accepts supported backend values" {
+    try std.testing.expectEqual(Selection.auto, parseSelectionToken("auto").?);
+    try std.testing.expectEqual(Selection.cpu, parseSelectionToken("CPU").?);
+    try std.testing.expectEqual(Selection.metal, parseSelectionToken("metal").?);
+    try std.testing.expectEqual(Selection.cuda, parseSelectionToken("cuda").?);
+}
+
+test "parseSelectionToken rejects unsupported values" {
+    try std.testing.expectEqual(@as(?Selection, null), parseSelectionToken(""));
+    try std.testing.expectEqual(@as(?Selection, null), parseSelectionToken("  "));
+    try std.testing.expectEqual(@as(?Selection, null), parseSelectionToken("rocm"));
+}
+
+test "optionalSelectionName returns tag or unset" {
+    try std.testing.expectEqualStrings("unset", optionalSelectionName(null));
+    try std.testing.expectEqualStrings("cpu", optionalSelectionName(.cpu));
+    try std.testing.expectEqualStrings("cuda", optionalSelectionName(.cuda));
+}
+
+test "cudaProbeName exposes stable tags" {
+    try std.testing.expectEqualStrings("disabled", cudaProbeName(.disabled));
+    try std.testing.expectEqualStrings("available", cudaProbeName(.available));
+    try std.testing.expectEqualStrings("driver_not_found", cudaProbeName(.driver_not_found));
+}
+
+test "probeCudaRuntime returns disabled when CUDA backend is unsupported by target" {
+    if (has_cuda) return;
+    try std.testing.expectEqual(CudaProbe.disabled, probeCudaRuntime());
+}
+
 test "backend selection" {
     // This test just verifies the module compiles correctly
     // Actual backend tests require model files
@@ -531,6 +686,13 @@ test "generationPath: metal always selects scheduler" {
     try std.testing.expectEqual(Backend.GenerationPath.scheduler, metal_backend.generationPath(false));
 }
 
+test "generationPath: cuda always selects scheduler" {
+    if (!has_cuda) return;
+    const cuda_backend: Backend = .{ .cuda = undefined };
+    try std.testing.expectEqual(Backend.GenerationPath.scheduler, cuda_backend.generationPath(true));
+    try std.testing.expectEqual(Backend.GenerationPath.scheduler, cuda_backend.generationPath(false));
+}
+
 test "supportsSchedulerStreamingFastPath: cpu disabled" {
     const cpu_backend: Backend = .{ .cpu = undefined };
     try std.testing.expectEqual(false, cpu_backend.supportsSchedulerStreamingFastPath());
@@ -540,6 +702,12 @@ test "supportsSchedulerStreamingFastPath: metal enabled" {
     if (!has_metal) return;
     const metal_backend: Backend = .{ .metal = undefined };
     try std.testing.expectEqual(true, metal_backend.supportsSchedulerStreamingFastPath());
+}
+
+test "supportsSchedulerStreamingFastPath: cuda disabled" {
+    if (!has_cuda) return;
+    const cuda_backend: Backend = .{ .cuda = undefined };
+    try std.testing.expectEqual(false, cuda_backend.supportsSchedulerStreamingFastPath());
 }
 
 test "kernel parity: rope cpu vs metal" {
@@ -731,5 +899,9 @@ test "visionMaxPixels dispatches to backend vision module" {
     if (has_metal) {
         var metal_backend = Backend{ .metal = undefined };
         try std.testing.expectEqual(metal.vision.maxPixels(), metal_backend.visionMaxPixels());
+    }
+    if (has_cuda) {
+        var cuda_backend = Backend{ .cuda = undefined };
+        try std.testing.expectEqual(cuda.vision.maxPixels(), cuda_backend.visionMaxPixels());
     }
 }

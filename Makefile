@@ -25,6 +25,10 @@ else
 	SED_INPLACE := sed -i
 endif
 
+ifdef TALU_ENABLE_CUDA
+	ZIG_BUILD_FLAGS += -Dcuda=true
+endif
+
 all: build
 
 deps:

@@ -8,6 +8,7 @@ const main = @import("main");
 const backend = main.inference.backend;
 const models = main.models.dispatcher;
 const has_metal = build_options.enable_metal and builtin.os.tag == .macos;
+const has_cuda = build_options.enable_cuda and (builtin.os.tag == .linux or builtin.os.tag == .windows);
 
 test "cpu backend consumes models-owned block contracts" {
     const runtime_blocks = models.weights.blocks;
@@ -24,6 +25,15 @@ test "metal backend consumes models-owned block kind contract" {
     try std.testing.expect(
         backend.metal.executor.weights.WeightHandles.LayerWeights.LayerKind == models.op_types.BlockKind,
     );
+}
+
+test "cuda backend consumes models-owned block contracts" {
+    if (comptime !has_cuda) return;
+    const runtime_blocks = models.weights.blocks;
+    try std.testing.expect(backend.cuda.executor.weights.BlockType == models.op_types.BlockKind);
+    try std.testing.expect(backend.cuda.executor.weights.BlockWeights == runtime_blocks.BlockWeights);
+    try std.testing.expect(backend.cuda.executor.weights.BlockMapContext == runtime_blocks.BlockMapContext);
+    try std.testing.expect(backend.cuda.executor.weights.WeightMap == runtime_blocks.WeightMap);
 }
 
 fn shouldSkipPath(path: []const u8) bool {

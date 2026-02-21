@@ -7,6 +7,7 @@ const main = @import("main");
 
 const backend = main.inference.backend;
 const has_metal = build_options.enable_metal and builtin.os.tag == .macos;
+const has_cuda = build_options.enable_cuda and (builtin.os.tag == .linux or builtin.os.tag == .windows);
 
 fn expectKernelModuleDecls(comptime K: type) !void {
     inline for ([_][]const u8{
@@ -39,10 +40,21 @@ test "metal executor exposes model and block modules" {
     _ = backend.metal.executor.block;
 }
 
+test "cuda executor exposes model and block modules" {
+    if (comptime !has_cuda) return;
+    _ = backend.cuda.executor.model;
+    _ = backend.cuda.executor.block;
+}
+
 test "kernel module names stay symmetric" {
     try expectKernelModuleDecls(backend.cpu.kernels);
     if (comptime !has_metal) return;
     try expectKernelModuleDecls(backend.metal.kernels);
+}
+
+test "kernel module names stay symmetric for cuda" {
+    if (comptime !has_cuda) return;
+    try expectKernelModuleDecls(backend.cuda.kernels);
 }
 
 test "cpu kernel symbols expose symmetric struct names" {
@@ -107,6 +119,16 @@ test "kernel forward arity matches across cpu and metal" {
     try std.testing.expectEqual(@as(usize, 7), forwardArity(backend.metal.kernels.attention.MultiHeadAttention));
 }
 
+test "kernel forward arity matches across cpu and cuda" {
+    if (comptime !has_cuda) return;
+    try std.testing.expectEqual(@as(usize, 3), forwardArity(backend.cpu.kernels.norm.RMSNorm));
+    try std.testing.expectEqual(@as(usize, 3), forwardArity(backend.cuda.kernels.norm.RMSNorm));
+    try std.testing.expectEqual(@as(usize, 5), forwardArity(backend.cpu.kernels.ffn.SwiGLU));
+    try std.testing.expectEqual(@as(usize, 5), forwardArity(backend.cuda.kernels.ffn.SwiGLU));
+    try std.testing.expectEqual(@as(usize, 7), forwardArity(backend.cpu.kernels.attention.MultiHeadAttention));
+    try std.testing.expectEqual(@as(usize, 7), forwardArity(backend.cuda.kernels.attention.MultiHeadAttention));
+}
+
 test "metal kernel symbols expose symmetric struct names" {
     if (comptime !has_metal) return;
     try std.testing.expect(@hasDecl(backend.metal.kernels, "TransformerBlock"));
@@ -126,4 +148,18 @@ test "metal unsupported kernel declarations stay explicit" {
     try std.testing.expect(backend.metal.kernels.mamba.supported);
     try std.testing.expect(!backend.metal.kernels.mla_attention.supported);
     try std.testing.expectError(error.MLANotSupportedOnMetal, backend.metal.kernels.mla_attention.unsupported());
+}
+
+test "cuda kernel symbols expose symmetric struct names" {
+    if (comptime !has_cuda) return;
+    try std.testing.expect(@hasDecl(backend.cuda.kernels, "TransformerBlock"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.norm, "RMSNorm"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.attention, "MultiHeadAttention"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.ffn, "SwiGLU"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.norm.RMSNorm, "ForwardParams"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.attention.MultiHeadAttention, "ForwardParams"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.ffn.SwiGLU, "ForwardParams"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.norm.RMSNorm, "forward"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.attention.MultiHeadAttention, "forward"));
+    try std.testing.expect(@hasDecl(backend.cuda.kernels.ffn.SwiGLU, "forward"));
 }
