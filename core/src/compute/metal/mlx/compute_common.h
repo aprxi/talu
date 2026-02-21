@@ -6,7 +6,7 @@
 // - array pool declarations
 // - shared compile-time constants
 //
-// Model/runtime state containers (for example KV cache structs) must live
+// Runtime state containers (for example slotted history/cache structs) must live
 // outside compute and be owned by inference runtime code.
 
 #pragma once
@@ -28,11 +28,11 @@ using namespace mlx::core;
 // Array Pool - reuses array objects to avoid heap allocations.
 // ============================================================================
 // MLX arrays are lightweight (~16 bytes, shared_ptr to data).
-// But allocating 400+ arrays per token via new/delete adds overhead.
+// But allocating 400+ arrays per step via new/delete adds overhead.
 // This pool pre-allocates and reuses array objects.
 //
-// IMPORTANT: Only call mlx_pool_reset() at the START of a full generation,
-// NOT between tokens. Arrays from decode step N must stay valid for step N+1.
+// IMPORTANT: Only call mlx_pool_reset() at the START of a full run,
+// NOT between iterative steps. Arrays from step N must stay valid for step N+1.
 // ============================================================================
 
 extern thread_local std::deque<std::optional<array>> g_array_pool;

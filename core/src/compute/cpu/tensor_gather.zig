@@ -1,4 +1,4 @@
-//! Tensor gather/scatter primitives for CPU kernels.
+//! Tensor gather/scatter primitives for CPU compute.
 
 const std = @import("std");
 
@@ -22,7 +22,7 @@ pub fn gatherRowsF32(
     }
 }
 
-/// Add feature rows into destination rows selected by token positions.
+/// Add feature rows into destination rows selected by positions.
 pub fn scatterAddRowsByPositions(
     dst_rows: []f32,
     dst_row_count: usize,
@@ -36,25 +36,25 @@ pub fn scatterAddRowsByPositions(
     const available_rows = src_rows.len / row_width;
     const row_count = @min(positions.len, available_rows);
     for (0..row_count) |row_idx| {
-        const token_pos = positions[row_idx];
-        if (token_pos >= dst_row_count) continue;
-        const dst = dst_rows[token_pos * row_width ..][0..row_width];
+        const dst_row_idx = positions[row_idx];
+        if (dst_row_idx >= dst_row_count) continue;
+        const dst = dst_rows[dst_row_idx * row_width ..][0..row_width];
         const src = src_rows[row_idx * row_width ..][0..row_width];
         for (dst, src) |*d, s| d.* += s;
     }
 }
 
-/// Collect token positions matching `needle`.
+/// Collect positions in `values` matching `needle`.
 ///
 /// Returns an owned slice; caller owns the result and must free it.
 pub fn collectPositionsU32(
     allocator: std.mem.Allocator,
-    tokens: []const u32,
+    values: []const u32,
     needle: u32,
 ) ![]usize {
     var count: usize = 0;
-    for (tokens) |token| {
-        if (token == needle) count += 1;
+    for (values) |value| {
+        if (value == needle) count += 1;
     }
     if (count == 0) return &.{};
 
@@ -62,8 +62,8 @@ pub fn collectPositionsU32(
     errdefer allocator.free(positions);
 
     var write_idx: usize = 0;
-    for (tokens, 0..) |token, idx| {
-        if (token != needle) continue;
+    for (values, 0..) |value, idx| {
+        if (value != needle) continue;
         positions[write_idx] = idx;
         write_idx += 1;
     }
@@ -71,24 +71,24 @@ pub fn collectPositionsU32(
     return positions;
 }
 
-/// Scatter source rows into destination rows selected by matched identifier.
+/// Scatter source rows into destination rows selected by matched identifier values.
 pub fn scatterRowsByMatchedId(
     hidden_states: []f32,
     seq_len: usize,
     row_width: usize,
-    token_ids: []const u32,
-    token_id_match: u32,
+    row_ids: []const u32,
+    row_id_match: u32,
     embeddings: []const f32,
 ) !void {
     if (hidden_states.len != seq_len * row_width) return error.InvalidShape;
-    if (token_ids.len != seq_len) return error.InvalidShape;
+    if (row_ids.len != seq_len) return error.InvalidShape;
     if (embeddings.len % row_width != 0) return error.InvalidShape;
 
     const embed_tokens = embeddings.len / row_width;
     var embed_idx: usize = 0;
 
-    for (token_ids, 0..) |token_id, pos| {
-        if (token_id != token_id_match) continue;
+    for (row_ids, 0..) |row_id, pos| {
+        if (row_id != row_id_match) continue;
         if (embed_idx >= embed_tokens) return error.InvalidShape;
         const src = embeddings[embed_idx * row_width ..][0..row_width];
         const dst = hidden_states[pos * row_width ..][0..row_width];
@@ -151,18 +151,18 @@ test "collectPositionsU32 returns matching indexes" {
     try std.testing.expectEqual(@as(usize, 4), positions[2]);
 }
 
-test "scatterRowsByMatchedId copies embeddings for matched tokens" {
+test "scatterRowsByMatchedId copies embeddings for matched ids" {
     var hidden = [_]f32{
         0, 0,
         0, 0,
         0, 0,
     };
-    const token_ids = [_]u32{ 7, 1, 7 };
+    const row_ids = [_]u32{ 7, 1, 7 };
     const embeds = [_]f32{
         10, 11,
         20, 21,
     };
-    try scatterRowsByMatchedId(&hidden, 3, 2, &token_ids, 7, &embeds);
+    try scatterRowsByMatchedId(&hidden, 3, 2, &row_ids, 7, &embeds);
     try std.testing.expectEqualSlices(f32, &[_]f32{
         10, 11,
         0,  0,

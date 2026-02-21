@@ -1,4 +1,4 @@
-//! Quantized row decode primitives for CPU kernels.
+//! Quantized row decode primitives for CPU compute.
 
 const std = @import("std");
 const dtype = @import("../../dtype.zig");
@@ -20,7 +20,7 @@ pub fn decodeBf16Row(src: []align(1) const u16, dst: []f32) void {
     }
 }
 
-/// Gather and decode FP16 rows by token index.
+/// Gather and decode FP16 rows by row index.
 pub fn gatherDecodeF16Rows(
     src_rows: []align(1) const u16,
     row_count: usize,
@@ -40,7 +40,7 @@ pub fn gatherDecodeF16Rows(
     }
 }
 
-/// Gather and decode BF16 rows by token index.
+/// Gather and decode BF16 rows by row index.
 pub fn gatherDecodeBf16Rows(
     src_rows: []align(1) const u16,
     row_count: usize,
@@ -129,7 +129,7 @@ pub fn decodeGroupedAffineU8Row(
     }
 }
 
-/// Gather and decode grouped-affine U4 rows by token index.
+/// Gather and decode grouped-affine U4 rows by row index.
 pub fn gatherDecodeGroupedAffineU4Rows(
     packed_values: []align(1) const u32,
     scales: []align(1) const u16,
@@ -169,7 +169,7 @@ pub fn gatherDecodeGroupedAffineU4Rows(
     }
 }
 
-/// Gather and decode grouped-affine U8 rows by token index.
+/// Gather and decode grouped-affine U8 rows by row index.
 pub fn gatherDecodeGroupedAffineU8Rows(
     packed_values: []align(1) const u32,
     scales: []align(1) const u16,
@@ -246,7 +246,7 @@ test "gatherDecodeF16Rows decodes selected rows" {
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[3], 1e-3);
 }
 
-test "gatherDecodeBf16Rows rejects out-of-bounds token index" {
+test "gatherDecodeBf16Rows rejects out-of-bounds row index" {
     const src = [_]u16{ 0x3F80, 0x4000, 0x4040, 0x4080 };
     const idx = [_]u32{ 0, 2 };
     var out = [_]f32{0} ** 4;

@@ -1,4 +1,4 @@
-//! Shared CPU helpers for inference kernels.
+//! Shared CPU helpers for compute primitives.
 
 const std = @import("std");
 const simd = @import("simd/arch/root.zig");

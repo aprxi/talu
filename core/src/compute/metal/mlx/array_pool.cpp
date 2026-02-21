@@ -1,6 +1,6 @@
 // MLX Bridge - Array Pool and Memory Management
 //
-// Provides array object pooling to eliminate per-token heap allocations.
+// Provides array object pooling to eliminate per-step heap allocations.
 // Also handles MLX initialization and memory cache management.
 
 #include "compute_common.h"
@@ -26,7 +26,7 @@ static struct Init {
     Init() {
         if (metal::is_available()) {
             // Set wired limit to max recommended working set
-            // Keeps model weights pinned in GPU memory
+            // Keeps static arrays pinned in GPU memory
             auto info = metal::device_info();
             auto it = info.find("max_recommended_working_set_size");
             if (it != info.end()) {
@@ -34,7 +34,7 @@ static struct Init {
                 set_wired_limit(max_wired);
             }
 
-            // Create dedicated generation stream (like Python mlx-lm)
+            // Create dedicated compute stream.
             auto stream = new_stream(default_device());
             set_default_stream(stream);
         }
@@ -83,7 +83,7 @@ void mlx_pool_stats(size_t* pool_size, size_t* used) {
 }
 
 // ============================================================================
-// C API - Array from existing pointer (for model loading)
+// C API - Array from existing pointer
 // ============================================================================
 
 void* mlx_array_from_ptr(void* mlx_array_ptr) {

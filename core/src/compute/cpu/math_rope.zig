@@ -244,7 +244,7 @@ pub const RoPE = struct {
         return self.freqs_sin[base .. base + half];
     }
 
-    /// Apply interleaved RoPE rotation (for MLA-style models).
+    /// Apply interleaved RoPE rotation (pairwise-interleaved layout).
     /// In interleaved layout, consecutive pairs (x0, x1), (x2, x3), ... rotate together.
     /// This differs from standard RoPE where first half rotates with second half.
     pub fn applyInterleavedInPlace(self: *RoPE, vec: []f32, pos: usize) void {
@@ -264,7 +264,6 @@ pub const RoPE = struct {
             vec[i * 2 + 1] = x1 * cos[i] + x0 * sin[i];
         }
     }
-
 };
 
 fn scaleCosSin(cos: []f32, sin: []f32, scale: f32) void {

@@ -10,7 +10,7 @@ const tensor_mod = @import("../../tensor.zig");
 const dtype_mod = @import("../../dtype.zig");
 const simd = @import("simd/arch/root.zig");
 const grouped_affine_quant = @import("quant/grouped_affine_quant.zig");
-const prefill = @import("matmul_prefill.zig");
+const multi_row = @import("matmul_prefill.zig");
 const log = @import("../../log.zig");
 
 // Re-export types
@@ -53,16 +53,16 @@ pub const MatmulScratch = struct {
 // These control tiling and parallelization strategies. Values are tuned for
 // modern x86-64 CPUs with AVX2/AVX-512.
 
-/// Number of output columns per tile in the decode (m=1) path.
+/// Number of output columns per tile in the single-row (`m=1`) path.
 /// Smaller tiles mean better load balancing but more overhead.
 const TILE_COLS: usize = 4;
 
-/// Column tile size for small-batch prefill path (quantized kernels).
+/// Column tile size for small-batch multi-row path (quantized kernels).
 /// Larger tiles improve cache locality at the cost of load balancing.
 /// Quantized kernels benefit from larger tiles to amortize unpacking overhead.
 const COL_TILE_SIZE: usize = 128;
 
-/// Column tile size for BF16/F16 prefill path.
+/// Column tile size for BF16/F16 multi-row path.
 /// BF16/F16 are memory-bandwidth bound (not compute bound like quantized).
 /// Smaller tiles keep the active weight block in L1 cache (32KB typical).
 /// With k=1024 (common hidden dim), 32 columns * 1024 * 2 bytes = 64KB fits in L1.
@@ -78,7 +78,7 @@ const TILE_THRESHOLD: usize = 64;
 
 /// Maximum number of quantization groups supported per matmul column.
 /// For grouped-affine quantization: max_groups = max_k / min_group_size = 32768 / 32 = 1024.
-/// Supports models up to ~130B parameters (k=32768 with group_size=32).
+/// Supports very large matrices (k=32768 with group_size=32).
 pub const MAX_GROUPS: usize = 1024;
 
 /// Function pointer type for matmul kernels. Use `matmulKernel` to get the
@@ -92,7 +92,7 @@ pub const DispatchedKernel = struct {
 };
 
 /// Returns the appropriate matmul kernel for a weight tensor's dtype.
-/// Call this once at model load time and store the result.
+/// Call this once at weight-load time and store the result.
 /// Returns both the function pointer and the real function name for tracing.
 pub fn matmulKernel(weight_dtype: DType) !DispatchedKernel {
     return switch (weight_dtype) {
@@ -823,15 +823,15 @@ pub fn matmulGaffineU4(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch
 
     // IMPORTANT: Keep the CPU backend CPU-only in this kernel.
     // Per-op MLX/Metal offload from the CPU path causes frequent host<->device
-    // transfers and synchronization, which regresses small/decode-heavy and
+    // transfers and synchronization, which regresses small/single-row-heavy and
     // heterogeneous workloads (for example Granite with many Mamba blocks).
     // GPU acceleration belongs in the Metal backend selection, not inside a
     // CPU matmul primitive.
 
-    // Prefill (m_rows > 1): use dedicated prefill kernel
+    // Multi-row (m_rows > 1): use dedicated multi-row kernel
     if (m_rows > 1) {
-        log.trace("compute", "gaffine_u4 prefill", .{ .m = m_rows, .k = k_dim, .n = n_cols, .group = group }, @src());
-        prefill.matmulGaffineU4Prefill(a_data, m_rows, k_dim, packed_vals, scales, biases, scales_dtype, n_cols, group, out_data);
+        log.trace("compute", "gaffine_u4 multi-row", .{ .m = m_rows, .k = k_dim, .n = n_cols, .group = group }, @src());
+        multi_row.matmulGaffineU4Prefill(a_data, m_rows, k_dim, packed_vals, scales, biases, scales_dtype, n_cols, group, out_data);
         return;
     }
 
@@ -990,9 +990,9 @@ fn matmulGaffineU8(a: *const Tensor, b: *const Tensor, out: *Tensor, scratch: *M
     const a_data = a.asSlice(f32);
     const out_data = out.asSlice(f32);
 
-    // Prefill (m_rows > 1): use dedicated prefill kernel
+    // Multi-row (m_rows > 1): use dedicated multi-row kernel
     if (m_rows > 1) {
-        prefill.matmulGaffineU8Prefill(a_data, m_rows, k_dim, packed_vals, scales, biases, scales_dtype, n_cols, group, out_data);
+        multi_row.matmulGaffineU8Prefill(a_data, m_rows, k_dim, packed_vals, scales, biases, scales_dtype, n_cols, group, out_data);
         return;
     }
 

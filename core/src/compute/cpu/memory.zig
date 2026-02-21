@@ -5,7 +5,7 @@ pub const gather = @import("tensor_gather.zig");
 pub const padding = @import("padding.zig");
 pub const slotted = @import("memory_slotted.zig");
 
-// Re-export commonly-used helpers so inference imports only this namespace.
+// Re-export commonly-used helpers so callers import only this namespace.
 pub const gatherRowsF32 = gather.gatherRowsF32;
 pub const scatterAddRowsByPositions = gather.scatterAddRowsByPositions;
 pub const collectPositionsU32 = gather.collectPositionsU32;

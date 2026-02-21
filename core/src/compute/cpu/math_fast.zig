@@ -28,7 +28,7 @@ const exp_constants = struct {
 };
 
 /// Fast vectorized exp approximation using Schraudolph's method.
-/// Accurate to ~1% for |x| < 10, good enough for neural networks (softmax, sigmoid).
+/// Accurate to ~1% for |x| < 10, suitable for normalized-score transforms.
 /// Based on: exp(x) ≈ 2^(x/ln2) with polynomial approximation for fractional part.
 /// Uses comptime-detected SIMD width for optimal performance on any architecture.
 pub inline fn fastExp(x: F32Vec) F32Vec {
@@ -86,7 +86,7 @@ pub inline fn fastExpScalar(x: f32) f32 {
 
 test "fastExp accuracy - compare against std.math.exp" {
     // Test fastExp accuracy compared to standard library exp
-    // Using typical values seen in LLM inference (attention scores, logits)
+    // Using representative score/logit ranges.
     const test_values = [_]f32{ -5.0, -2.0, -1.0, -0.5, 0.0, 0.5, 1.0, 2.0, 5.0 };
 
     for (test_values) |x| {
@@ -99,9 +99,8 @@ test "fastExp accuracy - compare against std.math.exp" {
     }
 }
 
-test "fastExp range - typical LLM range (-10 to 10)" {
-    // Test fastExp across the full range typically encountered in LLMs
-    // Attention scores and logits usually fall in this range
+test "fastExp range - typical score range (-10 to 10)" {
+    // Test fastExp across a common score range.
     var x: f32 = -10.0;
     while (x <= 10.0) : (x += 0.5) {
         const fast_result = fastExpScalar(x);

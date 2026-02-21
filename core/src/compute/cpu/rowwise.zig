@@ -1,4 +1,4 @@
-//! Row-wise and element-wise CPU primitives for inference backends.
+//! Row-wise and element-wise CPU primitives.
 
 const std = @import("std");
 const simd = @import("simd/arch/root.zig");

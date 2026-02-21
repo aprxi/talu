@@ -39,24 +39,24 @@ pub fn rmsnormInPlaceWeightTensor(vec: []f32, weight_tensor: *const Tensor, eps:
     math_ops.rmsnormInPlaceWeightTensor(vec, weight_tensor, eps, weight_offset);
 }
 
-/// Apply RMSNorm over a `[token_count, head_count, head_dim]` view packed with
+/// Apply RMSNorm over a `[row_count, group_count, feature_width]` view packed with
 /// row stride `row_stride`.
 pub fn rmsnormHeadsInPlace(
     values: []f32,
-    token_count: usize,
-    head_count: usize,
-    head_dim: usize,
+    row_count: usize,
+    group_count: usize,
+    feature_width: usize,
     row_stride: usize,
     weight_tensor: *const Tensor,
     eps: f32,
     weight_offset: f32,
 ) void {
-    std.debug.assert(row_stride >= head_count * head_dim);
-    std.debug.assert(values.len >= token_count * row_stride);
-    for (0..token_count) |token_idx| {
-        for (0..head_count) |head_idx| {
-            const offset = token_idx * row_stride + head_idx * head_dim;
-            rmsnormInPlaceWeightTensor(values[offset .. offset + head_dim], weight_tensor, eps, weight_offset);
+    std.debug.assert(row_stride >= group_count * feature_width);
+    std.debug.assert(values.len >= row_count * row_stride);
+    for (0..row_count) |row_idx| {
+        for (0..group_count) |group_idx| {
+            const offset = row_idx * row_stride + group_idx * feature_width;
+            rmsnormInPlaceWeightTensor(values[offset .. offset + feature_width], weight_tensor, eps, weight_offset);
         }
     }
 }
@@ -154,7 +154,7 @@ test "rmsnormInPlaceWeightTensor handles f32 weights" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), rms, 1e-3);
 }
 
-test "rmsnormHeadsInPlace normalizes each head slice" {
+test "rmsnormHeadsInPlace normalizes each group slice" {
     const allocator = std.testing.allocator;
     var w = try tensor.OwnedTensor.init(allocator, .f32, &.{2});
     defer w.deinit();
@@ -162,15 +162,15 @@ test "rmsnormHeadsInPlace normalizes each head slice" {
     @memcpy(ws, &[_]f32{ 1, 1 });
 
     var x = [_]f32{
-        1, 2, // token0 head0
-        3, 4, // token0 head1
-        5, 6, // token1 head0
-        7, 8, // token1 head1
+        1, 2, // row0 group0
+        3, 4, // row0 group1
+        5, 6, // row1 group0
+        7, 8, // row1 group1
     };
     var wv = w.view();
     rmsnormHeadsInPlace(&x, 2, 2, 2, 4, &wv, 1e-6, 0.0);
 
-    // Spot-check first head scaled to finite normalized values.
+    // Spot-check first group scaled to finite normalized values.
     try std.testing.expect(std.math.isFinite(x[0]));
     try std.testing.expect(std.math.isFinite(x[1]));
     try std.testing.expect(std.math.isFinite(x[2]));

@@ -10,9 +10,9 @@ const simd = @import("arch/root.zig");
 pub const FlashAttentionConfig = struct {
     /// Tile size for keys/values (affects cache efficiency).
     kv_tile_size: usize = 256,
-    /// Head dimension (must be known for SIMD vectorization).
+    /// Feature width (must be known for SIMD vectorization).
     head_dim: usize,
-    /// Attention scale (typically 1/sqrt(head_dim)).
+    /// Attention scale (typically 1/sqrt(feature_width)).
     scale: f32,
     /// Enable causal masking.
     causal: bool = true,
@@ -48,7 +48,7 @@ pub const FlashAttentionFn = *const fn (
     sliding_window: usize, // 0 = disabled
 ) void;
 
-/// Flash Attention for f32 with compile-time head dimension and tile size.
+/// Flash Attention for f32 with compile-time feature width and tile size.
 pub fn flashAttentionF32(
     comptime head_dim: usize,
     comptime kv_tile_size: usize,

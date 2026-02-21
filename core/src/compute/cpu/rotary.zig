@@ -5,22 +5,22 @@ const indexing = @import("indexing.zig");
 
 /// Fill inverse-frequency table for RoPE.
 ///
-/// `inv_freq[i] = 1 / rope_theta^(2*i/head_dim)`.
-pub fn fillInverseFrequency(inv_freq: []f32, head_dim: usize, rope_theta: f32) !void {
-    if ((head_dim % 2) != 0) return error.InvalidShape;
-    if (inv_freq.len != head_dim / 2) return error.InvalidShape;
+/// `inv_freq[i] = 1 / rope_theta^(2*i/feature_width)`.
+pub fn fillInverseFrequency(inv_freq: []f32, feature_width: usize, rope_theta: f32) !void {
+    if ((feature_width % 2) != 0) return error.InvalidShape;
+    if (inv_freq.len != feature_width / 2) return error.InvalidShape;
     if (rope_theta <= 0.0) return error.InvalidShape;
 
     for (0..inv_freq.len) |idx| {
-        const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(head_dim));
+        const exponent = @as(f32, @floatFromInt(2 * idx)) / @as(f32, @floatFromInt(feature_width));
         inv_freq[idx] = 1.0 / std.math.pow(f32, rope_theta, exponent);
     }
 }
 
-/// Build combined cos/sin tables from precomputed inverse frequencies and per-token
+/// Build combined cos/sin tables from precomputed inverse frequencies and per-position
 /// position components.
 ///
-/// Writes `cos` and `sin` as `[seq_len, head_dim]` flattened contiguous buffers.
+/// Writes `cos` and `sin` as `[seq_len, feature_width]` flattened contiguous buffers.
 pub fn buildCosSinTablesFromAxisTriples(
     cos: []f32,
     sin: []f32,
@@ -28,25 +28,25 @@ pub fn buildCosSinTablesFromAxisTriples(
     pos_h: []const u32,
     pos_w: []const u32,
     inv_freq: []const f32,
-    head_dim: usize,
+    feature_width: usize,
     mrope_section: [3]usize,
 ) !void {
     const seq_len = pos_t.len;
     if (pos_h.len != seq_len or pos_w.len != seq_len) return error.InvalidShape;
-    if ((head_dim % 2) != 0) return error.InvalidShape;
-    const half_dim = head_dim / 2;
+    if ((feature_width % 2) != 0) return error.InvalidShape;
+    const half_dim = feature_width / 2;
     if (inv_freq.len != half_dim) return error.InvalidShape;
-    if (cos.len < seq_len * head_dim or sin.len < seq_len * head_dim) return error.InvalidShape;
+    if (cos.len < seq_len * feature_width or sin.len < seq_len * feature_width) return error.InvalidShape;
     if (mrope_section[0] + mrope_section[1] + mrope_section[2] != half_dim) return error.InvalidShape;
 
     const h_limit = mrope_section[1] * 3;
     const w_limit = mrope_section[2] * 3;
-    for (0..seq_len) |token_idx| {
-        const base = token_idx * head_dim;
+    for (0..seq_len) |position_idx| {
+        const base = position_idx * feature_width;
         for (0..half_dim) |freq_idx| {
-            var pos_component = pos_t[token_idx];
-            if (freq_idx < h_limit and (freq_idx % 3) == 1) pos_component = pos_h[token_idx];
-            if (freq_idx < w_limit and (freq_idx % 3) == 2) pos_component = pos_w[token_idx];
+            var pos_component = pos_t[position_idx];
+            if (freq_idx < h_limit and (freq_idx % 3) == 1) pos_component = pos_h[position_idx];
+            if (freq_idx < w_limit and (freq_idx % 3) == 2) pos_component = pos_w[position_idx];
 
             const angle = @as(f32, @floatFromInt(pos_component)) * inv_freq[freq_idx];
             const c = @cos(angle);
@@ -59,41 +59,41 @@ pub fn buildCosSinTablesFromAxisTriples(
     }
 }
 
-/// Apply precomputed runtime RoPE tables over Q/K buffers in-place.
+/// Apply precomputed runtime rotation tables over paired buffers in-place.
 pub fn applyRuntimeTablesToPair(
     query_values: []f32,
     key_values: []f32,
     sequence_len: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    query_dim: usize,
-    kv_total_dim: usize,
+    query_group_count: usize,
+    source_group_count: usize,
+    feature_width: usize,
+    query_row_width: usize,
+    source_row_width: usize,
     pos_offset: usize,
     cos: []const f32,
     sin: []const f32,
     rope_dim: usize,
 ) !void {
-    if (rope_dim == 0 or rope_dim > head_dim or (rope_dim % 2) != 0) return error.InvalidShape;
-    for (0..sequence_len) |token_idx| {
-        const pos = pos_offset + token_idx;
+    if (rope_dim == 0 or rope_dim > feature_width or (rope_dim % 2) != 0) return error.InvalidShape;
+    for (0..sequence_len) |position_idx| {
+        const pos = pos_offset + position_idx;
         const base = pos * rope_dim;
         if (base + rope_dim > cos.len or base + rope_dim > sin.len) return error.InvalidShape;
         const cos_row = cos[base .. base + rope_dim];
         const sin_row = sin[base .. base + rope_dim];
 
-        for (0..n_heads) |head_idx| {
-            const off = token_idx * query_dim + head_idx * head_dim;
+        for (0..query_group_count) |group_idx| {
+            const off = position_idx * query_row_width + group_idx * feature_width;
             applyFromCosSin(query_values[off .. off + rope_dim], cos_row, sin_row);
         }
-        for (0..n_kv_heads) |head_idx| {
-            const off = token_idx * kv_total_dim + head_idx * head_dim;
+        for (0..source_group_count) |group_idx| {
+            const off = position_idx * source_row_width + group_idx * feature_width;
             applyFromCosSin(key_values[off .. off + rope_dim], cos_row, sin_row);
         }
     }
 }
 
-/// Apply static RoPE in-place for Q/K buffers.
+/// Apply static rotation in-place for paired buffers.
 ///
 /// `rope` must expose:
 /// - `dim: usize`
@@ -102,25 +102,25 @@ pub fn applyStaticTablesToPair(
     query_values: []f32,
     key_values: []f32,
     sequence_len: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
-    query_dim: usize,
-    kv_total_dim: usize,
+    query_group_count: usize,
+    source_group_count: usize,
+    feature_width: usize,
+    query_row_width: usize,
+    source_row_width: usize,
     pos_offset: usize,
     position_delta: isize,
     rope: anytype,
 ) !void {
     const rope_dim = rope.dim;
-    if (rope_dim == 0 or rope_dim > head_dim) return error.InvalidShape;
-    for (0..sequence_len) |token_idx| {
-        const pos = try indexing.offsetSigned(pos_offset + token_idx, position_delta);
-        for (0..n_heads) |head_idx| {
-            const off = token_idx * query_dim + head_idx * head_dim;
+    if (rope_dim == 0 or rope_dim > feature_width) return error.InvalidShape;
+    for (0..sequence_len) |position_idx| {
+        const pos = try indexing.offsetSigned(pos_offset + position_idx, position_delta);
+        for (0..query_group_count) |group_idx| {
+            const off = position_idx * query_row_width + group_idx * feature_width;
             rope.applyInPlace(query_values[off .. off + rope_dim], pos);
         }
-        for (0..n_kv_heads) |head_idx| {
-            const off = token_idx * kv_total_dim + head_idx * head_dim;
+        for (0..source_group_count) |group_idx| {
+            const off = position_idx * source_row_width + group_idx * feature_width;
             rope.applyInPlace(key_values[off .. off + rope_dim], pos);
         }
     }
@@ -207,8 +207,8 @@ pub fn fillSpatialRotaryTables(
 ///
 /// Supported shapes:
 /// - 2D: `[seq, dim]`
-/// - 3D: `[seq, n_heads, head_dim]`
-/// - 4D: `[batch, n_heads, seq, head_dim]`
+/// - 3D: `[seq, groups, feature_width]`
+/// - 4D: `[batch, groups, seq, feature_width]`
 pub fn applyRopeTensorInPlace(
     input_data: []f32,
     n_dims: usize,
@@ -231,14 +231,14 @@ pub fn applyRopeTensorInPlace(
 
     if (n_dims == 3) {
         const seq_len: usize = @intCast(shape[0]);
-        const n_heads: usize = @intCast(shape[1]);
-        const head_dim: usize = @intCast(shape[2]);
-        const active_dim = @min(rope_dim, head_dim);
-        const total_dim = n_heads * head_dim;
+        const group_count: usize = @intCast(shape[1]);
+        const feature_width: usize = @intCast(shape[2]);
+        const active_dim = @min(rope_dim, feature_width);
+        const total_dim = group_count * feature_width;
         for (0..seq_len) |t| {
             const pos = pos_offset + t;
-            for (0..n_heads) |h| {
-                const base = t * total_dim + h * head_dim;
+            for (0..group_count) |g| {
+                const base = t * total_dim + g * feature_width;
                 rope.applyInPlace(input_data[base .. base + active_dim], pos);
             }
         }
@@ -247,17 +247,17 @@ pub fn applyRopeTensorInPlace(
 
     if (n_dims == 4) {
         const batch: usize = @intCast(shape[0]);
-        const n_heads: usize = @intCast(shape[1]);
+        const group_count: usize = @intCast(shape[1]);
         const seq_len: usize = @intCast(shape[2]);
-        const head_dim: usize = @intCast(shape[3]);
-        const active_dim = @min(rope_dim, head_dim);
-        const head_stride = seq_len * head_dim;
-        const batch_stride = n_heads * head_stride;
+        const feature_width: usize = @intCast(shape[3]);
+        const active_dim = @min(rope_dim, feature_width);
+        const group_stride = seq_len * feature_width;
+        const batch_stride = group_count * group_stride;
         for (0..batch) |b| {
-            for (0..n_heads) |h| {
+            for (0..group_count) |g| {
                 for (0..seq_len) |t| {
                     const pos = pos_offset + t;
-                    const base = b * batch_stride + h * head_stride + t * head_dim;
+                    const base = b * batch_stride + g * group_stride + t * feature_width;
                     rope.applyInPlace(input_data[base .. base + active_dim], pos);
                 }
             }

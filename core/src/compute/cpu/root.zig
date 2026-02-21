@@ -1,7 +1,7 @@
-//! CPU compute primitives shared by inference kernels.
+//! CPU compute primitives.
 //!
 //! This package contains CPU-specific low-level kernels and helpers that are
-//! called from higher-level inference backend code.
+//! called from higher-level runtime orchestration code.
 
 pub const common = @import("common.zig");
 pub const tensor_view = @import("tensor_view.zig");

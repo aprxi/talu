@@ -1,4 +1,4 @@
-//! TensorView transpose helper for CPU inference graph execution.
+//! TensorView transpose helper for CPU compute execution.
 
 const std = @import("std");
 const tv = @import("tensor_view.zig");

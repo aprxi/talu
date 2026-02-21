@@ -129,7 +129,7 @@ fn rmsNormTyped(
         }
     } else {
         // Optimized strided path: use incremental offset calculation.
-        // For each token, compute base offset once, then stride along last dim.
+        // For each row, compute base offset once, then stride along last dim.
         const in_last_stride = input.strides[input.ndim - 1];
         const out_last_stride = out.strides[out.ndim - 1];
         const w_stride = weight.strides[0]; // weight is 1D

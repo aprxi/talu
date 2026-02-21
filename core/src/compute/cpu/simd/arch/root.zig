@@ -9,8 +9,8 @@ const builtin = @import("builtin");
 /// Preferred vector width in bits for the target CPU.
 /// We cap at 256-bit (AVX2) because:
 /// 1. AVX-512 causes frequency throttling on many CPUs
-/// 2. Small head_dim (64-128) doesn't benefit from wider vectors
-/// 3. AVX2 is the sweet spot for LLM inference workloads
+/// 2. Small/medium row widths often do not benefit from wider vectors
+/// 3. AVX2 is typically the best throughput/clock tradeoff for these kernels
 pub const vector_bit_width: comptime_int = blk: {
     const arch = builtin.cpu.arch;
     if (arch == .x86_64 or arch == .x86) {

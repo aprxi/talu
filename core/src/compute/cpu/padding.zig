@@ -1,4 +1,4 @@
-//! Padding Utilities for Batched Sequences
+//! Padding utilities for batched sequences.
 //!
 //! Functions for calculating max sequence lengths, padding, and mask generation.
 //! Used by capi modules to avoid inline loop logic.
@@ -29,7 +29,7 @@ pub const BatchPaddingResult = struct {
 
 /// Result of mask generation operation.
 pub const BatchMaskResult = struct {
-    /// Mask 2D data: [num_sequences, padded_len], 1=token, 0=padding
+    /// Mask 2D data: [num_sequences, padded_len], 1=data, 0=padding
     data: []i32,
     /// Number of sequences
     num_sequences: usize,
@@ -63,10 +63,10 @@ pub fn maxSequenceLength(offsets: []const usize, num_sequences: usize) usize {
 ///
 /// Args:
 ///   allocator: Memory allocator
-///   ids: Token IDs in CSR data array
+///   ids: Sequence IDs in CSR data array
 ///   offsets: CSR offsets (num_sequences + 1 elements)
 ///   num_sequences: Number of sequences
-///   pad_id: Token ID to use for padding
+///   pad_id: ID value to use for padding
 ///   max_length: Maximum length (0 = use longest sequence)
 ///   pad_left: If true, pad on left side
 ///
@@ -154,7 +154,7 @@ pub fn generateMask(
     errdefer allocator.free(mask_data);
     @memset(mask_data, 0);
 
-    // Set 1s for real tokens
+    // Set 1s for real values
     for (0..num_sequences) |i| {
         const seq_start = offsets_slice[i];
         const seq_end = offsets_slice[i + 1];

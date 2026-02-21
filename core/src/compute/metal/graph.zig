@@ -1,7 +1,6 @@
 //! Zig bindings for MLX lazy graph API
 //!
 //! Keeps arrays on GPU using opaque handles, builds lazy computation graphs.
-//! Follows pattern from test_mlx_single.py for 243 t/s decode performance.
 const std = @import("std");
 
 // ============================================================================
@@ -134,7 +133,7 @@ pub extern fn mlx_lazy_quantized_attention(
     v_weights: ArrayHandle,
     v_scales: ArrayHandle,
     v_biases: ArrayHandle,
-    mask: ArrayHandle, // null for decode, causal_mask for prefill
+    mask: ArrayHandle, // null for single-step path, causal mask for multi-step path
     scale: f32,
     group_size: usize,
     bits: usize,
@@ -279,7 +278,7 @@ pub extern fn mlx_eval(handles: [*]ArrayHandle, n_handles: usize) void;
 
 /// Async evaluation - >>> C++ call: mx.async_eval()
 /// Starts GPU work in background, returns immediately.
-/// Use for pipelining: start next token's eval while processing current token.
+/// Use for pipelining staged compute dispatches.
 pub extern fn mlx_async_eval(handles: [*]ArrayHandle, n_handles: usize) void;
 
 // ============================================================================
@@ -293,7 +292,7 @@ pub extern fn mlx_array_to_float32(
     size: usize,
 ) void;
 
-/// GPU-side argmax - returns array handle with token index
+/// GPU-side argmax - returns array handle with selected index
 /// Use to avoid CPU roundtrip during sampling
 pub extern fn mlx_lazy_argmax(handle: ArrayHandle, axis: c_int) ArrayHandle;
 
@@ -301,7 +300,7 @@ pub extern fn mlx_lazy_argmax(handle: ArrayHandle, axis: c_int) ArrayHandle;
 pub extern fn mlx_array_item_u32(handle: ArrayHandle) u32;
 
 /// Extract last position from 3D logits tensor [B, L, V] -> [V]
-/// Used for efficient argmax sampling from decode output
+/// Used for efficient argmax sampling from the most recent output row.
 pub extern fn mlx_lazy_slice_last(handle: ArrayHandle) ArrayHandle;
 
 /// Get array shape

@@ -1,4 +1,4 @@
-//! Shared grouped-affine quantization helpers for 4-bit and 8-bit decode paths.
+//! Shared grouped-affine quantization helpers for 4-bit and 8-bit kernels.
 
 const std = @import("std");
 const dtype = @import("../../../dtype.zig");

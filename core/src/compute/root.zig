@@ -13,7 +13,7 @@
 //! ## Internal API (for core/src/ only)
 //!
 //! - `metal` - Metal/MLX GPU compute primitives
-//! - `cpu` - CPU-specific compute primitives shared by inference kernels
+//! - `cpu` - CPU-specific compute primitives consumed by runtime layers
 
 // =============================================================================
 // Public API
@@ -53,5 +53,5 @@ pub const TensorView = cpu.tensor_view.TensorView;
 /// Metal/MLX GPU compute primitives.
 pub const metal = @import("metal/root.zig");
 
-/// CPU compute primitives used by inference kernels.
+/// CPU compute primitives used by runtime execution layers.
 pub const cpu = @import("cpu/root.zig");

@@ -56,9 +56,9 @@ pub fn ropeFreqs(out: TensorView, theta: f32, offset: usize) void {
     math.ropeFillCosSinCombinedStrided(out_data, stride0, stride1, seq_len, dim, theta, offset);
 }
 
-/// Apply RoPE to query and key tensors in-place (PyTorch-compatible).
-/// q, k: [batch, heads, seq, feature_width]
-/// cos, sin: [batch, seq, feature_width/2] or [1, seq, feature_width/2] (broadcasts over batch/heads)
+/// Apply RoPE to query/source tensors in-place (PyTorch-compatible layout).
+/// q, k: [batch, groups, seq, feature_width]
+/// cos, sin: [batch, seq, feature_width/2] or [1, seq, feature_width/2] (broadcasts over batch/groups)
 ///           Also supports [seq, feature_width] format (used by C API rope_freqs).
 pub fn applyRope(q: TensorView, k: TensorView, cos: TensorView, sin: TensorView) void {
     switch (q.dtype) {
@@ -82,7 +82,7 @@ fn applyRopeTyped(
     cos: TensorView,
     sin: TensorView,
 ) void {
-    std.debug.assert(q.ndim == 4); // [batch, heads, seq, feature_width]
+    std.debug.assert(q.ndim == 4); // [batch, groups, seq, feature_width]
 
     const q_data = @as([*]T, @ptrCast(@alignCast(q.data)));
     const k_data = @as([*]T, @ptrCast(@alignCast(k.data)));
@@ -92,8 +92,8 @@ fn applyRopeTyped(
     const sin_data = @as([*]const T, @ptrCast(@alignCast(sin.data)));
 
     const batch = q.shape[0];
-    const q_heads = q.shape[1];
-    const k_heads = k.shape[1];
+    const q_group_count = q.shape[1];
+    const k_group_count = k.shape[1];
     const seq_len = q.shape[2];
     const feature_width = q.shape[3];
     const half_dim = feature_width / 2;
@@ -117,8 +117,8 @@ fn applyRopeTyped(
                 freq_offset = s * feature_width;
             }
 
-            // Process query heads
-            for (0..q_heads) |h| {
+            // Process query groups
+            for (0..q_group_count) |h| {
                 const q_offset = b * q.strides[0] + h * q.strides[1] + s * q.strides[2];
                 const q_ptr = q_data + q_offset;
                 const q_stride = q.strides[3];
@@ -141,8 +141,8 @@ fn applyRopeTyped(
                 );
             }
 
-            // Process key heads
-            for (0..k_heads) |h| {
+            // Process source groups
+            for (0..k_group_count) |h| {
                 const k_offset = b * k.strides[0] + h * k.strides[1] + s * k.strides[2];
                 const k_ptr = k_data + k_offset;
                 const k_stride = k.strides[3];
@@ -226,7 +226,7 @@ fn sdpaTyped(
     defer if (heap_scores) |hs| allocator.?.free(hs);
     const scores = if (heap_scores) |hs| hs else stack_scores[0..key_steps];
 
-    // For each batch and head
+    // For each batch and group
     for (0..batch) |b| {
         for (0..group_count) |h| {
             // For each query position
@@ -329,7 +329,7 @@ fn sdpaCausalTyped(
     const v_data = @as([*]const T, @ptrCast(@alignCast(v.data)));
 
     const batch = q.shape[0];
-    const num_heads = q.shape[1];
+    const group_count = q.shape[1];
     const query_steps = q.shape[2];
     const feature_width = q.shape[3];
     const seq_k = k.shape[2];
@@ -346,7 +346,7 @@ fn sdpaCausalTyped(
     const neg_inf = -std.math.inf(f32);
 
     for (0..batch) |b| {
-        for (0..num_heads) |h| {
+        for (0..group_count) |h| {
             for (0..query_steps) |sq| {
 
                 // The query position in the full sequence
@@ -404,19 +404,19 @@ fn sdpaCausalTyped(
 /// SDPA over query rows and history buffers with optional masking features.
 ///
 /// Parameters:
-/// - out_data: output buffer [n_heads * query_steps * feature_width]
-/// - out_strides: strides for output [batch, heads, seq, dim]
-/// - q_data: query data [batch * n_heads * query_steps * feature_width]
+/// - out_data: output buffer [query_group_count * query_steps * feature_width]
+/// - out_strides: strides for output [batch, groups, seq, dim]
+/// - q_data: query data [batch * query_group_count * query_steps * feature_width]
 /// - q_strides: strides for query
 /// - key_history: cached keys [max_seq * source_group_count * feature_width] for this layer
 /// - value_history: cached values [max_seq * source_group_count * feature_width] for this layer
-/// - n_heads, source_group_count: number of query groups and source groups
+/// - query_group_count, source_group_count: number of query groups and source groups
 /// - query_steps: number of query positions
 /// - history_len: number of valid positions in cache
-/// - feature_width: dimension per head
+/// - feature_width: dimension per query/source slice
 /// - causal_mask_shift: offset for causal masking (current position in full sequence)
 /// - scale: attention scale (typically 1/sqrt(feature_width))
-/// - sinks: optional per-head sink logits (null if not used)
+/// - sinks: optional per-group sink logits (null if not used)
 /// - sliding_window: 0 = disabled, >0 = only attend to last N positions
 /// - allocator: optional allocator for large sequences (>8192). If null, large sequences will error.
 fn sdpaHistory(
@@ -426,7 +426,7 @@ fn sdpaHistory(
     q_strides: [4]usize,
     key_history: []const f32,
     value_history: []const f32,
-    n_heads: usize,
+    query_group_count: usize,
     source_group_count: usize,
     query_steps: usize,
     history_len: usize,
@@ -438,7 +438,7 @@ fn sdpaHistory(
     allocator: ?std.mem.Allocator,
 ) AttentionError!void {
     const neg_inf = -std.math.inf(f32);
-    const heads_per_kv = n_heads / source_group_count;
+    const groups_per_source_group = query_group_count / source_group_count;
     const kv_size = source_group_count * feature_width;
 
     // Allocate scores buffer - use stack for small sequences, heap for large
@@ -450,9 +450,9 @@ fn sdpaHistory(
     defer if (heap_scores) |hs| allocator.?.free(hs);
     const scores = if (heap_scores) |hs| hs else stack_scores[0..history_len];
 
-    for (0..n_heads) |qh| {
-        const kv_head = qh / heads_per_kv;
-        const sink_logit: ?f32 = if (sinks) |s| s[qh] else null;
+    for (0..query_group_count) |query_group_idx| {
+        const source_group_idx = query_group_idx / groups_per_source_group;
+        const sink_logit: ?f32 = if (sinks) |s| s[query_group_idx] else null;
 
         for (0..query_steps) |sq| {
             const q_pos = causal_mask_shift + sq;
@@ -472,10 +472,10 @@ fn sdpaHistory(
                     continue;
                 }
 
-                const key_history_idx = sk * kv_size + kv_head * feature_width;
+                const key_history_idx = sk * kv_size + source_group_idx * feature_width;
                 var dot: f32 = 0;
                 for (0..feature_width) |d| {
-                    const q_idx = qh * q_strides[1] + sq * q_strides[2] + d * q_strides[3];
+                    const q_idx = query_group_idx * q_strides[1] + sq * q_strides[2] + d * q_strides[3];
                     dot += q_data[q_idx] * key_history[key_history_idx + d];
                 }
                 scores[sk] = dot * scale;
@@ -494,10 +494,10 @@ fn sdpaHistory(
             for (0..feature_width) |d| {
                 var acc: f32 = 0;
                 for (0..history_len) |sk| {
-                    const value_history_idx = sk * kv_size + kv_head * feature_width;
+                    const value_history_idx = sk * kv_size + source_group_idx * feature_width;
                     acc += scores[sk] * value_history[value_history_idx + d];
                 }
-                const out_idx = qh * out_strides[1] + sq * out_strides[2] + d * out_strides[3];
+                const out_idx = query_group_idx * out_strides[1] + sq * out_strides[2] + d * out_strides[3];
                 out_data[out_idx] = acc;
             }
         }
@@ -507,7 +507,7 @@ fn sdpaHistory(
 /// Parameters for history buffer attention, pre-validated.
 /// Use validateHistoryParams() to construct.
 const HistoryAttentionParams = struct {
-    n_heads: usize,
+    query_group_count: usize,
     source_group_count: usize,
     seq_len: usize,
     feature_width: usize,

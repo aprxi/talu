@@ -1,8 +1,8 @@
-//! Prefill-specific GEMM kernels (AVX2-optimized)
+//! Multi-row GEMM kernels (AVX2-optimized)
 //!
 //! Based on expert optimization advice:
 //! 1. 4x2 microkernel fits AVX2's 16 registers
-//! 2. Deferred scaling: accumulate Sum(W*X) and Sum(X) separately
+//! 2. Deferred scaling: accumulate sum(W*X) and sum(X) separately
 //! 3. @reduce only at group boundary, not in hot loop
 
 const std = @import("std");
@@ -24,7 +24,7 @@ const scaleBiasToF32 = grouped_affine_quant.scaleBiasToF32;
 // 4-bit Prefill Entry Point
 // =============================================================================
 
-/// f32-based prefill kernel with 4x2 microkernel
+/// f32-based multi-row kernel with 4x2 microkernel
 pub fn matmulGaffineU4Prefill(
     a_data: []const f32,
     m_rows: usize,
@@ -145,7 +145,7 @@ fn kernel4x2(context: anytype, row_base_idx: usize, col_idx: usize) void {
     const bias1_base = context.biases.ptr + (col_idx + 1) * k_div_group;
 
     // Vector accumulators for scale*wx and bias*xs (defer reduction to end!)
-    // This is the key optimization from the decode kernel
+    // This is the key optimization reused from the single-row kernel
     var acc00: @Vector(8, f32) = @splat(0);
     var acc01: @Vector(8, f32) = @splat(0);
     var acc10: @Vector(8, f32) = @splat(0);
@@ -444,7 +444,7 @@ inline fn kernel1x2(context: anytype, row_idx: usize, col_idx: usize) void {
 }
 
 // =============================================================================
-// 1x1 Kernel (for odd column at end) - reuses decode's optimized dot product
+// 1x1 kernel (for odd column at end) - reuses single-row optimized dot product
 // =============================================================================
 
 inline fn kernel1x1(context: anytype, row_idx: usize, col_idx: usize) void {
@@ -458,7 +458,7 @@ inline fn kernel1x1(context: anytype, row_idx: usize, col_idx: usize) void {
     const scale_ptr = context.scales.ptr + col_idx * k_div_group;
     const bias_ptr = context.biases.ptr + col_idx * k_div_group;
 
-    // Pre-convert scales/biases (same as decode kernel)
+    // Pre-convert scales/biases (same as single-row kernel)
     var scales_f32: [matmul.MAX_GROUPS]f32 align(64) = undefined;
     var biases_f32: [matmul.MAX_GROUPS]f32 align(64) = undefined;
 
@@ -467,7 +467,7 @@ inline fn kernel1x1(context: anytype, row_idx: usize, col_idx: usize) void {
         biases_f32[group_idx] = scaleBiasToF32(context.scales_dtype, bias_ptr[group_idx]);
     }
 
-    // Reuse decode's optimized dot product
+    // Reuse single-row optimized dot product
     context.out[row_idx * n_dim + col_idx] = matmul.gaffineU4DotProductOpt(
         a_ptr,
         w_ptr,
@@ -824,7 +824,7 @@ inline fn kernel1x2_8bit(context: anytype, row_idx: usize, col_idx: usize) void 
     context.out[row_idx * n_dim + col_idx + 1] = out1;
 }
 
-/// 1x1 kernel for 8-bit (odd column at end) - reuses decode's optimized dot product
+/// 1x1 kernel for 8-bit (odd column at end) - reuses single-row optimized dot product
 inline fn kernel1x1_8bit(context: anytype, row_idx: usize, col_idx: usize) void {
     const k_dim = context.k_dim;
     const n_dim = context.n_cols;
@@ -836,7 +836,7 @@ inline fn kernel1x1_8bit(context: anytype, row_idx: usize, col_idx: usize) void 
     const scale_ptr = context.scales.ptr + col_idx * k_div_group;
     const bias_ptr = context.biases.ptr + col_idx * k_div_group;
 
-    // Pre-convert scales/biases (same as decode kernel)
+    // Pre-convert scales/biases (same as single-row kernel)
     var scales_f32: [matmul.MAX_GROUPS]f32 align(64) = undefined;
     var biases_f32: [matmul.MAX_GROUPS]f32 align(64) = undefined;
 
@@ -845,7 +845,7 @@ inline fn kernel1x1_8bit(context: anytype, row_idx: usize, col_idx: usize) void 
         biases_f32[group_idx] = scaleBiasToF32(context.scales_dtype, bias_ptr[group_idx]);
     }
 
-    // Reuse decode's optimized dot product
+    // Reuse single-row optimized dot product
     context.out[row_idx * n_dim + col_idx] = matmul.gaffineU8DotProductOpt(
         a_ptr,
         w_ptr,

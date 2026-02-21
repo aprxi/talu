@@ -1,4 +1,4 @@
-//! State-space recurrence primitives for CPU Mamba-style kernels.
+//! State-space recurrence primitives for CPU kernels.
 
 const std = @import("std");
 const activation = @import("activation.zig");
@@ -37,35 +37,35 @@ pub fn applySiluGateInPlace(values: []f32, gates: []const f32) !void {
     }
 }
 
-/// Run one SSM scan/update step using the selected backend kernel implementation.
+/// Run one state scan/update step using the selected backend implementation.
 pub fn scanStep(
     ssm_scan: ssm_scan_mod.StateScanFn,
     ssm_state: []f32,
     ssm_out: []f32,
-    x_conv_out: []const f32,
-    b_raw: []const f32,
-    c_raw: []const f32,
-    a_log: []const f32,
-    d_skip: []const f32,
+    input_values: []const f32,
+    state_in_weights: []const f32,
+    state_out_weights: []const f32,
+    state_decay_log: []const f32,
+    skip_weights: []const f32,
     dt: []const f32,
-    d_head: usize,
-    d_state: usize,
-    n_heads: usize,
-    n_groups: usize,
+    feature_block_width: usize,
+    state_width: usize,
+    group_count: usize,
+    source_group_count: usize,
 ) void {
     ssm_scan(
         ssm_state,
         ssm_out,
-        x_conv_out,
-        b_raw,
-        c_raw,
-        a_log,
-        d_skip,
+        input_values,
+        state_in_weights,
+        state_out_weights,
+        state_decay_log,
+        skip_weights,
         dt,
-        d_head,
-        d_state,
-        n_heads,
-        n_groups,
+        feature_block_width,
+        state_width,
+        group_count,
+        source_group_count,
     );
 }
 
@@ -105,27 +105,27 @@ test "scanStep delegates to provided scan function" {
         fn scan(
             ssm_state: []f32,
             ssm_out: []f32,
-            x_conv_out: []const f32,
-            b_raw: []const f32,
-            c_raw: []const f32,
-            a_log: []const f32,
-            d_skip: []const f32,
+            input_values: []const f32,
+            state_in_weights: []const f32,
+            state_out_weights: []const f32,
+            state_decay_log: []const f32,
+            skip_weights: []const f32,
             dt: []const f32,
-            d_head: usize,
-            d_state: usize,
-            n_heads: usize,
-            n_groups: usize,
+            feature_block_width: usize,
+            state_width: usize,
+            group_count: usize,
+            source_group_count: usize,
         ) void {
-            _ = x_conv_out;
-            _ = b_raw;
-            _ = c_raw;
-            _ = a_log;
-            _ = d_skip;
+            _ = input_values;
+            _ = state_in_weights;
+            _ = state_out_weights;
+            _ = state_decay_log;
+            _ = skip_weights;
             _ = dt;
-            _ = d_head;
-            _ = d_state;
-            _ = n_heads;
-            _ = n_groups;
+            _ = feature_block_width;
+            _ = state_width;
+            _ = group_count;
+            _ = source_group_count;
             for (ssm_state) |*v| v.* = 42.0;
             for (ssm_out) |*v| v.* = 7.0;
         }

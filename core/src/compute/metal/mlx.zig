@@ -147,10 +147,10 @@ fn mlx_scaled_dot_product_attention_impl(
     const k_array = mlx_graph.mlx_array_from_float32(k_data, &kv_shape, 4);
     const v_array = mlx_graph.mlx_array_from_float32(v_data, &kv_shape, 4);
 
-    // Handle GQA (grouped query attention)
-    // If n_kv_heads < n_heads, we need to repeat K/V heads
+    // Handle grouped-query form.
+    // If n_kv_heads < n_heads, source groups may need repetition.
     // For now, call attention directly and let MLX handle GQA.
-    // Note: If MLX does not repeat K/V heads internally, add a repeat op here.
+    // Note: If MLX does not repeat source groups internally, add a repeat op here.
     defer mlx_graph.mlx_array_free(k_array);
     defer mlx_graph.mlx_array_free(v_array);
 
