@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const agent_mod = @import("../agent/root.zig");
+const agent_capi_bridge = @import("../agent/capi_bridge.zig");
 const chat_mod = @import("../responses/chat.zig");
 const router_mod = @import("../router/root.zig");
 const db_mod = @import("../db/root.zig");
@@ -18,10 +19,7 @@ const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
 
 const ToolRegistry = agent_mod.ToolRegistry;
-const Tool = agent_mod.Tool;
-const ToolResult = agent_mod.ToolResult;
 const Agent = agent_mod.Agent;
-const AgentConfig = agent_mod.AgentConfig;
 const AgentLoopResult = agent_mod.AgentLoopResult;
 const MessageBus = agent_mod.MessageBus;
 const BusError = agent_mod.BusError;
@@ -63,89 +61,7 @@ pub const TaluAgentBus = opaque {};
 
 /// C function pointer type for tool execution.
 /// Returns 0 on success, non-zero on error.
-pub const CToolExecuteFn = *const fn (
-    user_data: ?*anyopaque,
-    args_ptr: [*]const u8,
-    args_len: usize,
-    out_ptr: *?[*]u8,
-    out_len: *usize,
-    out_is_error: *u8,
-) callconv(.c) i32;
-
-/// Wraps a C callback as a Tool vtable implementation.
-const CCallbackTool = struct {
-    tool_name: [:0]u8,
-    tool_description: [:0]u8,
-    tool_schema: [:0]u8,
-    execute_fn: CToolExecuteFn,
-    user_data: ?*anyopaque,
-
-    fn name(ctx: *anyopaque) []const u8 {
-        const self: *CCallbackTool = @ptrCast(@alignCast(ctx));
-        return self.tool_name;
-    }
-
-    fn description(ctx: *anyopaque) []const u8 {
-        const self: *CCallbackTool = @ptrCast(@alignCast(ctx));
-        return self.tool_description;
-    }
-
-    fn parametersSchema(ctx: *anyopaque) []const u8 {
-        const self: *CCallbackTool = @ptrCast(@alignCast(ctx));
-        return self.tool_schema;
-    }
-
-    fn execute(ctx: *anyopaque, alloc: std.mem.Allocator, arguments_json: []const u8) anyerror!ToolResult {
-        const self: *CCallbackTool = @ptrCast(@alignCast(ctx));
-
-        var out_ptr: ?[*]u8 = null;
-        var out_len: usize = 0;
-        var out_is_error: u8 = 0;
-
-        const rc = self.execute_fn(
-            self.user_data,
-            arguments_json.ptr,
-            arguments_json.len,
-            &out_ptr,
-            &out_len,
-            &out_is_error,
-        );
-
-        if (rc != 0) {
-            return error.ToolExecutionFailed;
-        }
-
-        // Copy output from C-allocated buffer to Zig allocator
-        const c_output = if (out_ptr) |ptr| ptr[0..out_len] else "";
-        const output = try alloc.dupe(u8, c_output);
-
-        // Free C-allocated output
-        if (out_ptr) |ptr| {
-            std.heap.c_allocator.free(ptr[0..out_len]);
-        }
-
-        return ToolResult{
-            .output = output,
-            .is_error = out_is_error != 0,
-        };
-    }
-
-    fn deinitFn(ctx: *anyopaque) void {
-        const self: *CCallbackTool = @ptrCast(@alignCast(ctx));
-        allocator.free(self.tool_name);
-        allocator.free(self.tool_description);
-        allocator.free(self.tool_schema);
-        allocator.destroy(self);
-    }
-
-    const vtable = Tool.VTable{
-        .name = name,
-        .description = description,
-        .parametersSchema = parametersSchema,
-        .execute = execute,
-        .deinit = deinitFn,
-    };
-};
+pub const CToolExecuteFn = agent_capi_bridge.CToolExecuteFn;
 
 // =============================================================================
 // Registry lifecycle
@@ -204,71 +120,23 @@ pub export fn talu_agent_registry_add(
     user_data: ?*anyopaque,
 ) callconv(.c) i32 {
     capi_error.clearError();
-
     const registry: *ToolRegistry = @ptrCast(@alignCast(handle orelse {
         capi_error.setErrorWithCode(.invalid_argument, "registry handle is null", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }));
-
-    const name_z = name_ptr orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "name is null", .{});
+    const callback_args = agent_capi_bridge.parseCallbackToolArgs(name_ptr, description_ptr, parameters_schema_ptr, execute_fn) catch |err| {
+        switch (err) {
+            error.NullName => capi_error.setErrorWithCode(.invalid_argument, "name is null", .{}),
+            error.NullDescription => capi_error.setErrorWithCode(.invalid_argument, "description is null", .{}),
+            error.NullSchema => capi_error.setErrorWithCode(.invalid_argument, "parameters_schema is null", .{}),
+            error.NullExecuteFn => capi_error.setErrorWithCode(.invalid_argument, "execute_fn is null", .{}),
+        }
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
-
-    const desc_z = description_ptr orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "description is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-
-    const schema_z = parameters_schema_ptr orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "parameters_schema is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-
-    const exec_fn = execute_fn orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "execute_fn is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-
-    // Create the CCallbackTool
-    const callback_tool = allocator.create(CCallbackTool) catch |err| {
-        capi_error.setError(err, "failed to allocate tool", .{});
-        return @intFromEnum(error_codes.errorToCode(err));
-    };
-    errdefer allocator.destroy(callback_tool);
-
-    const name_slice = std.mem.span(name_z);
-    const desc_slice = std.mem.span(desc_z);
-    const schema_slice = std.mem.span(schema_z);
-
-    callback_tool.* = .{
-        .tool_name = allocator.dupeZ(u8, name_slice) catch |err| {
-            capi_error.setError(err, "failed to allocate tool name", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        },
-        .tool_description = allocator.dupeZ(u8, desc_slice) catch |err| {
-            allocator.free(callback_tool.tool_name);
-            capi_error.setError(err, "failed to allocate tool description", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        },
-        .tool_schema = allocator.dupeZ(u8, schema_slice) catch |err| {
-            allocator.free(callback_tool.tool_name);
-            allocator.free(callback_tool.tool_description);
-            capi_error.setError(err, "failed to allocate tool schema", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        },
-        .execute_fn = exec_fn,
-        .user_data = user_data,
-    };
-
-    const tool = Tool.init(callback_tool, &CCallbackTool.vtable);
-
-    registry.register(tool) catch |err| {
-        tool.deinit();
+    agent_capi_bridge.registerCallbackTool(allocator, registry, callback_args.name, callback_args.description, callback_args.schema, callback_args.execute_fn, user_data) catch |err| {
         capi_error.setError(err, "failed to register tool", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-
     return 0;
 }
 
@@ -290,6 +158,8 @@ pub export fn talu_agent_registry_count(
 /// backward compatibility: zeroed config = synchronous generation, no callbacks.
 pub const CAgentLoopConfig = extern struct {
     max_iterations: usize = 10,
+    /// Maximum tool calls before the loop stops. 0 = unlimited.
+    max_tool_calls: usize = 0,
     abort_on_tool_error: u8 = 0,
     _pad0: [7]u8 = .{0} ** 7,
     stop_flag: ?*const std.atomic.Value(bool) = null,
@@ -371,43 +241,18 @@ pub export fn talu_agent_run(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }));
 
-    // Build config from C struct
-    var loop_config = agent_mod.AgentLoopConfig{};
-    if (config_ptr) |cfg| {
-        loop_config.max_iterations = cfg.max_iterations;
-        loop_config.abort_on_tool_error = cfg.abort_on_tool_error != 0;
-        loop_config.stop_flag = cfg.stop_flag;
-        loop_config.on_token = cfg.on_token;
-        loop_config.on_token_data = cfg.on_token_data;
-        loop_config.on_event = cfg.on_event;
-        loop_config.on_event_data = cfg.on_event_data;
-        loop_config.generate_config = cfg.generate_config;
-        loop_config.initial_iteration_count = cfg.initial_iteration_count;
-        loop_config.initial_tool_call_count = cfg.initial_tool_call_count;
-        loop_config.on_context = cfg.on_context;
-        loop_config.on_context_data = cfg.on_context_data;
-        loop_config.on_before_tool = cfg.on_before_tool;
-        loop_config.on_before_tool_data = cfg.on_before_tool_data;
-        loop_config.on_after_tool = cfg.on_after_tool;
-        loop_config.on_after_tool_data = cfg.on_after_tool_data;
-        loop_config.on_session = cfg.on_session;
-        loop_config.on_session_data = cfg.on_session_data;
-        loop_config.max_tool_output_bytes = cfg.max_tool_output_bytes;
-    }
-
-    const result = agent_mod.run(allocator, chat, backend, registry, loop_config) catch |err| {
+    const result = agent_capi_bridge.runLoopWithConfig(
+        allocator,
+        chat,
+        backend,
+        registry,
+        config_ptr,
+    ) catch |err| {
         capi_error.setError(err, "agent loop failed", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
 
-    // Write result to output struct
-    if (out_result) |out| {
-        out.* = std.mem.zeroes(CAgentLoopResult);
-        out.stop_reason = @intFromEnum(result.stop_reason);
-        out.iterations = result.iterations;
-        out.total_tool_calls = result.total_tool_calls;
-    }
-
+    writeLoopResult(out_result, result);
     return 0;
 }
 
@@ -452,6 +297,7 @@ test "talu_agent_registry_count null returns 0" {
 test "CAgentLoopConfig zeroed is valid" {
     const config = std.mem.zeroes(CAgentLoopConfig);
     try std.testing.expectEqual(@as(usize, 0), config.max_iterations);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_calls);
     try std.testing.expectEqual(@as(u8, 0), config.abort_on_tool_error);
     try std.testing.expect(config.stop_flag == null);
     try std.testing.expect(config.on_token == null);
@@ -499,6 +345,8 @@ pub const CAgentCreateConfig = extern struct {
     _pad0: [4]u8 = .{0} ** 4,
     /// Maximum tool-call iterations per turn.
     max_iterations_per_turn: usize = 10,
+    /// Maximum tool calls per turn. 0 = unlimited.
+    max_tool_calls_per_turn: usize = 0,
     /// Stop loop when a tool execution returns an error.
     abort_on_tool_error: u8 = 0,
     _pad1: [7]u8 = .{0} ** 7,
@@ -527,6 +375,21 @@ pub const CAgentCreateConfig = extern struct {
 
     /// Maximum bytes for tool output. 0 = unlimited.
     max_tool_output_bytes: usize = 0,
+
+    /// Built-in tool auto-registration. Null workspace disables built-ins.
+    builtin_workspace_dir: ?[*:0]const u8 = null,
+    /// Max bytes read by built-in file tools. 0 uses core default.
+    builtin_file_max_read_bytes: usize = 0,
+    /// Max bytes returned by built-in http tool. 0 uses core default.
+    builtin_http_max_response_bytes: usize = 0,
+
+    /// Memory integration over db blobs/documents. Null db path disables memory.
+    memory_db_path: ?[*:0]const u8 = null,
+    memory_namespace: ?[*:0]const u8 = null,
+    memory_owner_id: ?[*:0]const u8 = null,
+    memory_recall_limit: usize = 0,
+    memory_append_on_run: u8 = 1,
+    _pad2: [7]u8 = .{0} ** 7,
 };
 
 /// Create a stateful agent. Caller owns the returned handle.
@@ -550,38 +413,7 @@ pub export fn talu_agent_create(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }));
 
-    // Build AgentConfig from C struct
-    var agent_config = AgentConfig{};
-    if (config_ptr) |cfg| {
-        agent_config.context_limit = cfg.context_limit;
-        agent_config.compaction_threshold = @as(f32, @floatFromInt(cfg.compaction_threshold_pct)) / 100.0;
-        agent_config.max_retries = cfg.max_retries;
-        agent_config.retry_base_delay_ns = @as(u64, cfg.retry_base_delay_ms) * std.time.ns_per_ms;
-        agent_config.max_iterations_per_turn = cfg.max_iterations_per_turn;
-        agent_config.abort_on_tool_error = cfg.abort_on_tool_error != 0;
-        agent_config.on_token = cfg.on_token;
-        agent_config.on_token_data = cfg.on_token_data;
-        agent_config.on_event = cfg.on_event;
-        agent_config.on_event_data = cfg.on_event_data;
-        agent_config.on_session = cfg.on_session;
-        agent_config.on_session_data = cfg.on_session_data;
-        agent_config.on_context_inject = cfg.on_context_inject;
-        agent_config.on_context_inject_data = cfg.on_context_inject_data;
-        agent_config.on_before_tool = cfg.on_before_tool;
-        agent_config.on_before_tool_data = cfg.on_before_tool_data;
-        agent_config.on_after_tool = cfg.on_after_tool;
-        agent_config.on_after_tool_data = cfg.on_after_tool_data;
-        agent_config.max_tool_output_bytes = cfg.max_tool_output_bytes;
-
-        if (cfg.agent_id) |id_z| {
-            agent_config.agent_id = std.mem.span(id_z);
-        }
-        if (cfg.state_dir) |dir_z| {
-            agent_config.state_dir = std.mem.span(dir_z);
-        }
-    }
-
-    const agent_ptr = Agent.init(allocator, backend, agent_config) catch |err| {
+    const agent_ptr = agent_capi_bridge.createAgent(allocator, backend, config_ptr) catch |err| {
         capi_error.setError(err, "failed to create agent", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -633,62 +465,36 @@ pub export fn talu_agent_register_tool(
     user_data: ?*anyopaque,
 ) callconv(.c) i32 {
     capi_error.clearError();
-
     const agent_ptr: *Agent = @ptrCast(@alignCast(handle orelse {
         capi_error.setErrorWithCode(.invalid_argument, "agent handle is null", .{});
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }));
-
-    const name_z = name_ptr orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "name is null", .{});
+    const callback_args = agent_capi_bridge.parseCallbackToolArgs(
+        name_ptr,
+        description_ptr,
+        parameters_schema_ptr,
+        execute_fn,
+    ) catch |err| {
+        switch (err) {
+            error.NullName => capi_error.setErrorWithCode(.invalid_argument, "name is null", .{}),
+            error.NullDescription => capi_error.setErrorWithCode(.invalid_argument, "description is null", .{}),
+            error.NullSchema => capi_error.setErrorWithCode(.invalid_argument, "parameters_schema is null", .{}),
+            error.NullExecuteFn => capi_error.setErrorWithCode(.invalid_argument, "execute_fn is null", .{}),
+        }
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     };
-    const desc_z = description_ptr orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "description is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-    const schema_z = parameters_schema_ptr orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "parameters_schema is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-    const exec_fn = execute_fn orelse {
-        capi_error.setErrorWithCode(.invalid_argument, "execute_fn is null", .{});
-        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    };
-
-    const callback_tool = allocator.create(CCallbackTool) catch |err| {
-        capi_error.setError(err, "failed to allocate tool", .{});
-        return @intFromEnum(error_codes.errorToCode(err));
-    };
-    errdefer allocator.destroy(callback_tool);
-
-    callback_tool.* = .{
-        .tool_name = allocator.dupeZ(u8, std.mem.span(name_z)) catch |err| {
-            capi_error.setError(err, "failed to allocate tool name", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        },
-        .tool_description = allocator.dupeZ(u8, std.mem.span(desc_z)) catch |err| {
-            allocator.free(callback_tool.tool_name);
-            capi_error.setError(err, "failed to allocate tool description", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        },
-        .tool_schema = allocator.dupeZ(u8, std.mem.span(schema_z)) catch |err| {
-            allocator.free(callback_tool.tool_name);
-            allocator.free(callback_tool.tool_description);
-            capi_error.setError(err, "failed to allocate tool schema", .{});
-            return @intFromEnum(error_codes.errorToCode(err));
-        },
-        .execute_fn = exec_fn,
-        .user_data = user_data,
-    };
-
-    const tool_iface = Tool.init(callback_tool, &CCallbackTool.vtable);
-    agent_ptr.registerTool(tool_iface) catch |err| {
-        tool_iface.deinit();
+    agent_capi_bridge.registerCallbackToolOnAgent(
+        allocator,
+        agent_ptr,
+        callback_args.name,
+        callback_args.description,
+        callback_args.schema,
+        callback_args.execute_fn,
+        user_data,
+    ) catch |err| {
         capi_error.setError(err, "failed to register tool", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-
     return 0;
 }
 
@@ -1368,6 +1174,7 @@ test "CAgentCreateConfig zeroed is valid" {
     try std.testing.expectEqual(@as(u32, 0), config.max_retries);
     try std.testing.expectEqual(@as(u32, 0), config.retry_base_delay_ms);
     try std.testing.expectEqual(@as(usize, 0), config.max_iterations_per_turn);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_calls_per_turn);
     try std.testing.expectEqual(@as(u8, 0), config.abort_on_tool_error);
     try std.testing.expect(config.state_dir == null);
     try std.testing.expect(config.agent_id == null);
@@ -1379,6 +1186,14 @@ test "CAgentCreateConfig zeroed is valid" {
     try std.testing.expect(config.on_before_tool == null);
     try std.testing.expect(config.on_after_tool == null);
     try std.testing.expectEqual(@as(usize, 0), config.max_tool_output_bytes);
+    try std.testing.expect(config.builtin_workspace_dir == null);
+    try std.testing.expectEqual(@as(usize, 0), config.builtin_file_max_read_bytes);
+    try std.testing.expectEqual(@as(usize, 0), config.builtin_http_max_response_bytes);
+    try std.testing.expect(config.memory_db_path == null);
+    try std.testing.expect(config.memory_namespace == null);
+    try std.testing.expect(config.memory_owner_id == null);
+    try std.testing.expectEqual(@as(usize, 0), config.memory_recall_limit);
+    try std.testing.expectEqual(@as(u8, 0), config.memory_append_on_run);
 }
 
 test "talu_agent_create null backend returns error" {
@@ -1393,6 +1208,40 @@ test "talu_agent_create null out returns error" {
     const config = std.mem.zeroes(CAgentCreateConfig);
     const rc = talu_agent_create(null, &config, null);
     try std.testing.expect(rc != 0);
+}
+
+test "talu_agent_create maps tool and memory config into core AgentConfig" {
+    const test_allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(test_allocator, ".");
+    defer test_allocator.free(workspace);
+    const workspace_z = try test_allocator.dupeZ(u8, workspace);
+    defer test_allocator.free(workspace_z);
+
+    var backend: InferenceBackend = undefined;
+    var out: ?*TaluAgent = null;
+
+    var config = std.mem.zeroes(CAgentCreateConfig);
+    config.agent_id = "agent-capi-map";
+    config.max_tool_calls_per_turn = 9;
+    config.builtin_workspace_dir = workspace_z;
+    config.memory_db_path = workspace_z;
+    config.memory_namespace = "agent_capi_map";
+    config.memory_recall_limit = 4;
+    config.memory_append_on_run = 1;
+
+    const rc = talu_agent_create(@ptrCast(&backend), &config, &out);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    defer talu_agent_free(out);
+
+    const agent_ptr: *Agent = @ptrCast(@alignCast(out.?));
+    try std.testing.expectEqual(@as(usize, 9), agent_ptr.max_tool_calls_per_turn);
+    try std.testing.expectEqual(@as(usize, 4), agent_ptr.getRegistry().count());
+    try std.testing.expect(agent_ptr.memory_store != null);
+    try std.testing.expectEqual(@as(usize, 4), agent_ptr.memory_recall_limit);
+    try std.testing.expect(agent_ptr.memory_append_on_run);
 }
 
 test "talu_agent_free null is safe" {

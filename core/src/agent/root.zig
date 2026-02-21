@@ -6,6 +6,8 @@
 //!   - `loop.zig`: Stateless generate → execute → repeat loop
 //!   - `agent.zig`: Stateful Agent with compaction, retry, inbox drain
 //!   - `bus.zig`: Transport-agnostic inter-agent MessageBus
+//!   - `tools/`: Built-in agent tools (file, HTTP)
+//!   - `memory/`: Agent memory layer on top of db primitives
 //!
 //! Two levels of usage:
 //!   1. **Low-level** (`loop.run()`): Caller manages everything via callbacks.
@@ -18,6 +20,8 @@ pub const loop = @import("loop.zig");
 pub const agent = @import("agent.zig");
 pub const bus = @import("bus.zig");
 pub const compaction = @import("compaction.zig");
+pub const tools = @import("tools/root.zig");
+pub const memory = @import("memory/root.zig");
 
 // Re-export primary types at module level
 
@@ -52,6 +56,7 @@ pub const run = loop.run;
 // High-level agent types
 pub const Agent = agent.Agent;
 pub const AgentConfig = agent.AgentConfig;
+pub const MemoryIntegrationConfig = agent.MemoryIntegrationConfig;
 pub const AgentError = agent.AgentError;
 pub const OnContextInjectFn = agent.OnContextInjectFn;
 pub const OnEmbedFn = agent.OnEmbedFn;

@@ -13,10 +13,10 @@ use std::env;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
-use crate::server::{run_server, ServerArgs};
+use crate::server::{ServerArgs, run_server};
 
 use talu::LogFormat;
 use talu::LogLevel;
@@ -77,8 +77,8 @@ pub(super) enum Commands {
     Describe(DescribeArgs),
     /// XRay kernel profiling
     Xray(XrayArgs),
-    /// Interactive shell agent (tool-calling loop with execute_command)
-    Shell(ShellArgs),
+    /// Agent mode (tool-calling loop with execute_command)
+    Agent(AgentArgs),
     /// Set default model (interactive picker or explicit)
     Set(SetArgs),
     /// Inspect and transform input files for inference
@@ -274,7 +274,7 @@ pub(super) enum AskOutputFormat {
 }
 
 #[derive(Args)]
-pub(super) struct ShellArgs {
+pub(super) struct AgentArgs {
     /// Model to use (overrides MODEL_URI env and `talu set` default)
     #[arg(short = 'm', long = "model", env = "MODEL_URI")]
     pub model: Option<String>,
@@ -577,7 +577,7 @@ fn should_implicit_ask(args: &[String], stdin_is_pipe: bool) -> bool {
     // If first arg is a known subcommand, don't add implicit ask
     let subcommands = [
         "ask", "help", "serve", "convert", "tokenize", "ls", "get", "rm", "describe", "xray",
-        "shell", "set", "sample", "file",
+        "agent", "set", "sample", "file",
     ];
     if subcommands.iter().any(|&cmd| cmd == first) {
         return false;
@@ -617,7 +617,11 @@ fn run_inner() -> Result<()> {
     };
 
     // Configure logging before any operations
-    configure_logging(parsed.verbose, parsed.log_format, parsed.log_filter.as_deref());
+    configure_logging(
+        parsed.verbose,
+        parsed.log_format,
+        parsed.log_filter.as_deref(),
+    );
 
     match parsed.command {
         None => {
@@ -629,7 +633,9 @@ fn run_inner() -> Result<()> {
             Ok(())
         }
         Some(Commands::Ask(args)) => ask::cmd_ask(args, stdin_is_pipe, parsed.verbose),
-        Some(Commands::Serve(args)) => run_server(args, parsed.verbose, parsed.log_filter.as_deref()),
+        Some(Commands::Serve(args)) => {
+            run_server(args, parsed.verbose, parsed.log_filter.as_deref())
+        }
         Some(Commands::Tokenize(args)) => convert::cmd_tokenize(args),
         Some(Commands::Convert(args)) => convert::cmd_convert(args),
         Some(Commands::Ls(args)) => models::cmd_ls(args),
@@ -638,7 +644,7 @@ fn run_inner() -> Result<()> {
         Some(Commands::Rm(args)) => repo::cmd_rm(args),
         Some(Commands::Describe(args)) => models::cmd_describe(args),
         Some(Commands::Xray(args)) => xray::cmd_xray(args),
-        Some(Commands::Shell(args)) => shell::cmd_shell(args, stdin_is_pipe),
+        Some(Commands::Agent(args)) => shell::cmd_agent(args, stdin_is_pipe),
         Some(Commands::Set(args)) => cmd_set(args),
         Some(Commands::File(args)) => file::cmd_file(args),
     }
@@ -994,15 +1000,17 @@ mod tests {
 
     #[test]
     fn reject_get_add_and_remove_pin_flags() {
-        assert!(parse(&[
-            "talu",
-            "get",
-            "--add-pin",
-            "Qwen/Qwen3-0.6B",
-            "--remove-pin",
-            "Qwen/Qwen3-0.6B"
-        ])
-        .is_err());
+        assert!(
+            parse(&[
+                "talu",
+                "get",
+                "--add-pin",
+                "Qwen/Qwen3-0.6B",
+                "--remove-pin",
+                "Qwen/Qwen3-0.6B"
+            ])
+            .is_err()
+        );
     }
 
     #[test]
@@ -1147,5 +1155,31 @@ mod tests {
             }
             _ => panic!("expected file command"),
         }
+    }
+
+    #[test]
+    fn parse_agent_command() {
+        let cli = parse(&[
+            "talu",
+            "agent",
+            "--model",
+            "Qwen/Qwen3-0.6B",
+            "list",
+            "files",
+        ])
+        .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Agent(args)) => {
+                assert_eq!(args.model.as_deref(), Some("Qwen/Qwen3-0.6B"));
+                assert_eq!(args.prompt, vec!["list", "files"]);
+            }
+            _ => panic!("expected agent command"),
+        }
+    }
+
+    #[test]
+    fn reject_shell_subcommand() {
+        assert!(parse(&["talu", "shell", "--model", "Qwen/Qwen3-0.6B", "pwd"]).is_err());
     }
 }

@@ -1763,6 +1763,7 @@ impl Default for CGenerateConfig {
 #[derive(Copy, Clone)]
 pub struct CAgentLoopConfig {
     pub max_iterations: usize,
+    pub max_tool_calls: usize,
     pub abort_on_tool_error: u8,
     pub _pad0: [u8; 7],
     pub stop_flag: *mut c_void,
@@ -1788,6 +1789,7 @@ impl Default for CAgentLoopConfig {
     fn default() -> Self {
         Self {
             max_iterations: 0,
+            max_tool_calls: 0,
             abort_on_tool_error: 0,
             _pad0: [0; 7],
             stop_flag: std::ptr::null_mut(),
@@ -2266,6 +2268,7 @@ pub struct CAgentCreateConfig {
     pub retry_base_delay_ms: u32,
     pub _pad0: [u8; 4],
     pub max_iterations_per_turn: usize,
+    pub max_tool_calls_per_turn: usize,
     pub abort_on_tool_error: u8,
     pub _pad1: [u8; 7],
     pub state_dir: *const c_char,
@@ -2283,6 +2286,15 @@ pub struct CAgentCreateConfig {
     pub on_after_tool: *mut c_void,
     pub on_after_tool_data: *mut c_void,
     pub max_tool_output_bytes: usize,
+    pub builtin_workspace_dir: *const c_char,
+    pub builtin_file_max_read_bytes: usize,
+    pub builtin_http_max_response_bytes: usize,
+    pub memory_db_path: *const c_char,
+    pub memory_namespace: *const c_char,
+    pub memory_owner_id: *const c_char,
+    pub memory_recall_limit: usize,
+    pub memory_append_on_run: u8,
+    pub _pad2: [u8; 7],
 }
 
 impl Default for CAgentCreateConfig {
@@ -2294,6 +2306,7 @@ impl Default for CAgentCreateConfig {
             retry_base_delay_ms: 0,
             _pad0: [0; 4],
             max_iterations_per_turn: 0,
+            max_tool_calls_per_turn: 0,
             abort_on_tool_error: 0,
             _pad1: [0; 7],
             state_dir: std::ptr::null(),
@@ -2311,6 +2324,15 @@ impl Default for CAgentCreateConfig {
             on_after_tool: std::ptr::null_mut(),
             on_after_tool_data: std::ptr::null_mut(),
             max_tool_output_bytes: 0,
+            builtin_workspace_dir: std::ptr::null(),
+            builtin_file_max_read_bytes: 0,
+            builtin_http_max_response_bytes: 0,
+            memory_db_path: std::ptr::null(),
+            memory_namespace: std::ptr::null(),
+            memory_owner_id: std::ptr::null(),
+            memory_recall_limit: 0,
+            memory_append_on_run: 0,
+            _pad2: [0; 7],
         }
     }
 }

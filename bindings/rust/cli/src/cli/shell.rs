@@ -1,21 +1,21 @@
 use std::env;
 use std::io::{self, Read};
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 
 use talu::{ChatHandle, InferenceBackend};
 
-use crate::provider::{get_provider, parse_model_target, ModelTarget};
+use crate::provider::{ModelTarget, get_provider, parse_model_target};
 
+use super::AgentArgs;
 use super::repo::{generation_config, resolve_model_for_inference};
 use super::util::DEFAULT_MAX_TOKENS;
-use super::ShellArgs;
 
-/// Interactive shell agent (talu shell)
+/// Interactive agent mode (`talu agent`)
 ///
 /// Enters an agent loop with the built-in `execute_command` tool.
 /// The model can request shell commands; execution requires user confirmation.
-pub(super) fn cmd_shell(args: ShellArgs, stdin_is_pipe: bool) -> Result<()> {
+pub(super) fn cmd_agent(args: AgentArgs, stdin_is_pipe: bool) -> Result<()> {
     let mut prompt_parts = args.prompt.clone();
     let seed = args.seed.unwrap_or(0);
     let db_path =
@@ -51,7 +51,7 @@ pub(super) fn cmd_shell(args: ShellArgs, stdin_is_pipe: bool) -> Result<()> {
         .unwrap_or(DEFAULT_MAX_TOKENS);
 
     if prompt.is_empty() {
-        bail!("Error: shell requires a prompt");
+        bail!("Error: agent requires a prompt");
     }
 
     // Shell system prompt with CWD context

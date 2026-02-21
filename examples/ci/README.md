@@ -118,14 +118,14 @@ talu ask --session <session_id> --delete
 talu ask --no-bucket "Quick check"
 ```
 
-### 4) Shell Agent
+### 4) Agent
 
 ```bash
-# Tool-calling shell agent with confirmation
-talu shell "Find large files in this repo"
+# Tool-calling agent with confirmation
+talu agent "Find large files in this repo"
 
 # Custom policy/tools
-talu shell --policy ./policy.json --tools ./tools/ "Run diagnostics"
+talu agent --policy ./policy.json --tools ./tools/ "Run diagnostics"
 ```
 
 ### 5) Inspect and Analyze
@@ -281,7 +281,7 @@ talu serve
 | `talu ask --format json "prompt"` | OpenResponses JSON output | Script/CI |
 | `talu ask --output <path> "prompt"` | Write output to file | Script/CI |
 | `talu ask --no-bucket "prompt"` | Ephemeral query | Both |
-| `talu shell "prompt"` | Interactive shell agent | Interactive |
+| `talu agent "prompt"` | Interactive tool-calling agent | Interactive |
 | `talu search` | Interactive conversation search | Interactive |
 | `talu get` | Interactive HuggingFace browser | Interactive |
 | `talu get <model-uri>` | Download model | Both |

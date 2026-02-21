@@ -203,6 +203,8 @@ pub const OnSessionFn = *const fn (
 pub const AgentLoopConfig = struct {
     /// Maximum number of generate→execute iterations before stopping.
     max_iterations: usize = 10,
+    /// Maximum number of tool calls before stopping. 0 = unlimited.
+    max_tool_calls: usize = 0,
     /// If true, stop the loop when a tool execution returns an error.
     abort_on_tool_error: bool = false,
     /// Atomic flag for cross-thread cancellation. Set to true to stop the loop.
@@ -257,7 +259,7 @@ pub const AgentLoopConfig = struct {
 pub const LoopStopReason = enum(u8) {
     /// LLM produced a response with no tool calls (normal completion).
     completed = 0,
-    /// Reached max_iterations without completing.
+    /// Reached max_iterations or max_tool_calls budget without completing.
     max_iterations = 1,
     /// A tool execution failed and abort_on_tool_error was set.
     tool_error = 2,
@@ -327,6 +329,12 @@ pub fn run(
 
     while (new_iterations < config.max_iterations) : (new_iterations += 1) {
         iterations = config.initial_iteration_count + new_iterations;
+
+        // Tool call budget exhausted
+        if (config.max_tool_calls > 0 and total_tool_calls >= config.max_tool_calls) {
+            stop_reason = .max_iterations;
+            break;
+        }
 
         // Check cancellation
         if (config.stop_flag) |flag| {
@@ -402,6 +410,11 @@ pub fn run(
             .stop_tool_error => {
                 iterations += 1;
                 stop_reason = .tool_error;
+                break;
+            },
+            .stop_tool_budget => {
+                iterations += 1;
+                stop_reason = .max_iterations;
                 break;
             },
         }
@@ -526,6 +539,7 @@ const ExecResult = enum {
     continue_loop,
     stop_cancelled,
     stop_tool_error,
+    stop_tool_budget,
 };
 
 /// Execute pending tool calls from the conversation.
@@ -575,6 +589,9 @@ fn executeToolCalls(
             else => continue,
         };
 
+        if (config.max_tool_calls > 0 and total_tool_calls.* >= config.max_tool_calls) {
+            return .stop_tool_budget;
+        }
         total_tool_calls.* += 1;
 
         // Null-terminate strings for event callbacks
@@ -780,14 +797,13 @@ fn emitEvent(
     fields: EventFields,
 ) bool {
     const on_event = config.on_event orelse return true;
-    const event = AgentEvent{
-        .event_type = event_type,
-        .iteration = @intCast(iteration),
-        .tool_name = fields.tool_name,
-        .tool_arguments = fields.tool_arguments,
-        .tool_output = fields.tool_output,
-        .tool_is_error = fields.tool_is_error,
-    };
+    var event = std.mem.zeroes(AgentEvent);
+    event.event_type = event_type;
+    event.iteration = @intCast(iteration);
+    event.tool_name = fields.tool_name;
+    event.tool_arguments = fields.tool_arguments;
+    event.tool_output = fields.tool_output;
+    event.tool_is_error = fields.tool_is_error;
     return on_event(&event, config.on_event_data);
 }
 
@@ -800,12 +816,11 @@ fn emitSessionEvent(
     stop_reason: u8,
 ) void {
     const on_session = config.on_session orelse return;
-    const event = SessionEvent{
-        .event_type = event_type,
-        .stop_reason = stop_reason,
-        .iterations = iterations,
-        .total_tool_calls = total_tool_calls,
-    };
+    var event = std.mem.zeroes(SessionEvent);
+    event.event_type = event_type;
+    event.stop_reason = stop_reason;
+    event.iterations = iterations;
+    event.total_tool_calls = total_tool_calls;
     on_session(&event, config.on_session_data);
 }
 
@@ -821,12 +836,12 @@ pub fn computeContextInfo(conv: *const Conversation, iteration: usize) ContextIn
             total_output += item.output_tokens;
         }
     }
-    return .{
-        .item_count = count,
-        .total_input_tokens = total_input,
-        .total_output_tokens = total_output,
-        .iteration = @intCast(iteration),
-    };
+    var info = std.mem.zeroes(ContextInfo);
+    info.item_count = count;
+    info.total_input_tokens = total_input;
+    info.total_output_tokens = total_output;
+    info.iteration = @intCast(iteration);
+    return info;
 }
 
 // =============================================================================
@@ -841,6 +856,7 @@ pub fn computeContextInfo(conv: *const Conversation, iteration: usize) ContextIn
 test "AgentLoopConfig defaults" {
     const config = AgentLoopConfig{};
     try std.testing.expectEqual(@as(usize, 10), config.max_iterations);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_calls);
     try std.testing.expect(!config.abort_on_tool_error);
     try std.testing.expect(config.stop_flag == null);
     try std.testing.expect(config.on_token == null);
@@ -878,7 +894,8 @@ test "AgentEventType enum values" {
 }
 
 test "AgentEvent default construction" {
-    const event = AgentEvent{ .event_type = .generation_start };
+    var event = std.mem.zeroes(AgentEvent);
+    event.event_type = .generation_start;
     try std.testing.expectEqual(AgentEventType.generation_start, event.event_type);
     try std.testing.expectEqual(@as(u32, 0), event.iteration);
     try std.testing.expect(event.tool_name == null);
@@ -928,7 +945,7 @@ test "emitEvent calls callback and returns result" {
 }
 
 test "ContextInfo default construction" {
-    const info = ContextInfo{};
+    const info = std.mem.zeroes(ContextInfo);
     try std.testing.expectEqual(@as(usize, 0), info.item_count);
     try std.testing.expectEqual(@as(u64, 0), info.total_input_tokens);
     try std.testing.expectEqual(@as(u64, 0), info.total_output_tokens);
@@ -942,7 +959,8 @@ test "SessionEventType enum values" {
 }
 
 test "SessionEvent default construction" {
-    const event = SessionEvent{ .event_type = .loop_start };
+    var event = std.mem.zeroes(SessionEvent);
+    event.event_type = .loop_start;
     try std.testing.expectEqual(SessionEventType.loop_start, event.event_type);
     try std.testing.expectEqual(@as(u8, 0), event.stop_reason);
     try std.testing.expectEqual(@as(usize, 0), event.iterations);

@@ -1,6 +1,6 @@
 //! Shell agent: single-turn structured tool call.
 //!
-//! `talu shell` generates exactly one tool call via grammar-constrained
+//! `talu agent` generates exactly one tool call via grammar-constrained
 //! sampling. The built-in `execute_command` tool is executed with a
 //! conservative shell whitelist; custom tools are executed via their
 //! manifests. All tool calls require user confirmation.
@@ -13,7 +13,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 
-use anyhow::{anyhow, Result};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 
 use talu::policy::Policy;

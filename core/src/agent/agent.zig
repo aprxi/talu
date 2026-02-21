@@ -32,6 +32,8 @@ const loop_mod = @import("loop.zig");
 const tool_mod = @import("tool.zig");
 const bus_mod = @import("bus.zig");
 const compaction_mod = @import("compaction.zig");
+const tools_mod = @import("tools/root.zig");
+const memory_mod = @import("memory/root.zig");
 
 const responses = @import("../responses/root.zig");
 const Chat = responses.Chat;
@@ -56,6 +58,19 @@ const ToolRegistry = tool_mod.ToolRegistry;
 const Tool = tool_mod.Tool;
 const MessageBus = bus_mod.MessageBus;
 const Message = bus_mod.Message;
+
+const persisted_state_filename = "agent_state.json";
+const persisted_state_version: u32 = 1;
+const max_state_file_bytes: usize = 1024 * 1024;
+
+const PersistedAgentState = struct {
+    version: u32,
+    agent_id: []const u8,
+    total_iterations: usize,
+    total_tool_calls: usize,
+    base_system_prompt: ?[]const u8,
+    goals: []const []const u8,
+};
 
 // =============================================================================
 // Callback types
@@ -114,6 +129,20 @@ pub const RagConfig = struct {
     on_resolve_data: ?*anyopaque = null,
 };
 
+/// Configuration for optional agent memory integration.
+pub const MemoryIntegrationConfig = struct {
+    /// Talu DB path used by MemoryStore.
+    db_path: []const u8,
+    /// Memory namespace partition.
+    namespace: []const u8 = "default",
+    /// Optional owner partition.
+    owner_id: ?[]const u8 = null,
+    /// Max number of recall hits to inject per run.
+    recall_limit: usize = 5,
+    /// Whether to append a run summary to daily memory.
+    append_on_run: bool = true,
+};
+
 // =============================================================================
 // Configuration
 // =============================================================================
@@ -134,10 +163,16 @@ pub const AgentConfig = struct {
     abort_on_tool_error: bool = false,
     /// Maximum bytes for tool output. 0 = unlimited.
     max_tool_output_bytes: usize = 0,
+    /// Maximum tool calls per turn. 0 = unlimited.
+    max_tool_calls_per_turn: usize = 0,
     /// Agent identifier. Null = auto-generate a random ID.
     agent_id: ?[]const u8 = null,
     /// Directory for agent state files (tools, skills, key-value).
     state_dir: ?[]const u8 = null,
+    /// Optional built-in tool auto-registration.
+    builtin_tools: ?tools_mod.BuiltinToolsConfig = null,
+    /// Optional memory integration over db blobs/documents.
+    memory: ?MemoryIntegrationConfig = null,
 
     // Observation callbacks (forwarded to loop.run)
     on_token: ?OnTokenFn = null,
@@ -166,6 +201,8 @@ pub const AgentError = error{
     OutOfMemory,
     GenerationFailed,
     IteratorCreationFailed,
+    InvalidAgentState,
+    UnsupportedAgentStateVersion,
 };
 
 /// Stateful agent with built-in compaction, retry, and inter-agent messaging.
@@ -192,6 +229,7 @@ pub const Agent = struct {
     max_iterations_per_turn: usize,
     abort_on_tool_error: bool,
     max_tool_output_bytes: usize,
+    max_tool_calls_per_turn: usize,
 
     // Runtime state
     stop_flag: std.atomic.Value(bool),
@@ -219,6 +257,9 @@ pub const Agent = struct {
     // Built-in vector store RAG
     vector_store: ?*VectorAdapter,
     rag_config: RagConfig,
+    memory_store: ?memory_mod.MemoryStore,
+    memory_recall_limit: usize,
+    memory_append_on_run: bool,
 
     // Message notification (for waitForMessage / runLoop)
     message_mutex: std.Thread.Mutex,
@@ -283,6 +324,7 @@ pub const Agent = struct {
             .max_iterations_per_turn = config.max_iterations_per_turn,
             .abort_on_tool_error = config.abort_on_tool_error,
             .max_tool_output_bytes = config.max_tool_output_bytes,
+            .max_tool_calls_per_turn = config.max_tool_calls_per_turn,
             .stop_flag = std.atomic.Value(bool).init(false),
             .total_iterations = 0,
             .total_tool_calls = 0,
@@ -300,17 +342,42 @@ pub const Agent = struct {
             .on_after_tool_data = config.on_after_tool_data,
             .vector_store = null,
             .rag_config = .{},
+            .memory_store = null,
+            .memory_recall_limit = 0,
+            .memory_append_on_run = false,
             .message_mutex = .{},
             .message_cond = .{},
             .message_pending = false,
             .goals = .{},
             .base_system_prompt = null,
         };
+
+        errdefer agent.deinit();
+
+        if (config.memory) |memory_cfg| {
+            agent.memory_store = try memory_mod.MemoryStore.init(allocator, .{
+                .db_path = memory_cfg.db_path,
+                .namespace = memory_cfg.namespace,
+                .owner_id = memory_cfg.owner_id,
+            });
+            agent.memory_recall_limit = memory_cfg.recall_limit;
+            agent.memory_append_on_run = memory_cfg.append_on_run;
+        }
+
+        if (config.builtin_tools) |builtin_cfg| {
+            try tools_mod.registerDefaultTools(allocator, &agent.registry, builtin_cfg);
+        }
+
+        try agent.loadPersistedState();
+
         return agent;
     }
 
     /// Free all owned resources.
     pub fn deinit(self: *Agent) void {
+        if (self.memory_store) |*store| {
+            store.deinit();
+        }
         self.registry.deinit();
         self.chat.deinit();
         self.allocator.destroy(self.chat);
@@ -334,6 +401,7 @@ pub const Agent = struct {
         if (self.base_system_prompt) |old| self.allocator.free(old);
         self.base_system_prompt = try self.allocator.dupe(u8, system_prompt);
         try self.syncSystemPromptWithGoals();
+        try self.persistState();
     }
 
     /// Register a tool. The agent takes ownership via its ToolRegistry.
@@ -382,6 +450,7 @@ pub const Agent = struct {
         const owned = try self.allocator.dupe(u8, goal);
         errdefer self.allocator.free(owned);
         try self.goals.append(self.allocator, owned);
+        try self.persistState();
     }
 
     /// Remove a specific goal by exact string match.
@@ -391,6 +460,7 @@ pub const Agent = struct {
             if (std.mem.eql(u8, existing, goal)) {
                 self.allocator.free(existing);
                 _ = self.goals.orderedRemove(idx);
+                self.persistState() catch {};
                 return true;
             }
         }
@@ -399,10 +469,8 @@ pub const Agent = struct {
 
     /// Remove all goals.
     pub fn clearGoals(self: *Agent) void {
-        for (self.goals.items) |goal| {
-            self.allocator.free(goal);
-        }
-        self.goals.clearRetainingCapacity();
+        self.clearGoalsInMemory();
+        self.persistState() catch {};
     }
 
     /// Get the current goals (read-only slice).
@@ -430,10 +498,13 @@ pub const Agent = struct {
         try self.syncSystemPromptWithGoals();
         self.compactIfNeeded();
         _ = try self.chat.conv.appendUserMessage(message);
+        try self.injectMemoryRecall(message);
         if (!try self.injectVectorContext()) return cancelledResult(self);
         if (!try self.injectContext()) return cancelledResult(self);
 
-        return self.runWithRetry();
+        const result = try self.runWithRetry();
+        try self.appendRunMemoryEntry("prompt", message, result);
+        return result;
     }
 
     /// Resume the agent loop without a new user message.
@@ -446,10 +517,15 @@ pub const Agent = struct {
         try self.drainInbox();
         try self.syncSystemPromptWithGoals();
         self.compactIfNeeded();
+        if (self.lastUserText()) |query| {
+            try self.injectMemoryRecall(query);
+        }
         if (!try self.injectVectorContext()) return cancelledResult(self);
         if (!try self.injectContext()) return cancelledResult(self);
 
-        return self.runWithRetry();
+        const result = try self.runWithRetry();
+        try self.appendRunMemoryEntry("continue", null, result);
+        return result;
     }
 
     /// Autonomous heartbeat: drain inbox and act on pending work.
@@ -465,10 +541,15 @@ pub const Agent = struct {
         _ = try self.chat.conv.appendDeveloperMessage(
             "Heartbeat: review pending work and act.",
         );
+        if (self.lastUserText()) |query| {
+            try self.injectMemoryRecall(query);
+        }
         if (!try self.injectVectorContext()) return cancelledResult(self);
         if (!try self.injectContext()) return cancelledResult(self);
 
-        return self.runWithRetry();
+        const result = try self.runWithRetry();
+        try self.appendRunMemoryEntry("heartbeat", null, result);
+        return result;
     }
 
     /// Request cancellation from another thread.
@@ -610,6 +691,156 @@ pub const Agent = struct {
     }
 
     // =========================================================================
+    // Internal: state persistence
+    // =========================================================================
+
+    /// Persist agent state to `state_dir/agent_state.json` if state_dir is set.
+    fn persistState(self: *const Agent) !void {
+        const state_dir = self.state_dir orelse return;
+
+        try std.fs.cwd().makePath(state_dir);
+
+        const state_path = try std.fs.path.join(
+            self.allocator,
+            &.{ state_dir, persisted_state_filename },
+        );
+        defer self.allocator.free(state_path);
+
+        const tmp_path = try std.fmt.allocPrint(self.allocator, "{s}.tmp", .{state_path});
+        defer self.allocator.free(tmp_path);
+
+        const goals_view = try self.allocator.alloc([]const u8, self.goals.items.len);
+        defer self.allocator.free(goals_view);
+        for (self.goals.items, 0..) |goal, idx| {
+            goals_view[idx] = goal;
+        }
+
+        const state = PersistedAgentState{
+            .version = persisted_state_version,
+            .agent_id = self.agent_id,
+            .total_iterations = self.total_iterations,
+            .total_tool_calls = self.total_tool_calls,
+            .base_system_prompt = self.base_system_prompt,
+            .goals = goals_view,
+        };
+
+        const json_bytes = try std.json.Stringify.valueAlloc(
+            self.allocator,
+            state,
+            .{ .whitespace = .indent_2 },
+        );
+        defer self.allocator.free(json_bytes);
+
+        var tmp_file = try std.fs.cwd().createFile(tmp_path, .{ .truncate = true });
+        errdefer {
+            tmp_file.close();
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+        }
+        try tmp_file.writeAll(json_bytes);
+        try tmp_file.sync();
+        tmp_file.close();
+
+        try std.fs.cwd().rename(tmp_path, state_path);
+    }
+
+    /// Load persisted state from `state_dir/agent_state.json` if present.
+    fn loadPersistedState(self: *Agent) !void {
+        const state_dir = self.state_dir orelse return;
+        const state_path = try std.fs.path.join(
+            self.allocator,
+            &.{ state_dir, persisted_state_filename },
+        );
+        defer self.allocator.free(state_path);
+
+        const json_bytes = std.fs.cwd().readFileAlloc(
+            self.allocator,
+            state_path,
+            max_state_file_bytes,
+        ) catch |err| switch (err) {
+            error.FileNotFound => return,
+            else => return err,
+        };
+        defer self.allocator.free(json_bytes);
+
+        const parsed = std.json.parseFromSlice(
+            std.json.Value,
+            self.allocator,
+            json_bytes,
+            .{},
+        ) catch return AgentError.InvalidAgentState;
+        defer parsed.deinit();
+
+        const root = switch (parsed.value) {
+            .object => |obj| obj,
+            else => return AgentError.InvalidAgentState,
+        };
+
+        if (root.get("version")) |version_value| {
+            const version = try parseStateU32(version_value);
+            if (version != persisted_state_version) {
+                return AgentError.UnsupportedAgentStateVersion;
+            }
+        }
+
+        if (root.get("agent_id")) |agent_id_value| {
+            const stored_id = switch (agent_id_value) {
+                .string => |s| s,
+                else => return AgentError.InvalidAgentState,
+            };
+            if (!std.mem.eql(u8, stored_id, self.agent_id)) {
+                return;
+            }
+        }
+
+        if (root.get("total_iterations")) |iterations_value| {
+            self.total_iterations = try parseStateUsize(iterations_value);
+        }
+
+        if (root.get("total_tool_calls")) |tool_calls_value| {
+            self.total_tool_calls = try parseStateUsize(tool_calls_value);
+        }
+
+        if (self.base_system_prompt) |old| {
+            self.allocator.free(old);
+            self.base_system_prompt = null;
+        }
+        self.clearGoalsInMemory();
+
+        if (root.get("base_system_prompt")) |system_value| {
+            switch (system_value) {
+                .null => {},
+                .string => |s| {
+                    self.base_system_prompt = try self.allocator.dupe(u8, s);
+                },
+                else => return AgentError.InvalidAgentState,
+            }
+        }
+
+        if (root.get("goals")) |goals_value| {
+            const goals = switch (goals_value) {
+                .array => |arr| arr.items,
+                else => return AgentError.InvalidAgentState,
+            };
+            for (goals) |goal_value| {
+                const goal_text = switch (goal_value) {
+                    .string => |s| s,
+                    else => return AgentError.InvalidAgentState,
+                };
+                try self.goals.append(self.allocator, try self.allocator.dupe(u8, goal_text));
+            }
+        }
+
+        try self.syncSystemPromptWithGoals();
+    }
+
+    fn clearGoalsInMemory(self: *Agent) void {
+        for (self.goals.items) |goal| {
+            self.allocator.free(goal);
+        }
+        self.goals.clearRetainingCapacity();
+    }
+
+    // =========================================================================
     // Internal: context injection
     // =========================================================================
 
@@ -653,6 +884,34 @@ pub const Agent = struct {
         return true;
     }
 
+    /// Inject markdown memory recall as hidden developer context.
+    fn injectMemoryRecall(self: *Agent, query: []const u8) !void {
+        var store = &(self.memory_store orelse return);
+        if (self.memory_recall_limit == 0) return;
+
+        const hits = try store.recall(query, self.memory_recall_limit);
+        defer store.freeRecallHits(hits);
+        if (hits.len == 0) return;
+
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        const writer = buf.writer(self.allocator);
+
+        try writer.writeAll("## Recalled Memory\n");
+        for (hits) |hit| {
+            try writer.print("- {s}: ", .{hit.filename});
+            try writer.writeAll(hit.snippet);
+            try writer.writeByte('\n');
+        }
+
+        _ = try self.chat.conv.appendMessageWithHidden(
+            .developer,
+            .input_text,
+            buf.items,
+            true,
+        );
+    }
+
     /// Embed → search → resolve → inject via the built-in vector store.
     ///
     /// Returns false if the resolve callback requested cancellation.
@@ -664,18 +923,7 @@ pub const Agent = struct {
         const resolve_fn = config.on_resolve orelse return true;
 
         // 1. Extract last user message text.
-        var last_text: ?[]const u8 = null;
-        var idx: usize = self.chat.conv.len();
-        while (idx > 0) {
-            idx -= 1;
-            const item = self.chat.conv.getItem(idx) orelse continue;
-            const msg = item.asMessage() orelse continue;
-            if (msg.role == .user) {
-                last_text = msg.getFirstText();
-                break;
-            }
-        }
-        const text = last_text orelse return true;
+        const text = self.lastUserText() orelse return true;
         if (text.len == 0) return true;
 
         // 2. Embed.
@@ -729,6 +977,18 @@ pub const Agent = struct {
         return true;
     }
 
+    /// Returns the latest user message text from the conversation.
+    fn lastUserText(self: *const Agent) ?[]const u8 {
+        var idx: usize = self.chat.conv.len();
+        while (idx > 0) {
+            idx -= 1;
+            const item = self.chat.conv.getItem(idx) orelse continue;
+            const msg = item.asMessage() orelse continue;
+            if (msg.role == .user) return msg.getFirstText();
+        }
+        return null;
+    }
+
     // =========================================================================
     // Internal: compaction
     // =========================================================================
@@ -773,6 +1033,7 @@ pub const Agent = struct {
     fn runWithRetry(self: *Agent) !AgentLoopResult {
         const loop_config = AgentLoopConfig{
             .max_iterations = self.max_iterations_per_turn,
+            .max_tool_calls = self.max_tool_calls_per_turn,
             .abort_on_tool_error = self.abort_on_tool_error,
             .stop_flag = &self.stop_flag,
             .on_token = self.on_token,
@@ -812,11 +1073,47 @@ pub const Agent = struct {
             // Update cumulative state
             self.total_iterations = result.iterations;
             self.total_tool_calls = result.total_tool_calls;
+            self.persistState() catch {};
             return result;
         }
 
         // All retries exhausted
         return last_err.?;
+    }
+
+    fn appendRunMemoryEntry(
+        self: *Agent,
+        trigger: []const u8,
+        user_message: ?[]const u8,
+        result: AgentLoopResult,
+    ) !void {
+        var store = &(self.memory_store orelse return);
+        if (!self.memory_append_on_run) return;
+
+        var buf = std.ArrayListUnmanaged(u8){};
+        defer buf.deinit(self.allocator);
+        const writer = buf.writer(self.allocator);
+
+        try writer.writeAll("## Agent Run\n");
+        try writer.print("- Trigger: {s}\n", .{trigger});
+        try writer.print("- Stop: {s}\n", .{stopReasonLabel(result.stop_reason)});
+        try writer.print("- Iterations: {d}\n", .{result.iterations});
+        try writer.print("- Tool calls: {d}\n", .{result.total_tool_calls});
+
+        if (user_message) |msg| {
+            if (msg.len > 0) {
+                const max_user_len: usize = 400;
+                const keep = @min(msg.len, max_user_len);
+                try writer.writeAll("- User: ");
+                try writer.writeAll(msg[0..keep]);
+                if (keep < msg.len) {
+                    try writer.writeAll("...");
+                }
+                try writer.writeByte('\n');
+            }
+        }
+
+        try store.appendDaily(std.time.milliTimestamp(), buf.items);
     }
 
     // =========================================================================
@@ -849,6 +1146,31 @@ pub const Agent = struct {
     }
 };
 
+fn stopReasonLabel(reason: LoopStopReason) []const u8 {
+    return switch (reason) {
+        .completed => "completed",
+        .max_iterations => "max_iterations_or_budget",
+        .tool_error => "tool_error",
+        .cancelled => "cancelled",
+    };
+}
+
+fn parseStateUsize(value: std.json.Value) AgentError!usize {
+    if (value != .integer) return AgentError.InvalidAgentState;
+    if (value.integer < 0) return AgentError.InvalidAgentState;
+    const as_u64: u64 = @intCast(value.integer);
+    if (as_u64 > std.math.maxInt(usize)) return AgentError.InvalidAgentState;
+    return @intCast(as_u64);
+}
+
+fn parseStateU32(value: std.json.Value) AgentError!u32 {
+    if (value != .integer) return AgentError.InvalidAgentState;
+    if (value.integer < 0) return AgentError.InvalidAgentState;
+    const as_u64: u64 = @intCast(value.integer);
+    if (as_u64 > std.math.maxInt(u32)) return AgentError.InvalidAgentState;
+    return @intCast(as_u64);
+}
+
 // =============================================================================
 // Helpers
 // =============================================================================
@@ -874,8 +1196,11 @@ test "AgentConfig defaults" {
     try std.testing.expectEqual(@as(usize, 10), config.max_iterations_per_turn);
     try std.testing.expect(!config.abort_on_tool_error);
     try std.testing.expectEqual(@as(usize, 0), config.max_tool_output_bytes);
+    try std.testing.expectEqual(@as(usize, 0), config.max_tool_calls_per_turn);
     try std.testing.expect(config.agent_id == null);
     try std.testing.expect(config.state_dir == null);
+    try std.testing.expect(config.builtin_tools == null);
+    try std.testing.expect(config.memory == null);
     try std.testing.expect(config.on_token == null);
     try std.testing.expect(config.on_event == null);
     try std.testing.expect(config.on_session == null);
@@ -885,6 +1210,119 @@ test "AgentConfig defaults" {
     try std.testing.expect(config.on_before_tool_data == null);
     try std.testing.expect(config.on_after_tool == null);
     try std.testing.expect(config.on_after_tool_data == null);
+}
+
+test "Agent init auto-registers built-in tools when configured" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(workspace);
+
+    var backend: InferenceBackend = undefined;
+    var agent = try Agent.init(allocator, &backend, .{
+        .builtin_tools = .{
+            .workspace_dir = workspace,
+        },
+    });
+    defer agent.deinit();
+
+    try std.testing.expectEqual(@as(usize, 4), agent.getRegistry().count());
+    try std.testing.expect(agent.getRegistry().get("read_file") != null);
+    try std.testing.expect(agent.getRegistry().get("write_file") != null);
+    try std.testing.expect(agent.getRegistry().get("edit_file") != null);
+    try std.testing.expect(agent.getRegistry().get("http_fetch") != null);
+}
+
+test "Agent memory integration recalls and appends entries" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    var backend: InferenceBackend = undefined;
+    var agent = try Agent.init(allocator, &backend, .{
+        .memory = .{
+            .db_path = db_path,
+            .namespace = "agent_test",
+            .recall_limit = 5,
+            .append_on_run = true,
+        },
+    });
+    defer agent.deinit();
+
+    var store = try memory_mod.MemoryStore.init(allocator, .{
+        .db_path = db_path,
+        .namespace = "agent_test",
+    });
+    defer store.deinit();
+
+    try store.upsertMarkdown("20260221.md", "memory sentinel line");
+    try agent.injectMemoryRecall("sentinel");
+
+    const last = agent.chat.conv.lastItem() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(last.hidden);
+    const msg = last.asMessage() orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(.developer, msg.role);
+    try std.testing.expect(std.mem.indexOf(u8, msg.getFirstText(), "Recalled Memory") != null);
+
+    const result = AgentLoopResult{
+        .stop_reason = .completed,
+        .iterations = 2,
+        .total_tool_calls = 1,
+    };
+    try agent.appendRunMemoryEntry("prompt", "remember this", result);
+
+    const day = memory_mod.buildDailyFilename(std.time.milliTimestamp());
+    const day_doc = try store.readMarkdown(day[0..]);
+    defer if (day_doc) |buf| allocator.free(buf);
+
+    try std.testing.expect(day_doc != null);
+    try std.testing.expect(std.mem.indexOf(u8, day_doc.?, "Trigger: prompt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, day_doc.?, "remember this") != null);
+}
+
+test "Agent state_dir persists and restores goals, system prompt, and counters" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const state_dir = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(state_dir);
+
+    var backend: InferenceBackend = undefined;
+    var first = try Agent.init(allocator, &backend, .{
+        .agent_id = "stateful-agent",
+        .state_dir = state_dir,
+    });
+    defer first.deinit();
+
+    try first.setSystem("Base system prompt.");
+    try first.addGoal("Goal One");
+    try first.addGoal("Goal Two");
+    first.total_iterations = 7;
+    first.total_tool_calls = 3;
+    try first.persistState();
+
+    var second = try Agent.init(allocator, &backend, .{
+        .agent_id = "stateful-agent",
+        .state_dir = state_dir,
+    });
+    defer second.deinit();
+
+    try std.testing.expect(second.base_system_prompt != null);
+    try std.testing.expectEqualStrings("Base system prompt.", second.base_system_prompt.?);
+    try std.testing.expectEqual(@as(usize, 2), second.getGoals().len);
+    try std.testing.expectEqualStrings("Goal One", second.getGoals()[0]);
+    try std.testing.expectEqualStrings("Goal Two", second.getGoals()[1]);
+    try std.testing.expectEqual(@as(usize, 7), second.total_iterations);
+    try std.testing.expectEqual(@as(usize, 3), second.total_tool_calls);
+
+    const effective_system = second.chat.getSystem() orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, effective_system, "## Active Goals") != null);
 }
 
 test "generateId produces 16 hex chars" {
