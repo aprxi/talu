@@ -177,8 +177,24 @@ pub(crate) struct SyncPinsResponse {
     pub missing: usize,
     /// Number downloaded in this sync (0 if dry_run).
     pub downloaded: usize,
+    /// Estimated total bytes for missing models (from HF API, best-effort).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub missing_size_bytes: Option<u64>,
     /// Errors encountered during download.
     pub errors: Vec<String>,
+}
+
+/// A single file entry in a model.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct FileEntry {
+    pub filename: String,
+}
+
+/// Response for GET /v1/repo/models/{model_id}/files.
+#[derive(Serialize, ToSchema)]
+pub(crate) struct FileListResponse {
+    pub model_id: String,
+    pub files: Vec<FileEntry>,
 }
 
 // ---------------------------------------------------------------------------
@@ -815,6 +831,10 @@ pub async fn handle_unpin(
 }
 
 /// POST /v1/repo/sync-pins — synchronize pinned models (download missing ones).
+///
+/// When the `Accept` header contains `text/event-stream`, the response streams
+/// SSE progress events per model. Otherwise, blocks until sync completes and
+/// returns a JSON summary.
 #[utoipa::path(post, path = "/v1/repo/sync-pins", tag = "Repository",
     request_body = SyncPinsRequest,
     responses(
@@ -830,6 +850,12 @@ pub async fn handle_sync_pins(
         Some(bp) => bp,
         None => return no_bucket_error(),
     };
+
+    let wants_stream = req
+        .headers()
+        .get("accept")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.contains("text/event-stream"));
 
     let body_bytes = match req.into_body().collect().await {
         Ok(body) => body.to_bytes(),
@@ -847,12 +873,120 @@ pub async fn handle_sync_pins(
         }
     };
 
-    let result = tokio::task::spawn_blocking(move || {
-        let store = PinStore::open(&bucket_path.join("meta.sqlite"))?;
-        let entries = store.list_pinned_entries()?;
-        let total = entries.len();
+    if wants_stream && !request.dry_run {
+        return handle_sync_pins_streaming(bucket_path, request);
+    }
 
-        // Classify each pinned model as cached or missing.
+    let result = tokio::task::spawn_blocking(move || sync_pins_blocking(&bucket_path, &request))
+        .await;
+
+    match result {
+        Ok(Ok(resp)) => json_response(StatusCode::OK, &resp),
+        Ok(Err(e)) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sync_error",
+            &format!("Sync failed: {e}"),
+        ),
+        Err(e) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "sync_error",
+            &format!("Sync task failed: {e}"),
+        ),
+    }
+}
+
+/// Blocking sync-pins logic shared between JSON and SSE paths.
+fn sync_pins_blocking(
+    bucket_path: &std::path::Path,
+    request: &SyncPinsRequest,
+) -> Result<SyncPinsResponse, anyhow::Error> {
+    let store = PinStore::open(&bucket_path.join("meta.sqlite"))?;
+    let entries = store.list_pinned_entries()?;
+    let total = entries.len();
+
+    // Classify each pinned model as cached or missing.
+    let cached_models = talu::repo::repo_list_models(false).unwrap_or_default();
+    let cached_ids: HashSet<String> = cached_models.into_iter().map(|m| m.id).collect();
+
+    let mut cached = 0usize;
+    let mut missing_ids = Vec::new();
+    for entry in &entries {
+        if cached_ids.contains(&entry.model_uri) {
+            cached += 1;
+        } else {
+            missing_ids.push(entry.model_uri.clone());
+        }
+    }
+    let missing = missing_ids.len();
+
+    // Hydrate sizes for missing models from HF API (best-effort).
+    let missing_size_bytes = if !missing_ids.is_empty() {
+        hydrate_missing_sizes(&missing_ids, request.token.as_deref(), request.endpoint_url.as_deref(), request.skip_weights)
+    } else {
+        None
+    };
+
+    let mut downloaded = 0usize;
+    let mut errors = Vec::new();
+
+    if !request.dry_run {
+        for model_id in &missing_ids {
+            let options = talu::repo::DownloadOptions {
+                token: request.token.clone(),
+                force: false,
+                endpoint_url: request.endpoint_url.clone(),
+                skip_weights: request.skip_weights,
+            };
+            match talu::repo::repo_fetch(model_id, options, None) {
+                Ok(_) => {
+                    downloaded += 1;
+                    let size = talu::repo::repo_size(model_id);
+                    if size > 0 {
+                        let _ = store.upsert_size_bytes(model_id, size);
+                    }
+                }
+                Err(e) => errors.push(format!("{model_id}: {e}")),
+            }
+        }
+    }
+
+    Ok(SyncPinsResponse {
+        total,
+        cached,
+        missing,
+        downloaded,
+        missing_size_bytes,
+        errors,
+    })
+}
+
+/// SSE streaming variant for sync-pins: emits per-model progress events.
+fn handle_sync_pins_streaming(
+    bucket_path: std::path::PathBuf,
+    request: SyncPinsRequest,
+) -> Response<BoxBody> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+
+    std::thread::spawn(move || {
+        let store = match PinStore::open(&bucket_path.join("meta.sqlite")) {
+            Ok(s) => s,
+            Err(e) => {
+                let err = json!({ "event": "error", "message": format!("{e}") });
+                let _ = tx.send(Bytes::from(format!("data: {}\n\n", err)));
+                return;
+            }
+        };
+
+        let entries = match store.list_pinned_entries() {
+            Ok(e) => e,
+            Err(e) => {
+                let err = json!({ "event": "error", "message": format!("{e}") });
+                let _ = tx.send(Bytes::from(format!("data: {}\n\n", err)));
+                return;
+            }
+        };
+
+        let total = entries.len();
         let cached_models = talu::repo::repo_list_models(false).unwrap_or_default();
         let cached_ids: HashSet<String> = cached_models.into_iter().map(|m| m.id).collect();
 
@@ -867,51 +1001,176 @@ pub async fn handle_sync_pins(
         }
         let missing = missing_ids.len();
 
+        // Emit scan summary.
+        let scan = json!({
+            "event": "scan",
+            "total": total,
+            "cached": cached,
+            "missing": missing,
+        });
+        let _ = tx.send(Bytes::from(format!("data: {}\n\n", scan)));
+
         let mut downloaded = 0usize;
         let mut errors = Vec::new();
 
-        if !request.dry_run {
-            for model_id in &missing_ids {
-                let options = talu::repo::DownloadOptions {
-                    token: request.token.clone(),
-                    force: false,
-                    endpoint_url: request.endpoint_url.clone(),
-                    skip_weights: request.skip_weights,
-                };
-                match talu::repo::repo_fetch(model_id, options, None) {
-                    Ok(_) => {
-                        downloaded += 1;
-                        let size = talu::repo::repo_size(model_id);
-                        if size > 0 {
-                            let _ = store.upsert_size_bytes(model_id, size);
-                        }
+        for (i, model_id) in missing_ids.iter().enumerate() {
+            let start_evt = json!({
+                "event": "download_start",
+                "model_id": model_id,
+                "index": i,
+                "of": missing,
+            });
+            let _ = tx.send(Bytes::from(format!("data: {}\n\n", start_evt)));
+
+            let tx_progress = tx.clone();
+            let mid = model_id.clone();
+            let callback: talu::repo::ProgressCallback =
+                Box::new(move |progress: talu::repo::DownloadProgress| {
+                    let event = json!({
+                        "event": "progress",
+                        "model_id": mid,
+                        "action": match progress.action {
+                            talu::repo::ProgressAction::Add => "add",
+                            talu::repo::ProgressAction::Update => "update",
+                            talu::repo::ProgressAction::Complete => "complete",
+                        },
+                        "line_id": progress.line_id,
+                        "label": progress.label,
+                        "message": progress.message,
+                        "current": progress.current,
+                        "total": progress.total,
+                    });
+                    let _ = tx_progress.send(Bytes::from(format!("data: {}\n\n", event)));
+                });
+
+            let options = talu::repo::DownloadOptions {
+                token: request.token.clone(),
+                force: false,
+                endpoint_url: request.endpoint_url.clone(),
+                skip_weights: request.skip_weights,
+            };
+
+            match talu::repo::repo_fetch(model_id, options, Some(callback)) {
+                Ok(_) => {
+                    downloaded += 1;
+                    let size = talu::repo::repo_size(model_id);
+                    if size > 0 {
+                        let _ = store.upsert_size_bytes(model_id, size);
                     }
-                    Err(e) => errors.push(format!("{model_id}: {e}")),
+                    let ok_evt = json!({
+                        "event": "download_complete",
+                        "model_id": model_id,
+                    });
+                    let _ = tx.send(Bytes::from(format!("data: {}\n\n", ok_evt)));
+                }
+                Err(e) => {
+                    let err_msg = format!("{model_id}: {e}");
+                    errors.push(err_msg.clone());
+                    let err_evt = json!({
+                        "event": "download_error",
+                        "model_id": model_id,
+                        "message": err_msg,
+                    });
+                    let _ = tx.send(Bytes::from(format!("data: {}\n\n", err_evt)));
                 }
             }
         }
 
-        Ok::<_, anyhow::Error>(SyncPinsResponse {
-            total,
-            cached,
-            missing,
-            downloaded,
-            errors,
+        // Final done event with summary.
+        let done = json!({
+            "event": "done",
+            "total": total,
+            "cached": cached,
+            "missing": missing,
+            "downloaded": downloaded,
+            "errors": errors,
+        });
+        let _ = tx.send(Bytes::from(format!("data: {}\n\n", done)));
+    });
+
+    let stream =
+        UnboundedReceiverStream::new(rx).map(|chunk| Ok::<_, Infallible>(Frame::data(chunk)));
+    let body = StreamBody::new(stream).boxed();
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/event-stream")
+        .header("cache-control", "no-cache")
+        .header("connection", "keep-alive")
+        .body(body)
+        .unwrap()
+}
+
+/// GET /v1/repo/models/{model_id}/files — list files inside a cached or remote model.
+#[utoipa::path(get, path = "/v1/repo/models/{model_id}/files", tag = "Repository",
+    params(
+        ("model_id" = String, Path, description = "Model ID (URL-encoded)"),
+        ("token" = Option<String>, Query, description = "HuggingFace token for private repos"),
+    ),
+    responses(
+        (status = 200, body = FileListResponse),
+        (status = 400, body = super::http::ErrorResponse, description = "Missing model_id"),
+        (status = 500, body = super::http::ErrorResponse, description = "File listing failed"),
+    ))]
+pub async fn handle_list_files(
+    _state: Arc<AppState>,
+    req: Request<Incoming>,
+    _auth_ctx: Option<AuthContext>,
+    model_id: &str,
+) -> Response<BoxBody> {
+    if model_id.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "model_id is required",
+        );
+    }
+
+    let uri = req.uri().clone();
+    let params: Vec<(String, String)> = uri
+        .query()
+        .map(|q| {
+            url::form_urlencoded::parse(q.as_bytes())
+                .into_owned()
+                .collect()
         })
+        .unwrap_or_default();
+
+    let token: Option<String> = params
+        .iter()
+        .find(|(k, _)| k == "token")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty());
+
+    let model_id_owned = model_id.to_string();
+    let result = tokio::task::spawn_blocking(move || {
+        talu::repo::repo_list_files(&model_id_owned, token.as_deref())
     })
     .await;
 
     match result {
-        Ok(Ok(resp)) => json_response(StatusCode::OK, &resp),
+        Ok(Ok(files)) => {
+            let entries: Vec<FileEntry> = files
+                .into_iter()
+                .map(|f| FileEntry { filename: f })
+                .collect();
+            json_response(
+                StatusCode::OK,
+                &FileListResponse {
+                    model_id: model_id.to_string(),
+                    files: entries,
+                },
+            )
+        }
         Ok(Err(e)) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "sync_error",
-            &format!("Sync failed: {e}"),
+            "list_files_error",
+            &format!("Failed to list files: {e}"),
         ),
         Err(e) => json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
-            "sync_error",
-            &format!("Sync task failed: {e}"),
+            "list_files_error",
+            &format!("File list task failed: {e}"),
         ),
     }
 }
@@ -958,6 +1217,156 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)).boxed())
         .unwrap()
+}
+
+/// Hydrate missing model sizes from the HuggingFace API (best-effort).
+///
+/// Returns the sum of sizes for models where the API returned data, or None
+/// if no sizes could be retrieved.
+fn hydrate_missing_sizes(
+    model_ids: &[String],
+    token: Option<&str>,
+    endpoint_url: Option<&str>,
+    skip_weights: bool,
+) -> Option<u64> {
+    let endpoint = effective_hf_endpoint(endpoint_url);
+
+    // Build a blocking reqwest client for HF API calls.
+    let client = match reqwest::blocking::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+    {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+
+    let mut total: u64 = 0;
+    let mut any_success = false;
+
+    for model_id in model_ids {
+        if let Some(size) = fetch_hf_model_size_blocking(&client, &endpoint, model_id, token, skip_weights) {
+            total = total.saturating_add(size);
+            any_success = true;
+        }
+    }
+
+    if any_success { Some(total) } else { None }
+}
+
+/// Fetch model size from HF API (blocking). Returns None on failure.
+fn fetch_hf_model_size_blocking(
+    client: &reqwest::blocking::Client,
+    endpoint: &str,
+    model_id: &str,
+    token: Option<&str>,
+    skip_weights: bool,
+) -> Option<u64> {
+    // Try /api/models/{id}?blobs=true&files_metadata=true first.
+    let info_url = format!("{}/api/models/{}?blobs=true&files_metadata=true", endpoint, model_id);
+    if let Some(body) = hf_get_text_blocking(client, &info_url, token) {
+        if let Some(size) = parse_hf_model_size_bytes(&body, skip_weights) {
+            return Some(size);
+        }
+    }
+
+    // Fallback: /api/models/{id}/tree/main?recursive=0
+    let tree_url = format!("{}/api/models/{}/tree/main?recursive=0", endpoint, model_id);
+    let body = hf_get_text_blocking(client, &tree_url, token)?;
+    parse_hf_tree_size_bytes(&body, skip_weights)
+}
+
+fn hf_get_text_blocking(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    token: Option<&str>,
+) -> Option<String> {
+    let mut req = client.get(url);
+    if let Some(t) = token {
+        if !t.trim().is_empty() {
+            req = req.bearer_auth(t);
+        }
+    }
+    let resp = req.send().ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    resp.text().ok()
+}
+
+fn effective_hf_endpoint(endpoint_url: Option<&str>) -> String {
+    let endpoint = endpoint_url
+        .map(str::to_string)
+        .or_else(|| std::env::var("HF_ENDPOINT").ok())
+        .unwrap_or_else(|| "https://huggingface.co".to_string());
+    endpoint.trim_end_matches('/').to_string()
+}
+
+/// Parse model size from HF /api/models response (siblings array).
+fn parse_hf_model_size_bytes(body: &str, skip_weights: bool) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let siblings = value.get("siblings")?.as_array()?;
+
+    let mut total_size = 0u64;
+    for sibling in siblings {
+        let filename = sibling.get("rfilename").and_then(|v| v.as_str()).unwrap_or_default();
+        if filename.starts_with('.') || filename.contains('/') {
+            continue;
+        }
+        if skip_weights && is_weight_filename(filename) {
+            continue;
+        }
+        let size = value_as_u64(sibling.get("size")?)
+            .or_else(|| value_as_u64(sibling.get("lfs")?.get("size")?))
+            .unwrap_or(0);
+        total_size = total_size.saturating_add(size);
+    }
+
+    if total_size > 0 { Some(total_size) } else { None }
+}
+
+/// Parse model size from HF /tree response.
+fn parse_hf_tree_size_bytes(body: &str, skip_weights: bool) -> Option<u64> {
+    let value: serde_json::Value = serde_json::from_str(body).ok()?;
+    let entries = value.as_array()?;
+
+    let mut total_size = 0u64;
+    for entry in entries {
+        let filename = entry.get("path")
+            .or_else(|| entry.get("rfilename"))
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        if filename.is_empty() || filename.starts_with('.') || filename.contains('/') {
+            continue;
+        }
+        if let Some(entry_type) = entry.get("type").and_then(|v| v.as_str()) {
+            if entry_type != "file" {
+                continue;
+            }
+        }
+        if skip_weights && is_weight_filename(filename) {
+            continue;
+        }
+        let size = entry.get("size").and_then(value_as_u64)
+            .or_else(|| entry.get("lfs").and_then(|v| v.get("size")).and_then(value_as_u64))
+            .unwrap_or(0);
+        total_size = total_size.saturating_add(size);
+    }
+
+    if total_size > 0 { Some(total_size) } else { None }
+}
+
+fn is_weight_filename(filename: &str) -> bool {
+    filename.ends_with(".safetensors") || filename.ends_with(".safetensors.index.json")
+}
+
+fn value_as_u64(value: &serde_json::Value) -> Option<u64> {
+    if let Some(v) = value.as_u64() {
+        return Some(v);
+    }
+    if let Some(v) = value.as_i64() {
+        return u64::try_from(v).ok();
+    }
+    value.as_str().and_then(|s| s.parse::<u64>().ok())
 }
 
 /// Format quantization method as a scheme name.

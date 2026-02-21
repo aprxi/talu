@@ -503,6 +503,22 @@ impl Service<Request<Incoming>> for Router {
                         (Method::POST, "/v1/repo/models") | (Method::POST, "/repo/models") => {
                             repo::handle_fetch(state, req, auth).await
                         }
+                        // File listing (must come before DELETE /repo/models/{id})
+                        (Method::GET, p)
+                            if (p.starts_with("/v1/repo/models/")
+                                || p.starts_with("/repo/models/"))
+                                && p.ends_with("/files") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/models/"
+                            } else {
+                                "/repo/models/"
+                            };
+                            let raw = &p[prefix.len()..p.len() - "/files".len()];
+                            let model_id = percent_encoding::percent_decode_str(raw)
+                                .decode_utf8_lossy();
+                            repo::handle_list_files(state, req, auth, &model_id).await
+                        }
                         (Method::DELETE, p)
                             if p.starts_with("/v1/repo/models/")
                                 || p.starts_with("/repo/models/") =>

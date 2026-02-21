@@ -305,6 +305,88 @@ fn sync_pins_dry_run() {
     assert_eq!(json["downloaded"], 0, "dry_run should not download");
     assert_eq!(json["total"], 1);
     assert_eq!(json["missing"], 1);
+
+    // missing_size_bytes may be present (null if HF API unreachable) or absent.
+    // When present, it should be a number.
+    if !json["missing_size_bytes"].is_null() {
+        if let Some(msb) = json.get("missing_size_bytes") {
+            assert!(msb.is_number(), "missing_size_bytes should be a number when present");
+        }
+    }
+}
+
+/// Sync pins with SSE Accept header returns text/event-stream.
+#[test]
+fn sync_pins_sse_returns_event_stream() {
+    let (config, _bucket) = pin_config();
+    let ctx = ServerTestContext::new(config);
+
+    // Pin a model
+    post_json(
+        ctx.addr(),
+        "/v1/repo/pins",
+        &json!({"model_id": "nonexistent-org/nonexistent-model"}),
+    );
+
+    // Sync with dry_run=false and SSE accept.
+    // The download will fail for a nonexistent model, but we should still
+    // get SSE events (scan, download_start, download_error, done).
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/repo/sync-pins",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "text/event-stream"),
+        ],
+        Some(r#"{"dry_run": false}"#),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(
+        resp.header("content-type"),
+        Some("text/event-stream"),
+        "SSE Accept should produce text/event-stream response"
+    );
+
+    // Body should contain SSE data lines.
+    assert!(
+        resp.body.contains("data: "),
+        "SSE body should contain 'data: ' lines"
+    );
+    // Should contain scan event.
+    assert!(
+        resp.body.contains("\"event\":\"scan\"") || resp.body.contains("\"event\": \"scan\""),
+        "SSE body should contain scan event"
+    );
+    // Should contain done event.
+    assert!(
+        resp.body.contains("\"event\":\"done\"") || resp.body.contains("\"event\": \"done\""),
+        "SSE body should contain done event"
+    );
+}
+
+/// Sync pins with dry_run=true ignores SSE Accept header (returns JSON).
+#[test]
+fn sync_pins_dry_run_ignores_sse_accept() {
+    let (config, _bucket) = pin_config();
+    let ctx = ServerTestContext::new(config);
+
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/repo/sync-pins",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "text/event-stream"),
+        ],
+        Some(r#"{}"#), // dry_run defaults to true
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(
+        resp.header("content-type"),
+        Some("application/json"),
+        "dry_run should always return JSON regardless of Accept header"
+    );
 }
 
 /// Sync pins with no bucket returns 400.

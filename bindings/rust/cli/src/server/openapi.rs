@@ -96,6 +96,7 @@ use crate::server::{
         repo::handle_fetch,
         repo::handle_delete,
         // Pin management
+        repo::handle_list_files,
         repo::handle_list_pins,
         repo::handle_pin,
         repo::handle_unpin,
@@ -184,6 +185,8 @@ use crate::server::{
         repo::PinActionResponse,
         repo::SyncPinsRequest,
         repo::SyncPinsResponse,
+        repo::FileEntry,
+        repo::FileListResponse,
         // Code (tree-sitter)
         code::HighlightRequest,
         code::ParseRequest,

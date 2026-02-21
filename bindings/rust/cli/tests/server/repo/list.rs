@@ -174,6 +174,16 @@ fn repo_endpoints_in_openapi() {
         delete_path.get("delete").is_some(),
         "/v1/repo/models/{{model_id}} should have DELETE"
     );
+
+    assert!(
+        paths.contains_key("/v1/repo/models/{model_id}/files"),
+        "OpenAPI spec should contain /v1/repo/models/{{model_id}}/files"
+    );
+    let files_path = &paths["/v1/repo/models/{model_id}/files"];
+    assert!(
+        files_path.get("get").is_some(),
+        "/v1/repo/models/{{model_id}}/files should have GET"
+    );
 }
 
 // ---------------------------------------------------------------------------
