@@ -1055,6 +1055,210 @@ pub const MultiHeadAttention = struct {
         }
     }
 
+    /// Decode multiple scheduler slots in one batched kernel call.
+    ///
+    /// Layout contract:
+    /// - input/output tensors are [1, batch_size, d_model]
+    /// - slot_indices.len == batch_size
+    /// - each batch row corresponds to one decode token for one scheduler slot
+    pub fn forwardWithBatchedCacheSlots(
+        self: *const MultiHeadAttention,
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        cache: *BatchedKVCache,
+        slot_indices: []const usize,
+        scratch: *AttnTemp,
+        matmul_scratch: *cpu_linalg.MatmulScratch,
+        use_cache: bool,
+    ) !void {
+        if (!use_cache) return error.InvalidArgument;
+
+        const exact_softmax = std.process.hasEnvVar(self.allocator, "TALU_CPU_EXACT_SOFTMAX") catch false;
+        std.debug.assert(self.n_heads > 0 and self.n_kv_heads > 0);
+        std.debug.assert(self.n_heads % self.n_kv_heads == 0);
+        std.debug.assert(input_tensor.n_dims == 3 and output_tensor.n_dims == 3);
+        std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
+
+        const batch_size: usize = @intCast(input_tensor.shape[1]);
+        std.debug.assert(batch_size == slot_indices.len);
+        std.debug.assert(input_tensor.shape[2] == self.d_model and output_tensor.shape[2] == self.d_model);
+
+        const query_dim = self.n_heads * self.head_dim;
+        const kv_total_dim = self.n_kv_heads * self.head_dim;
+        const head_dim = self.head_dim;
+        const n_heads = self.n_heads;
+        const n_kv_heads = self.n_kv_heads;
+        const heads_per_kv_group = n_heads / n_kv_heads;
+        const scale = self.scale;
+
+        const use_fused_projection = if (self.fused_qkv) |fq| blk: {
+            if (fq.dtype == .f32 and fq.shape[1] == query_dim + 2 * kv_total_dim) break :blk true;
+            break :blk fq.shape[0] == query_dim + 2 * kv_total_dim;
+        } else false;
+        try self.ensureTemp(scratch, batch_size, true, query_dim, kv_total_dim, use_fused_projection);
+
+        const input_view = Tensor.view2D(input_tensor.data(), batch_size, self.d_model);
+        var query_view: Tensor = undefined;
+        var key_view: Tensor = undefined;
+        var value_view: Tensor = undefined;
+
+        if (use_fused_projection) {
+            const fused_weights = self.fused_qkv.?;
+            const fused_kernel = self.matmul_qkv_fused orelse self.matmul_qkv;
+            const views = cpu_layout.projectQkv(&input_view, &fused_weights, scratch.qkv, batch_size, query_dim, kv_total_dim, fused_kernel, matmul_scratch);
+            query_view = views.q;
+            key_view = views.k;
+            value_view = views.v;
+        } else {
+            const query_weights = self.q_proj orelse return error.MissingAttentionWeights;
+            const key_weights = self.k_proj orelse return error.MissingAttentionWeights;
+            const value_weights = self.v_proj orelse return error.MissingAttentionWeights;
+
+            var query_workspace = Tensor.view2DSlice(scratch.q[0 .. batch_size * query_dim], batch_size, query_dim);
+            var key_workspace = Tensor.view2DSlice(scratch.k[0 .. batch_size * kv_total_dim], batch_size, kv_total_dim);
+            var value_workspace = Tensor.view2DSlice(scratch.v[0 .. batch_size * kv_total_dim], batch_size, kv_total_dim);
+
+            self.matmul_qkv(&input_view, query_weights, &query_workspace, matmul_scratch);
+            const matmul_kernel_k = self.matmul_k orelse self.matmul_qkv;
+            const matmul_kernel_v = self.matmul_v orelse self.matmul_qkv;
+            matmul_kernel_k(&input_view, key_weights, &key_workspace, matmul_scratch);
+            matmul_kernel_v(&input_view, value_weights, &value_workspace, matmul_scratch);
+
+            query_view = query_workspace;
+            key_view = key_workspace;
+            value_view = value_workspace;
+        }
+
+        if (self.q_bias) |bias| cpu_common.addBiasRows(query_view.asSlice(f32), bias, batch_size, query_dim);
+        if (self.k_bias) |bias| cpu_common.addBiasRows(key_view.asSlice(f32), bias, batch_size, kv_total_dim);
+        if (self.v_bias) |bias| cpu_common.addBiasRows(value_view.asSlice(f32), bias, batch_size, kv_total_dim);
+
+        if (self.q_norm) |qn| {
+            cpu_norm.rmsnormHeadsInPlace(
+                query_view.asSlice(f32),
+                batch_size,
+                n_heads,
+                head_dim,
+                query_dim,
+                qn,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
+        }
+        if (self.k_norm) |kn| {
+            cpu_norm.rmsnormHeadsInPlace(
+                key_view.asSlice(f32),
+                batch_size,
+                n_kv_heads,
+                head_dim,
+                kv_total_dim,
+                kn,
+                self.norm_eps,
+                self.qk_norm_weight_offset,
+            );
+        }
+
+        // RoPE position is slot-specific in continuous batching.
+        const query_values = query_view.asSlice(f32);
+        const key_values = key_view.asSlice(f32);
+        if (self.runtime_rope) |runtime_rope| {
+            for (slot_indices, 0..) |slot_index, batch_index| {
+                const pos_offset = cache.getPosition(slot_index);
+                const q_row = query_values[batch_index * query_dim ..][0..query_dim];
+                const k_row = key_values[batch_index * kv_total_dim ..][0..kv_total_dim];
+                try cpu_rotary.applyRuntimeTablesToPair(
+                    q_row,
+                    k_row,
+                    1,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    runtime_rope.cos,
+                    runtime_rope.sin,
+                    runtime_rope.dim,
+                );
+            }
+        } else if (self.rope) |rope| {
+            for (slot_indices, 0..) |slot_index, batch_index| {
+                const pos_offset = cache.getPosition(slot_index);
+                const q_row = query_values[batch_index * query_dim ..][0..query_dim];
+                const k_row = key_values[batch_index * kv_total_dim ..][0..kv_total_dim];
+                try cpu_rotary.applyStaticTablesToPair(
+                    q_row,
+                    k_row,
+                    1,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    query_dim,
+                    kv_total_dim,
+                    pos_offset,
+                    self.position_delta,
+                    rope,
+                );
+            }
+        }
+
+        const value_values = value_view.asSlice(f32);
+        const score_values = scratch.scores;
+        const context_values = scratch.context_values;
+        const score_stride = self.max_seq_len;
+
+        for (slot_indices, 0..) |slot_index, batch_index| {
+            if (cache.getPosition(slot_index) >= self.max_seq_len) return error.CacheOverflow;
+
+            const query_row = query_values[batch_index * query_dim ..][0..query_dim];
+            const key_row = key_values[batch_index * kv_total_dim ..][0..kv_total_dim];
+            const value_row = value_values[batch_index * kv_total_dim ..][0..kv_total_dim];
+
+            try cache.appendKV(slot_index, key_row, value_row);
+            const kv_sequence_len = cache.getPosition(slot_index);
+            const start_kv_index: usize = if (self.sliding_window > 0 and kv_sequence_len > self.sliding_window)
+                kv_sequence_len - self.sliding_window
+            else
+                0;
+
+            const scores_base_offset = batch_index * n_heads * score_stride;
+            const scores_base = score_values[scores_base_offset .. scores_base_offset + (n_heads * score_stride)];
+            const context_base = context_values[batch_index * query_dim ..][0..query_dim];
+
+            for (0..n_kv_heads) |kv_head_idx| {
+                const k_cache_head = cache.getKHead(slot_index, kv_head_idx);
+                const v_cache_head = cache.getVHead(slot_index, kv_head_idx);
+                const q_head_start = kv_head_idx * heads_per_kv_group;
+                const q_head_end = q_head_start + heads_per_kv_group;
+
+                for (q_head_start..q_head_end) |head_index| {
+                    const query_head = query_row[head_index * head_dim ..][0..head_dim];
+                    const scores_for_head = scores_base[head_index * score_stride ..][0..kv_sequence_len];
+                    const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
+                    const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
+                    cpu_sdpa.decodeHeadScoresAndContext(
+                        query_head,
+                        k_cache_head,
+                        v_cache_head,
+                        scores_for_head,
+                        context_for_head,
+                        start_kv_index,
+                        kv_sequence_len,
+                        head_dim,
+                        scale,
+                        sink_logit,
+                        exact_softmax,
+                    );
+                }
+            }
+        }
+
+        const attn_view = Tensor.view2DSlice(context_values[0 .. batch_size * query_dim], batch_size, query_dim);
+        var out_view = Tensor.view2DSlice(output_tensor.asSlice(f32), batch_size, self.d_model);
+        self.matmul_o(&attn_view, self.o_proj, &out_view, matmul_scratch);
+        if (self.o_bias) |bias| cpu_common.addBiasRows(output_tensor.asSlice(f32), bias, batch_size, self.d_model);
+    }
+
     /// Describe this attention module for introspection/debugging.
     pub fn describe(self: *const MultiHeadAttention, writer: anytype, indent: usize, show_kernels: bool) !void {
         const query_dim = self.n_heads * self.head_dim;
@@ -1144,6 +1348,8 @@ pub const MultiHeadAttention = struct {
         try self.forward(input_tensor, output_tensor, cache, scratch, matmul_scratch, use_cache);
     }
 };
+
+pub const FusedAttention = MultiHeadAttention;
 
 // =============================================================================
 // Batched Decode Support (for continuous batching)

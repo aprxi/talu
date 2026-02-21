@@ -3,7 +3,7 @@
 //! Provides compile-time model metadata and block programs.
 
 const std = @import("std");
-const contract = @import("contract.zig");
+const common_types = @import("common/types.zig");
 const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
 const runtime_architectures = @import("runtime_architectures.zig");
@@ -23,7 +23,7 @@ const qwen3_moe = @import("qwen/qwen3_moe.zig");
 const qwen3_next = @import("qwen/qwen3_next.zig");
 const youtu_vl = @import("youtu_vl/youtu_vl.zig");
 
-pub const Entry = contract.ModelDescriptor;
+pub const Entry = common_types.ModelDescriptor;
 
 pub const entries: []const Entry = &.{
     .{

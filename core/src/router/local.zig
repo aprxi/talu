@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const inference = @import("../inference/root.zig");
+const models = @import("../models/root.zig");
 const responses_mod = @import("../responses/root.zig");
 const Chat = responses_mod.Chat;
 const protocol = @import("protocol/root.zig");
@@ -38,7 +39,6 @@ pub const PoolingStrategy = backend_root.PoolingStrategy;
 const tokenizer_mod = @import("../tokenizer/root.zig");
 const io = @import("../io/root.zig");
 const image_mod = @import("../image/root.zig");
-const model_loader = inference.model_loader;
 const gen_config_mod = @import("../inference/config/generation.zig");
 const preproc_mod = @import("../inference/config/preprocessor.zig");
 const validate_mod = @import("../validate/root.zig");
@@ -50,6 +50,7 @@ const commit_mod = @import("commit.zig");
 const progress_mod = @import("../capi/progress.zig");
 
 pub const ResolutionConfig = io.repository.ResolutionConfig;
+pub const BackendInitOptions = backend_root.InitOptions;
 
 // Re-export scheduler types for router API
 pub const BackendScheduler = inference.scheduler.GenericScheduler(Backend);
@@ -232,7 +233,7 @@ pub const LocalEngine = struct {
     allocator: std.mem.Allocator,
 
     /// Loaded model weights and config.
-    loaded: *model_loader.LoadedModel,
+    loaded: *models.LoadedModel,
 
     /// Tokenizer for encoding/decoding.
     tok: tokenizer_mod.Tokenizer,
@@ -262,12 +263,12 @@ pub const LocalEngine = struct {
     /// Ownership: The engine does not retain the input slice; it resolves and
     /// owns its internal model path copy for the engine lifetime.
     pub fn init(allocator: std.mem.Allocator, model_path: []const u8) !LocalEngine {
-        return initWithSeedAndResolutionConfig(allocator, model_path, 42, .{}, progress_mod.ProgressContext.NONE);
+        return initWithSeedAndResolutionConfig(allocator, model_path, 42, .{}, .{}, progress_mod.ProgressContext.NONE);
     }
 
     /// Initialize engine with a specific random seed.
     pub fn initWithSeed(allocator: std.mem.Allocator, model_path: []const u8, seed: u64) !LocalEngine {
-        return initWithSeedAndResolutionConfig(allocator, model_path, seed, .{}, progress_mod.ProgressContext.NONE);
+        return initWithSeedAndResolutionConfig(allocator, model_path, seed, .{}, .{}, progress_mod.ProgressContext.NONE);
     }
 
     /// Initialize engine with resolution configuration.
@@ -276,7 +277,7 @@ pub const LocalEngine = struct {
         model_path: []const u8,
         config: ResolutionConfig,
     ) !LocalEngine {
-        return initWithSeedAndResolutionConfig(allocator, model_path, 42, config, progress_mod.ProgressContext.NONE);
+        return initWithSeedAndResolutionConfig(allocator, model_path, 42, config, .{}, progress_mod.ProgressContext.NONE);
     }
 
     /// Initialize engine with a specific random seed and resolution configuration.
@@ -285,6 +286,7 @@ pub const LocalEngine = struct {
         model_path: []const u8,
         seed: u64,
         config: ResolutionConfig,
+        backend_init_options: BackendInitOptions,
         progress: progress_mod.ProgressContext,
     ) !LocalEngine {
         var timing_start_ns: i128 = std.time.nanoTimestamp();
@@ -316,20 +318,20 @@ pub const LocalEngine = struct {
         // Load preprocessor config (pixel limits for vision smart resize)
         const preproc_config = preproc_mod.loadPreprocessorConfig(allocator, resolved_model_path);
 
-        const model_load_options = backend_root.defaultModelLoadOptions();
+        const model_load_options = backend_root.defaultModelLoadOptions(backend_init_options);
 
         // Start model loading in background thread
         const ModelLoaderThread = struct {
             alloc: std.mem.Allocator,
             config_path: []const u8,
             weights_path: []const u8,
-            load_options: model_loader.LoadOptions,
+            load_options: models.LoadOptions,
             prog: progress_mod.ProgressContext,
-            loaded_model: ?model_loader.LoadedModel = null,
+            loaded_model: ?models.LoadedModel = null,
             err: ?anyerror = null,
 
             fn loadModel(self: *@This()) void {
-                self.loaded_model = model_loader.loadModel(self.alloc, self.config_path, self.weights_path, self.load_options, self.prog) catch |e| {
+                self.loaded_model = models.loadModel(self.alloc, self.config_path, self.weights_path, self.load_options, self.prog) catch |e| {
                     self.err = e;
                     return;
                 };
@@ -366,12 +368,12 @@ pub const LocalEngine = struct {
             thread.join();
         } else {
             // Thread spawn failed - load synchronously
-            loader_thread_state.loaded_model = try model_loader.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
+            loader_thread_state.loaded_model = try models.loadModel(allocator, model_bundle.config_path(), wp, model_load_options, progress);
         }
 
         if (loader_thread_state.err) |e| return e;
 
-        const loaded_model = try allocator.create(model_loader.LoadedModel);
+        const loaded_model = try allocator.create(models.LoadedModel);
         errdefer allocator.destroy(loaded_model);
         loaded_model.* = loader_thread_state.loaded_model.?;
         errdefer loaded_model.deinit();
@@ -395,7 +397,7 @@ pub const LocalEngine = struct {
         }
 
         // Create backend (progress bar emitted from buildBlocks inside)
-        var compute_backend = try Backend.init(allocator, loaded_model, progress);
+        var compute_backend = try Backend.init(allocator, loaded_model, backend_init_options, progress);
         errdefer compute_backend.deinit();
 
         {

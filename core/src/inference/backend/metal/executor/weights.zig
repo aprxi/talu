@@ -1,4 +1,4 @@
-//! Metal weight-loading and fused decode model lifecycle.
+//! Metal weight-loading and decode-model lifecycle.
 //!
 //! Owns GPU weight materialization (`WeightHandles`) and fused-model planning
 //! for the Metal backend. Forward orchestration lives in `model.zig`.
@@ -15,7 +15,7 @@ const runtime_graph = @import("../runtime_graph.zig");
 const model_runtime = @import("../model_runtime.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
 const mla_kernel = @import("../kernels/mla_attention.zig");
-const topology = @import("../../topology.zig");
+const topology = @import("../../../../models/op_types.zig");
 
 const builtin = @import("builtin");
 const LoadedModel = models.LoadedModel;
@@ -188,8 +188,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
     var weight_handles = try allocator.create(WeightHandles);
     // Initialize all optional fields to null to avoid undefined memory
-    weight_handles.fused_model = null;
-    weight_handles.dense_model = null;
+    weight_handles.decode_model = null;
     weight_handles.compiled_layers = null;
     weight_handles.is_moe = is_moe_model;
     weight_handles.num_experts = if (is_moe_model) @intCast(loaded.config.num_experts) else 0;
@@ -756,22 +755,22 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     // Initialize compiled layers to null (will be compiled on first use or via compileLayersForFusion)
     weight_handles.compiled_layers = null;
 
-    // Initialize fused model to null (will be created via createFusedModel)
-    weight_handles.fused_model = null;
+    // Initialize decode model to null (created by createDecodeModel when possible)
+    weight_handles.decode_model = null;
 
     return weight_handles;
 }
 
-/// Create a fully fused decode model (all layers in one C++ call) to
+/// Create a decode model (quantized or dense fused backend implementation) to
 /// reduce per-token FFI overhead.
 /// Supports both quantized (4-bit/8-bit) and dense (BF16) models.
-const FusedDecodeModelKind = enum {
+const DecodeModelCandidate = enum {
     none,
     quantized,
     dense,
 };
 
-fn classifyFusedDecodeModel(weight_handles: *const WeightHandles) FusedDecodeModelKind {
+fn classifyDecodeModelCandidate(weight_handles: *const WeightHandles) DecodeModelCandidate {
     // IMPORTANT: keep this selection fully data-driven from traced layer kinds and tensor dtypes.
     // Do not branch on model names here. Naming belongs in static model metadata.
     var all_layers_quantized = true;
@@ -830,7 +829,7 @@ const QuantizedLayout = struct {
     bits: usize,
 };
 
-fn quantizedFusedLayout(weight_handles: *const WeightHandles) ?QuantizedLayout {
+fn quantizedDecodeModelLayout(weight_handles: *const WeightHandles) ?QuantizedLayout {
     var group_size_opt: ?usize = null;
     var quant_bits_opt: ?usize = null;
 
@@ -861,7 +860,7 @@ fn quantizedFusedLayout(weight_handles: *const WeightHandles) ?QuantizedLayout {
     };
 }
 
-fn buildFusedLayerKindPlan(
+fn buildDecodeLayerKindPlan(
     allocator: std.mem.Allocator,
     layers: []const WeightHandles.LayerWeights,
 ) ![]u8 {
@@ -875,14 +874,13 @@ fn buildFusedLayerKindPlan(
     return plan;
 }
 
-pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHandles, config: anytype) !void {
-    if (weight_handles.fused_model != null) return; // Already created
-    if (weight_handles.dense_model != null) return; // Already created dense
+pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHandles, config: anytype) !void {
+    if (weight_handles.decode_model != null) return; // Already created
 
-    // MoE fused decode is not implemented yet.
+    // MoE decode-model path is not implemented yet.
     if (weight_handles.is_moe) return;
 
-    const model_kind = classifyFusedDecodeModel(weight_handles);
+    const model_kind = classifyDecodeModelCandidate(weight_handles);
     if (model_kind == .none) return;
 
     const layer_count: usize = @intCast(config.n_layers);
@@ -893,7 +891,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
 
     if (model_kind == .quantized) {
         // QUANTIZED PATH: Use FusedModelWeights with quantized_matmul
-        const quant_layout = quantizedFusedLayout(weight_handles) orelse return;
+        const quant_layout = quantizedDecodeModelLayout(weight_handles) orelse return;
 
         const fused = model_runtime.mlx_fused_model_create(
             layer_count,
@@ -907,7 +905,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
             config.norm_eps,
         );
 
-        // Set embeddings (must be quantized for fused model)
+        // Set embeddings (must be quantized for quantized decode-model path)
         if (weight_handles.embed_tokens_quantized) |quantized_weight| {
             model_runtime.mlx_fused_model_set_embeddings(fused, quantized_weight.weights, quantized_weight.scales, quantized_weight.biases);
         } else {
@@ -921,7 +919,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
             return error.FusedModelRequiresQuantizedLMHead;
         }
 
-        const layer_kind_plan = try buildFusedLayerKindPlan(allocator, weight_handles.layers);
+        const layer_kind_plan = try buildDecodeLayerKindPlan(allocator, weight_handles.layers);
         defer allocator.free(layer_kind_plan);
         model_runtime.mlx_fused_model_set_topology(fused, layer_kind_plan.ptr, layer_kind_plan.len);
 
@@ -1016,13 +1014,13 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         if (layer.shortconv_conv_bias) |b| b else null,
                     );
                 },
-                .mamba => unreachable, // filtered by classifyFusedDecodeModel()
+                .mamba => unreachable, // filtered by classifyDecodeModelCandidate()
             }
         }
 
-        weight_handles.fused_model = fused;
+        weight_handles.decode_model = model_runtime.decodeModelFromFused(fused);
 
-        // Set architecture-specific config for fused model
+        // Set architecture-specific config for quantized decode-model path
         if (weight_handles.has_norm_weight_offset or config.use_gelu or config.query_pre_attn_scalar != 0) {
             model_runtime.mlx_fused_model_set_arch_config(
                 fused,
@@ -1104,7 +1102,7 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
             return error.DenseModelRequiresLMHead;
         }
 
-        const layer_kind_plan = try buildFusedLayerKindPlan(allocator, weight_handles.layers);
+        const layer_kind_plan = try buildDecodeLayerKindPlan(allocator, weight_handles.layers);
         defer allocator.free(layer_kind_plan);
         model_runtime.mlx_dense_model_set_topology(dense, layer_kind_plan.ptr, layer_kind_plan.len);
 
@@ -1170,11 +1168,11 @@ pub fn createFusedModel(allocator: std.mem.Allocator, weight_handles: *WeightHan
                         layer.shortconv_out_proj_bf16.?,
                     );
                 },
-                .mamba => unreachable, // filtered by classifyFusedDecodeModel()
+                .mamba => unreachable, // filtered by classifyDecodeModelCandidate()
             }
         }
 
-        weight_handles.dense_model = dense;
+        weight_handles.decode_model = model_runtime.decodeModelFromDense(dense);
     }
 }
 
@@ -1237,13 +1235,8 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
         allocator.destroy(quantized_weight);
     }
 
-    // Free fused model if created
-    if (weight_handles.fused_model) |fm| {
-        model_runtime.mlx_fused_model_free(fm);
-    }
-    // Free dense model if created
-    if (weight_handles.dense_model) |dm| {
-        model_runtime.mlx_dense_model_free(dm);
+    if (weight_handles.decode_model) |decode_model| {
+        model_runtime.decodeModelFree(decode_model);
     }
 
     allocator.destroy(weight_handles);
@@ -1383,10 +1376,8 @@ pub const WeightHandles = struct {
     // Compiled layer functions (for fusion optimization)
     compiled_layers: ?[]model_runtime.CompiledLayer,
 
-    // Fully fused model (all layers in one C++ call - ZERO FFI overhead)
-    fused_model: model_runtime.FusedModelHandle,
-    // Dense model for BF16 weights (non-quantized)
-    dense_model: model_runtime.DenseModelHandle = null,
+    // Fully prepared decode model (quantized or dense backend implementation).
+    decode_model: ?model_runtime.DecodeModel = null,
 
     // Final
     ln_final: ArrayHandle,
@@ -1745,7 +1736,7 @@ test "LayerWeights storage helpers classify moe ffn path" {
     try testing.expectEqual(WeightHandles.LayerWeights.FfnStorageKind.moe, layer.ffnStorageKind());
 }
 
-test "classifyFusedDecodeModel returns quantized for mixed attention/shortconv quantized layers" {
+test "classifyDecodeModelCandidate returns quantized for mixed attention/shortconv quantized layers" {
     var layers = [_]WeightHandles.LayerWeights{
         .{
             .kind = .attention_mlp,
@@ -1778,16 +1769,16 @@ test "classifyFusedDecodeModel returns quantized for mixed attention/shortconv q
         .embed_tokens_quantized = null,
         .layers = &layers,
         .compiled_layers = null,
-        .fused_model = null,
+        .decode_model = null,
         .ln_final = testHandle(5),
         .lm_head = null,
         .lm_head_quantized = null,
     };
 
-    try testing.expectEqual(FusedDecodeModelKind.quantized, classifyFusedDecodeModel(&weight_handles));
+    try testing.expectEqual(DecodeModelCandidate.quantized, classifyDecodeModelCandidate(&weight_handles));
 }
 
-test "classifyFusedDecodeModel returns dense for mixed attention/shortconv dense layers" {
+test "classifyDecodeModelCandidate returns dense for mixed attention/shortconv dense layers" {
     var layers = [_]WeightHandles.LayerWeights{
         .{
             .kind = .attention_mlp,
@@ -1820,16 +1811,16 @@ test "classifyFusedDecodeModel returns dense for mixed attention/shortconv dense
         .embed_tokens_quantized = null,
         .layers = &layers,
         .compiled_layers = null,
-        .fused_model = null,
+        .decode_model = null,
         .ln_final = testHandle(30),
         .lm_head = null,
         .lm_head_quantized = null,
     };
 
-    try testing.expectEqual(FusedDecodeModelKind.dense, classifyFusedDecodeModel(&weight_handles));
+    try testing.expectEqual(DecodeModelCandidate.dense, classifyDecodeModelCandidate(&weight_handles));
 }
 
-test "quantizedFusedLayout rejects mixed quantization layout" {
+test "quantizedDecodeModelLayout rejects mixed quantization layout" {
     var layers = [_]WeightHandles.LayerWeights{
         .{
             .kind = .attention_mlp,
@@ -1862,13 +1853,13 @@ test "quantizedFusedLayout rejects mixed quantization layout" {
         .embed_tokens_quantized = null,
         .layers = &layers,
         .compiled_layers = null,
-        .fused_model = null,
+        .decode_model = null,
         .ln_final = testHandle(5),
         .lm_head = null,
         .lm_head_quantized = null,
     };
 
-    try testing.expect(quantizedFusedLayout(&weight_handles) == null);
+    try testing.expect(quantizedDecodeModelLayout(&weight_handles) == null);
 }
 
 /// Helper to create a minimal test LoadedModel with BF16 weights (non-quantized path)
@@ -2064,7 +2055,7 @@ test "freeWeights releases all GPU resources" {
     // If we get here without crash, test passes
 }
 
-test "createFusedModel skips when fused_model already exists" {
+test "createDecodeModel skips when decode_model already exists (quantized)" {
     if (comptime builtin.os.tag != .macos) return;
     if (!metal_device.isAvailable()) return;
 
@@ -2074,21 +2065,24 @@ test "createFusedModel skips when fused_model already exists" {
     const weight_handles = try loadWeightsToGPU(testing.allocator, loaded);
     defer freeWeights(testing.allocator, weight_handles);
 
-    // Set a sentinel value for fused_model
-    const original_fused = weight_handles.fused_model;
-    weight_handles.fused_model = @ptrFromInt(0xDEADBEEF);
+    // Set a sentinel decode model
+    const original_decode_model = weight_handles.decode_model;
+    weight_handles.decode_model = .{
+        .handle = @ptrFromInt(0xDEADBEEF),
+    };
 
-    // createFusedModel should return early without changing it
-    try createFusedModel(testing.allocator, weight_handles, loaded.config);
+    // createDecodeModel should return early without changing it
+    try createDecodeModel(testing.allocator, weight_handles, loaded.config);
 
     // Verify it wasn't changed
-    try testing.expect(weight_handles.fused_model == @as(?*anyopaque, @ptrFromInt(0xDEADBEEF)));
+    try testing.expect(weight_handles.decode_model != null);
+    try testing.expect(weight_handles.decode_model.?.handle == @as(*anyopaque, @ptrFromInt(0xDEADBEEF)));
 
     // Restore for proper cleanup
-    weight_handles.fused_model = original_fused;
+    weight_handles.decode_model = original_decode_model;
 }
 
-test "createFusedModel skips when dense_model already exists" {
+test "createDecodeModel skips when decode_model already exists (dense)" {
     if (comptime builtin.os.tag != .macos) return;
     if (!metal_device.isAvailable()) return;
 
@@ -2098,18 +2092,21 @@ test "createFusedModel skips when dense_model already exists" {
     const weight_handles = try loadWeightsToGPU(testing.allocator, loaded);
     defer freeWeights(testing.allocator, weight_handles);
 
-    // Set a sentinel value for dense_model
-    const original_dense = weight_handles.dense_model;
-    weight_handles.dense_model = @ptrFromInt(0xDEADBEEF);
+    // Set a sentinel decode model
+    const original_decode_model = weight_handles.decode_model;
+    weight_handles.decode_model = .{
+        .handle = @ptrFromInt(0xDEADBEEF),
+    };
 
-    // createFusedModel should return early without error
-    try createFusedModel(testing.allocator, weight_handles, loaded.config);
+    // createDecodeModel should return early without error
+    try createDecodeModel(testing.allocator, weight_handles, loaded.config);
 
-    // Verify dense_model wasn't changed
-    try testing.expect(weight_handles.dense_model == @as(?*anyopaque, @ptrFromInt(0xDEADBEEF)));
+    // Verify decode_model wasn't changed
+    try testing.expect(weight_handles.decode_model != null);
+    try testing.expect(weight_handles.decode_model.?.handle == @as(*anyopaque, @ptrFromInt(0xDEADBEEF)));
 
     // Restore for proper cleanup
-    weight_handles.dense_model = original_dense;
+    weight_handles.decode_model = original_decode_model;
 }
 
 test "Model.forward produces logits from input tokens" {

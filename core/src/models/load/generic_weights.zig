@@ -18,7 +18,6 @@ const WeightMap = std.StringHashMapUnmanaged(*const Tensor);
 
 pub const LoadOptions = struct {
     preserve_native_norm_dtype: bool = false,
-    force_mamba_f32: bool = false,
 };
 
 pub fn loadWeightMap(
@@ -110,12 +109,10 @@ fn applySpecTransforms(
         .none => raw_tensor,
     };
 
-    tensor_view = try maybeForceMambaF32(allocator, tensor_view, spec.id, options);
-    if (options.force_mamba_f32 and isMambaKernelWeight(spec.id)) return tensor_view;
-
-    const force_f32 = hasTransform(spec.transforms, .dtype_f32) or spec.layout == .conv1d_depthwise;
+    const force_f32 = spec.force_f32 or hasTransform(spec.transforms, .dtype_f32) or spec.layout == .conv1d_depthwise;
     if (force_f32 or (spec.layout == .none and !isNormModule(spec.module_type))) {
-        if (!(options.preserve_native_norm_dtype and isNormModule(spec.module_type))) {
+        const preserve_norm_dtype = options.preserve_native_norm_dtype and isNormModule(spec.module_type) and !force_f32;
+        if (!preserve_norm_dtype) {
             tensor_view = try transforms.ensureF32(allocator, tensor_view);
             if (spec.layout == .linear and tensor_view.dtype == .f32) {
                 // Grouped-affine weights are converted to F32 after orientWeight().
@@ -126,21 +123,6 @@ fn applySpecTransforms(
     }
 
     return tensor_view;
-}
-
-fn maybeForceMambaF32(allocator: Allocator, tensor_view: Tensor, spec_id: []const u8, options: LoadOptions) !Tensor {
-    if (!options.force_mamba_f32) return tensor_view;
-    if (!isMambaKernelWeight(spec_id)) return tensor_view;
-    return try transforms.ensureF32(allocator, tensor_view);
-}
-
-fn isMambaKernelWeight(spec_id: []const u8) bool {
-    return std.mem.eql(u8, spec_id, "mixer.conv1d.weight") or
-        std.mem.eql(u8, spec_id, "mixer.conv1d.bias") or
-        std.mem.eql(u8, spec_id, "mixer.A_log") or
-        std.mem.eql(u8, spec_id, "mixer.D") or
-        std.mem.eql(u8, spec_id, "mixer.dt_bias") or
-        std.mem.eql(u8, spec_id, "mixer.norm.weight");
 }
 
 /// Determine the expected input dimension for weight orientation.
@@ -291,23 +273,72 @@ test "loadWeightMap tested via integration tests" {
     // The function delegates to loadWeightBySpec which is also integration-tested.
 }
 
-test "maybeForceMambaF32 converts only mamba kernel weights" {
+test "WeightSpec.force_f32 overrides preserve_native_norm_dtype for norm weights" {
     const allocator = std.testing.allocator;
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
 
-    var owned = try tensor.OwnedTensor.init(arena_alloc, .bf16, &.{ 2, 2 });
-    defer owned.deinit();
+    var raw_owned = try tensor.OwnedTensor.init(arena_alloc, .bf16, &.{ 2, 2 });
+    defer raw_owned.deinit();
+    const raw_tensor = raw_owned.view();
 
-    // Mamba SSM-specific weights (conv1d, A_log, D, dt_bias, norm) should be converted to F32
-    const mamba_forced = try maybeForceMambaF32(arena_alloc, owned.view(), "mixer.A_log", .{ .force_mamba_f32 = true });
-    try std.testing.expectEqual(tensor.DType.f32, mamba_forced.dtype);
+    var dummy_safetensors: st_loader.UnifiedSafeTensors = undefined;
 
-    const in_proj_unforced = try maybeForceMambaF32(arena_alloc, owned.view(), "mixer.in_proj.weight", .{ .force_mamba_f32 = true });
-    try std.testing.expectEqual(tensor.DType.bf16, in_proj_unforced.dtype);
+    const spec_force = WeightSpec{
+        .id = "mixer.norm.weight",
+        .candidates = &.{"model.layers.{d}.mixer.norm.weight"},
+        .module_type = "RMSNorm",
+        .layout = .none,
+        .dtype = "float32",
+        .required = true,
+        .force_f32 = true,
+    };
+    const spec_preserve = WeightSpec{
+        .id = "mixer.norm.weight",
+        .candidates = &.{"model.layers.{d}.mixer.norm.weight"},
+        .module_type = "RMSNorm",
+        .layout = .none,
+        .dtype = "float32",
+        .required = true,
+        .force_f32 = false,
+    };
 
-    // MLP weights (even in Mamba blocks) should NOT be forced to F32 by this function
-    const mlp_unforced = try maybeForceMambaF32(arena_alloc, owned.view(), "mlp.input_linear.weight", .{ .force_mamba_f32 = true });
-    try std.testing.expectEqual(tensor.DType.bf16, mlp_unforced.dtype);
+    const model_config = tensor.ModelConfig{
+        .d_model = 2,
+        .vocab_size = 16,
+        .n_layers = 1,
+        .n_heads = 1,
+        .n_kv_groups = 1,
+        .d_ff = 4,
+        .head_dim = 2,
+        .max_seq_len = 16,
+        .rope_theta = 10_000.0,
+        .norm_eps = 1e-5,
+        .gaffine_group_size = 32,
+        .model_arch = .custom,
+    };
+
+    const force_tensor = try applySpecTransforms(
+        arena_alloc,
+        &dummy_safetensors,
+        "model.layers.0.mixer.norm.weight",
+        raw_tensor,
+        spec_force,
+        &model_config,
+        .{ .preserve_native_norm_dtype = true },
+    );
+
+    const preserve_tensor = try applySpecTransforms(
+        arena_alloc,
+        &dummy_safetensors,
+        "model.layers.0.mixer.norm.weight",
+        raw_tensor,
+        spec_preserve,
+        &model_config,
+        .{ .preserve_native_norm_dtype = true },
+    );
+
+    try std.testing.expectEqual(tensor.DType.f32, force_tensor.dtype);
+    try std.testing.expectEqual(tensor.DType.bf16, preserve_tensor.dtype);
 }

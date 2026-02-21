@@ -1,15 +1,23 @@
 //! Metal backend vision module.
 //!
-//! Vision preprocessing/runtime currently delegates to CPU implementation.
-//! Keeping this under `metal/vision/` makes delegation explicit and keeps
-//! backend module layout symmetric.
+//! Metal-native vision runtime module.
+//!
+//! Keeps vision preprocessing/runtime under `metal/vision/` so backend
+//! ownership is explicit. Runtime compute executes on Metal through MLX.
 
-const cpu_vision_types = @import("../../cpu/vision/types.zig");
-const cpu_vision = @import("../../cpu/vision/root.zig");
+const std = @import("std");
+const native = @import("native_split_qkv.zig");
 
-pub const PrefillVisionImage = cpu_vision_types.PrefillVisionImage;
-pub const PrefillVisionInput = cpu_vision_types.PrefillVisionInput;
-pub const EncodedVisionOutput = cpu_vision_types.EncodedVisionOutput;
+pub const PrefillVisionImage = native.PrefillVisionImage;
+pub const PrefillVisionInput = native.PrefillVisionInput;
+pub const EncodedVisionOutput = native.EncodedVisionOutput;
+pub const VisionRuntime = native.VisionRuntime;
+pub const scatterVisionEmbeddings = native.scatterVisionEmbeddings;
 
-pub const VisionRuntime = cpu_vision.VisionRuntime;
-pub const scatterVisionEmbeddings = cpu_vision.scatterVisionEmbeddings;
+pub fn maxPixels() u64 {
+    return 512 * 512;
+}
+
+test "maxPixels returns metal vision limit" {
+    try std.testing.expectEqual(@as(u64, 512 * 512), maxPixels());
+}

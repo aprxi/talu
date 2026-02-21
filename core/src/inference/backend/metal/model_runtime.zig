@@ -10,6 +10,9 @@ pub const ShortConvCacheHandle = runtime_graph.ShortConvCacheHandle;
 pub const FusedModelHandle = ?*anyopaque;
 pub const DenseModelHandle = ?*anyopaque;
 pub const CompiledLayerHandle = ?*anyopaque;
+pub const DecodeModel = struct {
+    handle: *anyopaque,
+};
 
 pub const CompiledLayer = struct {
     handle: CompiledLayerHandle,
@@ -25,6 +28,111 @@ pub const CompiledLayer = struct {
         return mlx_layer_forward(self.handle, hidden, cache_ptr, layer_idx, pos_offset);
     }
 };
+
+pub fn decodeModelFromFused(handle: FusedModelHandle) ?DecodeModel {
+    if (handle) |h| {
+        const wrapped = mlx_decode_model_wrap_fused(h);
+        if (wrapped) |w| return .{ .handle = w };
+        mlx_fused_model_free(h);
+    }
+    return null;
+}
+
+pub fn decodeModelFromDense(handle: DenseModelHandle) ?DecodeModel {
+    if (handle) |h| {
+        const wrapped = mlx_decode_model_wrap_dense(h);
+        if (wrapped) |w| return .{ .handle = w };
+        mlx_dense_model_free(h);
+    }
+    return null;
+}
+
+pub fn decodeModelFree(model: DecodeModel) void {
+    mlx_decode_model_free(model.handle);
+}
+
+pub fn decodeStepLogits(
+    model: DecodeModel,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    token_id: u32,
+    pos_offset: usize,
+) ArrayHandle {
+    return mlx_decode_model_step_logits(model.handle, cache, shortconv_cache, token_id, pos_offset);
+}
+
+pub fn decodeBatch(
+    model: DecodeModel,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    first_token: u32,
+    start_pos: usize,
+    out_tokens: [*]u32,
+    max_tokens: usize,
+    eos_ids: [*]const u32,
+    n_eos_ids: usize,
+) u32 {
+    return mlx_decode_model_decode_batch(model.handle, cache, shortconv_cache, first_token, start_pos, out_tokens, max_tokens, eos_ids, n_eos_ids);
+}
+
+pub fn pipelinePrime(
+    model: DecodeModel,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    first_token_id: u32,
+    pos_offset: usize,
+) void {
+    mlx_decode_model_pipeline_prime(model.handle, cache, shortconv_cache, first_token_id, pos_offset);
+}
+
+pub fn pipelineStep(
+    model: DecodeModel,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    pos_offset: usize,
+) u32 {
+    return mlx_decode_model_pipeline_step(model.handle, cache, shortconv_cache, pos_offset);
+}
+
+pub fn pipelineFlush(model: DecodeModel) u32 {
+    return mlx_decode_model_pipeline_flush(model.handle);
+}
+
+pub extern fn mlx_decode_model_wrap_fused(model: *anyopaque) ?*anyopaque;
+pub extern fn mlx_decode_model_wrap_dense(model: *anyopaque) ?*anyopaque;
+pub extern fn mlx_decode_model_free(model: *anyopaque) void;
+pub extern fn mlx_decode_model_step_logits(
+    model: *anyopaque,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    token_id: u32,
+    pos_offset: usize,
+) ArrayHandle;
+pub extern fn mlx_decode_model_decode_batch(
+    model: *anyopaque,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    first_token: u32,
+    start_pos: usize,
+    out_tokens: [*]u32,
+    max_tokens: usize,
+    eos_ids: [*]const u32,
+    n_eos_ids: usize,
+) u32;
+pub extern fn mlx_decode_model_pipeline_prime(
+    model: *anyopaque,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    first_token_id: u32,
+    pos_offset: usize,
+) void;
+pub extern fn mlx_decode_model_pipeline_step(
+    model: *anyopaque,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    pos_offset: usize,
+) u32;
+pub extern fn mlx_decode_model_pipeline_flush(model: *anyopaque) u32;
 
 pub extern fn mlx_compile_layer(
     q_weight: ArrayHandle,

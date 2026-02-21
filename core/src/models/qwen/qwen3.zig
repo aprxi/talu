@@ -98,6 +98,7 @@ pub var arch: types.Architecture = .{
     .block_weights = &qwen3_block_weights,
     .global_weights = &qwen3_global_weights,
     .weight_prefixes = &qwen3_weight_prefixes,
+    .d_ff_source_weight_ids = &.{"mlp.gate_proj.weight"},
     .has_qk_norm = true,
     .has_moe = false,
     .has_mamba = false,

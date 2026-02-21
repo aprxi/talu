@@ -3,13 +3,13 @@
 pub const supported = true;
 
 const weights = @import("../executor/weights.zig");
-const cache_executor = @import("../executor/runtime.zig");
+const runtime_graph = @import("../runtime_graph.zig");
 const mlx_fused = @import("../mlx/ffi.zig");
 
 const ArrayHandle = mlx_fused.ArrayHandle;
 
 pub const WeightHandles = weights.WeightHandles;
-pub const ShortConvCache = cache_executor.ShortConvCache;
+pub const ShortConvCache = runtime_graph.ShortConvCache;
 
 pub const ShortConvState = struct {
     cache: ?ShortConvCache = null,

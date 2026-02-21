@@ -124,6 +124,7 @@
 //! ```
 
 const std = @import("std");
+const progress_mod = @import("../capi/progress.zig");
 
 pub const local = @import("local.zig");
 pub const capi_bridge = @import("capi_bridge.zig");
@@ -357,6 +358,16 @@ pub fn getOrCreateEngineWithConfig(
     model_id: []const u8,
     config: ResolutionConfig,
 ) !*LocalEngine {
+    return getOrCreateEngineWithBackendConfig(allocator, model_id, config, .{});
+}
+
+/// Get or create an engine for a model identifier with resolution and backend config.
+pub fn getOrCreateEngineWithBackendConfig(
+    allocator: std.mem.Allocator,
+    model_id: []const u8,
+    config: ResolutionConfig,
+    backend_init_options: local.BackendInitOptions,
+) !*LocalEngine {
     engine_cache_mutex.lock();
     defer engine_cache_mutex.unlock();
 
@@ -368,7 +379,14 @@ pub fn getOrCreateEngineWithConfig(
     const engine = try allocator.create(LocalEngine);
     errdefer allocator.destroy(engine);
 
-    engine.* = try LocalEngine.initWithResolutionConfig(allocator, model_id, config);
+    engine.* = try LocalEngine.initWithSeedAndResolutionConfig(
+        allocator,
+        model_id,
+        42,
+        config,
+        backend_init_options,
+        progress_mod.ProgressContext.NONE,
+    );
 
     // Cache with copied key
     const key = try allocator.dupe(u8, model_id);

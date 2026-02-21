@@ -438,7 +438,7 @@ pub fn createInferenceBackend(
         .Local => {
             const engine = try allocator.create(local_mod.LocalEngine);
             errdefer allocator.destroy(engine);
-            engine.* = try local_mod.LocalEngine.initWithSeedAndResolutionConfig(allocator, canon.ref, 42, .{}, progress);
+            engine.* = try local_mod.LocalEngine.initWithSeedAndResolutionConfig(allocator, canon.ref, 42, .{}, .{}, progress);
             if (std.debug.runtime_safety) {
                 // Ensure the engine owns an independent model path copy.
                 std.debug.assert(engine.*.model_path.len == canon.ref.len);

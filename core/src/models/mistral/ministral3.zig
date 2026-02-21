@@ -115,6 +115,7 @@ pub var arch: types.Architecture = .{
     .block_weights = &ministral3_block_weights,
     .global_weights = &ministral3_global_weights,
     .weight_prefixes = &ministral3_weight_prefixes,
+    .d_ff_source_weight_ids = &.{"block_sparse_moe.experts.0.gate_proj.weight"},
     .has_qk_norm = false,
     .has_moe = true,
     .has_mamba = false,

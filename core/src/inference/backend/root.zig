@@ -12,14 +12,6 @@
 //! 3. Model type (MoE/Mamba not supported on Metal)
 //! 4. Build configuration (`enable_metal` flag)
 //!
-//! ## Override
-//!
-//! Set `BACKEND` environment variable to override:
-//! - `BACKEND=cpu` - Force FusedCpuBackend
-//! - `BACKEND=metal` - Force MetalBackend (macOS only)
-//!
-//! The `BACKEND` override is deprecated and will be removed in a future phase.
-//!
 //! ## Supported Backends
 //!
 //! | Backend | Type | Description |
@@ -39,7 +31,6 @@ const build_options = @import("build_options");
 pub const contract = @import("contract.zig");
 
 const models = @import("../../models/root.zig");
-const capi = @import("../../capi/error.zig");
 const log = @import("../../log.zig");
 const progress_mod = @import("../../capi/progress.zig");
 const tensor = @import("../../tensor.zig");
@@ -50,7 +41,6 @@ const LoadedModel = models.LoadedModel;
 const LoadOptions = models.LoadOptions;
 
 pub const cpu = @import("cpu/root.zig");
-pub const topology = @import("topology.zig");
 
 /// Re-export types used by the scheduler interface
 pub const DecodeRequest = contract.DecodeRequest;
@@ -66,6 +56,7 @@ pub const metal = if (has_metal) @import("metal/root.zig") else struct {
 
 comptime {
     contract.assertBackendModuleLayout(cpu, "cpu");
+    contract.assertVisionModuleLayout(cpu.vision, "cpu");
     contract.assertExecutorModuleLayout(cpu.executor, "cpu");
     contract.assertExecutorSymbolLayout(cpu.executor, "cpu");
     contract.assertKernelModuleLayout(cpu.kernels, "cpu");
@@ -77,6 +68,7 @@ comptime {
     contract.assertBackendType(cpu.BackendType);
     if (has_metal) {
         contract.assertBackendModuleLayout(metal, "metal");
+        contract.assertVisionModuleLayout(metal.vision, "metal");
         contract.assertExecutorModuleLayout(metal.executor, "metal");
         contract.assertExecutorSymbolLayout(metal.executor, "metal");
         contract.assertKernelModuleLayout(metal.kernels, "metal");
@@ -94,18 +86,29 @@ const DEFAULT_MAX_BATCH_SIZE: usize = 8;
 
 /// Compute model-load options before backend initialization.
 /// This keeps backend/platform policy out of io/ while preserving fast paths.
-pub fn defaultModelLoadOptions() LoadOptions {
+pub fn defaultModelLoadOptions(init_options: InitOptions) LoadOptions {
     return .{
-        .preserve_native_norm_dtype = shouldPreserveNativeNormDType(),
+        .preserve_native_norm_dtype = shouldPreserveNativeNormDType(init_options.selection),
     };
 }
 
-fn shouldPreserveNativeNormDType() bool {
-    if (std.posix.getenv("BACKEND")) |backend_override| {
-        if (std.mem.eql(u8, backend_override, "cpu")) return false;
-        if (std.mem.eql(u8, backend_override, "metal")) return has_metal;
-    }
-    return has_metal;
+pub const Selection = enum {
+    auto,
+    cpu,
+    metal,
+};
+
+/// Backend initialization options selected at startup/config layer.
+pub const InitOptions = struct {
+    selection: Selection = .auto,
+};
+
+fn shouldPreserveNativeNormDType(selection: Selection) bool {
+    return switch (selection) {
+        .auto => has_metal,
+        .cpu => false,
+        .metal => has_metal,
+    };
 }
 
 /// Backend type - tagged union of available backends
@@ -145,10 +148,16 @@ pub const Backend = union(enum) {
 
     /// Initialize the appropriate backend based on platform and model format.
     /// Automatically selects FusedCpuBackend for CPU, Metal when available.
-    pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel, progress: progress_mod.ProgressContext) !Backend {
-        // Check for BACKEND override
-        if (std.posix.getenv("BACKEND")) |backend_override| {
-            return initFromOverride(allocator, loaded, backend_override, progress);
+    pub fn init(
+        allocator: std.mem.Allocator,
+        loaded: *LoadedModel,
+        init_options: InitOptions,
+        progress: progress_mod.ProgressContext,
+    ) !Backend {
+        switch (init_options.selection) {
+            .cpu => return initCpu(allocator, loaded, "configured", progress),
+            .metal => return initMetal(allocator, loaded, "configured"),
+            .auto => {},
         }
 
         // Check if we should use Metal backend (macOS + quantized/bf16 model)
@@ -160,8 +169,7 @@ pub const Backend = union(enum) {
                         .reason = @errorName(err),
                         .detail = getMetalUnsupportedReason(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features),
                     });
-                    const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
-                    return .{ .cpu = cpu_backend_state };
+                    return initCpu(allocator, loaded, "auto_fallback", progress);
                 }
                 return err;
             };
@@ -170,9 +178,7 @@ pub const Backend = union(enum) {
         }
 
         // Default to CPU backend
-        const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
-        log.debug("inference", "Backend selected", .{ .backend = "cpu", .reason = "default" }, @src());
-        return .{ .cpu = cpu_backend_state };
+        return initCpu(allocator, loaded, "default", progress);
     }
 
     /// Clean up backend resources
@@ -371,13 +377,11 @@ pub const Backend = union(enum) {
     }
 
     /// Maximum pixel count the vision encoder can handle efficiently.
-    ///
-    /// Today all backends use the CPU vision encoder (O(n²) serial attention),
-    /// so they all return 512².  When a backend gains a flash-attention vision
-    /// encoder, it raises its own value here.
     pub fn visionMaxPixels(self: *const Backend) u64 {
-        _ = self;
-        return 512 * 512;
+        return switch (self.*) {
+            .cpu => cpu.vision.maxPixels(),
+            .metal => if (has_metal) metal.vision.maxPixels() else unreachable,
+        };
     }
 };
 
@@ -424,30 +428,28 @@ fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool 
     return runtime.has_mamba or runtime.has_mla;
 }
 
-fn initFromOverride(
+fn initCpu(
     allocator: std.mem.Allocator,
     loaded: *LoadedModel,
-    backend_override: []const u8,
+    reason: []const u8,
     progress: progress_mod.ProgressContext,
 ) !Backend {
-    if (std.mem.eql(u8, backend_override, "cpu")) {
-        log.info("inference", "BACKEND=cpu: forcing CPU backend", .{});
-        const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
-        log.debug("inference", "Backend selected", .{ .backend = "cpu", .reason = "forced" }, @src());
-        return .{ .cpu = cpu_backend_state };
+    const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
+    log.debug("inference", "Backend selected", .{ .backend = "cpu", .reason = reason }, @src());
+    return .{ .cpu = cpu_backend_state };
+}
+
+fn initMetal(
+    allocator: std.mem.Allocator,
+    loaded: *LoadedModel,
+    reason: []const u8,
+) !Backend {
+    if (!has_metal) {
+        return error.MetalNotEnabled;
     }
-    if (std.mem.eql(u8, backend_override, "metal")) {
-        if (!has_metal) {
-            capi.setContext("BACKEND=metal requested but Metal backend is not enabled for this build/platform", .{});
-            return error.MetalNotEnabled;
-        }
-        log.info("inference", "BACKEND=metal: forcing Metal backend", .{});
-        const metal_backend_state = try metal.BackendType.init(allocator, loaded);
-        log.debug("inference", "Backend selected", .{ .backend = "metal", .reason = "forced" }, @src());
-        return .{ .metal = metal_backend_state };
-    }
-    capi.setContext("Unknown BACKEND value: {s}", .{backend_override});
-    return error.InvalidBackendOverride;
+    const metal_backend_state = try metal.BackendType.init(allocator, loaded);
+    log.debug("inference", "Backend selected", .{ .backend = "metal", .reason = reason }, @src());
+    return .{ .metal = metal_backend_state };
 }
 
 // ============================================================================
@@ -511,8 +513,13 @@ test "isMetalSupported rejects mamba models" {
 }
 
 test "defaultModelLoadOptions follows platform capability" {
-    const opts = defaultModelLoadOptions();
+    const opts = defaultModelLoadOptions(.{});
     try std.testing.expectEqual(has_metal, opts.preserve_native_norm_dtype);
+}
+
+test "defaultModelLoadOptions honors explicit CPU selection" {
+    const opts = defaultModelLoadOptions(.{ .selection = .cpu });
+    try std.testing.expectEqual(false, opts.preserve_native_norm_dtype);
 }
 
 test "backend selection" {
@@ -669,8 +676,7 @@ test "kernel parity: embedding lookup cpu vs metal" {
         .embed_tokens_quantized = null,
         .layers = empty_layers[0..],
         .compiled_layers = null,
-        .fused_model = null,
-        .dense_model = null,
+        .decode_model = null,
         .ln_final = dummy_ln,
         .lm_head = null,
         .lm_head_quantized = null,
@@ -717,8 +723,7 @@ test "kernel parity: weight access error semantics cpu vs metal" {
         .embed_tokens_quantized = null,
         .layers = empty_layers[0..],
         .compiled_layers = null,
-        .fused_model = null,
-        .dense_model = null,
+        .decode_model = null,
         .ln_final = dummy_ln,
         .lm_head = null,
         .lm_head_quantized = null,
@@ -728,4 +733,14 @@ test "kernel parity: weight access error semantics cpu vs metal" {
     };
     var metal_out: *const metal.executor.weights.WeightHandles.LayerWeights = undefined;
     try std.testing.expectError(error.InvalidArgument, metal_access.forward(0, &metal_out));
+}
+
+test "visionMaxPixels dispatches to backend vision module" {
+    var cpu_backend = Backend{ .cpu = undefined };
+    try std.testing.expectEqual(cpu.vision.maxPixels(), cpu_backend.visionMaxPixels());
+
+    if (has_metal) {
+        var metal_backend = Backend{ .metal = undefined };
+        try std.testing.expectEqual(metal.vision.maxPixels(), metal_backend.visionMaxPixels());
+    }
 }

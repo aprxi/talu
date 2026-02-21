@@ -9,19 +9,15 @@ const std = @import("std");
 const loader = @import("loader.zig");
 const progress_mod = @import("../capi/progress.zig");
 
-pub const contract = @import("contract.zig");
 pub const registry = @import("registry.zig");
 pub const layer_ops = @import("layer_ops.zig");
 pub const op_types = @import("op_types.zig");
 pub const config = @import("config/root.zig");
-
 pub const common = struct {
     pub const types = @import("common/types.zig");
-    pub const weight_manifest = @import("common/weight_manifest.zig");
-    pub const memory_requirements = @import("common/memory_requirements.zig");
 };
+pub const ModelDescriptor = registry.Entry;
 
-// Compatibility exports during phased migration (old loader API surface).
 pub const LoadedModel = loader.LoadedModel;
 pub const LoadOptions = loader.LoadOptions;
 pub const weights = loader.weights;
@@ -41,7 +37,7 @@ pub fn loadArchitectureDefinitions(allocator: std.mem.Allocator) bool {
     return registry.loadArchitectureDefinitions(allocator);
 }
 
-pub fn detectByModelType(model_type: []const u8) ?contract.ModelDescriptor {
+pub fn detectByModelType(model_type: []const u8) ?ModelDescriptor {
     return registry.detectByModelType(model_type);
 }
 

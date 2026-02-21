@@ -2,13 +2,13 @@
 
 pub const supported = true;
 
-const cache_executor = @import("../executor/runtime.zig");
+const runtime_graph = @import("../runtime_graph.zig");
 const weights = @import("../executor/weights.zig");
 const mlx_fused = @import("../mlx/ffi.zig");
 
 const ArrayHandle = mlx_fused.ArrayHandle;
 
-pub const Cache = cache_executor.Cache;
+pub const Cache = runtime_graph.Cache;
 
 pub const AttnCache = struct {
     cache: ?Cache = null,
@@ -204,3 +204,5 @@ pub const MultiHeadAttention = struct {
         );
     }
 };
+
+pub const FusedAttention = MultiHeadAttention;

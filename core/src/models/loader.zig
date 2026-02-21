@@ -8,16 +8,10 @@ const json = @import("../io/json/root.zig");
 const tensor = @import("../tensor.zig");
 const op_types = @import("op_types.zig");
 const weights_impl = @import("load/weights.zig");
-const moe = @import("load/moe.zig");
 const models_registry = @import("registry.zig");
 const log = @import("../log.zig");
 const progress_mod = @import("../capi/progress.zig");
 const validation = @import("load/validation.zig");
-
-// Generic MoE hooks for models that use Mixture of Experts
-const moe_hooks = struct {
-    pub const inferMoEFromWeights = moe.MoEHooks.inferMoEFromWeights;
-};
 
 // Re-export types
 pub const weights = weights_impl;
@@ -62,8 +56,7 @@ fn loadSafeTensorsModel(
     const model_kind = try detectModelKind(backing_allocator, config_path);
 
     // Load model using architecture-driven metadata with MoE support.
-    var loaded_model = try weights_impl.loadModelWithHooks(
-        moe_hooks,
+    var loaded_model = try weights_impl.loadModelWithArchitecture(
         backing_allocator,
         config_path,
         weights_path,

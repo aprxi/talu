@@ -96,6 +96,7 @@ pub var arch: types.Architecture = .{
     .block_weights = &llama2_block_weights,
     .global_weights = &llama2_global_weights,
     .weight_prefixes = &llama2_weight_prefixes,
+    .d_ff_source_weight_ids = &.{"mlp.gate_proj.weight"},
     .has_qk_norm = false,
     .has_moe = false,
     .has_mamba = false,

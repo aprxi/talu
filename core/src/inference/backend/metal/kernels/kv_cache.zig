@@ -3,10 +3,10 @@
 pub const supported = true;
 
 const compute = @import("../../../../compute/root.zig");
-const cache = @import("../executor/runtime.zig");
+const runtime_graph = @import("../runtime_graph.zig");
 
-pub const Cache = cache.Cache;
-pub const ShortConvCache = cache.ShortConvCache;
+pub const Cache = runtime_graph.Cache;
+pub const ShortConvCache = runtime_graph.ShortConvCache;
 const ArrayHandle = compute.metal.graph.ArrayHandle;
 
 pub const KVCache = struct {

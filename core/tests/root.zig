@@ -83,7 +83,6 @@ pub const io_repository_cached_model_list_c = @import("io/repository/cached_mode
 pub const io_json = @import("io/json_test.zig");
 
 // inference
-pub const inference_model_loader_arch_check = @import("inference/model_loader_architecture_check_test.zig");
 pub const inference_config_generation = @import("inference/config/generation_config_test.zig");
 
 // converter (top-level, not in io/)

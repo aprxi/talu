@@ -24,6 +24,13 @@ pub const PrefillVisionImage = common_vision.PrefillVisionImage;
 pub const PrefillVisionInput = common_vision.PrefillVisionInput;
 pub const EncodedVisionOutput = common_vision.EncodedVisionOutput;
 
+/// CPU vision runtime uses serial O(n²) attention today.
+pub const MAX_PIXELS: u64 = 512 * 512;
+
+pub fn maxPixels() u64 {
+    return MAX_PIXELS;
+}
+
 const VisionAttentionLayout = enum {
     fused_qkv,
     split_qkv,
@@ -467,4 +474,8 @@ test "inferSpatialMergeSize infers square merge units from merger input width" {
     var data: [8]f32 = [_]f32{0} ** 8;
     const weight = tensor.Tensor.view2DSlice(data[0..], 2, 4);
     try std.testing.expectEqual(@as(?i32, 2), inferSpatialMergeSize(weight, 1));
+}
+
+test "maxPixels returns cpu vision limit" {
+    try std.testing.expectEqual(@as(u64, 512 * 512), maxPixels());
 }

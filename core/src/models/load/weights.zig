@@ -11,18 +11,19 @@ const compute = @import("../../compute/root.zig");
 const rope_math = compute.cpu.math;
 const log = @import("../../log.zig");
 const progress_mod = @import("../../capi/progress.zig");
+const runtime_blocks = @import("runtime_blocks.zig");
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
 const DType = dtype.DType;
 const cfg_loader = @import("../config/root.zig");
 const st_loader = @import("../../io/safetensors/root.zig");
-const inference_mod = @import("../../inference/root.zig");
 const model_types = @import("../op_types.zig");
-pub const transformer = inference_mod.backend.block_kernels;
 const transforms = @import("transforms.zig");
 const generic_weights = @import("generic_weights.zig");
 const rope_scaling = @import("rope_scaling.zig");
+
+pub const blocks = runtime_blocks;
 
 const maybeConcatGateUpWeights = transforms.maybeConcatGateUpWeights;
 const maybeConcatQkvWeights = transforms.maybeConcatQkvWeights;
@@ -33,8 +34,6 @@ const convertToF32 = transforms.convertToF32;
 const bytesToU16Slice = transforms.bytesToU16Slice;
 const orientWeightF32 = transforms.orientWeightF32;
 const orientWeightTyped = transforms.orientWeightTyped;
-
-const NoHooks = struct {};
 
 pub const LoadOptions = struct {
     /// Keep native (bf16/f16) norm weight dtype instead of converting to f32.
@@ -56,7 +55,7 @@ pub const LoadedModel = struct {
     /// Optional embedding layer norm (BERT-family).
     embedding_norm_weight: ?Tensor = null,
     embedding_norm_bias: ?Tensor = null,
-    blocks: []transformer.BlockWeights,
+    blocks: []runtime_blocks.BlockWeights,
     /// Original dtype of projection weights (before conversion to f32)
     /// Used to detect BF16 models for MLX GPU path
     original_weight_dtype: DType,
@@ -65,38 +64,12 @@ pub const LoadedModel = struct {
     /// Total tensor count (for display)
     tensor_count: usize = 0,
 
-    cpu_blocks: ?[]transformer.TransformerBlock = null,
-    cpu_blocks_allocator: ?std.mem.Allocator = null,
-
     /// RoPE instances allocated with backing_allocator (not arena) to support realloc.
     /// These must be explicitly freed in deinit().
     rope_global: ?*rope_math.RoPE = null,
     rope_local: ?*rope_math.RoPE = null,
 
-    pub fn ensureCpuBlocks(self: *LoadedModel, allocator: std.mem.Allocator, progress: progress_mod.ProgressContext) ![]const transformer.TransformerBlock {
-        if (self.cpu_blocks) |b| return b;
-        const cpu = try transformer.buildBlocks(allocator, self.config, self.runtime, self.blocks, progress);
-        if (self.runtime.explicit_qk_norm_ops) {
-            for (cpu) |*block| {
-                if (block.getAttentionMut()) |attn_ptr| {
-                    attn_ptr.q_norm = null;
-                    attn_ptr.k_norm = null;
-                }
-            }
-        }
-        self.cpu_blocks = cpu;
-        self.cpu_blocks_allocator = allocator;
-        return cpu;
-    }
-
     pub fn deinit(self: *LoadedModel) void {
-        if (self.cpu_blocks) |b| {
-            if (self.cpu_blocks_allocator) |a| {
-                for (b) |*block| block.deinit(a);
-                a.free(b);
-            }
-        }
-
         // Free RoPE instances (allocated with backing_allocator, not arena)
         if (self.rope_global) |rope| rope.deinit(rope.allocator);
         if (self.rope_local) |rope| rope.deinit(rope.allocator);
@@ -114,7 +87,7 @@ pub fn loadModel(
     load_options: LoadOptions,
     progress: progress_mod.ProgressContext,
 ) !LoadedModel {
-    return loadModelWithHooks(NoHooks, backing_allocator, config_path, safetensors_path, null, load_options, progress);
+    return loadModelWithArchitecture(backing_allocator, config_path, safetensors_path, null, load_options, progress);
 }
 
 /// Environment flags collected once at load time to avoid repeated lookups.
@@ -144,7 +117,7 @@ fn archHasGlobalWeights(arch: *const model_types.Architecture) bool {
 
 fn maybeAddFusedWeights(
     allocator: std.mem.Allocator,
-    map: *transformer.WeightMap,
+    map: *runtime_blocks.WeightMap,
 ) !void {
     if (map.get("self_attn.qkv_proj.weight") == null) {
         const q = map.get("self_attn.q_proj.weight");
@@ -176,14 +149,19 @@ fn maybeAddFusedWeights(
 /// Config files may omit some dimensions (e.g., conv_dim_out in LFM2.5).
 /// The depthwise conv weight is always f32 with shape [conv_dim, d_conv] or
 /// [conv_dim, 1, d_conv], making it a reliable source for both dimensions.
-fn inferShortConvDims(config: *transformer.ShortConvConfig, weight_map: *const transformer.WeightMap) void {
+fn inferShortConvDims(
+    config: *runtime_blocks.ShortConvConfig,
+    weight_map: *const runtime_blocks.WeightMap,
+    source_weight_id: ?[]const u8,
+) void {
     if (config.conv_dim != 0 and config.conv_dim_out != 0 and config.d_conv != 0) return;
 
-    // Infer from depthwise conv weight (always f32, never quantized): [conv_dim, d_conv]
-    if (weight_map.get("conv.conv.weight")) |conv_w| {
-        if (config.conv_dim == 0) config.conv_dim = @intCast(conv_w.shape[0]);
-        const d_idx: usize = if (conv_w.n_dims == 3) 2 else 1;
-        if (config.d_conv == 0) config.d_conv = @intCast(conv_w.shape[d_idx]);
+    if (source_weight_id) |id| {
+        if (weight_map.get(id)) |conv_w| {
+            if (config.conv_dim == 0) config.conv_dim = @intCast(conv_w.shape[0]);
+            const d_idx: usize = if (conv_w.n_dims == 3) 2 else 1;
+            if (config.d_conv == 0) config.d_conv = @intCast(conv_w.shape[d_idx]);
+        }
     }
 
     // conv_dim_out is typically equal to conv_dim for known architectures.
@@ -207,19 +185,15 @@ fn inferShortConvDims(config: *transformer.ShortConvConfig, weight_map: *const t
 /// - For quantized weights (GAF4/GAF8), shape[0] is always the output dim (never packed)
 /// - For BF16/F16, shape[0] is the output dim (kept in [out, in] format)
 /// - For F32, shape[1] is d_ff (transposed to [in, out] = [d_model, d_ff])
-fn inferDff(model_config: *ModelConfig, weight_map: *const transformer.WeightMap) void {
+fn inferDff(
+    model_config: *ModelConfig,
+    weight_map: *const runtime_blocks.WeightMap,
+    source_weight_ids: []const []const u8,
+) void {
     const d_model: usize = @intCast(model_config.d_model);
     const config_d_ff: usize = @intCast(model_config.d_ff);
 
-    // Try known gate projection weight IDs across architectures.
-    // For MoE models, check expert gate weights first (they use moe_intermediate_size, not intermediate_size).
-    const gate_weight_ids = [_][]const u8{
-        "mlp.experts.0.gate_proj.weight", // Qwen3 MoE, DeepSeek MoE (expert d_ff)
-        "mlp.gate_proj.weight", // Llama, Qwen, Gemma, Granite (dense FFN)
-        "feed_forward.w1.weight", // LFM2, LFM2.5
-    };
-
-    for (&gate_weight_ids) |id| {
+    for (source_weight_ids) |id| {
         if (weight_map.get(id)) |w| {
             if (inferDffFromWeight(w.*, d_model)) |inferred| {
                 if (inferred != config_d_ff) {
@@ -252,8 +226,48 @@ fn inferDffFromWeight(w: Tensor, d_model: usize) ?usize {
     return null;
 }
 
-pub fn loadModelWithHooks(
-    comptime Hooks: type,
+fn inferMoEFromArchitecture(arch: *const model_types.Architecture, model_config: *ModelConfig) void {
+    var inferred_num_experts: i32 = 0;
+    var inferred_experts_per_token: i32 = 0;
+
+    const capture = struct {
+        fn fromOps(
+            ops: []const model_types.Op,
+            out_num_experts: *i32,
+            out_experts_per_token: *i32,
+        ) void {
+            for (ops) |op| {
+                if (op.op_type != .moe) continue;
+                if (out_num_experts.* <= 0 and op.num_experts > 0) out_num_experts.* = op.num_experts;
+                if (out_experts_per_token.* <= 0 and op.experts_per_token > 0) out_experts_per_token.* = op.experts_per_token;
+            }
+        }
+    };
+
+    capture.fromOps(arch.block_ops, &inferred_num_experts, &inferred_experts_per_token);
+    if (arch.block_variants) |variants| {
+        for (variants) |variant| {
+            capture.fromOps(variant.ops, &inferred_num_experts, &inferred_experts_per_token);
+        }
+    }
+
+    if (model_config.num_experts <= 0 and inferred_num_experts > 0) {
+        model_config.num_experts = inferred_num_experts;
+        log.debug("load", "Inferred MoE num_experts from architecture metadata", .{
+            .num_experts = inferred_num_experts,
+            .architecture = arch.name,
+        }, @src());
+    }
+    if (model_config.experts_per_token <= 0 and inferred_experts_per_token > 0) {
+        model_config.experts_per_token = inferred_experts_per_token;
+        log.debug("load", "Inferred MoE experts_per_token from architecture metadata", .{
+            .experts_per_token = inferred_experts_per_token,
+            .architecture = arch.name,
+        }, @src());
+    }
+}
+
+pub fn loadModelWithArchitecture(
     backing_allocator: std.mem.Allocator,
     config_path: []const u8,
     safetensors_path: []const u8,
@@ -278,13 +292,7 @@ pub fn loadModelWithHooks(
         start_time_ns = now;
     }
 
-    var model_config = cfg_loader.loadConfig(arena_allocator, config_path) catch |err| switch (err) {
-        error.MissingField => if (@hasDecl(Hooks, "inferConfigFromWeights"))
-            try Hooks.inferConfigFromWeights(arena_allocator, config_path, &safetensors_file)
-        else
-            return err,
-        else => return err,
-    };
+    var model_config = try cfg_loader.loadConfig(arena_allocator, config_path);
 
     log.debug("load", "Vision config from loadConfig", .{
         .vision_hidden_size = model_config.vision_hidden_size,
@@ -300,8 +308,6 @@ pub fn loadModelWithHooks(
         .image_token_id = model_config.image_token_id,
     }, @src());
 
-    // Some models omit MoE fields in config.json. Detect MoE from weights.
-    if (@hasDecl(Hooks, "inferMoEFromWeights")) Hooks.inferMoEFromWeights(&safetensors_file, &model_config);
     log.trace("load", "Config loaded", .{
         .n_layers = model_config.n_layers,
         .d_model = model_config.d_model,
@@ -317,7 +323,7 @@ pub fn loadModelWithHooks(
 
     const layer_count: usize = @intCast(model_config.n_layers);
 
-    var block_weights = try arena_allocator.alloc(transformer.BlockWeights, layer_count);
+    var block_weights = try arena_allocator.alloc(runtime_blocks.BlockWeights, layer_count);
 
     // Detect whether the architecture uses absolute position embeddings (BERT-family).
     // Models with position_embeddings use absolute positions and don't need RoPE.
@@ -393,6 +399,7 @@ pub fn loadModelWithHooks(
     // Legacy hardcoded loader has been removed - all models need architecture definitions.
     const arch = runtime_arch orelse return error.MissingArchitecture;
     if (!archHasBlockWeights(arch)) return error.MissingArchitecture;
+    inferMoEFromArchitecture(arch, &model_config);
 
     // For heterogeneous models, parse layer_types from model config.json.
     // This allows different model sizes of the same architecture to have different
@@ -435,11 +442,11 @@ pub fn loadModelWithHooks(
 
         const variant = arch.getVariantWithOverride(layer_idx, model_config.layer_types);
         const block_type = if (variant) |v|
-            transformer.BlockType.fromVariantName(v.name) orelse return error.UnknownBlockVariant
+            runtime_blocks.BlockKind.fromVariantName(v.name) orelse return error.UnknownBlockVariant
         else if (arch.has_mamba)
-            transformer.BlockType.mamba
+            runtime_blocks.BlockKind.mamba
         else
-            transformer.BlockType.attention_mlp;
+            runtime_blocks.BlockKind.attention_mlp;
 
         const specs = if (variant) |v| v.weights else arch.block_weights;
 
@@ -458,7 +465,6 @@ pub fn loadModelWithHooks(
 
         const weight_load_options = generic_weights.LoadOptions{
             .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype,
-            .force_mamba_f32 = block_type == .mamba,
         };
         var weight_map = try generic_weights.loadWeightMap(
             arena_allocator,
@@ -473,7 +479,7 @@ pub fn loadModelWithHooks(
         // This corrects config mismatches where intermediate_size != actual weight dim
         // (e.g., LFM2.5 where config says 12288 but actual gate weight output is 8192).
         if (layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {
-            inferDff(&model_config, &weight_map);
+            inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids);
         }
 
         if (env_flags.enable_cpu_fusion) {
@@ -491,8 +497,8 @@ pub fn loadModelWithHooks(
             break :blk true;
         };
 
-        var map_context = transformer.BlockMapContext{
-            .rope = if (block_type == .attention_mlp) layer_rope else null,
+        var map_context = runtime_blocks.BlockMapContext{
+            .rope = if (block_type == .attention_mlp and layer_rope != null) @ptrCast(layer_rope.?) else null,
             .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
             .is_causal = layer_is_causal,
             .block_ops = layer_block_ops,
@@ -543,10 +549,10 @@ pub fn loadModelWithHooks(
             };
             // Infer missing shortconv dimensions from weight tensor shapes.
             // Config files may not specify all dimensions (e.g., LFM2.5 omits conv_dim_out).
-            inferShortConvDims(&map_context.shortconv_config.?, &weight_map);
+            inferShortConvDims(&map_context.shortconv_config.?, &weight_map, arch.shortconv_dims_source_weight_id);
         }
 
-        block_weights[layer_idx] = try transformer.blockWeightsFromMap(&weight_map, block_type, map_context);
+        block_weights[layer_idx] = try runtime_blocks.blockWeightsFromMap(&weight_map, block_type, map_context);
         block_time_ns += std.time.nanoTimestamp() - block_start_ns;
         progress.updateLine(0, @intCast(layer_idx + 1), null);
     }
@@ -693,8 +699,6 @@ fn readEnvFlag(allocator: std.mem.Allocator, name: []const u8, default_value: bo
     if (std.ascii.eqlIgnoreCase(env_value, "1") or std.ascii.eqlIgnoreCase(env_value, "true")) return true;
     return default_value;
 }
-
-// MoE inference lives in `src/models/load/moe.zig`.
 
 // =============================================================================
 // Unit Tests
@@ -1117,7 +1121,7 @@ test "convertToF32: invalid shape error" {
     try std.testing.expectError(error.InvalidShape, convertToF32(allocator, t));
 }
 
-test "LoadedModel.deinit: cleanup without cpu_blocks" {
+test "LoadedModel.deinit: cleanup without backend runtime state" {
     const allocator = std.testing.allocator;
 
     const arena = std.heap.ArenaAllocator.init(allocator);
@@ -1144,59 +1148,13 @@ test "LoadedModel.deinit: cleanup without cpu_blocks" {
         .ln_final = undefined,
         .lm_head = undefined,
         .token_embeddings = undefined,
-        .blocks = &[_]transformer.BlockWeights{},
+        .blocks = &[_]runtime_blocks.BlockWeights{},
         .original_weight_dtype = .f32,
     };
 
     // Should not leak memory
     model.deinit();
 }
-
-test "LoadedModel.deinit: cleanup with cpu_blocks" {
-    const allocator = std.testing.allocator;
-
-    const arena = std.heap.ArenaAllocator.init(allocator);
-    const config = ModelConfig{
-        .model_arch = .custom,
-        .n_layers = 1,
-        .d_model = 64,
-        .n_heads = 4,
-        .n_kv_groups = 4,
-        .head_dim = 16,
-        .d_ff = 128,
-        .max_seq_len = 128,
-        .vocab_size = 100,
-        .rope_theta = 10000.0,
-        .norm_eps = 1e-6,
-        .gaffine_group_size = 128,
-    };
-
-    // Allocate an empty cpu_blocks slice to exercise the cleanup path without
-    // requiring fully-initialized TransformerBlock instances.
-    const cpu_blocks = try allocator.alloc(transformer.TransformerBlock, 0);
-
-    var model = LoadedModel{
-        .arena = arena,
-        .config = config,
-        .runtime = .{},
-        .st = null,
-        .ln_final = undefined,
-        .lm_head = undefined,
-        .token_embeddings = undefined,
-        .blocks = &[_]transformer.BlockWeights{},
-        .original_weight_dtype = .f32,
-        .cpu_blocks = cpu_blocks,
-        .cpu_blocks_allocator = allocator,
-    };
-
-    // Should free cpu_blocks and not leak memory
-    model.deinit();
-}
-
-// Tests for ensureCpuBlocks are skipped because they expose a memory leak in
-// TransformerBlock that requires production code changes to fix. The buildBlocks function
-// allocates TransformerBlocks that have internal allocations, but LoadedModel.deinit only
-// frees the slice, not the individual block allocations.
 
 test "orientWeight: error on missing tensor" {
     // Test that orientWeight returns error.NotFound when tensor doesn't exist.

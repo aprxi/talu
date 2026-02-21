@@ -33,12 +33,6 @@ fn isComputeRootImport(target: []const u8) bool {
     return std.mem.endsWith(u8, target, "compute/root.zig");
 }
 
-fn isAllowedModelsToInferenceImport(path: []const u8, target: []const u8) bool {
-    // Explicit transitional coupling while block contracts are still inference-owned.
-    return std.mem.eql(u8, path, "core/src/models/load/weights.zig") and
-        std.mem.indexOf(u8, target, "inference/root.zig") != null;
-}
-
 fn isOldTopLevelSimdOrQuantImport(target: []const u8) bool {
     if (std.mem.startsWith(u8, target, "../simd/") and !std.mem.startsWith(u8, target, "../simd/arch/")) return true;
     if (std.mem.startsWith(u8, target, "../../simd/") and !std.mem.startsWith(u8, target, "../../simd/arch/")) return true;
@@ -125,7 +119,7 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
             }
         }
 
-        if (isModelsPath(file_path) and std.mem.indexOf(u8, target, "inference/") != null and !isAllowedModelsToInferenceImport(file_path, target)) {
+        if (isModelsPath(file_path) and std.mem.indexOf(u8, target, "inference/") != null) {
             violations += 1;
             if (emit) {
                 std.debug.print("{s}:{d}: models must not import inference internals: \"{s}\"\n", .{ file_path, line, target });
@@ -421,14 +415,8 @@ test "lintSource rejects models importing inference internals" {
     );
 }
 
-test "lintSource allows temporary models/load/weights inference root import" {
-    const src =
-        \\const inference_mod = @import("../../inference/root.zig");
-    ;
-    try std.testing.expectEqual(
-        @as(usize, 0),
-        try lintSource(std.testing.allocator, "core/src/models/load/weights.zig", src, false),
-    );
+test "models to inference import count is zero" {
+    try std.testing.expectEqual(@as(usize, 0), try lintTree(std.testing.allocator, "core/src/models"));
 }
 
 test "lintSource rejects hardcoded vision tensor templates in selector" {

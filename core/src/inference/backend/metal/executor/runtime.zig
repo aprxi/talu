@@ -1,9 +1,6 @@
 //! Metal executor glue module.
 //!
-//! Historically this file owned all Metal backend execution logic.
-//! The ownership now lives in `executor/weights.zig` (weight lifecycle)
-//! and `executor/model.zig` (forward orchestration). This module keeps
-//! compatibility symbols for callers while remaining thin.
+//! This module exposes the Metal runtime types used by executor kernels.
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");

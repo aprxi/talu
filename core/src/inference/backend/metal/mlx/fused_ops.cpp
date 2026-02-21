@@ -303,6 +303,227 @@ static array orient_matmul_rhs(
     throw std::invalid_argument("[dense] weight orientation incompatible with matmul shape");
 }
 
+static array gelu_approx(const array& x) {
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    constexpr float kCoeff = 0.044715f;
+    const auto x3 = x * x * x;
+    return 0.5f * x * (1.0f + tanh(kSqrt2OverPi * (x + kCoeff * x3)));
+}
+
+static array layer_norm_last_dim(
+    const array& x,
+    const array& weight,
+    const array& bias,
+    float eps
+) {
+    const auto x_mean = mean(x, -1, true);
+    const auto centered = x - x_mean;
+    const auto variance = mean(centered * centered, -1, true);
+    const auto inv_std = rsqrt(variance + eps);
+    const auto normed = centered * inv_std;
+    return normed * weight + bias;
+}
+
+static array linear_bf16_with_bias(
+    const array& input,
+    const array& weight,
+    const array& bias,
+    std::optional<int> out_features = std::nullopt
+) {
+    const int in_features = input.shape(input.ndim() - 1);
+    const auto rhs = orient_matmul_rhs(weight, in_features, out_features, true);
+    return matmul(input, rhs) + bias;
+}
+
+static bool can_use_runtime_rope(
+    const array* runtime_rope_cos,
+    const array* runtime_rope_sin,
+    int seq_start,
+    int seq_len,
+    int head_dim,
+    int rope_dim
+) {
+    if (runtime_rope_cos == nullptr || runtime_rope_sin == nullptr) return false;
+    if (rope_dim <= 0 || rope_dim > head_dim || (rope_dim % 2) != 0) return false;
+    const int seq_stop = seq_start + seq_len;
+    return runtime_rope_cos->ndim() == 2 and runtime_rope_sin->ndim() == 2 and
+        runtime_rope_cos->shape(0) >= seq_stop and runtime_rope_sin->shape(0) >= seq_stop and
+        runtime_rope_cos->shape(1) >= rope_dim and runtime_rope_sin->shape(1) >= rope_dim;
+}
+
+static array apply_optional_runtime_rope(
+    const array& x, // [B, H, L, D]
+    const array* runtime_rope_cos,
+    const array* runtime_rope_sin,
+    int seq_start,
+    int seq_len,
+    int head_dim,
+    int rope_dim
+) {
+    if (!can_use_runtime_rope(runtime_rope_cos, runtime_rope_sin, seq_start, seq_len, head_dim, rope_dim)) {
+        return x;
+    }
+    auto cos_rows = slice(*runtime_rope_cos, {seq_start, 0}, {seq_start + seq_len, rope_dim});
+    auto sin_rows = slice(*runtime_rope_sin, {seq_start, 0}, {seq_start + seq_len, rope_dim});
+    return apply_runtime_rope_to_tensor(x, cos_rows, sin_rows, seq_len, head_dim, rope_dim);
+}
+
+void* mlx_lazy_vision_block_fused_qkv_bf16(
+    const void* input,
+    const void* ln1_weight,
+    const void* ln1_bias,
+    const void* ln2_weight,
+    const void* ln2_bias,
+    const void* qkv_weight,
+    const void* qkv_bias,
+    const void* o_weight,
+    const void* o_bias,
+    const void* fc1_weight,
+    const void* fc1_bias,
+    const void* fc2_weight,
+    const void* fc2_bias,
+    const void* runtime_rope_cos,
+    const void* runtime_rope_sin,
+    size_t runtime_rope_dim,
+    size_t n_heads,
+    size_t head_dim,
+    float attn_scale,
+    float norm_eps
+) {
+    const auto& x = *static_cast<const array*>(input);
+    const auto& ln1_w = *static_cast<const array*>(ln1_weight);
+    const auto& ln1_b = *static_cast<const array*>(ln1_bias);
+    const auto& ln2_w = *static_cast<const array*>(ln2_weight);
+    const auto& ln2_b = *static_cast<const array*>(ln2_bias);
+    const auto& qkv_w = *static_cast<const array*>(qkv_weight);
+    const auto& qkv_b = *static_cast<const array*>(qkv_bias);
+    const auto& o_w = *static_cast<const array*>(o_weight);
+    const auto& o_b = *static_cast<const array*>(o_bias);
+    const auto& fc1_w = *static_cast<const array*>(fc1_weight);
+    const auto& fc1_b = *static_cast<const array*>(fc1_bias);
+    const auto& fc2_w = *static_cast<const array*>(fc2_weight);
+    const auto& fc2_b = *static_cast<const array*>(fc2_bias);
+    const auto* rope_cos = static_cast<const array*>(runtime_rope_cos);
+    const auto* rope_sin = static_cast<const array*>(runtime_rope_sin);
+
+    const int batch = x.shape(0);
+    const int seq_len = x.shape(1);
+    const int hidden_dim = x.shape(2);
+    const int heads = static_cast<int>(n_heads);
+    const int hd = static_cast<int>(head_dim);
+    const int rope_dim = static_cast<int>(runtime_rope_dim);
+    const int expected_qkv_dim = 3 * hidden_dim;
+
+    auto ln1 = layer_norm_last_dim(x, ln1_w, ln1_b, norm_eps);
+    auto qkv = linear_bf16_with_bias(ln1, qkv_w, qkv_b, expected_qkv_dim);
+    auto q = slice(qkv, {0, 0, 0}, {batch, seq_len, hidden_dim});
+    auto k = slice(qkv, {0, 0, hidden_dim}, {batch, seq_len, 2 * hidden_dim});
+    auto v = slice(qkv, {0, 0, 2 * hidden_dim}, {batch, seq_len, 3 * hidden_dim});
+
+    q = reshape(q, {batch, seq_len, heads, hd});
+    k = reshape(k, {batch, seq_len, heads, hd});
+    v = reshape(v, {batch, seq_len, heads, hd});
+    q = transpose(q, {0, 2, 1, 3});
+    k = transpose(k, {0, 2, 1, 3});
+    v = transpose(v, {0, 2, 1, 3});
+
+    q = apply_optional_runtime_rope(q, rope_cos, rope_sin, 0, seq_len, hd, rope_dim);
+    k = apply_optional_runtime_rope(k, rope_cos, rope_sin, 0, seq_len, hd, rope_dim);
+
+    auto attn = fast::scaled_dot_product_attention(q, k, v, attn_scale, "");
+    attn = transpose(attn, {0, 2, 1, 3});
+    attn = reshape(attn, {batch, seq_len, hidden_dim});
+    const auto attn_out = linear_bf16_with_bias(attn, o_w, o_b, hidden_dim);
+    const auto hidden_1 = x + attn_out;
+
+    auto ln2 = layer_norm_last_dim(hidden_1, ln2_w, ln2_b, norm_eps);
+    auto ffn = linear_bf16_with_bias(ln2, fc1_w, fc1_b, std::nullopt);
+    ffn = gelu_approx(ffn);
+    const auto ffn_out = linear_bf16_with_bias(ffn, fc2_w, fc2_b, hidden_dim);
+    return pool_array(hidden_1 + ffn_out);
+}
+
+void* mlx_lazy_vision_block_split_qkv_bf16(
+    const void* input,
+    const void* ln1_weight,
+    const void* ln1_bias,
+    const void* ln2_weight,
+    const void* ln2_bias,
+    const void* q_weight,
+    const void* q_bias,
+    const void* k_weight,
+    const void* k_bias,
+    const void* v_weight,
+    const void* v_bias,
+    const void* o_weight,
+    const void* o_bias,
+    const void* fc1_weight,
+    const void* fc1_bias,
+    const void* fc2_weight,
+    const void* fc2_bias,
+    const void* runtime_rope_cos,
+    const void* runtime_rope_sin,
+    size_t runtime_rope_dim,
+    size_t n_heads,
+    size_t head_dim,
+    float attn_scale,
+    float norm_eps
+) {
+    const auto& x = *static_cast<const array*>(input);
+    const auto& ln1_w = *static_cast<const array*>(ln1_weight);
+    const auto& ln1_b = *static_cast<const array*>(ln1_bias);
+    const auto& ln2_w = *static_cast<const array*>(ln2_weight);
+    const auto& ln2_b = *static_cast<const array*>(ln2_bias);
+    const auto& q_w = *static_cast<const array*>(q_weight);
+    const auto& q_b = *static_cast<const array*>(q_bias);
+    const auto& k_w = *static_cast<const array*>(k_weight);
+    const auto& k_b = *static_cast<const array*>(k_bias);
+    const auto& v_w = *static_cast<const array*>(v_weight);
+    const auto& v_b = *static_cast<const array*>(v_bias);
+    const auto& o_w = *static_cast<const array*>(o_weight);
+    const auto& o_b = *static_cast<const array*>(o_bias);
+    const auto& fc1_w = *static_cast<const array*>(fc1_weight);
+    const auto& fc1_b = *static_cast<const array*>(fc1_bias);
+    const auto& fc2_w = *static_cast<const array*>(fc2_weight);
+    const auto& fc2_b = *static_cast<const array*>(fc2_bias);
+    const auto* rope_cos = static_cast<const array*>(runtime_rope_cos);
+    const auto* rope_sin = static_cast<const array*>(runtime_rope_sin);
+
+    const int batch = x.shape(0);
+    const int seq_len = x.shape(1);
+    const int hidden_dim = x.shape(2);
+    const int heads = static_cast<int>(n_heads);
+    const int hd = static_cast<int>(head_dim);
+    const int rope_dim = static_cast<int>(runtime_rope_dim);
+
+    auto ln1 = layer_norm_last_dim(x, ln1_w, ln1_b, norm_eps);
+    auto q = linear_bf16_with_bias(ln1, q_w, q_b, hidden_dim);
+    auto k = linear_bf16_with_bias(ln1, k_w, k_b, hidden_dim);
+    auto v = linear_bf16_with_bias(ln1, v_w, v_b, hidden_dim);
+
+    q = reshape(q, {batch, seq_len, heads, hd});
+    k = reshape(k, {batch, seq_len, heads, hd});
+    v = reshape(v, {batch, seq_len, heads, hd});
+    q = transpose(q, {0, 2, 1, 3});
+    k = transpose(k, {0, 2, 1, 3});
+    v = transpose(v, {0, 2, 1, 3});
+
+    q = apply_optional_runtime_rope(q, rope_cos, rope_sin, 0, seq_len, hd, rope_dim);
+    k = apply_optional_runtime_rope(k, rope_cos, rope_sin, 0, seq_len, hd, rope_dim);
+
+    auto attn = fast::scaled_dot_product_attention(q, k, v, attn_scale, "");
+    attn = transpose(attn, {0, 2, 1, 3});
+    attn = reshape(attn, {batch, seq_len, hidden_dim});
+    const auto attn_out = linear_bf16_with_bias(attn, o_w, o_b, hidden_dim);
+    const auto hidden_1 = x + attn_out;
+
+    auto ln2 = layer_norm_last_dim(hidden_1, ln2_w, ln2_b, norm_eps);
+    auto ffn = linear_bf16_with_bias(ln2, fc1_w, fc1_b, std::nullopt);
+    ffn = gelu_approx(ffn);
+    const auto ffn_out = linear_bf16_with_bias(ffn, fc2_w, fc2_b, hidden_dim);
+    return pool_array(hidden_1 + ffn_out);
+}
+
 // ============================================================================
 // Fused Attention Block (Quantized)
 // ============================================================================

@@ -59,8 +59,8 @@ test "LoadedModel has deinit method" {
     try std.testing.expect(@hasDecl(LoadedModel, "deinit"));
 }
 
-test "LoadedModel has ensureCpuBlocks method" {
-    try std.testing.expect(@hasDecl(LoadedModel, "ensureCpuBlocks"));
+test "LoadedModel does not expose ensureCpuBlocks method" {
+    try std.testing.expect(!@hasDecl(LoadedModel, "ensureCpuBlocks"));
 }
 
 // =============================================================================

@@ -10,15 +10,10 @@
 //! - LayeredBatchedKVCache with slot management (alloc/free/reset)
 //! - Per-slot buffers for hidden states, attention, FFN, logits
 //! - decodeBatch() accepts multiple sequences per call
+//! - Batched embedding lookup + batched LM-head logits matmul in decodeBatch()
 //!
-//! **However, compute is NOT yet batched.** The decodeBatch() function currently
-//! processes sequences sequentially in a loop. True batched compute would combine
-//! multiple sequences into single matrix operations for better throughput.
-//!
-//! TODO(batched-compute): Implement batched kernels that process multiple sequences in parallel. lint:ignore no-todo
-//! - Batched embedding lookup
-//! - Batched transformer forward (shared matmuls across sequences)
-//! - Batched logits computation
+//! Transformer layer decode is batched for slot-compatible block programs, with
+//! explicit slot-wise fallback for unsupported kernel topologies.
 //!
 //! This backend is the sole CPU inference path.
 //!
@@ -85,7 +80,7 @@ pub const FusedCpuBackend = struct {
     model: Transformer,
 
     /// CPU kernel blocks
-    blocks: []const cpu_blocks.TransformerBlock,
+    blocks: []cpu_blocks.TransformerBlock,
 
     /// Batched KV cache (replaces per-layer AttnCache)
     kv_cache: LayeredBatchedKVCache,
@@ -112,6 +107,12 @@ pub const FusedCpuBackend = struct {
 
     /// Per-sequence logits buffers [max_batch_size][vocab_size]
     logits_buffers: []f32,
+    /// Compact token workspace [max_batch_size] used by decodeBatch embedding gather.
+    decode_batch_tokens: []u32,
+    /// Compact slot index workspace [max_batch_size] used by decodeBatch.
+    decode_batch_slot_indices: []usize,
+    /// Compact batched logits workspace [max_batch_size][vocab_size].
+    decode_batch_logits: []f32,
     /// Per-slot RoPE position delta used during decode for multimodal prompts.
     slot_rope_position_deltas: []isize,
 
@@ -157,7 +158,21 @@ pub const FusedCpuBackend = struct {
         const progress_total: u64 = @intCast(layer_total + 3);
         progress.addLine(1, "Preparing", progress_total, null, null);
 
-        const cpu_block_set = try loaded.ensureCpuBlocks(allocator, progress);
+        const cpu_block_set = try cpu_blocks.buildBlocks(
+            allocator,
+            loaded.config,
+            loaded.runtime,
+            loaded.blocks,
+            progress,
+        );
+        if (loaded.runtime.explicit_qk_norm_ops) {
+            for (cpu_block_set) |*block| {
+                if (block.getAttentionMut()) |attn_ptr| {
+                    attn_ptr.q_norm = null;
+                    attn_ptr.k_norm = null;
+                }
+            }
+        }
 
         // Build batched KV cache
         var kv_cache = try LayeredBatchedKVCache.init(
@@ -285,6 +300,12 @@ pub const FusedCpuBackend = struct {
 
         const logits_buffers = try allocator.alloc(f32, max_batch_size * vocab_size);
         errdefer allocator.free(logits_buffers);
+        const decode_batch_tokens = try allocator.alloc(u32, max_batch_size);
+        errdefer allocator.free(decode_batch_tokens);
+        const decode_batch_slot_indices = try allocator.alloc(usize, max_batch_size);
+        errdefer allocator.free(decode_batch_slot_indices);
+        const decode_batch_logits = try allocator.alloc(f32, max_batch_size * vocab_size);
+        errdefer allocator.free(decode_batch_logits);
         const slot_rope_position_deltas = try allocator.alloc(isize, max_batch_size);
         errdefer allocator.free(slot_rope_position_deltas);
         @memset(slot_rope_position_deltas, 0);
@@ -303,6 +324,9 @@ pub const FusedCpuBackend = struct {
             .attn_out_buffers = attn_out_buffers,
             .ffn_out_buffers = ffn_out_buffers,
             .logits_buffers = logits_buffers,
+            .decode_batch_tokens = decode_batch_tokens,
+            .decode_batch_slot_indices = decode_batch_slot_indices,
+            .decode_batch_logits = decode_batch_logits,
             .slot_rope_position_deltas = slot_rope_position_deltas,
             .d_model = model_width,
             .vocab_size = vocab_size,
@@ -318,6 +342,9 @@ pub const FusedCpuBackend = struct {
         if (self.vision_runtime) |*vision| {
             vision.deinit();
         }
+        self.allocator.free(self.decode_batch_logits);
+        self.allocator.free(self.decode_batch_slot_indices);
+        self.allocator.free(self.decode_batch_tokens);
         self.allocator.free(self.logits_buffers);
         self.allocator.free(self.ffn_out_buffers);
         self.allocator.free(self.attn_out_buffers);
@@ -325,6 +352,8 @@ pub const FusedCpuBackend = struct {
         self.allocator.free(self.hidden_buffers);
         self.allocator.free(self.slot_rope_position_deltas);
         self.allocator.free(self.model.layers);
+        for (self.blocks) |*block| block.deinit(self.allocator);
+        self.allocator.free(self.blocks);
         self.scratch.deinit();
         self.batched_attn_scratch.deinit();
         self.kv_cache.deinit();
@@ -924,16 +953,9 @@ pub const FusedCpuBackend = struct {
     ///
     /// ## Implementation Note
     ///
-    /// Currently processes sequences **sequentially** in a loop. This provides
-    /// the correct API for continuous batching (dynamic join/leave) but does not
-    /// yet achieve compute-level batching where multiple sequences share matrix
-    /// operations.
-    ///
-    /// TODO(batched-compute): Implement true batched kernels that combine lint:ignore no-todo
-    /// sequences into single matmul calls for better throughput. This requires:
-    /// - Gathering embeddings for all tokens into a batch tensor
-    /// - Running batched forward through all layers
-    /// - Scattering results back to per-slot logits buffers
+    /// Embedding gather, transformer execution, and LM-head logits are batched
+    /// when the loaded block topology supports slot-batched decode.
+    /// Unsupported topologies use a slot-wise fallback for correctness.
     ///
     /// Uses graph-based execution via model.forwardWithBatchedCache() for
     /// architecture compatibility across all model types.
@@ -949,34 +971,84 @@ pub const FusedCpuBackend = struct {
         defer self.setPositionDeltaForTextLayers(0);
 
         const model_width = self.d_model;
+        const vocab_size = self.vocab_size;
+        const embedding_multiplier = self.loaded.config.embedding_multiplier;
+        const batch_tokens = self.decode_batch_tokens[0..request_total];
+        const slot_indices = self.decode_batch_slot_indices[0..request_total];
+        const compact_hidden = self.norm_buffers[0 .. request_total * model_width];
+        const compact_logits = self.decode_batch_logits[0 .. request_total * vocab_size];
 
-        // TODO(batched-compute): Replace sequential loop with true batched compute. lint:ignore no-todo
-        // Currently each sequence is processed independently through the model.
+        // 1) Batched embedding gather for all requests in one kernel call.
         for (requests, 0..) |request, request_index| {
-            const hidden_values = self.getHiddenBuffer(request.slot_index);
-            const token_ids = &[_]u32{request.token};
-            self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[request.slot_index]);
+            batch_tokens[request_index] = request.token;
+            slot_indices[request_index] = request.slot_index;
+        }
+        var compact_hidden_view = Tensor.view3D(
+            std.mem.sliceAsBytes(compact_hidden),
+            request_total,
+            model_width,
+        );
+        self.model.embed_tokens.forward(batch_tokens, &compact_hidden_view) catch return;
+        cpu_rowwise.scaleInPlace(compact_hidden, embedding_multiplier);
 
-            // 1. Get embedding
-            var hidden_tensor_view = Tensor.view3D(
-                std.mem.sliceAsBytes(hidden_values),
-                1,
-                model_width,
-            );
-            self.model.embed_tokens.forward(token_ids, &hidden_tensor_view) catch return;
-            cpu_rowwise.scaleInPlace(hidden_values, self.loaded.config.embedding_multiplier);
+        // 2) Transformer forward through all layers.
+        var slot_delta_equal = true;
+        const shared_delta: isize = self.slot_rope_position_deltas[slot_indices[0]];
+        for (slot_indices[1..]) |slot_index| {
+            if (self.slot_rope_position_deltas[slot_index] != shared_delta) {
+                slot_delta_equal = false;
+                break;
+            }
+        }
 
-            // 2. Forward through transformer layers using graph with batched cache
-            self.model.forwardWithBatchedCache(&hidden_tensor_view, &hidden_tensor_view, &self.scratch, &self.kv_cache, request.slot_index, true) catch return;
+        var used_batched_transformer = false;
+        if (slot_delta_equal and self.model.supportsBatchedDecodeSlots()) {
+            self.setPositionDeltaForTextLayers(shared_delta);
+            self.model.forwardWithBatchedCacheSlots(
+                &compact_hidden_view,
+                &compact_hidden_view,
+                &self.scratch,
+                &self.kv_cache,
+                slot_indices,
+                true,
+            ) catch |err| switch (err) {
+                error.UnsupportedBatchedDecodeKernel, error.UnsupportedOpInBatchedMode => {},
+                else => return err,
+            };
+            if (self.model.norm) |*n| n.forward(&compact_hidden_view, &compact_hidden_view);
+            used_batched_transformer = true;
+        }
 
-            // 3. Final layer norm (if present)
-            if (self.model.norm) |*n| n.forward(&hidden_tensor_view, &hidden_tensor_view);
+        if (!used_batched_transformer) {
+            for (requests, 0..) |request, request_index| {
+                self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[request.slot_index]);
+                const compact_hidden_row = compact_hidden[request_index * model_width ..][0..model_width];
+                var hidden_tensor_view = Tensor.view3D(
+                    std.mem.sliceAsBytes(compact_hidden_row),
+                    1,
+                    model_width,
+                );
+                self.model.forwardWithBatchedCache(
+                    &hidden_tensor_view,
+                    &hidden_tensor_view,
+                    &self.scratch,
+                    &self.kv_cache,
+                    request.slot_index,
+                    true,
+                ) catch return;
+                if (self.model.norm) |*n| n.forward(&hidden_tensor_view, &hidden_tensor_view);
+            }
+        }
 
-            // 4. Compute logits
+        // 3) Batched LM-head logits in one matmul over compact hidden rows.
+        self.computeLogitsFromHiddenBatch(compact_hidden, request_total, compact_logits) catch return;
+
+        // 4) Scatter compact logits rows back to slot-local buffers and fill results.
+        for (requests, 0..) |request, request_index| {
             const logits_buffer = self.getLogitsBuffer(request.slot_index);
-            self.computeLogitsFromHidden(hidden_values, logits_buffer) catch return;
+            const compact_logits_row = compact_logits[request_index * vocab_size ..][0..vocab_size];
+            @memcpy(logits_buffer, compact_logits_row);
 
-            // Fill result
             results[request_index] = .{
                 .slot_index = request.slot_index,
                 .logits = logits_buffer,
@@ -1045,6 +1117,50 @@ pub const FusedCpuBackend = struct {
                 1,
                 null,
             );
+        }
+    }
+
+    fn computeLogitsFromHiddenBatch(
+        self: *FusedCpuBackend,
+        hidden_rows: []const f32,
+        row_count: usize,
+        logits_out: []f32,
+    ) !void {
+        const lm_head_ptr = &(self.loaded.lm_head orelse return error.MissingLmHead);
+        std.debug.assert(hidden_rows.len >= row_count * self.d_model);
+        std.debug.assert(logits_out.len >= row_count * self.vocab_size);
+
+        var hidden_view = Tensor.view2DSlice(@constCast(hidden_rows), row_count, self.d_model);
+        var logits_view = Tensor.view2DSlice(logits_out, row_count, self.vocab_size);
+        try cpu_linalg.matmulAuto(&hidden_view, lm_head_ptr, &logits_view, &self.scratch.matmul_scratch);
+        cpu_rowwise.scaleInPlaceReciprocal(logits_out[0 .. row_count * self.vocab_size], self.loaded.config.logits_scaling);
+
+        if (trace.isEnabled()) {
+            for (0..row_count) |row_index| {
+                const row_logits = logits_out[row_index * self.vocab_size ..][0..self.vocab_size];
+                trace.emitFinal(
+                    .lm_head,
+                    @intCast(row_index),
+                    0,
+                    @ptrCast(row_logits.ptr),
+                    .f32,
+                    .{ @intCast(self.vocab_size), 0, 0, 0 },
+                    1,
+                    "matmul_lm_head",
+                );
+                if (self.loaded.config.logits_scaling != 1.0) {
+                    trace.emitFinal(
+                        .logits_scaled,
+                        @intCast(row_index),
+                        0,
+                        @ptrCast(row_logits.ptr),
+                        .f32,
+                        .{ @intCast(self.vocab_size), 0, 0, 0 },
+                        1,
+                        null,
+                    );
+                }
+            }
         }
     }
 

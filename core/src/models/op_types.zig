@@ -133,6 +133,8 @@ pub const WeightSpec = struct {
     expected_shape: ?[]const usize = null,
     /// Optional transforms to apply.
     transforms: []const WeightTransform = &.{},
+    /// Force conversion to f32 regardless of module-type preservation policy.
+    force_f32: bool = false,
 };
 
 /// A block variant for heterogeneous models (e.g., Mamba + Attention).
@@ -267,6 +269,12 @@ pub const Architecture = struct {
     // Common prefixes for block weight names (for candidate generation).
     // E.g., ["model.layers.{d}.", "layers.{d}."] - weights specify suffix only.
     weight_prefixes: []const []const u8 = &.{},
+    // Weight IDs used to infer d_ff from actual loaded tensors when config
+    // fields are inconsistent with checkpoint shapes.
+    d_ff_source_weight_ids: []const []const u8 = &.{},
+    // Optional shortconv depthwise weight id used for shape-driven dimension
+    // inference when config omits conv_dim/conv_dim_out/d_conv.
+    shortconv_dims_source_weight_id: ?[]const u8 = null,
 
     // Flags derived from analyzing block_ops
     has_qk_norm: bool = false,

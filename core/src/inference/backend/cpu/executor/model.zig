@@ -350,6 +350,14 @@ pub const Transformer = struct {
         );
     }
 
+    /// Returns true when every layer can execute decode in slot-batched mode.
+    pub fn supportsBatchedDecodeSlots(self: *const Transformer) bool {
+        for (self.layers) |*layer| {
+            if (!layer.supportsBatchedDecodeSlots()) return false;
+        }
+        return true;
+    }
+
     pub fn forwardWithBatchedCacheWithDeepstack(
         self: *const Transformer,
         input_tensor: *const Tensor,
@@ -430,6 +438,72 @@ pub const Transformer = struct {
         }
 
         // Copy final result to out if needed
+        if (current_input_tensor != output_tensor) {
+            block_kernels.copyTensor(current_input_tensor, output_tensor);
+        }
+    }
+
+    /// Forward pass through transformer layers using batched cache and a slot map.
+    /// The decode-batch tensor layout is [1, batch_size, d_model].
+    pub fn forwardWithBatchedCacheSlots(
+        self: *const Transformer,
+        input_tensor: *const Tensor,
+        output_tensor: *Tensor,
+        scratch: *ScratchBuffer,
+        batched_cache: *LayeredBatchedKVCache,
+        slot_indices: []const usize,
+        use_cache: bool,
+    ) !void {
+        std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
+        std.debug.assert(@as(usize, @intCast(input_tensor.shape[1])) == slot_indices.len);
+        std.debug.assert(@as(usize, @intCast(output_tensor.shape[1])) == slot_indices.len);
+        if (!use_cache) {
+            for (slot_indices) |slot_index| batched_cache.resetSlot(slot_index);
+        }
+
+        const batch_size: usize = @intCast(input_tensor.shape[1]);
+        try scratch.ensure(batch_size);
+
+        var scratch_tensor_view = Tensor.view3DSlice(scratch.tmp[0], batch_size, self.hidden_size);
+        var current_input_tensor: *const Tensor = input_tensor;
+        var write_to_scratch_view = false;
+
+        for (self.layers, 0..) |*layer, layer_idx| {
+            trace.emit(
+                .layer_input,
+                @intCast(layer_idx),
+                0,
+                @intCast(batch_size),
+                current_input_tensor.data().ptr,
+                .f32,
+                .{ 1, @intCast(batch_size), @intCast(self.hidden_size), 0 },
+                3,
+                null,
+            );
+
+            const layer_cache = batched_cache.getLayer(layer_idx);
+            if (write_to_scratch_view) {
+                try layer.forwardWithBatchedCacheSlots(current_input_tensor, &scratch_tensor_view, scratch, layer_cache, slot_indices, use_cache);
+                current_input_tensor = &scratch_tensor_view;
+            } else {
+                try layer.forwardWithBatchedCacheSlots(current_input_tensor, output_tensor, scratch, layer_cache, slot_indices, use_cache);
+                current_input_tensor = output_tensor;
+            }
+            write_to_scratch_view = !write_to_scratch_view;
+
+            trace.emit(
+                .block_out,
+                @intCast(layer_idx),
+                0,
+                @intCast(batch_size),
+                current_input_tensor.data().ptr,
+                .f32,
+                .{ 1, @intCast(batch_size), @intCast(self.hidden_size), 0 },
+                3,
+                null,
+            );
+        }
+
         if (current_input_tensor != output_tensor) {
             block_kernels.copyTensor(current_input_tensor, output_tensor);
         }
@@ -842,7 +916,7 @@ pub const Transformer = struct {
         };
     }
 
-    fn detectStaticTopologyEntry(loaded: *const LoadedModel) ?models.contract.ModelDescriptor {
+    fn detectStaticTopologyEntry(loaded: *const LoadedModel) ?models.ModelDescriptor {
         if (loaded.runtime.architecture_id) |arch_id| {
             return models.registry.detectByArchitectureId(arch_id);
         }
@@ -850,7 +924,7 @@ pub const Transformer = struct {
     }
 
     fn resolveLayerProgram(
-        static_entry: ?models.contract.ModelDescriptor,
+        static_entry: ?models.ModelDescriptor,
         block_kind: BlockKind,
     ) ![]const LayerOp {
         if (static_entry) |entry| {

@@ -4,7 +4,7 @@
 //! This has zero runtime overhead: checks run at comptime only.
 
 const std = @import("std");
-const topology = @import("topology.zig");
+const topology = @import("../../models/op_types.zig");
 
 /// Pooling strategy for embedding extraction.
 pub const PoolingStrategy = enum(u8) {
@@ -114,6 +114,19 @@ pub fn assertBackendModuleLayout(comptime M: type, comptime backend_name: []cons
         requireLayoutDecl(M, backend_name, "vision");
         requireLayoutDecl(M, backend_name, "scheduler");
         requireLayoutDecl(M, backend_name, "sampling");
+    }
+}
+
+/// Assert vision module layout symmetry for backends.
+pub fn assertVisionModuleLayout(comptime V: type, comptime backend_name: []const u8) void {
+    comptime {
+        const owner = backend_name ++ ".vision";
+        requireLayoutDecl(V, owner, "PrefillVisionImage");
+        requireLayoutDecl(V, owner, "PrefillVisionInput");
+        requireLayoutDecl(V, owner, "EncodedVisionOutput");
+        requireLayoutDecl(V, owner, "VisionRuntime");
+        requireCallableDecl(V, owner, "scatterVisionEmbeddings");
+        requireCallableDecl(V, owner, "maxPixels");
     }
 }
 

@@ -315,6 +315,10 @@ pub const ScratchBuffer = struct {
 
 const BatchedKVCache = kv_cache.BatchedKVCache;
 
+pub const BatchedKernelError = error{
+    UnsupportedBatchedDecodeKernel,
+};
+
 /// Runtime resources needed by kernels during execution.
 pub const KernelContext = struct {
     scratch: *ScratchBuffer,
@@ -379,6 +383,33 @@ pub const CpuKernel = union(enum) {
             .swiglu => |k| try k.forward(input, output, ctx.scratch.getFfnScratch(slot_index), ctx.matmul_scratch),
             .moe => |k| try k.forward(input, output, ctx.scratch.getMoeScratch(slot_index), ctx.matmul_scratch),
             .norm => |k| k.forward(input, output),
+        }
+    }
+
+    /// Batched decode across multiple scheduler slots in a single kernel call.
+    /// `slot_indices.len` must match `input.shape[1]` for decode tensors [1, batch, d_model].
+    pub fn forwardBatchedSlots(
+        self: CpuKernel,
+        input: *const Tensor,
+        output: *Tensor,
+        ctx: KernelContext,
+        batched_cache: *BatchedKVCache,
+        slot_indices: []const usize,
+    ) !void {
+        switch (self) {
+            .attention => |k| try k.forwardWithBatchedCacheSlots(
+                input,
+                output,
+                batched_cache,
+                slot_indices,
+                &ctx.scratch.attn_scratch,
+                ctx.matmul_scratch,
+                ctx.use_cache,
+            ),
+            .swiglu => |k| try k.forward(input, output, &ctx.scratch.ffn_scratch, ctx.matmul_scratch),
+            .moe => |k| try k.forward(input, output, &ctx.scratch.moe_scratch, ctx.matmul_scratch),
+            .norm => |k| k.forward(input, output),
+            .mla_attention, .mamba, .shortconv => return BatchedKernelError.UnsupportedBatchedDecodeKernel,
         }
     }
 };

@@ -983,6 +983,27 @@ pub const Block = struct {
         return self.block.getFfnLayer();
     }
 
+    /// Returns true when this block can execute decode in a single batched pass
+    /// across multiple scheduler slots.
+    pub fn supportsBatchedDecodeSlots(self: *const Block) bool {
+        for (self.program) |op| {
+            switch (op) {
+                .kernel => |kernel_op| {
+                    const kernel_id: usize = @intCast(kernel_op.id);
+                    if (kernel_id >= self.block.kernels.len) return false;
+                    const kernel = self.block.kernels[kernel_id];
+                    switch (kernel) {
+                        .attention, .swiglu, .moe, .norm => {},
+                        .mla_attention, .mamba, .shortconv => return false,
+                    }
+                },
+                .add, .mul_scalar, .add_tensor => {},
+                else => return false,
+            }
+        }
+        return true;
+    }
+
     /// Forward pass using BatchedKVCache instead of AttnCache.
     /// This enables graph-based execution with batched caching for continuous batching.
     pub fn forwardWithBatchedCache(
@@ -1105,6 +1126,128 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
+        const final_buf = finalOutputBuffer(self.program);
+        if (final_buf != .residual) {
+            copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
+        }
+    }
+
+    /// Forward pass across multiple scheduler slots in a single block execution.
+    /// Input/output tensors use decode-batch layout [1, batch_size, d_model].
+    pub fn forwardWithBatchedCacheSlots(
+        self: *const Block,
+        x: *const Tensor,
+        out: *Tensor,
+        scratch: *ScratchBuffer,
+        batched_cache: *BatchedKVCache,
+        slot_indices: []const usize,
+        use_cache: bool,
+    ) !void {
+        std.debug.assert(x.shape[0] == 1 and out.shape[0] == 1);
+        const batch_size: usize = @intCast(x.shape[1]);
+        std.debug.assert(batch_size == slot_indices.len);
+        try scratch.ensure(batch_size);
+
+        const norm_output_view = Tensor.view3DSlice(scratch.tmp[1], batch_size, self.hidden_size);
+        const branch_output_view = Tensor.view3DSlice(scratch.tmp[2], batch_size, self.hidden_size);
+
+        var buffer_views: [64]Tensor = undefined;
+        buffer_views[@intFromEnum(BufferId.residual)] = out.*;
+        buffer_views[@intFromEnum(BufferId.norm_out)] = norm_output_view;
+        buffer_views[@intFromEnum(BufferId.branch_out)] = branch_output_view;
+
+        copyTensor(x, out);
+
+        const is_mla = self.block.isMLA();
+        const mla_cache = if (is_mla) scratch.getMLACache(self.block_idx) else null;
+        const mla_scratch = if (is_mla) scratch.getMLAScratch() else null;
+
+        const ctx = KernelContext{
+            .scratch = scratch,
+            .attn_cache = null,
+            .mla_cache = mla_cache,
+            .mla_scratch = mla_scratch,
+            .mamba_state = if (self.mamba_layer_idx) |idx| scratch.getMambaState(idx) else null,
+            .mamba_scratch = scratch.getMambaScratch(),
+            .shortconv_state = if (self.shortconv_layer_idx) |idx| scratch.getShortConvState(idx) else null,
+            .shortconv_scratch = scratch.getShortConvScratch(),
+            .matmul_scratch = &scratch.matmul_scratch,
+            .use_cache = use_cache,
+        };
+
+        for (self.program) |op| {
+            switch (op) {
+                .kernel => |kernel_op| {
+                    const kernel_id: usize = @intCast(kernel_op.id);
+                    if (kernel_id >= self.block.kernels.len) {
+                        capi.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
+                        return error.KernelIndexOutOfBounds;
+                    }
+                    const kernel = self.block.kernels[kernel_id];
+                    if (builtin.mode == .Debug) {
+                        const actual_type = kernel.getOpType();
+                        if (actual_type != kernel_op.debug_type) {
+                            log.err("inference", "Graph/Kernel ordering mismatch", .{
+                                .block = self.block_idx,
+                                .kernel = kernel_op.id,
+                                .expected = @tagName(kernel_op.debug_type),
+                                .actual = @tagName(actual_type),
+                            }, @src());
+                            @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
+                        }
+                    }
+                    const input = &buffer_views[@intFromEnum(kernel_op.in)];
+                    const output = &buffer_views[@intFromEnum(kernel_op.out)];
+                    try kernel.forwardBatchedSlots(input, output, ctx, batched_cache, slot_indices);
+                },
+                .add => |add_op| {
+                    addIntoScaled(
+                        &buffer_views[@intFromEnum(BufferId.residual)],
+                        &buffer_views[@intFromEnum(add_op.branch)],
+                        &buffer_views[@intFromEnum(BufferId.residual)],
+                        self.residualScaleValue(add_op.scale),
+                    );
+                },
+                .mul_scalar => |mul_scalar_op| {
+                    const input_tensor = buffer_views[@intFromEnum(mul_scalar_op.in)];
+                    const input_data = input_tensor.asSlice(f32);
+                    const output_len = input_tensor.numel;
+
+                    const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_scalar_op.out, output_len);
+                    cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
+
+                    buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
+                },
+                .add_tensor => |add_tensor_op| {
+                    const left_tensor = buffer_views[@intFromEnum(add_tensor_op.in_a)];
+                    const right_tensor = buffer_views[@intFromEnum(add_tensor_op.in_b)];
+                    const output_len = @max(left_tensor.numel, right_tensor.numel);
+
+                    const output_slice = resolveOutputSlice(&buffer_views, scratch, add_tensor_op.out, output_len);
+                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
+                        fn addScalar(lhs: f32, rhs: f32) f32 {
+                            return lhs + rhs;
+                        }
+                    }.addScalar);
+
+                    const output_shape = if (left_tensor.numel >= right_tensor.numel)
+                        left_tensor.shape
+                    else
+                        right_tensor.shape;
+                    const output_dims: i32 = if (left_tensor.numel >= right_tensor.numel)
+                        left_tensor.n_dims
+                    else
+                        right_tensor.n_dims;
+                    buffer_views[@intFromEnum(add_tensor_op.out)] = tensorFromSlice(output_slice[0..output_len], output_shape, output_dims);
+                },
+                else => |other_op| {
+                    const op_name = @tagName(other_op);
+                    capi.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
+                    return error.UnsupportedOpInBatchedMode;
+                },
+            }
+        }
+
         const final_buf = finalOutputBuffer(self.program);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);

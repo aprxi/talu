@@ -68,9 +68,8 @@ pub const MetalBackend = struct {
     // Track position for decode
     current_position: usize,
 
-    // Fused model handles (quantized or dense)
-    fused_model: ?*anyopaque,
-    dense_model: ?*anyopaque,
+    // Unified decode model handle (quantized or dense implementation).
+    decode_model: ?model_runtime.DecodeModel,
 
     const SlotState = struct {
         cache: runtime_graph_mod.Cache,
@@ -82,16 +81,13 @@ pub const MetalBackend = struct {
 
     const DecodeExecutionMode = enum {
         non_fused,
-        fused_quantized,
-        fused_dense,
+        fused,
     };
 
     const DecodePath = enum {
         non_fused,
-        pipeline_fused_quantized,
-        batch_fused_quantized,
-        pipeline_fused_dense,
-        batch_fused_dense,
+        pipeline_fused,
+        batch_fused,
     };
 
     const DecodePlan = struct {
@@ -99,20 +95,16 @@ pub const MetalBackend = struct {
         path: DecodePath,
     };
 
-    fn decodeExecutionModeFromHandles(
+    fn decodeExecutionModeFromModel(
         force_non_fused_path: bool,
-        fused_model: ?*anyopaque,
-        dense_model: ?*anyopaque,
-    ) !DecodeExecutionMode {
+        decode_model: ?model_runtime.DecodeModel,
+    ) DecodeExecutionMode {
         if (force_non_fused_path) return .non_fused;
-        if (fused_model != null and dense_model != null) return error.InvalidState;
-        if (fused_model != null) return .fused_quantized;
-        if (dense_model != null) return .fused_dense;
-        return .non_fused;
+        return if (decode_model != null) .fused else .non_fused;
     }
 
-    fn decodeExecutionMode(self: *const MetalBackend, force_non_fused_path: bool) !DecodeExecutionMode {
-        return decodeExecutionModeFromHandles(force_non_fused_path, self.fused_model, self.dense_model);
+    fn decodeExecutionMode(self: *const MetalBackend, force_non_fused_path: bool) DecodeExecutionMode {
+        return decodeExecutionModeFromModel(force_non_fused_path, self.decode_model);
     }
 
     fn shouldUseBatchDecode(
@@ -121,7 +113,7 @@ pub const MetalBackend = struct {
         mode: DecodeExecutionMode,
     ) bool {
         if (env_batch_decode) return true;
-        return callback == null and mode != .non_fused;
+        return callback == null and mode == .fused;
     }
 
     fn selectDecodePlan(
@@ -131,8 +123,7 @@ pub const MetalBackend = struct {
     ) DecodePlan {
         const batch_decode_enabled = shouldUseBatchDecode(env_batch_decode, callback, mode);
         const path: DecodePath = switch (mode) {
-            .fused_quantized => if (batch_decode_enabled) .batch_fused_quantized else .pipeline_fused_quantized,
-            .fused_dense => if (batch_decode_enabled) .batch_fused_dense else .pipeline_fused_dense,
+            .fused => if (batch_decode_enabled) .batch_fused else .pipeline_fused,
             .non_fused => .non_fused,
         };
         return .{ .mode = mode, .path = path };
@@ -141,17 +132,15 @@ pub const MetalBackend = struct {
     fn decodePathLabel(path: DecodePath) []const u8 {
         return switch (path) {
             .non_fused => "non_fused",
-            .pipeline_fused_quantized => "pipeline_fused",
-            .batch_fused_quantized => "batch_fused",
-            .pipeline_fused_dense => "pipeline_dense",
-            .batch_fused_dense => "batch_dense",
+            .pipeline_fused => "pipeline_fused",
+            .batch_fused => "batch_fused",
         };
     }
 
     fn isBatchDecodePath(path: DecodePath) bool {
         return switch (path) {
-            .batch_fused_quantized, .batch_fused_dense => true,
-            .non_fused, .pipeline_fused_quantized, .pipeline_fused_dense => false,
+            .batch_fused => true,
+            .non_fused, .pipeline_fused => false,
         };
     }
 
@@ -269,26 +258,13 @@ pub const MetalBackend = struct {
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
-        const mode = try self.decodeExecutionMode(false);
+        const mode = self.decodeExecutionMode(false);
 
         switch (mode) {
-            .fused_quantized => {
-                const fused = self.fused_model orelse return error.InvalidArgument;
-                const logits_handle = model_runtime.mlx_fused_decode_step_logits(
-                    fused,
-                    slot_cache.handle,
-                    slot_shortconv_cache.handle,
-                    token,
-                    effective_position,
-                );
-                graph.copyToHost(logits_handle, logits_out);
-                slot_position.* = position + 1;
-                return;
-            },
-            .fused_dense => {
-                const dense = self.dense_model orelse return error.InvalidArgument;
-                const logits_handle = model_runtime.mlx_dense_decode_step_logits(
-                    dense,
+            .fused => {
+                const decode_model = self.decode_model orelse return error.InvalidArgument;
+                const logits_handle = model_runtime.decodeStepLogits(
+                    decode_model,
                     slot_cache.handle,
                     slot_shortconv_cache.handle,
                     token,
@@ -338,15 +314,16 @@ pub const MetalBackend = struct {
         const weight_handles = try weights_trait.loadWeightsToGPU(allocator, loaded);
         errdefer weights_trait.freeWeights(allocator, weight_handles);
 
-        // Create fused model for decode optimization
-        weights_trait.createFusedModel(allocator, weight_handles, loaded.config) catch |err| {
-            log.warn("inference", "Failed to create fused model", .{ .err = @errorName(err) });
-            // Continue without fused model - will fall back to per-layer calls
+        // Create decode model for low-FFI decode optimization.
+        weights_trait.createDecodeModel(allocator, weight_handles, loaded.config) catch |err| {
+            log.warn("inference", "Failed to create decode model", .{ .err = @errorName(err) });
+            // Continue without decode model - will fall back to per-layer calls.
         };
 
         log.debug("inference", "Metal decode model selection", .{
-            .fused_model = @as(u8, @intFromBool(weight_handles.fused_model != null)),
-            .dense_model = @as(u8, @intFromBool(weight_handles.dense_model != null)),
+            .decode_model = @as(u8, @intFromBool(weight_handles.decode_model != null)),
+            .decode_model_quantized = 0,
+            .decode_model_dense = 0,
             .has_shortconv = @as(u8, @intFromBool(weight_handles.has_shortconv)),
             .is_quantized = @as(u8, @intFromBool(weight_handles.is_quantized)),
             .is_moe = @as(u8, @intFromBool(weight_handles.is_moe)),
@@ -397,8 +374,7 @@ pub const MetalBackend = struct {
             .vision_runtime = vision_runtime,
             .slot_rope_position_delta = 0,
             .current_position = 0,
-            .fused_model = weight_handles.fused_model,
-            .dense_model = weight_handles.dense_model,
+            .decode_model = weight_handles.decode_model,
         };
     }
 
@@ -657,14 +633,15 @@ pub const MetalBackend = struct {
         // Allow forcing non-fused path for debugging
         const force_non_fused_path = std.process.hasEnvVar(self.allocator, "TALU_NO_FUSED") catch false;
         const env_batch_decode = std.process.hasEnvVar(self.allocator, "TALU_BATCH_DECODE") catch false;
-        const mode = try self.decodeExecutionMode(force_non_fused_path);
+        const mode = self.decodeExecutionMode(force_non_fused_path);
         const decode_plan = selectDecodePlan(mode, env_batch_decode, callback);
         const decode_path = decodePathLabel(decode_plan.path);
         const batch_decode_enabled = isBatchDecodePath(decode_plan.path);
         log.debug("inference", "Metal decode path", .{
-            .fused = @as(u8, @intFromBool(self.fused_model != null)),
-            .dense = @as(u8, @intFromBool(self.dense_model != null)),
-            .selected_fused_path = @as(u8, @intFromBool(decode_plan.mode != .non_fused)),
+            .decode_model = @as(u8, @intFromBool(self.decode_model != null)),
+            .decode_model_quantized = 0,
+            .decode_model_dense = 0,
+            .selected_decode_model_path = @as(u8, @intFromBool(decode_plan.mode != .non_fused)),
             .force_non_fused_path = @as(u8, @intFromBool(force_non_fused_path)),
             .batch_decode_enabled = @as(u8, @intFromBool(batch_decode_enabled)),
             .path = decode_path,
@@ -675,10 +652,10 @@ pub const MetalBackend = struct {
         if (batch_decode_enabled) {
             const effective_start_position = try common_mrope.applyPositionDelta(start_position, self.slot_rope_position_delta);
             const generated_count = switch (decode_plan.path) {
-                .batch_fused_quantized => blk: {
-                    const fused = self.fused_model orelse return error.InvalidArgument;
-                    break :blk model_runtime.mlx_fused_decode_batch(
-                        fused,
+                .batch_fused => blk: {
+                    const decode_model = self.decode_model orelse return error.InvalidArgument;
+                    break :blk model_runtime.decodeBatch(
+                        decode_model,
                         self.cache.handle,
                         self.shortconv_cache.handle,
                         first_token,
@@ -689,21 +666,7 @@ pub const MetalBackend = struct {
                         eos_token_ids.len,
                     );
                 },
-                .batch_fused_dense => blk: {
-                    const dense = self.dense_model orelse return error.InvalidArgument;
-                    break :blk model_runtime.mlx_dense_decode_batch(
-                        dense,
-                        self.cache.handle,
-                        self.shortconv_cache.handle,
-                        first_token,
-                        effective_start_position,
-                        output_tokens.ptr,
-                        max_tokens,
-                        eos_token_ids.ptr,
-                        eos_token_ids.len,
-                    );
-                },
-                .non_fused, .pipeline_fused_quantized, .pipeline_fused_dense => return error.InvalidState,
+                .non_fused, .pipeline_fused => return error.InvalidState,
             };
 
             if (generated_count > 0) {
@@ -719,7 +682,7 @@ pub const MetalBackend = struct {
         }
 
         switch (decode_plan.path) {
-            .pipeline_fused_quantized, .pipeline_fused_dense => {
+            .pipeline_fused => {
                 return self.decodeStreamingFused(
                     first_token,
                     start_position,
@@ -740,11 +703,11 @@ pub const MetalBackend = struct {
                 callback,
                 callback_data,
             ),
-            .batch_fused_quantized, .batch_fused_dense => return error.InvalidState,
+            .batch_fused => return error.InvalidState,
         }
     }
 
-    /// Fused decode path - uses pipelined C++ execution
+    /// Decode-model path - uses pipelined C++ execution
     fn decodeStreamingFused(
         self: *MetalBackend,
         first_token: u32,
@@ -761,27 +724,15 @@ pub const MetalBackend = struct {
 
         // Prime the pipeline
         const effective_start_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
+        const decode_model = self.decode_model orelse return error.InvalidArgument;
         switch (mode) {
-            .fused_quantized => {
-                const fused = self.fused_model orelse return error.InvalidArgument;
-                model_runtime.mlx_pipeline_prime(
-                    fused,
-                    self.cache.handle,
-                    self.shortconv_cache.handle,
-                    first_token,
-                    effective_start_position,
-                );
-            },
-            .fused_dense => {
-                const dense = self.dense_model orelse return error.InvalidArgument;
-                model_runtime.mlx_dense_pipeline_prime(
-                    dense,
-                    self.cache.handle,
-                    self.shortconv_cache.handle,
-                    first_token,
-                    effective_start_position,
-                );
-            },
+            .fused => model_runtime.pipelinePrime(
+                decode_model,
+                self.cache.handle,
+                self.shortconv_cache.handle,
+                first_token,
+                effective_start_position,
+            ),
             .non_fused => return error.InvalidArgument,
         }
         position_index += 1;
@@ -793,31 +744,18 @@ pub const MetalBackend = struct {
                 // Normal step: returns current, queues next
                 const effective_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
                 switch (mode) {
-                    .fused_quantized => {
-                        const fused = self.fused_model orelse return error.InvalidArgument;
-                        sampled_token_id = model_runtime.mlx_pipeline_step(
-                            fused,
-                            self.cache.handle,
-                            self.shortconv_cache.handle,
-                            effective_position,
-                        );
-                    },
-                    .fused_dense => {
-                        const dense = self.dense_model orelse return error.InvalidArgument;
-                        sampled_token_id = model_runtime.mlx_dense_pipeline_step(
-                            dense,
-                            self.cache.handle,
-                            self.shortconv_cache.handle,
-                            effective_position,
-                        );
-                    },
+                    .fused => sampled_token_id = model_runtime.pipelineStep(
+                        decode_model,
+                        self.cache.handle,
+                        self.shortconv_cache.handle,
+                        effective_position,
+                    ),
                     .non_fused => return error.InvalidArgument,
                 }
             } else {
                 // Last iteration: flush
                 sampled_token_id = switch (mode) {
-                    .fused_quantized => model_runtime.mlx_pipeline_flush(),
-                    .fused_dense => model_runtime.mlx_dense_pipeline_flush(),
+                    .fused => model_runtime.pipelineFlush(decode_model),
                     .non_fused => return error.InvalidArgument,
                 };
             }
@@ -851,7 +789,7 @@ pub const MetalBackend = struct {
         return generated_count;
     }
 
-    /// Non-fused decode path - uses lazy graph API with pipelining
+    /// Non decode-model path - uses lazy graph API with pipelining
     fn decodeStreamingNonFused(
         self: *MetalBackend,
         first_token: u32,
@@ -1063,33 +1001,45 @@ pub const MetalBackend = struct {
     }
 };
 
-test "decodeExecutionModeFromHandles returns non_fused when forced" {
+test "decodeExecutionModeFromModel returns non_fused when forced" {
     try std.testing.expectEqual(
         MetalBackend.DecodeExecutionMode.non_fused,
-        try MetalBackend.decodeExecutionModeFromHandles(true, @ptrFromInt(1), null),
+        MetalBackend.decodeExecutionModeFromModel(true, .{
+            .handle = @ptrFromInt(1),
+        }),
     );
 }
 
-test "decodeExecutionModeFromHandles returns non_fused when no fused handles exist" {
+test "decodeExecutionModeFromModel returns non_fused when no decode model exists" {
     try std.testing.expectEqual(
         MetalBackend.DecodeExecutionMode.non_fused,
-        try MetalBackend.decodeExecutionModeFromHandles(false, null, null),
+        MetalBackend.decodeExecutionModeFromModel(false, null),
     );
 }
 
-test "shouldUseBatchDecode enables auto batch for fused model without callback" {
-    try std.testing.expect(MetalBackend.shouldUseBatchDecode(
-        false,
-        null,
-        .fused_quantized,
-    ));
+test "decodeExecutionModeFromModel returns fused for quantized decode model" {
+    try std.testing.expectEqual(
+        MetalBackend.DecodeExecutionMode.fused,
+        MetalBackend.decodeExecutionModeFromModel(false, .{
+            .handle = @ptrFromInt(1),
+        }),
+    );
 }
 
-test "shouldUseBatchDecode enables auto batch for dense model without callback" {
+test "decodeExecutionModeFromModel returns fused for dense decode model" {
+    try std.testing.expectEqual(
+        MetalBackend.DecodeExecutionMode.fused,
+        MetalBackend.decodeExecutionModeFromModel(false, .{
+            .handle = @ptrFromInt(2),
+        }),
+    );
+}
+
+test "shouldUseBatchDecode enables auto batch for decode model without callback" {
     try std.testing.expect(MetalBackend.shouldUseBatchDecode(
         false,
         null,
-        .fused_dense,
+        .fused,
     ));
 }
 
@@ -1100,7 +1050,7 @@ test "shouldUseBatchDecode keeps streaming path when callback is set" {
     try std.testing.expect(!MetalBackend.shouldUseBatchDecode(
         false,
         TestCallback.cb,
-        .fused_quantized,
+        .fused,
     ));
 }
 
@@ -1110,20 +1060,6 @@ test "shouldUseBatchDecode honors env override" {
         null,
         .non_fused,
     ));
-}
-
-test "decodeExecutionModeFromHandles returns fused_quantized when fused model exists" {
-    try std.testing.expectEqual(
-        MetalBackend.DecodeExecutionMode.fused_quantized,
-        try MetalBackend.decodeExecutionModeFromHandles(false, @ptrFromInt(1), null),
-    );
-}
-
-test "decodeExecutionModeFromHandles returns fused_dense when dense model exists" {
-    try std.testing.expectEqual(
-        MetalBackend.DecodeExecutionMode.fused_dense,
-        try MetalBackend.decodeExecutionModeFromHandles(false, null, @ptrFromInt(1)),
-    );
 }
 
 test "extraSlotIndexFor maps scheduler slots to extra-slot storage" {
@@ -1136,34 +1072,27 @@ test "extraSlotIndexFor rejects slot 0 and out-of-range slots" {
     try std.testing.expectError(error.InvalidArgument, MetalBackend.extraSlotIndexFor(4, 4));
 }
 
-test "decodeExecutionModeFromHandles rejects conflicting fused handles" {
-    try std.testing.expectError(
-        error.InvalidState,
-        MetalBackend.decodeExecutionModeFromHandles(false, @ptrFromInt(1), @ptrFromInt(2)),
-    );
-}
-
 test "selectDecodePlan returns pipeline path for fused mode with callback" {
     const TestCallback = struct {
         fn cb(_: u32, _: ?*anyopaque) void {}
     };
     const plan = MetalBackend.selectDecodePlan(
-        .fused_quantized,
+        .fused,
         false,
         TestCallback.cb,
     );
-    try std.testing.expectEqual(MetalBackend.DecodeExecutionMode.fused_quantized, plan.mode);
-    try std.testing.expectEqual(MetalBackend.DecodePath.pipeline_fused_quantized, plan.path);
+    try std.testing.expectEqual(MetalBackend.DecodeExecutionMode.fused, plan.mode);
+    try std.testing.expectEqual(MetalBackend.DecodePath.pipeline_fused, plan.path);
 }
 
-test "selectDecodePlan returns batch path for dense mode without callback" {
+test "selectDecodePlan returns batch path for fused mode without callback" {
     const plan = MetalBackend.selectDecodePlan(
-        .fused_dense,
+        .fused,
         false,
         null,
     );
-    try std.testing.expectEqual(MetalBackend.DecodeExecutionMode.fused_dense, plan.mode);
-    try std.testing.expectEqual(MetalBackend.DecodePath.batch_fused_dense, plan.path);
+    try std.testing.expectEqual(MetalBackend.DecodeExecutionMode.fused, plan.mode);
+    try std.testing.expectEqual(MetalBackend.DecodePath.batch_fused, plan.path);
 }
 
 test "selectDecodePlan returns non_fused path for non_fused mode" {
