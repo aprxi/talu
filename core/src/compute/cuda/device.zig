@@ -130,7 +130,7 @@ pub const Device = struct {
     }
 
     pub fn synchronize(self: *Device) !void {
-        try self.setCurrent();
+        try self.makeCurrent();
         if (self.api.cu_ctx_synchronize() != cuda_success) return error.CudaSynchronizeFailed;
     }
 
@@ -142,7 +142,7 @@ pub const Device = struct {
     }
 
     pub fn allocBuffer(self: *Device, buffer_size: usize) !Buffer {
-        try self.setCurrent();
+        try self.makeCurrent();
 
         var pointer: u64 = 0;
         const rc = self.api.cu_mem_alloc(&pointer, buffer_size);
@@ -151,7 +151,7 @@ pub const Device = struct {
         return .{ .pointer = pointer, .size = buffer_size };
     }
 
-    fn setCurrent(self: *Device) !void {
+    pub fn makeCurrent(self: *Device) !void {
         if (self.context == null) return error.CudaContextLost;
         if (self.api.cu_ctx_set_current(self.context) != cuda_success) return error.CudaContextLost;
     }
@@ -163,7 +163,7 @@ pub const Buffer = struct {
 
     pub fn deinit(self: *Buffer, device: *Device) void {
         if (self.pointer == 0) return;
-        device.setCurrent() catch return;
+        device.makeCurrent() catch return;
         _ = device.api.cu_mem_free(self.pointer);
         self.pointer = 0;
         self.size = 0;
@@ -173,7 +173,7 @@ pub const Buffer = struct {
         if (data.len > self.size) return error.InvalidArgument;
         if (data.len == 0) return;
 
-        try device.setCurrent();
+        try device.makeCurrent();
         if (device.api.cu_memcpy_htod(self.pointer, @ptrCast(data.ptr), data.len) != cuda_success) {
             return error.CudaCopyFailed;
         }
@@ -183,7 +183,7 @@ pub const Buffer = struct {
         if (data.len > self.size) return error.InvalidArgument;
         if (data.len == 0) return;
 
-        try device.setCurrent();
+        try device.makeCurrent();
         if (device.api.cu_memcpy_dtoh(@ptrCast(data.ptr), self.pointer, data.len) != cuda_success) {
             return error.CudaCopyFailed;
         }

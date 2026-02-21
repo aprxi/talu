@@ -5,13 +5,16 @@
 
 pub const capabilities = @import("capabilities.zig");
 pub const device = @import("device.zig");
+pub const matmul = @import("matmul.zig");
 
 pub const Device = device.Device;
 pub const Buffer = device.Buffer;
 pub const Probe = device.Probe;
 pub const probeRuntime = device.probeRuntime;
+pub const Blas = matmul.Blas;
 
 test {
     _ = capabilities;
     _ = device;
+    _ = matmul;
 }

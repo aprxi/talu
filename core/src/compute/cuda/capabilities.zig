@@ -1,7 +1,7 @@
 //! Explicit CUDA primitive capability map (stub backend).
 
 pub const PrimitiveCapabilities = struct {
-    linalg: bool = false,
+    linalg: bool = true,
     normalization: bool = false,
     activation: bool = false,
     softmax: bool = false,

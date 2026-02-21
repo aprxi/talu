@@ -37,6 +37,7 @@ pub const CudaBackend = struct {
         errdefer device.deinit();
 
         log.info("inference", "CUDA device ready", .{ .name = device.name() });
+        try runMatmulSmoke(&device);
 
         return .{
             .allocator = allocator,
@@ -133,6 +134,53 @@ pub const CudaBackend = struct {
     }
 };
 
+fn runMatmulSmoke(device: *compute.cuda.Device) !void {
+    var blas = try compute.cuda.Blas.init(device);
+    defer blas.deinit(device);
+
+    const m: usize = 2;
+    const k: usize = 2;
+    const n: usize = 2;
+
+    const a = [_]f32{
+        1.0, 2.0,
+        3.0, 4.0,
+    };
+    const b = [_]f32{
+        5.0, 6.0,
+        7.0, 8.0,
+    };
+    const expected = [_]f32{
+        19.0, 22.0,
+        43.0, 50.0,
+    };
+    var actual = [_]f32{0.0} ** (m * n);
+
+    var a_dev = try device.allocBuffer(@sizeOf(f32) * a.len);
+    defer a_dev.deinit(device);
+    var b_dev = try device.allocBuffer(@sizeOf(f32) * b.len);
+    defer b_dev.deinit(device);
+    var c_dev = try device.allocBuffer(@sizeOf(f32) * actual.len);
+    defer c_dev.deinit(device);
+
+    try a_dev.upload(device, std.mem.sliceAsBytes(a[0..]));
+    try b_dev.upload(device, std.mem.sliceAsBytes(b[0..]));
+    try blas.matmulF32(device, &a_dev, m, k, &b_dev, n, &c_dev);
+    try device.synchronize();
+    try c_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (expected, actual) |want, got| {
+        if (@abs(want - got) > 0.001) return error.CudaSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA matmul smoke passed", .{
+        .m = m,
+        .k = k,
+        .n = n,
+        .c00 = actual[0],
+    });
+}
+
 test "allocSlot allows only a single slot in stub backend" {
     if (compute.cuda.probeRuntime() != .available) return error.SkipZigTest;
 
@@ -142,7 +190,10 @@ test "allocSlot allows only a single slot in stub backend" {
     loaded.config.vocab_size = 32;
     loaded.config.d_model = 16;
 
-    var backend = try CudaBackend.init(allocator, &loaded);
+    var backend = CudaBackend.init(allocator, &loaded) catch |err| {
+        if (err == error.CublasUnavailable or err == error.CublasSymbolMissing) return error.SkipZigTest;
+        return err;
+    };
     defer backend.deinit();
 
     try std.testing.expectEqual(@as(?usize, 0), backend.allocSlot());
@@ -158,7 +209,10 @@ test "prefill returns typed not-implemented error" {
     loaded.config.vocab_size = 8;
     loaded.config.d_model = 4;
 
-    var backend = try CudaBackend.init(allocator, &loaded);
+    var backend = CudaBackend.init(allocator, &loaded) catch |err| {
+        if (err == error.CublasUnavailable or err == error.CublasSymbolMissing) return error.SkipZigTest;
+        return err;
+    };
     defer backend.deinit();
 
     var logits: [8]f32 = undefined;
