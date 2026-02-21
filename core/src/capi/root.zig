@@ -34,7 +34,7 @@ pub const documents = @import("documents.zig");
 pub const blobs = @import("blobs.zig");
 pub const plugins = @import("plugins.zig");
 pub const file_api = @import("file.zig");
-pub const treesitter = @import("treesitter.zig");
+pub const treesitter = @import("code.zig");
 
 pub const router = @import("router.zig");
 pub const agent = @import("agent.zig");
