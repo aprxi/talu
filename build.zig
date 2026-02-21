@@ -838,6 +838,7 @@ pub fn build(b: *std.Build) void {
             .name = "perf_sanity",
             .root_module = perf_exe_mod,
         });
+        linkCDependencies(b, perf_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
         addMetalCoreSupport(b, perf_exe_mod, perf_exe, enable_metal);
         b.installArtifact(perf_exe);
 
@@ -866,6 +867,7 @@ pub fn build(b: *std.Build) void {
         const perf_tests = b.addTest(.{
             .root_module = perf_test_mod,
         });
+        linkCDependencies(b, perf_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
         const run_perf_tests = b.addRunArtifact(perf_tests);
         const perf_test_step = b.step("test-perf-sanity", "Run perf/lifecycle sanity tests");
         perf_test_step.dependOn(&run_perf_tests.step);

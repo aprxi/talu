@@ -57,6 +57,7 @@ fn build_app() -> Router {
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
         max_file_inspect_bytes: 50 * 1024 * 1024,
+        code_sessions: Mutex::new(HashMap::new()),
     };
     Router::new(Arc::new(state))
 }
@@ -76,6 +77,7 @@ fn build_app_with_inspect_limit(limit: u64) -> Router {
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
         max_file_inspect_bytes: limit,
+        code_sessions: Mutex::new(HashMap::new()),
     };
     Router::new(Arc::new(state))
 }

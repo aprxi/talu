@@ -5,6 +5,7 @@
 
 mod server {
     pub mod auth;
+    pub mod code;
     pub mod common;
     pub mod compliance;
     pub mod console;
