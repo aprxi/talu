@@ -404,6 +404,23 @@ comptime {
     // Agent context injection API
     _ = &capi.talu_agent_set_context_inject;
 
+    // Tree-sitter API (code parsing, highlighting, querying)
+    _ = &capi.talu_treesitter_parser_create;
+    _ = &capi.talu_treesitter_parser_free;
+    _ = &capi.talu_treesitter_parse;
+    _ = &capi.talu_treesitter_tree_free;
+    _ = &capi.talu_treesitter_tree_sexp;
+    _ = &capi.talu_treesitter_highlight;
+    _ = &capi.talu_treesitter_query_create;
+    _ = &capi.talu_treesitter_query_free;
+    _ = &capi.talu_treesitter_query_exec;
+    _ = &capi.talu_treesitter_languages;
+    _ = &capi.talu_treesitter_language_from_filename;
+    _ = &capi.talu_treesitter_tree_json;
+    _ = &capi.talu_treesitter_highlight_rich;
+    _ = &capi.talu_treesitter_extract_callables;
+    _ = &capi.talu_treesitter_extract_call_sites;
+
     // MessageBus API
     _ = &capi.talu_agent_bus_create;
     _ = &capi.talu_agent_bus_free;

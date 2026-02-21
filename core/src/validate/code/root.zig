@@ -3,18 +3,13 @@
 //! Provides detection and validation of code blocks in LLM output.
 //! Currently supports markdown-style code fences (CommonMark compliant).
 //!
-//! # Future Scope
-//!
-//! This module is designed to expand into language-specific syntax
-//! validation (e.g., via tree-sitter), enabling enforcement of
-//! syntactically valid Python, Zig, Rust, etc.
-//!
 //! Thread safety: Types are NOT thread-safe unless documented otherwise.
 
 // ===== Public API =====
 
 pub const fence = @import("fence.zig");
 pub const block = @import("block.zig");
+pub const treesitter = @import("treesitter/root.zig");
 
 // Re-export commonly used types at module level
 pub const CodeBlock = block.CodeBlock;

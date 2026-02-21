@@ -34,6 +34,7 @@ pub const documents = @import("documents.zig");
 pub const blobs = @import("blobs.zig");
 pub const plugins = @import("plugins.zig");
 pub const file_api = @import("file.zig");
+pub const treesitter = @import("treesitter.zig");
 
 pub const router = @import("router.zig");
 pub const agent = @import("agent.zig");
@@ -605,6 +606,26 @@ pub const talu_agent_bus_broadcast = agent.talu_agent_bus_broadcast;
 pub const talu_agent_bus_pending = agent.talu_agent_bus_pending;
 pub const talu_agent_bus_set_notify = agent.talu_agent_bus_set_notify;
 pub const TaluAgentBus = agent.TaluAgentBus;
+
+// Re-export Tree-sitter C API functions (code parsing, highlighting, querying).
+pub const talu_treesitter_parser_create = treesitter.talu_treesitter_parser_create;
+pub const talu_treesitter_parser_free = treesitter.talu_treesitter_parser_free;
+pub const talu_treesitter_parse = treesitter.talu_treesitter_parse;
+pub const talu_treesitter_tree_free = treesitter.talu_treesitter_tree_free;
+pub const talu_treesitter_tree_sexp = treesitter.talu_treesitter_tree_sexp;
+pub const talu_treesitter_highlight = treesitter.talu_treesitter_highlight;
+pub const talu_treesitter_query_create = treesitter.talu_treesitter_query_create;
+pub const talu_treesitter_query_free = treesitter.talu_treesitter_query_free;
+pub const talu_treesitter_query_exec = treesitter.talu_treesitter_query_exec;
+pub const talu_treesitter_languages = treesitter.talu_treesitter_languages;
+pub const talu_treesitter_language_from_filename = treesitter.talu_treesitter_language_from_filename;
+pub const talu_treesitter_tree_json = treesitter.talu_treesitter_tree_json;
+pub const talu_treesitter_highlight_rich = treesitter.talu_treesitter_highlight_rich;
+pub const talu_treesitter_extract_callables = treesitter.talu_treesitter_extract_callables;
+pub const talu_treesitter_extract_call_sites = treesitter.talu_treesitter_extract_call_sites;
+pub const TreeSitterParserHandle = treesitter.TreeSitterParserHandle;
+pub const TreeSitterTreeHandle = treesitter.TreeSitterTreeHandle;
+pub const TreeSitterQueryHandle = treesitter.TreeSitterQueryHandle;
 
 // ABI validation - comptime assertions ensure struct sizes match expected values.
 // When struct layouts change, update abi.zig and bindings/python/talu/_abi.py.

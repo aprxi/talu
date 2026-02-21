@@ -56,6 +56,19 @@ deps:
 	@test -d deps/pdfium || git clone --depth 1 https://pdfium.googlesource.com/pdfium deps/pdfium
 	@test -d deps/pdfium/third_party/fast_float/src || \
 		git clone --branch v8.2.3 --depth 1 https://github.com/fastfloat/fast_float.git deps/pdfium/third_party/fast_float/src
+	@# Tree-sitter core runtime + language grammars
+	@test -d deps/tree-sitter || git clone --branch v0.26.5 --depth 1 https://github.com/tree-sitter/tree-sitter.git deps/tree-sitter
+	@test -d deps/tree-sitter-python || git clone --branch v0.23.6 --depth 1 https://github.com/tree-sitter/tree-sitter-python.git deps/tree-sitter-python
+	@test -d deps/tree-sitter-javascript || git clone --branch v0.23.1 --depth 1 https://github.com/tree-sitter/tree-sitter-javascript.git deps/tree-sitter-javascript
+	@test -d deps/tree-sitter-typescript || git clone --branch v0.23.2 --depth 1 https://github.com/tree-sitter/tree-sitter-typescript.git deps/tree-sitter-typescript
+	@test -d deps/tree-sitter-rust || git clone --branch v0.23.2 --depth 1 https://github.com/tree-sitter/tree-sitter-rust.git deps/tree-sitter-rust
+	@test -d deps/tree-sitter-go || git clone --branch v0.23.4 --depth 1 https://github.com/tree-sitter/tree-sitter-go.git deps/tree-sitter-go
+	@test -d deps/tree-sitter-c || git clone --branch v0.23.5 --depth 1 https://github.com/tree-sitter/tree-sitter-c.git deps/tree-sitter-c
+	@test -d deps/tree-sitter-zig || git clone --branch v1.1.2 --depth 1 https://github.com/tree-sitter-grammars/tree-sitter-zig.git deps/tree-sitter-zig
+	@test -d deps/tree-sitter-json || git clone --branch v0.24.8 --depth 1 https://github.com/tree-sitter/tree-sitter-json.git deps/tree-sitter-json
+	@test -d deps/tree-sitter-html || git clone --branch v0.23.2 --depth 1 https://github.com/tree-sitter/tree-sitter-html.git deps/tree-sitter-html
+	@test -d deps/tree-sitter-css || git clone --branch v0.23.1 --depth 1 https://github.com/tree-sitter/tree-sitter-css.git deps/tree-sitter-css
+	@test -d deps/tree-sitter-bash || git clone --branch v0.23.3 --depth 1 https://github.com/tree-sitter/tree-sitter-bash.git deps/tree-sitter-bash
 	@test -f deps/mbedtls/build/library/libmbedtls.a || $(MAKE) mbedtls-build
 	@test -f deps/curl/build/lib/libcurl.a || $(MAKE) curl-build
 	@test -f deps/freetype/build/libfreetype.a || $(MAKE) freetype-build

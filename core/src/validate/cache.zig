@@ -3,6 +3,7 @@
 const std = @import("std");
 const ast = @import("ast.zig");
 const schema_mod = @import("schema.zig");
+const query_cache = @import("code/treesitter/query_cache.zig");
 
 const Grammar = ast.Grammar;
 
@@ -241,6 +242,7 @@ pub fn cleanupGlobalCaches() void {
             global_cache = null;
         }
     }
+    query_cache.cleanupQueryCache();
 }
 
 test "cache hit returns same grammar" {
