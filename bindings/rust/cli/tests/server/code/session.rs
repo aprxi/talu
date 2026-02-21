@@ -73,10 +73,11 @@ async fn session_update_full_source() {
         body_json(send_request(&app, post_json("/v1/code/session/update", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        json.get("tokens").and_then(|v| v.as_array()).is_some(),
-        "update should return tokens"
-    );
+    let tokens = json
+        .get("tokens")
+        .and_then(|v| v.as_array())
+        .expect("update should return tokens array");
+    assert!(!tokens.is_empty(), "updated source should produce tokens");
 }
 
 #[tokio::test]
@@ -113,10 +114,11 @@ async fn session_update_delta() {
         body_json(send_request(&app, post_json("/v1/code/session/update", &update_body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
-    assert!(
-        json.get("tokens").and_then(|v| v.as_array()).is_some(),
-        "delta update should return tokens"
-    );
+    let tokens = json
+        .get("tokens")
+        .and_then(|v| v.as_array())
+        .expect("delta update should return tokens array");
+    assert!(!tokens.is_empty(), "delta-updated source 'x = 42' should produce tokens");
 }
 
 #[tokio::test]
@@ -193,4 +195,34 @@ async fn session_update_delta_out_of_bounds() {
         Some("edit_failed"),
         "should return edit_failed error: {json}"
     );
+}
+
+#[tokio::test]
+async fn session_highlight_nonexistent() {
+    let app = build_app();
+    let body = serde_json::json!({
+        "session_id": "nonexistent_id_xyz"
+    });
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/session/highlight", &body)).await).await;
+
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("session_not_found")
+    );
+}
+
+#[tokio::test]
+async fn session_create_invalid_language() {
+    let app = build_app();
+    let body = serde_json::json!({
+        "source": "hello",
+        "language": "nonexistent_language_xyz"
+    });
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/session/create", &body)).await).await;
+
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(json.get("error").is_some(), "should return error object");
 }

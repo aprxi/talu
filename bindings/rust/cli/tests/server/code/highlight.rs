@@ -60,6 +60,12 @@ async fn highlight_javascript() {
     assert_eq!(status, StatusCode::OK);
     let tokens = json.as_array().expect("response should be a JSON array");
     assert!(!tokens.is_empty(), "JavaScript source should produce tokens");
+
+    for token in tokens {
+        assert!(token.get("s").is_some(), "token missing 's': {token}");
+        assert!(token.get("e").is_some(), "token missing 'e': {token}");
+        assert!(token.get("t").is_some(), "token missing 't': {token}");
+    }
 }
 
 #[tokio::test]
