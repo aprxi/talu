@@ -18,12 +18,13 @@ test "compute.cpu exposes primitive-first modules" {
     _ = compute.cpu.topk;
     _ = compute.cpu.reduction;
     _ = compute.cpu.softmax;
-    _ = compute.cpu.sdpa_decode;
+    _ = compute.cpu.sdpa_rowwise;
+    _ = compute.cpu.linalg.matmul;
+    _ = compute.cpu.linalg.sdpa;
+    _ = compute.cpu.math;
 }
 
-test "compute.cpu transitional modules remain available during migration" {
-    _ = compute.cpu.linalg.matmul;
-    _ = compute.cpu.normalization;
-    _ = compute.cpu.linalg_sdpa;
-    _ = compute.cpu.math;
+test "compute.cpu transitional sdpa aliases are removed" {
+    try std.testing.expect(!@hasDecl(compute.cpu, "linalg_sdpa"));
+    try std.testing.expect(!@hasDecl(compute.cpu, "sdpa_decode"));
 }

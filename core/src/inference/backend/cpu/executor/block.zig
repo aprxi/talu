@@ -8,12 +8,12 @@ const builtin = @import("builtin");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const capi = @import("../../../../capi/error.zig");
+const error_context = @import("../../../../error_context.zig");
 const cpu_linalg = compute.cpu.linalg;
 const tv = compute.cpu.tensor_view;
 const activation_ops = compute.cpu.activation_view;
 const transpose_ops = compute.cpu.layout.transpose;
-const attention_ops = compute.cpu.linalg_sdpa;
+const attention_ops = cpu_linalg.sdpa;
 const cpu_broadcast = compute.cpu.layout.broadcast;
 const cpu_elementwise = compute.cpu.elementwise;
 const cpu_reduction = compute.cpu.reduction;
@@ -233,7 +233,7 @@ pub const Block = struct {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
                     if (kernel_id >= self.block.kernels.len) {
-                        capi.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
+                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
                         return error.KernelIndexOutOfBounds;
                     }
                     const kernel = self.block.kernels[kernel_id];
@@ -270,7 +270,7 @@ pub const Block = struct {
                     // Linear projection: output = input @ weight
                     // Look up weight from registry by name
                     const weight = self.block.weight_registry.get(linear_op.weight_name) orelse {
-                        capi.setContext("block={d}, op={d}, weight={s}", .{ self.block_idx, op_index, linear_op.weight_name });
+                        error_context.setContext("block={d}, op={d}, weight={s}", .{ self.block_idx, op_index, linear_op.weight_name });
                         return error.MissingWeight;
                     };
 
@@ -323,7 +323,7 @@ pub const Block = struct {
 
                     // Use the appropriate matmul kernel based on weight dtype
                     const dk = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
-                        capi.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
+                        error_context.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
                         return err;
                     };
                     dk.func(&input_view, weight, &output_view, &scratch.matmul_scratch);
@@ -738,11 +738,11 @@ pub const Block = struct {
 
                     // Get RoPE from attention module
                     const attn = self.block.getAttention() orelse {
-                        capi.setContext("block={d}, op={d}, type=mamba", .{ self.block_idx, op_index });
+                        error_context.setContext("block={d}, op={d}, type=mamba", .{ self.block_idx, op_index });
                         return error.RopeNotAvailableForMamba;
                     };
                     const rope = attn.rope orelse {
-                        capi.setContext("block={d}, op={d}", .{ self.block_idx, op_index });
+                        error_context.setContext("block={d}, op={d}", .{ self.block_idx, op_index });
                         return error.MissingRopeConfig;
                     };
 
@@ -756,7 +756,7 @@ pub const Block = struct {
                         pos_offset,
                         rope,
                     ) catch |err| {
-                        capi.setContext("block={d}, op={d}, ndim={d}", .{ self.block_idx, op_index, in_tensor.n_dims });
+                        error_context.setContext("block={d}, op={d}, ndim={d}", .{ self.block_idx, op_index, in_tensor.n_dims });
                         return err;
                     };
 
@@ -796,7 +796,7 @@ pub const Block = struct {
 
                     // Verify 4D shape
                     if (query_buf.n_dims != 4) {
-                        capi.setContext("block={d}, op={d}, got {d}D, need 4D", .{ self.block_idx, op_index, query_buf.n_dims });
+                        error_context.setContext("block={d}, op={d}, got {d}D, need 4D", .{ self.block_idx, op_index, query_buf.n_dims });
                         return error.InvalidShape;
                     }
 
@@ -828,13 +828,13 @@ pub const Block = struct {
                     if (sdpa_op.is_causal) {
                         // Use causal version (no explicit mask needed)
                         attention_ops.sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, scratch.allocator) catch |err| {
-                            capi.setContext("block={d}, op={d}, causal=true", .{ self.block_idx, op_index });
+                            error_context.setContext("block={d}, op={d}, causal=true", .{ self.block_idx, op_index });
                             return err;
                         };
                     } else {
                         // Non-causal (no mask)
                         attention_ops.sdpa(out_view, q_view, k_view, v_view, null, scale, scratch.allocator) catch |err| {
-                            capi.setContext("block={d}, op={d}, causal=false", .{ self.block_idx, op_index });
+                            error_context.setContext("block={d}, op={d}, causal=false", .{ self.block_idx, op_index });
                             return err;
                         };
                     }
@@ -872,36 +872,36 @@ pub const Block = struct {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
                     if (kernel_id >= self.block.kernels.len) {
-                        capi.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
+                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
                         return error.KernelIndexOutOfBounds;
                     }
                 },
                 .linear => |linear_op| {
                     if (self.block.weight_registry.get(linear_op.weight_name) == null) {
-                        capi.setContext("block={d}, op={d}, weight={s}", .{ self.block_idx, op_index, linear_op.weight_name });
+                        error_context.setContext("block={d}, op={d}, weight={s}", .{ self.block_idx, op_index, linear_op.weight_name });
                         return error.MissingWeight;
                     }
                     const weight = self.block.weight_registry.get(linear_op.weight_name).?;
                     _ = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
-                        capi.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
+                        error_context.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
                         return err;
                     };
                 },
                 .add_param => |add_param_op| {
                     if (self.block.weight_registry.get(add_param_op.param_name) == null) {
-                        capi.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, add_param_op.param_name });
+                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, add_param_op.param_name });
                         return error.MissingParam;
                     }
                 },
                 .add_param_scalar => |add_param_scalar_op| {
                     if (self.block.weight_registry.get(add_param_scalar_op.param_name) == null) {
-                        capi.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, add_param_scalar_op.param_name });
+                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, add_param_scalar_op.param_name });
                         return error.MissingParam;
                     }
                 },
                 .mul_param => |mul_param_op| {
                     if (self.block.weight_registry.get(mul_param_op.param_name) == null) {
-                        capi.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, mul_param_op.param_name });
+                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, mul_param_op.param_name });
                         return error.MissingParam;
                     }
                 },
@@ -1054,7 +1054,7 @@ pub const Block = struct {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
                     if (kernel_id >= self.block.kernels.len) {
-                        capi.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
+                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
                         return error.KernelIndexOutOfBounds;
                     }
                     const kernel = self.block.kernels[kernel_id];
@@ -1117,7 +1117,7 @@ pub const Block = struct {
                 else => |other_op| {
                     // Other ops (linear, rope, etc.) not yet supported in batched mode
                     const op_name = @tagName(other_op);
-                    capi.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
+                    error_context.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
                     return error.UnsupportedOpInBatchedMode;
                 },
             }
@@ -1180,7 +1180,7 @@ pub const Block = struct {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
                     if (kernel_id >= self.block.kernels.len) {
-                        capi.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
+                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
                         return error.KernelIndexOutOfBounds;
                     }
                     const kernel = self.block.kernels[kernel_id];
@@ -1242,7 +1242,7 @@ pub const Block = struct {
                 },
                 else => |other_op| {
                     const op_name = @tagName(other_op);
-                    capi.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
+                    error_context.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
                     return error.UnsupportedOpInBatchedMode;
                 },
             }

@@ -102,23 +102,10 @@ pub const SamplingWorkspace = sampling.Workspace;
 // Internal API (for core/src/ only)
 // =============================================================================
 
-/// Executor - LayerOp bytecode execution
-pub const executor = @import("backend/cpu/executor/root.zig");
-
 /// Backend implementations
 pub const backend = struct {
     pub const cpu = @import("backend/cpu/root.zig");
     pub const metal = @import("backend/metal/root.zig");
-    pub const cpu_executor = @import("backend/cpu/executor/root.zig");
-
-    /// CPU kernel implementations
-    pub const kernels = struct {
-        pub const moe = @import("backend/cpu/kernels/moe.zig");
-        pub const attention = @import("backend/cpu/kernels/attention.zig");
-        pub const ffn = @import("backend/cpu/kernels/ffn.zig");
-        pub const kv_cache = @import("backend/cpu/kernels/kv_cache.zig");
-    };
-
-    // Re-export inference behavioral types so check_coverage.sh --integration can verify test coverage
+    // Re-export inference behavioral type used by dump/xray tooling.
     pub const FusedCpuBackend = cpu.FusedCpuBackend;
 };

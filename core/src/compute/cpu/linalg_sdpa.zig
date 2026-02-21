@@ -1,6 +1,4 @@
-//! Attention operations with stride-aware implementations.
-//!
-//! Includes RoPE (rotary position embeddings) and SDPA (scaled dot-product attention).
+//! Stride-aware SDPA and rotary-transform primitives.
 
 const std = @import("std");
 const tv = @import("tensor_view.zig");
@@ -59,9 +57,9 @@ pub fn ropeFreqs(out: TensorView, theta: f32, offset: usize) void {
 }
 
 /// Apply RoPE to query and key tensors in-place (PyTorch-compatible).
-/// q, k: [batch, heads, seq, head_dim]
-/// cos, sin: [batch, seq, head_dim/2] or [1, seq, head_dim/2] (broadcasts over batch/heads)
-///           Also supports [seq, head_dim] format (used by C API rope_freqs).
+/// q, k: [batch, heads, seq, feature_width]
+/// cos, sin: [batch, seq, feature_width/2] or [1, seq, feature_width/2] (broadcasts over batch/heads)
+///           Also supports [seq, feature_width] format (used by C API rope_freqs).
 pub fn applyRope(q: TensorView, k: TensorView, cos: TensorView, sin: TensorView) void {
     switch (q.dtype) {
         .f32 => applyRopeTyped(f32, f32Identity, f32Identity, q, k, cos, sin),
@@ -84,7 +82,7 @@ fn applyRopeTyped(
     cos: TensorView,
     sin: TensorView,
 ) void {
-    std.debug.assert(q.ndim == 4); // [batch, heads, seq, head_dim]
+    std.debug.assert(q.ndim == 4); // [batch, heads, seq, feature_width]
 
     const q_data = @as([*]T, @ptrCast(@alignCast(q.data)));
     const k_data = @as([*]T, @ptrCast(@alignCast(k.data)));
@@ -97,12 +95,12 @@ fn applyRopeTyped(
     const q_heads = q.shape[1];
     const k_heads = k.shape[1];
     const seq_len = q.shape[2];
-    const head_dim = q.shape[3];
-    const half_dim = head_dim / 2;
+    const feature_width = q.shape[3];
+    const half_dim = feature_width / 2;
 
     // Detect cos/sin layout based on ndim:
     // - Runtime format: [batch, seq, half_dim] with ndim=3
-    // - C API format: [seq, head_dim] with ndim=2
+    // - C API format: [seq, feature_width] with ndim=2
     const is_batched_format = cos.ndim == 3;
 
     // Apply RoPE: x_rotated = x * cos - x_rotated_half * sin
@@ -115,8 +113,8 @@ fn applyRopeTyped(
                 freq_offset = cos_batch * @as(usize, @intCast(cos.strides[0])) +
                     s * @as(usize, @intCast(cos.strides[1]));
             } else {
-                // C API: [seq, head_dim] - cos in first half, sin in second half
-                freq_offset = s * head_dim;
+                // C API: [seq, feature_width] - cos in first half, sin in second half
+                freq_offset = s * feature_width;
             }
 
             // Process query heads
@@ -332,8 +330,8 @@ fn sdpaCausalTyped(
 
     const batch = q.shape[0];
     const num_heads = q.shape[1];
-    const seq_q = q.shape[2];
-    const head_dim = q.shape[3];
+    const query_steps = q.shape[2];
+    const feature_width = q.shape[3];
     const seq_k = k.shape[2];
 
     // Allocate scores buffer - use stack for small sequences, heap for large
@@ -349,7 +347,7 @@ fn sdpaCausalTyped(
 
     for (0..batch) |b| {
         for (0..num_heads) |h| {
-            for (0..seq_q) |sq| {
+            for (0..query_steps) |sq| {
 
                 // The query position in the full sequence
                 const q_pos = causal_mask_shift + sq;
@@ -363,7 +361,7 @@ fn sdpaCausalTyped(
                     }
 
                     var dot: f32 = 0;
-                    for (0..head_dim) |d| {
+                    for (0..feature_width) |d| {
                         const q_idx = b * @as(usize, @intCast(q.strides[0])) +
                             h * @as(usize, @intCast(q.strides[1])) +
                             sq * @as(usize, @intCast(q.strides[2])) +
@@ -383,7 +381,7 @@ fn sdpaCausalTyped(
                 math.softmaxMaskedInPlaceWithMax(scores[0..seq_k], 0, seq_k, null, false, max_score, neg_inf + 1.0);
 
                 // Weighted sum of values
-                for (0..head_dim) |d| {
+                for (0..feature_width) |d| {
                     var acc: f32 = 0;
                     for (0..seq_k) |sk| {
                         const v_idx = b * @as(usize, @intCast(v.strides[0])) +
@@ -403,62 +401,61 @@ fn sdpaCausalTyped(
     }
 }
 
-/// SDPA with cached K/V and optional features.
-/// Computes attention where K/V come from a pre-filled cache.
+/// SDPA over query rows and history buffers with optional masking features.
 ///
 /// Parameters:
-/// - out_data: output buffer [n_heads * seq_q * head_dim]
+/// - out_data: output buffer [n_heads * query_steps * feature_width]
 /// - out_strides: strides for output [batch, heads, seq, dim]
-/// - q_data: query data [batch * n_heads * seq_q * head_dim]
+/// - q_data: query data [batch * n_heads * query_steps * feature_width]
 /// - q_strides: strides for query
-/// - k_cache: cached keys [max_seq * n_kv_heads * head_dim] for this layer
-/// - v_cache: cached values [max_seq * n_kv_heads * head_dim] for this layer
-/// - n_heads, n_kv_heads: number of query and kv heads
-/// - seq_q: number of query positions
-/// - cached_seq: number of valid positions in cache
-/// - head_dim: dimension per head
-/// - kv_offset: offset for causal masking (current position in full sequence)
-/// - scale: attention scale (typically 1/sqrt(head_dim))
+/// - key_history: cached keys [max_seq * source_group_count * feature_width] for this layer
+/// - value_history: cached values [max_seq * source_group_count * feature_width] for this layer
+/// - n_heads, source_group_count: number of query groups and source groups
+/// - query_steps: number of query positions
+/// - history_len: number of valid positions in cache
+/// - feature_width: dimension per head
+/// - causal_mask_shift: offset for causal masking (current position in full sequence)
+/// - scale: attention scale (typically 1/sqrt(feature_width))
 /// - sinks: optional per-head sink logits (null if not used)
 /// - sliding_window: 0 = disabled, >0 = only attend to last N positions
 /// - allocator: optional allocator for large sequences (>8192). If null, large sequences will error.
-fn sdpaCached(
+fn sdpaHistory(
     out_data: [*]f32,
     out_strides: [4]usize,
     q_data: [*]const f32,
     q_strides: [4]usize,
-    k_cache: []const f32,
-    v_cache: []const f32,
+    key_history: []const f32,
+    value_history: []const f32,
     n_heads: usize,
-    n_kv_heads: usize,
-    seq_q: usize,
-    cached_seq: usize,
-    head_dim: usize,
-    kv_offset: usize,
+    source_group_count: usize,
+    query_steps: usize,
+    history_len: usize,
+    feature_width: usize,
+    causal_mask_shift: usize,
     scale: f32,
     sinks: ?[]const f32,
     sliding_window: usize,
     allocator: ?std.mem.Allocator,
 ) AttentionError!void {
     const neg_inf = -std.math.inf(f32);
-    const heads_per_kv = n_heads / n_kv_heads;
-    const kv_size = n_kv_heads * head_dim;
+    const heads_per_kv = n_heads / source_group_count;
+    const kv_size = source_group_count * feature_width;
 
     // Allocate scores buffer - use stack for small sequences, heap for large
-    var stack_scores: [MAX_STACK_SEQ]f32 = undefined; // Safe: only scores[0..cached_seq] used, written before read
-    const heap_scores: ?[]f32 = if (cached_seq > MAX_STACK_SEQ) blk: {
+    var stack_scores: [MAX_STACK_SEQ]f32 = undefined; // Safe: only scores[0..history_len] used, written before read
+    const heap_scores: ?[]f32 = if (history_len > MAX_STACK_SEQ) blk: {
         const alloc = allocator orelse return error.SequenceTooLong;
-        break :blk alloc.alloc(f32, cached_seq) catch return error.OutOfMemory;
+        break :blk alloc.alloc(f32, history_len) catch return error.OutOfMemory;
     } else null;
     defer if (heap_scores) |hs| allocator.?.free(hs);
-    const scores = if (heap_scores) |hs| hs else stack_scores[0..cached_seq];
+    const scores = if (heap_scores) |hs| hs else stack_scores[0..history_len];
 
     for (0..n_heads) |qh| {
         const kv_head = qh / heads_per_kv;
         const sink_logit: ?f32 = if (sinks) |s| s[qh] else null;
 
-        for (0..seq_q) |sq| {
-            const q_pos = kv_offset + sq;
+        for (0..query_steps) |sq| {
+            const q_pos = causal_mask_shift + sq;
 
             // Determine attention window
             const window_start: usize = if (sliding_window > 0 and q_pos >= sliding_window)
@@ -469,17 +466,17 @@ fn sdpaCached(
             var max_score: f32 = neg_inf;
 
             // Q @ K^T with causal + sliding window masking
-            for (0..cached_seq) |sk| {
+            for (0..history_len) |sk| {
                 if (sk < window_start or sk > q_pos) {
                     scores[sk] = neg_inf;
                     continue;
                 }
 
-                const k_cache_idx = sk * kv_size + kv_head * head_dim;
+                const key_history_idx = sk * kv_size + kv_head * feature_width;
                 var dot: f32 = 0;
-                for (0..head_dim) |d| {
+                for (0..feature_width) |d| {
                     const q_idx = qh * q_strides[1] + sq * q_strides[2] + d * q_strides[3];
-                    dot += q_data[q_idx] * k_cache[k_cache_idx + d];
+                    dot += q_data[q_idx] * key_history[key_history_idx + d];
                 }
                 scores[sk] = dot * scale;
                 max_score = @max(max_score, scores[sk]);
@@ -491,14 +488,14 @@ fn sdpaCached(
             }
 
             // Softmax with optional sink
-            math.softmaxMaskedInPlaceWithMax(scores[0..cached_seq], 0, cached_seq, sink_logit, false, max_score, neg_inf + 1.0);
+            math.softmaxMaskedInPlaceWithMax(scores[0..history_len], 0, history_len, sink_logit, false, max_score, neg_inf + 1.0);
 
             // Weighted sum of values
-            for (0..head_dim) |d| {
+            for (0..feature_width) |d| {
                 var acc: f32 = 0;
-                for (0..cached_seq) |sk| {
-                    const v_cache_idx = sk * kv_size + kv_head * head_dim;
-                    acc += scores[sk] * v_cache[v_cache_idx + d];
+                for (0..history_len) |sk| {
+                    const value_history_idx = sk * kv_size + kv_head * feature_width;
+                    acc += scores[sk] * value_history[value_history_idx + d];
                 }
                 const out_idx = qh * out_strides[1] + sq * out_strides[2] + d * out_strides[3];
                 out_data[out_idx] = acc;
@@ -507,13 +504,13 @@ fn sdpaCached(
     }
 }
 
-/// Parameters for KV cache attention, pre-validated.
-/// Use validateKVCacheParams() to construct.
-const KVCacheAttentionParams = struct {
+/// Parameters for history buffer attention, pre-validated.
+/// Use validateHistoryParams() to construct.
+const HistoryAttentionParams = struct {
     n_heads: usize,
-    n_kv_heads: usize,
+    source_group_count: usize,
     seq_len: usize,
-    head_dim: usize,
+    feature_width: usize,
     layer_offset: usize,
     kv_size: usize,
     scale: f32,
@@ -522,14 +519,14 @@ const KVCacheAttentionParams = struct {
     out_strides: [4]usize,
 };
 
-/// Validation error for KV cache parameters.
-const KVCacheValidationError = error{
+/// Validation error for history buffer parameters.
+const HistoryValidationError = error{
     LayerIndexOutOfBounds,
     InvalidTensorDims,
     CacheShapeMismatch,
     BatchMismatch,
     SeqLenMismatch,
-    KVShapeMismatch,
+    GroupShapeMismatch,
     UnsupportedDType,
 };
 
@@ -543,11 +540,10 @@ fn stridesToUsize4D(strides: *const [8]i64) [4]usize {
     };
 }
 
-/// Update KV cache with new K/V values (stride-aware copy)
-/// Used by attention_with_kv_cache to update the cache before computing attention.
-fn updateKVCache(
-    k_cache: []f32,
-    v_cache: []f32,
+/// Update history buffer with new key/value rows (stride-aware copy).
+fn writeHistoryRing(
+    key_history: []f32,
+    value_history: []f32,
     k_data: [*]const f32,
     v_data: [*]const f32,
     k_strides: [4]usize,
@@ -555,20 +551,20 @@ fn updateKVCache(
     seq_pos: usize,
     max_seq_len: usize,
     seq_len: usize,
-    n_kv_heads: usize,
-    head_dim: usize,
+    source_group_count: usize,
+    feature_width: usize,
 ) void {
-    const kv_size = n_kv_heads * head_dim;
+    const kv_size = source_group_count * feature_width;
 
     for (0..seq_len) |s| {
         const cache_pos = (seq_pos + s) % max_seq_len;
         const cache_idx = layer_offset + cache_pos * kv_size;
 
-        for (0..n_kv_heads) |h| {
-            for (0..head_dim) |d| {
+        for (0..source_group_count) |h| {
+            for (0..feature_width) |d| {
                 const in_idx = h * k_strides[1] + s * k_strides[2] + d * k_strides[3];
-                k_cache[cache_idx + h * head_dim + d] = k_data[in_idx];
-                v_cache[cache_idx + h * head_dim + d] = v_data[in_idx];
+                key_history[cache_idx + h * feature_width + d] = k_data[in_idx];
+                value_history[cache_idx + h * feature_width + d] = v_data[in_idx];
             }
         }
     }
@@ -643,7 +639,7 @@ test "applyRope - verify rotation is applied correctly to Q/K vectors" {
 
     const allocator = std.testing.allocator;
 
-    // Create Q and K: [batch=1, heads=1, seq=1, head_dim=4]
+    // Create Q and K: [batch=1, heads=1, seq=1, feature_width=4]
     var q_data = [_]f32{ 1.0, 0.0, 2.0, 0.0 }; // Simple pattern for verification
     var k_data = [_]f32{ 0.0, 1.0, 0.0, 3.0 };
     const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, 1, 4 }, .f32);
@@ -706,7 +702,7 @@ test "sdpaCausal - causal mask" {
     // Test that causal masking prevents attending to future tokens
     const allocator = std.testing.allocator;
 
-    // Q, K, V: [batch=1, heads=1, seq=3, head_dim=2]
+    // Q, K, V: [batch=1, heads=1, seq=3, feature_width=2]
     var q_data = [_]f32{ 1.0, 0.0, 1.0, 0.0, 1.0, 0.0 };
     var k_data = [_]f32{ 1.0, 0.0, 1.0, 0.0, 1.0, 0.0 };
     var v_data = [_]f32{ 1.0, 0.0, 2.0, 0.0, 3.0, 0.0 }; // Distinct values
@@ -734,7 +730,7 @@ test "sdpa - explicit padding mask" {
     // Test that explicit mask values are applied correctly
     const allocator = std.testing.allocator;
 
-    // Q, K, V: [batch=1, heads=1, seq=2, head_dim=2]
+    // Q, K, V: [batch=1, heads=1, seq=2, feature_width=2]
     var q_data = [_]f32{ 1.0, 0.0, 1.0, 0.0 };
     var k_data = [_]f32{ 1.0, 0.0, 1.0, 0.0 };
     var v_data = [_]f32{ 1.0, 0.0, 2.0, 0.0 };
@@ -764,9 +760,9 @@ test "sdpa - single token sequence" {
     // Test attention with single token (decode step)
     const allocator = std.testing.allocator;
 
-    // Q: [batch=1, heads=1, seq=1, head_dim=4]
+    // Q: [batch=1, heads=1, seq=1, feature_width=4]
     var q_data = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
-    // K, V: [batch=1, heads=1, seq=3, head_dim=4] (cache)
+    // K, V: [batch=1, heads=1, seq=3, feature_width=4] (cache)
     var k_data = [_]f32{ 1.0, 0.0, 0.0, 0.0, 0.5, 0.5, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0 };
     var v_data = [_]f32{ 1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0 };
     var out_data = [_]f32{0} ** 4;
@@ -788,34 +784,34 @@ test "sdpa - long sequence" {
     const allocator = std.testing.allocator;
 
     const seq_len: usize = 16;
-    const head_dim: usize = 8;
+    const feature_width: usize = 8;
 
-    var q_data = [_]f32{0} ** (seq_len * head_dim);
-    var k_data = [_]f32{0} ** (seq_len * head_dim);
-    var v_data = [_]f32{0} ** (seq_len * head_dim);
-    var out_data = [_]f32{0} ** (seq_len * head_dim);
+    var q_data = [_]f32{0} ** (seq_len * feature_width);
+    var k_data = [_]f32{0} ** (seq_len * feature_width);
+    var v_data = [_]f32{0} ** (seq_len * feature_width);
+    var out_data = [_]f32{0} ** (seq_len * feature_width);
 
     // Initialize with simple patterns
     for (0..seq_len) |i| {
-        for (0..head_dim) |d| {
-            const idx = i * head_dim + d;
+        for (0..feature_width) |d| {
+            const idx = i * feature_width + d;
             q_data[idx] = @as(f32, @floatFromInt(i + 1));
             k_data[idx] = @as(f32, @floatFromInt(i + 1));
             v_data[idx] = @as(f32, @floatFromInt(i + 1));
         }
     }
 
-    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const k = TensorView.initContiguous(@ptrCast(&k_data), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const v = TensorView.initContiguous(@ptrCast(&v_data), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, seq_len, head_dim }, .f32);
+    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const k = TensorView.initContiguous(@ptrCast(&k_data), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const v = TensorView.initContiguous(@ptrCast(&v_data), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, seq_len, feature_width }, .f32);
 
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(feature_width)));
     try sdpaCausal(out, q, k, v, scale, 0, allocator);
 
     // Verify output is non-zero and reasonable
     try std.testing.expect(out_data[0] > 0.0);
-    try std.testing.expect(out_data[seq_len * head_dim - 1] > 0.0);
+    try std.testing.expect(out_data[seq_len * feature_width - 1] > 0.0);
 }
 
 test "sdpa - verify head dimension handling" {
@@ -824,34 +820,34 @@ test "sdpa - verify head dimension handling" {
 
     const n_heads: usize = 2;
     const seq_len: usize = 2;
-    const head_dim: usize = 4;
+    const feature_width: usize = 4;
 
-    var q_data = [_]f32{0} ** (n_heads * seq_len * head_dim);
-    var k_data = [_]f32{0} ** (n_heads * seq_len * head_dim);
-    var v_data = [_]f32{0} ** (n_heads * seq_len * head_dim);
-    var out_data = [_]f32{0} ** (n_heads * seq_len * head_dim);
+    var q_data = [_]f32{0} ** (n_heads * seq_len * feature_width);
+    var k_data = [_]f32{0} ** (n_heads * seq_len * feature_width);
+    var v_data = [_]f32{0} ** (n_heads * seq_len * feature_width);
+    var out_data = [_]f32{0} ** (n_heads * seq_len * feature_width);
 
     // Initialize head 0 with ones, head 1 with twos
     for (0..seq_len) |s| {
-        for (0..head_dim) |d| {
+        for (0..feature_width) |d| {
             // Head 0
-            const idx0 = 0 * seq_len * head_dim + s * head_dim + d;
+            const idx0 = 0 * seq_len * feature_width + s * feature_width + d;
             q_data[idx0] = 1.0;
             k_data[idx0] = 1.0;
             v_data[idx0] = 1.0;
 
             // Head 1
-            const idx1 = 1 * seq_len * head_dim + s * head_dim + d;
+            const idx1 = 1 * seq_len * feature_width + s * feature_width + d;
             q_data[idx1] = 2.0;
             k_data[idx1] = 2.0;
             v_data[idx1] = 2.0;
         }
     }
 
-    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, n_heads, seq_len, head_dim }, .f32);
-    const k = TensorView.initContiguous(@ptrCast(&k_data), &.{ 1, n_heads, seq_len, head_dim }, .f32);
-    const v = TensorView.initContiguous(@ptrCast(&v_data), &.{ 1, n_heads, seq_len, head_dim }, .f32);
-    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, n_heads, seq_len, head_dim }, .f32);
+    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, n_heads, seq_len, feature_width }, .f32);
+    const k = TensorView.initContiguous(@ptrCast(&k_data), &.{ 1, n_heads, seq_len, feature_width }, .f32);
+    const v = TensorView.initContiguous(@ptrCast(&v_data), &.{ 1, n_heads, seq_len, feature_width }, .f32);
+    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, n_heads, seq_len, feature_width }, .f32);
 
     const scale = 1.0 / @sqrt(4.0);
     try sdpa(out, q, k, v, null, scale, allocator);
@@ -860,7 +856,7 @@ test "sdpa - verify head dimension handling" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[0], 0.1);
 
     // Head 1 output should be close to 2.0
-    const head1_offset = seq_len * head_dim;
+    const head1_offset = seq_len * feature_width;
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out_data[head1_offset], 0.2);
 }
 
@@ -869,33 +865,33 @@ test "sdpa - grouped query attention (GQA)" {
     const allocator = std.testing.allocator;
 
     const n_q_heads: usize = 4;
-    const n_kv_heads: usize = 2;
+    const source_group_count: usize = 2;
     const seq_len: usize = 2;
-    const head_dim: usize = 4;
+    const feature_width: usize = 4;
 
-    var q_data = [_]f32{0} ** (n_q_heads * seq_len * head_dim);
-    var k_data = [_]f32{0} ** (n_kv_heads * seq_len * head_dim);
-    var v_data = [_]f32{0} ** (n_kv_heads * seq_len * head_dim);
-    var out_data = [_]f32{0} ** (n_q_heads * seq_len * head_dim);
+    var q_data = [_]f32{0} ** (n_q_heads * seq_len * feature_width);
+    var k_data = [_]f32{0} ** (source_group_count * seq_len * feature_width);
+    var v_data = [_]f32{0} ** (source_group_count * seq_len * feature_width);
+    var out_data = [_]f32{0} ** (n_q_heads * seq_len * feature_width);
 
     // Initialize with ones
-    for (0..n_q_heads * seq_len * head_dim) |i| q_data[i] = 1.0;
-    for (0..n_kv_heads * seq_len * head_dim) |i| {
+    for (0..n_q_heads * seq_len * feature_width) |i| q_data[i] = 1.0;
+    for (0..source_group_count * seq_len * feature_width) |i| {
         k_data[i] = 1.0;
         v_data[i] = 1.0;
     }
 
-    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, n_q_heads, seq_len, head_dim }, .f32);
-    const k = TensorView.initContiguous(@ptrCast(&k_data), &.{ 1, n_kv_heads, seq_len, head_dim }, .f32);
-    const v = TensorView.initContiguous(@ptrCast(&v_data), &.{ 1, n_kv_heads, seq_len, head_dim }, .f32);
-    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, n_q_heads, seq_len, head_dim }, .f32);
+    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, n_q_heads, seq_len, feature_width }, .f32);
+    const k = TensorView.initContiguous(@ptrCast(&k_data), &.{ 1, source_group_count, seq_len, feature_width }, .f32);
+    const v = TensorView.initContiguous(@ptrCast(&v_data), &.{ 1, source_group_count, seq_len, feature_width }, .f32);
+    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, n_q_heads, seq_len, feature_width }, .f32);
 
     const scale = 1.0 / @sqrt(4.0);
     try sdpa(out, q, k, v, null, scale, allocator);
 
     // All outputs should be approximately 1.0
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[0], 0.1);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[seq_len * head_dim], 0.1);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), out_data[seq_len * feature_width], 0.1);
 }
 
 test "sdpa - softmax with large values" {
@@ -980,32 +976,32 @@ test "applyRope - mixed precision" {
     _ = allocator;
 }
 
-test "updateKVCache - verify cache storage" {
-    // Test that KV cache is correctly updated with new values
-    const n_kv_heads: usize = 2;
-    const head_dim: usize = 4;
+test "updateHistory - verify cache storage" {
+    // Test that history buffer is correctly updated with new values
+    const source_group_count: usize = 2;
+    const feature_width: usize = 4;
     const max_seq: usize = 10;
     const seq_len: usize = 3;
 
     // Allocate cache
-    var k_cache = [_]f32{0} ** (max_seq * n_kv_heads * head_dim);
-    var v_cache = [_]f32{0} ** (max_seq * n_kv_heads * head_dim);
+    var key_history = [_]f32{0} ** (max_seq * source_group_count * feature_width);
+    var value_history = [_]f32{0} ** (max_seq * source_group_count * feature_width);
 
-    // New K, V data: [1, n_kv_heads, seq_len, head_dim]
-    var k_data = [_]f32{0} ** (n_kv_heads * seq_len * head_dim);
-    var v_data = [_]f32{0} ** (n_kv_heads * seq_len * head_dim);
+    // New K, V data: [1, source_group_count, seq_len, feature_width]
+    var k_data = [_]f32{0} ** (source_group_count * seq_len * feature_width);
+    var v_data = [_]f32{0} ** (source_group_count * seq_len * feature_width);
 
     // Fill with test pattern
-    for (0..n_kv_heads * seq_len * head_dim) |i| {
+    for (0..source_group_count * seq_len * feature_width) |i| {
         k_data[i] = @as(f32, @floatFromInt(i + 1));
         v_data[i] = @as(f32, @floatFromInt(i + 100));
     }
 
-    const k_strides = [4]usize{ n_kv_heads * seq_len * head_dim, seq_len * head_dim, head_dim, 1 };
+    const k_strides = [4]usize{ source_group_count * seq_len * feature_width, seq_len * feature_width, feature_width, 1 };
 
-    updateKVCache(
-        &k_cache,
-        &v_cache,
+    writeHistoryRing(
+        &key_history,
+        &value_history,
         @ptrCast(&k_data),
         @ptrCast(&v_data),
         k_strides,
@@ -1013,60 +1009,60 @@ test "updateKVCache - verify cache storage" {
         0, // seq_pos
         max_seq,
         seq_len,
-        n_kv_heads,
-        head_dim,
+        source_group_count,
+        feature_width,
     );
 
     // Verify first position was written correctly
-    const kv_size = n_kv_heads * head_dim;
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), k_cache[0], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0), v_cache[0], 1e-6);
+    const kv_size = source_group_count * feature_width;
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), key_history[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0), value_history[0], 1e-6);
 
     // Verify second position
-    try std.testing.expectApproxEqAbs(k_data[head_dim], k_cache[kv_size], 1e-6);
-    try std.testing.expectApproxEqAbs(v_data[head_dim], v_cache[kv_size], 1e-6);
+    try std.testing.expectApproxEqAbs(k_data[feature_width], key_history[kv_size], 1e-6);
+    try std.testing.expectApproxEqAbs(v_data[feature_width], value_history[kv_size], 1e-6);
 }
 
-test "sdpaCached - basic cache attention" {
+test "sdpaHistory - basic cache attention" {
     // Test attention using cached K/V values
     const allocator = std.testing.allocator;
 
     const n_heads: usize = 2;
-    const n_kv_heads: usize = 2;
-    const head_dim: usize = 4;
-    const cached_seq: usize = 3;
-    const seq_q: usize = 1;
+    const source_group_count: usize = 2;
+    const feature_width: usize = 4;
+    const history_len: usize = 3;
+    const query_steps: usize = 1;
 
-    // Query: [n_heads, seq_q, head_dim]
-    var q_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
-    for (0..n_heads * seq_q * head_dim) |i| q_data[i] = 1.0;
+    // Query: [n_heads, query_steps, feature_width]
+    var q_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
+    for (0..n_heads * query_steps * feature_width) |i| q_data[i] = 1.0;
 
-    // Cache: [cached_seq * n_kv_heads * head_dim]
-    var k_cache = [_]f32{0} ** (cached_seq * n_kv_heads * head_dim);
-    var v_cache = [_]f32{0} ** (cached_seq * n_kv_heads * head_dim);
-    for (0..cached_seq * n_kv_heads * head_dim) |i| {
-        k_cache[i] = 1.0;
-        v_cache[i] = @as(f32, @floatFromInt(i + 1));
+    // Cache: [history_len * source_group_count * feature_width]
+    var key_history = [_]f32{0} ** (history_len * source_group_count * feature_width);
+    var value_history = [_]f32{0} ** (history_len * source_group_count * feature_width);
+    for (0..history_len * source_group_count * feature_width) |i| {
+        key_history[i] = 1.0;
+        value_history[i] = @as(f32, @floatFromInt(i + 1));
     }
 
-    var out_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
+    var out_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
 
-    const out_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
-    const q_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
+    const out_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
+    const q_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
 
-    try sdpaCached(
+    try sdpaHistory(
         @ptrCast(&out_data),
         out_strides,
         @ptrCast(&q_data),
         q_strides,
-        &k_cache,
-        &v_cache,
+        &key_history,
+        &value_history,
         n_heads,
-        n_kv_heads,
-        seq_q,
-        cached_seq,
-        head_dim,
-        cached_seq - 1, // kv_offset (current position)
+        source_group_count,
+        query_steps,
+        history_len,
+        feature_width,
+        history_len - 1, // causal_mask_shift (current position)
         1.0 / @sqrt(4.0),
         null, // no sinks
         0, // no sliding window
@@ -1078,50 +1074,50 @@ test "sdpaCached - basic cache attention" {
     try std.testing.expect(out_data[0] > 0.0);
 }
 
-test "sdpaCached - with sliding window" {
+test "sdpaHistory - with sliding window" {
     // Test attention with sliding window (only attend to recent tokens)
     const allocator = std.testing.allocator;
 
     const n_heads: usize = 1;
-    const n_kv_heads: usize = 1;
-    const head_dim: usize = 4;
-    const cached_seq: usize = 10;
-    const seq_q: usize = 1;
+    const source_group_count: usize = 1;
+    const feature_width: usize = 4;
+    const history_len: usize = 10;
+    const query_steps: usize = 1;
     const sliding_window: usize = 3; // Only attend to last 3 tokens
 
-    var q_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
-    for (0..n_heads * seq_q * head_dim) |i| q_data[i] = 1.0;
+    var q_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
+    for (0..n_heads * query_steps * feature_width) |i| q_data[i] = 1.0;
 
-    var k_cache = [_]f32{0} ** (cached_seq * n_kv_heads * head_dim);
-    var v_cache = [_]f32{0} ** (cached_seq * n_kv_heads * head_dim);
+    var key_history = [_]f32{0} ** (history_len * source_group_count * feature_width);
+    var value_history = [_]f32{0} ** (history_len * source_group_count * feature_width);
 
     // Make older values large, recent values small
-    for (0..cached_seq) |pos| {
-        const base = pos * n_kv_heads * head_dim;
-        for (0..head_dim) |d| {
-            k_cache[base + d] = if (pos < 7) 100.0 else 1.0;
-            v_cache[base + d] = if (pos < 7) 999.0 else @as(f32, @floatFromInt(pos));
+    for (0..history_len) |pos| {
+        const base = pos * source_group_count * feature_width;
+        for (0..feature_width) |d| {
+            key_history[base + d] = if (pos < 7) 100.0 else 1.0;
+            value_history[base + d] = if (pos < 7) 999.0 else @as(f32, @floatFromInt(pos));
         }
     }
 
-    var out_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
+    var out_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
 
-    const out_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
-    const q_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
+    const out_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
+    const q_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
 
-    try sdpaCached(
+    try sdpaHistory(
         @ptrCast(&out_data),
         out_strides,
         @ptrCast(&q_data),
         q_strides,
-        &k_cache,
-        &v_cache,
+        &key_history,
+        &value_history,
         n_heads,
-        n_kv_heads,
-        seq_q,
-        cached_seq,
-        head_dim,
-        cached_seq - 1,
+        source_group_count,
+        query_steps,
+        history_len,
+        feature_width,
+        history_len - 1,
         1.0 / @sqrt(4.0),
         null,
         sliding_window,
@@ -1136,24 +1132,24 @@ test "sdpaCached - with sliding window" {
 test "sdpa - error sequence too long without allocator" {
     // Test that SDPA returns SequenceTooLong error when seq > MAX_STACK_SEQ and no allocator
     const seq_len = MAX_STACK_SEQ + 1;
-    const head_dim: usize = 4;
+    const feature_width: usize = 4;
 
-    var q_data = [_]f32{1.0} ** head_dim;
-    const k_data = std.testing.allocator.alloc(f32, seq_len * head_dim) catch unreachable;
+    var q_data = [_]f32{1.0} ** feature_width;
+    const k_data = std.testing.allocator.alloc(f32, seq_len * feature_width) catch unreachable;
     defer std.testing.allocator.free(k_data);
-    const v_data = std.testing.allocator.alloc(f32, seq_len * head_dim) catch unreachable;
+    const v_data = std.testing.allocator.alloc(f32, seq_len * feature_width) catch unreachable;
     defer std.testing.allocator.free(v_data);
-    var out_data = [_]f32{0} ** head_dim;
+    var out_data = [_]f32{0} ** feature_width;
 
     @memset(k_data, 1.0);
     @memset(v_data, 1.0);
 
-    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, 1, head_dim }, .f32);
-    const k = TensorView.initContiguous(@ptrCast(k_data.ptr), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const v = TensorView.initContiguous(@ptrCast(v_data.ptr), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, 1, head_dim }, .f32);
+    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, 1, feature_width }, .f32);
+    const k = TensorView.initContiguous(@ptrCast(k_data.ptr), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const v = TensorView.initContiguous(@ptrCast(v_data.ptr), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, 1, feature_width }, .f32);
 
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(feature_width)));
     const result = sdpa(out, q, k, v, null, scale, null);
 
     try std.testing.expectError(error.SequenceTooLong, result);
@@ -1163,25 +1159,25 @@ test "sdpa - sequence too long with allocator succeeds" {
     // Test that SDPA succeeds with allocator even when seq > MAX_STACK_SEQ
     const allocator = std.testing.allocator;
     const seq_len = MAX_STACK_SEQ + 100;
-    const head_dim: usize = 4;
+    const feature_width: usize = 4;
 
-    var q_data = [_]f32{0} ** (1 * 1 * 1 * head_dim);
-    const k_data = try allocator.alloc(f32, seq_len * head_dim);
+    var q_data = [_]f32{0} ** (1 * 1 * 1 * feature_width);
+    const k_data = try allocator.alloc(f32, seq_len * feature_width);
     defer allocator.free(k_data);
-    const v_data = try allocator.alloc(f32, seq_len * head_dim);
+    const v_data = try allocator.alloc(f32, seq_len * feature_width);
     defer allocator.free(v_data);
-    var out_data = [_]f32{0} ** (1 * 1 * 1 * head_dim);
+    var out_data = [_]f32{0} ** (1 * 1 * 1 * feature_width);
 
     @memset(&q_data, 1.0);
     @memset(k_data, 1.0);
     @memset(v_data, 1.0);
 
-    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, 1, head_dim }, .f32);
-    const k = TensorView.initContiguous(@ptrCast(k_data.ptr), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const v = TensorView.initContiguous(@ptrCast(v_data.ptr), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, 1, head_dim }, .f32);
+    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, 1, feature_width }, .f32);
+    const k = TensorView.initContiguous(@ptrCast(k_data.ptr), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const v = TensorView.initContiguous(@ptrCast(v_data.ptr), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, 1, feature_width }, .f32);
 
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(feature_width)));
     try sdpa(out, q, k, v, null, scale, allocator);
 
     // Should succeed and produce valid output
@@ -1191,64 +1187,64 @@ test "sdpa - sequence too long with allocator succeeds" {
 test "sdpaCausal - error sequence too long without allocator" {
     // Test that sdpaCausal returns SequenceTooLong error when seq > MAX_STACK_SEQ and no allocator
     const seq_len = MAX_STACK_SEQ + 1;
-    const head_dim: usize = 4;
+    const feature_width: usize = 4;
 
-    var q_data = [_]f32{0} ** (1 * 1 * 1 * head_dim);
-    const k_data = std.testing.allocator.alloc(f32, seq_len * head_dim) catch unreachable;
+    var q_data = [_]f32{0} ** (1 * 1 * 1 * feature_width);
+    const k_data = std.testing.allocator.alloc(f32, seq_len * feature_width) catch unreachable;
     defer std.testing.allocator.free(k_data);
-    const v_data = std.testing.allocator.alloc(f32, seq_len * head_dim) catch unreachable;
+    const v_data = std.testing.allocator.alloc(f32, seq_len * feature_width) catch unreachable;
     defer std.testing.allocator.free(v_data);
-    var out_data = [_]f32{0} ** (1 * 1 * 1 * head_dim);
+    var out_data = [_]f32{0} ** (1 * 1 * 1 * feature_width);
 
     @memset(&q_data, 1.0);
     @memset(k_data, 1.0);
     @memset(v_data, 1.0);
 
-    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, 1, head_dim }, .f32);
-    const k = TensorView.initContiguous(@ptrCast(k_data.ptr), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const v = TensorView.initContiguous(@ptrCast(v_data.ptr), &.{ 1, 1, seq_len, head_dim }, .f32);
-    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, 1, head_dim }, .f32);
+    const q = TensorView.initContiguous(@ptrCast(&q_data), &.{ 1, 1, 1, feature_width }, .f32);
+    const k = TensorView.initContiguous(@ptrCast(k_data.ptr), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const v = TensorView.initContiguous(@ptrCast(v_data.ptr), &.{ 1, 1, seq_len, feature_width }, .f32);
+    const out = TensorView.initContiguous(@ptrCast(&out_data), &.{ 1, 1, 1, feature_width }, .f32);
 
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(feature_width)));
     const result = sdpaCausal(out, q, k, v, scale, 0, null);
 
     try std.testing.expectError(error.SequenceTooLong, result);
 }
 
-test "sdpaCached - error sequence too long without allocator" {
-    // Test that sdpaCached returns SequenceTooLong error when seq > MAX_STACK_SEQ and no allocator
-    const cached_seq = MAX_STACK_SEQ + 1;
+test "sdpaHistory - error sequence too long without allocator" {
+    // Test that sdpaHistory returns SequenceTooLong error when seq > MAX_STACK_SEQ and no allocator
+    const history_len = MAX_STACK_SEQ + 1;
     const n_heads: usize = 1;
-    const n_kv_heads: usize = 1;
-    const head_dim: usize = 4;
-    const seq_q: usize = 1;
+    const source_group_count: usize = 1;
+    const feature_width: usize = 4;
+    const query_steps: usize = 1;
 
-    var q_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
-    const k_cache = std.testing.allocator.alloc(f32, cached_seq * n_kv_heads * head_dim) catch unreachable;
-    defer std.testing.allocator.free(k_cache);
-    const v_cache = std.testing.allocator.alloc(f32, cached_seq * n_kv_heads * head_dim) catch unreachable;
-    defer std.testing.allocator.free(v_cache);
-    var out_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
+    var q_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
+    const key_history = std.testing.allocator.alloc(f32, history_len * source_group_count * feature_width) catch unreachable;
+    defer std.testing.allocator.free(key_history);
+    const value_history = std.testing.allocator.alloc(f32, history_len * source_group_count * feature_width) catch unreachable;
+    defer std.testing.allocator.free(value_history);
+    var out_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
 
     @memset(&q_data, 1.0);
-    @memset(k_cache, 1.0);
-    @memset(v_cache, 1.0);
+    @memset(key_history, 1.0);
+    @memset(value_history, 1.0);
 
-    const out_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
-    const q_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
+    const out_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
+    const q_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
 
-    const result = sdpaCached(
+    const result = sdpaHistory(
         @ptrCast(&out_data),
         out_strides,
         @ptrCast(&q_data),
         q_strides,
-        k_cache,
-        v_cache,
+        key_history,
+        value_history,
         n_heads,
-        n_kv_heads,
-        seq_q,
-        cached_seq,
-        head_dim,
+        source_group_count,
+        query_steps,
+        history_len,
+        feature_width,
         0,
         1.0 / @sqrt(4.0),
         null,
@@ -1285,25 +1281,25 @@ test "ropeFreqs - edge case large offset" {
     }
 }
 
-test "updateKVCache edge case - wrapping around max_seq_len" {
-    // Test KV cache update with position wrapping
-    const n_kv_heads: usize = 1;
-    const head_dim: usize = 2;
+test "updateHistory edge case - wrapping around max_seq_len" {
+    // Test history buffer update with position wrapping
+    const source_group_count: usize = 1;
+    const feature_width: usize = 2;
     const max_seq: usize = 4;
     const seq_len: usize = 2;
 
-    var k_cache = [_]f32{0} ** (max_seq * n_kv_heads * head_dim);
-    var v_cache = [_]f32{0} ** (max_seq * n_kv_heads * head_dim);
+    var key_history = [_]f32{0} ** (max_seq * source_group_count * feature_width);
+    var value_history = [_]f32{0} ** (max_seq * source_group_count * feature_width);
 
     var k_data = [_]f32{ 10.0, 20.0, 30.0, 40.0 };
     var v_data = [_]f32{ 100.0, 200.0, 300.0, 400.0 };
 
-    const k_strides = [4]usize{ n_kv_heads * seq_len * head_dim, seq_len * head_dim, head_dim, 1 };
+    const k_strides = [4]usize{ source_group_count * seq_len * feature_width, seq_len * feature_width, feature_width, 1 };
 
     // Write at position that will wrap (seq_pos=3, will write to 3 and 0)
-    updateKVCache(
-        &k_cache,
-        &v_cache,
+    writeHistoryRing(
+        &key_history,
+        &value_history,
         @ptrCast(&k_data),
         @ptrCast(&v_data),
         k_strides,
@@ -1311,40 +1307,40 @@ test "updateKVCache edge case - wrapping around max_seq_len" {
         3, // seq_pos (near end)
         max_seq,
         seq_len,
-        n_kv_heads,
-        head_dim,
+        source_group_count,
+        feature_width,
     );
 
     // Check position 3 (first token)
-    const pos3_idx = (3 % max_seq) * n_kv_heads * head_dim;
-    try std.testing.expectApproxEqAbs(@as(f32, 10.0), k_cache[pos3_idx], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 100.0), v_cache[pos3_idx], 1e-6);
+    const pos3_idx = (3 % max_seq) * source_group_count * feature_width;
+    try std.testing.expectApproxEqAbs(@as(f32, 10.0), key_history[pos3_idx], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 100.0), value_history[pos3_idx], 1e-6);
 
     // Check position 0 (second token wraps around)
-    const pos0_idx = (4 % max_seq) * n_kv_heads * head_dim;
-    try std.testing.expectApproxEqAbs(@as(f32, 30.0), k_cache[pos0_idx], 1e-6);
-    try std.testing.expectApproxEqAbs(@as(f32, 300.0), v_cache[pos0_idx], 1e-6);
+    const pos0_idx = (4 % max_seq) * source_group_count * feature_width;
+    try std.testing.expectApproxEqAbs(@as(f32, 30.0), key_history[pos0_idx], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 300.0), value_history[pos0_idx], 1e-6);
 }
 
-test "updateKVCache edge case - layer offset" {
-    // Test KV cache update with non-zero layer offset
-    const n_kv_heads: usize = 1;
-    const head_dim: usize = 2;
+test "updateHistory edge case - layer offset" {
+    // Test history buffer update with non-zero layer offset
+    const source_group_count: usize = 1;
+    const feature_width: usize = 2;
     const max_seq: usize = 4;
     const seq_len: usize = 1;
-    const layer_offset: usize = max_seq * n_kv_heads * head_dim; // Offset for second layer
+    const layer_offset: usize = max_seq * source_group_count * feature_width; // Offset for second layer
 
-    var k_cache = [_]f32{0} ** (2 * max_seq * n_kv_heads * head_dim); // 2 layers
-    var v_cache = [_]f32{0} ** (2 * max_seq * n_kv_heads * head_dim);
+    var key_history = [_]f32{0} ** (2 * max_seq * source_group_count * feature_width); // 2 layers
+    var value_history = [_]f32{0} ** (2 * max_seq * source_group_count * feature_width);
 
     var k_data = [_]f32{ 5.0, 6.0 };
     var v_data = [_]f32{ 50.0, 60.0 };
 
-    const k_strides = [4]usize{ n_kv_heads * seq_len * head_dim, seq_len * head_dim, head_dim, 1 };
+    const k_strides = [4]usize{ source_group_count * seq_len * feature_width, seq_len * feature_width, feature_width, 1 };
 
-    updateKVCache(
-        &k_cache,
-        &v_cache,
+    writeHistoryRing(
+        &key_history,
+        &value_history,
         @ptrCast(&k_data),
         @ptrCast(&v_data),
         k_strides,
@@ -1352,57 +1348,57 @@ test "updateKVCache edge case - layer offset" {
         0, // seq_pos
         max_seq,
         seq_len,
-        n_kv_heads,
-        head_dim,
+        source_group_count,
+        feature_width,
     );
 
     // Verify data was written to second layer, not first
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), k_cache[0], 1e-6); // First layer unchanged
-    try std.testing.expectApproxEqAbs(@as(f32, 5.0), k_cache[layer_offset], 1e-6); // Second layer
-    try std.testing.expectApproxEqAbs(@as(f32, 50.0), v_cache[layer_offset], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), key_history[0], 1e-6); // First layer unchanged
+    try std.testing.expectApproxEqAbs(@as(f32, 5.0), key_history[layer_offset], 1e-6); // Second layer
+    try std.testing.expectApproxEqAbs(@as(f32, 50.0), value_history[layer_offset], 1e-6);
 }
 
-test "sdpaCached - with sink logits" {
+test "sdpaHistory - with sink logits" {
     // Test attention with sink tokens (streaming LLM feature)
     const allocator = std.testing.allocator;
 
     const n_heads: usize = 2;
-    const n_kv_heads: usize = 2;
-    const head_dim: usize = 4;
-    const cached_seq: usize = 4;
-    const seq_q: usize = 1;
+    const source_group_count: usize = 2;
+    const feature_width: usize = 4;
+    const history_len: usize = 4;
+    const query_steps: usize = 1;
 
-    var q_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
-    for (0..n_heads * seq_q * head_dim) |i| q_data[i] = 1.0;
+    var q_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
+    for (0..n_heads * query_steps * feature_width) |i| q_data[i] = 1.0;
 
-    var k_cache = [_]f32{0} ** (cached_seq * n_kv_heads * head_dim);
-    var v_cache = [_]f32{0} ** (cached_seq * n_kv_heads * head_dim);
-    for (0..cached_seq * n_kv_heads * head_dim) |i| {
-        k_cache[i] = 1.0;
-        v_cache[i] = @as(f32, @floatFromInt(i));
+    var key_history = [_]f32{0} ** (history_len * source_group_count * feature_width);
+    var value_history = [_]f32{0} ** (history_len * source_group_count * feature_width);
+    for (0..history_len * source_group_count * feature_width) |i| {
+        key_history[i] = 1.0;
+        value_history[i] = @as(f32, @floatFromInt(i));
     }
 
     // Sink logits: large values that should influence attention
     var sink_logits = [_]f32{ 5.0, 3.0 }; // One per head
 
-    var out_data = [_]f32{0} ** (n_heads * seq_q * head_dim);
+    var out_data = [_]f32{0} ** (n_heads * query_steps * feature_width);
 
-    const out_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
-    const q_strides = [4]usize{ n_heads * seq_q * head_dim, seq_q * head_dim, head_dim, 1 };
+    const out_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
+    const q_strides = [4]usize{ n_heads * query_steps * feature_width, query_steps * feature_width, feature_width, 1 };
 
-    try sdpaCached(
+    try sdpaHistory(
         @ptrCast(&out_data),
         out_strides,
         @ptrCast(&q_data),
         q_strides,
-        &k_cache,
-        &v_cache,
+        &key_history,
+        &value_history,
         n_heads,
-        n_kv_heads,
-        seq_q,
-        cached_seq,
-        head_dim,
-        cached_seq - 1,
+        source_group_count,
+        query_steps,
+        history_len,
+        feature_width,
+        history_len - 1,
         1.0 / @sqrt(4.0),
         &sink_logits,
         0,
@@ -1415,7 +1411,7 @@ test "sdpaCached - with sink logits" {
 }
 
 test "stridesToUsize4D basic conversion" {
-    // Typical 4D strides for [batch, heads, seq, head_dim]
+    // Typical 4D strides for [batch, heads, seq, feature_width]
     const strides = [8]i64{ 1024, 256, 64, 1, 0, 0, 0, 0 };
     const result = stridesToUsize4D(&strides);
 

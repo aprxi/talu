@@ -4,6 +4,7 @@ pub const matmul = @import("matmul_primitives.zig");
 pub const prefill = @import("matmul_prefill.zig");
 pub const matvec = @import("matvec.zig");
 pub const dot = @import("dot_product.zig");
+pub const sdpa = @import("linalg_sdpa.zig");
 
 // Re-export the canonical matmul surface at namespace root so callers can
 // depend on `compute.cpu.linalg.*` without importing leaf modules directly.

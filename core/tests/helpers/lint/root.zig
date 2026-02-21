@@ -206,6 +206,23 @@ fn lintSource(allocator: std.mem.Allocator, file_path: []const u8, source: []con
         }
     }
 
+    // Inference must route SDPA usage through stable compute namespaces.
+    // Transitional aliases in `compute.cpu.*` are forbidden.
+    if (isInferencePath(file_path)) {
+        const forbidden = [_][]const u8{
+            "compute.cpu.linalg_sdpa",
+            "compute.cpu.sdpa_decode",
+        };
+        for (forbidden) |token| {
+            if (std.mem.indexOf(u8, source, token) != null) {
+                violations += 1;
+                if (emit) {
+                    std.debug.print("{s}: forbidden transitional compute symbol: \"{s}\"\n", .{ file_path, token });
+                }
+            }
+        }
+    }
+
     return violations;
 }
 
@@ -536,6 +553,16 @@ test "lintSource allows model-family literal in vision backend path" {
     try std.testing.expectEqual(
         @as(usize, 0),
         try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/vision/split_qkv.zig", src, false),
+    );
+}
+
+test "lintSource rejects transitional compute symbol in inference" {
+    const src =
+        \\const bad = compute.cpu.linalg_sdpa;
+    ;
+    try std.testing.expectEqual(
+        @as(usize, 1),
+        try lintSource(std.testing.allocator, "core/src/inference/backend/cpu/executor/block.zig", src, false),
     );
 }
 

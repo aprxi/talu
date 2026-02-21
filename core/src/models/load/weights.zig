@@ -446,7 +446,7 @@ pub fn loadModelWithArchitecture(
             try inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids);
         }
 
-        if (env_flags.enable_cpu_fusion) {
+        if (env_flags.enable_cpu_fusion and arch.enable_loader_fusions) {
             try maybeAddFusedWeights(arena_allocator, &weight_map);
         }
 

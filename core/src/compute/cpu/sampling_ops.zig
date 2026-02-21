@@ -1,4 +1,4 @@
-//! Sampling vector primitives for CPU inference paths.
+//! Index-space score/probability vector primitives.
 
 const std = @import("std");
 
@@ -33,26 +33,34 @@ pub fn applyMinP(probabilities: []f32, min_p: f32) void {
 }
 
 /// Apply multiplicative penalty for selected indices in a score vector.
-pub fn applyIndexPenalty(logits: []f32, context_tokens: []const u32, penalty: f32) void {
+pub fn applyIndexPenalty(logits: []f32, selected_indices: []const u32, penalty: f32) void {
     if (penalty == 1.0) return;
 
-    for (context_tokens) |token_id| {
-        if (token_id < logits.len) {
-            const token_logit = logits[token_id];
-            if (token_logit > 0) {
-                logits[token_id] = token_logit / penalty;
+    for (selected_indices) |idx| {
+        if (idx < logits.len) {
+            const score = logits[idx];
+            if (score > 0) {
+                logits[idx] = score / penalty;
             } else {
-                logits[token_id] = token_logit * penalty;
+                logits[idx] = score * penalty;
             }
         }
     }
 }
 
+fn biasEntryIndex(bias_entry: anytype) ?usize {
+    const BiasEntry = @TypeOf(bias_entry);
+    if (@hasField(BiasEntry, "index")) return @intCast(@field(bias_entry, "index"));
+    if (@hasField(BiasEntry, "token_id")) return @intCast(@field(bias_entry, "token_id"));
+    return null;
+}
+
 /// Apply additive bias entries to a score vector.
 pub fn applyIndexBias(logits: []f32, bias_entries: anytype) void {
     for (bias_entries) |bias_entry| {
-        if (bias_entry.token_id < logits.len) {
-            logits[bias_entry.token_id] += bias_entry.bias;
+        const idx = biasEntryIndex(bias_entry) orelse continue;
+        if (idx < logits.len) {
+            logits[idx] += bias_entry.bias;
         }
     }
 }

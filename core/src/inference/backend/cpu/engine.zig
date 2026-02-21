@@ -39,7 +39,7 @@ const models = @import("../../../models/root.zig");
 const rope_scaling = models.rope_scaling;
 const contract = @import("../contract.zig");
 const log = @import("../../../log.zig");
-const progress_mod = @import("../../../capi/progress.zig");
+const progress_mod = @import("../../../progress.zig");
 
 const cpu_executor = @import("executor/root.zig");
 const Transformer = cpu_executor.Model;
@@ -255,7 +255,7 @@ pub const FusedCpuBackend = struct {
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
         max_batch_size: usize,
-        progress: progress_mod.ProgressContext,
+        progress: progress_mod.Context,
     ) !FusedCpuBackend {
         const model_width: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);

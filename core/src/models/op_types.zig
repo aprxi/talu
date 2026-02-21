@@ -171,14 +171,163 @@ pub const VisionMetadata = struct {
         "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
         "model.vision_model.embeddings.patch_embedding.weight",
     },
+    patch_embed_bias_candidates: []const []const u8 = &.{
+        "model.visual.patch_embed.proj.bias",
+        "model.vision_tower.vision_model.embeddings.patch_embedding.bias",
+        "model.vision_model.embeddings.patch_embedding.bias",
+    },
     position_embed_candidates: []const []const u8 = &.{
         "model.visual.pos_embed.weight",
         "model.vision_tower.vision_model.embeddings.position_embedding.weight",
         "model.vision_model.embeddings.position_embedding.weight",
     },
+    post_norm_weight_candidates: []const []const u8 = &.{
+        "model.visual.norm.weight",
+        "model.vision_tower.vision_model.post_layernorm.weight",
+        "model.vision_model.post_layernorm.weight",
+    },
+    post_norm_bias_candidates: []const []const u8 = &.{
+        "model.visual.norm.bias",
+        "model.vision_tower.vision_model.post_layernorm.bias",
+        "model.vision_model.post_layernorm.bias",
+    },
+    merger_norm_weight_candidates: []const []const u8 = &.{
+        "model.visual.merger.norm.weight",
+        "model.multi_modal_projector.layer_norm.weight",
+    },
+    merger_norm_bias_candidates: []const []const u8 = &.{
+        "model.visual.merger.norm.bias",
+        "model.multi_modal_projector.layer_norm.bias",
+    },
     merger_fc1_candidates: []const []const u8 = &.{
         "model.visual.merger.linear_fc1.weight",
         "model.multi_modal_projector.linear_1.weight",
+    },
+    merger_fc1_bias_candidates: []const []const u8 = &.{
+        "model.visual.merger.linear_fc1.bias",
+        "model.multi_modal_projector.linear_1.bias",
+    },
+    merger_fc2_candidates: []const []const u8 = &.{
+        "model.visual.merger.linear_fc2.weight",
+        "model.multi_modal_projector.linear_2.weight",
+    },
+    merger_fc2_bias_candidates: []const []const u8 = &.{
+        "model.visual.merger.linear_fc2.bias",
+        "model.multi_modal_projector.linear_2.bias",
+    },
+
+    /// Layer templates for per-block vision weights.
+    ln1_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.norm1.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.weight",
+        "model.vision_model.encoder.layers.{d}.layer_norm1.weight",
+    },
+    ln1_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.norm1.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.bias",
+        "model.vision_model.encoder.layers.{d}.layer_norm1.bias",
+    },
+    ln2_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.norm2.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.weight",
+        "model.vision_model.encoder.layers.{d}.layer_norm2.weight",
+    },
+    ln2_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.norm2.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.bias",
+        "model.vision_model.encoder.layers.{d}.layer_norm2.bias",
+    },
+    fused_qkv_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.qkv.weight",
+    },
+    fused_qkv_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.qkv.bias",
+    },
+    split_q_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.q_proj.weight",
+        "model.visual.blocks.{d}.self_attn.q_proj.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
+        "model.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
+    },
+    split_q_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.q_proj.bias",
+        "model.visual.blocks.{d}.self_attn.q_proj.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
+        "model.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
+    },
+    split_k_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.k_proj.weight",
+        "model.visual.blocks.{d}.self_attn.k_proj.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
+        "model.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
+    },
+    split_k_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.k_proj.bias",
+        "model.visual.blocks.{d}.self_attn.k_proj.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
+        "model.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
+    },
+    split_v_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.v_proj.weight",
+        "model.visual.blocks.{d}.self_attn.v_proj.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
+        "model.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
+    },
+    split_v_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.v_proj.bias",
+        "model.visual.blocks.{d}.self_attn.v_proj.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
+        "model.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
+    },
+    out_proj_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.proj.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
+        "model.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
+    },
+    out_proj_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.attn.proj.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
+        "model.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
+    },
+    fc1_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.mlp.linear_fc1.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.weight",
+        "model.vision_model.encoder.layers.{d}.mlp.fc1.weight",
+    },
+    fc1_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.mlp.linear_fc1.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.bias",
+        "model.vision_model.encoder.layers.{d}.mlp.fc1.bias",
+    },
+    fc2_weight_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.mlp.linear_fc2.weight",
+        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.weight",
+        "model.vision_model.encoder.layers.{d}.mlp.fc2.weight",
+    },
+    fc2_bias_templates: []const []const u8 = &.{
+        "model.visual.blocks.{d}.mlp.linear_fc2.bias",
+        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.bias",
+        "model.vision_model.encoder.layers.{d}.mlp.fc2.bias",
+    },
+
+    /// Deepstack merger templates (if present).
+    deepstack_norm_weight_templates: []const []const u8 = &.{
+        "model.visual.deepstack_merger_list.{d}.norm.weight",
+    },
+    deepstack_norm_bias_templates: []const []const u8 = &.{
+        "model.visual.deepstack_merger_list.{d}.norm.bias",
+    },
+    deepstack_fc1_weight_templates: []const []const u8 = &.{
+        "model.visual.deepstack_merger_list.{d}.linear_fc1.weight",
+    },
+    deepstack_fc1_bias_templates: []const []const u8 = &.{
+        "model.visual.deepstack_merger_list.{d}.linear_fc1.bias",
+    },
+    deepstack_fc2_weight_templates: []const []const u8 = &.{
+        "model.visual.deepstack_merger_list.{d}.linear_fc2.weight",
+    },
+    deepstack_fc2_bias_templates: []const []const u8 = &.{
+        "model.visual.deepstack_merger_list.{d}.linear_fc2.bias",
     },
 
     /// Layer templates used to infer depth/intermediate size.
@@ -285,6 +434,10 @@ pub const Architecture = struct {
     // Optional weight IDs used to probe original checkpoint dtype. When empty,
     // loader falls back to d_ff_source_weight_ids, then metadata order.
     weight_dtype_source_weight_ids: []const []const u8 = &.{},
+    // Explicit opt-in for loader-side synthetic fused weights (QKV/GateUp).
+    // Keep true for existing architectures; new families can disable to enforce
+    // strict checkpoint-native weight contracts.
+    enable_loader_fusions: bool = true,
 
     // Flags derived from analyzing block_ops
     has_qk_norm: bool = false,

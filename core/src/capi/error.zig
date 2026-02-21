@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const error_codes = @import("error_codes.zig");
+const error_context = @import("../error_context.zig");
 const ErrorCode = error_codes.ErrorCode;
 const errorToCode = error_codes.errorToCode;
 
@@ -20,11 +21,6 @@ threadlocal var error_length: usize = 0;
 threadlocal var last_error_code: ErrorCode = .ok;
 threadlocal var is_truncated: bool = false;
 
-// Internal error context - set by internal code before returning errors
-const CONTEXT_BUF_SIZE: usize = 256;
-threadlocal var context_buffer: [CONTEXT_BUF_SIZE]u8 = undefined; // Safe: setContext writes before any read
-threadlocal var context_length: usize = 0;
-
 /// Set internal error context. Call this before returning an error to provide
 /// additional diagnostic information. The context is accumulated silently (not
 /// logged) and only surfaces when setError() is called at the C API boundary.
@@ -37,20 +33,12 @@ threadlocal var context_length: usize = 0;
 /// }
 /// ```
 pub fn setContext(comptime fmt: []const u8, args: anytype) void {
-    var stream = std.io.fixedBufferStream(&context_buffer);
-    stream.writer().print(fmt, args) catch {};
-    context_length = stream.pos;
+    error_context.setContext(fmt, args);
 }
 
 /// Clear internal error context.
 pub fn clearContext() void {
-    context_length = 0;
-}
-
-/// Get current context (for use in setError).
-fn getContext() ?[]const u8 {
-    if (context_length == 0) return null;
-    return context_buffer[0..context_length];
+    error_context.clearContext();
 }
 
 /// Store error for retrieval by talu_take_last_error().
@@ -77,15 +65,12 @@ pub fn setErrorWithCode(code: ErrorCode, comptime fmt: []const u8, args: anytype
 
     // Append internal context if set
     if (!is_truncated) {
-        if (getContext()) |ctx| {
+        if (error_context.consumeContext()) |ctx| {
             writer.print(" ({s})", .{ctx}) catch {
                 is_truncated = true;
             };
         }
     }
-
-    // Clear context after use
-    clearContext();
 
     if (is_truncated) {
         @memcpy(error_buffer[buffer_stream.pos..][0..TRUNCATED_SUFFIX.len], TRUNCATED_SUFFIX);

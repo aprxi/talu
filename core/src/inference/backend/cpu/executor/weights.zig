@@ -20,7 +20,7 @@ const runtime_mod = @import("runtime.zig");
 const inspect = @import("../../../../xray/root.zig");
 const trace = inspect.trace;
 const log = @import("../../../../log.zig");
-const progress_mod = @import("../../../../capi/progress.zig");
+const progress_mod = @import("../../../../progress.zig");
 const runtime_blocks = @import("../../../../models/runtime_blocks.zig");
 const topology = @import("../../../../models/op_types.zig");
 
@@ -1366,7 +1366,7 @@ pub fn buildBlocks(
     config: ModelConfig,
     runtime: tensor.ModelRuntime,
     block_weights: []const BlockWeights,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) ![]TransformerBlock {
     if (block_weights.len != config.n_layers) return error.InvalidLayerCount;
 
@@ -2006,7 +2006,7 @@ test "buildBlocks: creates correct number of blocks" {
         } };
     }
 
-    const blocks = try buildBlocks(allocator, config, runtime, &block_weights, progress_mod.ProgressContext.NONE);
+    const blocks = try buildBlocks(allocator, config, runtime, &block_weights, progress_mod.Context.NONE);
     defer {
         for (blocks) |*block| block.deinit(allocator);
         allocator.free(blocks);
@@ -2153,7 +2153,7 @@ test "buildBlocks handles heterogeneous blocks" {
         .{ .mamba = mamba_weights },
     };
 
-    const blocks = try buildBlocks(allocator, config, runtime, &block_weights, progress_mod.ProgressContext.NONE);
+    const blocks = try buildBlocks(allocator, config, runtime, &block_weights, progress_mod.Context.NONE);
     defer {
         for (blocks) |*block| block.deinit(allocator);
         allocator.free(blocks);
@@ -2190,7 +2190,7 @@ test "buildBlocks: validates layer count mismatch" {
     // Create only 2 block weights when config expects 3
     const empty_block_weights = [_]BlockWeights{};
 
-    const result = buildBlocks(allocator, config, runtime, &empty_block_weights, progress_mod.ProgressContext.NONE);
+    const result = buildBlocks(allocator, config, runtime, &empty_block_weights, progress_mod.Context.NONE);
     try std.testing.expectError(error.InvalidLayerCount, result);
 }
 

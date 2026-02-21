@@ -12,7 +12,7 @@ const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const flash_attention = compute.cpu.simd.flash_attention;
-const cpu_sdpa = compute.cpu.sdpa_decode;
+const cpu_sdpa = compute.cpu.sdpa_rowwise;
 const cpu_common = compute.cpu.common;
 const cpu_layout = compute.cpu.layout;
 const cpu_indexing = compute.cpu.indexing;
@@ -437,7 +437,7 @@ pub const MultiHeadAttention = struct {
                     const scores_for_head = score_values[head_index * score_stride ..][0..kv_sequence_len];
                     const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
                     const context_for_head = context_values[head_index * head_dim ..][0..head_dim];
-                    cpu_sdpa.decodeHeadScoresAndContext(
+                    cpu_sdpa.computeMaskedRowWeightedSum(
                         query_head,
                         k_cache_base,
                         v_cache_base,
@@ -616,7 +616,7 @@ pub const MultiHeadAttention = struct {
                 const scores_for_query = score_values[head_index * sequence_len ..][0..sequence_len];
                 const context_for_head = context_values[(query_index * self.n_heads + head_index) * head_dim ..][0..head_dim];
                 const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                cpu_sdpa.prefillHeadScoresAndContext(
+                cpu_sdpa.computeBoundedRowWeightedSum(
                     query_head,
                     key_values,
                     value_values,
@@ -940,7 +940,7 @@ pub const MultiHeadAttention = struct {
                     const scores_for_head = score_values[head_index * score_stride ..][0..kv_sequence_len];
                     const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
                     const context_for_head = context_values[head_index * head_dim ..][0..head_dim];
-                    cpu_sdpa.decodeHeadScoresAndContext(
+                    cpu_sdpa.computeMaskedRowWeightedSum(
                         query_head,
                         k_cache_head,
                         v_cache_head,
@@ -979,7 +979,7 @@ pub const MultiHeadAttention = struct {
                     const scores_for_query = score_values[head_index * sequence_len ..][0..sequence_len];
                     const context_for_head = context_values[(query_index * n_heads + head_index) * head_dim ..][0..head_dim];
                     const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
-                    cpu_sdpa.prefillHeadScoresAndContext(
+                    cpu_sdpa.computeBoundedRowWeightedSum(
                         query_head,
                         key_values,
                         value_values,
@@ -1236,7 +1236,7 @@ pub const MultiHeadAttention = struct {
                     const scores_for_head = scores_base[head_index * score_stride ..][0..kv_sequence_len];
                     const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
                     const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
-                    cpu_sdpa.decodeHeadScoresAndContext(
+                    cpu_sdpa.computeMaskedRowWeightedSum(
                         query_head,
                         k_cache_head,
                         v_cache_head,
@@ -1585,7 +1585,7 @@ fn forwardBatchedDecode(
                 const scores_for_head = scores_base[head_index * max_seq_len ..][0..kv_sequence_len];
                 const sink_logit: ?f32 = if (self.sinks) |s| s[head_index] else null;
                 const context_for_head = context_base[head_index * head_dim ..][0..head_dim];
-                cpu_sdpa.decodeHeadScoresAndContext(
+                cpu_sdpa.computeMaskedRowWeightedSum(
                     query_head,
                     k_cache_head,
                     v_cache_head,

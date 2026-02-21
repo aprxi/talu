@@ -32,7 +32,7 @@ pub const contract = @import("contract.zig");
 
 const models = @import("../../models/root.zig");
 const log = @import("../../log.zig");
-const progress_mod = @import("../../capi/progress.zig");
+const progress_mod = @import("../../progress.zig");
 const tensor = @import("../../tensor.zig");
 const ModelConfig = tensor.ModelConfig;
 const dtype_mod = @import("../../dtype.zig");
@@ -152,7 +152,7 @@ pub const Backend = union(enum) {
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
         init_options: InitOptions,
-        progress: progress_mod.ProgressContext,
+        progress: progress_mod.Context,
     ) !Backend {
         switch (init_options.selection) {
             .cpu => return initCpu(allocator, loaded, "configured", progress),
@@ -431,7 +431,7 @@ fn initCpu(
     allocator: std.mem.Allocator,
     loaded: *LoadedModel,
     reason: []const u8,
-    progress: progress_mod.ProgressContext,
+    progress: progress_mod.Context,
 ) !Backend {
     const cpu_backend_state = try cpu.BackendType.init(allocator, loaded, DEFAULT_MAX_BATCH_SIZE, progress);
     log.debug("inference", "Backend selected", .{ .backend = "cpu", .reason = reason }, @src());

@@ -6,7 +6,6 @@
 pub const common = @import("common.zig");
 pub const tensor_view = @import("tensor_view.zig");
 pub const activation_view = @import("activation_view.zig");
-pub const linalg_sdpa = @import("linalg_sdpa.zig");
 pub const mxfp4 = @import("mxfp4.zig");
 pub const math = @import("math.zig");
 pub const simd = @import("simd/root.zig");
@@ -32,13 +31,12 @@ pub const topk = @import("topk.zig");
 pub const reduction = @import("reduction.zig");
 pub const softmax = @import("softmax.zig");
 pub const sampling_ops = @import("sampling_ops.zig");
-pub const sdpa_decode = @import("sdpa_decode.zig");
+pub const sdpa_rowwise = @import("sdpa_rowwise.zig");
 
 test {
     _ = common;
     _ = tensor_view;
     _ = activation_view;
-    _ = linalg_sdpa;
     _ = mxfp4;
     _ = math;
     _ = simd;
@@ -61,5 +59,5 @@ test {
     _ = reduction;
     _ = softmax;
     _ = sampling_ops;
-    _ = sdpa_decode;
+    _ = sdpa_rowwise;
 }
