@@ -9,28 +9,11 @@
 const std = @import("std");
 const node_mod = @import("node.zig");
 const parser_mod = @import("parser.zig");
+const json_helpers = @import("json_helpers.zig");
 const Node = node_mod.Node;
+const writeJsonEscaped = json_helpers.writeJsonEscaped;
 
-/// Write a JSON-escaped string value (without surrounding quotes) into the writer.
-fn writeJsonEscaped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
-    for (text) |ch| {
-        switch (ch) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => |c| {
-                if (c < 0x20) {
-                    // Control characters as \u00XX
-                    try std.fmt.format(buf.writer(allocator), "\\u{x:0>4}", .{c});
-                } else {
-                    try buf.append(allocator, c);
-                }
-            },
-        }
-    }
-}
+const max_node_depth: u32 = 256;
 
 /// Write a recursive JSON object for the given node into buf.
 fn writeNodeJson(
@@ -38,7 +21,21 @@ fn writeNodeJson(
     buf: *std.ArrayList(u8),
     node: Node,
     source: []const u8,
+    depth: u32,
 ) !void {
+    if (depth >= max_node_depth) {
+        const sp = node.startPoint();
+        const ep = node.endPoint();
+        const w = buf.writer(allocator);
+        try std.fmt.format(w,
+            \\{{"kind":"_truncated","is_named":true,"start_byte":{d},"end_byte":{d},
+        , .{ node.startByte(), node.endByte() });
+        try std.fmt.format(w,
+            \\"start_point":{{"row":{d},"column":{d}}},"end_point":{{"row":{d},"column":{d}}},
+        , .{ sp.row, sp.column, ep.row, ep.column });
+        try std.fmt.format(w, "\"child_count\":{d}}}", .{node.childCount()});
+        return;
+    }
     const w = buf.writer(allocator);
 
     try buf.appendSlice(allocator, "{\"kind\":\"");
@@ -72,7 +69,7 @@ fn writeNodeJson(
         while (i < child_count) : (i += 1) {
             if (i > 0) try buf.append(allocator, ',');
             if (node.child(i)) |ch| {
-                try writeNodeJson(allocator, buf, ch, source);
+                try writeNodeJson(allocator, buf, ch, source, depth + 1);
             }
         }
         try buf.append(allocator, ']');
@@ -102,7 +99,7 @@ pub fn treeToJson(
     try writeJsonEscaped(allocator, &buf, language_name);
     try buf.appendSlice(allocator, "\",\"tree\":");
 
-    try writeNodeJson(allocator, &buf, tree.rootNode(), source);
+    try writeNodeJson(allocator, &buf, tree.rootNode(), source, 0);
 
     try buf.append(allocator, '}');
     try buf.append(allocator, 0);
@@ -175,6 +172,55 @@ test "treeToJson escapes special characters in text" {
 
     // Should contain escaped backslash from the source string
     try std.testing.expect(json.len > 0);
+}
+
+test "treeToJson truncates deeply nested trees" {
+    var p = try parser_mod.Parser.init(.python);
+    defer p.deinit();
+
+    // Build deeply nested parentheses: x = ((((...))))
+    // Each paren pair adds ~2 levels of nesting (parenthesized_expression + inner).
+    // 300 open + 300 close parens should exceed max_node_depth (256).
+    var source_buf: [605]u8 = undefined;
+    source_buf[0] = 'x';
+    source_buf[1] = '=';
+    for (2..302) |i| {
+        source_buf[i] = '(';
+    }
+    source_buf[302] = '1';
+    for (303..603) |i| {
+        source_buf[i] = ')';
+    }
+    source_buf[603] = '\n';
+    source_buf[604] = 0;
+    const source = source_buf[0..604];
+
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const json = try treeToJson(std.testing.allocator, &tree, source, "python");
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"_truncated\"") != null);
+    // Truncated nodes must include positional fields so clients don't crash on missing keys.
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"start_byte\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"start_point\":") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"child_count\":") != null);
+}
+
+test "treeToJson does not truncate shallow trees" {
+    var p = try parser_mod.Parser.init(.python);
+    defer p.deinit();
+    const source = "x = 1\ndef foo():\n    return 42\n";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const json = try treeToJson(std.testing.allocator, &tree, source, "python");
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"_truncated\"") == null);
+    // Should still have normal structure
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"kind\":\"module\"") != null);
 }
 
 test "treeToJson includes position info" {

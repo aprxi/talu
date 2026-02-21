@@ -57,6 +57,54 @@ async fn parse_tree_contains_function_definition() {
 }
 
 #[tokio::test]
+async fn parse_deeply_nested_produces_truncated_node() {
+    use http_body_util::BodyExt;
+
+    let app = build_app();
+
+    // Build deeply nested parentheses: x = ((((...))))
+    // 300 open + 300 close parens exceeds the AST depth limit (256).
+    let mut source = String::with_capacity(605);
+    source.push_str("x=");
+    for _ in 0..300 {
+        source.push('(');
+    }
+    source.push('1');
+    for _ in 0..300 {
+        source.push(')');
+    }
+
+    let body = serde_json::json!({
+        "source": source,
+        "language": "python"
+    });
+    let resp = send_request(&app, post_json("/v1/code/parse", &body)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // The JSON is too deeply nested for serde_json's default recursion limit,
+    // so verify the raw string contains the expected truncation marker and fields.
+    let body_bytes = resp.into_body().collect().await.unwrap().to_bytes();
+    let raw = String::from_utf8_lossy(&body_bytes);
+
+    assert!(
+        raw.contains("\"_truncated\""),
+        "deeply nested AST should contain _truncated node"
+    );
+
+    // Verify the truncated node includes positional fields so clients don't crash.
+    // Extract a ~500 char window after the _truncated marker to check for required fields.
+    let trunc_pos = raw.find("\"_truncated\"").unwrap();
+    let window_start = raw[..trunc_pos].rfind('{').unwrap();
+    let window_end = (window_start + 500).min(raw.len());
+    let window = &raw[window_start..window_end];
+
+    assert!(window.contains("\"start_byte\":"), "_truncated missing start_byte: {window}");
+    assert!(window.contains("\"end_byte\":"), "_truncated missing end_byte: {window}");
+    assert!(window.contains("\"start_point\":"), "_truncated missing start_point: {window}");
+    assert!(window.contains("\"child_count\":"), "_truncated missing child_count: {window}");
+}
+
+#[tokio::test]
 async fn parse_invalid_language() {
     let app = build_app();
     let body = serde_json::json!({

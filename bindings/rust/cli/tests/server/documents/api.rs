@@ -83,6 +83,7 @@ fn build_app_with_storage(temp_dir: &TempDir) -> Router {
         max_file_upload_bytes: 100 * 1024 * 1024,
         max_file_inspect_bytes: 50 * 1024 * 1024,
         code_sessions: Mutex::new(HashMap::new()),
+        code_session_ttl: std::time::Duration::from_secs(15 * 60),
     };
 
     Router::new(Arc::new(state))
@@ -105,6 +106,7 @@ fn build_app_no_storage() -> Router {
         max_file_upload_bytes: 100 * 1024 * 1024,
         max_file_inspect_bytes: 50 * 1024 * 1024,
         code_sessions: Mutex::new(HashMap::new()),
+        code_session_ttl: std::time::Duration::from_secs(15 * 60),
     };
 
     Router::new(Arc::new(state))

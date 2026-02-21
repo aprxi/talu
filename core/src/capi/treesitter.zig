@@ -24,6 +24,7 @@ const Tree = treesitter.Tree;
 const Query = treesitter.Query;
 const QueryCursor = treesitter.QueryCursor;
 const highlight_mod = treesitter.highlight;
+const query_mod = treesitter.query;
 const node_mod = treesitter.node;
 const ast_mod = treesitter.ast;
 const graph_mod = treesitter.graph;
@@ -413,27 +414,12 @@ pub export fn talu_treesitter_highlight(
     };
     defer allocator.free(tokens);
 
-    // Build JSON array
-    var json = std.ArrayList(u8).empty;
-    defer json.deinit(allocator);
-
-    json.append(allocator, '[') catch {
-        capi_error.setError(error.OutOfMemory, "JSON allocation failed", .{});
+    const json = highlight_mod.tokensToJson(allocator, tokens) catch {
+        capi_error.setError(error.OutOfMemory, "JSON serialization failed", .{});
         return @intFromEnum(error_codes.ErrorCode.out_of_memory);
     };
 
-    for (tokens, 0..) |token, i| {
-        if (i > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-        std.fmt.format(json.writer(allocator),
-            \\{{"s":{d},"e":{d},"t":"{s}"}}
-        , .{ token.start, token.end, token.token_type.cssClass() }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    }
-
-    json.append(allocator, ']') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    json.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    const owned = json.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    result.* = @ptrCast(owned.ptr);
+    result.* = json.ptr;
     return 0;
 }
 
@@ -478,46 +464,12 @@ pub export fn talu_treesitter_highlight_rich(
     };
     defer allocator.free(tokens);
 
-    // Build JSON array
-    var json = std.ArrayList(u8).empty;
-    defer json.deinit(allocator);
+    const json = highlight_mod.richTokensToJson(allocator, tokens, source_slice) catch {
+        capi_error.setError(error.OutOfMemory, "JSON serialization failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
 
-    json.append(allocator, '[') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    for (tokens, 0..) |token, i| {
-        if (i > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-        // Write token fields
-        std.fmt.format(json.writer(allocator),
-            \\{{"s":{d},"e":{d},"t":"{s}","nk":"{s}","tx":"
-        , .{ token.start, token.end, token.token_type.cssClass(), token.node_kind }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-        // Escape the text portion
-        const text_slice = if (token.start < source_slice.len and token.end <= source_slice.len)
-            source_slice[token.start..token.end]
-        else
-            "";
-        for (text_slice) |ch| {
-            switch (ch) {
-                '"' => json.appendSlice(allocator, "\\\"") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\\' => json.appendSlice(allocator, "\\\\") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\n' => json.appendSlice(allocator, "\\n") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\r' => json.appendSlice(allocator, "\\r") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\t' => json.appendSlice(allocator, "\\t") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                else => json.append(allocator, ch) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-            }
-        }
-
-        std.fmt.format(json.writer(allocator),
-            \\","sr":{d},"sc":{d},"er":{d},"ec":{d}}}
-        , .{ token.start_row, token.start_column, token.end_row, token.end_column }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    }
-
-    json.append(allocator, ']') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    json.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    const owned = json.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    result.* = @ptrCast(owned.ptr);
+    result.* = json.ptr;
     return 0;
 }
 
@@ -573,23 +525,12 @@ pub export fn talu_treesitter_highlight_from_tree(
     };
     defer allocator.free(tokens);
 
-    var json = std.ArrayList(u8).empty;
-    defer json.deinit(allocator);
+    const json = highlight_mod.tokensToJson(allocator, tokens) catch {
+        capi_error.setError(error.OutOfMemory, "JSON serialization failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
 
-    json.append(allocator, '[') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    for (tokens, 0..) |token, i| {
-        if (i > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-        std.fmt.format(json.writer(allocator),
-            \\{{"s":{d},"e":{d},"t":"{s}"}}
-        , .{ token.start, token.end, token.token_type.cssClass() }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    }
-
-    json.append(allocator, ']') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    json.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    const owned = json.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    result.* = @ptrCast(owned.ptr);
+    result.* = json.ptr;
     return 0;
 }
 
@@ -631,43 +572,12 @@ pub export fn talu_treesitter_highlight_rich_from_tree(
     };
     defer allocator.free(tokens);
 
-    var json = std.ArrayList(u8).empty;
-    defer json.deinit(allocator);
+    const json = highlight_mod.richTokensToJson(allocator, tokens, source_slice) catch {
+        capi_error.setError(error.OutOfMemory, "JSON serialization failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
 
-    json.append(allocator, '[') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    for (tokens, 0..) |token, i| {
-        if (i > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-        std.fmt.format(json.writer(allocator),
-            \\{{"s":{d},"e":{d},"t":"{s}","nk":"{s}","tx":"
-        , .{ token.start, token.end, token.token_type.cssClass(), token.node_kind }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-        const text_slice = if (token.start < source_slice.len and token.end <= source_slice.len)
-            source_slice[token.start..token.end]
-        else
-            "";
-        for (text_slice) |ch| {
-            switch (ch) {
-                '"' => json.appendSlice(allocator, "\\\"") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\\' => json.appendSlice(allocator, "\\\\") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\n' => json.appendSlice(allocator, "\\n") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\r' => json.appendSlice(allocator, "\\r") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                '\t' => json.appendSlice(allocator, "\\t") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                else => json.append(allocator, ch) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-            }
-        }
-
-        std.fmt.format(json.writer(allocator),
-            \\","sr":{d},"sc":{d},"er":{d},"ec":{d}}}
-        , .{ token.start_row, token.start_column, token.end_row, token.end_column }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    }
-
-    json.append(allocator, ']') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    json.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    const owned = json.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    result.* = @ptrCast(owned.ptr);
+    result.* = json.ptr;
     return 0;
 }
 
@@ -780,53 +690,12 @@ pub export fn talu_treesitter_query_exec(
 
     cursor.exec(query_ptr, tree_ptr.rootNode());
 
-    // Build JSON array of matches
-    var json = std.ArrayList(u8).empty;
-    defer json.deinit(allocator);
+    const json = query_mod.queryMatchesToJson(allocator, &cursor, source_slice, query_ptr) catch {
+        capi_error.setError(error.OutOfMemory, "JSON serialization failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
 
-    json.append(allocator, '[') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    var match_count: usize = 0;
-    while (cursor.nextMatch()) |match| {
-        if (match_count > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-        std.fmt.format(json.writer(allocator), "{{\"id\":{d},\"captures\":[", .{match.id}) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-        for (match.captures, 0..) |capture, ci| {
-            if (ci > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-            const cap_node = node_mod.Node{ .raw = capture.node };
-            const cap_name = query_ptr.captureNameForId(capture.index);
-            const start = cap_node.startByte();
-            const end = cap_node.endByte();
-            const text_slice = cap_node.text(source_slice);
-
-            // Escape text for JSON
-            std.fmt.format(json.writer(allocator), "{{\"name\":\"{s}\",\"start\":{d},\"end\":{d},\"text\":\"", .{ cap_name, start, end }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-            for (text_slice) |ch| {
-                switch (ch) {
-                    '"' => json.appendSlice(allocator, "\\\"") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                    '\\' => json.appendSlice(allocator, "\\\\") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                    '\n' => json.appendSlice(allocator, "\\n") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                    '\r' => json.appendSlice(allocator, "\\r") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                    '\t' => json.appendSlice(allocator, "\\t") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                    else => json.append(allocator, ch) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
-                }
-            }
-
-            json.appendSlice(allocator, "\"}") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-        }
-
-        json.appendSlice(allocator, "]}") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-        match_count += 1;
-    }
-
-    json.append(allocator, ']') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    json.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-
-    const owned = json.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    result.* = @ptrCast(owned.ptr);
+    result.* = json.ptr;
     return 0;
 }
 
@@ -970,24 +839,18 @@ pub export fn talu_treesitter_extract_callables(
     };
     defer allocator.free(callables_json);
 
-    var buf = std.ArrayList(u8).empty;
-    defer buf.deinit(allocator);
-
     const aliases_json = graph_mod.aliasesToJson(allocator, extraction.aliases) catch {
         capi_error.setError(error.OutOfMemory, "Alias JSON serialization failed", .{});
         return @intFromEnum(error_codes.ErrorCode.out_of_memory);
     };
     defer allocator.free(aliases_json);
 
-    buf.appendSlice(allocator, "{\"callables\":") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    buf.appendSlice(allocator, callables_json) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    buf.appendSlice(allocator, ",\"aliases\":") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    buf.appendSlice(allocator, aliases_json) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    buf.append(allocator, '}') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    buf.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    const json = graph_mod.extractionToJson(allocator, callables_json, aliases_json) catch {
+        capi_error.setError(error.OutOfMemory, "Envelope JSON serialization failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
 
-    const owned = buf.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
-    out.* = @ptrCast(owned.ptr);
+    out.* = json.ptr;
     return 0;
 }
 
@@ -1060,4 +923,77 @@ pub export fn talu_treesitter_extract_call_sites(
 
     out.* = json.ptr;
     return 0;
+}
+
+// =============================================================================
+// Fuzz Tests
+// =============================================================================
+
+const memory = @import("memory.zig");
+
+test "fuzz talu_treesitter_parse" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, input: []const u8) !void {
+            const parser = talu_treesitter_parser_create("python") orelse return;
+            defer talu_treesitter_parser_free(parser);
+
+            var tree: ?*TreeSitterTreeHandle = null;
+            const rc = talu_treesitter_parse(parser, input.ptr, @intCast(@min(input.len, std.math.maxInt(u32))), &tree);
+            if (rc == 0) {
+                talu_treesitter_tree_free(tree);
+            }
+        }
+    }.testOne, .{});
+}
+
+test "fuzz talu_treesitter_highlight" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, input: []const u8) !void {
+            var out_json: [*:0]u8 = undefined;
+            const rc = talu_treesitter_highlight(
+                input.ptr,
+                @intCast(@min(input.len, std.math.maxInt(u32))),
+                "python",
+                &out_json,
+            );
+            if (rc == 0) {
+                const span = std.mem.span(out_json);
+                memory.talu_free_string(out_json, span.len + 1);
+            }
+        }
+    }.testOne, .{});
+}
+
+test "fuzz talu_treesitter_query_exec" {
+    try std.testing.fuzz({}, struct {
+        fn testOne(_: void, input: []const u8) !void {
+            const parser = talu_treesitter_parser_create("python") orelse return;
+            defer talu_treesitter_parser_free(parser);
+
+            const src_len: u32 = @intCast(@min(input.len, std.math.maxInt(u32)));
+            var tree: ?*TreeSitterTreeHandle = null;
+            const parse_rc = talu_treesitter_parse(parser, input.ptr, src_len, &tree);
+            if (parse_rc != 0) return;
+            defer talu_treesitter_tree_free(tree);
+
+            const pattern = "(identifier) @id";
+            var query: ?*TreeSitterQueryHandle = null;
+            const query_rc = talu_treesitter_query_create("python", pattern, pattern.len, &query);
+            if (query_rc != 0) return;
+            defer talu_treesitter_query_free(query);
+
+            var out_json: [*:0]u8 = undefined;
+            const rc = talu_treesitter_query_exec(
+                query,
+                tree,
+                input.ptr,
+                src_len,
+                &out_json,
+            );
+            if (rc == 0) {
+                const span = std.mem.span(out_json);
+                memory.talu_free_string(out_json, span.len + 1);
+            }
+        }
+    }.testOne, .{});
 }

@@ -15,6 +15,7 @@ pub const highlight = @import("highlight.zig");
 pub const query_cache = @import("query_cache.zig");
 pub const ast = @import("ast.zig");
 pub const token_refine = @import("token_refine.zig");
+pub const json_helpers = @import("json_helpers.zig");
 pub const graph = @import("graph/root.zig");
 
 // Re-export commonly used types at module level
@@ -33,6 +34,9 @@ pub const highlightTokens = highlight.highlightTokens;
 pub const treeToJson = ast.treeToJson;
 pub const RichToken = highlight.RichToken;
 pub const highlightTokensRich = highlight.highlightTokensRich;
+pub const tokensToJson = highlight.tokensToJson;
+pub const richTokensToJson = highlight.richTokensToJson;
+pub const queryMatchesToJson = query.queryMatchesToJson;
 
 // Force compilation/testing of all submodules
 comptime {
@@ -44,5 +48,6 @@ comptime {
     _ = query_cache;
     _ = ast;
     _ = token_refine;
+    _ = json_helpers;
     _ = graph;
 }

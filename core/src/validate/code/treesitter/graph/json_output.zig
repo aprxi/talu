@@ -7,23 +7,11 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const json_helpers = @import("../json_helpers.zig");
 const CallableDefinitionInfo = types.CallableDefinitionInfo;
 const CallSiteDetail = types.CallSiteDetail;
 const AliasInfo = types.AliasInfo;
-
-/// Write a JSON-escaped string (without surrounding quotes) into buf.
-fn writeEscaped(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), text: []const u8) !void {
-    for (text) |ch| {
-        switch (ch) {
-            '"' => try buf.appendSlice(allocator, "\\\""),
-            '\\' => try buf.appendSlice(allocator, "\\\\"),
-            '\n' => try buf.appendSlice(allocator, "\\n"),
-            '\r' => try buf.appendSlice(allocator, "\\r"),
-            '\t' => try buf.appendSlice(allocator, "\\t"),
-            else => try buf.append(allocator, ch),
-        }
-    }
-}
+const writeEscaped = json_helpers.writeJsonEscaped;
 
 /// Serialize callable definitions to a NUL-terminated JSON array string.
 /// Caller owns the returned slice.
@@ -189,9 +177,36 @@ fn writeSpan(w: anytype, span: types.Span) !void {
     try std.fmt.format(w, "{{\"start\":{d},\"end\":{d}}}", .{ span.start, span.end });
 }
 
+/// Wrap callables and aliases JSON arrays into the extraction envelope.
+/// Caller owns the returned slice.
+pub fn extractionToJson(
+    allocator: std.mem.Allocator,
+    callables_json: [:0]const u8,
+    aliases_json: [:0]const u8,
+) ![:0]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.appendSlice(allocator, "{\"callables\":");
+    try buf.appendSlice(allocator, callables_json);
+    try buf.appendSlice(allocator, ",\"aliases\":");
+    try buf.appendSlice(allocator, aliases_json);
+    try buf.append(allocator, '}');
+    try buf.append(allocator, 0);
+
+    const owned = try buf.toOwnedSlice(allocator);
+    return owned[0 .. owned.len - 1 :0];
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
+
+test "extractionToJson wraps callables and aliases" {
+    const json = try extractionToJson(std.testing.allocator, "[]", "[]");
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("{\"callables\":[],\"aliases\":[]}", json);
+}
 
 test "callablesToJson produces valid JSON" {
     const callables = [_]CallableDefinitionInfo{

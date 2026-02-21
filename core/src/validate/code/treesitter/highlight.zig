@@ -308,8 +308,99 @@ pub fn highlightTokensRich(
 }
 
 // =============================================================================
+// JSON Serialization
+// =============================================================================
+
+const json_helpers = @import("json_helpers.zig");
+
+/// Serialize tokens to a NUL-terminated JSON array: [{"s":0,"e":3,"t":"syntax-keyword"}, ...]
+/// Caller owns the returned slice.
+pub fn tokensToJson(allocator: std.mem.Allocator, tokens: []const Token) ![:0]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+
+    try buf.append(allocator, '[');
+    for (tokens, 0..) |token, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try std.fmt.format(buf.writer(allocator),
+            \\{{"s":{d},"e":{d},"t":"{s}"}}
+        , .{ token.start, token.end, token.token_type.cssClass() });
+    }
+    try buf.append(allocator, ']');
+    try buf.append(allocator, 0);
+
+    const owned = try buf.toOwnedSlice(allocator);
+    return owned[0 .. owned.len - 1 :0];
+}
+
+/// Serialize rich tokens to a NUL-terminated JSON array with positions and text.
+/// Caller owns the returned slice.
+pub fn richTokensToJson(allocator: std.mem.Allocator, tokens: []const RichToken, source: []const u8) ![:0]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try buf.append(allocator, '[');
+    for (tokens, 0..) |token, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        try std.fmt.format(w,
+            \\{{"s":{d},"e":{d},"t":"{s}","nk":"{s}","tx":"
+        , .{ token.start, token.end, token.token_type.cssClass(), token.node_kind });
+
+        // Text from source (needs JSON escaping)
+        if (token.start < source.len and token.end <= source.len) {
+            try json_helpers.writeJsonEscaped(allocator, &buf, source[token.start..token.end]);
+        }
+
+        try std.fmt.format(w,
+            \\","sr":{d},"sc":{d},"er":{d},"ec":{d}}}
+        , .{ token.start_row, token.start_column, token.end_row, token.end_column });
+    }
+    try buf.append(allocator, ']');
+    try buf.append(allocator, 0);
+
+    const owned = try buf.toOwnedSlice(allocator);
+    return owned[0 .. owned.len - 1 :0];
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
+
+test "tokensToJson produces valid JSON for tokens" {
+    const tokens = [_]Token{
+        .{ .start = 0, .end = 3, .token_type = .keyword },
+        .{ .start = 4, .end = 9, .token_type = .function },
+    };
+    const json = try tokensToJson(std.testing.allocator, &tokens);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"s\":0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"t\":\"syntax-keyword\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"t\":\"syntax-function\"") != null);
+}
+
+test "tokensToJson empty tokens produces empty array" {
+    const json = try tokensToJson(std.testing.allocator, &.{});
+    defer std.testing.allocator.free(json);
+    try std.testing.expectEqualStrings("[]", json);
+}
+
+test "richTokensToJson produces valid JSON with text" {
+    const source = "def hello";
+    const tokens = [_]RichToken{
+        .{
+            .start = 0, .end = 3, .token_type = .keyword,
+            .node_kind = "keyword", .start_row = 0, .start_column = 0, .end_row = 0, .end_column = 3,
+        },
+    };
+    const json = try richTokensToJson(std.testing.allocator, &tokens, source);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"tx\":\"def\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"nk\":\"keyword\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"sr\":0") != null);
+}
 
 test "highlightTokens returns tokens for Python" {
     const source = "def hello():\n    return 42\n";

@@ -10,12 +10,15 @@ mod highlight;
 mod languages;
 mod parse;
 mod query;
+mod reaper;
 mod session;
+mod ws;
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use futures_util::{SinkExt, StreamExt};
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::client::conn::http1 as client_http1;
@@ -25,6 +28,7 @@ use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use serde_json::Value;
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message;
 
 use talu_cli::server::http::Router;
 use talu_cli::server::state::{AppState, BackendState};
@@ -49,6 +53,7 @@ fn build_app() -> Router {
         max_file_upload_bytes: 100 * 1024 * 1024,
         max_file_inspect_bytes: 50 * 1024 * 1024,
         code_sessions: Mutex::new(HashMap::new()),
+        code_session_ttl: std::time::Duration::from_secs(15 * 60),
     };
     Router::new(Arc::new(state))
 }
@@ -60,6 +65,7 @@ async fn send_request(router: &Router, req: Request<Full<Bytes>>) -> Response<In
     tokio::spawn(async move {
         let _ = server_http1::Builder::new()
             .serve_connection(TokioIo::new(server_io), service)
+            .with_upgrades()
             .await;
     });
 
@@ -72,6 +78,39 @@ async fn send_request(router: &Router, req: Request<Full<Bytes>>) -> Response<In
     });
 
     sender.send_request(req).await.expect("send_request failed")
+}
+
+type WsStream = tokio_tungstenite::WebSocketStream<tokio::io::DuplexStream>;
+
+/// Open a WebSocket connection to `/v1/code/ws` via in-process duplex IO.
+async fn ws_connect(router: &Router) -> WsStream {
+    let (client_io, server_io) = tokio::io::duplex(1024 * 1024);
+
+    let service = TowerToHyperService::new(router.clone());
+    tokio::spawn(async move {
+        let _ = server_http1::Builder::new()
+            .serve_connection(TokioIo::new(server_io), service)
+            .with_upgrades()
+            .await;
+    });
+
+    let (ws, _) = tokio_tungstenite::client_async("ws://localhost/v1/code/ws", client_io)
+        .await
+        .expect("WebSocket handshake failed");
+
+    ws
+}
+
+/// Send a JSON message and receive the response.
+async fn ws_roundtrip(ws: &mut WsStream, msg: &Value) -> Value {
+    ws.send(Message::Text(msg.to_string()))
+        .await
+        .expect("ws send failed");
+    let reply = ws.next().await.expect("ws stream ended").expect("ws recv failed");
+    match reply {
+        Message::Text(text) => serde_json::from_str(&text).expect("invalid JSON in ws reply"),
+        other => panic!("expected text message, got: {other:?}"),
+    }
 }
 
 async fn body_json(resp: Response<Incoming>) -> (StatusCode, Value) {

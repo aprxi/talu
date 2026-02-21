@@ -72,4 +72,6 @@ pub struct AppState {
     pub max_file_inspect_bytes: u64,
     /// In-memory code session store for incremental parsing.
     pub code_sessions: Mutex<HashMap<String, CodeSession>>,
+    /// Max idle time before a code session is evicted by the reaper.
+    pub code_session_ttl: std::time::Duration,
 }

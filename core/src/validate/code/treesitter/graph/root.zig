@@ -29,6 +29,7 @@ pub const extractCallSites = extract.extractCallSites;
 pub const callablesToJson = json_output.callablesToJson;
 pub const callSitesToJson = json_output.callSitesToJson;
 pub const aliasesToJson = json_output.aliasesToJson;
+pub const extractionToJson = json_output.extractionToJson;
 
 // Force compilation/testing of all submodules
 comptime {

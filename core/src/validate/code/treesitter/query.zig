@@ -135,6 +135,59 @@ pub const QueryCursor = struct {
 };
 
 // =============================================================================
+// JSON Serialization
+// =============================================================================
+
+const json_helpers = @import("json_helpers.zig");
+
+/// Serialize query matches to a NUL-terminated JSON array string.
+/// Iterates the cursor to exhaustion. Caller owns the returned slice.
+pub fn queryMatchesToJson(
+    allocator: std.mem.Allocator,
+    cursor: *QueryCursor,
+    source: []const u8,
+    query_ref: *const Query,
+) ![:0]u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    try buf.append(allocator, '[');
+
+    var match_count: usize = 0;
+    while (cursor.nextMatch()) |match| {
+        if (match_count > 0) try buf.append(allocator, ',');
+
+        try std.fmt.format(w, "{{\"id\":{d},\"captures\":[", .{match.id});
+
+        for (match.captures, 0..) |capture, ci| {
+            if (ci > 0) try buf.append(allocator, ',');
+
+            const cap_node = Node{ .raw = capture.node };
+            const cap_name = query_ref.captureNameForId(capture.index);
+            const start = cap_node.startByte();
+            const end = cap_node.endByte();
+
+            try std.fmt.format(w, "{{\"name\":\"{s}\",\"start\":{d},\"end\":{d},\"text\":\"", .{ cap_name, start, end });
+
+            const text_slice = cap_node.text(source);
+            try json_helpers.writeJsonEscaped(allocator, &buf, text_slice);
+
+            try buf.appendSlice(allocator, "\"}");
+        }
+
+        try buf.appendSlice(allocator, "]}");
+        match_count += 1;
+    }
+
+    try buf.append(allocator, ']');
+    try buf.append(allocator, 0);
+
+    const owned = try buf.toOwnedSlice(allocator);
+    return owned[0 .. owned.len - 1 :0];
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -198,6 +251,50 @@ test "QueryMatch provides capture nodes" {
     } else {
         return error.TestUnexpectedResult;
     }
+}
+
+test "queryMatchesToJson produces valid JSON" {
+    var p = try parser_mod.Parser.init(.python);
+    defer p.deinit();
+
+    const source = "x = 1";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    var q = try Query.init(.python, "(identifier) @id");
+    defer q.deinit();
+
+    var cursor = try QueryCursor.init();
+    defer cursor.deinit();
+    cursor.exec(&q, tree.rootNode());
+
+    const json = try queryMatchesToJson(std.testing.allocator, &cursor, source, &q);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"name\":\"id\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"text\":\"x\"") != null);
+}
+
+test "queryMatchesToJson handles no matches" {
+    var p = try parser_mod.Parser.init(.python);
+    defer p.deinit();
+
+    const source = "42";
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    // Pattern that won't match a bare integer
+    var q = try Query.init(.python, "(function_definition) @fn");
+    defer q.deinit();
+
+    var cursor = try QueryCursor.init();
+    defer cursor.deinit();
+    cursor.exec(&q, tree.rootNode());
+
+    const json = try queryMatchesToJson(std.testing.allocator, &cursor, source, &q);
+    defer std.testing.allocator.free(json);
+
+    try std.testing.expectEqualStrings("[]", json);
 }
 
 test "Query.captureNameForId returns empty for invalid id" {

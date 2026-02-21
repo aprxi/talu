@@ -17,8 +17,8 @@ use std::os::unix::fs::PermissionsExt;
 use crate::server::http::Router;
 use crate::server::state::AppState;
 
-/// Max idle time before a code session is evicted.
-const CODE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Default max idle time before a code session is evicted.
+pub const CODE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// How often the session reaper runs.
 const CODE_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -34,7 +34,8 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
             interval.tick().await;
             let mut sessions = gc_state.code_sessions.lock().await;
             let before = sessions.len();
-            sessions.retain(|_, session| session.last_access.elapsed() < CODE_SESSION_TTL);
+            let ttl = gc_state.code_session_ttl;
+            sessions.retain(|_, session| session.last_access.elapsed() < ttl);
             let evicted = before - sessions.len();
             if evicted > 0 {
                 log::info!(
@@ -115,6 +116,7 @@ async fn serve_tcp_connection(stream: TcpStream, router: Router) -> Result<()> {
     let service: TowerToHyperService<Router> = TowerToHyperService::new(router);
     http1::Builder::new()
         .serve_connection(io, service)
+        .with_upgrades()
         .await
         .context("TCP connection failed")?;
     Ok(())
@@ -143,6 +145,7 @@ async fn serve_unix_connection(stream: UnixStream, router: Router) -> Result<()>
     let service: TowerToHyperService<Router> = TowerToHyperService::new(router);
     http1::Builder::new()
         .serve_connection(io, service)
+        .with_upgrades()
         .await
         .context("UDS connection failed")?;
     Ok(())
