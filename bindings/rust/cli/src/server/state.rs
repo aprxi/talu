@@ -37,6 +37,22 @@ pub struct PluginTokenEntry {
 /// Cleared and regenerated on each `GET /v1/plugins` call.
 pub type PluginTokenStore = HashMap<String, PluginTokenEntry>;
 
+/// A code analysis session holding a parser and tree for incremental re-parsing.
+///
+/// Sessions enable sub-millisecond re-highlighting on edits by reusing the
+/// tree-sitter parser and feeding the previous tree for incremental parsing.
+pub struct CodeSession {
+    pub parser: talu::treesitter::ParserHandle,
+    pub tree: talu::treesitter::TreeHandle,
+    pub language: String,
+    /// Pre-allocated CString for the language identifier.
+    /// Avoids per-keystroke CString allocation in highlight/query FFI calls.
+    pub c_language: std::ffi::CString,
+    /// Source code that produced the current tree. Kept for highlight-without-reparse.
+    pub source: Vec<u8>,
+    pub last_access: std::time::Instant,
+}
+
 pub struct AppState {
     pub backend: Arc<Mutex<BackendState>>,
     pub configured_model: Option<String>,
@@ -54,4 +70,6 @@ pub struct AppState {
     pub max_file_upload_bytes: u64,
     /// Max allowed size (bytes) for `/v1/file/inspect` and `/v1/file/transform` in-memory operations.
     pub max_file_inspect_bytes: u64,
+    /// In-memory code session store for incremental parsing.
+    pub code_sessions: Mutex<HashMap<String, CodeSession>>,
 }

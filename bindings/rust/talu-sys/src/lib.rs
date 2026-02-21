@@ -2657,6 +2657,30 @@ pub struct CachedModelList {
     _private: [u8; 0],
 }
 
+/// Opaque handle for tree-sitter parser.
+/// Thread safety: NOT thread-safe. Create one per thread.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TreeSitterParserHandle {
+    _private: [u8; 0],
+}
+
+/// Opaque handle for parsed syntax tree.
+/// Thread safety: Immutable after creation. Safe to share read-only.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TreeSitterTreeHandle {
+    _private: [u8; 0],
+}
+
+/// Opaque handle for compiled query pattern.
+/// Thread safety: Immutable after creation. Safe to share read-only.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TreeSitterQueryHandle {
+    _private: [u8; 0],
+}
+
 // =============================================================================
 // Callback Types
 // =============================================================================
@@ -3569,6 +3593,44 @@ extern "C" {
     pub fn talu_tokens_concat(tokens_a: *const u32, num_a: usize, tokens_b: *const u32, num_b: usize) -> *const u32;
     // core/src/capi/tokenizer.zig
     pub fn talu_tokens_free(tokens: *const u32, num_tokens: usize);
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_extract_call_sites(source: *const u8, source_len: u32, lang: *const c_char, definer_fqn: *const c_char, file_path: *const c_char, project_root: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_extract_callables(source: *const u8, source_len: u32, lang: *const c_char, file_path: *const c_char, project_root: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_highlight(source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_highlight_from_tree(tree_handle: *mut c_void, source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_highlight_rich(source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_highlight_rich_from_tree(tree_handle: *mut c_void, source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_language_from_filename(filename: *const c_char, out_lang: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_languages(out_str: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_parse(handle: *mut c_void, source: *const u8, source_len: u32, out_tree: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_parse_incremental(handle: *mut c_void, source: *const u8, source_len: u32, old_tree: *mut c_void, out_tree: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_parser_create(lang: *const c_char) -> *mut c_void;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_parser_free(handle: *mut c_void);
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_query_create(lang: *const c_char, pattern: *const u8, pattern_len: u32, out_handle: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_query_exec(query_handle: *mut c_void, tree_handle: *mut c_void, source: *const u8, source_len: u32, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_query_free(handle: *mut c_void);
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_tree_edit(handle: *mut c_void, start_byte: u32, old_end_byte: u32, new_end_byte: u32, start_row: u32, start_column: u32, old_end_row: u32, old_end_column: u32, new_end_row: u32, new_end_column: u32) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_tree_free(handle: *mut c_void);
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_tree_json(tree_handle: *mut c_void, source: *const u8, source_len: u32, lang: *const c_char, out_json: *mut c_void) -> c_int;
+    // core/src/capi/treesitter.zig
+    pub fn talu_treesitter_tree_sexp(handle: *mut c_void, out_str: *mut c_void) -> c_int;
     // core/src/capi/validate.zig
     pub fn talu_validate_accept(handle: *mut c_void, token_id: u32, token_text: *const c_char) -> c_int;
     // core/src/capi/validate.zig

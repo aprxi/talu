@@ -398,6 +398,187 @@ test "captureNameToTokenType maps known names" {
     try std.testing.expectEqual(TokenType.plain, captureNameToTokenType("unknown_capture"));
 }
 
+/// Extract syntax highlighting tokens using an already-parsed tree.
+/// Skips parsing — use when the caller owns the tree (e.g., session-based incremental parsing).
+/// Caller owns the returned slice.
+pub fn highlightTokensFromTree(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tree: *const parser_mod.Tree,
+    language: Language,
+) ![]Token {
+    if (source.len == 0) return allocator.alloc(Token, 0);
+
+    const query = query_cache.getHighlightQuery(language) catch {
+        return allocator.alloc(Token, 0);
+    };
+
+    var cursor = try query_mod.QueryCursor.init();
+    defer cursor.deinit();
+
+    cursor.exec(query, tree.rootNode());
+
+    var tokens = std.ArrayList(Token).empty;
+    errdefer tokens.deinit(allocator);
+
+    while (cursor.nextMatch()) |match| {
+        for (match.captures) |capture| {
+            const capture_name = query.captureNameForId(capture.index);
+            const token_type = captureNameToTokenType(capture_name);
+
+            if (token_type == .plain) continue;
+
+            const node = node_mod.Node{ .raw = capture.node };
+            const start = node.startByte();
+            const end = node.endByte();
+
+            if (start >= end) continue;
+            if (end > source.len) continue;
+
+            try tokens.append(allocator, .{
+                .start = start,
+                .end = end,
+                .token_type = token_type,
+            });
+        }
+    }
+
+    token_refine.refineTokens(tokens.items, source, language);
+
+    std.mem.sort(Token, tokens.items, {}, struct {
+        fn lessThan(_: void, a: Token, b: Token) bool {
+            if (a.start != b.start) return a.start < b.start;
+            return a.end < b.end;
+        }
+    }.lessThan);
+
+    return tokens.toOwnedSlice(allocator);
+}
+
+/// Like highlightTokensFromTree, but with rich position info.
+/// Caller owns the returned slice.
+pub fn highlightTokensRichFromTree(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    tree: *const parser_mod.Tree,
+    language: Language,
+) ![]RichToken {
+    if (source.len == 0) return allocator.alloc(RichToken, 0);
+
+    const query = query_cache.getHighlightQuery(language) catch {
+        return allocator.alloc(RichToken, 0);
+    };
+
+    var cursor = try query_mod.QueryCursor.init();
+    defer cursor.deinit();
+
+    cursor.exec(query, tree.rootNode());
+
+    var tokens = std.ArrayList(RichToken).empty;
+    errdefer tokens.deinit(allocator);
+
+    var basic_tokens = std.ArrayList(Token).empty;
+    defer basic_tokens.deinit(allocator);
+
+    while (cursor.nextMatch()) |match| {
+        for (match.captures) |capture| {
+            const capture_name = query.captureNameForId(capture.index);
+            const token_type = captureNameToTokenType(capture_name);
+
+            if (token_type == .plain) continue;
+
+            const node = node_mod.Node{ .raw = capture.node };
+            const start = node.startByte();
+            const end = node.endByte();
+
+            if (start >= end) continue;
+            if (end > source.len) continue;
+
+            const sp = node.startPoint();
+            const ep = node.endPoint();
+
+            try tokens.append(allocator, .{
+                .start = start,
+                .end = end,
+                .token_type = token_type,
+                .node_kind = node.kind(),
+                .start_row = sp.row,
+                .start_column = sp.column,
+                .end_row = ep.row,
+                .end_column = ep.column,
+            });
+
+            try basic_tokens.append(allocator, .{
+                .start = start,
+                .end = end,
+                .token_type = token_type,
+            });
+        }
+    }
+
+    token_refine.refineTokens(basic_tokens.items, source, language);
+    for (basic_tokens.items, 0..) |bt, i| {
+        tokens.items[i].token_type = bt.token_type;
+    }
+
+    std.mem.sort(RichToken, tokens.items, {}, struct {
+        fn lessThan(_: void, a: RichToken, b: RichToken) bool {
+            if (a.start != b.start) return a.start < b.start;
+            return a.end < b.end;
+        }
+    }.lessThan);
+
+    return tokens.toOwnedSlice(allocator);
+}
+
+test "highlightTokensFromTree matches highlightTokens output" {
+    const source = "def hello():\n    return 42\n";
+
+    // Parse manually
+    var p = try parser_mod.Parser.init(.python);
+    defer p.deinit();
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    // Highlight from tree
+    const from_tree = try highlightTokensFromTree(std.testing.allocator, source, &tree, .python);
+    defer std.testing.allocator.free(from_tree);
+
+    // Highlight stateless
+    const stateless = try highlightTokens(std.testing.allocator, source, .python);
+    defer std.testing.allocator.free(stateless);
+
+    // Should produce identical results
+    try std.testing.expectEqual(stateless.len, from_tree.len);
+    for (stateless, from_tree) |s, f| {
+        try std.testing.expectEqual(s.start, f.start);
+        try std.testing.expectEqual(s.end, f.end);
+        try std.testing.expectEqual(s.token_type, f.token_type);
+    }
+}
+
+test "highlightTokensRichFromTree matches highlightTokensRich output" {
+    const source = "def hello():\n    return 42\n";
+
+    var p = try parser_mod.Parser.init(.python);
+    defer p.deinit();
+    var tree = try p.parse(source, null);
+    defer tree.deinit();
+
+    const from_tree = try highlightTokensRichFromTree(std.testing.allocator, source, &tree, .python);
+    defer std.testing.allocator.free(from_tree);
+
+    const stateless = try highlightTokensRich(std.testing.allocator, source, .python);
+    defer std.testing.allocator.free(stateless);
+
+    try std.testing.expectEqual(stateless.len, from_tree.len);
+    for (stateless, from_tree) |s, f| {
+        try std.testing.expectEqual(s.start, f.start);
+        try std.testing.expectEqual(s.end, f.end);
+        try std.testing.expectEqual(s.token_type, f.token_type);
+    }
+}
+
 test "highlightTokensRich includes position info" {
     const source = "def hello():\n    return 42\n";
     const tokens = try highlightTokensRich(std.testing.allocator, source, .python);

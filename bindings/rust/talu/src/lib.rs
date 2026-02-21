@@ -61,6 +61,7 @@ pub mod repo;
 pub mod responses;
 pub mod router;
 pub mod storage;
+pub mod treesitter;
 pub mod vector;
 mod wrappers;
 pub mod xray;

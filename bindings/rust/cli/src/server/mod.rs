@@ -8,6 +8,8 @@ use log::LevelFilter;
 use talu::blobs::BlobsHandle;
 
 pub mod auth_gateway;
+pub mod code;
+pub mod code_ws;
 pub mod conversations;
 pub mod documents;
 pub mod file;
@@ -138,6 +140,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         plugin_tokens: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         max_file_upload_bytes: args.max_file_upload_bytes,
         max_file_inspect_bytes: args.max_file_inspect_bytes,
+        code_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     };
 
     let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);

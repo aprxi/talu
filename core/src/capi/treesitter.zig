@@ -163,6 +163,114 @@ pub export fn talu_treesitter_parse(
     return 0;
 }
 
+/// Parse source code into a syntax tree with optional incremental parsing.
+///
+/// If `old_tree` is provided (non-null), tree-sitter will reuse unchanged
+/// subtrees from the previous parse for faster re-parsing.
+///
+/// Parameters:
+///   handle: Parser handle
+///   source: Source code bytes
+///   source_len: Length of source code
+///   old_tree: Previous tree handle for incremental parsing (null for full parse)
+///   out_tree: Output: receives tree handle on success
+///
+/// Returns 0 on success, error code on failure.
+/// Caller must call talu_treesitter_tree_free() on the output tree.
+/// The old_tree is NOT freed — caller retains ownership and must free it.
+pub export fn talu_treesitter_parse_incremental(
+    handle: ?*TreeSitterParserHandle,
+    source: [*]const u8,
+    source_len: u32,
+    old_tree: ?*TreeSitterTreeHandle,
+    out_tree: ?*?*TreeSitterTreeHandle,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const allocator = std.heap.c_allocator;
+
+    const result = out_tree orelse {
+        capi_error.setError(error.InvalidArgument, "out_tree is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    result.* = null;
+
+    const parser_ptr = (handle orelse {
+        capi_error.setError(error.InvalidArgument, "parser handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }).toPtr();
+
+    const source_slice = source[0..source_len];
+
+    const old_tree_ptr: ?*const Tree = if (old_tree) |ot| ot.toPtr() else null;
+
+    const tree_ptr = allocator.create(Tree) catch {
+        capi_error.setError(error.OutOfMemory, "Failed to allocate tree", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+
+    tree_ptr.* = parser_ptr.parse(source_slice, old_tree_ptr) catch {
+        allocator.destroy(tree_ptr);
+        capi_error.setError(error.Unexpected, "Incremental parse failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.internal_error);
+    };
+
+    result.* = TreeSitterTreeHandle.fromPtr(tree_ptr);
+    return 0;
+}
+
+/// Edit a syntax tree to reflect a source code change.
+///
+/// You must call this before re-parsing with the old tree to enable
+/// correct incremental parsing. Describes the edit in both byte offsets
+/// and (row, column) coordinates.
+///
+/// Parameters:
+///   handle: Tree handle to edit (mutated in place)
+///   start_byte: Byte offset where the edit starts
+///   old_end_byte: Byte offset where the old text ended
+///   new_end_byte: Byte offset where the new text ends
+///   start_row: Row (0-indexed) where the edit starts
+///   start_column: Column (0-indexed) where the edit starts
+///   old_end_row: Row where the old text ended
+///   old_end_column: Column where the old text ended
+///   new_end_row: Row where the new text ends
+///   new_end_column: Column where the new text ends
+///
+/// Returns 0 on success, error code on failure (null handle).
+pub export fn talu_treesitter_tree_edit(
+    handle: ?*TreeSitterTreeHandle,
+    start_byte: u32,
+    old_end_byte: u32,
+    new_end_byte: u32,
+    start_row: u32,
+    start_column: u32,
+    old_end_row: u32,
+    old_end_column: u32,
+    new_end_row: u32,
+    new_end_column: u32,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const tree_ptr = (handle orelse {
+        capi_error.setError(error.InvalidArgument, "tree handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }).toPtr();
+
+    tree_ptr.edit(.{
+        .start_byte = start_byte,
+        .old_end_byte = old_end_byte,
+        .new_end_byte = new_end_byte,
+        .start_row = start_row,
+        .start_column = start_column,
+        .old_end_row = old_end_row,
+        .old_end_column = old_end_column,
+        .new_end_row = new_end_row,
+        .new_end_column = new_end_column,
+    });
+
+    return 0;
+}
+
 /// Free a syntax tree handle.
 pub export fn talu_treesitter_tree_free(
     handle: ?*TreeSitterTreeHandle,
@@ -385,6 +493,156 @@ pub export fn talu_treesitter_highlight_rich(
         , .{ token.start, token.end, token.token_type.cssClass(), token.node_kind }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
 
         // Escape the text portion
+        const text_slice = if (token.start < source_slice.len and token.end <= source_slice.len)
+            source_slice[token.start..token.end]
+        else
+            "";
+        for (text_slice) |ch| {
+            switch (ch) {
+                '"' => json.appendSlice(allocator, "\\\"") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
+                '\\' => json.appendSlice(allocator, "\\\\") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
+                '\n' => json.appendSlice(allocator, "\\n") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
+                '\r' => json.appendSlice(allocator, "\\r") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
+                '\t' => json.appendSlice(allocator, "\\t") catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
+                else => json.append(allocator, ch) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory),
+            }
+        }
+
+        std.fmt.format(json.writer(allocator),
+            \\","sr":{d},"sc":{d},"er":{d},"ec":{d}}}
+        , .{ token.start_row, token.start_column, token.end_row, token.end_column }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    }
+
+    json.append(allocator, ']') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    json.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+
+    const owned = json.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    result.* = @ptrCast(owned.ptr);
+    return 0;
+}
+
+// =============================================================================
+// Highlighting (from existing tree)
+// =============================================================================
+
+/// Highlight source code using an already-parsed tree.
+///
+/// Skips parsing — use with trees from talu_treesitter_parse or
+/// talu_treesitter_parse_incremental for session-based workflows.
+///
+/// Parameters:
+///   tree_handle: Parsed tree handle
+///   source: Source code bytes (must match the tree)
+///   source_len: Length of source code
+///   lang: Language name string
+///   out_json: Output: receives NUL-terminated JSON string
+///
+/// Returns 0 on success, error code on failure.
+/// Caller must call talu_free_string() on the output JSON.
+pub export fn talu_treesitter_highlight_from_tree(
+    tree_handle: ?*TreeSitterTreeHandle,
+    source: [*]const u8,
+    source_len: u32,
+    lang: [*:0]const u8,
+    out_json: ?*[*:0]u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const allocator = std.heap.c_allocator;
+
+    const result = out_json orelse {
+        capi_error.setError(error.InvalidArgument, "out_json is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const tree_ptr = (tree_handle orelse {
+        capi_error.setError(error.InvalidArgument, "tree handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }).toPtr();
+
+    const lang_str = std.mem.span(lang);
+    const language = Language.fromString(lang_str) orelse {
+        capi_error.setError(error.InvalidArgument, "Unknown language: {s}", .{lang_str});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const source_slice = source[0..source_len];
+
+    const tokens = highlight_mod.highlightTokensFromTree(allocator, source_slice, tree_ptr, language) catch {
+        capi_error.setError(error.Unexpected, "Highlight from tree failed for {s}", .{lang_str});
+        return @intFromEnum(error_codes.ErrorCode.internal_error);
+    };
+    defer allocator.free(tokens);
+
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    json.append(allocator, '[') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+
+    for (tokens, 0..) |token, i| {
+        if (i > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+        std.fmt.format(json.writer(allocator),
+            \\{{"s":{d},"e":{d},"t":"{s}"}}
+        , .{ token.start, token.end, token.token_type.cssClass() }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    }
+
+    json.append(allocator, ']') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    json.append(allocator, 0) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+
+    const owned = json.toOwnedSlice(allocator) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    result.* = @ptrCast(owned.ptr);
+    return 0;
+}
+
+/// Highlight source code using an already-parsed tree, with rich output.
+///
+/// Like talu_treesitter_highlight_from_tree but includes node_kind, text,
+/// and line/column positions in the output.
+pub export fn talu_treesitter_highlight_rich_from_tree(
+    tree_handle: ?*TreeSitterTreeHandle,
+    source: [*]const u8,
+    source_len: u32,
+    lang: [*:0]const u8,
+    out_json: ?*[*:0]u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const allocator = std.heap.c_allocator;
+
+    const result = out_json orelse {
+        capi_error.setError(error.InvalidArgument, "out_json is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const tree_ptr = (tree_handle orelse {
+        capi_error.setError(error.InvalidArgument, "tree handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }).toPtr();
+
+    const lang_str = std.mem.span(lang);
+    const language = Language.fromString(lang_str) orelse {
+        capi_error.setError(error.InvalidArgument, "Unknown language: {s}", .{lang_str});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const source_slice = source[0..source_len];
+
+    const tokens = highlight_mod.highlightTokensRichFromTree(allocator, source_slice, tree_ptr, language) catch {
+        capi_error.setError(error.Unexpected, "Rich highlight from tree failed for {s}", .{lang_str});
+        return @intFromEnum(error_codes.ErrorCode.internal_error);
+    };
+    defer allocator.free(tokens);
+
+    var json = std.ArrayList(u8).empty;
+    defer json.deinit(allocator);
+
+    json.append(allocator, '[') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+
+    for (tokens, 0..) |token, i| {
+        if (i > 0) json.append(allocator, ',') catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+
+        std.fmt.format(json.writer(allocator),
+            \\{{"s":{d},"e":{d},"t":"{s}","nk":"{s}","tx":"
+        , .{ token.start, token.end, token.token_type.cssClass(), token.node_kind }) catch return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+
         const text_slice = if (token.start < source_slice.len and token.end <= source_slice.len)
             source_slice[token.start..token.end]
         else

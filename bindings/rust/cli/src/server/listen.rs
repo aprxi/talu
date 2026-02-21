@@ -17,8 +17,36 @@ use std::os::unix::fs::PermissionsExt;
 use crate::server::http::Router;
 use crate::server::state::AppState;
 
+/// Max idle time before a code session is evicted.
+const CODE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How often the session reaper runs.
+const CODE_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result<()> {
     let state = Arc::new(state);
+
+    // Background task: evict stale code sessions.
+    let gc_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(CODE_SESSION_REAP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let mut sessions = gc_state.code_sessions.lock().await;
+            let before = sessions.len();
+            sessions.retain(|_, session| session.last_access.elapsed() < CODE_SESSION_TTL);
+            let evicted = before - sessions.len();
+            if evicted > 0 {
+                log::info!(
+                    target: "server::code",
+                    "evicted {} stale code session(s) ({} remaining)",
+                    evicted,
+                    sessions.len(),
+                );
+            }
+        }
+    });
+
     let router = Router::new(state.clone());
 
     let tcp_listener = TcpListener::bind(addr)

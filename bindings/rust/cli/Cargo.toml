@@ -39,6 +39,9 @@ crossterm = "0.28"
 # Proxy endpoint (plugin outbound HTTP)
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 url = "2"
+# WebSocket (code analysis real-time editor integration)
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 [dev-dependencies]
 tempfile = "3"

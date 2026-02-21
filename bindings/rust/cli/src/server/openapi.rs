@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    conversations, documents, file, files, handlers, http, plugins, proxy, responses_types, search,
-    settings, tags,
+    code, conversations, documents, file, files, handlers, http, plugins, proxy, responses_types,
+    search, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -30,6 +30,7 @@ use crate::server::{
         (name = "Settings", description = "Server and model configuration"),
         (name = "Plugins", description = "Plugin discovery"),
         (name = "Proxy", description = "Plugin outbound HTTP proxy"),
+        (name = "Code", description = "Tree-sitter code analysis and incremental parsing"),
     ),
     security(
         ("gateway_secret" = []),
@@ -88,6 +89,16 @@ use crate::server::{
         plugins::handle_list,
         // Proxy
         proxy::handle_proxy,
+        // Code (tree-sitter)
+        code::handle_highlight,
+        code::handle_parse,
+        code::handle_query,
+        code::handle_graph,
+        code::handle_languages,
+        code::handle_session_create,
+        code::handle_session_update,
+        code::handle_session_highlight,
+        code::handle_session_delete,
     ),
     components(schemas(
         // Shared
@@ -148,6 +159,16 @@ use crate::server::{
         // Proxy
         proxy::ProxyRequest,
         proxy::ProxyResponse,
+        // Code (tree-sitter)
+        code::HighlightRequest,
+        code::ParseRequest,
+        code::QueryRequest,
+        code::GraphRequest,
+        code::LanguagesResponse,
+        code::SessionCreateRequest,
+        code::SessionUpdateRequest,
+        code::SessionTextEdit,
+        code::SessionHighlightRequest,
     ))
 )]
 pub struct ApiDoc;

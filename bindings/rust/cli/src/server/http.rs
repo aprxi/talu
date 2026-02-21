@@ -18,6 +18,8 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
+use crate::server::code;
+use crate::server::code_ws;
 use crate::server::conversations;
 use crate::server::documents;
 use crate::server::file;
@@ -359,6 +361,85 @@ impl Service<Request<Incoming>> for Router {
                             if p.starts_with("/v1/files/") || p.starts_with("/files/") =>
                         {
                             files::handle_delete(state, req, auth).await
+                        }
+                        // Code analysis endpoints (tree-sitter)
+                        (Method::POST, "/v1/code/highlight")
+                        | (Method::POST, "/code/highlight") => {
+                            code::handle_highlight(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/code/parse")
+                        | (Method::POST, "/code/parse") => {
+                            code::handle_parse(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/code/query")
+                        | (Method::POST, "/code/query") => {
+                            code::handle_query(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/code/graph")
+                        | (Method::POST, "/code/graph") => {
+                            code::handle_graph(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/code/languages")
+                        | (Method::GET, "/code/languages") => {
+                            code::handle_languages(state, req, auth).await
+                        }
+                        // Code session endpoints (incremental parsing)
+                        (Method::POST, "/v1/code/session/create")
+                        | (Method::POST, "/code/session/create") => {
+                            code::handle_session_create(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/code/session/update")
+                        | (Method::POST, "/code/session/update") => {
+                            code::handle_session_update(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/code/session/highlight")
+                        | (Method::POST, "/code/session/highlight") => {
+                            code::handle_session_highlight(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/code/session/")
+                                || p.starts_with("/code/session/") =>
+                        {
+                            code::handle_session_delete(state, req, auth).await
+                        }
+                        // WebSocket upgrade for real-time code analysis
+                        (Method::GET, "/v1/code/ws") | (Method::GET, "/code/ws")
+                            if req.headers().get("upgrade")
+                                .and_then(|v| v.to_str().ok())
+                                .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
+                        {
+                            let key = match req.headers().get("sec-websocket-key") {
+                                Some(k) => k.as_bytes().to_vec(),
+                                None => {
+                                    return Ok(json_error(
+                                        StatusCode::BAD_REQUEST,
+                                        "invalid_request",
+                                        "Missing Sec-WebSocket-Key header",
+                                    ));
+                                }
+                            };
+                            let accept = code_ws::compute_accept_key(&key);
+
+                            let upgrade = hyper::upgrade::on(req);
+                            tokio::spawn(async move {
+                                match upgrade.await {
+                                    Ok(upgraded) => {
+                                        log::info!(target: "server::code_ws", "WebSocket connection established");
+                                        code_ws::handle_ws_connection(upgraded).await;
+                                    }
+                                    Err(e) => {
+                                        log::error!(target: "server::code_ws", "WebSocket upgrade failed: {e}");
+                                    }
+                                }
+                            });
+
+                            Response::builder()
+                                .status(StatusCode::SWITCHING_PROTOCOLS)
+                                .header("upgrade", "websocket")
+                                .header("connection", "Upgrade")
+                                .header("sec-websocket-accept", accept)
+                                .body(Full::new(Bytes::new()).boxed())
+                                .unwrap()
                         }
                         (Method::POST, "/v1/documents/search")
                         | (Method::POST, "/documents/search") => {

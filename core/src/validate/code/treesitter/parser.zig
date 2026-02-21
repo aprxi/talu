@@ -44,13 +44,49 @@ pub const Parser = struct {
     }
 };
 
-/// An immutable syntax tree produced by parsing.
+/// Describes a text edit for incremental parsing.
+///
+/// You must describe the edit both in terms of byte offsets and
+/// (row, column) coordinates so tree-sitter can update the tree.
+pub const InputEdit = struct {
+    start_byte: u32,
+    old_end_byte: u32,
+    new_end_byte: u32,
+    start_row: u32,
+    start_column: u32,
+    old_end_row: u32,
+    old_end_column: u32,
+    new_end_row: u32,
+    new_end_column: u32,
+};
+
+/// A syntax tree produced by parsing.
 /// The tree references the original source text by byte offsets.
+///
+/// After creation, the tree is immutable — except for `edit()`, which
+/// must be called before re-parsing to inform tree-sitter what changed.
 pub const Tree = struct {
     handle: *c.TSTree,
 
     pub fn rootNode(self: *const Tree) Node {
         return .{ .raw = c.ts_tree_root_node(self.handle) };
+    }
+
+    /// Inform tree-sitter that the source has been edited.
+    ///
+    /// You must call this before passing the tree as `old_tree` to
+    /// `Parser.parse()` for correct incremental parsing. Without it,
+    /// tree-sitter cannot identify which nodes to reuse.
+    pub fn edit(self: *Tree, input_edit: InputEdit) void {
+        var ts_edit = c.TSInputEdit{
+            .start_byte = input_edit.start_byte,
+            .old_end_byte = input_edit.old_end_byte,
+            .new_end_byte = input_edit.new_end_byte,
+            .start_point = .{ .row = input_edit.start_row, .column = input_edit.start_column },
+            .old_end_point = .{ .row = input_edit.old_end_row, .column = input_edit.old_end_column },
+            .new_end_point = .{ .row = input_edit.new_end_row, .column = input_edit.new_end_column },
+        };
+        c.ts_tree_edit(self.handle, &ts_edit);
     }
 
     /// Create an independent copy of this tree.
@@ -201,6 +237,36 @@ test "Parser.parse empty string" {
     const root = tree.rootNode();
     try std.testing.expectEqualStrings("module", root.kind());
     try std.testing.expectEqual(@as(u32, 0), root.childCount());
+}
+
+test "Tree.edit enables correct incremental re-parse" {
+    var p = try Parser.init(.python);
+    defer p.deinit();
+
+    // Initial parse: "x = 1"
+    var tree = try p.parse("x = 1", null);
+
+    // Edit: replace "1" (byte 4..5) with "42" (byte 4..6)
+    tree.edit(.{
+        .start_byte = 4,
+        .old_end_byte = 5,
+        .new_end_byte = 6,
+        .start_row = 0,
+        .start_column = 4,
+        .old_end_row = 0,
+        .old_end_column = 5,
+        .new_end_row = 0,
+        .new_end_column = 6,
+    });
+
+    // Re-parse with edited old tree
+    var new_tree = try p.parse("x = 42", &tree);
+    defer new_tree.deinit();
+    tree.deinit();
+
+    const root = new_tree.rootNode();
+    try std.testing.expectEqualStrings("module", root.kind());
+    try std.testing.expect(root.childCount() > 0);
 }
 
 test "Tree.copy produces independent copy" {

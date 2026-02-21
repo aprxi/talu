@@ -66,6 +66,9 @@ const OPAQUE_HANDLES = [_][]const u8{
     "ResponsesHandle",
     "StringList",
     "CachedModelList",
+    "TreeSitterParserHandle",
+    "TreeSitterTreeHandle",
+    "TreeSitterQueryHandle",
 };
 
 fn isOpaqueHandle(name: []const u8) bool {
@@ -739,6 +742,30 @@ pub fn main() !void {
         \\#[repr(C)]
         \\#[derive(Copy, Clone)]
         \\pub struct CachedModelList {
+        \\    _private: [u8; 0],
+        \\}
+        \\
+        \\/// Opaque handle for tree-sitter parser.
+        \\/// Thread safety: NOT thread-safe. Create one per thread.
+        \\#[repr(C)]
+        \\#[derive(Copy, Clone)]
+        \\pub struct TreeSitterParserHandle {
+        \\    _private: [u8; 0],
+        \\}
+        \\
+        \\/// Opaque handle for parsed syntax tree.
+        \\/// Thread safety: Immutable after creation. Safe to share read-only.
+        \\#[repr(C)]
+        \\#[derive(Copy, Clone)]
+        \\pub struct TreeSitterTreeHandle {
+        \\    _private: [u8; 0],
+        \\}
+        \\
+        \\/// Opaque handle for compiled query pattern.
+        \\/// Thread safety: Immutable after creation. Safe to share read-only.
+        \\#[repr(C)]
+        \\#[derive(Copy, Clone)]
+        \\pub struct TreeSitterQueryHandle {
         \\    _private: [u8; 0],
         \\}
         \\
