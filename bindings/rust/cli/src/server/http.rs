@@ -28,6 +28,7 @@ use crate::server::handlers;
 use crate::server::openapi;
 use crate::server::plugins;
 use crate::server::proxy;
+use crate::server::repo;
 use crate::server::search;
 use crate::server::settings;
 use crate::server::state::AppState;
@@ -491,6 +492,55 @@ impl Service<Request<Incoming>> for Router {
                         // Plugin discovery
                         (Method::GET, "/v1/plugins") | (Method::GET, "/plugins") => {
                             plugins::handle_list(state, req, auth).await
+                        }
+                        // Repository management endpoints
+                        (Method::GET, "/v1/repo/models") | (Method::GET, "/repo/models") => {
+                            repo::handle_list(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/repo/search") | (Method::GET, "/repo/search") => {
+                            repo::handle_search(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/repo/models") | (Method::POST, "/repo/models") => {
+                            repo::handle_fetch(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/repo/models/")
+                                || p.starts_with("/repo/models/") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/models/"
+                            } else {
+                                "/repo/models/"
+                            };
+                            let raw = &p[prefix.len()..];
+                            let model_id = percent_encoding::percent_decode_str(raw)
+                                .decode_utf8_lossy();
+                            repo::handle_delete(state, req, auth, &model_id).await
+                        }
+                        // Pin management endpoints
+                        (Method::GET, "/v1/repo/pins") | (Method::GET, "/repo/pins") => {
+                            repo::handle_list_pins(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/repo/pins") | (Method::POST, "/repo/pins") => {
+                            repo::handle_pin(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/repo/pins/")
+                                || p.starts_with("/repo/pins/") =>
+                        {
+                            let prefix = if p.starts_with("/v1") {
+                                "/v1/repo/pins/"
+                            } else {
+                                "/repo/pins/"
+                            };
+                            let raw = &p[prefix.len()..];
+                            let model_id = percent_encoding::percent_decode_str(raw)
+                                .decode_utf8_lossy();
+                            repo::handle_unpin(state, req, auth, &model_id).await
+                        }
+                        (Method::POST, "/v1/repo/sync-pins")
+                        | (Method::POST, "/repo/sync-pins") => {
+                            repo::handle_sync_pins(state, req, auth).await
                         }
                         // Proxy endpoint (plugin outbound HTTP)
                         (Method::POST, "/v1/proxy") | (Method::POST, "/proxy") => {

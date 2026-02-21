@@ -588,6 +588,7 @@ pub fn repo_search_rich(
     query: &str,
     limit: usize,
     token: Option<&str>,
+    endpoint_url: Option<&str>,
     filter: Option<&str>,
     sort: SearchSort,
     direction: SearchDirection,
@@ -595,12 +596,17 @@ pub fn repo_search_rich(
 ) -> Result<Vec<HfSearchResult>> {
     let c_query = CString::new(query)?;
     let c_token = token.map(|t| CString::new(t)).transpose()?;
+    let c_endpoint = endpoint_url.map(|u| CString::new(u)).transpose()?;
     let c_filter = filter.map(|f| CString::new(f)).transpose()?;
     let c_library = library.map(|l| CString::new(l)).transpose()?;
 
     let token_ptr = c_token
         .as_ref()
         .map(|t| t.as_ptr())
+        .unwrap_or(std::ptr::null());
+    let endpoint_ptr = c_endpoint
+        .as_ref()
+        .map(|u| u.as_ptr())
         .unwrap_or(std::ptr::null());
     let filter_ptr = c_filter
         .as_ref()
@@ -619,7 +625,7 @@ pub fn repo_search_rich(
             c_query.as_ptr(),
             limit,
             token_ptr,
-            std::ptr::null(), // endpoint_url
+            endpoint_ptr,
             filter_ptr,
             sort.to_u8(),
             direction.to_u8(),

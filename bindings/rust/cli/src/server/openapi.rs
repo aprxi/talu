@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    code, conversations, documents, file, files, handlers, http, plugins, proxy, responses_types,
-    search, settings, tags,
+    code, conversations, documents, file, files, handlers, http, plugins, proxy, repo,
+    responses_types, search, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -30,6 +30,7 @@ use crate::server::{
         (name = "Settings", description = "Server and model configuration"),
         (name = "Plugins", description = "Plugin discovery"),
         (name = "Proxy", description = "Plugin outbound HTTP proxy"),
+        (name = "Repository", description = "Model cache management (list, search, download, delete)"),
         (name = "Code", description = "Tree-sitter code analysis and incremental parsing"),
     ),
     security(
@@ -89,6 +90,16 @@ use crate::server::{
         plugins::handle_list,
         // Proxy
         proxy::handle_proxy,
+        // Repository management
+        repo::handle_list,
+        repo::handle_search,
+        repo::handle_fetch,
+        repo::handle_delete,
+        // Pin management
+        repo::handle_list_pins,
+        repo::handle_pin,
+        repo::handle_unpin,
+        repo::handle_sync_pins,
         // Code (tree-sitter)
         code::handle_highlight,
         code::handle_parse,
@@ -159,6 +170,20 @@ use crate::server::{
         // Proxy
         proxy::ProxyRequest,
         proxy::ProxyResponse,
+        // Repository
+        repo::CachedModelResponse,
+        repo::RepoListResponse,
+        repo::SearchResultResponse,
+        repo::RepoSearchResponse,
+        repo::RepoFetchRequest,
+        repo::RepoFetchResponse,
+        repo::RepoDeleteResponse,
+        repo::PinnedModelResponse,
+        repo::PinListResponse,
+        repo::PinRequest,
+        repo::PinActionResponse,
+        repo::SyncPinsRequest,
+        repo::SyncPinsResponse,
         // Code (tree-sitter)
         code::HighlightRequest,
         code::ParseRequest,

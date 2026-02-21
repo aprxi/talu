@@ -14,6 +14,7 @@ mod server {
     pub mod file;
     pub mod files;
     pub mod plugins;
+    pub mod repo;
     pub mod responses;
     pub mod search;
     pub mod settings;

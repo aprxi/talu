@@ -21,6 +21,7 @@ mod logger;
 pub mod openapi;
 pub mod plugins;
 pub mod proxy;
+pub mod repo;
 pub mod responses_types;
 pub mod search;
 pub mod settings;
