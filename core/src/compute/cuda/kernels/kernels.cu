@@ -354,7 +354,17 @@ extern "C" __global__ void talu_attn_fused_heads_f16_kv_v1(
     const float* query_head = query + (unsigned long long)head * head_dim;
     const unsigned int mask = 0xFFFFffffu;
 
-    float max_logit = -3.402823466e+38f;
+    // One warp per head. Each lane owns dimensions d = lane + k*32.
+    // Use online softmax update to avoid score/prob buffers and avoid recomputing dots.
+    const unsigned int dims_per_lane = (head_dim + 31u) >> 5;
+    float out_acc[16];
+    #pragma unroll
+    for (unsigned int i = 0; i < 16; ++i) out_acc[i] = 0.0f;
+    if (dims_per_lane > 16u) return;
+
+    float m = -3.402823466e+38f;
+    float s = 0.0f;
+
     for (unsigned int t = 0; t < seq_len; ++t) {
         const unsigned short* key_row = key_cache + ((unsigned long long)t * row_stride + head_offset);
         float partial = 0.0f;
@@ -365,48 +375,41 @@ extern "C" __global__ void talu_attn_fused_heads_f16_kv_v1(
             partial += __shfl_down_sync(mask, partial, offset);
         }
         const float dot = __shfl_sync(mask, partial, 0);
+        const float score = dot * scale;
+
+        float alpha = 0.0f;
+        float beta = 0.0f;
         if (lane == 0) {
-            const float logit = dot * scale;
-            if (logit > max_logit) max_logit = logit;
+            const float m_new = fmaxf(m, score);
+            alpha = expf(m - m_new);
+            beta = expf(score - m_new);
+            s = s * alpha + beta;
+            m = m_new;
+        }
+        alpha = __shfl_sync(mask, alpha, 0);
+        beta = __shfl_sync(mask, beta, 0);
+
+        const unsigned short* value_row = value_cache + ((unsigned long long)t * row_stride + head_offset);
+        #pragma unroll
+        for (unsigned int k = 0; k < 16; ++k) {
+            if (k >= dims_per_lane) break;
+            const unsigned int d = lane + (k << 5);
+            if (d < head_dim) {
+                const float v = __half2float(*reinterpret_cast<const __half*>(&value_row[d]));
+                out_acc[k] = out_acc[k] * alpha + v * beta;
+            }
         }
     }
-    max_logit = __shfl_sync(mask, max_logit, 0);
 
-    float sum_exp = 0.0f;
-    for (unsigned int t = 0; t < seq_len; ++t) {
-        const unsigned short* key_row = key_cache + ((unsigned long long)t * row_stride + head_offset);
-        float partial = 0.0f;
-        for (unsigned int d = lane; d < head_dim; d += 32u) {
-            partial += query_head[d] * __half2float(*reinterpret_cast<const __half*>(&key_row[d]));
+    s = __shfl_sync(mask, s, 0);
+    const float inv_s = 1.0f / fmaxf(s, 1.0e-20f);
+    #pragma unroll
+    for (unsigned int k = 0; k < 16; ++k) {
+        if (k >= dims_per_lane) break;
+        const unsigned int d = lane + (k << 5);
+        if (d < head_dim) {
+            out[(unsigned long long)head * head_dim + d] = out_acc[k] * inv_s;
         }
-        for (unsigned int offset = 16; offset > 0; offset >>= 1) {
-            partial += __shfl_down_sync(mask, partial, offset);
-        }
-        const float dot = __shfl_sync(mask, partial, 0);
-        if (lane == 0) {
-            sum_exp += expf(dot * scale - max_logit);
-        }
-    }
-    sum_exp = __shfl_sync(mask, sum_exp, 0);
-    const float inv_sum = 1.0f / fmaxf(sum_exp, 1.0e-20f);
-
-    for (unsigned int d = lane; d < head_dim; d += 32u) {
-        float acc = 0.0f;
-        for (unsigned int t = 0; t < seq_len; ++t) {
-            const unsigned short* key_row = key_cache + ((unsigned long long)t * row_stride + head_offset);
-            float partial = 0.0f;
-            for (unsigned int j = lane; j < head_dim; j += 32u) {
-                partial += query_head[j] * __half2float(*reinterpret_cast<const __half*>(&key_row[j]));
-            }
-            for (unsigned int offset = 16; offset > 0; offset >>= 1) {
-                partial += __shfl_down_sync(mask, partial, offset);
-            }
-            const float dot = __shfl_sync(mask, partial, 0);
-            const float prob = expf(dot * scale - max_logit) * inv_sum;
-            const unsigned long long value_index = (unsigned long long)t * row_stride + head_offset + d;
-            acc += prob * __half2float(*reinterpret_cast<const __half*>(&value_cache[value_index]));
-        }
-        out[(unsigned long long)head * head_dim + d] = acc;
     }
 }
 

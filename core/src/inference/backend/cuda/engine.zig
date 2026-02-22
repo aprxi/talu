@@ -21,6 +21,7 @@ const prototype_eps: f32 = 1e-5;
 const prototype_low_token_band: usize = 4096;
 const initial_kv_cache_tokens: usize = 1024;
 const kv_cache_dtype_fp16: bool = true;
+const enable_fused_attention_f16_kv: bool = false;
 const gaffine_scales_dtype_f16 = compute.cuda.gaffine_u4_matvec.scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
 
@@ -788,6 +789,7 @@ pub const CudaBackend = struct {
             .attn_scores_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_scores_f16_kv_function != null)),
             .attn_scores_heads_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_scores_heads_f16_kv_function != null)),
             .attn_fused_heads_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_fused_heads_f16_kv_function != null)),
+            .attn_fused_heads_f16_kv_enabled = @as(u8, @intFromBool(enable_fused_attention_f16_kv)),
             .softmax_kernel = @as(u8, @intFromBool(backend.softmax_function != null)),
             .softmax_rows_kernel = @as(u8, @intFromBool(backend.softmax_rows_function != null)),
             .attn_weighted_sum_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_function != null)),
@@ -1240,11 +1242,11 @@ pub const CudaBackend = struct {
             const kv_groups_u32: u32 = @intCast(kv_groups);
             const kv_dim_u32: u32 = @intCast(block.kv_dim);
             if (kv_cache_dtype_fp16) {
-                if (attn_fused_heads_f16_kv_function) |fused_fn| {
+                if (enable_fused_attention_f16_kv and head_dim_u32 <= 512 and attn_fused_heads_f16_kv_function != null) {
                     try compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
                         &self.kernel_arg_pack,
                         &self.device,
-                        fused_fn,
+                        attn_fused_heads_f16_kv_function.?,
                         &self.prototype.attn_q_dev,
                         &block.k_cache,
                         &block.v_cache,
