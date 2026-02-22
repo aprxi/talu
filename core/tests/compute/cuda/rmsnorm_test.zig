@@ -29,6 +29,7 @@ test "rmsnorm.run returns InvalidArgument for non-positive epsilon" {
             1,
             4,
             0.0,
+            0.0,
         ),
     );
 }
@@ -79,6 +80,7 @@ test "rmsnorm.run computes expected output on CUDA" {
         rows,
         cols,
         eps,
+        0.0,
     );
     try std.testing.expectEqual(cuda.registry.KernelSource.embedded_ptx, source);
     try device.synchronize();

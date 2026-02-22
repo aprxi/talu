@@ -28,6 +28,7 @@ const CuMemcpyHtoDFn = *const fn (u64, *const anyopaque, usize) callconv(.c) c_i
 const CuMemcpyDtoHFn = *const fn (*anyopaque, u64, usize) callconv(.c) c_int;
 const CuDeviceGetNameFn = *const fn ([*]u8, c_int, c_int) callconv(.c) c_int;
 const CuDeviceTotalMemFn = *const fn (*usize, c_int) callconv(.c) c_int;
+const CuDeviceGetAttributeFn = *const fn (*c_int, c_int, c_int) callconv(.c) c_int;
 const CuModuleLoadDataFn = *const fn (*?*anyopaque, *const anyopaque) callconv(.c) c_int;
 const CuModuleGetFunctionFn = *const fn (*?*anyopaque, ?*anyopaque, [*:0]const u8) callconv(.c) c_int;
 const CuModuleUnloadFn = *const fn (?*anyopaque) callconv(.c) c_int;
@@ -71,10 +72,19 @@ const DriverApi = struct {
     cu_memcpy_dtoh: CuMemcpyDtoHFn,
     cu_device_get_name: CuDeviceGetNameFn,
     cu_device_total_mem: ?CuDeviceTotalMemFn,
+    cu_device_get_attribute: ?CuDeviceGetAttributeFn,
     cu_module_load_data: ?CuModuleLoadDataFn,
     cu_module_get_function: ?CuModuleGetFunctionFn,
     cu_module_unload: ?CuModuleUnloadFn,
     cu_launch_kernel: ?CuLaunchKernelFn,
+};
+
+const cu_device_attribute_compute_capability_major: c_int = 75;
+const cu_device_attribute_compute_capability_minor: c_int = 76;
+
+pub const ComputeCapability = struct {
+    major: u32,
+    minor: u32,
 };
 
 pub fn isRuntimeSupported() bool {
@@ -167,6 +177,25 @@ pub const Device = struct {
         var total: usize = 0;
         if (cu_device_total_mem(&total, self.device_index) != cuda_success) return error.CudaQueryFailed;
         return total;
+    }
+
+    pub fn computeCapability(self: *Device) !ComputeCapability {
+        const cu_device_get_attribute = self.api.cu_device_get_attribute orelse return error.CudaQueryUnavailable;
+
+        var major_raw: c_int = 0;
+        if (cu_device_get_attribute(&major_raw, cu_device_attribute_compute_capability_major, self.device_index) != cuda_success) {
+            return error.CudaQueryFailed;
+        }
+        var minor_raw: c_int = 0;
+        if (cu_device_get_attribute(&minor_raw, cu_device_attribute_compute_capability_minor, self.device_index) != cuda_success) {
+            return error.CudaQueryFailed;
+        }
+        if (major_raw < 0 or minor_raw < 0) return error.CudaQueryFailed;
+
+        return .{
+            .major = @intCast(major_raw),
+            .minor = @intCast(minor_raw),
+        };
     }
 
     pub fn allocBuffer(self: *Device, buffer_size: usize) !Buffer {
@@ -343,6 +372,7 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_memcpy_dtoh = try lookupRequiredAny(CuMemcpyDtoHFn, lib, &.{ "cuMemcpyDtoH_v2", "cuMemcpyDtoH" }),
         .cu_device_get_name = try lookupRequired(CuDeviceGetNameFn, lib, "cuDeviceGetName"),
         .cu_device_total_mem = lookupOptionalAny(CuDeviceTotalMemFn, lib, &.{ "cuDeviceTotalMem_v2", "cuDeviceTotalMem" }),
+        .cu_device_get_attribute = lookupOptional(CuDeviceGetAttributeFn, lib, "cuDeviceGetAttribute"),
         .cu_module_load_data = lookupOptional(CuModuleLoadDataFn, lib, "cuModuleLoadData"),
         .cu_module_get_function = lookupOptional(CuModuleGetFunctionFn, lib, "cuModuleGetFunction"),
         .cu_module_unload = lookupOptional(CuModuleUnloadFn, lib, "cuModuleUnload"),
@@ -414,4 +444,17 @@ test "Device.supportsModuleLaunch reports availability after Device.init" {
     defer device.deinit();
 
     _ = device.supportsModuleLaunch();
+}
+
+test "Device.computeCapability returns non-zero major when available" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try Device.init();
+    defer device.deinit();
+
+    const capability = device.computeCapability() catch |err| {
+        try std.testing.expect(err == error.CudaQueryUnavailable);
+        return;
+    };
+    try std.testing.expect(capability.major > 0);
 }

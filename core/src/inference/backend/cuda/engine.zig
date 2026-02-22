@@ -7,26 +7,47 @@ const std = @import("std");
 const models = @import("../../../models/root.zig");
 const contract = @import("../contract.zig");
 const cpu_vision = @import("../cpu/vision/root.zig");
+const cpu_engine = @import("../cpu/engine.zig");
+const progress = @import("../../../progress.zig");
 const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
 const dtype = @import("../../../dtype.zig");
 const log = @import("../../../log.zig");
+const load_transforms = @import("../../../models/load/transforms.zig");
 
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 const prototype_eps: f32 = 1e-5;
-const prototype_projected_vocab_cap: usize = 256;
+const prototype_low_token_band: usize = 4096;
 
 const PrototypeRuntime = struct {
     projected_vocab: usize,
+    max_dff: usize,
+    max_attn: usize,
+    max_kv: usize,
+    max_seq_len: usize,
+    head_dim: usize,
     using_model_norm: bool,
     using_model_projection: bool,
+    projection_from_lm_head: bool,
     using_model_embeddings: bool,
     hidden_host: []f32,
     projected_logits_host: []f32,
     input_dev: compute.cuda.Buffer,
     norm_weight_dev: compute.cuda.Buffer,
     norm_out_dev: compute.cuda.Buffer,
+    attn_q_dev: compute.cuda.Buffer,
+    attn_k_dev: compute.cuda.Buffer,
+    attn_v_dev: compute.cuda.Buffer,
+    attn_context_dev: compute.cuda.Buffer,
+    attn_scores_dev: compute.cuda.Buffer,
+    attn_probs_dev: compute.cuda.Buffer,
+    attn_head_dev: compute.cuda.Buffer,
+    attn_out_dev: compute.cuda.Buffer,
+    ffn_gate_dev: compute.cuda.Buffer,
+    ffn_up_dev: compute.cuda.Buffer,
+    ffn_mul_dev: compute.cuda.Buffer,
+    ffn_down_dev: compute.cuda.Buffer,
     projection_dev: compute.cuda.Buffer,
     logits_dev: compute.cuda.Buffer,
 
@@ -34,14 +55,27 @@ const PrototypeRuntime = struct {
         allocator: std.mem.Allocator,
         device: *compute.cuda.Device,
         loaded: *const LoadedModel,
+        max_dff: usize,
+        max_attn: usize,
+        max_kv: usize,
+        max_seq_len: usize,
+        head_dim: usize,
     ) !PrototypeRuntime {
         const d_model: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
         if (d_model == 0 or vocab_size == 0) return error.InvalidArgument;
+        if (max_dff == 0) return error.InvalidArgument;
+        if (max_attn == 0) return error.InvalidArgument;
+        if (max_kv == 0 or max_seq_len == 0 or head_dim == 0) return error.InvalidArgument;
 
-        const projected_vocab = @min(vocab_size, prototype_projected_vocab_cap);
+        const projected_vocab = vocab_size;
         const projection_elements = std.math.mul(usize, d_model, projected_vocab) catch return error.InvalidArgument;
         const d_model_bytes = std.math.mul(usize, d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+        const d_ff_bytes = std.math.mul(usize, max_dff, @sizeOf(f32)) catch return error.InvalidArgument;
+        const d_attn_bytes = std.math.mul(usize, max_attn, @sizeOf(f32)) catch return error.InvalidArgument;
+        const d_kv_bytes = std.math.mul(usize, max_kv, @sizeOf(f32)) catch return error.InvalidArgument;
+        const seq_bytes = std.math.mul(usize, max_seq_len, @sizeOf(f32)) catch return error.InvalidArgument;
+        const head_bytes = std.math.mul(usize, head_dim, @sizeOf(f32)) catch return error.InvalidArgument;
         const projection_bytes = std.math.mul(usize, projection_elements, @sizeOf(f32)) catch return error.InvalidArgument;
         const logits_bytes = std.math.mul(usize, projected_vocab, @sizeOf(f32)) catch return error.InvalidArgument;
 
@@ -54,10 +88,28 @@ const PrototypeRuntime = struct {
         defer allocator.free(norm_weight_host);
         const using_model_norm = tryPopulateFinalNormWeight(loaded, norm_weight_host);
         if (!using_model_norm) fillPrototypeNormWeight(norm_weight_host);
-
         const projection_host = try allocator.alloc(f32, projection_elements);
         defer allocator.free(projection_host);
-        const using_model_projection = tryPopulateProjectionFromLoadedModel(loaded, d_model, projected_vocab, projection_host);
+        var projection_from_lm_head = false;
+        if (loaded.lm_head) |lm_head| {
+            projection_from_lm_head = tryPopulateProjectionFromWeight(
+                allocator,
+                &lm_head,
+                d_model,
+                projected_vocab,
+                projection_host,
+            );
+        }
+        const using_model_projection = if (projection_from_lm_head)
+            true
+        else
+            tryPopulateProjectionFromWeight(
+                allocator,
+                &loaded.token_embeddings,
+                d_model,
+                projected_vocab,
+                projection_host,
+            );
         if (!using_model_projection) fillPrototypeProjection(projection_host, d_model, projected_vocab);
 
         var input_dev = try device.allocBuffer(d_model_bytes);
@@ -66,6 +118,30 @@ const PrototypeRuntime = struct {
         errdefer norm_weight_dev.deinit(device);
         var norm_out_dev = try device.allocBuffer(d_model_bytes);
         errdefer norm_out_dev.deinit(device);
+        var attn_q_dev = try device.allocBuffer(d_attn_bytes);
+        errdefer attn_q_dev.deinit(device);
+        var attn_k_dev = try device.allocBuffer(d_kv_bytes);
+        errdefer attn_k_dev.deinit(device);
+        var attn_v_dev = try device.allocBuffer(d_kv_bytes);
+        errdefer attn_v_dev.deinit(device);
+        var attn_context_dev = try device.allocBuffer(d_attn_bytes);
+        errdefer attn_context_dev.deinit(device);
+        var attn_scores_dev = try device.allocBuffer(seq_bytes);
+        errdefer attn_scores_dev.deinit(device);
+        var attn_probs_dev = try device.allocBuffer(seq_bytes);
+        errdefer attn_probs_dev.deinit(device);
+        var attn_head_dev = try device.allocBuffer(head_bytes);
+        errdefer attn_head_dev.deinit(device);
+        var attn_out_dev = try device.allocBuffer(d_model_bytes);
+        errdefer attn_out_dev.deinit(device);
+        var ffn_gate_dev = try device.allocBuffer(d_ff_bytes);
+        errdefer ffn_gate_dev.deinit(device);
+        var ffn_up_dev = try device.allocBuffer(d_ff_bytes);
+        errdefer ffn_up_dev.deinit(device);
+        var ffn_mul_dev = try device.allocBuffer(d_ff_bytes);
+        errdefer ffn_mul_dev.deinit(device);
+        var ffn_down_dev = try device.allocBuffer(d_model_bytes);
+        errdefer ffn_down_dev.deinit(device);
         var projection_dev = try device.allocBuffer(projection_bytes);
         errdefer projection_dev.deinit(device);
         var logits_dev = try device.allocBuffer(logits_bytes);
@@ -76,14 +152,32 @@ const PrototypeRuntime = struct {
 
         return .{
             .projected_vocab = projected_vocab,
+            .max_dff = max_dff,
+            .max_attn = max_attn,
+            .max_kv = max_kv,
+            .max_seq_len = max_seq_len,
+            .head_dim = head_dim,
             .using_model_norm = using_model_norm,
             .using_model_projection = using_model_projection,
+            .projection_from_lm_head = projection_from_lm_head,
             .using_model_embeddings = canUseModelEmbeddings(loaded),
             .hidden_host = hidden_host,
             .projected_logits_host = projected_logits_host,
             .input_dev = input_dev,
             .norm_weight_dev = norm_weight_dev,
             .norm_out_dev = norm_out_dev,
+            .attn_q_dev = attn_q_dev,
+            .attn_k_dev = attn_k_dev,
+            .attn_v_dev = attn_v_dev,
+            .attn_context_dev = attn_context_dev,
+            .attn_scores_dev = attn_scores_dev,
+            .attn_probs_dev = attn_probs_dev,
+            .attn_head_dev = attn_head_dev,
+            .attn_out_dev = attn_out_dev,
+            .ffn_gate_dev = ffn_gate_dev,
+            .ffn_up_dev = ffn_up_dev,
+            .ffn_mul_dev = ffn_mul_dev,
+            .ffn_down_dev = ffn_down_dev,
             .projection_dev = projection_dev,
             .logits_dev = logits_dev,
         };
@@ -92,6 +186,18 @@ const PrototypeRuntime = struct {
     fn deinit(self: *PrototypeRuntime, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
         self.logits_dev.deinit(device);
         self.projection_dev.deinit(device);
+        self.ffn_down_dev.deinit(device);
+        self.ffn_mul_dev.deinit(device);
+        self.ffn_up_dev.deinit(device);
+        self.ffn_gate_dev.deinit(device);
+        self.attn_out_dev.deinit(device);
+        self.attn_head_dev.deinit(device);
+        self.attn_probs_dev.deinit(device);
+        self.attn_scores_dev.deinit(device);
+        self.attn_context_dev.deinit(device);
+        self.attn_v_dev.deinit(device);
+        self.attn_k_dev.deinit(device);
+        self.attn_q_dev.deinit(device);
         self.norm_out_dev.deinit(device);
         self.norm_weight_dev.deinit(device);
         self.input_dev.deinit(device);
@@ -100,11 +206,340 @@ const PrototypeRuntime = struct {
     }
 };
 
+const DeviceTensor = struct {
+    rows: usize,
+    cols: usize,
+    buffer: compute.cuda.Buffer,
+
+    fn deinit(self: *DeviceTensor, device: *compute.cuda.Device) void {
+        self.buffer.deinit(device);
+    }
+};
+
+const AttentionMlpBlockRuntime = struct {
+    q_dim: usize,
+    kv_dim: usize,
+    d_ff: usize,
+    ln1_weight: DeviceTensor,
+    ln2_weight: DeviceTensor,
+    q_norm_weight: ?DeviceTensor = null,
+    k_norm_weight: ?DeviceTensor = null,
+    q_proj: DeviceTensor,
+    k_proj: DeviceTensor,
+    v_proj: DeviceTensor,
+    o_proj: DeviceTensor,
+    w1: DeviceTensor,
+    w2: DeviceTensor,
+    w3: DeviceTensor,
+    k_cache: compute.cuda.Buffer,
+    v_cache: compute.cuda.Buffer,
+
+    fn deinit(self: *AttentionMlpBlockRuntime, device: *compute.cuda.Device) void {
+        self.v_cache.deinit(device);
+        self.k_cache.deinit(device);
+        if (self.k_norm_weight) |*w| w.deinit(device);
+        if (self.q_norm_weight) |*w| w.deinit(device);
+        self.w3.deinit(device);
+        self.w2.deinit(device);
+        self.w1.deinit(device);
+        self.o_proj.deinit(device);
+        self.v_proj.deinit(device);
+        self.k_proj.deinit(device);
+        self.q_proj.deinit(device);
+        self.ln2_weight.deinit(device);
+        self.ln1_weight.deinit(device);
+    }
+};
+
+const BlockRuntime = struct {
+    blocks: []AttentionMlpBlockRuntime,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    q_norm_blocks: usize,
+    k_norm_blocks: usize,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        device: *compute.cuda.Device,
+        loaded: *const LoadedModel,
+    ) !BlockRuntime {
+        const d_model: usize = @intCast(loaded.config.d_model);
+        const n_heads: usize = @intCast(loaded.config.n_heads);
+        const n_kv_heads: usize = @intCast(loaded.config.n_kv_groups);
+        const head_dim: usize = @intCast(loaded.config.head_dim);
+        const max_seq_len: usize = @intCast(loaded.config.max_seq_len);
+        if (n_heads == 0 or n_kv_heads == 0 or head_dim == 0 or max_seq_len == 0) return error.InvalidArgument;
+        if (n_heads % n_kv_heads != 0) return error.UnsupportedModel;
+        const layer_count = loaded.blocks.len;
+        var q_norm_blocks: usize = 0;
+        var k_norm_blocks: usize = 0;
+        var blocks = try allocator.alloc(AttentionMlpBlockRuntime, layer_count);
+        errdefer allocator.free(blocks);
+        var initialized: usize = 0;
+        errdefer {
+            while (initialized > 0) {
+                initialized -= 1;
+                blocks[initialized].deinit(device);
+            }
+        }
+
+        for (loaded.blocks, 0..) |block_weights, layer_idx| {
+            const attn = switch (block_weights) {
+                .attention_mlp => |weights| weights,
+                else => {
+                    log.warn("inference", "CUDA block runtime unsupported block kind", .{
+                        .layer = layer_idx,
+                    });
+                    return error.UnsupportedModel;
+                },
+            };
+            if (attn.mla_config != null) {
+                log.warn("inference", "CUDA block runtime MLA not supported yet", .{ .layer = layer_idx });
+                return error.UnsupportedModel;
+            }
+            if (attn.moe_weights != null) {
+                log.warn("inference", "CUDA block runtime MoE not supported yet", .{ .layer = layer_idx });
+                return error.UnsupportedModel;
+            }
+            if (attn.fused.qkv_proj != null or attn.fused.gate_up != null) {
+                log.warn("inference", "CUDA block runtime fused weights not supported yet", .{ .layer = layer_idx });
+                return error.UnsupportedModel;
+            }
+
+            const q_proj = attn.q_proj orelse return error.MissingWeight;
+            const k_proj = attn.k_proj orelse return error.MissingWeight;
+            const v_proj = attn.v_proj orelse return error.MissingWeight;
+            const w1 = attn.w1 orelse return error.MissingWeight;
+            const w2 = attn.w2 orelse return error.MissingWeight;
+            const w3 = attn.w3 orelse return error.MissingWeight;
+            if (layer_idx == 0) {
+                log.info("inference", "CUDA block0 weight dtypes", .{
+                    .q_proj = @tagName(q_proj.dtype),
+                    .k_proj = @tagName(k_proj.dtype),
+                    .v_proj = @tagName(v_proj.dtype),
+                    .o_proj = @tagName(attn.o_proj.dtype),
+                    .w1 = @tagName(w1.dtype),
+                    .w2 = @tagName(w2.dtype),
+                    .w3 = @tagName(w3.dtype),
+                });
+                log.info("inference", "CUDA block0 weight shapes", .{
+                    .q0 = q_proj.shape[0],
+                    .q1 = q_proj.shape[1],
+                    .k0 = k_proj.shape[0],
+                    .k1 = k_proj.shape[1],
+                    .v0 = v_proj.shape[0],
+                    .v1 = v_proj.shape[1],
+                    .o0 = attn.o_proj.shape[0],
+                    .o1 = attn.o_proj.shape[1],
+                    .w10 = w1.shape[0],
+                    .w11 = w1.shape[1],
+                    .w20 = w2.shape[0],
+                    .w21 = w2.shape[1],
+                    .w30 = w3.shape[0],
+                    .w31 = w3.shape[1],
+                });
+            }
+
+            var ln1_weight = try uploadTensor(device, allocator, attn.ln1_weight);
+            errdefer ln1_weight.deinit(device);
+            var ln2_weight = try uploadTensor(device, allocator, attn.ln2_weight);
+            errdefer ln2_weight.deinit(device);
+            if (!(ln1_weight.rows == d_model and ln1_weight.cols == 1)) {
+                log.warn("inference", "CUDA block runtime ln1 shape unsupported", .{
+                    .layer = layer_idx,
+                    .rows = ln1_weight.rows,
+                    .cols = ln1_weight.cols,
+                    .d_model = d_model,
+                });
+                return error.UnsupportedModel;
+            }
+            if (!(ln2_weight.rows == d_model and ln2_weight.cols == 1)) {
+                log.warn("inference", "CUDA block runtime ln2 shape unsupported", .{
+                    .layer = layer_idx,
+                    .rows = ln2_weight.rows,
+                    .cols = ln2_weight.cols,
+                    .d_model = d_model,
+                });
+                return error.UnsupportedModel;
+            }
+
+            var q_norm_weight: ?DeviceTensor = null;
+            if (attn.q_norm) |q_norm| {
+                var qn = try uploadTensor(device, allocator, q_norm);
+                errdefer qn.deinit(device);
+                if (!(qn.rows == head_dim and qn.cols == 1)) {
+                    log.warn("inference", "CUDA block runtime q_norm shape unsupported", .{
+                        .layer = layer_idx,
+                        .rows = qn.rows,
+                        .cols = qn.cols,
+                        .head_dim = head_dim,
+                    });
+                    return error.UnsupportedModel;
+                }
+                q_norm_weight = qn;
+                q_norm_blocks += 1;
+            }
+            errdefer if (q_norm_weight) |*w| w.deinit(device);
+
+            var k_norm_weight: ?DeviceTensor = null;
+            if (attn.k_norm) |k_norm| {
+                var kn = try uploadTensor(device, allocator, k_norm);
+                errdefer kn.deinit(device);
+                if (!(kn.rows == head_dim and kn.cols == 1)) {
+                    log.warn("inference", "CUDA block runtime k_norm shape unsupported", .{
+                        .layer = layer_idx,
+                        .rows = kn.rows,
+                        .cols = kn.cols,
+                        .head_dim = head_dim,
+                    });
+                    return error.UnsupportedModel;
+                }
+                k_norm_weight = kn;
+                k_norm_blocks += 1;
+            }
+            errdefer if (k_norm_weight) |*w| w.deinit(device);
+
+            var q_proj_dev = try uploadLinearWeight(device, allocator, q_proj, d_model);
+            errdefer q_proj_dev.deinit(device);
+            var k_proj_dev = try uploadLinearWeight(device, allocator, k_proj, d_model);
+            errdefer k_proj_dev.deinit(device);
+            var v_proj_dev = try uploadLinearWeight(device, allocator, v_proj, d_model);
+            errdefer v_proj_dev.deinit(device);
+            var o_proj_dev = try uploadLinearWeight(device, allocator, attn.o_proj, q_proj_dev.cols);
+            errdefer o_proj_dev.deinit(device);
+            var w1_dev = try uploadLinearWeight(device, allocator, w1, d_model);
+            errdefer w1_dev.deinit(device);
+            var w3_dev = try uploadLinearWeight(device, allocator, w3, d_model);
+            errdefer w3_dev.deinit(device);
+            if (w1_dev.cols != w3_dev.cols) {
+                log.warn("inference", "CUDA block runtime gate/up dim mismatch", .{
+                    .layer = layer_idx,
+                    .w1_cols = w1_dev.cols,
+                    .w3_cols = w3_dev.cols,
+                });
+                return error.UnsupportedModel;
+            }
+            const d_ff = w1_dev.cols;
+            var w2_dev = try uploadLinearWeight(device, allocator, w2, d_ff);
+            errdefer w2_dev.deinit(device);
+            if (k_proj_dev.cols != v_proj_dev.cols) {
+                log.warn("inference", "CUDA block runtime k/v dim mismatch", .{
+                    .layer = layer_idx,
+                    .k_cols = k_proj_dev.cols,
+                    .v_cols = v_proj_dev.cols,
+                });
+                return error.UnsupportedModel;
+            }
+
+            if (o_proj_dev.cols != d_model) {
+                log.warn("inference", "CUDA block runtime o_proj out dim unsupported", .{
+                    .layer = layer_idx,
+                    .o_proj_cols = o_proj_dev.cols,
+                    .d_model = d_model,
+                });
+                return error.UnsupportedModel;
+            }
+            if (w2_dev.cols != d_model) {
+                log.warn("inference", "CUDA block runtime down_proj out dim unsupported", .{
+                    .layer = layer_idx,
+                    .w2_cols = w2_dev.cols,
+                    .d_model = d_model,
+                });
+                return error.UnsupportedModel;
+            }
+            if (q_proj_dev.cols != n_heads * head_dim) {
+                log.warn("inference", "CUDA block runtime q_proj dim unsupported", .{
+                    .layer = layer_idx,
+                    .q_cols = q_proj_dev.cols,
+                    .expected = n_heads * head_dim,
+                });
+                return error.UnsupportedModel;
+            }
+            if (k_proj_dev.cols != n_kv_heads * head_dim) {
+                log.warn("inference", "CUDA block runtime kv dim unsupported", .{
+                    .layer = layer_idx,
+                    .kv_cols = k_proj_dev.cols,
+                    .expected = n_kv_heads * head_dim,
+                });
+                return error.UnsupportedModel;
+            }
+
+            const kv_cache_elems = std.math.mul(usize, max_seq_len, k_proj_dev.cols) catch return error.InvalidArgument;
+            const kv_cache_bytes = std.math.mul(usize, kv_cache_elems, @sizeOf(f32)) catch return error.InvalidArgument;
+            var k_cache = try device.allocBuffer(kv_cache_bytes);
+            errdefer k_cache.deinit(device);
+            var v_cache = try device.allocBuffer(kv_cache_bytes);
+            errdefer v_cache.deinit(device);
+
+            blocks[layer_idx] = .{
+                .q_dim = q_proj_dev.cols,
+                .kv_dim = k_proj_dev.cols,
+                .d_ff = d_ff,
+                .ln1_weight = ln1_weight,
+                .ln2_weight = ln2_weight,
+                .q_norm_weight = q_norm_weight,
+                .k_norm_weight = k_norm_weight,
+                .q_proj = q_proj_dev,
+                .k_proj = k_proj_dev,
+                .v_proj = v_proj_dev,
+                .o_proj = o_proj_dev,
+                .w1 = w1_dev,
+                .w2 = w2_dev,
+                .w3 = w3_dev,
+                .k_cache = k_cache,
+                .v_cache = v_cache,
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .blocks = blocks,
+            .n_heads = n_heads,
+            .n_kv_heads = n_kv_heads,
+            .head_dim = head_dim,
+            .max_seq_len = max_seq_len,
+            .q_norm_blocks = q_norm_blocks,
+            .k_norm_blocks = k_norm_blocks,
+        };
+    }
+
+    fn deinit(self: *BlockRuntime, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+        for (self.blocks) |*block| block.deinit(device);
+        allocator.free(self.blocks);
+    }
+
+    fn maxDff(self: *const BlockRuntime) usize {
+        var max_dff: usize = 0;
+        for (self.blocks) |block| {
+            if (block.d_ff > max_dff) max_dff = block.d_ff;
+        }
+        return max_dff;
+    }
+
+    fn maxAttn(self: *const BlockRuntime) usize {
+        var max_attn: usize = 0;
+        for (self.blocks) |block| {
+            if (block.q_proj.cols > max_attn) max_attn = block.q_proj.cols;
+        }
+        return max_attn;
+    }
+
+    fn maxKv(self: *const BlockRuntime) usize {
+        var max_kv: usize = 0;
+        for (self.blocks) |block| {
+            if (block.kv_dim > max_kv) max_kv = block.kv_dim;
+        }
+        return max_kv;
+    }
+};
+
 pub const CudaBackend = struct {
     pub const capabilities: contract.Capabilities = .{
         .vision_prefill = true,
         .decode_batch = true,
-        .decode_streaming = false,
+        .decode_streaming = true,
         .embedding = false,
         .warmup = false,
     };
@@ -117,17 +552,43 @@ pub const CudaBackend = struct {
     kernel_registry: compute.cuda.Registry,
     vector_add_function: ?compute.cuda.Function = null,
     vector_add_source: ?compute.cuda.registry.KernelSource = null,
+    mul_function: ?compute.cuda.Function = null,
+    mul_source: ?compute.cuda.registry.KernelSource = null,
+    copy_function: ?compute.cuda.Function = null,
+    copy_source: ?compute.cuda.registry.KernelSource = null,
     rmsnorm_function: ?compute.cuda.Function = null,
     rmsnorm_source: ?compute.cuda.registry.KernelSource = null,
+    rope_function: ?compute.cuda.Function = null,
+    rope_source: ?compute.cuda.registry.KernelSource = null,
+    attn_scores_function: ?compute.cuda.Function = null,
+    attn_scores_source: ?compute.cuda.registry.KernelSource = null,
+    softmax_function: ?compute.cuda.Function = null,
+    softmax_source: ?compute.cuda.registry.KernelSource = null,
+    attn_weighted_sum_function: ?compute.cuda.Function = null,
+    attn_weighted_sum_source: ?compute.cuda.registry.KernelSource = null,
+    silu_function: ?compute.cuda.Function = null,
+    silu_source: ?compute.cuda.registry.KernelSource = null,
+    argmax_function: ?compute.cuda.Function = null,
+    argmax_source: ?compute.cuda.registry.KernelSource = null,
     kernel_arg_pack: compute.cuda.ArgPack,
     blas: compute.cuda.Blas,
     prototype: PrototypeRuntime,
+    block_runtime: BlockRuntime,
     d_model: usize,
     vocab_size: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq_len: usize,
+    rope_dim: usize,
+    attention_scale: f32,
+    norm_eps: f32,
     max_batch_size: usize = 1,
     slot_in_use: bool = false,
     slot_position: usize = 0,
     slot_logits: []f32,
+    argmax_logits_dev: compute.cuda.Buffer,
+    argmax_index_dev: compute.cuda.Buffer,
 
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel) !CudaBackend {
         var device = try compute.cuda.Device.init();
@@ -142,35 +603,125 @@ pub const CudaBackend = struct {
             .kernel_arg_pack = compute.cuda.ArgPack.init(allocator),
             .blas = undefined,
             .prototype = undefined,
+            .block_runtime = undefined,
             .d_model = @intCast(loaded.config.d_model),
             .vocab_size = @intCast(loaded.config.vocab_size),
+            .n_heads = @intCast(loaded.config.n_heads),
+            .n_kv_heads = @intCast(loaded.config.n_kv_groups),
+            .head_dim = @intCast(loaded.config.head_dim),
+            .max_seq_len = @intCast(loaded.config.max_seq_len),
+            .rope_dim = 0,
+            .attention_scale = 0.0,
+            .norm_eps = prototype_eps,
             .slot_logits = undefined,
+            .argmax_logits_dev = undefined,
+            .argmax_index_dev = undefined,
         };
+        if (backend.n_heads == 0 or backend.n_kv_heads == 0 or backend.head_dim == 0 or backend.max_seq_len == 0) {
+            return error.InvalidArgument;
+        }
+        if (backend.n_heads % backend.n_kv_heads != 0) return error.UnsupportedModel;
+        backend.rope_dim = if (loaded.config.rope_dim > 0)
+            @intCast(loaded.config.rope_dim)
+        else
+            backend.head_dim;
+        if (backend.rope_dim == 0 or backend.rope_dim > backend.head_dim or (backend.rope_dim & 1) != 0) {
+            return error.UnsupportedModel;
+        }
+        backend.attention_scale = if (loaded.config.attention_multiplier > 0.0)
+            loaded.config.attention_multiplier
+        else
+            1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
+        backend.norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else prototype_eps;
         backend.kernel_registry = compute.cuda.Registry.init(allocator, &backend.device);
         errdefer backend.kernel_registry.deinit();
         backend.slot_logits = try allocator.alloc(f32, backend.vocab_size);
         errdefer allocator.free(backend.slot_logits);
+        const vocab_logits_bytes = std.math.mul(usize, backend.vocab_size, @sizeOf(f32)) catch return error.InvalidArgument;
+        backend.argmax_logits_dev = try backend.device.allocBuffer(vocab_logits_bytes);
+        errdefer backend.argmax_logits_dev.deinit(&backend.device);
+        backend.argmax_index_dev = try backend.device.allocBuffer(@sizeOf(u32));
+        errdefer backend.argmax_index_dev.deinit(&backend.device);
+        backend.block_runtime = try BlockRuntime.init(allocator, &backend.device, loaded);
+        errdefer backend.block_runtime.deinit(allocator, &backend.device);
+        if (loaded.config.use_qk_norm and
+            (backend.block_runtime.q_norm_blocks != backend.block_runtime.blocks.len or backend.block_runtime.k_norm_blocks != backend.block_runtime.blocks.len))
+        {
+            log.warn("inference", "CUDA backend requires explicit q/k norm weights when qk_norm is enabled", .{
+                .q_norm_blocks = backend.block_runtime.q_norm_blocks,
+                .k_norm_blocks = backend.block_runtime.k_norm_blocks,
+                .layers = backend.block_runtime.blocks.len,
+            });
+            return error.UnsupportedModel;
+        }
+        const max_dff = backend.block_runtime.maxDff();
+        const max_attn = backend.block_runtime.maxAttn();
+        const max_kv = backend.block_runtime.maxKv();
         backend.blas = try compute.cuda.Blas.init(&backend.device);
         errdefer backend.blas.deinit(&backend.device);
-        backend.prototype = try PrototypeRuntime.init(allocator, &backend.device, loaded);
+        backend.prototype = try PrototypeRuntime.init(
+            allocator,
+            &backend.device,
+            loaded,
+            max_dff,
+            max_attn,
+            max_kv,
+            backend.max_seq_len,
+            backend.head_dim,
+        );
         errdefer backend.prototype.deinit(allocator, &backend.device);
         try backend.initKernelFunctions();
 
         try runMatmulSmoke(&backend);
         try runKernelSmoke(&backend);
-        log.info("inference", "CUDA prototype decode path ready", .{
+        runCpuParityProbe(&backend) catch |err| {
+            log.warn("inference", "CUDA parity probe unavailable", .{
+                .reason = @errorName(err),
+            });
+        };
+        log.info("inference", "CUDA layered decode path ready", .{
             .d_model = backend.d_model,
             .projected_vocab = backend.prototype.projected_vocab,
+            .max_dff = backend.prototype.max_dff,
+            .max_attn = backend.prototype.max_attn,
+            .max_kv = backend.prototype.max_kv,
+            .max_seq = backend.max_seq_len,
+            .n_heads = backend.n_heads,
+            .n_kv = backend.n_kv_heads,
+            .head_dim = backend.head_dim,
+            .use_qk_norm = @as(u8, @intFromBool(loaded.config.use_qk_norm)),
+            .attention_bias = @as(u8, @intFromBool(loaded.config.attention_bias)),
+            .norm_weight_offset = loaded.runtime.weight_offset,
+            .qk_norm_weight_offset = loaded.runtime.qk_norm_weight_offset,
+            .q_norm_blocks = backend.block_runtime.q_norm_blocks,
+            .k_norm_blocks = backend.block_runtime.k_norm_blocks,
             .rmsnorm_kernel = @as(u8, @intFromBool(backend.rmsnorm_function != null)),
+            .mul_kernel = @as(u8, @intFromBool(backend.mul_function != null)),
+            .copy_kernel = @as(u8, @intFromBool(backend.copy_function != null)),
+            .rope_kernel = @as(u8, @intFromBool(backend.rope_function != null)),
+            .attn_scores_kernel = @as(u8, @intFromBool(backend.attn_scores_function != null)),
+            .softmax_kernel = @as(u8, @intFromBool(backend.softmax_function != null)),
+            .attn_weighted_sum_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_function != null)),
+            .silu_kernel = @as(u8, @intFromBool(backend.silu_function != null)),
+            .argmax_kernel = @as(u8, @intFromBool(backend.argmax_function != null)),
+            .device_blocks = backend.block_runtime.blocks.len,
             .model_norm = @as(u8, @intFromBool(backend.prototype.using_model_norm)),
             .model_projection = @as(u8, @intFromBool(backend.prototype.using_model_projection)),
+            .projection_lm_head = @as(u8, @intFromBool(backend.prototype.projection_from_lm_head)),
+            .has_lm_head = @as(u8, @intFromBool(loaded.lm_head != null)),
             .model_embeddings = @as(u8, @intFromBool(backend.prototype.using_model_embeddings)),
+            .embed_dtype = @tagName(loaded.token_embeddings.dtype),
+            .embed_shape_0 = loaded.token_embeddings.shape[0],
+            .embed_shape_1 = loaded.token_embeddings.shape[1],
         });
         return backend;
     }
 
     pub fn deinit(self: *CudaBackend) void {
+        self.argmax_index_dev.deinit(&self.device);
+        self.argmax_logits_dev.deinit(&self.device);
         self.allocator.free(self.slot_logits);
+        self.block_runtime.deinit(self.allocator, &self.device);
         self.prototype.deinit(self.allocator, &self.device);
         self.blas.deinit(&self.device);
         self.kernel_arg_pack.deinit();
@@ -202,9 +753,13 @@ pub const CudaBackend = struct {
             });
             return error.InvalidArgument;
         }
+        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
 
-        const last_token = tokens[tokens.len - 1];
-        try self.computeGpuPrototypeLogits(last_token, logits_out);
+        var i: usize = 0;
+        while (i < tokens.len) : (i += 1) {
+            try self.computeGpuPrototypeLogits(tokens[i], i, self.slot_logits);
+        }
+        @memcpy(logits_out, self.slot_logits);
         self.slot_position = tokens.len;
     }
 
@@ -217,8 +772,46 @@ pub const CudaBackend = struct {
             });
             return error.InvalidArgument;
         }
-        try self.computeGpuPrototypeLogits(token, logits_out);
+        try self.computeGpuPrototypeLogits(token, position, logits_out);
         self.slot_position = position + 1;
+    }
+
+    pub fn decodeStreaming(
+        self: *CudaBackend,
+        first_token: u32,
+        start_position: usize,
+        max_tokens: usize,
+        eos_token_ids: []const u32,
+        output_tokens: []u32,
+        callback: ?*const fn (u32, ?*anyopaque) void,
+        callback_data: ?*anyopaque,
+    ) !usize {
+        if (max_tokens == 0 or output_tokens.len == 0) return 0;
+        if (!self.slot_in_use) {
+            self.slot_in_use = true;
+            self.slot_position = start_position;
+        }
+
+        var current_token = first_token;
+        var generated: usize = 0;
+        var position = self.slot_position;
+        const budget = @min(max_tokens, output_tokens.len);
+        while (generated < budget) : (generated += 1) {
+            try self.computeGpuPrototypeLogits(current_token, position, self.slot_logits);
+            const next_token = try selectNextTokenFromLogits(self, self.slot_logits);
+            output_tokens[generated] = next_token;
+            position += 1;
+            self.slot_position = position;
+            if (callback) |cb| cb(next_token, callback_data);
+
+            for (eos_token_ids) |eos_id| {
+                if (next_token == eos_id) {
+                    return generated + 1;
+                }
+            }
+            current_token = next_token;
+        }
+        return generated;
     }
 
     pub fn allocSlot(self: *CudaBackend) ?usize {
@@ -275,8 +868,12 @@ pub const CudaBackend = struct {
             return error.InvalidArgument;
         }
 
-        const last_token = tokens[tokens.len - 1];
-        try self.computeGpuPrototypeLogits(last_token, logits_out);
+        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
+        var i: usize = 0;
+        while (i < tokens.len) : (i += 1) {
+            try self.computeGpuPrototypeLogits(tokens[i], i, self.slot_logits);
+        }
+        @memcpy(logits_out, self.slot_logits);
         self.slot_position = tokens.len;
     }
 
@@ -323,7 +920,7 @@ pub const CudaBackend = struct {
             return error.InvalidArgument;
         }
 
-        try self.computeGpuPrototypeLogits(req.token, self.slot_logits);
+        try self.computeGpuPrototypeLogits(req.token, self.slot_position, self.slot_logits);
         results[0] = .{
             .slot_index = req.slot_index,
             .logits = self.slot_logits,
@@ -331,32 +928,339 @@ pub const CudaBackend = struct {
         self.slot_position += 1;
     }
 
-    fn computeGpuPrototypeLogits(self: *CudaBackend, token: u32, logits_out: []f32) !void {
+    fn computeGpuPrototypeLogits(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
+        return self.computeGpuPrototypeLogitsWithLayerLimit(
+            token,
+            position,
+            logits_out,
+            self.block_runtime.blocks.len,
+        );
+    }
+
+    fn computeGpuPrototypeLogitsWithLayerLimit(
+        self: *CudaBackend,
+        token: u32,
+        position: usize,
+        logits_out: []f32,
+        layer_limit: usize,
+    ) !void {
         if (logits_out.len != self.vocab_size) return error.InvalidArgument;
+        if (position >= self.max_seq_len) return error.InvalidArgument;
+        if (layer_limit > self.block_runtime.blocks.len) return error.InvalidArgument;
+
+        const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
+        const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
+        const mul_function = self.mul_function orelse return error.CudaKernelUnavailable;
+        const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
+        const rope_function = self.rope_function orelse return error.CudaKernelUnavailable;
+        const attn_scores_function = self.attn_scores_function orelse return error.CudaKernelUnavailable;
+        const softmax_function = self.softmax_function orelse return error.CudaKernelUnavailable;
+        const attn_weighted_sum_function = self.attn_weighted_sum_function orelse return error.CudaKernelUnavailable;
+        const silu_function = self.silu_function orelse return error.CudaKernelUnavailable;
+        const d_model_u32: u32 = @intCast(self.d_model);
+        const head_dim_u32: u32 = @intCast(self.head_dim);
+        const rope_dim_u32: u32 = @intCast(self.rope_dim);
+        const n_heads_u32: u32 = @intCast(self.n_heads);
+        const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
+        const seq_len_u32: u32 = @intCast(position + 1);
+        const position_u32: u32 = @intCast(position);
+        const theta: f32 = if (self.loaded.config.rope_theta > 1.0) self.loaded.config.rope_theta else 10000.0;
 
         const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.prototype.hidden_host) catch |err| switch (err) {
             error.InvalidArgument => return error.InvalidArgument,
             else => return err,
         };
         if (!used_model_embeddings) fillPrototypeInput(self.prototype.hidden_host, token);
+        if (!used_model_embeddings and position == 0) {
+            log.warn("inference", "CUDA using synthetic embedding fallback", .{
+                .token = token,
+                .embed_shape_0 = self.loaded.token_embeddings.shape[0],
+                .embed_shape_1 = self.loaded.token_embeddings.shape[1],
+                .embed_dtype = @tagName(self.loaded.token_embeddings.dtype),
+                .embed_ndim = self.loaded.token_embeddings.n_dims,
+            });
+        }
+        if (self.loaded.config.embedding_multiplier != 1.0) {
+            for (self.prototype.hidden_host) |*v| {
+                v.* *= self.loaded.config.embedding_multiplier;
+            }
+        }
         try self.prototype.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.prototype.hidden_host));
 
-        if (self.rmsnorm_function) |rmsnorm_function| {
-            const cols_u32 = std.math.cast(u32, self.d_model) orelse return error.InvalidArgument;
+        var layer_idx: usize = 0;
+        while (layer_idx < layer_limit) : (layer_idx += 1) {
+            const block = &self.block_runtime.blocks[layer_idx];
             try compute.cuda.rmsnorm.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 rmsnorm_function,
                 &self.prototype.input_dev,
-                &self.prototype.norm_weight_dev,
+                &block.ln1_weight.buffer,
                 &self.prototype.norm_out_dev,
                 1,
-                cols_u32,
-                prototype_eps,
+                d_model_u32,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
             );
-        } else {
-            try self.prototype.norm_out_dev.upload(&self.device, std.mem.sliceAsBytes(self.prototype.hidden_host));
+
+            try self.blas.matmulF32(
+                &self.device,
+                &self.prototype.norm_out_dev,
+                1,
+                self.d_model,
+                &block.q_proj.buffer,
+                block.q_proj.cols,
+                &self.prototype.attn_q_dev,
+            );
+            try self.blas.matmulF32(
+                &self.device,
+                &self.prototype.norm_out_dev,
+                1,
+                self.d_model,
+                &block.k_proj.buffer,
+                block.k_proj.cols,
+                &self.prototype.attn_k_dev,
+            );
+            try self.blas.matmulF32(
+                &self.device,
+                &self.prototype.norm_out_dev,
+                1,
+                self.d_model,
+                &block.v_proj.buffer,
+                block.v_proj.cols,
+                &self.prototype.attn_v_dev,
+            );
+
+            if (block.q_norm_weight) |*q_norm| {
+                try compute.cuda.rmsnorm.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    rmsnorm_function,
+                    &self.prototype.attn_q_dev,
+                    &q_norm.buffer,
+                    &self.prototype.attn_q_dev,
+                    n_heads_u32,
+                    head_dim_u32,
+                    self.norm_eps,
+                    self.loaded.runtime.qk_norm_weight_offset,
+                );
+            }
+            if (block.k_norm_weight) |*k_norm| {
+                try compute.cuda.rmsnorm.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    rmsnorm_function,
+                    &self.prototype.attn_k_dev,
+                    &k_norm.buffer,
+                    &self.prototype.attn_k_dev,
+                    n_kv_heads_u32,
+                    head_dim_u32,
+                    self.norm_eps,
+                    self.loaded.runtime.qk_norm_weight_offset,
+                );
+            }
+
+            try compute.cuda.rope.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rope_function,
+                &self.prototype.attn_q_dev,
+                n_heads_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                position_u32,
+                theta,
+            );
+            try compute.cuda.rope.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rope_function,
+                &self.prototype.attn_k_dev,
+                n_kv_heads_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                position_u32,
+                theta,
+            );
+
+            const kv_row_bytes = std.math.mul(usize, block.kv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+            const kv_row_offset = std.math.mul(usize, position, kv_row_bytes) catch return error.InvalidArgument;
+            var k_row = try bufferSlice(&block.k_cache, kv_row_offset, kv_row_bytes);
+            var v_row = try bufferSlice(&block.v_cache, kv_row_offset, kv_row_bytes);
+            try compute.cuda.copy.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                copy_function,
+                &self.prototype.attn_k_dev,
+                &k_row,
+                @intCast(block.kv_dim),
+            );
+            try compute.cuda.copy.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                copy_function,
+                &self.prototype.attn_v_dev,
+                &v_row,
+                @intCast(block.kv_dim),
+            );
+
+            const kv_groups = self.n_heads / self.n_kv_heads;
+            var head_idx: usize = 0;
+            while (head_idx < self.n_heads) : (head_idx += 1) {
+                const q_offset = std.math.mul(usize, head_idx, self.head_dim) catch return error.InvalidArgument;
+                const q_offset_bytes = std.math.mul(usize, q_offset, @sizeOf(f32)) catch return error.InvalidArgument;
+                const head_bytes = std.math.mul(usize, self.head_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+                var q_head = try bufferSlice(&self.prototype.attn_q_dev, q_offset_bytes, head_bytes);
+                var ctx_head = try bufferSlice(&self.prototype.attn_context_dev, q_offset_bytes, head_bytes);
+
+                const kv_head = kvHeadForQueryHead(head_idx, kv_groups);
+                const kv_offset = std.math.mul(usize, kv_head, self.head_dim) catch return error.InvalidArgument;
+                const kv_offset_u32: u32 = @intCast(kv_offset);
+                const kv_dim_u32: u32 = @intCast(block.kv_dim);
+
+                try compute.cuda.attn_scores.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    attn_scores_function,
+                    &q_head,
+                    &block.k_cache,
+                    &self.prototype.attn_scores_dev,
+                    seq_len_u32,
+                    kv_dim_u32,
+                    kv_offset_u32,
+                    head_dim_u32,
+                    self.attention_scale,
+                );
+                try compute.cuda.softmax.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    softmax_function,
+                    &self.prototype.attn_scores_dev,
+                    &self.prototype.attn_probs_dev,
+                    seq_len_u32,
+                );
+                try compute.cuda.attn_weighted_sum.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    attn_weighted_sum_function,
+                    &self.prototype.attn_probs_dev,
+                    &block.v_cache,
+                    &self.prototype.attn_head_dev,
+                    seq_len_u32,
+                    kv_dim_u32,
+                    kv_offset_u32,
+                    head_dim_u32,
+                );
+                try compute.cuda.copy.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    copy_function,
+                    &self.prototype.attn_head_dev,
+                    &ctx_head,
+                    head_dim_u32,
+                );
+            }
+
+            try self.blas.matmulF32(
+                &self.device,
+                &self.prototype.attn_context_dev,
+                1,
+                block.q_dim,
+                &block.o_proj.buffer,
+                block.o_proj.cols,
+                &self.prototype.attn_out_dev,
+            );
+            try compute.cuda.vector_add.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                vector_add_function,
+                &self.prototype.input_dev,
+                &self.prototype.attn_out_dev,
+                &self.prototype.input_dev,
+                d_model_u32,
+            );
+
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rmsnorm_function,
+                &self.prototype.input_dev,
+                &block.ln2_weight.buffer,
+                &self.prototype.norm_out_dev,
+                1,
+                d_model_u32,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
+            );
+
+            try self.blas.matmulF32(
+                &self.device,
+                &self.prototype.norm_out_dev,
+                1,
+                self.d_model,
+                &block.w1.buffer,
+                block.w1.cols,
+                &self.prototype.ffn_gate_dev,
+            );
+            try self.blas.matmulF32(
+                &self.device,
+                &self.prototype.norm_out_dev,
+                1,
+                self.d_model,
+                &block.w3.buffer,
+                block.w3.cols,
+                &self.prototype.ffn_up_dev,
+            );
+            const d_ff_u32: u32 = @intCast(block.d_ff);
+            try compute.cuda.silu.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                silu_function,
+                &self.prototype.ffn_gate_dev,
+                &self.prototype.ffn_gate_dev,
+                d_ff_u32,
+            );
+            try compute.cuda.mul.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                mul_function,
+                &self.prototype.ffn_gate_dev,
+                &self.prototype.ffn_up_dev,
+                &self.prototype.ffn_mul_dev,
+                d_ff_u32,
+            );
+            try self.blas.matmulF32(
+                &self.device,
+                &self.prototype.ffn_mul_dev,
+                1,
+                block.d_ff,
+                &block.w2.buffer,
+                block.w2.cols,
+                &self.prototype.ffn_down_dev,
+            );
+            try compute.cuda.vector_add.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                vector_add_function,
+                &self.prototype.input_dev,
+                &self.prototype.ffn_down_dev,
+                &self.prototype.input_dev,
+                d_model_u32,
+            );
         }
+
+        try compute.cuda.rmsnorm.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            rmsnorm_function,
+            &self.prototype.input_dev,
+            &self.prototype.norm_weight_dev,
+            &self.prototype.norm_out_dev,
+            1,
+            d_model_u32,
+            self.norm_eps,
+            self.loaded.runtime.weight_offset,
+        );
 
         try self.blas.matmulF32(
             &self.device,
@@ -370,14 +1274,32 @@ pub const CudaBackend = struct {
         try self.device.synchronize();
         try self.prototype.logits_dev.download(&self.device, std.mem.sliceAsBytes(self.prototype.projected_logits_host));
 
-        @memset(logits_out, -1.0e9);
-        @memcpy(logits_out[0..self.prototype.projected_vocab], self.prototype.projected_logits_host);
+        if (self.prototype.projected_vocab == logits_out.len) {
+            @memcpy(logits_out, self.prototype.projected_logits_host);
+        } else {
+            @memset(logits_out, -1.0e9);
+            @memcpy(logits_out[0..self.prototype.projected_vocab], self.prototype.projected_logits_host);
+        }
+        if (self.loaded.config.logits_scaling != 1.0) {
+            for (logits_out) |*v| {
+                v.* /= self.loaded.config.logits_scaling;
+            }
+        }
     }
 
     fn initKernelFunctions(self: *CudaBackend) !void {
         if (!self.device.supportsModuleLaunch()) return;
 
         try self.kernel_registry.loadEmbeddedModule(compute.cuda.vector_add.embedded_ptx);
+        const sideload_loaded = self.tryLoadSideloadModule() catch |err| blk: {
+            log.warn("inference", "CUDA sideload unavailable; using embedded PTX", .{
+                .reason = @errorName(err),
+            });
+            break :blk false;
+        };
+        if (sideload_loaded) {
+            log.info("inference", "CUDA sideload kernel module active", .{});
+        }
 
         const vector_add = try self.kernel_registry.resolveFunction(
             "vector_add_f32",
@@ -386,14 +1308,190 @@ pub const CudaBackend = struct {
         self.vector_add_function = vector_add.function;
         self.vector_add_source = vector_add.source;
 
+        const mul = try self.kernel_registry.resolveFunction(
+            "mul_f32",
+            compute.cuda.mul.embedded_symbol,
+        );
+        self.mul_function = mul.function;
+        self.mul_source = mul.source;
+
+        const copy = try self.kernel_registry.resolveFunction(
+            "copy_f32",
+            compute.cuda.copy.embedded_symbol,
+        );
+        self.copy_function = copy.function;
+        self.copy_source = copy.source;
+
         const rmsnorm = try self.kernel_registry.resolveFunction(
             "rmsnorm_f32",
             compute.cuda.rmsnorm.embedded_symbol,
         );
         self.rmsnorm_function = rmsnorm.function;
         self.rmsnorm_source = rmsnorm.source;
+
+        const rope = try self.kernel_registry.resolveFunction(
+            "rope_f32",
+            compute.cuda.rope.embedded_symbol,
+        );
+        self.rope_function = rope.function;
+        self.rope_source = rope.source;
+
+        const attn_scores = try self.kernel_registry.resolveFunction(
+            "attn_scores_f32",
+            compute.cuda.attn_scores.embedded_symbol,
+        );
+        self.attn_scores_function = attn_scores.function;
+        self.attn_scores_source = attn_scores.source;
+
+        const softmax = try self.kernel_registry.resolveFunction(
+            "softmax_f32",
+            compute.cuda.softmax.embedded_symbol,
+        );
+        self.softmax_function = softmax.function;
+        self.softmax_source = softmax.source;
+
+        const attn_weighted_sum = try self.kernel_registry.resolveFunction(
+            "attn_weighted_sum_f32",
+            compute.cuda.attn_weighted_sum.embedded_symbol,
+        );
+        self.attn_weighted_sum_function = attn_weighted_sum.function;
+        self.attn_weighted_sum_source = attn_weighted_sum.source;
+
+        const silu = try self.kernel_registry.resolveFunction(
+            "silu_f32",
+            compute.cuda.silu.embedded_symbol,
+        );
+        self.silu_function = silu.function;
+        self.silu_source = silu.source;
+
+        const argmax = try self.kernel_registry.resolveFunction(
+            "argmax_f32",
+            compute.cuda.argmax.embedded_symbol,
+        );
+        self.argmax_function = argmax.function;
+        self.argmax_source = argmax.source;
+    }
+
+    fn tryLoadSideloadModule(self: *CudaBackend) !bool {
+        const base_url_raw = std.process.getEnvVarOwned(self.allocator, compute.cuda.sideload.kernel_base_url_env) catch |err| switch (err) {
+            error.EnvironmentVariableNotFound => return false,
+            else => return err,
+        };
+        defer self.allocator.free(base_url_raw);
+        const base_url = std.mem.trim(u8, base_url_raw, " \t\r\n");
+        if (base_url.len == 0) return false;
+
+        const capability = self.device.computeCapability() catch |err| switch (err) {
+            error.CudaQueryUnavailable => return false,
+            else => return err,
+        };
+        const arch = try compute.cuda.sideload.archTag(self.allocator, capability.major, capability.minor);
+        defer self.allocator.free(arch);
+
+        const cache_dir = try compute.cuda.sideload.resolveCacheDir(self.allocator);
+        defer self.allocator.free(cache_dir);
+        try compute.cuda.sideload.ensureCacheDir(cache_dir);
+
+        const manifest_bytes = try compute.cuda.sideload.loadOrFetchManifest(
+            self.allocator,
+            cache_dir,
+            arch,
+            base_url,
+        );
+        defer self.allocator.free(manifest_bytes);
+        var parsed_manifest = try compute.cuda.manifest.parse(self.allocator, manifest_bytes);
+        defer parsed_manifest.deinit();
+        if (!std.mem.eql(u8, parsed_manifest.manifest.arch, arch)) return error.CudaManifestArchMismatch;
+
+        const artifact_bytes = try compute.cuda.sideload.loadOrFetchArtifact(
+            self.allocator,
+            cache_dir,
+            arch,
+            base_url,
+            parsed_manifest.manifest.sha256,
+        );
+        defer self.allocator.free(artifact_bytes);
+
+        try self.kernel_registry.loadSideloadModule(manifest_bytes, artifact_bytes);
+        log.info("inference", "CUDA sideload payload loaded", .{
+            .arch = arch,
+            .cache_dir = cache_dir,
+        });
+        return true;
     }
 };
+
+fn runCpuParityProbe(backend: *CudaBackend) !void {
+    const probe_token: u32 = 42;
+    var cpu_backend = try cpu_engine.FusedCpuBackend.init(
+        backend.allocator,
+        backend.loaded,
+        1,
+        progress.Context.NONE,
+    );
+    defer cpu_backend.deinit();
+
+    const vocab = backend.vocab_size;
+    const cpu_logits = try backend.allocator.alloc(f32, vocab);
+    defer backend.allocator.free(cpu_logits);
+    const cuda_logits = try backend.allocator.alloc(f32, vocab);
+    defer backend.allocator.free(cuda_logits);
+
+    const probe_tokens = [_]u32{probe_token};
+    const cpu_slot = cpu_backend.allocSlot() orelse return error.OutOfMemory;
+    defer cpu_backend.freeSlot(cpu_slot);
+    try cpu_backend.prefillSlot(cpu_slot, probe_tokens[0..], cpu_logits);
+
+    try backend.computeGpuPrototypeLogits(probe_token, 0, cuda_logits);
+
+    const cpu_top = argmaxHost(cpu_logits);
+    const cuda_top = argmaxHost(cuda_logits);
+
+    var max_abs_diff: f32 = 0.0;
+    var sum_abs_diff: f64 = 0.0;
+    var finite_count: usize = 0;
+    var cpu_nan_count: usize = 0;
+    var cuda_nan_count: usize = 0;
+    for (cpu_logits, cuda_logits) |cpu_v, cuda_v| {
+        if (std.math.isNan(cpu_v)) cpu_nan_count += 1;
+        if (std.math.isNan(cuda_v)) cuda_nan_count += 1;
+        if (std.math.isFinite(cpu_v) and std.math.isFinite(cuda_v)) {
+            const diff = @abs(cpu_v - cuda_v);
+            if (diff > max_abs_diff) max_abs_diff = diff;
+            sum_abs_diff += diff;
+            finite_count += 1;
+        }
+    }
+    const mean_abs_diff: f32 = if (finite_count > 0)
+        @floatCast(sum_abs_diff / @as(f64, @floatFromInt(finite_count)))
+    else
+        0.0;
+
+    log.info("inference", "CUDA parity probe full", .{
+        .token = probe_token,
+        .layers = backend.block_runtime.blocks.len,
+        .cpu_top = cpu_top,
+        .cuda_top = cuda_top,
+        .same_top = @as(u8, @intFromBool(cpu_top == cuda_top)),
+        .mean_abs_diff = mean_abs_diff,
+        .max_abs_diff = max_abs_diff,
+        .finite_count = finite_count,
+        .cpu_nan_count = cpu_nan_count,
+        .cuda_nan_count = cuda_nan_count,
+    });
+}
+
+fn argmaxHost(values: []const f32) u32 {
+    var best_idx: usize = 0;
+    var best_val: f32 = -std.math.inf(f32);
+    for (values, 0..) |v, idx| {
+        if (v > best_val) {
+            best_val = v;
+            best_idx = idx;
+        }
+    }
+    return @intCast(best_idx);
+}
 
 fn runMatmulSmoke(backend: *CudaBackend) !void {
     const device = &backend.device;
@@ -447,7 +1545,17 @@ fn runKernelSmoke(
         log.info("inference", "CUDA module launch API unavailable; skipping kernel smoke", .{});
         return;
     }
-    if (backend.vector_add_function == null or backend.rmsnorm_function == null) {
+    if (backend.vector_add_function == null or
+        backend.mul_function == null or
+        backend.copy_function == null or
+        backend.rmsnorm_function == null or
+        backend.rope_function == null or
+        backend.attn_scores_function == null or
+        backend.softmax_function == null or
+        backend.attn_weighted_sum_function == null or
+        backend.silu_function == null or
+        backend.argmax_function == null)
+    {
         return error.CudaKernelUnavailable;
     }
 
@@ -457,11 +1565,43 @@ fn runKernelSmoke(
         backend.vector_add_function.?,
         backend.vector_add_source orelse .embedded_ptx,
     );
+    try runMulSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.mul_function.?,
+        backend.mul_source orelse .embedded_ptx,
+    );
+    try runCopySmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.copy_function.?,
+        backend.copy_source orelse .embedded_ptx,
+    );
     try runRmsNormSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.rmsnorm_function.?,
         backend.rmsnorm_source orelse .embedded_ptx,
+    );
+    try runSiluSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.silu_function.?,
+        backend.silu_source orelse .embedded_ptx,
+    );
+    try runAttentionSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.rope_function.?,
+        backend.attn_scores_function.?,
+        backend.softmax_function.?,
+        backend.attn_weighted_sum_function.?,
+    );
+    try runArgmaxSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.argmax_function.?,
+        backend.argmax_source orelse .embedded_ptx,
     );
 }
 
@@ -508,6 +1648,86 @@ fn runVectorAddSmoke(
     });
 }
 
+fn runMulSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const lhs = [_]f32{ 1.0, -2.0, 3.0, -4.0 };
+    const rhs = [_]f32{ 10.0, 20.0, -30.0, -40.0 };
+    const expected = [_]f32{ 10.0, -40.0, -90.0, 160.0 };
+    var actual = [_]f32{0.0} ** lhs.len;
+
+    var lhs_dev = try device.allocBuffer(lhs.len * @sizeOf(f32));
+    defer lhs_dev.deinit(device);
+    var rhs_dev = try device.allocBuffer(rhs.len * @sizeOf(f32));
+    defer rhs_dev.deinit(device);
+    var out_dev = try device.allocBuffer(actual.len * @sizeOf(f32));
+    defer out_dev.deinit(device);
+
+    try lhs_dev.upload(device, std.mem.sliceAsBytes(lhs[0..]));
+    try rhs_dev.upload(device, std.mem.sliceAsBytes(rhs[0..]));
+    try compute.cuda.mul.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &lhs_dev,
+        &rhs_dev,
+        &out_dev,
+        @intCast(lhs.len),
+    );
+    try device.synchronize();
+    try out_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (expected, actual) |want, got| {
+        if (@abs(want - got) > 0.0001) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA mul smoke passed", .{
+        .n = lhs.len,
+        .source = @tagName(source),
+        .out0 = actual[0],
+    });
+}
+
+fn runCopySmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const input = [_]f32{ 5.5, -2.0, 9.25, 0.125 };
+    var actual = [_]f32{0.0} ** input.len;
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var out_dev = try device.allocBuffer(actual.len * @sizeOf(f32));
+    defer out_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try compute.cuda.copy.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &input_dev,
+        &out_dev,
+        @intCast(input.len),
+    );
+    try device.synchronize();
+    try out_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (input, actual) |want, got| {
+        if (@abs(want - got) > 0.0001) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA copy smoke passed", .{
+        .n = input.len,
+        .source = @tagName(source),
+        .out0 = actual[0],
+    });
+}
+
 fn runRmsNormSmoke(
     arg_pack: *compute.cuda.ArgPack,
     device: *compute.cuda.Device,
@@ -547,6 +1767,7 @@ fn runRmsNormSmoke(
         rows,
         cols,
         eps,
+        0.0,
     );
     try device.synchronize();
     try output_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
@@ -560,6 +1781,191 @@ fn runRmsNormSmoke(
         .cols = cols,
         .source = @tagName(source),
         .out0 = actual[0],
+    });
+}
+
+fn runSiluSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const input = [_]f32{ -1.0, 0.0, 1.0, 2.0 };
+    const expected = [_]f32{
+        -0.26894143,
+        0.0,
+        0.7310586,
+        1.7615942,
+    };
+    var actual = [_]f32{0.0} ** input.len;
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var output_dev = try device.allocBuffer(actual.len * @sizeOf(f32));
+    defer output_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try compute.cuda.silu.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &input_dev,
+        &output_dev,
+        @intCast(input.len),
+    );
+    try device.synchronize();
+    try output_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (expected, actual) |want, got| {
+        if (@abs(want - got) > 0.001) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA silu smoke passed", .{
+        .n = input.len,
+        .source = @tagName(source),
+        .out0 = actual[0],
+    });
+}
+
+fn runAttentionSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    rope_function: compute.cuda.Function,
+    scores_function: compute.cuda.Function,
+    softmax_function: compute.cuda.Function,
+    weighted_sum_function: compute.cuda.Function,
+) !void {
+    const head_dim: u32 = 4;
+    const n_heads: u32 = 1;
+    const seq_len: u32 = 2;
+    const row_stride: u32 = 4;
+    const scale: f32 = 0.5;
+
+    const query = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const key_cache = [_]f32{
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+    };
+    const value_cache = [_]f32{
+        2.0, 3.0, 0.0, 0.0,
+        4.0, 1.0, 0.0, 0.0,
+    };
+    const scores = [_]f32{0.0} ** seq_len;
+    var probs = [_]f32{0.0} ** seq_len;
+    var out = [_]f32{0.0} ** head_dim;
+
+    var query_dev = try device.allocBuffer(query.len * @sizeOf(f32));
+    defer query_dev.deinit(device);
+    var key_dev = try device.allocBuffer(key_cache.len * @sizeOf(f32));
+    defer key_dev.deinit(device);
+    var value_dev = try device.allocBuffer(value_cache.len * @sizeOf(f32));
+    defer value_dev.deinit(device);
+    var scores_dev = try device.allocBuffer(scores.len * @sizeOf(f32));
+    defer scores_dev.deinit(device);
+    var probs_dev = try device.allocBuffer(probs.len * @sizeOf(f32));
+    defer probs_dev.deinit(device);
+    var out_dev = try device.allocBuffer(out.len * @sizeOf(f32));
+    defer out_dev.deinit(device);
+
+    try query_dev.upload(device, std.mem.sliceAsBytes(query[0..]));
+    try key_dev.upload(device, std.mem.sliceAsBytes(key_cache[0..]));
+    try value_dev.upload(device, std.mem.sliceAsBytes(value_cache[0..]));
+
+    try compute.cuda.rope.runWithFunction(
+        arg_pack,
+        device,
+        rope_function,
+        &query_dev,
+        n_heads,
+        head_dim,
+        head_dim,
+        0,
+        10000.0,
+    );
+    try compute.cuda.attn_scores.runWithFunction(
+        arg_pack,
+        device,
+        scores_function,
+        &query_dev,
+        &key_dev,
+        &scores_dev,
+        seq_len,
+        row_stride,
+        0,
+        head_dim,
+        scale,
+    );
+    try compute.cuda.softmax.runWithFunction(
+        arg_pack,
+        device,
+        softmax_function,
+        &scores_dev,
+        &probs_dev,
+        seq_len,
+    );
+    try compute.cuda.attn_weighted_sum.runWithFunction(
+        arg_pack,
+        device,
+        weighted_sum_function,
+        &probs_dev,
+        &value_dev,
+        &out_dev,
+        seq_len,
+        row_stride,
+        0,
+        head_dim,
+    );
+    try device.synchronize();
+    try out_dev.download(device, std.mem.sliceAsBytes(out[0..]));
+    try probs_dev.download(device, std.mem.sliceAsBytes(probs[0..]));
+
+    const expected_p0 = std.math.exp(0.5) / (std.math.exp(0.5) + std.math.exp(0.0));
+    const expected_p1 = 1.0 - expected_p0;
+    if (@abs(probs[0] - expected_p0) > 0.01) return error.CudaKernelSmokeMismatch;
+    if (@abs(probs[1] - expected_p1) > 0.01) return error.CudaKernelSmokeMismatch;
+    const expected_out0 = expected_p0 * 2.0 + expected_p1 * 4.0;
+    if (@abs(out[0] - expected_out0) > 0.02) return error.CudaKernelSmokeMismatch;
+
+    log.info("inference", "CUDA attention smoke passed", .{
+        .seq = seq_len,
+        .head_dim = head_dim,
+        .out0 = out[0],
+    });
+}
+
+fn runArgmaxSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const input = [_]f32{ -1.0, 4.5, 3.25, 4.5, 0.0 };
+    const expected_index: u32 = 1;
+    var actual_index: u32 = 0;
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var out_index_dev = try device.allocBuffer(@sizeOf(u32));
+    defer out_index_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try compute.cuda.argmax.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &input_dev,
+        &out_index_dev,
+        @intCast(input.len),
+    );
+    try device.synchronize();
+    try out_index_dev.download(device, std.mem.asBytes(&actual_index));
+
+    if (actual_index != expected_index) return error.CudaKernelSmokeMismatch;
+
+    log.info("inference", "CUDA argmax smoke passed", .{
+        .n = input.len,
+        .source = @tagName(source),
+        .idx = actual_index,
     });
 }
 
@@ -598,6 +2004,193 @@ fn fillPrototypeInput(out: []f32, token: u32) void {
         const centered: i32 = @intCast(hashed & 0x3ff);
         value.* = (@as(f32, @floatFromInt(centered)) - 512.0) / 512.0;
     }
+}
+
+fn suppressPrototypeLowTokenBand(logits_out: []f32, projected_vocab: usize) void {
+    if (projected_vocab <= prototype_low_token_band) return;
+    const masked = @min(projected_vocab, logits_out.len);
+    const band = @min(masked, prototype_low_token_band);
+    if (band == 0) return;
+    @memset(logits_out[0..band], -1.0e9);
+}
+
+fn selectNextTokenFromLogits(self: *CudaBackend, logits: []const f32) !u32 {
+    if (logits.len != self.vocab_size) return error.InvalidArgument;
+    const argmax_function = self.argmax_function orelse return error.CudaKernelUnavailable;
+    const count_u32: u32 = @intCast(logits.len);
+    try self.argmax_logits_dev.upload(&self.device, std.mem.sliceAsBytes(logits));
+    try compute.cuda.argmax.runWithFunction(
+        &self.kernel_arg_pack,
+        &self.device,
+        argmax_function,
+        &self.argmax_logits_dev,
+        &self.argmax_index_dev,
+        count_u32,
+    );
+    try self.device.synchronize();
+    var token: u32 = 0;
+    try self.argmax_index_dev.download(&self.device, std.mem.asBytes(&token));
+    return token;
+}
+
+fn bufferSlice(buffer: *const compute.cuda.Buffer, byte_offset: usize, byte_len: usize) !compute.cuda.Buffer {
+    if (byte_offset > buffer.size) return error.InvalidArgument;
+    const end = std.math.add(usize, byte_offset, byte_len) catch return error.InvalidArgument;
+    if (end > buffer.size) return error.InvalidArgument;
+    const ptr = std.math.add(u64, buffer.pointer, @intCast(byte_offset)) catch return error.InvalidArgument;
+    return .{
+        .pointer = ptr,
+        .size = byte_len,
+    };
+}
+
+fn freeOwnedTensorView(allocator: std.mem.Allocator, t: Tensor) void {
+    if (t.data_ptr) |ptr| {
+        const aligned_ptr: [*]align(32) u8 = @alignCast(ptr);
+        allocator.free(aligned_ptr[0..t.data_size]);
+    }
+}
+
+fn kvHeadForQueryHead(query_head: usize, kv_group: usize) usize {
+    return query_head / kv_group;
+}
+
+fn uploadTensor(
+    device: *compute.cuda.Device,
+    allocator: std.mem.Allocator,
+    src: *const Tensor,
+) !DeviceTensor {
+    if (src.n_dims < 1 or src.n_dims > 2) return error.UnsupportedModel;
+    if (src.shape[0] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(src.shape[0]);
+    const cols: usize = if (src.n_dims == 1) 1 else blk: {
+        if (src.shape[1] <= 0) return error.InvalidArgument;
+        break :blk @intCast(src.shape[1]);
+    };
+
+    const host_f32 = try materializeTensorF32(allocator, src);
+    defer allocator.free(host_f32);
+    var buffer = try device.allocBuffer(host_f32.len * @sizeOf(f32));
+    errdefer buffer.deinit(device);
+    try buffer.upload(device, std.mem.sliceAsBytes(host_f32));
+
+    return .{
+        .rows = rows,
+        .cols = cols,
+        .buffer = buffer,
+    };
+}
+
+fn uploadLinearWeight(
+    device: *compute.cuda.Device,
+    allocator: std.mem.Allocator,
+    src: *const Tensor,
+    input_dim: usize,
+) !DeviceTensor {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    if (src.shape[0] <= 0 or src.shape[1] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(src.shape[0]);
+    const cols: usize = @intCast(src.shape[1]);
+
+    const host_f32 = try materializeTensorF32(allocator, src);
+    defer allocator.free(host_f32);
+
+    var oriented: []f32 = host_f32;
+    var out_rows = rows;
+    var out_cols = cols;
+    var transposed: ?[]f32 = null;
+    defer if (transposed) |t| allocator.free(t);
+
+    const assume_loader_out_in = src.dtype != .f32;
+    if (assume_loader_out_in and cols == input_dim) {
+        // Typed/quantized loader weights follow [out, in], so transpose to [in, out] for CUDA GEMM.
+        const tmp = try allocator.alloc(f32, host_f32.len);
+        transposed = tmp;
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            var c: usize = 0;
+            while (c < cols) : (c += 1) {
+                tmp[c * rows + r] = host_f32[r * cols + c];
+            }
+        }
+        oriented = tmp;
+        out_rows = cols;
+        out_cols = rows;
+    } else if (rows == input_dim) {
+        // Already [in, out].
+    } else if (cols == input_dim) {
+        // F32 loader weights are already normalized to [in, out] when needed; only transpose when required.
+        const tmp = try allocator.alloc(f32, host_f32.len);
+        transposed = tmp;
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            var c: usize = 0;
+            while (c < cols) : (c += 1) {
+                tmp[c * rows + r] = host_f32[r * cols + c];
+            }
+        }
+        oriented = tmp;
+        out_rows = cols;
+        out_cols = rows;
+    } else {
+        log.warn("inference", "CUDA linear weight orientation unsupported", .{
+            .rows = rows,
+            .cols = cols,
+            .input_dim = input_dim,
+            .dtype = @tagName(src.dtype),
+        });
+        return error.UnsupportedModel;
+    }
+
+    var buffer = try device.allocBuffer(oriented.len * @sizeOf(f32));
+    errdefer buffer.deinit(device);
+    try buffer.upload(device, std.mem.sliceAsBytes(oriented));
+
+    return .{
+        .rows = out_rows,
+        .cols = out_cols,
+        .buffer = buffer,
+    };
+}
+
+fn materializeTensorF32(allocator: std.mem.Allocator, src: *const Tensor) ![]f32 {
+    if (src.data_ptr == null) return error.InvalidArgument;
+    if (src.n_dims < 1 or src.n_dims > 2) return error.UnsupportedModel;
+    if (src.shape[0] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(src.shape[0]);
+    const cols: usize = if (src.n_dims == 1) 1 else blk: {
+        if (src.shape[1] <= 0) return error.InvalidArgument;
+        break :blk @intCast(src.shape[1]);
+    };
+    const logical_count = std.math.mul(usize, rows, cols) catch return error.InvalidArgument;
+
+    const out = try allocator.alloc(f32, logical_count);
+    errdefer allocator.free(out);
+
+    switch (src.dtype) {
+        .f32 => {
+            const values = src.asSlice(f32);
+            if (values.len < logical_count) return error.InvalidArgument;
+            @memcpy(out, values[0..logical_count]);
+        },
+        .f16, .bf16 => {
+            const values = src.asSliceUnaligned(u16);
+            if (values.len < logical_count) return error.InvalidArgument;
+            for (out, 0..) |*dst, i| {
+                dst.* = if (src.dtype == .f16) dtype.fp16ToF32(values[i]) else dtype.bf16ToF32(values[i]);
+            }
+        },
+        .grouped_affine_u4, .grouped_affine_u8 => {
+            const dequantized = try load_transforms.convertToF32(allocator, src.*);
+            defer freeOwnedTensorView(allocator, dequantized);
+            const src_f32 = dequantized.asSlice(f32);
+            if (src_f32.len < logical_count) return error.InvalidArgument;
+            @memcpy(out, src_f32[0..logical_count]);
+        },
+        else => return error.UnsupportedModel,
+    }
+
+    return out;
 }
 
 fn canUseModelEmbeddings(loaded: *const LoadedModel) bool {
@@ -678,9 +2271,37 @@ fn tryPopulateHiddenFromToken(
             // Common layout: [vocab, d_model].
             if (dim1 == hidden_dim) {
                 if (token_idx >= dim0) return error.InvalidArgument;
-                var i: usize = 0;
-                while (i < hidden_dim) : (i += 1) {
-                    out[i] = try gaffineValueAt(embeddings, token_idx, i);
+                const gaffine = embeddings.gaffine orelse return false;
+                const scales: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine.scales.ptr))[0 .. gaffine.scales.len / @sizeOf(u16)];
+                const biases: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine.biases.ptr))[0 .. gaffine.biases.len / @sizeOf(u16)];
+                const rows = dim0;
+                const row_ids = [_]u32{@intCast(token_idx)};
+                if (embeddings.dtype == .grouped_affine_u4) {
+                    const packed_vals = embeddings.asSliceUnaligned(u32);
+                    try compute.cpu.quant_decode.gatherDecodeGroupedAffineU4Rows(
+                        packed_vals,
+                        scales,
+                        biases,
+                        gaffine.scales_dtype,
+                        gaffine.group_size,
+                        rows,
+                        hidden_dim,
+                        &row_ids,
+                        out,
+                    );
+                } else {
+                    const packed_vals = embeddings.asSliceUnaligned(u32);
+                    try compute.cpu.quant_decode.gatherDecodeGroupedAffineU8Rows(
+                        packed_vals,
+                        scales,
+                        biases,
+                        gaffine.scales_dtype,
+                        gaffine.group_size,
+                        rows,
+                        hidden_dim,
+                        &row_ids,
+                        out,
+                    );
                 }
                 return true;
             }
@@ -748,18 +2369,20 @@ fn tryPopulateFinalNormWeight(loaded: *const LoadedModel, out: []f32) bool {
 }
 
 fn tryPopulateProjectionFromLoadedModel(
+    allocator: std.mem.Allocator,
     loaded: *const LoadedModel,
     d_model: usize,
     projected_vocab: usize,
     out: []f32,
 ) bool {
     if (loaded.lm_head) |lm_head| {
-        if (tryPopulateProjectionFromWeight(&lm_head, d_model, projected_vocab, out)) return true;
+        if (tryPopulateProjectionFromWeight(allocator, &lm_head, d_model, projected_vocab, out)) return true;
     }
-    return tryPopulateProjectionFromWeight(&loaded.token_embeddings, d_model, projected_vocab, out);
+    return tryPopulateProjectionFromWeight(allocator, &loaded.token_embeddings, d_model, projected_vocab, out);
 }
 
 fn tryPopulateProjectionFromWeight(
+    allocator: std.mem.Allocator,
     weight: *const Tensor,
     d_model: usize,
     projected_vocab: usize,
@@ -836,30 +2459,29 @@ fn tryPopulateProjectionFromWeight(
             return false;
         },
         .grouped_affine_u4, .grouped_affine_u8 => {
-            // Direct layout: [d_model, vocab]
+            const dequantized = load_transforms.convertToF32(allocator, weight.*) catch return false;
+            defer freeOwnedTensorView(allocator, dequantized);
+            const src = dequantized.asSlice(f32);
+
             if (dim0 == d_model and dim1 >= projected_vocab) {
                 var row: usize = 0;
                 while (row < d_model) : (row += 1) {
-                    var col: usize = 0;
-                    while (col < projected_vocab) : (col += 1) {
-                        out[row * projected_vocab + col] = gaffineValueAt(weight, row, col) catch return false;
-                    }
+                    const src_start = row * dim1;
+                    const dst_start = row * projected_vocab;
+                    @memcpy(out[dst_start .. dst_start + projected_vocab], src[src_start .. src_start + projected_vocab]);
                 }
                 return true;
             }
-
-            // Transposed layout: [vocab, d_model]
             if (dim1 == d_model and dim0 >= projected_vocab) {
                 var row: usize = 0;
                 while (row < d_model) : (row += 1) {
                     var col: usize = 0;
                     while (col < projected_vocab) : (col += 1) {
-                        out[row * projected_vocab + col] = gaffineValueAt(weight, col, row) catch return false;
+                        out[row * projected_vocab + col] = src[col * dim1 + row];
                     }
                 }
                 return true;
             }
-
             return false;
         },
         else => return false,
@@ -925,7 +2547,7 @@ test "tryPopulateProjectionFromWeight supports [d_model, vocab] layout" {
     const weight = Tensor.view(weight_bytes.ptr, &.{ d_model, 4 }, .f32, weight_bytes.len);
     var out = [_]f32{0.0} ** (d_model * projected_vocab);
 
-    try std.testing.expect(tryPopulateProjectionFromWeight(&weight, d_model, projected_vocab, out[0..]));
+    try std.testing.expect(tryPopulateProjectionFromWeight(std.testing.allocator, &weight, d_model, projected_vocab, out[0..]));
     const expected = [_]f32{ 1.0, 2.0, 5.0, 6.0, 9.0, 10.0 };
     for (expected, out) |want, got| {
         try std.testing.expectApproxEqAbs(want, got, 0.0);
@@ -945,7 +2567,7 @@ test "tryPopulateProjectionFromWeight supports [vocab, d_model] layout" {
     const weight = Tensor.view(weight_bytes.ptr, &.{ 4, d_model }, .f32, weight_bytes.len);
     var out = [_]f32{0.0} ** (d_model * projected_vocab);
 
-    try std.testing.expect(tryPopulateProjectionFromWeight(&weight, d_model, projected_vocab, out[0..]));
+    try std.testing.expect(tryPopulateProjectionFromWeight(std.testing.allocator, &weight, d_model, projected_vocab, out[0..]));
     const expected = [_]f32{ 1.0, 4.0, 2.0, 5.0, 3.0, 6.0 };
     for (expected, out) |want, got| {
         try std.testing.expectApproxEqAbs(want, got, 0.0);
@@ -1054,15 +2676,6 @@ test "tryPopulateFinalNormWeight supports bf16 weights" {
     try std.testing.expectApproxEqAbs(@as(f32, -0.5), out[1], 0.01);
 }
 
-test "allocSlot allows only a single slot in stub backend" {
-    var backend: CudaBackend = undefined;
-    backend.slot_in_use = false;
-    backend.slot_position = 999;
-    try std.testing.expectEqual(@as(?usize, 0), backend.allocSlot());
-    try std.testing.expectEqual(@as(usize, 0), backend.slot_position);
-    try std.testing.expectEqual(@as(?usize, null), backend.allocSlot());
-}
-
 test "fillPrototypeInput is deterministic for token id" {
     var a: [8]f32 = undefined;
     var b: [8]f32 = undefined;
@@ -1086,4 +2699,19 @@ test "fillPrototypeProjection writes non-zero coefficients" {
         }
     }
     try std.testing.expect(has_non_zero);
+}
+
+test "suppressPrototypeLowTokenBand masks first band when projected vocab is large" {
+    var logits = [_]f32{1.0} ** (prototype_low_token_band + 32);
+    suppressPrototypeLowTokenBand(logits[0..], logits.len);
+
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0e9), logits[0], 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, -1.0e9), logits[prototype_low_token_band - 1], 0.0);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[prototype_low_token_band], 0.0);
+}
+
+test "suppressPrototypeLowTokenBand keeps logits when projected vocab is small" {
+    var logits = [_]f32{2.0} ** 128;
+    suppressPrototypeLowTokenBand(logits[0..], 128);
+    for (logits) |v| try std.testing.expectApproxEqAbs(@as(f32, 2.0), v, 0.0);
 }

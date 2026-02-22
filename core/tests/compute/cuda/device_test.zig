@@ -22,3 +22,16 @@ test "Device.init and Device.deinit succeed when probeRuntime is available" {
 
     try std.testing.expect(device.name().len > 0);
 }
+
+test "Device.computeCapability returns non-zero major when available" {
+    if (cuda.probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try cuda.Device.init();
+    defer device.deinit();
+
+    const capability = device.computeCapability() catch |err| {
+        try std.testing.expect(err == error.CudaQueryUnavailable);
+        return;
+    };
+    try std.testing.expect(capability.major > 0);
+}

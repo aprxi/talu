@@ -1,0 +1,88 @@
+//! Device-to-device copy kernel wrapper for modular CUDA runtime.
+
+const std = @import("std");
+const device_mod = @import("device.zig");
+const args_mod = @import("args.zig");
+const launch_mod = @import("launch.zig");
+const module_mod = @import("module.zig");
+const registry_mod = @import("registry.zig");
+
+pub const embedded_ptx = @embedFile("kernels/fallback_kernels.ptx");
+pub const embedded_symbol: [:0]const u8 = "talu_copy_f32_v1";
+
+pub fn run(
+    allocator: std.mem.Allocator,
+    device: *device_mod.Device,
+    registry: *registry_mod.Registry,
+    src: *const device_mod.Buffer,
+    dst: *device_mod.Buffer,
+    count: u32,
+) !registry_mod.KernelSource {
+    if (count == 0) return error.InvalidArgument;
+
+    const required_bytes = @as(usize, count) * @sizeOf(f32);
+    if (src.size < required_bytes or dst.size < required_bytes) {
+        return error.InvalidArgument;
+    }
+
+    if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_ptx);
+    const resolved = try registry.resolveFunction("copy_f32", embedded_symbol);
+    var arg_pack = args_mod.ArgPack.init(allocator);
+    defer arg_pack.deinit();
+    try runWithFunction(&arg_pack, device, resolved.function, src, dst, count);
+    return resolved.source;
+}
+
+pub fn runWithFunction(
+    arg_pack: *args_mod.ArgPack,
+    device: *device_mod.Device,
+    function: module_mod.Function,
+    src: *const device_mod.Buffer,
+    dst: *device_mod.Buffer,
+    count: u32,
+) !void {
+    if (count == 0) return error.InvalidArgument;
+
+    const required_bytes = @as(usize, count) * @sizeOf(f32);
+    if (src.size < required_bytes or dst.size < required_bytes) {
+        return error.InvalidArgument;
+    }
+
+    arg_pack.reset();
+    try arg_pack.appendBufferPtr(dst);
+    try arg_pack.appendBufferPtr(src);
+    try arg_pack.appendScalar(u32, count);
+
+    const block_x: u32 = 256;
+    const grid_x: u32 = ceilDiv(count, block_x);
+    try launch_mod.launch(device, function, .{
+        .grid_x = grid_x,
+        .block_x = block_x,
+    }, arg_pack);
+}
+
+fn ceilDiv(numerator: u32, denominator: u32) u32 {
+    return (numerator + denominator - 1) / denominator;
+}
+
+test "run rejects zero count" {
+    var fake_device: device_mod.Device = undefined;
+    var registry = registry_mod.Registry.init(std.testing.allocator, &fake_device);
+    defer {
+        registry.embedded_module = null;
+        registry.sideload_module = null;
+        registry.sideload_manifest = null;
+    }
+
+    const fake_buffer = device_mod.Buffer{ .pointer = 0, .size = 4 };
+    var dst = fake_buffer;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        run(std.testing.allocator, &fake_device, &registry, &fake_buffer, &dst, 0),
+    );
+}
+
+test "ceilDiv computes expected block count" {
+    try std.testing.expectEqual(@as(u32, 1), ceilDiv(1, 256));
+    try std.testing.expectEqual(@as(u32, 2), ceilDiv(257, 256));
+}

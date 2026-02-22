@@ -4,6 +4,7 @@ const std = @import("std");
 const transport = @import("../../io/transport/root.zig");
 
 pub const cache_dir_env = "TALU_CUDA_CACHE_DIR";
+pub const kernel_base_url_env = "TALU_CUDA_KERNEL_BASE_URL";
 
 pub fn resolveCacheDir(allocator: std.mem.Allocator) ![]u8 {
     const override = std.process.getEnvVarOwned(allocator, cache_dir_env) catch null;
@@ -25,10 +26,26 @@ pub fn artifactFileName(allocator: std.mem.Allocator, arch: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "kernels_{s}.cubin", .{arch});
 }
 
+pub fn manifestFileName(allocator: std.mem.Allocator, arch: []const u8) ![]u8 {
+    if (arch.len == 0) return error.InvalidArgument;
+    return std.fmt.allocPrint(allocator, "manifest_{s}.json", .{arch});
+}
+
 pub fn artifactPath(allocator: std.mem.Allocator, cache_dir: []const u8, arch: []const u8) ![]u8 {
     const file_name = try artifactFileName(allocator, arch);
     defer allocator.free(file_name);
     return std.fs.path.join(allocator, &.{ cache_dir, file_name });
+}
+
+pub fn manifestPath(allocator: std.mem.Allocator, cache_dir: []const u8, arch: []const u8) ![]u8 {
+    const file_name = try manifestFileName(allocator, arch);
+    defer allocator.free(file_name);
+    return std.fs.path.join(allocator, &.{ cache_dir, file_name });
+}
+
+pub fn archTag(allocator: std.mem.Allocator, major: u32, minor: u32) ![]u8 {
+    if (major == 0) return error.InvalidArgument;
+    return std.fmt.allocPrint(allocator, "sm_{d}{d}", .{ major, minor });
 }
 
 pub fn ensureCacheDir(cache_dir: []const u8) !void {
@@ -101,6 +118,35 @@ pub fn loadOrFetchArtifact(
     return downloaded;
 }
 
+pub fn loadOrFetchManifest(
+    allocator: std.mem.Allocator,
+    cache_dir: []const u8,
+    arch: []const u8,
+    base_url: []const u8,
+) ![]u8 {
+    const path = try manifestPath(allocator, cache_dir, arch);
+    defer allocator.free(path);
+
+    const cached = readCachedArtifact(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    if (cached) |bytes| return bytes;
+
+    const file_name = try manifestFileName(allocator, arch);
+    defer allocator.free(file_name);
+    const url = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ base_url, file_name });
+    defer allocator.free(url);
+
+    transport.http.globalInit();
+    defer transport.http.globalCleanup();
+
+    const downloaded = try transport.http.fetch(allocator, url, .{});
+    errdefer allocator.free(downloaded);
+    try writeCachedArtifact(path, downloaded);
+    return downloaded;
+}
+
 fn sha256(bytes: []const u8) [32]u8 {
     var digest: [32]u8 = undefined;
     std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
@@ -124,6 +170,19 @@ test "artifactPath includes architecture suffix" {
     defer std.testing.allocator.free(path);
 
     try std.testing.expect(std.mem.endsWith(u8, path, "kernels_sm_89.cubin"));
+}
+
+test "manifestPath includes architecture suffix" {
+    const path = try manifestPath(std.testing.allocator, "/tmp/talu-cuda", "sm_89");
+    defer std.testing.allocator.free(path);
+
+    try std.testing.expect(std.mem.endsWith(u8, path, "manifest_sm_89.json"));
+}
+
+test "archTag formats major and minor" {
+    const tag = try archTag(std.testing.allocator, 8, 9);
+    defer std.testing.allocator.free(tag);
+    try std.testing.expectEqualStrings("sm_89", tag);
 }
 
 test "verifySha256 accepts matching digest" {

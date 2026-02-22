@@ -331,7 +331,17 @@ pub const Backend = union(enum) {
                     callback_data,
                 );
             } else unreachable,
-            .cuda => return error.CudaNotImplemented,
+            .cuda => |*b| if (has_cuda) {
+                return b.decodeStreaming(
+                    first_token,
+                    start_position,
+                    max_tokens,
+                    eos_token_ids,
+                    output_tokens,
+                    callback,
+                    callback_data,
+                );
+            } else unreachable,
         }
     }
 

@@ -435,6 +435,9 @@ pub fn main() !void {
             // Parse enums
             try parseEnums(allocator, source, full_path, &enums);
 
+            // Resolve re-exports (pub const X = imported.X;) by reading imported files
+            try resolveReExports(allocator, source, full_path, project_root, &structs, &enums);
+
             // Parse exported functions
             try parseExportedFunctions(allocator, source, full_path, &functions);
         }
@@ -1033,6 +1036,84 @@ pub fn main() !void {
 // =============================================================================
 // Parsing Functions
 // =============================================================================
+
+/// Resolve re-exports: when a capi file has `pub const X = imported.X;`,
+/// find and parse the type from the imported source file.
+fn resolveReExports(
+    allocator: std.mem.Allocator,
+    source: []const u8,
+    source_file: []const u8,
+    project_root: []const u8,
+    structs: *std.StringHashMap(StructInfo),
+    enums: *std.StringHashMap(EnumInfo),
+) !void {
+    // Build import map: alias name → relative import path
+    var import_map = std.StringHashMap([]const u8).init(allocator);
+    defer import_map.deinit();
+
+    var lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+
+        // Match: const alias = @import("path");
+        if (!std.mem.startsWith(u8, trimmed, "const ")) continue;
+        const import_marker = " = @import(\"";
+        const import_pos = std.mem.indexOf(u8, trimmed, import_marker) orelse continue;
+        const alias = trimmed["const ".len..import_pos];
+        const path_start = import_pos + import_marker.len;
+        const path_end = std.mem.indexOf(u8, trimmed[path_start..], "\")") orelse continue;
+        const rel_path = trimmed[path_start .. path_start + path_end];
+
+        try import_map.put(alias, rel_path);
+    }
+
+    if (import_map.count() == 0) return;
+
+    // Look for pub const Name = alias.Name; patterns
+    lines = std.mem.splitScalar(u8, source, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (!std.mem.startsWith(u8, trimmed, "pub const ")) continue;
+
+        const name_start = "pub const ".len;
+        const eq_pos = std.mem.indexOf(u8, trimmed[name_start..], " = ") orelse continue;
+        const type_name = trimmed[name_start .. name_start + eq_pos];
+
+        // Already discovered this type? Skip.
+        if (structs.contains(type_name)) continue;
+        if (enums.contains(type_name)) continue;
+
+        const rhs_start = name_start + eq_pos + " = ".len;
+        const rhs = trimmed[rhs_start..];
+        if (!std.mem.endsWith(u8, rhs, ";")) continue;
+        const rhs_body = rhs[0 .. rhs.len - 1];
+
+        // Must be alias.TypeName pattern
+        const dot_pos = std.mem.indexOf(u8, rhs_body, ".") orelse continue;
+        const alias = rhs_body[0..dot_pos];
+
+        const rel_import_path = import_map.get(alias) orelse continue;
+
+        // Resolve path relative to the current source file's directory
+        const dir_end = std.mem.lastIndexOfScalar(u8, source_file, '/') orelse continue;
+        const source_dir = source_file[0..dir_end];
+
+        const abs_path = try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{
+            project_root, source_dir, rel_import_path,
+        });
+        defer allocator.free(abs_path);
+
+        const file = std.fs.cwd().openFile(abs_path, .{}) catch continue;
+        defer file.close();
+
+        const imported_source = file.readToEndAlloc(allocator, 10 * 1024 * 1024) catch continue;
+        defer allocator.free(imported_source);
+
+        // Parse types from the imported file, attributed to the capi source
+        try parseExternStructs(allocator, imported_source, source_file, structs);
+        try parseEnums(allocator, imported_source, source_file, enums);
+    }
+}
 
 fn parseExternStructs(
     allocator: std.mem.Allocator,

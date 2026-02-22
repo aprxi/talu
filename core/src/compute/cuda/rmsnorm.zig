@@ -20,6 +20,7 @@ pub fn run(
     rows: u32,
     cols: u32,
     eps: f32,
+    weight_offset: f32,
 ) !registry_mod.KernelSource {
     if (rows == 0 or cols == 0) return error.InvalidArgument;
     if (!std.math.isFinite(eps) or eps <= 0.0) return error.InvalidArgument;
@@ -34,7 +35,7 @@ pub fn run(
     const resolved = try registry.resolveFunction("rmsnorm_f32", embedded_symbol);
     var arg_pack = args_mod.ArgPack.init(allocator);
     defer arg_pack.deinit();
-    try runWithFunction(&arg_pack, device, resolved.function, input, weight, output, rows, cols, eps);
+    try runWithFunction(&arg_pack, device, resolved.function, input, weight, output, rows, cols, eps, weight_offset);
     return resolved.source;
 }
 
@@ -48,6 +49,7 @@ pub fn runWithFunction(
     rows: u32,
     cols: u32,
     eps: f32,
+    weight_offset: f32,
 ) !void {
     if (rows == 0 or cols == 0) return error.InvalidArgument;
     if (!std.math.isFinite(eps) or eps <= 0.0) return error.InvalidArgument;
@@ -65,6 +67,7 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, rows);
     try arg_pack.appendScalar(u32, cols);
     try arg_pack.appendScalar(f32, eps);
+    try arg_pack.appendScalar(f32, weight_offset);
 
     try launch_mod.launch(device, function, .{
         .grid_x = rows,
@@ -96,6 +99,7 @@ test "run validates rows and cols" {
             0,
             128,
             1e-5,
+            0.0,
         ),
     );
 }
@@ -122,6 +126,7 @@ test "run validates eps" {
             &output,
             1,
             128,
+            0.0,
             0.0,
         ),
     );
