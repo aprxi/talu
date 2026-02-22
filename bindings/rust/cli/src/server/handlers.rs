@@ -527,18 +527,25 @@ async fn generate_response(
             .map_err(|e| anyhow!("failed to create storage directory: {}", e))?;
     }
 
-    // Apply bucket settings fallback for max_output_tokens if request doesn't specify it.
+    // Load bucket settings for fallback values (max_output_tokens + per-model overrides).
     // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
+    let fallback_settings = state.bucket_path.as_ref().map(|base| match auth_ctx {
+        Some(ctx) => base.join(&ctx.storage_prefix),
+        None => base.to_path_buf(),
+    }).and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
+
     let max_output_tokens = request_max_output_tokens.or_else(|| {
-        let settings_bucket = state.bucket_path.as_ref().map(|base| match auth_ctx {
-            Some(ctx) => base.join(&ctx.storage_prefix),
-            None => base.to_path_buf(),
-        });
-        settings_bucket.and_then(|bp| {
-            bucket_settings::load_bucket_settings(&bp)
-                .ok()
-                .and_then(|s| s.max_output_tokens.map(|v| v as i64))
-        })
+        fallback_settings.as_ref().and_then(|s| s.max_output_tokens.map(|v| v as i64))
+    });
+
+    // Apply per-model sampling overrides as fallbacks when the request doesn't specify them.
+    let model_overrides = fallback_settings.as_ref()
+        .and_then(|s| s.models.get(&model_id).cloned());
+    let temperature = temperature.or_else(|| {
+        model_overrides.as_ref().and_then(|o| o.temperature)
+    });
+    let top_p = top_p.or_else(|| {
+        model_overrides.as_ref().and_then(|o| o.top_p)
     });
 
     // If prompt_id is provided, fetch the document and extract system prompt.
@@ -894,21 +901,25 @@ async fn stream_response(
         }
     }
 
-    // Apply bucket settings fallback for max_output_tokens if request doesn't specify it.
+    // Load bucket settings for fallback values (max_output_tokens + per-model overrides).
     // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
+    let fallback_settings = state.bucket_path.as_ref().map(|base| match auth_ctx.as_ref() {
+        Some(ctx) => base.join(&ctx.storage_prefix),
+        None => base.to_path_buf(),
+    }).and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
+
     let max_output_tokens = request_max_output_tokens.or_else(|| {
-        let settings_bucket = state
-            .bucket_path
-            .as_ref()
-            .map(|base| match auth_ctx.as_ref() {
-                Some(ctx) => base.join(&ctx.storage_prefix),
-                None => base.to_path_buf(),
-            });
-        settings_bucket.and_then(|bp| {
-            bucket_settings::load_bucket_settings(&bp)
-                .ok()
-                .and_then(|s| s.max_output_tokens.map(|v| v as i64))
-        })
+        fallback_settings.as_ref().and_then(|s| s.max_output_tokens.map(|v| v as i64))
+    });
+
+    // Apply per-model sampling overrides as fallbacks when the request doesn't specify them.
+    let model_overrides = fallback_settings.as_ref()
+        .and_then(|s| s.models.get(&model_id).cloned());
+    let temperature = temperature.or_else(|| {
+        model_overrides.as_ref().and_then(|o| o.temperature)
+    });
+    let top_p = top_p.or_else(|| {
+        model_overrides.as_ref().and_then(|o| o.top_p)
     });
 
     // If prompt_id is provided, fetch the document and extract system prompt.

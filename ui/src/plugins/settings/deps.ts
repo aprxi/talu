@@ -4,18 +4,21 @@
  */
 
 import type { ApiClient } from "../../api.ts";
-import type { EventBus, ManagedTimers } from "../../kernel/types.ts";
+import type { EventBus, ManagedTimers, ModeAccess } from "../../kernel/types.ts";
 
 export let api: ApiClient;
 export let events: EventBus;
 export let timers: ManagedTimers;
+export let mode: ModeAccess;
 
 export function initSettingsDeps(deps: {
   api: ApiClient;
   events: EventBus;
   timers: ManagedTimers;
+  mode: ModeAccess;
 }): void {
   api = deps.api;
   events = deps.events;
   timers = deps.timers;
+  mode = deps.mode;
 }

@@ -45,6 +45,18 @@ fn get_defaults_with_empty_bucket() {
         json["context_length"].is_null(),
         "context_length should be null by default"
     );
+    assert_eq!(
+        json["auto_title"], true,
+        "auto_title should default to true"
+    );
+    assert!(
+        json["default_prompt_id"].is_null(),
+        "default_prompt_id should be null by default"
+    );
+    assert_eq!(
+        json["system_prompt_enabled"], true,
+        "system_prompt_enabled should default to true"
+    );
     assert!(
         json["available_models"].is_array(),
         "available_models should be an array"
@@ -132,6 +144,194 @@ fn patch_sets_context_length() {
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.json()["context_length"], 8192);
+}
+
+/// PATCH sets default_prompt_id.
+#[test]
+fn patch_sets_default_prompt_id() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"default_prompt_id": "prompt-abc-123"}),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.json()["default_prompt_id"], "prompt-abc-123");
+}
+
+/// PATCH sets system_prompt_enabled to false.
+#[test]
+fn patch_sets_system_prompt_enabled() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"system_prompt_enabled": false}),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.json()["system_prompt_enabled"], false);
+
+    // Verify it persists via GET.
+    let resp = get(ctx.addr(), "/v1/settings");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["system_prompt_enabled"], false);
+}
+
+/// PATCH sets auto_title to false.
+#[test]
+fn patch_sets_auto_title() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"auto_title": false}),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(resp.json()["auto_title"], false);
+
+    // Verify it persists via GET.
+    let resp = get(ctx.addr(), "/v1/settings");
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["auto_title"], false);
+}
+
+/// PATCH with null clears default_prompt_id.
+#[test]
+fn patch_null_clears_default_prompt_id() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    // Set it first.
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"default_prompt_id": "prompt-xyz"}),
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["default_prompt_id"], "prompt-xyz");
+
+    // Clear it via null.
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"default_prompt_id": null}),
+    );
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.json()["default_prompt_id"].is_null(),
+        "default_prompt_id should be null in PATCH response"
+    );
+
+    // Verify null persists via GET (round-trip through disk).
+    let resp = get(ctx.addr(), "/v1/settings");
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.json()["default_prompt_id"].is_null(),
+        "default_prompt_id should be null after disk round-trip"
+    );
+}
+
+/// Sequential PATCHes preserve default_prompt_id across unrelated updates.
+#[test]
+fn patch_preserves_default_prompt_id() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    // Set default_prompt_id.
+    patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"default_prompt_id": "prompt-keep"}),
+    );
+
+    // Patch an unrelated field.
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"model": "other-model"}),
+    );
+    assert_eq!(resp.status, 200);
+
+    // Verify default_prompt_id survived.
+    let resp = get(ctx.addr(), "/v1/settings");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.json()["default_prompt_id"], "prompt-keep",
+        "default_prompt_id should be preserved across unrelated patches"
+    );
+}
+
+/// auto_title=false survives serialization round-trip through disk.
+///
+/// Since auto_title defaults to true (via serde default), a serialization
+/// bug that omits false values would silently reset it on the next load.
+#[test]
+fn patch_preserves_auto_title_false() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    // Set auto_title to false.
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"auto_title": false}),
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["auto_title"], false);
+
+    // Patch an unrelated field (forces a load → save → load round-trip).
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"model": "some-model"}),
+    );
+    assert_eq!(resp.status, 200);
+
+    // Verify auto_title survived as false.
+    let resp = get(ctx.addr(), "/v1/settings");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.json()["auto_title"], false,
+        "auto_title=false must survive an unrelated PATCH round-trip"
+    );
+}
+
+/// system_prompt_enabled=false survives serialization round-trip through disk.
+#[test]
+fn patch_preserves_system_prompt_enabled_false() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    // Set system_prompt_enabled to false.
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"system_prompt_enabled": false}),
+    );
+    assert_eq!(resp.status, 200);
+    assert_eq!(resp.json()["system_prompt_enabled"], false);
+
+    // Patch an unrelated field.
+    let resp = patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({"model": "some-model"}),
+    );
+    assert_eq!(resp.status, 200);
+
+    // Verify system_prompt_enabled survived as false.
+    let resp = get(ctx.addr(), "/v1/settings");
+    assert_eq!(resp.status, 200);
+    assert_eq!(
+        resp.json()["system_prompt_enabled"], false,
+        "system_prompt_enabled=false must survive an unrelated PATCH round-trip"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -400,6 +600,54 @@ fn delete_model_overrides() {
     assert_eq!(json["model"], "test-model");
 }
 
+/// DELETE response includes all settings fields (same shape as GET).
+#[test]
+fn delete_response_has_all_fields() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(settings_config(temp.path()));
+
+    // Set some state first so the response is non-trivial.
+    patch_json(
+        ctx.addr(),
+        "/v1/settings",
+        &json!({
+            "model": "test-model",
+            "default_prompt_id": "prompt-123",
+            "auto_title": false,
+            "system_prompt_enabled": false,
+        }),
+    );
+
+    let resp = delete(ctx.addr(), "/v1/settings/models/test-model");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let obj = json.as_object().expect("response should be an object");
+    assert!(obj.contains_key("model"), "DELETE response missing 'model'");
+    assert!(
+        obj.contains_key("auto_title"),
+        "DELETE response missing 'auto_title'"
+    );
+    assert!(
+        obj.contains_key("default_prompt_id"),
+        "DELETE response missing 'default_prompt_id'"
+    );
+    assert!(
+        obj.contains_key("system_prompt_enabled"),
+        "DELETE response missing 'system_prompt_enabled'"
+    );
+    assert!(
+        obj.contains_key("available_models"),
+        "DELETE response missing 'available_models'"
+    );
+
+    // Verify values survived the DELETE (which only removes model overrides).
+    assert_eq!(json["model"], "test-model");
+    assert_eq!(json["default_prompt_id"], "prompt-123");
+    assert_eq!(json["auto_title"], false);
+    assert_eq!(json["system_prompt_enabled"], false);
+}
+
 /// DELETE for a nonexistent model is a no-op (returns 200).
 #[test]
 fn delete_nonexistent_model_noop() {
@@ -452,6 +700,18 @@ fn response_has_correct_fields() {
     assert!(
         obj.contains_key("context_length"),
         "missing 'context_length' field"
+    );
+    assert!(
+        obj.contains_key("auto_title"),
+        "missing 'auto_title' field"
+    );
+    assert!(
+        obj.contains_key("default_prompt_id"),
+        "missing 'default_prompt_id' field"
+    );
+    assert!(
+        obj.contains_key("system_prompt_enabled"),
+        "missing 'system_prompt_enabled' field"
     );
     assert!(
         obj.contains_key("available_models"),

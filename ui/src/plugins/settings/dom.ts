@@ -5,7 +5,9 @@
 
 export interface SettingsDom {
   model: HTMLSelectElement;
-  systemPrompt: HTMLTextAreaElement;
+  systemPromptEnabled: HTMLInputElement;
+  systemPromptName: HTMLElement;
+  openPrompts: HTMLButtonElement;
   maxOutputTokens: HTMLInputElement;
   contextLength: HTMLInputElement;
   autoTitle: HTMLInputElement;
@@ -36,7 +38,9 @@ export function getSettingsDom(): SettingsDom {
 
   cached = {
     model: q<HTMLSelectElement>("sp-model"),
-    systemPrompt: q<HTMLTextAreaElement>("sp-system-prompt"),
+    systemPromptEnabled: q<HTMLInputElement>("sp-system-prompt-enabled"),
+    systemPromptName: q("sp-system-prompt-name"),
+    openPrompts: q<HTMLButtonElement>("sp-open-prompts"),
     maxOutputTokens: q<HTMLInputElement>("sp-max-output-tokens"),
     contextLength: q<HTMLInputElement>("sp-context-length"),
     autoTitle: q<HTMLInputElement>("sp-auto-title"),

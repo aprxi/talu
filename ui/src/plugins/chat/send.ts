@@ -266,7 +266,11 @@ async function handleWelcomeSend(): Promise<void> {
   if (chatState.isGenerating || isAttachmentUploadInProgress()) return;
   if (!text.trim() && !hasAttachments()) return;
 
-  const promptId = getPromptsService()?.getSelectedPromptId() ?? null;
+  // Explicit selection from dropdown; if "None", auto-apply default when enabled.
+  let promptId = dom.welcomePrompt.value || null;
+  if (!promptId && chatState.systemPromptEnabled) {
+    promptId = getPromptsService()?.getDefaultPromptId() ?? null;
+  }
   const input = composeUserInput(text);
   const displayText = typeof input === "string" ? input : text.trim() || "Describe the attached file.";
 

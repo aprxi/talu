@@ -4,13 +4,13 @@
 
 import type { Settings, SettingsPatch, ApiResult } from "../../types.ts";
 import { populateModelSelect } from "../../render/helpers.ts";
-import { api, timers } from "./deps.ts";
+import { api, events, timers } from "./deps.ts";
 import { settingsState, notifyChange, emitModelChanged } from "./state.ts";
 import { getSettingsDom } from "./dom.ts";
 
 export function populateForm(s: Settings): void {
   const dom = getSettingsDom();
-  dom.systemPrompt.value = s.system_prompt ?? "";
+  dom.systemPromptEnabled.checked = s.system_prompt_enabled;
   dom.maxOutputTokens.value = s.max_output_tokens != null ? String(s.max_output_tokens) : "";
   dom.contextLength.value = s.context_length != null ? String(s.context_length) : "";
   dom.autoTitle.checked = s.auto_title;
@@ -19,6 +19,21 @@ export function populateForm(s: Settings): void {
 export function populateLocalModelSelect(): void {
   const dom = getSettingsDom();
   populateModelSelect(dom.model, settingsState.availableModels, settingsState.activeModel);
+}
+
+/** Update the system prompt name display from the current default prompt. */
+export function updateSystemPromptDisplay(
+  prompts: { id: string; name: string }[],
+  defaultId: string | null,
+  isBuiltinDefault: boolean,
+): void {
+  const dom = getSettingsDom();
+  if (isBuiltinDefault) {
+    dom.systemPromptName.textContent = "Default";
+    return;
+  }
+  const prompt = defaultId ? prompts.find((p) => p.id === defaultId) : null;
+  dom.systemPromptName.textContent = prompt ? prompt.name : "Default";
 }
 
 export function showModelParams(modelId: string): void {
@@ -68,7 +83,7 @@ export async function saveTopLevelSettings(): Promise<void> {
   const ctxLen = dom.contextLength.value.trim();
 
   const patch: SettingsPatch = {
-    system_prompt: dom.systemPrompt.value.trim() || null,
+    system_prompt_enabled: dom.systemPromptEnabled.checked,
     max_output_tokens: maxTok ? parseInt(maxTok, 10) : null,
     context_length: ctxLen ? parseInt(ctxLen, 10) : null,
     auto_title: dom.autoTitle.checked,
@@ -76,6 +91,15 @@ export async function saveTopLevelSettings(): Promise<void> {
 
   const result = await api.patchSettings(patch);
   showSaveResult(result);
+
+  // Sync system prompt enabled state and notify other plugins.
+  const newEnabled = dom.systemPromptEnabled.checked;
+  if (newEnabled !== settingsState.systemPromptEnabled) {
+    settingsState.systemPromptEnabled = newEnabled;
+    events.emit("settings.system_prompt_enabled", {
+      enabled: newEnabled,
+    });
+  }
 }
 
 export async function saveModelOverrides(): Promise<void> {

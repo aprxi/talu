@@ -234,6 +234,8 @@ export interface Settings {
   max_output_tokens: number | null;
   context_length: number | null;
   auto_title: boolean;
+  default_prompt_id: string | null;
+  system_prompt_enabled: boolean;
   available_models: ModelEntry[];
 }
 
@@ -241,9 +243,11 @@ export interface Settings {
 export interface SettingsPatch {
   model?: string | null;
   system_prompt?: string | null;
+  default_prompt_id?: string | null;
   max_output_tokens?: number | null;
   context_length?: number | null;
   auto_title?: boolean;
+  system_prompt_enabled?: boolean;
   model_overrides?: ModelOverrides;
 }
 
@@ -516,6 +520,7 @@ export interface ModelsService {
 /** Service contract for the prompts plugin ("talu.prompts"). */
 export interface PromptsService {
   getSelectedPromptId(): string | null;
+  getDefaultPromptId(): string | null;
   getPromptNameById(id: string): string | null;
   getAll(): { id: string; name: string }[];
 }

@@ -317,7 +317,7 @@ cuda: deps sync-version gen-bindings ui
 		echo "Error: nvcc not found. Install CUDA toolkit or add nvcc to PATH." >&2; \
 		exit 1; \
 	fi
-	PATH="$(CUDA_BIN_DIR):$$PATH" zig build gen-ptx $(CUDA_BUILD_FLAGS)
+	PATH="$(CUDA_BIN_DIR):$$PATH" zig build gen-cuda-kernels $(CUDA_BUILD_FLAGS)
 	PATH="$(CUDA_BIN_DIR):$$PATH" zig build release $(CUDA_BUILD_FLAGS)
 
 # Generate Python ctypes bindings from Zig C API

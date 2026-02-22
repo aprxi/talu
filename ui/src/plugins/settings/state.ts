@@ -9,12 +9,14 @@ export interface SettingsState {
   activeModel: string;
   availableModels: ModelEntry[];
   changeHandlers: Set<() => void>;
+  systemPromptEnabled: boolean;
 }
 
 export const settingsState: SettingsState = {
   activeModel: "",
   availableModels: [],
   changeHandlers: new Set(),
+  systemPromptEnabled: true,
 };
 
 /** Notify internal change listeners (e.g. chat plugin's model service subscription). */

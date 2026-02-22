@@ -152,6 +152,10 @@ export const chatPlugin: PluginDefinition = {
       populatePromptSelect(getChatDom().welcomePrompt, prompts, defaultId);
     });
 
+    ctx.events.on<{ enabled: boolean }>("settings.system_prompt_enabled", ({ enabled }) => {
+      chatState.systemPromptEnabled = enabled;
+    });
+
     // Pull initial state from services (events fired before our listeners existed).
     const models = getModelsService();
     if (models) {

@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import {
   populateForm,
+  updateSystemPromptDisplay,
   showModelParams,
   saveTopLevelSettings,
   saveModelOverrides,
@@ -42,8 +43,9 @@ beforeEach(() => {
   settingsState.activeModel = "";
   settingsState.availableModels = [];
   settingsState.changeHandlers.clear();
+  settingsState.systemPromptEnabled = true;
 
-  // DOM with typed elements (select, textarea, input, button).
+  // DOM with typed elements (select, input, button).
   initSettingsDom(createDomRoot(SETTINGS_DOM_IDS, undefined, SETTINGS_DOM_TAGS));
 
   // Deps with controllable timer (does NOT auto-fire).
@@ -71,6 +73,11 @@ beforeEach(() => {
       setInterval() { return { dispose() {} }; },
       requestAnimationFrame(fn: () => void) { fn(); return { dispose() {} }; },
     } as any,
+    mode: {
+      switch: () => {},
+      getActive: () => "settings",
+      onChange: () => ({ dispose() {} }),
+    } as any,
   });
 });
 
@@ -87,9 +94,11 @@ function makeModelEntry(id: string, defaults: any = {}, overrides: any = {}) {
 // ── populateForm ──────────────────────────────────────────────────────────────
 
 describe("populateForm", () => {
-  test("sets system prompt value", () => {
-    populateForm({ system_prompt: "Be helpful", auto_title: true } as any);
-    expect(getSettingsDom().systemPrompt.value).toBe("Be helpful");
+  test("sets system prompt enabled checkbox", () => {
+    populateForm({ system_prompt_enabled: true, auto_title: true } as any);
+    expect(getSettingsDom().systemPromptEnabled.checked).toBe(true);
+    populateForm({ system_prompt_enabled: false, auto_title: true } as any);
+    expect(getSettingsDom().systemPromptEnabled.checked).toBe(false);
   });
 
   test("sets max output tokens value", () => {
@@ -100,11 +109,6 @@ describe("populateForm", () => {
   test("sets context length value", () => {
     populateForm({ context_length: 4096, auto_title: true } as any);
     expect(getSettingsDom().contextLength.value).toBe("4096");
-  });
-
-  test("null system_prompt → empty string", () => {
-    populateForm({ system_prompt: null, auto_title: true } as any);
-    expect(getSettingsDom().systemPrompt.value).toBe("");
   });
 
   test("null max_output_tokens → empty string", () => {
@@ -122,6 +126,51 @@ describe("populateForm", () => {
     expect((getSettingsDom().autoTitle as HTMLInputElement).checked).toBe(false);
     populateForm({ auto_title: true } as any);
     expect((getSettingsDom().autoTitle as HTMLInputElement).checked).toBe(true);
+  });
+});
+
+// ── updateSystemPromptDisplay ────────────────────────────────────────────────
+
+describe("updateSystemPromptDisplay", () => {
+  test("shows prompt name when custom default exists", () => {
+    updateSystemPromptDisplay(
+      [{ id: "p1", name: "My Prompt" }, { id: "p2", name: "Other" }],
+      "p1",
+      false,
+    );
+    expect(getSettingsDom().systemPromptName.textContent).toBe("My Prompt");
+  });
+
+  test("shows 'Default' when isBuiltinDefault is true", () => {
+    updateSystemPromptDisplay(
+      [{ id: "p1", name: "My Prompt" }],
+      "builtin-1",
+      true,
+    );
+    expect(getSettingsDom().systemPromptName.textContent).toBe("Default");
+  });
+
+  test("shows 'Default' when no default and not built-in", () => {
+    updateSystemPromptDisplay(
+      [{ id: "p1", name: "My Prompt" }],
+      null,
+      false,
+    );
+    expect(getSettingsDom().systemPromptName.textContent).toBe("Default");
+  });
+
+  test("shows 'Default' when default not in list", () => {
+    updateSystemPromptDisplay(
+      [{ id: "p1", name: "A" }],
+      "nonexistent",
+      false,
+    );
+    expect(getSettingsDom().systemPromptName.textContent).toBe("Default");
+  });
+
+  test("shows 'Default' when prompts list is empty", () => {
+    updateSystemPromptDisplay([], "p1", false);
+    expect(getSettingsDom().systemPromptName.textContent).toBe("Default");
   });
 });
 
@@ -197,36 +246,28 @@ describe("saveTopLevelSettings", () => {
 
   test("sends correct patch from form values", async () => {
     const dom = getSettingsDom();
-    dom.systemPrompt.value = "Be concise";
+    dom.systemPromptEnabled.checked = true;
     dom.maxOutputTokens.value = "1024";
     dom.contextLength.value = "8192";
     (dom.autoTitle as HTMLInputElement).checked = true;
     await saveTopLevelSettings();
 
     const patch = apiCalls[0]!.args[0] as any;
-    expect(patch.system_prompt).toBe("Be concise");
+    expect(patch.system_prompt_enabled).toBe(true);
     expect(patch.max_output_tokens).toBe(1024);
     expect(patch.context_length).toBe(8192);
     expect(patch.auto_title).toBe(true);
   });
 
-  test("sends null for empty fields", async () => {
+  test("sends null for empty numeric fields", async () => {
     const dom = getSettingsDom();
-    dom.systemPrompt.value = "";
     dom.maxOutputTokens.value = "";
     dom.contextLength.value = "";
     await saveTopLevelSettings();
 
     const patch = apiCalls[0]!.args[0] as any;
-    expect(patch.system_prompt).toBeNull();
     expect(patch.max_output_tokens).toBeNull();
     expect(patch.context_length).toBeNull();
-  });
-
-  test("trims whitespace-only system prompt to null", async () => {
-    getSettingsDom().systemPrompt.value = "   ";
-    await saveTopLevelSettings();
-    expect((apiCalls[0]!.args[0] as any).system_prompt).toBeNull();
   });
 
   test("shows Saved on success", async () => {
@@ -262,6 +303,23 @@ describe("saveTopLevelSettings", () => {
     // Fire the clear-status timer.
     timerCallbacks[0]!.fn();
     expect(getSettingsDom().status.textContent).toBe("");
+  });
+
+  test("emits settings.system_prompt_enabled when toggle changes", async () => {
+    settingsState.systemPromptEnabled = true;
+    getSettingsDom().systemPromptEnabled.checked = false;
+    await saveTopLevelSettings();
+    const event = emittedEvents.find((e) => e.event === "settings.system_prompt_enabled");
+    expect(event).toBeDefined();
+    expect((event!.data as any).enabled).toBe(false);
+  });
+
+  test("does not emit event when system prompt enabled unchanged", async () => {
+    settingsState.systemPromptEnabled = true;
+    getSettingsDom().systemPromptEnabled.checked = true;
+    await saveTopLevelSettings();
+    const event = emittedEvents.find((e) => e.event === "settings.system_prompt_enabled");
+    expect(event).toBeUndefined();
   });
 });
 
@@ -418,13 +476,6 @@ describe("handleModelChange", () => {
 // ── wireEvents — debouncing ──────────────────────────────────────────────────
 
 describe("wireEvents — debouncing", () => {
-  test("system prompt input schedules 600ms debounce", () => {
-    wireEvents();
-    getSettingsDom().systemPrompt.dispatchEvent(new Event("input"));
-    expect(timerCallbacks.length).toBe(1);
-    expect(timerCallbacks[0]!.ms).toBe(600);
-  });
-
   test("max output tokens input schedules 400ms debounce", () => {
     wireEvents();
     getSettingsDom().maxOutputTokens.dispatchEvent(new Event("input"));
@@ -446,6 +497,13 @@ describe("wireEvents — debouncing", () => {
     expect(timerCallbacks[0]!.ms).toBe(400);
   });
 
+  test("system prompt enabled change triggers immediate save", async () => {
+    wireEvents();
+    getSettingsDom().systemPromptEnabled.dispatchEvent(new Event("change"));
+    await new Promise((r) => setTimeout(r, 10));
+    expect(apiCalls[0]!.method).toBe("patchSettings");
+  });
+
   test("model change triggers immediate API call (no debounce)", () => {
     settingsState.availableModels = [makeModelEntry("gpt-4")];
     wireEvents();
@@ -462,9 +520,9 @@ describe("wireEvents — debouncing", () => {
   test("rapid typing cancels previous debounce timers", () => {
     wireEvents();
     const dom = getSettingsDom();
-    dom.systemPrompt.dispatchEvent(new Event("input"));
-    dom.systemPrompt.dispatchEvent(new Event("input"));
-    dom.systemPrompt.dispatchEvent(new Event("input"));
+    dom.maxOutputTokens.dispatchEvent(new Event("input"));
+    dom.maxOutputTokens.dispatchEvent(new Event("input"));
+    dom.maxOutputTokens.dispatchEvent(new Event("input"));
 
     expect(timerCallbacks[0]!.disposed).toBe(true);
     expect(timerCallbacks[1]!.disposed).toBe(true);
@@ -474,8 +532,8 @@ describe("wireEvents — debouncing", () => {
   test("settings and overrides share debounce handle", () => {
     wireEvents();
     const dom = getSettingsDom();
-    dom.systemPrompt.dispatchEvent(new Event("input"));  // settings (600ms)
-    dom.temperature.dispatchEvent(new Event("input"));    // overrides (400ms) cancels settings
+    dom.maxOutputTokens.dispatchEvent(new Event("input"));  // settings (400ms)
+    dom.temperature.dispatchEvent(new Event("input"));       // overrides (400ms) cancels settings
 
     expect(timerCallbacks[0]!.disposed).toBe(true);
     expect(timerCallbacks[1]!.disposed).toBe(false);
@@ -484,8 +542,8 @@ describe("wireEvents — debouncing", () => {
   test("debounce callback triggers actual save", async () => {
     wireEvents();
     const dom = getSettingsDom();
-    dom.systemPrompt.value = "Hello";
-    dom.systemPrompt.dispatchEvent(new Event("input"));
+    dom.maxOutputTokens.value = "512";
+    dom.maxOutputTokens.dispatchEvent(new Event("input"));
     // Fire the debounced callback manually.
     timerCallbacks[0]!.fn();
     await new Promise((r) => setTimeout(r, 10));

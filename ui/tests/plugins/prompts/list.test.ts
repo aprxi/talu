@@ -7,7 +7,7 @@ import { createDomRoot, PROMPTS_DOM_IDS } from "../../helpers/dom.ts";
 import { mockTimers, mockNotifications } from "../../helpers/mocks.ts";
 
 /**
- * Tests for prompts list — sorting, default prompt placement, separator.
+ * Tests for prompts list — sorting, built-in prompt, default button.
  */
 
 const PROMPTS_DOM_TAGS: Record<string, string> = {
@@ -24,6 +24,7 @@ beforeEach(() => {
   initPromptsDom(createDomRoot(PROMPTS_DOM_IDS, undefined, PROMPTS_DOM_TAGS));
 
   promptsState.prompts = [];
+  promptsState.builtinId = null;
   promptsState.selectedId = null;
   promptsState.defaultId = null;
 
@@ -53,7 +54,7 @@ describe("renderList — empty", () => {
 // ── Sorting ─────────────────────────────────────────────────────────────────
 
 describe("renderList — sorting", () => {
-  test("sorts alphabetically by name", () => {
+  test("sorts user prompts alphabetically by name", () => {
     promptsState.prompts = [
       { id: "c", name: "Charlie", content: "", createdAt: 0, updatedAt: 0 },
       { id: "a", name: "Alpha", content: "", createdAt: 0, updatedAt: 0 },
@@ -66,7 +67,7 @@ describe("renderList — sorting", () => {
     expect(items[2]!.querySelector(".prompt-item-name")!.textContent).toBe("Charlie");
   });
 
-  test("default prompt is always first", () => {
+  test("default prompt stays in alphabetical position (no reordering)", () => {
     promptsState.prompts = [
       { id: "z", name: "Zulu", content: "", createdAt: 0, updatedAt: 0 },
       { id: "a", name: "Alpha", content: "", createdAt: 0, updatedAt: 0 },
@@ -74,43 +75,8 @@ describe("renderList — sorting", () => {
     promptsState.defaultId = "z";
     renderList();
     const items = getPromptsDom().listEl.querySelectorAll(".prompt-item");
-    expect(items[0]!.querySelector(".prompt-item-name")!.textContent).toBe("Zulu");
-    expect(items[1]!.querySelector(".prompt-item-name")!.textContent).toBe("Alpha");
-  });
-});
-
-// ── Separator ───────────────────────────────────────────────────────────────
-
-describe("renderList — separator", () => {
-  test("inserts separator between default and non-default", () => {
-    promptsState.prompts = [
-      { id: "def", name: "Default", content: "", createdAt: 0, updatedAt: 0 },
-      { id: "other", name: "Other", content: "", createdAt: 0, updatedAt: 0 },
-    ];
-    promptsState.defaultId = "def";
-    renderList();
-    const sep = getPromptsDom().listEl.querySelector(".prompts-list-separator");
-    expect(sep).not.toBeNull();
-  });
-
-  test("no separator when no default", () => {
-    promptsState.prompts = [
-      { id: "a", name: "Alpha", content: "", createdAt: 0, updatedAt: 0 },
-      { id: "b", name: "Bravo", content: "", createdAt: 0, updatedAt: 0 },
-    ];
-    renderList();
-    const sep = getPromptsDom().listEl.querySelector(".prompts-list-separator");
-    expect(sep).toBeNull();
-  });
-
-  test("no separator when only default exists", () => {
-    promptsState.prompts = [
-      { id: "def", name: "Default", content: "", createdAt: 0, updatedAt: 0 },
-    ];
-    promptsState.defaultId = "def";
-    renderList();
-    const sep = getPromptsDom().listEl.querySelector(".prompts-list-separator");
-    expect(sep).toBeNull();
+    expect(items[0]!.querySelector(".prompt-item-name")!.textContent).toBe("Alpha");
+    expect(items[1]!.querySelector(".prompt-item-name")!.textContent).toBe("Zulu");
   });
 });
 
@@ -127,6 +93,70 @@ describe("renderList — selection", () => {
     const items = getPromptsDom().listEl.querySelectorAll(".prompt-item");
     expect(items[0]!.classList.contains("active")).toBe(false);
     expect(items[1]!.classList.contains("active")).toBe(true);
+  });
+});
+
+// ── Built-in prompt ─────────────────────────────────────────────────────────
+
+describe("renderList — built-in prompt", () => {
+  test("built-in prompt renders first with builtin class", () => {
+    promptsState.prompts = [
+      { id: "custom", name: "Custom", content: "", createdAt: 0, updatedAt: 0 },
+      { id: "builtin", name: "Default", content: "You are a helpful assistant.", createdAt: 0, updatedAt: 0 },
+    ];
+    promptsState.builtinId = "builtin";
+    renderList();
+    const items = getPromptsDom().listEl.querySelectorAll(".prompt-item");
+    expect(items[0]!.classList.contains("builtin")).toBe(true);
+    expect(items[0]!.querySelector(".prompt-item-name")!.textContent).toBe("Default");
+  });
+
+  test("built-in has clickable default button with data-action", () => {
+    promptsState.prompts = [
+      { id: "builtin", name: "Default", content: "You are a helpful assistant.", createdAt: 0, updatedAt: 0 },
+    ];
+    promptsState.builtinId = "builtin";
+    renderList();
+    const btn = getPromptsDom().listEl.querySelector<HTMLElement>("[data-action='toggle-default']");
+    expect(btn).not.toBeNull();
+    expect(btn!.dataset["promptId"]).toBe("builtin");
+    expect(btn!.classList.contains("builtin")).toBe(true);
+  });
+
+  test("built-in button is active when no custom default", () => {
+    promptsState.prompts = [
+      { id: "builtin", name: "Default", content: "You are a helpful assistant.", createdAt: 0, updatedAt: 0 },
+    ];
+    promptsState.builtinId = "builtin";
+    promptsState.defaultId = null;
+    renderList();
+    const btn = getPromptsDom().listEl.querySelector(".prompt-default-btn.builtin");
+    expect(btn).not.toBeNull();
+    expect(btn!.classList.contains("active")).toBe(true);
+  });
+
+  test("built-in button is inactive when custom default is set", () => {
+    promptsState.prompts = [
+      { id: "builtin", name: "Default", content: "You are a helpful assistant.", createdAt: 0, updatedAt: 0 },
+      { id: "custom", name: "Custom", content: "", createdAt: 0, updatedAt: 0 },
+    ];
+    promptsState.builtinId = "builtin";
+    promptsState.defaultId = "custom";
+    renderList();
+    const btn = getPromptsDom().listEl.querySelector(".prompt-default-btn.builtin");
+    expect(btn).not.toBeNull();
+    expect(btn!.classList.contains("active")).toBe(false);
+  });
+
+  test("no separator between built-in and user prompts", () => {
+    promptsState.prompts = [
+      { id: "builtin", name: "Default", content: "You are a helpful assistant.", createdAt: 0, updatedAt: 0 },
+      { id: "custom", name: "Custom", content: "", createdAt: 0, updatedAt: 0 },
+    ];
+    promptsState.builtinId = "builtin";
+    renderList();
+    const sep = getPromptsDom().listEl.querySelector(".prompts-list-separator");
+    expect(sep).toBeNull();
   });
 });
 
@@ -163,5 +193,25 @@ describe("renderList — default button", () => {
     const btn = getPromptsDom().listEl.querySelector<HTMLElement>(".prompt-default-btn")!;
     expect(btn.dataset["promptId"]).toBe("p1");
     expect(btn.dataset["action"]).toBe("toggle-default");
+  });
+
+  test("default button title says 'Active default' on current default", () => {
+    promptsState.prompts = [
+      { id: "p1", name: "One", content: "", createdAt: 0, updatedAt: 0 },
+    ];
+    promptsState.defaultId = "p1";
+    renderList();
+    const btn = getPromptsDom().listEl.querySelector<HTMLElement>(".prompt-default-btn")!;
+    expect(btn.title).toBe("Active default");
+  });
+
+  test("default button title says 'Set as default' on non-default", () => {
+    promptsState.prompts = [
+      { id: "p1", name: "One", content: "", createdAt: 0, updatedAt: 0 },
+    ];
+    promptsState.defaultId = null;
+    renderList();
+    const btn = getPromptsDom().listEl.querySelector<HTMLElement>(".prompt-default-btn")!;
+    expect(btn.title).toBe("Set as default");
   });
 });

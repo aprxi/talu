@@ -3,7 +3,7 @@
  */
 
 import type { Disposable } from "../../kernel/types.ts";
-import { timers } from "./deps.ts";
+import { timers, mode } from "./deps.ts";
 import { getSettingsDom } from "./dom.ts";
 import { saveTopLevelSettings, saveModelOverrides, handleResetModelOverrides, handleModelChange } from "./form.ts";
 
@@ -28,7 +28,8 @@ export function wireEvents(): void {
 
   const dom = getSettingsDom();
   dom.model.addEventListener("change", () => handleModelChange(dom.model.value));
-  dom.systemPrompt.addEventListener("input", () => scheduleSettingsSave(600));
+  dom.systemPromptEnabled.addEventListener("change", () => saveTopLevelSettings());
+  dom.openPrompts.addEventListener("click", () => mode.switch("prompts"));
   dom.maxOutputTokens.addEventListener("input", () => scheduleSettingsSave(400));
   dom.contextLength.addEventListener("input", () => scheduleSettingsSave(400));
   dom.autoTitle.addEventListener("change", () => saveTopLevelSettings());

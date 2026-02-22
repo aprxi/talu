@@ -94,7 +94,7 @@ beforeEach(() => {
     services: {
       get: (name: string) => {
         if (name === "talu.models") return { getActiveModel: () => "gpt-4" };
-        if (name === "talu.prompts") return { getSelectedPromptId: () => null };
+        if (name === "talu.prompts") return { getSelectedPromptId: () => null, getDefaultPromptId: () => null };
         return undefined;
       },
     } as any,

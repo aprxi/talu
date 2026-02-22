@@ -39,6 +39,7 @@ beforeEach(() => {
 
   // Reset state.
   promptsState.prompts = [];
+  promptsState.builtinId = null;
   promptsState.selectedId = null;
   promptsState.defaultId = null;
   promptsState.originalName = "";
@@ -65,6 +66,10 @@ beforeEach(() => {
       deleteDocument: async (id: string) => {
         apiCalls.push({ method: "deleteDocument", args: [id] });
         return { ok: true };
+      },
+      patchSettings: async (patch: any) => {
+        apiCalls.push({ method: "patchSettings", args: [patch] });
+        return { ok: true, data: {} };
       },
     } as any,
     events: {
@@ -209,6 +214,18 @@ describe("saveCurrentPrompt", () => {
     await saveCurrentPrompt();
     expect(emittedEvents.some((e: any) => e.event === "prompts.changed")).toBe(true);
   });
+
+  test("no-op when selectedId is the built-in prompt", async () => {
+    addPrompt("builtin-1", "Default", "You are a helpful assistant.");
+    promptsState.builtinId = "builtin-1";
+    promptsState.selectedId = "builtin-1";
+    setEditorValues("Hacked Name", "Hacked Content");
+
+    await saveCurrentPrompt();
+
+    expect(apiCalls.length).toBe(0);
+    expect(promptsState.prompts[0]!.name).toBe("Default");
+  });
 });
 
 // ── handleDelete (2-click confirmation) ────────────────────────────────────
@@ -265,7 +282,21 @@ describe("handleDelete", () => {
     expect(promptsState.selectedId).toBeNull();
   });
 
-  test("deleting default prompt clears defaultId", async () => {
+  test("deleting default prompt reverts to built-in", async () => {
+    addPrompt("p1", "Default");
+    addPrompt("p2", "Other");
+    promptsState.selectedId = "p1";
+    promptsState.defaultId = "p1";
+
+    handleDelete();
+    handleDelete();
+    await new Promise((r) => setTimeout(r, 10));
+
+    expect(promptsState.defaultId).toBeNull();
+    expect(apiCalls.some((c) => c.method === "patchSettings" && (c.args[0] as any).default_prompt_id === null)).toBe(true);
+  });
+
+  test("deleting only default prompt sets defaultId to null", async () => {
     addPrompt("p1", "Default");
     promptsState.selectedId = "p1";
     promptsState.defaultId = "p1";
@@ -275,7 +306,6 @@ describe("handleDelete", () => {
     await new Promise((r) => setTimeout(r, 10));
 
     expect(promptsState.defaultId).toBeNull();
-    expect(storageCalls.some((c) => c.method === "delete" && c.key === DEFAULT_PROMPT_KEY)).toBe(true);
   });
 
   test("timeout fires resetDeleteBtn to revert UI", () => {
@@ -295,6 +325,14 @@ describe("handleDelete", () => {
 
   test("no-op when no selectedId", () => {
     promptsState.selectedId = null;
+    handleDelete();
+    expect(apiCalls.length).toBe(0);
+    expect(timerCallbacks.length).toBe(0);
+  });
+
+  test("no-op when selectedId is the built-in prompt", () => {
+    promptsState.builtinId = "builtin-1";
+    promptsState.selectedId = "builtin-1";
     handleDelete();
     expect(apiCalls.length).toBe(0);
     expect(timerCallbacks.length).toBe(0);
@@ -333,28 +371,40 @@ describe("toggleDefault", () => {
     expect(promptsState.defaultId).toBe("p1");
   });
 
-  test("persists to storage on set", () => {
+  test("persists via patchSettings API", () => {
     addPrompt("p1", "Test");
     toggleDefault("p1");
-    expect(storageCalls.some((c) => c.method === "set" && c.key === DEFAULT_PROMPT_KEY)).toBe(true);
+    expect(apiCalls.some((c) => c.method === "patchSettings" && (c.args[0] as any).default_prompt_id === "p1")).toBe(true);
   });
 
-  test("clears defaultId when toggling off (same id)", () => {
+  test("no-op when toggling same id", () => {
     promptsState.defaultId = "p1";
     toggleDefault("p1");
-    expect(promptsState.defaultId).toBeNull();
+    expect(promptsState.defaultId).toBe("p1");
+    expect(apiCalls.length).toBe(0);
   });
 
-  test("deletes from storage on clear", () => {
-    promptsState.defaultId = "p1";
-    toggleDefault("p1");
-    expect(storageCalls.some((c) => c.method === "delete" && c.key === DEFAULT_PROMPT_KEY)).toBe(true);
-  });
-
-  test("toggleDefault(null) clears defaultId", () => {
+  test("null reverts to built-in default", () => {
     promptsState.defaultId = "p1";
     toggleDefault(null);
     expect(promptsState.defaultId).toBeNull();
+    expect(apiCalls.some((c) => c.method === "patchSettings" && (c.args[0] as any).default_prompt_id === null)).toBe(true);
+  });
+
+  test("null is no-op when already on built-in default", () => {
+    promptsState.defaultId = null;
+    toggleDefault(null);
+    expect(promptsState.defaultId).toBeNull();
+    expect(apiCalls.length).toBe(0);
+  });
+
+  test("switches default to a different prompt", () => {
+    addPrompt("p1", "First");
+    addPrompt("p2", "Second");
+    promptsState.defaultId = "p1";
+    toggleDefault("p2");
+    expect(promptsState.defaultId).toBe("p2");
+    expect(apiCalls.some((c) => c.method === "patchSettings" && (c.args[0] as any).default_prompt_id === "p2")).toBe(true);
   });
 
   test("emits prompts.changed event", () => {

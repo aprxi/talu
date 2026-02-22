@@ -31,6 +31,8 @@ export interface ChatState {
   /** Saved transcript DOM fragments for background-streaming sessions (keyed by session ID).
    *  Streams continue writing to these detached elements; restored when user navigates back. */
   backgroundStreamDom: Map<string, DocumentFragment>;
+  /** Whether system prompts are enabled (from settings). */
+  systemPromptEnabled: boolean;
   pagination: {
     offset: number;
     hasMore: boolean;
@@ -50,6 +52,7 @@ export const chatState: ChatState = {
   activeViewId: 0,
   backgroundStreamSessions: new Set(),
   backgroundStreamDom: new Map(),
+  systemPromptEnabled: true,
   pagination: {
     offset: 0,
     hasMore: true,

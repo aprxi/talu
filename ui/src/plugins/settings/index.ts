@@ -7,12 +7,12 @@
 
 import type { PluginDefinition, PluginContext, Disposable } from "../../kernel/types.ts";
 import { createApiClient } from "../../api.ts";
-import type { ModelsService } from "../../types.ts";
+import type { ModelsService, PromptsService } from "../../types.ts";
 import { initSettingsDeps } from "./deps.ts";
 import { settingsState, emitModelChanged } from "./state.ts";
 import { initSettingsDom } from "./dom.ts";
 import { buildSettingsDOM } from "./build-dom.ts";
-import { populateForm, populateLocalModelSelect, showModelParams, handleModelChange } from "./form.ts";
+import { populateForm, populateLocalModelSelect, updateSystemPromptDisplay, showModelParams, handleModelChange } from "./form.ts";
 import { wireEvents } from "./events.ts";
 
 export const settingsPlugin: PluginDefinition = {
@@ -42,7 +42,7 @@ export const settingsPlugin: PluginDefinition = {
 
   async run(ctx: PluginContext): Promise<void> {
     const api = createApiClient((url, init) => ctx.network.fetch(url, init));
-    initSettingsDeps({ api, events: ctx.events, timers: ctx.timers });
+    initSettingsDeps({ api, events: ctx.events, timers: ctx.timers, mode: ctx.mode });
 
     buildSettingsDOM(ctx.container);
     initSettingsDom(ctx.container);
@@ -56,6 +56,7 @@ export const settingsPlugin: PluginDefinition = {
     }
 
     settingsState.availableModels = result.data.available_models ?? [];
+    settingsState.systemPromptEnabled = result.data.system_prompt_enabled;
     if (result.data.model) {
       settingsState.activeModel = result.data.model;
     } else if (settingsState.availableModels.length > 0 && settingsState.availableModels[0]) {
@@ -66,6 +67,22 @@ export const settingsPlugin: PluginDefinition = {
     populateLocalModelSelect();
     showModelParams(settingsState.activeModel);
     emitModelChanged();
+
+    // Show current default prompt name from prompts service (if already loaded).
+    // The prompts.changed event will update the display with the correct
+    // isBuiltinDefault flag once the prompts plugin finishes loading.
+    const promptsSvc = ctx.services.get<PromptsService>("talu.prompts");
+    if (promptsSvc) {
+      updateSystemPromptDisplay(promptsSvc.getAll(), promptsSvc.getDefaultPromptId(), false);
+    }
+
+    // Update display when prompts change (add/delete/rename/default toggle).
+    ctx.events.on<{ prompts: { id: string; name: string }[]; defaultId: string | null; isBuiltinDefault: boolean }>(
+      "prompts.changed",
+      ({ prompts, defaultId, isBuiltinDefault }) => {
+        updateSystemPromptDisplay(prompts, defaultId, isBuiltinDefault);
+      },
+    );
 
     // Re-fetch available models when the repo plugin downloads or deletes models.
     ctx.events.on("repo.models.changed", async () => {

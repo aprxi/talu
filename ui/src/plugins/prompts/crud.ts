@@ -3,8 +3,8 @@
  */
 
 import { DELETE_ICON as ICON_DELETE } from "../../icons.ts";
-import { api, storage, clipboard, timers, notifications, log } from "./deps.ts";
-import { promptsState, DEFAULT_PROMPT_KEY } from "./state.ts";
+import { api, clipboard, timers, notifications, log } from "./deps.ts";
+import { promptsState } from "./state.ts";
 import { getPromptsDom } from "./dom.ts";
 import { renderList } from "./list.ts";
 import { showEmpty, updateSaveButton, emitPromptsChanged } from "./editor.ts";
@@ -18,6 +18,9 @@ export async function saveCurrentPrompt(): Promise<void> {
     notifications.error("Please enter a prompt name");
     return;
   }
+
+  // Prevent saving over the built-in prompt.
+  if (promptsState.builtinId && promptsState.selectedId === promptsState.builtinId) return;
 
   if (promptsState.selectedId) {
     const result = await api.updateDocument(promptsState.selectedId, {
@@ -69,6 +72,7 @@ export async function saveCurrentPrompt(): Promise<void> {
 
 export function handleDelete(): void {
   if (!promptsState.selectedId) return;
+  if (promptsState.selectedId === promptsState.builtinId) return;
   const dom = getPromptsDom();
 
   if (!dom.deleteBtn.classList.contains("confirming")) {
@@ -96,6 +100,7 @@ export function resetDeleteBtn(): void {
 
 async function doDelete(): Promise<void> {
   if (!promptsState.selectedId) return;
+  if (promptsState.selectedId === promptsState.builtinId) return;
   resetDeleteBtn();
 
   const result = await api.deleteDocument(promptsState.selectedId);
@@ -107,9 +112,12 @@ async function doDelete(): Promise<void> {
   const idx = promptsState.prompts.findIndex((p) => p.id === promptsState.selectedId);
   if (idx >= 0) promptsState.prompts.splice(idx, 1);
 
+  // If deleting the custom default, revert to built-in.
   if (promptsState.defaultId === promptsState.selectedId) {
     promptsState.defaultId = null;
-    storage.delete(DEFAULT_PROMPT_KEY).catch(() => log.warn("Failed to clear default prompt"));
+    api.patchSettings({ default_prompt_id: null }).catch(() =>
+      log.warn("Failed to clear default prompt"),
+    );
   }
 
   promptsState.selectedId = null;
@@ -120,17 +128,19 @@ async function doDelete(): Promise<void> {
 }
 
 export function toggleDefault(promptId: string | null): void {
-  if (promptsState.defaultId === promptId) {
+  if (promptId === null) {
+    // Unsetting custom default → revert to built-in.
+    if (promptsState.defaultId === null) return; // Already on built-in
     promptsState.defaultId = null;
-    storage.delete(DEFAULT_PROMPT_KEY).catch(() => log.warn("Failed to clear default prompt"));
   } else {
+    // Setting a custom prompt as default.
+    if (promptsState.defaultId === promptId) return; // Already set
     promptsState.defaultId = promptId;
-    if (promptId) {
-      storage.set(DEFAULT_PROMPT_KEY, promptId).catch(() => log.warn("Failed to save default prompt"));
-    } else {
-      storage.delete(DEFAULT_PROMPT_KEY).catch(() => log.warn("Failed to clear default prompt"));
-    }
   }
+
+  api.patchSettings({ default_prompt_id: promptsState.defaultId }).catch(() =>
+    log.warn("Failed to save default prompt"),
+  );
   renderList();
   emitPromptsChanged();
 }

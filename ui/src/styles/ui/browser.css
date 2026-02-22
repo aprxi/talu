@@ -500,6 +500,16 @@
   background: color-mix(in srgb, var(--primary) 8%, transparent);
 }
 
+.prompt-item.builtin {
+  color: var(--text-muted);
+  opacity: 0.7;
+}
+
+.prompt-item.builtin.active {
+  opacity: 0.85;
+  color: var(--text);
+}
+
 .prompt-item-name {
   flex: 1;
 }
@@ -531,6 +541,20 @@
 .prompt-default-btn.active {
   opacity: 1;
   color: var(--success, #22c55e);
+}
+
+/* Built-in prompt default button — always visible but dimmed. */
+.prompt-default-btn.builtin {
+  opacity: 0.4;
+}
+
+.prompt-default-btn.builtin.active {
+  opacity: 0.5;
+  color: var(--text-muted);
+}
+
+.prompt-item:hover .prompt-default-btn.builtin {
+  opacity: 0.7;
 }
 
 .prompts-list-separator {

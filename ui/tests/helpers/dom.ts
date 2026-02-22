@@ -98,7 +98,8 @@ export const PROMPTS_DOM_IDS = [
 
 /** Element IDs expected by getSettingsDom(). */
 export const SETTINGS_DOM_IDS = [
-  "sp-model", "sp-system-prompt", "sp-max-output-tokens", "sp-context-length",
+  "sp-model", "sp-system-prompt-enabled", "sp-system-prompt-name", "sp-open-prompts",
+  "sp-max-output-tokens", "sp-context-length",
   "sp-auto-title",
   "sp-temperature", "sp-top-p", "sp-top-k",
   "sp-temperature-default", "sp-top-p-default", "sp-top-k-default",
@@ -139,7 +140,8 @@ export const FILES_DOM_TAGS: Record<string, string> = {
 /** Tag overrides for settings DOM elements that need specific types. */
 export const SETTINGS_DOM_TAGS: Record<string, string> = {
   "sp-model": "select",
-  "sp-system-prompt": "textarea",
+  "sp-system-prompt-enabled": "input",
+  "sp-open-prompts": "button",
   "sp-max-output-tokens": "input",
   "sp-context-length": "input",
   "sp-auto-title": "input",

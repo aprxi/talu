@@ -22,6 +22,9 @@ pub(crate) struct SettingsResponse {
     pub system_prompt: Option<String>,
     pub max_output_tokens: Option<u32>,
     pub context_length: Option<u32>,
+    pub auto_title: bool,
+    pub default_prompt_id: Option<String>,
+    pub system_prompt_enabled: bool,
     pub available_models: Vec<ModelEntry>,
 }
 
@@ -63,6 +66,8 @@ pub async fn handle_get(
         "max_output_tokens": settings.max_output_tokens,
         "context_length": settings.context_length,
         "auto_title": settings.auto_title,
+        "default_prompt_id": settings.default_prompt_id,
+        "system_prompt_enabled": settings.system_prompt_enabled,
         "available_models": models,
     });
 
@@ -77,6 +82,9 @@ pub(crate) struct SettingsPatchRequest {
     pub system_prompt: Option<String>,
     pub max_output_tokens: Option<u32>,
     pub context_length: Option<u32>,
+    pub auto_title: Option<bool>,
+    pub default_prompt_id: Option<String>,
+    pub system_prompt_enabled: Option<bool>,
     pub model_overrides: Option<OverridesJson>,
 }
 
@@ -147,6 +155,12 @@ pub async fn handle_patch(
     if let Some(v) = patch.get("auto_title") {
         settings.auto_title = v.as_bool().unwrap_or(true);
     }
+    if let Some(v) = patch.get("default_prompt_id") {
+        settings.default_prompt_id = v.as_str().map(|s| s.to_string());
+    }
+    if let Some(v) = patch.get("system_prompt_enabled") {
+        settings.system_prompt_enabled = v.as_bool().unwrap_or(true);
+    }
 
     // Merge per-model generation overrides (keyed to the active model).
     if let Some(overrides) = patch.get("model_overrides") {
@@ -184,6 +198,8 @@ pub async fn handle_patch(
         "max_output_tokens": settings.max_output_tokens,
         "context_length": settings.context_length,
         "auto_title": settings.auto_title,
+        "default_prompt_id": settings.default_prompt_id,
+        "system_prompt_enabled": settings.system_prompt_enabled,
         "available_models": models,
     });
 
@@ -241,6 +257,8 @@ pub async fn handle_reset_model(
         "max_output_tokens": settings.max_output_tokens,
         "context_length": settings.context_length,
         "auto_title": settings.auto_title,
+        "default_prompt_id": settings.default_prompt_id,
+        "system_prompt_enabled": settings.system_prompt_enabled,
         "available_models": models,
     });
 

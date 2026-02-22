@@ -41,7 +41,7 @@ impl ModelOverrides {
 }
 
 /// Runtime settings stored in `<bucket>/settings.toml`.
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketSettings {
     /// Active model for this profile (e.g., "Qwen/Qwen3-0.6B-GAF4").
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -64,9 +64,34 @@ pub struct BucketSettings {
     #[serde(default = "default_true")]
     pub auto_title: bool,
 
+    /// Default prompt document ID. When set, new conversations use this
+    /// prompt's system message automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_prompt_id: Option<String>,
+
+    /// Whether system prompts are applied to new conversations.
+    /// When false, the default prompt is ignored.
+    #[serde(default = "default_true")]
+    pub system_prompt_enabled: bool,
+
     /// Per-model sampling parameter overrides, keyed by model ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelOverrides>,
+}
+
+impl Default for BucketSettings {
+    fn default() -> Self {
+        Self {
+            model: None,
+            system_prompt: None,
+            max_output_tokens: None,
+            context_length: None,
+            auto_title: true,
+            default_prompt_id: None,
+            system_prompt_enabled: true,
+            models: BTreeMap::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
