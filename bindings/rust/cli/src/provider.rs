@@ -87,8 +87,15 @@ pub fn provider_from_prefix(s: &str) -> Option<String> {
 }
 
 pub fn create_backend_for_model(model: &str) -> Result<InferenceBackend> {
+    create_backend_for_model_with_progress(model, None)
+}
+
+pub fn create_backend_for_model_with_progress(
+    model: &str,
+    callback: Option<talu::LoadProgressCallback>,
+) -> Result<InferenceBackend> {
     match parse_model_target(model)? {
-        ModelTarget::Local(local_id) => Ok(InferenceBackend::new(local_id)?),
+        ModelTarget::Local(local_id) => Ok(InferenceBackend::new_with_progress(local_id, callback)?),
         ModelTarget::Remote { provider, model } => {
             let provider_info =
                 get_provider(&provider).ok_or_else(|| anyhow!("Unknown provider: {}", provider))?;

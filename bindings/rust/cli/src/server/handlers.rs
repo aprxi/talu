@@ -806,7 +806,9 @@ async fn stream_response(
     let request_max_output_tokens = request.max_output_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
-    let model_id = match select_model_id(state.clone(), request.model.clone()).await {
+    // Resolve model ID without loading — loading happens inside spawn_blocking
+    // so that progress events can be streamed through the SSE channel.
+    let model_id = match resolve_model_id(state.clone(), request.model.clone()).await {
         Ok(val) => val,
         Err(err) => {
             return json_error(
@@ -987,6 +989,51 @@ async fn stream_response(
     let tools_for_events = effective_tools.clone();
     let tool_choice_for_events = effective_tool_choice.clone();
     tokio::task::spawn_blocking(move || {
+        // Load/switch backend if needed, emitting progress events through SSE.
+        {
+            let mut guard = backend.blocking_lock();
+            let needs_load = guard.current_model.as_deref() != Some(&model_id)
+                || guard.backend.is_none();
+            if needs_load {
+                let tx_progress = tx.clone();
+                let callback: Option<talu::LoadProgressCallback> =
+                    Some(Box::new(move |p: talu::LoadProgress| {
+                        let _ = send_event(
+                            &tx_progress,
+                            "response.progress",
+                            json!({
+                                "type": "response.progress",
+                                "phase": p.label,
+                                "current": p.current,
+                                "total": p.total,
+                            }),
+                        );
+                    }));
+                match provider::create_backend_for_model_with_progress(&model_id, callback) {
+                    Ok(new_backend) => {
+                        guard.backend = Some(new_backend);
+                        guard.current_model = Some(model_id.clone());
+                    }
+                    Err(e) => {
+                        let _ = send_event(
+                            &tx,
+                            "response.failed",
+                            json!({
+                                "type": "response.failed",
+                                "response": {
+                                    "error": {
+                                        "code": "model_error",
+                                        "message": format!("Failed to load model: {e}"),
+                                    }
+                                }
+                            }),
+                        );
+                        return;
+                    }
+                }
+            }
+        }
+
         let mut seq = 0u64;
         let created_response = normalize_response_value(build_response_resource_value(
             &response_id,
@@ -1024,6 +1071,7 @@ async fn stream_response(
         );
         seq += 1;
 
+        let progress_tx = tx.clone();
         let ctx = Arc::new(std::sync::Mutex::new(StreamCtx {
             tx,
             seq,
@@ -1059,6 +1107,7 @@ async fn stream_response(
             file_storage_path,
             ctx,
             stop_flag_for_gen,
+            progress_tx,
         );
 
         // Store conversation for chaining after streaming completes.
@@ -1116,6 +1165,7 @@ fn run_streaming_generation(
     file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
+    progress_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
 ) -> Result<StreamGenResult> {
     let mut backend = backend.blocking_lock();
     let backend = backend
@@ -1175,6 +1225,21 @@ fn run_streaming_generation(
 
     // Pass the stop flag for cooperative cancellation.
     cfg.stop_flag = Some(stop_flag);
+
+    // Prefill progress — emit response.progress events with phase "Prefill".
+    let prefill_tx = progress_tx;
+    cfg.prefill_progress = Some(Box::new(move |completed: usize, total: usize| {
+        let _ = send_event(
+            &prefill_tx,
+            "response.progress",
+            json!({
+                "type": "response.progress",
+                "phase": "Prefill",
+                "current": completed,
+                "total": total,
+            }),
+        );
+    }));
 
     log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
         model_id, max_output_tokens, temperature, top_p);
@@ -1714,6 +1779,21 @@ fn normalize_response_value(value: serde_json::Value) -> serde_json::Value {
 }
 
 async fn select_model_id(state: Arc<AppState>, request_model: Option<String>) -> Result<String> {
+    select_model_id_ex(state, request_model, true).await
+}
+
+/// Resolve model ID without loading the backend. Used by the streaming path
+/// so that model loading can happen inside the spawn_blocking task where
+/// progress events can be emitted through the SSE channel.
+async fn resolve_model_id(state: Arc<AppState>, request_model: Option<String>) -> Result<String> {
+    select_model_id_ex(state, request_model, false).await
+}
+
+async fn select_model_id_ex(
+    state: Arc<AppState>,
+    request_model: Option<String>,
+    load_backend: bool,
+) -> Result<String> {
     if let Some(configured) = state.configured_model.clone() {
         if let Some(requested) = request_model {
             // Accept exact match or suffix match (short ID vs full path).
@@ -1741,7 +1821,9 @@ async fn select_model_id(state: Arc<AppState>, request_model: Option<String>) ->
             .unwrap_or(None);
 
             if found.is_some() {
-                ensure_backend_for_model(state.clone(), &requested).await?;
+                if load_backend {
+                    ensure_backend_for_model(state.clone(), &requested).await?;
+                }
                 return Ok(requested);
             }
 
@@ -1759,7 +1841,9 @@ async fn select_model_id(state: Arc<AppState>, request_model: Option<String>) ->
     }
 
     let requested = request_model.ok_or_else(|| anyhow!("model is required"))?;
-    ensure_backend_for_model(state.clone(), &requested).await?;
+    if load_backend {
+        ensure_backend_for_model(state.clone(), &requested).await?;
+    }
     Ok(requested)
 }
 

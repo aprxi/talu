@@ -108,6 +108,30 @@ export function appendAssistantPlaceholder(): { wrapper: HTMLElement; body: HTML
   return { wrapper, body, textEl };
 }
 
+/** Create or update a progress bar at the bottom of the transcript container. */
+export function updateProgressBar(phase: string, current: number, total: number): void {
+  const tc = getChatDom().transcriptContainer;
+  let bar = tc.querySelector(".chat-progress") as HTMLElement | null;
+  if (!bar) {
+    bar = document.createElement("div");
+    bar.className = "chat-progress";
+    bar.innerHTML =
+      '<span class="chat-progress-label"></span>' +
+      '<div class="chat-progress-track"><div class="chat-progress-fill"></div></div>' +
+      '<span class="chat-progress-pct"></span>';
+    tc.appendChild(bar);
+  }
+  const pct = total > 0 ? Math.round((current / total) * 100) : 0;
+  (bar.querySelector(".chat-progress-label") as HTMLElement).textContent = phase;
+  (bar.querySelector(".chat-progress-fill") as HTMLElement).style.width = `${pct}%`;
+  (bar.querySelector(".chat-progress-pct") as HTMLElement).textContent = `${pct}%`;
+}
+
+/** Remove the progress bar from the transcript container. */
+export function removeProgressBar(): void {
+  getChatDom().transcriptContainer.querySelector(".chat-progress")?.remove();
+}
+
 /** Add action buttons (copy, stats) to a streamed assistant message after generation completes. */
 export function addAssistantActionButtons(
   wrapper: HTMLElement,

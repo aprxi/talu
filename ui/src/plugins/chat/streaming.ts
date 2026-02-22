@@ -2,13 +2,14 @@ import { chatState } from "./state.ts";
 import { notifications, timers } from "./deps.ts";
 import { sanitizedMarkdown } from "../../render/markdown.ts";
 import { isThinkingExpanded } from "../../render/helpers.ts";
-import { scrollToBottomIfNear } from "./messages.ts";
+import { scrollToBottomIfNear, updateProgressBar, removeProgressBar } from "./messages.ts";
 import type { UsageStats } from "../../types.ts";
 import type { RendererRegistry, ContentPart } from "../../kernel/types.ts";
 
 export interface SSECallbacks {
   onTextDelta: (text: string) => void;
   onReasoningDelta: (text: string) => void;
+  onProgress?: (phase: string, current: number, total: number) => void;
   onComplete?: (usage: UsageStats | null) => void;
 }
 
@@ -78,8 +79,18 @@ export async function readSSEStream(
     }
   }
 
+  let progressVisible = false;
+
   const callbacks: SSECallbacks = {
+    onProgress(phase, current, total) {
+      progressVisible = true;
+      updateProgressBar(phase, current, total);
+    },
     onTextDelta(t) {
+      if (progressVisible) {
+        progressVisible = false;
+        removeProgressBar();
+      }
       textAccumulated += t;
       if (!textRenderPending) {
         textRenderPending = true;
@@ -91,6 +102,10 @@ export async function readSSEStream(
       }
     },
     onReasoningDelta(t) {
+      if (progressVisible) {
+        progressVisible = false;
+        removeProgressBar();
+      }
       ensureReasoningEl();
       reasoningAccumulated += t;
       if (!reasoningRenderPending) {
@@ -171,6 +186,15 @@ function handleSSEEvent(
       const meta = response?.["metadata"] as Record<string, unknown> | undefined;
       if (meta && typeof meta["session_id"] === "string") {
         chatState.activeSessionId = meta["session_id"] as string;
+      }
+      break;
+    }
+    case "response.progress": {
+      const phase = parsed["phase"];
+      const current = parsed["current"];
+      const total = parsed["total"];
+      if (typeof phase === "string" && typeof current === "number" && typeof total === "number") {
+        callbacks.onProgress?.(phase, current, total);
       }
       break;
     }
