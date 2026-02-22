@@ -650,6 +650,16 @@
   flex-shrink: 0;
 }
 
+/* Generating indicator (shown when navigating to a chat with a background stream) */
+.chat-generating {
+  max-width: 768px;
+  margin: 1rem auto;
+  padding: 0.75rem 0.5rem;
+  font-size: 13px;
+  color: var(--text-muted);
+  font-style: italic;
+}
+
 /* Stopped indicator */
 .stopped-indicator {
   margin-top: 0.5rem;

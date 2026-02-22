@@ -132,6 +132,20 @@ export function removeProgressBar(): void {
   getChatDom().transcriptContainer.querySelector(".chat-progress")?.remove();
 }
 
+/** Append a "Generating response…" indicator to the given container. */
+export function appendGeneratingIndicator(container: HTMLElement): void {
+  removeGeneratingIndicator(container);
+  const el = document.createElement("div");
+  el.className = "chat-generating";
+  el.textContent = "Generating response\u2026";
+  container.appendChild(el);
+}
+
+/** Remove a generating indicator from the given container. */
+export function removeGeneratingIndicator(container: HTMLElement): void {
+  container.querySelector(".chat-generating")?.remove();
+}
+
 /** Add action buttons (copy, stats) to a streamed assistant message after generation completes. */
 export function addAssistantActionButtons(
   wrapper: HTMLElement,

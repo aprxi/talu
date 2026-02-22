@@ -3,20 +3,53 @@ import { chatState } from "./state.ts";
 import { api, notifications, getModelsService, menus } from "./deps.ts";
 import { renderTranscriptHeader, renderTranscript } from "../../render/transcript.ts";
 import { renderEmptyState, renderLoadingSpinner } from "../../render/common.ts";
-import { showInputBar, hideWelcome, hideInputBar } from "./welcome.ts";
+import { showInputBar, hideWelcome, hideInputBar, setInputEnabled } from "./welcome.ts";
 import { layout } from "./deps.ts";
 import { updatePanelChatInfo } from "./panel-params.ts";
 import { handleTitleRename } from "./sidebar-actions.ts";
 import { renderSidebar } from "./sidebar-list.ts";
+import { appendGeneratingIndicator } from "./messages.ts";
 import type { Conversation } from "../../types.ts";
 
 export async function selectChat(id: string): Promise<void> {
+  // If the current view has an active stream (foreground or background), save
+  // the transcript DOM so the stream can continue writing to detached elements.
+  const currentId = chatState.activeSessionId;
+  if (currentId && (chatState.isGenerating || chatState.backgroundStreamSessions.has(currentId))) {
+    chatState.backgroundStreamSessions.add(currentId);
+    const dom = getChatDom();
+    const fragment = document.createDocumentFragment();
+    while (dom.transcriptContainer.firstChild) {
+      fragment.appendChild(dom.transcriptContainer.firstChild);
+    }
+    chatState.backgroundStreamDom.set(currentId, fragment);
+  }
+  chatState.activeViewId++;
+  chatState.isGenerating = false;
+  chatState.streamAbort = null;
+
   const dom = getChatDom();
   chatState.activeSessionId = id;
   chatState.lastResponseId = null;
+  setInputEnabled(true);
   renderSidebar();
 
   hideWelcome();
+
+  // If navigating to a background-streaming chat with saved DOM, restore it
+  // so the user sees live-streaming text instead of a stale API snapshot.
+  const savedDom = chatState.backgroundStreamDom.get(id);
+  if (chatState.backgroundStreamSessions.has(id) && savedDom) {
+    dom.transcriptContainer.innerHTML = "";
+    dom.transcriptContainer.appendChild(savedDom);
+    chatState.backgroundStreamDom.delete(id);
+    appendGeneratingIndicator(dom.transcriptContainer);
+    hideInputBar();
+    dom.inputText.value = "";
+    dom.inputText.style.height = "auto";
+    return;
+  }
+
   dom.transcriptContainer.innerHTML = "";
   dom.transcriptContainer.appendChild(renderLoadingSpinner());
   hideInputBar();
@@ -36,7 +69,14 @@ export async function selectChat(id: string): Promise<void> {
 
   chatState.activeChat = result.data;
   renderChatView(result.data);
-  showInputBar();
+
+  if (chatState.backgroundStreamSessions.has(id)) {
+    appendGeneratingIndicator(dom.transcriptContainer);
+    hideInputBar();
+  } else {
+    showInputBar();
+  }
+
   dom.inputText.value = "";
   dom.inputText.style.height = "auto";
 }

@@ -13,6 +13,11 @@ export interface SSECallbacks {
   onComplete?: (usage: UsageStats | null) => void;
 }
 
+export interface StreamResult {
+  usage: UsageStats | null;
+  sessionId: string | null;
+}
+
 // --- Renderer pipeline bridge ---
 // Set by the chat plugin during run() to route text through the kernel renderer pipeline.
 
@@ -28,9 +33,14 @@ export async function readSSEStream(
   resp: Response,
   bodyEl: HTMLElement,
   textEl: HTMLElement,
-): Promise<UsageStats | null> {
+  viewId: number,
+  onSessionDiscovered?: (sessionId: string) => void,
+): Promise<StreamResult> {
   const reader = resp.body?.getReader();
-  if (!reader) return null;
+  if (!reader) return { usage: null, sessionId: null };
+
+  const isActive = () => viewId === chatState.activeViewId;
+  const streamMeta: StreamMeta = { sessionId: null, lastResponseId: null };
 
   const startTime = performance.now();
   const decoder = new TextDecoder();
@@ -83,11 +93,12 @@ export async function readSSEStream(
 
   const callbacks: SSECallbacks = {
     onProgress(phase, current, total) {
+      if (!isActive()) return;
       progressVisible = true;
       updateProgressBar(phase, current, total);
     },
     onTextDelta(t) {
-      if (progressVisible) {
+      if (isActive() && progressVisible) {
         progressVisible = false;
         removeProgressBar();
       }
@@ -97,12 +108,12 @@ export async function readSSEStream(
         timers.requestAnimationFrame(() => {
           renderText(false);
           textRenderPending = false;
-          scrollToBottomIfNear();
+          if (isActive()) scrollToBottomIfNear();
         });
       }
     },
     onReasoningDelta(t) {
-      if (progressVisible) {
+      if (isActive() && progressVisible) {
         progressVisible = false;
         removeProgressBar();
       }
@@ -113,12 +124,13 @@ export async function readSSEStream(
         timers.requestAnimationFrame(() => {
           reasoningBody!.innerHTML = sanitizedMarkdown(reasoningAccumulated);
           reasoningRenderPending = false;
-          scrollToBottomIfNear();
+          if (isActive()) scrollToBottomIfNear();
         });
       }
     },
     onComplete(usage) {
       // Final render — flush any pending text through the pipeline.
+      // Runs even when backgrounded so detached DOM elements get the final content.
       if (textAccumulated) {
         renderText(true);
       }
@@ -152,7 +164,7 @@ export async function readSSEStream(
         currentEvent = line.slice(7).trim();
       } else if (line.startsWith("data: ")) {
         const data = line.slice(6);
-        handleSSEEvent(currentEvent, data, callbacks);
+        handleSSEEvent(currentEvent, data, callbacks, isActive, streamMeta, onSessionDiscovered);
       }
       if (line === "") {
         currentEvent = "";
@@ -161,13 +173,21 @@ export async function readSSEStream(
 
     if (done) break;
   }
-  return usageStats;
+  return { usage: usageStats, sessionId: streamMeta.sessionId };
+}
+
+interface StreamMeta {
+  sessionId: string | null;
+  lastResponseId: string | null;
 }
 
 function handleSSEEvent(
   event: string,
   data: string,
   callbacks: SSECallbacks,
+  isActive: () => boolean,
+  streamMeta: StreamMeta,
+  onSessionDiscovered?: (sessionId: string) => void,
 ): void {
   let parsed: Record<string, unknown>;
   try {
@@ -181,11 +201,17 @@ function handleSSEEvent(
     case "response.in_progress": {
       const response = parsed["response"] as Record<string, unknown> | undefined;
       if (response && typeof response["id"] === "string") {
-        chatState.lastResponseId = response["id"] as string;
+        streamMeta.lastResponseId = response["id"] as string;
+        if (isActive()) chatState.lastResponseId = response["id"] as string;
       }
       const meta = response?.["metadata"] as Record<string, unknown> | undefined;
       if (meta && typeof meta["session_id"] === "string") {
-        chatState.activeSessionId = meta["session_id"] as string;
+        const sid = meta["session_id"] as string;
+        if (streamMeta.sessionId !== sid) {
+          streamMeta.sessionId = sid;
+          onSessionDiscovered?.(sid);
+        }
+        if (isActive()) chatState.activeSessionId = sid;
       }
       break;
     }
@@ -216,11 +242,17 @@ function handleSSEEvent(
     case "response.incomplete": {
       const response = parsed["response"] as Record<string, unknown> | undefined;
       if (response && typeof response["id"] === "string") {
-        chatState.lastResponseId = response["id"] as string;
+        streamMeta.lastResponseId = response["id"] as string;
+        if (isActive()) chatState.lastResponseId = response["id"] as string;
       }
       const meta = response?.["metadata"] as Record<string, unknown> | undefined;
       if (meta && typeof meta["session_id"] === "string") {
-        chatState.activeSessionId = meta["session_id"] as string;
+        const sid = meta["session_id"] as string;
+        if (streamMeta.sessionId !== sid) {
+          streamMeta.sessionId = sid;
+          onSessionDiscovered?.(sid);
+        }
+        if (isActive()) chatState.activeSessionId = sid;
       }
       const usage = response?.["usage"] as Record<string, unknown> | undefined;
       if (usage && callbacks.onComplete) {
@@ -236,6 +268,7 @@ function handleSSEEvent(
       break;
     }
     case "response.failed": {
+      if (!isActive()) break;
       const response = parsed["response"] as Record<string, unknown> | undefined;
       const error = response?.["error"] as Record<string, unknown> | undefined;
       if (error && typeof error["message"] === "string") {

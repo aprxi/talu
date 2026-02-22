@@ -30,7 +30,24 @@ export function hideInputBar(): void {
 }
 
 export function startNewConversation(): void {
+  // If the current view has an active stream, save the transcript DOM so the
+  // stream can continue writing to detached elements while backgrounded.
+  const currentId = chatState.activeSessionId;
+  if (currentId && (chatState.isGenerating || chatState.backgroundStreamSessions.has(currentId))) {
+    chatState.backgroundStreamSessions.add(currentId);
+    const dom = getChatDom();
+    const fragment = document.createDocumentFragment();
+    while (dom.transcriptContainer.firstChild) {
+      fragment.appendChild(dom.transcriptContainer.firstChild);
+    }
+    chatState.backgroundStreamDom.set(currentId, fragment);
+  }
+  chatState.activeViewId++;
+  chatState.isGenerating = false;
+  chatState.streamAbort = null;
+
   const dom = getChatDom();
+  setInputEnabled(true);
   chatState.activeSessionId = null;
   chatState.activeChat = null;
   chatState.lastResponseId = null;

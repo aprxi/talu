@@ -5,7 +5,13 @@
 //! `api_compliance` test suite. This module tests advanced lifecycle events
 //! and edge cases that only the subprocess harness exercises.
 
-use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
+use crate::server::common::{
+    get, model_config, post_json, require_model, ServerConfig, ServerTestContext,
+};
+use std::io::{Read, Write};
+use std::net::TcpStream;
+use std::time::Duration;
+use tempfile::TempDir;
 
 fn streaming_body(model: &str, input: &str) -> serde_json::Value {
     serde_json::json!({
@@ -416,5 +422,377 @@ fn non_streaming_incomplete_on_max_tokens() {
     assert!(
         output_tokens <= 3,
         "output_tokens ({output_tokens}) should be limited"
+    );
+}
+
+// =============================================================================
+// Session creation & metadata tests
+//
+// These tests verify that:
+// - session_id appears in the response.created SSE event metadata
+// - session_id is consistent across the full SSE lifecycle
+// - the conversation is persisted before generation completes
+// =============================================================================
+
+fn model_and_bucket_config(bucket: &std::path::Path) -> ServerConfig {
+    let mut config = model_config();
+    config.bucket = Some(bucket.to_path_buf());
+    config
+}
+
+fn streaming_body_with_store(model: &str, input: &str) -> serde_json::Value {
+    serde_json::json!({
+        "model": model,
+        "input": input,
+        "stream": true,
+        "store": true,
+        "max_output_tokens": 10,
+    })
+}
+
+/// Extract session_id from a specific event type's response.metadata.
+fn session_id_from_event<'a>(
+    events: &'a [(String, serde_json::Value)],
+    event_type: &str,
+) -> Option<&'a str> {
+    events
+        .iter()
+        .find(|(t, _)| t == event_type)
+        .and_then(|(_, data)| data["response"]["metadata"]["session_id"].as_str())
+}
+
+/// response.created event carries session_id in metadata.
+#[test]
+fn streaming_created_event_has_session_id() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/responses",
+        &streaming_body_with_store(&model, "Hello"),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+
+    let created = events
+        .iter()
+        .find(|(t, _)| t == "response.created");
+    assert!(created.is_some(), "should have response.created event");
+    let (_, data) = created.unwrap();
+
+    let metadata = &data["response"]["metadata"];
+    assert!(metadata.is_object(), "response should have metadata object");
+    let session_id = metadata["session_id"].as_str();
+    assert!(
+        session_id.is_some() && !session_id.unwrap().is_empty(),
+        "response.created should have non-empty session_id in metadata, got: {:?}",
+        metadata,
+    );
+}
+
+/// response.in_progress event also carries session_id matching response.created.
+#[test]
+fn streaming_in_progress_event_has_session_id() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/responses",
+        &streaming_body_with_store(&model, "Hello"),
+    );
+    assert_eq!(resp.status, 200);
+    let events = parse_sse_events(&resp.body);
+
+    let created_sid = session_id_from_event(&events, "response.created")
+        .expect("response.created should have session_id");
+    let in_progress_sid = session_id_from_event(&events, "response.in_progress")
+        .expect("response.in_progress should have session_id");
+
+    assert_eq!(
+        created_sid, in_progress_sid,
+        "session_id should match between response.created and response.in_progress",
+    );
+}
+
+/// session_id is the same in response.created and the terminal event.
+#[test]
+fn streaming_session_id_consistent_across_lifecycle() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/responses",
+        &streaming_body_with_store(&model, "Hello"),
+    );
+    assert_eq!(resp.status, 200);
+    let events = parse_sse_events(&resp.body);
+
+    let created_sid = session_id_from_event(&events, "response.created")
+        .expect("response.created should have session_id");
+
+    // Find terminal event (completed or incomplete).
+    let terminal = events
+        .iter()
+        .find(|(t, _)| t == "response.completed" || t == "response.incomplete");
+    assert!(terminal.is_some(), "should have terminal event");
+    let (_, terminal_data) = terminal.unwrap();
+    let terminal_sid = terminal_data["response"]["metadata"]["session_id"]
+        .as_str()
+        .expect("terminal event should have session_id in metadata");
+
+    assert_eq!(
+        created_sid, terminal_sid,
+        "session_id should be consistent from response.created to terminal event",
+    );
+}
+
+/// Session is visible via GET and list APIs **during** an active stream.
+///
+/// This is the core test for early session creation. It uses raw TCP to
+/// read the first SSE event (response.created), extracts the session_id,
+/// then queries the conversations API on a second connection while
+/// generation is still running. Synchronization is event-based (not
+/// timing-based): we proceed only after receiving the first SSE event,
+/// which guarantees the server has already persisted the session.
+#[test]
+fn streaming_session_visible_during_generation() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+
+    // Use enough tokens so the stream stays open long enough for our GET.
+    let body = serde_json::json!({
+        "model": model,
+        "input": "Write a detailed essay about the history of computing",
+        "stream": true,
+        "store": true,
+        "max_output_tokens": 100,
+    });
+    let body_str = serde_json::to_string(&body).unwrap();
+
+    // Open a raw TCP connection and send the POST manually.
+    let request = format!(
+        "POST /v1/responses HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {}",
+        ctx.addr(),
+        body_str.len(),
+        body_str,
+    );
+
+    let mut stream =
+        TcpStream::connect_timeout(&ctx.addr().into(), Duration::from_secs(5)).expect("connect");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("set read timeout");
+    stream.write_all(request.as_bytes()).expect("write");
+    stream.flush().expect("flush");
+
+    // Read bytes incrementally until we find the response.created event.
+    let mut accumulated = String::new();
+    let mut session_id: Option<String> = None;
+
+    'outer: loop {
+        let mut buf = [0u8; 4096];
+        let n = stream.read(&mut buf).expect("read from stream");
+        if n == 0 {
+            break;
+        }
+        accumulated.push_str(&String::from_utf8_lossy(&buf[..n]));
+
+        // Scan for "data: " lines in the accumulated text.
+        for line in accumulated.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                    if json["type"].as_str() == Some("response.created") {
+                        session_id = json["response"]["metadata"]["session_id"]
+                            .as_str()
+                            .map(String::from);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    let session_id = session_id.expect("should find session_id in response.created event");
+
+    // While the stream is still active, check that the session exists via
+    // a separate HTTP connection. This proves early session creation works.
+    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    assert_eq!(
+        conv_resp.status, 200,
+        "session should be visible via GET during streaming, got {}: {}",
+        conv_resp.status, conv_resp.body,
+    );
+    let conv = conv_resp.json();
+    assert_eq!(conv["id"].as_str(), Some(session_id.as_str()));
+    assert!(
+        conv["title"].as_str().is_some() && !conv["title"].as_str().unwrap().is_empty(),
+        "session should have a title derived from input",
+    );
+
+    // Also check the list endpoint.
+    let list_resp = get(ctx.addr(), "/v1/conversations");
+    assert_eq!(list_resp.status, 200);
+    let list = list_resp.json();
+    let data = list["data"].as_array().expect("data array");
+    let found = data
+        .iter()
+        .any(|c| c["id"].as_str() == Some(session_id.as_str()));
+    assert!(
+        found,
+        "session {session_id} should appear in conversations list during streaming",
+    );
+
+    // Drain the rest of the stream so the server doesn't get a broken pipe.
+    loop {
+        let mut buf = [0u8; 8192];
+        match stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(e) => panic!("drain error: {e}"),
+        }
+    }
+}
+
+/// Session title is derived from the user's input text (verified post-stream).
+#[test]
+fn streaming_session_title_derived_from_input() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/responses",
+        &streaming_body_with_store(&model, "Tell me about penguins"),
+    );
+    assert_eq!(resp.status, 200);
+    let events = parse_sse_events(&resp.body);
+
+    let session_id = session_id_from_event(&events, "response.created")
+        .expect("response.created should have session_id");
+
+    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    assert_eq!(conv_resp.status, 200);
+
+    let conv_json = conv_resp.json();
+    let title = conv_json["title"]
+        .as_str()
+        .expect("conversation should have title");
+    assert!(
+        title.starts_with("Tell me about penguins"),
+        "title should be derived from input, got: {title:?}",
+    );
+}
+
+/// Non-streaming response has session_id in metadata; session is accessible
+/// and appears in the list with the correct title.
+#[test]
+fn non_streaming_response_has_session_id() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+    let body = serde_json::json!({
+        "model": model,
+        "input": "Explain gravity briefly",
+        "store": true,
+        "max_output_tokens": 10,
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+
+    let session_id = json["metadata"]["session_id"]
+        .as_str()
+        .expect("non-streaming response should have session_id in metadata");
+    assert!(!session_id.is_empty(), "session_id should be non-empty");
+
+    // Session should be accessible via GET with correct properties.
+    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    assert_eq!(
+        conv_resp.status, 200,
+        "GET conversation should return 200 for non-streaming session",
+    );
+    let conv = conv_resp.json();
+    assert_eq!(conv["id"].as_str(), Some(session_id));
+
+    let title = conv["title"].as_str().expect("should have title");
+    assert!(
+        title.starts_with("Explain gravity"),
+        "title should be derived from input, got: {title:?}",
+    );
+
+    // Session should appear in the list.
+    let list_resp = get(ctx.addr(), "/v1/conversations");
+    assert_eq!(list_resp.status, 200);
+    let list = list_resp.json();
+    let found = list["data"]
+        .as_array()
+        .expect("data array")
+        .iter()
+        .any(|c| c["id"].as_str() == Some(session_id));
+    assert!(found, "session should appear in conversations list");
+}
+
+/// Chained streaming response reuses the same session_id.
+#[test]
+fn streaming_chained_response_preserves_session() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+
+    // First request: create a new session.
+    let resp1 = post_json(
+        ctx.addr(),
+        "/v1/responses",
+        &streaming_body_with_store(&model, "Hello"),
+    );
+    assert_eq!(resp1.status, 200);
+    let events1 = parse_sse_events(&resp1.body);
+
+    let session_id_1 = session_id_from_event(&events1, "response.created")
+        .expect("first response should have session_id");
+
+    // Extract the response id from the terminal event for chaining.
+    let terminal = events1
+        .iter()
+        .find(|(t, _)| t == "response.completed" || t == "response.incomplete")
+        .expect("should have terminal event");
+    let response_id = terminal.1["response"]["id"]
+        .as_str()
+        .expect("terminal response should have id");
+
+    // Second request: chain off the first response.
+    let body2 = serde_json::json!({
+        "model": model,
+        "input": "Tell me more",
+        "stream": true,
+        "store": true,
+        "max_output_tokens": 10,
+        "previous_response_id": response_id,
+    });
+    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    assert_eq!(resp2.status, 200);
+    let events2 = parse_sse_events(&resp2.body);
+
+    let session_id_2 = session_id_from_event(&events2, "response.created")
+        .expect("chained response should have session_id");
+
+    assert_eq!(
+        session_id_1, session_id_2,
+        "chained response should reuse the same session_id",
     );
 }

@@ -4,9 +4,9 @@ import { api, hooks, notifications, getModelsService, getPromptsService } from "
 import { getSamplingParams } from "./panel-params.ts";
 import { refreshSidebar } from "./sidebar-list.ts";
 import { setInputEnabled, showInputBar, hideWelcome } from "./welcome.ts";
-import { appendUserMessage, appendAssistantPlaceholder, addAssistantActionButtons, appendStoppedIndicator, scrollToBottom } from "./messages.ts";
+import { appendUserMessage, appendAssistantPlaceholder, addAssistantActionButtons, appendStoppedIndicator, scrollToBottom, removeGeneratingIndicator } from "./messages.ts";
 import { readSSEStream } from "./streaming.ts";
-import { ensureChatHeader } from "./selection.ts";
+import { ensureChatHeader, renderChatView } from "./selection.ts";
 import {
   clearAttachments,
   composeUserInput,
@@ -77,6 +77,9 @@ export interface StreamOptions {
 
 /** Shared streaming pipeline used by send, welcome-send, and rerun. */
 export async function streamResponse(opts: StreamOptions): Promise<void> {
+  const myViewId = chatState.activeViewId;
+  const isActive = () => myViewId === chatState.activeViewId;
+
   chatState.streamAbort = new AbortController();
   chatState.isGenerating = true;
   setInputEnabled(false);
@@ -87,6 +90,22 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
 
   let userCancelled = false;
   let usageStats: UsageStats | null = null;
+  let streamSessionId: string | null = chatState.activeSessionId;
+  let sidebarRefreshed = false;
+
+  const onSessionDiscovered = (sid: string) => {
+    streamSessionId = sid;
+    if (isActive()) {
+      chatState.activeSessionId = sid;
+    } else {
+      chatState.backgroundStreamSessions.add(sid);
+    }
+    if (!sidebarRefreshed) {
+      sidebarRefreshed = true;
+      void refreshSidebar();
+    }
+  };
+
   try {
     let requestBody: CreateResponseRequest = {
       model: getModelsService()?.getActiveModel() ?? "",
@@ -111,55 +130,84 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
     const resp = await api.createResponse(requestBody, chatState.streamAbort.signal);
 
     if (!resp.ok) {
-      const err = await resp.json().catch(() => null);
-      const msg = err?.error?.message ?? `${resp.status} ${resp.statusText}`;
-      textEl.textContent = `Error: ${msg}`;
-      textEl.classList.add("text-danger");
-      notifications.error(msg);
-      chatState.isGenerating = false;
-      chatState.streamAbort = null;
-      setInputEnabled(true);
+      if (isActive()) {
+        const err = await resp.json().catch(() => null);
+        const msg = err?.error?.message ?? `${resp.status} ${resp.statusText}`;
+        textEl.textContent = `Error: ${msg}`;
+        textEl.classList.add("text-danger");
+        notifications.error(msg);
+        chatState.isGenerating = false;
+        chatState.streamAbort = null;
+        setInputEnabled(true);
+      }
+      if (streamSessionId) {
+        chatState.backgroundStreamSessions.delete(streamSessionId);
+      }
       return;
     }
 
-    usageStats = await readSSEStream(resp, body, textEl);
+    const result = await readSSEStream(resp, body, textEl, myViewId, onSessionDiscovered);
+    usageStats = result.usage;
+    streamSessionId = result.sessionId ?? streamSessionId;
   } catch (e) {
     if (e instanceof DOMException && e.name === "AbortError") {
       userCancelled = true;
-    } else {
+    } else if (isActive()) {
       const msg = e instanceof Error ? e.message : String(e);
       textEl.textContent = `Error: ${msg}`;
       notifications.error(msg);
     }
   }
 
-  chatState.isGenerating = false;
-  chatState.streamAbort = null;
-  setInputEnabled(true);
-
-  if (userCancelled) {
-    appendStoppedIndicator(textEl);
+  if (streamSessionId) {
+    chatState.backgroundStreamSessions.delete(streamSessionId);
+    chatState.backgroundStreamDom.delete(streamSessionId);
   }
 
-  if (opts.discoverSession) {
-    await discoverSessionId();
-  }
+  if (isActive()) {
+    chatState.isGenerating = false;
+    chatState.streamAbort = null;
+    setInputEnabled(true);
 
-  if (chatState.activeSessionId) {
-    const updated = await api.getConversation(chatState.activeSessionId);
-    if (updated.ok && updated.data) {
-      // Run chat.receive.after hook — plugins can inspect/transform the response.
-      const afterResult = await hooks.run<Conversation>("chat.receive.after", updated.data);
-      const conversation = (afterResult && typeof afterResult === "object" && "$block" in afterResult)
-        ? updated.data // Ignore $block on receive — the response already happened.
-        : afterResult as Conversation;
-      chatState.activeChat = conversation;
-      opts.afterResponse?.(conversation);
-      addAssistantActionButtons(wrapper, conversation, usageStats);
+    if (userCancelled) {
+      appendStoppedIndicator(textEl);
+    }
+
+    if (opts.discoverSession) {
+      await discoverSessionId();
+    }
+
+    if (chatState.activeSessionId) {
+      const updated = await api.getConversation(chatState.activeSessionId);
+      if (updated.ok && updated.data) {
+        // Run chat.receive.after hook — plugins can inspect/transform the response.
+        const afterResult = await hooks.run<Conversation>("chat.receive.after", updated.data);
+        const conversation = (afterResult && typeof afterResult === "object" && "$block" in afterResult)
+          ? updated.data // Ignore $block on receive — the response already happened.
+          : afterResult as Conversation;
+        chatState.activeChat = conversation;
+        opts.afterResponse?.(conversation);
+        addAssistantActionButtons(wrapper, conversation, usageStats);
+      }
+    }
+
+    await refreshSidebar();
+  } else {
+    // Background stream completed — refresh sidebar to update status.
+    await refreshSidebar();
+
+    // If the user is currently viewing this chat, re-render with full data.
+    if (streamSessionId && chatState.activeSessionId === streamSessionId) {
+      const dom = getChatDom();
+      const updated = await api.getConversation(streamSessionId);
+      if (updated.ok && updated.data && chatState.activeSessionId === streamSessionId) {
+        chatState.activeChat = updated.data;
+        renderChatView(updated.data);
+        removeGeneratingIndicator(dom.transcriptContainer);
+        showInputBar();
+      }
     }
   }
-
-  await refreshSidebar();
 }
 
 interface SendOptions {

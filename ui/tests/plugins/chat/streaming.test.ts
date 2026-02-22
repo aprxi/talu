@@ -123,15 +123,15 @@ describe("readSSEStream — edge cases", () => {
   test("returns null when response has no body", async () => {
     const resp = new Response(null);
     const { bodyEl, textEl } = makeDomEls();
-    const result = await readSSEStream(resp, bodyEl, textEl);
-    expect(result).toBeNull();
+    const result = await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
+    expect(result).toEqual({ usage: null, sessionId: null });
   });
 
-  test("returns null for empty stream (no events)", async () => {
+  test("returns null usage for empty stream (no events)", async () => {
     const resp = sseResponse("");
     const { bodyEl, textEl } = makeDomEls();
-    const result = await readSSEStream(resp, bodyEl, textEl);
-    expect(result).toBeNull();
+    const result = await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
+    expect(result).toEqual({ usage: null, sessionId: null });
   });
 });
 
@@ -144,7 +144,7 @@ describe("readSSEStream — text delta", () => {
       sseEvent("response.output_text.delta", { delta: " World" }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
 
     // First delta mounts, second updates.
     expect(mountedParts.length).toBe(1);
@@ -157,7 +157,7 @@ describe("readSSEStream — text delta", () => {
       sseEvent("response.output_text.delta", { delta: "processed text" }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(preProcessorCalled.length).toBeGreaterThanOrEqual(1);
     expect(preProcessorCalled.some((t) => t.includes("processed text"))).toBe(true);
   });
@@ -167,7 +167,7 @@ describe("readSSEStream — text delta", () => {
       sseEvent("response.output_text.delta", { delta: 42 }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(mountedParts.length).toBe(0);
   });
 });
@@ -180,7 +180,7 @@ describe("readSSEStream — reasoning delta", () => {
       sseEvent("response.reasoning.delta", { delta: "Let me think..." }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
 
     const details = bodyEl.querySelector("details.reasoning-block");
     expect(details).not.toBeNull();
@@ -193,7 +193,7 @@ describe("readSSEStream — reasoning delta", () => {
       sseEvent("response.reasoning.delta", { delta: "**bold reasoning**" }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
 
     const reasoningBody = bodyEl.querySelector(".reasoning-body");
     expect(reasoningBody).not.toBeNull();
@@ -205,7 +205,7 @@ describe("readSSEStream — reasoning delta", () => {
       sseEvent("response.reasoning.delta", { delta: null }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     const details = bodyEl.querySelector("details.reasoning-block");
     expect(details).toBeNull();
   });
@@ -224,7 +224,7 @@ describe("readSSEStream — state mutations", () => {
       }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(chatState.lastResponseId).toBe("resp-123");
     expect(chatState.activeSessionId).toBe("sess-456");
   });
@@ -236,7 +236,7 @@ describe("readSSEStream — state mutations", () => {
       }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(chatState.lastResponseId).toBe("resp-789");
     expect(chatState.activeSessionId).toBe("sess-012");
   });
@@ -252,7 +252,7 @@ describe("readSSEStream — state mutations", () => {
       }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(chatState.lastResponseId).toBe("resp-final");
     expect(chatState.activeSessionId).toBe("sess-final");
   });
@@ -262,7 +262,7 @@ describe("readSSEStream — state mutations", () => {
       sseEvent("response.created", { response: { id: "resp-no-meta" } }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(chatState.lastResponseId).toBe("resp-no-meta");
     expect(chatState.activeSessionId).toBeNull();
   });
@@ -281,14 +281,14 @@ describe("readSSEStream — usage stats", () => {
       }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    const stats = await readSSEStream(resp, bodyEl, textEl);
-    expect(stats).not.toBeNull();
-    expect(stats!.input_tokens).toBe(100);
-    expect(stats!.output_tokens).toBe(50);
-    expect(stats!.total_tokens).toBe(150);
-    expect(typeof stats!.duration_ms).toBe("number");
-    expect(stats!.duration_ms).toBeGreaterThanOrEqual(0);
-    expect(typeof stats!.tokens_per_second).toBe("number");
+    const result = await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
+    expect(result.usage).not.toBeNull();
+    expect(result.usage!.input_tokens).toBe(100);
+    expect(result.usage!.output_tokens).toBe(50);
+    expect(result.usage!.total_tokens).toBe(150);
+    expect(typeof result.usage!.duration_ms).toBe("number");
+    expect(result.usage!.duration_ms).toBeGreaterThanOrEqual(0);
+    expect(typeof result.usage!.tokens_per_second).toBe("number");
   });
 
   test("response.completed without usage returns null stats", async () => {
@@ -296,8 +296,8 @@ describe("readSSEStream — usage stats", () => {
       sseEvent("response.completed", { response: { id: "r2" } }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    const stats = await readSSEStream(resp, bodyEl, textEl);
-    expect(stats).toBeNull();
+    const result = await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
+    expect(result.usage).toBeNull();
   });
 
   test("response.incomplete also returns usage stats", async () => {
@@ -310,9 +310,9 @@ describe("readSSEStream — usage stats", () => {
       }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    const stats = await readSSEStream(resp, bodyEl, textEl);
-    expect(stats).not.toBeNull();
-    expect(stats!.output_tokens).toBe(3);
+    const result = await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
+    expect(result.usage).not.toBeNull();
+    expect(result.usage!.output_tokens).toBe(3);
   });
 });
 
@@ -326,7 +326,7 @@ describe("readSSEStream — error handling", () => {
       }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(errorMessages).toContain("Rate limited");
   });
 
@@ -337,7 +337,7 @@ describe("readSSEStream — error handling", () => {
     );
     const { bodyEl, textEl } = makeDomEls();
     // Should not throw.
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     // Only the valid delta should have been processed.
     expect(mountedParts.length).toBe(1);
   });
@@ -347,7 +347,7 @@ describe("readSSEStream — error handling", () => {
       sseEvent("response.unknown_event", { foo: "bar" }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     // No crash, no side effects.
     expect(mountedParts.length).toBe(0);
     expect(errorMessages.length).toBe(0);
@@ -363,7 +363,7 @@ describe("readSSEStream — chunk splitting", () => {
     const mid = Math.floor(full.length / 2);
     const resp = sseResponse(full.slice(0, mid), full.slice(mid));
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(mountedParts.length).toBe(1);
     expect(preProcessorCalled.some((t) => t.includes("split-test"))).toBe(true);
   });
@@ -374,7 +374,7 @@ describe("readSSEStream — chunk splitting", () => {
       sseEvent("response.output_text.delta", { delta: "B" });
     const resp = sseResponse(combined);
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     // Both deltas processed — first mounts, second updates.
     expect(mountedParts.length).toBe(1);
     expect(updatedParts.length).toBeGreaterThanOrEqual(1);
@@ -389,7 +389,7 @@ describe("readSSEStream — chunk splitting", () => {
       eventLine.slice(4) + dataLine, // "t: response...\ndata: ...\n\n"
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(mountedParts.length).toBe(1);
     expect(preProcessorCalled.some((t) => t.includes("boundary"))).toBe(true);
   });
@@ -400,7 +400,7 @@ describe("readSSEStream — chunk splitting", () => {
       "event: response.output_text.delta\ndata: {\"delta\":\"flush\"}\n",
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
     expect(mountedParts.length).toBe(1);
     expect(preProcessorCalled.some((t) => t.includes("flush"))).toBe(true);
   });
@@ -424,12 +424,12 @@ describe("readSSEStream — full flow", () => {
       }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    const stats = await readSSEStream(resp, bodyEl, textEl);
+    const result = await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
 
     expect(chatState.lastResponseId).toBe("r-flow");
     expect(chatState.activeSessionId).toBe("s-flow");
-    expect(stats).not.toBeNull();
-    expect(stats!.total_tokens).toBe(12);
+    expect(result.usage).not.toBeNull();
+    expect(result.usage!.total_tokens).toBe(12);
     // Text was mounted and updated.
     expect(mountedParts.length).toBe(1);
     // Final render triggers an update with isFinal=true.
@@ -443,7 +443,7 @@ describe("readSSEStream — full flow", () => {
       sseEvent("response.output_text.delta", { delta: "Answer" }),
     );
     const { bodyEl, textEl } = makeDomEls();
-    await readSSEStream(resp, bodyEl, textEl);
+    await readSSEStream(resp, bodyEl, textEl, chatState.activeViewId);
 
     // Reasoning block created.
     expect(bodyEl.querySelector("details.reasoning-block")).not.toBeNull();

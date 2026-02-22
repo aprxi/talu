@@ -23,6 +23,14 @@ export interface ChatState {
   isUploadingAttachments: boolean;
   isGenerating: boolean;
   streamAbort: AbortController | null;
+  /** Incremented on each navigation (selectChat, startNewConversation). Streams
+   *  capture this at start and only write to global state while it matches. */
+  activeViewId: number;
+  /** Session IDs with active background streams (user navigated away during generation). */
+  backgroundStreamSessions: Set<string>;
+  /** Saved transcript DOM fragments for background-streaming sessions (keyed by session ID).
+   *  Streams continue writing to these detached elements; restored when user navigates back. */
+  backgroundStreamDom: Map<string, DocumentFragment>;
   pagination: {
     offset: number;
     hasMore: boolean;
@@ -39,6 +47,9 @@ export const chatState: ChatState = {
   isUploadingAttachments: false,
   isGenerating: false,
   streamAbort: null,
+  activeViewId: 0,
+  backgroundStreamSessions: new Set(),
+  backgroundStreamDom: new Map(),
   pagination: {
     offset: 0,
     hasMore: true,

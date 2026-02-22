@@ -677,6 +677,19 @@ async fn generate_response(
             // Record item count before generation to extract only new output items.
             let pre_gen_count = chat.item_count();
 
+            // Persist session metadata BEFORE generation so the conversation
+            // appears in list_sessions immediately.
+            if bucket_for_task.is_some() && pre_gen_count <= 2 {
+                let t = input_string.as_deref().unwrap_or("Untitled");
+                let title: String = t.chars().take(47).collect();
+                let _ = chat.notify_session_update_ex(
+                    Some(&model_id_for_task),
+                    Some(&title),
+                    Some("active"),
+                    prompt_id_for_task.as_deref(),
+                );
+            }
+
             let mut cfg = talu::router::GenerateConfig::default();
             if let Some(max_tokens) = max_output_tokens {
                 cfg.max_tokens = max_tokens as usize;
@@ -699,22 +712,6 @@ async fn generate_response(
             let completion_tokens = result.completion_tokens();
             log::debug!(target: "server::gen", "completed: prompt_tokens={} completion_tokens={}",
                 prompt_tokens, completion_tokens);
-
-            // Persist session metadata so the conversation appears in list_sessions.
-            // A brand-new chat has at most 2 items before generation: an optional
-            // system message (from prompt_id) + the user message.  Chained requests
-            // have more items and must skip this to avoid overwriting the title.
-            if bucket_for_task.is_some() && pre_gen_count <= 2 {
-                let t = input_string.as_deref().unwrap_or("Untitled");
-                let title: String = t.chars().take(47).collect();
-                // Use extended update with source_doc_id for lineage tracking
-                let _ = chat.notify_session_update_ex(
-                    Some(&model_id_for_task),
-                    Some(&title),
-                    Some("active"),
-                    prompt_id_for_task.as_deref(),
-                );
-            }
 
             // Serialize ALL items (response direction), then slice to output only.
             let all_json = chat
@@ -1035,7 +1032,7 @@ async fn stream_response(
         }
 
         let mut seq = 0u64;
-        let created_response = normalize_response_value(build_response_resource_value(
+        let mut created_response = normalize_response_value(build_response_resource_value(
             &response_id,
             &model_id,
             created_at,
@@ -1049,6 +1046,9 @@ async fn stream_response(
             tools_for_events.as_ref(),
             tool_choice_for_events.as_ref(),
         ));
+        // Include session_id in the very first event so the UI can track
+        // the conversation immediately (before generation completes).
+        created_response["metadata"] = json!({ "session_id": session_id });
         let _ = send_event(
             &tx,
             "response.created",
@@ -1255,19 +1255,15 @@ fn run_streaming_generation(
     // Record item count before generation to extract only new output items.
     let pre_gen_count = chat.item_count();
 
-    log::trace!(target: "server::gen", "generate_stream(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
-        pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
-    let stream_result = talu::router::generate_stream(&chat, &[], backend, &cfg, callback)
-        .map_err(|e| anyhow!("generation failed: {}", e))?;
-
-    // Persist session metadata so the conversation appears in list_sessions.
+    // Persist session metadata BEFORE generation so the conversation appears
+    // in list_sessions immediately — the user can navigate to it while
+    // generation is still in progress.
     // A brand-new chat has at most 2 items before generation: an optional
     // system message (from prompt_id) + the user message.  Chained requests
     // have more items and must skip this to avoid overwriting the title.
     if bucket_path.is_some() && pre_gen_count <= 2 {
         let t = input_string.as_deref().unwrap_or("Untitled");
         let title: String = t.chars().take(47).collect();
-        // Use extended update with source_doc_id for lineage tracking
         let _ = chat.notify_session_update_ex(
             Some(&model_id),
             Some(&title),
@@ -1275,6 +1271,11 @@ fn run_streaming_generation(
             prompt_id.as_deref(),
         );
     }
+
+    log::trace!(target: "server::gen", "generate_stream(items={}, cfg={{max_tokens={}, temp={}, top_p={}}})",
+        pre_gen_count, cfg.max_tokens, cfg.temperature, cfg.top_p);
+    let stream_result = talu::router::generate_stream(&chat, &[], backend, &cfg, callback)
+        .map_err(|e| anyhow!("generation failed: {}", e))?;
 
     // Serialize all items and full conversation for storage/chaining.
     let all_json = chat
