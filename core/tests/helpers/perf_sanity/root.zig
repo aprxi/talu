@@ -20,6 +20,7 @@ const rowwise = root_main.compute.cpu.rowwise;
 const softmax = root_main.compute.cpu.softmax;
 const metal = root_main.compute.metal;
 const runtime = root_main.inference.backend.cpu.executor.runtime;
+const vector_bench = root_main.db.vector.bench;
 
 fn envUsize(allocator: std.mem.Allocator, name: []const u8, default_value: usize) usize {
     const raw = std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
@@ -182,6 +183,37 @@ fn runLifecycle(writer: anytype, allocator: std.mem.Allocator) !void {
     try writer.print("LIFECYCLE_CHECK name=cpu_scratch status=pass cycles={}\n", .{cycles});
 }
 
+fn runDbVectorBench(writer: anytype, allocator: std.mem.Allocator) !void {
+    const rows = envUsize(allocator, "TALU_PERF_VECTOR_ROWS", 4096);
+    const dims = envUsize(allocator, "TALU_PERF_VECTOR_DIMS", 128);
+    const queries = envUsize(allocator, "TALU_PERF_VECTOR_QUERIES", 8);
+    const k = envUsize(allocator, "TALU_PERF_VECTOR_TOPK", 10);
+
+    const flat = try vector_bench.benchmarkFlatSearch(
+        allocator,
+        rows,
+        @intCast(dims),
+        @intCast(queries),
+        @intCast(k),
+    );
+    const ivf = try vector_bench.benchmarkIvfSearch(
+        allocator,
+        rows,
+        @intCast(dims),
+        @intCast(queries),
+        @intCast(k),
+    );
+
+    try writer.print(
+        "PERF_CHECK name=db_vector_flat elapsed_ns={} rows={} queries={} status=pass\n",
+        .{ flat.elapsed_ns, flat.rows_scanned, flat.queries },
+    );
+    try writer.print(
+        "PERF_CHECK name=db_vector_ivf elapsed_ns={} rows={} queries={} status=pass\n",
+        .{ ivf.elapsed_ns, ivf.rows_scanned, ivf.queries },
+    );
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer {
@@ -199,6 +231,7 @@ pub fn main() !void {
         try runCpu(stdout, allocator);
         try runMetal(stdout, allocator);
         try runLifecycle(stdout, allocator);
+        try runDbVectorBench(stdout, allocator);
         return;
     }
 
@@ -214,6 +247,11 @@ pub fn main() !void {
 
     if (std.mem.eql(u8, args[1], "metal")) {
         try runMetal(stdout, allocator);
+        return;
+    }
+
+    if (std.mem.eql(u8, args[1], "db-vector")) {
+        try runDbVectorBench(stdout, allocator);
         return;
     }
 
@@ -234,4 +272,12 @@ test "benchmarkMetalDecodeProxy returns optional throughput" {
 
 test "checkCpuScratchLifecycle does not leak" {
     try checkCpuScratchLifecycle(8);
+}
+
+test "runDbVectorBench emits benchmark rows" {
+    var list = std.ArrayList(u8).empty;
+    defer list.deinit(std.testing.allocator);
+    try runDbVectorBench(list.writer(std.testing.allocator), std.testing.allocator);
+    try std.testing.expect(std.mem.indexOf(u8, list.items, "db_vector_flat") != null);
+    try std.testing.expect(std.mem.indexOf(u8, list.items, "db_vector_ivf") != null);
 }

@@ -77,6 +77,7 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.InvalidArgument => .invalid_argument,
         error.AlreadyExists => .invalid_argument,
         error.IdempotencyConflict => .invalid_argument,
+        error.ManifestGenerationConflict => .invalid_argument,
         error.InvalidHandle => .invalid_handle,
         error.ResourceExhausted => .resource_exhausted,
         error.ZeroVectorNotAllowed => .invalid_argument,

@@ -818,6 +818,68 @@ pub export fn talu_vector_store_compact_idempotent(
     return 0;
 }
 
+/// Compact vector storage if the current manifest generation matches expected_generation.
+pub export fn talu_vector_store_compact_with_generation(
+    handle: ?*VectorStoreHandle,
+    dims: u32,
+    expected_generation: u64,
+    out_kept_count: *usize,
+    out_removed_tombstones: *usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_kept_count.* = 0;
+    out_removed_tombstones.* = 0;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const result = backend.compactWithExpectedGeneration(dims, expected_generation) catch |err| {
+        switch (err) {
+            error.ManifestGenerationConflict => capi_error.setErrorWithCode(
+                .invalid_argument,
+                "manifest generation conflict",
+                .{},
+            ),
+            else => capi_error.setError(err, "failed to compact vectors with generation guard", .{}),
+        }
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out_kept_count.* = result.kept_count;
+    out_removed_tombstones.* = result.removed_tombstones;
+    return 0;
+}
+
+/// Compact vectors when tombstones older than TTL are present.
+pub export fn talu_vector_store_compact_expired_tombstones(
+    handle: ?*VectorStoreHandle,
+    dims: u32,
+    now_ms: i64,
+    max_age_ms: i64,
+    out_kept_count: *usize,
+    out_removed_tombstones: *usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_kept_count.* = 0;
+    out_removed_tombstones.* = 0;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const result = backend.compactExpiredTombstones(dims, now_ms, max_age_ms) catch |err| {
+        capi_error.setError(err, "failed to compact expired tombstones", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out_kept_count.* = result.kept_count;
+    out_removed_tombstones.* = result.removed_tombstones;
+    return 0;
+}
+
 /// Read vector change events with cursor pagination.
 pub export fn talu_vector_store_changes(
     handle: ?*VectorStoreHandle,
@@ -1019,6 +1081,7 @@ pub export fn talu_vector_store_search_batch(
         query_count,
         k,
         false,
+        false,
         out_ids,
         out_scores,
         out_count_per_query,
@@ -1034,6 +1097,7 @@ pub export fn talu_vector_store_search_batch_ex(
     query_count: u32,
     k: u32,
     normalize_queries: bool,
+    approximate: bool,
     out_ids: *?[*]u64,
     out_scores: *?[*]f32,
     out_count_per_query: *u32,
@@ -1060,6 +1124,7 @@ pub export fn talu_vector_store_search_batch_ex(
 
     const result = backend.searchBatchWithOptions(allocator, query[0..query_len], dims, query_count, k, .{
         .normalize_queries = normalize_queries,
+        .approximate = approximate,
     }) catch |err| {
         capi_error.setError(err, "failed to search vectors", .{});
         return @intFromEnum(error_codes.errorToCode(err));

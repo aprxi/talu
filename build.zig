@@ -891,6 +891,8 @@ pub fn build(b: *std.Build) void {
         const run_perf_tests = b.addRunArtifact(perf_tests);
         const perf_test_step = b.step("test-perf-sanity", "Run perf/lifecycle sanity tests");
         perf_test_step.dependOn(&run_perf_tests.step);
+        // Keep perf/determinism guardrails part of integration validation.
+        integration_test_step.dependOn(&run_perf_tests.step);
     } else |_| {
         // perf sanity checker not present - skip
     }

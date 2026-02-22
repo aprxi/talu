@@ -66,6 +66,7 @@ const SegmentStats = struct {
     min_ts: i64,
     max_ts: i64,
     row_count: u64,
+    segment_checksum_crc32c: u32,
 };
 
 pub const default_max_segment_size: u64 = 64 * 1024 * 1024;
@@ -371,9 +372,11 @@ pub const Writer = struct {
         }
 
         const segment_stats = try self.writeFooterAndCollectSegmentStats(seg_name);
+        const segment_index = self.maybeBuildVectorSegmentIndex(seg_name) catch null;
+        defer if (segment_index) |meta| self.allocator.free(meta.path);
 
         // Update manifest (load existing or create empty)
-        try self.updateManifest(seg_name, &uuid_bytes, segment_stats);
+        try self.updateManifest(seg_name, &uuid_bytes, segment_stats, segment_index);
 
         // Open fresh current.talu
         self.data_file = try self.dir.createFile("current.talu", .{ .read = true, .truncate = true });
@@ -384,6 +387,7 @@ pub const Writer = struct {
         seg_name: []const u8,
         uuid_bytes: *const [16]u8,
         segment_stats: SegmentStats,
+        segment_index: ?manifest_mod.SegmentIndexMeta,
     ) !void {
         const manifest_path = try std.fs.path.join(self.allocator, &.{ self.ns_path, "manifest.json" });
         defer self.allocator.free(manifest_path);
@@ -393,6 +397,7 @@ pub const Writer = struct {
                 const empty = try self.allocator.alloc(manifest_mod.SegmentEntry, 0);
                 break :blk manifest_mod.Manifest{
                     .version = 1,
+                    .generation = 0,
                     .segments = empty,
                     .last_compaction_ts = 0,
                 };
@@ -419,6 +424,15 @@ pub const Writer = struct {
             .min_ts = segment_stats.min_ts,
             .max_ts = segment_stats.max_ts,
             .row_count = segment_stats.row_count,
+            .checksum_crc32c = segment_stats.segment_checksum_crc32c,
+            .index = if (segment_index) |meta|
+                .{
+                    .kind = meta.kind,
+                    .path = try self.allocator.dupe(u8, meta.path),
+                    .checksum_crc32c = meta.checksum_crc32c,
+                }
+            else
+                null,
         };
 
         // Transfer ownership to manifest. After this, errdefer m.deinit
@@ -426,7 +440,7 @@ pub const Writer = struct {
         self.allocator.free(m.segments);
         m.segments = new_segments;
 
-        try m.save(manifest_path);
+        m.generation = try m.saveNextGeneration(self.allocator, manifest_path, m.generation);
         m.deinit(self.allocator);
     }
 
@@ -484,6 +498,65 @@ pub const Writer = struct {
             .min_ts = if (has_ts_range) min_ts else 0,
             .max_ts = if (has_ts_range) max_ts else 0,
             .row_count = row_count,
+            .segment_checksum_crc32c = if (entries.len > 0) blk: {
+                const size_after_footer = (try file.stat()).size;
+                break :blk try crc32cFilePrefix(file, size_after_footer);
+            } else 0,
+        };
+    }
+
+    fn maybeBuildVectorSegmentIndex(self: *Writer, seg_name: []const u8) !?manifest_mod.SegmentIndexMeta {
+        const ns_base = std.fs.path.basename(self.ns_path);
+        if (!std.mem.eql(u8, ns_base, "vector")) return null;
+
+        var seg_file = try self.dir.openFile(seg_name, .{ .mode = .read_only });
+        defer seg_file.close();
+        const seg_stat = try seg_file.stat();
+        const reader = block_reader.BlockReader.init(seg_file, self.allocator);
+        const block_index = try reader.getBlockIndex(seg_stat.size);
+        defer self.allocator.free(block_index);
+
+        var dims: u32 = 0;
+        var row_count: u64 = 0;
+        for (block_index) |entry| {
+            const header = try reader.readHeader(entry.block_off);
+            if (header.schema_id != 10) continue;
+            const descs = try reader.readColumnDirectory(header, entry.block_off);
+            defer self.allocator.free(descs);
+            for (descs) |desc| {
+                if (desc.column_id != 10) continue;
+                if (desc.shape != @intFromEnum(types.ColumnShape.VECTOR)) continue;
+                if (desc.phys_type != @intFromEnum(types.PhysicalType.F32)) continue;
+                if (dims == 0) dims = desc.dims;
+                if (dims != desc.dims) return error.InvalidColumnData;
+                row_count += header.row_count;
+            }
+        }
+
+        if (dims == 0 or row_count == 0) return null;
+
+        const suffix = ".talu";
+        if (!std.mem.endsWith(u8, seg_name, suffix)) return null;
+        const base = seg_name[0 .. seg_name.len - suffix.len];
+        const index_name = try std.fmt.allocPrint(self.allocator, "{s}.ivf", .{base});
+        errdefer self.allocator.free(index_name);
+
+        const payload = try std.fmt.allocPrint(
+            self.allocator,
+            "{{\"version\":1,\"kind\":\"ivf_flat\",\"segment\":\"{s}\",\"dims\":{d},\"row_count\":{d}}}",
+            .{ seg_name, dims, row_count },
+        );
+        defer self.allocator.free(payload);
+
+        var index_file = try self.dir.createFile(index_name, .{ .truncate = true });
+        defer index_file.close();
+        try index_file.writeAll(payload);
+        try index_file.sync();
+
+        return .{
+            .kind = .ivf_flat,
+            .path = index_name,
+            .checksum_crc32c = checksum.crc32c(payload),
         };
     }
 
@@ -1277,6 +1350,7 @@ test "Writer.rotateSegment seals current segment" {
     defer manifest_data.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), manifest_data.segments.len);
     try std.testing.expect(manifest_data.segments[0].row_count > 0);
+    try std.testing.expect(manifest_data.segments[0].checksum_crc32c != 0);
 }
 
 test "Writer.rotateSegment records timestamp range in manifest metadata" {
@@ -1346,6 +1420,99 @@ test "Writer.rotateSegment records timestamp range in manifest metadata" {
     try std.testing.expectEqual(@as(i64, 100), manifest_data.segments[0].min_ts);
     try std.testing.expectEqual(@as(i64, 100), manifest_data.segments[0].max_ts);
     try std.testing.expectEqual(@as(u64, 1), manifest_data.segments[0].row_count);
+}
+
+test "Writer.rotateSegment writes vector index metadata for vector namespace" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var writer = try Writer.open(std.testing.allocator, tmp_path, "vector");
+    defer writer.deinit();
+
+    writer.max_segment_size = 1;
+
+    const ids_first = [_]u64{1};
+    const ts_first = [_]i64{100};
+    const vectors_first = [_]f32{ 1.0, 0.0 };
+    const cols_first = [_]ColumnBatch{
+        .{
+            .column_id = 1,
+            .shape = .SCALAR,
+            .phys_type = .U64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ids_first),
+        },
+        .{
+            .column_id = 2,
+            .shape = .SCALAR,
+            .phys_type = .I64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ts_first),
+        },
+        .{
+            .column_id = 10,
+            .shape = .VECTOR,
+            .phys_type = .F32,
+            .encoding = .RAW,
+            .dims = 2,
+            .data = std.mem.sliceAsBytes(&vectors_first),
+        },
+    };
+    try writer.appendBatch(10, 1, &cols_first);
+    try writer.flushBlock();
+
+    const ids_second = [_]u64{2};
+    const ts_second = [_]i64{200};
+    const vectors_second = [_]f32{ 0.0, 1.0 };
+    const cols_second = [_]ColumnBatch{
+        .{
+            .column_id = 1,
+            .shape = .SCALAR,
+            .phys_type = .U64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ids_second),
+        },
+        .{
+            .column_id = 2,
+            .shape = .SCALAR,
+            .phys_type = .I64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ts_second),
+        },
+        .{
+            .column_id = 10,
+            .shape = .VECTOR,
+            .phys_type = .F32,
+            .encoding = .RAW,
+            .dims = 2,
+            .data = std.mem.sliceAsBytes(&vectors_second),
+        },
+    };
+    try writer.appendBatch(10, 1, &cols_second);
+    try writer.flushBlock();
+
+    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "vector/manifest.json");
+    defer std.testing.allocator.free(manifest_path);
+    var manifest_data = try manifest_mod.Manifest.load(std.testing.allocator, manifest_path);
+    defer manifest_data.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), manifest_data.segments.len);
+    try std.testing.expect(manifest_data.segments[0].index != null);
+    const index_meta = manifest_data.segments[0].index.?;
+    try std.testing.expectEqual(manifest_mod.SegmentIndexKind.ivf_flat, index_meta.kind);
+    try std.testing.expect(index_meta.checksum_crc32c != 0);
+
+    const index_rel_path = try std.fmt.allocPrint(std.testing.allocator, "vector/{s}", .{index_meta.path});
+    defer std.testing.allocator.free(index_rel_path);
+    const stat = try tmp.dir.statFile(index_rel_path);
+    try std.testing.expect(stat.size > 0);
 }
 
 test "Writer.rotateSegment failure keeps writer usable" {
