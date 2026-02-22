@@ -9,6 +9,11 @@ const build_options = @import("build_options");
 
 const cuda_success: c_int = 0;
 const cuda_error_out_of_memory: c_int = 2;
+const cuda_error_invalid_value: c_int = 1;
+const cuda_error_deinitialized: c_int = 4;
+const cuda_error_not_initialized: c_int = 3;
+const cuda_error_invalid_context: c_int = 201;
+const cuda_error_context_is_destroyed: c_int = 709;
 
 const CuInitFn = *const fn (u32) callconv(.c) c_int;
 const CuDeviceGetCountFn = *const fn (*c_int) callconv(.c) c_int;
@@ -23,6 +28,25 @@ const CuMemcpyHtoDFn = *const fn (u64, *const anyopaque, usize) callconv(.c) c_i
 const CuMemcpyDtoHFn = *const fn (*anyopaque, u64, usize) callconv(.c) c_int;
 const CuDeviceGetNameFn = *const fn ([*]u8, c_int, c_int) callconv(.c) c_int;
 const CuDeviceTotalMemFn = *const fn (*usize, c_int) callconv(.c) c_int;
+const CuModuleLoadDataFn = *const fn (*?*anyopaque, *const anyopaque) callconv(.c) c_int;
+const CuModuleGetFunctionFn = *const fn (*?*anyopaque, ?*anyopaque, [*:0]const u8) callconv(.c) c_int;
+const CuModuleUnloadFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuLaunchKernelFn = *const fn (
+    ?*anyopaque,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    u32,
+    ?*anyopaque,
+    ?*anyopaque,
+    ?*anyopaque,
+) callconv(.c) c_int;
+
+pub const ModuleHandle = *anyopaque;
+pub const FunctionHandle = *anyopaque;
 
 pub const Probe = enum {
     disabled,
@@ -47,6 +71,10 @@ const DriverApi = struct {
     cu_memcpy_dtoh: CuMemcpyDtoHFn,
     cu_device_get_name: CuDeviceGetNameFn,
     cu_device_total_mem: ?CuDeviceTotalMemFn,
+    cu_module_load_data: ?CuModuleLoadDataFn,
+    cu_module_get_function: ?CuModuleGetFunctionFn,
+    cu_module_unload: ?CuModuleUnloadFn,
+    cu_launch_kernel: ?CuLaunchKernelFn,
 };
 
 pub fn isRuntimeSupported() bool {
@@ -147,6 +175,9 @@ pub const Device = struct {
         var pointer: u64 = 0;
         const rc = self.api.cu_mem_alloc(&pointer, buffer_size);
         if (rc == cuda_error_out_of_memory) return error.OutOfMemory;
+        if (rc == cuda_error_invalid_value) return error.InvalidArgument;
+        if (rc == cuda_error_deinitialized or rc == cuda_error_not_initialized) return error.CudaInitFailed;
+        if (rc == cuda_error_invalid_context or rc == cuda_error_context_is_destroyed) return error.CudaContextLost;
         if (rc != cuda_success) return error.CudaAllocFailed;
         return .{ .pointer = pointer, .size = buffer_size };
     }
@@ -154,6 +185,78 @@ pub const Device = struct {
     pub fn makeCurrent(self: *Device) !void {
         if (self.context == null) return error.CudaContextLost;
         if (self.api.cu_ctx_set_current(self.context) != cuda_success) return error.CudaContextLost;
+    }
+
+    pub fn supportsModuleLaunch(self: *const Device) bool {
+        return self.api.cu_module_load_data != null and
+            self.api.cu_module_get_function != null and
+            self.api.cu_module_unload != null and
+            self.api.cu_launch_kernel != null;
+    }
+
+    pub fn moduleLoadData(self: *Device, image: *const anyopaque) !ModuleHandle {
+        const cu_module_load_data = self.api.cu_module_load_data orelse return error.CudaModuleApiUnavailable;
+        try self.makeCurrent();
+
+        var module_handle: ?*anyopaque = null;
+        if (cu_module_load_data(&module_handle, image) != cuda_success or module_handle == null) {
+            return error.CudaModuleLoadFailed;
+        }
+        return module_handle.?;
+    }
+
+    pub fn moduleGetFunction(self: *Device, module: ModuleHandle, symbol: [:0]const u8) !FunctionHandle {
+        const cu_module_get_function = self.api.cu_module_get_function orelse return error.CudaModuleApiUnavailable;
+        try self.makeCurrent();
+
+        var function_handle: ?*anyopaque = null;
+        if (cu_module_get_function(&function_handle, module, symbol.ptr) != cuda_success or function_handle == null) {
+            return error.CudaFunctionLookupFailed;
+        }
+        return function_handle.?;
+    }
+
+    pub fn moduleUnload(self: *Device, module: ModuleHandle) void {
+        const cu_module_unload = self.api.cu_module_unload orelse return;
+        self.makeCurrent() catch return;
+        _ = cu_module_unload(module);
+    }
+
+    pub fn launchKernel(
+        self: *Device,
+        function: FunctionHandle,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared_mem_bytes: u32,
+        kernel_params: ?[*]const ?*anyopaque,
+    ) !void {
+        const cu_launch_kernel = self.api.cu_launch_kernel orelse return error.CudaModuleApiUnavailable;
+        try self.makeCurrent();
+
+        const params_ptr: ?*anyopaque = if (kernel_params) |params|
+            @ptrCast(@constCast(params))
+        else
+            null;
+
+        if (cu_launch_kernel(
+            function,
+            grid_x,
+            grid_y,
+            grid_z,
+            block_x,
+            block_y,
+            block_z,
+            shared_mem_bytes,
+            null, // stream
+            params_ptr,
+            null, // extra
+        ) != cuda_success) {
+            return error.CudaKernelLaunchFailed;
+        }
     }
 };
 
@@ -207,6 +310,10 @@ fn lookupRequired(comptime T: type, lib: *std.DynLib, symbol: [:0]const u8) !T {
     return lib.lookup(T, symbol) orelse error.CudaSymbolMissing;
 }
 
+fn lookupOptional(comptime T: type, lib: *std.DynLib, symbol: [:0]const u8) ?T {
+    return lib.lookup(T, symbol);
+}
+
 fn lookupRequiredAny(comptime T: type, lib: *std.DynLib, symbols: []const [:0]const u8) !T {
     for (symbols) |symbol| {
         if (lib.lookup(T, symbol)) |fn_ptr| return fn_ptr;
@@ -236,6 +343,10 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_memcpy_dtoh = try lookupRequiredAny(CuMemcpyDtoHFn, lib, &.{ "cuMemcpyDtoH_v2", "cuMemcpyDtoH" }),
         .cu_device_get_name = try lookupRequired(CuDeviceGetNameFn, lib, "cuDeviceGetName"),
         .cu_device_total_mem = lookupOptionalAny(CuDeviceTotalMemFn, lib, &.{ "cuDeviceTotalMem_v2", "cuDeviceTotalMem" }),
+        .cu_module_load_data = lookupOptional(CuModuleLoadDataFn, lib, "cuModuleLoadData"),
+        .cu_module_get_function = lookupOptional(CuModuleGetFunctionFn, lib, "cuModuleGetFunction"),
+        .cu_module_unload = lookupOptional(CuModuleUnloadFn, lib, "cuModuleUnload"),
+        .cu_launch_kernel = lookupOptional(CuLaunchKernelFn, lib, "cuLaunchKernel"),
     };
 }
 
@@ -294,4 +405,13 @@ test "Device.totalMemory reports non-zero bytes when available" {
         return;
     };
     try std.testing.expect(bytes > 0);
+}
+
+test "Device.supportsModuleLaunch reports availability after Device.init" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try Device.init();
+    defer device.deinit();
+
+    _ = device.supportsModuleLaunch();
 }

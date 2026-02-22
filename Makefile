@@ -1,4 +1,4 @@
-.PHONY: all deps build static clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
+.PHONY: all deps build static cuda clean clean-deps test docs curl-build mlx-build mbedtls-build freetype-build pdfium-build gen-bindings ui
 
 # Detect platform-specific settings
 UNAME_S := $(shell uname -s)
@@ -28,6 +28,20 @@ endif
 ifdef TALU_ENABLE_CUDA
 	ZIG_BUILD_FLAGS += -Dcuda=true
 endif
+
+CUDA_BUILD_FLAGS := $(ZIG_BUILD_FLAGS)
+ifeq ($(findstring -Dcuda=true,$(CUDA_BUILD_FLAGS)),)
+	CUDA_BUILD_FLAGS += -Dcuda=true
+endif
+
+CUDA_NVCC := $(shell command -v nvcc 2>/dev/null)
+ifeq ($(CUDA_NVCC),)
+ifneq ("$(wildcard /usr/local/cuda/bin/nvcc)","")
+	CUDA_NVCC := /usr/local/cuda/bin/nvcc
+endif
+endif
+
+CUDA_BIN_DIR := $(dir $(CUDA_NVCC))
 
 all: build
 
@@ -297,6 +311,14 @@ endif
 
 build: deps sync-version gen-bindings ui
 	zig build release $(ZIG_BUILD_FLAGS)
+
+cuda: deps sync-version gen-bindings ui
+	@if [ -z "$(CUDA_NVCC)" ]; then \
+		echo "Error: nvcc not found. Install CUDA toolkit or add nvcc to PATH." >&2; \
+		exit 1; \
+	fi
+	PATH="$(CUDA_BIN_DIR):$$PATH" zig build gen-ptx $(CUDA_BUILD_FLAGS)
+	PATH="$(CUDA_BIN_DIR):$$PATH" zig build release $(CUDA_BUILD_FLAGS)
 
 # Generate Python ctypes bindings from Zig C API
 gen-bindings:

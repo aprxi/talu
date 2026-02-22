@@ -396,6 +396,19 @@ pub fn build(b: *std.Build) void {
     const dump_tensors = b.option(bool, "dump-tensors", "Enable full tensor dump (for debugging, produces talu-dump binary)") orelse false;
     const version = getVersion(b);
 
+    const gen_ptx_step = b.step("gen-ptx", "Generate CUDA PTX assets (requires nvcc)");
+    {
+        const gen_fallback_ptx = b.addSystemCommand(&.{
+            "nvcc",
+            "-ptx",
+            "-arch=sm_80",
+            "core/src/compute/cuda/kernels/fallback_kernels.cu",
+            "-o",
+            "core/src/compute/cuda/kernels/fallback_kernels.ptx",
+        });
+        gen_ptx_step.dependOn(&gen_fallback_ptx.step);
+    }
+
     const build_options = b.addOptions();
     build_options.addOption(bool, "enable_metal", enable_metal);
     build_options.addOption(bool, "enable_cuda", enable_cuda);

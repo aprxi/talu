@@ -2,7 +2,7 @@
 
 pub const PrimitiveCapabilities = struct {
     linalg: bool = true,
-    normalization: bool = false,
+    normalization: bool = true,
     activation: bool = false,
     softmax: bool = false,
     layout: bool = false,
