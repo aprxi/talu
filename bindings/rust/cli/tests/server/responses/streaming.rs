@@ -747,6 +747,179 @@ fn non_streaming_response_has_session_id() {
     assert!(found, "session should appear in conversations list");
 }
 
+// =============================================================================
+// Session availability at response.created
+//
+// The session record must be persisted and queryable by the time the client
+// receives the `response.created` SSE event. These tests use raw TCP to
+// read exactly up to `response.created`, then query the conversations API
+// on a separate connection while generation is still in progress.
+// =============================================================================
+
+/// Open a raw TCP streaming request and return (tcp_stream, accumulated_bytes,
+/// session_id) after receiving the `response.created` event. The TCP stream
+/// remains open (generation in progress) when this returns.
+fn stream_until_created(
+    addr: std::net::SocketAddr,
+    body: &serde_json::Value,
+) -> (TcpStream, String, String) {
+    let body_str = serde_json::to_string(body).unwrap();
+    let request = format!(
+        "POST /v1/responses HTTP/1.1\r\n\
+         Host: {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Connection: close\r\n\r\n\
+         {}",
+        addr,
+        body_str.len(),
+        body_str,
+    );
+
+    let mut tcp =
+        TcpStream::connect_timeout(&addr.into(), Duration::from_secs(5)).expect("connect");
+    tcp.set_read_timeout(Some(Duration::from_secs(30)))
+        .expect("set read timeout");
+    tcp.write_all(request.as_bytes()).expect("write");
+    tcp.flush().expect("flush");
+
+    let mut accumulated = String::new();
+    let mut session_id: Option<String> = None;
+
+    'outer: loop {
+        let mut buf = [0u8; 4096];
+        let n = tcp.read(&mut buf).expect("read from stream");
+        if n == 0 {
+            break;
+        }
+        accumulated.push_str(&String::from_utf8_lossy(&buf[..n]));
+
+        for line in accumulated.lines() {
+            if let Some(data) = line.strip_prefix("data: ") {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(data) {
+                    if json["type"].as_str() == Some("response.created") {
+                        session_id = json["response"]["metadata"]["session_id"]
+                            .as_str()
+                            .map(String::from);
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
+
+    let sid = session_id.expect("should find session_id in response.created event");
+    (tcp, accumulated, sid)
+}
+
+/// Drain a TCP stream to avoid broken-pipe errors on the server.
+fn drain_stream(mut tcp: TcpStream) {
+    loop {
+        let mut buf = [0u8; 8192];
+        match tcp.read(&mut buf) {
+            Ok(0) => break,
+            Ok(_) => continue,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+}
+
+/// Session appears in the conversations list with `marker: "active"` at
+/// the time the client receives `response.created`.
+#[test]
+fn streaming_session_listed_with_active_marker_at_created() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": "Tell me about the solar system",
+        "stream": true,
+        "store": true,
+        "max_output_tokens": 100,
+    });
+
+    let (tcp, _acc, session_id) = stream_until_created(ctx.addr(), &body);
+
+    let list_resp = get(ctx.addr(), "/v1/conversations");
+    assert_eq!(list_resp.status, 200);
+    let list = list_resp.json();
+    let data = list["data"].as_array().expect("data array");
+    let entry = data
+        .iter()
+        .find(|c| c["id"].as_str() == Some(session_id.as_str()));
+    assert!(
+        entry.is_some(),
+        "session {session_id} should be in conversations list at response.created time",
+    );
+
+    let entry = entry.unwrap();
+    assert_eq!(
+        entry["marker"].as_str(),
+        Some("active"),
+        "session should have marker='active'",
+    );
+
+    drain_stream(tcp);
+}
+
+/// Session is accessible via GET with correct title and model metadata at
+/// the time the client receives `response.created`.
+#[test]
+fn streaming_session_has_metadata_at_created() {
+    let model = require_model!();
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": "Explain quantum mechanics in simple terms",
+        "stream": true,
+        "store": true,
+        "max_output_tokens": 100,
+    });
+
+    let (tcp, _acc, session_id) = stream_until_created(ctx.addr(), &body);
+
+    // Immediately query GET — session must already be persisted.
+    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    assert_eq!(
+        conv_resp.status, 200,
+        "session must be accessible via GET at response.created time, got {}: {}",
+        conv_resp.status, conv_resp.body,
+    );
+
+    let conv = conv_resp.json();
+    assert_eq!(conv["id"].as_str(), Some(session_id.as_str()));
+
+    // Title should be derived from input (truncated to 47 chars).
+    let title = conv["title"]
+        .as_str()
+        .expect("early-persisted session should have title");
+    assert!(
+        title.starts_with("Explain quantum mechanics"),
+        "title should be derived from input, got: {title:?}",
+    );
+
+    // Model should match the request.
+    let conv_model = conv["model"]
+        .as_str()
+        .expect("early-persisted session should have model");
+    assert!(
+        !conv_model.is_empty(),
+        "model should be non-empty",
+    );
+
+    drain_stream(tcp);
+}
+
 /// Chained streaming response reuses the same session_id.
 #[test]
 fn streaming_chained_response_preserves_session() {

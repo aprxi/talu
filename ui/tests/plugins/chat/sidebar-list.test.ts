@@ -357,13 +357,14 @@ describe("refreshSidebar", () => {
   });
 
   test("resets cursor and hasMore before load", async () => {
-    chatState.pagination.cursor = "stale";
+    chatState.pagination.offset = 50;
     chatState.pagination.hasMore = false;
 
     await refreshSidebar();
 
-    // loadSessions was called with cursor=null (reset).
-    expect(apiCalls[0]!.args[0]).toBeNull();
+    // refreshSidebar fetches from offset 0 to pick up new conversations.
+    expect(apiCalls[0]!.args[0]).toEqual({ offset: 0, limit: 100 });
+    expect(chatState.pagination.hasMore).toBe(false);
   });
 });
 

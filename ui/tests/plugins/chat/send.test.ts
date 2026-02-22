@@ -424,8 +424,8 @@ describe("streamResponse", () => {
 
     await streamResponse({ text: "Hello", discoverSession: true });
 
-    // discoverSessionId calls listConversations(null, 1); refreshSidebar calls with (cursor, 100).
-    expect(apiCalls.some((c) => c.method === "listConversations" && c.args[1] === 1)).toBe(true);
+    // discoverSessionId calls listConversations({ limit: 1 }).
+    expect(apiCalls.some((c) => c.method === "listConversations" && c.args[0]?.limit === 1)).toBe(true);
   });
 
   test("skips session discovery when session already known", async () => {

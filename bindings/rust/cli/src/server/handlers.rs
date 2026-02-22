@@ -982,6 +982,11 @@ async fn stream_response(
     let store_tool_choice = effective_tool_choice.clone();
     let response_id_for_store = response_id.clone();
 
+    // A brand-new conversation has no previous_response_id and no request_session_id.
+    // For these, we persist session metadata BEFORE sending response.created so
+    // the session is visible in list_sessions when the client refreshes the sidebar.
+    let is_new_conversation = previous_response_id.is_none();
+
     let backend = state.backend.clone();
     let tools_for_events = effective_tools.clone();
     let tool_choice_for_events = effective_tool_choice.clone();
@@ -1026,6 +1031,26 @@ async fn stream_response(
                             }),
                         );
                         return;
+                    }
+                }
+            }
+        }
+
+        // Persist session metadata for new conversations BEFORE sending
+        // response.created — the client refreshes the sidebar on receipt and
+        // the session must already be in list_sessions at that point.
+        if is_new_conversation && bucket_path.is_some() {
+            if let Ok(temp_chat) = ChatHandle::new(system_prompt_from_doc.as_deref()) {
+                if let Some(bp_str) = bucket_path.as_ref().and_then(|p| p.to_str()) {
+                    if temp_chat.set_storage_db(bp_str, &session_id).is_ok() {
+                        let t = input_string.as_deref().unwrap_or("Untitled");
+                        let title: String = t.chars().take(47).collect();
+                        let _ = temp_chat.notify_session_update_ex(
+                            Some(&model_id),
+                            Some(&title),
+                            Some("active"),
+                            prompt_id.as_deref(),
+                        );
                     }
                 }
             }

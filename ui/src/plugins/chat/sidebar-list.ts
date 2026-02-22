@@ -72,12 +72,21 @@ export function renderSidebar(): void {
 }
 
 export async function refreshSidebar(): Promise<void> {
-  // Reset pagination and reload from scratch to pick up new conversations
-  chatState.sessions = [];
-  chatState.pagination.offset = 0;
-  chatState.pagination.hasMore = true;
+  // Fetch fresh data before replacing — avoids a flash of empty sidebar
+  // while the API call is in flight.
+  chatState.pagination.isLoading = true;
+  const result = await api.listConversations({ offset: 0, limit: 100 });
   chatState.pagination.isLoading = false;
-  await loadSessions();
+
+  if (!result.ok || !result.data) {
+    notifications.error(result.error ?? "Failed to load conversations");
+    return;
+  }
+
+  chatState.sessions = result.data.data;
+  chatState.pagination.offset = result.data.data.length;
+  chatState.pagination.hasMore = result.data.has_more;
+  renderSidebar();
 }
 
 export function setupInfiniteScroll(): void {

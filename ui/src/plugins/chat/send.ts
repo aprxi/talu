@@ -2,7 +2,7 @@ import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
 import { api, hooks, notifications, getModelsService, getPromptsService } from "./deps.ts";
 import { getSamplingParams } from "./panel-params.ts";
-import { refreshSidebar } from "./sidebar-list.ts";
+import { refreshSidebar, renderSidebar } from "./sidebar-list.ts";
 import { setInputEnabled, showInputBar, hideWelcome } from "./welcome.ts";
 import { appendUserMessage, appendAssistantPlaceholder, addAssistantActionButtons, appendStoppedIndicator, scrollToBottom, removeGeneratingIndicator } from "./messages.ts";
 import { readSSEStream } from "./streaming.ts";
@@ -99,6 +99,25 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       chatState.activeSessionId = sid;
     } else {
       chatState.backgroundStreamSessions.add(sid);
+    }
+    // Optimistically add to the sidebar so the session is navigable immediately,
+    // without waiting for the full API refresh round-trip.
+    if (!chatState.sessions.some(s => s.id === sid)) {
+      const now = Math.floor(Date.now() / 1000);
+      chatState.sessions.unshift({
+        id: sid,
+        object: "conversation",
+        created_at: now,
+        updated_at: now,
+        model: getModelsService()?.getActiveModel() ?? "",
+        title: opts.text.slice(0, 47) || null,
+        marker: "active",
+        group_id: null,
+        parent_session_id: null,
+        source_doc_id: null,
+        metadata: {},
+      });
+      renderSidebar();
     }
     if (!sidebarRefreshed) {
       sidebarRefreshed = true;
@@ -276,7 +295,7 @@ async function handleSend(): Promise<void> {
  */
 async function discoverSessionId(): Promise<void> {
   if (chatState.activeSessionId) return;
-  const list = await api.listConversations(null, 1);
+  const list = await api.listConversations({ limit: 1 });
   if (list.ok && list.data && list.data.data.length > 0) {
     chatState.activeSessionId = list.data.data[0]!.id;
   }
