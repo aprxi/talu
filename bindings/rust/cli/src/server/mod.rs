@@ -11,6 +11,7 @@ pub mod auth_gateway;
 pub mod code;
 pub mod code_ws;
 pub mod conversations;
+pub mod db_vector;
 pub mod documents;
 pub mod file;
 pub mod files;

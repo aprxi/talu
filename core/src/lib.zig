@@ -375,6 +375,12 @@ comptime {
     _ = &capi.talu_blobs_stream_total_size;
     _ = &capi.talu_blobs_stream_close;
 
+    // Vector DB idempotent write API
+    _ = &capi.talu_vector_store_append_idempotent_ex;
+    _ = &capi.talu_vector_store_upsert_idempotent_ex;
+    _ = &capi.talu_vector_store_delete_idempotent;
+    _ = &capi.talu_vector_store_compact_idempotent;
+
     // Agent API (tool registry + agent loop)
     _ = &capi.talu_agent_registry_create;
     _ = &capi.talu_agent_registry_free;

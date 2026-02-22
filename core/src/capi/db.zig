@@ -497,6 +497,44 @@ pub export fn talu_vector_store_append(
     count: usize,
     dims: u32,
 ) callconv(.c) i32 {
+    return talu_vector_store_append_ex(handle, ids_ptr, vectors_ptr, count, dims, false, false);
+}
+
+/// Append a batch of vectors with explicit mutation options.
+pub export fn talu_vector_store_append_ex(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    vectors_ptr: ?[*]const f32,
+    count: usize,
+    dims: u32,
+    normalize: bool,
+    reject_existing: bool,
+) callconv(.c) i32 {
+    return talu_vector_store_append_idempotent_ex(
+        handle,
+        ids_ptr,
+        vectors_ptr,
+        count,
+        dims,
+        normalize,
+        reject_existing,
+        0,
+        0,
+    );
+}
+
+/// Append vectors with durable idempotency semantics.
+pub export fn talu_vector_store_append_idempotent_ex(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    vectors_ptr: ?[*]const f32,
+    count: usize,
+    dims: u32,
+    normalize: bool,
+    reject_existing: bool,
+    key_hash: u64,
+    request_hash: u64,
+) callconv(.c) i32 {
     capi_error.clearError();
     const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
         capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
@@ -514,10 +552,340 @@ pub export fn talu_vector_store_append(
     if (count == 0) return 0;
 
     const total = count * @as(usize, dims);
-    backend.appendBatch(ids[0..count], vectors[0..total], dims) catch |err| {
-        capi_error.setError(err, "failed to append vectors", .{});
+    backend.appendBatchIdempotentWithOptions(ids[0..count], vectors[0..total], dims, .{
+        .normalize = normalize,
+        .reject_existing = reject_existing,
+    }, key_hash, request_hash) catch |err| {
+        switch (err) {
+            error.IdempotencyConflict => capi_error.setError(err, "idempotency conflict", .{}),
+            error.AlreadyExists => capi_error.setError(err, "already exists", .{}),
+            else => capi_error.setError(err, "failed to append vectors", .{}),
+        }
         return @intFromEnum(error_codes.errorToCode(err));
     };
+    return 0;
+}
+
+/// Upsert a batch of vectors in the store.
+pub export fn talu_vector_store_upsert(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    vectors_ptr: ?[*]const f32,
+    count: usize,
+    dims: u32,
+) callconv(.c) i32 {
+    return talu_vector_store_upsert_ex(handle, ids_ptr, vectors_ptr, count, dims, false);
+}
+
+/// Upsert a batch of vectors with explicit mutation options.
+pub export fn talu_vector_store_upsert_ex(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    vectors_ptr: ?[*]const f32,
+    count: usize,
+    dims: u32,
+    normalize: bool,
+) callconv(.c) i32 {
+    return talu_vector_store_upsert_idempotent_ex(
+        handle,
+        ids_ptr,
+        vectors_ptr,
+        count,
+        dims,
+        normalize,
+        0,
+        0,
+    );
+}
+
+/// Upsert vectors with durable idempotency semantics.
+pub export fn talu_vector_store_upsert_idempotent_ex(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    vectors_ptr: ?[*]const f32,
+    count: usize,
+    dims: u32,
+    normalize: bool,
+    key_hash: u64,
+    request_hash: u64,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const ids = ids_ptr orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "ids_ptr is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const vectors = vectors_ptr orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "vectors_ptr is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    if (count == 0) return 0;
+
+    const total = count * @as(usize, dims);
+    backend.upsertBatchIdempotentWithOptions(ids[0..count], vectors[0..total], dims, .{
+        .normalize = normalize,
+        .reject_existing = false,
+    }, key_hash, request_hash) catch |err| {
+        switch (err) {
+            error.IdempotencyConflict => capi_error.setError(err, "idempotency conflict", .{}),
+            else => capi_error.setError(err, "failed to upsert vectors", .{}),
+        }
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
+/// Delete vectors by ID with tombstone semantics.
+pub export fn talu_vector_store_delete(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    count: usize,
+    out_deleted_count: *usize,
+    out_not_found_count: *usize,
+) callconv(.c) i32 {
+    return talu_vector_store_delete_idempotent(
+        handle,
+        ids_ptr,
+        count,
+        0,
+        0,
+        out_deleted_count,
+        out_not_found_count,
+    );
+}
+
+/// Delete vectors with durable idempotency semantics.
+pub export fn talu_vector_store_delete_idempotent(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    count: usize,
+    key_hash: u64,
+    request_hash: u64,
+    out_deleted_count: *usize,
+    out_not_found_count: *usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_deleted_count.* = 0;
+    out_not_found_count.* = 0;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const ids = ids_ptr orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "ids_ptr is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const result = backend.deleteIdsIdempotent(ids[0..count], key_hash, request_hash) catch |err| {
+        switch (err) {
+            error.IdempotencyConflict => capi_error.setError(err, "idempotency conflict", .{}),
+            else => capi_error.setError(err, "failed to delete vectors", .{}),
+        }
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out_deleted_count.* = result.deleted_count;
+    out_not_found_count.* = result.not_found_count;
+    return 0;
+}
+
+/// Fetch vectors by ID from visible state.
+pub export fn talu_vector_store_fetch(
+    handle: ?*VectorStoreHandle,
+    ids_ptr: ?[*]const u64,
+    count: usize,
+    include_values: bool,
+    out_ids: *?[*]u64,
+    out_vectors: *?[*]f32,
+    out_found_count: *usize,
+    out_dims: *u32,
+    out_missing_ids: *?[*]u64,
+    out_missing_count: *usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_ids.* = null;
+    out_vectors.* = null;
+    out_found_count.* = 0;
+    out_dims.* = 0;
+    out_missing_ids.* = null;
+    out_missing_count.* = 0;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const ids = ids_ptr orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "ids_ptr is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const result = backend.fetchByIds(allocator, ids[0..count], include_values) catch |err| {
+        capi_error.setError(err, "failed to fetch vectors", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out_found_count.* = result.ids.len;
+    out_dims.* = result.dims;
+    out_missing_count.* = result.missing_ids.len;
+    out_ids.* = result.ids.ptr;
+    out_vectors.* = result.vectors.ptr;
+    out_missing_ids.* = result.missing_ids.ptr;
+    return 0;
+}
+
+/// Read vector mutation statistics.
+pub export fn talu_vector_store_stats(
+    handle: ?*VectorStoreHandle,
+    out_visible_count: *usize,
+    out_tombstone_count: *usize,
+    out_segment_count: *usize,
+    out_total_count: *usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_visible_count.* = 0;
+    out_tombstone_count.* = 0;
+    out_segment_count.* = 0;
+    out_total_count.* = 0;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const stats = backend.stats() catch |err| {
+        capi_error.setError(err, "failed to read vector stats", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    out_visible_count.* = stats.visible_count;
+    out_tombstone_count.* = stats.tombstone_count;
+    out_segment_count.* = stats.segment_count;
+    out_total_count.* = stats.total_count;
+    return 0;
+}
+
+/// Compact vector storage from visible state.
+pub export fn talu_vector_store_compact(
+    handle: ?*VectorStoreHandle,
+    dims: u32,
+    out_kept_count: *usize,
+    out_removed_tombstones: *usize,
+) callconv(.c) i32 {
+    return talu_vector_store_compact_idempotent(
+        handle,
+        dims,
+        0,
+        0,
+        out_kept_count,
+        out_removed_tombstones,
+    );
+}
+
+/// Compact vectors with durable idempotency semantics.
+pub export fn talu_vector_store_compact_idempotent(
+    handle: ?*VectorStoreHandle,
+    dims: u32,
+    key_hash: u64,
+    request_hash: u64,
+    out_kept_count: *usize,
+    out_removed_tombstones: *usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_kept_count.* = 0;
+    out_removed_tombstones.* = 0;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const result = backend.compactIdempotent(dims, key_hash, request_hash) catch |err| {
+        switch (err) {
+            error.IdempotencyConflict => capi_error.setError(err, "idempotency conflict", .{}),
+            else => capi_error.setError(err, "failed to compact vectors", .{}),
+        }
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out_kept_count.* = result.kept_count;
+    out_removed_tombstones.* = result.removed_tombstones;
+    return 0;
+}
+
+/// Read vector change events with cursor pagination.
+pub export fn talu_vector_store_changes(
+    handle: ?*VectorStoreHandle,
+    since: u64,
+    limit: usize,
+    out_seqs: *?[*]u64,
+    out_ops: *?[*]u8,
+    out_ids: *?[*]u64,
+    out_timestamps: *?[*]i64,
+    out_count: *usize,
+    out_has_more: *bool,
+    out_next_since: *u64,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_seqs.* = null;
+    out_ops.* = null;
+    out_ids.* = null;
+    out_timestamps.* = null;
+    out_count.* = 0;
+    out_has_more.* = false;
+    out_next_since.* = since;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    var result = backend.readChanges(allocator, since, limit) catch |err| {
+        capi_error.setError(err, "failed to read vector changes", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    defer result.deinit(allocator);
+
+    const seqs = allocator.alloc(u64, result.events.len) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate change seqs", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    errdefer allocator.free(seqs);
+    const ops = allocator.alloc(u8, result.events.len) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate change ops", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    errdefer allocator.free(ops);
+    const ids = allocator.alloc(u64, result.events.len) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate change ids", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    errdefer allocator.free(ids);
+    const timestamps = allocator.alloc(i64, result.events.len) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate change timestamps", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    errdefer allocator.free(timestamps);
+
+    for (result.events, 0..) |event, idx| {
+        seqs[idx] = event.seq;
+        ops[idx] = @intFromEnum(event.op);
+        ids[idx] = event.id;
+        timestamps[idx] = event.timestamp;
+    }
+
+    out_seqs.* = seqs.ptr;
+    out_ops.* = ops.ptr;
+    out_ids.* = ids.ptr;
+    out_timestamps.* = timestamps.ptr;
+    out_count.* = result.events.len;
+    out_has_more.* = result.has_more;
+    out_next_since.* = result.next_since;
     return 0;
 }
 
@@ -643,6 +1011,33 @@ pub export fn talu_vector_store_search_batch(
     out_scores: *?[*]f32,
     out_count_per_query: *u32,
 ) callconv(.c) i32 {
+    return talu_vector_store_search_batch_ex(
+        handle,
+        query_ptr,
+        query_len,
+        dims,
+        query_count,
+        k,
+        false,
+        out_ids,
+        out_scores,
+        out_count_per_query,
+    );
+}
+
+/// Search vectors for multiple queries using a dot-product scan with explicit options.
+pub export fn talu_vector_store_search_batch_ex(
+    handle: ?*VectorStoreHandle,
+    query_ptr: ?[*]const f32,
+    query_len: usize,
+    dims: u32,
+    query_count: u32,
+    k: u32,
+    normalize_queries: bool,
+    out_ids: *?[*]u64,
+    out_scores: *?[*]f32,
+    out_count_per_query: *u32,
+) callconv(.c) i32 {
     capi_error.clearError();
     out_ids.* = null;
     out_scores.* = null;
@@ -663,7 +1058,9 @@ pub export fn talu_vector_store_search_batch(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }
 
-    const result = backend.searchBatch(allocator, query[0..query_len], dims, query_count, k) catch |err| {
+    const result = backend.searchBatchWithOptions(allocator, query[0..query_len], dims, query_count, k, .{
+        .normalize_queries = normalize_queries,
+    }) catch |err| {
         capi_error.setError(err, "failed to search vectors", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -807,6 +1204,43 @@ pub export fn talu_vector_store_free_load(
         const total = count * @as(usize, dims);
         allocator.free(ptr[0..total]);
     }
+}
+
+/// Free buffers returned by `talu_vector_store_fetch`.
+pub export fn talu_vector_store_free_fetch(
+    ids_ptr: ?[*]u64,
+    vectors_ptr: ?[*]f32,
+    found_count: usize,
+    dims: u32,
+    missing_ids_ptr: ?[*]u64,
+    missing_count: usize,
+) callconv(.c) void {
+    capi_error.clearError();
+    if (ids_ptr) |ptr| {
+        allocator.free(ptr[0..found_count]);
+    }
+    if (vectors_ptr) |ptr| {
+        const total = found_count * @as(usize, dims);
+        allocator.free(ptr[0..total]);
+    }
+    if (missing_ids_ptr) |ptr| {
+        allocator.free(ptr[0..missing_count]);
+    }
+}
+
+/// Free buffers returned by `talu_vector_store_changes`.
+pub export fn talu_vector_store_free_changes(
+    seqs_ptr: ?[*]u64,
+    ops_ptr: ?[*]u8,
+    ids_ptr: ?[*]u64,
+    timestamps_ptr: ?[*]i64,
+    count: usize,
+) callconv(.c) void {
+    capi_error.clearError();
+    if (seqs_ptr) |ptr| allocator.free(ptr[0..count]);
+    if (ops_ptr) |ptr| allocator.free(ptr[0..count]);
+    if (ids_ptr) |ptr| allocator.free(ptr[0..count]);
+    if (timestamps_ptr) |ptr| allocator.free(ptr[0..count]);
 }
 
 /// Emit a PutSession event to the storage callback.

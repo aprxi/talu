@@ -10,6 +10,7 @@ mod server {
     pub mod compliance;
     pub mod console;
     pub mod conversations;
+    pub mod db;
     pub mod documents;
     pub mod file;
     pub mod files;

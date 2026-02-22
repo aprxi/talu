@@ -14,14 +14,29 @@ pub const BlockRef = struct {
     offset: u64,
 };
 
+const FileSignature = struct {
+    exists: bool,
+    size: u64,
+    mtime_ns: i128,
+
+    fn eql(a: FileSignature, b: FileSignature) bool {
+        return a.exists == b.exists and a.size == b.size and a.mtime_ns == b.mtime_ns;
+    }
+};
+
 pub const Reader = struct {
     allocator: Allocator,
     dir: std.fs.Dir,
+    db_root: []const u8,
     ns_prefix: []const u8,
+    manifest_rel_path: []const u8,
+    current_rel_path: []const u8,
     manifest_data: ?manifest.Manifest,
     current_file: ?std.fs.File,
     current_blocks: std.ArrayList(u64),
     current_path: ?[]const u8,
+    manifest_sig: FileSignature,
+    current_sig: FileSignature,
     /// Block references for sealed segments (path index + offset pairs).
     segment_blocks: std.ArrayList(BlockRef),
 
@@ -37,6 +52,10 @@ pub const Reader = struct {
         var manifest_data: ?manifest.Manifest = null;
         var current_file: ?std.fs.File = null;
         var current_path: ?[]const u8 = null;
+        const manifest_rel_path = try std.fs.path.join(allocator, &.{ namespace, "manifest.json" });
+        errdefer allocator.free(manifest_rel_path);
+        const current_rel_path = try std.fs.path.join(allocator, &.{ namespace, "current.talu" });
+        errdefer allocator.free(current_rel_path);
 
         manifest_data = manifest.Manifest.load(allocator, manifest_path) catch |err| switch (err) {
             error.FileNotFound => blk: {
@@ -51,32 +70,34 @@ pub const Reader = struct {
         };
         errdefer if (manifest_data) |*data| data.deinit(allocator);
 
-        const current_path_full = try std.fs.path.join(allocator, &.{ db_root, namespace, "current.talu" });
-        defer allocator.free(current_path_full);
-
-        current_file = std.fs.cwd().openFile(current_path_full, .{ .mode = .read_only }) catch |err| switch (err) {
+        current_file = dir.openFile(current_rel_path, .{ .mode = .read_only }) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
 
         if (current_file != null) {
-            const rel_path = try std.fs.path.join(allocator, &.{ namespace, "current.talu" });
-            defer allocator.free(rel_path);
-            current_path = try allocator.dupe(u8, rel_path);
+            current_path = try allocator.dupe(u8, current_rel_path);
         }
         errdefer if (current_path) |path| allocator.free(path);
 
         const ns_prefix = try allocator.dupe(u8, namespace);
         errdefer allocator.free(ns_prefix);
+        const db_root_copy = try allocator.dupe(u8, db_root);
+        errdefer allocator.free(db_root_copy);
 
         var reader = Reader{
             .allocator = allocator,
             .dir = dir,
+            .db_root = db_root_copy,
             .ns_prefix = ns_prefix,
+            .manifest_rel_path = manifest_rel_path,
+            .current_rel_path = current_rel_path,
             .manifest_data = manifest_data,
             .current_file = current_file,
             .current_blocks = .empty,
             .current_path = current_path,
+            .manifest_sig = .{ .exists = false, .size = 0, .mtime_ns = 0 },
+            .current_sig = .{ .exists = false, .size = 0, .mtime_ns = 0 },
             .segment_blocks = .empty,
         };
         errdefer reader.deinit();
@@ -89,6 +110,9 @@ pub const Reader = struct {
         if (reader.current_file) |file| {
             try reader.scanCurrent(file);
         }
+
+        reader.manifest_sig = try reader.readFileSignature(reader.manifest_rel_path);
+        reader.current_sig = try reader.readFileSignature(reader.current_rel_path);
 
         return reader;
     }
@@ -105,6 +129,9 @@ pub const Reader = struct {
         }
         self.segment_blocks.deinit(self.allocator);
         self.current_blocks.deinit(self.allocator);
+        self.allocator.free(self.manifest_rel_path);
+        self.allocator.free(self.current_rel_path);
+        self.allocator.free(self.db_root);
         self.allocator.free(self.ns_prefix);
         self.dir.close();
     }
@@ -142,8 +169,92 @@ pub const Reader = struct {
         }
     }
 
+    /// Refreshes both manifest-backed segments and current.talu.
+    ///
+    /// This is required for cross-process visibility when another writer
+    /// seals segments or replaces current.talu.
+    pub fn refresh(self: *Reader) !void {
+        const manifest_path = try std.fs.path.join(self.allocator, &.{ self.db_root, self.manifest_rel_path });
+        defer self.allocator.free(manifest_path);
+
+        var manifest_data = manifest.Manifest.load(self.allocator, manifest_path) catch |err| switch (err) {
+            error.FileNotFound => blk: {
+                const empty_segments = try self.allocator.alloc(manifest.SegmentEntry, 0);
+                break :blk manifest.Manifest{
+                    .version = 1,
+                    .segments = empty_segments,
+                    .last_compaction_ts = 0,
+                };
+            },
+            else => return err,
+        };
+        errdefer manifest_data.deinit(self.allocator);
+
+        for (self.segment_blocks.items) |block| {
+            self.allocator.free(block.path);
+        }
+        self.segment_blocks.clearRetainingCapacity();
+        if (manifest_data.segments.len > 0) {
+            try self.scanSegments(manifest_data.segments);
+        }
+
+        if (self.manifest_data) |*old_manifest| {
+            old_manifest.deinit(self.allocator);
+        }
+        self.manifest_data = manifest_data;
+        // Ownership transferred to self.manifest_data.
+        manifest_data.segments = &.{};
+
+        if (self.current_file) |file| file.close();
+        self.current_file = null;
+        self.current_blocks.clearRetainingCapacity();
+
+        if (self.current_path == null) {
+            self.current_path = try self.allocator.dupe(u8, self.current_rel_path);
+        }
+
+        self.current_file = self.dir.openFile(self.current_rel_path, .{ .mode = .read_only }) catch |err| switch (err) {
+            error.FileNotFound => null,
+            else => return err,
+        };
+        if (self.current_file) |file| {
+            try self.scanCurrent(file);
+        }
+
+        self.manifest_sig = try self.readFileSignature(self.manifest_rel_path);
+        self.current_sig = try self.readFileSignature(self.current_rel_path);
+    }
+
+    /// Refreshes reader state only when manifest/current files changed.
+    ///
+    /// Returns true when a refresh was applied, false when signatures match
+    /// and no rescan was needed.
+    pub fn refreshIfChanged(self: *Reader) !bool {
+        const manifest_sig = try self.readFileSignature(self.manifest_rel_path);
+        const current_sig = try self.readFileSignature(self.current_rel_path);
+        if (FileSignature.eql(manifest_sig, self.manifest_sig) and
+            FileSignature.eql(current_sig, self.current_sig))
+        {
+            return false;
+        }
+        try self.refresh();
+        return true;
+    }
+
     fn scanCurrent(self: *Reader, file: std.fs.File) !void {
         try scanFileBlocks(file, self.allocator, &self.current_blocks);
+    }
+
+    fn readFileSignature(self: *Reader, rel_path: []const u8) !FileSignature {
+        const stat = self.dir.statFile(rel_path) catch |err| switch (err) {
+            error.FileNotFound => return .{ .exists = false, .size = 0, .mtime_ns = 0 },
+            else => return err,
+        };
+        return .{
+            .exists = true,
+            .size = stat.size,
+            .mtime_ns = stat.mtime,
+        };
     }
 
     /// Scans sealed segments from the manifest, recording all block
@@ -334,6 +445,94 @@ test "Reader.refreshCurrent rescans file" {
     try file.writeAll(block2);
 
     try reader.refreshCurrent();
+    try std.testing.expectEqual(@as(usize, 2), reader.current_blocks.items.len);
+}
+
+test "Reader.refresh reloads manifest segments and current file" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    try tmp.dir.makePath("vector");
+
+    var reader = try Reader.open(std.testing.allocator, root_path, "vector");
+    defer reader.deinit();
+
+    const initial_blocks = try reader.getBlocks(std.testing.allocator);
+    defer std.testing.allocator.free(initial_blocks);
+    try std.testing.expectEqual(@as(usize, 0), initial_blocks.len);
+
+    const seg_block = try buildTestBlock(std.testing.allocator, 9);
+    defer std.testing.allocator.free(seg_block);
+    var seg_file = try tmp.dir.createFile("vector/seg-1.talu", .{});
+    try seg_file.writeAll(seg_block);
+    seg_file.close();
+
+    const current_block = try buildTestBlock(std.testing.allocator, 10);
+    defer std.testing.allocator.free(current_block);
+    var current_file = try tmp.dir.createFile("vector/current.talu", .{ .read = true });
+    defer current_file.close();
+    try current_file.writeAll(current_block);
+
+    const segments = try std.testing.allocator.alloc(manifest.SegmentEntry, 1); // lint:ignore errdefer-alloc - freed via manifest_data.deinit()
+    segments[0] = .{
+        .id = 0x0123456789abcdef0123456789abcdef,
+        .path = try std.testing.allocator.dupe(u8, "seg-1.talu"), // lint:ignore errdefer-alloc - freed via manifest_data.deinit()
+        .min_ts = 0,
+        .max_ts = 1,
+        .row_count = 1,
+    };
+
+    var manifest_data = manifest.Manifest{
+        .version = 1,
+        .segments = segments,
+        .last_compaction_ts = 0,
+    };
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "vector", "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    try manifest_data.save(manifest_path);
+    manifest_data.deinit(std.testing.allocator);
+
+    try reader.refresh();
+
+    const refreshed = try reader.getBlocks(std.testing.allocator);
+    defer std.testing.allocator.free(refreshed);
+    try std.testing.expectEqual(@as(usize, 2), refreshed.len);
+    try std.testing.expectEqualStrings("vector/seg-1.talu", refreshed[0].path);
+    try std.testing.expectEqualStrings("vector/current.talu", refreshed[1].path);
+}
+
+test "Reader.refreshIfChanged skips when unchanged and refreshes on current append" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    try tmp.dir.makePath("vector");
+
+    const block1 = try buildTestBlock(std.testing.allocator, 1);
+    defer std.testing.allocator.free(block1);
+    const block2 = try buildTestBlock(std.testing.allocator, 2);
+    defer std.testing.allocator.free(block2);
+
+    var current_file = try tmp.dir.createFile("vector/current.talu", .{ .read = true });
+    defer current_file.close();
+    try current_file.writeAll(block1);
+
+    var reader = try Reader.open(std.testing.allocator, root_path, "vector");
+    defer reader.deinit();
+    try std.testing.expectEqual(@as(usize, 1), reader.current_blocks.items.len);
+
+    const unchanged = try reader.refreshIfChanged();
+    try std.testing.expect(!unchanged);
+    try std.testing.expectEqual(@as(usize, 1), reader.current_blocks.items.len);
+
+    try current_file.writeAll(block2);
+    const changed = try reader.refreshIfChanged();
+    try std.testing.expect(changed);
     try std.testing.expectEqual(@as(usize, 2), reader.current_blocks.items.len);
 }
 

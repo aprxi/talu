@@ -15,10 +15,20 @@ const parallel = @import("../../system/parallel.zig");
 const Allocator = std.mem.Allocator;
 
 const schema_embeddings: u16 = 10;
+const schema_vector_changes: u16 = 16;
+const schema_vector_idempotency: u16 = 17;
 
 const col_doc_id: u32 = 1;
 const col_ts: u32 = 2;
+const col_seq: u32 = 3;
 const col_embedding: u32 = 10;
+const col_change_op: u32 = 11;
+const col_idempotency_key_hash: u32 = 20;
+const col_idempotency_request_hash: u32 = 21;
+const col_idempotency_op: u32 = 22;
+const col_idempotency_status: u32 = 23;
+const col_idempotency_result_a: u32 = 24;
+const col_idempotency_result_b: u32 = 25;
 
 pub const VectorBatch = struct {
     ids: []u64,
@@ -64,8 +74,104 @@ pub const SearchBatchResult = struct {
     }
 };
 
+pub const DeleteResult = struct {
+    deleted_count: usize,
+    not_found_count: usize,
+};
+
+pub const FetchResult = struct {
+    ids: []u64,
+    vectors: []f32,
+    missing_ids: []u64,
+    dims: u32,
+    include_values: bool,
+
+    pub fn deinit(self: *FetchResult, allocator: Allocator) void {
+        allocator.free(self.ids);
+        allocator.free(self.vectors);
+        allocator.free(self.missing_ids);
+    }
+};
+
+pub const StatsResult = struct {
+    visible_count: usize,
+    tombstone_count: usize,
+    segment_count: usize,
+    total_count: usize,
+};
+
+pub const CompactResult = struct {
+    kept_count: usize,
+    removed_tombstones: usize,
+};
+
+pub const IdempotencyStatus = enum(u8) {
+    pending = 0,
+    committed = 1,
+};
+
+const IdempotencyRecord = struct {
+    seq: u64,
+    request_hash: u64,
+    op: ChangeOp,
+    status: IdempotencyStatus,
+    result_a: u64,
+    result_b: u64,
+};
+
+pub const ChangeOp = enum(u8) {
+    append = 1,
+    upsert = 2,
+    delete = 3,
+    compact = 4,
+};
+
+pub const ChangeEvent = struct {
+    seq: u64,
+    op: ChangeOp,
+    id: u64,
+    timestamp: i64,
+};
+
+pub const MutationOptions = struct {
+    normalize: bool = false,
+    reject_existing: bool = false,
+};
+
+pub const SearchOptions = struct {
+    normalize_queries: bool = false,
+};
+
+pub const ChangesResult = struct {
+    events: []ChangeEvent,
+    has_more: bool,
+    next_since: u64,
+
+    pub fn deinit(self: *ChangesResult, allocator: Allocator) void {
+        allocator.free(self.events);
+    }
+};
+
 pub const ScoreCallback = *const fn (ctx: *anyopaque, id: u64, score: f32) void;
 pub const ScoreCallbackC = *const fn (ctx: ?*anyopaque, id: u64, score: f32) callconv(.c) void;
+
+const PointVisibility = struct {
+    seq: u64,
+    deleted: bool,
+};
+
+const LatestVectors = struct {
+    dims: u32,
+    map: std.AutoHashMap(u64, []f32),
+
+    fn deinit(self: *LatestVectors, allocator: Allocator) void {
+        var iter = self.map.valueIterator();
+        while (iter.next()) |values| {
+            allocator.free(values.*);
+        }
+        self.map.deinit();
+    }
+};
 
 const ScratchBuffers = struct {
     id_buf: []u8 = &[_]u8{},
@@ -93,6 +199,16 @@ const ScratchBuffers = struct {
     }
 };
 
+const BlockSnapshots = struct {
+    vector_blocks: []db_reader.BlockRef,
+    change_blocks: []db_reader.BlockRef,
+
+    fn deinit(self: BlockSnapshots, allocator: Allocator) void {
+        allocator.free(self.vector_blocks);
+        allocator.free(self.change_blocks);
+    }
+};
+
 /// Vector backend API ("vector" namespace).
 ///
 /// Public operations:
@@ -115,11 +231,29 @@ const ScratchBuffers = struct {
 /// See also: `create` / `destroy` for heap-allocated lifecycle.
 pub const VectorAdapter = struct {
     allocator: Allocator,
+    db_root: []u8,
     fs_writer: *db_writer.Writer,
     fs_reader: *db_reader.Reader,
+    change_writer: *db_writer.Writer,
+    change_reader: *db_reader.Reader,
+    idempotency_writer: *db_writer.Writer,
+    idempotency_reader: *db_reader.Reader,
+    next_seq: u64,
+    read_cache_valid: bool,
+    cached_vector_block_count: usize,
+    cached_change_block_count: usize,
+    cached_vector_block_hash: u64,
+    cached_change_block_hash: u64,
+    cached_visibility: std.AutoHashMap(u64, PointVisibility),
+    cached_latest: LatestVectors,
+    cached_visible_ids: []u64,
+    cached_visible_vectors: []f32,
 
     /// Initialize vector TaluDB backend for the "vector" namespace.
     pub fn init(allocator: Allocator, db_root: []const u8) !VectorAdapter {
+        const db_root_copy = try allocator.dupe(u8, db_root);
+        errdefer allocator.free(db_root_copy);
+
         var writer_ptr = try allocator.create(db_writer.Writer);
         errdefer allocator.destroy(writer_ptr);
         writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "vector");
@@ -130,15 +264,988 @@ pub const VectorAdapter = struct {
         reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "vector");
         errdefer reader_ptr.deinit();
 
-        return .{
+        var change_writer_ptr = try allocator.create(db_writer.Writer);
+        errdefer allocator.destroy(change_writer_ptr);
+        change_writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "vector_changes");
+        errdefer change_writer_ptr.deinit();
+
+        var change_reader_ptr = try allocator.create(db_reader.Reader);
+        errdefer allocator.destroy(change_reader_ptr);
+        change_reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "vector_changes");
+        errdefer change_reader_ptr.deinit();
+
+        var idempotency_writer_ptr = try allocator.create(db_writer.Writer);
+        errdefer allocator.destroy(idempotency_writer_ptr);
+        idempotency_writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "vector_idempotency");
+        errdefer idempotency_writer_ptr.deinit();
+
+        var idempotency_reader_ptr = try allocator.create(db_reader.Reader);
+        errdefer allocator.destroy(idempotency_reader_ptr);
+        idempotency_reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "vector_idempotency");
+        errdefer idempotency_reader_ptr.deinit();
+
+        var adapter = VectorAdapter{
             .allocator = allocator,
+            .db_root = db_root_copy,
             .fs_writer = writer_ptr,
             .fs_reader = reader_ptr,
+            .change_writer = change_writer_ptr,
+            .change_reader = change_reader_ptr,
+            .idempotency_writer = idempotency_writer_ptr,
+            .idempotency_reader = idempotency_reader_ptr,
+            .next_seq = 1,
+            .read_cache_valid = false,
+            .cached_vector_block_count = 0,
+            .cached_change_block_count = 0,
+            .cached_vector_block_hash = 0,
+            .cached_change_block_hash = 0,
+            .cached_visibility = std.AutoHashMap(u64, PointVisibility).init(allocator),
+            .cached_latest = .{
+                .dims = 0,
+                .map = std.AutoHashMap(u64, []f32).init(allocator),
+            },
+            .cached_visible_ids = &[_]u64{},
+            .cached_visible_vectors = &[_]f32{},
         };
+        adapter.next_seq = try adapter.discoverNextSeq();
+        return adapter;
     }
 
     /// Append a batch of embeddings.
     pub fn appendBatch(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32) !void {
+        try self.appendBatchWithOptions(doc_ids, vectors, dims, .{});
+    }
+
+    /// Append a batch with explicit mutation options.
+    pub fn appendBatchWithOptions(
+        self: *VectorAdapter,
+        doc_ids: []const u64,
+        vectors: []const f32,
+        dims: u32,
+        options: MutationOptions,
+    ) !void {
+        try self.appendBatchWithOp(doc_ids, vectors, dims, .append, options);
+    }
+
+    /// Append with durable idempotency tracking.
+    pub fn appendBatchIdempotentWithOptions(
+        self: *VectorAdapter,
+        doc_ids: []const u64,
+        vectors: []const f32,
+        dims: u32,
+        options: MutationOptions,
+        key_hash: u64,
+        request_hash: u64,
+    ) !void {
+        if (doc_ids.len == 0) return;
+        if (vectors.len != doc_ids.len * @as(usize, dims)) return error.InvalidColumnData;
+
+        var vectors_buf = vectors;
+        var normalized_vectors: ?[]f32 = null;
+        defer if (normalized_vectors) |owned| self.allocator.free(owned);
+        if (options.normalize) {
+            const owned = try self.allocator.dupe(f32, vectors);
+            errdefer self.allocator.free(owned);
+            try normalizeRowsInPlace(owned, dims);
+            vectors_buf = owned;
+            normalized_vectors = owned;
+        }
+
+        if (key_hash != 0) {
+            if (try self.loadIdempotencyRecord(key_hash, request_hash, .append)) |record| {
+                switch (record.status) {
+                    .committed => return,
+                    .pending => {
+                        if (!(try self.allIdsMatchVectors(doc_ids, vectors_buf, dims))) {
+                            const pending_options = MutationOptions{
+                                .normalize = false,
+                                .reject_existing = options.reject_existing,
+                            };
+                            self.appendBatchWithOp(doc_ids, vectors_buf, dims, .append, pending_options) catch |err| {
+                                if (err == error.AlreadyExists and try self.allIdsMatchVectors(doc_ids, vectors_buf, dims)) {
+                                    // Prior attempt likely completed before crash.
+                                } else {
+                                    return err;
+                                }
+                            };
+                        }
+                        try self.appendIdempotencyRecord(
+                            key_hash,
+                            request_hash,
+                            .append,
+                            .committed,
+                            record.result_a,
+                            record.result_b,
+                        );
+                        return;
+                    },
+                }
+            }
+        }
+
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .append,
+                .pending,
+                @intCast(doc_ids.len),
+                0,
+            );
+        }
+
+        const pending_options = MutationOptions{
+            .normalize = false,
+            .reject_existing = options.reject_existing,
+        };
+        self.appendBatchWithOp(doc_ids, vectors_buf, dims, .append, pending_options) catch |err| {
+            if (err == error.AlreadyExists and try self.allIdsMatchVectors(doc_ids, vectors_buf, dims)) {
+                // Prior attempt likely completed before crash.
+            } else {
+                return err;
+            }
+        };
+
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .append,
+                .committed,
+                @intCast(doc_ids.len),
+                0,
+            );
+        }
+    }
+
+    /// Upsert a batch of embeddings.
+    ///
+    /// Physical storage remains append-only; upsert visibility is resolved
+    /// through the vector change log.
+    pub fn upsertBatch(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32) !void {
+        try self.upsertBatchWithOptions(doc_ids, vectors, dims, .{});
+    }
+
+    /// Upsert a batch with explicit mutation options.
+    pub fn upsertBatchWithOptions(
+        self: *VectorAdapter,
+        doc_ids: []const u64,
+        vectors: []const f32,
+        dims: u32,
+        options: MutationOptions,
+    ) !void {
+        try self.appendBatchWithOp(doc_ids, vectors, dims, .upsert, options);
+    }
+
+    /// Upsert with durable idempotency tracking.
+    pub fn upsertBatchIdempotentWithOptions(
+        self: *VectorAdapter,
+        doc_ids: []const u64,
+        vectors: []const f32,
+        dims: u32,
+        options: MutationOptions,
+        key_hash: u64,
+        request_hash: u64,
+    ) !void {
+        if (doc_ids.len == 0) return;
+        if (vectors.len != doc_ids.len * @as(usize, dims)) return error.InvalidColumnData;
+
+        var vectors_buf = vectors;
+        var normalized_vectors: ?[]f32 = null;
+        defer if (normalized_vectors) |owned| self.allocator.free(owned);
+        if (options.normalize) {
+            const owned = try self.allocator.dupe(f32, vectors);
+            errdefer self.allocator.free(owned);
+            try normalizeRowsInPlace(owned, dims);
+            vectors_buf = owned;
+            normalized_vectors = owned;
+        }
+
+        if (key_hash != 0) {
+            if (try self.loadIdempotencyRecord(key_hash, request_hash, .upsert)) |record| {
+                switch (record.status) {
+                    .committed => return,
+                    .pending => {
+                        if (!(try self.allIdsMatchVectors(doc_ids, vectors_buf, dims))) {
+                            try self.appendBatchWithOp(
+                                doc_ids,
+                                vectors_buf,
+                                dims,
+                                .upsert,
+                                .{ .normalize = false, .reject_existing = false },
+                            );
+                        }
+                        try self.appendIdempotencyRecord(
+                            key_hash,
+                            request_hash,
+                            .upsert,
+                            .committed,
+                            record.result_a,
+                            record.result_b,
+                        );
+                        return;
+                    },
+                }
+            }
+        }
+
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .upsert,
+                .pending,
+                @intCast(doc_ids.len),
+                0,
+            );
+        }
+
+        if (!(try self.allIdsMatchVectors(doc_ids, vectors_buf, dims))) {
+            try self.appendBatchWithOp(
+                doc_ids,
+                vectors_buf,
+                dims,
+                .upsert,
+                .{ .normalize = false, .reject_existing = false },
+            );
+        }
+
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .upsert,
+                .committed,
+                @intCast(doc_ids.len),
+                0,
+            );
+        }
+    }
+
+    /// Delete vectors by ID using tombstone semantics.
+    pub fn deleteIds(self: *VectorAdapter, ids: []const u64) !DeleteResult {
+        try self.ensureReadCache();
+
+        var ids_to_delete = std.ArrayList(u64).empty;
+        defer ids_to_delete.deinit(self.allocator);
+        var seqs_to_delete = std.ArrayList(u64).empty;
+        defer seqs_to_delete.deinit(self.allocator);
+
+        var deleted: usize = 0;
+        var not_found: usize = 0;
+        for (ids) |id| {
+            const visible = self.idIsVisibleCached(id);
+
+            if (visible) {
+                deleted += 1;
+                try ids_to_delete.append(self.allocator, id);
+                try seqs_to_delete.append(self.allocator, self.allocateNextSeq());
+            } else {
+                not_found += 1;
+            }
+        }
+
+        if (ids_to_delete.items.len > 0) {
+            try self.appendChangeRowsForOp(ids_to_delete.items, seqs_to_delete.items, .delete);
+            self.invalidateReadCache();
+        }
+
+        return .{ .deleted_count = deleted, .not_found_count = not_found };
+    }
+
+    /// Delete vectors with durable idempotency tracking.
+    pub fn deleteIdsIdempotent(
+        self: *VectorAdapter,
+        ids: []const u64,
+        key_hash: u64,
+        request_hash: u64,
+    ) !DeleteResult {
+        if (key_hash != 0) {
+            if (try self.loadIdempotencyRecord(key_hash, request_hash, .delete)) |record| {
+                switch (record.status) {
+                    .committed => {
+                        return .{
+                            .deleted_count = @intCast(record.result_a),
+                            .not_found_count = @intCast(record.result_b),
+                        };
+                    },
+                    .pending => {
+                        _ = try self.deleteIds(ids);
+                        try self.appendIdempotencyRecord(
+                            key_hash,
+                            request_hash,
+                            .delete,
+                            .committed,
+                            record.result_a,
+                            record.result_b,
+                        );
+                        return .{
+                            .deleted_count = @intCast(record.result_a),
+                            .not_found_count = @intCast(record.result_b),
+                        };
+                    },
+                }
+            }
+        }
+
+        const preview = try self.previewDeleteCounts(ids);
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .delete,
+                .pending,
+                @intCast(preview.deleted_count),
+                @intCast(preview.not_found_count),
+            );
+        }
+
+        _ = try self.deleteIds(ids);
+
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .delete,
+                .committed,
+                @intCast(preview.deleted_count),
+                @intCast(preview.not_found_count),
+            );
+        }
+
+        return preview;
+    }
+
+    /// Fetch vectors by ID from the current visible state.
+    pub fn fetchByIds(self: *VectorAdapter, allocator: Allocator, ids: []const u64, include_values: bool) !FetchResult {
+        try self.ensureReadCache();
+
+        var missing_count: usize = 0;
+        var found_count: usize = 0;
+        for (ids) |id| {
+            const visible = self.idIsVisibleCached(id);
+            if (visible) {
+                found_count += 1;
+            } else {
+                missing_count += 1;
+            }
+        }
+
+        const dims_value = self.cached_latest.dims;
+        const found_ids = try allocator.alloc(u64, found_count);
+        errdefer allocator.free(found_ids);
+        const found_vectors = try allocator.alloc(f32, found_count * @as(usize, dims_value));
+        errdefer allocator.free(found_vectors);
+        const missing_ids = try allocator.alloc(u64, missing_count);
+        errdefer allocator.free(missing_ids);
+
+        var found_idx: usize = 0;
+        var missing_idx: usize = 0;
+        for (ids) |id| {
+            const visible = self.idIsVisibleCached(id);
+            if (visible) {
+                const values = self.cached_latest.map.get(id) orelse {
+                    missing_ids[missing_idx] = id;
+                    missing_idx += 1;
+                    continue;
+                };
+                found_ids[found_idx] = id;
+                if (include_values and dims_value > 0) {
+                    const base = found_idx * @as(usize, dims_value);
+                    std.mem.copyForwards(f32, found_vectors[base .. base + @as(usize, dims_value)], values);
+                }
+                found_idx += 1;
+            } else {
+                missing_ids[missing_idx] = id;
+                missing_idx += 1;
+            }
+        }
+
+        return .{ .ids = found_ids, .vectors = found_vectors, .missing_ids = missing_ids, .dims = dims_value, .include_values = include_values };
+    }
+
+    /// Return vector mutation statistics from the change log.
+    pub fn stats(self: *VectorAdapter) !StatsResult {
+        try self.ensureReadCache();
+
+        var visible: usize = 0;
+        var latest_iter = self.cached_latest.map.iterator();
+        while (latest_iter.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id == 0) continue;
+            if (self.cached_visibility.get(id)) |state| {
+                if (!state.deleted) visible += 1;
+            } else {
+                visible += 1;
+            }
+        }
+
+        var tombstones: usize = 0;
+        var vis_iter = self.cached_visibility.iterator();
+        while (vis_iter.next()) |entry| {
+            if (entry.key_ptr.* == 0) continue;
+            if (entry.value_ptr.deleted) {
+                tombstones += 1;
+            }
+        }
+
+        return .{ .visible_count = visible, .tombstone_count = tombstones, .segment_count = try self.countVectorSegments(), .total_count = visible + tombstones };
+    }
+
+    /// Compact vector storage by rebuilding physical segments from visible rows.
+    pub fn compact(self: *VectorAdapter, dims: u32) !CompactResult {
+        if (dims == 0) return error.InvalidColumnData;
+        try self.ensureReadCache();
+        if (self.cached_latest.dims != 0 and self.cached_latest.dims != dims) return error.InvalidColumnData;
+
+        var removed_tombstones: usize = 0;
+        var vis_iter = self.cached_visibility.iterator();
+        while (vis_iter.next()) |entry| {
+            if (entry.key_ptr.* == 0) continue;
+            if (entry.value_ptr.deleted) removed_tombstones += 1;
+        }
+
+        var kept_count: usize = 0;
+        var latest_iter = self.cached_latest.map.iterator();
+        while (latest_iter.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id == 0) continue;
+            if (self.cached_visibility.get(id)) |state| {
+                if (!state.deleted) kept_count += 1;
+            } else {
+                kept_count += 1;
+            }
+        }
+
+        const ids = try self.allocator.alloc(u64, kept_count);
+        defer self.allocator.free(ids);
+        const vectors = try self.allocator.alloc(f32, kept_count * @as(usize, dims));
+        defer self.allocator.free(vectors);
+
+        var write_idx: usize = 0;
+        latest_iter = self.cached_latest.map.iterator();
+        while (latest_iter.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id == 0) continue;
+            if (self.cached_visibility.get(id)) |state| {
+                if (state.deleted) continue;
+            }
+            ids[write_idx] = id;
+            const base = write_idx * @as(usize, dims);
+            std.mem.copyForwards(f32, vectors[base .. base + @as(usize, dims)], entry.value_ptr.*);
+            write_idx += 1;
+        }
+
+        const compact_seq = self.allocateNextSeq();
+        const compact_ts = std.time.milliTimestamp();
+        const compact_event = ChangeEvent{
+            .seq = compact_seq,
+            .op = .compact,
+            .id = 0,
+            .timestamp = compact_ts,
+        };
+
+        try self.resetVectorNamespace();
+        if (kept_count > 0) {
+            try self.appendBatchRaw(ids, vectors, dims);
+        }
+        try self.appendChangeEvents(&[_]ChangeEvent{compact_event});
+        if (kept_count > 0) {
+            const compact_seqs = try self.allocator.alloc(u64, kept_count);
+            defer self.allocator.free(compact_seqs);
+            for (compact_seqs) |*seq| {
+                seq.* = self.allocateNextSeq();
+            }
+            try self.appendChangeRowsForOp(ids, compact_seqs, .upsert);
+        }
+        self.invalidateReadCache();
+
+        return .{ .kept_count = kept_count, .removed_tombstones = removed_tombstones };
+    }
+
+    /// Compact vectors with durable idempotency tracking.
+    pub fn compactIdempotent(
+        self: *VectorAdapter,
+        dims: u32,
+        key_hash: u64,
+        request_hash: u64,
+    ) !CompactResult {
+        if (key_hash != 0) {
+            if (try self.loadIdempotencyRecord(key_hash, request_hash, .compact)) |record| {
+                switch (record.status) {
+                    .committed => {
+                        return .{
+                            .kept_count = @intCast(record.result_a),
+                            .removed_tombstones = @intCast(record.result_b),
+                        };
+                    },
+                    .pending => {
+                        _ = try self.compact(dims);
+                        try self.appendIdempotencyRecord(
+                            key_hash,
+                            request_hash,
+                            .compact,
+                            .committed,
+                            record.result_a,
+                            record.result_b,
+                        );
+                        return .{
+                            .kept_count = @intCast(record.result_a),
+                            .removed_tombstones = @intCast(record.result_b),
+                        };
+                    },
+                }
+            }
+        }
+
+        const stats_before = try self.stats();
+        const expected = CompactResult{
+            .kept_count = stats_before.visible_count,
+            .removed_tombstones = stats_before.tombstone_count,
+        };
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .compact,
+                .pending,
+                @intCast(expected.kept_count),
+                @intCast(expected.removed_tombstones),
+            );
+        }
+
+        _ = try self.compact(dims);
+
+        if (key_hash != 0) {
+            try self.appendIdempotencyRecord(
+                key_hash,
+                request_hash,
+                .compact,
+                .committed,
+                @intCast(expected.kept_count),
+                @intCast(expected.removed_tombstones),
+            );
+        }
+
+        return expected;
+    }
+
+    /// Read mutation events with cursor pagination.
+    pub fn readChanges(self: *VectorAdapter, allocator: Allocator, since: u64, limit: usize) !ChangesResult {
+        const all_changes = try self.loadAllChanges(allocator);
+        defer allocator.free(all_changes);
+
+        const clamped_limit = @max(@as(usize, 1), @min(limit, 1000));
+
+        var matched_total: usize = 0;
+        for (all_changes) |change| {
+            if (change.seq > since) {
+                matched_total += 1;
+            }
+        }
+
+        const out_count = @min(matched_total, clamped_limit);
+        const out = try allocator.alloc(ChangeEvent, out_count);
+        errdefer allocator.free(out);
+
+        var write_idx: usize = 0;
+        for (all_changes) |change| {
+            if (change.seq <= since) continue;
+            if (write_idx >= out_count) break;
+            out[write_idx] = change;
+            write_idx += 1;
+        }
+
+        const has_more = matched_total > out_count;
+        const next_since = if (out_count > 0) out[out_count - 1].seq else since;
+        return .{ .events = out, .has_more = has_more, .next_since = next_since };
+    }
+
+    fn appendBatchWithOp(
+        self: *VectorAdapter,
+        doc_ids: []const u64,
+        vectors: []const f32,
+        dims: u32,
+        op: ChangeOp,
+        options: MutationOptions,
+    ) !void {
+        if (doc_ids.len == 0) return;
+        if (vectors.len != doc_ids.len * @as(usize, dims)) return error.InvalidColumnData;
+
+        var vectors_buf = vectors;
+        var normalized_vectors: ?[]f32 = null;
+        defer if (normalized_vectors) |owned| self.allocator.free(owned);
+        if (options.normalize) {
+            const owned = try self.allocator.dupe(f32, vectors);
+            errdefer self.allocator.free(owned);
+            try normalizeRowsInPlace(owned, dims);
+            vectors_buf = owned;
+            normalized_vectors = owned;
+        }
+
+        if (op == .append and options.reject_existing and try self.anyVisibleIdExists(doc_ids)) {
+            return error.AlreadyExists;
+        }
+
+        const seqs = try self.allocator.alloc(u64, doc_ids.len);
+        defer self.allocator.free(seqs);
+        for (seqs) |*seq| {
+            seq.* = self.allocateNextSeq();
+        }
+
+        try self.appendBatchRaw(doc_ids, vectors_buf, dims);
+        try self.appendChangeRowsForOp(doc_ids, seqs, op);
+        self.invalidateReadCache();
+    }
+
+    fn anyVisibleIdExists(self: *VectorAdapter, ids: []const u64) !bool {
+        try self.ensureReadCache();
+        for (ids) |id| {
+            if (self.idIsVisibleCached(id)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    fn allIdsMatchVectors(self: *VectorAdapter, ids: []const u64, vectors: []const f32, dims: u32) !bool {
+        if (ids.len == 0) return true;
+        if (vectors.len != ids.len * @as(usize, dims)) return false;
+
+        var unique = std.AutoHashMap(u64, void).init(self.allocator);
+        defer unique.deinit();
+        for (ids) |id| {
+            if (try unique.fetchPut(id, {})) |_| return false;
+        }
+        try self.ensureReadCache();
+        if (self.cached_latest.dims != dims) return false;
+
+        for (ids, 0..) |id, idx| {
+            if (!self.idIsVisibleCached(id)) return false;
+            const stored = self.cached_latest.map.get(id) orelse return false;
+            if (stored.len != @as(usize, dims)) return false;
+            const start = idx * @as(usize, dims);
+            const expected = vectors[start .. start + @as(usize, dims)];
+            if (!std.mem.eql(f32, stored, expected)) return false;
+        }
+
+        return true;
+    }
+
+    fn previewDeleteCounts(self: *VectorAdapter, ids: []const u64) !DeleteResult {
+        try self.ensureReadCache();
+
+        var deleted: usize = 0;
+        var not_found: usize = 0;
+        for (ids) |id| {
+            if (self.idIsVisibleCached(id)) {
+                deleted += 1;
+            } else {
+                not_found += 1;
+            }
+        }
+        return .{ .deleted_count = deleted, .not_found_count = not_found };
+    }
+
+    fn idIsVisibleCached(self: *VectorAdapter, id: u64) bool {
+        if (self.cached_visibility.get(id)) |entry| {
+            if (entry.deleted) return false;
+            return self.cached_latest.map.contains(id);
+        }
+        return self.cached_latest.map.contains(id);
+    }
+
+    fn ensureReadCache(self: *VectorAdapter) !void {
+        var snapshots = try self.readBlockSnapshots(self.allocator);
+        defer snapshots.deinit(self.allocator);
+
+        const vector_count = snapshots.vector_blocks.len;
+        const change_count = snapshots.change_blocks.len;
+        const vector_hash = hashBlockRefs(snapshots.vector_blocks);
+        const change_hash = hashBlockRefs(snapshots.change_blocks);
+
+        if (!self.read_cache_valid) {
+            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            return;
+        }
+
+        if (vector_count == self.cached_vector_block_count and
+            change_count == self.cached_change_block_count and
+            vector_hash == self.cached_vector_block_hash and
+            change_hash == self.cached_change_block_hash)
+        {
+            return;
+        }
+
+        if (vector_count < self.cached_vector_block_count or
+            change_count < self.cached_change_block_count)
+        {
+            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            return;
+        }
+
+        const vector_is_append_only = blk: {
+            if (vector_count == self.cached_vector_block_count) {
+                break :blk vector_hash == self.cached_vector_block_hash;
+            }
+            const prefix_hash = hashBlockRefs(snapshots.vector_blocks[0..self.cached_vector_block_count]);
+            break :blk prefix_hash == self.cached_vector_block_hash;
+        };
+        const change_is_append_only = blk: {
+            if (change_count == self.cached_change_block_count) {
+                break :blk change_hash == self.cached_change_block_hash;
+            }
+            const prefix_hash = hashBlockRefs(snapshots.change_blocks[0..self.cached_change_block_count]);
+            break :blk prefix_hash == self.cached_change_block_hash;
+        };
+        if (!vector_is_append_only or !change_is_append_only) {
+            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            return;
+        }
+
+        self.read_cache_valid = false;
+        const change_needs_full = try self.applyChangeBlocks(snapshots.change_blocks[self.cached_change_block_count..]);
+        if (change_needs_full) {
+            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            return;
+        }
+        try self.applyVectorBlocks(snapshots.vector_blocks[self.cached_vector_block_count..]);
+        try self.rebuildVisibleDenseCache();
+
+        self.cached_vector_block_count = vector_count;
+        self.cached_change_block_count = change_count;
+        self.cached_vector_block_hash = vector_hash;
+        self.cached_change_block_hash = change_hash;
+        self.read_cache_valid = true;
+    }
+
+    fn refreshReadCacheFromBlocks(
+        self: *VectorAdapter,
+        vector_blocks: []const db_reader.BlockRef,
+        change_blocks: []const db_reader.BlockRef,
+        vector_hash: u64,
+        change_hash: u64,
+    ) !void {
+        self.read_cache_valid = false;
+        var visibility = try self.loadLatestVisibilityFromBlocks(self.allocator, change_blocks);
+        errdefer visibility.deinit();
+        var latest = try self.loadLatestVectorsFromBlocks(self.allocator, vector_blocks, null);
+        errdefer latest.deinit(self.allocator);
+
+        self.cached_visibility.deinit();
+        self.cached_latest.deinit(self.allocator);
+        self.cached_visibility = visibility;
+        self.cached_latest = latest;
+        try self.rebuildVisibleDenseCache();
+        self.cached_vector_block_count = vector_blocks.len;
+        self.cached_change_block_count = change_blocks.len;
+        self.cached_vector_block_hash = vector_hash;
+        self.cached_change_block_hash = change_hash;
+        self.read_cache_valid = true;
+    }
+
+    fn invalidateReadCache(self: *VectorAdapter) void {
+        self.read_cache_valid = false;
+        self.cached_vector_block_count = 0;
+        self.cached_change_block_count = 0;
+        self.cached_vector_block_hash = 0;
+        self.cached_change_block_hash = 0;
+        self.clearVisibleDenseCache();
+    }
+
+    fn clearVisibleDenseCache(self: *VectorAdapter) void {
+        if (self.cached_visible_ids.len > 0) {
+            self.allocator.free(self.cached_visible_ids);
+        }
+        if (self.cached_visible_vectors.len > 0) {
+            self.allocator.free(self.cached_visible_vectors);
+        }
+        self.cached_visible_ids = &[_]u64{};
+        self.cached_visible_vectors = &[_]f32{};
+    }
+
+    fn rebuildVisibleDenseCache(self: *VectorAdapter) !void {
+        self.clearVisibleDenseCache();
+
+        const dims = self.cached_latest.dims;
+        if (dims == 0) return;
+
+        var visible_count: usize = 0;
+        var latest_iter = self.cached_latest.map.iterator();
+        while (latest_iter.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id == 0) continue;
+            if (self.cached_visibility.get(id)) |state| {
+                if (state.deleted) continue;
+            }
+            visible_count += 1;
+        }
+
+        if (visible_count == 0) return;
+
+        const ids = try self.allocator.alloc(u64, visible_count);
+        errdefer self.allocator.free(ids);
+        const vectors = try self.allocator.alloc(f32, visible_count * @as(usize, dims));
+        errdefer self.allocator.free(vectors);
+
+        var write_idx: usize = 0;
+        latest_iter = self.cached_latest.map.iterator();
+        while (latest_iter.next()) |entry| {
+            const id = entry.key_ptr.*;
+            if (id == 0) continue;
+            if (self.cached_visibility.get(id)) |state| {
+                if (state.deleted) continue;
+            }
+
+            ids[write_idx] = id;
+            const base = write_idx * @as(usize, dims);
+            std.mem.copyForwards(f32, vectors[base .. base + @as(usize, dims)], entry.value_ptr.*);
+            write_idx += 1;
+        }
+
+        self.cached_visible_ids = ids;
+        self.cached_visible_vectors = vectors;
+    }
+
+    fn readBlockSnapshots(self: *VectorAdapter, allocator: Allocator) !BlockSnapshots {
+        try self.fs_writer.flushBlock();
+        _ = try self.fs_reader.refreshIfChanged();
+        const vector_blocks = try self.fs_reader.getBlocks(allocator);
+        errdefer allocator.free(vector_blocks);
+
+        try self.change_writer.flushBlock();
+        _ = try self.change_reader.refreshIfChanged();
+        const change_blocks = try self.change_reader.getBlocks(allocator);
+        errdefer allocator.free(change_blocks);
+
+        return .{
+            .vector_blocks = vector_blocks,
+            .change_blocks = change_blocks,
+        };
+    }
+
+    fn applyChangeBlocks(self: *VectorAdapter, blocks: []const db_reader.BlockRef) !bool {
+        if (blocks.len == 0) return false;
+
+        var current_path: ?[]const u8 = null;
+        var current_file: ?std.fs.File = null;
+        defer if (current_file) |file| file.close();
+
+        for (blocks) |block| {
+            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
+                if (current_file) |file| file.close();
+                current_file = try self.change_reader.dir.openFile(block.path, .{ .mode = .read_only });
+                current_path = block.path;
+            }
+
+            const reader = block_reader.BlockReader.init(current_file.?, self.allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_vector_changes) continue;
+            if (header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer self.allocator.free(descs);
+
+            const seq_desc = findColumn(descs, col_seq) orelse return error.MissingColumn;
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const op_desc = findColumn(descs, col_change_op) orelse return error.MissingColumn;
+
+            const seq_buf = try self.allocator.alloc(u8, seq_desc.data_len);
+            defer self.allocator.free(seq_buf);
+            try reader.readColumnDataInto(block.offset, seq_desc, seq_buf);
+            _ = try checkedRowCount(header.row_count, seq_buf.len, @sizeOf(u64));
+
+            const id_buf = try self.allocator.alloc(u8, id_desc.data_len);
+            defer self.allocator.free(id_buf);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+
+            const op_buf = try self.allocator.alloc(u8, op_desc.data_len);
+            defer self.allocator.free(op_buf);
+            try reader.readColumnDataInto(block.offset, op_desc, op_buf);
+            _ = try checkedRowCount(header.row_count, op_buf.len, @sizeOf(u8));
+
+            const seqs = @as([*]const u64, @ptrCast(@alignCast(seq_buf.ptr)))[0..header.row_count];
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+            const ops = @as([*]const u8, @ptrCast(@alignCast(op_buf.ptr)))[0..header.row_count];
+
+            for (0..header.row_count) |idx| {
+                const op = try parseChangeOpByte(ops[idx]);
+                if (op == .compact) return true;
+
+                const id = ids[idx];
+                if (id == 0) continue;
+                if (self.cached_visibility.get(id)) |existing| {
+                    if (existing.seq > seqs[idx]) continue;
+                }
+                try self.cached_visibility.put(id, .{
+                    .seq = seqs[idx],
+                    .deleted = (op == .delete),
+                });
+            }
+        }
+        return false;
+    }
+
+    fn applyVectorBlocks(self: *VectorAdapter, blocks: []const db_reader.BlockRef) !void {
+        if (blocks.len == 0) return;
+
+        var current_path: ?[]const u8 = null;
+        var current_file: ?std.fs.File = null;
+        defer if (current_file) |file| file.close();
+        var scratch = ScratchBuffers{};
+        defer scratch.deinit(self.allocator);
+
+        for (blocks) |block| {
+            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
+                if (current_file) |file| file.close();
+                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
+                current_path = block.path;
+            }
+
+            const reader = block_reader.BlockReader.init(current_file.?, self.allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_embeddings) continue;
+            if (header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer self.allocator.free(descs);
+
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
+            if (embedding_desc.dims == 0) return error.InvalidColumnData;
+
+            if (self.cached_latest.dims == 0) {
+                self.cached_latest.dims = embedding_desc.dims;
+            } else if (self.cached_latest.dims != embedding_desc.dims) {
+                return error.InvalidColumnData;
+            }
+
+            const id_buf = try scratch.ensureId(self.allocator, id_desc.data_len);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+
+            const vector_buf = try scratch.ensureVector(self.allocator, embedding_desc.data_len);
+            try reader.readColumnDataInto(block.offset, embedding_desc, vector_buf);
+            const vector_len = @as(usize, header.row_count) * @as(usize, embedding_desc.dims);
+            if (vector_buf.len != vector_len * @sizeOf(f32)) return error.InvalidColumnData;
+
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+            const vectors = @as([*]const f32, @ptrCast(@alignCast(vector_buf.ptr)))[0..vector_len];
+
+            for (0..header.row_count) |row_idx| {
+                const id = ids[row_idx];
+                const base = row_idx * @as(usize, embedding_desc.dims);
+                const values = try self.allocator.dupe(f32, vectors[base .. base + @as(usize, embedding_desc.dims)]);
+                if (try self.cached_latest.map.fetchPut(id, values)) |replaced| {
+                    self.allocator.free(replaced.value);
+                }
+            }
+        }
+    }
+
+    fn appendBatchRaw(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32) !void {
         if (dims == 0) return error.InvalidColumnData;
         if (doc_ids.len == 0) return;
         if (vectors.len != doc_ids.len * @as(usize, dims)) return error.InvalidColumnData;
@@ -146,40 +1253,559 @@ pub const VectorAdapter = struct {
 
         const ts_buf = try self.allocator.alloc(i64, doc_ids.len);
         defer self.allocator.free(ts_buf);
-
         const ts_value = std.time.milliTimestamp();
         for (ts_buf) |*entry| {
             entry.* = ts_value;
         }
 
         const columns = [_]db_writer.ColumnBatch{
-            .{
-                .column_id = col_doc_id,
-                .shape = .SCALAR,
-                .phys_type = .U64,
-                .encoding = .RAW,
-                .dims = 1,
-                .data = std.mem.sliceAsBytes(doc_ids),
-            },
-            .{
-                .column_id = col_ts,
-                .shape = .SCALAR,
-                .phys_type = .I64,
-                .encoding = .RAW,
-                .dims = 1,
-                .data = std.mem.sliceAsBytes(ts_buf),
-            },
-            .{
-                .column_id = col_embedding,
-                .shape = .VECTOR,
-                .phys_type = .F32,
-                .encoding = .RAW,
-                .dims = @intCast(dims),
-                .data = std.mem.sliceAsBytes(vectors),
-            },
+            .{ .column_id = col_doc_id, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(doc_ids) },
+            .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(ts_buf) },
+            .{ .column_id = col_embedding, .shape = .VECTOR, .phys_type = .F32, .encoding = .RAW, .dims = @intCast(dims), .data = std.mem.sliceAsBytes(vectors) },
         };
 
         try self.fs_writer.appendBatch(schema_embeddings, @intCast(doc_ids.len), &columns);
+    }
+
+    fn appendChangeRowsForOp(self: *VectorAdapter, ids: []const u64, seqs: []const u64, op: ChangeOp) !void {
+        if (ids.len == 0) return;
+        if (ids.len != seqs.len) return error.InvalidColumnData;
+
+        const ops = try self.allocator.alloc(u8, ids.len);
+        defer self.allocator.free(ops);
+        for (ops) |*entry| {
+            entry.* = @intFromEnum(op);
+        }
+
+        const timestamps = try self.allocator.alloc(i64, ids.len);
+        defer self.allocator.free(timestamps);
+        const now = std.time.milliTimestamp();
+        for (timestamps) |*entry| {
+            entry.* = now;
+        }
+
+        try self.appendChangeRowsRaw(ids, seqs, ops, timestamps);
+    }
+
+    fn appendChangeEvents(self: *VectorAdapter, events: []const ChangeEvent) !void {
+        if (events.len == 0) return;
+
+        const ids = try self.allocator.alloc(u64, events.len);
+        defer self.allocator.free(ids);
+        const seqs = try self.allocator.alloc(u64, events.len);
+        defer self.allocator.free(seqs);
+        const ops = try self.allocator.alloc(u8, events.len);
+        defer self.allocator.free(ops);
+        const timestamps = try self.allocator.alloc(i64, events.len);
+        defer self.allocator.free(timestamps);
+
+        for (events, 0..) |event, idx| {
+            ids[idx] = event.id;
+            seqs[idx] = event.seq;
+            ops[idx] = @intFromEnum(event.op);
+            timestamps[idx] = event.timestamp;
+        }
+
+        try self.appendChangeRowsRaw(ids, seqs, ops, timestamps);
+    }
+
+    fn appendChangeRowsRaw(self: *VectorAdapter, ids: []const u64, seqs: []const u64, ops: []const u8, timestamps: []const i64) !void {
+        if (ids.len == 0) return;
+        if (ids.len != seqs.len or ids.len != ops.len or ids.len != timestamps.len) {
+            return error.InvalidColumnData;
+        }
+
+        const columns = [_]db_writer.ColumnBatch{
+            .{ .column_id = col_seq, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(seqs) },
+            .{ .column_id = col_doc_id, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(ids) },
+            .{ .column_id = col_change_op, .shape = .SCALAR, .phys_type = .U8, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(ops) },
+            .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(timestamps) },
+        };
+
+        try self.change_writer.flushBlock();
+        try self.change_writer.appendBatch(schema_vector_changes, @intCast(ids.len), &columns);
+    }
+
+    fn loadIdempotencyRecord(
+        self: *VectorAdapter,
+        key_hash: u64,
+        request_hash: u64,
+        op: ChangeOp,
+    ) !?IdempotencyRecord {
+        if (key_hash == 0) return null;
+        var records = try self.loadLatestIdempotency(self.allocator);
+        defer records.deinit();
+
+        const record = records.get(key_hash) orelse return null;
+        if (record.request_hash != request_hash or record.op != op) {
+            return error.IdempotencyConflict;
+        }
+        return record;
+    }
+
+    fn appendIdempotencyRecord(
+        self: *VectorAdapter,
+        key_hash: u64,
+        request_hash: u64,
+        op: ChangeOp,
+        status: IdempotencyStatus,
+        result_a: u64,
+        result_b: u64,
+    ) !void {
+        if (key_hash == 0) return;
+
+        const seq = self.allocateNextSeq();
+        const timestamp = std.time.milliTimestamp();
+
+        const seqs = [_]u64{seq};
+        const keys = [_]u64{key_hash};
+        const req_hashes = [_]u64{request_hash};
+        const ops = [_]u8{@intFromEnum(op)};
+        const statuses = [_]u8{@intFromEnum(status)};
+        const results_a = [_]u64{result_a};
+        const results_b = [_]u64{result_b};
+        const timestamps = [_]i64{timestamp};
+
+        try self.appendIdempotencyRowsRaw(
+            &seqs,
+            &keys,
+            &req_hashes,
+            &ops,
+            &statuses,
+            &results_a,
+            &results_b,
+            &timestamps,
+        );
+    }
+
+    fn appendIdempotencyRowsRaw(
+        self: *VectorAdapter,
+        seqs: []const u64,
+        key_hashes: []const u64,
+        request_hashes: []const u64,
+        ops: []const u8,
+        statuses: []const u8,
+        result_as: []const u64,
+        result_bs: []const u64,
+        timestamps: []const i64,
+    ) !void {
+        if (seqs.len == 0) return;
+        if (seqs.len != key_hashes.len or
+            seqs.len != request_hashes.len or
+            seqs.len != ops.len or
+            seqs.len != statuses.len or
+            seqs.len != result_as.len or
+            seqs.len != result_bs.len or
+            seqs.len != timestamps.len)
+        {
+            return error.InvalidColumnData;
+        }
+
+        const columns = [_]db_writer.ColumnBatch{
+            .{ .column_id = col_seq, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(seqs) },
+            .{ .column_id = col_idempotency_key_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(key_hashes) },
+            .{ .column_id = col_idempotency_request_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(request_hashes) },
+            .{ .column_id = col_idempotency_op, .shape = .SCALAR, .phys_type = .U8, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(ops) },
+            .{ .column_id = col_idempotency_status, .shape = .SCALAR, .phys_type = .U8, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(statuses) },
+            .{ .column_id = col_idempotency_result_a, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(result_as) },
+            .{ .column_id = col_idempotency_result_b, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(result_bs) },
+            .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.sliceAsBytes(timestamps) },
+        };
+
+        try self.idempotency_writer.flushBlock();
+        try self.idempotency_writer.appendBatch(schema_vector_idempotency, @intCast(seqs.len), &columns);
+    }
+
+    fn loadLatestIdempotency(self: *VectorAdapter, allocator: Allocator) !std.AutoHashMap(u64, IdempotencyRecord) {
+        try self.idempotency_writer.flushBlock();
+        try self.idempotency_reader.refreshCurrent();
+        const blocks = try self.idempotency_reader.getBlocks(allocator);
+        defer allocator.free(blocks);
+
+        var records = std.AutoHashMap(u64, IdempotencyRecord).init(allocator);
+        errdefer records.deinit();
+
+        var current_path: ?[]const u8 = null;
+        var current_file: ?std.fs.File = null;
+        defer if (current_file) |file| file.close();
+
+        for (blocks) |block| {
+            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
+                if (current_file) |file| file.close();
+                current_file = try self.idempotency_reader.dir.openFile(block.path, .{ .mode = .read_only });
+                current_path = block.path;
+            }
+
+            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_vector_idempotency) continue;
+            if (header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer allocator.free(descs);
+
+            const seq_desc = findColumn(descs, col_seq) orelse return error.MissingColumn;
+            const key_desc = findColumn(descs, col_idempotency_key_hash) orelse return error.MissingColumn;
+            const req_hash_desc = findColumn(descs, col_idempotency_request_hash) orelse return error.MissingColumn;
+            const op_desc = findColumn(descs, col_idempotency_op) orelse return error.MissingColumn;
+            const status_desc = findColumn(descs, col_idempotency_status) orelse return error.MissingColumn;
+            const result_a_desc = findColumn(descs, col_idempotency_result_a) orelse return error.MissingColumn;
+            const result_b_desc = findColumn(descs, col_idempotency_result_b) orelse return error.MissingColumn;
+
+            const seq_buf = try allocator.alloc(u8, seq_desc.data_len);
+            defer allocator.free(seq_buf);
+            try reader.readColumnDataInto(block.offset, seq_desc, seq_buf);
+            _ = try checkedRowCount(header.row_count, seq_buf.len, @sizeOf(u64));
+
+            const key_buf = try allocator.alloc(u8, key_desc.data_len);
+            defer allocator.free(key_buf);
+            try reader.readColumnDataInto(block.offset, key_desc, key_buf);
+            _ = try checkedRowCount(header.row_count, key_buf.len, @sizeOf(u64));
+
+            const req_hash_buf = try allocator.alloc(u8, req_hash_desc.data_len);
+            defer allocator.free(req_hash_buf);
+            try reader.readColumnDataInto(block.offset, req_hash_desc, req_hash_buf);
+            _ = try checkedRowCount(header.row_count, req_hash_buf.len, @sizeOf(u64));
+
+            const op_buf = try allocator.alloc(u8, op_desc.data_len);
+            defer allocator.free(op_buf);
+            try reader.readColumnDataInto(block.offset, op_desc, op_buf);
+            _ = try checkedRowCount(header.row_count, op_buf.len, @sizeOf(u8));
+
+            const status_buf = try allocator.alloc(u8, status_desc.data_len);
+            defer allocator.free(status_buf);
+            try reader.readColumnDataInto(block.offset, status_desc, status_buf);
+            _ = try checkedRowCount(header.row_count, status_buf.len, @sizeOf(u8));
+
+            const result_a_buf = try allocator.alloc(u8, result_a_desc.data_len);
+            defer allocator.free(result_a_buf);
+            try reader.readColumnDataInto(block.offset, result_a_desc, result_a_buf);
+            _ = try checkedRowCount(header.row_count, result_a_buf.len, @sizeOf(u64));
+
+            const result_b_buf = try allocator.alloc(u8, result_b_desc.data_len);
+            defer allocator.free(result_b_buf);
+            try reader.readColumnDataInto(block.offset, result_b_desc, result_b_buf);
+            _ = try checkedRowCount(header.row_count, result_b_buf.len, @sizeOf(u64));
+
+            const seqs = @as([*]const u64, @ptrCast(@alignCast(seq_buf.ptr)))[0..header.row_count];
+            const keys = @as([*]const u64, @ptrCast(@alignCast(key_buf.ptr)))[0..header.row_count];
+            const request_hashes = @as([*]const u64, @ptrCast(@alignCast(req_hash_buf.ptr)))[0..header.row_count];
+            const ops = @as([*]const u8, @ptrCast(@alignCast(op_buf.ptr)))[0..header.row_count];
+            const statuses = @as([*]const u8, @ptrCast(@alignCast(status_buf.ptr)))[0..header.row_count];
+            const results_a = @as([*]const u64, @ptrCast(@alignCast(result_a_buf.ptr)))[0..header.row_count];
+            const results_b = @as([*]const u64, @ptrCast(@alignCast(result_b_buf.ptr)))[0..header.row_count];
+
+            for (0..header.row_count) |idx| {
+                const key_hash = keys[idx];
+                const seq = seqs[idx];
+                const record = IdempotencyRecord{
+                    .seq = seq,
+                    .request_hash = request_hashes[idx],
+                    .op = try parseChangeOpByte(ops[idx]),
+                    .status = try parseIdempotencyStatusByte(statuses[idx]),
+                    .result_a = results_a[idx],
+                    .result_b = results_b[idx],
+                };
+
+                if (records.get(key_hash)) |existing| {
+                    if (existing.seq > seq) continue;
+                }
+                try records.put(key_hash, record);
+            }
+        }
+
+        return records;
+    }
+
+    fn loadAllChanges(self: *VectorAdapter, allocator: Allocator) ![]ChangeEvent {
+        var snapshots = try self.readBlockSnapshots(allocator);
+        defer snapshots.deinit(allocator);
+        return self.loadAllChangesFromBlocks(allocator, snapshots.change_blocks);
+    }
+
+    fn loadAllChangesFromBlocks(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        blocks: []const db_reader.BlockRef,
+    ) ![]ChangeEvent {
+        var events = std.ArrayList(ChangeEvent).empty;
+        errdefer events.deinit(allocator);
+
+        var current_path: ?[]const u8 = null;
+        var current_file: ?std.fs.File = null;
+        defer if (current_file) |file| file.close();
+
+        for (blocks) |block| {
+            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
+                if (current_file) |file| file.close();
+                current_file = try self.change_reader.dir.openFile(block.path, .{ .mode = .read_only });
+                current_path = block.path;
+            }
+
+            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_vector_changes) continue;
+            if (header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer allocator.free(descs);
+
+            const seq_desc = findColumn(descs, col_seq) orelse return error.MissingColumn;
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const op_desc = findColumn(descs, col_change_op) orelse return error.MissingColumn;
+            const ts_desc = findColumn(descs, col_ts) orelse return error.MissingColumn;
+
+            const seq_buf = try allocator.alloc(u8, seq_desc.data_len);
+            defer allocator.free(seq_buf);
+            try reader.readColumnDataInto(block.offset, seq_desc, seq_buf);
+            _ = try checkedRowCount(header.row_count, seq_buf.len, @sizeOf(u64));
+
+            const id_buf = try allocator.alloc(u8, id_desc.data_len);
+            defer allocator.free(id_buf);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+
+            const op_buf = try allocator.alloc(u8, op_desc.data_len);
+            defer allocator.free(op_buf);
+            try reader.readColumnDataInto(block.offset, op_desc, op_buf);
+            _ = try checkedRowCount(header.row_count, op_buf.len, @sizeOf(u8));
+
+            const ts_buf = try allocator.alloc(u8, ts_desc.data_len);
+            defer allocator.free(ts_buf);
+            try reader.readColumnDataInto(block.offset, ts_desc, ts_buf);
+            _ = try checkedRowCount(header.row_count, ts_buf.len, @sizeOf(i64));
+
+            const seqs = @as([*]const u64, @ptrCast(@alignCast(seq_buf.ptr)))[0..header.row_count];
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+            const ops = @as([*]const u8, @ptrCast(@alignCast(op_buf.ptr)))[0..header.row_count];
+            const timestamps = @as([*]const i64, @ptrCast(@alignCast(ts_buf.ptr)))[0..header.row_count];
+
+            for (0..header.row_count) |idx| {
+                try events.append(allocator, .{
+                    .seq = seqs[idx],
+                    .op = try parseChangeOpByte(ops[idx]),
+                    .id = ids[idx],
+                    .timestamp = timestamps[idx],
+                });
+            }
+        }
+
+        std.sort.pdq(ChangeEvent, events.items, {}, struct {
+            fn lessThan(_: void, a: ChangeEvent, b: ChangeEvent) bool {
+                return a.seq < b.seq;
+            }
+        }.lessThan);
+
+        return events.toOwnedSlice(allocator);
+    }
+
+    fn buildVisibilityMap(self: *VectorAdapter, allocator: Allocator, changes: []const ChangeEvent) !std.AutoHashMap(u64, PointVisibility) {
+        _ = self;
+        var visibility = std.AutoHashMap(u64, PointVisibility).init(allocator);
+        errdefer visibility.deinit();
+        for (changes) |change| {
+            if (change.op == .compact) {
+                visibility.clearRetainingCapacity();
+                continue;
+            }
+            if (change.id == 0) continue;
+            try visibility.put(change.id, .{
+                .seq = change.seq,
+                .deleted = (change.op == .delete),
+            });
+        }
+        return visibility;
+    }
+
+    fn loadLatestVisibility(self: *VectorAdapter, allocator: Allocator) !std.AutoHashMap(u64, PointVisibility) {
+        var snapshots = try self.readBlockSnapshots(allocator);
+        defer snapshots.deinit(allocator);
+        return self.loadLatestVisibilityFromBlocks(allocator, snapshots.change_blocks);
+    }
+
+    fn loadLatestVisibilityFromBlocks(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        blocks: []const db_reader.BlockRef,
+    ) !std.AutoHashMap(u64, PointVisibility) {
+        const changes = try self.loadAllChangesFromBlocks(allocator, blocks);
+        defer allocator.free(changes);
+        return self.buildVisibilityMap(allocator, changes);
+    }
+
+    fn loadLatestVectors(self: *VectorAdapter, allocator: Allocator, only_ids: ?*const std.AutoHashMap(u64, void)) !LatestVectors {
+        var snapshots = try self.readBlockSnapshots(allocator);
+        defer snapshots.deinit(allocator);
+        return self.loadLatestVectorsFromBlocks(allocator, snapshots.vector_blocks, only_ids);
+    }
+
+    fn loadLatestVectorsFromBlocks(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        blocks: []const db_reader.BlockRef,
+        only_ids: ?*const std.AutoHashMap(u64, void),
+    ) !LatestVectors {
+        var latest = LatestVectors{
+            .dims = 0,
+            .map = std.AutoHashMap(u64, []f32).init(allocator),
+        };
+        errdefer latest.deinit(allocator);
+
+        var current_path: ?[]const u8 = null;
+        var current_file: ?std.fs.File = null;
+        defer if (current_file) |file| file.close();
+        var scratch = ScratchBuffers{};
+        defer scratch.deinit(allocator);
+
+        for (blocks) |block| {
+            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
+                if (current_file) |file| file.close();
+                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
+                current_path = block.path;
+            }
+
+            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_embeddings) continue;
+            if (header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer allocator.free(descs);
+
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
+            if (embedding_desc.dims == 0) return error.InvalidColumnData;
+
+            if (latest.dims == 0) {
+                latest.dims = embedding_desc.dims;
+            } else if (latest.dims != embedding_desc.dims) {
+                return error.InvalidColumnData;
+            }
+
+            const id_buf = try scratch.ensureId(allocator, id_desc.data_len);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+
+            const vector_buf = try scratch.ensureVector(allocator, embedding_desc.data_len);
+            try reader.readColumnDataInto(block.offset, embedding_desc, vector_buf);
+            const vector_len = @as(usize, header.row_count) * @as(usize, embedding_desc.dims);
+            if (vector_buf.len != vector_len * @sizeOf(f32)) return error.InvalidColumnData;
+
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+            const vectors = @as([*]const f32, @ptrCast(@alignCast(vector_buf.ptr)))[0..vector_len];
+
+            for (0..header.row_count) |row_idx| {
+                const id = ids[row_idx];
+                if (only_ids) |subset| {
+                    if (!subset.contains(id)) continue;
+                }
+
+                const base = row_idx * @as(usize, embedding_desc.dims);
+                const values = try allocator.dupe(f32, vectors[base .. base + @as(usize, embedding_desc.dims)]);
+                if (try latest.map.fetchPut(id, values)) |replaced| {
+                    allocator.free(replaced.value);
+                }
+            }
+        }
+
+        return latest;
+    }
+
+    fn discoverNextSeq(self: *VectorAdapter) !u64 {
+        var max_seq: u64 = 0;
+
+        const events = try self.loadAllChanges(self.allocator);
+        defer self.allocator.free(events);
+        if (events.len > 0) {
+            max_seq = @max(max_seq, events[events.len - 1].seq);
+        }
+
+        var idempotency = try self.loadLatestIdempotency(self.allocator);
+        defer idempotency.deinit();
+        var iter = idempotency.valueIterator();
+        while (iter.next()) |record| {
+            max_seq = @max(max_seq, record.seq);
+        }
+
+        if (max_seq == 0) return 1;
+        if (max_seq == std.math.maxInt(u64)) return std.math.maxInt(u64);
+        return max_seq + 1;
+    }
+
+    fn allocateNextSeq(self: *VectorAdapter) u64 {
+        const seq = self.next_seq;
+        self.next_seq = if (seq == std.math.maxInt(u64)) std.math.maxInt(u64) else seq + 1;
+        return seq;
+    }
+
+    fn resetVectorNamespace(self: *VectorAdapter) !void {
+        self.invalidateReadCache();
+        self.fs_writer.flushBlock() catch {};
+        self.fs_writer.deinit();
+        self.allocator.destroy(self.fs_writer);
+        self.fs_reader.deinit();
+        self.allocator.destroy(self.fs_reader);
+
+        const vector_dir = try self.vectorDirPath(self.allocator);
+        defer self.allocator.free(vector_dir);
+        try std.fs.cwd().deleteTree(vector_dir);
+
+        self.fs_writer = try self.allocator.create(db_writer.Writer);
+        errdefer self.allocator.destroy(self.fs_writer);
+        self.fs_writer.* = try db_writer.Writer.open(self.allocator, self.db_root, "vector");
+
+        self.fs_reader = try self.allocator.create(db_reader.Reader);
+        errdefer self.allocator.destroy(self.fs_reader);
+        self.fs_reader.* = try db_reader.Reader.open(self.allocator, self.db_root, "vector");
+    }
+
+    fn vectorDirPath(self: *VectorAdapter, allocator: Allocator) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.db_root, "vector" });
+    }
+
+    fn countVectorSegments(self: *VectorAdapter) !usize {
+        const vector_dir = try self.vectorDirPath(self.allocator);
+        defer self.allocator.free(vector_dir);
+
+        var dir = std.fs.cwd().openDir(vector_dir, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return 0,
+            else => return err,
+        };
+        defer dir.close();
+
+        var iter = dir.iterate();
+        var count: usize = 0;
+        while (try iter.next()) |entry| {
+            if (entry.kind != .file) continue;
+            if (std.mem.endsWith(u8, entry.name, ".talu")) {
+                count += 1;
+            }
+        }
+        return count;
+    }
+
+    fn rebuildVectorNamespace(self: *VectorAdapter, ids: []const u64, vectors: []const f32, dims: u32) !void {
+        try self.resetVectorNamespace();
+        if (ids.len == 0) return;
+        try self.appendBatchRaw(ids, vectors, dims);
+    }
+
+    fn parseChangeOpByte(op: u8) !ChangeOp {
+        return switch (op) {
+            1 => .append,
+            2 => .upsert,
+            3 => .delete,
+            4 => .compact,
+            else => error.InvalidColumnData,
+        };
+    }
+
+    fn parseIdempotencyStatusByte(status: u8) !IdempotencyStatus {
+        return switch (status) {
+            0 => .pending,
+            1 => .committed,
+            else => error.InvalidColumnData,
+        };
     }
 
     /// Load all stored embeddings.
@@ -357,68 +1983,24 @@ pub const VectorAdapter = struct {
         query: []const f32,
         k: u32,
     ) !SearchResult {
-        if (k == 0) {
-            return .{
-                .ids = try allocator.alloc(u64, 0),
-                .scores = try allocator.alloc(f32, 0),
-            };
-        }
+        return self.searchWithOptions(allocator, query, k, .{});
+    }
+
+    /// Search stored embeddings with a dot-product scan and explicit options.
+    pub fn searchWithOptions(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        query: []const f32,
+        k: u32,
+        options: SearchOptions,
+    ) !SearchResult {
         if (query.len == 0) return error.InvalidColumnData;
-        if (k > std.math.maxInt(usize)) return error.InvalidColumnData;
-
-        try self.fs_writer.flushBlock();
-        try self.fs_reader.refreshCurrent();
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        var heap = try MinHeap.init(allocator, @intCast(k));
-        defer heap.deinit(allocator);
-        var scratch = ScratchBuffers{};
-        defer scratch.deinit(allocator);
-
-        var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
-
-        for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
-            const header = try reader.readHeader(block.offset);
-            if (header.schema_id != schema_embeddings) continue;
-            if (header.row_count == 0) continue;
-
-            const descs = try reader.readColumnDirectory(header, block.offset);
-            defer allocator.free(descs);
-
-            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
-            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
-
-            if (embedding_desc.dims == 0) return error.InvalidColumnData;
-            const dims_u32: u32 = embedding_desc.dims;
-            if (@as(usize, dims_u32) != query.len) return error.InvalidColumnData;
-
-            const id_buf = try scratch.ensureId(allocator, id_desc.data_len);
-            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
-            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
-
-            const vector_buf = try scratch.ensureVector(allocator, embedding_desc.data_len);
-            try reader.readColumnDataInto(block.offset, embedding_desc, vector_buf);
-
-            const vector_len = @as(usize, header.row_count) * @as(usize, dims_u32);
-            if (vector_buf.len != vector_len * @sizeOf(f32)) return error.InvalidColumnData;
-
-            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
-            const vectors = @as([*]const f32, @ptrCast(@alignCast(vector_buf.ptr)))[0..vector_len];
-
-            try scoreAndCollect(allocator, query, ids, vectors, @as(usize, dims_u32), header.row_count, &heap);
-        }
-
-        return heap.finalize(allocator);
+        if (query.len > std.math.maxInt(u32)) return error.InvalidColumnData;
+        const batch = try self.searchBatchWithOptions(allocator, query, @intCast(query.len), 1, k, options);
+        return .{
+            .ids = batch.ids,
+            .scores = batch.scores,
+        };
     }
 
     /// Stream scores for every vector to a caller-provided callback.
@@ -640,6 +2222,19 @@ pub const VectorAdapter = struct {
         query_count: u32,
         k: u32,
     ) !SearchBatchResult {
+        return self.searchBatchWithOptions(allocator, queries, dims, query_count, k, .{});
+    }
+
+    /// Search multiple queries using a dot-product scan with explicit options.
+    pub fn searchBatchWithOptions(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        queries: []const f32,
+        dims: u32,
+        query_count: u32,
+        k: u32,
+        options: SearchOptions,
+    ) !SearchBatchResult {
         if (k == 0 or query_count == 0) {
             return .{
                 .ids = try allocator.alloc(u64, 0),
@@ -653,78 +2248,72 @@ pub const VectorAdapter = struct {
             return error.InvalidColumnData;
         }
 
-        try self.fs_writer.flushBlock();
-        try self.fs_reader.refreshCurrent();
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
+        var query_buf = queries;
+        var normalized_queries: ?[]f32 = null;
+        defer if (normalized_queries) |owned| allocator.free(owned);
+        if (options.normalize_queries) {
+            const owned = try allocator.dupe(f32, queries);
+            errdefer allocator.free(owned);
+            try normalizeRowsInPlace(owned, dims);
+            query_buf = owned;
+            normalized_queries = owned;
+        }
 
+        try self.ensureReadCache();
+
+        if (self.cached_latest.dims == 0) {
+            return .{
+                .ids = try allocator.alloc(u64, 0),
+                .scores = try allocator.alloc(f32, 0),
+                .count_per_query = 0,
+                .query_count = query_count,
+            };
+        }
+        if (self.cached_latest.dims != dims) return error.InvalidColumnData;
+
+        const row_count = self.cached_visible_ids.len;
+        if (row_count == 0) {
+            return .{
+                .ids = try allocator.alloc(u64, 0),
+                .scores = try allocator.alloc(f32, 0),
+                .count_per_query = 0,
+                .query_count = query_count,
+            };
+        }
+
+        const per_query_capacity = @min(@as(usize, k), row_count);
         var heaps = try allocator.alloc(MinHeap, query_count);
         errdefer {
             for (heaps) |*heap| heap.deinit(allocator);
             allocator.free(heaps);
         }
-
         for (heaps) |*heap| {
-            heap.* = try MinHeap.init(allocator, @intCast(k));
+            heap.* = try MinHeap.init(allocator, per_query_capacity);
         }
 
-        var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        const all_scores = try allocator.alloc(f32, row_count * @as(usize, query_count));
+        defer allocator.free(all_scores);
+        parallelScoreBatchRows(
+            query_buf,
+            self.cached_visible_vectors,
+            @as(usize, dims),
+            query_count,
+            row_count,
+            row_count,
+            0,
+            all_scores,
+        );
 
-        var scratch = ScratchBuffers{};
-        defer scratch.deinit(allocator);
-
-        for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
-            const header = try reader.readHeader(block.offset);
-            if (header.schema_id != schema_embeddings) continue;
-            if (header.row_count == 0) continue;
-
-            const descs = try reader.readColumnDirectory(header, block.offset);
-            defer allocator.free(descs);
-
-            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
-            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
-
-            if (embedding_desc.dims == 0) return error.InvalidColumnData;
-            if (embedding_desc.dims != dims) return error.InvalidColumnData;
-
-            const id_buf = try scratch.ensureId(allocator, id_desc.data_len);
-            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
-            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
-
-            const vector_buf = try scratch.ensureVector(allocator, embedding_desc.data_len);
-            try reader.readColumnDataInto(block.offset, embedding_desc, vector_buf);
-
-            const vector_len = @as(usize, header.row_count) * @as(usize, dims);
-            if (vector_buf.len != vector_len * @sizeOf(f32)) return error.InvalidColumnData;
-
-            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
-            const vectors = @as([*]const f32, @ptrCast(@alignCast(vector_buf.ptr)))[0..vector_len];
-
-            // Allocate flat score buffer: query_count scores per row.
-            const block_scores = try allocator.alloc(f32, @as(usize, header.row_count) * @as(usize, query_count));
-            defer allocator.free(block_scores);
-
-            // Parallel scoring: each thread scores a range of rows against all queries.
-            parallelScoreBatchRows(queries, vectors, @as(usize, dims), query_count, header.row_count, header.row_count, 0, block_scores);
-
-            // Serial heap collection from the flat score buffer.
-            for (0..header.row_count) |row_idx| {
-                for (0..@as(usize, query_count)) |query_idx| {
-                    heaps[query_idx].push(block_scores[query_idx * header.row_count + row_idx], ids[row_idx]);
-                }
+        for (0..row_count) |row_idx| {
+            for (0..@as(usize, query_count)) |query_idx| {
+                heaps[query_idx].push(
+                    all_scores[query_idx * row_count + row_idx],
+                    self.cached_visible_ids[row_idx],
+                );
             }
         }
 
-        const count_per_query: u32 = if (query_count == 0) 0 else @intCast(heaps[0].size);
+        const count_per_query: u32 = @intCast(heaps[0].size);
         const total = @as(usize, count_per_query) * @as(usize, query_count);
         const ids_out = try allocator.alloc(u64, total);
         errdefer allocator.free(ids_out);
@@ -752,11 +2341,25 @@ pub const VectorAdapter = struct {
 
     /// Release resources.
     pub fn deinit(self: *VectorAdapter) void {
+        self.clearVisibleDenseCache();
+        self.cached_visibility.deinit();
+        self.cached_latest.deinit(self.allocator);
         self.fs_writer.flushBlock() catch {};
         self.fs_writer.deinit();
         self.allocator.destroy(self.fs_writer);
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.change_writer.flushBlock() catch {};
+        self.change_writer.deinit();
+        self.allocator.destroy(self.change_writer);
+        self.change_reader.deinit();
+        self.allocator.destroy(self.change_reader);
+        self.idempotency_writer.flushBlock() catch {};
+        self.idempotency_writer.deinit();
+        self.allocator.destroy(self.idempotency_writer);
+        self.idempotency_reader.deinit();
+        self.allocator.destroy(self.idempotency_reader);
+        self.allocator.free(self.db_root);
     }
 
     /// Simulates a process crash for testing.
@@ -764,10 +2367,22 @@ pub const VectorAdapter = struct {
     /// Releases all resources (closing fds, releasing flocks) WITHOUT
     /// flushing pending data or deleting the WAL file.
     pub fn simulateCrash(self: *VectorAdapter) void {
+        self.clearVisibleDenseCache();
+        self.cached_visibility.deinit();
+        self.cached_latest.deinit(self.allocator);
         self.fs_writer.simulateCrash();
         self.allocator.destroy(self.fs_writer);
         self.fs_reader.deinit();
         self.allocator.destroy(self.fs_reader);
+        self.change_writer.simulateCrash();
+        self.allocator.destroy(self.change_writer);
+        self.change_reader.deinit();
+        self.allocator.destroy(self.change_reader);
+        self.idempotency_writer.simulateCrash();
+        self.allocator.destroy(self.idempotency_writer);
+        self.idempotency_reader.deinit();
+        self.allocator.destroy(self.idempotency_reader);
+        self.allocator.free(self.db_root);
     }
 };
 
@@ -796,6 +2411,16 @@ fn checkedRowCount(row_count: u32, data_len: usize, value_size: usize) !usize {
     const expected = @as(usize, row_count) * value_size;
     if (expected != data_len) return error.InvalidColumnData;
     return @as(usize, row_count);
+}
+
+fn hashBlockRefs(blocks: []const db_reader.BlockRef) u64 {
+    var hasher = std.hash.Wyhash.init(0);
+    for (blocks) |block| {
+        hasher.update(block.path);
+        hasher.update(&[_]u8{0});
+        hasher.update(std.mem.asBytes(&block.offset));
+    }
+    return hasher.final();
 }
 
 const MinHeap = struct {
@@ -1013,6 +2638,26 @@ fn computeScores(query: []const f32, vectors: []const f32, dims: u32, out_scores
     parallelScoreRows(query, vectors, dims_usize, out_scores);
 }
 
+fn normalizeRowsInPlace(values: []f32, dims: u32) !void {
+    if (dims == 0) return error.InvalidColumnData;
+    const dims_usize = @as(usize, dims);
+    if (values.len % dims_usize != 0) return error.InvalidColumnData;
+
+    var row_idx: usize = 0;
+    const row_count = values.len / dims_usize;
+    while (row_idx < row_count) : (row_idx += 1) {
+        const base = row_idx * dims_usize;
+        const row = values[base .. base + dims_usize];
+        var norm_sq: f32 = 0.0;
+        for (row) |v| norm_sq += v * v;
+        if (norm_sq == 0.0) return error.ZeroVectorNotAllowed;
+        const inv_norm = 1.0 / @sqrt(norm_sq);
+        for (row) |*v| {
+            v.* *= inv_norm;
+        }
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1160,4 +2805,336 @@ test "VectorAdapter.searchScores streams scores" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), collected.items[0].score, 0.0);
     try std.testing.expectEqual(@as(u64, 11), collected.items[1].id);
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), collected.items[1].score, 0.0);
+}
+
+test "VectorAdapter.searchBatch returns visible latest vectors only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims);
+    _ = try backend.deleteIds(&[_]u64{2});
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{
+        0.5, 0.5,
+    }, dims);
+
+    var result = try backend.searchBatch(std.testing.allocator, &[_]f32{ 1.0, 0.0 }, dims, 1, 5);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.query_count);
+    try std.testing.expectEqual(@as(u32, 1), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), result.scores[0], 1e-6);
+}
+
+test "VectorAdapter.search returns visible latest vectors only" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{7}, &[_]f32{
+        1.0, 0.0,
+    }, dims);
+    try backend.upsertBatch(&[_]u64{7}, &[_]f32{
+        0.0, 1.0,
+    }, dims);
+
+    var latest = try backend.search(std.testing.allocator, &[_]f32{ 1.0, 0.0 }, 1);
+    defer latest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), latest.ids.len);
+    try std.testing.expectEqual(@as(u64, 7), latest.ids[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), latest.scores[0], 1e-6);
+
+    _ = try backend.deleteIds(&[_]u64{7});
+    var deleted = try backend.search(std.testing.allocator, &[_]f32{ 1.0, 0.0 }, 1);
+    defer deleted.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 0), deleted.ids.len);
+    try std.testing.expectEqual(@as(usize, 0), deleted.scores.len);
+}
+
+test "VectorAdapter.ensureReadCache applies incremental delta blocks" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{
+        1.0, 0.0,
+    }, dims);
+
+    var warm = try backend.searchBatch(std.testing.allocator, &[_]f32{ 1.0, 0.0 }, dims, 1, 4);
+    defer warm.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), warm.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), warm.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), warm.ids[0]);
+    try std.testing.expectEqual(@as(usize, 1), backend.cached_visible_ids.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.cached_visible_vectors.len);
+
+    const cached_vector_blocks_before = backend.cached_vector_block_count;
+    const cached_change_blocks_before = backend.cached_change_block_count;
+    try std.testing.expect(backend.read_cache_valid);
+
+    try backend.upsertBatch(&[_]u64{2}, &[_]f32{
+        0.0, 1.0,
+    }, dims);
+    try std.testing.expect(!backend.read_cache_valid);
+
+    // Simulate a stale-but-initialized reader to force incremental refresh.
+    backend.read_cache_valid = true;
+    backend.cached_vector_block_count = cached_vector_blocks_before;
+    backend.cached_change_block_count = cached_change_blocks_before;
+
+    var refreshed = try backend.searchBatch(std.testing.allocator, &[_]f32{ 0.0, 1.0 }, dims, 1, 4);
+    defer refreshed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), refreshed.count_per_query);
+    try std.testing.expectEqual(@as(usize, 2), refreshed.ids.len);
+    try std.testing.expectEqual(@as(u64, 2), refreshed.ids[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), refreshed.scores[0], 1e-6);
+    try std.testing.expectEqual(@as(usize, 2), backend.cached_visible_ids.len);
+    try std.testing.expectEqual(@as(usize, 4), backend.cached_visible_vectors.len);
+
+    try std.testing.expect(backend.cached_vector_block_count > cached_vector_blocks_before);
+    try std.testing.expect(backend.cached_change_block_count > cached_change_blocks_before);
+}
+
+test "VectorAdapter.ensureReadCache refreshes when block hash differs at same count" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{
+        1.0, 0.0,
+    }, dims);
+
+    var warm = try backend.searchBatch(std.testing.allocator, &[_]f32{ 1.0, 0.0 }, dims, 1, 2);
+    defer warm.deinit(std.testing.allocator);
+    try std.testing.expect(backend.read_cache_valid);
+
+    var snapshots = try backend.readBlockSnapshots(std.testing.allocator);
+    defer snapshots.deinit(std.testing.allocator);
+    const expected_vector_hash = hashBlockRefs(snapshots.vector_blocks);
+    const expected_change_hash = hashBlockRefs(snapshots.change_blocks);
+
+    backend.cached_vector_block_hash ^= 0x9e3779b97f4a7c15;
+    backend.cached_change_block_hash ^= 0xc2b2ae3d27d4eb4f;
+
+    var refreshed = try backend.searchBatch(std.testing.allocator, &[_]f32{ 1.0, 0.0 }, dims, 1, 2);
+    defer refreshed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), refreshed.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), refreshed.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), refreshed.ids[0]);
+    try std.testing.expectEqual(expected_vector_hash, backend.cached_vector_block_hash);
+    try std.testing.expectEqual(expected_change_hash, backend.cached_change_block_hash);
+}
+
+test "VectorAdapter.appendBatchWithOptions rejects existing visible IDs" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{1}, &[_]f32{ 1.0, 0.0 }, dims);
+
+    try std.testing.expectError(
+        error.AlreadyExists,
+        backend.appendBatchWithOptions(&[_]u64{1}, &[_]f32{ 0.0, 1.0 }, dims, .{ .reject_existing = true }),
+    );
+}
+
+test "VectorAdapter.searchBatchWithOptions normalizes queries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatchWithOptions(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims, .{ .normalize = true });
+
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 2.0, 0.0 },
+        dims,
+        1,
+        1,
+        .{
+            .normalize_queries = true,
+        },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), result.scores[0], 1e-6);
+}
+
+test "VectorAdapter.appendBatchIdempotentWithOptions replays and conflicts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    const key_hash: u64 = 0xabc1;
+    const request_hash: u64 = 0x1111;
+    try backend.appendBatchIdempotentWithOptions(
+        &[_]u64{1},
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        .{ .reject_existing = true },
+        key_hash,
+        request_hash,
+    );
+    try backend.appendBatchIdempotentWithOptions(
+        &[_]u64{1},
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        .{ .reject_existing = true },
+        key_hash,
+        request_hash,
+    );
+
+    try std.testing.expectError(
+        error.IdempotencyConflict,
+        backend.appendBatchIdempotentWithOptions(
+            &[_]u64{1},
+            &[_]f32{ 1.0, 0.0 },
+            dims,
+            .{ .reject_existing = true },
+            key_hash,
+            0x2222,
+        ),
+    );
+
+    var changes = try backend.readChanges(std.testing.allocator, 0, 20);
+    defer changes.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), changes.events.len);
+    try std.testing.expectEqual(ChangeOp.append, changes.events[0].op);
+}
+
+test "VectorAdapter.upsertBatchIdempotentWithOptions replays committed writes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatchIdempotentWithOptions(
+        &[_]u64{7},
+        &[_]f32{ 0.0, 1.0 },
+        dims,
+        .{},
+        0xabc2,
+        0x3333,
+    );
+    try backend.upsertBatchIdempotentWithOptions(
+        &[_]u64{7},
+        &[_]f32{ 0.0, 1.0 },
+        dims,
+        .{},
+        0xabc2,
+        0x3333,
+    );
+
+    var changes = try backend.readChanges(std.testing.allocator, 0, 20);
+    defer changes.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), changes.events.len);
+    try std.testing.expectEqual(ChangeOp.upsert, changes.events[0].op);
+}
+
+test "VectorAdapter.deleteIdsIdempotent replays delete counts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{42}, &[_]f32{ 1.0, 0.0 }, dims);
+
+    const first = try backend.deleteIdsIdempotent(&[_]u64{42}, 0xabc3, 0x4444);
+    try std.testing.expectEqual(@as(usize, 1), first.deleted_count);
+    try std.testing.expectEqual(@as(usize, 0), first.not_found_count);
+
+    const replay = try backend.deleteIdsIdempotent(&[_]u64{42}, 0xabc3, 0x4444);
+    try std.testing.expectEqual(@as(usize, 1), replay.deleted_count);
+    try std.testing.expectEqual(@as(usize, 0), replay.not_found_count);
+}
+
+test "VectorAdapter.compactIdempotent replays compact counts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims);
+    _ = try backend.deleteIds(&[_]u64{2});
+
+    const first = try backend.compactIdempotent(dims, 0xabc4, 0x5555);
+    try std.testing.expectEqual(@as(usize, 1), first.kept_count);
+    try std.testing.expectEqual(@as(usize, 1), first.removed_tombstones);
+
+    const replay = try backend.compactIdempotent(dims, 0xabc4, 0x5555);
+    try std.testing.expectEqual(@as(usize, 1), replay.kept_count);
+    try std.testing.expectEqual(@as(usize, 1), replay.removed_tombstones);
 }

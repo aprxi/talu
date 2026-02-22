@@ -169,9 +169,15 @@ fn batch_1k_dim128() {
     store.append(&ids, &vectors, dims).expect("append failed");
 
     // Search for the first vector — should return itself as top result.
+    // The shared deterministic generator repeats every 100 rows, so multiple
+    // IDs are exact ties for this query at score ~= 1.0.
     let query = &vectors[0..dims as usize];
     let result = store.search(query, 1).expect("search failed");
-    assert_eq!(result.ids[0], 1);
+    let top_id = result.ids[0];
+    assert!(
+        top_id % 100 == 1,
+        "expected an equivalent tied id ending in 01, got {top_id}"
+    );
     assert!((result.scores[0] - 1.0).abs() < 1e-4);
 
     let loaded = store.load().expect("load failed");

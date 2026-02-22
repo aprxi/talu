@@ -21,6 +21,7 @@ use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
 use crate::server::conversations;
+use crate::server::db_vector;
 use crate::server::documents;
 use crate::server::file;
 use crate::server::files;
@@ -114,10 +115,14 @@ impl Service<Request<Incoming>> for Router {
             let path = req.uri().path().to_string();
             let path_log = path.clone();
 
-            let content_length = req.headers().get("content-length")
+            let content_length = req
+                .headers()
+                .get("content-length")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-");
-            let content_type = req.headers().get("content-type")
+            let content_type = req
+                .headers()
+                .get("content-type")
                 .and_then(|v| v.to_str().ok())
                 .unwrap_or("-");
             log::info!(target: "server::http", "{} {}", method, path);
@@ -259,6 +264,82 @@ impl Service<Request<Incoming>> for Router {
                         (Method::POST, "/v1/search") | (Method::POST, "/search") => {
                             search::handle_search(state, req, auth).await
                         }
+                        // DB vector collections and points (low-level API)
+                        (Method::POST, "/v1/db/collections")
+                        | (Method::POST, "/db/collections") => {
+                            db_vector::handle_create_collection(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/db/collections") | (Method::GET, "/db/collections") => {
+                            db_vector::handle_list_collections(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.ends_with("/points/append")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_append_points(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.ends_with("/points/upsert")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_upsert_points(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.ends_with("/points/delete")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_delete_points(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.ends_with("/points/fetch")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_fetch_points(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.ends_with("/points/query")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_query_points(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.ends_with("/compact")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_compact_collection(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.ends_with("/stats")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_collection_stats(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.ends_with("/changes")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_collection_changes(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/db/collections/")
+                                || p.starts_with("/db/collections/") =>
+                        {
+                            db_vector::handle_get_collection(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/db/collections/")
+                                || p.starts_with("/db/collections/") =>
+                        {
+                            db_vector::handle_delete_collection(state, req, auth).await
+                        }
                         // Tag management endpoints
                         (Method::GET, "/v1/tags") | (Method::GET, "/tags") => {
                             tags::handle_list(state, req, auth).await
@@ -326,8 +407,7 @@ impl Service<Request<Incoming>> for Router {
                             file::handle_transform(state, req, auth).await
                         }
                         // Batch must come before single-file routes
-                        (Method::POST, "/v1/files/batch")
-                        | (Method::POST, "/files/batch") => {
+                        (Method::POST, "/v1/files/batch") | (Method::POST, "/files/batch") => {
                             files::handle_batch(state, req, auth).await
                         }
                         (Method::POST, "/v1/files") | (Method::POST, "/files") => {
@@ -368,20 +448,16 @@ impl Service<Request<Incoming>> for Router {
                         | (Method::POST, "/code/highlight") => {
                             code::handle_highlight(state, req, auth).await
                         }
-                        (Method::POST, "/v1/code/parse")
-                        | (Method::POST, "/code/parse") => {
+                        (Method::POST, "/v1/code/parse") | (Method::POST, "/code/parse") => {
                             code::handle_parse(state, req, auth).await
                         }
-                        (Method::POST, "/v1/code/query")
-                        | (Method::POST, "/code/query") => {
+                        (Method::POST, "/v1/code/query") | (Method::POST, "/code/query") => {
                             code::handle_query(state, req, auth).await
                         }
-                        (Method::POST, "/v1/code/graph")
-                        | (Method::POST, "/code/graph") => {
+                        (Method::POST, "/v1/code/graph") | (Method::POST, "/code/graph") => {
                             code::handle_graph(state, req, auth).await
                         }
-                        (Method::GET, "/v1/code/languages")
-                        | (Method::GET, "/code/languages") => {
+                        (Method::GET, "/v1/code/languages") | (Method::GET, "/code/languages") => {
                             code::handle_languages(state, req, auth).await
                         }
                         // Code session endpoints (incremental parsing)
@@ -405,7 +481,9 @@ impl Service<Request<Incoming>> for Router {
                         }
                         // WebSocket upgrade for real-time code analysis
                         (Method::GET, "/v1/code/ws") | (Method::GET, "/code/ws")
-                            if req.headers().get("upgrade")
+                            if req
+                                .headers()
+                                .get("upgrade")
                                 .and_then(|v| v.to_str().ok())
                                 .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
                         {

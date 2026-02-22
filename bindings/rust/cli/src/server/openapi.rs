@@ -7,7 +7,7 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    code, conversations, documents, file, files, handlers, http, plugins, proxy, repo,
+    code, conversations, db_vector, documents, file, files, handlers, http, plugins, proxy, repo,
     responses_types, search, settings, tags,
 };
 
@@ -27,6 +27,7 @@ use crate::server::{
         (name = "File", description = "Stateless file inspect/transform"),
         (name = "Tags", description = "Tag CRUD and assignment"),
         (name = "Search", description = "Full-text and vector search"),
+        (name = "DB", description = "Low-level database operations"),
         (name = "Settings", description = "Server and model configuration"),
         (name = "Plugins", description = "Plugin discovery"),
         (name = "Proxy", description = "Plugin outbound HTTP proxy"),
@@ -86,6 +87,19 @@ use crate::server::{
         file::handle_transform,
         // Search
         search::handle_search,
+        // DB
+        db_vector::handle_create_collection,
+        db_vector::handle_list_collections,
+        db_vector::handle_get_collection,
+        db_vector::handle_delete_collection,
+        db_vector::handle_append_points,
+        db_vector::handle_upsert_points,
+        db_vector::handle_delete_points,
+        db_vector::handle_fetch_points,
+        db_vector::handle_query_points,
+        db_vector::handle_collection_stats,
+        db_vector::handle_compact_collection,
+        db_vector::handle_collection_changes,
         // Plugins
         plugins::handle_list,
         // Proxy
@@ -165,6 +179,31 @@ use crate::server::{
         search::SearchResponse,
         search::SearchFilters,
         search::VectorSearch,
+        // DB
+        db_vector::CreateCollectionRequest,
+        db_vector::CollectionResponse,
+        db_vector::CollectionListResponse,
+        db_vector::CollectionMetric,
+        db_vector::NormalizationPolicy,
+        db_vector::CollectionIdType,
+        db_vector::VectorPointInput,
+        db_vector::AppendPointsRequest,
+        db_vector::AppendPointsResponse,
+        db_vector::UpsertPointsRequest,
+        db_vector::UpsertPointsResponse,
+        db_vector::IdListRequest,
+        db_vector::DeletePointsResponse,
+        db_vector::FetchPointsRequest,
+        db_vector::FetchedPoint,
+        db_vector::FetchPointsResponse,
+        db_vector::QueryPointsRequest,
+        db_vector::QueryMatch,
+        db_vector::QueryResultSet,
+        db_vector::QueryPointsResponse,
+        db_vector::CollectionStatsResponse,
+        db_vector::CompactResponse,
+        db_vector::ChangeEventResponse,
+        db_vector::ChangesResponse,
         // Plugins
         plugins::PluginEntry,
         plugins::PluginListResponse,
