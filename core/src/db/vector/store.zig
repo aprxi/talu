@@ -8,10 +8,12 @@ const db_writer = @import("../writer.zig");
 const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
 const manifest = @import("../manifest.zig");
+const checksum = @import("../checksum.zig");
 const segment_source = @import("../segment_source.zig");
 const types = @import("../types.zig");
 const vector_filter = @import("filter.zig");
 const vector_index = @import("index/root.zig");
+const ivf_flat_index = @import("index/ivfflat.zig");
 const vector_planner = @import("planner.zig");
 const vector_cdc = @import("cdc.zig");
 const vector_ttl = @import("ttl.zig");
@@ -36,6 +38,8 @@ const col_idempotency_op: u32 = 22;
 const col_idempotency_status: u32 = 23;
 const col_idempotency_result_a: u32 = 24;
 const col_idempotency_result_b: u32 = 25;
+const min_approximate_rows: usize = 1024;
+const min_ivf_visible_coverage: f32 = 0.95;
 
 pub const VectorBatch = struct {
     ids: []u64,
@@ -105,11 +109,21 @@ pub const StatsResult = struct {
     tombstone_count: usize,
     segment_count: usize,
     total_count: usize,
+    manifest_generation: u64,
+    index_ready_segments: usize,
+    index_pending_segments: usize,
+    index_failed_segments: usize,
 };
 
 pub const CompactResult = struct {
     kept_count: usize,
     removed_tombstones: usize,
+};
+
+pub const IndexBuildResult = struct {
+    built_segments: usize,
+    failed_segments: usize,
+    pending_segments: usize,
 };
 
 pub const IdempotencyStatus = enum(u8) {
@@ -208,6 +222,33 @@ const ScratchBuffers = struct {
     }
 };
 
+const SegmentVectorData = struct {
+    ids: []u64,
+    vectors: []f32,
+    dims: u32,
+
+    fn deinit(self: *SegmentVectorData, allocator: Allocator) void {
+        allocator.free(self.ids);
+        allocator.free(self.vectors);
+        self.* = .{
+            .ids = &[_]u64{},
+            .vectors = &[_]f32{},
+            .dims = 0,
+        };
+    }
+};
+
+const PendingIndexUpdate = struct {
+    segment_path: []u8,
+    meta: manifest.SegmentIndexMeta,
+
+    fn deinit(self: *PendingIndexUpdate, allocator: Allocator) void {
+        allocator.free(self.segment_path);
+        allocator.free(self.meta.path);
+        self.* = undefined;
+    }
+};
+
 const BlockSnapshots = struct {
     vector_generation: u64,
     change_generation: u64,
@@ -217,24 +258,6 @@ const BlockSnapshots = struct {
     fn deinit(self: BlockSnapshots, allocator: Allocator) void {
         allocator.free(self.vector_blocks);
         allocator.free(self.change_blocks);
-    }
-};
-
-const SearchCandidates = struct {
-    ids: []const u64,
-    vectors: []const f32,
-    owned_ids: ?[]u64 = null,
-    owned_vectors: ?[]f32 = null,
-
-    fn deinit(self: *SearchCandidates, allocator: Allocator) void {
-        if (self.owned_ids) |owned| allocator.free(owned);
-        if (self.owned_vectors) |owned| allocator.free(owned);
-        self.* = .{
-            .ids = &[_]u64{},
-            .vectors = &[_]f32{},
-            .owned_ids = null,
-            .owned_vectors = null,
-        };
     }
 };
 
@@ -275,10 +298,14 @@ pub const VectorAdapter = struct {
     cached_change_generation: u64,
     cached_vector_block_hash: u64,
     cached_change_block_hash: u64,
+    cached_ivf_generation: u64,
+    cached_ivf_visible_coverage: f32,
     cached_visibility: std.AutoHashMap(u64, PointVisibility),
     cached_latest: LatestVectors,
     cached_visible_ids: []u64,
     cached_visible_vectors: []f32,
+    cached_visible_row_map: std.AutoHashMap(u64, usize),
+    cached_ivf_indexes: []vector_index.IvfSegmentIndex,
 
     /// Initialize vector TaluDB backend for the "vector" namespace.
     pub fn init(allocator: Allocator, db_root: []const u8) !VectorAdapter {
@@ -288,6 +315,7 @@ pub const VectorAdapter = struct {
         var writer_ptr = try allocator.create(db_writer.Writer);
         errdefer allocator.destroy(writer_ptr);
         writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "vector");
+        writer_ptr.vector_index_build_mode = .deferred;
         errdefer writer_ptr.deinit();
 
         var reader_ptr = try allocator.create(db_reader.Reader);
@@ -332,6 +360,8 @@ pub const VectorAdapter = struct {
             .cached_change_generation = 0,
             .cached_vector_block_hash = 0,
             .cached_change_block_hash = 0,
+            .cached_ivf_generation = 0,
+            .cached_ivf_visible_coverage = 0.0,
             .cached_visibility = std.AutoHashMap(u64, PointVisibility).init(allocator),
             .cached_latest = .{
                 .dims = 0,
@@ -339,6 +369,8 @@ pub const VectorAdapter = struct {
             },
             .cached_visible_ids = &[_]u64{},
             .cached_visible_vectors = &[_]f32{},
+            .cached_visible_row_map = std.AutoHashMap(u64, usize).init(allocator),
+            .cached_ivf_indexes = &[_]vector_index.IvfSegmentIndex{},
         };
         adapter.next_seq = try adapter.discoverNextSeq();
         return adapter;
@@ -722,7 +754,39 @@ pub const VectorAdapter = struct {
             }
         }
 
-        return .{ .visible_count = visible, .tombstone_count = tombstones, .segment_count = try self.countVectorSegments(), .total_count = visible + tombstones };
+        var snapshot = try self.fs_reader.loadManifestSnapshot(self.allocator);
+        defer snapshot.deinit(self.allocator);
+
+        var index_ready_segments: usize = 0;
+        var index_pending_segments: usize = 0;
+        var index_failed_segments: usize = 0;
+        for (snapshot.segments) |segment| {
+            if (segment.row_count == 0) continue;
+            if (segmentNeedsApproximateIndexBuild(&segment)) {
+                if (segment.index) |meta| {
+                    if (meta.kind == .ivf_flat and meta.state == .failed) {
+                        index_failed_segments += 1;
+                    } else {
+                        index_pending_segments += 1;
+                    }
+                } else {
+                    index_pending_segments += 1;
+                }
+            } else {
+                index_ready_segments += 1;
+            }
+        }
+
+        return .{
+            .visible_count = visible,
+            .tombstone_count = tombstones,
+            .segment_count = try self.countVectorSegments(),
+            .total_count = visible + tombstones,
+            .manifest_generation = snapshot.generation,
+            .index_ready_segments = index_ready_segments,
+            .index_pending_segments = index_pending_segments,
+            .index_failed_segments = index_failed_segments,
+        };
     }
 
     /// Compact vector storage by rebuilding physical segments from visible rows.
@@ -810,6 +874,114 @@ pub const VectorAdapter = struct {
         const current_generation = self.fs_reader.snapshotGeneration();
         if (current_generation != expected_generation) return error.ManifestGenerationConflict;
         return self.compact(dims);
+    }
+
+    /// Build pending IVF index artifacts for sealed segments.
+    ///
+    /// Uses manifest generation CAS so callers can safely run this in
+    /// background workers without publishing stale metadata.
+    pub fn buildPendingApproximateIndexesWithExpectedGeneration(
+        self: *VectorAdapter,
+        expected_generation: u64,
+        max_segments: usize,
+    ) !IndexBuildResult {
+        if (max_segments == 0) {
+            return .{
+                .built_segments = 0,
+                .failed_segments = 0,
+                .pending_segments = 0,
+            };
+        }
+
+        try self.fs_writer.flushBlock();
+        _ = try self.fs_reader.refreshIfChanged();
+        var snapshot = try self.fs_reader.loadManifestSnapshot(self.allocator);
+        defer snapshot.deinit(self.allocator);
+        if (snapshot.generation != expected_generation) return error.ManifestGenerationConflict;
+
+        var updates = std.ArrayList(PendingIndexUpdate).empty;
+        defer {
+            for (updates.items) |*update| update.deinit(self.allocator);
+            updates.deinit(self.allocator);
+        }
+
+        var built_segments: usize = 0;
+        var failed_segments: usize = 0;
+        for (snapshot.segments) |segment| {
+            if (updates.items.len >= max_segments) break;
+            if (!segmentNeedsApproximateIndexBuild(&segment)) continue;
+
+            const index_rel = if (segment.index) |meta|
+                try self.allocator.dupe(u8, meta.path)
+            else
+                try deriveIndexPathFromSegmentPath(self.allocator, segment.path);
+            errdefer self.allocator.free(index_rel);
+            const segment_path_copy = try self.allocator.dupe(u8, segment.path);
+            errdefer self.allocator.free(segment_path_copy);
+
+            const built_ok = self.buildSingleSegmentApproximateIndex(segment.path, index_rel) catch false;
+            const update = PendingIndexUpdate{
+                .segment_path = segment_path_copy,
+                .meta = .{
+                    .kind = .ivf_flat,
+                    .path = index_rel,
+                    .checksum_crc32c = if (built_ok) try self.computeIndexChecksum(index_rel) else 0,
+                    .state = if (built_ok) .ready else .failed,
+                },
+            };
+            try updates.append(self.allocator, update);
+            if (built_ok) {
+                built_segments += 1;
+            } else {
+                failed_segments += 1;
+            }
+        }
+
+        if (updates.items.len == 0) {
+            var pending_count: usize = 0;
+            for (snapshot.segments) |segment| {
+                if (segmentNeedsApproximateIndexBuild(&segment)) pending_count += 1;
+            }
+            return .{
+                .built_segments = 0,
+                .failed_segments = 0,
+                .pending_segments = pending_count,
+            };
+        }
+
+        const manifest_path = try std.fs.path.join(self.allocator, &.{ self.db_root, "vector", "manifest.json" });
+        defer self.allocator.free(manifest_path);
+        var loaded = try manifest.Manifest.load(self.allocator, manifest_path);
+        defer loaded.deinit(self.allocator);
+        if (loaded.generation != expected_generation) return error.ManifestGenerationConflict;
+
+        for (loaded.segments) |*segment| {
+            for (updates.items) |update| {
+                if (!std.mem.eql(u8, segment.path, update.segment_path)) continue;
+                if (segment.index) |meta| self.allocator.free(meta.path);
+                segment.index = .{
+                    .kind = .ivf_flat,
+                    .path = try self.allocator.dupe(u8, update.meta.path),
+                    .checksum_crc32c = update.meta.checksum_crc32c,
+                    .state = update.meta.state,
+                };
+                break;
+            }
+        }
+
+        _ = try loaded.saveNextGeneration(self.allocator, manifest_path, expected_generation);
+        _ = try self.fs_reader.refreshIfChanged();
+        self.clearApproximateIndexCache();
+
+        var pending_count: usize = 0;
+        for (loaded.segments) |segment| {
+            if (segmentNeedsApproximateIndexBuild(&segment)) pending_count += 1;
+        }
+        return .{
+            .built_segments = built_segments,
+            .failed_segments = failed_segments,
+            .pending_segments = pending_count,
+        };
     }
 
     /// Compact only when tombstones older than TTL are present.
@@ -1181,7 +1353,20 @@ pub const VectorAdapter = struct {
         self.cached_change_generation = 0;
         self.cached_vector_block_hash = 0;
         self.cached_change_block_hash = 0;
+        self.clearApproximateIndexCache();
         self.clearVisibleDenseCache();
+    }
+
+    fn clearApproximateIndexCache(self: *VectorAdapter) void {
+        for (self.cached_ivf_indexes) |*index| {
+            index.deinit(self.allocator);
+        }
+        if (self.cached_ivf_indexes.len > 0) {
+            self.allocator.free(self.cached_ivf_indexes);
+        }
+        self.cached_ivf_indexes = &[_]vector_index.IvfSegmentIndex{};
+        self.cached_ivf_generation = 0;
+        self.cached_ivf_visible_coverage = 0.0;
     }
 
     fn clearVisibleDenseCache(self: *VectorAdapter) void {
@@ -1191,6 +1376,7 @@ pub const VectorAdapter = struct {
         if (self.cached_visible_vectors.len > 0) {
             self.allocator.free(self.cached_visible_vectors);
         }
+        self.cached_visible_row_map.clearRetainingCapacity();
         self.cached_visible_ids = &[_]u64{};
         self.cached_visible_vectors = &[_]f32{};
     }
@@ -1218,6 +1404,7 @@ pub const VectorAdapter = struct {
         errdefer self.allocator.free(ids);
         const vectors = try self.allocator.alloc(f32, visible_count * @as(usize, dims));
         errdefer self.allocator.free(vectors);
+        try self.cached_visible_row_map.ensureTotalCapacity(@intCast(visible_count));
 
         var write_idx: usize = 0;
         latest_iter = self.cached_latest.map.iterator();
@@ -1231,6 +1418,7 @@ pub const VectorAdapter = struct {
             ids[write_idx] = id;
             const base = write_idx * @as(usize, dims);
             std.mem.copyForwards(f32, vectors[base .. base + @as(usize, dims)], entry.value_ptr.*);
+            try self.cached_visible_row_map.put(id, write_idx);
             write_idx += 1;
         }
 
@@ -1904,6 +2092,7 @@ pub const VectorAdapter = struct {
         self.fs_writer = try self.allocator.create(db_writer.Writer);
         errdefer self.allocator.destroy(self.fs_writer);
         self.fs_writer.* = try db_writer.Writer.open(self.allocator, self.db_root, "vector");
+        self.fs_writer.vector_index_build_mode = .deferred;
 
         self.fs_reader = try self.allocator.create(db_reader.Reader);
         errdefer self.allocator.destroy(self.fs_reader);
@@ -2239,15 +2428,35 @@ pub const VectorAdapter = struct {
 
         try self.fs_writer.flushBlock();
         _ = try self.fs_reader.refreshIfChanged();
+        var snapshot = try self.fs_reader.loadManifestSnapshot(allocator);
+        defer snapshot.deinit(allocator);
         const blocks = try self.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
         var total_rows: usize = 0;
+        for (snapshot.segments) |segment| {
+            if (segment.row_count > std.math.maxInt(usize) - total_rows) return error.RowCountOverflow;
+            total_rows += @intCast(segment.row_count);
+        }
+
+        var segment_paths = std.StringHashMap(void).init(allocator);
+        defer {
+            var iter = segment_paths.keyIterator();
+            while (iter.next()) |key_ptr| allocator.free(key_ptr.*);
+            segment_paths.deinit();
+        }
+        for (snapshot.segments) |segment| {
+            const ns_path = try std.fmt.allocPrint(allocator, "vector/{s}", .{segment.path});
+            errdefer allocator.free(ns_path);
+            try segment_paths.put(ns_path, {});
+        }
+
         var current_path: ?[]const u8 = null;
         var current_handle: ?segment_source.SegmentHandle = null;
         defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
 
         for (blocks) |block| {
+            if (segment_paths.contains(block.path)) continue;
             try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
             const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
@@ -2261,6 +2470,7 @@ pub const VectorAdapter = struct {
             if (embedding_desc.dims == 0) return error.InvalidColumnData;
             if (embedding_desc.dims != dims) return error.InvalidColumnData;
 
+            if (header.row_count > std.math.maxInt(usize) - total_rows) return error.RowCountOverflow;
             total_rows += header.row_count;
         }
 
@@ -2394,10 +2604,6 @@ pub const VectorAdapter = struct {
 
         try self.ensureReadCache();
 
-        if (plan.index_kind == .ivf_flat and !self.canUseApproximateIndex()) {
-            plan.index_kind = .flat;
-        }
-
         if (self.cached_latest.dims == 0) {
             return .{
                 .ids = try allocator.alloc(u64, 0),
@@ -2407,17 +2613,30 @@ pub const VectorAdapter = struct {
             };
         }
         if (self.cached_latest.dims != dims) return error.InvalidColumnData;
-        var candidates = try self.selectSearchCandidates(allocator, dims, plan, options.filter_expr);
-        defer candidates.deinit(allocator);
+        var allow_list: ?vector_filter.AllowList = null;
+        defer if (allow_list) |*allow| vector_filter.deinitAllowList(allocator, allow);
 
-        const row_count = candidates.ids.len;
-        if (row_count == 0) {
+        var allow_ptr: ?*const vector_filter.AllowList = null;
+        var candidate_count: usize = self.cached_visible_ids.len;
+        if (plan.filter_mode != .none) {
+            allow_list = try vector_filter.evaluateAllowList(allocator, options.filter_expr, self.cached_visible_ids);
+            allow_ptr = &allow_list.?;
+            candidate_count = vector_filter.allowListCount(allow_ptr.?);
+        }
+
+        if (candidate_count == 0) {
             return .{
                 .ids = try allocator.alloc(u64, 0),
                 .scores = try allocator.alloc(f32, 0),
                 .count_per_query = 0,
                 .query_count = query_count,
             };
+        }
+        if (plan.index_kind == .ivf_flat and candidate_count < min_approximate_rows) {
+            plan.index_kind = .flat;
+        }
+        if (plan.index_kind == .ivf_flat and !(try self.ensureApproximateIndexCache(dims))) {
+            plan.index_kind = .flat;
         }
 
         const index = switch (plan.index_kind) {
@@ -2427,8 +2646,8 @@ pub const VectorAdapter = struct {
         const index_result = try index.searchBatch(
             allocator,
             .{
-                .ids = candidates.ids,
-                .vectors = candidates.vectors,
+                .ids = self.cached_visible_ids,
+                .vectors = self.cached_visible_vectors,
                 .dims = dims,
             },
             .{
@@ -2436,6 +2655,10 @@ pub const VectorAdapter = struct {
                 .query_count = query_count,
                 .k = k,
                 .dims = dims,
+                .allow_list = allow_ptr,
+                .allowed_count = candidate_count,
+                .segment_indexes = if (plan.index_kind == .ivf_flat) self.cached_ivf_indexes else null,
+                .id_to_row = if (plan.index_kind == .ivf_flat) &self.cached_visible_row_map else null,
             },
         );
 
@@ -2447,71 +2670,36 @@ pub const VectorAdapter = struct {
         };
     }
 
-    fn selectSearchCandidates(
-        self: *VectorAdapter,
-        allocator: Allocator,
-        dims: u32,
-        plan: vector_planner.QueryPlan,
-        filter_expr: ?*const vector_filter.FilterExpr,
-    ) !SearchCandidates {
-        _ = dims;
-        if (plan.filter_mode == .none) {
-            return .{
-                .ids = self.cached_visible_ids,
-                .vectors = self.cached_visible_vectors,
-            };
-        }
-
-        var allow = try vector_filter.evaluateAllowList(allocator, filter_expr, self.cached_visible_ids);
-        defer vector_filter.deinitAllowList(allocator, &allow);
-
-        const kept = vector_filter.allowListCount(&allow);
-        if (kept == 0) {
-            return .{
-                .ids = &[_]u64{},
-                .vectors = &[_]f32{},
-            };
-        }
-
-        const dims_usize = @as(usize, self.cached_latest.dims);
-        const ids = try allocator.alloc(u64, kept);
-        errdefer allocator.free(ids);
-        const vectors = try allocator.alloc(f32, kept * dims_usize);
-        errdefer allocator.free(vectors);
-
-        var write_idx: usize = 0;
-        for (self.cached_visible_ids, 0..) |id, idx| {
-            if (!vector_filter.allowListContains(&allow, idx)) continue;
-            ids[write_idx] = id;
-            const src_base = idx * dims_usize;
-            const dst_base = write_idx * dims_usize;
-            std.mem.copyForwards(
-                f32,
-                vectors[dst_base .. dst_base + dims_usize],
-                self.cached_visible_vectors[src_base .. src_base + dims_usize],
-            );
-            write_idx += 1;
-        }
-
-        return .{
-            .ids = ids,
-            .vectors = vectors,
-            .owned_ids = ids,
-            .owned_vectors = vectors,
-        };
-    }
-
-    fn canUseApproximateIndex(self: *VectorAdapter) bool {
+    fn ensureApproximateIndexCache(self: *VectorAdapter, dims: u32) !bool {
         var snapshot = self.fs_reader.loadManifestSnapshot(self.allocator) catch return false;
         defer snapshot.deinit(self.allocator);
-        if (snapshot.segments.len == 0) return false;
+        if (snapshot.segments.len == 0) {
+            self.clearApproximateIndexCache();
+            return false;
+        }
+
+        if (self.cached_ivf_generation == snapshot.generation and self.cached_ivf_indexes.len > 0) {
+            for (self.cached_ivf_indexes) |index| {
+                if (index.dims != dims) return false;
+            }
+            if (self.cached_ivf_visible_coverage < min_ivf_visible_coverage) return false;
+            return true;
+        }
+
+        self.clearApproximateIndexCache();
+        var loaded = std.ArrayList(vector_index.IvfSegmentIndex).empty;
+        defer {
+            for (loaded.items) |*index| index.deinit(self.allocator);
+            loaded.deinit(self.allocator);
+        }
 
         for (snapshot.segments) |segment| {
-            const index_meta = segment.index orelse return false;
-            if (index_meta.kind != manifest.SegmentIndexKind.ivf_flat) return false;
+            const index_meta = segment.index orelse continue;
+            if (index_meta.kind != manifest.SegmentIndexKind.ivf_flat) continue;
+            if (index_meta.state != .ready) continue;
             if (index_meta.path.len == 0) return false;
 
-            const ns_path = std.fmt.allocPrint(self.allocator, "vector/{s}", .{index_meta.path}) catch return false;
+            const ns_path = try std.fmt.allocPrint(self.allocator, "vector/{s}", .{index_meta.path});
             defer self.allocator.free(ns_path);
 
             var handle = self.fs_reader.openBlockReadOnly(ns_path) catch return false;
@@ -2519,13 +2707,159 @@ pub const VectorAdapter = struct {
 
             const actual = crc32cFile(handle.file, handle.size) catch return false;
             if (actual != index_meta.checksum_crc32c) return false;
+            if (handle.size > std.math.maxInt(usize)) return false;
+
+            const payload = try self.allocator.alloc(u8, @intCast(handle.size));
+            defer self.allocator.free(payload);
+            const read_len = try handle.file.preadAll(payload, 0);
+            if (read_len != payload.len) return false;
+
+            var decoded = ivf_flat_index.decodeSegmentIndex(self.allocator, payload) catch return false;
+            errdefer decoded.deinit(self.allocator);
+            if (decoded.dims != dims) return false;
+            if (decoded.row_count != segment.row_count) return false;
+            try loaded.append(self.allocator, decoded);
         }
+
+        const visible_count = self.cached_visible_ids.len;
+        if (visible_count == 0) return false;
+        const covered = try self.countCoveredVisibleRows(loaded.items);
+        const coverage = @as(f32, @floatFromInt(covered)) / @as(f32, @floatFromInt(visible_count));
+        if (coverage < min_ivf_visible_coverage) return false;
+
+        self.cached_ivf_indexes = try loaded.toOwnedSlice(self.allocator);
+        self.cached_ivf_generation = snapshot.generation;
+        self.cached_ivf_visible_coverage = coverage;
+        return self.cached_ivf_indexes.len > 0;
+    }
+
+    fn buildSingleSegmentApproximateIndex(
+        self: *VectorAdapter,
+        segment_rel_path: []const u8,
+        index_rel_path: []const u8,
+    ) !bool {
+        const ns_segment_path = try std.fmt.allocPrint(self.allocator, "vector/{s}", .{segment_rel_path});
+        defer self.allocator.free(ns_segment_path);
+        var segment_data = try self.loadSegmentVectorDataForPath(ns_segment_path);
+        defer segment_data.deinit(self.allocator);
+        if (segment_data.ids.len == 0 or segment_data.dims == 0) return false;
+
+        var index = try ivf_flat_index.buildSegmentIndex(
+            self.allocator,
+            segment_data.ids,
+            segment_data.vectors,
+            segment_data.dims,
+        );
+        defer index.deinit(self.allocator);
+        const payload = try ivf_flat_index.encodeSegmentIndex(self.allocator, index);
+        defer self.allocator.free(payload);
+
+        const index_path = try std.fs.path.join(self.allocator, &.{ self.db_root, "vector", index_rel_path });
+        defer self.allocator.free(index_path);
+        const parent = std.fs.path.dirname(index_path) orelse ".";
+        try std.fs.cwd().makePath(parent);
+        var file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
+        defer file.close();
+        try file.writeAll(payload);
+        try file.sync();
         return true;
+    }
+
+    fn computeIndexChecksum(self: *VectorAdapter, index_rel_path: []const u8) !u32 {
+        const index_path = try std.fs.path.join(self.allocator, &.{ self.db_root, "vector", index_rel_path });
+        defer self.allocator.free(index_path);
+        const bytes = try std.fs.cwd().readFileAlloc(self.allocator, index_path, 128 * 1024 * 1024);
+        defer self.allocator.free(bytes);
+        return checksum.crc32c(bytes);
+    }
+
+    fn loadSegmentVectorDataForPath(self: *VectorAdapter, ns_segment_path: []const u8) !SegmentVectorData {
+        var handle = try self.fs_reader.openBlockReadOnly(ns_segment_path);
+        defer self.fs_reader.closeBlock(&handle);
+        const reader = block_reader.BlockReader.init(handle.file, self.allocator);
+        const block_index = try reader.getBlockIndex(handle.size);
+        defer self.allocator.free(block_index);
+
+        var dims: u32 = 0;
+        var total_rows: usize = 0;
+        for (block_index) |entry| {
+            const header = try reader.readHeader(entry.block_off);
+            if (header.schema_id != schema_embeddings or header.row_count == 0) continue;
+            const descs = try reader.readColumnDirectory(header, entry.block_off);
+            defer self.allocator.free(descs);
+            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
+            if (embedding_desc.dims == 0) return error.InvalidColumnData;
+            if (dims == 0) dims = embedding_desc.dims;
+            if (dims != embedding_desc.dims) return error.InvalidColumnData;
+            total_rows += header.row_count;
+        }
+
+        const ids = try self.allocator.alloc(u64, total_rows);
+        errdefer self.allocator.free(ids);
+        const vectors = try self.allocator.alloc(f32, total_rows * @as(usize, dims));
+        errdefer self.allocator.free(vectors);
+        if (total_rows == 0 or dims == 0) {
+            return .{
+                .ids = ids,
+                .vectors = vectors,
+                .dims = 0,
+            };
+        }
+
+        var row_offset: usize = 0;
+        var vector_offset: usize = 0;
+        for (block_index) |entry| {
+            const header = try reader.readHeader(entry.block_off);
+            if (header.schema_id != schema_embeddings or header.row_count == 0) continue;
+            const descs = try reader.readColumnDirectory(header, entry.block_off);
+            defer self.allocator.free(descs);
+
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
+            if (embedding_desc.dims != dims) return error.InvalidColumnData;
+
+            const id_dest = std.mem.sliceAsBytes(ids[row_offset .. row_offset + header.row_count]);
+            try reader.readColumnDataInto(entry.block_off, id_desc, id_dest);
+            const vector_len = @as(usize, header.row_count) * @as(usize, dims);
+            const vector_dest = std.mem.sliceAsBytes(vectors[vector_offset .. vector_offset + vector_len]);
+            try reader.readColumnDataInto(entry.block_off, embedding_desc, vector_dest);
+
+            row_offset += header.row_count;
+            vector_offset += vector_len;
+        }
+
+        return .{
+            .ids = ids,
+            .vectors = vectors,
+            .dims = dims,
+        };
+    }
+
+    fn countCoveredVisibleRows(self: *VectorAdapter, indexes: []const vector_index.IvfSegmentIndex) !usize {
+        if (self.cached_visible_ids.len == 0) return 0;
+        var seen = try self.allocator.alloc(u8, self.cached_visible_ids.len);
+        defer self.allocator.free(seen);
+        @memset(seen, 0);
+
+        var covered: usize = 0;
+        for (indexes) |index| {
+            for (index.list_ids) |id| {
+                const row_idx = self.cached_visible_row_map.get(id) orelse continue;
+                if (row_idx >= seen.len) continue;
+                if (seen[row_idx] != 0) continue;
+                seen[row_idx] = 1;
+                covered += 1;
+                if (covered == seen.len) return covered;
+            }
+        }
+        return covered;
     }
 
     /// Release resources.
     pub fn deinit(self: *VectorAdapter) void {
+        self.clearApproximateIndexCache();
         self.clearVisibleDenseCache();
+        self.cached_visible_row_map.deinit();
         self.cached_visibility.deinit();
         self.cached_latest.deinit(self.allocator);
         self.fs_writer.flushBlock() catch {};
@@ -2551,7 +2885,9 @@ pub const VectorAdapter = struct {
     /// Releases all resources (closing fds, releasing flocks) WITHOUT
     /// flushing pending data or deleting the WAL file.
     pub fn simulateCrash(self: *VectorAdapter) void {
+        self.clearApproximateIndexCache();
         self.clearVisibleDenseCache();
+        self.cached_visible_row_map.deinit();
         self.cached_visibility.deinit();
         self.cached_latest.deinit(self.allocator);
         self.fs_writer.simulateCrash();
@@ -2582,6 +2918,21 @@ pub fn create(allocator: Allocator, db_root: []const u8) !*VectorAdapter {
 pub fn destroy(allocator: Allocator, backend: *VectorAdapter) void {
     backend.deinit();
     allocator.destroy(backend);
+}
+
+fn segmentNeedsApproximateIndexBuild(segment: *const manifest.SegmentEntry) bool {
+    if (segment.row_count == 0) return false;
+    if (segment.index == null) return true;
+    const index = segment.index.?;
+    if (index.kind != manifest.SegmentIndexKind.ivf_flat) return true;
+    return index.state != .ready or index.checksum_crc32c == 0;
+}
+
+fn deriveIndexPathFromSegmentPath(allocator: Allocator, segment_path: []const u8) ![]u8 {
+    const suffix = ".talu";
+    if (!std.mem.endsWith(u8, segment_path, suffix)) return error.InvalidColumnData;
+    const base = segment_path[0 .. segment_path.len - suffix.len];
+    return std.fmt.allocPrint(allocator, "{s}.ivf", .{base});
 }
 
 fn findColumn(descs: []const types.ColumnDesc, column_id: u32) ?types.ColumnDesc {
@@ -3076,6 +3427,8 @@ test "VectorAdapter.ensureReadCache applies incremental delta blocks" {
     try std.testing.expectEqual(@as(u64, 1), warm.ids[0]);
     try std.testing.expectEqual(@as(usize, 1), backend.cached_visible_ids.len);
     try std.testing.expectEqual(@as(usize, 2), backend.cached_visible_vectors.len);
+    try std.testing.expectEqual(@as(usize, 1), backend.cached_visible_row_map.count());
+    try std.testing.expectEqual(@as(usize, 0), backend.cached_visible_row_map.get(1).?);
 
     const cached_vector_blocks_before = backend.cached_vector_block_count;
     const cached_change_blocks_before = backend.cached_change_block_count;
@@ -3100,6 +3453,9 @@ test "VectorAdapter.ensureReadCache applies incremental delta blocks" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), refreshed.scores[0], 1e-6);
     try std.testing.expectEqual(@as(usize, 2), backend.cached_visible_ids.len);
     try std.testing.expectEqual(@as(usize, 4), backend.cached_visible_vectors.len);
+    try std.testing.expectEqual(@as(usize, 2), backend.cached_visible_row_map.count());
+    try std.testing.expect(backend.cached_visible_row_map.get(1) != null);
+    try std.testing.expect(backend.cached_visible_row_map.get(2) != null);
 
     try std.testing.expect(backend.cached_vector_block_count > cached_vector_blocks_before);
     try std.testing.expect(backend.cached_change_block_count > cached_change_blocks_before);
@@ -3229,6 +3585,39 @@ test "VectorAdapter.searchBatchWithOptions applies filter pre-allowlist" {
     try std.testing.expectEqual(@as(u64, 3), result.ids[1]);
 }
 
+test "VectorAdapter.searchBatchWithOptions clamps top_k to allowlist size" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{ 1, 2, 3 }, &[_]f32{
+        1.0, 0.0,
+        0.8, 0.0,
+        0.7, 0.0,
+    }, dims);
+
+    const filter_expr = vector_filter.FilterExpr{ .id_eq = 2 };
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        1,
+        3,
+        .{ .filter_expr = &filter_expr },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 2), result.ids[0]);
+}
+
 test "VectorAdapter.searchBatchWithOptions supports approximate planner path" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3308,6 +3697,97 @@ test "VectorAdapter.searchBatchWithOptions falls back to flat when segment index
     try std.testing.expectEqual(@as(usize, 2), result.ids.len);
     try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
     try std.testing.expectEqual(@as(u64, 2), result.ids[1]);
+}
+
+test "VectorAdapter.searchBatchWithOptions falls back to flat when segment row_count mismatches index payload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.fs_writer.max_segment_size = 1;
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{ 1.0, 0.0 }, dims);
+    try backend.fs_writer.flushBlock();
+    try backend.upsertBatch(&[_]u64{ 2, 3 }, &[_]f32{
+        0.9, 0.0,
+        0.2, 0.0,
+    }, dims);
+    try backend.fs_writer.flushBlock();
+
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "vector", "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    var loaded_manifest = try manifest.Manifest.load(std.testing.allocator, manifest_path);
+    defer loaded_manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded_manifest.segments.len);
+    loaded_manifest.segments[0].row_count += 1;
+    try loaded_manifest.save(manifest_path);
+
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        1,
+        2,
+        .{ .approximate = true },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 2), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
+    try std.testing.expectEqual(@as(u64, 2), result.ids[1]);
+}
+
+test "VectorAdapter.searchBatchWithOptions falls back to flat when IVF coverage of visible rows is low" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.fs_writer.max_segment_size = 1;
+    const dims: u32 = 2;
+
+    // Seal a segment with an orthogonal vector so IVF metadata exists.
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{ 0.0, 1.0 }, dims);
+    try backend.fs_writer.flushBlock();
+
+    // Keep a large visible set in current.talu so approximate path is considered.
+    const tail_count: usize = 1100;
+    const tail_ids = try std.testing.allocator.alloc(u64, tail_count);
+    defer std.testing.allocator.free(tail_ids);
+    const tail_vectors = try std.testing.allocator.alloc(f32, tail_count * @as(usize, dims));
+    defer std.testing.allocator.free(tail_vectors);
+    for (0..tail_count) |idx| {
+        tail_ids[idx] = @intCast(2 + idx);
+        const base = idx * @as(usize, dims);
+        tail_vectors[base] = 1.0;
+        tail_vectors[base + 1] = 0.0;
+    }
+    try backend.upsertBatch(tail_ids, tail_vectors, dims);
+
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        1,
+        1,
+        .{ .approximate = true },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    // If ANN path were used despite low coverage, stale segment id=1 would dominate.
+    // Flat fallback should return the best current id with deterministic tie-break.
+    try std.testing.expectEqual(@as(u32, 1), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 2), result.ids[0]);
 }
 
 test "VectorAdapter.searchBatch uses deterministic id tie-break for equal scores" {
@@ -3638,4 +4118,112 @@ test "VectorAdapter.discoverNextSeq resumes after idempotency records" {
     defer records_after.deinit();
     const resumed = records_after.get(0x9002) orelse return error.TestUnexpectedResult;
     try std.testing.expect(resumed.seq > max_seq_before);
+}
+
+test "VectorAdapter.buildPendingApproximateIndexesWithExpectedGeneration builds pending segment indexes" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.fs_writer.max_segment_size = 1;
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{ 1.0, 0.0 }, dims);
+    try backend.fs_writer.flushBlock();
+    try backend.upsertBatch(&[_]u64{2}, &[_]f32{ 0.0, 1.0 }, dims);
+    try backend.fs_writer.flushBlock();
+
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "vector", "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    var before = try manifest.Manifest.load(std.testing.allocator, manifest_path);
+    defer before.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), before.segments.len);
+    try std.testing.expect(before.segments[0].index != null);
+    try std.testing.expectEqual(manifest.SegmentIndexState.pending, before.segments[0].index.?.state);
+    const before_generation = before.generation;
+
+    const result = try backend.buildPendingApproximateIndexesWithExpectedGeneration(before_generation, 8);
+    try std.testing.expectEqual(@as(usize, 1), result.built_segments);
+    try std.testing.expectEqual(@as(usize, 0), result.failed_segments);
+    try std.testing.expectEqual(@as(usize, 0), result.pending_segments);
+
+    var after = try manifest.Manifest.load(std.testing.allocator, manifest_path);
+    defer after.deinit(std.testing.allocator);
+    try std.testing.expectEqual(before_generation + 1, after.generation);
+    try std.testing.expectEqual(@as(usize, 1), after.segments.len);
+    try std.testing.expect(after.segments[0].index != null);
+    const index_meta = after.segments[0].index.?;
+    try std.testing.expectEqual(manifest.SegmentIndexState.ready, index_meta.state);
+    try std.testing.expect(index_meta.checksum_crc32c != 0);
+
+    const index_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "vector", index_meta.path });
+    defer std.testing.allocator.free(index_path);
+    const stat = try std.fs.cwd().statFile(index_path);
+    try std.testing.expect(stat.size > 0);
+}
+
+test "VectorAdapter.stats reports manifest generation and index readiness counts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.fs_writer.max_segment_size = 1;
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{ 1.0, 0.0 }, dims);
+    try backend.fs_writer.flushBlock();
+    try backend.upsertBatch(&[_]u64{2}, &[_]f32{ 0.0, 1.0 }, dims);
+    try backend.fs_writer.flushBlock();
+
+    const before = try backend.stats();
+    try std.testing.expectEqual(@as(usize, 2), before.visible_count);
+    try std.testing.expectEqual(@as(usize, 0), before.tombstone_count);
+    try std.testing.expectEqual(@as(usize, 1), before.index_pending_segments);
+    try std.testing.expectEqual(@as(usize, 0), before.index_ready_segments);
+    try std.testing.expectEqual(@as(usize, 0), before.index_failed_segments);
+
+    const build = try backend.buildPendingApproximateIndexesWithExpectedGeneration(before.manifest_generation, 8);
+    try std.testing.expectEqual(@as(usize, 1), build.built_segments);
+
+    const after = try backend.stats();
+    try std.testing.expectEqual(before.manifest_generation + 1, after.manifest_generation);
+    try std.testing.expectEqual(@as(usize, 0), after.index_pending_segments);
+    try std.testing.expectEqual(@as(usize, 1), after.index_ready_segments);
+    try std.testing.expectEqual(@as(usize, 0), after.index_failed_segments);
+}
+
+test "VectorAdapter.buildPendingApproximateIndexesWithExpectedGeneration rejects stale generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.fs_writer.max_segment_size = 1;
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{ 1.0, 0.0 }, dims);
+    try backend.fs_writer.flushBlock();
+    try backend.upsertBatch(&[_]u64{2}, &[_]f32{ 0.0, 1.0 }, dims);
+    try backend.fs_writer.flushBlock();
+
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "vector", "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    var manifest_before = try manifest.Manifest.load(std.testing.allocator, manifest_path);
+    defer manifest_before.deinit(std.testing.allocator);
+
+    try std.testing.expectError(
+        error.ManifestGenerationConflict,
+        backend.buildPendingApproximateIndexesWithExpectedGeneration(manifest_before.generation + 1, 8),
+    );
 }

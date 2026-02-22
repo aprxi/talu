@@ -377,6 +377,7 @@ pub const talu_vector_store_upsert_idempotent_ex = db_storage.talu_vector_store_
 pub const talu_vector_store_delete_idempotent = db_storage.talu_vector_store_delete_idempotent;
 pub const talu_vector_store_compact_idempotent = db_storage.talu_vector_store_compact_idempotent;
 pub const talu_vector_store_compact_with_generation = db_storage.talu_vector_store_compact_with_generation;
+pub const talu_vector_store_build_indexes_with_generation = db_storage.talu_vector_store_build_indexes_with_generation;
 pub const talu_vector_store_compact_expired_tombstones = db_storage.talu_vector_store_compact_expired_tombstones;
 pub const talu_vector_store_changes = db_storage.talu_vector_store_changes;
 pub const CStorageRecord = db_storage.CStorageRecord;

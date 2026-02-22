@@ -3,6 +3,7 @@
 const std = @import("std");
 const dot_product = @import("../../../compute/cpu/linalg.zig").dot;
 const parallel = @import("../../../system/parallel.zig");
+const vector_filter = @import("../filter.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -29,6 +30,8 @@ pub const FlatIndex = struct {
         query_count: u32,
         k: u32,
         dims: u32,
+        allow_list: ?*const vector_filter.AllowList,
+        allowed_count: ?usize,
     ) !SearchBatchResult {
         if (query_count == 0 or k == 0) {
             return .{
@@ -52,8 +55,24 @@ pub const FlatIndex = struct {
                 .query_count = query_count,
             };
         }
+        if (allow_list) |allow| {
+            if (allow.len != row_count) return error.InvalidColumnData;
+        }
+        const candidate_count = if (allow_list != null)
+            allowed_count orelse vector_filter.allowListCount(allow_list.?)
+        else
+            row_count;
+        if (candidate_count > row_count) return error.InvalidColumnData;
+        if (candidate_count == 0) {
+            return .{
+                .ids = try allocator.alloc(u64, 0),
+                .scores = try allocator.alloc(f32, 0),
+                .count_per_query = 0,
+                .query_count = query_count,
+            };
+        }
 
-        const per_query_capacity = @min(@as(usize, k), row_count);
+        const per_query_capacity = @min(@as(usize, k), candidate_count);
         var heaps = try allocator.alloc(MinHeap, query_count);
         errdefer {
             for (heaps) |*heap| heap.deinit(allocator);
@@ -73,10 +92,14 @@ pub const FlatIndex = struct {
             row_count,
             row_count,
             0,
+            allow_list,
             all_scores,
         );
 
         for (0..row_count) |row_idx| {
+            if (allow_list) |allow| {
+                if (!vector_filter.allowListContains(allow, row_idx)) continue;
+            }
             for (0..@as(usize, query_count)) |query_idx| {
                 heaps[query_idx].push(
                     all_scores[query_idx * row_count + row_idx],
@@ -203,6 +226,7 @@ const BatchScoreScanCtx = struct {
     query_count: u32,
     total_rows: usize,
     row_offset: usize,
+    allow_list: ?*const vector_filter.AllowList,
     scores_out: []f32,
 };
 
@@ -210,6 +234,15 @@ fn batchScoreScanWorker(start: usize, end: usize, ctx: *BatchScoreScanCtx) void 
     const dims = ctx.dims;
     const query_count = @as(usize, ctx.query_count);
     for (start..end) |row_idx| {
+        const global_row = ctx.row_offset + row_idx;
+        if (ctx.allow_list) |allow| {
+            if (!vector_filter.allowListContains(allow, global_row)) {
+                for (0..query_count) |qi| {
+                    ctx.scores_out[qi * ctx.total_rows + global_row] = -std.math.inf(f32);
+                }
+                continue;
+            }
+        }
         const base = row_idx * dims;
         const row_slice = ctx.vectors[base .. base + dims];
 
@@ -220,7 +253,6 @@ fn batchScoreScanWorker(start: usize, end: usize, ctx: *BatchScoreScanCtx) void 
             const q2 = ctx.queries[(qi + 2) * dims .. (qi + 3) * dims];
             const q3 = ctx.queries[(qi + 3) * dims .. (qi + 4) * dims];
             const scores = dot_product.dotProductF32Batch4(q0, q1, q2, q3, row_slice);
-            const global_row = ctx.row_offset + row_idx;
             ctx.scores_out[(qi + 0) * ctx.total_rows + global_row] = scores[0];
             ctx.scores_out[(qi + 1) * ctx.total_rows + global_row] = scores[1];
             ctx.scores_out[(qi + 2) * ctx.total_rows + global_row] = scores[2];
@@ -242,6 +274,7 @@ fn parallelScoreBatchRows(
     row_count: usize,
     total_rows: usize,
     row_offset: usize,
+    allow_list: ?*const vector_filter.AllowList,
     scores_out: []f32,
 ) void {
     var ctx = BatchScoreScanCtx{
@@ -251,6 +284,7 @@ fn parallelScoreBatchRows(
         .query_count = query_count,
         .total_rows = total_rows,
         .row_offset = row_offset,
+        .allow_list = allow_list,
         .scores_out = scores_out,
     };
     parallel.global().parallelFor(row_count, batchScoreScanWorker, &ctx);
@@ -276,9 +310,43 @@ test "FlatIndex.searchBatch returns deterministic score order" {
         1,
         1,
         2,
+        null,
+        null,
     );
     defer result.deinit(std.testing.allocator);
 
     try std.testing.expectEqual(@as(usize, 1), result.ids.len);
     try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
+}
+
+test "FlatIndex.searchBatch applies allowlist pre-filter" {
+    const ids = [_]u64{ 10, 20, 30 };
+    const vectors = [_]f32{
+        1.0, 0.0,
+        0.9, 0.0,
+        0.8, 0.0,
+    };
+    const queries = [_]f32{ 1.0, 0.0 };
+    const filter = vector_filter.FilterExpr{ .id_in = &[_]u64{20} };
+    var allow = try vector_filter.evaluateAllowList(std.testing.allocator, &filter, &ids);
+    defer vector_filter.deinitAllowList(std.testing.allocator, &allow);
+
+    var index = FlatIndex{};
+    var result = try index.searchBatch(
+        std.testing.allocator,
+        &ids,
+        &vectors,
+        2,
+        &queries,
+        1,
+        2,
+        2,
+        &allow,
+        1,
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 20), result.ids[0]);
 }

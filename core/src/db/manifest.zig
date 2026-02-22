@@ -24,10 +24,17 @@ pub const SegmentIndexKind = enum {
     ivf_flat,
 };
 
+pub const SegmentIndexState = enum {
+    pending,
+    ready,
+    failed,
+};
+
 pub const SegmentIndexMeta = struct {
     kind: SegmentIndexKind,
     path: []const u8,
     checksum_crc32c: u32 = 0,
+    state: SegmentIndexState = .ready,
 };
 
 pub const Manifest = struct {
@@ -171,6 +178,7 @@ const SegmentIndexJson = struct {
     kind: []const u8,
     path: []const u8,
     checksum_crc32c: u32,
+    state: ?[]const u8 = null,
 };
 
 const ManifestJson = struct {
@@ -197,6 +205,7 @@ fn buildSegmentJson(arena: *std.heap.ArenaAllocator, segments: []const SegmentEn
                     .kind = segmentIndexKindToString(index_meta.kind),
                     .path = index_meta.path,
                     .checksum_crc32c = index_meta.checksum_crc32c,
+                    .state = segmentIndexStateToString(index_meta.state),
                 }
             else
                 null,
@@ -281,6 +290,10 @@ fn parseSegmentIndex(allocator: Allocator, value: std.json.Value) !?SegmentIndex
         .kind = try parseSegmentIndexKind(kind_str),
         .path = try allocator.dupe(u8, path_str),
         .checksum_crc32c = parsed_checksum,
+        .state = if (obj.get("state")) |state_value|
+            try parseSegmentIndexState(try parseString(state_value))
+        else
+            .ready,
     };
 }
 
@@ -294,6 +307,21 @@ fn segmentIndexKindToString(kind: SegmentIndexKind) []const u8 {
     return switch (kind) {
         .flat => "flat",
         .ivf_flat => "ivf_flat",
+    };
+}
+
+fn parseSegmentIndexState(value: []const u8) !SegmentIndexState {
+    if (std.mem.eql(u8, value, "pending")) return .pending;
+    if (std.mem.eql(u8, value, "ready")) return .ready;
+    if (std.mem.eql(u8, value, "failed")) return .failed;
+    return error.InvalidManifest;
+}
+
+fn segmentIndexStateToString(state: SegmentIndexState) []const u8 {
+    return switch (state) {
+        .pending => "pending",
+        .ready => "ready",
+        .failed => "failed",
     };
 }
 
@@ -587,6 +615,7 @@ test "Manifest.load and Manifest.save preserve segment index metadata" {
             .kind = .ivf_flat,
             .path = try std.testing.allocator.dupe(u8, "vector/seg-2.ivf"),
             .checksum_crc32c = 1234,
+            .state = .failed,
         },
     };
 
@@ -608,7 +637,44 @@ test "Manifest.load and Manifest.save preserve segment index metadata" {
     try std.testing.expectEqual(SegmentIndexKind.ivf_flat, index_meta.kind);
     try std.testing.expectEqualStrings("vector/seg-2.ivf", index_meta.path);
     try std.testing.expectEqual(@as(u32, 1234), index_meta.checksum_crc32c);
+    try std.testing.expectEqual(SegmentIndexState.failed, index_meta.state);
     try std.testing.expectEqual(@as(u32, 777), loaded.segments[0].checksum_crc32c);
+}
+
+test "Manifest.load defaults segment index state to ready when state field is missing" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const manifest_json =
+        "{" ++
+        "\"version\":1," ++
+        "\"generation\":2," ++
+        "\"last_compaction_ts\":0," ++
+        "\"segments\":[{" ++
+        "\"id\":\"0123456789abcdef0123456789abcdef\"," ++
+        "\"path\":\"vector/seg-1.talu\"," ++
+        "\"min_ts\":0," ++
+        "\"max_ts\":0," ++
+        "\"row_count\":1," ++
+        "\"checksum_crc32c\":11," ++
+        "\"index\":{" ++
+        "\"kind\":\"ivf_flat\"," ++
+        "\"path\":\"vector/seg-1.ivf\"," ++
+        "\"checksum_crc32c\":22" ++
+        "}" ++
+        "}]" ++
+        "}";
+
+    try tmp.dir.writeFile(.{ .sub_path = "manifest-legacy-index.json", .data = manifest_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "manifest-legacy-index.json");
+    defer std.testing.allocator.free(path);
+
+    var loaded = try Manifest.load(std.testing.allocator, path);
+    defer loaded.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), loaded.segments.len);
+    try std.testing.expect(loaded.segments[0].index != null);
+    try std.testing.expectEqual(SegmentIndexState.ready, loaded.segments[0].index.?.state);
 }
 
 test "Manifest.deinit frees segments" {

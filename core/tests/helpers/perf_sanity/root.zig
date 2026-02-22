@@ -11,6 +11,8 @@
 //!   TALU_PERF_CPU_MIN_TOKENS_PER_SEC=<float>   optional minimum threshold
 //!   TALU_PERF_CPU_ITERS=<usize>                optional iteration count (default: 2048)
 //!   TALU_LIFECYCLE_CYCLES=<usize>              optional cycle count (default: 128)
+//!   TALU_PERF_VECTOR_MIN_RECALL=<float>        optional minimum IVF recall@k threshold
+//!   TALU_PERF_VECTOR_MAX_SLOWDOWN=<float>      optional max IVF/Flat elapsed ratio
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -188,15 +190,10 @@ fn runDbVectorBench(writer: anytype, allocator: std.mem.Allocator) !void {
     const dims = envUsize(allocator, "TALU_PERF_VECTOR_DIMS", 128);
     const queries = envUsize(allocator, "TALU_PERF_VECTOR_QUERIES", 8);
     const k = envUsize(allocator, "TALU_PERF_VECTOR_TOPK", 10);
+    const min_recall = envF64(allocator, "TALU_PERF_VECTOR_MIN_RECALL");
+    const max_slowdown = envF64(allocator, "TALU_PERF_VECTOR_MAX_SLOWDOWN");
 
-    const flat = try vector_bench.benchmarkFlatSearch(
-        allocator,
-        rows,
-        @intCast(dims),
-        @intCast(queries),
-        @intCast(k),
-    );
-    const ivf = try vector_bench.benchmarkIvfSearch(
+    const recall = try vector_bench.benchmarkIvfRecall(
         allocator,
         rows,
         @intCast(dims),
@@ -206,12 +203,48 @@ fn runDbVectorBench(writer: anytype, allocator: std.mem.Allocator) !void {
 
     try writer.print(
         "PERF_CHECK name=db_vector_flat elapsed_ns={} rows={} queries={} status=pass\n",
-        .{ flat.elapsed_ns, flat.rows_scanned, flat.queries },
+        .{ recall.flat_elapsed_ns, recall.rows_scanned, recall.queries },
     );
     try writer.print(
         "PERF_CHECK name=db_vector_ivf elapsed_ns={} rows={} queries={} status=pass\n",
-        .{ ivf.elapsed_ns, ivf.rows_scanned, ivf.queries },
+        .{ recall.ivf_elapsed_ns, recall.rows_scanned, recall.queries },
     );
+
+    const recall_status: []const u8 = if (min_recall) |threshold|
+        if (@as(f64, recall.recall_at_k) >= threshold) "pass" else "fail"
+    else
+        "pass";
+    var recall_threshold_buf: [64]u8 = undefined;
+    const recall_threshold_str: []const u8 = if (min_recall) |threshold|
+        try std.fmt.bufPrint(&recall_threshold_buf, "{d:.3}", .{threshold})
+    else
+        "none";
+    try writer.print(
+        "PERF_CHECK name=db_vector_ivf_recall recall_at_k={d:.6} threshold={s} status={s}\n",
+        .{ recall.recall_at_k, recall_threshold_str, recall_status },
+    );
+
+    const slowdown = if (recall.flat_elapsed_ns == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(recall.ivf_elapsed_ns)) / @as(f64, @floatFromInt(recall.flat_elapsed_ns));
+    const slowdown_status: []const u8 = if (max_slowdown) |threshold|
+        if (slowdown <= threshold) "pass" else "fail"
+    else
+        "pass";
+    var slowdown_threshold_buf: [64]u8 = undefined;
+    const slowdown_threshold_str: []const u8 = if (max_slowdown) |threshold|
+        try std.fmt.bufPrint(&slowdown_threshold_buf, "{d:.3}", .{threshold})
+    else
+        "none";
+    try writer.print(
+        "PERF_CHECK name=db_vector_ivf_slowdown ratio={d:.6} threshold={s} status={s}\n",
+        .{ slowdown, slowdown_threshold_str, slowdown_status },
+    );
+
+    if (std.mem.eql(u8, recall_status, "fail") or std.mem.eql(u8, slowdown_status, "fail")) {
+        return error.PerfRegression;
+    }
 }
 
 pub fn main() !void {

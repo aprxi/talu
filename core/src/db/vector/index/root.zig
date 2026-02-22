@@ -3,6 +3,7 @@
 const std = @import("std");
 const flat_mod = @import("flat.zig");
 const ivf_flat_mod = @import("ivfflat.zig");
+const vector_filter = @import("../filter.zig");
 
 const Allocator = std.mem.Allocator;
 
@@ -12,11 +13,17 @@ pub const QueryInput = struct {
     dims: u32,
 };
 
+pub const IvfSegmentIndex = ivf_flat_mod.IvfSegmentIndex;
+
 pub const SearchParams = struct {
     queries: []const f32,
     query_count: u32,
     k: u32,
     dims: u32,
+    allow_list: ?*const vector_filter.AllowList = null,
+    allowed_count: ?usize = null,
+    segment_indexes: ?[]const ivf_flat_mod.IvfSegmentIndex = null,
+    id_to_row: ?*const std.AutoHashMap(u64, usize) = null,
 };
 
 pub const SearchBatchResult = struct {
@@ -52,6 +59,8 @@ pub const VectorIndex = union(enum) {
                     params.query_count,
                     params.k,
                     params.dims,
+                    params.allow_list,
+                    params.allowed_count,
                 );
                 break :blk .{
                     .ids = flat_result.ids,
@@ -70,6 +79,10 @@ pub const VectorIndex = union(enum) {
                     params.query_count,
                     params.k,
                     params.dims,
+                    params.allow_list,
+                    params.allowed_count,
+                    params.segment_indexes,
+                    params.id_to_row,
                 );
                 break :blk .{
                     .ids = ivf_result.ids,

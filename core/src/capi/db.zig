@@ -747,12 +747,20 @@ pub export fn talu_vector_store_stats(
     out_tombstone_count: *usize,
     out_segment_count: *usize,
     out_total_count: *usize,
+    out_manifest_generation: *u64,
+    out_index_ready_segments: *usize,
+    out_index_pending_segments: *usize,
+    out_index_failed_segments: *usize,
 ) callconv(.c) i32 {
     capi_error.clearError();
     out_visible_count.* = 0;
     out_tombstone_count.* = 0;
     out_segment_count.* = 0;
     out_total_count.* = 0;
+    out_manifest_generation.* = 0;
+    out_index_ready_segments.* = 0;
+    out_index_pending_segments.* = 0;
+    out_index_failed_segments.* = 0;
 
     const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
         capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
@@ -767,6 +775,10 @@ pub export fn talu_vector_store_stats(
     out_tombstone_count.* = stats.tombstone_count;
     out_segment_count.* = stats.segment_count;
     out_total_count.* = stats.total_count;
+    out_manifest_generation.* = stats.manifest_generation;
+    out_index_ready_segments.* = stats.index_ready_segments;
+    out_index_pending_segments.* = stats.index_pending_segments;
+    out_index_failed_segments.* = stats.index_failed_segments;
     return 0;
 }
 
@@ -849,6 +861,43 @@ pub export fn talu_vector_store_compact_with_generation(
 
     out_kept_count.* = result.kept_count;
     out_removed_tombstones.* = result.removed_tombstones;
+    return 0;
+}
+
+/// Build pending vector ANN indexes if the current manifest generation matches expected_generation.
+pub export fn talu_vector_store_build_indexes_with_generation(
+    handle: ?*VectorStoreHandle,
+    expected_generation: u64,
+    max_segments: usize,
+    out_built_segments: *usize,
+    out_failed_segments: *usize,
+    out_pending_segments: *usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    out_built_segments.* = 0;
+    out_failed_segments.* = 0;
+    out_pending_segments.* = 0;
+
+    const backend: *db.vector.store.VectorAdapter = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const result = backend.buildPendingApproximateIndexesWithExpectedGeneration(expected_generation, max_segments) catch |err| {
+        switch (err) {
+            error.ManifestGenerationConflict => capi_error.setErrorWithCode(
+                .invalid_argument,
+                "manifest generation conflict",
+                .{},
+            ),
+            else => capi_error.setError(err, "failed to build vector indexes with generation guard", .{}),
+        }
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out_built_segments.* = result.built_segments;
+    out_failed_segments.* = result.failed_segments;
+    out_pending_segments.* = result.pending_segments;
     return 0;
 }
 
