@@ -3,6 +3,7 @@
 //! Reads header and column chunks without loading entire blocks into memory.
 
 const std = @import("std");
+const checksum = @import("checksum.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -39,6 +40,9 @@ pub const BlockReader = struct {
 
         const header = std.mem.bytesToValue(types.BlockHeader, header_bytes[0..]);
         if (header.magic != types.MagicValues.BLOCK) return error.InvalidMagic;
+        if (header.version != 1) return error.InvalidBlock;
+        if (header.header_len != @sizeOf(types.BlockHeader)) return error.InvalidBlock;
+        if (header.block_len < header.header_len) return error.InvalidBlock;
         return header;
     }
 
@@ -137,12 +141,15 @@ pub const BlockReader = struct {
 
         // 2. Validate magic
         if (trailer.magic != types.MagicValues.FOOTER) return null;
+        if (trailer.version != 1) return error.InvalidFooter;
 
         // 3. Calculate footer payload location
         const footer_len = trailer.footer_len;
         if (footer_len == 0) {
+            if (trailer.footer_crc32c != 0) return error.InvalidFooter;
             return try self.allocator.alloc(types.FooterBlockEntry, 0);
         }
+        if (footer_len > file_size - trailer_size) return error.InvalidFooter;
 
         const entry_size: u32 = @intCast(@sizeOf(types.FooterBlockEntry));
         if (footer_len % entry_size != 0) return error.InvalidFooter;
@@ -157,6 +164,8 @@ pub const BlockReader = struct {
         const payload_bytes = std.mem.sliceAsBytes(entries);
         const payload_read = try self.file.preadAll(payload_bytes, payload_offset);
         if (payload_read != payload_bytes.len) return error.UnexpectedEof;
+        if (checksum.crc32c(payload_bytes) != trailer.footer_crc32c) return error.InvalidFooter;
+        try validateFooterEntries(entries, payload_offset);
 
         return entries;
     }
@@ -173,13 +182,7 @@ pub const BlockReader = struct {
 
         var offset: u64 = 0;
         while (offset + header_size <= file_size) {
-            var header_bytes: [@sizeOf(types.BlockHeader)]u8 = undefined;
-            const read_len = try self.file.preadAll(&header_bytes, offset);
-            if (read_len != header_bytes.len) break;
-
-            const header = std.mem.bytesToValue(types.BlockHeader, header_bytes[0..]);
-            if (header.magic != types.MagicValues.BLOCK) break;
-            if (header.block_len < header_size) break;
+            const header = self.readHeader(offset) catch break;
 
             const next_offset = offset + @as(u64, header.block_len);
             if (next_offset > file_size) break;
@@ -201,13 +204,38 @@ pub const BlockReader = struct {
     /// Caller owns the returned slice.
     pub fn getBlockIndex(self: BlockReader, file_size: u64) ![]types.FooterBlockEntry {
         // Try footer first (O(1) read for sealed segments)
-        if (try self.readFooter(file_size)) |entries| {
+        const footer_entries = self.readFooter(file_size) catch |err| switch (err) {
+            // Corrupt/truncated footer should not make the segment unreadable.
+            // Fall back to scanning block headers.
+            error.InvalidFooter, error.UnexpectedEof => null,
+            else => return err,
+        };
+        if (footer_entries) |entries| {
             return entries;
         }
         // Fallback to header scanning (O(blocks) reads)
         return self.scanBlocksFromHeaders(file_size);
     }
 };
+
+fn validateFooterEntries(entries: []const types.FooterBlockEntry, data_end: u64) !void {
+    if (entries.len == 0) return;
+
+    const min_block_len = @as(u32, @intCast(@sizeOf(types.BlockHeader)));
+    var prev_end: u64 = 0;
+    for (entries, 0..) |entry, idx| {
+        if (entry.block_len < min_block_len) return error.InvalidFooter;
+
+        const block_off = entry.block_off;
+        const block_len = @as(u64, entry.block_len);
+        if (block_off > std.math.maxInt(u64) - block_len) return error.InvalidFooter;
+        const block_end = block_off + block_len;
+        if (block_end > data_end) return error.InvalidFooter;
+
+        if (idx > 0 and block_off < prev_end) return error.InvalidFooter;
+        prev_end = block_end;
+    }
+}
 
 fn buildTestBlock(allocator: Allocator) ![]u8 {
     const writer = @import("block_writer.zig");
@@ -248,6 +276,28 @@ test "BlockReader.readHeader reads header" {
 
     try std.testing.expectEqual(types.MagicValues.BLOCK, header.magic);
     try std.testing.expectEqual(@as(u16, 2), header.schema_id);
+}
+
+test "BlockReader.readHeader rejects invalid header_len" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const block = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block);
+
+    const mutated = try std.testing.allocator.dupe(u8, block);
+    defer std.testing.allocator.free(mutated);
+
+    var header = std.mem.bytesToValue(types.BlockHeader, mutated[0..@sizeOf(types.BlockHeader)]);
+    header.header_len = 0;
+    std.mem.copyForwards(u8, mutated[0..@sizeOf(types.BlockHeader)], std.mem.asBytes(&header));
+
+    var file = try tmp.dir.createFile("bad-header.bin", .{ .read = true });
+    defer file.close();
+    try file.writeAll(mutated);
+
+    const reader = BlockReader.init(file, std.testing.allocator);
+    try std.testing.expectError(error.InvalidBlock, reader.readHeader(0));
 }
 
 test "BlockReader.readColumnDirectory reads descriptors" {
@@ -360,6 +410,36 @@ test "BlockReader.scanBlocksFromHeaders finds blocks" {
     try std.testing.expectEqual(@as(u16, 2), entries[1].schema_id);
 }
 
+test "BlockReader.scanBlocksFromHeaders stops on invalid header version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const block1 = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block1);
+    const block2 = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block2);
+
+    const mutated = try std.testing.allocator.dupe(u8, block2);
+    defer std.testing.allocator.free(mutated);
+    var header2 = std.mem.bytesToValue(types.BlockHeader, mutated[0..@sizeOf(types.BlockHeader)]);
+    header2.version = 9;
+    std.mem.copyForwards(u8, mutated[0..@sizeOf(types.BlockHeader)], std.mem.asBytes(&header2));
+
+    var file = try tmp.dir.createFile("blocks-bad-version.bin", .{ .read = true });
+    defer file.close();
+    try file.writeAll(block1);
+    try file.writeAll(mutated);
+
+    const reader = BlockReader.init(file, std.testing.allocator);
+    const stat = try file.stat();
+
+    const entries = try reader.scanBlocksFromHeaders(stat.size);
+    defer std.testing.allocator.free(entries);
+
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].block_off);
+}
+
 test "BlockReader.getBlockIndex falls back to header scan" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -403,12 +483,13 @@ test "BlockReader.readFooter parses valid footer" {
     try file.writeAll(std.mem.asBytes(&entry));
 
     // Write footer trailer
+    const footer_payload = std.mem.asBytes(&entry);
     const trailer = types.FooterTrailer{
         .magic = types.MagicValues.FOOTER,
         .version = 1,
         .flags = 0,
         .footer_len = @sizeOf(types.FooterBlockEntry),
-        .footer_crc32c = 0,
+        .footer_crc32c = checksum.crc32c(footer_payload),
         .segment_crc32c = 0,
         .reserved = [_]u8{0} ** 12,
     };
@@ -424,4 +505,207 @@ test "BlockReader.readFooter parses valid footer" {
     try std.testing.expectEqual(@as(usize, 1), entries.?.len);
     try std.testing.expectEqual(@as(u64, 0), entries.?[0].block_off);
     try std.testing.expectEqual(@as(u16, 2), entries.?[0].schema_id);
+}
+
+test "BlockReader.readFooter rejects invalid crc32c" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const block = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block);
+
+    var file = try tmp.dir.createFile("sealed-invalid-crc.bin", .{ .read = true });
+    defer file.close();
+    try file.writeAll(block);
+
+    const entry = types.FooterBlockEntry{
+        .block_off = 0,
+        .block_len = @intCast(block.len),
+        .schema_id = 2,
+    };
+    try file.writeAll(std.mem.asBytes(&entry));
+
+    const trailer = types.FooterTrailer{
+        .magic = types.MagicValues.FOOTER,
+        .version = 1,
+        .flags = 0,
+        .footer_len = @sizeOf(types.FooterBlockEntry),
+        .footer_crc32c = 0, // Deliberately wrong.
+        .segment_crc32c = 0,
+        .reserved = [_]u8{0} ** 12,
+    };
+    try file.writeAll(std.mem.asBytes(&trailer));
+
+    const reader = BlockReader.init(file, std.testing.allocator);
+    const stat = try file.stat();
+
+    try std.testing.expectError(error.InvalidFooter, reader.readFooter(stat.size));
+}
+
+test "BlockReader.getBlockIndex falls back on invalid footer" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const block1 = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block1);
+    const block2 = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block2);
+
+    var file = try tmp.dir.createFile("sealed-bad-footer.bin", .{ .read = true });
+    defer file.close();
+    try file.writeAll(block1);
+    try file.writeAll(block2);
+
+    const entry = types.FooterBlockEntry{
+        .block_off = 0,
+        .block_len = @intCast(block1.len),
+        .schema_id = 2,
+    };
+    try file.writeAll(std.mem.asBytes(&entry));
+
+    const trailer = types.FooterTrailer{
+        .magic = types.MagicValues.FOOTER,
+        .version = 1,
+        .flags = 0,
+        .footer_len = @sizeOf(types.FooterBlockEntry),
+        .footer_crc32c = 0, // Deliberately wrong.
+        .segment_crc32c = 0,
+        .reserved = [_]u8{0} ** 12,
+    };
+    try file.writeAll(std.mem.asBytes(&trailer));
+
+    const reader = BlockReader.init(file, std.testing.allocator);
+    const stat = try file.stat();
+
+    const entries = try reader.getBlockIndex(stat.size);
+    defer std.testing.allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].block_off);
+    try std.testing.expectEqual(@as(u64, block1.len), entries[1].block_off);
+}
+
+test "BlockReader.readFooter rejects out-of-range entry offsets" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const block = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block);
+
+    var file = try tmp.dir.createFile("sealed-bad-offset.bin", .{ .read = true });
+    defer file.close();
+    try file.writeAll(block);
+
+    const entry = types.FooterBlockEntry{
+        .block_off = 1024, // Outside segment data range.
+        .block_len = @intCast(block.len),
+        .schema_id = 2,
+    };
+    const payload = std.mem.asBytes(&entry);
+    try file.writeAll(payload);
+
+    const trailer = types.FooterTrailer{
+        .magic = types.MagicValues.FOOTER,
+        .version = 1,
+        .flags = 0,
+        .footer_len = @sizeOf(types.FooterBlockEntry),
+        .footer_crc32c = checksum.crc32c(payload),
+        .segment_crc32c = 0,
+        .reserved = [_]u8{0} ** 12,
+    };
+    try file.writeAll(std.mem.asBytes(&trailer));
+
+    const reader = BlockReader.init(file, std.testing.allocator);
+    const stat = try file.stat();
+    try std.testing.expectError(error.InvalidFooter, reader.readFooter(stat.size));
+}
+
+test "BlockReader.getBlockIndex falls back on invalid footer entries" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const block1 = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block1);
+    const block2 = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block2);
+
+    var file = try tmp.dir.createFile("sealed-bad-entries.bin", .{ .read = true });
+    defer file.close();
+    try file.writeAll(block1);
+    try file.writeAll(block2);
+
+    // Corrupt footer payload: second entry overlaps first block.
+    const entries_payload = [_]types.FooterBlockEntry{
+        .{
+            .block_off = 0,
+            .block_len = @intCast(block1.len),
+            .schema_id = 2,
+        },
+        .{
+            .block_off = @as(u64, @intCast(block1.len / 2)),
+            .block_len = @intCast(block2.len),
+            .schema_id = 2,
+        },
+    };
+    const payload = std.mem.sliceAsBytes(&entries_payload);
+    try file.writeAll(payload);
+
+    const trailer = types.FooterTrailer{
+        .magic = types.MagicValues.FOOTER,
+        .version = 1,
+        .flags = 0,
+        .footer_len = @intCast(payload.len),
+        .footer_crc32c = checksum.crc32c(payload),
+        .segment_crc32c = 0,
+        .reserved = [_]u8{0} ** 12,
+    };
+    try file.writeAll(std.mem.asBytes(&trailer));
+
+    const reader = BlockReader.init(file, std.testing.allocator);
+    const stat = try file.stat();
+
+    const entries = try reader.getBlockIndex(stat.size);
+    defer std.testing.allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].block_off);
+    try std.testing.expectEqual(@as(u64, block1.len), entries[1].block_off);
+}
+
+test "BlockReader.getBlockIndex falls back on unsupported footer version" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const block = try buildTestBlock(std.testing.allocator);
+    defer std.testing.allocator.free(block);
+
+    var file = try tmp.dir.createFile("sealed-bad-version.bin", .{ .read = true });
+    defer file.close();
+    try file.writeAll(block);
+
+    const entry = types.FooterBlockEntry{
+        .block_off = 0,
+        .block_len = @intCast(block.len),
+        .schema_id = 2,
+    };
+    const payload = std.mem.asBytes(&entry);
+    try file.writeAll(payload);
+
+    const trailer = types.FooterTrailer{
+        .magic = types.MagicValues.FOOTER,
+        .version = 2, // Unsupported.
+        .flags = 0,
+        .footer_len = @sizeOf(types.FooterBlockEntry),
+        .footer_crc32c = checksum.crc32c(payload),
+        .segment_crc32c = 0,
+        .reserved = [_]u8{0} ** 12,
+    };
+    try file.writeAll(std.mem.asBytes(&trailer));
+
+    const reader = BlockReader.init(file, std.testing.allocator);
+    const stat = try file.stat();
+    try std.testing.expectError(error.InvalidFooter, reader.readFooter(stat.size));
+
+    const entries = try reader.getBlockIndex(stat.size);
+    defer std.testing.allocator.free(entries);
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqual(@as(u64, 0), entries[0].block_off);
 }

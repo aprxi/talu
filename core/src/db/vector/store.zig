@@ -1418,7 +1418,7 @@ pub const VectorAdapter = struct {
 
     fn loadLatestIdempotency(self: *VectorAdapter, allocator: Allocator) !std.AutoHashMap(u64, IdempotencyRecord) {
         try self.idempotency_writer.flushBlock();
-        try self.idempotency_reader.refreshCurrent();
+        _ = try self.idempotency_reader.refreshIfChanged();
         const blocks = try self.idempotency_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
@@ -1713,23 +1713,70 @@ pub const VectorAdapter = struct {
 
     fn discoverNextSeq(self: *VectorAdapter) !u64 {
         var max_seq: u64 = 0;
-
-        const events = try self.loadAllChanges(self.allocator);
-        defer self.allocator.free(events);
-        if (events.len > 0) {
-            max_seq = @max(max_seq, events[events.len - 1].seq);
-        }
-
-        var idempotency = try self.loadLatestIdempotency(self.allocator);
-        defer idempotency.deinit();
-        var iter = idempotency.valueIterator();
-        while (iter.next()) |record| {
-            max_seq = @max(max_seq, record.seq);
-        }
+        max_seq = @max(max_seq, try self.maxSeqInChangeLog(self.allocator));
+        max_seq = @max(max_seq, try self.maxSeqInIdempotencyLog(self.allocator));
 
         if (max_seq == 0) return 1;
         if (max_seq == std.math.maxInt(u64)) return std.math.maxInt(u64);
         return max_seq + 1;
+    }
+
+    fn maxSeqInChangeLog(self: *VectorAdapter, allocator: Allocator) !u64 {
+        try self.change_writer.flushBlock();
+        _ = try self.change_reader.refreshIfChanged();
+        const blocks = try self.change_reader.getBlocks(allocator);
+        defer allocator.free(blocks);
+        return self.maxSeqFromBlocks(allocator, self.change_reader, blocks, schema_vector_changes);
+    }
+
+    fn maxSeqInIdempotencyLog(self: *VectorAdapter, allocator: Allocator) !u64 {
+        try self.idempotency_writer.flushBlock();
+        _ = try self.idempotency_reader.refreshIfChanged();
+        const blocks = try self.idempotency_reader.getBlocks(allocator);
+        defer allocator.free(blocks);
+        return self.maxSeqFromBlocks(allocator, self.idempotency_reader, blocks, schema_vector_idempotency);
+    }
+
+    fn maxSeqFromBlocks(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        reader_owner: *db_reader.Reader,
+        blocks: []const db_reader.BlockRef,
+        schema_id: u16,
+    ) !u64 {
+        _ = self;
+        var max_seq: u64 = 0;
+        var current_path: ?[]const u8 = null;
+        var current_file: ?std.fs.File = null;
+        defer if (current_file) |file| file.close();
+
+        for (blocks) |block| {
+            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
+                if (current_file) |file| file.close();
+                current_file = try reader_owner.dir.openFile(block.path, .{ .mode = .read_only });
+                current_path = block.path;
+            }
+
+            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_id or header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer allocator.free(descs);
+            const seq_desc = findColumn(descs, col_seq) orelse return error.MissingColumn;
+
+            const seq_buf = try allocator.alloc(u8, seq_desc.data_len);
+            defer allocator.free(seq_buf);
+            try reader.readColumnDataInto(block.offset, seq_desc, seq_buf);
+            _ = try checkedRowCount(header.row_count, seq_buf.len, @sizeOf(u64));
+
+            const seqs = @as([*]const u64, @ptrCast(@alignCast(seq_buf.ptr)))[0..header.row_count];
+            for (seqs) |seq| {
+                max_seq = @max(max_seq, seq);
+            }
+        }
+
+        return max_seq;
     }
 
     fn allocateNextSeq(self: *VectorAdapter) u64 {
@@ -1811,7 +1858,7 @@ pub const VectorAdapter = struct {
     /// Load all stored embeddings.
     pub fn loadVectors(self: *VectorAdapter, allocator: Allocator) !VectorBatch {
         try self.fs_writer.flushBlock();
-        try self.fs_reader.refreshCurrent();
+        _ = try self.fs_reader.refreshIfChanged();
         const blocks = try self.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
         var total_rows: usize = 0;
@@ -1891,7 +1938,7 @@ pub const VectorAdapter = struct {
     /// Load all stored embeddings into a Tensor for DLPack export.
     pub fn loadVectorsTensor(self: *VectorAdapter, allocator: Allocator) !VectorTensorBatch {
         try self.fs_writer.flushBlock();
-        try self.fs_reader.refreshCurrent();
+        _ = try self.fs_reader.refreshIfChanged();
         const blocks = try self.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
@@ -2014,7 +2061,7 @@ pub const VectorAdapter = struct {
         if (query.len == 0) return error.InvalidColumnData;
 
         try self.fs_writer.flushBlock();
-        try self.fs_reader.refreshCurrent();
+        _ = try self.fs_reader.refreshIfChanged();
         const blocks = try self.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
@@ -2096,7 +2143,7 @@ pub const VectorAdapter = struct {
         if (dims == 0) return error.InvalidColumnData;
 
         try self.fs_writer.flushBlock();
-        try self.fs_reader.refreshCurrent();
+        _ = try self.fs_reader.refreshIfChanged();
         const blocks = try self.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
@@ -2438,14 +2485,15 @@ const MinHeap = struct {
     }
 
     pub fn push(self: *MinHeap, score: f32, id: u64) void {
+        const candidate = SearchEntry{ .score = score, .id = id };
         if (self.size < self.entries.len) {
-            self.entries[self.size] = .{ .score = score, .id = id };
+            self.entries[self.size] = candidate;
             self.siftUp(self.size);
             self.size += 1;
             return;
         }
-        if (score <= self.entries[0].score) return;
-        self.entries[0] = .{ .score = score, .id = id };
+        if (!betterThan(candidate, self.entries[0])) return;
+        self.entries[0] = candidate;
         self.siftDown(0);
     }
 
@@ -2463,7 +2511,7 @@ const MinHeap = struct {
         var idx = start_idx;
         while (idx > 0) {
             const parent = (idx - 1) / 2;
-            if (self.entries[parent].score <= self.entries[idx].score) break;
+            if (!betterThan(self.entries[parent], self.entries[idx])) break;
             std.mem.swap(SearchEntry, &self.entries[parent], &self.entries[idx]);
             idx = parent;
         }
@@ -2477,10 +2525,10 @@ const MinHeap = struct {
             if (left >= size) break;
             const right = left + 1;
             var smallest = left;
-            if (right < size and self.entries[right].score < self.entries[left].score) {
+            if (right < size and betterThan(self.entries[left], self.entries[right])) {
                 smallest = right;
             }
-            if (self.entries[idx].score <= self.entries[smallest].score) break;
+            if (!betterThan(self.entries[idx], self.entries[smallest])) break;
             std.mem.swap(SearchEntry, &self.entries[idx], &self.entries[smallest]);
             idx = smallest;
         }
@@ -2494,7 +2542,7 @@ const MinHeap = struct {
 
         std.sort.pdq(SearchEntry, items, {}, struct {
             fn lessThan(_: void, a: SearchEntry, b: SearchEntry) bool {
-                return a.score > b.score;
+                return betterThan(a, b);
             }
         }.lessThan);
 
@@ -2502,6 +2550,12 @@ const MinHeap = struct {
             ids[idx] = entry.id;
             scores[idx] = entry.score;
         }
+    }
+
+    fn betterThan(a: SearchEntry, b: SearchEntry) bool {
+        if (a.score > b.score) return true;
+        if (a.score < b.score) return false;
+        return a.id < b.id;
     }
 };
 
@@ -2768,6 +2822,73 @@ test "VectorAdapter.loadVectorsTensor roundtrip" {
     }
 }
 
+test "VectorAdapter.loadVectors includes sealed segment rows after rotation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.fs_writer.max_segment_size = 1;
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{1}, &[_]f32{ 1.0, 0.0 }, dims);
+    try backend.fs_writer.flushBlock();
+
+    try backend.appendBatch(&[_]u64{2}, &[_]f32{ 0.0, 1.0 }, dims);
+    try backend.fs_writer.flushBlock();
+
+    var batch = try backend.loadVectors(std.testing.allocator);
+    defer batch.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 2), batch.ids.len);
+    try std.testing.expectEqual(dims, batch.dims);
+
+    var saw_one = false;
+    var saw_two = false;
+    for (batch.ids) |id| {
+        if (id == 1) saw_one = true;
+        if (id == 2) saw_two = true;
+    }
+    try std.testing.expect(saw_one);
+    try std.testing.expect(saw_two);
+
+    const row_count = try backend.countEmbeddingRows(std.testing.allocator, dims);
+    try std.testing.expectEqual(@as(usize, 2), row_count);
+}
+
+test "VectorAdapter.loadIdempotencyRecord sees sealed segment rows after rotation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.idempotency_writer.max_segment_size = 1;
+
+    const key_a: u64 = 0xa1;
+    const request_a: u64 = 0xb1;
+    const key_b: u64 = 0xa2;
+    const request_b: u64 = 0xb2;
+
+    try backend.appendIdempotencyRecord(key_a, request_a, .append, .pending, 1, 0);
+    try backend.appendIdempotencyRecord(key_a, request_a, .append, .committed, 1, 0);
+    try backend.appendIdempotencyRecord(key_b, request_b, .append, .pending, 1, 0);
+    try backend.appendIdempotencyRecord(key_b, request_b, .append, .committed, 1, 0);
+
+    const record = try backend.loadIdempotencyRecord(key_a, request_a, .append);
+    try std.testing.expect(record != null);
+    try std.testing.expectEqual(IdempotencyStatus.committed, record.?.status);
+    try std.testing.expectEqual(@as(u64, 1), record.?.result_a);
+    try std.testing.expectEqual(@as(u64, 0), record.?.result_b);
+}
+
 test "VectorAdapter.searchScores streams scores" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3009,6 +3130,31 @@ test "VectorAdapter.searchBatchWithOptions normalizes queries" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), result.scores[0], 1e-6);
 }
 
+test "VectorAdapter.searchBatch uses deterministic id tie-break for equal scores" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    // Equal vectors with equal scores; smaller id should win.
+    try backend.upsertBatch(&[_]u64{ 2, 1 }, &[_]f32{
+        1.0, 0.0,
+        1.0, 0.0,
+    }, dims);
+
+    var result = try backend.searchBatch(std.testing.allocator, &[_]f32{ 1.0, 0.0 }, dims, 1, 1);
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 1), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 1), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
+}
+
 test "VectorAdapter.appendBatchIdempotentWithOptions replays and conflicts" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3137,4 +3283,41 @@ test "VectorAdapter.compactIdempotent replays compact counts" {
     const replay = try backend.compactIdempotent(dims, 0xabc4, 0x5555);
     try std.testing.expectEqual(@as(usize, 1), replay.kept_count);
     try std.testing.expectEqual(@as(usize, 1), replay.removed_tombstones);
+}
+
+test "VectorAdapter.discoverNextSeq resumes after idempotency records" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    const dims: u32 = 2;
+    var backend_a = try VectorAdapter.init(std.testing.allocator, root_path);
+    try backend_a.appendBatchIdempotentWithOptions(
+        &[_]u64{42},
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        .{},
+        0x9001,
+        0x7001,
+    );
+
+    var records_before = try backend_a.loadLatestIdempotency(std.testing.allocator);
+    defer records_before.deinit();
+    var max_seq_before: u64 = 0;
+    var iter_before = records_before.valueIterator();
+    while (iter_before.next()) |record| {
+        max_seq_before = @max(max_seq_before, record.seq);
+    }
+    backend_a.deinit();
+
+    var backend_b = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend_b.deinit();
+    try backend_b.appendIdempotencyRecord(0x9002, 0x7002, .append, .pending, 0, 0);
+
+    var records_after = try backend_b.loadLatestIdempotency(std.testing.allocator);
+    defer records_after.deinit();
+    const resumed = records_after.get(0x9002) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(resumed.seq > max_seq_before);
 }

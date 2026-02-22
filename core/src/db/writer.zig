@@ -7,6 +7,8 @@
 
 const std = @import("std");
 const block_writer = @import("block_writer.zig");
+const block_reader = @import("block_reader.zig");
+const checksum = @import("checksum.zig");
 const lock = @import("lock.zig");
 const manifest_mod = @import("manifest.zig");
 const types = @import("types.zig");
@@ -58,6 +60,12 @@ pub const ColumnBatch = struct {
     encoding: types.Encoding,
     dims: u16,
     data: []const u8,
+};
+
+const SegmentStats = struct {
+    min_ts: i64,
+    max_ts: i64,
+    row_count: u64,
 };
 
 pub const default_max_segment_size: u64 = 64 * 1024 * 1024;
@@ -262,6 +270,7 @@ pub const Writer = struct {
 
         self.block_builder.deinit();
         self.block_builder = block_writer.BlockBuilder.init(self.allocator, schema_id, self.row_count);
+        self.setBlockTimestampRange();
 
         for (self.columns.items) |column| {
             const offsets = if (column.shape == .VARBYTES) column.offsets.items else null;
@@ -335,15 +344,47 @@ pub const Writer = struct {
             self.data_file = try self.dir.createFile("current.talu", .{ .read = true, .truncate = false });
             return err;
         };
+        if (comptime @hasDecl(std.posix, "fsync")) {
+            try std.posix.fsync(self.dir.fd);
+        }
+        errdefer {
+            // If seal/manifest update fails after rename, try to roll back the
+            // rename so existing data stays in current.talu.
+            const rolled_back = blk: {
+                self.dir.rename(seg_name, "current.talu") catch break :blk false;
+                break :blk true;
+            };
+            var recovered = false;
+            if (rolled_back) {
+                if (self.dir.openFile("current.talu", .{ .mode = .read_write }) catch null) |file| {
+                    self.data_file = file;
+                    recovered = true;
+                }
+            }
+
+            // Fallback: restore a writable current.talu even if rollback fails.
+            if (!recovered) {
+                if (self.dir.createFile("current.talu", .{ .read = true, .truncate = false }) catch null) |file| {
+                    self.data_file = file;
+                }
+            }
+        }
+
+        const segment_stats = try self.writeFooterAndCollectSegmentStats(seg_name);
 
         // Update manifest (load existing or create empty)
-        try self.updateManifest(seg_name, &uuid_bytes);
+        try self.updateManifest(seg_name, &uuid_bytes, segment_stats);
 
         // Open fresh current.talu
         self.data_file = try self.dir.createFile("current.talu", .{ .read = true, .truncate = true });
     }
 
-    fn updateManifest(self: *Writer, seg_name: []const u8, uuid_bytes: *const [16]u8) !void {
+    fn updateManifest(
+        self: *Writer,
+        seg_name: []const u8,
+        uuid_bytes: *const [16]u8,
+        segment_stats: SegmentStats,
+    ) !void {
         const manifest_path = try std.fs.path.join(self.allocator, &.{ self.ns_path, "manifest.json" });
         defer self.allocator.free(manifest_path);
 
@@ -375,9 +416,9 @@ pub const Writer = struct {
         new_segments[old_len] = .{
             .id = id,
             .path = seg_path,
-            .min_ts = 0,
-            .max_ts = 0,
-            .row_count = 0,
+            .min_ts = segment_stats.min_ts,
+            .max_ts = segment_stats.max_ts,
+            .row_count = segment_stats.row_count,
         };
 
         // Transfer ownership to manifest. After this, errdefer m.deinit
@@ -387,6 +428,115 @@ pub const Writer = struct {
 
         try m.save(manifest_path);
         m.deinit(self.allocator);
+    }
+
+    fn writeFooterAndCollectSegmentStats(self: *Writer, seg_name: []const u8) !SegmentStats {
+        var file = try self.dir.openFile(seg_name, .{ .mode = .read_write });
+        defer file.close();
+
+        const stat = try file.stat();
+        const reader = block_reader.BlockReader.init(file, self.allocator);
+        const entries = try reader.scanBlocksFromHeaders(stat.size);
+        defer self.allocator.free(entries);
+
+        var row_count: u64 = 0;
+        var min_ts: i64 = std.math.maxInt(i64);
+        var max_ts: i64 = std.math.minInt(i64);
+        var has_ts_range = false;
+
+        for (entries) |entry| {
+            const header = try reader.readHeader(entry.block_off);
+            row_count += header.row_count;
+            const flags: types.BlockFlags = @bitCast(header.flags);
+            if (flags.has_ts_range) {
+                if (!has_ts_range) {
+                    min_ts = header.min_ts;
+                    max_ts = header.max_ts;
+                    has_ts_range = true;
+                } else {
+                    min_ts = @min(min_ts, header.min_ts);
+                    max_ts = @max(max_ts, header.max_ts);
+                }
+            }
+        }
+
+        if (entries.len > 0) {
+            const footer_bytes = std.mem.sliceAsBytes(entries);
+            if (footer_bytes.len > std.math.maxInt(u32)) return error.SizeOverflow;
+            const segment_crc32c = try crc32cFilePrefix(file, stat.size);
+            const trailer = types.FooterTrailer{
+                .magic = types.MagicValues.FOOTER,
+                .version = 1,
+                .flags = 0,
+                .footer_len = @intCast(footer_bytes.len),
+                .footer_crc32c = checksum.crc32c(footer_bytes),
+                .segment_crc32c = segment_crc32c,
+                .reserved = [_]u8{0} ** 12,
+            };
+
+            try file.seekTo(stat.size);
+            try file.writeAll(footer_bytes);
+            try file.writeAll(std.mem.asBytes(&trailer));
+            try file.sync();
+        }
+
+        return .{
+            .min_ts = if (has_ts_range) min_ts else 0,
+            .max_ts = if (has_ts_range) max_ts else 0,
+            .row_count = row_count,
+        };
+    }
+
+    fn crc32cFilePrefix(file: std.fs.File, len: u64) !u32 {
+        var crc = std.hash.crc.Crc32Iscsi.init();
+        var buf: [64 * 1024]u8 = undefined;
+        var offset: u64 = 0;
+
+        while (offset < len) {
+            const remaining = len - offset;
+            const chunk_len: usize = @intCast(@min(remaining, buf.len));
+            const chunk = buf[0..chunk_len];
+            const read_len = try file.preadAll(chunk, offset);
+            if (read_len != chunk_len) return error.UnexpectedEof;
+            crc.update(chunk);
+            offset += @as(u64, @intCast(chunk_len));
+        }
+
+        return crc.final();
+    }
+
+    fn setBlockTimestampRange(self: *Writer) void {
+        self.block_builder.flags.has_ts_range = false;
+        self.block_builder.min_ts = 0;
+        self.block_builder.max_ts = 0;
+
+        const ts_column = for (self.columns.items) |column| {
+            if (column.column_id == 2 and
+                column.shape == .SCALAR and
+                column.phys_type == .I64 and
+                column.encoding == .RAW and
+                column.data.items.len == @as(usize, self.row_count) * @sizeOf(i64))
+            {
+                break column;
+            }
+        } else return;
+
+        if (self.row_count == 0) return;
+
+        var min_ts: i64 = std.math.maxInt(i64);
+        var max_ts: i64 = std.math.minInt(i64);
+        var row_idx: usize = 0;
+        const row_count: usize = self.row_count;
+        while (row_idx < row_count) : (row_idx += 1) {
+            const off = row_idx * @sizeOf(i64);
+            const ts = std.mem.readInt(i64, ts_column.data.items[off..][0..8], .little);
+            min_ts = @min(min_ts, ts);
+            max_ts = @max(max_ts, ts);
+        }
+
+        self.block_builder.flags.has_ts_range = true;
+        self.block_builder.min_ts = min_ts;
+        self.block_builder.max_ts = max_ts;
     }
 
     fn currentFileSize(self: *Writer) !u64 {
@@ -1080,16 +1230,190 @@ test "Writer.rotateSegment seals current segment" {
 
     // A seg-*.talu file should exist in the namespace directory
     var seg_found = false;
+    var seg_name_buf: [64]u8 = undefined;
+    var seg_name_len: usize = 0;
     var dir = try tmp.dir.openDir("rot", .{ .iterate = true });
     defer dir.close();
     var dir_iter = dir.iterate();
     while (try dir_iter.next()) |entry| {
         if (std.mem.startsWith(u8, entry.name, "seg-") and std.mem.endsWith(u8, entry.name, ".talu")) {
             seg_found = true;
+            if (entry.name.len <= seg_name_buf.len) {
+                @memcpy(seg_name_buf[0..entry.name.len], entry.name);
+                seg_name_len = entry.name.len;
+            }
             break;
         }
     }
     try std.testing.expect(seg_found);
+
+    const seg_name = seg_name_buf[0..seg_name_len];
+    try std.testing.expect(seg_name_len > 0);
+
+    // Sealed segment should carry a footer index.
+    const seg_rel_path = try std.fmt.allocPrint(std.testing.allocator, "rot/{s}", .{seg_name});
+    defer std.testing.allocator.free(seg_rel_path);
+    var seg_file = try tmp.dir.openFile(seg_rel_path, .{ .mode = .read_only });
+    defer seg_file.close();
+    const seg_reader = block_reader.BlockReader.init(seg_file, std.testing.allocator);
+    const seg_stat = try seg_file.stat();
+    const footer = try seg_reader.readFooter(seg_stat.size);
+    try std.testing.expect(footer != null);
+    defer std.testing.allocator.free(footer.?);
+    try std.testing.expect(footer.?.len > 0);
+
+    var trailer_bytes: [@sizeOf(types.FooterTrailer)]u8 = undefined;
+    const trailer_off = seg_stat.size - @sizeOf(types.FooterTrailer);
+    const trailer_len = try seg_file.preadAll(&trailer_bytes, trailer_off);
+    try std.testing.expectEqual(@as(usize, trailer_bytes.len), trailer_len);
+    const trailer = std.mem.bytesToValue(types.FooterTrailer, trailer_bytes[0..]);
+    try std.testing.expectEqual(types.MagicValues.FOOTER, trailer.magic);
+    try std.testing.expect(trailer.segment_crc32c != 0);
+
+    // Manifest entry should include non-zero segment row_count metadata.
+    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "rot/manifest.json");
+    defer std.testing.allocator.free(manifest_path);
+    var manifest_data = try manifest_mod.Manifest.load(std.testing.allocator, manifest_path);
+    defer manifest_data.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest_data.segments.len);
+    try std.testing.expect(manifest_data.segments[0].row_count > 0);
+}
+
+test "Writer.rotateSegment records timestamp range in manifest metadata" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var writer = try Writer.open(std.testing.allocator, tmp_path, "rot-ts");
+    defer writer.deinit();
+
+    writer.max_segment_size = 1;
+
+    const ids_first = [_]u64{1};
+    const ts_first = [_]i64{100};
+    const cols_first = [_]ColumnBatch{
+        .{
+            .column_id = 1,
+            .shape = .SCALAR,
+            .phys_type = .U64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ids_first),
+        },
+        .{
+            .column_id = 2,
+            .shape = .SCALAR,
+            .phys_type = .I64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ts_first),
+        },
+    };
+    try writer.appendBatch(10, 1, &cols_first);
+    try writer.flushBlock();
+
+    const ids_second = [_]u64{2};
+    const ts_second = [_]i64{200};
+    const cols_second = [_]ColumnBatch{
+        .{
+            .column_id = 1,
+            .shape = .SCALAR,
+            .phys_type = .U64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ids_second),
+        },
+        .{
+            .column_id = 2,
+            .shape = .SCALAR,
+            .phys_type = .I64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ts_second),
+        },
+    };
+    try writer.appendBatch(10, 1, &cols_second);
+    try writer.flushBlock();
+
+    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "rot-ts/manifest.json");
+    defer std.testing.allocator.free(manifest_path);
+    var manifest_data = try manifest_mod.Manifest.load(std.testing.allocator, manifest_path);
+    defer manifest_data.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), manifest_data.segments.len);
+    try std.testing.expectEqual(@as(i64, 100), manifest_data.segments[0].min_ts);
+    try std.testing.expectEqual(@as(i64, 100), manifest_data.segments[0].max_ts);
+    try std.testing.expectEqual(@as(u64, 1), manifest_data.segments[0].row_count);
+}
+
+test "Writer.rotateSegment failure keeps writer usable" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var writer = try Writer.open(std.testing.allocator, tmp_path, "rot-fail");
+    defer writer.deinit();
+
+    writer.max_segment_size = 1;
+
+    const first = ColumnValue{
+        .column_id = 1,
+        .shape = .VARBYTES,
+        .phys_type = .BINARY,
+        .encoding = .RAW,
+        .dims = 0,
+        .data = "a" ** 128,
+    };
+
+    // Initial block goes into current.talu.
+    try writer.appendRow(1, &.{first});
+    try writer.flushBlock();
+
+    // Corrupt manifest to force rotateSegment -> updateManifest failure.
+    var manifest_file = try tmp.dir.createFile("rot-fail/manifest.json", .{ .truncate = true });
+    defer manifest_file.close();
+    try manifest_file.writeAll("{not-json");
+
+    // Next flush attempts rotation and should fail while keeping writer usable.
+    const second = ColumnValue{
+        .column_id = 1,
+        .shape = .VARBYTES,
+        .phys_type = .BINARY,
+        .encoding = .RAW,
+        .dims = 0,
+        .data = "b" ** 128,
+    };
+    try writer.appendRow(1, &.{second});
+    try std.testing.expectError(error.InvalidManifest, writer.flushBlock());
+
+    // Failed rotation should roll back sealed rename and keep data in current.
+    var seg_found = false;
+    var dir = try tmp.dir.openDir("rot-fail", .{ .iterate = true });
+    defer dir.close();
+    var it = dir.iterate();
+    while (try it.next()) |entry| {
+        if (entry.kind == .file and std.mem.startsWith(u8, entry.name, "seg-") and std.mem.endsWith(u8, entry.name, ".talu")) {
+            seg_found = true;
+            break;
+        }
+    }
+    try std.testing.expect(!seg_found);
+
+    const current_before_retry = try tmp.dir.readFileAlloc(std.testing.allocator, "rot-fail/current.talu", 8192);
+    defer std.testing.allocator.free(current_before_retry);
+    try std.testing.expect(current_before_retry.len > 0);
+
+    // Writer should still be able to flush buffered rows after the failure.
+    writer.max_segment_size = 1024 * 1024;
+    try writer.flushBlock();
+
+    const current_data = try tmp.dir.readFileAlloc(std.testing.allocator, "rot-fail/current.talu", 8192);
+    defer std.testing.allocator.free(current_data);
+    try std.testing.expect(current_data.len > 0);
 }
 
 test "Writer.appendRow async_os durability skips fsync" {

@@ -6,6 +6,7 @@ const std = @import("std");
 const json = @import("../io/json/root.zig");
 
 const Allocator = std.mem.Allocator;
+const max_manifest_bytes: usize = 64 * 1024 * 1024;
 
 pub const SegmentEntry = struct {
     id: u128,
@@ -31,10 +32,10 @@ pub const Manifest = struct {
 
     /// Loads a manifest from disk.
     pub fn load(allocator: Allocator, path: []const u8) !Manifest {
-        const file_data = try std.fs.cwd().readFileAlloc(allocator, path, 1024 * 1024);
+        const file_data = try std.fs.cwd().readFileAlloc(allocator, path, max_manifest_bytes);
         defer allocator.free(file_data);
 
-        var parsed = json.parseValue(allocator, file_data, .{ .max_size_bytes = 1 * 1024 * 1024 }) catch |err| {
+        var parsed = json.parseValue(allocator, file_data, .{ .max_size_bytes = max_manifest_bytes }) catch |err| {
             return switch (err) {
                 error.InputTooLarge => error.InvalidManifest,
                 error.InputTooDeep => error.InvalidManifest,
@@ -87,6 +88,7 @@ pub const Manifest = struct {
         tmp_file.close();
 
         try std.fs.cwd().rename(tmp_path, path);
+        try syncParentDir(path);
     }
 };
 
@@ -214,6 +216,15 @@ fn uuidToHexLower(allocator: Allocator, value: u128) ![]const u8 {
     return allocator.dupe(u8, slice);
 }
 
+fn syncParentDir(path: []const u8) !void {
+    const parent = std.fs.path.dirname(path) orelse ".";
+    var dir = try std.fs.cwd().openDir(parent, .{});
+    defer dir.close();
+    if (comptime @hasDecl(std.posix, "fsync")) {
+        try std.posix.fsync(dir.fd);
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -301,4 +312,31 @@ test "Manifest.deinit frees segments" {
     };
 
     manifest.deinit(std.testing.allocator);
+}
+
+test "Manifest.load accepts manifest larger than 1MB" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const padding_len = 1024 * 1024 + 64;
+    const padding = try std.testing.allocator.alloc(u8, padding_len);
+    defer std.testing.allocator.free(padding);
+    @memset(padding, ' ');
+
+    const manifest_json = try std.fmt.allocPrint(
+        std.testing.allocator,
+        "{{\"version\":1,\"last_compaction_ts\":0,\"segments\":[{s}]}}",
+        .{padding},
+    );
+    defer std.testing.allocator.free(manifest_json);
+
+    try tmp.dir.writeFile(.{ .sub_path = "manifest-large.json", .data = manifest_json });
+
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "manifest-large.json");
+    defer std.testing.allocator.free(path);
+
+    var manifest = try Manifest.load(std.testing.allocator, path);
+    defer manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 1), manifest.version);
+    try std.testing.expectEqual(@as(usize, 0), manifest.segments.len);
 }
