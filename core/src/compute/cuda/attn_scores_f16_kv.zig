@@ -7,8 +7,9 @@ const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
 const registry_mod = @import("registry.zig");
 
-pub const embedded_ptx = @embedFile("kernels/kernels.ptx");
-pub const embedded_symbol: [:0]const u8 = "talu_attn_scores_f16_kv_v1";
+const cuda_assets = @import("cuda_assets");
+pub const embedded_module = cuda_assets.kernels_fatbin;
+pub const embedded_symbol: [:0]const u8 = "talu_attn_scores_f16_kv";
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,

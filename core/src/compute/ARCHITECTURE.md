@@ -2,6 +2,9 @@
 > **Status:** Enforced  
 > **Scope:** `core/src/compute/`
 
+Backend-specific policy addenda:
+- CUDA: `core/src/compute/cuda/POLICY.md`
+
 ## 1. The Core Philosophy
 `core/src/compute` is a **pure mathematical, memory-layout, and hardware-abstraction library**. 
 

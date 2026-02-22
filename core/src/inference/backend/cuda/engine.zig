@@ -19,11 +19,13 @@ const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 const prototype_eps: f32 = 1e-5;
 const prototype_low_token_band: usize = 4096;
-const initial_kv_cache_tokens: usize = 1024;
+const initial_kv_cache_tokens: usize = 256;
 const kv_cache_dtype_fp16: bool = true;
 const enable_fused_attention_f16_kv: bool = false;
 const gaffine_scales_dtype_f16 = compute.cuda.gaffine_u4_matvec.scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
+const matvec_u16_dtype_f16 = compute.cuda.matvec_u16.dtype_f16;
+const matvec_u16_dtype_bf16 = compute.cuda.matvec_u16.dtype_bf16;
 
 const DeviceTensor = struct {
     rows: usize,
@@ -32,6 +34,10 @@ const DeviceTensor = struct {
 
     fn deinit(self: *DeviceTensor, device: *compute.cuda.Device) void {
         self.buffer.deinit(device);
+    }
+
+    fn byteSize(self: *const DeviceTensor) usize {
+        return self.buffer.size;
     }
 };
 
@@ -49,15 +55,36 @@ const GaffineU4LinearWeight = struct {
         self.scales.deinit(device);
         self.packed_data.deinit(device);
     }
+
+    fn byteSize(self: *const GaffineU4LinearWeight) usize {
+        return self.packed_data.size + self.scales.size + self.biases.size;
+    }
+};
+
+const U16LinearWeight = struct {
+    rows: usize,
+    cols: usize,
+    buffer: compute.cuda.Buffer,
+    dtype_tag: u32,
+
+    fn deinit(self: *U16LinearWeight, device: *compute.cuda.Device) void {
+        self.buffer.deinit(device);
+    }
+
+    fn byteSize(self: *const U16LinearWeight) usize {
+        return self.buffer.size;
+    }
 };
 
 const LinearWeight = union(enum) {
     dense_f32: DeviceTensor,
+    dense_u16: U16LinearWeight,
     gaffine_u4: GaffineU4LinearWeight,
 
     fn deinit(self: *LinearWeight, device: *compute.cuda.Device) void {
         switch (self.*) {
             .dense_f32 => |*w| w.deinit(device),
+            .dense_u16 => |*w| w.deinit(device),
             .gaffine_u4 => |*w| w.deinit(device),
         }
     }
@@ -65,6 +92,7 @@ const LinearWeight = union(enum) {
     fn rows(self: *const LinearWeight) usize {
         return switch (self.*) {
             .dense_f32 => |w| w.rows,
+            .dense_u16 => |w| w.rows,
             .gaffine_u4 => |w| w.rows,
         };
     }
@@ -72,7 +100,16 @@ const LinearWeight = union(enum) {
     fn cols(self: *const LinearWeight) usize {
         return switch (self.*) {
             .dense_f32 => |w| w.cols,
+            .dense_u16 => |w| w.cols,
             .gaffine_u4 => |w| w.cols,
+        };
+    }
+
+    fn byteSize(self: *const LinearWeight) usize {
+        return switch (self.*) {
+            .dense_f32 => |w| w.buffer.size,
+            .dense_u16 => |w| w.byteSize(),
+            .gaffine_u4 => |w| w.byteSize(),
         };
     }
 };
@@ -274,6 +311,26 @@ const PrototypeRuntime = struct {
         allocator.free(self.projected_logits_host);
         allocator.free(self.hidden_host);
     }
+
+    fn deviceByteSize(self: *const PrototypeRuntime) usize {
+        return self.input_dev.size +
+            self.norm_weight_dev.size +
+            self.norm_out_dev.size +
+            self.attn_q_dev.size +
+            self.attn_k_dev.size +
+            self.attn_v_dev.size +
+            self.attn_context_dev.size +
+            self.attn_scores_dev.size +
+            self.attn_probs_dev.size +
+            self.attn_head_dev.size +
+            self.attn_out_dev.size +
+            self.ffn_gate_dev.size +
+            self.ffn_up_dev.size +
+            self.ffn_mul_dev.size +
+            self.ffn_down_dev.size +
+            self.logits_dev.size +
+            self.projection_weight.byteSize();
+    }
 };
 
 const AttentionMlpBlockRuntime = struct {
@@ -320,6 +377,9 @@ const BlockRuntime = struct {
     max_seq_len: usize,
     q_norm_blocks: usize,
     k_norm_blocks: usize,
+    linear_weight_bytes: usize,
+    norm_weight_bytes: usize,
+    kv_cache_bytes: usize,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -336,6 +396,9 @@ const BlockRuntime = struct {
         const layer_count = loaded.blocks.len;
         var q_norm_blocks: usize = 0;
         var k_norm_blocks: usize = 0;
+        var linear_weight_bytes: usize = 0;
+        var norm_weight_bytes: usize = 0;
+        var kv_cache_bytes: usize = 0;
         var blocks = try allocator.alloc(AttentionMlpBlockRuntime, layer_count);
         errdefer allocator.free(blocks);
         var initialized: usize = 0;
@@ -531,11 +594,29 @@ const BlockRuntime = struct {
             if (kv_capacity == 0) return error.InvalidArgument;
             const kv_cache_elems = std.math.mul(usize, kv_capacity, k_proj_dev.cols()) catch return error.InvalidArgument;
             const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
-            const kv_cache_bytes = std.math.mul(usize, kv_cache_elems, kv_elem_bytes) catch return error.InvalidArgument;
-            var k_cache = try device.allocBuffer(kv_cache_bytes);
+            const kv_cache_bytes_per_buffer = std.math.mul(usize, kv_cache_elems, kv_elem_bytes) catch return error.InvalidArgument;
+            var k_cache = try device.allocBuffer(kv_cache_bytes_per_buffer);
             errdefer k_cache.deinit(device);
-            var v_cache = try device.allocBuffer(kv_cache_bytes);
+            var v_cache = try device.allocBuffer(kv_cache_bytes_per_buffer);
             errdefer v_cache.deinit(device);
+
+            const layer_norm_bytes = ln1_weight.byteSize() +
+                ln2_weight.byteSize() +
+                (if (q_norm_weight) |w| w.byteSize() else 0) +
+                (if (k_norm_weight) |w| w.byteSize() else 0);
+            norm_weight_bytes = std.math.add(usize, norm_weight_bytes, layer_norm_bytes) catch return error.InvalidArgument;
+
+            const layer_linear_bytes = q_proj_dev.byteSize() +
+                k_proj_dev.byteSize() +
+                v_proj_dev.byteSize() +
+                o_proj_dev.byteSize() +
+                w1_dev.byteSize() +
+                w2_dev.byteSize() +
+                w3_dev.byteSize();
+            linear_weight_bytes = std.math.add(usize, linear_weight_bytes, layer_linear_bytes) catch return error.InvalidArgument;
+
+            const layer_kv_bytes = std.math.mul(usize, kv_cache_bytes_per_buffer, 2) catch return error.InvalidArgument;
+            kv_cache_bytes = std.math.add(usize, kv_cache_bytes, layer_kv_bytes) catch return error.InvalidArgument;
 
             blocks[layer_idx] = .{
                 .q_dim = q_proj_dev.cols(),
@@ -567,6 +648,9 @@ const BlockRuntime = struct {
             .max_seq_len = max_seq_len,
             .q_norm_blocks = q_norm_blocks,
             .k_norm_blocks = k_norm_blocks,
+            .linear_weight_bytes = linear_weight_bytes,
+            .norm_weight_bytes = norm_weight_bytes,
+            .kv_cache_bytes = kv_cache_bytes,
         };
     }
 
@@ -651,6 +735,8 @@ pub const CudaBackend = struct {
     silu_source: ?compute.cuda.registry.KernelSource = null,
     argmax_function: ?compute.cuda.Function = null,
     argmax_source: ?compute.cuda.registry.KernelSource = null,
+    matvec_u16_function: ?compute.cuda.Function = null,
+    matvec_u16_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_gate_up_function: ?compute.cuda.Function = null,
@@ -797,10 +883,16 @@ pub const CudaBackend = struct {
             .attn_weighted_sum_heads_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_heads_f16_kv_function != null)),
             .silu_kernel = @as(u8, @intFromBool(backend.silu_function != null)),
             .argmax_kernel = @as(u8, @intFromBool(backend.argmax_function != null)),
+            .matvec_u16_kernel = @as(u8, @intFromBool(backend.matvec_u16_function != null)),
             .gaffine_u4_matvec_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_function != null)),
             .gaffine_u4_matvec_gate_up_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_gate_up_function != null)),
             .gaffine_u4_matvec_qkv_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_qkv_function != null)),
             .kv_dtype = if (kv_cache_dtype_fp16) "f16" else "f32",
+            .linear_weight_mib = bytesToMiB(backend.block_runtime.linear_weight_bytes),
+            .norm_weight_mib = bytesToMiB(backend.block_runtime.norm_weight_bytes),
+            .kv_cache_mib = bytesToMiB(backend.block_runtime.kv_cache_bytes),
+            .prototype_mib = bytesToMiB(backend.prototype.deviceByteSize()),
+            .slot_logits_mib = bytesToMiB(std.math.mul(usize, backend.slot_logits.len, @sizeOf(f32)) catch 0),
             .stream_token_select = "gpu_argmax",
             .device_blocks = backend.block_runtime.blocks.len,
             .model_norm = @as(u8, @intFromBool(backend.prototype.using_model_norm)),
@@ -1536,6 +1628,20 @@ pub const CudaBackend = struct {
                     out,
                 );
             },
+            .dense_u16 => |w| {
+                const kernel = self.matvec_u16_function orelse return error.CudaKernelUnavailable;
+                try compute.cuda.matvec_u16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    kernel,
+                    input,
+                    &w.buffer,
+                    out,
+                    @intCast(w.rows),
+                    @intCast(w.cols),
+                    w.dtype_tag,
+                );
+            },
             .gaffine_u4 => |w| {
                 const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
                 try compute.cuda.gaffine_u4_matvec.runWithFunction(
@@ -1667,7 +1773,7 @@ pub const CudaBackend = struct {
     fn initKernelFunctions(self: *CudaBackend) !void {
         if (!self.device.supportsModuleLaunch()) return;
 
-        try self.kernel_registry.loadEmbeddedModule(compute.cuda.vector_add.embedded_ptx);
+        try self.kernel_registry.loadEmbeddedModule(compute.cuda.vector_add.embedded_module);
         const sideload_loaded = self.tryLoadSideloadModule() catch |err| blk: {
             log.warn("inference", "CUDA sideload unavailable; using embedded PTX", .{
                 .reason = @errorName(err),
@@ -1803,6 +1909,13 @@ pub const CudaBackend = struct {
         );
         self.argmax_function = argmax.function;
         self.argmax_source = argmax.source;
+
+        const matvec_u16 = try self.kernel_registry.resolveFunction(
+            "matvec_u16_f32",
+            compute.cuda.matvec_u16.embedded_symbol,
+        );
+        self.matvec_u16_function = matvec_u16.function;
+        self.matvec_u16_source = matvec_u16.source;
 
         const gaffine_u4_matvec = try self.kernel_registry.resolveFunction(
             "gaffine_u4_matvec_f32",
@@ -1959,6 +2072,10 @@ fn argminHost(values: []const f32) u32 {
     return @intCast(best_idx);
 }
 
+fn bytesToMiB(bytes: usize) f32 {
+    return @as(f32, @floatFromInt(bytes)) / (1024.0 * 1024.0);
+}
+
 fn runMatmulSmoke(backend: *CudaBackend) !void {
     const device = &backend.device;
     const m: usize = 2;
@@ -2029,6 +2146,7 @@ fn runKernelSmoke(
         backend.attn_weighted_sum_heads_f16_kv_function == null or
         backend.silu_function == null or
         backend.argmax_function == null or
+        backend.matvec_u16_function == null or
         backend.gaffine_u4_matvec_function == null or
         backend.gaffine_u4_matvec_gate_up_function == null or
         backend.gaffine_u4_matvec_qkv_function == null)
@@ -2040,31 +2158,31 @@ fn runKernelSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.vector_add_function.?,
-        backend.vector_add_source orelse .embedded_ptx,
+        backend.vector_add_source orelse .embedded_module,
     );
     try runMulSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.mul_function.?,
-        backend.mul_source orelse .embedded_ptx,
+        backend.mul_source orelse .embedded_module,
     );
     try runCopySmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.copy_function.?,
-        backend.copy_source orelse .embedded_ptx,
+        backend.copy_source orelse .embedded_module,
     );
     try runRmsNormSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.rmsnorm_function.?,
-        backend.rmsnorm_source orelse .embedded_ptx,
+        backend.rmsnorm_source orelse .embedded_module,
     );
     try runSiluSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.silu_function.?,
-        backend.silu_source orelse .embedded_ptx,
+        backend.silu_source orelse .embedded_module,
     );
     try runAttentionSmoke(
         &backend.kernel_arg_pack,
@@ -2078,25 +2196,31 @@ fn runKernelSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.argmax_function.?,
-        backend.argmax_source orelse .embedded_ptx,
+        backend.argmax_source orelse .embedded_module,
+    );
+    try runMatvecU16Smoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.matvec_u16_function.?,
+        backend.matvec_u16_source orelse .embedded_module,
     );
     try runGaffineU4MatvecSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.gaffine_u4_matvec_function.?,
-        backend.gaffine_u4_matvec_source orelse .embedded_ptx,
+        backend.gaffine_u4_matvec_source orelse .embedded_module,
     );
     try runGaffineU4MatvecGateUpSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.gaffine_u4_matvec_gate_up_function.?,
-        backend.gaffine_u4_matvec_gate_up_source orelse .embedded_ptx,
+        backend.gaffine_u4_matvec_gate_up_source orelse .embedded_module,
     );
     try runGaffineU4MatvecQkvSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.gaffine_u4_matvec_qkv_function.?,
-        backend.gaffine_u4_matvec_qkv_source orelse .embedded_ptx,
+        backend.gaffine_u4_matvec_qkv_source orelse .embedded_module,
     );
     try runF16KvAttentionSmoke(
         &backend.kernel_arg_pack,
@@ -2705,6 +2829,58 @@ fn runArgmaxSmoke(
     });
 }
 
+fn runMatvecU16Smoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const in_dim: u32 = 2;
+    const out_dim: u32 = 2;
+    const input = [_]f32{ 1.0, 1.0 };
+    // Weight is [in, out] = [[1,2],[3,4]] encoded as bf16.
+    const weights_bf16 = [_]u16{
+        dtype.f32ToBf16(1.0), dtype.f32ToBf16(2.0),
+        dtype.f32ToBf16(3.0), dtype.f32ToBf16(4.0),
+    };
+    const expected = [_]f32{ 4.0, 6.0 };
+    var actual = [_]f32{0.0} ** out_dim;
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var weight_dev = try device.allocBuffer(weights_bf16.len * @sizeOf(u16));
+    defer weight_dev.deinit(device);
+    var out_dev = try device.allocBuffer(actual.len * @sizeOf(f32));
+    defer out_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try weight_dev.upload(device, std.mem.sliceAsBytes(weights_bf16[0..]));
+    try compute.cuda.matvec_u16.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &input_dev,
+        &weight_dev,
+        &out_dev,
+        in_dim,
+        out_dim,
+        matvec_u16_dtype_bf16,
+    );
+    try device.synchronize();
+    try out_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (expected, actual) |want, got| {
+        if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA matvec_u16 smoke passed", .{
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .source = @tagName(source),
+        .out0 = actual[0],
+    });
+}
+
 fn runGaffineU4MatvecSmoke(
     arg_pack: *compute.cuda.ArgPack,
     device: *compute.cuda.Device,
@@ -3161,6 +3337,9 @@ fn uploadLinearWeightDense(
     src: *const Tensor,
     input_dim: usize,
 ) !LinearWeight {
+    if (src.dtype == .f16 or src.dtype == .bf16) {
+        return uploadLinearWeightDenseU16(device, allocator, src, input_dim);
+    }
     if (src.n_dims != 2) return error.UnsupportedModel;
     if (src.shape[0] <= 0 or src.shape[1] <= 0) return error.InvalidArgument;
     const rows: usize = @intCast(src.shape[0]);
@@ -3225,6 +3404,76 @@ fn uploadLinearWeightDense(
             .rows = out_rows,
             .cols = out_cols,
             .buffer = buffer,
+        },
+    };
+}
+
+fn uploadLinearWeightDenseU16(
+    device: *compute.cuda.Device,
+    allocator: std.mem.Allocator,
+    src: *const Tensor,
+    input_dim: usize,
+) !LinearWeight {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    if (src.shape[0] <= 0 or src.shape[1] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(src.shape[0]);
+    const cols: usize = @intCast(src.shape[1]);
+    const logical_count = std.math.mul(usize, rows, cols) catch return error.InvalidArgument;
+
+    const host_u16 = src.asSliceUnaligned(u16);
+    if (host_u16.len < logical_count) return error.InvalidArgument;
+    const view = host_u16[0..logical_count];
+
+    var oriented: []align(1) const u16 = view;
+    var out_rows = rows;
+    var out_cols = cols;
+    var transposed: ?[]u16 = null;
+    defer if (transposed) |t| allocator.free(t);
+
+    const assume_loader_out_in = true;
+    if (assume_loader_out_in and cols == input_dim) {
+        // Typed loader weights follow [out, in], so transpose to [in, out].
+        const tmp = try allocator.alloc(u16, view.len);
+        transposed = tmp;
+        var r: usize = 0;
+        while (r < rows) : (r += 1) {
+            var c: usize = 0;
+            while (c < cols) : (c += 1) {
+                tmp[c * rows + r] = view[r * cols + c];
+            }
+        }
+        oriented = tmp;
+        out_rows = cols;
+        out_cols = rows;
+    } else if (rows == input_dim) {
+        // Already [in, out].
+    } else {
+        log.warn("inference", "CUDA u16 linear weight orientation unsupported", .{
+            .rows = rows,
+            .cols = cols,
+            .input_dim = input_dim,
+            .dtype = @tagName(src.dtype),
+        });
+        return error.UnsupportedModel;
+    }
+
+    const bytes = std.math.mul(usize, oriented.len, @sizeOf(u16)) catch return error.InvalidArgument;
+    var buffer = try device.allocBuffer(bytes);
+    errdefer buffer.deinit(device);
+    try buffer.upload(device, std.mem.sliceAsBytes(oriented));
+
+    const dtype_tag: u32 = switch (src.dtype) {
+        .f16 => matvec_u16_dtype_f16,
+        .bf16 => matvec_u16_dtype_bf16,
+        else => return error.UnsupportedModel,
+    };
+
+    return .{
+        .dense_u16 = .{
+            .rows = out_rows,
+            .cols = out_cols,
+            .buffer = buffer,
+            .dtype_tag = dtype_tag,
         },
     };
 }

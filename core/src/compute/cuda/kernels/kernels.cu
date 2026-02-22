@@ -1,6 +1,6 @@
 #include <cuda_fp16.h>
 
-extern "C" __global__ void talu_vector_add_f32_v1(
+extern "C" __global__ void talu_vector_add_f32(
     float* out,
     const float* a,
     const float* b,
@@ -11,7 +11,7 @@ extern "C" __global__ void talu_vector_add_f32_v1(
     out[index] = a[index] + b[index];
 }
 
-extern "C" __global__ void talu_mul_f32_v1(
+extern "C" __global__ void talu_mul_f32(
     float* out,
     const float* a,
     const float* b,
@@ -22,7 +22,7 @@ extern "C" __global__ void talu_mul_f32_v1(
     out[index] = a[index] * b[index];
 }
 
-extern "C" __global__ void talu_copy_f32_v1(
+extern "C" __global__ void talu_copy_f32(
     float* out,
     const float* input,
     unsigned int count
@@ -32,7 +32,7 @@ extern "C" __global__ void talu_copy_f32_v1(
     out[index] = input[index];
 }
 
-extern "C" __global__ void talu_copy_u16_v1(
+extern "C" __global__ void talu_copy_u16(
     unsigned short* out,
     const unsigned short* input,
     unsigned int count
@@ -42,7 +42,7 @@ extern "C" __global__ void talu_copy_u16_v1(
     out[index] = input[index];
 }
 
-extern "C" __global__ void talu_cast_f32_to_f16_v1(
+extern "C" __global__ void talu_cast_f32_to_f16(
     unsigned short* out,
     const float* input,
     unsigned int count
@@ -53,7 +53,7 @@ extern "C" __global__ void talu_cast_f32_to_f16_v1(
     out[index] = __half_as_ushort(h);
 }
 
-extern "C" __global__ void talu_rmsnorm_f32_v1(
+extern "C" __global__ void talu_rmsnorm_f32(
     float* out,
     const float* input,
     const float* weight,
@@ -87,7 +87,7 @@ extern "C" __global__ void talu_rmsnorm_f32_v1(
     }
 }
 
-extern "C" __global__ void talu_rope_f32_v1(
+extern "C" __global__ void talu_rope_f32(
     float* io,
     unsigned int n_heads,
     unsigned int head_dim,
@@ -117,7 +117,7 @@ extern "C" __global__ void talu_rope_f32_v1(
     io[hi_idx] = x0 * s + x1 * c;
 }
 
-extern "C" __global__ void talu_attn_scores_f32_v1(
+extern "C" __global__ void talu_attn_scores_f32(
     float* scores,
     const float* query_head,
     const float* key_cache,
@@ -138,7 +138,7 @@ extern "C" __global__ void talu_attn_scores_f32_v1(
     scores[index] = dot * scale;
 }
 
-extern "C" __global__ void talu_attn_scores_f16_kv_v1(
+extern "C" __global__ void talu_attn_scores_f16_kv(
     float* scores,
     const float* query_head,
     const unsigned short* key_cache,
@@ -159,7 +159,7 @@ extern "C" __global__ void talu_attn_scores_f16_kv_v1(
     scores[index] = dot * scale;
 }
 
-extern "C" __global__ void talu_attn_scores_heads_f16_kv_v1(
+extern "C" __global__ void talu_attn_scores_heads_f16_kv(
     float* scores,
     const float* query,
     const unsigned short* key_cache,
@@ -187,7 +187,7 @@ extern "C" __global__ void talu_attn_scores_heads_f16_kv_v1(
     scores[(unsigned long long)head * seq_len + token_index] = dot * scale;
 }
 
-extern "C" __global__ void talu_softmax_f32_v1(
+extern "C" __global__ void talu_softmax_f32(
     float* out,
     const float* input,
     unsigned int count
@@ -212,7 +212,7 @@ extern "C" __global__ void talu_softmax_f32_v1(
     }
 }
 
-extern "C" __global__ void talu_softmax_rows_f32_v1(
+extern "C" __global__ void talu_softmax_rows_f32(
     float* out,
     const float* input,
     unsigned int rows,
@@ -264,7 +264,7 @@ extern "C" __global__ void talu_softmax_rows_f32_v1(
     }
 }
 
-extern "C" __global__ void talu_attn_weighted_sum_f32_v1(
+extern "C" __global__ void talu_attn_weighted_sum_f32(
     float* out_head,
     const float* probs,
     const float* value_cache,
@@ -285,7 +285,7 @@ extern "C" __global__ void talu_attn_weighted_sum_f32_v1(
     out_head[d] = acc;
 }
 
-extern "C" __global__ void talu_attn_weighted_sum_f16_kv_v1(
+extern "C" __global__ void talu_attn_weighted_sum_f16_kv(
     float* out_head,
     const float* probs,
     const unsigned short* value_cache,
@@ -306,7 +306,7 @@ extern "C" __global__ void talu_attn_weighted_sum_f16_kv_v1(
     out_head[d] = acc;
 }
 
-extern "C" __global__ void talu_attn_weighted_sum_heads_f16_kv_v1(
+extern "C" __global__ void talu_attn_weighted_sum_heads_f16_kv(
     float* out,
     const float* probs,
     const unsigned short* value_cache,
@@ -333,7 +333,7 @@ extern "C" __global__ void talu_attn_weighted_sum_heads_f16_kv_v1(
     out[(unsigned long long)head * head_dim + d] = acc;
 }
 
-extern "C" __global__ void talu_attn_fused_heads_f16_kv_v1(
+extern "C" __global__ void talu_attn_fused_heads_f16_kv(
     float* out,
     const float* query,
     const unsigned short* key_cache,
@@ -413,7 +413,7 @@ extern "C" __global__ void talu_attn_fused_heads_f16_kv_v1(
     }
 }
 
-extern "C" __global__ void talu_silu_f32_v1(
+extern "C" __global__ void talu_silu_f32(
     float* out,
     const float* input,
     unsigned int count
@@ -424,7 +424,7 @@ extern "C" __global__ void talu_silu_f32_v1(
     out[index] = x / (1.0f + expf(-x));
 }
 
-extern "C" __global__ void talu_argmax_f32_v1(
+extern "C" __global__ void talu_argmax_f32(
     const float* input,
     unsigned int count,
     unsigned int* out_index
@@ -466,16 +466,69 @@ extern "C" __global__ void talu_argmax_f32_v1(
     }
 }
 
-static __device__ __forceinline__ float talu_decode_scale_bias_u16(unsigned short raw, unsigned int dtype_tag) {
-    // dtype_tag: 0 => f16, 1 => bf16
-    if (dtype_tag == 0) {
-        return __half2float(*reinterpret_cast<const __half*>(&raw));
-    }
+static __device__ __forceinline__ float talu_decode_f16_u16(unsigned short raw) {
+    return __half2float(*reinterpret_cast<const __half*>(&raw));
+}
+
+static __device__ __forceinline__ float talu_decode_bf16_u16(unsigned short raw) {
     const unsigned int bits = static_cast<unsigned int>(raw) << 16;
     return __uint_as_float(bits);
 }
 
-extern "C" __global__ void talu_gaffine_u4_matvec_f32_v1(
+static __device__ __forceinline__ float talu_decode_scale_bias_u16(unsigned short raw, unsigned int dtype_tag) {
+    // dtype_tag: 0 => f16, 1 => bf16
+    return (dtype_tag == 0) ? talu_decode_f16_u16(raw) : talu_decode_bf16_u16(raw);
+}
+
+extern "C" __global__ void talu_matvec_u16_f32(
+    const float* input,
+    const unsigned short* weight,
+    float* out,
+    unsigned int in_dim,
+    unsigned int out_dim,
+    unsigned int weight_dtype_tag
+) {
+    extern __shared__ float shared_input[];
+    const unsigned int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = out_idx < out_dim;
+    if (weight_dtype_tag > 1) return;
+    if (in_dim == 0) {
+        if (active) out[out_idx] = 0.0f;
+        return;
+    }
+
+    float acc = 0.0f;
+    for (unsigned int tile_base = 0; tile_base < in_dim; tile_base += blockDim.x) {
+        const unsigned int in_idx = tile_base + threadIdx.x;
+        shared_input[threadIdx.x] = (in_idx < in_dim) ? input[in_idx] : 0.0f;
+        __syncthreads();
+
+        if (active) {
+            const unsigned int tile_remaining = in_dim - tile_base;
+            const unsigned int tile_count = (tile_remaining < blockDim.x) ? tile_remaining : blockDim.x;
+            const unsigned long long row_base = (unsigned long long)tile_base * out_dim + out_idx;
+            if (weight_dtype_tag == 0) {
+                #pragma unroll 4
+                for (unsigned int k = 0; k < tile_count; ++k) {
+                    const unsigned long long w_idx = row_base + (unsigned long long)k * out_dim;
+                    const float w = talu_decode_f16_u16(weight[w_idx]);
+                    acc = fmaf(shared_input[k], w, acc);
+                }
+            } else {
+                #pragma unroll 4
+                for (unsigned int k = 0; k < tile_count; ++k) {
+                    const unsigned long long w_idx = row_base + (unsigned long long)k * out_dim;
+                    const float w = talu_decode_bf16_u16(weight[w_idx]);
+                    acc = fmaf(shared_input[k], w, acc);
+                }
+            }
+        }
+        __syncthreads();
+    }
+    if (active) out[out_idx] = acc;
+}
+
+extern "C" __global__ void talu_gaffine_u4_matvec_f32(
     const float* input,
     const unsigned int* packed_weight,
     const unsigned short* scales,
@@ -559,7 +612,7 @@ static __device__ __forceinline__ float talu_gaffine_u4_dot_row(
     return acc;
 }
 
-extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32_v1(
+extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
     const float* input,
     const unsigned int* q_packed_weight,
     const unsigned short* q_scales,
@@ -636,7 +689,7 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32_v1(
     );
 }
 
-extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32_v1(
+extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
     const float* input,
     const unsigned int* gate_packed_weight,
     const unsigned short* gate_scales,

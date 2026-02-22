@@ -30,6 +30,7 @@ pub const attn_weighted_sum_f16_kv = @import("attn_weighted_sum_f16_kv.zig");
 pub const attn_weighted_sum_heads_f16_kv = @import("attn_weighted_sum_heads_f16_kv.zig");
 pub const silu = @import("silu.zig");
 pub const argmax = @import("argmax.zig");
+pub const matvec_u16 = @import("matvec_u16.zig");
 pub const gaffine_u4_matvec = @import("gaffine_u4_matvec.zig");
 pub const gaffine_u4_matvec_gate_up = @import("gaffine_u4_matvec_gate_up.zig");
 pub const gaffine_u4_matvec_qkv = @import("gaffine_u4_matvec_qkv.zig");
@@ -73,6 +74,7 @@ test {
     _ = attn_weighted_sum_heads_f16_kv;
     _ = silu;
     _ = argmax;
+    _ = matvec_u16;
     _ = gaffine_u4_matvec;
     _ = gaffine_u4_matvec_gate_up;
     _ = gaffine_u4_matvec_qkv;

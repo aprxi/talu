@@ -7,8 +7,9 @@ const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
 const gaffine = @import("gaffine_u4_matvec.zig");
 
-pub const embedded_ptx = @embedFile("kernels/kernels.ptx");
-pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_gate_up_f32_v1";
+const cuda_assets = @import("cuda_assets");
+pub const embedded_module = cuda_assets.kernels_fatbin;
+pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_gate_up_f32";
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,

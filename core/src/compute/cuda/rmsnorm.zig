@@ -7,8 +7,9 @@ const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
 const registry_mod = @import("registry.zig");
 
-pub const embedded_ptx = @embedFile("kernels/kernels.ptx");
-pub const embedded_symbol: [:0]const u8 = "talu_rmsnorm_f32_v1";
+const cuda_assets = @import("cuda_assets");
+pub const embedded_module = cuda_assets.kernels_fatbin;
+pub const embedded_symbol: [:0]const u8 = "talu_rmsnorm_f32";
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -31,7 +32,7 @@ pub fn run(
         return error.InvalidArgument;
     }
 
-    if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_ptx);
+    if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_module);
     const resolved = try registry.resolveFunction("rmsnorm_f32", embedded_symbol);
     var arg_pack = args_mod.ArgPack.init(allocator);
     defer arg_pack.deinit();

@@ -7,8 +7,9 @@ const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
 const registry_mod = @import("registry.zig");
 
-pub const embedded_ptx = @embedFile("kernels/kernels.ptx");
-pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_f32_v1";
+const cuda_assets = @import("cuda_assets");
+pub const embedded_module = cuda_assets.kernels_fatbin;
+pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_f32";
 pub const scales_dtype_f16: u32 = 0;
 pub const scales_dtype_bf16: u32 = 1;
 
@@ -28,7 +29,7 @@ pub fn run(
 ) !registry_mod.KernelSource {
     try validateArgs(input, packed_weight, scales, biases, out, in_dim, out_dim, group_size, scales_dtype_tag);
 
-    if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_ptx);
+    if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_module);
     const resolved = try registry.resolveFunction("gaffine_u4_matvec_f32", embedded_symbol);
     var arg_pack = args_mod.ArgPack.init(allocator);
     defer arg_pack.deinit();

@@ -78,7 +78,7 @@ test "parse validates v1 manifest payload" {
         \\  "driver_min": "550.00",
         \\  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         \\  "kernels": [
-        \\    {"op":"rmsnorm_f32","symbol":"talu_rmsnorm_f32_v1"}
+        \\    {"op":"rmsnorm_f32","symbol":"talu_rmsnorm_f32"}
         \\  ]
         \\}
     ;
@@ -87,7 +87,7 @@ test "parse validates v1 manifest payload" {
     defer parsed.deinit();
 
     try std.testing.expectEqual(@as(u32, 1), parsed.manifest.schema_version);
-    try std.testing.expectEqualStrings("talu_rmsnorm_f32_v1", parsed.manifest.findSymbol("rmsnorm_f32").?);
+    try std.testing.expectEqualStrings("talu_rmsnorm_f32", parsed.manifest.findSymbol("rmsnorm_f32").?);
 }
 
 test "validate rejects non-hex sha256" {

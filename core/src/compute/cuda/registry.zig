@@ -6,7 +6,7 @@ const module_mod = @import("module.zig");
 const manifest_mod = @import("manifest.zig");
 
 pub const KernelSource = enum {
-    embedded_ptx,
+    embedded_module,
     sideload_cubin,
 };
 
@@ -83,7 +83,7 @@ pub const Registry = struct {
 
         if (self.embedded_module) |module| {
             return .{
-                .source = .embedded_ptx,
+                .source = .embedded_module,
                 .function = try module.getFunction(self.device, embedded_symbol),
             };
         }

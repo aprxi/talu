@@ -396,17 +396,23 @@ pub fn build(b: *std.Build) void {
     const dump_tensors = b.option(bool, "dump-tensors", "Enable full tensor dump (for debugging, produces talu-dump binary)") orelse false;
     const version = getVersion(b);
 
-    const gen_ptx_step = b.step("gen-ptx", "Generate CUDA PTX assets (requires nvcc)");
+    const gen_cuda_kernels_step = b.step("gen-cuda-kernels", "Generate CUDA kernel module assets (requires nvcc)");
     {
-        const gen_fallback_ptx = b.addSystemCommand(&.{
+        const ensure_cuda_assets_dir = b.addSystemCommand(&.{
+            "mkdir",
+            "-p",
+            "core/assets/cuda",
+        });
+        const gen_kernel_module = b.addSystemCommand(&.{
             "nvcc",
-            "-ptx",
-            "-arch=sm_80",
+            "--fatbin",
+            "-arch=all-major",
             "core/src/compute/cuda/kernels/kernels.cu",
             "-o",
-            "core/src/compute/cuda/kernels/kernels.ptx",
+            "core/assets/cuda/kernels.fatbin",
         });
-        gen_ptx_step.dependOn(&gen_fallback_ptx.step);
+        gen_kernel_module.step.dependOn(&ensure_cuda_assets_dir.step);
+        gen_cuda_kernels_step.dependOn(&gen_kernel_module.step);
     }
 
     const build_options = b.addOptions();
@@ -415,6 +421,12 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "debug_matmul", debug_matmul);
     build_options.addOption(bool, "dump_tensors", dump_tensors);
     build_options.addOption([]const u8, "version", version);
+
+    const cuda_assets_mod = b.createModule(.{
+        .root_source_file = b.path("core/cuda_assets.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     // Build dependencies
     const pcre2 = pcre2_port.add(b, target, optimize);
@@ -435,6 +447,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    lib_mod.addImport("cuda_assets", cuda_assets_mod);
     lib_mod.addOptions("build_options", build_options);
     addCDependencies(b, lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
 
@@ -476,6 +489,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    static_lib_mod.addImport("cuda_assets", cuda_assets_mod);
 
     static_lib_mod.addOptions("build_options", build_options);
     addCDependencies(b, static_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
@@ -595,6 +609,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .link_libc = true,
         });
+        dump_lib_mod.addImport("cuda_assets", cuda_assets_mod);
         dump_lib_mod.addOptions("build_options", dump_build_options);
         addCDependencies(b, dump_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
 
@@ -646,6 +661,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    test_mod.addImport("cuda_assets", cuda_assets_mod);
     test_mod.addOptions("build_options", unit_test_build_options);
     addCDependencies(b, test_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
 
@@ -674,6 +690,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    integration_main_mod.addImport("cuda_assets", cuda_assets_mod);
     integration_main_mod.addOptions("build_options", integration_build_options);
     addCDependencies(b, integration_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
 
