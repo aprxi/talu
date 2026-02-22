@@ -494,8 +494,9 @@ pub(super) struct SampleArgs {
 
 #[derive(Args)]
 pub(super) struct RmArgs {
-    /// Org/Model
-    pub target: String,
+    /// Org/Model (one or more)
+    #[arg(required = true)]
+    pub targets: Vec<String>,
 
     /// Script-friendly mode: no stdout output
     #[arg(long = "model-uri")]
@@ -894,7 +895,7 @@ mod tests {
 
         match cli.command {
             Some(Commands::Rm(args)) => {
-                assert_eq!(args.target, "Qwen/Qwen3-0.6B");
+                assert_eq!(args.targets, vec!["Qwen/Qwen3-0.6B"]);
                 assert!(args.model_uri_only);
             }
             _ => panic!("expected rm command"),

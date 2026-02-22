@@ -2,6 +2,7 @@
 
 use crate::server::common::*;
 use serde_json::json;
+use std::io::Write;
 
 fn repo_config() -> ServerConfig {
     let mut config = ServerConfig::new();
@@ -166,6 +167,106 @@ fn fetch_accepts_skip_weights() {
     assert_ne!(
         resp.json()["error"]["code"], "invalid_request",
         "skip_weights field should be accepted"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SSE streaming: error event for failed downloads
+// ---------------------------------------------------------------------------
+
+/// SSE streaming request for nonexistent model returns text/event-stream
+/// with an error event (download fails, but response format is correct).
+#[test]
+fn fetch_stream_returns_event_stream_content_type() {
+    let ctx = ServerTestContext::new(repo_config());
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/repo/models",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "text/event-stream"),
+        ],
+        Some(r#"{"model_id": "nonexistent-org/nonexistent-model"}"#),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(
+        resp.header("content-type"),
+        Some("text/event-stream"),
+        "SSE Accept should produce text/event-stream response"
+    );
+}
+
+/// SSE stream for nonexistent model contains an error event with message.
+#[test]
+fn fetch_stream_error_event_for_nonexistent_model() {
+    let ctx = ServerTestContext::new(repo_config());
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/repo/models",
+        &[
+            ("Content-Type", "application/json"),
+            ("Accept", "text/event-stream"),
+        ],
+        Some(r#"{"model_id": "nonexistent-org/nonexistent-model"}"#),
+    );
+    assert_eq!(resp.status, 200);
+    assert!(
+        resp.body.contains("data: "),
+        "SSE body should contain 'data: ' lines"
+    );
+    assert!(
+        resp.body.contains("\"event\":\"error\"") || resp.body.contains("\"event\": \"error\""),
+        "SSE body should contain error event for nonexistent model, got: {}",
+        resp.body
+    );
+}
+
+/// Client disconnect during SSE stream does not crash the server.
+/// We open a streaming request, close the connection immediately, then verify
+/// the server is still responsive by making another request.
+#[test]
+fn fetch_stream_client_disconnect_does_not_crash_server() {
+    let ctx = ServerTestContext::new(repo_config());
+
+    // Open a streaming request and close the connection without reading the response.
+    {
+        let body = r#"{"model_id": "nonexistent-org/some-model"}"#;
+        let request = format!(
+            "POST /v1/repo/models HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nAccept: text/event-stream\r\nContent-Length: {}\r\n\r\n{}",
+            ctx.addr(),
+            body.len(),
+            body
+        );
+        let mut stream = std::net::TcpStream::connect_timeout(
+            &ctx.addr().into(),
+            std::time::Duration::from_secs(5),
+        )
+        .expect("connect");
+        stream
+            .set_write_timeout(Some(std::time::Duration::from_secs(5)))
+            .expect("set write timeout");
+        stream
+            .write_all(request.as_bytes())
+            .expect("write request");
+        stream.flush().expect("flush");
+        // Drop the stream immediately — simulates client disconnect.
+    }
+
+    // Small delay to let the server process the disconnect.
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Verify the server is still alive by making a normal request.
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/repo/models",
+        &json!({"model_id": "another-org/another-model"}),
+    );
+    // Should get an error (model not found) but NOT a connection failure.
+    assert!(
+        resp.status > 0,
+        "Server should still be responsive after client disconnect"
     );
 }
 

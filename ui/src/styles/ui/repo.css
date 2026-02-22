@@ -125,20 +125,82 @@
   flex-shrink: 0;
 }
 
-/* Progress bar (inline in item) */
-.repo-progress {
-  flex: 1;
-  min-width: 80px;
-  max-width: 160px;
-  height: 6px;
-  background: var(--bg-code);
-  border-radius: 3px;
-  overflow: hidden;
+/* "Downloading..." label in discover card */
+.repo-downloading-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
-.repo-progress-bar {
+/* ── Downloads strip (persistent, all tabs) ────────────────────────────── */
+
+.repo-downloads {
+  border-bottom: 1px solid var(--border);
+  background: var(--bg-code);
+}
+
+.repo-dl-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  font-size: 12px;
+}
+
+.repo-dl-row + .repo-dl-row {
+  border-top: 1px solid var(--border);
+}
+
+.repo-dl-name {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  flex: 1;
+}
+
+.repo-dl-progress {
+  width: 160px;
+  height: 6px;
+  background: var(--bg);
+  border-radius: 3px;
+  overflow: hidden;
+  flex-shrink: 0;
+}
+
+.repo-dl-bar {
   height: 100%;
   background: var(--primary);
   border-radius: 3px;
-  transition: width 0.3s ease;
+  transition: width 0.2s ease;
+}
+
+.repo-dl-bytes {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  min-width: 140px;
+}
+
+.repo-dl-cancel {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
+  transition: color 0.15s, background 0.15s;
+}
+
+.repo-dl-cancel:hover {
+  background: var(--bg-hover);
+  color: var(--text);
 }

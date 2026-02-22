@@ -45,6 +45,9 @@ export function buildRepoDOM(container: HTMLElement): void {
       <span id="rp-count" class="files-count"></span>
     </div>
 
+    <!-- Active downloads strip -->
+    <div id="rp-downloads" class="repo-downloads hidden"></div>
+
     <!-- Local / Pinned table view -->
     <div id="rp-table-container" class="files-table-container scroll-thin">
       <table class="files-table">

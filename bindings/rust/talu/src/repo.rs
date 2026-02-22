@@ -26,7 +26,6 @@ pub struct CachedModel {
 }
 
 /// Options for downloading a model.
-#[derive(Debug, Clone, Default)]
 pub struct DownloadOptions {
     /// HuggingFace token for private repos.
     pub token: Option<String>,
@@ -36,6 +35,20 @@ pub struct DownloadOptions {
     pub endpoint_url: Option<String>,
     /// Skip downloading weight files (.safetensors).
     pub skip_weights: bool,
+    /// Cancel flag — set to true to abort the download from another thread.
+    pub cancel_flag: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+}
+
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        Self {
+            token: None,
+            force: false,
+            endpoint_url: None,
+            skip_weights: false,
+            cancel_flag: None,
+        }
+    }
 }
 
 /// Progress action type.
@@ -488,6 +501,15 @@ pub fn repo_fetch(
         std::ptr::null_mut()
     };
 
+    // SAFETY: AtomicBool has the same layout as bool (1 byte). The Zig side
+    // reads this with @atomicLoad. The pointer is valid for the lifetime of
+    // this function call (options owns the Arc, callback closure may hold a clone).
+    let cancel_ptr = options
+        .cancel_flag
+        .as_ref()
+        .map(|flag| flag.as_ptr() as *mut c_void)
+        .unwrap_or(std::ptr::null_mut());
+
     let mut c_options = talu_sys::DownloadOptions {
         token: c_token
             .as_ref()
@@ -501,6 +523,7 @@ pub fn repo_fetch(
             .map(|e| e.as_ptr())
             .unwrap_or(std::ptr::null()),
         skip_weights: options.skip_weights,
+        cancel_flag: cancel_ptr,
     };
 
     let mut out: *mut c_char = std::ptr::null_mut();

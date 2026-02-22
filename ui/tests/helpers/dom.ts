@@ -152,7 +152,7 @@ export const REPO_DOM_IDS = [
   "rp-search", "rp-search-clear",
   "rp-tab-local", "rp-tab-pinned", "rp-tab-discover",
   "rp-stats", "rp-thead", "rp-tbody",
-  "rp-table-container", "rp-discover-container", "rp-discover-results",
+  "rp-table-container", "rp-discover-container", "rp-discover-results", "rp-downloads",
   "rp-count", "rp-select-all", "rp-pin-all", "rp-delete", "rp-cancel",
   "rp-bulk-actions",
   "rp-sort", "rp-size-filter", "rp-task-filter", "rp-library-filter",

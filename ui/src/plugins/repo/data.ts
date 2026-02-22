@@ -1,10 +1,12 @@
 /** Data loading and mutation functions for the repo plugin. */
 
-import { api, events, notifications, dialogs, status } from "./deps.ts";
+import { api, events, notifications, dialogs, status, timers } from "./deps.ts";
 import { repoState } from "./state.ts";
 import {
   renderModelsTable,
   renderDiscoverResults,
+  renderDownloads,
+  updateDownloadProgress,
   renderStats,
   updateRepoToolbar,
 } from "./render.ts";
@@ -69,19 +71,35 @@ export async function searchHub(query: string): Promise<void> {
 // Download with SSE streaming
 // ---------------------------------------------------------------------------
 
+/** rAF-throttled progress render — coalesces rapid SSE events. */
+let progressDirty = false;
+
+export function scheduleProgressRender(): void {
+  if (progressDirty) return;
+  progressDirty = true;
+  timers.requestAnimationFrame(() => {
+    progressDirty = false;
+    updateDownloadProgress();
+  });
+}
+
 export async function downloadModel(modelId: string): Promise<void> {
+  const abort = new AbortController();
   repoState.activeDownloads.set(modelId, {
     modelId,
     current: 0,
     total: 0,
     label: "Starting...",
     status: "downloading",
+    abort,
   });
   status.setBusy(`Downloading ${modelId}...`);
+  renderDownloads();
   renderDiscoverResults();
 
+  let cancelled = false;
   try {
-    const resp = await api.fetchRepoModel({ model_id: modelId });
+    const resp = await api.fetchRepoModel({ model_id: modelId }, abort.signal);
     if (!resp.ok || !resp.body) {
       throw new Error(`HTTP ${resp.status}`);
     }
@@ -117,16 +135,22 @@ export async function downloadModel(modelId: string): Promise<void> {
       dl.status = "done";
     }
   } catch (err) {
-    const dl = repoState.activeDownloads.get(modelId);
-    if (dl) dl.status = "error";
-    notifications.error(`Download failed: ${err}`);
+    if (err instanceof DOMException && err.name === "AbortError") {
+      cancelled = true;
+    } else {
+      notifications.error(`Download failed: ${err}`);
+    }
   }
 
   repoState.activeDownloads.delete(modelId);
   if (repoState.activeDownloads.size === 0) status.setReady();
+  renderDownloads();
   renderDiscoverResults();
-  await loadModels();
-  events.emit("repo.models.changed", {});
+
+  if (!cancelled) {
+    await loadModels();
+    events.emit("repo.models.changed", {});
+  }
 }
 
 function handleDownloadEvent(modelId: string, data: Record<string, unknown>): void {
@@ -140,17 +164,33 @@ function handleDownloadEvent(modelId: string, data: Record<string, unknown>): vo
   }
 
   if (data.event === "error") {
+    const msg = String(data.message ?? "unknown");
+    // "Cancelled" is expected when user aborts — not a real error.
+    if (msg.includes("Cancelled")) {
+      dl.status = "done";
+      return;
+    }
     dl.status = "error";
-    notifications.error(`Download error: ${data.message ?? "unknown"}`);
+    notifications.error(`Download error: ${msg}`);
     return;
   }
 
-  // Progress event from the fetch streaming endpoint.
+  // Progress event — update state and schedule throttled render.
   if (typeof data.current === "number") dl.current = data.current as number;
   if (typeof data.total === "number") dl.total = data.total as number;
   if (typeof data.label === "string") dl.label = data.label as string;
 
-  renderDiscoverResults();
+  scheduleProgressRender();
+}
+
+// ---------------------------------------------------------------------------
+// Cancel
+// ---------------------------------------------------------------------------
+
+export function cancelDownload(modelId: string): void {
+  const dl = repoState.activeDownloads.get(modelId);
+  if (!dl) return;
+  dl.abort.abort();
 }
 
 // ---------------------------------------------------------------------------
@@ -168,6 +208,7 @@ export async function deleteModel(modelId: string): Promise<void> {
     renderModelsTable();
     renderStats();
     updateRepoToolbar();
+    if (repoState.tab === "discover") renderDiscoverResults();
     notifications.success(`Deleted ${modelId}`);
     events.emit("repo.models.changed", {});
   } else {

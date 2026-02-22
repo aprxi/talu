@@ -6,12 +6,13 @@ import {
   pinModel,
   unpinModel,
   downloadModel,
+  cancelDownload,
   deleteSelectedModels,
   pinSelectedModels,
 } from "../../../src/plugins/repo/data.ts";
 import { repoState } from "../../../src/plugins/repo/state.ts";
 import { initRepoDeps } from "../../../src/plugins/repo/deps.ts";
-import { initRepoDom } from "../../../src/plugins/repo/dom.ts";
+import { initRepoDom, getRepoDom } from "../../../src/plugins/repo/dom.ts";
 import { createDomRoot, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts";
 import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 
@@ -78,8 +79,8 @@ beforeEach(() => {
         apiCalls.push({ method: "searchRepoModels", args: [query, opts] });
         return searchRepoModelsResult;
       },
-      fetchRepoModel: async (body: any) => {
-        apiCalls.push({ method: "fetchRepoModel", args: [body] });
+      fetchRepoModel: async (body: any, signal?: AbortSignal) => {
+        apiCalls.push({ method: "fetchRepoModel", args: [body, signal] });
         // Return a simple done SSE stream.
         const text = 'data: {"event":"done"}\n\n';
         return new Response(text, {
@@ -384,6 +385,23 @@ describe("deleteModel", () => {
 
     expect(emitted).toBe(false);
   });
+
+  test("re-renders discover results when on discover tab", async () => {
+    repoState.tab = "discover";
+    repoState.models = [makeModel("m1")];
+    repoState.searchResults = [{ model_id: "m1", downloads: 100, likes: 10, last_modified: "2025-01-01T00:00:00Z", params_total: 1000 }];
+
+    await deleteModel("m1");
+
+    // After deletion, model is removed from state.
+    expect(repoState.models.length).toBe(0);
+
+    // The discover card for m1 should now show Download (not Delete),
+    // because the model was removed from repoState.models.
+    const dom = getRepoDom();
+    const btn = dom.discoverResults.querySelector<HTMLElement>("[data-action]");
+    expect(btn?.dataset["action"]).toBe("download");
+  });
 });
 
 // ── pinModel / unpinModel ───────────────────────────────────────────────────
@@ -438,11 +456,12 @@ describe("downloadModel", () => {
     expect(repoState.activeDownloads.size).toBe(0);
   });
 
-  test("calls fetchRepoModel with model_id", async () => {
+  test("calls fetchRepoModel with model_id and abort signal", async () => {
     await downloadModel("org/model");
 
     expect(apiCalls[0]!.method).toBe("fetchRepoModel");
     expect(apiCalls[0]!.args[0]).toEqual({ model_id: "org/model" });
+    expect(apiCalls[0]!.args[1]).toBeInstanceOf(AbortSignal);
   });
 
   test("emits repo.models.changed after download", async () => {
@@ -600,6 +619,55 @@ describe("downloadModel", () => {
     await downloadModel("org/model");
 
     expect(notif.messages.some((m) => m.type === "success" && m.msg.includes("org/model"))).toBe(true);
+  });
+
+  test("cancelDownload aborts the download without error notification", async () => {
+    let emitted = false;
+    initRepoDeps({
+      api: {
+        fetchRepoModel: async (_body: any, signal?: AbortSignal) => {
+          // Return a stream that blocks until aborted.
+          const stream = new ReadableStream<Uint8Array>({
+            pull() {
+              return new Promise<void>((_resolve, reject) => {
+                signal?.addEventListener("abort", () => {
+                  reject(new DOMException("Aborted", "AbortError"));
+                });
+              });
+            },
+          });
+          return new Response(stream, {
+            status: 200,
+            headers: { "Content-Type": "text/event-stream" },
+          });
+        },
+        listRepoModels: async () => ({ ok: true, data: { models: [], total_size_bytes: 0 } }),
+      } as any,
+      notifications: notif.mock as any,
+      dialogs: {} as any,
+      events: { emit: () => { emitted = true; }, on: () => ({ dispose() {} }) } as any,
+      timers: mockTimers(),
+      format: { dateTime: () => "" } as any,
+      status: { setBusy: () => {}, setReady: () => {} } as any,
+    });
+
+    const dlPromise = downloadModel("org/model");
+    await flushAsync(); // Let download reach reader.read()
+
+    cancelDownload("org/model");
+    await dlPromise;
+
+    // No error notification for cancel.
+    expect(notif.messages.filter((m) => m.type === "error").length).toBe(0);
+    expect(repoState.activeDownloads.size).toBe(0);
+    // Does not emit repo.models.changed or call loadModels.
+    expect(emitted).toBe(false);
+  });
+
+  test("cancelDownload on non-existent download is a no-op", () => {
+    // Should not throw.
+    cancelDownload("non-existent");
+    expect(repoState.activeDownloads.size).toBe(0);
   });
 });
 

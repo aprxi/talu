@@ -12,6 +12,7 @@ export interface RepoDom {
   tableContainer: HTMLElement;
   discoverContainer: HTMLElement;
   discoverResults: HTMLElement;
+  downloads: HTMLElement;
   count: HTMLElement;
   selectAllBtn: HTMLButtonElement;
   pinAllBtn: HTMLButtonElement;
@@ -46,6 +47,7 @@ export function getRepoDom(): RepoDom {
     tableContainer: root.querySelector<HTMLElement>("#rp-table-container")!,
     discoverContainer: root.querySelector<HTMLElement>("#rp-discover-container")!,
     discoverResults: root.querySelector<HTMLElement>("#rp-discover-results")!,
+    downloads: root.querySelector<HTMLElement>("#rp-downloads")!,
     count: root.querySelector<HTMLElement>("#rp-count")!,
     selectAllBtn: root.querySelector<HTMLButtonElement>("#rp-select-all")!,
     pinAllBtn: root.querySelector<HTMLButtonElement>("#rp-pin-all")!,

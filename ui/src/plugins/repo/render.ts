@@ -1,6 +1,6 @@
 /** DOM rendering for the repo plugin. */
 
-import { PIN_ICON, DELETE_ICON, CHECK_CIRCLE_ICON, CIRCLE_ICON, EXPORT_ICON } from "../../icons.ts";
+import { PIN_ICON, DELETE_ICON, CHECK_CIRCLE_ICON, CIRCLE_ICON, EXPORT_ICON, CLOSE_ICON } from "../../icons.ts";
 import { renderEmptyState } from "../../render/common.ts";
 import { el } from "../../render/helpers.ts";
 import { format } from "./deps.ts";
@@ -15,7 +15,7 @@ const ICON_UNCHECKED = CIRCLE_ICON;
 // Helpers
 // ---------------------------------------------------------------------------
 
-function formatBytes(bytes: number): string {
+export function formatBytes(bytes: number): string {
   if (bytes === 0) return "0 B";
   const units = ["B", "KB", "MB", "GB", "TB"];
   const i = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), units.length - 1);
@@ -197,16 +197,14 @@ export function renderDiscoverResults(): void {
     const title = el("div", "repo-discover-item-title", result.model_id);
     top.appendChild(title);
 
-    const dl = repoState.activeDownloads.get(result.model_id);
-    const isDownloading = dl && dl.status === "downloading";
-
-    if (isDownloading) {
-      const progressWrap = el("div", "repo-progress");
-      const bar = el("div", "repo-progress-bar");
-      const pct = dl!.total > 0 ? Math.round((dl!.current / dl!.total) * 100) : 0;
-      bar.style.width = `${pct}%`;
-      progressWrap.appendChild(bar);
-      top.appendChild(progressWrap);
+    if (repoState.activeDownloads.has(result.model_id)) {
+      const label = el("span", "repo-downloading-label", "Downloading\u2026");
+      top.appendChild(label);
+    } else if (repoState.models.some((m) => m.id === result.model_id)) {
+      const delBtn = el("button", "btn btn-ghost btn-sm repo-delete-btn");
+      delBtn.innerHTML = `${DELETE_ICON} Delete`;
+      delBtn.dataset["action"] = "delete";
+      top.appendChild(delBtn);
     } else {
       const dlBtn = el("button", "btn btn-ghost btn-sm repo-download-btn");
       dlBtn.innerHTML = `${EXPORT_ICON} Download`;
@@ -229,6 +227,76 @@ export function renderDiscoverResults(): void {
     item.appendChild(meta);
 
     dom.discoverResults.appendChild(item);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Downloads strip (persistent across tabs)
+// ---------------------------------------------------------------------------
+
+export function renderDownloads(): void {
+  const dom = getRepoDom();
+  const { activeDownloads } = repoState;
+
+  if (activeDownloads.size === 0) {
+    dom.downloads.classList.add("hidden");
+    dom.downloads.innerHTML = "";
+    return;
+  }
+
+  dom.downloads.classList.remove("hidden");
+  dom.downloads.innerHTML = "";
+
+  for (const dl of activeDownloads.values()) {
+    const row = el("div", "repo-dl-row");
+    row.dataset["downloadId"] = dl.modelId;
+
+    const name = el("span", "repo-dl-name", dl.modelId);
+    row.appendChild(name);
+
+    const progress = el("div", "repo-dl-progress");
+    const bar = el("div", "repo-dl-bar");
+    const pct = dl.total > 0 ? Math.round((dl.current / dl.total) * 100) : 0;
+    bar.style.width = `${pct}%`;
+    progress.appendChild(bar);
+    row.appendChild(progress);
+
+    const bytes = el("span", "repo-dl-bytes");
+    bytes.textContent = dl.total > 0
+      ? `${formatBytes(dl.current)} / ${formatBytes(dl.total)}`
+      : dl.current > 0 ? formatBytes(dl.current) : dl.label;
+    row.appendChild(bytes);
+
+    const cancelBtn = el("button", "repo-dl-cancel");
+    cancelBtn.innerHTML = CLOSE_ICON;
+    cancelBtn.title = "Cancel download";
+    cancelBtn.dataset["action"] = "cancel";
+    cancelBtn.dataset["downloadId"] = dl.modelId;
+    row.appendChild(cancelBtn);
+
+    dom.downloads.appendChild(row);
+  }
+}
+
+/** Targeted update of progress bar and byte counter — no DOM creation. */
+export function updateDownloadProgress(): void {
+  const dom = getRepoDom();
+  for (const dl of repoState.activeDownloads.values()) {
+    const row = dom.downloads.querySelector<HTMLElement>(`[data-download-id="${dl.modelId}"]`);
+    if (!row) continue;
+
+    const bar = row.querySelector<HTMLElement>(".repo-dl-bar");
+    if (bar) {
+      const pct = dl.total > 0 ? Math.round((dl.current / dl.total) * 100) : 0;
+      bar.style.width = `${pct}%`;
+    }
+
+    const bytes = row.querySelector<HTMLElement>(".repo-dl-bytes");
+    if (bytes) {
+      bytes.textContent = dl.total > 0
+        ? `${formatBytes(dl.current)} / ${formatBytes(dl.total)}`
+        : dl.current > 0 ? formatBytes(dl.current) : dl.label;
+    }
   }
 }
 

@@ -24,6 +24,7 @@ pub const HttpError = error{
     Unauthorized,
     RateLimited,
     OutOfMemory,
+    Cancelled,
 };
 
 /// Progress callback for download progress reporting
@@ -45,6 +46,8 @@ pub const HttpConfig = struct {
     max_response_bytes: ?usize = null,
     /// Resume offset in bytes for ranged downloads (0 = start from beginning)
     resume_from: u64 = 0,
+    /// Cancel flag — set to true from another thread to abort the download
+    cancel_flag: ?*const bool = null,
 };
 
 /// Writer context for curl write callback (to file)
@@ -66,6 +69,7 @@ const CurlProgressContext = struct {
     callback: ?ProgressCallback,
     user_data: ?*anyopaque,
     resume_from: u64,
+    cancel_flag: ?*const bool = null,
 };
 
 /// libcurl write callback - writes data to file
@@ -109,6 +113,12 @@ fn curlProgressCallback(
     _: c.curl_off_t,
 ) callconv(.c) c_int {
     const progress_ctx: *CurlProgressContext = @ptrCast(@alignCast(user_data));
+
+    // Check cancel flag — abort if set.
+    if (progress_ctx.cancel_flag) |flag| {
+        if (@atomicLoad(bool, flag, .monotonic)) return 1;
+    }
+
     if (progress_ctx.callback) |cb| {
         const downloaded_now: u64 = if (dlnow > 0) @intCast(dlnow) else 0;
         const total_now: u64 = if (dltotal > 0) @intCast(dltotal) else 0;
@@ -123,7 +133,7 @@ fn curlProgressCallback(
             progress_ctx.user_data,
         );
     }
-    return 0; // Return non-zero to abort transfer
+    return 0;
 }
 
 /// Configure SSL/TLS for curl using embedded Mozilla CA bundle
@@ -243,6 +253,7 @@ pub fn downloadToFile(
         .callback = config.progress_callback,
         .user_data = config.progress_data,
         .resume_from = config.resume_from,
+        .cancel_flag = config.cancel_flag,
     };
 
     try configureSsl(curl_handle);
@@ -263,7 +274,7 @@ pub fn downloadToFile(
             return HttpError.CurlSetOptFailed;
     }
 
-    if (config.progress_callback != null) {
+    if (config.progress_callback != null or config.cancel_flag != null) {
         if (c.curl_easy_setopt(curl_handle, c.CURLOPT_XFERINFOFUNCTION, @as(*const anyopaque, @ptrCast(&curlProgressCallback))) != c.CURLE_OK)
             return HttpError.CurlSetOptFailed;
         if (c.curl_easy_setopt(curl_handle, c.CURLOPT_XFERINFODATA, @as(*anyopaque, @ptrCast(&progress_ctx))) != c.CURLE_OK)
@@ -277,6 +288,10 @@ pub fn downloadToFile(
 
     const result = c.curl_easy_perform(curl_handle);
     if (result != c.CURLE_OK) {
+        // CURLE_ABORTED_BY_CALLBACK (42) — progress callback returned non-zero (cancel flag).
+        if (result == c.CURLE_ABORTED_BY_CALLBACK) {
+            return HttpError.Cancelled;
+        }
         // CURLE_WRITE_ERROR (23) indicates the write callback returned an error
         if (result == c.CURLE_WRITE_ERROR) {
             return HttpError.StreamWriteFailed;
@@ -481,4 +496,32 @@ test "curlProgressCallback applies resume offset" {
     try std.testing.expectEqual(@as(u32, 1), TestData.call_count);
     try std.testing.expectEqual(@as(u64, 384), TestData.last_downloaded);
     try std.testing.expectEqual(@as(u64, 1152), TestData.last_total);
+}
+
+test "curlProgressCallback aborts when cancel flag is set" {
+    var cancelled: bool = true;
+
+    var ctx = CurlProgressContext{
+        .callback = null,
+        .user_data = null,
+        .resume_from = 0,
+        .cancel_flag = &cancelled,
+    };
+
+    const result = curlProgressCallback(@ptrCast(&ctx), 1000, 500, 0, 0);
+    try std.testing.expectEqual(@as(c_int, 1), result);
+}
+
+test "curlProgressCallback continues when cancel flag is false" {
+    var cancelled: bool = false;
+
+    var ctx = CurlProgressContext{
+        .callback = null,
+        .user_data = null,
+        .resume_from = 0,
+        .cancel_flag = &cancelled,
+    };
+
+    const result = curlProgressCallback(@ptrCast(&ctx), 1000, 500, 0, 0);
+    try std.testing.expectEqual(@as(c_int, 0), result);
 }

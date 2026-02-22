@@ -1166,24 +1166,24 @@ fn format_sync_file_activity(
 }
 
 pub(super) fn cmd_rm(args: RmArgs) -> Result<()> {
-    let target = args.target;
-
-    let model_id = strip_hf_prefix(&target);
-    if !is_model_id(&model_id) {
-        bail!("Error: Invalid model URI. Expected format: Org/Model");
-    }
-
-    if talu::repo::repo_delete(&model_id) {
-        if !args.model_uri_only {
-            println!("Deleted {} from cache.", model_id);
+    for target in &args.targets {
+        let model_id = strip_hf_prefix(target);
+        if !is_model_id(&model_id) {
+            bail!("Error: Invalid model URI '{}'. Expected format: Org/Model", model_id);
         }
-    } else {
-        // Delete returned false - could be error or not found
-        if let Some(err_msg) = last_error_message() {
-            bail!("Error deleting from cache: {}", err_msg);
-        }
-        if !args.model_uri_only {
-            println!("Model {} was not found in cache.", model_id);
+
+        if talu::repo::repo_delete(&model_id) {
+            if !args.model_uri_only {
+                println!("Deleted {} from cache.", model_id);
+            }
+        } else {
+            // Delete returned false - could be error or not found
+            if let Some(err_msg) = last_error_message() {
+                bail!("Error deleting from cache: {}", err_msg);
+            }
+            if !args.model_uri_only {
+                println!("Model {} was not found in cache.", model_id);
+            }
         }
     }
     Ok(())
@@ -1399,6 +1399,7 @@ pub(super) fn repo_fetch_with_sync_progress(
         force,
         endpoint_url: endpoint_url.map(|s| s.to_string()),
         skip_weights,
+        cancel_flag: None,
     };
 
     let callback = file_bar.map(|bar| {

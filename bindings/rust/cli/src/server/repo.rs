@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::convert::Infallible;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -505,6 +506,7 @@ pub async fn handle_fetch(
         force: request.force,
         endpoint_url: request.endpoint_url,
         skip_weights: request.skip_weights,
+        cancel_flag: None,
     };
 
     let result =
@@ -536,15 +538,18 @@ fn handle_fetch_streaming(request: RepoFetchRequest) -> Response<BoxBody> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
 
     let model_id = request.model_id.clone();
+    let cancel = Arc::new(AtomicBool::new(false));
     let options = talu::repo::DownloadOptions {
         token: request.token,
         force: request.force,
         endpoint_url: request.endpoint_url,
         skip_weights: request.skip_weights,
+        cancel_flag: Some(cancel.clone()),
     };
 
     std::thread::spawn(move || {
         let tx_progress = tx.clone();
+        let cancel_clone = cancel;
         let callback: talu::repo::ProgressCallback =
             Box::new(move |progress: talu::repo::DownloadProgress| {
                 let event = json!({
@@ -560,7 +565,9 @@ fn handle_fetch_streaming(request: RepoFetchRequest) -> Response<BoxBody> {
                     "total": progress.total,
                 });
                 let chunk = format!("data: {}\n\n", event);
-                let _ = tx_progress.send(Bytes::from(chunk));
+                if tx_progress.send(Bytes::from(chunk)).is_err() {
+                    cancel_clone.store(true, Ordering::Relaxed);
+                }
             });
 
         let result = talu::repo::repo_fetch(&model_id, options, Some(callback));
@@ -926,6 +933,7 @@ fn sync_pins_blocking(
                 force: false,
                 endpoint_url: request.endpoint_url.clone(),
                 skip_weights: request.skip_weights,
+                cancel_flag: None,
             };
             match talu::repo::repo_fetch(model_id, options, None) {
                 Ok(_) => {
@@ -1038,6 +1046,7 @@ fn handle_sync_pins_streaming(
                 force: false,
                 endpoint_url: request.endpoint_url.clone(),
                 skip_weights: request.skip_weights,
+                cancel_flag: None,
             };
 
             match talu::repo::repo_fetch(model_id, options, Some(callback)) {

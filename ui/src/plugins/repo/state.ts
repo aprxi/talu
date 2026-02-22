@@ -55,6 +55,7 @@ export interface DownloadProgress {
   total: number;
   label: string;
   status: "downloading" | "done" | "error";
+  abort: AbortController;
 }
 
 export const repoState = {

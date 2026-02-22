@@ -427,6 +427,7 @@ describe("Discover card actions", () => {
   test("download action is ignored if already downloading", async () => {
     repoState.activeDownloads.set("org/model", {
       modelId: "org/model", current: 0, total: 100, label: "...", status: "downloading",
+      abort: new AbortController(),
     });
     wireRepoEvents();
     const dom = getRepoDom();
@@ -443,6 +444,61 @@ describe("Discover card actions", () => {
 
     // Should not start a second download.
     expect(apiCalls.filter((c) => c.method === "fetchRepoModel").length).toBe(0);
+  });
+
+  test("delete action in discover card calls deleteModel", async () => {
+    repoState.models = [{ id: "org/model", path: "/m", source: "hub", size_bytes: 1024, mtime: 0, pinned: false } as any];
+    wireRepoEvents();
+    const dom = getRepoDom();
+
+    const card = document.createElement("div");
+    card.dataset["modelId"] = "org/model";
+    const btn = document.createElement("button");
+    btn.dataset["action"] = "delete";
+    card.appendChild(btn);
+    dom.discoverResults.appendChild(card);
+
+    btn.dispatchEvent(new Event("click", { bubbles: true }));
+    await flushAsync();
+
+    expect(apiCalls.some((c) => c.method === "deleteRepoModel")).toBe(true);
+  });
+});
+
+// ── Downloads strip cancel ──────────────────────────────────────────────────
+
+describe("Downloads strip cancel", () => {
+  test("cancel button click aborts the download", () => {
+    const abort = new AbortController();
+    repoState.activeDownloads.set("org/model", {
+      modelId: "org/model", current: 50, total: 100, label: "...", status: "downloading",
+      abort,
+    });
+    wireRepoEvents();
+    const dom = getRepoDom();
+
+    const btn = document.createElement("button");
+    btn.dataset["action"] = "cancel";
+    btn.dataset["downloadId"] = "org/model";
+    dom.downloads.appendChild(btn);
+
+    btn.dispatchEvent(new Event("click", { bubbles: true }));
+
+    expect(abort.signal.aborted).toBe(true);
+  });
+
+  test("cancel click with no matching download is a no-op", () => {
+    wireRepoEvents();
+    const dom = getRepoDom();
+
+    const btn = document.createElement("button");
+    btn.dataset["action"] = "cancel";
+    btn.dataset["downloadId"] = "nonexistent";
+    dom.downloads.appendChild(btn);
+
+    // Should not throw.
+    btn.dispatchEvent(new Event("click", { bubbles: true }));
+    expect(repoState.activeDownloads.size).toBe(0);
   });
 });
 

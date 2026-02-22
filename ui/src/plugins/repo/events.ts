@@ -13,6 +13,7 @@ import {
   deleteSelectedModels,
   pinSelectedModels,
   downloadModel,
+  cancelDownload,
 } from "./data.ts";
 import {
   renderModelsTable,
@@ -183,6 +184,22 @@ export function wireRepoEvents(): void {
       if (repoState.activeDownloads.has(modelId)) return;
       downloadModel(modelId);
     }
+
+    if (action === "delete") {
+      deleteModel(modelId);
+    }
+  });
+
+  // -----------------------------------------------------------------------
+  // Downloads strip cancel (delegated)
+  // -----------------------------------------------------------------------
+
+  dom.downloads.addEventListener("click", (e) => {
+    const target = e.target as HTMLElement;
+    const btn = target.closest<HTMLElement>("[data-action='cancel']");
+    if (!btn) return;
+    const modelId = btn.dataset["downloadId"];
+    if (modelId) cancelDownload(modelId);
   });
 
   // -----------------------------------------------------------------------

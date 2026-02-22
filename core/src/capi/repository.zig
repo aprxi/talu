@@ -66,6 +66,8 @@ pub const DownloadOptions = extern struct {
     endpoint_url: ?[*:0]const u8 = null,
     /// Skip downloading weight files (.safetensors).
     skip_weights: bool = false,
+    /// Cancel flag — set to true from another thread to abort the download.
+    cancel_flag: ?*const bool = null,
 
     /// Get a ProgressContext from the options.
     pub fn progressContext(self: DownloadOptions) progress_api.ProgressContext {
@@ -495,6 +497,7 @@ fn buildDownloadConfig(options: ?*const DownloadOptions) repository.hf.DownloadC
         .force = if (options) |o| o.force else false,
         .endpoint_url = endpoint,
         .skip_weights = if (options) |o| o.skip_weights else false,
+        .cancel_flag = if (options) |o| o.cancel_flag else null,
     };
 }
 

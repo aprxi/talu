@@ -162,6 +162,7 @@ fn downloadFile(
     progress_callback: ?http.ProgressCallback,
     progress_data: ?*anyopaque,
     allow_resume: bool,
+    cancel_flag: ?*const bool,
 ) DownloadError!void {
     // Create parent directory if needed
     if (std.fs.path.dirname(dest_path)) |dir| {
@@ -186,6 +187,7 @@ fn downloadFile(
         .progress_callback = progress_callback,
         .progress_data = progress_data,
         .resume_from = resume_from,
+        .cancel_flag = cancel_flag,
     }) catch |err| {
         return err; // HttpError is a subset of DownloadError
     };
@@ -217,6 +219,8 @@ pub const DownloadError = error{
     NoSpaceLeft, // ENOSPC - disk full
     DiskQuota, // EDQUOT - quota exceeded
     FileRenameFailed,
+    // Cancellation
+    Cancelled,
     // General
     OutOfMemory,
     Unexpected,
@@ -236,6 +240,8 @@ pub const DownloadConfig = struct {
     /// Skip downloading weight files (.safetensors).
     /// Used for tokenizer-only caching and --no-weights sync.
     skip_weights: bool = false,
+    /// Cancel flag — set to true from another thread to abort the download.
+    cancel_flag: ?*const bool = null,
 };
 
 /// Get the effective HF API base URL.
@@ -416,6 +422,14 @@ pub fn fetchModel(
     };
 
     for (repo_file_names) |filename| {
+        // Check for cancellation between files.
+        if (download_config.cancel_flag) |flag| {
+            if (@atomicLoad(bool, flag, .monotonic)) {
+                progress.completeLine(0);
+                return DownloadError.Cancelled;
+            }
+        }
+
         // Skip weight files when skip_weights is set
         if (download_config.skip_weights and isWeightFile(filename)) continue;
 
@@ -470,9 +484,15 @@ pub fn fetchModel(
             byteProgressCallback,
             @ptrCast(&byte_ctx),
             !download_config.force,
+            download_config.cancel_flag,
         ) catch |err| {
             // Complete byte progress line on error
             progress.completeLine(1);
+            // Cancellation is always fatal regardless of which file.
+            if (err == DownloadError.Cancelled) {
+                progress.completeLine(0);
+                return err;
+            }
             // Only error for essential files, skip others silently
             if (std.mem.eql(u8, filename, "config.json")) {
                 progress.completeLine(0);
@@ -602,6 +622,7 @@ pub fn fetchFile(
         null,
         null,
         !download_config.force,
+        download_config.cancel_flag,
     ) catch |err| {
         capi.setContext("file={s}, model_id={s}", .{ filename, model_id });
         return err;

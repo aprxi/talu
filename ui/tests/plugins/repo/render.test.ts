@@ -2,6 +2,8 @@ import { describe, test, expect, beforeEach } from "bun:test";
 import {
   renderModelsTable,
   renderDiscoverResults,
+  renderDownloads,
+  updateDownloadProgress,
   renderStats,
   renderSortIndicators,
   updateRepoToolbar,
@@ -362,17 +364,18 @@ describe("renderDiscoverResults", () => {
     expect(btn).not.toBeNull();
   });
 
-  test("renders progress bar instead of button when downloading", () => {
+  test("renders static Downloading label instead of button when downloading", () => {
     repoState.searchResults = [makeSearchResult("org/model")];
     repoState.activeDownloads.set("org/model", {
       modelId: "org/model", current: 50, total: 100, label: "50%", status: "downloading",
+      abort: new AbortController(),
     });
     renderDiscoverResults();
 
     const dom = getRepoDom();
-    const progress = dom.discoverResults.querySelector(".repo-progress-bar");
-    expect(progress).not.toBeNull();
-    expect((progress as HTMLElement).style.width).toBe("50%");
+    const label = dom.discoverResults.querySelector(".repo-downloading-label");
+    expect(label).not.toBeNull();
+    expect(label!.textContent).toContain("Downloading");
     // No download button when downloading.
     const btn = dom.discoverResults.querySelector("[data-action='download']");
     expect(btn).toBeNull();
@@ -510,6 +513,152 @@ describe("renderDiscoverResults", () => {
     const items = dom.discoverResults.querySelectorAll(".repo-discover-item");
     expect(items.length).toBe(0);
     expect(dom.discoverResults.innerHTML).toContain("llama");
+  });
+
+  test("shows Delete button for cached model instead of Download", () => {
+    repoState.models = [makeModel("org/cached-model")];
+    repoState.searchResults = [
+      makeSearchResult("org/cached-model"),
+      makeSearchResult("org/not-cached"),
+    ];
+    renderDiscoverResults();
+
+    const dom = getRepoDom();
+    const items = dom.discoverResults.querySelectorAll(".repo-discover-item");
+    expect(items.length).toBe(2);
+
+    const cachedBtn = items[0].querySelector("[data-action]") as HTMLElement;
+    expect(cachedBtn.dataset["action"]).toBe("delete");
+    expect(cachedBtn.textContent).toContain("Delete");
+
+    const newBtn = items[1].querySelector("[data-action]") as HTMLElement;
+    expect(newBtn.dataset["action"]).toBe("download");
+    expect(newBtn.textContent).toContain("Download");
+  });
+
+  test("downloading model shows label even if cached", () => {
+    repoState.models = [makeModel("org/model")];
+    repoState.activeDownloads.set("org/model", {
+      modelId: "org/model", current: 0, total: 100,
+      label: "Starting...", status: "downloading",
+      abort: new AbortController(),
+    });
+    repoState.searchResults = [makeSearchResult("org/model")];
+    renderDiscoverResults();
+
+    const dom = getRepoDom();
+    const item = dom.discoverResults.querySelector(".repo-discover-item")!;
+    expect(item.querySelector(".repo-downloading-label")).toBeTruthy();
+    expect(item.querySelector("[data-action='delete']")).toBeNull();
+  });
+});
+
+// ── renderDownloads ─────────────────────────────────────────────────────────
+
+describe("renderDownloads", () => {
+  test("hides strip when no active downloads", () => {
+    repoState.activeDownloads.clear();
+    renderDownloads();
+
+    const dom = getRepoDom();
+    expect(dom.downloads.classList.contains("hidden")).toBe(true);
+    expect(dom.downloads.innerHTML).toBe("");
+  });
+
+  test("shows strip with download row", () => {
+    repoState.activeDownloads.set("org/model", {
+      modelId: "org/model", current: 500_000_000, total: 2_000_000_000,
+      label: "Downloading", status: "downloading", abort: new AbortController(),
+    });
+    renderDownloads();
+
+    const dom = getRepoDom();
+    expect(dom.downloads.classList.contains("hidden")).toBe(false);
+    const row = dom.downloads.querySelector(".repo-dl-row");
+    expect(row).not.toBeNull();
+  });
+
+  test("row contains model ID, progress bar, byte counter, and cancel button", () => {
+    repoState.activeDownloads.set("org/model-7b", {
+      modelId: "org/model-7b", current: 1_073_741_824, total: 4_294_967_296,
+      label: "dl", status: "downloading", abort: new AbortController(),
+    });
+    renderDownloads();
+
+    const dom = getRepoDom();
+    const row = dom.downloads.querySelector(".repo-dl-row")!;
+
+    // Model name.
+    expect(row.querySelector(".repo-dl-name")!.textContent).toBe("org/model-7b");
+    // Progress bar width.
+    const bar = row.querySelector<HTMLElement>(".repo-dl-bar")!;
+    expect(bar.style.width).toBe("25%");
+    // Byte counter.
+    const bytes = row.querySelector(".repo-dl-bytes")!;
+    expect(bytes.textContent).toContain("1.0 GB");
+    expect(bytes.textContent).toContain("4.0 GB");
+    // Cancel button.
+    const cancel = row.querySelector("[data-action='cancel']");
+    expect(cancel).not.toBeNull();
+    expect((cancel as HTMLElement).dataset["downloadId"]).toBe("org/model-7b");
+  });
+
+  test("shows multiple rows for concurrent downloads", () => {
+    repoState.activeDownloads.set("model-a", {
+      modelId: "model-a", current: 0, total: 100, label: "", status: "downloading",
+      abort: new AbortController(),
+    });
+    repoState.activeDownloads.set("model-b", {
+      modelId: "model-b", current: 0, total: 200, label: "", status: "downloading",
+      abort: new AbortController(),
+    });
+    renderDownloads();
+
+    const dom = getRepoDom();
+    const rows = dom.downloads.querySelectorAll(".repo-dl-row");
+    expect(rows.length).toBe(2);
+  });
+
+  test("shows label when total is 0 and current is 0", () => {
+    repoState.activeDownloads.set("org/model", {
+      modelId: "org/model", current: 0, total: 0, label: "Starting...",
+      status: "downloading", abort: new AbortController(),
+    });
+    renderDownloads();
+
+    const dom = getRepoDom();
+    const bytes = dom.downloads.querySelector(".repo-dl-bytes")!;
+    expect(bytes.textContent).toBe("Starting...");
+  });
+});
+
+// ── updateDownloadProgress ──────────────────────────────────────────────────
+
+describe("updateDownloadProgress", () => {
+  test("updates bar width and byte text without DOM rebuild", () => {
+    repoState.activeDownloads.set("org/model", {
+      modelId: "org/model", current: 100, total: 1000, label: "",
+      status: "downloading", abort: new AbortController(),
+    });
+    renderDownloads();
+
+    const dom = getRepoDom();
+    const row = dom.downloads.querySelector(".repo-dl-row")!;
+    const bar = row.querySelector<HTMLElement>(".repo-dl-bar")!;
+    const bytes = row.querySelector<HTMLElement>(".repo-dl-bytes")!;
+
+    // Initial state.
+    expect(bar.style.width).toBe("10%");
+
+    // Update state and call targeted update.
+    const dl = repoState.activeDownloads.get("org/model")!;
+    dl.current = 500;
+    updateDownloadProgress();
+
+    // Same DOM element (not rebuilt).
+    expect(row.querySelector<HTMLElement>(".repo-dl-bar")).toBe(bar);
+    expect(bar.style.width).toBe("50%");
+    expect(bytes.textContent).toContain("500");
   });
 });
 
