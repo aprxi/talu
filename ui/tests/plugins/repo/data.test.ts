@@ -203,12 +203,17 @@ describe("loadModels", () => {
 // ── searchHub ───────────────────────────────────────────────────────────────
 
 describe("searchHub", () => {
-  test("empty query clears results without API call", async () => {
-    repoState.searchResults = [makeSearchResult("old")];
-    await searchHub("   ");
+  test("empty query calls API for trending models", async () => {
+    searchRepoModelsResult = {
+      ok: true,
+      data: { results: [makeSearchResult("trending-model")] },
+    };
+    await searchHub("");
 
-    expect(apiCalls.length).toBe(0);
-    expect(repoState.searchResults.length).toBe(0);
+    expect(apiCalls.length).toBe(1);
+    expect(apiCalls[0]!.method).toBe("searchRepoModels");
+    expect(repoState.searchResults.length).toBe(1);
+    expect(repoState.searchResults[0]!.model_id).toBe("trending-model");
   });
 
   test("passes query and filter state to API", async () => {

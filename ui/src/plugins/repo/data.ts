@@ -41,12 +41,6 @@ export async function loadModels(): Promise<void> {
 // ---------------------------------------------------------------------------
 
 export async function searchHub(query: string): Promise<void> {
-  if (!query.trim()) {
-    repoState.searchResults = [];
-    renderDiscoverResults();
-    return;
-  }
-
   const gen = ++repoState.searchGeneration;
   repoState.isLoading = true;
   renderDiscoverResults(); // Show spinner.

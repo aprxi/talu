@@ -40,7 +40,7 @@ export function wireRepoEvents(): void {
       syncRepoTabs();
       updateRepoToolbar();
       if (tab === "discover") {
-        renderDiscoverResults();
+        searchHub(repoState.searchQuery);
       } else {
         loadModels();
       }
@@ -79,8 +79,7 @@ export function wireRepoEvents(): void {
     // Bump generation so any in-flight searchHub response is discarded.
     repoState.searchGeneration++;
     if (repoState.tab === "discover") {
-      repoState.searchResults = [];
-      renderDiscoverResults();
+      searchHub("");
     } else {
       renderModelsTable();
     }
@@ -96,7 +95,7 @@ export function wireRepoEvents(): void {
       repoState.discoverSort = dom.sortSelect.value as typeof repoState.discoverSort;
       repoState.discoverTask = dom.taskFilter.value as typeof repoState.discoverTask;
       repoState.discoverLibrary = dom.libraryFilter.value as typeof repoState.discoverLibrary;
-      if (repoState.tab === "discover" && repoState.searchQuery) {
+      if (repoState.tab === "discover") {
         searchHub(repoState.searchQuery);
       }
     });

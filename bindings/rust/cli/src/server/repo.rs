@@ -329,7 +329,7 @@ pub async fn handle_list(
 /// GET /v1/repo/search — search HuggingFace Hub for models.
 #[utoipa::path(get, path = "/v1/repo/search", tag = "Repository",
     params(
-        ("query" = String, Query, description = "Search query"),
+        ("query" = Option<String>, Query, description = "Search query (empty returns trending models)"),
         ("limit" = Option<usize>, Query, description = "Max results (default 20)"),
         ("token" = Option<String>, Query, description = "HuggingFace token for private repos"),
         ("endpoint_url" = Option<String>, Query, description = "Custom endpoint URL"),
@@ -340,7 +340,7 @@ pub async fn handle_list(
     ),
     responses(
         (status = 200, body = RepoSearchResponse),
-        (status = 400, body = super::http::ErrorResponse, description = "Missing query"),
+        (status = 400, body = super::http::ErrorResponse, description = "Bad request"),
         (status = 500, body = super::http::ErrorResponse, description = "Search failed"),
     ))]
 pub async fn handle_search(
@@ -361,18 +361,8 @@ pub async fn handle_search(
     let query = params
         .iter()
         .find(|(k, _)| k == "query")
-        .map(|(_, v)| v.clone());
-
-    let query = match query {
-        Some(q) if !q.is_empty() => q,
-        _ => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "missing_query",
-                "Query parameter 'query' is required",
-            )
-        }
-    };
+        .map(|(_, v)| v.clone())
+        .unwrap_or_default();
 
     let limit: usize = params
         .iter()

@@ -157,6 +157,14 @@ describe("Tab switching", () => {
 
     expect(apiCalls.some((c) => c.method === "listRepoModels")).toBe(true);
   });
+
+  test("switching to discover tab loads trending models", async () => {
+    wireRepoEvents();
+    getRepoDom().tabDiscover.dispatchEvent(new Event("click"));
+    await flushAsync();
+
+    expect(apiCalls.some((c) => c.method === "searchRepoModels")).toBe(true);
+  });
 });
 
 // ── Search debouncing ───────────────────────────────────────────────────────
@@ -228,7 +236,7 @@ describe("Search debouncing", () => {
     expect((dom.search as HTMLInputElement).value).toBe("");
   });
 
-  test("search clear in discover mode clears searchResults", () => {
+  test("search clear in discover mode reloads trending models", async () => {
     repoState.tab = "discover";
     repoState.searchQuery = "llama";
     repoState.searchResults = [{ model_id: "r1" } as any];
@@ -237,9 +245,11 @@ describe("Search debouncing", () => {
     (dom.search as HTMLInputElement).value = "llama";
 
     dom.searchClear.dispatchEvent(new Event("click"));
+    await flushAsync();
 
     expect(repoState.searchQuery).toBe("");
-    expect(repoState.searchResults.length).toBe(0);
+    // Clear triggers searchHub("") which calls the API.
+    expect(apiCalls.some((c) => c.method === "searchRepoModels" && c.args[0] === "")).toBe(true);
   });
 
   test("search clear bumps searchGeneration to discard in-flight results", () => {
@@ -252,11 +262,12 @@ describe("Search debouncing", () => {
 
     dom.searchClear.dispatchEvent(new Event("click"));
 
-    // Generation must increase so searchHub's stale-guard discards pending responses.
-    expect(repoState.searchGeneration).toBe(6);
+    // Clear handler bumps generation once (5→6), then searchHub("") bumps again (6→7).
+    // Any in-flight response from the "llama" search has gen ≤ 5 and will be discarded.
+    expect(repoState.searchGeneration).toBeGreaterThan(5);
   });
 
-  test("search clear cancels pending debounce timer", () => {
+  test("search clear cancels pending debounce timer", async () => {
     repoState.tab = "discover";
     wireRepoEvents();
     const dom = getRepoDom();
@@ -269,11 +280,17 @@ describe("Search debouncing", () => {
 
     // Click clear → debounce must be cancelled.
     dom.searchClear.dispatchEvent(new Event("click"));
+    await flushAsync();
     expect(ct.pending[0]!.disposed).toBe(true);
 
-    // flush() skips disposed timers — same as real timer system.
+    // The only API call should be from clear's searchHub(""), not the debounce.
+    const searchCalls = apiCalls.filter((c) => c.method === "searchRepoModels");
+    expect(searchCalls.length).toBe(1);
+    expect(searchCalls[0]!.args[0]).toBe(""); // Trending reload, not "llama".
+
+    // Flushing disposed timers should not add another call.
     ct.flush();
-    expect(apiCalls.length).toBe(0);
+    expect(apiCalls.filter((c) => c.method === "searchRepoModels").length).toBe(1);
   });
 });
 
@@ -515,7 +532,7 @@ describe("Discover filter selects", () => {
     expect(apiCalls.filter((c) => c.method === "searchRepoModels").length).toBe(0);
   });
 
-  test("sort/task/library changes with no query do not trigger API", () => {
+  test("sort/task/library changes with no query still trigger API for trending", async () => {
     repoState.tab = "discover";
     repoState.searchQuery = "";
     wireRepoEvents();
@@ -523,7 +540,8 @@ describe("Discover filter selects", () => {
     const dom = getRepoDom();
     (dom.sortSelect as HTMLSelectElement).value = "likes";
     dom.sortSelect.dispatchEvent(new Event("change"));
+    await flushAsync();
 
-    expect(apiCalls.length).toBe(0);
+    expect(apiCalls.some((c) => c.method === "searchRepoModels")).toBe(true);
   });
 });
