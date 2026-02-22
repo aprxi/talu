@@ -166,6 +166,8 @@ pub(crate) struct QueryPointsRequest {
     pub top_k: Option<u32>,
     #[serde(default)]
     pub min_score: Option<f32>,
+    #[serde(default)]
+    pub approximate: Option<bool>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -205,6 +207,16 @@ pub(crate) struct CompactResponse {
     pub dims: u32,
     pub kept_count: usize,
     pub removed_tombstones: usize,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CompactCollectionRequest {
+    #[serde(default)]
+    pub expected_generation: Option<u64>,
+    #[serde(default)]
+    pub ttl_max_age_ms: Option<i64>,
+    #[serde(default)]
+    pub now_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -921,6 +933,7 @@ pub async fn handle_query_points(
     }
 
     let min_score = query_req.min_score;
+    let approximate = query_req.approximate.unwrap_or(false);
 
     let mut flat_queries = Vec::with_capacity(queries.len() * collection.dims as usize);
     for query in &queries {
@@ -934,6 +947,7 @@ pub async fn handle_query_points(
                 collection.dims,
                 top_k,
                 collection.normalization == NormalizationPolicy::L2,
+                approximate,
             )
             .map_err(vector_error_response)
     }) {
@@ -1030,6 +1044,7 @@ pub async fn handle_collection_stats(
     path = "/v1/db/collections/{name}/compact",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
+    request_body = CompactCollectionRequest,
     responses((status = 200, body = CompactResponse))
 )]
 /// POST /v1/db/collections/{name}/compact - Compact collection state and vector store.
@@ -1059,6 +1074,18 @@ pub async fn handle_compact_collection(
         Ok(b) => b,
         Err(err) => return body_read_error_response(err),
     };
+    let compact_req: CompactCollectionRequest = if body.is_empty() {
+        CompactCollectionRequest {
+            expected_generation: None,
+            ttl_max_age_ms: None,
+            now_ms: None,
+        }
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(v) => v,
+            Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
+        }
+    };
     let request_hash = hash_bytes(&body);
     let (idempotency_key_hash, idempotency_request_hash) =
         idempotency_hashes(idempotency_key.as_deref(), request_hash);
@@ -1069,14 +1096,33 @@ pub async fn handle_compact_collection(
             Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", &e),
         };
 
+    if compact_req.ttl_max_age_ms.is_some() && compact_req.expected_generation.is_some() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "compact supports either ttl_max_age_ms or expected_generation, not both",
+        );
+    }
+
     let compact = match with_collection_store(&storage_root, &collection_name, |store| {
-        store
-            .compact_idempotent(
-                collection.dims,
-                idempotency_key_hash,
-                idempotency_request_hash,
-            )
-            .map_err(vector_error_response)
+        if let Some(ttl_max_age_ms) = compact_req.ttl_max_age_ms {
+            let now_ms = compact_req.now_ms.unwrap_or_else(unix_ms_now);
+            store
+                .compact_expired_tombstones(collection.dims, now_ms, ttl_max_age_ms)
+                .map_err(vector_error_response)
+        } else if let Some(expected_generation) = compact_req.expected_generation {
+            store
+                .compact_with_generation(collection.dims, expected_generation)
+                .map_err(vector_error_response)
+        } else {
+            store
+                .compact_idempotent(
+                    collection.dims,
+                    idempotency_key_hash,
+                    idempotency_request_hash,
+                )
+                .map_err(vector_error_response)
+        }
     }) {
         Ok(result) => result,
         Err(resp) => return resp,
@@ -1536,6 +1582,14 @@ fn vector_error_response(err: talu::VectorError) -> Response<BoxBody> {
                     "idempotency_conflict",
                     "idempotency key was used with a different request payload",
                 )
+            } else if lower.contains("manifestgenerationconflict")
+                || lower.contains("generation conflict")
+            {
+                json_error(
+                    StatusCode::CONFLICT,
+                    "generation_conflict",
+                    "manifest generation does not match expected_generation",
+                )
             } else if lower.contains("alreadyexists") || lower.contains("already exists") {
                 json_error(
                     StatusCode::CONFLICT,
@@ -1555,6 +1609,14 @@ fn vector_error_response(err: talu::VectorError) -> Response<BoxBody> {
                     StatusCode::CONFLICT,
                     "idempotency_conflict",
                     "idempotency key was used with a different request payload",
+                )
+            } else if lower.contains("manifestgenerationconflict")
+                || lower.contains("generation conflict")
+            {
+                json_error(
+                    StatusCode::CONFLICT,
+                    "generation_conflict",
+                    "manifest generation does not match expected_generation",
                 )
             } else if lower.contains("alreadyexists") || lower.contains("already exists") {
                 json_error(

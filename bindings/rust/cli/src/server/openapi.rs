@@ -201,6 +201,7 @@ use crate::server::{
         db_vector::QueryResultSet,
         db_vector::QueryPointsResponse,
         db_vector::CollectionStatsResponse,
+        db_vector::CompactCollectionRequest,
         db_vector::CompactResponse,
         db_vector::ChangeEventResponse,
         db_vector::ChangesResponse,

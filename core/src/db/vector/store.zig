@@ -7,7 +7,14 @@ const std = @import("std");
 const db_writer = @import("../writer.zig");
 const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
+const manifest = @import("../manifest.zig");
+const segment_source = @import("../segment_source.zig");
 const types = @import("../types.zig");
+const vector_filter = @import("filter.zig");
+const vector_index = @import("index/root.zig");
+const vector_planner = @import("planner.zig");
+const vector_cdc = @import("cdc.zig");
+const vector_ttl = @import("ttl.zig");
 const tensor_mod = @import("../../tensor.zig");
 const dot_product = @import("../../compute/cpu/linalg.zig").dot;
 const parallel = @import("../../system/parallel.zig");
@@ -140,6 +147,8 @@ pub const MutationOptions = struct {
 
 pub const SearchOptions = struct {
     normalize_queries: bool = false,
+    filter_expr: ?*const vector_filter.FilterExpr = null,
+    approximate: bool = false,
 };
 
 pub const ChangesResult = struct {
@@ -200,12 +209,32 @@ const ScratchBuffers = struct {
 };
 
 const BlockSnapshots = struct {
+    vector_generation: u64,
+    change_generation: u64,
     vector_blocks: []db_reader.BlockRef,
     change_blocks: []db_reader.BlockRef,
 
     fn deinit(self: BlockSnapshots, allocator: Allocator) void {
         allocator.free(self.vector_blocks);
         allocator.free(self.change_blocks);
+    }
+};
+
+const SearchCandidates = struct {
+    ids: []const u64,
+    vectors: []const f32,
+    owned_ids: ?[]u64 = null,
+    owned_vectors: ?[]f32 = null,
+
+    fn deinit(self: *SearchCandidates, allocator: Allocator) void {
+        if (self.owned_ids) |owned| allocator.free(owned);
+        if (self.owned_vectors) |owned| allocator.free(owned);
+        self.* = .{
+            .ids = &[_]u64{},
+            .vectors = &[_]f32{},
+            .owned_ids = null,
+            .owned_vectors = null,
+        };
     }
 };
 
@@ -242,6 +271,8 @@ pub const VectorAdapter = struct {
     read_cache_valid: bool,
     cached_vector_block_count: usize,
     cached_change_block_count: usize,
+    cached_vector_generation: u64,
+    cached_change_generation: u64,
     cached_vector_block_hash: u64,
     cached_change_block_hash: u64,
     cached_visibility: std.AutoHashMap(u64, PointVisibility),
@@ -297,6 +328,8 @@ pub const VectorAdapter = struct {
             .read_cache_valid = false,
             .cached_vector_block_count = 0,
             .cached_change_block_count = 0,
+            .cached_vector_generation = 0,
+            .cached_change_generation = 0,
             .cached_vector_block_hash = 0,
             .cached_change_block_hash = 0,
             .cached_visibility = std.AutoHashMap(u64, PointVisibility).init(allocator),
@@ -763,6 +796,49 @@ pub const VectorAdapter = struct {
         return .{ .kept_count = kept_count, .removed_tombstones = removed_tombstones };
     }
 
+    /// Compact only if the vector manifest generation matches `expected_generation`.
+    ///
+    /// This protects background jobs from publishing stale compaction output
+    /// when another writer already advanced the manifest snapshot.
+    pub fn compactWithExpectedGeneration(
+        self: *VectorAdapter,
+        dims: u32,
+        expected_generation: u64,
+    ) !CompactResult {
+        try self.fs_writer.flushBlock();
+        _ = try self.fs_reader.refreshIfChanged();
+        const current_generation = self.fs_reader.snapshotGeneration();
+        if (current_generation != expected_generation) return error.ManifestGenerationConflict;
+        return self.compact(dims);
+    }
+
+    /// Compact only when tombstones older than TTL are present.
+    pub fn compactExpiredTombstones(
+        self: *VectorAdapter,
+        dims: u32,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) !CompactResult {
+        const changes = try self.loadAllChanges(self.allocator);
+        defer self.allocator.free(changes);
+
+        var expired_tombstones: usize = 0;
+        for (changes) |change| {
+            if (change.op != .delete) continue;
+            if (vector_ttl.isExpired(change.timestamp, now_ms, max_age_ms)) {
+                expired_tombstones += 1;
+            }
+        }
+        if (!vector_ttl.shouldCompactForTtl(expired_tombstones)) {
+            const current = try self.stats();
+            return .{
+                .kept_count = current.visible_count,
+                .removed_tombstones = 0,
+            };
+        }
+        return self.compact(dims);
+    }
+
     /// Compact vectors with durable idempotency tracking.
     pub fn compactIdempotent(
         self: *VectorAdapter,
@@ -962,26 +1038,58 @@ pub const VectorAdapter = struct {
 
         const vector_count = snapshots.vector_blocks.len;
         const change_count = snapshots.change_blocks.len;
+        const vector_generation = snapshots.vector_generation;
+        const change_generation = snapshots.change_generation;
         const vector_hash = hashBlockRefs(snapshots.vector_blocks);
         const change_hash = hashBlockRefs(snapshots.change_blocks);
 
         if (!self.read_cache_valid) {
-            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            try self.refreshReadCacheFromBlocks(
+                snapshots.vector_generation,
+                snapshots.change_generation,
+                snapshots.vector_blocks,
+                snapshots.change_blocks,
+                vector_hash,
+                change_hash,
+            );
             return;
         }
 
         if (vector_count == self.cached_vector_block_count and
             change_count == self.cached_change_block_count and
+            vector_generation == self.cached_vector_generation and
+            change_generation == self.cached_change_generation and
             vector_hash == self.cached_vector_block_hash and
             change_hash == self.cached_change_block_hash)
         {
             return;
         }
 
+        if (vector_generation != self.cached_vector_generation or
+            change_generation != self.cached_change_generation)
+        {
+            try self.refreshReadCacheFromBlocks(
+                snapshots.vector_generation,
+                snapshots.change_generation,
+                snapshots.vector_blocks,
+                snapshots.change_blocks,
+                vector_hash,
+                change_hash,
+            );
+            return;
+        }
+
         if (vector_count < self.cached_vector_block_count or
             change_count < self.cached_change_block_count)
         {
-            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            try self.refreshReadCacheFromBlocks(
+                snapshots.vector_generation,
+                snapshots.change_generation,
+                snapshots.vector_blocks,
+                snapshots.change_blocks,
+                vector_hash,
+                change_hash,
+            );
             return;
         }
 
@@ -1000,14 +1108,28 @@ pub const VectorAdapter = struct {
             break :blk prefix_hash == self.cached_change_block_hash;
         };
         if (!vector_is_append_only or !change_is_append_only) {
-            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            try self.refreshReadCacheFromBlocks(
+                snapshots.vector_generation,
+                snapshots.change_generation,
+                snapshots.vector_blocks,
+                snapshots.change_blocks,
+                vector_hash,
+                change_hash,
+            );
             return;
         }
 
         self.read_cache_valid = false;
         const change_needs_full = try self.applyChangeBlocks(snapshots.change_blocks[self.cached_change_block_count..]);
         if (change_needs_full) {
-            try self.refreshReadCacheFromBlocks(snapshots.vector_blocks, snapshots.change_blocks, vector_hash, change_hash);
+            try self.refreshReadCacheFromBlocks(
+                snapshots.vector_generation,
+                snapshots.change_generation,
+                snapshots.vector_blocks,
+                snapshots.change_blocks,
+                vector_hash,
+                change_hash,
+            );
             return;
         }
         try self.applyVectorBlocks(snapshots.vector_blocks[self.cached_vector_block_count..]);
@@ -1015,6 +1137,8 @@ pub const VectorAdapter = struct {
 
         self.cached_vector_block_count = vector_count;
         self.cached_change_block_count = change_count;
+        self.cached_vector_generation = vector_generation;
+        self.cached_change_generation = change_generation;
         self.cached_vector_block_hash = vector_hash;
         self.cached_change_block_hash = change_hash;
         self.read_cache_valid = true;
@@ -1022,6 +1146,8 @@ pub const VectorAdapter = struct {
 
     fn refreshReadCacheFromBlocks(
         self: *VectorAdapter,
+        vector_generation: u64,
+        change_generation: u64,
         vector_blocks: []const db_reader.BlockRef,
         change_blocks: []const db_reader.BlockRef,
         vector_hash: u64,
@@ -1040,6 +1166,8 @@ pub const VectorAdapter = struct {
         try self.rebuildVisibleDenseCache();
         self.cached_vector_block_count = vector_blocks.len;
         self.cached_change_block_count = change_blocks.len;
+        self.cached_vector_generation = vector_generation;
+        self.cached_change_generation = change_generation;
         self.cached_vector_block_hash = vector_hash;
         self.cached_change_block_hash = change_hash;
         self.read_cache_valid = true;
@@ -1049,6 +1177,8 @@ pub const VectorAdapter = struct {
         self.read_cache_valid = false;
         self.cached_vector_block_count = 0;
         self.cached_change_block_count = 0;
+        self.cached_vector_generation = 0;
+        self.cached_change_generation = 0;
         self.cached_vector_block_hash = 0;
         self.cached_change_block_hash = 0;
         self.clearVisibleDenseCache();
@@ -1113,13 +1243,17 @@ pub const VectorAdapter = struct {
         _ = try self.fs_reader.refreshIfChanged();
         const vector_blocks = try self.fs_reader.getBlocks(allocator);
         errdefer allocator.free(vector_blocks);
+        const vector_generation = self.fs_reader.snapshotGeneration();
 
         try self.change_writer.flushBlock();
         _ = try self.change_reader.refreshIfChanged();
         const change_blocks = try self.change_reader.getBlocks(allocator);
         errdefer allocator.free(change_blocks);
+        const change_generation = self.change_reader.snapshotGeneration();
 
         return .{
+            .vector_generation = vector_generation,
+            .change_generation = change_generation,
             .vector_blocks = vector_blocks,
             .change_blocks = change_blocks,
         };
@@ -1129,17 +1263,12 @@ pub const VectorAdapter = struct {
         if (blocks.len == 0) return false;
 
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.change_reader, &current_handle);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.change_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, self.allocator);
+            try ensureBlockHandle(self.change_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, self.allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_vector_changes) continue;
             if (header.row_count == 0) continue;
@@ -1192,19 +1321,14 @@ pub const VectorAdapter = struct {
         if (blocks.len == 0) return;
 
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
         var scratch = ScratchBuffers{};
         defer scratch.deinit(self.allocator);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, self.allocator);
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, self.allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -1426,17 +1550,12 @@ pub const VectorAdapter = struct {
         errdefer records.deinit();
 
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.idempotency_reader, &current_handle);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.idempotency_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            try ensureBlockHandle(self.idempotency_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_vector_idempotency) continue;
             if (header.row_count == 0) continue;
@@ -1532,17 +1651,12 @@ pub const VectorAdapter = struct {
         errdefer events.deinit(allocator);
 
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.change_reader, &current_handle);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.change_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            try ensureBlockHandle(self.change_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_vector_changes) continue;
             if (header.row_count == 0) continue;
@@ -1652,19 +1766,14 @@ pub const VectorAdapter = struct {
         errdefer latest.deinit(allocator);
 
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
         var scratch = ScratchBuffers{};
         defer scratch.deinit(allocator);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -1747,17 +1856,12 @@ pub const VectorAdapter = struct {
         _ = self;
         var max_seq: u64 = 0;
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(reader_owner, &current_handle);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try reader_owner.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            try ensureBlockHandle(reader_owner, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_id or header.row_count == 0) continue;
 
@@ -1865,10 +1969,9 @@ pub const VectorAdapter = struct {
         var dims: ?u32 = null;
 
         for (blocks) |block| {
-            var file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
+            var handle = try self.fs_reader.openBlockReadOnly(block.path);
+            defer self.fs_reader.closeBlock(&handle);
+            const reader = block_reader.BlockReader.init(handle.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -1900,10 +2003,9 @@ pub const VectorAdapter = struct {
         var vector_offset: usize = 0;
 
         for (blocks) |block| {
-            var file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
+            var handle = try self.fs_reader.openBlockReadOnly(block.path);
+            defer self.fs_reader.closeBlock(&handle);
+            const reader = block_reader.BlockReader.init(handle.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -1946,10 +2048,9 @@ pub const VectorAdapter = struct {
         var dims: ?u32 = null;
 
         for (blocks) |block| {
-            var file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
+            var handle = try self.fs_reader.openBlockReadOnly(block.path);
+            defer self.fs_reader.closeBlock(&handle);
+            const reader = block_reader.BlockReader.init(handle.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -1988,10 +2089,9 @@ pub const VectorAdapter = struct {
         var vector_offset: usize = 0;
 
         for (blocks) |block| {
-            var file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
+            var handle = try self.fs_reader.openBlockReadOnly(block.path);
+            defer self.fs_reader.closeBlock(&handle);
+            const reader = block_reader.BlockReader.init(handle.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -2066,19 +2166,14 @@ pub const VectorAdapter = struct {
         defer allocator.free(blocks);
 
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
         var scratch = ScratchBuffers{};
         defer scratch.deinit(allocator);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -2149,17 +2244,12 @@ pub const VectorAdapter = struct {
 
         var total_rows: usize = 0;
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -2204,8 +2294,8 @@ pub const VectorAdapter = struct {
         defer allocator.free(blocks);
 
         var current_path: ?[]const u8 = null;
-        var current_file: ?std.fs.File = null;
-        defer if (current_file) |file| file.close();
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
         var scratch = ScratchBuffers{};
         defer scratch.deinit(allocator);
 
@@ -2213,13 +2303,8 @@ pub const VectorAdapter = struct {
         const dims_usize = @as(usize, dims);
 
         for (blocks) |block| {
-            if (current_path == null or !std.mem.eql(u8, current_path.?, block.path)) {
-                if (current_file) |file| file.close();
-                current_file = try self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only });
-                current_path = block.path;
-            }
-
-            const reader = block_reader.BlockReader.init(current_file.?, allocator);
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
             const header = try reader.readHeader(block.offset);
             if (header.schema_id != schema_embeddings) continue;
             if (header.row_count == 0) continue;
@@ -2282,7 +2367,7 @@ pub const VectorAdapter = struct {
         k: u32,
         options: SearchOptions,
     ) !SearchBatchResult {
-        if (k == 0 or query_count == 0) {
+        if (query_count == 0 or k == 0) {
             return .{
                 .ids = try allocator.alloc(u64, 0),
                 .scores = try allocator.alloc(f32, 0),
@@ -2294,6 +2379,7 @@ pub const VectorAdapter = struct {
         if (queries.len != @as(usize, dims) * @as(usize, query_count)) {
             return error.InvalidColumnData;
         }
+        var plan = try vector_planner.buildSearchPlan(k, query_count, options.filter_expr, options.approximate);
 
         var query_buf = queries;
         var normalized_queries: ?[]f32 = null;
@@ -2308,6 +2394,10 @@ pub const VectorAdapter = struct {
 
         try self.ensureReadCache();
 
+        if (plan.index_kind == .ivf_flat and !self.canUseApproximateIndex()) {
+            plan.index_kind = .flat;
+        }
+
         if (self.cached_latest.dims == 0) {
             return .{
                 .ids = try allocator.alloc(u64, 0),
@@ -2317,8 +2407,10 @@ pub const VectorAdapter = struct {
             };
         }
         if (self.cached_latest.dims != dims) return error.InvalidColumnData;
+        var candidates = try self.selectSearchCandidates(allocator, dims, plan, options.filter_expr);
+        defer candidates.deinit(allocator);
 
-        const row_count = self.cached_visible_ids.len;
+        const row_count = candidates.ids.len;
         if (row_count == 0) {
             return .{
                 .ids = try allocator.alloc(u64, 0),
@@ -2328,62 +2420,107 @@ pub const VectorAdapter = struct {
             };
         }
 
-        const per_query_capacity = @min(@as(usize, k), row_count);
-        var heaps = try allocator.alloc(MinHeap, query_count);
-        errdefer {
-            for (heaps) |*heap| heap.deinit(allocator);
-            allocator.free(heaps);
-        }
-        for (heaps) |*heap| {
-            heap.* = try MinHeap.init(allocator, per_query_capacity);
-        }
-
-        const all_scores = try allocator.alloc(f32, row_count * @as(usize, query_count));
-        defer allocator.free(all_scores);
-        parallelScoreBatchRows(
-            query_buf,
-            self.cached_visible_vectors,
-            @as(usize, dims),
-            query_count,
-            row_count,
-            row_count,
-            0,
-            all_scores,
+        const index = switch (plan.index_kind) {
+            .flat => vector_index.VectorIndex{ .flat = .{} },
+            .ivf_flat => vector_index.VectorIndex{ .ivf_flat = .{} },
+        };
+        const index_result = try index.searchBatch(
+            allocator,
+            .{
+                .ids = candidates.ids,
+                .vectors = candidates.vectors,
+                .dims = dims,
+            },
+            .{
+                .queries = query_buf,
+                .query_count = query_count,
+                .k = k,
+                .dims = dims,
+            },
         );
 
-        for (0..row_count) |row_idx| {
-            for (0..@as(usize, query_count)) |query_idx| {
-                heaps[query_idx].push(
-                    all_scores[query_idx * row_count + row_idx],
-                    self.cached_visible_ids[row_idx],
-                );
-            }
+        return .{
+            .ids = index_result.ids,
+            .scores = index_result.scores,
+            .count_per_query = index_result.count_per_query,
+            .query_count = index_result.query_count,
+        };
+    }
+
+    fn selectSearchCandidates(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        dims: u32,
+        plan: vector_planner.QueryPlan,
+        filter_expr: ?*const vector_filter.FilterExpr,
+    ) !SearchCandidates {
+        _ = dims;
+        if (plan.filter_mode == .none) {
+            return .{
+                .ids = self.cached_visible_ids,
+                .vectors = self.cached_visible_vectors,
+            };
         }
 
-        const count_per_query: u32 = @intCast(heaps[0].size);
-        const total = @as(usize, count_per_query) * @as(usize, query_count);
-        const ids_out = try allocator.alloc(u64, total);
-        errdefer allocator.free(ids_out);
-        const scores_out = try allocator.alloc(f32, total);
-        errdefer allocator.free(scores_out);
+        var allow = try vector_filter.evaluateAllowList(allocator, filter_expr, self.cached_visible_ids);
+        defer vector_filter.deinitAllowList(allocator, &allow);
 
-        var query_idx: usize = 0;
-        while (query_idx < query_count) : (query_idx += 1) {
-            const offset = query_idx * @as(usize, count_per_query);
-            const ids_slice = ids_out[offset .. offset + @as(usize, count_per_query)];
-            const scores_slice = scores_out[offset .. offset + @as(usize, count_per_query)];
-            try heaps[query_idx].writeSorted(allocator, ids_slice, scores_slice);
+        const kept = vector_filter.allowListCount(&allow);
+        if (kept == 0) {
+            return .{
+                .ids = &[_]u64{},
+                .vectors = &[_]f32{},
+            };
         }
 
-        for (heaps) |*heap| heap.deinit(allocator);
-        allocator.free(heaps);
+        const dims_usize = @as(usize, self.cached_latest.dims);
+        const ids = try allocator.alloc(u64, kept);
+        errdefer allocator.free(ids);
+        const vectors = try allocator.alloc(f32, kept * dims_usize);
+        errdefer allocator.free(vectors);
+
+        var write_idx: usize = 0;
+        for (self.cached_visible_ids, 0..) |id, idx| {
+            if (!vector_filter.allowListContains(&allow, idx)) continue;
+            ids[write_idx] = id;
+            const src_base = idx * dims_usize;
+            const dst_base = write_idx * dims_usize;
+            std.mem.copyForwards(
+                f32,
+                vectors[dst_base .. dst_base + dims_usize],
+                self.cached_visible_vectors[src_base .. src_base + dims_usize],
+            );
+            write_idx += 1;
+        }
 
         return .{
-            .ids = ids_out,
-            .scores = scores_out,
-            .count_per_query = count_per_query,
-            .query_count = query_count,
+            .ids = ids,
+            .vectors = vectors,
+            .owned_ids = ids,
+            .owned_vectors = vectors,
         };
+    }
+
+    fn canUseApproximateIndex(self: *VectorAdapter) bool {
+        var snapshot = self.fs_reader.loadManifestSnapshot(self.allocator) catch return false;
+        defer snapshot.deinit(self.allocator);
+        if (snapshot.segments.len == 0) return false;
+
+        for (snapshot.segments) |segment| {
+            const index_meta = segment.index orelse return false;
+            if (index_meta.kind != manifest.SegmentIndexKind.ivf_flat) return false;
+            if (index_meta.path.len == 0) return false;
+
+            const ns_path = std.fmt.allocPrint(self.allocator, "vector/{s}", .{index_meta.path}) catch return false;
+            defer self.allocator.free(ns_path);
+
+            var handle = self.fs_reader.openBlockReadOnly(ns_path) catch return false;
+            defer self.fs_reader.closeBlock(&handle);
+
+            const actual = crc32cFile(handle.file, handle.size) catch return false;
+            if (actual != index_meta.checksum_crc32c) return false;
+        }
+        return true;
     }
 
     /// Release resources.
@@ -2470,94 +2607,42 @@ fn hashBlockRefs(blocks: []const db_reader.BlockRef) u64 {
     return hasher.final();
 }
 
-const MinHeap = struct {
-    entries: []SearchEntry,
-    size: usize,
-
-    pub fn init(allocator: Allocator, capacity: usize) !MinHeap {
-        if (capacity == 0) return error.InvalidColumnData;
-        const entries = try allocator.alloc(SearchEntry, capacity);
-        return .{ .entries = entries, .size = 0 };
+fn crc32cFile(file: std.fs.File, len: u64) !u32 {
+    var crc = std.hash.crc.Crc32Iscsi.init();
+    var buf: [64 * 1024]u8 = undefined;
+    var offset: u64 = 0;
+    while (offset < len) {
+        const remaining = len - offset;
+        const chunk_len: usize = @intCast(@min(remaining, buf.len));
+        const chunk = buf[0..chunk_len];
+        const read_len = try file.preadAll(chunk, offset);
+        if (read_len != chunk_len) return error.UnexpectedEof;
+        crc.update(chunk);
+        offset += @as(u64, @intCast(chunk_len));
     }
+    return crc.final();
+}
 
-    pub fn deinit(self: *MinHeap, allocator: Allocator) void {
-        allocator.free(self.entries);
+fn closeCurrentBlockHandle(reader_owner: *db_reader.Reader, current_handle: *?segment_source.SegmentHandle) void {
+    if (current_handle.*) |*handle| {
+        reader_owner.closeBlock(handle);
+        current_handle.* = null;
     }
+}
 
-    pub fn push(self: *MinHeap, score: f32, id: u64) void {
-        const candidate = SearchEntry{ .score = score, .id = id };
-        if (self.size < self.entries.len) {
-            self.entries[self.size] = candidate;
-            self.siftUp(self.size);
-            self.size += 1;
-            return;
-        }
-        if (!betterThan(candidate, self.entries[0])) return;
-        self.entries[0] = candidate;
-        self.siftDown(0);
+fn ensureBlockHandle(
+    reader_owner: *db_reader.Reader,
+    current_path: *?[]const u8,
+    current_handle: *?segment_source.SegmentHandle,
+    path: []const u8,
+) !void {
+    if (current_path.* != null and std.mem.eql(u8, current_path.*.?, path)) {
+        return;
     }
-
-    pub fn finalize(self: *MinHeap, allocator: Allocator) !SearchResult {
-        const ids = try allocator.alloc(u64, self.size);
-        errdefer allocator.free(ids);
-        const scores = try allocator.alloc(f32, self.size);
-        errdefer allocator.free(scores);
-        try self.writeSorted(allocator, ids, scores);
-
-        return .{ .ids = ids, .scores = scores };
-    }
-
-    fn siftUp(self: *MinHeap, start_idx: usize) void {
-        var idx = start_idx;
-        while (idx > 0) {
-            const parent = (idx - 1) / 2;
-            if (!betterThan(self.entries[parent], self.entries[idx])) break;
-            std.mem.swap(SearchEntry, &self.entries[parent], &self.entries[idx]);
-            idx = parent;
-        }
-    }
-
-    fn siftDown(self: *MinHeap, start_idx: usize) void {
-        var idx = start_idx;
-        const size = self.size;
-        while (true) {
-            const left = idx * 2 + 1;
-            if (left >= size) break;
-            const right = left + 1;
-            var smallest = left;
-            if (right < size and betterThan(self.entries[left], self.entries[right])) {
-                smallest = right;
-            }
-            if (!betterThan(self.entries[idx], self.entries[smallest])) break;
-            std.mem.swap(SearchEntry, &self.entries[idx], &self.entries[smallest]);
-            idx = smallest;
-        }
-    }
-
-    fn writeSorted(self: *MinHeap, allocator: Allocator, ids: []u64, scores: []f32) !void {
-        if (ids.len != self.size or scores.len != self.size) return error.InvalidColumnData;
-        const items = try allocator.alloc(SearchEntry, self.size);
-        defer allocator.free(items);
-        std.mem.copyForwards(SearchEntry, items, self.entries[0..self.size]);
-
-        std.sort.pdq(SearchEntry, items, {}, struct {
-            fn lessThan(_: void, a: SearchEntry, b: SearchEntry) bool {
-                return betterThan(a, b);
-            }
-        }.lessThan);
-
-        for (items, 0..) |entry, idx| {
-            ids[idx] = entry.id;
-            scores[idx] = entry.score;
-        }
-    }
-
-    fn betterThan(a: SearchEntry, b: SearchEntry) bool {
-        if (a.score > b.score) return true;
-        if (a.score < b.score) return false;
-        return a.id < b.id;
-    }
-};
+    closeCurrentBlockHandle(reader_owner, current_handle);
+    current_handle.* = try reader_owner.openBlockReadOnly(path);
+    current_path.* = path;
+}
 
 // =============================================================================
 // Parallel vector scoring
@@ -2659,26 +2744,6 @@ fn parallelScoreBatchRows(
         .scores_out = scores_out,
     };
     parallel.global().parallelFor(row_count, batchScoreScanWorker, &ctx);
-}
-
-/// Score all rows against a single query (parallel), then push into the heap (serial).
-fn scoreAndCollect(
-    allocator: Allocator,
-    query: []const f32,
-    ids: []const u64,
-    vectors: []const f32,
-    dims: usize,
-    row_count: usize,
-    heap: *MinHeap,
-) !void {
-    const scores = try allocator.alloc(f32, row_count);
-    defer allocator.free(scores);
-
-    parallelScoreRows(query, vectors, dims, scores);
-
-    for (0..row_count) |i| {
-        heap.push(scores[i], ids[i]);
-    }
 }
 
 fn computeScores(query: []const f32, vectors: []const f32, dims: u32, out_scores: []f32) !void {
@@ -3130,6 +3195,121 @@ test "VectorAdapter.searchBatchWithOptions normalizes queries" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), result.scores[0], 1e-6);
 }
 
+test "VectorAdapter.searchBatchWithOptions applies filter pre-allowlist" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{ 1, 2, 3 }, &[_]f32{
+        1.0, 0.0,
+        0.8, 0.0,
+        0.7, 0.0,
+    }, dims);
+
+    const filter_expr = vector_filter.FilterExpr{ .id_in = &[_]u64{ 2, 3 } };
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        1,
+        2,
+        .{ .filter_expr = &filter_expr },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 2), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 2), result.ids[0]);
+    try std.testing.expectEqual(@as(u64, 3), result.ids[1]);
+}
+
+test "VectorAdapter.searchBatchWithOptions supports approximate planner path" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{ 1, 2, 3 }, &[_]f32{
+        1.0, 0.0,
+        0.8, 0.0,
+        0.2, 0.0,
+    }, dims);
+
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        1,
+        2,
+        .{ .approximate = true },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 2), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
+}
+
+test "VectorAdapter.searchBatchWithOptions falls back to flat when segment index checksum mismatches" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    backend.fs_writer.max_segment_size = 1;
+    const dims: u32 = 2;
+    try backend.upsertBatch(&[_]u64{1}, &[_]f32{ 1.0, 0.0 }, dims);
+    try backend.fs_writer.flushBlock();
+    try backend.upsertBatch(&[_]u64{ 2, 3 }, &[_]f32{
+        0.9, 0.0,
+        0.2, 0.0,
+    }, dims);
+    try backend.fs_writer.flushBlock();
+
+    const manifest_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "vector", "manifest.json" });
+    defer std.testing.allocator.free(manifest_path);
+    var loaded_manifest = try manifest.Manifest.load(std.testing.allocator, manifest_path);
+    defer loaded_manifest.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), loaded_manifest.segments.len);
+    try std.testing.expect(loaded_manifest.segments[0].index != null);
+    const index_rel = loaded_manifest.segments[0].index.?.path;
+
+    const index_path = try std.fs.path.join(std.testing.allocator, &.{ root_path, "vector", index_rel });
+    defer std.testing.allocator.free(index_path);
+    var index_file = try std.fs.cwd().createFile(index_path, .{ .truncate = true });
+    defer index_file.close();
+    try index_file.writeAll("corrupt-index");
+
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        1,
+        2,
+        .{ .approximate = true },
+    );
+    defer result.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 2), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 2), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 1), result.ids[0]);
+    try std.testing.expectEqual(@as(u64, 2), result.ids[1]);
+}
+
 test "VectorAdapter.searchBatch uses deterministic id tie-break for equal scores" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3283,6 +3463,144 @@ test "VectorAdapter.compactIdempotent replays compact counts" {
     const replay = try backend.compactIdempotent(dims, 0xabc4, 0x5555);
     try std.testing.expectEqual(@as(usize, 1), replay.kept_count);
     try std.testing.expectEqual(@as(usize, 1), replay.removed_tombstones);
+}
+
+test "VectorAdapter.compactWithExpectedGeneration succeeds on matching generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims);
+    _ = try backend.deleteIds(&[_]u64{2});
+
+    try backend.fs_writer.flushBlock();
+    _ = try backend.fs_reader.refreshIfChanged();
+    const generation = backend.fs_reader.snapshotGeneration();
+
+    const result = try backend.compactWithExpectedGeneration(dims, generation);
+    try std.testing.expectEqual(@as(usize, 1), result.kept_count);
+    try std.testing.expectEqual(@as(usize, 1), result.removed_tombstones);
+}
+
+test "VectorAdapter.compactWithExpectedGeneration rejects stale generation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims);
+
+    try backend.fs_writer.flushBlock();
+    _ = try backend.fs_reader.refreshIfChanged();
+    const generation = backend.fs_reader.snapshotGeneration();
+
+    try std.testing.expectError(
+        error.ManifestGenerationConflict,
+        backend.compactWithExpectedGeneration(dims, generation + 1),
+    );
+}
+
+test "VectorAdapter.compactExpiredTombstones skips compaction when no tombstones are expired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims);
+    _ = try backend.deleteIds(&[_]u64{2});
+
+    const result = try backend.compactExpiredTombstones(dims, std.time.milliTimestamp(), std.time.ms_per_hour);
+    try std.testing.expectEqual(@as(usize, 1), result.kept_count);
+    try std.testing.expectEqual(@as(usize, 0), result.removed_tombstones);
+}
+
+test "VectorAdapter.compactExpiredTombstones compacts when tombstones are expired" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims);
+    _ = try backend.deleteIds(&[_]u64{2});
+
+    const far_future = std.math.maxInt(i64);
+    const result = try backend.compactExpiredTombstones(dims, far_future, 1);
+    try std.testing.expectEqual(@as(usize, 1), result.kept_count);
+    try std.testing.expectEqual(@as(usize, 1), result.removed_tombstones);
+}
+
+test "VectorAdapter.readChanges preserves cursor order across compaction" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    const dims: u32 = 2;
+    try backend.appendBatch(&[_]u64{ 1, 2 }, &[_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    }, dims);
+    _ = try backend.deleteIds(&[_]u64{2});
+
+    var first_page = try backend.readChanges(std.testing.allocator, 0, 2);
+    defer first_page.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), first_page.events.len);
+
+    const encoded_cursor = try vector_cdc.encodeCursor(std.testing.allocator, .{
+        .since = first_page.next_since,
+        .generation = backend.change_reader.snapshotGeneration(),
+    });
+    defer std.testing.allocator.free(encoded_cursor);
+    const cursor = try vector_cdc.decodeCursor(encoded_cursor);
+
+    _ = try backend.compact(dims);
+
+    var second_page = try backend.readChanges(std.testing.allocator, cursor.since, 100);
+    defer second_page.deinit(std.testing.allocator);
+    try std.testing.expect(second_page.events.len >= 2);
+
+    var last_seq = cursor.since;
+    for (second_page.events) |event| {
+        try std.testing.expect(event.seq > last_seq);
+        last_seq = event.seq;
+    }
 }
 
 test "VectorAdapter.discoverNextSeq resumes after idempotency records" {

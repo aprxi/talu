@@ -7,6 +7,7 @@ const block_writer = @import("block_writer.zig");
 const block_reader = @import("block_reader.zig");
 const checksum = @import("checksum.zig");
 const manifest = @import("manifest.zig");
+const segment_source = @import("segment_source.zig");
 const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
@@ -14,6 +15,20 @@ const Allocator = std.mem.Allocator;
 pub const BlockRef = struct {
     path: []const u8,
     offset: u64,
+};
+
+pub const ManifestSnapshot = struct {
+    generation: u64,
+    segments: []manifest.SegmentEntry,
+
+    pub fn deinit(self: *ManifestSnapshot, allocator: Allocator) void {
+        for (self.segments) |segment| {
+            allocator.free(segment.path);
+            if (segment.index) |index_meta| allocator.free(index_meta.path);
+        }
+        allocator.free(self.segments);
+        self.segments = &.{};
+    }
 };
 
 const FileSignature = struct {
@@ -34,9 +49,10 @@ pub const Reader = struct {
     manifest_rel_path: []const u8,
     current_rel_path: []const u8,
     manifest_data: ?manifest.Manifest,
-    current_file: ?std.fs.File,
+    current_handle: ?segment_source.SegmentHandle,
     current_blocks: std.ArrayList(u64),
     current_path: ?[]const u8,
+    source_override: ?segment_source.SegmentSource,
     manifest_sig: FileSignature,
     current_sig: FileSignature,
     /// Block references for sealed segments (path index + offset pairs).
@@ -44,6 +60,18 @@ pub const Reader = struct {
 
     /// Opens the TaluDB root and indexes the current file if present.
     pub fn open(allocator: Allocator, db_root: []const u8, namespace: []const u8) !Reader {
+        return openWithSegmentSource(allocator, db_root, namespace, null);
+    }
+
+    /// Opens the TaluDB root and indexes the current file if present.
+    /// If `source_override` is provided, sealed segments/current file reads are
+    /// routed through that segment source instead of direct local opens.
+    pub fn openWithSegmentSource(
+        allocator: Allocator,
+        db_root: []const u8,
+        namespace: []const u8,
+        source_override: ?segment_source.SegmentSource,
+    ) !Reader {
         // Manifest lives inside the namespace directory.
         const manifest_path = try std.fs.path.join(allocator, &.{ db_root, namespace, "manifest.json" });
         defer allocator.free(manifest_path);
@@ -52,7 +80,7 @@ pub const Reader = struct {
         errdefer dir.close();
 
         var manifest_data: ?manifest.Manifest = null;
-        var current_file: ?std.fs.File = null;
+        var current_handle: ?segment_source.SegmentHandle = null;
         var current_path: ?[]const u8 = null;
         const manifest_rel_path = try std.fs.path.join(allocator, &.{ namespace, "manifest.json" });
         errdefer allocator.free(manifest_rel_path);
@@ -64,6 +92,7 @@ pub const Reader = struct {
                 const empty_segments = try allocator.alloc(manifest.SegmentEntry, 0);
                 break :blk manifest.Manifest{
                     .version = 1,
+                    .generation = 0,
                     .segments = empty_segments,
                     .last_compaction_ts = 0,
                 };
@@ -72,14 +101,29 @@ pub const Reader = struct {
         };
         errdefer if (manifest_data) |*data| data.deinit(allocator);
 
-        current_file = dir.openFile(current_rel_path, .{ .mode = .read_only }) catch |err| switch (err) {
-            error.FileNotFound => null,
-            else => return err,
-        };
+        if (source_override) |source| {
+            current_handle = source.openReadOnly(current_rel_path) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+        } else {
+            var local = segment_source.LocalSegmentSource.init(&dir);
+            current_handle = local.asSource().openReadOnly(current_rel_path) catch |err| switch (err) {
+                error.FileNotFound => null,
+                else => return err,
+            };
+        }
 
-        if (current_file != null) {
+        if (current_handle != null) {
             current_path = try allocator.dupe(u8, current_rel_path);
         }
+        errdefer if (current_handle) |*handle| {
+            if (source_override) |source| {
+                source.close(handle);
+            } else {
+                handle.file.close();
+            }
+        };
         errdefer if (current_path) |path| allocator.free(path);
 
         const ns_prefix = try allocator.dupe(u8, namespace);
@@ -95,9 +139,10 @@ pub const Reader = struct {
             .manifest_rel_path = manifest_rel_path,
             .current_rel_path = current_rel_path,
             .manifest_data = manifest_data,
-            .current_file = current_file,
+            .current_handle = current_handle,
             .current_blocks = .empty,
             .current_path = current_path,
+            .source_override = source_override,
             .manifest_sig = .{ .exists = false, .size = 0, .mtime_ns = 0 },
             .current_sig = .{ .exists = false, .size = 0, .mtime_ns = 0 },
             .segment_blocks = .empty,
@@ -109,8 +154,8 @@ pub const Reader = struct {
             try reader.scanSegments(data.segments);
         }
 
-        if (reader.current_file) |file| {
-            try reader.scanCurrent(file);
+        if (reader.current_handle) |handle| {
+            try reader.scanCurrent(handle);
         }
 
         reader.manifest_sig = try reader.readFileSignature(reader.manifest_rel_path);
@@ -124,7 +169,7 @@ pub const Reader = struct {
         if (self.manifest_data) |*data| {
             data.deinit(self.allocator);
         }
-        if (self.current_file) |file| file.close();
+        if (self.current_handle) |*handle| self.closeHandle(handle);
         if (self.current_path) |path| self.allocator.free(path);
         for (self.segment_blocks.items) |block| {
             self.allocator.free(block.path);
@@ -163,11 +208,60 @@ pub const Reader = struct {
         return blocks;
     }
 
+    /// Returns the currently loaded manifest generation snapshot.
+    pub fn snapshotGeneration(self: *Reader) u64 {
+        if (self.manifest_data) |data| return data.generation;
+        return 0;
+    }
+
+    /// Returns a deep-copied manifest snapshot that stays stable for callers.
+    pub fn loadManifestSnapshot(self: *Reader, allocator: Allocator) !ManifestSnapshot {
+        const data = self.manifest_data orelse return .{
+            .generation = 0,
+            .segments = try allocator.alloc(manifest.SegmentEntry, 0),
+        };
+
+        const out = try allocator.alloc(manifest.SegmentEntry, data.segments.len);
+        var initialized: usize = 0;
+        errdefer {
+            var i: usize = 0;
+            while (i < initialized) : (i += 1) {
+                allocator.free(out[i].path);
+                if (out[i].index) |index_meta| allocator.free(index_meta.path);
+            }
+            allocator.free(out);
+        }
+        for (data.segments, 0..) |segment, idx| {
+            out[idx] = .{
+                .id = segment.id,
+                .path = try allocator.dupe(u8, segment.path),
+                .min_ts = segment.min_ts,
+                .max_ts = segment.max_ts,
+                .row_count = segment.row_count,
+                .checksum_crc32c = segment.checksum_crc32c,
+                .index = if (segment.index) |index_meta|
+                    .{
+                        .kind = index_meta.kind,
+                        .path = try allocator.dupe(u8, index_meta.path),
+                        .checksum_crc32c = index_meta.checksum_crc32c,
+                    }
+                else
+                    null,
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .generation = data.generation,
+            .segments = out,
+        };
+    }
+
     /// Refresh the current.talu block index.
     pub fn refreshCurrent(self: *Reader) !void {
         self.current_blocks.clearRetainingCapacity();
-        if (self.current_file) |file| {
-            try self.scanCurrent(file);
+        if (self.current_handle) |handle| {
+            try self.scanCurrent(handle);
         }
     }
 
@@ -184,6 +278,7 @@ pub const Reader = struct {
                 const empty_segments = try self.allocator.alloc(manifest.SegmentEntry, 0);
                 break :blk manifest.Manifest{
                     .version = 1,
+                    .generation = 0,
                     .segments = empty_segments,
                     .last_compaction_ts = 0,
                 };
@@ -238,25 +333,25 @@ pub const Reader = struct {
         return true;
     }
 
-    fn scanCurrent(self: *Reader, file: std.fs.File) !void {
-        try scanFileBlocks(file, self.allocator, &self.current_blocks);
+    fn scanCurrent(self: *Reader, handle: segment_source.SegmentHandle) !void {
+        try scanFileBlocks(handle.file, self.allocator, &self.current_blocks);
     }
 
     fn refreshCurrentOnly(self: *Reader) !void {
-        if (self.current_file) |file| file.close();
-        self.current_file = null;
+        if (self.current_handle) |*handle| self.closeHandle(handle);
+        self.current_handle = null;
         self.current_blocks.clearRetainingCapacity();
 
         if (self.current_path == null) {
             self.current_path = try self.allocator.dupe(u8, self.current_rel_path);
         }
 
-        self.current_file = self.dir.openFile(self.current_rel_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        self.current_handle = self.openReadOnlyHandle(self.current_rel_path) catch |err| switch (err) {
             error.FileNotFound => null,
             else => return err,
         };
-        if (self.current_file) |file| {
-            try self.scanCurrent(file);
+        if (self.current_handle) |handle| {
+            try self.scanCurrent(handle);
         }
     }
 
@@ -280,19 +375,18 @@ pub const Reader = struct {
             const ns_path = try std.fs.path.join(self.allocator, &.{ self.ns_prefix, segment.path });
             errdefer self.allocator.free(ns_path);
 
-            var file = self.dir.openFile(ns_path, .{ .mode = .read_only }) catch |err| switch (err) {
+            var handle = self.openReadOnlyHandle(ns_path) catch |err| switch (err) {
                 error.FileNotFound => {
                     self.allocator.free(ns_path);
                     continue; // Sealed segment may have been compacted away.
                 },
                 else => return err,
             };
-            defer file.close();
+            defer self.closeHandle(&handle);
 
             // Prefer O(1) footer index for sealed segments, fallback to header scan.
-            const stat = try file.stat();
-            const idx_reader = block_reader.BlockReader.init(file, self.allocator);
-            const block_index = try idx_reader.getBlockIndex(stat.size);
+            const idx_reader = block_reader.BlockReader.init(handle.file, self.allocator);
+            const block_index = try idx_reader.getBlockIndex(handle.size);
             defer self.allocator.free(block_index);
 
             // Record each block with its namespace-prefixed path.
@@ -310,6 +404,32 @@ pub const Reader = struct {
                 });
             }
         }
+    }
+
+    fn openReadOnlyHandle(self: *Reader, rel_path: []const u8) !segment_source.SegmentHandle {
+        if (self.source_override) |source| {
+            return source.openReadOnly(rel_path);
+        }
+        var local = segment_source.LocalSegmentSource.init(&self.dir);
+        return local.asSource().openReadOnly(rel_path);
+    }
+
+    fn closeHandle(self: *Reader, handle: *segment_source.SegmentHandle) void {
+        if (self.source_override) |source| {
+            source.close(handle);
+            return;
+        }
+        handle.file.close();
+    }
+
+    /// Open a block/segment path using the configured segment source.
+    pub fn openBlockReadOnly(self: *Reader, rel_path: []const u8) !segment_source.SegmentHandle {
+        return self.openReadOnlyHandle(rel_path);
+    }
+
+    /// Close a block/segment handle opened with `openBlockReadOnly`.
+    pub fn closeBlock(self: *Reader, handle: *segment_source.SegmentHandle) void {
+        self.closeHandle(handle);
     }
 };
 
@@ -414,6 +534,7 @@ test "Reader.getBlocks returns manifest then current" {
 
     var manifest_data = manifest.Manifest{
         .version = 1,
+        .generation = 0,
         .segments = segments,
         .last_compaction_ts = 0,
     };
@@ -499,6 +620,7 @@ test "Reader.getBlocks reads sealed segment footer index" {
 
     var manifest_data = manifest.Manifest{
         .version = 1,
+        .generation = 0,
         .segments = segments,
         .last_compaction_ts = 0,
     };
@@ -589,6 +711,7 @@ test "Reader.refresh reloads manifest segments and current file" {
 
     var manifest_data = manifest.Manifest{
         .version = 1,
+        .generation = 0,
         .segments = segments,
         .last_compaction_ts = 0,
     };
@@ -664,6 +787,7 @@ test "Reader.refreshIfChanged loads current created after open when manifest is 
 
     var manifest_data = manifest.Manifest{
         .version = 1,
+        .generation = 0,
         .segments = segments,
         .last_compaction_ts = 0,
     };
@@ -728,4 +852,93 @@ test "Reader.open ignores trailing invalid bytes in current file" {
 
     try std.testing.expectEqual(@as(usize, 1), reader.current_blocks.items.len);
     try std.testing.expectEqual(@as(u64, 0), reader.current_blocks.items[0]);
+}
+
+test "Reader.openWithSegmentSource reads blocks via source override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    try tmp.dir.makePath("chat");
+
+    const block = try buildTestBlock(std.testing.allocator, 55);
+    defer std.testing.allocator.free(block);
+
+    var file = try tmp.dir.createFile("chat/current.talu", .{ .read = true });
+    defer file.close();
+    try file.writeAll(block);
+
+    var source_dir = try tmp.dir.openDir(".", .{});
+    defer source_dir.close();
+    var local = segment_source.LocalSegmentSource.init(&source_dir);
+
+    var reader = try Reader.openWithSegmentSource(std.testing.allocator, root_path, "chat", local.asSource());
+    defer reader.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), reader.current_blocks.items.len);
+    try std.testing.expectEqual(@as(u64, 0), reader.current_blocks.items[0]);
+}
+
+test "Reader.openBlockReadOnly and Reader.closeBlock open and close segment handles" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    try tmp.dir.makePath("chat");
+    var file = try tmp.dir.createFile("chat/seg-1.talu", .{ .read = true });
+    defer file.close();
+    try file.writeAll("abcd");
+
+    var reader = try Reader.open(std.testing.allocator, root_path, "chat");
+    defer reader.deinit();
+
+    var handle = try reader.openBlockReadOnly("chat/seg-1.talu");
+    var buf: [4]u8 = undefined;
+    const n = try handle.file.preadAll(&buf, 0);
+    try std.testing.expectEqual(@as(usize, 4), n);
+    try std.testing.expectEqualSlices(u8, "abcd", &buf);
+
+    reader.closeBlock(&handle);
+}
+
+test "Reader.loadManifestSnapshot returns deep-copied stable snapshot" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+    try tmp.dir.makePath("vector");
+    try tmp.dir.writeFile(.{
+        .sub_path = "vector/manifest.json",
+        .data = "{" ++
+            "\"version\":1," ++
+            "\"generation\":4," ++
+            "\"last_compaction_ts\":0," ++
+            "\"segments\":[{" ++
+            "\"id\":\"0123456789abcdef0123456789abcdef\"," ++
+            "\"path\":\"seg-1.talu\"," ++
+            "\"min_ts\":1," ++
+            "\"max_ts\":2," ++
+            "\"row_count\":3," ++
+            "\"checksum_crc32c\":123," ++
+            "\"index\":{\"kind\":\"ivf_flat\",\"path\":\"seg-1.ivf\",\"checksum_crc32c\":9}" ++
+            "}]" ++
+            "}",
+    });
+
+    var reader = try Reader.open(std.testing.allocator, root_path, "vector");
+    defer reader.deinit();
+
+    var snapshot = try reader.loadManifestSnapshot(std.testing.allocator);
+    defer snapshot.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u64, 4), snapshot.generation);
+    try std.testing.expectEqual(@as(usize, 1), snapshot.segments.len);
+    try std.testing.expectEqual(@as(u32, 123), snapshot.segments[0].checksum_crc32c);
+    try std.testing.expect(snapshot.segments[0].index != null);
+    try std.testing.expectEqualStrings("seg-1.ivf", snapshot.segments[0].index.?.path);
 }

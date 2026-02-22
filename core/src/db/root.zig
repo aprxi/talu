@@ -54,6 +54,10 @@ pub const blob = @import("blob/root.zig");
 
 /// Namespace read path (manifest + current file).
 pub const reader = @import("reader.zig");
+pub const segment_source = @import("segment_source.zig");
+pub const segment_source_object = @import("segment_source_object.zig");
+pub const cache = @import("cache.zig");
+pub const jobs = @import("jobs.zig");
 
 /// Vector search domain (storage, search, indexing).
 pub const vector = @import("vector/root.zig");

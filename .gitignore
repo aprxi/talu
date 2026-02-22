@@ -179,6 +179,7 @@ celerybeat.pid
 .env
 .venv
 envg
+issues/
 venv/
 ENV/
 #env/

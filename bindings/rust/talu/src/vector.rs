@@ -734,7 +734,7 @@ impl VectorStore {
         dims: u32,
         k: u32,
     ) -> Result<SearchBatchResult, VectorError> {
-        self.search_batch_with_options(queries, dims, k, false)
+        self.search_batch_with_options(queries, dims, k, false, false)
     }
 
     /// Search batch with explicit options.
@@ -744,6 +744,7 @@ impl VectorStore {
         dims: u32,
         k: u32,
         normalize_queries: bool,
+        approximate: bool,
     ) -> Result<SearchBatchResult, VectorError> {
         if dims == 0 {
             return Err(VectorError::InvalidArgument("dims must be > 0".into()));
@@ -771,6 +772,7 @@ impl VectorStore {
                 query_count,
                 k,
                 normalize_queries,
+                approximate,
                 &mut out_ids as *mut *mut u64 as *mut c_void,
                 &mut out_scores as *mut *mut f32 as *mut c_void,
                 &mut out_count_per_query as *mut u32 as *mut c_void,
@@ -812,6 +814,66 @@ impl VectorStore {
             scores,
             count_per_query: out_count_per_query,
             query_count,
+        })
+    }
+
+    /// Compact vectors only if manifest generation matches `expected_generation`.
+    pub fn compact_with_generation(
+        &self,
+        dims: u32,
+        expected_generation: u64,
+    ) -> Result<CompactResult, VectorError> {
+        let mut kept_count: usize = 0;
+        let mut removed_tombstones: usize = 0;
+
+        let rc = unsafe {
+            talu_sys::talu_vector_store_compact_with_generation(
+                self.ptr,
+                dims,
+                expected_generation,
+                &mut kept_count as *mut usize as *mut c_void,
+                &mut removed_tombstones as *mut usize as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(VectorError::from_last(
+                "failed to compact vectors with generation",
+            ));
+        }
+        Ok(CompactResult {
+            kept_count,
+            removed_tombstones,
+        })
+    }
+
+    /// Compact vectors when tombstones older than `max_age_ms` exist.
+    pub fn compact_expired_tombstones(
+        &self,
+        dims: u32,
+        now_ms: i64,
+        max_age_ms: i64,
+    ) -> Result<CompactResult, VectorError> {
+        let mut kept_count: usize = 0;
+        let mut removed_tombstones: usize = 0;
+
+        let rc = unsafe {
+            talu_sys::talu_vector_store_compact_expired_tombstones(
+                self.ptr,
+                dims,
+                now_ms,
+                max_age_ms,
+                &mut kept_count as *mut usize as *mut c_void,
+                &mut removed_tombstones as *mut usize as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(VectorError::from_last(
+                "failed to compact expired tombstones",
+            ));
+        }
+        Ok(CompactResult {
+            kept_count,
+            removed_tombstones,
         })
     }
 

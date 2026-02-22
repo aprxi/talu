@@ -262,6 +262,38 @@ fn query_batch_returns_per_query_matches() {
 }
 
 #[test]
+fn query_accepts_approximate_flag() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    create_collection(&ctx, "emb", 3);
+
+    let append = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/points/append",
+        &json!({
+            "vectors": [
+                { "id": 10, "values": [1.0, 0.0, 0.0] },
+                { "id": 20, "values": [0.0, 1.0, 0.0] }
+            ]
+        }),
+    );
+    assert_eq!(append.status, 200, "body: {}", append.body);
+
+    let query = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/points/query",
+        &json!({
+            "vector": [1.0, 0.0, 0.0],
+            "top_k": 1,
+            "approximate": true
+        }),
+    );
+    assert_eq!(query.status, 200, "body: {}", query.body);
+    assert_eq!(query.json()["results"][0]["matches"][0]["id"], "10");
+}
+
+#[test]
 fn query_rejects_invalid_shape_and_top_k_zero() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
@@ -295,6 +327,42 @@ fn query_rejects_invalid_shape_and_top_k_zero() {
     );
     assert_eq!(zero_top_k.status, 400, "body: {}", zero_top_k.body);
     assert_eq!(zero_top_k.json()["error"]["code"], "invalid_argument");
+}
+
+#[test]
+fn db_openapi_includes_query_and_compact_request_fields() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let resp = get(ctx.addr(), "/openapi.json");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let schemas = &json["components"]["schemas"];
+    assert!(
+        schemas["QueryPointsRequest"]["properties"]
+            .get("approximate")
+            .is_some(),
+        "missing QueryPointsRequest.approximate"
+    );
+    assert!(
+        schemas["CompactCollectionRequest"]["properties"]
+            .get("expected_generation")
+            .is_some(),
+        "missing CompactCollectionRequest.expected_generation"
+    );
+    assert!(
+        schemas["CompactCollectionRequest"]["properties"]
+            .get("ttl_max_age_ms")
+            .is_some(),
+        "missing CompactCollectionRequest.ttl_max_age_ms"
+    );
+    assert!(
+        schemas["CompactCollectionRequest"]["properties"]
+            .get("now_ms")
+            .is_some(),
+        "missing CompactCollectionRequest.now_ms"
+    );
 }
 
 #[test]
@@ -456,6 +524,96 @@ fn stats_changes_and_compact_reflect_lifecycle() {
         data.iter().any(|event| event["op"] == "compact"),
         "expected compact event in change feed"
     );
+}
+
+#[test]
+fn compact_with_expected_generation_returns_generation_conflict() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    create_collection(&ctx, "emb", 3);
+    let append = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/points/append",
+        &json!({
+            "vectors": [
+                { "id": 1, "values": [1.0, 0.0, 0.0] }
+            ]
+        }),
+    );
+    assert_eq!(append.status, 200, "body: {}", append.body);
+
+    let compact = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/compact",
+        &json!({
+            "expected_generation": u64::MAX
+        }),
+    );
+    assert_eq!(compact.status, 409, "body: {}", compact.body);
+    assert_eq!(compact.json()["error"]["code"], "generation_conflict");
+}
+
+#[test]
+fn compact_with_ttl_removes_expired_tombstones() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    create_collection(&ctx, "emb", 3);
+
+    let append = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/points/append",
+        &json!({
+            "vectors": [
+                { "id": 1, "values": [1.0, 0.0, 0.0] },
+                { "id": 2, "values": [0.0, 1.0, 0.0] }
+            ]
+        }),
+    );
+    assert_eq!(append.status, 200, "body: {}", append.body);
+
+    let delete_resp = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/points/delete",
+        &json!({ "ids": [2] }),
+    );
+    assert_eq!(delete_resp.status, 200, "body: {}", delete_resp.body);
+
+    let compact = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/compact",
+        &json!({
+            "ttl_max_age_ms": 0,
+            "now_ms": 4_102_444_800_000_i64
+        }),
+    );
+    assert_eq!(compact.status, 200, "body: {}", compact.body);
+    let compact_json = compact.json();
+    assert_eq!(compact_json["kept_count"], 1);
+    assert_eq!(compact_json["removed_tombstones"], 1);
+
+    let stats = get(ctx.addr(), "/v1/db/collections/emb/stats");
+    assert_eq!(stats.status, 200, "body: {}", stats.body);
+    assert_eq!(stats.json()["tombstone_count"], 0);
+}
+
+#[test]
+fn compact_rejects_combined_ttl_and_generation_options() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    create_collection(&ctx, "emb", 3);
+    let compact = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/compact",
+        &json!({
+            "expected_generation": 1,
+            "ttl_max_age_ms": 0
+        }),
+    );
+    assert_eq!(compact.status, 400, "body: {}", compact.body);
+    assert_eq!(compact.json()["error"]["code"], "invalid_argument");
 }
 
 #[test]
