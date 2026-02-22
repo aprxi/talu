@@ -8,6 +8,7 @@ export interface SettingsDom {
   systemPrompt: HTMLTextAreaElement;
   maxOutputTokens: HTMLInputElement;
   contextLength: HTMLInputElement;
+  autoTitle: HTMLInputElement;
   temperature: HTMLInputElement;
   topP: HTMLInputElement;
   topK: HTMLInputElement;
@@ -38,6 +39,7 @@ export function getSettingsDom(): SettingsDom {
     systemPrompt: q<HTMLTextAreaElement>("sp-system-prompt"),
     maxOutputTokens: q<HTMLInputElement>("sp-max-output-tokens"),
     contextLength: q<HTMLInputElement>("sp-context-length"),
+    autoTitle: q<HTMLInputElement>("sp-auto-title"),
     temperature: q<HTMLInputElement>("sp-temperature"),
     topP: q<HTMLInputElement>("sp-top-p"),
     topK: q<HTMLInputElement>("sp-top-k"),

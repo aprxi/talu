@@ -62,6 +62,7 @@ pub async fn handle_get(
         "system_prompt": settings.system_prompt,
         "max_output_tokens": settings.max_output_tokens,
         "context_length": settings.context_length,
+        "auto_title": settings.auto_title,
         "available_models": models,
     });
 
@@ -143,6 +144,9 @@ pub async fn handle_patch(
     if let Some(v) = patch.get("context_length") {
         settings.context_length = v.as_u64().map(|n| n as u32);
     }
+    if let Some(v) = patch.get("auto_title") {
+        settings.auto_title = v.as_bool().unwrap_or(true);
+    }
 
     // Merge per-model generation overrides (keyed to the active model).
     if let Some(overrides) = patch.get("model_overrides") {
@@ -179,6 +183,7 @@ pub async fn handle_patch(
         "system_prompt": settings.system_prompt,
         "max_output_tokens": settings.max_output_tokens,
         "context_length": settings.context_length,
+        "auto_title": settings.auto_title,
         "available_models": models,
     });
 
@@ -235,6 +240,7 @@ pub async fn handle_reset_model(
         "system_prompt": settings.system_prompt,
         "max_output_tokens": settings.max_output_tokens,
         "context_length": settings.context_length,
+        "auto_title": settings.auto_title,
         "available_models": models,
     });
 

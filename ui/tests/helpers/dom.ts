@@ -99,6 +99,7 @@ export const PROMPTS_DOM_IDS = [
 /** Element IDs expected by getSettingsDom(). */
 export const SETTINGS_DOM_IDS = [
   "sp-model", "sp-system-prompt", "sp-max-output-tokens", "sp-context-length",
+  "sp-auto-title",
   "sp-temperature", "sp-top-p", "sp-top-k",
   "sp-temperature-default", "sp-top-p-default", "sp-top-k-default",
   "sp-model-label", "sp-reset-model", "sp-status",
@@ -141,6 +142,7 @@ export const SETTINGS_DOM_TAGS: Record<string, string> = {
   "sp-system-prompt": "textarea",
   "sp-max-output-tokens": "input",
   "sp-context-length": "input",
+  "sp-auto-title": "input",
   "sp-temperature": "input",
   "sp-top-p": "input",
   "sp-top-k": "input",

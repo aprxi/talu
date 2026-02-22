@@ -32,6 +32,17 @@ export function buildSettingsDOM(root: HTMLElement): void {
           </div>
         </div>
 
+        <div class="section-label">Features</div>
+        <div class="card" style="margin-bottom: 1.5rem;">
+          <label style="display: flex; align-items: center; gap: 0.75rem; cursor: pointer;">
+            <input type="checkbox" id="sp-auto-title" checked>
+            <div>
+              <div class="form-label" style="margin: 0;">Auto-generate conversation titles</div>
+              <div class="form-hint">Use the model to create a descriptive title after a response completes.</div>
+            </div>
+          </label>
+        </div>
+
         <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.5rem;">
           <span class="section-label" style="margin-bottom: 0;">Model Sampling</span>
           <span id="sp-model-label" style="font-size: 12px; color: var(--text-muted);"></span>

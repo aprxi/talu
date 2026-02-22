@@ -88,33 +88,40 @@ function makeModelEntry(id: string, defaults: any = {}, overrides: any = {}) {
 
 describe("populateForm", () => {
   test("sets system prompt value", () => {
-    populateForm({ system_prompt: "Be helpful" } as any);
+    populateForm({ system_prompt: "Be helpful", auto_title: true } as any);
     expect(getSettingsDom().systemPrompt.value).toBe("Be helpful");
   });
 
   test("sets max output tokens value", () => {
-    populateForm({ max_output_tokens: 2048 } as any);
+    populateForm({ max_output_tokens: 2048, auto_title: true } as any);
     expect(getSettingsDom().maxOutputTokens.value).toBe("2048");
   });
 
   test("sets context length value", () => {
-    populateForm({ context_length: 4096 } as any);
+    populateForm({ context_length: 4096, auto_title: true } as any);
     expect(getSettingsDom().contextLength.value).toBe("4096");
   });
 
   test("null system_prompt → empty string", () => {
-    populateForm({ system_prompt: null } as any);
+    populateForm({ system_prompt: null, auto_title: true } as any);
     expect(getSettingsDom().systemPrompt.value).toBe("");
   });
 
   test("null max_output_tokens → empty string", () => {
-    populateForm({ max_output_tokens: null } as any);
+    populateForm({ max_output_tokens: null, auto_title: true } as any);
     expect(getSettingsDom().maxOutputTokens.value).toBe("");
   });
 
   test("null context_length → empty string", () => {
-    populateForm({ context_length: null } as any);
+    populateForm({ context_length: null, auto_title: true } as any);
     expect(getSettingsDom().contextLength.value).toBe("");
+  });
+
+  test("sets auto_title checkbox", () => {
+    populateForm({ auto_title: false } as any);
+    expect((getSettingsDom().autoTitle as HTMLInputElement).checked).toBe(false);
+    populateForm({ auto_title: true } as any);
+    expect((getSettingsDom().autoTitle as HTMLInputElement).checked).toBe(true);
   });
 });
 
@@ -193,12 +200,14 @@ describe("saveTopLevelSettings", () => {
     dom.systemPrompt.value = "Be concise";
     dom.maxOutputTokens.value = "1024";
     dom.contextLength.value = "8192";
+    (dom.autoTitle as HTMLInputElement).checked = true;
     await saveTopLevelSettings();
 
     const patch = apiCalls[0]!.args[0] as any;
     expect(patch.system_prompt).toBe("Be concise");
     expect(patch.max_output_tokens).toBe(1024);
     expect(patch.context_length).toBe(8192);
+    expect(patch.auto_title).toBe(true);
   });
 
   test("sends null for empty fields", async () => {

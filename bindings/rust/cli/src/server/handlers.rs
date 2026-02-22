@@ -513,6 +513,14 @@ async fn generate_response(
         None
     };
 
+    // Load auto_title setting from bucket config.
+    let auto_title = bucket_path.as_ref().map_or(false, |bp| {
+        bucket_settings::load_bucket_settings(bp)
+            .map(|s| s.auto_title)
+            .unwrap_or(true)
+    });
+    let is_new_conversation = previous_response_id.is_none();
+
     // Ensure storage directory exists.
     if let Some(ref bp) = bucket_path {
         std::fs::create_dir_all(bp)
@@ -780,6 +788,24 @@ async fn generate_response(
     // Include session_id in metadata so the UI can adopt it for follow-ups.
     response_value["metadata"] = json!({ "session_id": session_id_for_response });
 
+    // Auto-generate a descriptive title for new conversations in the background.
+    if is_new_conversation && auto_title {
+        let title_input = input_value.as_ref().and_then(|v| v.as_str()).map(|s| s.to_string());
+        if let Some(input) = title_input {
+            let title_backend = state.backend.clone();
+            let title_bucket = bucket_path.clone();
+            let title_session_id = session_id_for_response.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = generate_title(
+                    &title_backend,
+                    &title_bucket,
+                    &title_session_id,
+                    &input,
+                );
+            });
+        }
+    }
+
     Ok(normalize_response_value(response_value))
 }
 
@@ -853,6 +879,13 @@ async fn stream_response(
     } else {
         None
     };
+
+    // Load auto_title setting from bucket config.
+    let auto_title = bucket_path.as_ref().map_or(false, |bp| {
+        bucket_settings::load_bucket_settings(bp)
+            .map(|s| s.auto_title)
+            .unwrap_or(true)
+    });
 
     // Ensure storage directory exists.
     if let Some(ref bp) = bucket_path {
@@ -990,6 +1023,13 @@ async fn stream_response(
     let backend = state.backend.clone();
     let tools_for_events = effective_tools.clone();
     let tool_choice_for_events = effective_tool_choice.clone();
+
+    // Clones for post-generation title generation.
+    let title_input = input_string.clone();
+    let title_bucket = bucket_path.clone();
+    let title_session_id = session_id.clone();
+    let title_backend = state.backend.clone();
+
     tokio::task::spawn_blocking(move || {
         // Load/switch backend if needed, emitting progress events through SSE.
         {
@@ -1159,6 +1199,18 @@ async fn stream_response(
                 gen_result,
             );
         };
+
+        // Auto-generate a descriptive title for new conversations.
+        if is_new_conversation && auto_title {
+            if let Some(ref input) = title_input {
+                let _ = generate_title(
+                    &title_backend,
+                    &title_bucket,
+                    &title_session_id,
+                    input,
+                );
+            }
+        }
     });
 
     let stream =
@@ -1324,6 +1376,70 @@ fn run_streaming_generation(
         finish_reason: stream_result.finish_reason,
         responses_json: all_json,
     })
+}
+
+/// Generate a short descriptive title for a conversation using the model.
+///
+/// Called after the main generation completes for new conversations when
+/// auto_title is enabled. Uses a short inference (max 20 tokens) with a
+/// title-generation system prompt.
+fn generate_title(
+    backend: &Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
+    bucket_path: &Option<std::path::PathBuf>,
+    session_id: &str,
+    input_text: &str,
+) -> Result<String> {
+    let mut guard = backend.blocking_lock();
+    let backend = guard
+        .backend
+        .as_mut()
+        .ok_or_else(|| anyhow!("no backend available for title generation"))?;
+
+    let chat = ChatHandle::new(Some(
+        "Generate a concise title (under 8 words) for a conversation starting \
+         with the user message below. Reply with only the title, no quotes or \
+         extra punctuation.",
+    ))?;
+    chat.append_user_message(input_text)
+        .map_err(|e| anyhow!("failed to append message for title gen: {e}"))?;
+
+    let mut cfg = talu::router::GenerateConfig::default();
+    cfg.max_tokens = 20;
+    cfg.temperature = 0.7;
+
+    let title_buf = Arc::new(std::sync::Mutex::new(String::new()));
+    let buf_clone = title_buf.clone();
+    let callback: talu::router::StreamCallback = Box::new(move |token| {
+        if let Ok(mut buf) = buf_clone.lock() {
+            buf.push_str(token.text);
+        }
+        true
+    });
+
+    talu::router::generate_stream(&chat, &[], backend, &cfg, callback)
+        .map_err(|e| anyhow!("title generation failed: {e}"))?;
+
+    let title = title_buf.lock().unwrap().clone();
+    // Clean up: trim whitespace, strip surrounding quotes.
+    let title = title.trim().to_string();
+    let title = title.trim_matches('"').trim_matches('\'').trim().to_string();
+    if title.is_empty() {
+        return Err(anyhow!("generated title is empty"));
+    }
+
+    // Update the session title in storage.
+    if let Some(ref bp) = bucket_path {
+        if let Ok(storage) = talu::storage::StorageHandle::open(bp) {
+            let update = talu::storage::SessionUpdate {
+                title: Some(title.clone()),
+                ..Default::default()
+            };
+            let _ = storage.update_session(session_id, &update);
+            log::info!(target: "server::gen", "auto-title for {session_id}: {title:?}");
+        }
+    }
+
+    Ok(title)
 }
 
 /// Result from streaming generation, carrying output items and usage stats.

@@ -1,6 +1,6 @@
 import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
-import { api, hooks, notifications, getModelsService, getPromptsService } from "./deps.ts";
+import { api, hooks, notifications, timers, getModelsService, getPromptsService } from "./deps.ts";
 import { getSamplingParams } from "./panel-params.ts";
 import { refreshSidebar, renderSidebar } from "./sidebar-list.ts";
 import { setInputEnabled, showInputBar, hideWelcome } from "./welcome.ts";
@@ -211,6 +211,11 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
     }
 
     await refreshSidebar();
+
+    // Pick up auto-generated title (runs server-side after generation).
+    if (opts.discoverSession && chatState.activeSessionId) {
+      timers.setTimeout(() => refreshSidebar(), 3000);
+    }
   } else {
     // Background stream completed — refresh sidebar to update status.
     await refreshSidebar();

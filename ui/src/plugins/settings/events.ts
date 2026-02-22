@@ -31,6 +31,7 @@ export function wireEvents(): void {
   dom.systemPrompt.addEventListener("input", () => scheduleSettingsSave(600));
   dom.maxOutputTokens.addEventListener("input", () => scheduleSettingsSave(400));
   dom.contextLength.addEventListener("input", () => scheduleSettingsSave(400));
+  dom.autoTitle.addEventListener("change", () => saveTopLevelSettings());
   dom.temperature.addEventListener("input", () => scheduleOverridesSave(400));
   dom.topP.addEventListener("input", () => scheduleOverridesSave(400));
   dom.topK.addEventListener("input", () => scheduleOverridesSave(400));

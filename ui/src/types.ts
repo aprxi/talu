@@ -233,6 +233,7 @@ export interface Settings {
   system_prompt: string | null;
   max_output_tokens: number | null;
   context_length: number | null;
+  auto_title: boolean;
   available_models: ModelEntry[];
 }
 
@@ -242,6 +243,7 @@ export interface SettingsPatch {
   system_prompt?: string | null;
   max_output_tokens?: number | null;
   context_length?: number | null;
+  auto_title?: boolean;
   model_overrides?: ModelOverrides;
 }
 

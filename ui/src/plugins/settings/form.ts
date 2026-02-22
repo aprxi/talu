@@ -13,6 +13,7 @@ export function populateForm(s: Settings): void {
   dom.systemPrompt.value = s.system_prompt ?? "";
   dom.maxOutputTokens.value = s.max_output_tokens != null ? String(s.max_output_tokens) : "";
   dom.contextLength.value = s.context_length != null ? String(s.context_length) : "";
+  dom.autoTitle.checked = s.auto_title;
 }
 
 export function populateLocalModelSelect(): void {
@@ -70,6 +71,7 @@ export async function saveTopLevelSettings(): Promise<void> {
     system_prompt: dom.systemPrompt.value.trim() || null,
     max_output_tokens: maxTok ? parseInt(maxTok, 10) : null,
     context_length: ctxLen ? parseInt(ctxLen, 10) : null,
+    auto_title: dom.autoTitle.checked,
   };
 
   const result = await api.patchSettings(patch);

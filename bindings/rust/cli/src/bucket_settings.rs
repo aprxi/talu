@@ -59,9 +59,18 @@ pub struct BucketSettings {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_length: Option<u32>,
 
+    /// Automatically generate a descriptive conversation title after the
+    /// first response completes (uses a short model inference).
+    #[serde(default = "default_true")]
+    pub auto_title: bool,
+
     /// Per-model sampling parameter overrides, keyed by model ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelOverrides>,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Load settings from `<bucket>/settings.toml`. Returns defaults if the file
