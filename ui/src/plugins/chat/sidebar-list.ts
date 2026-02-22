@@ -49,11 +49,15 @@ export function renderSidebar(): void {
   const pinned = visible.filter(isPinned);
   const unpinned = visible.filter((s) => !isPinned(s));
 
+  const isSessionGenerating = (id: string) =>
+    (id === chatState.activeSessionId && chatState.isGenerating) ||
+    chatState.backgroundStreamSessions.has(id);
+
   if (pinned.length > 0) {
     dom.sidebarList.insertBefore(renderSectionLabel("Pinned"), dom.sidebarSentinel);
     for (const session of pinned) {
       dom.sidebarList.insertBefore(
-        renderSidebarItem(session, session.id === chatState.activeSessionId),
+        renderSidebarItem(session, session.id === chatState.activeSessionId, isSessionGenerating(session.id)),
         dom.sidebarSentinel,
       );
     }
@@ -65,7 +69,7 @@ export function renderSidebar(): void {
 
   for (const session of unpinned) {
     dom.sidebarList.insertBefore(
-      renderSidebarItem(session, session.id === chatState.activeSessionId),
+      renderSidebarItem(session, session.id === chatState.activeSessionId, isSessionGenerating(session.id)),
       dom.sidebarSentinel,
     );
   }

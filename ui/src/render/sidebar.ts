@@ -4,6 +4,7 @@ import { el, isPinned, getTags, PIN_SVG, FORK_SVG, relativeTime } from "./helper
 export function renderSidebarItem(
   session: Conversation,
   isActive: boolean,
+  isGenerating: boolean = false,
 ): HTMLElement {
   const pinned = isPinned(session);
   const isForked = session.parent_session_id != null;
@@ -11,6 +12,7 @@ export function renderSidebarItem(
   let cls = "sidebar-item";
   if (isActive) cls += " active";
   if (isForked) cls += " forked";
+  if (isGenerating) cls += " generating";
 
   const item = el("div", cls);
   item.dataset["id"] = session.id;
@@ -29,6 +31,9 @@ export function renderSidebarItem(
     forkIcon.innerHTML = FORK_SVG;
     forkIcon.title = "Forked conversation";
     titleRow.appendChild(forkIcon);
+  }
+  if (isGenerating) {
+    titleRow.appendChild(el("span", "sidebar-generating-dot"));
   }
   const title = el("span", "sidebar-item-title truncate", session.title || "Untitled");
   titleRow.appendChild(title);

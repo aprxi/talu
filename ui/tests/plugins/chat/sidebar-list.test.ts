@@ -45,6 +45,7 @@ beforeEach(() => {
   chatState.lastResponseId = null;
   chatState.isGenerating = false;
   chatState.streamAbort = null;
+  chatState.backgroundStreamSessions = new Set();
   chatState.pagination = { cursor: null, hasMore: true, isLoading: false };
 
   // DOM — sentinel must be inside sidebarList.
@@ -333,6 +334,50 @@ describe("renderSidebar", () => {
     renderSidebar();
     expect(sidebarItems().length).toBe(1);
     expect(sidebarItems()[0]!.dataset["id"]).toBe("c3");
+  });
+
+  test("marks active generating session with generating class", () => {
+    chatState.sessions = [makeConvo("c1"), makeConvo("c2")];
+    chatState.activeSessionId = "c1";
+    chatState.isGenerating = true;
+    renderSidebar();
+
+    const items = sidebarItems();
+    const c1 = items.find((el) => el.dataset["id"] === "c1");
+    const c2 = items.find((el) => el.dataset["id"] === "c2");
+    expect(c1?.classList.contains("generating")).toBe(true);
+    expect(c2?.classList.contains("generating")).toBe(false);
+  });
+
+  test("marks background streaming session with generating class", () => {
+    chatState.sessions = [makeConvo("c1"), makeConvo("c2")];
+    chatState.backgroundStreamSessions.add("c2");
+    renderSidebar();
+
+    const items = sidebarItems();
+    const c1 = items.find((el) => el.dataset["id"] === "c1");
+    const c2 = items.find((el) => el.dataset["id"] === "c2");
+    expect(c1?.classList.contains("generating")).toBe(false);
+    expect(c2?.classList.contains("generating")).toBe(true);
+  });
+
+  test("generating item has pulsing dot element", () => {
+    chatState.sessions = [makeConvo("c1")];
+    chatState.backgroundStreamSessions.add("c1");
+    renderSidebar();
+
+    const item = sidebarItems()[0]!;
+    const dot = item.querySelector(".sidebar-generating-dot");
+    expect(dot).not.toBeNull();
+  });
+
+  test("non-generating item has no pulsing dot", () => {
+    chatState.sessions = [makeConvo("c1")];
+    renderSidebar();
+
+    const item = sidebarItems()[0]!;
+    const dot = item.querySelector(".sidebar-generating-dot");
+    expect(dot).toBeNull();
   });
 });
 

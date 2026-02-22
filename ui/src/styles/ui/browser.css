@@ -179,6 +179,21 @@
 .icon-pin { color: var(--primary); }
 .icon-fork { color: #a855f7; }
 
+/* Generating indicator (pulsing dot in title row) */
+.sidebar-generating-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--primary);
+  flex-shrink: 0;
+  animation: sidebar-pulse 1.5s ease-in-out infinite;
+}
+
+@keyframes sidebar-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
 /* =============================================================================
    Browser Cards (extends shared .card-grid / .card)
    ============================================================================= */
