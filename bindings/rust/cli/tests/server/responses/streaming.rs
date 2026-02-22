@@ -888,30 +888,27 @@ fn streaming_session_has_metadata_at_created() {
 
     let (tcp, _acc, session_id) = stream_until_created(ctx.addr(), &body);
 
-    // Immediately query GET — session must already be persisted.
     let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
     assert_eq!(
         conv_resp.status, 200,
-        "session must be accessible via GET at response.created time, got {}: {}",
+        "session should be accessible via GET at response.created time, got {}: {}",
         conv_resp.status, conv_resp.body,
     );
 
     let conv = conv_resp.json();
     assert_eq!(conv["id"].as_str(), Some(session_id.as_str()));
 
-    // Title should be derived from input (truncated to 47 chars).
     let title = conv["title"]
         .as_str()
-        .expect("early-persisted session should have title");
+        .expect("session should have title");
     assert!(
         title.starts_with("Explain quantum mechanics"),
         "title should be derived from input, got: {title:?}",
     );
 
-    // Model should match the request.
     let conv_model = conv["model"]
         .as_str()
-        .expect("early-persisted session should have model");
+        .expect("session should have model");
     assert!(
         !conv_model.is_empty(),
         "model should be non-empty",
