@@ -67,6 +67,16 @@ export const settingsPlugin: PluginDefinition = {
     showModelParams(settingsState.activeModel);
     emitModelChanged();
 
+    // Re-fetch available models when the repo plugin downloads or deletes models.
+    ctx.events.on("repo.models.changed", async () => {
+      const res = await api.getSettings();
+      if (res.ok && res.data) {
+        settingsState.availableModels = res.data.available_models ?? [];
+        populateLocalModelSelect();
+        emitModelChanged();
+      }
+    });
+
     ctx.log.info("Settings loaded.", { model: settingsState.activeModel, models: settingsState.availableModels.length });
   },
 };

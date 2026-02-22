@@ -1,0 +1,144 @@
+/* ── Repo plugin (talu.repo) ────────────────────────────────────────────── */
+
+/* Source badge (hub / managed) */
+.repo-source-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 3px;
+  margin-left: 8px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  background: var(--bg-code);
+  color: var(--text-muted);
+  vertical-align: middle;
+}
+
+.repo-source-hub { color: var(--primary); background: color-mix(in srgb, var(--primary) 12%, transparent); }
+.repo-source-managed { color: var(--success); background: color-mix(in srgb, var(--success) 12%, transparent); }
+
+/* Quantization badge */
+.repo-quant-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  background: var(--bg-code);
+  color: var(--text-muted);
+}
+
+/* Pin button */
+.repo-pin-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: none;
+  color: var(--text-secondary);
+  cursor: pointer;
+  border-radius: 4px;
+  transition: color 0.15s, background 0.15s;
+}
+
+.repo-pin-btn:hover {
+  background: var(--bg-code);
+  color: var(--text);
+}
+
+.repo-pin-btn.pinned {
+  color: var(--secondary);
+}
+
+/* Filter bar */
+.repo-filter-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 1;
+}
+
+.repo-filter-bar .form-select-sm {
+  width: auto;
+  min-width: 0;
+}
+
+/* Discover list (single column) */
+.repo-discover-list {
+  display: flex;
+  flex-direction: column;
+}
+
+/* Discover item (single row) */
+.repo-discover-item {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+
+.repo-discover-item:hover {
+  background: var(--bg-hover);
+}
+
+.repo-discover-item-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.repo-discover-item-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.repo-discover-item-meta {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-muted);
+  flex-wrap: wrap;
+}
+
+/* Download button */
+.repo-download-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Progress bar (inline in item) */
+.repo-progress {
+  flex: 1;
+  min-width: 80px;
+  max-width: 160px;
+  height: 6px;
+  background: var(--bg-code);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.repo-progress-bar {
+  height: 100%;
+  background: var(--primary);
+  border-radius: 3px;
+  transition: width 0.3s ease;
+}

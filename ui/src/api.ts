@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection, RepoModelList, RepoSearchResponse } from "./types.ts";
 
 const BASE = "";
 
@@ -37,6 +37,12 @@ export interface ApiClient {
   getFileContent(id: string): Promise<ApiResult<Blob>>;
   inspectFile(file: File): Promise<ApiResult<FileInspection>>;
   transformFile(file: File, opts?: { resize?: string; fit?: string; format?: string; quality?: number }): Promise<ApiResult<Blob>>;
+  listRepoModels(query?: string): Promise<ApiResult<RepoModelList>>;
+  searchRepoModels(query: string, opts?: { sort?: string; filter?: string; library?: string; limit?: number }): Promise<ApiResult<RepoSearchResponse>>;
+  fetchRepoModel(body: { model_id: string }, signal?: AbortSignal): Promise<Response>;
+  deleteRepoModel(modelId: string): Promise<ApiResult<void>>;
+  pinRepoModel(modelId: string): Promise<ApiResult<void>>;
+  unpinRepoModel(modelId: string): Promise<ApiResult<void>>;
 }
 
 export function createApiClient(fetchFn: FetchFn): ApiClient {
@@ -189,5 +195,25 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
         return { ok: false, error: e instanceof Error ? e.message : String(e) };
       }
     },
+    listRepoModels(query?: string) {
+      const path = query ? `/v1/repo/models${query}` : "/v1/repo/models";
+      return requestJson<RepoModelList>("GET", path);
+    },
+    searchRepoModels(query: string, opts?: { sort?: string; filter?: string; library?: string; limit?: number }) {
+      const params = new URLSearchParams({ query, limit: String(opts?.limit ?? 50) });
+      if (opts?.sort) params.set("sort", opts.sort);
+      if (opts?.filter) params.set("filter", opts.filter);
+      if (opts?.library) params.set("library", opts.library);
+      return requestJson<RepoSearchResponse>("GET", `/v1/repo/search?${params}`);
+    },
+    fetchRepoModel: (body, signal) => fetchFn(`${BASE}/v1/repo/models`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body: JSON.stringify(body),
+      signal,
+    }),
+    deleteRepoModel: (modelId) => requestJson<void>("DELETE", `/v1/repo/models/${encodeURIComponent(modelId)}`),
+    pinRepoModel: (modelId) => requestJson<void>("POST", `/v1/repo/pins`, { model_id: modelId }),
+    unpinRepoModel: (modelId) => requestJson<void>("DELETE", `/v1/repo/pins/${encodeURIComponent(modelId)}`),
   };
 }

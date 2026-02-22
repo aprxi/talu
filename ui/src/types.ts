@@ -464,6 +464,42 @@ export interface FileInspection {
 }
 
 // ---------------------------------------------------------------------------
+// Repo API types
+// ---------------------------------------------------------------------------
+
+/** Cached model entry from GET /v1/repo/models. */
+export interface RepoModel {
+  id: string;
+  path: string;
+  source: string;
+  size_bytes: number;
+  mtime: number;
+  architecture?: string;
+  quant_scheme?: string;
+  pinned: boolean;
+}
+
+/** Response from GET /v1/repo/models. */
+export interface RepoModelList {
+  models: RepoModel[];
+  total_size_bytes: number;
+}
+
+/** Search result from GET /v1/repo/search. */
+export interface RepoSearchResult {
+  model_id: string;
+  downloads: number;
+  likes: number;
+  last_modified: string;
+  params_total: number;
+}
+
+/** Response from GET /v1/repo/search. */
+export interface RepoSearchResponse {
+  results: RepoSearchResult[];
+}
+
+// ---------------------------------------------------------------------------
 // Plugin service contracts
 // ---------------------------------------------------------------------------
 
