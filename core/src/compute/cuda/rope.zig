@@ -7,7 +7,7 @@ const launch_mod = @import("launch.zig");
 const module_mod = @import("module.zig");
 const registry_mod = @import("registry.zig");
 
-pub const embedded_ptx = @embedFile("kernels/fallback_kernels.ptx");
+pub const embedded_ptx = @embedFile("kernels/kernels.ptx");
 pub const embedded_symbol: [:0]const u8 = "talu_rope_f32_v1";
 
 pub fn run(

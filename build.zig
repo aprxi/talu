@@ -402,9 +402,9 @@ pub fn build(b: *std.Build) void {
             "nvcc",
             "-ptx",
             "-arch=sm_80",
-            "core/src/compute/cuda/kernels/fallback_kernels.cu",
+            "core/src/compute/cuda/kernels/kernels.cu",
             "-o",
-            "core/src/compute/cuda/kernels/fallback_kernels.ptx",
+            "core/src/compute/cuda/kernels/kernels.ptx",
         });
         gen_ptx_step.dependOn(&gen_fallback_ptx.step);
     }
