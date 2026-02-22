@@ -146,3 +146,33 @@ export const SETTINGS_DOM_TAGS: Record<string, string> = {
   "sp-top-k": "input",
   "sp-reset-model": "button",
 };
+
+/** Element IDs expected by getRepoDom(). */
+export const REPO_DOM_IDS = [
+  "rp-search", "rp-search-clear",
+  "rp-tab-local", "rp-tab-pinned", "rp-tab-discover",
+  "rp-stats", "rp-thead", "rp-tbody",
+  "rp-table-container", "rp-discover-container", "rp-discover-results",
+  "rp-count", "rp-select-all", "rp-pin-all", "rp-delete", "rp-cancel",
+  "rp-bulk-actions",
+  "rp-sort", "rp-size-filter", "rp-task-filter", "rp-library-filter",
+];
+
+/** Tag overrides for repo DOM elements that need specific types. */
+export const REPO_DOM_TAGS: Record<string, string> = {
+  "rp-search": "input",
+  "rp-search-clear": "button",
+  "rp-tab-local": "button",
+  "rp-tab-pinned": "button",
+  "rp-tab-discover": "button",
+  "rp-thead": "thead",
+  "rp-tbody": "tbody",
+  "rp-select-all": "button",
+  "rp-pin-all": "button",
+  "rp-delete": "button",
+  "rp-cancel": "button",
+  "rp-sort": "select",
+  "rp-size-filter": "select",
+  "rp-task-filter": "select",
+  "rp-library-filter": "select",
+};

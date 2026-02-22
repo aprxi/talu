@@ -70,9 +70,14 @@ export function wireRepoEvents(): void {
   });
 
   dom.searchClear.addEventListener("click", () => {
+    // Cancel any pending debounce so it doesn't fire after clear.
+    searchDebounce?.dispose();
+    searchDebounce = null;
     dom.search.value = "";
     repoState.searchQuery = "";
     dom.searchClear.classList.add("hidden");
+    // Bump generation so any in-flight searchHub response is discarded.
+    repoState.searchGeneration++;
     if (repoState.tab === "discover") {
       repoState.searchResults = [];
       renderDiscoverResults();
