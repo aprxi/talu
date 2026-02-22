@@ -28,6 +28,7 @@ const COLLECTION_STORES_DIR: &str = "collections";
 
 const SCHEMA_VERSION: u32 = 1;
 const MAX_DB_REQUEST_BODY_BYTES: usize = 16 * 1024 * 1024;
+const DEFAULT_INDEX_BUILD_MAX_SEGMENTS: usize = 32;
 
 static COLLECTIONS_CACHE: Lazy<RwLock<HashMap<PathBuf, CollectionsDisk>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
@@ -199,6 +200,10 @@ pub(crate) struct CollectionStatsResponse {
     pub tombstone_count: usize,
     pub segment_count: usize,
     pub total_vector_count: usize,
+    pub manifest_generation: u64,
+    pub index_ready_segments: usize,
+    pub index_pending_segments: usize,
+    pub index_failed_segments: usize,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -217,6 +222,21 @@ pub(crate) struct CompactCollectionRequest {
     pub ttl_max_age_ms: Option<i64>,
     #[serde(default)]
     pub now_ms: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct BuildIndexesRequest {
+    pub expected_generation: u64,
+    #[serde(default)]
+    pub max_segments: Option<usize>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct BuildIndexesResponse {
+    pub collection: String,
+    pub built_segments: usize,
+    pub failed_segments: usize,
+    pub pending_segments: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -1035,6 +1055,10 @@ pub async fn handle_collection_stats(
             tombstone_count: stats.tombstone_count,
             segment_count: stats.segment_count,
             total_vector_count: stats.total_count,
+            manifest_generation: stats.manifest_generation,
+            index_ready_segments: stats.index_ready_segments,
+            index_pending_segments: stats.index_pending_segments,
+            index_failed_segments: stats.index_failed_segments,
         },
     )
 }
@@ -1136,6 +1160,88 @@ pub async fn handle_compact_collection(
     };
 
     json_response(StatusCode::OK, &payload)
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/db/collections/{name}/indexes/build",
+    tag = "DB",
+    params(("name" = String, Path, description = "Collection name")),
+    request_body = BuildIndexesRequest,
+    responses((status = 200, body = BuildIndexesResponse))
+)]
+/// POST /v1/db/collections/{name}/indexes/build - Build pending ANN indexes.
+pub async fn handle_build_collection_indexes(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth: Option<AuthContext>,
+) -> Response<BoxBody> {
+    let storage_root = match resolve_storage_root(&state, &auth) {
+        Ok(path) => path,
+        Err(resp) => return resp,
+    };
+
+    let Some(collection_name) =
+        extract_collection_name_with_suffix(req.uri().path(), "/indexes/build")
+            .map(ToOwned::to_owned)
+    else {
+        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    };
+
+    if let Err(resp) = require_collection(&storage_root, &collection_name).map(|_| ()) {
+        return resp;
+    }
+
+    let body = match read_body(req, MAX_DB_REQUEST_BODY_BYTES).await {
+        Ok(b) => b,
+        Err(err) => return body_read_error_response(err),
+    };
+    if body.is_empty() {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "request body is required",
+        );
+    }
+    let build_req: BuildIndexesRequest = match serde_json::from_slice(&body) {
+        Ok(v) => v,
+        Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
+    };
+    let max_segments = build_req
+        .max_segments
+        .unwrap_or(DEFAULT_INDEX_BUILD_MAX_SEGMENTS);
+    if max_segments == 0 {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "max_segments must be greater than zero",
+        );
+    }
+
+    let _collection_lock =
+        match acquire_file_lock(&collection_lock_path(&storage_root, &collection_name)) {
+            Ok(lock) => lock,
+            Err(e) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", &e),
+        };
+
+    let build = match with_collection_store(&storage_root, &collection_name, |store| {
+        store
+            .build_indexes_with_generation(build_req.expected_generation, max_segments)
+            .map_err(vector_error_response)
+    }) {
+        Ok(result) => result,
+        Err(resp) => return resp,
+    };
+
+    json_response(
+        StatusCode::OK,
+        &BuildIndexesResponse {
+            collection: collection_name.to_string(),
+            built_segments: build.built_segments,
+            failed_segments: build.failed_segments,
+            pending_segments: build.pending_segments,
+        },
+    )
 }
 
 #[utoipa::path(

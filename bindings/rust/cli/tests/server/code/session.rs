@@ -90,7 +90,8 @@ async fn session_update_delta() {
         "language": "python"
     });
     let (status, json) =
-        body_json(send_request(&app, post_json("/v1/code/session/create", &create_body)).await).await;
+        body_json(send_request(&app, post_json("/v1/code/session/create", &create_body)).await)
+            .await;
     assert_eq!(status, StatusCode::OK);
     let session_id = json["session_id"].as_str().unwrap().to_string();
 
@@ -111,14 +112,18 @@ async fn session_update_delta() {
         }]
     });
     let (status, json) =
-        body_json(send_request(&app, post_json("/v1/code/session/update", &update_body)).await).await;
+        body_json(send_request(&app, post_json("/v1/code/session/update", &update_body)).await)
+            .await;
 
     assert_eq!(status, StatusCode::OK);
     let tokens = json
         .get("tokens")
         .and_then(|v| v.as_array())
         .expect("delta update should return tokens array");
-    assert!(!tokens.is_empty(), "delta-updated source 'x = 42' should produce tokens");
+    assert!(
+        !tokens.is_empty(),
+        "delta-updated source 'x = 42' should produce tokens"
+    );
 }
 
 #[tokio::test]
@@ -151,10 +156,7 @@ async fn session_update_nonexistent() {
         body_json(send_request(&app, post_json("/v1/code/session/update", &body)).await).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        json["error"]["code"].as_str(),
-        Some("session_not_found")
-    );
+    assert_eq!(json["error"]["code"].as_str(), Some("session_not_found"));
 }
 
 #[tokio::test]
@@ -167,7 +169,8 @@ async fn session_update_delta_out_of_bounds() {
         "language": "python"
     });
     let (status, json) =
-        body_json(send_request(&app, post_json("/v1/code/session/create", &create_body)).await).await;
+        body_json(send_request(&app, post_json("/v1/code/session/create", &create_body)).await)
+            .await;
     assert_eq!(status, StatusCode::OK);
     let session_id = json["session_id"].as_str().unwrap().to_string();
 
@@ -187,7 +190,8 @@ async fn session_update_delta_out_of_bounds() {
         }]
     });
     let (status, json) =
-        body_json(send_request(&app, post_json("/v1/code/session/update", &update_body)).await).await;
+        body_json(send_request(&app, post_json("/v1/code/session/update", &update_body)).await)
+            .await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -207,10 +211,7 @@ async fn session_highlight_nonexistent() {
         body_json(send_request(&app, post_json("/v1/code/session/highlight", &body)).await).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert_eq!(
-        json["error"]["code"].as_str(),
-        Some("session_not_found")
-    );
+    assert_eq!(json["error"]["code"].as_str(), Some("session_not_found"));
 }
 
 #[tokio::test]

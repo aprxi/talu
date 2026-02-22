@@ -176,7 +176,10 @@ pub fn transform_image_bytes(bytes: &[u8], opts: TransformOptions) -> Result<Tra
     })
 }
 
-fn file_info_from_c(c_info: &talu_sys::TaluFileInfo, c_image: &talu_sys::TaluImageInfo) -> FileInfo {
+fn file_info_from_c(
+    c_info: &talu_sys::TaluFileInfo,
+    c_image: &talu_sys::TaluImageInfo,
+) -> FileInfo {
     let mime = copy_c_bytes(c_info.mime_ptr, c_info.mime_len);
     let description = copy_c_bytes(c_info.description_ptr, c_info.description_len);
     let kind = file_kind_from_c(c_info.kind);

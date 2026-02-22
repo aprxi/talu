@@ -301,8 +301,15 @@ fn batch_delete_does_not_affect_non_file_documents() {
             "content": {"text": "Hello world"}
         }),
     );
-    assert_eq!(create_resp.status, 201, "create doc body: {}", create_resp.body);
-    let prompt_id = create_resp.json()["id"].as_str().expect("doc id").to_string();
+    assert_eq!(
+        create_resp.status, 201,
+        "create doc body: {}",
+        create_resp.body
+    );
+    let prompt_id = create_resp.json()["id"]
+        .as_str()
+        .expect("doc id")
+        .to_string();
 
     // Upload a real file.
     let file_id = upload_text_file(&ctx, "real-file.txt", "text/plain", "file-content");
@@ -324,7 +331,10 @@ fn batch_delete_does_not_affect_non_file_documents() {
 
     // The prompt document must still exist.
     let doc_resp = get(ctx.addr(), &format!("/v1/documents/{prompt_id}"));
-    assert_eq!(doc_resp.status, 200, "prompt document must survive file batch delete");
+    assert_eq!(
+        doc_resp.status, 200,
+        "prompt document must survive file batch delete"
+    );
 }
 
 /// Batch archive via /v1/files/batch must not affect non-file documents.
@@ -344,7 +354,10 @@ fn batch_archive_does_not_affect_non_file_documents() {
         }),
     );
     assert_eq!(create_resp.status, 201);
-    let prompt_id = create_resp.json()["id"].as_str().expect("doc id").to_string();
+    let prompt_id = create_resp.json()["id"]
+        .as_str()
+        .expect("doc id")
+        .to_string();
 
     // Upload a file.
     let file_id = upload_text_file(&ctx, "to-archive.txt", "text/plain", "archive-me");

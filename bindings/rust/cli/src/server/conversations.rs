@@ -424,7 +424,8 @@ pub async fn handle_list(
         )?;
 
         // Only resolve tags and convert for the current page.
-        let page_data: Vec<serde_json::Value> = batch.sessions
+        let page_data: Vec<serde_json::Value> = batch
+            .sessions
             .iter()
             .map(|session| {
                 let tags = resolve_tags_for_session(&storage, &session.session_id);

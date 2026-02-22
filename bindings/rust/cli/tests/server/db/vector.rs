@@ -330,7 +330,7 @@ fn query_rejects_invalid_shape_and_top_k_zero() {
 }
 
 #[test]
-fn db_openapi_includes_query_and_compact_request_fields() {
+fn db_openapi_includes_query_compact_and_index_build_request_fields() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
@@ -362,6 +362,48 @@ fn db_openapi_includes_query_and_compact_request_fields() {
             .get("now_ms")
             .is_some(),
         "missing CompactCollectionRequest.now_ms"
+    );
+    assert!(
+        schemas["BuildIndexesRequest"]["properties"]
+            .get("expected_generation")
+            .is_some(),
+        "missing BuildIndexesRequest.expected_generation"
+    );
+    assert!(
+        schemas["BuildIndexesRequest"]["properties"]
+            .get("max_segments")
+            .is_some(),
+        "missing BuildIndexesRequest.max_segments"
+    );
+    assert!(
+        json["paths"]
+            .get("/v1/db/collections/{name}/indexes/build")
+            .is_some(),
+        "missing indexes/build path"
+    );
+    assert!(
+        schemas["CollectionStatsResponse"]["properties"]
+            .get("manifest_generation")
+            .is_some(),
+        "missing CollectionStatsResponse.manifest_generation"
+    );
+    assert!(
+        schemas["CollectionStatsResponse"]["properties"]
+            .get("index_ready_segments")
+            .is_some(),
+        "missing CollectionStatsResponse.index_ready_segments"
+    );
+    assert!(
+        schemas["CollectionStatsResponse"]["properties"]
+            .get("index_pending_segments")
+            .is_some(),
+        "missing CollectionStatsResponse.index_pending_segments"
+    );
+    assert!(
+        schemas["CollectionStatsResponse"]["properties"]
+            .get("index_failed_segments")
+            .is_some(),
+        "missing CollectionStatsResponse.index_failed_segments"
     );
 }
 
@@ -489,6 +531,10 @@ fn stats_changes_and_compact_reflect_lifecycle() {
     assert_eq!(stats_json["visible_count"], 1);
     assert_eq!(stats_json["tombstone_count"], 1);
     assert_eq!(stats_json["total_vector_count"], 2);
+    assert!(stats_json["manifest_generation"].is_number());
+    assert!(stats_json["index_ready_segments"].is_number());
+    assert!(stats_json["index_pending_segments"].is_number());
+    assert!(stats_json["index_failed_segments"].is_number());
 
     let changes = get(
         ctx.addr(),
@@ -510,6 +556,10 @@ fn stats_changes_and_compact_reflect_lifecycle() {
     let stats_json = stats_after.json();
     assert_eq!(stats_json["visible_count"], 1);
     assert_eq!(stats_json["tombstone_count"], 0);
+    assert!(stats_json["manifest_generation"].is_number());
+    assert!(stats_json["index_ready_segments"].is_number());
+    assert!(stats_json["index_pending_segments"].is_number());
+    assert!(stats_json["index_failed_segments"].is_number());
 
     let changes_after = get(
         ctx.addr(),
@@ -614,6 +664,46 @@ fn compact_rejects_combined_ttl_and_generation_options() {
     );
     assert_eq!(compact.status, 400, "body: {}", compact.body);
     assert_eq!(compact.json()["error"]["code"], "invalid_argument");
+}
+
+#[test]
+fn build_indexes_with_expected_generation_returns_generation_conflict() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    create_collection(&ctx, "emb", 3);
+    let build = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/indexes/build",
+        &json!({
+            "expected_generation": u64::MAX,
+            "max_segments": 8
+        }),
+    );
+    assert_eq!(build.status, 409, "body: {}", build.body);
+    assert_eq!(build.json()["error"]["code"], "generation_conflict");
+}
+
+#[test]
+fn build_indexes_with_expected_generation_succeeds_for_current_manifest() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    create_collection(&ctx, "emb", 3);
+    let build = post_json(
+        ctx.addr(),
+        "/v1/db/collections/emb/indexes/build",
+        &json!({
+            "expected_generation": 0,
+            "max_segments": 8
+        }),
+    );
+    assert_eq!(build.status, 200, "body: {}", build.body);
+    let json = build.json();
+    assert_eq!(json["collection"], "emb");
+    assert_eq!(json["built_segments"], 0);
+    assert_eq!(json["failed_segments"], 0);
+    assert_eq!(json["pending_segments"], 0);
 }
 
 #[test]

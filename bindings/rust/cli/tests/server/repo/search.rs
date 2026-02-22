@@ -97,10 +97,7 @@ fn search_accepts_endpoint_url_param() {
 #[test]
 fn search_accepts_sort_param() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = get(
-        ctx.addr(),
-        "/v1/repo/search?query=test&sort=downloads",
-    );
+    let resp = get(ctx.addr(), "/v1/repo/search?query=test&sort=downloads");
     assert_search_accepted(&resp);
 }
 
@@ -108,10 +105,7 @@ fn search_accepts_sort_param() {
 #[test]
 fn search_accepts_direction_param() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = get(
-        ctx.addr(),
-        "/v1/repo/search?query=test&direction=ascending",
-    );
+    let resp = get(ctx.addr(), "/v1/repo/search?query=test&direction=ascending");
     assert_search_accepted(&resp);
 }
 
@@ -130,10 +124,7 @@ fn search_accepts_filter_param() {
 #[test]
 fn search_accepts_library_param() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = get(
-        ctx.addr(),
-        "/v1/repo/search?query=test&library=safetensors",
-    );
+    let resp = get(ctx.addr(), "/v1/repo/search?query=test&library=safetensors");
     assert_search_accepted(&resp);
 }
 

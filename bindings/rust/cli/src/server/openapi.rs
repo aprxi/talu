@@ -99,6 +99,7 @@ use crate::server::{
         db_vector::handle_query_points,
         db_vector::handle_collection_stats,
         db_vector::handle_compact_collection,
+        db_vector::handle_build_collection_indexes,
         db_vector::handle_collection_changes,
         // Plugins
         plugins::handle_list,
@@ -203,6 +204,8 @@ use crate::server::{
         db_vector::CollectionStatsResponse,
         db_vector::CompactCollectionRequest,
         db_vector::CompactResponse,
+        db_vector::BuildIndexesRequest,
+        db_vector::BuildIndexesResponse,
         db_vector::ChangeEventResponse,
         db_vector::ChangesResponse,
         // Plugins

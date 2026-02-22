@@ -78,15 +78,11 @@ fn generate_text_produces_output() {
         mime_ptr: ptr::null(),
     };
 
-    let mut result = unsafe {
-        talu_sys::talu_router_generate_with_backend(chat, &part, 1, backend, &config)
-    };
+    let mut result =
+        unsafe { talu_sys::talu_router_generate_with_backend(chat, &part, 1, backend, &config) };
     assert_eq!(result.error_code, 0, "generation should succeed");
     assert!(!result.text.is_null(), "generated text should be non-null");
-    assert!(
-        result.prompt_tokens > 0,
-        "prompt_tokens should be positive"
-    );
+    assert!(result.prompt_tokens > 0, "prompt_tokens should be positive");
     assert!(
         result.completion_tokens > 0,
         "completion_tokens should be positive"

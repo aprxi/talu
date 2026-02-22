@@ -181,7 +181,11 @@ pub fn seed_session_with_tags(
                 c_tag_id.as_ptr(),
             )
         };
-        assert_eq!(rc, 0, "talu_storage_add_conversation_tag failed for {}", tag_name);
+        assert_eq!(
+            rc, 0,
+            "talu_storage_add_conversation_tag failed for {}",
+            tag_name
+        );
     }
 
     session_id.to_string()
@@ -251,7 +255,11 @@ pub fn seed_session_with_tags_and_group(
                 c_tag_id.as_ptr(),
             )
         };
-        assert_eq!(rc, 0, "talu_storage_add_conversation_tag failed for {}", tag_name);
+        assert_eq!(
+            rc, 0,
+            "talu_storage_add_conversation_tag failed for {}",
+            tag_name
+        );
     }
 
     session_id.to_string()

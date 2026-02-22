@@ -9,7 +9,8 @@ async fn highlight_python_returns_tokens() {
         "source": "def foo():\n    return 42\n",
         "language": "python"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let tokens = json.as_array().expect("response should be a JSON array");
@@ -31,7 +32,8 @@ async fn highlight_rich_includes_positions() {
         "language": "python",
         "rich": true
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let tokens = json.as_array().expect("response should be a JSON array");
@@ -39,12 +41,30 @@ async fn highlight_rich_includes_positions() {
 
     // Rich tokens include node kind (nk), text (tx), and position fields.
     for token in tokens {
-        assert!(token.get("nk").is_some(), "rich token missing 'nk': {token}");
-        assert!(token.get("tx").is_some(), "rich token missing 'tx': {token}");
-        assert!(token.get("sr").is_some(), "rich token missing 'sr': {token}");
-        assert!(token.get("sc").is_some(), "rich token missing 'sc': {token}");
-        assert!(token.get("er").is_some(), "rich token missing 'er': {token}");
-        assert!(token.get("ec").is_some(), "rich token missing 'ec': {token}");
+        assert!(
+            token.get("nk").is_some(),
+            "rich token missing 'nk': {token}"
+        );
+        assert!(
+            token.get("tx").is_some(),
+            "rich token missing 'tx': {token}"
+        );
+        assert!(
+            token.get("sr").is_some(),
+            "rich token missing 'sr': {token}"
+        );
+        assert!(
+            token.get("sc").is_some(),
+            "rich token missing 'sc': {token}"
+        );
+        assert!(
+            token.get("er").is_some(),
+            "rich token missing 'er': {token}"
+        );
+        assert!(
+            token.get("ec").is_some(),
+            "rich token missing 'ec': {token}"
+        );
     }
 }
 
@@ -55,11 +75,15 @@ async fn highlight_javascript() {
         "source": "function bar() { return 1; }\n",
         "language": "javascript"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let tokens = json.as_array().expect("response should be a JSON array");
-    assert!(!tokens.is_empty(), "JavaScript source should produce tokens");
+    assert!(
+        !tokens.is_empty(),
+        "JavaScript source should produce tokens"
+    );
 
     for token in tokens {
         assert!(token.get("s").is_some(), "token missing 's': {token}");
@@ -75,7 +99,8 @@ async fn highlight_invalid_language() {
         "source": "hello",
         "language": "nonexistent_language_xyz"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json.get("error").is_some(), "should return error object");
@@ -88,7 +113,8 @@ async fn highlight_empty_source() {
         "source": "",
         "language": "python"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/highlight", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let tokens = json.as_array().expect("response should be a JSON array");

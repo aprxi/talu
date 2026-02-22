@@ -4,7 +4,9 @@ use std::ffi::{c_void, CString};
 
 /// Returns the model path from `TALU_TEST_MODEL`, or `None` if unset.
 pub fn model_path() -> Option<String> {
-    std::env::var("TALU_TEST_MODEL").ok().filter(|s| !s.is_empty())
+    std::env::var("TALU_TEST_MODEL")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 /// Skips the current test if `TALU_TEST_MODEL` is not set.
@@ -34,10 +36,7 @@ pub fn make_local_spec(path: &CString) -> talu_sys::TaluModelSpec {
 /// Build a `TaluModelSpec` for an OpenAI-compatible backend (backend_type_raw = 1).
 ///
 /// The returned spec borrows from the CStrings — caller must keep them alive.
-pub fn make_openai_spec(
-    model_id: &CString,
-    base_url: &CString,
-) -> talu_sys::TaluModelSpec {
+pub fn make_openai_spec(model_id: &CString, base_url: &CString) -> talu_sys::TaluModelSpec {
     let openai_config = talu_sys::OpenAICompatibleConfig {
         base_url: base_url.as_ptr(),
         api_key: std::ptr::null(),
@@ -80,7 +79,10 @@ pub fn create_backend(canon: *mut c_void) -> *mut c_void {
         )
     };
     assert_eq!(rc, 0, "create_backend failed with error code {}", rc);
-    assert!(!backend_ptr.is_null(), "create_backend returned null handle");
+    assert!(
+        !backend_ptr.is_null(),
+        "create_backend returned null handle"
+    );
     backend_ptr
 }
 

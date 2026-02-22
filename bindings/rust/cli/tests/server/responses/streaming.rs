@@ -475,9 +475,7 @@ fn streaming_created_event_has_session_id() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let events = parse_sse_events(&resp.body);
 
-    let created = events
-        .iter()
-        .find(|(t, _)| t == "response.created");
+    let created = events.iter().find(|(t, _)| t == "response.created");
     assert!(created.is_some(), "should have response.created event");
     let (_, data) = created.unwrap();
 
@@ -898,21 +896,14 @@ fn streaming_session_has_metadata_at_created() {
     let conv = conv_resp.json();
     assert_eq!(conv["id"].as_str(), Some(session_id.as_str()));
 
-    let title = conv["title"]
-        .as_str()
-        .expect("session should have title");
+    let title = conv["title"].as_str().expect("session should have title");
     assert!(
         title.starts_with("Explain quantum mechanics"),
         "title should be derived from input, got: {title:?}",
     );
 
-    let conv_model = conv["model"]
-        .as_str()
-        .expect("session should have model");
-    assert!(
-        !conv_model.is_empty(),
-        "model should be non-empty",
-    );
+    let conv_model = conv["model"].as_str().expect("session should have model");
+    assert!(!conv_model.is_empty(), "model should be non-empty",);
 
     drain_stream(tcp);
 }

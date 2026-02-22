@@ -137,9 +137,7 @@ fn cmd_ls_local_models(
     let local_models: Vec<_> = list
         .iter()
         .filter(|(id, _, s)| {
-            source_filter.allows_managed()
-                && *s == talu::CacheOrigin::Managed
-                && is_pinned(id)
+            source_filter.allows_managed() && *s == talu::CacheOrigin::Managed && is_pinned(id)
         })
         .map(|(id, path, _)| (id.clone(), path.clone()))
         .collect();

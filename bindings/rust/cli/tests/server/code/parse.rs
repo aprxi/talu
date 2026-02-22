@@ -9,7 +9,8 @@ async fn parse_python_returns_ast() {
         "source": "x = 1",
         "language": "python"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/parse", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/parse", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
@@ -27,7 +28,10 @@ async fn parse_python_returns_ast() {
         .get("children")
         .and_then(|v| v.as_array())
         .expect("root node should have 'children' array");
-    assert!(!children.is_empty(), "AST for 'x = 1' should have child nodes");
+    assert!(
+        !children.is_empty(),
+        "AST for 'x = 1' should have child nodes"
+    );
 }
 
 #[tokio::test]
@@ -37,7 +41,8 @@ async fn parse_tree_contains_function_definition() {
         "source": "def foo(): pass",
         "language": "python"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/parse", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/parse", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let tree = json.get("tree").expect("should have 'tree'");
@@ -98,10 +103,22 @@ async fn parse_deeply_nested_produces_truncated_node() {
     let window_end = (window_start + 500).min(raw.len());
     let window = &raw[window_start..window_end];
 
-    assert!(window.contains("\"start_byte\":"), "_truncated missing start_byte: {window}");
-    assert!(window.contains("\"end_byte\":"), "_truncated missing end_byte: {window}");
-    assert!(window.contains("\"start_point\":"), "_truncated missing start_point: {window}");
-    assert!(window.contains("\"child_count\":"), "_truncated missing child_count: {window}");
+    assert!(
+        window.contains("\"start_byte\":"),
+        "_truncated missing start_byte: {window}"
+    );
+    assert!(
+        window.contains("\"end_byte\":"),
+        "_truncated missing end_byte: {window}"
+    );
+    assert!(
+        window.contains("\"start_point\":"),
+        "_truncated missing start_point: {window}"
+    );
+    assert!(
+        window.contains("\"child_count\":"),
+        "_truncated missing child_count: {window}"
+    );
 }
 
 #[tokio::test]
@@ -111,7 +128,8 @@ async fn parse_invalid_language() {
         "source": "hello",
         "language": "nonexistent_language_xyz"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/parse", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/parse", &body)).await).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json.get("error").is_some(), "should return error object");

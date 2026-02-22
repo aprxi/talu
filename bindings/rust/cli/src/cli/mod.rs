@@ -13,10 +13,10 @@ use std::env;
 use std::io::{self, IsTerminal};
 use std::path::PathBuf;
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 
-use crate::server::{ServerArgs, run_server};
+use crate::server::{run_server, ServerArgs};
 
 use talu::LogFormat;
 use talu::LogLevel;
@@ -1001,17 +1001,15 @@ mod tests {
 
     #[test]
     fn reject_get_add_and_remove_pin_flags() {
-        assert!(
-            parse(&[
-                "talu",
-                "get",
-                "--add-pin",
-                "Qwen/Qwen3-0.6B",
-                "--remove-pin",
-                "Qwen/Qwen3-0.6B"
-            ])
-            .is_err()
-        );
+        assert!(parse(&[
+            "talu",
+            "get",
+            "--add-pin",
+            "Qwen/Qwen3-0.6B",
+            "--remove-pin",
+            "Qwen/Qwen3-0.6B"
+        ])
+        .is_err());
     }
 
     #[test]

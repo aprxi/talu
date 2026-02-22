@@ -17,7 +17,10 @@ fn repo_config() -> ServerConfig {
 fn files_has_json_content_type() {
     let ctx = ServerTestContext::new(repo_config());
     // Nonexistent model will fail but should still return JSON.
-    let resp = get(ctx.addr(), "/v1/repo/models/nonexistent-org/nonexistent-model/files");
+    let resp = get(
+        ctx.addr(),
+        "/v1/repo/models/nonexistent-org/nonexistent-model/files",
+    );
     assert_eq!(resp.header("content-type"), Some("application/json"));
 }
 
@@ -25,7 +28,10 @@ fn files_has_json_content_type() {
 #[test]
 fn files_nonexistent_model_returns_error() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = get(ctx.addr(), "/v1/repo/models/nonexistent-org/nonexistent-model/files");
+    let resp = get(
+        ctx.addr(),
+        "/v1/repo/models/nonexistent-org/nonexistent-model/files",
+    );
     // The FFI call will fail for a nonexistent model.
     let _json = resp.json();
     // Either a 200 with empty files or a 500 with error — both are valid JSON.
@@ -41,7 +47,10 @@ fn files_nonexistent_model_returns_error() {
 #[test]
 fn files_response_structure() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = get(ctx.addr(), "/v1/repo/models/nonexistent-org/nonexistent-model/files");
+    let resp = get(
+        ctx.addr(),
+        "/v1/repo/models/nonexistent-org/nonexistent-model/files",
+    );
     let json = resp.json();
 
     if resp.status == 200 {
@@ -64,7 +73,10 @@ fn files_response_structure() {
 #[test]
 fn files_percent_encoded_model_id() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = get(ctx.addr(), "/v1/repo/models/meta-llama%2FLlama-3.2-1B/files");
+    let resp = get(
+        ctx.addr(),
+        "/v1/repo/models/meta-llama%2FLlama-3.2-1B/files",
+    );
     let json = resp.json();
 
     if resp.status == 200 {
@@ -95,7 +107,10 @@ fn files_accepts_token_param() {
 #[test]
 fn files_bare_path() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = get(ctx.addr(), "/repo/models/nonexistent-org/nonexistent-model/files");
+    let resp = get(
+        ctx.addr(),
+        "/repo/models/nonexistent-org/nonexistent-model/files",
+    );
     assert_eq!(resp.header("content-type"), Some("application/json"));
 }
 

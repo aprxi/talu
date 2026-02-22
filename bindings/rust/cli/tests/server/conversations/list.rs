@@ -728,7 +728,12 @@ fn list_untagged_session_has_empty_tags() {
 fn list_total_field_present() {
     let temp = TempDir::new().expect("temp dir");
     for i in 0..5 {
-        seed_session(temp.path(), &format!("sess-tot-{i}"), &format!("Chat {i}"), "m");
+        seed_session(
+            temp.path(),
+            &format!("sess-tot-{i}"),
+            &format!("Chat {i}"),
+            "m",
+        );
     }
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
@@ -777,20 +782,32 @@ fn list_offset_skips_sessions() {
     let data = json["data"].as_array().unwrap();
     assert_eq!(data.len(), 2);
     assert_eq!(json["total"], 5, "total should remain 5");
-    assert_eq!(json["has_more"], true, "there is still 1 more after offset=2+limit=2");
+    assert_eq!(
+        json["has_more"], true,
+        "there is still 1 more after offset=2+limit=2"
+    );
 
     let page_ids: Vec<String> = data
         .iter()
         .map(|v| v["id"].as_str().unwrap().to_string())
         .collect();
-    assert_eq!(page_ids, &all_ids[2..4], "offset=2 should skip the first 2 items");
+    assert_eq!(
+        page_ids,
+        &all_ids[2..4],
+        "offset=2 should skip the first 2 items"
+    );
 }
 
 #[test]
 fn list_offset_beyond_total_returns_empty() {
     let temp = TempDir::new().expect("temp dir");
     for i in 0..3 {
-        seed_session(temp.path(), &format!("sess-bey-{i}"), &format!("Chat {i}"), "m");
+        seed_session(
+            temp.path(),
+            &format!("sess-bey-{i}"),
+            &format!("Chat {i}"),
+            "m",
+        );
     }
 
     let ctx = ServerTestContext::new(conversation_config(temp.path()));
@@ -798,7 +815,10 @@ fn list_offset_beyond_total_returns_empty() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().unwrap();
-    assert!(data.is_empty(), "offset beyond total should return empty data");
+    assert!(
+        data.is_empty(),
+        "offset beyond total should return empty data"
+    );
     assert_eq!(json["total"], 3, "total should still reflect all sessions");
     assert_eq!(json["has_more"], false);
 }
@@ -840,12 +860,18 @@ fn list_marker_filter_with_offset() {
     assert_eq!(json["data"].as_array().unwrap().len(), 2);
 
     // List archived with offset=1, limit=1: should see 1 item, total still 2.
-    let resp = get(ctx.addr(), "/v1/conversations?marker=archived&offset=1&limit=1");
+    let resp = get(
+        ctx.addr(),
+        "/v1/conversations?marker=archived&offset=1&limit=1",
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["total"], 2, "total should be 2 archived");
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
-    assert_eq!(json["has_more"], false, "offset=1 + limit=1 covers all 2 archived");
+    assert_eq!(
+        json["has_more"], false,
+        "offset=1 + limit=1 covers all 2 archived"
+    );
 
     // List active only (marker=active): should see 3.
     let resp = get(ctx.addr(), "/v1/conversations?marker=active&limit=10");
@@ -858,5 +884,8 @@ fn list_marker_filter_with_offset() {
     let resp = get(ctx.addr(), "/v1/conversations?limit=10");
     assert_eq!(resp.status, 200);
     let json = resp.json();
-    assert_eq!(json["total"], 5, "all 5 sessions returned without marker filter");
+    assert_eq!(
+        json["total"], 5,
+        "all 5 sessions returned without marker filter"
+    );
 }

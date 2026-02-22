@@ -100,7 +100,11 @@ fn matches_filter(filter: &str, scope: &str) -> bool {
 
     // If there were positive patterns, scope must have matched at least one.
     // If only negations, everything not excluded passes.
-    if has_positive { positive_match } else { true }
+    if has_positive {
+        positive_match
+    } else {
+        true
+    }
 }
 
 static LOGGER: TaluServerLogger = TaluServerLogger;
@@ -145,9 +149,15 @@ mod tests {
 
     #[test]
     fn comma_separated_or() {
-        assert!(matches_filter("core::inference,server::gen", "core::inference"));
+        assert!(matches_filter(
+            "core::inference,server::gen",
+            "core::inference"
+        ));
         assert!(matches_filter("core::inference,server::gen", "server::gen"));
-        assert!(!matches_filter("core::inference,server::gen", "server::http"));
+        assert!(!matches_filter(
+            "core::inference,server::gen",
+            "server::http"
+        ));
     }
 
     #[test]
@@ -176,7 +186,10 @@ mod tests {
 
     #[test]
     fn empty_segments_ignored() {
-        assert!(matches_filter("core::inference,,server::gen", "server::gen"));
+        assert!(matches_filter(
+            "core::inference,,server::gen",
+            "server::gen"
+        ));
         assert!(matches_filter(",core::inference,", "core::inference"));
     }
 }

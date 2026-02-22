@@ -270,8 +270,14 @@ fn get_blob_returns_uploaded_content() {
         "expected octet-stream, got: {ct}"
     );
     let cc = blob_resp.header("cache-control").unwrap_or("");
-    assert!(cc.contains("immutable"), "should have immutable cache-control");
-    assert_eq!(blob_resp.body, payload, "blob content should match uploaded payload");
+    assert!(
+        cc.contains("immutable"),
+        "should have immutable cache-control"
+    );
+    assert_eq!(
+        blob_resp.body, payload,
+        "blob content should match uploaded payload"
+    );
 }
 
 /// Invalid (too-short) hash returns 400.
@@ -415,7 +421,10 @@ fn deleted_file_returns_404_for_metadata_and_content() {
 
     // Content is accessible before deletion.
     let content_resp = get(ctx.addr(), &format!("/v1/files/{}/content", file_id));
-    assert_eq!(content_resp.status, 200, "content should be accessible before delete");
+    assert_eq!(
+        content_resp.status, 200,
+        "content should be accessible before delete"
+    );
     assert_eq!(content_resp.body, payload);
 
     // Delete the file.

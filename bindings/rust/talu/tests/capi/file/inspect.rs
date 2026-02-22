@@ -20,7 +20,9 @@ fn inspect_png_returns_image_with_metadata() {
     assert_eq!(info.kind, FileKind::Image);
     assert_eq!(info.mime, "image/png");
 
-    let image = info.image.expect("image metadata should be present for PNG");
+    let image = info
+        .image
+        .expect("image metadata should be present for PNG");
     assert_eq!(image.format, ImageFormat::Png);
     assert_eq!(image.width, 1);
     assert_eq!(image.height, 1);
@@ -36,7 +38,9 @@ fn inspect_jpeg_returns_image_with_metadata() {
     assert_eq!(info.kind, FileKind::Image);
     assert_eq!(info.mime, "image/jpeg");
 
-    let image = info.image.expect("image metadata should be present for JPEG");
+    let image = info
+        .image
+        .expect("image metadata should be present for JPEG");
     assert_eq!(image.format, ImageFormat::Jpeg);
     assert_eq!(image.width, 1);
     assert_eq!(image.height, 1);
@@ -50,7 +54,9 @@ fn inspect_webp_returns_image_with_metadata() {
     assert_eq!(info.kind, FileKind::Image);
     assert_eq!(info.mime, "image/webp");
 
-    let image = info.image.expect("image metadata should be present for WebP");
+    let image = info
+        .image
+        .expect("image metadata should be present for WebP");
     assert_eq!(image.format, ImageFormat::Webp);
     assert_eq!(image.width, 1);
     assert_eq!(image.height, 1);

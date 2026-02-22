@@ -434,9 +434,6 @@ fn tag_usage_counts_documents() {
     // Usage should now reflect 2 documents.
     let resp = get(ctx.addr(), &format!("/v1/tags/{}", tag_id));
     let json = resp.json();
-    assert_eq!(
-        json["usage"]["documents"], 2,
-        "expected 2 tagged documents"
-    );
+    assert_eq!(json["usage"]["documents"], 2, "expected 2 tagged documents");
     assert_eq!(json["usage"]["total"], 2);
 }

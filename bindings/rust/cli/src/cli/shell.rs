@@ -1,15 +1,15 @@
 use std::env;
 use std::io::{self, Read};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{anyhow, bail, Result};
 
 use talu::{ChatHandle, InferenceBackend};
 
-use crate::provider::{ModelTarget, get_provider, parse_model_target};
+use crate::provider::{get_provider, parse_model_target, ModelTarget};
 
-use super::AgentArgs;
 use super::repo::{generation_config, resolve_model_for_inference};
 use super::util::DEFAULT_MAX_TOKENS;
+use super::AgentArgs;
 
 /// Interactive agent mode (`talu agent`)
 ///

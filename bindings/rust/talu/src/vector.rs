@@ -123,6 +123,10 @@ pub struct StatsResult {
     pub tombstone_count: usize,
     pub segment_count: usize,
     pub total_count: usize,
+    pub manifest_generation: u64,
+    pub index_ready_segments: usize,
+    pub index_pending_segments: usize,
+    pub index_failed_segments: usize,
 }
 
 /// Compaction result returned by [`VectorStore::compact`].
@@ -130,6 +134,14 @@ pub struct StatsResult {
 pub struct CompactResult {
     pub kept_count: usize,
     pub removed_tombstones: usize,
+}
+
+/// ANN index build summary returned by [`VectorStore::build_indexes_with_generation`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexBuildResult {
+    pub built_segments: usize,
+    pub failed_segments: usize,
+    pub pending_segments: usize,
 }
 
 /// Vector mutation operation type.
@@ -526,6 +538,10 @@ impl VectorStore {
         let mut tombstone_count: usize = 0;
         let mut segment_count: usize = 0;
         let mut total_count: usize = 0;
+        let mut manifest_generation: u64 = 0;
+        let mut index_ready_segments: usize = 0;
+        let mut index_pending_segments: usize = 0;
+        let mut index_failed_segments: usize = 0;
 
         let rc = unsafe {
             talu_sys::talu_vector_store_stats(
@@ -534,6 +550,10 @@ impl VectorStore {
                 &mut tombstone_count as *mut usize as *mut c_void,
                 &mut segment_count as *mut usize as *mut c_void,
                 &mut total_count as *mut usize as *mut c_void,
+                &mut manifest_generation as *mut u64 as *mut c_void,
+                &mut index_ready_segments as *mut usize as *mut c_void,
+                &mut index_pending_segments as *mut usize as *mut c_void,
+                &mut index_failed_segments as *mut usize as *mut c_void,
             )
         };
         if rc != 0 {
@@ -545,6 +565,10 @@ impl VectorStore {
             tombstone_count,
             segment_count,
             total_count,
+            manifest_generation,
+            index_ready_segments,
+            index_pending_segments,
+            index_failed_segments,
         })
     }
 
@@ -843,6 +867,38 @@ impl VectorStore {
         Ok(CompactResult {
             kept_count,
             removed_tombstones,
+        })
+    }
+
+    /// Build pending ANN indexes only if manifest generation matches `expected_generation`.
+    pub fn build_indexes_with_generation(
+        &self,
+        expected_generation: u64,
+        max_segments: usize,
+    ) -> Result<IndexBuildResult, VectorError> {
+        let mut built_segments: usize = 0;
+        let mut failed_segments: usize = 0;
+        let mut pending_segments: usize = 0;
+
+        let rc = unsafe {
+            talu_sys::talu_vector_store_build_indexes_with_generation(
+                self.ptr,
+                expected_generation,
+                max_segments,
+                &mut built_segments as *mut usize as *mut c_void,
+                &mut failed_segments as *mut usize as *mut c_void,
+                &mut pending_segments as *mut usize as *mut c_void,
+            )
+        };
+        if rc != 0 {
+            return Err(VectorError::from_last(
+                "failed to build vector indexes with generation",
+            ));
+        }
+        Ok(IndexBuildResult {
+            built_segments,
+            failed_segments,
+            pending_segments,
         })
     }
 

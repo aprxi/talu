@@ -52,6 +52,10 @@ fn stats_and_compact_remove_tombstones() {
     assert_eq!(before.visible_count, 1);
     assert_eq!(before.tombstone_count, 1);
     assert_eq!(before.total_count, 2);
+    assert!(
+        before.index_ready_segments + before.index_pending_segments + before.index_failed_segments
+            <= before.segment_count
+    );
 
     let compact = store.compact(dims).expect("compact failed");
     assert_eq!(compact.kept_count, 1);
@@ -61,6 +65,10 @@ fn stats_and_compact_remove_tombstones() {
     assert_eq!(after.visible_count, 1);
     assert_eq!(after.tombstone_count, 0);
     assert_eq!(after.total_count, 1);
+    assert!(
+        after.index_ready_segments + after.index_pending_segments + after.index_failed_segments
+            <= after.segment_count
+    );
 
     let q = [1.0, 0.0, 0.0];
     let result = store.search(&q, 2).expect("search after compact");
@@ -88,4 +96,26 @@ fn changes_pagination_reports_ordered_events() {
     let page2 = store.changes(page1.next_since, 10).expect("changes page2");
     assert!(!page2.events.is_empty());
     assert_eq!(page2.events[0].op, ChangeOp::Compact);
+}
+
+#[test]
+fn build_indexes_with_generation_reports_success_and_conflict() {
+    let ctx = TestContext::new();
+    let store = VectorStore::open(ctx.db_path()).expect("open failed");
+
+    let success = store
+        .build_indexes_with_generation(0, 8)
+        .expect("build indexes with current generation");
+    assert_eq!(success.built_segments, 0);
+    assert_eq!(success.failed_segments, 0);
+    assert_eq!(success.pending_segments, 0);
+
+    let err = store
+        .build_indexes_with_generation(u64::MAX, 8)
+        .expect_err("expected generation conflict");
+    let msg = err.to_string().to_ascii_lowercase();
+    assert!(
+        msg.contains("generation conflict") || msg.contains("manifestgenerationconflict"),
+        "unexpected error: {msg}"
+    );
 }

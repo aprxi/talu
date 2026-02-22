@@ -46,10 +46,7 @@ fn list_cursor_pagination_round_trip() {
     let cursor = json1["cursor"].as_str().expect("cursor string");
 
     // Page 2: use cursor
-    let resp2 = get(
-        ctx.addr(),
-        &format!("/v1/files?limit=2&cursor={cursor}"),
-    );
+    let resp2 = get(ctx.addr(), &format!("/v1/files?limit=2&cursor={cursor}"));
     assert_eq!(resp2.status, 200, "body: {}", resp2.body);
     let json2 = resp2.json();
     let page2 = json2["data"].as_array().expect("page2 data");
@@ -58,10 +55,7 @@ fn list_cursor_pagination_round_trip() {
     let cursor2 = json2["cursor"].as_str().expect("cursor2 string");
 
     // Page 3: last page
-    let resp3 = get(
-        ctx.addr(),
-        &format!("/v1/files?limit=2&cursor={cursor2}"),
-    );
+    let resp3 = get(ctx.addr(), &format!("/v1/files?limit=2&cursor={cursor2}"));
     assert_eq!(resp3.status, 200, "body: {}", resp3.body);
     let json3 = resp3.json();
     let page3 = json3["data"].as_array().expect("page3 data");
@@ -180,7 +174,12 @@ fn list_invalid_cursor_ignored() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(files_config(temp.path()));
 
-    upload_text_file(&ctx, "cursor-test.txt", "text/plain", "cursor-ignored-content");
+    upload_text_file(
+        &ctx,
+        "cursor-test.txt",
+        "text/plain",
+        "cursor-ignored-content",
+    );
 
     let resp = get(ctx.addr(), "/v1/files?cursor=not-valid-base64!!!");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -313,7 +312,11 @@ fn list_cursor_pagination_archived() {
         cursor = Some(json["cursor"].as_str().expect("cursor").to_string());
     }
 
-    assert_eq!(collected_ids.len(), 5, "should collect all 5 archived files");
+    assert_eq!(
+        collected_ids.len(),
+        5,
+        "should collect all 5 archived files"
+    );
     for id in &all_ids {
         assert!(
             collected_ids.contains(id),

@@ -4892,6 +4892,10 @@ extern "C" {
         out_tombstone_count: *mut c_void,
         out_segment_count: *mut c_void,
         out_total_count: *mut c_void,
+        out_manifest_generation: *mut c_void,
+        out_index_ready_segments: *mut c_void,
+        out_index_pending_segments: *mut c_void,
+        out_index_failed_segments: *mut c_void,
     ) -> c_int;
     // core/src/capi/db.zig
     pub fn talu_vector_store_compact(
@@ -5095,6 +5099,15 @@ extern "C" {
         expected_generation: u64,
         out_kept_count: *mut c_void,
         out_removed_tombstones: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/db.zig
+    pub fn talu_vector_store_build_indexes_with_generation(
+        handle: *mut c_void,
+        expected_generation: u64,
+        max_segments: usize,
+        out_built_segments: *mut c_void,
+        out_failed_segments: *mut c_void,
+        out_pending_segments: *mut c_void,
     ) -> c_int;
     // core/src/capi/db.zig
     pub fn talu_vector_store_compact_expired_tombstones(

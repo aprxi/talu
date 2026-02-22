@@ -489,12 +489,19 @@ fn deleted_tag_silently_dropped_from_conversation() {
     // GET single conversation — only "keep-me" should appear.
     let get_resp = get(ctx.addr(), "/v1/conversations/sess-orphan");
     assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
-    let resolved_tags = get_resp.json()["tags"].as_array().expect("tags array").clone();
+    let resolved_tags = get_resp.json()["tags"]
+        .as_array()
+        .expect("tags array")
+        .clone();
     let names: Vec<&str> = resolved_tags
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names, vec!["keep-me"], "deleted tag should be silently dropped");
+    assert_eq!(
+        names,
+        vec!["keep-me"],
+        "deleted tag should be silently dropped"
+    );
 
     // LIST conversations — same assertion.
     let list_resp = get(ctx.addr(), "/v1/conversations");
@@ -510,5 +517,9 @@ fn deleted_tag_silently_dropped_from_conversation() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(list_names, vec!["keep-me"], "deleted tag dropped from list too");
+    assert_eq!(
+        list_names,
+        vec!["keep-me"],
+        "deleted tag dropped from list too"
+    );
 }

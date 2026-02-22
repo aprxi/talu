@@ -13,7 +13,7 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Write};
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use serde_json::Value;
 
 use talu::policy::Policy;

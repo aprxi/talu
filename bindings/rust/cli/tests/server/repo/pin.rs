@@ -69,11 +69,7 @@ fn pin_idempotent() {
 fn pin_empty_model_id_returns_400() {
     let (config, _bucket) = pin_config();
     let ctx = ServerTestContext::new(config);
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/repo/pins",
-        &json!({"model_id": ""}),
-    );
+    let resp = post_json(ctx.addr(), "/v1/repo/pins", &json!({"model_id": ""}));
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     assert_eq!(resp.json()["error"]["code"], "invalid_request");
 }
@@ -133,7 +129,10 @@ fn list_pins_after_pin() {
     let pins = json["pins"].as_array().expect("pins should be array");
     assert_eq!(pins.len(), 1);
     assert_eq!(pins[0]["model_uri"], "test-org/test-model");
-    assert!(pins[0]["pinned_at_ms"].is_number(), "pinned_at_ms should be number");
+    assert!(
+        pins[0]["pinned_at_ms"].is_number(),
+        "pinned_at_ms should be number"
+    );
 }
 
 /// Pin list has application/json content type.
@@ -178,7 +177,10 @@ fn unpin_returns_pinned_false() {
 fn unpin_nonexistent() {
     let (config, _bucket) = pin_config();
     let ctx = ServerTestContext::new(config);
-    let resp = delete(ctx.addr(), "/v1/repo/pins/nonexistent-org/nonexistent-model");
+    let resp = delete(
+        ctx.addr(),
+        "/v1/repo/pins/nonexistent-org/nonexistent-model",
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -203,7 +205,8 @@ fn unpin_percent_encoded_model_id() {
     let resp = delete(ctx.addr(), "/v1/repo/pins/meta-llama%2FLlama-3.2-1B");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(
-        resp.json()["model_id"], "meta-llama/Llama-3.2-1B",
+        resp.json()["model_id"],
+        "meta-llama/Llama-3.2-1B",
         "percent-encoded slash should be decoded"
     );
 
@@ -287,18 +290,17 @@ fn sync_pins_dry_run() {
     );
 
     // Sync with dry_run (default)
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/repo/sync-pins",
-        &json!({}),
-    );
+    let resp = post_json(ctx.addr(), "/v1/repo/sync-pins", &json!({}));
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
     assert!(json["total"].is_number(), "total should be number");
     assert!(json["cached"].is_number(), "cached should be number");
     assert!(json["missing"].is_number(), "missing should be number");
-    assert!(json["downloaded"].is_number(), "downloaded should be number");
+    assert!(
+        json["downloaded"].is_number(),
+        "downloaded should be number"
+    );
     assert!(json["errors"].is_array(), "errors should be array");
 
     // dry_run should not download anything
@@ -310,7 +312,10 @@ fn sync_pins_dry_run() {
     // When present, it should be a number.
     if !json["missing_size_bytes"].is_null() {
         if let Some(msb) = json.get("missing_size_bytes") {
-            assert!(msb.is_number(), "missing_size_bytes should be a number when present");
+            assert!(
+                msb.is_number(),
+                "missing_size_bytes should be a number when present"
+            );
         }
     }
 }
@@ -393,11 +398,7 @@ fn sync_pins_dry_run_ignores_sse_accept() {
 #[test]
 fn sync_pins_no_bucket_returns_400() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/repo/sync-pins",
-        &json!({}),
-    );
+    let resp = post_json(ctx.addr(), "/v1/repo/sync-pins", &json!({}));
     assert_eq!(resp.status, 400);
     assert_eq!(resp.json()["error"]["code"], "pin_store_unavailable");
 }
@@ -463,8 +464,14 @@ fn pin_endpoints_in_openapi() {
 
     // Verify HTTP methods
     let pins_path = &paths["/v1/repo/pins"];
-    assert!(pins_path.get("get").is_some(), "/v1/repo/pins should have GET");
-    assert!(pins_path.get("post").is_some(), "/v1/repo/pins should have POST");
+    assert!(
+        pins_path.get("get").is_some(),
+        "/v1/repo/pins should have GET"
+    );
+    assert!(
+        pins_path.get("post").is_some(),
+        "/v1/repo/pins should have POST"
+    );
 
     let unpin_path = &paths["/v1/repo/pins/{model_id}"];
     assert!(

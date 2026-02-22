@@ -514,7 +514,12 @@ unsafe impl Send for TreeHandle {}
 /// Get the list of supported languages (comma-separated).
 pub fn languages() -> Result<String> {
     // SAFETY: out_str is a valid out-param.
-    unsafe { call_returning_json(|out| talu_sys::talu_treesitter_languages(out), "Failed to get languages") }
+    unsafe {
+        call_returning_json(
+            |out| talu_sys::talu_treesitter_languages(out),
+            "Failed to get languages",
+        )
+    }
 }
 
 /// Detect language from a filename or extension.

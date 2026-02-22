@@ -106,10 +106,12 @@ fn canonicalize_nonexistent_local_model_returns_error() {
     let c_ref = CString::new("/nonexistent/path/to/model.gguf").unwrap();
     let mut spec = common::make_local_spec(&c_ref);
     let mut out: *mut c_void = ptr::null_mut();
-    let rc = unsafe {
-        talu_sys::talu_config_canonicalize(&mut spec, &mut out as *mut _ as *mut c_void)
-    };
-    assert_ne!(rc, 0, "nonexistent local model should fail canonicalization");
+    let rc =
+        unsafe { talu_sys::talu_config_canonicalize(&mut spec, &mut out as *mut _ as *mut c_void) };
+    assert_ne!(
+        rc, 0,
+        "nonexistent local model should fail canonicalization"
+    );
     assert!(out.is_null(), "output handle should remain null on error");
 }
 
@@ -119,9 +121,8 @@ fn canonicalize_valid_openai_spec_succeeds() {
     let c_url = CString::new("https://api.openai.com/v1").unwrap();
     let mut spec = common::make_openai_spec(&c_model, &c_url);
     let mut out: *mut c_void = ptr::null_mut();
-    let rc = unsafe {
-        talu_sys::talu_config_canonicalize(&mut spec, &mut out as *mut _ as *mut c_void)
-    };
+    let rc =
+        unsafe { talu_sys::talu_config_canonicalize(&mut spec, &mut out as *mut _ as *mut c_void) };
     assert_eq!(rc, 0, "valid OpenAI spec should canonicalize successfully");
     assert!(!out.is_null(), "canonical handle should be non-null");
     unsafe { talu_sys::talu_config_free(out) };

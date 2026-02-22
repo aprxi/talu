@@ -121,12 +121,8 @@ type WsStream = WebSocketStream<TokioIo<Upgraded>>;
 
 /// Handle a WebSocket connection after HTTP upgrade.
 pub async fn handle_ws_connection(upgraded: Upgraded) {
-    let mut ws: WsStream = WebSocketStream::from_raw_socket(
-        TokioIo::new(upgraded),
-        Role::Server,
-        None,
-    )
-    .await;
+    let mut ws: WsStream =
+        WebSocketStream::from_raw_socket(TokioIo::new(upgraded), Role::Server, None).await;
 
     let mut session: Option<WsSession> = None;
 
@@ -178,11 +174,13 @@ fn handle_create(session: &mut Option<WsSession>, req: &WsRequest) -> Result<Str
         return Err("'language' is required for create".into());
     }
 
-    let c_language = CString::new(req.language.as_str())
-        .map_err(|e| format!("Invalid language string: {e}"))?;
+    let c_language =
+        CString::new(req.language.as_str()).map_err(|e| format!("Invalid language string: {e}"))?;
     let parser = ParserHandle::new(&req.language).map_err(|e| format!("Parser failed: {e}"))?;
     let source = req.source.as_bytes().to_vec();
-    let tree = parser.parse(&source, None).map_err(|e| format!("Parse failed: {e}"))?;
+    let tree = parser
+        .parse(&source, None)
+        .map_err(|e| format!("Parse failed: {e}"))?;
 
     let tokens = tree
         .highlight_with_c_lang(&source, &c_language)
@@ -205,7 +203,9 @@ fn handle_create(session: &mut Option<WsSession>, req: &WsRequest) -> Result<Str
 }
 
 fn handle_edit(session: &mut Option<WsSession>, req: &WsRequest) -> Result<String, String> {
-    let sess = session.as_mut().ok_or("No active session. Send 'create' first.")?;
+    let sess = session
+        .as_mut()
+        .ok_or("No active session. Send 'create' first.")?;
 
     if !req.edits.is_empty() {
         // Delta mode: apply edits to source buffer + tree, then re-parse.
@@ -277,7 +277,8 @@ fn apply_deltas(sess: &mut WsSession, edits: &[TextEdit]) -> Result<(), String> 
         }
 
         // Splice the source buffer.
-        sess.source.splice(start..old_end, new_bytes.iter().copied());
+        sess.source
+            .splice(start..old_end, new_bytes.iter().copied());
 
         // Apply tree edit for correct incremental parsing.
         // All coordinates are client-provided — no server-side O(N) scan.
@@ -318,12 +319,16 @@ fn byte_to_point(source: &[u8], byte: u32) -> (u32, u32) {
 }
 
 fn handle_highlight(session: &Option<WsSession>, req: &WsRequest) -> Result<String, String> {
-    let sess = session.as_ref().ok_or("No active session. Send 'create' first.")?;
+    let sess = session
+        .as_ref()
+        .ok_or("No active session. Send 'create' first.")?;
 
     let tokens = if req.rich {
-        sess.tree.highlight_rich_with_c_lang(&sess.source, &sess.c_language)
+        sess.tree
+            .highlight_rich_with_c_lang(&sess.source, &sess.c_language)
     } else {
-        sess.tree.highlight_with_c_lang(&sess.source, &sess.c_language)
+        sess.tree
+            .highlight_with_c_lang(&sess.source, &sess.c_language)
     }
     .map_err(|e| format!("Highlight failed: {e}"))?;
 
@@ -331,21 +336,29 @@ fn handle_highlight(session: &Option<WsSession>, req: &WsRequest) -> Result<Stri
 }
 
 fn handle_query(session: &Option<WsSession>, req: &WsRequest) -> Result<String, String> {
-    let sess = session.as_ref().ok_or("No active session. Send 'create' first.")?;
+    let sess = session
+        .as_ref()
+        .ok_or("No active session. Send 'create' first.")?;
 
     if req.query.is_empty() {
         return Err("'query' is required".into());
     }
 
-    let matches = sess.tree
+    let matches = sess
+        .tree
         .query_with_c_lang(&sess.source, &sess.c_language, &req.query)
         .map_err(|e| format!("Query failed: {e}"))?;
 
-    Ok(format!("{{\"type\":\"query_result\",\"matches\":{}}}", matches))
+    Ok(format!(
+        "{{\"type\":\"query_result\",\"matches\":{}}}",
+        matches
+    ))
 }
 
 fn handle_graph(session: &Option<WsSession>, req: &WsRequest) -> Result<String, String> {
-    let sess = session.as_ref().ok_or("No active session. Send 'create' first.")?;
+    let sess = session
+        .as_ref()
+        .ok_or("No active session. Send 'create' first.")?;
 
     let data = match req.mode.as_str() {
         "callables" => talu::treesitter::extract_callables(
@@ -361,7 +374,11 @@ fn handle_graph(session: &Option<WsSession>, req: &WsRequest) -> Result<String, 
             &req.file_path,
             &req.project_root,
         ),
-        other => return Err(format!("Unknown mode: {other}. Use \"callables\" or \"call_sites\"")),
+        other => {
+            return Err(format!(
+                "Unknown mode: {other}. Use \"callables\" or \"call_sites\""
+            ))
+        }
     }
     .map_err(|e| format!("Graph extraction failed: {e}"))?;
 

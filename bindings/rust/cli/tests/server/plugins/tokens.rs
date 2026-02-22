@@ -999,7 +999,6 @@ fn setup_plugin_with_host_permission(dir: &std::path::Path, host: &str) {
     fs::write(plugin_dir.join("index.js"), "export default function(){}").unwrap();
 }
 
-
 /// Proxy forwards POST body to upstream.
 #[test]
 fn proxy_forwards_post_body() {
@@ -1080,13 +1079,17 @@ fn proxy_forwards_custom_headers_and_strips_internal() {
 
     // Custom header should be forwarded.
     assert_eq!(
-        echo_headers["x-custom-auth"].as_str().or_else(|| echo_headers["X-Custom-Auth"].as_str()),
+        echo_headers["x-custom-auth"]
+            .as_str()
+            .or_else(|| echo_headers["X-Custom-Auth"].as_str()),
         Some("my-token"),
         "custom header should be forwarded, got headers: {}",
         echo_headers
     );
     assert_eq!(
-        echo_headers["accept"].as_str().or_else(|| echo_headers["Accept"].as_str()),
+        echo_headers["accept"]
+            .as_str()
+            .or_else(|| echo_headers["Accept"].as_str()),
         Some("application/json"),
         "Accept header should be forwarded"
     );

@@ -246,17 +246,13 @@ fn parse_stdin_content(mut stdin_buf: Vec<u8>) -> Result<ParsedStdin> {
                 };
                 let rendered = talu::file::pdf_transform_page(&stdin_buf, i, 150, opts)
                     .map_err(|e| anyhow!("Failed to render PDF page {}: {e}", i + 1))?;
-                let data_url =
-                    format!("data:image/png;base64,{}", encode_base64(&rendered.bytes));
+                let data_url = format!("data:image/png;base64,{}", encode_base64(&rendered.bytes));
                 images.push(talu::router::ContentPart::ImageUrl {
                     url: data_url,
                     mime: Some("image/png".into()),
                 });
             }
-            return Ok(ParsedStdin {
-                text: None,
-                images,
-            });
+            return Ok(ParsedStdin { text: None, images });
         }
 
         if !info.mime.starts_with("text/") && stdin_buf.contains(&0) {

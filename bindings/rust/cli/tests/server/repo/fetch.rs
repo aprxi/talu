@@ -146,7 +146,8 @@ fn fetch_accepts_endpoint_url() {
     // Will fail to actually download but should not return 400.
     // We just verify it's not rejected as invalid_request.
     assert_ne!(
-        resp.json()["error"]["code"], "invalid_request",
+        resp.json()["error"]["code"],
+        "invalid_request",
         "endpoint_url field should be accepted"
     );
 }
@@ -165,7 +166,8 @@ fn fetch_accepts_skip_weights() {
     );
     // Will fail to actually download but should not return 400.
     assert_ne!(
-        resp.json()["error"]["code"], "invalid_request",
+        resp.json()["error"]["code"],
+        "invalid_request",
         "skip_weights field should be accepted"
     );
 }
@@ -247,9 +249,7 @@ fn fetch_stream_client_disconnect_does_not_crash_server() {
         stream
             .set_write_timeout(Some(std::time::Duration::from_secs(5)))
             .expect("set write timeout");
-        stream
-            .write_all(request.as_bytes())
-            .expect("write request");
+        stream.write_all(request.as_bytes()).expect("write request");
         stream.flush().expect("flush");
         // Drop the stream immediately — simulates client disconnect.
     }

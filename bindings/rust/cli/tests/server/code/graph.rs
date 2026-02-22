@@ -2,10 +2,12 @@ use hyper::StatusCode;
 
 use super::*;
 
-const PYTHON_MULTI: &str = "import os\n\ndef greet(name):\n    print(name)\n\ndef main():\n    greet('world')\n";
+const PYTHON_MULTI: &str =
+    "import os\n\ndef greet(name):\n    print(name)\n\ndef main():\n    greet('world')\n";
 
 /// Source with a module-level call site for call_sites extraction.
-const PYTHON_MODULE_CALLS: &str = "import os\n\ndef greet(name):\n    print(name)\n\ngreet('world')\n";
+const PYTHON_MODULE_CALLS: &str =
+    "import os\n\ndef greet(name):\n    print(name)\n\ngreet('world')\n";
 
 #[tokio::test]
 async fn graph_callables_extracts_functions() {
@@ -17,14 +19,17 @@ async fn graph_callables_extracts_functions() {
         "file_path": "test.py",
         "project_root": "myproject"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/graph", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/graph", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     assert!(
         json.get("callables").is_some(),
         "response should have 'callables' key: {json}"
     );
-    let callables = json["callables"].as_array().expect("callables should be an array");
+    let callables = json["callables"]
+        .as_array()
+        .expect("callables should be an array");
     assert!(
         callables.len() >= 2,
         "should find at least 2 callables (greet, main), got {}",
@@ -59,10 +64,13 @@ async fn graph_call_sites() {
         "file_path": "test.py",
         "project_root": "myproject"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/graph", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/graph", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
-    let call_sites = json.as_array().expect("call_sites response should be a JSON array");
+    let call_sites = json
+        .as_array()
+        .expect("call_sites response should be a JSON array");
     // The source has `greet('world')` at module level.
     assert!(
         !call_sites.is_empty(),
@@ -72,7 +80,9 @@ async fn graph_call_sites() {
     // Verify call site structure: each should have target name and spans.
     for site in call_sites {
         assert!(
-            site.get("raw_target_name").and_then(|v| v.as_str()).is_some(),
+            site.get("raw_target_name")
+                .and_then(|v| v.as_str())
+                .is_some(),
             "call site missing 'raw_target_name': {site}"
         );
         assert!(
@@ -94,7 +104,8 @@ async fn graph_invalid_mode() {
         "language": "python",
         "mode": "nonexistent_mode"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/graph", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/graph", &body)).await).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json.get("error").is_some(), "should return error object");

@@ -1152,7 +1152,12 @@ fn validation_invalid_json_returns_400() {
 #[test]
 fn federated_search_returns_both_conversations_and_documents() {
     let temp = TempDir::new().expect("temp dir");
-    seed_session(temp.path(), "sess-fed-1", "Quantum computing basics", "gpt-4");
+    seed_session(
+        temp.path(),
+        "sess-fed-1",
+        "Quantum computing basics",
+        "gpt-4",
+    );
 
     let ctx = ServerTestContext::new(search_config(temp.path()));
 
@@ -1180,7 +1185,11 @@ fn federated_search_returns_both_conversations_and_documents() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert!(data.len() >= 2, "should have results from both backends, got {}", data.len());
+    assert!(
+        data.len() >= 2,
+        "should have results from both backends, got {}",
+        data.len()
+    );
 
     let has_conversation = data.iter().any(|d| d["object"] == "conversation");
     let has_document = data.iter().any(|d| d["object"] == "document");
@@ -1256,7 +1265,12 @@ fn federated_search_respects_limit() {
 #[test]
 fn federated_search_graceful_without_documents() {
     let temp = TempDir::new().expect("temp dir");
-    seed_session(temp.path(), "sess-fed-only", "Unique conversation topic", "gpt-4");
+    seed_session(
+        temp.path(),
+        "sess-fed-only",
+        "Unique conversation topic",
+        "gpt-4",
+    );
 
     let ctx = ServerTestContext::new(search_config(temp.path()));
 
@@ -1308,8 +1322,14 @@ fn aggregations_models_returns_counts() {
 
     // Each entry should have value and count.
     for entry in models {
-        assert!(entry["value"].is_string(), "model entry should have 'value'");
-        assert!(entry["count"].is_number(), "model entry should have 'count'");
+        assert!(
+            entry["value"].is_string(),
+            "model entry should have 'value'"
+        );
+        assert!(
+            entry["count"].is_number(),
+            "model entry should have 'count'"
+        );
     }
 
     // Find gpt-4 entry — should have count 2.
@@ -1318,7 +1338,10 @@ fn aggregations_models_returns_counts() {
     assert_eq!(gpt4.unwrap()["count"], 2);
 
     // Models should be sorted by count descending.
-    let counts: Vec<u64> = models.iter().map(|e| e["count"].as_u64().unwrap()).collect();
+    let counts: Vec<u64> = models
+        .iter()
+        .map(|e| e["count"].as_u64().unwrap())
+        .collect();
     let mut sorted = counts.clone();
     sorted.sort_by(|a, b| b.cmp(a));
     assert_eq!(counts, sorted, "models should be sorted by count desc");

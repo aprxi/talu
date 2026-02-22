@@ -740,7 +740,10 @@ fn expired_document_still_appears_in_list() {
     // list — update to assert the expired doc is absent instead.
     let list_resp = get(ctx.addr(), "/v1/documents");
     assert_eq!(list_resp.status, 200, "body: {}", list_resp.body);
-    let data = list_resp.json()["data"].as_array().expect("data array").clone();
+    let data = list_resp.json()["data"]
+        .as_array()
+        .expect("data array")
+        .clone();
     let ids: Vec<&str> = data.iter().filter_map(|d| d["id"].as_str()).collect();
 
     assert!(
@@ -787,7 +790,8 @@ fn patch_null_title_preserves_existing() {
     );
     assert_eq!(patch_resp.status, 200, "body: {}", patch_resp.body);
     assert_eq!(
-        patch_resp.json()["title"], "Original Title",
+        patch_resp.json()["title"],
+        "Original Title",
         "null title should preserve existing"
     );
 
@@ -831,7 +835,10 @@ fn list_has_more_reflects_total_vs_limit() {
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
     assert_eq!(data.len(), 2, "should return exactly 2 documents");
-    assert_eq!(json["has_more"], true, "has_more should be true when more exist");
+    assert_eq!(
+        json["has_more"], true,
+        "has_more should be true when more exist"
+    );
 
     // limit=10 when 5 exist → has_more=false, all 5 returned.
     let resp = get(ctx.addr(), "/v1/documents?limit=10");
@@ -839,5 +846,8 @@ fn list_has_more_reflects_total_vs_limit() {
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
     assert_eq!(data.len(), 5, "should return all 5 documents");
-    assert_eq!(json["has_more"], false, "has_more should be false when all returned");
+    assert_eq!(
+        json["has_more"], false,
+        "has_more should be false when all returned"
+    );
 }

@@ -12,10 +12,10 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::Serialize;
-use utoipa::ToSchema;
 use talu::file::{
     self, FileKind, FitMode, ImageFormat, OutputFormat, ResizeOptions, TransformOptions,
 };
+use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;

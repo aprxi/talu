@@ -874,8 +874,8 @@ pub async fn handle_sync_pins(
         return handle_sync_pins_streaming(bucket_path, request);
     }
 
-    let result = tokio::task::spawn_blocking(move || sync_pins_blocking(&bucket_path, &request))
-        .await;
+    let result =
+        tokio::task::spawn_blocking(move || sync_pins_blocking(&bucket_path, &request)).await;
 
     match result {
         Ok(Ok(resp)) => json_response(StatusCode::OK, &resp),
@@ -918,7 +918,12 @@ fn sync_pins_blocking(
 
     // Hydrate sizes for missing models from HF API (best-effort).
     let missing_size_bytes = if !missing_ids.is_empty() {
-        hydrate_missing_sizes(&missing_ids, request.token.as_deref(), request.endpoint_url.as_deref(), request.skip_weights)
+        hydrate_missing_sizes(
+            &missing_ids,
+            request.token.as_deref(),
+            request.endpoint_url.as_deref(),
+            request.skip_weights,
+        )
     } else {
         None
     };
@@ -1243,13 +1248,19 @@ fn hydrate_missing_sizes(
     let mut any_success = false;
 
     for model_id in model_ids {
-        if let Some(size) = fetch_hf_model_size_blocking(&client, &endpoint, model_id, token, skip_weights) {
+        if let Some(size) =
+            fetch_hf_model_size_blocking(&client, &endpoint, model_id, token, skip_weights)
+        {
             total = total.saturating_add(size);
             any_success = true;
         }
     }
 
-    if any_success { Some(total) } else { None }
+    if any_success {
+        Some(total)
+    } else {
+        None
+    }
 }
 
 /// Fetch model size from HF API (blocking). Returns None on failure.
@@ -1261,7 +1272,10 @@ fn fetch_hf_model_size_blocking(
     skip_weights: bool,
 ) -> Option<u64> {
     // Try /api/models/{id}?blobs=true&files_metadata=true first.
-    let info_url = format!("{}/api/models/{}?blobs=true&files_metadata=true", endpoint, model_id);
+    let info_url = format!(
+        "{}/api/models/{}?blobs=true&files_metadata=true",
+        endpoint, model_id
+    );
     if let Some(body) = hf_get_text_blocking(client, &info_url, token) {
         if let Some(size) = parse_hf_model_size_bytes(&body, skip_weights) {
             return Some(size);
@@ -1307,7 +1321,10 @@ fn parse_hf_model_size_bytes(body: &str, skip_weights: bool) -> Option<u64> {
 
     let mut total_size = 0u64;
     for sibling in siblings {
-        let filename = sibling.get("rfilename").and_then(|v| v.as_str()).unwrap_or_default();
+        let filename = sibling
+            .get("rfilename")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
         if filename.starts_with('.') || filename.contains('/') {
             continue;
         }
@@ -1320,7 +1337,11 @@ fn parse_hf_model_size_bytes(body: &str, skip_weights: bool) -> Option<u64> {
         total_size = total_size.saturating_add(size);
     }
 
-    if total_size > 0 { Some(total_size) } else { None }
+    if total_size > 0 {
+        Some(total_size)
+    } else {
+        None
+    }
 }
 
 /// Parse model size from HF /tree response.
@@ -1330,7 +1351,8 @@ fn parse_hf_tree_size_bytes(body: &str, skip_weights: bool) -> Option<u64> {
 
     let mut total_size = 0u64;
     for entry in entries {
-        let filename = entry.get("path")
+        let filename = entry
+            .get("path")
             .or_else(|| entry.get("rfilename"))
             .and_then(|v| v.as_str())
             .unwrap_or_default();
@@ -1345,13 +1367,24 @@ fn parse_hf_tree_size_bytes(body: &str, skip_weights: bool) -> Option<u64> {
         if skip_weights && is_weight_filename(filename) {
             continue;
         }
-        let size = entry.get("size").and_then(value_as_u64)
-            .or_else(|| entry.get("lfs").and_then(|v| v.get("size")).and_then(value_as_u64))
+        let size = entry
+            .get("size")
+            .and_then(value_as_u64)
+            .or_else(|| {
+                entry
+                    .get("lfs")
+                    .and_then(|v| v.get("size"))
+                    .and_then(value_as_u64)
+            })
             .unwrap_or(0);
         total_size = total_size.saturating_add(size);
     }
 
-    if total_size > 0 { Some(total_size) } else { None }
+    if total_size > 0 {
+        Some(total_size)
+    } else {
+        None
+    }
 }
 
 fn is_weight_filename(filename: &str) -> bool {
@@ -1371,11 +1404,7 @@ fn value_as_u64(value: &serde_json::Value) -> Option<u64> {
 /// Format quantization method as a scheme name.
 ///
 /// Mirrors `format_quant_scheme` in `cli/models.rs`.
-fn format_quant_scheme(
-    method: talu::model::QuantMethod,
-    bits: i32,
-    group_size: i32,
-) -> String {
+fn format_quant_scheme(method: talu::model::QuantMethod, bits: i32, group_size: i32) -> String {
     match method {
         talu::model::QuantMethod::None => "F16".to_string(),
         talu::model::QuantMethod::Gaffine => format!("GAF{}_{}", bits, group_size),

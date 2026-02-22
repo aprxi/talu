@@ -16,7 +16,10 @@ fn repo_config() -> ServerConfig {
 #[test]
 fn delete_nonexistent_returns_ok_with_false() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = delete(ctx.addr(), "/v1/repo/models/nonexistent-org/nonexistent-model");
+    let resp = delete(
+        ctx.addr(),
+        "/v1/repo/models/nonexistent-org/nonexistent-model",
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -28,7 +31,10 @@ fn delete_nonexistent_returns_ok_with_false() {
 #[test]
 fn delete_has_json_content_type() {
     let ctx = ServerTestContext::new(repo_config());
-    let resp = delete(ctx.addr(), "/v1/repo/models/nonexistent-org/nonexistent-model");
+    let resp = delete(
+        ctx.addr(),
+        "/v1/repo/models/nonexistent-org/nonexistent-model",
+    );
     assert_eq!(resp.status, 200);
     assert_eq!(resp.header("content-type"), Some("application/json"));
 }
@@ -45,10 +51,7 @@ fn delete_response_has_expected_fields() {
     assert!(obj.contains_key("deleted"), "should have 'deleted' field");
     assert!(obj.contains_key("model_id"), "should have 'model_id' field");
     assert!(json["deleted"].is_boolean(), "deleted should be a boolean");
-    assert!(
-        json["model_id"].is_string(),
-        "model_id should be a string"
-    );
+    assert!(json["model_id"].is_string(), "model_id should be a string");
 }
 
 /// Model ID with slashes is preserved correctly in the response.

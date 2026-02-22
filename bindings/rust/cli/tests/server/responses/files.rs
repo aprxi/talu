@@ -4,7 +4,9 @@
 //! `file_<id>` references inside structured input to `file://` blob paths
 //! so the Zig core can read them during generation.
 
-use crate::server::common::{model_config, post_json, require_model, send_request, ServerTestContext};
+use crate::server::common::{
+    model_config, post_json, require_model, send_request, ServerTestContext,
+};
 use tempfile::TempDir;
 
 /// Upload a text file via multipart and return its `file_id`.

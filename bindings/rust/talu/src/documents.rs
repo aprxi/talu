@@ -319,8 +319,7 @@ impl DocumentsHandle {
             .iter()
             .map(|id| to_cstring(id))
             .collect::<Result<_, _>>()?;
-        let c_ptrs: Vec<*const std::ffi::c_char> =
-            c_strings.iter().map(|s| s.as_ptr()).collect();
+        let c_ptrs: Vec<*const std::ffi::c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
         let doc_type_c = to_optional_cstring(doc_type)?;
 
         let mut deleted_count: usize = 0;
@@ -355,8 +354,7 @@ impl DocumentsHandle {
             .iter()
             .map(|id| to_cstring(id))
             .collect::<Result<_, _>>()?;
-        let c_ptrs: Vec<*const std::ffi::c_char> =
-            c_strings.iter().map(|s| s.as_ptr()).collect();
+        let c_ptrs: Vec<*const std::ffi::c_char> = c_strings.iter().map(|s| s.as_ptr()).collect();
         let doc_type_c = to_optional_cstring(doc_type)?;
 
         let mut updated_count: usize = 0;

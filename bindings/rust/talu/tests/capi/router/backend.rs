@@ -32,7 +32,10 @@ fn canonicalize_nonexistent_local_model_fails() {
     };
     // Canonicalization performs filesystem existence checks for local paths.
     // A nonexistent path must fail at this stage.
-    assert_ne!(rc, 0, "canonicalize for nonexistent local model should fail");
+    assert_ne!(
+        rc, 0,
+        "canonicalize for nonexistent local model should fail"
+    );
     assert!(
         canon_ptr.is_null(),
         "canonical handle should remain null on error"
@@ -108,7 +111,10 @@ fn create_backend_with_progress_callback_succeeds() {
             &mut backend_ptr as *mut _ as *mut c_void,
         )
     };
-    assert_eq!(rc, 0, "backend creation with progress callback should succeed");
+    assert_eq!(
+        rc, 0,
+        "backend creation with progress callback should succeed"
+    );
     assert!(
         !backend_ptr.is_null(),
         "backend handle should be non-null with progress callback"
@@ -150,11 +156,7 @@ fn list_models_on_openai_backend_returns_result() {
     }
 
     // Free the result (safe even on error — models is null, freeModelListResult handles it).
-    unsafe {
-        talu_sys::talu_backend_list_models_free(
-            &mut result as *mut _ as *mut c_void,
-        )
-    };
+    unsafe { talu_sys::talu_backend_list_models_free(&mut result as *mut _ as *mut c_void) };
 
     unsafe { talu_sys::talu_backend_free(backend) };
     unsafe { talu_sys::talu_config_free(canon) };

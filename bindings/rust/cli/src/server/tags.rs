@@ -9,9 +9,9 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
-use utoipa::ToSchema;
 use talu::documents::DocumentsHandle;
 use talu::storage::{StorageError, StorageHandle, TagCreate, TagRecord, TagUpdate};
+use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;

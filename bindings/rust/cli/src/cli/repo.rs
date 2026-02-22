@@ -1169,7 +1169,10 @@ pub(super) fn cmd_rm(args: RmArgs) -> Result<()> {
     for target in &args.targets {
         let model_id = strip_hf_prefix(target);
         if !is_model_id(&model_id) {
-            bail!("Error: Invalid model URI '{}'. Expected format: Org/Model", model_id);
+            bail!(
+                "Error: Invalid model URI '{}'. Expected format: Org/Model",
+                model_id
+            );
         }
 
         if talu::repo::repo_delete(&model_id) {

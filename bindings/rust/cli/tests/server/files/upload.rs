@@ -351,7 +351,10 @@ fn upload_unrecognizable_binary_succeeds() {
     // `kind` may be present (e.g. "binary"/"text") or absent (inspection
     // returned None → skip_serializing_if). Either is acceptable.
     if let Some(kind) = json["kind"].as_str() {
-        assert!(!kind.is_empty(), "if kind is present, it should not be empty");
+        assert!(
+            !kind.is_empty(),
+            "if kind is present, it should not be empty"
+        );
     }
 }
 
@@ -364,10 +367,9 @@ fn upload_exceeding_inspect_limit_skips_metadata() {
 
     // Configure a very small inspection limit (50 bytes).
     let mut config = files_config(temp.path());
-    config.env_vars.push((
-        "TALU_MAX_FILE_INSPECT_BYTES".to_string(),
-        "50".to_string(),
-    ));
+    config
+        .env_vars
+        .push(("TALU_MAX_FILE_INSPECT_BYTES".to_string(), "50".to_string()));
     let ctx = ServerTestContext::new(config);
 
     let boundary = "----talu-inspect-limit";

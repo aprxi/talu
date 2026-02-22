@@ -2,7 +2,8 @@ use hyper::StatusCode;
 
 use super::*;
 
-const PYTHON_MULTI: &str = "import os\n\ndef greet(name):\n    print(name)\n\ndef main():\n    greet('world')\n";
+const PYTHON_MULTI: &str =
+    "import os\n\ndef greet(name):\n    print(name)\n\ndef main():\n    greet('world')\n";
 
 #[tokio::test]
 async fn query_finds_function_definitions() {
@@ -12,7 +13,8 @@ async fn query_finds_function_definitions() {
         "language": "python",
         "query": "(function_definition) @fn"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let matches = json.as_array().expect("response should be a JSON array");
@@ -31,7 +33,8 @@ async fn query_captures_have_fields() {
         "language": "python",
         "query": "(function_definition name: (identifier) @name)"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let matches = json.as_array().expect("response should be a JSON array");
@@ -63,11 +66,15 @@ async fn query_no_matches_returns_empty() {
         "language": "python",
         "query": "(function_definition) @fn"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
 
     assert_eq!(status, StatusCode::OK);
     let matches = json.as_array().expect("response should be a JSON array");
-    assert!(matches.is_empty(), "should have no matches for code without functions");
+    assert!(
+        matches.is_empty(),
+        "should have no matches for code without functions"
+    );
 }
 
 #[tokio::test]
@@ -78,7 +85,8 @@ async fn query_invalid_pattern() {
         "language": "python",
         "query": "(((invalid_unclosed"
     });
-    let (status, json) = body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
+    let (status, json) =
+        body_json(send_request(&app, post_json("/v1/code/query", &body)).await).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(json.get("error").is_some(), "should return error object");

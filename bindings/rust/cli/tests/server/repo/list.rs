@@ -87,10 +87,7 @@ fn list_model_entries_have_expected_fields() {
 
         // architecture and quant_scheme are optional but typed when present
         if let Some(arch) = obj.get("architecture") {
-            assert!(
-                arch.is_string(),
-                "model[{i}].architecture should be string"
-            );
+            assert!(arch.is_string(), "model[{i}].architecture should be string");
         }
         if let Some(quant) = obj.get("quant_scheme") {
             assert!(
@@ -239,12 +236,7 @@ fn list_model_entries_have_pinned_field() {
     let resp = get(ctx.addr(), "/v1/repo/models");
     assert_eq!(resp.status, 200);
 
-    for (i, model) in resp.json()["models"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .enumerate()
-    {
+    for (i, model) in resp.json()["models"].as_array().unwrap().iter().enumerate() {
         assert!(
             model["pinned"].is_boolean(),
             "model[{i}].pinned should be boolean"

@@ -215,7 +215,9 @@ fn embed_all_pooling_strategies_produce_output() {
             assert!(
                 val.is_finite(),
                 "{} pooling: embedding[{}] should be finite, got {}",
-                name, i, val
+                name,
+                i,
+                val
             );
         }
 

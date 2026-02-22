@@ -106,7 +106,11 @@ async fn ws_roundtrip(ws: &mut WsStream, msg: &Value) -> Value {
     ws.send(Message::Text(msg.to_string()))
         .await
         .expect("ws send failed");
-    let reply = ws.next().await.expect("ws stream ended").expect("ws recv failed");
+    let reply = ws
+        .next()
+        .await
+        .expect("ws stream ended")
+        .expect("ws recv failed");
     match reply {
         Message::Text(text) => serde_json::from_str(&text).expect("invalid JSON in ws reply"),
         other => panic!("expected text message, got: {other:?}"),

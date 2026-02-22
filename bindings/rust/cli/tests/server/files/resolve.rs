@@ -64,7 +64,10 @@ fn upload_blob_is_resolvable_to_file_url() {
     let (file_id, blob_ref) = upload_file(&ctx, "photo.jpg", "image/jpeg", "fake-jpeg-bytes");
 
     // file_id is what the UI puts into structured input (input_image.image_url).
-    assert!(file_id.starts_with("file_"), "UI sends file_ IDs: {file_id}");
+    assert!(
+        file_id.starts_with("file_"),
+        "UI sends file_ IDs: {file_id}"
+    );
 
     // blob_ref must be sha256:<64hex> — the only format blob_ref_to_file_url handles.
     assert!(

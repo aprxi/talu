@@ -18,13 +18,13 @@ use hyper::body::{Frame, Incoming};
 use hyper::{Request, Response, StatusCode};
 use serde::Deserialize;
 use serde::Serialize;
-use utoipa::ToSchema;
 use talu::blobs::{BlobError, BlobsHandle};
 use talu::documents::{DocumentError, DocumentRecord, DocumentsHandle};
 use talu::file;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::UnboundedReceiverStream;
 use tokio_stream::StreamExt;
+use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::http;
@@ -259,7 +259,10 @@ pub async fn handle_upload(
     // Deterministic file ID from content hash — the blob_ref sha256 hex is
     // already computed during streaming, so same content = same document ID.
     // This makes uploads idempotent: docs.get() is an O(1) existence check.
-    let blob_hex = upload.blob_ref.strip_prefix("sha256:").unwrap_or(&upload.blob_ref);
+    let blob_hex = upload
+        .blob_ref
+        .strip_prefix("sha256:")
+        .unwrap_or(&upload.blob_ref);
     let file_id = format!("file_{}", &blob_hex[..blob_hex.len().min(32)]);
 
     // O(1) existence check: if this content already exists, return it.
@@ -1199,8 +1202,16 @@ fn encode_file_cursor(created_at_ms: i64, file_id: &str) -> String {
         let n = (b0 << 16) | (b1 << 8) | b2;
         result.push(ALPHABET[(n >> 18 & 0x3F) as usize] as char);
         result.push(ALPHABET[(n >> 12 & 0x3F) as usize] as char);
-        if chunk.len() > 1 { result.push(ALPHABET[(n >> 6 & 0x3F) as usize] as char); } else { result.push('='); }
-        if chunk.len() > 2 { result.push(ALPHABET[(n & 0x3F) as usize] as char); } else { result.push('='); }
+        if chunk.len() > 1 {
+            result.push(ALPHABET[(n >> 6 & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
+        if chunk.len() > 2 {
+            result.push(ALPHABET[(n & 0x3F) as usize] as char);
+        } else {
+            result.push('=');
+        }
     }
     result
 }
@@ -1252,7 +1263,11 @@ pub async fn handle_batch(
     };
 
     if batch_req.ids.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "missing_ids", "ids must not be empty");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "missing_ids",
+            "ids must not be empty",
+        );
     }
     if batch_req.ids.len() > 100 {
         return json_error(
@@ -1289,8 +1304,12 @@ pub async fn handle_batch(
         let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
         match action.as_str() {
             "delete" => docs.delete_batch(&id_refs, Some("file")).map(|_| ()),
-            "archive" => docs.set_marker_batch(&id_refs, "archived", Some("file")).map(|_| ()),
-            "unarchive" => docs.set_marker_batch(&id_refs, "active", Some("file")).map(|_| ()),
+            "archive" => docs
+                .set_marker_batch(&id_refs, "archived", Some("file"))
+                .map(|_| ()),
+            "unarchive" => docs
+                .set_marker_batch(&id_refs, "active", Some("file"))
+                .map(|_| ()),
             _ => unreachable!(),
         }
     })

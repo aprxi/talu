@@ -345,8 +345,12 @@ impl StorageHandle {
             .map_err(|_| StorageError::InvalidArgument("tags_any contains null bytes".into()))?;
 
         let group_ptr = group_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        let marker_ptr = marker_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
-        let search_ptr = search_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let marker_ptr = marker_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
+        let search_ptr = search_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
         let tags_ptr = tags_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut c_list: *mut CSessionList = std::ptr::null_mut();
@@ -366,7 +370,10 @@ impl StorageHandle {
         };
 
         if result != ERROR_CODE_OK {
-            return Err(StorageError::from_code(result, &self.path.to_string_lossy()));
+            return Err(StorageError::from_code(
+                result,
+                &self.path.to_string_lossy(),
+            ));
         }
 
         if c_list.is_null() {

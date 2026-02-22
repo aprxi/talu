@@ -308,6 +308,13 @@ impl Service<Request<Incoming>> for Router {
                             db_vector::handle_query_points(state, req, auth).await
                         }
                         (Method::POST, p)
+                            if p.ends_with("/indexes/build")
+                                && (p.starts_with("/v1/db/collections/")
+                                    || p.starts_with("/db/collections/")) =>
+                        {
+                            db_vector::handle_build_collection_indexes(state, req, auth).await
+                        }
+                        (Method::POST, p)
                             if p.ends_with("/compact")
                                 && (p.starts_with("/v1/db/collections/")
                                     || p.starts_with("/db/collections/")) =>
@@ -593,8 +600,8 @@ impl Service<Request<Incoming>> for Router {
                                 "/repo/models/"
                             };
                             let raw = &p[prefix.len()..p.len() - "/files".len()];
-                            let model_id = percent_encoding::percent_decode_str(raw)
-                                .decode_utf8_lossy();
+                            let model_id =
+                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
                             repo::handle_list_files(state, req, auth, &model_id).await
                         }
                         (Method::DELETE, p)
@@ -607,8 +614,8 @@ impl Service<Request<Incoming>> for Router {
                                 "/repo/models/"
                             };
                             let raw = &p[prefix.len()..];
-                            let model_id = percent_encoding::percent_decode_str(raw)
-                                .decode_utf8_lossy();
+                            let model_id =
+                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
                             repo::handle_delete(state, req, auth, &model_id).await
                         }
                         // Pin management endpoints
@@ -619,8 +626,7 @@ impl Service<Request<Incoming>> for Router {
                             repo::handle_pin(state, req, auth).await
                         }
                         (Method::DELETE, p)
-                            if p.starts_with("/v1/repo/pins/")
-                                || p.starts_with("/repo/pins/") =>
+                            if p.starts_with("/v1/repo/pins/") || p.starts_with("/repo/pins/") =>
                         {
                             let prefix = if p.starts_with("/v1") {
                                 "/v1/repo/pins/"
@@ -628,8 +634,8 @@ impl Service<Request<Incoming>> for Router {
                                 "/repo/pins/"
                             };
                             let raw = &p[prefix.len()..];
-                            let model_id = percent_encoding::percent_decode_str(raw)
-                                .decode_utf8_lossy();
+                            let model_id =
+                                percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
                             repo::handle_unpin(state, req, auth, &model_id).await
                         }
                         (Method::POST, "/v1/repo/sync-pins")

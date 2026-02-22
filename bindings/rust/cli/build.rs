@@ -37,8 +37,7 @@ fn main() {
     let version_path = rust_root.join("vendor").join("VERSION");
     println!("cargo:rerun-if-changed={}", version_path.display());
 
-    let content =
-        std::fs::read_to_string(&version_path).expect("Failed to read vendor/VERSION");
+    let content = std::fs::read_to_string(&version_path).expect("Failed to read vendor/VERSION");
     let version = content.trim();
     let version = if version.is_empty() { "0.0.0" } else { version };
     println!("cargo:rustc-env=TALU_VERSION={}", version);

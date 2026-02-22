@@ -199,7 +199,9 @@ fn transform_result_contains_output_metadata() {
     };
     let result = file::transform_image_bytes(BLUE_JPEG_2X3, opts).expect("transform failed");
 
-    let image = result.image.expect("transform result should include image metadata");
+    let image = result
+        .image
+        .expect("transform result should include image metadata");
     assert_eq!(image.format, ImageFormat::Png);
     assert_eq!(image.width, 4);
     assert_eq!(image.height, 6);

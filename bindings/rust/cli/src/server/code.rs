@@ -115,11 +115,7 @@ pub async fn handle_highlight(
 
     match result {
         Ok(json) => json_raw(StatusCode::OK, json),
-        Err(e) => json_error(
-            StatusCode::BAD_REQUEST,
-            "highlight_failed",
-            &e.to_string(),
-        ),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, "highlight_failed", &e.to_string()),
     }
 }
 
@@ -422,7 +418,11 @@ pub async fn handle_session_create(
         last_access: std::time::Instant::now(),
     };
 
-    state.code_sessions.lock().await.insert(session_id.clone(), session);
+    state
+        .code_sessions
+        .lock()
+        .await
+        .insert(session_id.clone(), session);
 
     let response = format!(
         "{{\"session_id\":{},\"tokens\":{}}}",
@@ -581,9 +581,13 @@ pub async fn handle_session_highlight(
     };
 
     let tokens_json = if request.rich {
-        session.tree.highlight_rich_with_c_lang(&session.source, &session.c_language)
+        session
+            .tree
+            .highlight_rich_with_c_lang(&session.source, &session.c_language)
     } else {
-        session.tree.highlight_with_c_lang(&session.source, &session.c_language)
+        session
+            .tree
+            .highlight_with_c_lang(&session.source, &session.c_language)
     };
 
     session.last_access = std::time::Instant::now();
@@ -597,11 +601,7 @@ pub async fn handle_session_highlight(
             );
             json_raw(StatusCode::OK, response)
         }
-        Err(e) => json_error(
-            StatusCode::BAD_REQUEST,
-            "highlight_failed",
-            &e.to_string(),
-        ),
+        Err(e) => json_error(StatusCode::BAD_REQUEST, "highlight_failed", &e.to_string()),
     }
 }
 
@@ -654,7 +654,9 @@ fn generate_session_id() -> String {
         .unwrap_or_default()
         .as_nanos();
     // Mix timestamp with a simple hash for uniqueness within a single server process.
-    let hash = ts.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+    let hash = ts
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
     format!("{:016x}", hash)
 }
 
@@ -666,7 +668,10 @@ fn generate_session_id() -> String {
 ///
 /// Edits are applied in reverse byte order so earlier edits don't shift
 /// the byte offsets of later edits.
-fn apply_session_deltas(session: &mut CodeSession, edits: &[SessionTextEdit]) -> Result<(), String> {
+fn apply_session_deltas(
+    session: &mut CodeSession,
+    edits: &[SessionTextEdit],
+) -> Result<(), String> {
     let mut sorted: Vec<&SessionTextEdit> = edits.iter().collect();
     sorted.sort_by(|a, b| b.start_byte.cmp(&a.start_byte));
 
@@ -686,7 +691,9 @@ fn apply_session_deltas(session: &mut CodeSession, edits: &[SessionTextEdit]) ->
         }
 
         // Splice the source buffer.
-        session.source.splice(start..old_end, new_bytes.iter().copied());
+        session
+            .source
+            .splice(start..old_end, new_bytes.iter().copied());
 
         // Apply tree edit for correct incremental parsing.
         // All coordinates are client-provided — no server-side O(N) scan.

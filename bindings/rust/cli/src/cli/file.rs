@@ -247,14 +247,8 @@ fn numbered_output_path(base: &Path, page_index: u32, total_pages: u32) -> PathB
     if total_pages <= 1 {
         return base.to_path_buf();
     }
-    let stem = base
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or("page");
-    let ext = base
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("png");
+    let stem = base.file_stem().and_then(|s| s.to_str()).unwrap_or("page");
+    let ext = base.extension().and_then(|s| s.to_str()).unwrap_or("png");
     let parent = base.parent().unwrap_or_else(|| Path::new("."));
     parent.join(format!("{stem}_{}.{ext}", page_index + 1))
 }
@@ -314,14 +308,26 @@ mod tests {
     #[test]
     fn numbered_output_single_page() {
         let base = Path::new("/tmp/out.png");
-        assert_eq!(numbered_output_path(base, 0, 1), PathBuf::from("/tmp/out.png"));
+        assert_eq!(
+            numbered_output_path(base, 0, 1),
+            PathBuf::from("/tmp/out.png")
+        );
     }
 
     #[test]
     fn numbered_output_multi_page() {
         let base = Path::new("/tmp/pages.jpg");
-        assert_eq!(numbered_output_path(base, 0, 3), PathBuf::from("/tmp/pages_1.jpg"));
-        assert_eq!(numbered_output_path(base, 1, 3), PathBuf::from("/tmp/pages_2.jpg"));
-        assert_eq!(numbered_output_path(base, 2, 3), PathBuf::from("/tmp/pages_3.jpg"));
+        assert_eq!(
+            numbered_output_path(base, 0, 3),
+            PathBuf::from("/tmp/pages_1.jpg")
+        );
+        assert_eq!(
+            numbered_output_path(base, 1, 3),
+            PathBuf::from("/tmp/pages_2.jpg")
+        );
+        assert_eq!(
+            numbered_output_path(base, 2, 3),
+            PathBuf::from("/tmp/pages_3.jpg")
+        );
     }
 }

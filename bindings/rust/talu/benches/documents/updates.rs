@@ -71,9 +71,7 @@ pub fn bench_hot_document(c: &mut Criterion) {
             &update_count,
             |b, _| {
                 b.iter(|| {
-                    let docs = handle
-                        .list(None, None, None, None, 100)
-                        .expect("list");
+                    let docs = handle.list(None, None, None, None, 100).expect("list");
                     assert_eq!(docs.len(), 1);
                 });
             },

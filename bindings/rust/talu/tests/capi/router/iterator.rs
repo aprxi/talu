@@ -111,8 +111,7 @@ fn create_iterator_and_drain() {
         mime_ptr: ptr::null(),
     };
 
-    let iter =
-        unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
+    let iter = unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
     assert!(!iter.is_null(), "iterator creation should succeed");
 
     let mut token_count = 0usize;
@@ -160,8 +159,7 @@ fn iterator_stats_populated_after_drain() {
         mime_ptr: ptr::null(),
     };
 
-    let iter =
-        unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
+    let iter = unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
     assert!(!iter.is_null());
 
     // Drain all tokens.
@@ -206,8 +204,7 @@ fn iterator_cancel_stops_generation() {
         mime_ptr: ptr::null(),
     };
 
-    let iter =
-        unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
+    let iter = unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
     assert!(!iter.is_null());
 
     // Read a few tokens then cancel.
@@ -262,8 +259,7 @@ fn iterator_content_type_is_valid() {
         mime_ptr: ptr::null(),
     };
 
-    let iter =
-        unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
+    let iter = unsafe { talu_sys::talu_router_create_iterator(chat, &part, 1, backend, &config) };
     assert!(!iter.is_null());
 
     let token_ptr = unsafe { talu_sys::talu_router_iterator_next(iter) };
