@@ -48,6 +48,8 @@ pub const Registry = struct {
         self: *Registry,
         manifest_bytes: []const u8,
         module_bytes: []const u8,
+        expected_arch: []const u8,
+        expected_kernel_abi_version: u32,
     ) !void {
         if (self.sideload_module) |*module| {
             module.deinit(self.device);
@@ -59,6 +61,15 @@ pub const Registry = struct {
         }
 
         self.sideload_manifest = try manifest_mod.parse(self.allocator, manifest_bytes);
+        errdefer if (self.sideload_manifest) |*manifest| {
+            manifest.deinit();
+            self.sideload_manifest = null;
+        };
+        try manifest_mod.ensureCompatible(
+            self.sideload_manifest.?.manifest,
+            expected_arch,
+            expected_kernel_abi_version,
+        );
         self.sideload_module = try module_mod.Module.load(self.device, module_bytes);
     }
 

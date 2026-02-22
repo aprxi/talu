@@ -9,6 +9,7 @@ const module_mod = @import("module.zig");
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_attn_scores_heads_f16_kv";
+pub const op_name: []const u8 = "attn_scores_heads_f16_kv";
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,

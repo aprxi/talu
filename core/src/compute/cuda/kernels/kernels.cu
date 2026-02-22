@@ -480,18 +480,16 @@ static __device__ __forceinline__ float talu_decode_scale_bias_u16(unsigned shor
     return (dtype_tag == 0) ? talu_decode_f16_u16(raw) : talu_decode_bf16_u16(raw);
 }
 
-extern "C" __global__ void talu_matvec_u16_f32(
+extern "C" __global__ void talu_matvec_f16_f32(
     const float* input,
     const unsigned short* weight,
     float* out,
     unsigned int in_dim,
-    unsigned int out_dim,
-    unsigned int weight_dtype_tag
+    unsigned int out_dim
 ) {
     extern __shared__ float shared_input[];
     const unsigned int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
     const bool active = out_idx < out_dim;
-    if (weight_dtype_tag > 1) return;
     if (in_dim == 0) {
         if (active) out[out_idx] = 0.0f;
         return;
@@ -506,21 +504,51 @@ extern "C" __global__ void talu_matvec_u16_f32(
         if (active) {
             const unsigned int tile_remaining = in_dim - tile_base;
             const unsigned int tile_count = (tile_remaining < blockDim.x) ? tile_remaining : blockDim.x;
-            const unsigned long long row_base = (unsigned long long)tile_base * out_dim + out_idx;
-            if (weight_dtype_tag == 0) {
-                #pragma unroll 4
-                for (unsigned int k = 0; k < tile_count; ++k) {
-                    const unsigned long long w_idx = row_base + (unsigned long long)k * out_dim;
-                    const float w = talu_decode_f16_u16(weight[w_idx]);
-                    acc = fmaf(shared_input[k], w, acc);
-                }
-            } else {
-                #pragma unroll 4
-                for (unsigned int k = 0; k < tile_count; ++k) {
-                    const unsigned long long w_idx = row_base + (unsigned long long)k * out_dim;
-                    const float w = talu_decode_bf16_u16(weight[w_idx]);
-                    acc = fmaf(shared_input[k], w, acc);
-                }
+            const unsigned long long row_base = (unsigned long long)out_idx * in_dim + tile_base;
+
+            #pragma unroll 4
+            for (unsigned int k = 0; k < tile_count; ++k) {
+                const unsigned long long w_idx = row_base + k;
+                const float w = talu_decode_f16_u16(weight[w_idx]);
+                acc = fmaf(shared_input[k], w, acc);
+            }
+        }
+        __syncthreads();
+    }
+    if (active) out[out_idx] = acc;
+}
+
+extern "C" __global__ void talu_matvec_bf16_f32(
+    const float* input,
+    const unsigned short* weight,
+    float* out,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    extern __shared__ float shared_input[];
+    const unsigned int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const bool active = out_idx < out_dim;
+    if (in_dim == 0) {
+        if (active) out[out_idx] = 0.0f;
+        return;
+    }
+
+    float acc = 0.0f;
+    for (unsigned int tile_base = 0; tile_base < in_dim; tile_base += blockDim.x) {
+        const unsigned int in_idx = tile_base + threadIdx.x;
+        shared_input[threadIdx.x] = (in_idx < in_dim) ? input[in_idx] : 0.0f;
+        __syncthreads();
+
+        if (active) {
+            const unsigned int tile_remaining = in_dim - tile_base;
+            const unsigned int tile_count = (tile_remaining < blockDim.x) ? tile_remaining : blockDim.x;
+            const unsigned long long row_base = (unsigned long long)out_idx * in_dim + tile_base;
+
+            #pragma unroll 4
+            for (unsigned int k = 0; k < tile_count; ++k) {
+                const unsigned long long w_idx = row_base + k;
+                const float w = talu_decode_bf16_u16(weight[w_idx]);
+                acc = fmaf(shared_input[k], w, acc);
             }
         }
         __syncthreads();

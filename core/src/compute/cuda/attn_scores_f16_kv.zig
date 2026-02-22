@@ -10,6 +10,7 @@ const registry_mod = @import("registry.zig");
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_attn_scores_f16_kv";
+pub const op_name: []const u8 = "attn_scores_f16_kv";
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -58,9 +59,10 @@ fn validateArgs(
     if (head_offset + head_dim > row_stride) return error.InvalidArgument;
     if (!std.math.isFinite(scale)) return error.InvalidArgument;
 
-    const query_bytes = @as(usize, head_dim) * @sizeOf(f32);
-    const cache_bytes = @as(usize, seq_len) * @as(usize, row_stride) * @sizeOf(u16);
-    const scores_bytes = @as(usize, seq_len) * @sizeOf(f32);
+    const query_bytes = std.math.mul(usize, @as(usize, head_dim), @sizeOf(f32)) catch return error.InvalidArgument;
+    const cache_elems = std.math.mul(usize, @as(usize, seq_len), @as(usize, row_stride)) catch return error.InvalidArgument;
+    const cache_bytes = std.math.mul(usize, cache_elems, @sizeOf(u16)) catch return error.InvalidArgument;
+    const scores_bytes = std.math.mul(usize, @as(usize, seq_len), @sizeOf(f32)) catch return error.InvalidArgument;
     if (query_head.size < query_bytes or key_cache_f16.size < cache_bytes or scores_out.size < scores_bytes) {
         return error.InvalidArgument;
     }
@@ -68,4 +70,25 @@ fn validateArgs(
 
 fn ceilDiv(numerator: u32, denominator: u32) u32 {
     return (numerator + denominator - 1) / denominator;
+}
+
+test "validateArgs rejects non-finite scale" {
+    const query = device_mod.Buffer{ .pointer = 0, .size = 64 * @sizeOf(f32) };
+    const cache = device_mod.Buffer{ .pointer = 0, .size = 8 * 64 * @sizeOf(u16) };
+    var scores = device_mod.Buffer{ .pointer = 0, .size = 8 * @sizeOf(f32) };
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&query, &cache, &scores, 8, 64, 0, 64, std.math.nan(f32)));
+}
+
+test "validateArgs rejects invalid head window" {
+    const query = device_mod.Buffer{ .pointer = 0, .size = 64 * @sizeOf(f32) };
+    const cache = device_mod.Buffer{ .pointer = 0, .size = 8 * 64 * @sizeOf(u16) };
+    var scores = device_mod.Buffer{ .pointer = 0, .size = 8 * @sizeOf(f32) };
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&query, &cache, &scores, 8, 64, 60, 8, 1.0));
+}
+
+test "validateArgs rejects undersized cache buffer" {
+    const query = device_mod.Buffer{ .pointer = 0, .size = 64 * @sizeOf(f32) };
+    const cache_small = device_mod.Buffer{ .pointer = 0, .size = 32 };
+    var scores = device_mod.Buffer{ .pointer = 0, .size = 8 * @sizeOf(f32) };
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&query, &cache_small, &scores, 8, 64, 0, 64, 1.0));
 }

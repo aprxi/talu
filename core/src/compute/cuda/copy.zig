@@ -10,6 +10,7 @@ const registry_mod = @import("registry.zig");
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_copy_f32";
+pub const op_name: []const u8 = "copy_f32";
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -27,7 +28,7 @@ pub fn run(
     }
 
     if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_module);
-    const resolved = try registry.resolveFunction("copy_f32", embedded_symbol);
+    const resolved = try registry.resolveFunction(op_name, embedded_symbol);
     var arg_pack = args_mod.ArgPack.init(allocator);
     defer arg_pack.deinit();
     try runWithFunction(&arg_pack, device, resolved.function, src, dst, count);

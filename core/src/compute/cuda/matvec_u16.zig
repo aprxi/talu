@@ -8,9 +8,10 @@ const module_mod = @import("module.zig");
 
 const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
-pub const embedded_symbol: [:0]const u8 = "talu_matvec_u16_f32";
-pub const dtype_f16: u32 = 0;
-pub const dtype_bf16: u32 = 1;
+pub const embedded_symbol_f16: [:0]const u8 = "talu_matvec_f16_f32";
+pub const embedded_symbol_bf16: [:0]const u8 = "talu_matvec_bf16_f32";
+pub const op_name_f16: []const u8 = "matvec_f16_f32";
+pub const op_name_bf16: []const u8 = "matvec_bf16_f32";
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -21,9 +22,8 @@ pub fn runWithFunction(
     out: *device_mod.Buffer,
     in_dim: u32,
     out_dim: u32,
-    weight_dtype_tag: u32,
 ) !void {
-    try validateArgs(input, weight_u16, out, in_dim, out_dim, weight_dtype_tag);
+    try validateArgs(input, weight_u16, out, in_dim, out_dim);
 
     arg_pack.reset();
     try arg_pack.appendBufferPtr(input);
@@ -31,7 +31,6 @@ pub fn runWithFunction(
     try arg_pack.appendBufferPtr(out);
     try arg_pack.appendScalar(u32, in_dim);
     try arg_pack.appendScalar(u32, out_dim);
-    try arg_pack.appendScalar(u32, weight_dtype_tag);
 
     const block_x: u32 = 256;
     const shared_mem_bytes: u32 = block_x * @sizeOf(f32);
@@ -48,10 +47,8 @@ fn validateArgs(
     out: *device_mod.Buffer,
     in_dim: u32,
     out_dim: u32,
-    weight_dtype_tag: u32,
 ) !void {
     if (in_dim == 0 or out_dim == 0) return error.InvalidArgument;
-    if (weight_dtype_tag != dtype_f16 and weight_dtype_tag != dtype_bf16) return error.InvalidArgument;
 
     const input_bytes = std.math.mul(usize, @as(usize, in_dim), @sizeOf(f32)) catch return error.InvalidArgument;
     const weight_elems = std.math.mul(usize, @as(usize, in_dim), @as(usize, out_dim)) catch return error.InvalidArgument;
@@ -64,8 +61,22 @@ fn ceilDiv(numerator: u32, denominator: u32) u32 {
     return (numerator + denominator - 1) / denominator;
 }
 
-test "validateArgs rejects invalid dtype tag" {
+test "validateArgs accepts valid dense u16 buffer sizing" {
     const b = device_mod.Buffer{ .pointer = 0, .size = 1024 };
     var out = b;
-    try std.testing.expectError(error.InvalidArgument, validateArgs(&b, &b, &out, 4, 4, 3));
+    try validateArgs(&b, &b, &out, 4, 4);
+}
+
+test "validateArgs rejects zero dimensions" {
+    const b = device_mod.Buffer{ .pointer = 0, .size = 1024 };
+    var out = b;
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&b, &b, &out, 0, 4));
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&b, &b, &out, 4, 0));
+}
+
+test "validateArgs rejects undersized weight buffer" {
+    const input = device_mod.Buffer{ .pointer = 0, .size = 4 * @sizeOf(f32) };
+    const weight_too_small = device_mod.Buffer{ .pointer = 0, .size = 8 };
+    var out = device_mod.Buffer{ .pointer = 0, .size = 4 * @sizeOf(f32) };
+    try std.testing.expectError(error.InvalidArgument, validateArgs(&input, &weight_too_small, &out, 4, 4));
 }
