@@ -1,5 +1,5 @@
 /**
- * Storage Facade — scoped KV store per plugin via /v1/documents API.
+ * Storage Facade — scoped KV store per plugin via /v1/db/tables/documents API.
  *
  * Maps get/set/delete/keys/clear to document CRUD with:
  *   doc_type = "plugin_storage"
@@ -57,7 +57,7 @@ export class StorageFacadeImpl implements StorageAccess, Disposable {
       owner_id: this.pluginId,
       title: key,
     });
-    const res = await fetch(`/v1/documents?${params}`, { headers: this.headers() });
+    const res = await fetch(`/v1/db/tables/documents?${params}`, { headers: this.headers() });
     if (!res.ok) return null;
     const docs = await res.json();
     if (Array.isArray(docs) && docs.length > 0) {
@@ -79,13 +79,13 @@ export class StorageFacadeImpl implements StorageAccess, Disposable {
     const existing = await this.findDocId(key);
 
     if (existing) {
-      await fetch(`/v1/documents/${existing}`, {
+      await fetch(`/v1/db/tables/documents/${existing}`, {
         method: "PATCH",
         headers: this.headers(),
         body: payload,
       });
     } else {
-      await fetch("/v1/documents", {
+      await fetch("/v1/db/tables/documents", {
         method: "POST",
         headers: this.headers(),
         body: JSON.stringify({
@@ -104,7 +104,7 @@ export class StorageFacadeImpl implements StorageAccess, Disposable {
   async delete(key: string): Promise<void> {
     const docId = await this.findDocId(key);
     if (docId) {
-      await fetch(`/v1/documents/${docId}`, {
+      await fetch(`/v1/db/tables/documents/${docId}`, {
         method: "DELETE",
         headers: this.headers(),
       });
@@ -118,7 +118,7 @@ export class StorageFacadeImpl implements StorageAccess, Disposable {
       type: DOC_TYPE,
       owner_id: this.pluginId,
     });
-    const res = await fetch(`/v1/documents?${params}`, { headers: this.headers() });
+    const res = await fetch(`/v1/db/tables/documents?${params}`, { headers: this.headers() });
     if (!res.ok) return [];
     const docs = await res.json();
     if (Array.isArray(docs)) {
@@ -151,7 +151,7 @@ export class StorageFacadeImpl implements StorageAccess, Disposable {
       owner_id: this.pluginId,
       title: key,
     });
-    const res = await fetch(`/v1/documents?${params}`, { headers: this.headers() });
+    const res = await fetch(`/v1/db/tables/documents?${params}`, { headers: this.headers() });
     if (!res.ok) return null;
     const docs = await res.json();
     if (Array.isArray(docs) && docs.length > 0) {

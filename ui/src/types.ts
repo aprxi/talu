@@ -350,7 +350,7 @@ export interface BatchRequest {
 // Documents API types
 // ---------------------------------------------------------------------------
 
-/** Document record from GET /v1/documents/:id. */
+/** Document record from GET /v1/db/tables/documents/:id. */
 export interface Document {
   id: string;
   type: string;

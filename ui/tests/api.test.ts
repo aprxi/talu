@@ -129,37 +129,37 @@ describe("ApiClient — URL paths and methods", () => {
     expect(calls[0]!.init?.method).toBe("DELETE");
   });
 
-  test("listDocuments without type → GET /v1/documents", async () => {
+  test("listDocuments without type → GET /v1/db/tables/documents", async () => {
     await client.listDocuments();
-    expect(calls[0]!.url).toBe("/v1/documents");
+    expect(calls[0]!.url).toBe("/v1/db/tables/documents");
   });
 
-  test("listDocuments with type → GET /v1/documents?type=...", async () => {
+  test("listDocuments with type → GET /v1/db/tables/documents?type=...", async () => {
     await client.listDocuments("prompt");
-    expect(calls[0]!.url).toBe("/v1/documents?type=prompt");
+    expect(calls[0]!.url).toBe("/v1/db/tables/documents?type=prompt");
   });
 
   test("getDocument → GET with URL-encoded id", async () => {
     await client.getDocument("doc-1");
-    expect(calls[0]!.url).toBe("/v1/documents/doc-1");
+    expect(calls[0]!.url).toBe("/v1/db/tables/documents/doc-1");
   });
 
-  test("createDocument → POST /v1/documents", async () => {
+  test("createDocument → POST /v1/db/tables/documents", async () => {
     await client.createDocument({ type: "prompt", title: "Test" } as any);
-    expect(calls[0]!.url).toBe("/v1/documents");
+    expect(calls[0]!.url).toBe("/v1/db/tables/documents");
     expect(calls[0]!.init?.method).toBe("POST");
   });
 
-  test("updateDocument → PATCH /v1/documents/:id", async () => {
+  test("updateDocument → PATCH /v1/db/tables/documents/:id", async () => {
     await client.updateDocument("doc-1", { title: "Updated" } as any);
-    expect(calls[0]!.url).toBe("/v1/documents/doc-1");
+    expect(calls[0]!.url).toBe("/v1/db/tables/documents/doc-1");
     expect(calls[0]!.init?.method).toBe("PATCH");
   });
 
-  test("deleteDocument → DELETE /v1/documents/:id", async () => {
+  test("deleteDocument → DELETE /v1/db/tables/documents/:id", async () => {
     mockResponse = new Response(null, { status: 204 });
     await client.deleteDocument("doc-1");
-    expect(calls[0]!.url).toBe("/v1/documents/doc-1");
+    expect(calls[0]!.url).toBe("/v1/db/tables/documents/doc-1");
     expect(calls[0]!.init?.method).toBe("DELETE");
   });
 

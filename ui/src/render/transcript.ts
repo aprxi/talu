@@ -416,7 +416,7 @@ function renderItem(item: Item): HTMLElement {
  * Convert an image_url from the conversation to a browser-accessible src.
  *
  * Handles:
- *   - file:// blob paths → /v1/blobs/{sha256hex}
+ *   - file:// blob paths → /v1/db/blobs/{sha256hex}
  *   - file_* IDs → /v1/files/{id}/content
  *   - data: URIs and http(s) URLs → pass through
  */
@@ -425,7 +425,7 @@ export function imageUrlToSrc(url: string): string {
     const path = url.slice("file://".length);
     const parts = path.split("/");
     const hash = parts[parts.length - 1] ?? "";
-    if (hash.length === 64) return `/v1/blobs/${hash}`;
+    if (hash.length === 64) return `/v1/db/blobs/${hash}`;
   }
   if (url.startsWith("file_")) return `/v1/files/${url}/content`;
   return url;

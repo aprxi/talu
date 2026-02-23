@@ -142,12 +142,12 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
       const params = new URLSearchParams();
       if (type) params.set("type", type);
       const query = params.toString();
-      return requestJson<DocumentList>("GET", `/v1/documents${query ? `?${query}` : ""}`);
+      return requestJson<DocumentList>("GET", `/v1/db/tables/documents${query ? `?${query}` : ""}`);
     },
-    getDocument: (id) => requestJson<Document>("GET", `/v1/documents/${encodeURIComponent(id)}`),
-    createDocument: (doc) => requestJson<Document>("POST", "/v1/documents", doc),
-    updateDocument: (id, doc) => requestJson<Document>("PATCH", `/v1/documents/${encodeURIComponent(id)}`, doc),
-    deleteDocument: (id) => requestJson<void>("DELETE", `/v1/documents/${encodeURIComponent(id)}`),
+    getDocument: (id) => requestJson<Document>("GET", `/v1/db/tables/documents/${encodeURIComponent(id)}`),
+    createDocument: (doc) => requestJson<Document>("POST", "/v1/db/tables/documents", doc),
+    updateDocument: (id, doc) => requestJson<Document>("PATCH", `/v1/db/tables/documents/${encodeURIComponent(id)}`, doc),
+    deleteDocument: (id) => requestJson<void>("DELETE", `/v1/db/tables/documents/${encodeURIComponent(id)}`),
     listFiles: (opts?: { limit?: number; marker?: string; offset?: number; sort?: string; order?: string; search?: string }) => {
       const params = new URLSearchParams();
       params.set("limit", String(opts?.limit ?? 100));

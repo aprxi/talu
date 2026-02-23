@@ -95,7 +95,7 @@ export function createPluginContext(
   disposables.track(globalEvt);
 
   // Built-in plugins get localStorage-backed storage (no server token needed).
-  // Third-party plugins get server-backed storage via /v1/documents with a
+  // Third-party plugins get server-backed storage via /v1/db/tables/documents with a
   // capability token received from /v1/plugins during registration.
   const storage = isBuiltin
     ? new LocalStorageFacade(pluginId)

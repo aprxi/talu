@@ -74,7 +74,7 @@ describe("StorageFacadeImpl — get", () => {
   test("fetches correct URL with query params", async () => {
     await storage.get("mykey");
     const url = fetchCalls[0]!.url;
-    expect(url).toContain("/v1/documents?");
+    expect(url).toContain("/v1/db/tables/documents?");
     expect(url).toContain("type=plugin_storage");
     expect(url).toContain("owner_id=ext.myplugin");
     expect(url).toContain("title=mykey");
@@ -115,7 +115,7 @@ describe("StorageFacadeImpl — set", () => {
     // First call: findDocId (GET), second call: POST.
     const postCall = fetchCalls.find((c) => c.init?.method === "POST");
     expect(postCall).not.toBeUndefined();
-    expect(postCall!.url).toBe("/v1/documents");
+    expect(postCall!.url).toBe("/v1/db/tables/documents");
     const body = JSON.parse(postCall!.init!.body as string);
     expect(body.type).toBe("plugin_storage");
     expect(body.owner_id).toBe("ext.myplugin");
@@ -136,7 +136,7 @@ describe("StorageFacadeImpl — set", () => {
 
     const patchCall = fetchCalls.find((c) => c.init?.method === "PATCH");
     expect(patchCall).not.toBeUndefined();
-    expect(patchCall!.url).toBe("/v1/documents/existing-id");
+    expect(patchCall!.url).toBe("/v1/db/tables/documents/existing-id");
     const body = JSON.parse(patchCall!.init!.body as string);
     expect(body.content).toBe("updated");
   });
@@ -181,7 +181,7 @@ describe("StorageFacadeImpl — delete", () => {
 
     const deleteCall = fetchCalls.find((c) => c.init?.method === "DELETE");
     expect(deleteCall).not.toBeUndefined();
-    expect(deleteCall!.url).toBe("/v1/documents/del-id");
+    expect(deleteCall!.url).toBe("/v1/db/tables/documents/del-id");
   });
 
   test("no DELETE sent when key does not exist", async () => {
