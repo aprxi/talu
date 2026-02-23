@@ -13,6 +13,8 @@ pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_f32";
 pub const op_name: []const u8 = "gaffine_u4_matvec_f32";
 pub const scales_dtype_f16: u32 = 0;
 pub const scales_dtype_bf16: u32 = 1;
+const warp_size: u32 = 32;
+const block_x: u32 = 256;
 
 pub fn run(
     allocator: std.mem.Allocator,
@@ -78,8 +80,8 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, group_size);
     try arg_pack.appendScalar(u32, scales_dtype_tag);
 
-    const block_x: u32 = 256;
-    const grid_x: u32 = ceilDiv(out_dim, block_x);
+    const rows_per_block = block_x / warp_size;
+    const grid_x: u32 = ceilDiv(out_dim, rows_per_block);
     try launch_mod.launch(device, function, .{
         .grid_x = grid_x,
         .block_x = block_x,

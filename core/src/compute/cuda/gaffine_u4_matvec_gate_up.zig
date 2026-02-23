@@ -11,6 +11,8 @@ const cuda_assets = @import("cuda_assets");
 pub const embedded_module = cuda_assets.kernels_fatbin;
 pub const embedded_symbol: [:0]const u8 = "talu_gaffine_u4_matvec_gate_up_f32";
 pub const op_name: []const u8 = "gaffine_u4_matvec_gate_up_f32";
+const warp_size: u32 = 32;
+const block_x: u32 = 256;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -71,9 +73,9 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, in_dim);
 
     const total_out = std.math.add(u32, gate_out_dim, up_out_dim) catch return error.InvalidArgument;
-    const block_x: u32 = 256;
+    const rows_per_block = block_x / warp_size;
     try launch_mod.launch(device, function, .{
-        .grid_x = ceilDiv(total_out, block_x),
+        .grid_x = ceilDiv(total_out, rows_per_block),
         .block_x = block_x,
     }, arg_pack);
 }

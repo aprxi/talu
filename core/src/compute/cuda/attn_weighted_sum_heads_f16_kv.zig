@@ -36,9 +36,9 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, kv_groups);
     try arg_pack.appendScalar(u32, head_dim);
 
-    const block_x: u32 = 256;
+    const block_x: u32 = 128;
     try launch_mod.launch(device, function, .{
-        .grid_x = ceilDiv(head_dim, block_x),
+        .grid_x = ceilDiv(head_dim, warpsPerBlock(block_x)),
         .grid_y = n_heads,
         .block_x = block_x,
     }, arg_pack);
@@ -75,6 +75,10 @@ fn ceilDiv(numerator: u32, denominator: u32) u32 {
     return (numerator + denominator - 1) / denominator;
 }
 
+fn warpsPerBlock(block_x: u32) u32 {
+    return block_x / 32;
+}
+
 test "validateArgs rejects invalid shapes" {
     const probs = device_mod.Buffer{ .pointer = 0, .size = 1024 };
     const cache = device_mod.Buffer{ .pointer = 0, .size = 1024 };
@@ -88,4 +92,9 @@ test "validateArgs rejects invalid shapes" {
         error.InvalidArgument,
         validateArgs(&probs, &cache, &out, 0, 2, 4, 1, 2),
     );
+}
+
+test "warpsPerBlock computes expected warp count" {
+    try std.testing.expectEqual(@as(u32, 4), warpsPerBlock(128));
+    try std.testing.expectEqual(@as(u32, 8), warpsPerBlock(256));
 }

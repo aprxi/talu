@@ -24,14 +24,11 @@ pub const kv_write_f16 = @import("kv_write_f16.zig");
 pub const rmsnorm = @import("rmsnorm.zig");
 pub const rope = @import("rope.zig");
 pub const rope_store_f16 = @import("rope_store_f16.zig");
-pub const attn_scores = @import("attn_scores.zig");
-pub const attn_scores_f16_kv = @import("attn_scores_f16_kv.zig");
+pub const attn_scores_heads_f32 = @import("attn_scores_heads_f32.zig");
 pub const attn_scores_heads_f16_kv = @import("attn_scores_heads_f16_kv.zig");
 pub const attn_fused_heads_f16_kv = @import("attn_fused_heads_f16_kv.zig");
-pub const softmax = @import("softmax.zig");
 pub const softmax_rows = @import("softmax_rows.zig");
-pub const attn_weighted_sum = @import("attn_weighted_sum.zig");
-pub const attn_weighted_sum_f16_kv = @import("attn_weighted_sum_f16_kv.zig");
+pub const attn_weighted_sum_heads_f32 = @import("attn_weighted_sum_heads_f32.zig");
 pub const attn_weighted_sum_heads_f16_kv = @import("attn_weighted_sum_heads_f16_kv.zig");
 pub const silu = @import("silu.zig");
 pub const silu_mul = @import("silu_mul.zig");
@@ -44,6 +41,7 @@ pub const gaffine_u4_matvec = @import("gaffine_u4_matvec.zig");
 pub const gaffine_u4_matvec_gate_up = @import("gaffine_u4_matvec_gate_up.zig");
 pub const gaffine_u4_matvec_qkv = @import("gaffine_u4_matvec_qkv.zig");
 pub const shortconv_step = @import("shortconv_step.zig");
+pub const matmul_u16 = @import("matmul_u16.zig");
 
 pub const Device = device.Device;
 pub const Buffer = device.Buffer;
@@ -79,14 +77,11 @@ test {
     _ = rmsnorm;
     _ = rope;
     _ = rope_store_f16;
-    _ = attn_scores;
-    _ = attn_scores_f16_kv;
+    _ = attn_scores_heads_f32;
     _ = attn_scores_heads_f16_kv;
     _ = attn_fused_heads_f16_kv;
-    _ = softmax;
     _ = softmax_rows;
-    _ = attn_weighted_sum;
-    _ = attn_weighted_sum_f16_kv;
+    _ = attn_weighted_sum_heads_f32;
     _ = attn_weighted_sum_heads_f16_kv;
     _ = silu;
     _ = silu_mul;
@@ -99,4 +94,5 @@ test {
     _ = gaffine_u4_matvec_gate_up;
     _ = gaffine_u4_matvec_qkv;
     _ = shortconv_step;
+    _ = matmul_u16;
 }

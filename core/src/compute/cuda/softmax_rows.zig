@@ -28,9 +28,10 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, rows);
     try arg_pack.appendScalar(u32, cols);
 
+    const block_x: u32 = 128;
     try launch_mod.launch(device, function, .{
         .grid_x = rows,
-        .block_x = 256,
+        .block_x = block_x,
     }, arg_pack);
 }
 

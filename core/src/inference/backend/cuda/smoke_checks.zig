@@ -65,22 +65,20 @@ pub fn runKernelSmoke(backend: anytype) !void {
         backend.cast_f32_to_f16_function == null or
         backend.kv_write_f16_function == null or
         backend.rmsnorm_function == null or
-        backend.rope_function == null or
         backend.rope_store_f16_function == null or
-        backend.attn_scores_function == null or
-        backend.attn_scores_f16_kv_function == null or
-        backend.softmax_function == null or
+        backend.attn_scores_heads_f32_function == null or
         backend.attn_scores_heads_f16_kv_function == null or
         backend.attn_fused_heads_f16_kv_function == null or
         backend.softmax_rows_function == null or
-        backend.attn_weighted_sum_function == null or
-        backend.attn_weighted_sum_f16_kv_function == null or
+        backend.attn_weighted_sum_heads_f32_function == null or
         backend.attn_weighted_sum_heads_f16_kv_function == null or
         backend.silu_function == null or
         backend.silu_mul_function == null or
         backend.gelu_mul_function == null or
         backend.shortconv_step_function == null or
         backend.argmax_function == null or
+        backend.matmul_f16_function == null or
+        backend.matmul_bf16_function == null or
         backend.matvec_f16_function == null or
         backend.matvec_bf16_function == null or
         backend.matvec_gate_up_f16_function == null or
@@ -166,27 +164,26 @@ pub fn runKernelSmoke(backend: anytype) !void {
         backend.shortconv_step_function.?,
         backend.shortconv_step_source orelse .embedded_module,
     );
-    try runAttentionSmoke(
+    try runF32KvAttentionSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
-        backend.rope_function.?,
-        backend.attn_scores_function.?,
-        backend.softmax_function.?,
-        backend.attn_weighted_sum_function.?,
-    );
-    try runF16KvScalarKernelsSmoke(
-        &backend.kernel_arg_pack,
-        &backend.device,
-        backend.attn_scores_f16_kv_function.?,
-        backend.attn_scores_f16_kv_source orelse .embedded_module,
-        backend.attn_weighted_sum_f16_kv_function.?,
-        backend.attn_weighted_sum_f16_kv_source orelse .embedded_module,
+        backend.attn_scores_heads_f32_function.?,
+        backend.softmax_rows_function.?,
+        backend.attn_weighted_sum_heads_f32_function.?,
     );
     try runArgmaxSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.argmax_function.?,
         backend.argmax_source orelse .embedded_module,
+    );
+    try runMatmulU16Smoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.matmul_f16_function.?,
+        backend.matmul_f16_source orelse .embedded_module,
+        backend.matmul_bf16_function.?,
+        backend.matmul_bf16_source orelse .embedded_module,
     );
     try runMatvecU16Smoke(
         &backend.kernel_arg_pack,
@@ -854,21 +851,24 @@ fn runShortConvStepSmoke(
     });
 }
 
-fn runAttentionSmoke(
+fn runF32KvAttentionSmoke(
     arg_pack: *compute.cuda.ArgPack,
     device: *compute.cuda.Device,
-    rope_function: compute.cuda.Function,
-    scores_function: compute.cuda.Function,
-    softmax_function: compute.cuda.Function,
-    weighted_sum_function: compute.cuda.Function,
+    scores_heads_f32_function: compute.cuda.Function,
+    softmax_rows_function: compute.cuda.Function,
+    weighted_sum_heads_f32_function: compute.cuda.Function,
 ) !void {
+    const n_heads: u32 = 2;
+    const kv_groups: u32 = 2;
     const head_dim: u32 = 4;
-    const n_heads: u32 = 1;
     const seq_len: u32 = 2;
     const row_stride: u32 = 4;
     const scale: f32 = 0.5;
 
-    const query = [_]f32{ 1.0, 0.0, 0.0, 0.0 };
+    const query = [_]f32{
+        1.0, 0.0, 0.0, 0.0, // head 0
+        0.0, 1.0, 0.0, 0.0, // head 1
+    };
     const key_cache = [_]f32{
         1.0, 0.0, 0.0, 0.0,
         0.0, 1.0, 0.0, 0.0,
@@ -877,9 +877,8 @@ fn runAttentionSmoke(
         2.0, 3.0, 0.0, 0.0,
         4.0, 1.0, 0.0, 0.0,
     };
-    const scores = [_]f32{0.0} ** seq_len;
-    var probs = [_]f32{0.0} ** seq_len;
-    var out = [_]f32{0.0} ** head_dim;
+    var probs = [_]f32{0.0} ** (n_heads * seq_len);
+    var out = [_]f32{0.0} ** (n_heads * head_dim);
 
     var query_dev = try device.allocBuffer(query.len * @sizeOf(f32));
     defer query_dev.deinit(device);
@@ -887,7 +886,7 @@ fn runAttentionSmoke(
     defer key_dev.deinit(device);
     var value_dev = try device.allocBuffer(value_cache.len * @sizeOf(f32));
     defer value_dev.deinit(device);
-    var scores_dev = try device.allocBuffer(scores.len * @sizeOf(f32));
+    var scores_dev = try device.allocBuffer(probs.len * @sizeOf(f32));
     defer scores_dev.deinit(device);
     var probs_dev = try device.allocBuffer(probs.len * @sizeOf(f32));
     defer probs_dev.deinit(device);
@@ -898,48 +897,40 @@ fn runAttentionSmoke(
     try key_dev.upload(device, std.mem.sliceAsBytes(key_cache[0..]));
     try value_dev.upload(device, std.mem.sliceAsBytes(value_cache[0..]));
 
-    try compute.cuda.rope.runWithFunction(
+    try compute.cuda.attn_scores_heads_f32.runWithFunction(
         arg_pack,
         device,
-        rope_function,
-        &query_dev,
-        n_heads,
-        head_dim,
-        head_dim,
-        0,
-        10000.0,
-    );
-    try compute.cuda.attn_scores.runWithFunction(
-        arg_pack,
-        device,
-        scores_function,
+        scores_heads_f32_function,
         &query_dev,
         &key_dev,
         &scores_dev,
+        n_heads,
         seq_len,
         row_stride,
-        0,
+        kv_groups,
         head_dim,
         scale,
     );
-    try compute.cuda.softmax.runWithFunction(
+    try compute.cuda.softmax_rows.runWithFunction(
         arg_pack,
         device,
-        softmax_function,
+        softmax_rows_function,
         &scores_dev,
         &probs_dev,
+        n_heads,
         seq_len,
     );
-    try compute.cuda.attn_weighted_sum.runWithFunction(
+    try compute.cuda.attn_weighted_sum_heads_f32.runWithFunction(
         arg_pack,
         device,
-        weighted_sum_function,
+        weighted_sum_heads_f32_function,
         &probs_dev,
         &value_dev,
         &out_dev,
+        n_heads,
         seq_len,
         row_stride,
-        0,
+        kv_groups,
         head_dim,
     );
     try out_dev.download(device, std.mem.sliceAsBytes(out[0..]));
@@ -949,105 +940,23 @@ fn runAttentionSmoke(
     const expected_p1 = 1.0 - expected_p0;
     if (@abs(probs[0] - expected_p0) > 0.01) return error.CudaKernelSmokeMismatch;
     if (@abs(probs[1] - expected_p1) > 0.01) return error.CudaKernelSmokeMismatch;
-    const expected_out0 = expected_p0 * 2.0 + expected_p1 * 4.0;
-    if (@abs(out[0] - expected_out0) > 0.02) return error.CudaKernelSmokeMismatch;
+    if (@abs(probs[2] - expected_p1) > 0.01) return error.CudaKernelSmokeMismatch;
+    if (@abs(probs[3] - expected_p0) > 0.01) return error.CudaKernelSmokeMismatch;
 
-    log.info("inference", "CUDA attention smoke passed", .{
+    const expected_out_h0_d0 = expected_p0 * 2.0 + expected_p1 * 4.0;
+    const expected_out_h0_d1 = expected_p0 * 3.0 + expected_p1 * 1.0;
+    const expected_out_h1_d0 = expected_p1 * 2.0 + expected_p0 * 4.0;
+    const expected_out_h1_d1 = expected_p1 * 3.0 + expected_p0 * 1.0;
+    if (@abs(out[0] - expected_out_h0_d0) > 0.03) return error.CudaKernelSmokeMismatch;
+    if (@abs(out[1] - expected_out_h0_d1) > 0.03) return error.CudaKernelSmokeMismatch;
+    if (@abs(out[4] - expected_out_h1_d0) > 0.03) return error.CudaKernelSmokeMismatch;
+    if (@abs(out[5] - expected_out_h1_d1) > 0.03) return error.CudaKernelSmokeMismatch;
+
+    log.info("inference", "CUDA attention f32-kv smoke passed", .{
+        .n_heads = n_heads,
         .seq = seq_len,
         .head_dim = head_dim,
         .out0 = out[0],
-    });
-}
-
-fn runF16KvScalarKernelsSmoke(
-    arg_pack: *compute.cuda.ArgPack,
-    device: *compute.cuda.Device,
-    scores_f16_kv_function: compute.cuda.Function,
-    scores_source: compute.cuda.registry.KernelSource,
-    weighted_sum_f16_kv_function: compute.cuda.Function,
-    weighted_sum_source: compute.cuda.registry.KernelSource,
-) !void {
-    const seq_len: u32 = 2;
-    const row_stride: u32 = 4;
-    const head_offset: u32 = 0;
-    const head_dim: u32 = 2;
-    const scale: f32 = 0.5;
-
-    const query = [_]f32{ 1.0, 2.0 };
-    const key_cache_f16 = [_]u16{
-        @bitCast(@as(f16, 1.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, 0.0)),
-        @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, 1.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, 0.0)),
-    };
-    const probs = [_]f32{ 0.25, 0.75 };
-    const value_cache_f16 = [_]u16{
-        @bitCast(@as(f16, 2.0)), @bitCast(@as(f16, 4.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, 0.0)),
-        @bitCast(@as(f16, 6.0)), @bitCast(@as(f16, 8.0)), @bitCast(@as(f16, 0.0)), @bitCast(@as(f16, 0.0)),
-    };
-    const expected_scores = [_]f32{ 0.5, 1.0 };
-    const expected_out = [_]f32{ 5.0, 7.0 };
-    var scores_actual = [_]f32{0.0} ** expected_scores.len;
-    var out_actual = [_]f32{0.0} ** expected_out.len;
-
-    var query_dev = try device.allocBuffer(query.len * @sizeOf(f32));
-    defer query_dev.deinit(device);
-    var key_dev = try device.allocBuffer(key_cache_f16.len * @sizeOf(u16));
-    defer key_dev.deinit(device);
-    var scores_dev = try device.allocBuffer(scores_actual.len * @sizeOf(f32));
-    defer scores_dev.deinit(device);
-    var probs_dev = try device.allocBuffer(probs.len * @sizeOf(f32));
-    defer probs_dev.deinit(device);
-    var value_dev = try device.allocBuffer(value_cache_f16.len * @sizeOf(u16));
-    defer value_dev.deinit(device);
-    var out_dev = try device.allocBuffer(out_actual.len * @sizeOf(f32));
-    defer out_dev.deinit(device);
-
-    try query_dev.upload(device, std.mem.sliceAsBytes(query[0..]));
-    try key_dev.upload(device, std.mem.sliceAsBytes(key_cache_f16[0..]));
-    try probs_dev.upload(device, std.mem.sliceAsBytes(probs[0..]));
-    try value_dev.upload(device, std.mem.sliceAsBytes(value_cache_f16[0..]));
-
-    try compute.cuda.attn_scores_f16_kv.runWithFunction(
-        arg_pack,
-        device,
-        scores_f16_kv_function,
-        &query_dev,
-        &key_dev,
-        &scores_dev,
-        seq_len,
-        row_stride,
-        head_offset,
-        head_dim,
-        scale,
-    );
-    try scores_dev.download(device, std.mem.sliceAsBytes(scores_actual[0..]));
-
-    try compute.cuda.attn_weighted_sum_f16_kv.runWithFunction(
-        arg_pack,
-        device,
-        weighted_sum_f16_kv_function,
-        &probs_dev,
-        &value_dev,
-        &out_dev,
-        seq_len,
-        row_stride,
-        head_offset,
-        head_dim,
-    );
-    try out_dev.download(device, std.mem.sliceAsBytes(out_actual[0..]));
-
-    for (expected_scores, scores_actual) |want, got| {
-        if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
-    }
-    for (expected_out, out_actual) |want, got| {
-        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
-    }
-
-    log.info("inference", "CUDA f16-kv scalar kernels smoke passed", .{
-        .seq = seq_len,
-        .head_dim = head_dim,
-        .scores_source = @tagName(scores_source),
-        .weighted_sum_source = @tagName(weighted_sum_source),
-        .out0 = out_actual[0],
     });
 }
 
@@ -1441,6 +1350,113 @@ fn runMatvecU16Smoke(
         .source_bf16 = @tagName(source_bf16),
         .out0_f16 = actual_f16[0],
         .out0_bf16 = actual_bf16[0],
+    });
+}
+
+fn runMatmulU16Smoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function_f16: compute.cuda.Function,
+    source_f16: compute.cuda.registry.KernelSource,
+    function_bf16: compute.cuda.Function,
+    source_bf16: compute.cuda.registry.KernelSource,
+) !void {
+    const rows_usize: usize = 2;
+    const in_dim_usize: usize = 8;
+    const out_dim_usize: usize = 3;
+    const rows: u32 = rows_usize;
+    const in_dim: u32 = in_dim_usize;
+    const out_dim: u32 = out_dim_usize;
+
+    var input: [rows_usize * in_dim_usize]f32 = undefined;
+    for (0..rows_usize) |r| {
+        for (0..in_dim_usize) |c| {
+            input[r * in_dim_usize + c] = @floatFromInt((r + 1) * (c + 1));
+        }
+    }
+
+    var weights_bf16: [out_dim_usize * in_dim_usize]u16 = undefined;
+    var weights_f16: [out_dim_usize * in_dim_usize]u16 = undefined;
+    var expected: [rows_usize * out_dim_usize]f32 = [_]f32{0.0} ** (rows_usize * out_dim_usize);
+    for (0..out_dim_usize) |row| {
+        for (0..in_dim_usize) |col| {
+            const w: f32 = @floatFromInt((row + 1) * (col + 1));
+            const idx = row * in_dim_usize + col;
+            weights_bf16[idx] = dtype.f32ToBf16(w);
+            weights_f16[idx] = @bitCast(@as(f16, @floatCast(w)));
+        }
+    }
+    for (0..rows_usize) |r| {
+        for (0..out_dim_usize) |o| {
+            var acc: f32 = 0.0;
+            for (0..in_dim_usize) |c| {
+                const x = input[r * in_dim_usize + c];
+                const w: f32 = @floatFromInt((o + 1) * (c + 1));
+                acc += x * w;
+            }
+            expected[r * out_dim_usize + o] = acc;
+        }
+    }
+
+    var actual_bf16 = [_]f32{0.0} ** (rows_usize * out_dim_usize);
+    var actual_f16 = [_]f32{0.0} ** (rows_usize * out_dim_usize);
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var weight_bf16_dev = try device.allocBuffer(weights_bf16.len * @sizeOf(u16));
+    defer weight_bf16_dev.deinit(device);
+    var weight_f16_dev = try device.allocBuffer(weights_f16.len * @sizeOf(u16));
+    defer weight_f16_dev.deinit(device);
+    var out_bf16_dev = try device.allocBuffer(actual_bf16.len * @sizeOf(f32));
+    defer out_bf16_dev.deinit(device);
+    var out_f16_dev = try device.allocBuffer(actual_f16.len * @sizeOf(f32));
+    defer out_f16_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try weight_bf16_dev.upload(device, std.mem.sliceAsBytes(weights_bf16[0..]));
+    try weight_f16_dev.upload(device, std.mem.sliceAsBytes(weights_f16[0..]));
+
+    try compute.cuda.matmul_u16.runWithFunction(
+        arg_pack,
+        device,
+        function_bf16,
+        &input_dev,
+        &weight_bf16_dev,
+        &out_bf16_dev,
+        rows,
+        in_dim,
+        out_dim,
+    );
+    try compute.cuda.matmul_u16.runWithFunction(
+        arg_pack,
+        device,
+        function_f16,
+        &input_dev,
+        &weight_f16_dev,
+        &out_f16_dev,
+        rows,
+        in_dim,
+        out_dim,
+    );
+
+    try out_bf16_dev.download(device, std.mem.sliceAsBytes(actual_bf16[0..]));
+    try out_f16_dev.download(device, std.mem.sliceAsBytes(actual_f16[0..]));
+
+    for (expected, actual_bf16) |want, got| {
+        if (@abs(want - got) > 0.05) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected, actual_f16) |want, got| {
+        if (@abs(want - got) > 0.05) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA matmul_u16 smoke passed", .{
+        .rows = rows,
+        .in_dim = in_dim,
+        .out_dim = out_dim,
+        .source_f16 = @tagName(source_f16),
+        .source_bf16 = @tagName(source_bf16),
+        .out00_f16 = actual_f16[0],
+        .out00_bf16 = actual_bf16[0],
     });
 }
 

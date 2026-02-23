@@ -1,3 +1,14 @@
+static constexpr unsigned int TALU_QUANT_WARP_SIZE = 32;
+
+static __device__ __forceinline__ float talu_quant_warp_sum_f32(float value) {
+    value += __shfl_down_sync(0xFFFFFFFFu, value, 16);
+    value += __shfl_down_sync(0xFFFFFFFFu, value, 8);
+    value += __shfl_down_sync(0xFFFFFFFFu, value, 4);
+    value += __shfl_down_sync(0xFFFFFFFFu, value, 2);
+    value += __shfl_down_sync(0xFFFFFFFFu, value, 1);
+    return value;
+}
+
 extern "C" __global__ void talu_embedding_lookup_gaffine_u4_f32(
     float* out,
     const unsigned int* packed_vals,
@@ -43,7 +54,10 @@ extern "C" __global__ void talu_gaffine_u4_matvec_f32(
     unsigned int group_size,
     unsigned int scales_dtype_tag
 ) {
-    const unsigned int out_idx = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int warps_per_block = blockDim.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
     if (out_idx >= out_dim) return;
     if (group_size == 0 || (in_dim % group_size) != 0 || (group_size % 8) != 0) {
         return;
@@ -56,29 +70,24 @@ extern "C" __global__ void talu_gaffine_u4_matvec_f32(
     const unsigned int row_sb_base = out_idx * groups_per_row;
 
     float acc = 0.0f;
-    for (unsigned int group_idx = 0; group_idx < groups_per_row; ++group_idx) {
+    for (unsigned int i = lane; i < in_dim; i += TALU_QUANT_WARP_SIZE) {
+        const unsigned int group_idx = i / group_size;
+        const unsigned int in_group = i - group_idx * group_size;
+        const unsigned int word_in_group = in_group / 8;
+        const unsigned int nib_in_word = in_group & 7;
+        const unsigned int packed_word = packed_weight[row_word_base + group_idx * words_per_group + word_in_group];
+        const unsigned int quant = (packed_word >> (nib_in_word * 4)) & 0xF;
         const float scale = talu_decode_scale_bias_u16(scales[row_sb_base + group_idx], scales_dtype_tag);
         const float bias = talu_decode_scale_bias_u16(biases[row_sb_base + group_idx], scales_dtype_tag);
-        const unsigned int group_input_base = group_idx * group_size;
-        const unsigned int group_word_base = row_word_base + group_idx * words_per_group;
-
-        for (unsigned int w = 0; w < words_per_group; ++w) {
-            const unsigned int packed = packed_weight[group_word_base + w];
-            const unsigned int value_base = group_input_base + w * 8;
-
-            #pragma unroll
-            for (unsigned int nib = 0; nib < 8; ++nib) {
-                const unsigned int quant = (packed >> (nib * 4)) & 0xF;
-                const float dequant = static_cast<float>(quant) * scale + bias;
-                acc += input[value_base + nib] * dequant;
-            }
-        }
+        const float dequant = static_cast<float>(quant) * scale + bias;
+        acc = fmaf(input[i], dequant, acc);
     }
+    acc = talu_quant_warp_sum_f32(acc);
 
-    out[out_idx] = acc;
+    if (lane == 0) out[out_idx] = acc;
 }
 
-static __device__ __forceinline__ float talu_gaffine_u4_dot_row(
+static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp(
     const float* input,
     const unsigned int* packed_weight,
     const unsigned short* scales,
@@ -86,34 +95,28 @@ static __device__ __forceinline__ float talu_gaffine_u4_dot_row(
     unsigned int in_dim,
     unsigned int out_idx,
     unsigned int group_size,
-    unsigned int scales_dtype_tag
+    unsigned int scales_dtype_tag,
+    unsigned int lane
 ) {
     const unsigned int groups_per_row = in_dim / group_size;
     const unsigned int words_per_group = group_size / 8;
-    const unsigned int words_per_row = in_dim / 8;
-    const unsigned int row_word_base = out_idx * words_per_row;
+    const unsigned int row_word_base = out_idx * (in_dim / 8);
     const unsigned int row_sb_base = out_idx * groups_per_row;
 
     float acc = 0.0f;
-    for (unsigned int group_idx = 0; group_idx < groups_per_row; ++group_idx) {
+    for (unsigned int i = lane; i < in_dim; i += TALU_QUANT_WARP_SIZE) {
+        const unsigned int group_idx = i / group_size;
+        const unsigned int in_group = i - group_idx * group_size;
+        const unsigned int word_in_group = in_group / 8;
+        const unsigned int nib_in_word = in_group & 7;
+        const unsigned int packed_word = packed_weight[row_word_base + group_idx * words_per_group + word_in_group];
+        const unsigned int quant = (packed_word >> (nib_in_word * 4)) & 0xF;
         const float scale = talu_decode_scale_bias_u16(scales[row_sb_base + group_idx], scales_dtype_tag);
         const float bias = talu_decode_scale_bias_u16(biases[row_sb_base + group_idx], scales_dtype_tag);
-        const unsigned int group_input_base = group_idx * group_size;
-        const unsigned int group_word_base = row_word_base + group_idx * words_per_group;
-
-        for (unsigned int w = 0; w < words_per_group; ++w) {
-            const unsigned int packed = packed_weight[group_word_base + w];
-            const unsigned int value_base = group_input_base + w * 8;
-
-            #pragma unroll
-            for (unsigned int nib = 0; nib < 8; ++nib) {
-                const unsigned int quant = (packed >> (nib * 4)) & 0xF;
-                const float dequant = static_cast<float>(quant) * scale + bias;
-                acc += input[value_base + nib] * dequant;
-            }
-        }
+        const float dequant = static_cast<float>(quant) * scale + bias;
+        acc = fmaf(input[i], dequant, acc);
     }
-    return acc;
+    return talu_quant_warp_sum_f32(acc);
 }
 
 extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
@@ -143,14 +146,18 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
 ) {
     if (in_dim == 0 || (in_dim % 8) != 0) return;
 
-    const unsigned int out_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int warps_per_block = blockDim.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int out_index = blockIdx.x * warps_per_block + warp_id;
     const unsigned int qk_dim = q_out_dim + k_out_dim;
     const unsigned int total_dim = qk_dim + v_out_dim;
     if (out_index >= total_dim) return;
 
+    float acc = 0.0f;
     if (out_index < q_out_dim) {
         if (q_group_size == 0 || (in_dim % q_group_size) != 0 || (q_group_size % 8) != 0) return;
-        q_out[out_index] = talu_gaffine_u4_dot_row(
+        acc = talu_gaffine_u4_dot_row_warp(
             input,
             q_packed_weight,
             q_scales,
@@ -158,15 +165,17 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
             in_dim,
             out_index,
             q_group_size,
-            q_scales_dtype_tag
+            q_scales_dtype_tag,
+            lane
         );
+        if (lane == 0) q_out[out_index] = acc;
         return;
     }
 
     if (out_index < qk_dim) {
         if (k_group_size == 0 || (in_dim % k_group_size) != 0 || (k_group_size % 8) != 0) return;
         const unsigned int k_row = out_index - q_out_dim;
-        k_out[k_row] = talu_gaffine_u4_dot_row(
+        acc = talu_gaffine_u4_dot_row_warp(
             input,
             k_packed_weight,
             k_scales,
@@ -174,14 +183,16 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
             in_dim,
             k_row,
             k_group_size,
-            k_scales_dtype_tag
+            k_scales_dtype_tag,
+            lane
         );
+        if (lane == 0) k_out[k_row] = acc;
         return;
     }
 
     if (v_group_size == 0 || (in_dim % v_group_size) != 0 || (v_group_size % 8) != 0) return;
     const unsigned int v_row = out_index - qk_dim;
-    v_out[v_row] = talu_gaffine_u4_dot_row(
+    acc = talu_gaffine_u4_dot_row_warp(
         input,
         v_packed_weight,
         v_scales,
@@ -189,8 +200,10 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
         in_dim,
         v_row,
         v_group_size,
-        v_scales_dtype_tag
+        v_scales_dtype_tag,
+        lane
     );
+    if (lane == 0) v_out[v_row] = acc;
 }
 
 extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
@@ -213,13 +226,17 @@ extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
 ) {
     if (in_dim == 0 || (in_dim % 8) != 0) return;
 
-    const unsigned int out_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
+    const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int warps_per_block = blockDim.x / TALU_QUANT_WARP_SIZE;
+    const unsigned int out_index = blockIdx.x * warps_per_block + warp_id;
     const unsigned int total_dim = gate_out_dim + up_out_dim;
     if (out_index >= total_dim) return;
 
+    float acc = 0.0f;
     if (out_index < gate_out_dim) {
         if (gate_group_size == 0 || (in_dim % gate_group_size) != 0 || (gate_group_size % 8) != 0) return;
-        gate_out[out_index] = talu_gaffine_u4_dot_row(
+        acc = talu_gaffine_u4_dot_row_warp(
             input,
             gate_packed_weight,
             gate_scales,
@@ -227,14 +244,16 @@ extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
             in_dim,
             out_index,
             gate_group_size,
-            gate_scales_dtype_tag
+            gate_scales_dtype_tag,
+            lane
         );
+        if (lane == 0) gate_out[out_index] = acc;
         return;
     }
 
     if (up_group_size == 0 || (in_dim % up_group_size) != 0 || (up_group_size % 8) != 0) return;
     const unsigned int up_row = out_index - gate_out_dim;
-    up_out[up_row] = talu_gaffine_u4_dot_row(
+    acc = talu_gaffine_u4_dot_row_warp(
         input,
         up_packed_weight,
         up_scales,
@@ -242,6 +261,8 @@ extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
         in_dim,
         up_row,
         up_group_size,
-        up_scales_dtype_tag
+        up_scales_dtype_tag,
+        lane
     );
+    if (lane == 0) up_out[up_row] = acc;
 }

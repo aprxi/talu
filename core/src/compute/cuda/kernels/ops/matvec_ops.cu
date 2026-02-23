@@ -9,6 +9,60 @@ static __device__ __forceinline__ float talu_warp_sum_f32(float value) {
     return value;
 }
 
+extern "C" __global__ void talu_matmul_f16_f32(
+    const float* input,
+    const unsigned short* weight,
+    float* out,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    const unsigned int lane = threadIdx.x;
+    const unsigned int warp_id = threadIdx.y;
+    const unsigned int warps_per_block = blockDim.y;
+    const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
+    const unsigned int row_idx = blockIdx.y;
+    if (row_idx >= rows || out_idx >= out_dim) return;
+
+    const float* input_row = input + (unsigned long long)row_idx * in_dim;
+    const unsigned short* weight_row = weight + (unsigned long long)out_idx * in_dim;
+    float acc = 0.0f;
+    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+        acc = fmaf(input_row[i], talu_decode_f16_u16(weight_row[i]), acc);
+    }
+    acc = talu_warp_sum_f32(acc);
+    if (lane == 0) {
+        out[(unsigned long long)row_idx * out_dim + out_idx] = acc;
+    }
+}
+
+extern "C" __global__ void talu_matmul_bf16_f32(
+    const float* input,
+    const unsigned short* weight,
+    float* out,
+    unsigned int rows,
+    unsigned int in_dim,
+    unsigned int out_dim
+) {
+    const unsigned int lane = threadIdx.x;
+    const unsigned int warp_id = threadIdx.y;
+    const unsigned int warps_per_block = blockDim.y;
+    const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
+    const unsigned int row_idx = blockIdx.y;
+    if (row_idx >= rows || out_idx >= out_dim) return;
+
+    const float* input_row = input + (unsigned long long)row_idx * in_dim;
+    const unsigned short* weight_row = weight + (unsigned long long)out_idx * in_dim;
+    float acc = 0.0f;
+    for (unsigned int i = lane; i < in_dim; i += TALU_WARP_SIZE) {
+        acc = fmaf(input_row[i], talu_decode_bf16_u16(weight_row[i]), acc);
+    }
+    acc = talu_warp_sum_f32(acc);
+    if (lane == 0) {
+        out[(unsigned long long)row_idx * out_dim + out_idx] = acc;
+    }
+}
+
 extern "C" __global__ void talu_matvec_f16_f32(
     const float* input,
     const unsigned short* weight,

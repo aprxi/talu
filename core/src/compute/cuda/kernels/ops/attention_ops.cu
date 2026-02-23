@@ -1,43 +1,20 @@
-extern "C" __global__ void talu_attn_scores_f32(
-    float* scores,
-    const float* query_head,
-    const float* key_cache,
-    unsigned int seq_len,
-    unsigned int row_stride,
-    unsigned int head_offset,
-    unsigned int head_dim,
-    float scale
-) {
-    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= seq_len) return;
+static constexpr unsigned int TALU_ATTN_WARP_SIZE = 32u;
 
-    const float* key_row = key_cache + ((unsigned long long)index * row_stride + head_offset);
-    float dot = 0.0f;
-    for (unsigned int d = 0; d < head_dim; ++d) {
-        dot += query_head[d] * key_row[d];
+static __forceinline__ __device__ float talu_attn_warp_sum_f32(float value) {
+    const unsigned int mask = 0xFFFFffffu;
+    for (unsigned int offset = TALU_ATTN_WARP_SIZE >> 1; offset > 0; offset >>= 1) {
+        value += __shfl_down_sync(mask, value, offset);
     }
-    scores[index] = dot * scale;
+    return value;
 }
 
-extern "C" __global__ void talu_attn_scores_f16_kv(
-    float* scores,
-    const float* query_head,
-    const unsigned short* key_cache,
-    unsigned int seq_len,
-    unsigned int row_stride,
-    unsigned int head_offset,
-    unsigned int head_dim,
-    float scale
-) {
-    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
-    if (index >= seq_len) return;
-
-    const unsigned short* key_row = key_cache + ((unsigned long long)index * row_stride + head_offset);
-    float dot = 0.0f;
-    for (unsigned int d = 0; d < head_dim; ++d) {
-        dot += query_head[d] * __half2float(*reinterpret_cast<const __half*>(&key_row[d]));
+static __forceinline__ __device__ float talu_attn_warp_max_f32(float value) {
+    const unsigned int mask = 0xFFFFffffu;
+    for (unsigned int offset = TALU_ATTN_WARP_SIZE >> 1; offset > 0; offset >>= 1) {
+        const float other = __shfl_down_sync(mask, value, offset);
+        value = fmaxf(value, other);
     }
-    scores[index] = dot * scale;
+    return value;
 }
 
 extern "C" __global__ void talu_attn_scores_heads_f16_kv(
@@ -51,7 +28,11 @@ extern "C" __global__ void talu_attn_scores_heads_f16_kv(
     unsigned int head_dim,
     float scale
 ) {
-    const unsigned int token_index = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warps_per_block = blockDim.x / TALU_ATTN_WARP_SIZE;
+    const unsigned int token_index = blockIdx.x * warps_per_block + warp;
     const unsigned int head = blockIdx.y;
     if (head >= n_heads || token_index >= seq_len) return;
     if (kv_groups == 0) return;
@@ -61,35 +42,48 @@ extern "C" __global__ void talu_attn_scores_heads_f16_kv(
     const float* query_head = query + (unsigned long long)head * head_dim;
     const unsigned short* key_row = key_cache + ((unsigned long long)token_index * row_stride + head_offset);
 
-    float dot = 0.0f;
-    for (unsigned int d = 0; d < head_dim; ++d) {
-        dot += query_head[d] * __half2float(*reinterpret_cast<const __half*>(&key_row[d]));
+    float partial = 0.0f;
+    for (unsigned int d = lane; d < head_dim; d += TALU_ATTN_WARP_SIZE) {
+        partial += query_head[d] * __half2float(*reinterpret_cast<const __half*>(&key_row[d]));
     }
-    scores[(unsigned long long)head * seq_len + token_index] = dot * scale;
+    const float dot = talu_attn_warp_sum_f32(partial);
+    if (lane == 0) {
+        scores[(unsigned long long)head * seq_len + token_index] = dot * scale;
+    }
 }
 
-extern "C" __global__ void talu_softmax_f32(
-    float* out,
-    const float* input,
-    unsigned int count
+extern "C" __global__ void talu_attn_scores_heads_f32(
+    float* scores,
+    const float* query,
+    const float* key_cache,
+    unsigned int n_heads,
+    unsigned int seq_len,
+    unsigned int row_stride,
+    unsigned int kv_groups,
+    unsigned int head_dim,
+    float scale
 ) {
-    if (blockIdx.x != 0 || threadIdx.x != 0) return;
-    if (count == 0) return;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warps_per_block = blockDim.x / TALU_ATTN_WARP_SIZE;
+    const unsigned int token_index = blockIdx.x * warps_per_block + warp;
+    const unsigned int head = blockIdx.y;
+    if (head >= n_heads || token_index >= seq_len) return;
+    if (kv_groups == 0) return;
 
-    float max_v = input[0];
-    for (unsigned int i = 1; i < count; ++i) {
-        const float v = input[i];
-        if (v > max_v) max_v = v;
+    const unsigned int kv_head = head / kv_groups;
+    const unsigned int head_offset = kv_head * head_dim;
+    const float* query_head = query + (unsigned long long)head * head_dim;
+    const float* key_row = key_cache + ((unsigned long long)token_index * row_stride + head_offset);
+
+    float partial = 0.0f;
+    for (unsigned int d = lane; d < head_dim; d += TALU_ATTN_WARP_SIZE) {
+        partial += query_head[d] * key_row[d];
     }
-
-    float sum = 0.0f;
-    for (unsigned int i = 0; i < count; ++i) {
-        sum += expf(input[i] - max_v);
-    }
-
-    const float inv_sum = 1.0f / sum;
-    for (unsigned int i = 0; i < count; ++i) {
-        out[i] = expf(input[i] - max_v) * inv_sum;
+    const float dot = talu_attn_warp_sum_f32(partial);
+    if (lane == 0) {
+        scores[(unsigned long long)head * seq_len + token_index] = dot * scale;
     }
 }
 
@@ -101,90 +95,53 @@ extern "C" __global__ void talu_softmax_rows_f32(
 ) {
     const unsigned int row = blockIdx.x;
     const unsigned int tid = threadIdx.x;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int warp_count = (blockDim.x + TALU_ATTN_WARP_SIZE - 1u) / TALU_ATTN_WARP_SIZE;
     if (row >= rows || cols == 0) return;
 
     const float* row_in = input + (unsigned long long)row * cols;
     float* row_out = out + (unsigned long long)row * cols;
+    __shared__ float warp_max[8];
+    __shared__ float warp_sum[8];
+    __shared__ float row_max;
+    __shared__ float row_inv_sum;
 
     float local_max = -3.402823466e+38f;
     for (unsigned int i = tid; i < cols; i += blockDim.x) {
-        const float v = row_in[i];
-        if (v > local_max) local_max = v;
+        local_max = fmaxf(local_max, row_in[i]);
     }
-
-    __shared__ float scratch[256];
-    scratch[tid] = local_max;
+    const float max_lane = talu_attn_warp_max_f32(local_max);
+    if (lane == 0) warp_max[warp] = max_lane;
     __syncthreads();
 
-    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            const float other = scratch[tid + stride];
-            if (other > scratch[tid]) scratch[tid] = other;
-        }
-        __syncthreads();
+    if (warp == 0) {
+        float block_max = (lane < warp_count) ? warp_max[lane] : -3.402823466e+38f;
+        block_max = talu_attn_warp_max_f32(block_max);
+        if (lane == 0) row_max = block_max;
     }
-    const float max_v = scratch[0];
+    __syncthreads();
 
+    const float max_v = row_max;
     float local_sum = 0.0f;
     for (unsigned int i = tid; i < cols; i += blockDim.x) {
         local_sum += expf(row_in[i] - max_v);
     }
-    scratch[tid] = local_sum;
+    const float sum_lane = talu_attn_warp_sum_f32(local_sum);
+    if (lane == 0) warp_sum[warp] = sum_lane;
     __syncthreads();
 
-    for (unsigned int stride = blockDim.x >> 1; stride > 0; stride >>= 1) {
-        if (tid < stride) {
-            scratch[tid] += scratch[tid + stride];
-        }
-        __syncthreads();
+    if (warp == 0) {
+        float block_sum = (lane < warp_count) ? warp_sum[lane] : 0.0f;
+        block_sum = talu_attn_warp_sum_f32(block_sum);
+        if (lane == 0) row_inv_sum = 1.0f / fmaxf(block_sum, 1.0e-20f);
     }
-    const float inv_sum = 1.0f / fmaxf(scratch[0], 1.0e-20f);
+    __syncthreads();
 
+    const float inv_sum = row_inv_sum;
     for (unsigned int i = tid; i < cols; i += blockDim.x) {
         row_out[i] = expf(row_in[i] - max_v) * inv_sum;
     }
-}
-
-extern "C" __global__ void talu_attn_weighted_sum_f32(
-    float* out_head,
-    const float* probs,
-    const float* value_cache,
-    unsigned int seq_len,
-    unsigned int row_stride,
-    unsigned int head_offset,
-    unsigned int head_dim
-) {
-    const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= head_dim) return;
-
-    float acc = 0.0f;
-    for (unsigned int t = 0; t < seq_len; ++t) {
-        const float p = probs[t];
-        const unsigned long long value_index = (unsigned long long)t * row_stride + head_offset + d;
-        acc += p * value_cache[value_index];
-    }
-    out_head[d] = acc;
-}
-
-extern "C" __global__ void talu_attn_weighted_sum_f16_kv(
-    float* out_head,
-    const float* probs,
-    const unsigned short* value_cache,
-    unsigned int seq_len,
-    unsigned int row_stride,
-    unsigned int head_offset,
-    unsigned int head_dim
-) {
-    const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
-    if (d >= head_dim) return;
-
-    float acc = 0.0f;
-    for (unsigned int t = 0; t < seq_len; ++t) {
-        const float p = probs[t];
-        const unsigned long long value_index = (unsigned long long)t * row_stride + head_offset + d;
-        acc += p * __half2float(*reinterpret_cast<const __half*>(&value_cache[value_index]));
-    }
-    out_head[d] = acc;
 }
 
 extern "C" __global__ void talu_attn_weighted_sum_heads_f16_kv(
@@ -197,7 +154,11 @@ extern "C" __global__ void talu_attn_weighted_sum_heads_f16_kv(
     unsigned int kv_groups,
     unsigned int head_dim
 ) {
-    const unsigned int d = blockIdx.x * blockDim.x + threadIdx.x;
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warps_per_block = blockDim.x / TALU_ATTN_WARP_SIZE;
+    const unsigned int d = blockIdx.x * warps_per_block + warp;
     const unsigned int head = blockIdx.y;
     if (head >= n_heads || d >= head_dim) return;
     if (kv_groups == 0) return;
@@ -206,12 +167,49 @@ extern "C" __global__ void talu_attn_weighted_sum_heads_f16_kv(
     const unsigned int head_offset = kv_head * head_dim;
     const float* probs_row = probs + (unsigned long long)head * seq_len;
 
-    float acc = 0.0f;
-    for (unsigned int t = 0; t < seq_len; ++t) {
+    float partial = 0.0f;
+    for (unsigned int t = lane; t < seq_len; t += TALU_ATTN_WARP_SIZE) {
         const unsigned long long value_index = (unsigned long long)t * row_stride + head_offset + d;
-        acc += probs_row[t] * __half2float(*reinterpret_cast<const __half*>(&value_cache[value_index]));
+        partial += probs_row[t] * __half2float(*reinterpret_cast<const __half*>(&value_cache[value_index]));
     }
-    out[(unsigned long long)head * head_dim + d] = acc;
+    const float acc = talu_attn_warp_sum_f32(partial);
+    if (lane == 0) {
+        out[(unsigned long long)head * head_dim + d] = acc;
+    }
+}
+
+extern "C" __global__ void talu_attn_weighted_sum_heads_f32(
+    float* out,
+    const float* probs,
+    const float* value_cache,
+    unsigned int n_heads,
+    unsigned int seq_len,
+    unsigned int row_stride,
+    unsigned int kv_groups,
+    unsigned int head_dim
+) {
+    const unsigned int tid = threadIdx.x;
+    const unsigned int warp = tid / TALU_ATTN_WARP_SIZE;
+    const unsigned int lane = tid & (TALU_ATTN_WARP_SIZE - 1u);
+    const unsigned int warps_per_block = blockDim.x / TALU_ATTN_WARP_SIZE;
+    const unsigned int d = blockIdx.x * warps_per_block + warp;
+    const unsigned int head = blockIdx.y;
+    if (head >= n_heads || d >= head_dim) return;
+    if (kv_groups == 0) return;
+
+    const unsigned int kv_head = head / kv_groups;
+    const unsigned int head_offset = kv_head * head_dim;
+    const float* probs_row = probs + (unsigned long long)head * seq_len;
+
+    float partial = 0.0f;
+    for (unsigned int t = lane; t < seq_len; t += TALU_ATTN_WARP_SIZE) {
+        const unsigned long long value_index = (unsigned long long)t * row_stride + head_offset + d;
+        partial += probs_row[t] * value_cache[value_index];
+    }
+    const float acc = talu_attn_warp_sum_f32(partial);
+    if (lane == 0) {
+        out[(unsigned long long)head * head_dim + d] = acc;
+    }
 }
 
 extern "C" __global__ void talu_attn_fused_heads_f16_kv(
