@@ -22,6 +22,21 @@ extern "C" __global__ void talu_silu_mul_f32(
     out[index] = silu_x * up[index];
 }
 
+extern "C" __global__ void talu_gelu_mul_f32(
+    float* out,
+    const float* gate,
+    const float* up,
+    unsigned int count
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    const float x = gate[index];
+    const float x3 = x * x * x;
+    const float inner = 0.7978845608028654f * (x + 0.044715f * x3);
+    const float gelu_x = 0.5f * x * (1.0f + tanhf(inner));
+    out[index] = gelu_x * up[index];
+}
+
 extern "C" __global__ void talu_argmax_f32(
     const float* input,
     unsigned int count,

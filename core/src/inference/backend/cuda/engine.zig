@@ -56,6 +56,7 @@ const KernelSlot = enum {
     attn_weighted_sum_heads_f16_kv,
     silu,
     silu_mul,
+    gelu_mul,
     shortconv_step,
     argmax,
     matvec_f16,
@@ -117,6 +118,7 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .attn_weighted_sum_heads_f16_kv, .op_name = compute.cuda.attn_weighted_sum_heads_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_f16_kv.embedded_symbol },
     .{ .slot = .silu, .op_name = compute.cuda.silu.op_name, .embedded_symbol = compute.cuda.silu.embedded_symbol },
     .{ .slot = .silu_mul, .op_name = compute.cuda.silu_mul.op_name, .embedded_symbol = compute.cuda.silu_mul.embedded_symbol },
+    .{ .slot = .gelu_mul, .op_name = compute.cuda.gelu_mul.op_name, .embedded_symbol = compute.cuda.gelu_mul.embedded_symbol },
     .{ .slot = .shortconv_step, .op_name = compute.cuda.shortconv_step.op_name, .embedded_symbol = compute.cuda.shortconv_step.embedded_symbol },
     .{ .slot = .argmax, .op_name = compute.cuda.argmax.op_name, .embedded_symbol = compute.cuda.argmax.embedded_symbol },
     .{ .slot = .matvec_f16, .op_name = compute.cuda.matvec_u16.op_name_f16, .embedded_symbol = compute.cuda.matvec_u16.embedded_symbol_f16 },
@@ -466,8 +468,12 @@ const AttentionMlpBlockRuntime = struct {
     q_dim: usize,
     kv_dim: usize,
     d_ff: usize,
+    sliding_window: usize,
+    is_causal: bool,
     ln1_weight: DeviceTensor,
     ln2_weight: DeviceTensor,
+    pre_ffn_norm_weight: ?DeviceTensor = null,
+    post_ffn_norm_weight: ?DeviceTensor = null,
     q_norm_weight: ?DeviceTensor = null,
     k_norm_weight: ?DeviceTensor = null,
     q_proj: LinearWeight,
@@ -484,6 +490,8 @@ const AttentionMlpBlockRuntime = struct {
     fn deinit(self: *AttentionMlpBlockRuntime, device: *compute.cuda.Device) void {
         self.v_cache.deinit(device);
         self.k_cache.deinit(device);
+        if (self.post_ffn_norm_weight) |*w| w.deinit(device);
+        if (self.pre_ffn_norm_weight) |*w| w.deinit(device);
         if (self.k_norm_weight) |*w| w.deinit(device);
         if (self.q_norm_weight) |*w| w.deinit(device);
         self.w3.deinit(device);
@@ -662,6 +670,40 @@ const BlockRuntime = struct {
                         return error.UnsupportedModel;
                     }
 
+                    var pre_ffn_norm_weight: ?DeviceTensor = null;
+                    if (attn.pre_ffn_norm) |pre_ffn_norm| {
+                        var pre_ffn = try uploadTensor(device, allocator, pre_ffn_norm);
+                        errdefer pre_ffn.deinit(device);
+                        if (!(pre_ffn.rows == d_model and pre_ffn.cols == 1)) {
+                            log.warn("inference", "CUDA block runtime pre_ffn_norm shape unsupported", .{
+                                .layer = layer_idx,
+                                .rows = pre_ffn.rows,
+                                .cols = pre_ffn.cols,
+                                .d_model = d_model,
+                            });
+                            return error.UnsupportedModel;
+                        }
+                        pre_ffn_norm_weight = pre_ffn;
+                    }
+                    errdefer if (pre_ffn_norm_weight) |*w| w.deinit(device);
+
+                    var post_ffn_norm_weight: ?DeviceTensor = null;
+                    if (attn.post_ffn_norm) |post_ffn_norm| {
+                        var post_ffn = try uploadTensor(device, allocator, post_ffn_norm);
+                        errdefer post_ffn.deinit(device);
+                        if (!(post_ffn.rows == d_model and post_ffn.cols == 1)) {
+                            log.warn("inference", "CUDA block runtime post_ffn_norm shape unsupported", .{
+                                .layer = layer_idx,
+                                .rows = post_ffn.rows,
+                                .cols = post_ffn.cols,
+                                .d_model = d_model,
+                            });
+                            return error.UnsupportedModel;
+                        }
+                        post_ffn_norm_weight = post_ffn;
+                    }
+                    errdefer if (post_ffn_norm_weight) |*w| w.deinit(device);
+
                     var q_norm_weight: ?DeviceTensor = null;
                     if (attn.q_norm) |q_norm| {
                         var qn = try uploadTensor(device, allocator, q_norm);
@@ -774,6 +816,8 @@ const BlockRuntime = struct {
 
                     const layer_norm_bytes = ln1_weight.byteSize() +
                         ln2_weight.byteSize() +
+                        (if (pre_ffn_norm_weight) |w| w.byteSize() else 0) +
+                        (if (post_ffn_norm_weight) |w| w.byteSize() else 0) +
                         (if (q_norm_weight) |w| w.byteSize() else 0) +
                         (if (k_norm_weight) |w| w.byteSize() else 0);
                     norm_weight_bytes = std.math.add(usize, norm_weight_bytes, layer_norm_bytes) catch return error.InvalidArgument;
@@ -794,8 +838,12 @@ const BlockRuntime = struct {
                         .q_dim = q_proj_dev.cols(),
                         .kv_dim = k_proj_dev.cols(),
                         .d_ff = d_ff,
+                        .sliding_window = attn.sliding_window,
+                        .is_causal = attn.is_causal,
                         .ln1_weight = ln1_weight,
                         .ln2_weight = ln2_weight,
+                        .pre_ffn_norm_weight = pre_ffn_norm_weight,
+                        .post_ffn_norm_weight = post_ffn_norm_weight,
                         .q_norm_weight = q_norm_weight,
                         .k_norm_weight = k_norm_weight,
                         .q_proj = q_proj_dev,
@@ -1127,6 +1175,8 @@ pub const CudaBackend = struct {
     silu_source: ?compute.cuda.registry.KernelSource = null,
     silu_mul_function: ?compute.cuda.Function = null,
     silu_mul_source: ?compute.cuda.registry.KernelSource = null,
+    gelu_mul_function: ?compute.cuda.Function = null,
+    gelu_mul_source: ?compute.cuda.registry.KernelSource = null,
     shortconv_step_function: ?compute.cuda.Function = null,
     shortconv_step_source: ?compute.cuda.registry.KernelSource = null,
     argmax_function: ?compute.cuda.Function = null,
@@ -1210,6 +1260,8 @@ pub const CudaBackend = struct {
         }
         backend.attention_scale = if (loaded.config.attention_multiplier > 0.0)
             loaded.config.attention_multiplier
+        else if (loaded.config.query_pre_attn_scalar > 0.0)
+            1.0 / std.math.sqrt(loaded.config.query_pre_attn_scalar)
         else
             1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
         backend.norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else prototype_eps;
@@ -1311,6 +1363,7 @@ pub const CudaBackend = struct {
             .attn_score_buffers = @as(u8, @intFromBool(backend.prototype.attn_scores_dev != null and backend.prototype.attn_probs_dev != null)),
             .silu_kernel = @as(u8, @intFromBool(backend.silu_function != null)),
             .silu_mul_kernel = @as(u8, @intFromBool(backend.silu_mul_function != null)),
+            .gelu_mul_kernel = @as(u8, @intFromBool(backend.gelu_mul_function != null)),
             .shortconv_step_kernel = @as(u8, @intFromBool(backend.shortconv_step_function != null)),
             .argmax_kernel = @as(u8, @intFromBool(backend.argmax_function != null)),
             .matvec_f16_kernel = @as(u8, @intFromBool(backend.matvec_f16_function != null)),
@@ -1698,7 +1751,11 @@ pub const CudaBackend = struct {
 
         const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
         const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
-        const silu_mul_function = self.silu_mul_function orelse return error.CudaKernelUnavailable;
+        if (self.loaded.config.use_gelu) {
+            if (self.gelu_mul_function == null) return error.CudaKernelUnavailable;
+        } else {
+            if (self.silu_mul_function == null) return error.CudaKernelUnavailable;
+        }
         const shortconv_step_function = self.shortconv_step_function orelse return error.CudaKernelUnavailable;
         const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
         const cast_f32_to_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
@@ -1746,7 +1803,11 @@ pub const CudaBackend = struct {
         const n_kv_heads_u32: u32 = @intCast(self.n_kv_heads);
         const seq_len_u32: u32 = @intCast(position + 1);
         const position_u32: u32 = @intCast(position);
-        const theta: f32 = if (self.loaded.config.rope_theta > 1.0) self.loaded.config.rope_theta else 10000.0;
+        const global_rope_theta: f32 = if (self.loaded.config.rope_theta > 1.0) self.loaded.config.rope_theta else 10000.0;
+        const local_rope_theta: f32 = if (self.loaded.config.rope_local_theta > 1.0 and self.loaded.config.sliding_window > 0)
+            self.loaded.config.rope_local_theta
+        else
+            global_rope_theta;
 
         if (hidden_override) |hidden| {
             if (hidden.len != self.d_model) return error.InvalidArgument;
@@ -1778,6 +1839,7 @@ pub const CudaBackend = struct {
         while (layer_idx < layer_limit) : (layer_idx += 1) {
             const layer = &self.block_runtime.blocks[layer_idx];
             if (layer.attention_mlp) |*block| {
+                const layer_rope_theta = if (block.sliding_window > 0) local_rope_theta else global_rope_theta;
                 try compute.cuda.rmsnorm.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -1836,7 +1898,7 @@ pub const CudaBackend = struct {
                         head_dim_u32,
                         rope_dim_u32,
                         position_u32,
-                        theta,
+                        layer_rope_theta,
                     );
                 }
                 const use_k_write_fused = kv_cache_dtype_fp16 and (kv_write_f16_function != null or rope_store_f16_function != null);
@@ -1850,7 +1912,7 @@ pub const CudaBackend = struct {
                         head_dim_u32,
                         rope_dim_u32,
                         position_u32,
-                        theta,
+                        layer_rope_theta,
                     );
                 }
 
@@ -1873,7 +1935,7 @@ pub const CudaBackend = struct {
                             head_dim_u32,
                             rope_dim_u32,
                             position_u32,
-                            theta,
+                            layer_rope_theta,
                         );
                     } else if (rope_store_f16_function) |rope_store_f16| {
                         try compute.cuda.rope_store_f16.runWithFunction(
@@ -1886,7 +1948,7 @@ pub const CudaBackend = struct {
                             head_dim_u32,
                             rope_dim_u32,
                             position_u32,
-                            theta,
+                            layer_rope_theta,
                         );
                         try compute.cuda.cast_f32_to_f16.runWithFunction(
                             &self.kernel_arg_pack,
@@ -1955,45 +2017,93 @@ pub const CudaBackend = struct {
                     kv_groups_u32,
                     rope_dim_u32,
                     position_u32,
-                    theta,
+                    layer_rope_theta,
                 );
 
                 try self.linearForward(&self.prototype.attn_context_dev, &block.o_proj, &self.prototype.attn_out_dev);
-                try compute.cuda.vector_add.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    vector_add_function,
-                    &self.prototype.input_dev,
-                    &self.prototype.attn_out_dev,
-                    &self.prototype.input_dev,
-                    d_model_u32,
-                );
+                if (block.pre_ffn_norm_weight != null or block.post_ffn_norm_weight != null) {
+                    // Extended norm topology (e.g. Gemma-family):
+                    // attn_out -> post_attn_norm(ln2) -> add residual -> pre_ffn_norm -> mlp -> post_ffn_norm -> add residual
+                    try compute.cuda.rmsnorm.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rmsnorm_function,
+                        &self.prototype.attn_out_dev,
+                        &block.ln2_weight.buffer,
+                        &self.prototype.attn_out_dev,
+                        1,
+                        d_model_u32,
+                        self.norm_eps,
+                        self.loaded.runtime.weight_offset,
+                    );
+                    try compute.cuda.vector_add.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        vector_add_function,
+                        &self.prototype.input_dev,
+                        &self.prototype.attn_out_dev,
+                        &self.prototype.input_dev,
+                        d_model_u32,
+                    );
 
-                try compute.cuda.rmsnorm.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    rmsnorm_function,
-                    &self.prototype.input_dev,
-                    &block.ln2_weight.buffer,
-                    &self.prototype.norm_out_dev,
-                    1,
-                    d_model_u32,
-                    self.norm_eps,
-                    self.loaded.runtime.weight_offset,
-                );
+                    const pre_ffn_norm = if (block.pre_ffn_norm_weight) |*w| &w.buffer else &block.ln2_weight.buffer;
+                    try compute.cuda.rmsnorm.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rmsnorm_function,
+                        &self.prototype.input_dev,
+                        pre_ffn_norm,
+                        &self.prototype.norm_out_dev,
+                        1,
+                        d_model_u32,
+                        self.norm_eps,
+                        self.loaded.runtime.weight_offset,
+                    );
+                } else {
+                    // Standard topology:
+                    // attn_out -> add residual -> ln2 -> mlp -> add residual
+                    try compute.cuda.vector_add.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        vector_add_function,
+                        &self.prototype.input_dev,
+                        &self.prototype.attn_out_dev,
+                        &self.prototype.input_dev,
+                        d_model_u32,
+                    );
+
+                    try compute.cuda.rmsnorm.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rmsnorm_function,
+                        &self.prototype.input_dev,
+                        &block.ln2_weight.buffer,
+                        &self.prototype.norm_out_dev,
+                        1,
+                        d_model_u32,
+                        self.norm_eps,
+                        self.loaded.runtime.weight_offset,
+                    );
+                }
 
                 _ = try self.runGateUpProjectionWithWeights(&self.prototype.norm_out_dev, &block.w1, &block.w3);
                 const d_ff_u32: u32 = @intCast(block.d_ff);
-                try compute.cuda.silu_mul.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    silu_mul_function,
-                    &self.prototype.ffn_gate_dev,
-                    &self.prototype.ffn_up_dev,
-                    &self.prototype.ffn_mul_dev,
-                    d_ff_u32,
-                );
+                try self.runFfnActivationMul(d_ff_u32);
                 try self.linearForward(&self.prototype.ffn_mul_dev, &block.w2, &self.prototype.ffn_down_dev);
+                if (block.post_ffn_norm_weight) |*post_ffn_norm| {
+                    try compute.cuda.rmsnorm.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rmsnorm_function,
+                        &self.prototype.ffn_down_dev,
+                        &post_ffn_norm.buffer,
+                        &self.prototype.ffn_down_dev,
+                        1,
+                        d_model_u32,
+                        self.norm_eps,
+                        self.loaded.runtime.weight_offset,
+                    );
+                }
                 try compute.cuda.vector_add.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -2064,15 +2174,7 @@ pub const CudaBackend = struct {
                     );
                     _ = try self.runGateUpProjectionWithWeights(&self.prototype.norm_out_dev, &block.ffn_w1.?, &block.ffn_w3.?);
                     const d_ff_u32: u32 = @intCast(block.d_ff);
-                    try compute.cuda.silu_mul.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        silu_mul_function,
-                        &self.prototype.ffn_gate_dev,
-                        &self.prototype.ffn_up_dev,
-                        &self.prototype.ffn_mul_dev,
-                        d_ff_u32,
-                    );
+                    try self.runFfnActivationMul(d_ff_u32);
                     try self.linearForward(&self.prototype.ffn_mul_dev, &block.ffn_w2.?, &self.prototype.ffn_down_dev);
                     try compute.cuda.vector_add.runWithFunction(
                         &self.kernel_arg_pack,
@@ -2302,6 +2404,33 @@ pub const CudaBackend = struct {
         return .unfused;
     }
 
+    fn runFfnActivationMul(self: *CudaBackend, count: u32) !void {
+        if (self.loaded.config.use_gelu) {
+            const gelu_mul_function = self.gelu_mul_function orelse return error.CudaKernelUnavailable;
+            try compute.cuda.gelu_mul.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                gelu_mul_function,
+                &self.prototype.ffn_gate_dev,
+                &self.prototype.ffn_up_dev,
+                &self.prototype.ffn_mul_dev,
+                count,
+            );
+            return;
+        }
+
+        const silu_mul_function = self.silu_mul_function orelse return error.CudaKernelUnavailable;
+        try compute.cuda.silu_mul.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            silu_mul_function,
+            &self.prototype.ffn_gate_dev,
+            &self.prototype.ffn_up_dev,
+            &self.prototype.ffn_mul_dev,
+            count,
+        );
+    }
+
     fn runAttentionContext(
         self: *CudaBackend,
         block: *const AttentionMlpBlockRuntime,
@@ -2315,6 +2444,23 @@ pub const CudaBackend = struct {
         position_u32: u32,
         theta: f32,
     ) !AttentionPath {
+        var effective_seq_len_u32 = seq_len_u32;
+        var k_cache_view = block.k_cache;
+        var v_cache_view = block.v_cache;
+
+        if (block.sliding_window > 0 and block.is_causal) {
+            const window_u32 = std.math.cast(u32, block.sliding_window) orelse std.math.maxInt(u32);
+            if (effective_seq_len_u32 > window_u32) {
+                const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
+                const row_bytes = std.math.mul(usize, @as(usize, kv_dim_u32), kv_elem_bytes) catch return error.InvalidArgument;
+                const start_row = effective_seq_len_u32 - window_u32;
+                const start_offset = std.math.mul(usize, @as(usize, start_row), row_bytes) catch return error.InvalidArgument;
+                k_cache_view = try bufferSlice(&block.k_cache, start_offset, block.k_cache.size - start_offset);
+                v_cache_view = try bufferSlice(&block.v_cache, start_offset, block.v_cache.size - start_offset);
+                effective_seq_len_u32 = window_u32;
+            }
+        }
+
         if (kv_cache_dtype_fp16) {
             if (enable_fused_attention_f16_kv and head_dim_u32 <= max_supported_fused_f16_kv_head_dim and kernels.attn_fused_heads_f16_kv_function != null) {
                 try compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
@@ -2322,11 +2468,11 @@ pub const CudaBackend = struct {
                     &self.device,
                     kernels.attn_fused_heads_f16_kv_function.?,
                     &self.prototype.attn_q_dev,
-                    &block.k_cache,
-                    &block.v_cache,
+                    &k_cache_view,
+                    &v_cache_view,
                     &self.prototype.attn_context_dev,
                     @intCast(self.n_heads),
-                    seq_len_u32,
+                    effective_seq_len_u32,
                     kv_dim_u32,
                     kv_groups_u32,
                     head_dim_u32,
@@ -2345,10 +2491,10 @@ pub const CudaBackend = struct {
                 &self.device,
                 kernels.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 &self.prototype.attn_q_dev,
-                &block.k_cache,
+                &k_cache_view,
                 attn_scores_dev,
                 @intCast(self.n_heads),
-                seq_len_u32,
+                effective_seq_len_u32,
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
@@ -2361,17 +2507,17 @@ pub const CudaBackend = struct {
                 attn_scores_dev,
                 attn_probs_dev,
                 @intCast(self.n_heads),
-                seq_len_u32,
+                effective_seq_len_u32,
             );
             try compute.cuda.attn_weighted_sum_heads_f16_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 attn_probs_dev,
-                &block.v_cache,
+                &v_cache_view,
                 &self.prototype.attn_context_dev,
                 @intCast(self.n_heads),
-                seq_len_u32,
+                effective_seq_len_u32,
                 kv_dim_u32,
                 kv_groups_u32,
                 head_dim_u32,
@@ -2401,9 +2547,9 @@ pub const CudaBackend = struct {
                 &self.device,
                 attn_scores_function,
                 &q_head,
-                &block.k_cache,
+                &k_cache_view,
                 attn_scores_dev,
-                seq_len_u32,
+                effective_seq_len_u32,
                 kv_dim_u32,
                 kv_offset_u32,
                 head_dim_u32,
@@ -2415,16 +2561,16 @@ pub const CudaBackend = struct {
                 kernels.softmax_function,
                 attn_scores_dev,
                 attn_probs_dev,
-                seq_len_u32,
+                effective_seq_len_u32,
             );
             try compute.cuda.attn_weighted_sum.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 attn_weighted_sum_function,
                 attn_probs_dev,
-                &block.v_cache,
+                &v_cache_view,
                 &ctx_head,
-                seq_len_u32,
+                effective_seq_len_u32,
                 kv_dim_u32,
                 kv_offset_u32,
                 head_dim_u32,
@@ -2456,6 +2602,7 @@ pub const CudaBackend = struct {
 
         if (q.rows != self.d_model or k.rows != self.d_model or v.rows != self.d_model) return false;
         if (q.scales_dtype_tag != k.scales_dtype_tag or q.scales_dtype_tag != v.scales_dtype_tag) return false;
+        if (q.cols != k.cols or q.cols != v.cols) return false;
         if (q.cols > std.math.maxInt(u32) or
             k.cols > std.math.maxInt(u32) or
             v.cols > std.math.maxInt(u32) or
@@ -2514,6 +2661,7 @@ pub const CudaBackend = struct {
         };
         if (q.rows != self.d_model or k.rows != self.d_model or v.rows != self.d_model) return false;
         if (q.dtype != k.dtype or q.dtype != v.dtype) return false;
+        if (q.cols != k.cols or q.cols != v.cols) return false;
         if (q.cols > std.math.maxInt(u32) or
             k.cols > std.math.maxInt(u32) or
             v.cols > std.math.maxInt(u32) or
@@ -2758,6 +2906,10 @@ pub const CudaBackend = struct {
             .silu_mul => {
                 self.silu_mul_function = resolved.function;
                 self.silu_mul_source = resolved.source;
+            },
+            .gelu_mul => {
+                self.gelu_mul_function = resolved.function;
+                self.gelu_mul_source = resolved.source;
             },
             .shortconv_step => {
                 self.shortconv_step_function = resolved.function;

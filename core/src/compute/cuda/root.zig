@@ -32,6 +32,7 @@ pub const attn_weighted_sum_f16_kv = @import("attn_weighted_sum_f16_kv.zig");
 pub const attn_weighted_sum_heads_f16_kv = @import("attn_weighted_sum_heads_f16_kv.zig");
 pub const silu = @import("silu.zig");
 pub const silu_mul = @import("silu_mul.zig");
+pub const gelu_mul = @import("gelu_mul.zig");
 pub const argmax = @import("argmax.zig");
 pub const matvec_u16 = @import("matvec_u16.zig");
 pub const matvec_u16_gate_up = @import("matvec_u16_gate_up.zig");
@@ -83,6 +84,7 @@ test {
     _ = attn_weighted_sum_heads_f16_kv;
     _ = silu;
     _ = silu_mul;
+    _ = gelu_mul;
     _ = argmax;
     _ = matvec_u16;
     _ = matvec_u16_gate_up;

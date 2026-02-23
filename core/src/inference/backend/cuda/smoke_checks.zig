@@ -78,6 +78,7 @@ pub fn runKernelSmoke(backend: anytype) !void {
         backend.attn_weighted_sum_heads_f16_kv_function == null or
         backend.silu_function == null or
         backend.silu_mul_function == null or
+        backend.gelu_mul_function == null or
         backend.shortconv_step_function == null or
         backend.argmax_function == null or
         backend.matvec_f16_function == null or
@@ -152,6 +153,12 @@ pub fn runKernelSmoke(backend: anytype) !void {
         &backend.device,
         backend.silu_mul_function.?,
         backend.silu_mul_source orelse .embedded_module,
+    );
+    try runGeluMulSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.gelu_mul_function.?,
+        backend.gelu_mul_source orelse .embedded_module,
     );
     try runShortConvStepSmoke(
         &backend.kernel_arg_pack,
@@ -720,6 +727,57 @@ fn runSiluMulSmoke(
     }
 
     log.info("inference", "CUDA silu_mul smoke passed", .{
+        .n = gate.len,
+        .source = @tagName(source),
+        .out0 = actual[0],
+    });
+}
+
+fn runGeluMulSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const gate = [_]f32{ -1.0, 0.0, 1.0, 2.0 };
+    const up = [_]f32{ 2.0, 3.0, 4.0, 5.0 };
+    var expected = [_]f32{0.0} ** gate.len;
+    var actual = [_]f32{0.0} ** gate.len;
+
+    const sqrt_2_over_pi: f32 = 0.7978845608028654;
+    const coeff: f32 = 0.044715;
+    for (gate, up, 0..) |g, u, idx| {
+        const x3 = g * g * g;
+        const inner = sqrt_2_over_pi * (g + coeff * x3);
+        const gelu_g = 0.5 * g * (1.0 + std.math.tanh(inner));
+        expected[idx] = gelu_g * u;
+    }
+
+    var gate_dev = try device.allocBuffer(gate.len * @sizeOf(f32));
+    defer gate_dev.deinit(device);
+    var up_dev = try device.allocBuffer(up.len * @sizeOf(f32));
+    defer up_dev.deinit(device);
+    var out_dev = try device.allocBuffer(actual.len * @sizeOf(f32));
+    defer out_dev.deinit(device);
+
+    try gate_dev.upload(device, std.mem.sliceAsBytes(gate[0..]));
+    try up_dev.upload(device, std.mem.sliceAsBytes(up[0..]));
+    try compute.cuda.gelu_mul.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &gate_dev,
+        &up_dev,
+        &out_dev,
+        @intCast(gate.len),
+    );
+    try out_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (expected, actual) |want, got| {
+        if (@abs(want - got) > 0.001) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA gelu_mul smoke passed", .{
         .n = gate.len,
         .source = @tagName(source),
         .out0 = actual[0],
