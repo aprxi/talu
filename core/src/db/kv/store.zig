@@ -55,6 +55,15 @@ pub const EntryRecord = struct {
     }
 };
 
+pub const ValueRecord = struct {
+    value: []u8,
+    updated_at_ms: i64,
+
+    pub fn deinit(self: *ValueRecord, allocator: Allocator) void {
+        allocator.free(self.value);
+    }
+};
+
 /// KVStore stores latest key/value state in-memory and appends every mutation.
 /// Thread safety: NOT thread-safe (single-writer lock semantics in Writer).
 pub const KVStore = struct {
@@ -124,6 +133,14 @@ pub const KVStore = struct {
     pub fn getCopy(self: *KVStore, allocator: Allocator, key: []const u8) !?[]u8 {
         const value = self.values.get(key) orelse return null;
         return try allocator.dupe(u8, value.value);
+    }
+
+    pub fn getEntryCopy(self: *KVStore, allocator: Allocator, key: []const u8) !?ValueRecord {
+        const value = self.values.get(key) orelse return null;
+        return .{
+            .value = try allocator.dupe(u8, value.value),
+            .updated_at_ms = value.updated_at_ms,
+        };
     }
 
     pub fn put(self: *KVStore, key: []const u8, value: []const u8) !void {
@@ -727,6 +744,24 @@ test "KVStore.put overwrites existing value" {
     const v = (try store.getCopy(std.testing.allocator, "k")).?;
     defer std.testing.allocator.free(v);
     try std.testing.expectEqualStrings("v2", v);
+}
+
+test "KVStore.getEntryCopy returns value with updated_at_ms" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root);
+
+    var store = try KVStore.init(std.testing.allocator, root, "kv_state_test");
+    defer store.deinit();
+
+    try store.put("k", "v");
+
+    var entry = (try store.getEntryCopy(std.testing.allocator, "k")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("v", entry.value);
+    try std.testing.expect(entry.updated_at_ms > 0);
 }
 
 test "KVStore.compact rewrites manifest to current active state only" {

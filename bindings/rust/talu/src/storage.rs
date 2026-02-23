@@ -422,7 +422,10 @@ impl StorageHandle {
         // Call C API
         // SAFETY: path_cstr and session_id_cstr are valid
         let result = unsafe {
-            talu_sys::talu_db_table_session_delete(self.path_cstr.as_ptr(), session_id_cstr.as_ptr())
+            talu_sys::talu_db_table_session_delete(
+                self.path_cstr.as_ptr(),
+                session_id_cstr.as_ptr(),
+            )
         };
 
         if result != ERROR_CODE_OK {

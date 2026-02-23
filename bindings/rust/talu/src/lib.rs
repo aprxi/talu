@@ -89,7 +89,7 @@ pub use file::{
     FileInfo, FileKind, FitMode, ImageFormat, ImageInfo, Limits as FileLimits, OutputFormat,
     ResizeFilter, ResizeOptions, TransformOptions as FileTransformOptions, TransformResult,
 };
-pub use kv::{KvEntry, KvError, KvHandle};
+pub use kv::{KvEntry, KvError, KvHandle, KvValue};
 pub use logging::{LogFormat, LogLevel};
 pub use model::{GenerationConfigInfo, ModelInfo, QuantMethod};
 pub use repo::{

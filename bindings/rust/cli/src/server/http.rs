@@ -535,14 +535,40 @@ impl Service<Request<Incoming>> for Router {
                                 .unwrap()
                         }
                         // DB KV plane endpoints
-                        (Method::GET, "/v1/db/kv/pins") => {
+                        (Method::GET, p)
+                            if p.starts_with("/v1/db/kv/namespaces/")
+                                && p.ends_with("/entries") =>
+                        {
                             db::kv::handle_list(state, req, auth).await
                         }
-                        (Method::POST, "/v1/db/kv/pins") => {
+                        (Method::PUT, p)
+                            if p.starts_with("/v1/db/kv/namespaces/")
+                                && p.contains("/entries/") =>
+                        {
                             db::kv::handle_put(state, req, auth).await
                         }
-                        (Method::DELETE, p) if p.starts_with("/v1/db/kv/pins/") => {
+                        (Method::GET, p)
+                            if p.starts_with("/v1/db/kv/namespaces/")
+                                && p.contains("/entries/") =>
+                        {
+                            db::kv::handle_get(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/db/kv/namespaces/")
+                                && p.contains("/entries/") =>
+                        {
                             db::kv::handle_delete(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.starts_with("/v1/db/kv/namespaces/") && p.ends_with("/flush") =>
+                        {
+                            db::kv::handle_flush(state, req, auth).await
+                        }
+                        (Method::POST, p)
+                            if p.starts_with("/v1/db/kv/namespaces/")
+                                && p.ends_with("/compact") =>
+                        {
+                            db::kv::handle_compact(state, req, auth).await
                         }
                         // DB SQL plane endpoints
                         (Method::POST, "/v1/db/sql/query") => {

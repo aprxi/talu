@@ -63,7 +63,11 @@ impl ChatHandle {
 
         // SAFETY: self.ptr is a valid chat handle; CStrings are valid.
         let rc = unsafe {
-            talu_sys::talu_db_ops_set_storage_db(self.ptr, c_db_path.as_ptr(), c_session_id.as_ptr())
+            talu_sys::talu_db_ops_set_storage_db(
+                self.ptr,
+                c_db_path.as_ptr(),
+                c_session_id.as_ptr(),
+            )
         };
 
         if rc != 0 {

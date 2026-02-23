@@ -9,28 +9,28 @@ const ERROR_CODE_OK: i32 = 0;
 const ERROR_CODE_RESOURCE_BUSY: i32 = 701;
 
 unsafe extern "C" {
-    #[link_name = "talu_db_kv_init"]
+    #[link_name = "talu_repo_meta_init"]
     fn talu_repo_meta_init_raw(db_path: *const c_char, out_handle: *mut *mut c_void) -> c_int;
-    #[link_name = "talu_db_kv_free"]
+    #[link_name = "talu_repo_meta_free"]
     fn talu_repo_meta_free_raw(handle: *mut c_void);
-    #[link_name = "talu_db_kv_put"]
+    #[link_name = "talu_repo_meta_pin"]
     fn talu_repo_meta_pin_raw(handle: *mut c_void, model_uri: *const c_char) -> c_int;
-    #[link_name = "talu_db_kv_delete"]
+    #[link_name = "talu_repo_meta_unpin"]
     fn talu_repo_meta_unpin_raw(handle: *mut c_void, model_uri: *const c_char) -> c_int;
-    #[link_name = "talu_db_kv_update_size"]
+    #[link_name = "talu_repo_meta_update_size"]
     fn talu_repo_meta_update_size_raw(
         handle: *mut c_void,
         model_uri: *const c_char,
         size_bytes: u64,
     ) -> c_int;
-    #[link_name = "talu_db_kv_clear_size"]
+    #[link_name = "talu_repo_meta_clear_size"]
     fn talu_repo_meta_clear_size_raw(handle: *mut c_void, model_uri: *const c_char) -> c_int;
-    #[link_name = "talu_db_kv_list"]
+    #[link_name = "talu_repo_meta_list_pins"]
     fn talu_repo_meta_list_pins_raw(
         handle: *mut c_void,
         out_list: *mut talu_sys::CPinList,
     ) -> c_int;
-    #[link_name = "talu_db_kv_free_list"]
+    #[link_name = "talu_repo_meta_free_list"]
     fn talu_repo_meta_free_list_raw(list: *mut talu_sys::CPinList);
 }
 

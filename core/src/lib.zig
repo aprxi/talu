@@ -385,6 +385,18 @@ comptime {
     _ = &capi.talu_db_blob_stream_total_size;
     _ = &capi.talu_db_blob_stream_close;
 
+    // KV API (generic key/value namespace primitives)
+    _ = &capi.talu_db_kv_init;
+    _ = &capi.talu_db_kv_free;
+    _ = &capi.talu_db_kv_put;
+    _ = &capi.talu_db_kv_get;
+    _ = &capi.talu_db_kv_delete;
+    _ = &capi.talu_db_kv_list;
+    _ = &capi.talu_db_kv_free_value;
+    _ = &capi.talu_db_kv_free_list;
+    _ = &capi.talu_db_kv_flush;
+    _ = &capi.talu_db_kv_compact;
+
     // Vector DB idempotent write API
     _ = &capi.talu_db_vector_append_idempotent_ex;
     _ = &capi.talu_db_vector_upsert_idempotent_ex;

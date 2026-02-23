@@ -101,6 +101,12 @@ use crate::server::{
         db::vector::handle_compact_collection,
         db::vector::handle_build_collection_indexes,
         db::vector::handle_collection_changes,
+        db::kv::handle_list,
+        db::kv::handle_put,
+        db::kv::handle_get,
+        db::kv::handle_delete,
+        db::kv::handle_flush,
+        db::kv::handle_compact,
         // Plugins
         plugins::handle_list,
         // Proxy
@@ -208,6 +214,11 @@ use crate::server::{
         db::vector::BuildIndexesResponse,
         db::vector::ChangeEventResponse,
         db::vector::ChangesResponse,
+        db::kv::KvEntryResponse,
+        db::kv::KvListResponse,
+        db::kv::KvPutResponse,
+        db::kv::KvDeleteResponse,
+        db::kv::KvCompactResponse,
         // Plugins
         plugins::PluginEntry,
         plugins::PluginListResponse,

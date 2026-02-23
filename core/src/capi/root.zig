@@ -213,14 +213,20 @@ pub const CPinRecord = repo_meta.CPinRecord;
 pub const CPinList = repo_meta.CPinList;
 
 // Re-export unified DB kv plane symbols.
+pub const KvHandle = db_storage.KvHandle;
+pub const CKvValue = db_storage.CKvValue;
+pub const CKvEntry = db_storage.CKvEntry;
+pub const CKvList = db_storage.CKvList;
 pub const talu_db_kv_init = db_storage.talu_db_kv_init;
 pub const talu_db_kv_free = db_storage.talu_db_kv_free;
 pub const talu_db_kv_put = db_storage.talu_db_kv_put;
+pub const talu_db_kv_get = db_storage.talu_db_kv_get;
 pub const talu_db_kv_delete = db_storage.talu_db_kv_delete;
-pub const talu_db_kv_update_size = db_storage.talu_db_kv_update_size;
-pub const talu_db_kv_clear_size = db_storage.talu_db_kv_clear_size;
 pub const talu_db_kv_list = db_storage.talu_db_kv_list;
+pub const talu_db_kv_free_value = db_storage.talu_db_kv_free_value;
 pub const talu_db_kv_free_list = db_storage.talu_db_kv_free_list;
+pub const talu_db_kv_flush = db_storage.talu_db_kv_flush;
+pub const talu_db_kv_compact = db_storage.talu_db_kv_compact;
 
 // Re-export SQL C API functions.
 pub const talu_sql_query = sql_api.talu_sql_query;
