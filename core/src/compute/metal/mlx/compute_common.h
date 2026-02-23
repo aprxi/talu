@@ -21,6 +21,8 @@
 #include <chrono>
 #include <algorithm>
 #include <functional>
+#include <mutex>
+#include <unordered_set>
 
 using namespace mlx::core;
 
@@ -41,6 +43,9 @@ extern thread_local size_t g_pool_index;
 // Pool an array and return pointer (for returning to Zig).
 void* pool_array(array&& result);
 void* pool_array(const array& result);
+
+// Allocate a heap-owned array handle tracked for mlx_array_free().
+void* make_owned_array(array&& result);
 
 // ============================================================================
 // Pre-computed constants (avoid per-call allocations).

@@ -65,6 +65,7 @@ pub const MetalBackend = struct {
     slot_logits_buffer: []f32,
     decode_batch_cache_handles: []runtime_graph_mod.CacheHandle,
     decode_batch_shortconv_handles: []runtime_graph_mod.ShortConvCacheHandle,
+    decode_batch_mamba_handles: []runtime_graph_mod.MambaCacheHandle,
     decode_batch_tokens: []u32,
     decode_batch_positions: []usize,
     decode_batch_logits_handles: []graph.ArrayHandle,
@@ -208,6 +209,7 @@ pub const MetalBackend = struct {
             @intCast(self.config.max_seq_len),
         );
         slot_shortconv_cache.reset();
+        slot_mamba_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazy(
             self.allocator,
@@ -250,15 +252,17 @@ pub const MetalBackend = struct {
     ) !void {
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
+        const slot_mamba_cache = try self.slotMambaCache(slot_index);
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
-        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        const decode_model = self.decode_model orelse return error.InvalidState;
         const logits_handle = model_runtime.decodeStepLogits(
             decode_model,
             slot_cache.handle,
             slot_shortconv_cache.handle,
+            slot_mamba_cache.handle,
             token,
             effective_position,
         );
@@ -287,7 +291,7 @@ pub const MetalBackend = struct {
 
         // Create decode model for low-FFI decode optimization.
         try weights_trait.createDecodeModel(allocator, weight_handles, loaded.config);
-        if (weight_handles.decode_model == null) return error.DecodeModelUnavailable;
+        if (weight_handles.decode_model == null) return error.InvalidState;
 
         log.debug("inference", "Metal decode model selection", .{
             .decode_model = @as(u8, @intFromBool(weight_handles.decode_model != null)),
@@ -335,6 +339,8 @@ pub const MetalBackend = struct {
         errdefer allocator.free(decode_batch_cache_handles);
         const decode_batch_shortconv_handles = try allocator.alloc(runtime_graph_mod.ShortConvCacheHandle, max_batch_size);
         errdefer allocator.free(decode_batch_shortconv_handles);
+        const decode_batch_mamba_handles = try allocator.alloc(runtime_graph_mod.MambaCacheHandle, max_batch_size);
+        errdefer allocator.free(decode_batch_mamba_handles);
         const decode_batch_tokens = try allocator.alloc(u32, max_batch_size);
         errdefer allocator.free(decode_batch_tokens);
         const decode_batch_positions = try allocator.alloc(usize, max_batch_size);
@@ -358,6 +364,7 @@ pub const MetalBackend = struct {
             .slot_logits_buffer = slot_logits_buffer,
             .decode_batch_cache_handles = decode_batch_cache_handles,
             .decode_batch_shortconv_handles = decode_batch_shortconv_handles,
+            .decode_batch_mamba_handles = decode_batch_mamba_handles,
             .decode_batch_tokens = decode_batch_tokens,
             .decode_batch_positions = decode_batch_positions,
             .decode_batch_logits_handles = decode_batch_logits_handles,
@@ -373,6 +380,7 @@ pub const MetalBackend = struct {
         self.allocator.free(self.decode_batch_logits_handles);
         self.allocator.free(self.decode_batch_positions);
         self.allocator.free(self.decode_batch_tokens);
+        self.allocator.free(self.decode_batch_mamba_handles);
         self.allocator.free(self.decode_batch_shortconv_handles);
         self.allocator.free(self.decode_batch_cache_handles);
         self.allocator.free(self.slot_logits_buffer);
@@ -674,17 +682,19 @@ pub const MetalBackend = struct {
         if (results.len < requests.len) return error.InvalidArgument;
         if (requests.len > self.max_batch_size) return error.InvalidArgument;
 
-        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        const decode_model = self.decode_model orelse return error.InvalidState;
         for (requests, 0..) |request, idx| {
             const logits = try self.slotLogits(request.slot_index);
             const slot_cache = try self.slotCache(request.slot_index);
             const slot_shortconv_cache = try self.slotShortConvCache(request.slot_index);
+            const slot_mamba_cache = try self.slotMambaCache(request.slot_index);
             const slot_position = try self.slotPositionPtr(request.slot_index);
             const slot_rope_delta = try self.slotRopeDeltaPtr(request.slot_index);
             const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
 
             self.decode_batch_cache_handles[idx] = slot_cache.handle;
             self.decode_batch_shortconv_handles[idx] = slot_shortconv_cache.handle;
+            self.decode_batch_mamba_handles[idx] = slot_mamba_cache.handle;
             self.decode_batch_tokens[idx] = request.token;
             self.decode_batch_positions[idx] = effective_position;
             self.decode_batch_logits_handles[idx] = null;
@@ -699,6 +709,7 @@ pub const MetalBackend = struct {
             decode_model,
             self.decode_batch_cache_handles[0..requests.len],
             self.decode_batch_shortconv_handles[0..requests.len],
+            self.decode_batch_mamba_handles[0..requests.len],
             self.decode_batch_tokens[0..requests.len],
             self.decode_batch_positions[0..requests.len],
             self.decode_batch_logits_handles[0..requests.len],
@@ -730,7 +741,7 @@ pub const MetalBackend = struct {
         callback_data: ?*anyopaque,
     ) !usize {
         const env_batch_decode = std.process.hasEnvVar(self.allocator, "TALU_BATCH_DECODE") catch false;
-        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        const decode_model = self.decode_model orelse return error.InvalidState;
         const decode_plan = selectDecodePlan(env_batch_decode, callback);
         const decode_path = decodePathLabel(decode_plan.path);
         const batch_decode_enabled = isBatchDecodePath(decode_plan.path);
@@ -751,6 +762,7 @@ pub const MetalBackend = struct {
                     decode_model,
                     self.cache.handle,
                     self.shortconv_cache.handle,
+                    self.mamba_cache.handle,
                     first_token,
                     effective_start_position,
                     output_tokens.ptr,
@@ -805,11 +817,12 @@ pub const MetalBackend = struct {
 
         // Prime the pipeline
         const effective_start_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
-        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        const decode_model = self.decode_model orelse return error.InvalidState;
         model_runtime.pipelinePrime(
             decode_model,
             self.cache.handle,
             self.shortconv_cache.handle,
+            self.mamba_cache.handle,
             first_token,
             effective_start_position,
         );
@@ -825,6 +838,7 @@ pub const MetalBackend = struct {
                     decode_model,
                     self.cache.handle,
                     self.shortconv_cache.handle,
+                    self.mamba_cache.handle,
                     effective_position,
                 );
             } else {
@@ -833,6 +847,7 @@ pub const MetalBackend = struct {
                     decode_model,
                     self.cache.handle,
                     self.shortconv_cache.handle,
+                    self.mamba_cache.handle,
                 );
             }
             position_index += 1;

@@ -4,6 +4,7 @@
 // Also handles MLX initialization and memory cache management.
 
 #include "compute_common.h"
+#include "../device.h"
 
 // ============================================================================
 // Global state
@@ -12,6 +13,11 @@
 // Array pool - thread-local for safety
 thread_local std::deque<std::optional<array>> g_array_pool;
 thread_local size_t g_pool_index = 0;
+
+// Heap-owned handles created via make_owned_array()/array_from_* APIs.
+// Freed by mlx_array_free() and guarded for cross-thread lifecycle safety.
+static std::mutex g_owned_arrays_mu;
+static std::unordered_set<void*> g_owned_arrays;
 
 // Pre-computed constants
 const std::vector<int> g_transpose_perm = {0, 2, 1, 3};
@@ -24,20 +30,10 @@ const Shape g_slice_start = {0, 0, 0, 0};
 
 static struct Init {
     Init() {
-        if (metal::is_available()) {
-            // Set wired limit to max recommended working set
-            // Keeps static arrays pinned in GPU memory
-            auto info = metal::device_info();
-            auto it = info.find("max_recommended_working_set_size");
-            if (it != info.end()) {
-                size_t max_wired = std::get<size_t>(it->second);
-                set_wired_limit(max_wired);
-            }
-
-            // Create dedicated compute stream.
-            auto stream = new_stream(default_device());
-            set_default_stream(stream);
-        }
+        // Do not touch MLX Metal device APIs at static-init time.
+        // Some host setups can raise Objective-C exceptions before main(),
+        // which bypass C++ catch blocks and abort the process.
+        (void)metal_is_available;
 
         // Enable compilation mode for better operation fusion
         enable_compile();
@@ -61,6 +57,13 @@ void* pool_array(array&& result) {
 
 void* pool_array(const array& result) {
     return pool_array(array(result));  // Copy then move
+}
+
+void* make_owned_array(array&& result) {
+    auto* handle = new array(std::move(result));
+    std::lock_guard<std::mutex> lock(g_owned_arrays_mu);
+    g_owned_arrays.insert(handle);
+    return handle;
 }
 
 // ============================================================================
@@ -106,7 +109,7 @@ void* mlx_array_from_float32(const void* data, const size_t* shape, size_t ndim)
     auto vec_data = std::make_shared<std::vector<float>>(element_count);
     std::memcpy(vec_data->data(), data, element_count * sizeof(float));
     auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return new array(vec_data->data(), shape_dims, float32, deleter);
+    return make_owned_array(array(vec_data->data(), shape_dims, float32, deleter));
 }
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
@@ -121,7 +124,7 @@ void* mlx_array_from_uint32(const void* data, const size_t* shape, size_t ndim) 
     auto vec_data = std::make_shared<std::vector<uint32_t>>(element_count);
     std::memcpy(vec_data->data(), data, element_count * sizeof(uint32_t));
     auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return new array(vec_data->data(), shape_dims, uint32, deleter);
+    return make_owned_array(array(vec_data->data(), shape_dims, uint32, deleter));
 }
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
@@ -136,7 +139,7 @@ void* mlx_array_from_bfloat16(const void* data, const size_t* shape, size_t ndim
     auto vec_data = std::make_shared<std::vector<uint16_t>>(element_count);
     std::memcpy(vec_data->data(), data, element_count * sizeof(uint16_t));
     auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return new array(vec_data->data(), shape_dims, bfloat16, deleter);
+    return make_owned_array(array(vec_data->data(), shape_dims, bfloat16, deleter));
 }
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
@@ -151,7 +154,7 @@ void* mlx_array_from_float16(const void* data, const size_t* shape, size_t ndim)
     auto vec_data = std::make_shared<std::vector<uint16_t>>(element_count);
     std::memcpy(vec_data->data(), data, element_count * sizeof(uint16_t));
     auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return new array(vec_data->data(), shape_dims, float16, deleter);
+    return make_owned_array(array(vec_data->data(), shape_dims, float16, deleter));
 }
 
 void* mlx_array_from_uint8(const uint8_t* data, const size_t* shape, size_t ndim) {
@@ -163,12 +166,16 @@ void* mlx_array_from_uint8(const uint8_t* data, const size_t* shape, size_t ndim
     }
     auto vec_data = std::make_shared<std::vector<uint8_t>>(data, data + element_count);
     auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return new array(vec_data->data(), shape_dims, uint8, deleter);
+    return make_owned_array(array(vec_data->data(), shape_dims, uint8, deleter));
 }
 
 void mlx_array_free(void* arr) {
-    // No-op: pooled arrays managed by pool, weight arrays are long-lived
-    (void)arr;
+    if (arr == nullptr) return;
+    std::lock_guard<std::mutex> lock(g_owned_arrays_mu);
+    auto it = g_owned_arrays.find(arr);
+    if (it == g_owned_arrays.end()) return;
+    delete static_cast<array*>(arr);
+    g_owned_arrays.erase(it);
 }
 
 // ============================================================================

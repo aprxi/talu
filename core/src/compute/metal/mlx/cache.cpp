@@ -16,33 +16,20 @@ static int next_cache_capacity(const CacheLayer& layer, size_t required, int cur
     if (required == 0) return current_capacity;
 
     const size_t current = current_capacity > 0 ? static_cast<size_t>(current_capacity) : 0;
-    const size_t step = static_cast<size_t>(layer.step);
 
     if (layer.max_seq_len > 0) {
         const size_t max_cap = layer.max_seq_len;
         if (required > max_cap) {
             throw std::invalid_argument("[cache] kv cache capacity exceeded");
         }
-
-        size_t capacity = current;
-        if (capacity == 0) {
-            const size_t base = std::max(required, step);
-            capacity = std::min(max_cap, static_cast<size_t>(round_up_step(base, layer.step)));
-        }
-        while (capacity < required) {
-            const size_t doubled = capacity * 2;
-            if (doubled <= capacity) {
-                capacity = max_cap;
-                break;
-            }
-            capacity = std::min(max_cap, doubled);
-        }
-        if (capacity < required) {
-            throw std::invalid_argument("[cache] kv cache capacity exceeded");
-        }
-        return static_cast<int>(capacity);
+        // Fixed-capacity mode: allocate full context once to avoid periodic
+        // O(N) cache growth copies during long decode.
+        if (current == 0) return static_cast<int>(max_cap);
+        if (required > current) return static_cast<int>(max_cap);
+        return static_cast<int>(current);
     }
 
+    const size_t step = static_cast<size_t>(layer.step);
     size_t capacity = current;
     if (capacity == 0) {
         const size_t base = std::max(required, step);

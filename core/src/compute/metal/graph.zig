@@ -475,8 +475,9 @@ test "freeArray releases array handle without double-free" {
         try std.testing.expect(handles[i] != null);
     }
 
-    // Free all handles - memory should be properly managed
+    // Free all handles and free again - freeArray must be idempotent.
     for (handles) |h| {
+        freeArray(h);
         freeArray(h);
     }
 }

@@ -38,7 +38,7 @@ const col_type_hash: u32 = 4;
 const col_expires_at: u32 = 9;
 const col_payload: u32 = 20;
 
-const transient_destructor = sqlite.SQLITE_TRANSIENT;
+const heap_destructor: sqlite.sqlite3_destructor_type = sqlite.sqlite3_free;
 const idx_group_eq: c_int = 1 << 0;
 const idx_doc_type_eq: c_int = 1 << 1;
 
@@ -520,7 +520,14 @@ fn resultText(ctx: ?*sqlite.sqlite3_context, value: []const u8) void {
         sqlite.sqlite3_result_error_toobig(ctx);
         return;
     }
-    sqlite.sqlite3_result_text(ctx, value.ptr, @intCast(value.len), transient_destructor);
+    const raw = sqlite.sqlite3_malloc64(@intCast(value.len + 1)) orelse {
+        sqlite.sqlite3_result_error_nomem(ctx);
+        return;
+    };
+    const copied: [*]u8 = @ptrCast(raw);
+    @memcpy(copied[0..value.len], value);
+    copied[value.len] = 0;
+    sqlite.sqlite3_result_text(ctx, @ptrCast(copied), @intCast(value.len), heap_destructor);
 }
 
 fn xCreate(
