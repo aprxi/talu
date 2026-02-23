@@ -265,7 +265,7 @@ impl VectorStore {
         let rc = unsafe {
             talu_sys::talu_vector_store_append_ex(
                 self.ptr,
-                ids.as_ptr(),
+                ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
                 ids.len(),
                 dims,
@@ -308,7 +308,7 @@ impl VectorStore {
         let rc = unsafe {
             talu_sys::talu_vector_store_append_idempotent_ex(
                 self.ptr,
-                ids.as_ptr(),
+                ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
                 ids.len(),
                 dims,
@@ -354,7 +354,7 @@ impl VectorStore {
         let rc = unsafe {
             talu_sys::talu_vector_store_upsert_ex(
                 self.ptr,
-                ids.as_ptr(),
+                ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
                 ids.len(),
                 dims,
@@ -394,7 +394,7 @@ impl VectorStore {
         let rc = unsafe {
             talu_sys::talu_vector_store_upsert_idempotent_ex(
                 self.ptr,
-                ids.as_ptr(),
+                ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
                 ids.len(),
                 dims,
@@ -446,7 +446,7 @@ impl VectorStore {
         let rc = unsafe {
             talu_sys::talu_vector_store_delete_idempotent(
                 self.ptr,
-                ids.as_ptr(),
+                ids.as_ptr() as *mut c_void,
                 ids.len(),
                 key_hash,
                 request_hash,
@@ -670,7 +670,7 @@ impl VectorStore {
         unsafe {
             talu_sys::talu_vector_store_free_changes(
                 out_seqs as *mut c_void,
-                out_ops as *mut c_void,
+                out_ops,
                 out_ids as *mut c_void,
                 out_timestamps as *mut c_void,
                 out_count,

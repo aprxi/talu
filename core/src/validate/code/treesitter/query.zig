@@ -82,9 +82,10 @@ pub const Query = struct {
     }
 
     pub fn captureNameForId(self: *const Query, id: u32) []const u8 {
+        if (id >= self.captureCount()) return "";
         var length: u32 = 0;
         const ptr = c.ts_query_capture_name_for_id(self.handle, id, &length);
-        if (ptr == null or length == 0) return "";
+        if (ptr == null or length == 0 or length == std.math.maxInt(u32)) return "";
         return ptr[0..length];
     }
 

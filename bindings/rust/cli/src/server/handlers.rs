@@ -110,7 +110,9 @@ pub async fn handle_responses(
 
     // Log reproducible curl command at DEBUG for replay/debugging.
     if log::log_enabled!(target: "server::gen", log::Level::Debug) {
-        let host = parts.headers.get("host")
+        let host = parts
+            .headers
+            .get("host")
             .and_then(|v| v.to_str().ok())
             .unwrap_or("localhost:8258");
         let body_str = String::from_utf8_lossy(&body_bytes);
@@ -330,10 +332,7 @@ struct FileDocContent {
 /// pointing directly to the blob on disk, so the engine can read it zero-copy.
 ///
 /// Returns the (possibly modified) JSON string ready for `load_responses_json`.
-fn resolve_file_references(
-    input_json: &str,
-    storage_path: &std::path::Path,
-) -> Result<String> {
+fn resolve_file_references(input_json: &str, storage_path: &std::path::Path) -> Result<String> {
     let mut items: serde_json::Value =
         serde_json::from_str(input_json).context("failed to parse input JSON")?;
 
@@ -416,7 +415,10 @@ fn resolve_file_references(
                 _ => continue,
             };
 
-            let mime = meta.mime_type.as_deref().unwrap_or("application/octet-stream");
+            let mime = meta
+                .mime_type
+                .as_deref()
+                .unwrap_or("application/octet-stream");
             let is_image = meta.kind.as_deref() == Some("image") || mime.starts_with("image/");
 
             if is_image {
@@ -529,24 +531,27 @@ async fn generate_response(
 
     // Load bucket settings for fallback values (max_output_tokens + per-model overrides).
     // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
-    let fallback_settings = state.bucket_path.as_ref().map(|base| match auth_ctx {
-        Some(ctx) => base.join(&ctx.storage_prefix),
-        None => base.to_path_buf(),
-    }).and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
+    let fallback_settings = state
+        .bucket_path
+        .as_ref()
+        .map(|base| match auth_ctx {
+            Some(ctx) => base.join(&ctx.storage_prefix),
+            None => base.to_path_buf(),
+        })
+        .and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
 
     let max_output_tokens = request_max_output_tokens.or_else(|| {
-        fallback_settings.as_ref().and_then(|s| s.max_output_tokens.map(|v| v as i64))
+        fallback_settings
+            .as_ref()
+            .and_then(|s| s.max_output_tokens.map(|v| v as i64))
     });
 
     // Apply per-model sampling overrides as fallbacks when the request doesn't specify them.
-    let model_overrides = fallback_settings.as_ref()
+    let model_overrides = fallback_settings
+        .as_ref()
         .and_then(|s| s.models.get(&model_id).cloned());
-    let temperature = temperature.or_else(|| {
-        model_overrides.as_ref().and_then(|o| o.temperature)
-    });
-    let top_p = top_p.or_else(|| {
-        model_overrides.as_ref().and_then(|o| o.top_p)
-    });
+    let temperature = temperature.or_else(|| model_overrides.as_ref().and_then(|o| o.temperature));
+    let top_p = top_p.or_else(|| model_overrides.as_ref().and_then(|o| o.top_p));
 
     // If prompt_id is provided, fetch the document and extract system prompt.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
@@ -797,18 +802,16 @@ async fn generate_response(
 
     // Auto-generate a descriptive title for new conversations in the background.
     if is_new_conversation && auto_title {
-        let title_input = input_value.as_ref().and_then(|v| v.as_str()).map(|s| s.to_string());
+        let title_input = input_value
+            .as_ref()
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
         if let Some(input) = title_input {
             let title_backend = state.backend.clone();
             let title_bucket = bucket_path.clone();
             let title_session_id = session_id_for_response.clone();
             tokio::task::spawn_blocking(move || {
-                let _ = generate_title(
-                    &title_backend,
-                    &title_bucket,
-                    &title_session_id,
-                    &input,
-                );
+                let _ = generate_title(&title_backend, &title_bucket, &title_session_id, &input);
             });
         }
     }
@@ -903,24 +906,27 @@ async fn stream_response(
 
     // Load bucket settings for fallback values (max_output_tokens + per-model overrides).
     // Use state.bucket_path (not bucket_path) so fallback works regardless of store flag.
-    let fallback_settings = state.bucket_path.as_ref().map(|base| match auth_ctx.as_ref() {
-        Some(ctx) => base.join(&ctx.storage_prefix),
-        None => base.to_path_buf(),
-    }).and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
+    let fallback_settings = state
+        .bucket_path
+        .as_ref()
+        .map(|base| match auth_ctx.as_ref() {
+            Some(ctx) => base.join(&ctx.storage_prefix),
+            None => base.to_path_buf(),
+        })
+        .and_then(|bp| bucket_settings::load_bucket_settings(&bp).ok());
 
     let max_output_tokens = request_max_output_tokens.or_else(|| {
-        fallback_settings.as_ref().and_then(|s| s.max_output_tokens.map(|v| v as i64))
+        fallback_settings
+            .as_ref()
+            .and_then(|s| s.max_output_tokens.map(|v| v as i64))
     });
 
     // Apply per-model sampling overrides as fallbacks when the request doesn't specify them.
-    let model_overrides = fallback_settings.as_ref()
+    let model_overrides = fallback_settings
+        .as_ref()
         .and_then(|s| s.models.get(&model_id).cloned());
-    let temperature = temperature.or_else(|| {
-        model_overrides.as_ref().and_then(|o| o.temperature)
-    });
-    let top_p = top_p.or_else(|| {
-        model_overrides.as_ref().and_then(|o| o.top_p)
-    });
+    let temperature = temperature.or_else(|| model_overrides.as_ref().and_then(|o| o.temperature));
+    let top_p = top_p.or_else(|| model_overrides.as_ref().and_then(|o| o.top_p));
 
     // If prompt_id is provided, fetch the document and extract system prompt.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
@@ -1045,8 +1051,8 @@ async fn stream_response(
         // Load/switch backend if needed, emitting progress events through SSE.
         {
             let mut guard = backend.blocking_lock();
-            let needs_load = guard.current_model.as_deref() != Some(&model_id)
-                || guard.backend.is_none();
+            let needs_load =
+                guard.current_model.as_deref() != Some(&model_id) || guard.backend.is_none();
             if needs_load {
                 let tx_progress = tx.clone();
                 let callback: Option<talu::LoadProgressCallback> =
@@ -1214,12 +1220,7 @@ async fn stream_response(
         // Auto-generate a descriptive title for new conversations.
         if is_new_conversation && auto_title {
             if let Some(ref input) = title_input {
-                let _ = generate_title(
-                    &title_backend,
-                    &title_bucket,
-                    &title_session_id,
-                    input,
-                );
+                let _ = generate_title(&title_backend, &title_bucket, &title_session_id, input);
             }
         }
     });
@@ -1433,7 +1434,11 @@ fn generate_title(
     let title = title_buf.lock().unwrap().clone();
     // Clean up: trim whitespace, strip surrounding quotes.
     let title = title.trim().to_string();
-    let title = title.trim_matches('"').trim_matches('\'').trim().to_string();
+    let title = title
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim()
+        .to_string();
     if title.is_empty() {
         return Err(anyhow!("generated title is empty"));
     }

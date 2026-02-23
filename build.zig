@@ -53,22 +53,22 @@ fn getVersion(b: *std.Build) []const u8 {
 // =============================================================================
 
 const pcre2_port = @import("ports/pcre2/build.zig");
-const sqlite_port = @import("ports/sqlite/build.zig");
 const miniz_port = @import("ports/miniz/build.zig");
 const jpeg_turbo_port = @import("ports/jpeg-turbo/build.zig");
 const spng_port = @import("ports/spng/build.zig");
 const webp_port = @import("ports/webp/build.zig");
 const libmagic_port = @import("ports/libmagic/build.zig");
 const tree_sitter_port = @import("ports/tree-sitter/build.zig");
+const sqlite_port = @import("ports/sqlite/build.zig");
 
 const Pcre2 = pcre2_port.Pcre2;
-const Sqlite3 = sqlite_port.Sqlite3;
 const Miniz = miniz_port.Miniz;
 const JpegTurbo = jpeg_turbo_port.JpegTurbo;
 const Spng = spng_port.Spng;
 const Webp = webp_port.Webp;
 const LibMagic = libmagic_port.LibMagic;
 const TreeSitter = tree_sitter_port.TreeSitter;
+const Sqlite3 = sqlite_port.Sqlite3;
 
 // =============================================================================
 // Helper to add C dependencies to a module
@@ -83,6 +83,7 @@ fn addCDependencies(
     jpeg_turbo: JpegTurbo,
     spng: Spng,
     webp: Webp,
+    sqlite3: Sqlite3,
     tree_sitter: TreeSitter,
 ) void {
     mod.addIncludePath(b.path("src/text"));
@@ -98,6 +99,7 @@ fn addCDependencies(
     mod.addIncludePath(jpeg_turbo.include_dir);
     mod.addIncludePath(spng.include_dir);
     mod.addIncludePath(webp.include_dir);
+    mod.addIncludePath(sqlite3.include_dir);
     mod.addIncludePath(tree_sitter.include_dir);
 
     // Mozilla CA certificates bundle for HTTPS - generated during `make deps`
@@ -120,6 +122,7 @@ fn linkCDependencies(
     jpeg_turbo: JpegTurbo,
     spng: Spng,
     webp: Webp,
+    sqlite3: Sqlite3,
     tree_sitter: TreeSitter,
     comptime skip_external_archives: bool,
 ) void {
@@ -134,6 +137,7 @@ fn linkCDependencies(
     artifact.linkLibrary(jpeg_turbo.turbojpeg16_lib);
     artifact.linkLibrary(spng.lib);
     artifact.linkLibrary(webp.lib);
+    artifact.linkLibrary(sqlite3.lib);
     artifact.linkLibrary(tree_sitter.lib);
 
     // For static libraries, skip external .a archives to avoid nested archive warnings.
@@ -204,6 +208,7 @@ fn linkExternalArchives(
     jpeg_turbo: JpegTurbo,
     spng: Spng,
     webp: Webp,
+    sqlite3: Sqlite3,
     tree_sitter: TreeSitter,
 ) void {
     artifact.linkLibC();
@@ -217,6 +222,7 @@ fn linkExternalArchives(
     artifact.linkLibrary(jpeg_turbo.turbojpeg16_lib);
     artifact.linkLibrary(spng.lib);
     artifact.linkLibrary(webp.lib);
+    artifact.linkLibrary(sqlite3.lib);
     artifact.linkLibrary(tree_sitter.lib);
 
     // Link pre-built libcurl static library
@@ -430,12 +436,12 @@ pub fn build(b: *std.Build) void {
 
     // Build dependencies
     const pcre2 = pcre2_port.add(b, target, optimize);
-    const sqlite3 = sqlite_port.add(b, target, optimize);
     const miniz = miniz_port.add(b, target, optimize);
     const libmagic = libmagic_port.add(b, target, optimize);
     const jpeg_turbo = jpeg_turbo_port.add(b, target, optimize);
     const spng = spng_port.add(b, target, optimize, miniz);
     const webp = webp_port.add(b, target, optimize);
+    const sqlite3 = sqlite_port.add(b, target, optimize);
     const tree_sitter = tree_sitter_port.add(b, target, optimize);
 
     // ==========================================================================
@@ -449,14 +455,14 @@ pub fn build(b: *std.Build) void {
     });
     lib_mod.addImport("cuda_assets", cuda_assets_mod);
     lib_mod.addOptions("build_options", build_options);
-    addCDependencies(b, lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
+    addCDependencies(b, lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
         .name = "talu",
         .root_module = lib_mod,
     });
-    linkCDependencies(b, lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+    linkCDependencies(b, lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
     addMetalSupport(b, lib_mod, lib, enable_metal);
 
     b.installArtifact(lib);
@@ -492,7 +498,7 @@ pub fn build(b: *std.Build) void {
     static_lib_mod.addImport("cuda_assets", cuda_assets_mod);
 
     static_lib_mod.addOptions("build_options", build_options);
-    addCDependencies(b, static_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
+    addCDependencies(b, static_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
     const static_lib = b.addLibrary(.{
         .linkage = .static,
@@ -500,7 +506,7 @@ pub fn build(b: *std.Build) void {
         .root_module = static_lib_mod,
     });
     // Skip external .a archives for static lib - they'll be linked by the final executable
-    linkCDependencies(b, static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, true);
+    linkCDependencies(b, static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, true);
     addMetalSupport(b, static_lib_mod, static_lib, enable_metal);
 
     const static_step = b.step("static", "Build static library");
@@ -524,7 +530,7 @@ pub fn build(b: *std.Build) void {
     exe.step.dependOn(&cargo_cmd.step);
     exe.linkLibrary(static_lib);
     // Link all deps including external .a archives (curl, mbedtls)
-    linkCDependencies(b, exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+    linkCDependencies(b, exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
     exe.addObjectFile(b.path("bindings/rust/target/release/libtalu_cli.a"));
 
     // Link platform-specific runtime libraries for Rust CLI
@@ -536,7 +542,6 @@ pub fn build(b: *std.Build) void {
         exe.linkSystemLibrary("pthread");
         exe.linkSystemLibrary("m");
     }
-    exe.linkLibrary(sqlite3.lib);
     // macOS frameworks already linked via linkCDependencies
 
     b.installArtifact(exe);
@@ -611,7 +616,7 @@ pub fn build(b: *std.Build) void {
         });
         dump_lib_mod.addImport("cuda_assets", cuda_assets_mod);
         dump_lib_mod.addOptions("build_options", dump_build_options);
-        addCDependencies(b, dump_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
+        addCDependencies(b, dump_lib_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
         const dump_static_lib = b.addLibrary(.{
             .linkage = .static,
@@ -619,7 +624,7 @@ pub fn build(b: *std.Build) void {
             .root_module = dump_lib_mod,
         });
         // Add C sources to static lib with skip_external_archives=true (matches main build pattern)
-        linkCDependencies(b, dump_static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, true);
+        linkCDependencies(b, dump_static_lib, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, true);
         addMetalSupport(b, dump_lib_mod, dump_static_lib, enable_metal);
 
         // Dump CLI executable - only links static lib and external archives (no C sources)
@@ -637,7 +642,7 @@ pub fn build(b: *std.Build) void {
         });
         dump_exe.linkLibrary(dump_static_lib);
         // Only link external archives - C sources are in the static lib
-        linkExternalArchives(b, dump_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
+        linkExternalArchives(b, dump_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
         addMetalSupport(b, dump_cli_mod, dump_exe, enable_metal);
 
         dump_step.dependOn(&b.addInstallArtifact(dump_exe, .{}).step);
@@ -663,12 +668,12 @@ pub fn build(b: *std.Build) void {
     });
     test_mod.addImport("cuda_assets", cuda_assets_mod);
     test_mod.addOptions("build_options", unit_test_build_options);
-    addCDependencies(b, test_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
+    addCDependencies(b, test_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
     const tests = b.addTest(.{
         .root_module = test_mod,
     });
-    linkCDependencies(b, tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+    linkCDependencies(b, tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
 
     const run_tests = b.addRunArtifact(tests);
     const test_step = b.step("test", "Run unit tests");
@@ -692,7 +697,7 @@ pub fn build(b: *std.Build) void {
     });
     integration_main_mod.addImport("cuda_assets", cuda_assets_mod);
     integration_main_mod.addOptions("build_options", integration_build_options);
-    addCDependencies(b, integration_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter);
+    addCDependencies(b, integration_main_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
 
     const integration_test_mod = b.createModule(.{
         .root_source_file = b.path("core/tests/root.zig"),
@@ -706,7 +711,7 @@ pub fn build(b: *std.Build) void {
     const integration_tests = b.addTest(.{
         .root_module = integration_test_mod,
     });
-    linkCDependencies(b, integration_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+    linkCDependencies(b, integration_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
 
     const run_integration_tests = b.addRunArtifact(integration_tests);
     const integration_test_step = b.step("test-integration", "Run integration tests");
@@ -729,7 +734,7 @@ pub fn build(b: *std.Build) void {
             .name = "models_report",
             .root_module = models_report_mod,
         });
-        linkCDependencies(b, models_report_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+        linkCDependencies(b, models_report_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
         const run_models_report = b.addRunArtifact(models_report_exe);
         if (b.args) |args| {
             for (args) |arg| run_models_report.addArg(arg);
@@ -874,7 +879,7 @@ pub fn build(b: *std.Build) void {
             .name = "perf_sanity",
             .root_module = perf_exe_mod,
         });
-        linkCDependencies(b, perf_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+        linkCDependencies(b, perf_exe, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
         addMetalCoreSupport(b, perf_exe_mod, perf_exe, enable_metal);
         b.installArtifact(perf_exe);
 
@@ -904,7 +909,7 @@ pub fn build(b: *std.Build) void {
         const perf_tests = b.addTest(.{
             .root_module = perf_test_mod,
         });
-        linkCDependencies(b, perf_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, tree_sitter, false);
+        linkCDependencies(b, perf_tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
         const run_perf_tests = b.addRunArtifact(perf_tests);
         const perf_test_step = b.step("test-perf-sanity", "Run perf/lifecycle sanity tests");
         perf_test_step.dependOn(&run_perf_tests.step);

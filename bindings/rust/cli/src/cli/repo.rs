@@ -180,7 +180,7 @@ pub(super) fn cmd_get(args: GetArgs) -> Result<()> {
     } else {
         crate::config::resolve_and_ensure_bucket(&args.profile)?
     };
-    let pin_db_path = pin_bucket.join("meta.sqlite");
+    let pin_db_path = pin_bucket.clone();
     let sync_pins = args.sync_pins;
     let add_pin = args.add_pin.as_deref();
     let remove_pin = args.remove_pin.as_deref();
@@ -277,7 +277,7 @@ pub(super) fn cmd_sample(args: SampleArgs) -> Result<()> {
     } else {
         crate::config::resolve_and_ensure_bucket(&args.profile)?
     };
-    let pin_db_path = pin_bucket.join("meta.sqlite");
+    let pin_db_path = pin_bucket.clone();
     let pin_store = PinStore::open(&pin_db_path)?;
     cmd_sample_pins(&pin_store, args.max_models)
 }
@@ -1578,6 +1578,6 @@ mod tests {
             .as_nanos();
         let dir = std::env::temp_dir().join(format!("{}_{}", prefix, now));
         std::fs::create_dir_all(&dir).expect("create temp dir");
-        dir.join("meta.sqlite")
+        dir
     }
 }

@@ -70,6 +70,7 @@ pub const cache = @import("cache.zig");
 pub const talu_cache = @import("talu_cache.zig");
 pub const scheme = @import("scheme.zig");
 pub const source = @import("source.zig");
+pub const meta = @import("meta.zig");
 
 // Re-export scheme types
 pub const Scheme = scheme.Scheme;

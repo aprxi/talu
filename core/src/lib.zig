@@ -198,6 +198,14 @@ comptime {
     _ = &capi.talu_repo_string_list_count;
     _ = &capi.talu_repo_string_list_get;
     _ = &capi.talu_repo_string_list_free;
+    _ = &capi.talu_repo_meta_init;
+    _ = &capi.talu_repo_meta_free;
+    _ = &capi.talu_repo_meta_pin;
+    _ = &capi.talu_repo_meta_unpin;
+    _ = &capi.talu_repo_meta_update_size;
+    _ = &capi.talu_repo_meta_clear_size;
+    _ = &capi.talu_repo_meta_list_pins;
+    _ = &capi.talu_repo_meta_free_list;
 
     // Validate API (high-level sampler)
     _ = &capi.talu_validate_create;

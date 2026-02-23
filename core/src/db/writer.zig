@@ -12,7 +12,6 @@ const checksum = @import("checksum.zig");
 const lock = @import("lock.zig");
 const manifest_mod = @import("manifest.zig");
 const types = @import("types.zig");
-const ivf_flat_index = @import("vector/index/ivfflat.zig");
 const wal = @import("wal.zig");
 
 const Allocator = std.mem.Allocator;
@@ -70,28 +69,11 @@ const SegmentStats = struct {
     segment_checksum_crc32c: u32,
 };
 
-const SegmentVectorData = struct {
-    ids: []u64,
-    vectors: []f32,
-    dims: u32,
-
-    fn deinit(self: *SegmentVectorData, allocator: Allocator) void {
-        allocator.free(self.ids);
-        allocator.free(self.vectors);
-        self.* = .{
-            .ids = &[_]u64{},
-            .vectors = &[_]f32{},
-            .dims = 0,
-        };
-    }
-};
-
 pub const default_max_segment_size: u64 = 64 * 1024 * 1024;
-
-pub const VectorIndexBuildMode = enum {
-    inline_build,
-    deferred,
-};
+pub const SegmentIndexMetadataProvider = *const fn (
+    allocator: Allocator,
+    segment_rel_path: []const u8,
+) anyerror!?manifest_mod.SegmentIndexMeta;
 
 /// Controls WAL fsync behavior after writes.
 ///
@@ -124,7 +106,7 @@ pub const Writer = struct {
     flush_threshold: usize,
     max_segment_size: u64,
     durability: Durability,
-    vector_index_build_mode: VectorIndexBuildMode,
+    segment_index_metadata_provider: ?SegmentIndexMetadataProvider,
 
     /// Opens or creates the TaluDB namespace and replays orphaned WALs.
     ///
@@ -184,7 +166,7 @@ pub const Writer = struct {
             .flush_threshold = 64 * 1024,
             .max_segment_size = default_max_segment_size,
             .durability = .full,
-            .vector_index_build_mode = .inline_build,
+            .segment_index_metadata_provider = null,
         };
         errdefer writer.deinit();
 
@@ -199,6 +181,17 @@ pub const Writer = struct {
         try writer.replayOrphanWals();
 
         return writer;
+    }
+
+    /// Configure optional segment metadata generation during segment sealing.
+    ///
+    /// The physical writer does not inspect metadata semantics; adapters may
+    /// provide a callback to attach per-segment manifest index metadata.
+    pub fn setSegmentIndexMetadataProvider(
+        self: *Writer,
+        provider: ?SegmentIndexMetadataProvider,
+    ) void {
+        self.segment_index_metadata_provider = provider;
     }
 
     /// Appends a single row, writing the WAL before updating in-memory buffers.
@@ -285,6 +278,27 @@ pub const Writer = struct {
         defer lock.unlock(self.lock_file);
 
         try self.flushBlockLocked();
+    }
+
+    /// Seal `current.talu` into a segment immediately.
+    ///
+    /// This is adapter-facing and intentionally domain-agnostic. It flushes any
+    /// buffered rows first, then seals `current.talu` if it has content.
+    ///
+    /// Returns true when a segment was sealed, false when current.talu was empty.
+    pub fn sealCurrentSegment(self: *Writer) !bool {
+        try lock.lock(self.lock_file);
+        defer lock.unlock(self.lock_file);
+
+        if (self.row_count > 0) {
+            try self.flushBlockLocked();
+        }
+
+        const current_size = try self.currentFileSize();
+        if (current_size == 0) return false;
+
+        try self.rotateSegment();
+        return true;
     }
 
     /// Internal: flush block when lock is already held.
@@ -396,10 +410,10 @@ pub const Writer = struct {
         }
 
         const segment_stats = try self.writeFooterAndCollectSegmentStats(seg_name);
-        const segment_index = switch (self.vector_index_build_mode) {
-            .inline_build => try self.maybeBuildVectorSegmentIndex(seg_name),
-            .deferred => try self.planDeferredVectorSegmentIndex(seg_name),
-        };
+        const segment_index = if (self.segment_index_metadata_provider) |provider|
+            try provider(self.allocator, seg_name)
+        else
+            null;
         defer if (segment_index) |meta| self.allocator.free(meta.path);
 
         // Update manifest (load existing or create empty)
@@ -530,147 +544,6 @@ pub const Writer = struct {
                 const size_after_footer = (try file.stat()).size;
                 break :blk try crc32cFilePrefix(file, size_after_footer);
             } else 0,
-        };
-    }
-
-    fn maybeBuildVectorSegmentIndex(self: *Writer, seg_name: []const u8) !?manifest_mod.SegmentIndexMeta {
-        const ns_base = std.fs.path.basename(self.ns_path);
-        if (!std.mem.eql(u8, ns_base, "vector")) return null;
-
-        var segment_data = try self.loadSegmentVectorData(seg_name);
-        defer segment_data.deinit(self.allocator);
-        if (segment_data.ids.len == 0 or segment_data.dims == 0) return null;
-
-        const suffix = ".talu";
-        if (!std.mem.endsWith(u8, seg_name, suffix)) return null;
-        const base = seg_name[0 .. seg_name.len - suffix.len];
-        const index_name = try std.fmt.allocPrint(self.allocator, "{s}.ivf", .{base});
-        errdefer self.allocator.free(index_name);
-
-        var segment_index = try ivf_flat_index.buildSegmentIndex(
-            self.allocator,
-            segment_data.ids,
-            segment_data.vectors,
-            segment_data.dims,
-        );
-        defer segment_index.deinit(self.allocator);
-
-        const payload = try ivf_flat_index.encodeSegmentIndex(self.allocator, segment_index);
-        defer self.allocator.free(payload);
-
-        var index_file = try self.dir.createFile(index_name, .{ .truncate = true });
-        defer index_file.close();
-        try index_file.writeAll(payload);
-        try index_file.sync();
-
-        return .{
-            .kind = .ivf_flat,
-            .path = index_name,
-            .checksum_crc32c = checksum.crc32c(payload),
-            .state = .ready,
-        };
-    }
-
-    fn planDeferredVectorSegmentIndex(self: *Writer, seg_name: []const u8) !?manifest_mod.SegmentIndexMeta {
-        const ns_base = std.fs.path.basename(self.ns_path);
-        if (!std.mem.eql(u8, ns_base, "vector")) return null;
-
-        const suffix = ".talu";
-        if (!std.mem.endsWith(u8, seg_name, suffix)) return null;
-        const base = seg_name[0 .. seg_name.len - suffix.len];
-        const index_name = try std.fmt.allocPrint(self.allocator, "{s}.ivf", .{base});
-        errdefer self.allocator.free(index_name);
-
-        return .{
-            .kind = .ivf_flat,
-            .path = index_name,
-            .checksum_crc32c = 0,
-            .state = .pending,
-        };
-    }
-
-    fn loadSegmentVectorData(self: *Writer, seg_name: []const u8) !SegmentVectorData {
-        var seg_file = try self.dir.openFile(seg_name, .{ .mode = .read_only });
-        defer seg_file.close();
-        const seg_stat = try seg_file.stat();
-        const reader = block_reader.BlockReader.init(seg_file, self.allocator);
-        const block_index = try reader.getBlockIndex(seg_stat.size);
-        defer self.allocator.free(block_index);
-
-        var dims: u32 = 0;
-        var total_rows: usize = 0;
-        for (block_index) |entry| {
-            const header = try reader.readHeader(entry.block_off);
-            if (header.schema_id != 10 or header.row_count == 0) continue;
-            const descs = try reader.readColumnDirectory(header, entry.block_off);
-            defer self.allocator.free(descs);
-
-            const embedding_desc = for (descs) |desc| {
-                if (desc.column_id == 10 and
-                    desc.shape == @intFromEnum(types.ColumnShape.VECTOR) and
-                    desc.phys_type == @intFromEnum(types.PhysicalType.F32))
-                {
-                    break desc;
-                }
-            } else return error.MissingColumn;
-            if (embedding_desc.dims == 0) return error.InvalidColumnData;
-            if (dims == 0) dims = embedding_desc.dims;
-            if (dims != embedding_desc.dims) return error.InvalidColumnData;
-            total_rows += header.row_count;
-        }
-
-        const ids = try self.allocator.alloc(u64, total_rows);
-        errdefer self.allocator.free(ids);
-        const vectors = try self.allocator.alloc(f32, total_rows * @as(usize, dims));
-        errdefer self.allocator.free(vectors);
-        if (total_rows == 0 or dims == 0) {
-            return .{
-                .ids = ids,
-                .vectors = vectors,
-                .dims = 0,
-            };
-        }
-
-        var row_offset: usize = 0;
-        var vector_offset: usize = 0;
-        for (block_index) |entry| {
-            const header = try reader.readHeader(entry.block_off);
-            if (header.schema_id != 10 or header.row_count == 0) continue;
-            const descs = try reader.readColumnDirectory(header, entry.block_off);
-            defer self.allocator.free(descs);
-
-            const id_desc = for (descs) |desc| {
-                if (desc.column_id == 1 and
-                    desc.shape == @intFromEnum(types.ColumnShape.SCALAR) and
-                    desc.phys_type == @intFromEnum(types.PhysicalType.U64))
-                {
-                    break desc;
-                }
-            } else return error.MissingColumn;
-            const embedding_desc = for (descs) |desc| {
-                if (desc.column_id == 10 and
-                    desc.shape == @intFromEnum(types.ColumnShape.VECTOR) and
-                    desc.phys_type == @intFromEnum(types.PhysicalType.F32))
-                {
-                    break desc;
-                }
-            } else return error.MissingColumn;
-            if (embedding_desc.dims != dims) return error.InvalidColumnData;
-
-            const id_dest = std.mem.sliceAsBytes(ids[row_offset .. row_offset + header.row_count]);
-            try reader.readColumnDataInto(entry.block_off, id_desc, id_dest);
-            const vector_len = @as(usize, header.row_count) * @as(usize, dims);
-            const vector_dest = std.mem.sliceAsBytes(vectors[vector_offset .. vector_offset + vector_len]);
-            try reader.readColumnDataInto(entry.block_off, embedding_desc, vector_dest);
-
-            row_offset += header.row_count;
-            vector_offset += vector_len;
-        }
-
-        return .{
-            .ids = ids,
-            .vectors = vectors,
-            .dims = dims,
         };
     }
 
@@ -1467,6 +1340,46 @@ test "Writer.rotateSegment seals current segment" {
     try std.testing.expect(manifest_data.segments[0].checksum_crc32c != 0);
 }
 
+test "Writer.sealCurrentSegment seals non-empty current.talu without size-triggered rotation" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var writer = try Writer.open(std.testing.allocator, tmp_path, "seal-now");
+    defer writer.deinit();
+
+    // Keep threshold high so regular flush does not rotate.
+    writer.max_segment_size = 1024 * 1024;
+
+    var value: u64 = 123;
+    const col = ColumnValue{
+        .column_id = 1,
+        .shape = .SCALAR,
+        .phys_type = .U64,
+        .encoding = .RAW,
+        .dims = 1,
+        .data = std.mem.asBytes(&value),
+    };
+    try writer.appendRow(7, &.{col});
+    try writer.flushBlock();
+
+    const sealed = try writer.sealCurrentSegment();
+    try std.testing.expect(sealed);
+
+    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "seal-now/manifest.json");
+    defer std.testing.allocator.free(manifest_path);
+    var manifest_data = try manifest_mod.Manifest.load(std.testing.allocator, manifest_path);
+    defer manifest_data.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), manifest_data.segments.len);
+    try std.testing.expect(manifest_data.segments[0].row_count > 0);
+
+    const current_data = try tmp.dir.readFileAlloc(std.testing.allocator, "seal-now/current.talu", 1024);
+    defer std.testing.allocator.free(current_data);
+    try std.testing.expectEqual(@as(usize, 0), current_data.len);
+}
+
 test "Writer.rotateSegment records timestamp range in manifest metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -1536,131 +1449,43 @@ test "Writer.rotateSegment records timestamp range in manifest metadata" {
     try std.testing.expectEqual(@as(u64, 1), manifest_data.segments[0].row_count);
 }
 
-test "Writer.rotateSegment writes vector index metadata for vector namespace" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(tmp_path);
-
-    var writer = try Writer.open(std.testing.allocator, tmp_path, "vector");
-    defer writer.deinit();
-
-    writer.max_segment_size = 1;
-
-    const ids_first = [_]u64{1};
-    const ts_first = [_]i64{100};
-    const vectors_first = [_]f32{ 1.0, 0.0 };
-    const cols_first = [_]ColumnBatch{
-        .{
-            .column_id = 1,
-            .shape = .SCALAR,
-            .phys_type = .U64,
-            .encoding = .RAW,
-            .dims = 1,
-            .data = std.mem.sliceAsBytes(&ids_first),
-        },
-        .{
-            .column_id = 2,
-            .shape = .SCALAR,
-            .phys_type = .I64,
-            .encoding = .RAW,
-            .dims = 1,
-            .data = std.mem.sliceAsBytes(&ts_first),
-        },
-        .{
-            .column_id = 10,
-            .shape = .VECTOR,
-            .phys_type = .F32,
-            .encoding = .RAW,
-            .dims = 2,
-            .data = std.mem.sliceAsBytes(&vectors_first),
-        },
+fn testPendingSegmentIndexProvider(
+    allocator: Allocator,
+    segment_rel_path: []const u8,
+) !?manifest_mod.SegmentIndexMeta {
+    const suffix = ".talu";
+    if (!std.mem.endsWith(u8, segment_rel_path, suffix)) return null;
+    const base = segment_rel_path[0 .. segment_rel_path.len - suffix.len];
+    return .{
+        .kind = .ivf_flat,
+        .path = try std.fmt.allocPrint(allocator, "{s}.ivf", .{base}),
+        .checksum_crc32c = 0,
+        .state = .pending,
     };
-    try writer.appendBatch(10, 1, &cols_first);
-    try writer.flushBlock();
-
-    const ids_second = [_]u64{2};
-    const ts_second = [_]i64{200};
-    const vectors_second = [_]f32{ 0.0, 1.0 };
-    const cols_second = [_]ColumnBatch{
-        .{
-            .column_id = 1,
-            .shape = .SCALAR,
-            .phys_type = .U64,
-            .encoding = .RAW,
-            .dims = 1,
-            .data = std.mem.sliceAsBytes(&ids_second),
-        },
-        .{
-            .column_id = 2,
-            .shape = .SCALAR,
-            .phys_type = .I64,
-            .encoding = .RAW,
-            .dims = 1,
-            .data = std.mem.sliceAsBytes(&ts_second),
-        },
-        .{
-            .column_id = 10,
-            .shape = .VECTOR,
-            .phys_type = .F32,
-            .encoding = .RAW,
-            .dims = 2,
-            .data = std.mem.sliceAsBytes(&vectors_second),
-        },
-    };
-    try writer.appendBatch(10, 1, &cols_second);
-    try writer.flushBlock();
-
-    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "vector/manifest.json");
-    defer std.testing.allocator.free(manifest_path);
-    var manifest_data = try manifest_mod.Manifest.load(std.testing.allocator, manifest_path);
-    defer manifest_data.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(usize, 1), manifest_data.segments.len);
-    try std.testing.expect(manifest_data.segments[0].index != null);
-    const index_meta = manifest_data.segments[0].index.?;
-    try std.testing.expectEqual(manifest_mod.SegmentIndexKind.ivf_flat, index_meta.kind);
-    try std.testing.expect(index_meta.checksum_crc32c != 0);
-    try std.testing.expectEqual(manifest_mod.SegmentIndexState.ready, index_meta.state);
-
-    const index_rel_path = try std.fmt.allocPrint(std.testing.allocator, "vector/{s}", .{index_meta.path});
-    defer std.testing.allocator.free(index_rel_path);
-    const stat = try tmp.dir.statFile(index_rel_path);
-    try std.testing.expect(stat.size > 0);
-
-    const encoded = try tmp.dir.readFileAlloc(std.testing.allocator, index_rel_path, 1024 * 1024);
-    defer std.testing.allocator.free(encoded);
-    var decoded = try ivf_flat_index.decodeSegmentIndex(std.testing.allocator, encoded);
-    defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(@as(u32, 2), decoded.dims);
-    try std.testing.expectEqual(@as(u64, 1), decoded.row_count);
 }
 
-test "Writer.rotateSegment records pending vector index metadata when vector_index_build_mode is deferred" {
+test "Writer.rotateSegment writes adapter-provided segment index metadata" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(tmp_path);
 
-    var writer = try Writer.open(std.testing.allocator, tmp_path, "vector");
+    var writer = try Writer.open(std.testing.allocator, tmp_path, "writer-meta");
     defer writer.deinit();
-
-    writer.vector_index_build_mode = .deferred;
+    writer.setSegmentIndexMetadataProvider(testPendingSegmentIndexProvider);
     writer.max_segment_size = 1;
 
-    const ids_first = [_]u64{1};
-    const ts_first = [_]i64{100};
-    const vectors_first = [_]f32{ 1.0, 0.0 };
-    const cols_first = [_]ColumnBatch{
+    const first_ids = [_]u64{1};
+    const first_ts = [_]i64{100};
+    const first_cols = [_]ColumnBatch{
         .{
             .column_id = 1,
             .shape = .SCALAR,
             .phys_type = .U64,
             .encoding = .RAW,
             .dims = 1,
-            .data = std.mem.sliceAsBytes(&ids_first),
+            .data = std.mem.sliceAsBytes(&first_ids),
         },
         .{
             .column_id = 2,
@@ -1668,31 +1493,22 @@ test "Writer.rotateSegment records pending vector index metadata when vector_ind
             .phys_type = .I64,
             .encoding = .RAW,
             .dims = 1,
-            .data = std.mem.sliceAsBytes(&ts_first),
-        },
-        .{
-            .column_id = 10,
-            .shape = .VECTOR,
-            .phys_type = .F32,
-            .encoding = .RAW,
-            .dims = 2,
-            .data = std.mem.sliceAsBytes(&vectors_first),
+            .data = std.mem.sliceAsBytes(&first_ts),
         },
     };
-    try writer.appendBatch(10, 1, &cols_first);
+    try writer.appendBatch(10, 1, &first_cols);
     try writer.flushBlock();
 
-    const ids_second = [_]u64{2};
-    const ts_second = [_]i64{200};
-    const vectors_second = [_]f32{ 0.0, 1.0 };
-    const cols_second = [_]ColumnBatch{
+    const second_ids = [_]u64{2};
+    const second_ts = [_]i64{200};
+    const second_cols = [_]ColumnBatch{
         .{
             .column_id = 1,
             .shape = .SCALAR,
             .phys_type = .U64,
             .encoding = .RAW,
             .dims = 1,
-            .data = std.mem.sliceAsBytes(&ids_second),
+            .data = std.mem.sliceAsBytes(&second_ids),
         },
         .{
             .column_id = 2,
@@ -1700,21 +1516,13 @@ test "Writer.rotateSegment records pending vector index metadata when vector_ind
             .phys_type = .I64,
             .encoding = .RAW,
             .dims = 1,
-            .data = std.mem.sliceAsBytes(&ts_second),
-        },
-        .{
-            .column_id = 10,
-            .shape = .VECTOR,
-            .phys_type = .F32,
-            .encoding = .RAW,
-            .dims = 2,
-            .data = std.mem.sliceAsBytes(&vectors_second),
+            .data = std.mem.sliceAsBytes(&second_ts),
         },
     };
-    try writer.appendBatch(10, 1, &cols_second);
+    try writer.appendBatch(10, 1, &second_cols);
     try writer.flushBlock();
 
-    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "vector/manifest.json");
+    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "writer-meta/manifest.json");
     defer std.testing.allocator.free(manifest_path);
     var manifest_data = try manifest_mod.Manifest.load(std.testing.allocator, manifest_path);
     defer manifest_data.deinit(std.testing.allocator);
@@ -1725,10 +1533,74 @@ test "Writer.rotateSegment records pending vector index metadata when vector_ind
     try std.testing.expectEqual(manifest_mod.SegmentIndexKind.ivf_flat, index_meta.kind);
     try std.testing.expectEqual(@as(u32, 0), index_meta.checksum_crc32c);
     try std.testing.expectEqual(manifest_mod.SegmentIndexState.pending, index_meta.state);
+    try std.testing.expect(std.mem.endsWith(u8, index_meta.path, ".ivf"));
+}
 
-    const index_rel_path = try std.fmt.allocPrint(std.testing.allocator, "vector/{s}", .{index_meta.path});
-    defer std.testing.allocator.free(index_rel_path);
-    try std.testing.expectError(error.FileNotFound, tmp.dir.statFile(index_rel_path));
+test "Writer.rotateSegment does not infer metadata from namespace without provider" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const tmp_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(tmp_path);
+
+    var writer = try Writer.open(std.testing.allocator, tmp_path, "vector");
+    defer writer.deinit();
+
+    writer.max_segment_size = 1;
+
+    const ids_first = [_]u64{1};
+    const ts_first = [_]i64{100};
+    const cols_first = [_]ColumnBatch{
+        .{
+            .column_id = 1,
+            .shape = .SCALAR,
+            .phys_type = .U64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ids_first),
+        },
+        .{
+            .column_id = 2,
+            .shape = .SCALAR,
+            .phys_type = .I64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ts_first),
+        },
+    };
+    try writer.appendBatch(10, 1, &cols_first);
+    try writer.flushBlock();
+
+    const ids_second = [_]u64{2};
+    const ts_second = [_]i64{200};
+    const cols_second = [_]ColumnBatch{
+        .{
+            .column_id = 1,
+            .shape = .SCALAR,
+            .phys_type = .U64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ids_second),
+        },
+        .{
+            .column_id = 2,
+            .shape = .SCALAR,
+            .phys_type = .I64,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = std.mem.sliceAsBytes(&ts_second),
+        },
+    };
+    try writer.appendBatch(10, 1, &cols_second);
+    try writer.flushBlock();
+
+    const manifest_path = try tmp.dir.realpathAlloc(std.testing.allocator, "vector/manifest.json");
+    defer std.testing.allocator.free(manifest_path);
+    var manifest_data = try manifest_mod.Manifest.load(std.testing.allocator, manifest_path);
+    defer manifest_data.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), manifest_data.segments.len);
+    try std.testing.expect(manifest_data.segments[0].index == null);
 }
 
 test "Writer.rotateSegment failure keeps writer usable" {

@@ -6,6 +6,7 @@
 const std = @import("std");
 const db_writer = @import("../writer.zig");
 const db_reader = @import("../reader.zig");
+const db_lock = @import("../lock.zig");
 const block_reader = @import("../block_reader.zig");
 const manifest = @import("../manifest.zig");
 const checksum = @import("../checksum.zig");
@@ -40,6 +41,8 @@ const col_idempotency_result_a: u32 = 24;
 const col_idempotency_result_b: u32 = 25;
 const min_approximate_rows: usize = 1024;
 const min_ivf_visible_coverage: f32 = 0.95;
+const compaction_batch_rows: usize = 1024;
+const streaming_exact_min_blocks: usize = 8;
 
 pub const VectorBatch = struct {
     ids: []u64,
@@ -261,6 +264,11 @@ const BlockSnapshots = struct {
     }
 };
 
+const RowLocator = struct {
+    block_idx: usize,
+    row_idx: u32,
+};
+
 /// Vector backend API ("vector" namespace).
 ///
 /// Public operations:
@@ -315,7 +323,7 @@ pub const VectorAdapter = struct {
         var writer_ptr = try allocator.create(db_writer.Writer);
         errdefer allocator.destroy(writer_ptr);
         writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "vector");
-        writer_ptr.vector_index_build_mode = .deferred;
+        writer_ptr.setSegmentIndexMetadataProvider(vectorSegmentIndexMetadataProvider);
         errdefer writer_ptr.deinit();
 
         var reader_ptr = try allocator.create(db_reader.Reader);
@@ -792,72 +800,415 @@ pub const VectorAdapter = struct {
     /// Compact vector storage by rebuilding physical segments from visible rows.
     pub fn compact(self: *VectorAdapter, dims: u32) !CompactResult {
         if (dims == 0) return error.InvalidColumnData;
-        try self.ensureReadCache();
-        if (self.cached_latest.dims != 0 and self.cached_latest.dims != dims) return error.InvalidColumnData;
+        self.invalidateReadCache();
+        var snapshots = try self.readBlockSnapshots(self.allocator);
+        defer snapshots.deinit(self.allocator);
+
+        var visibility = try self.loadLatestVisibilityFromBlocks(self.allocator, snapshots.change_blocks);
+        defer visibility.deinit();
 
         var removed_tombstones: usize = 0;
-        var vis_iter = self.cached_visibility.iterator();
+        var vis_iter = visibility.iterator();
         while (vis_iter.next()) |entry| {
             if (entry.key_ptr.* == 0) continue;
             if (entry.value_ptr.deleted) removed_tombstones += 1;
         }
 
-        var kept_count: usize = 0;
-        var latest_iter = self.cached_latest.map.iterator();
-        while (latest_iter.next()) |entry| {
-            const id = entry.key_ptr.*;
-            if (id == 0) continue;
-            if (self.cached_visibility.get(id)) |state| {
-                if (!state.deleted) kept_count += 1;
-            } else {
-                kept_count += 1;
-            }
-        }
+        var latest_rows = std.AutoHashMap(u64, RowLocator).init(self.allocator);
+        defer latest_rows.deinit();
+        const seen_dims = try self.collectLatestVisibleRowLocators(
+            snapshots.vector_blocks,
+            &visibility,
+            &latest_rows,
+            dims,
+        );
+        const compact_dims = if (seen_dims == 0) dims else seen_dims;
+        if (compact_dims != dims) return error.InvalidColumnData;
 
-        const ids = try self.allocator.alloc(u64, kept_count);
-        defer self.allocator.free(ids);
-        const vectors = try self.allocator.alloc(f32, kept_count * @as(usize, dims));
-        defer self.allocator.free(vectors);
+        const temp_namespace = try self.allocateCompactionTempNamespace();
+        defer self.allocator.free(temp_namespace);
+        errdefer self.deleteNamespaceTree(temp_namespace);
 
-        var write_idx: usize = 0;
-        latest_iter = self.cached_latest.map.iterator();
-        while (latest_iter.next()) |entry| {
-            const id = entry.key_ptr.*;
-            if (id == 0) continue;
-            if (self.cached_visibility.get(id)) |state| {
-                if (state.deleted) continue;
-            }
-            ids[write_idx] = id;
-            const base = write_idx * @as(usize, dims);
-            std.mem.copyForwards(f32, vectors[base .. base + @as(usize, dims)], entry.value_ptr.*);
-            write_idx += 1;
-        }
+        var temp_writer = try db_writer.Writer.open(self.allocator, self.db_root, temp_namespace);
+        var temp_writer_active = true;
+        errdefer if (temp_writer_active) temp_writer.deinit();
+        temp_writer.setSegmentIndexMetadataProvider(vectorSegmentIndexMetadataProvider);
+        const kept_count = try self.streamLatestRowsToWriter(
+            snapshots.vector_blocks,
+            &latest_rows,
+            compact_dims,
+            &temp_writer,
+        );
+        try temp_writer.flushBlock();
+        _ = try temp_writer.sealCurrentSegment();
+        temp_writer.deinit();
+        temp_writer_active = false;
+
+        const compact_ts = std.time.milliTimestamp();
+        try self.publishCompactedNamespaceWithCas(
+            temp_namespace,
+            snapshots.vector_generation,
+            snapshots.change_generation,
+            compact_ts,
+        );
+        self.deleteNamespaceTree(temp_namespace);
 
         const compact_seq = self.allocateNextSeq();
-        const compact_ts = std.time.milliTimestamp();
         const compact_event = ChangeEvent{
             .seq = compact_seq,
             .op = .compact,
             .id = 0,
             .timestamp = compact_ts,
         };
-
-        try self.resetVectorNamespace();
-        if (kept_count > 0) {
-            try self.appendBatchRaw(ids, vectors, dims);
-        }
         try self.appendChangeEvents(&[_]ChangeEvent{compact_event});
-        if (kept_count > 0) {
-            const compact_seqs = try self.allocator.alloc(u64, kept_count);
-            defer self.allocator.free(compact_seqs);
-            for (compact_seqs) |*seq| {
-                seq.* = self.allocateNextSeq();
-            }
-            try self.appendChangeRowsForOp(ids, compact_seqs, .upsert);
+        const replayed = try self.appendCompactionUpsertRowsFromCurrentVector();
+        if (replayed != kept_count) {
+            std.log.err("vector compaction replay mismatch: kept={}, replayed={}", .{ kept_count, replayed });
+            return error.InvalidColumnData;
         }
         self.invalidateReadCache();
 
         return .{ .kept_count = kept_count, .removed_tombstones = removed_tombstones };
+    }
+
+    fn collectLatestVisibleRowLocators(
+        self: *VectorAdapter,
+        blocks: []const db_reader.BlockRef,
+        visibility: *const std.AutoHashMap(u64, PointVisibility),
+        latest_rows: *std.AutoHashMap(u64, RowLocator),
+        expected_dims: u32,
+    ) !u32 {
+        var current_path: ?[]const u8 = null;
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
+        var scratch = ScratchBuffers{};
+        defer scratch.deinit(self.allocator);
+
+        var seen_dims: u32 = 0;
+        for (blocks, 0..) |block, block_idx| {
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, self.allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_embeddings or header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer self.allocator.free(descs);
+
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
+            if (embedding_desc.dims == 0) return error.InvalidColumnData;
+            if (expected_dims != 0 and embedding_desc.dims != expected_dims) return error.InvalidColumnData;
+            if (seen_dims == 0) {
+                seen_dims = embedding_desc.dims;
+            } else if (seen_dims != embedding_desc.dims) {
+                return error.InvalidColumnData;
+            }
+
+            const id_buf = try scratch.ensureId(self.allocator, id_desc.data_len);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+
+            for (0..header.row_count) |row_idx| {
+                const id = ids[row_idx];
+                if (id == 0) continue;
+
+                if (visibility.get(id)) |state| {
+                    if (state.deleted) {
+                        _ = latest_rows.fetchRemove(id);
+                        continue;
+                    }
+                }
+                try latest_rows.put(id, .{
+                    .block_idx = block_idx,
+                    .row_idx = @intCast(row_idx),
+                });
+            }
+        }
+        return seen_dims;
+    }
+
+    fn streamLatestRowsToWriter(
+        self: *VectorAdapter,
+        blocks: []const db_reader.BlockRef,
+        latest_rows: *const std.AutoHashMap(u64, RowLocator),
+        dims: u32,
+        out_writer: *db_writer.Writer,
+    ) !usize {
+        if (dims == 0) return 0;
+        const dims_usize: usize = @intCast(dims);
+
+        var current_path: ?[]const u8 = null;
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
+        var scratch = ScratchBuffers{};
+        defer scratch.deinit(self.allocator);
+
+        const chunk_ids = try self.allocator.alloc(u64, compaction_batch_rows);
+        defer self.allocator.free(chunk_ids);
+        const chunk_vectors = try self.allocator.alloc(f32, compaction_batch_rows * dims_usize);
+        defer self.allocator.free(chunk_vectors);
+
+        var chunk_len: usize = 0;
+        var kept_count: usize = 0;
+
+        for (blocks, 0..) |block, block_idx| {
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, self.allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_embeddings or header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer self.allocator.free(descs);
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
+            if (embedding_desc.dims != dims) return error.InvalidColumnData;
+
+            const id_buf = try scratch.ensureId(self.allocator, id_desc.data_len);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+
+            const vector_buf = try scratch.ensureVector(self.allocator, embedding_desc.data_len);
+            try reader.readColumnDataInto(block.offset, embedding_desc, vector_buf);
+
+            const vector_len = @as(usize, header.row_count) * dims_usize;
+            if (vector_buf.len != vector_len * @sizeOf(f32)) return error.InvalidColumnData;
+
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+            const vectors = @as([*]const f32, @ptrCast(@alignCast(vector_buf.ptr)))[0..vector_len];
+
+            for (0..header.row_count) |row_idx| {
+                const id = ids[row_idx];
+                if (id == 0) continue;
+                const locator = latest_rows.get(id) orelse continue;
+                if (locator.block_idx != block_idx or locator.row_idx != row_idx) continue;
+
+                chunk_ids[chunk_len] = id;
+                const src_base = row_idx * dims_usize;
+                const dst_base = chunk_len * dims_usize;
+                std.mem.copyForwards(
+                    f32,
+                    chunk_vectors[dst_base .. dst_base + dims_usize],
+                    vectors[src_base .. src_base + dims_usize],
+                );
+                chunk_len += 1;
+                kept_count += 1;
+
+                if (chunk_len == compaction_batch_rows) {
+                    try self.appendBatchRawToWriter(
+                        out_writer,
+                        chunk_ids[0..chunk_len],
+                        chunk_vectors[0 .. chunk_len * dims_usize],
+                        dims,
+                    );
+                    chunk_len = 0;
+                }
+            }
+        }
+
+        if (chunk_len > 0) {
+            try self.appendBatchRawToWriter(
+                out_writer,
+                chunk_ids[0..chunk_len],
+                chunk_vectors[0 .. chunk_len * dims_usize],
+                dims,
+            );
+        }
+
+        return kept_count;
+    }
+
+    fn allocateCompactionTempNamespace(self: *VectorAdapter) ![]u8 {
+        const nonce = std.crypto.random.int(u64);
+        return std.fmt.allocPrint(self.allocator, "vector_compact_tmp-{x}", .{nonce});
+    }
+
+    fn deleteNamespaceTree(self: *VectorAdapter, namespace: []const u8) void {
+        const path = std.fs.path.join(self.allocator, &.{ self.db_root, namespace }) catch return;
+        defer self.allocator.free(path);
+        std.fs.cwd().deleteTree(path) catch {};
+    }
+
+    fn publishCompactedNamespaceWithCas(
+        self: *VectorAdapter,
+        temp_namespace: []const u8,
+        expected_vector_generation: u64,
+        expected_change_generation: u64,
+        compact_ts: i64,
+    ) !void {
+        const vector_dir = try std.fs.path.join(self.allocator, &.{ self.db_root, "vector" });
+        defer self.allocator.free(vector_dir);
+        const temp_dir = try std.fs.path.join(self.allocator, &.{ self.db_root, temp_namespace });
+        defer self.allocator.free(temp_dir);
+
+        const vector_manifest_path = try std.fs.path.join(self.allocator, &.{ vector_dir, "manifest.json" });
+        defer self.allocator.free(vector_manifest_path);
+        const temp_manifest_path = try std.fs.path.join(self.allocator, &.{ temp_dir, "manifest.json" });
+        defer self.allocator.free(temp_manifest_path);
+
+        try db_lock.lock(self.fs_writer.lock_file);
+        defer db_lock.unlock(self.fs_writer.lock_file);
+        try db_lock.lock(self.change_writer.lock_file);
+        defer db_lock.unlock(self.change_writer.lock_file);
+
+        // Re-validate both generations under lock before publish.
+        _ = try self.fs_reader.refreshIfChanged();
+        if (self.fs_reader.snapshotGeneration() != expected_vector_generation) {
+            return error.ManifestGenerationConflict;
+        }
+        _ = try self.change_reader.refreshIfChanged();
+        if (self.change_reader.snapshotGeneration() != expected_change_generation) {
+            return error.ManifestGenerationConflict;
+        }
+
+        var current = try loadManifestOrEmpty(self.allocator, vector_manifest_path);
+        defer current.deinit(self.allocator);
+        var compacted = try loadManifestOrEmpty(self.allocator, temp_manifest_path);
+        defer compacted.deinit(self.allocator);
+
+        // Move newly compacted sealed segments into the live vector namespace.
+        for (compacted.segments) |segment| {
+            const src = try std.fs.path.join(self.allocator, &.{ temp_dir, segment.path });
+            defer self.allocator.free(src);
+            const dst = try std.fs.path.join(self.allocator, &.{ vector_dir, segment.path });
+            defer self.allocator.free(dst);
+            try std.fs.cwd().rename(src, dst);
+        }
+
+        const next_segments = try self.allocator.alloc(manifest.SegmentEntry, compacted.segments.len);
+        @memset(next_segments, std.mem.zeroes(manifest.SegmentEntry));
+        var filled_segments: usize = 0;
+        errdefer {
+            for (next_segments[0..filled_segments]) |entry| {
+                self.allocator.free(entry.path);
+                if (entry.index) |index_meta| self.allocator.free(index_meta.path);
+            }
+            self.allocator.free(next_segments);
+        }
+
+        for (compacted.segments, 0..) |segment, idx| {
+            next_segments[idx] = .{
+                .id = segment.id,
+                .path = try self.allocator.dupe(u8, segment.path),
+                .min_ts = segment.min_ts,
+                .max_ts = segment.max_ts,
+                .row_count = segment.row_count,
+                .checksum_crc32c = segment.checksum_crc32c,
+                .index = if (segment.index) |meta|
+                    .{
+                        .kind = meta.kind,
+                        .path = try self.allocator.dupe(u8, meta.path),
+                        .checksum_crc32c = meta.checksum_crc32c,
+                        .state = meta.state,
+                    }
+                else
+                    null,
+            };
+            filled_segments += 1;
+        }
+
+        var next = manifest.Manifest{
+            .version = current.version,
+            .generation = current.generation,
+            .segments = next_segments,
+            .last_compaction_ts = compact_ts,
+        };
+        defer next.deinit(self.allocator);
+        _ = try next.saveNextGeneration(self.allocator, vector_manifest_path, expected_vector_generation);
+
+        // Clear active writer files after publish; readers should use sealed segments.
+        try self.fs_writer.data_file.setEndPos(0);
+        try self.fs_writer.data_file.seekTo(0);
+        try self.fs_writer.data_file.sync();
+        try self.fs_writer.wal_writer.file.setEndPos(0);
+        try self.fs_writer.wal_writer.file.seekTo(0);
+        try self.fs_writer.wal_writer.file.sync();
+        if (comptime @hasDecl(std.posix, "fsync")) {
+            try std.posix.fsync(self.fs_writer.dir.fd);
+        }
+
+        // Remove superseded segment and index artifacts.
+        for (current.segments) |segment| {
+            var keep = false;
+            for (compacted.segments) |next_segment| {
+                if (std.mem.eql(u8, segment.path, next_segment.path)) {
+                    keep = true;
+                    break;
+                }
+            }
+            if (keep) continue;
+            const old_segment_path = try std.fs.path.join(self.allocator, &.{ vector_dir, segment.path });
+            defer self.allocator.free(old_segment_path);
+            std.fs.cwd().deleteFile(old_segment_path) catch {};
+            if (segment.index) |index_meta| {
+                const old_index_path = try std.fs.path.join(self.allocator, &.{ vector_dir, index_meta.path });
+                defer self.allocator.free(old_index_path);
+                std.fs.cwd().deleteFile(old_index_path) catch {};
+            }
+        }
+
+        _ = try self.fs_reader.refreshIfChanged();
+    }
+
+    fn appendCompactionUpsertRowsFromCurrentVector(self: *VectorAdapter) !usize {
+        try self.fs_writer.flushBlock();
+        _ = try self.fs_reader.refreshIfChanged();
+        const blocks = try self.fs_reader.getBlocks(self.allocator);
+        defer self.allocator.free(blocks);
+
+        const chunk_ids = try self.allocator.alloc(u64, compaction_batch_rows);
+        defer self.allocator.free(chunk_ids);
+        var chunk_len: usize = 0;
+        var total_rows: usize = 0;
+
+        var current_path: ?[]const u8 = null;
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
+        var scratch = ScratchBuffers{};
+        defer scratch.deinit(self.allocator);
+
+        for (blocks) |block| {
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, self.allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_embeddings or header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer self.allocator.free(descs);
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+
+            const id_buf = try scratch.ensureId(self.allocator, id_desc.data_len);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+
+            for (ids) |id| {
+                if (id == 0) continue;
+                chunk_ids[chunk_len] = id;
+                chunk_len += 1;
+                total_rows += 1;
+                if (chunk_len == compaction_batch_rows) {
+                    try self.appendCompactionUpsertChunk(chunk_ids[0..chunk_len]);
+                    chunk_len = 0;
+                }
+            }
+        }
+
+        if (chunk_len > 0) {
+            try self.appendCompactionUpsertChunk(chunk_ids[0..chunk_len]);
+        }
+
+        return total_rows;
+    }
+
+    fn appendCompactionUpsertChunk(self: *VectorAdapter, ids: []const u64) !void {
+        if (ids.len == 0) return;
+        const seqs = try self.allocator.alloc(u64, ids.len);
+        defer self.allocator.free(seqs);
+        for (seqs) |*seq| {
+            seq.* = self.allocateNextSeq();
+        }
+        try self.appendChangeRowsForOp(ids, seqs, .upsert);
     }
 
     /// Compact only if the vector manifest generation matches `expected_generation`.
@@ -1558,6 +1909,16 @@ pub const VectorAdapter = struct {
     }
 
     fn appendBatchRaw(self: *VectorAdapter, doc_ids: []const u64, vectors: []const f32, dims: u32) !void {
+        try self.appendBatchRawToWriter(self.fs_writer, doc_ids, vectors, dims);
+    }
+
+    fn appendBatchRawToWriter(
+        self: *VectorAdapter,
+        writer: *db_writer.Writer,
+        doc_ids: []const u64,
+        vectors: []const f32,
+        dims: u32,
+    ) !void {
         if (dims == 0) return error.InvalidColumnData;
         if (doc_ids.len == 0) return;
         if (vectors.len != doc_ids.len * @as(usize, dims)) return error.InvalidColumnData;
@@ -1576,7 +1937,7 @@ pub const VectorAdapter = struct {
             .{ .column_id = col_embedding, .shape = .VECTOR, .phys_type = .F32, .encoding = .RAW, .dims = @intCast(dims), .data = std.mem.sliceAsBytes(vectors) },
         };
 
-        try self.fs_writer.appendBatch(schema_embeddings, @intCast(doc_ids.len), &columns);
+        try writer.appendBatch(schema_embeddings, @intCast(doc_ids.len), &columns);
     }
 
     fn appendChangeRowsForOp(self: *VectorAdapter, ids: []const u64, seqs: []const u64, op: ChangeOp) !void {
@@ -2092,7 +2453,7 @@ pub const VectorAdapter = struct {
         self.fs_writer = try self.allocator.create(db_writer.Writer);
         errdefer self.allocator.destroy(self.fs_writer);
         self.fs_writer.* = try db_writer.Writer.open(self.allocator, self.db_root, "vector");
-        self.fs_writer.vector_index_build_mode = .deferred;
+        self.fs_writer.setSegmentIndexMetadataProvider(vectorSegmentIndexMetadataProvider);
 
         self.fs_reader = try self.allocator.create(db_reader.Reader);
         errdefer self.allocator.destroy(self.fs_reader);
@@ -2602,6 +2963,21 @@ pub const VectorAdapter = struct {
             normalized_queries = owned;
         }
 
+        // Streaming exact path: avoids mandatory full dense-cache
+        // materialization for large append-heavy datasets.
+        if (!options.approximate and plan.index_kind == .flat) {
+            if (try self.shouldUseStreamingExactSearch(allocator)) {
+                return self.searchBatchStreamingExact(
+                    allocator,
+                    query_buf,
+                    dims,
+                    query_count,
+                    k,
+                    options.filter_expr,
+                );
+            }
+        }
+
         try self.ensureReadCache();
 
         if (self.cached_latest.dims == 0) {
@@ -2668,6 +3044,137 @@ pub const VectorAdapter = struct {
             .count_per_query = index_result.count_per_query,
             .query_count = index_result.query_count,
         };
+    }
+
+    fn searchBatchStreamingExact(
+        self: *VectorAdapter,
+        allocator: Allocator,
+        queries: []const f32,
+        dims: u32,
+        query_count: u32,
+        k: u32,
+        filter_expr: ?*const vector_filter.FilterExpr,
+    ) !SearchBatchResult {
+        var snapshots = try self.readBlockSnapshots(allocator);
+        defer snapshots.deinit(allocator);
+
+        var visibility = try self.loadLatestVisibilityFromBlocks(allocator, snapshots.change_blocks);
+        defer visibility.deinit();
+
+        var latest_rows = std.AutoHashMap(u64, RowLocator).init(allocator);
+        defer latest_rows.deinit();
+        const seen_dims = try self.collectLatestVisibleRowLocators(
+            snapshots.vector_blocks,
+            &visibility,
+            &latest_rows,
+            dims,
+        );
+        if (seen_dims != 0 and seen_dims != dims) return error.InvalidColumnData;
+
+        var candidate_count: usize = 0;
+        var id_iter = latest_rows.keyIterator();
+        while (id_iter.next()) |id_ptr| {
+            if (idMatchesFilter(filter_expr, id_ptr.*)) candidate_count += 1;
+        }
+        if (candidate_count == 0) {
+            return .{
+                .ids = try allocator.alloc(u64, 0),
+                .scores = try allocator.alloc(f32, 0),
+                .count_per_query = 0,
+                .query_count = query_count,
+            };
+        }
+
+        const k_eff: u32 = if (candidate_count > @as(usize, k)) k else @intCast(candidate_count);
+        if (k_eff == 0) {
+            return .{
+                .ids = try allocator.alloc(u64, 0),
+                .scores = try allocator.alloc(f32, 0),
+                .count_per_query = 0,
+                .query_count = query_count,
+            };
+        }
+
+        const k_eff_usize: usize = @intCast(k_eff);
+        const query_count_usize: usize = @intCast(query_count);
+        const dims_usize: usize = @intCast(dims);
+        const total_slots = query_count_usize * k_eff_usize;
+        const out_ids = try allocator.alloc(u64, total_slots);
+        errdefer allocator.free(out_ids);
+        const out_scores = try allocator.alloc(f32, total_slots);
+        errdefer allocator.free(out_scores);
+        @memset(out_ids, 0);
+        @memset(out_scores, -std.math.inf(f32));
+
+        var current_path: ?[]const u8 = null;
+        var current_handle: ?segment_source.SegmentHandle = null;
+        defer closeCurrentBlockHandle(self.fs_reader, &current_handle);
+        var scratch = ScratchBuffers{};
+        defer scratch.deinit(self.allocator);
+
+        for (snapshots.vector_blocks, 0..) |block, block_idx| {
+            try ensureBlockHandle(self.fs_reader, &current_path, &current_handle, block.path);
+            const reader = block_reader.BlockReader.init(current_handle.?.file, allocator);
+            const header = try reader.readHeader(block.offset);
+            if (header.schema_id != schema_embeddings or header.row_count == 0) continue;
+
+            const descs = try reader.readColumnDirectory(header, block.offset);
+            defer allocator.free(descs);
+
+            const id_desc = findColumn(descs, col_doc_id) orelse return error.MissingColumn;
+            const embedding_desc = findColumn(descs, col_embedding) orelse return error.MissingColumn;
+            if (embedding_desc.dims != dims) return error.InvalidColumnData;
+
+            const id_buf = try scratch.ensureId(allocator, id_desc.data_len);
+            try reader.readColumnDataInto(block.offset, id_desc, id_buf);
+            _ = try checkedRowCount(header.row_count, id_buf.len, @sizeOf(u64));
+
+            const vector_buf = try scratch.ensureVector(allocator, embedding_desc.data_len);
+            try reader.readColumnDataInto(block.offset, embedding_desc, vector_buf);
+            const vector_len = @as(usize, header.row_count) * dims_usize;
+            if (vector_buf.len != vector_len * @sizeOf(f32)) return error.InvalidColumnData;
+
+            const ids = @as([*]const u64, @ptrCast(@alignCast(id_buf.ptr)))[0..header.row_count];
+            const vectors = @as([*]const f32, @ptrCast(@alignCast(vector_buf.ptr)))[0..vector_len];
+
+            for (0..header.row_count) |row_idx| {
+                const id = ids[row_idx];
+                if (id == 0) continue;
+                if (!idMatchesFilter(filter_expr, id)) continue;
+                const locator = latest_rows.get(id) orelse continue;
+                if (locator.block_idx != block_idx or locator.row_idx != row_idx) continue;
+
+                const row_base = row_idx * dims_usize;
+                const row = vectors[row_base .. row_base + dims_usize];
+                for (0..query_count_usize) |query_idx| {
+                    const query_base = query_idx * dims_usize;
+                    const query = queries[query_base .. query_base + dims_usize];
+                    const score = dot_product.dotProductF32(query, row);
+                    const slot_base = query_idx * k_eff_usize;
+                    insertSearchCandidate(
+                        out_ids[slot_base .. slot_base + k_eff_usize],
+                        out_scores[slot_base .. slot_base + k_eff_usize],
+                        id,
+                        score,
+                    );
+                }
+            }
+        }
+
+        return .{
+            .ids = out_ids,
+            .scores = out_scores,
+            .count_per_query = k_eff,
+            .query_count = query_count,
+        };
+    }
+
+    fn shouldUseStreamingExactSearch(self: *VectorAdapter, allocator: Allocator) !bool {
+        try self.fs_writer.flushBlock();
+        _ = try self.fs_reader.refreshIfChanged();
+        const blocks = try self.fs_reader.getBlocks(allocator);
+        defer allocator.free(blocks);
+        return blocks.len >= streaming_exact_min_blocks;
     }
 
     fn ensureApproximateIndexCache(self: *VectorAdapter, dims: u32) !bool {
@@ -2920,6 +3427,60 @@ pub fn destroy(allocator: Allocator, backend: *VectorAdapter) void {
     allocator.destroy(backend);
 }
 
+fn loadManifestOrEmpty(allocator: Allocator, path: []const u8) !manifest.Manifest {
+    return manifest.Manifest.load(allocator, path) catch |err| switch (err) {
+        error.FileNotFound => blk: {
+            const empty = try allocator.alloc(manifest.SegmentEntry, 0);
+            break :blk manifest.Manifest{
+                .version = 1,
+                .generation = 0,
+                .segments = empty,
+                .last_compaction_ts = 0,
+            };
+        },
+        else => return err,
+    };
+}
+
+fn idMatchesFilter(expr: ?*const vector_filter.FilterExpr, id: u64) bool {
+    const node = expr orelse return true;
+    return switch (node.*) {
+        .all => true,
+        .id_eq => |target| id == target,
+        .id_in => |targets| std.mem.indexOfScalar(u64, targets, id) != null,
+        .and_expr => |children| blk: {
+            for (children) |child| {
+                if (!idMatchesFilter(&child, id)) break :blk false;
+            }
+            break :blk true;
+        },
+        .or_expr => |children| blk: {
+            for (children) |child| {
+                if (idMatchesFilter(&child, id)) break :blk true;
+            }
+            break :blk false;
+        },
+        .not_expr => |child| !idMatchesFilter(child, id),
+    };
+}
+
+fn insertSearchCandidate(ids: []u64, scores: []f32, id: u64, score: f32) void {
+    if (ids.len == 0 or scores.len == 0) return;
+    const tail = scores.len - 1;
+    if (score < scores[tail]) return;
+    if (score == scores[tail] and ids[tail] != 0 and id >= ids[tail]) return;
+
+    var idx = tail;
+    while (idx > 0 and (score > scores[idx - 1] or
+        (score == scores[idx - 1] and (ids[idx - 1] == 0 or id < ids[idx - 1])))) : (idx -= 1)
+    {
+        scores[idx] = scores[idx - 1];
+        ids[idx] = ids[idx - 1];
+    }
+    scores[idx] = score;
+    ids[idx] = id;
+}
+
 fn segmentNeedsApproximateIndexBuild(segment: *const manifest.SegmentEntry) bool {
     if (segment.row_count == 0) return false;
     if (segment.index == null) return true;
@@ -2933,6 +3494,19 @@ fn deriveIndexPathFromSegmentPath(allocator: Allocator, segment_path: []const u8
     if (!std.mem.endsWith(u8, segment_path, suffix)) return error.InvalidColumnData;
     const base = segment_path[0 .. segment_path.len - suffix.len];
     return std.fmt.allocPrint(allocator, "{s}.ivf", .{base});
+}
+
+fn vectorSegmentIndexMetadataProvider(
+    allocator: Allocator,
+    segment_rel_path: []const u8,
+) !?manifest.SegmentIndexMeta {
+    const index_path = try deriveIndexPathFromSegmentPath(allocator, segment_rel_path);
+    return .{
+        .kind = .ivf_flat,
+        .path = index_path,
+        .checksum_crc32c = 0,
+        .state = .pending,
+    };
 }
 
 fn findColumn(descs: []const types.ColumnDesc, column_id: u32) ?types.ColumnDesc {
@@ -3583,6 +4157,49 @@ test "VectorAdapter.searchBatchWithOptions applies filter pre-allowlist" {
     try std.testing.expectEqual(@as(usize, 2), result.ids.len);
     try std.testing.expectEqual(@as(u64, 2), result.ids[0]);
     try std.testing.expectEqual(@as(u64, 3), result.ids[1]);
+}
+
+test "VectorAdapter.searchBatchWithOptions uses streaming exact path with filter on large block counts" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(root_path);
+
+    var backend = try VectorAdapter.init(std.testing.allocator, root_path);
+    defer backend.deinit();
+
+    // Force many small blocks so streaming exact path is selected.
+    backend.fs_writer.max_segment_size = 1;
+
+    const dims: u32 = 2;
+    var id: u64 = 1;
+    while (id <= 10) : (id += 1) {
+        const row = [_]f32{ @as(f32, @floatFromInt(id)), 0.0 };
+        try backend.upsertBatch(&[_]u64{id}, &row, dims);
+        try backend.fs_writer.flushBlock();
+    }
+
+    const filter_expr = vector_filter.FilterExpr{ .id_in = &[_]u64{ 3, 8, 10 } };
+    var result = try backend.searchBatchWithOptions(
+        std.testing.allocator,
+        &[_]f32{ 1.0, 0.0 },
+        dims,
+        1,
+        2,
+        .{ .filter_expr = &filter_expr },
+    );
+    defer result.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 2), result.count_per_query);
+    try std.testing.expectEqual(@as(usize, 2), result.ids.len);
+    try std.testing.expectEqual(@as(u64, 10), result.ids[0]);
+    try std.testing.expectEqual(@as(u64, 8), result.ids[1]);
+
+    // Streaming path should avoid dense-cache materialization.
+    try std.testing.expect(!backend.read_cache_valid);
+    try std.testing.expectEqual(@as(usize, 0), backend.cached_visible_ids.len);
+    try std.testing.expectEqual(@as(usize, 0), backend.cached_visible_vectors.len);
 }
 
 test "VectorAdapter.searchBatchWithOptions clamps top_k to allowlist size" {

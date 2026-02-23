@@ -49,6 +49,10 @@ deps:
 	# macOS: requires `brew install cmake` (Xcode Command Line Tools for Metal)
 	@test -d deps/utf8proc || git clone --branch v2.11.2 --depth 1 https://github.com/JuliaStrings/utf8proc.git deps/utf8proc
 	@test -d deps/pcre2 || git clone --branch pcre2-10.47 --depth 1 https://github.com/PCRE2Project/pcre2.git deps/pcre2
+	@test -d deps/curl || git clone --branch curl-8_17_0 --depth 1 https://github.com/curl/curl.git deps/curl
+	@test -d deps/mbedtls || (git clone --branch v3.6.2 --depth 1 --recurse-submodules https://github.com/Mbed-TLS/mbedtls.git deps/mbedtls)
+	@test -d deps/miniz || git clone --branch 3.1.1 --depth 1 https://github.com/richgel999/miniz.git deps/miniz
+	@test -f deps/miniz/miniz_export.h || printf '#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n' > deps/miniz/miniz_export.h
 	@test -d deps/sqlite || (mkdir -p /tmp/sqlite-dl && \
 		curl -sL "https://sqlite.org/2026/sqlite-amalgamation-3510200.zip" \
 		-o /tmp/sqlite-dl/sqlite.zip && \
@@ -57,10 +61,6 @@ deps:
 		cp /tmp/sqlite-dl/sqlite-amalgamation-*/sqlite3.c \
 		   /tmp/sqlite-dl/sqlite-amalgamation-*/sqlite3.h deps/sqlite/ && \
 		rm -rf /tmp/sqlite-dl)
-	@test -d deps/curl || git clone --branch curl-8_17_0 --depth 1 https://github.com/curl/curl.git deps/curl
-	@test -d deps/mbedtls || (git clone --branch v3.6.2 --depth 1 --recurse-submodules https://github.com/Mbed-TLS/mbedtls.git deps/mbedtls)
-	@test -d deps/miniz || git clone --branch 3.1.1 --depth 1 https://github.com/richgel999/miniz.git deps/miniz
-	@test -f deps/miniz/miniz_export.h || printf '#ifndef MINIZ_EXPORT\n#define MINIZ_EXPORT\n#endif\n' > deps/miniz/miniz_export.h
 	@test -d deps/file || git clone --branch FILE5_46 --depth 1 https://github.com/file/file.git deps/file
 	@test -d deps/jpeg-turbo || git clone --branch 3.1.3 --depth 1 https://github.com/libjpeg-turbo/libjpeg-turbo.git deps/jpeg-turbo
 	@test -d deps/spng || git clone --branch v0.7.4 --depth 1 https://github.com/randy408/libspng.git deps/spng

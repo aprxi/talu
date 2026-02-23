@@ -51,7 +51,7 @@ pub(super) fn cmd_ls(args: LsArgs) -> Result<()> {
         } else {
             crate::config::resolve_and_ensure_bucket(&args.profile)?
         };
-        let pin_store = PinStore::open(&pin_bucket.join("meta.sqlite"))?;
+        let pin_store = PinStore::open(&pin_bucket)?;
         Some(pin_store.list_pinned()?.into_iter().collect::<HashSet<_>>())
     } else {
         None

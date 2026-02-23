@@ -58,6 +58,7 @@ pub mod plugins;
 pub mod policy;
 pub mod provider;
 pub mod repo;
+pub mod repo_meta;
 pub mod responses;
 pub mod router;
 pub mod storage;
@@ -91,6 +92,7 @@ pub use repo::{
     CacheOrigin, CachedModel, DownloadOptions, DownloadProgress, HfSearchResult,
     ProgressAction as RepoProgressAction, SearchDirection, SearchSort,
 };
+pub use repo_meta::{RepoMetaError, RepoMetaStore, RepoPinEntry};
 pub use storage::{SessionRecord, StorageError, StorageHandle};
 pub use vector::{SearchBatchResult, VectorError, VectorStore};
 pub use xray::{TraceRecord, TraceStats, XrayCaptureHandle};

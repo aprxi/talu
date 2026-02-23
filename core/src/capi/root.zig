@@ -26,6 +26,7 @@ pub const buffer = @import("buffer.zig");
 pub const types = @import("types.zig");
 pub const provider = @import("provider.zig");
 pub const db_storage = @import("db.zig");
+pub const repo_meta = @import("repo_meta.zig");
 pub const log_api = @import("log.zig");
 pub const progress = @import("progress.zig");
 pub const memory = @import("memory.zig");
@@ -198,6 +199,19 @@ pub const CachedModelList = repo.CachedModelList;
 pub const SearchResultList = repo.SearchResultList;
 pub const StringList = repo.StringList;
 pub const DownloadOptions = repo.DownloadOptions;
+
+// Re-export repo metadata C API functions.
+pub const talu_repo_meta_init = repo_meta.talu_repo_meta_init;
+pub const talu_repo_meta_free = repo_meta.talu_repo_meta_free;
+pub const talu_repo_meta_pin = repo_meta.talu_repo_meta_pin;
+pub const talu_repo_meta_unpin = repo_meta.talu_repo_meta_unpin;
+pub const talu_repo_meta_update_size = repo_meta.talu_repo_meta_update_size;
+pub const talu_repo_meta_clear_size = repo_meta.talu_repo_meta_clear_size;
+pub const talu_repo_meta_list_pins = repo_meta.talu_repo_meta_list_pins;
+pub const talu_repo_meta_free_list = repo_meta.talu_repo_meta_free_list;
+pub const PinAdapterHandle = repo_meta.PinAdapterHandle;
+pub const CPinRecord = repo_meta.CPinRecord;
+pub const CPinList = repo_meta.CPinList;
 
 // Re-export error C API functions.
 pub const talu_last_error = err.talu_last_error;

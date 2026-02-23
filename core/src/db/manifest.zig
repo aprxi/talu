@@ -375,7 +375,9 @@ fn uuidToHexLower(allocator: Allocator, value: u128) ![]const u8 {
 
 fn syncParentDir(path: []const u8) !void {
     const parent = std.fs.path.dirname(path) orelse ".";
-    var dir = try std.fs.cwd().openDir(parent, .{});
+    // Use iterate=true to avoid O_PATH-style descriptors that are not fsync-able
+    // on some filesystems/runtime configurations.
+    var dir = try std.fs.cwd().openDir(parent, .{ .iterate = true });
     defer dir.close();
     if (comptime @hasDecl(std.posix, "fsync")) {
         try std.posix.fsync(dir.fd);

@@ -248,7 +248,7 @@ pub async fn handle_list(
         // Load pinned set for filtering and annotation.
         let pinned_set: HashSet<String> = bucket_path
             .as_ref()
-            .and_then(|bp| PinStore::open(&bp.join("meta.sqlite")).ok())
+            .and_then(|bp| PinStore::open(bp).ok())
             .and_then(|store| store.list_pinned().ok())
             .map(|v| v.into_iter().collect())
             .unwrap_or_default();
@@ -665,7 +665,7 @@ pub async fn handle_list_pins(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let store = PinStore::open(&bucket_path.join("meta.sqlite"))?;
+        let store = PinStore::open(&bucket_path)?;
         store.list_pinned_entries()
     })
     .await;
@@ -738,7 +738,7 @@ pub async fn handle_pin(
 
     let model_id = request.model_id.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let store = PinStore::open(&bucket_path.join("meta.sqlite"))?;
+        let store = PinStore::open(&bucket_path)?;
         store.pin(&model_id)?;
 
         // Update size if model is already cached.
@@ -800,7 +800,7 @@ pub async fn handle_unpin(
 
     let model_id_owned = model_id.to_string();
     let result = tokio::task::spawn_blocking(move || {
-        let store = PinStore::open(&bucket_path.join("meta.sqlite"))?;
+        let store = PinStore::open(&bucket_path)?;
         store.unpin(&model_id_owned)?;
         Ok::<_, anyhow::Error>(())
     })
@@ -897,7 +897,7 @@ fn sync_pins_blocking(
     bucket_path: &std::path::Path,
     request: &SyncPinsRequest,
 ) -> Result<SyncPinsResponse, anyhow::Error> {
-    let store = PinStore::open(&bucket_path.join("meta.sqlite"))?;
+    let store = PinStore::open(&bucket_path)?;
     let entries = store.list_pinned_entries()?;
     let total = entries.len();
 
@@ -971,7 +971,7 @@ fn handle_sync_pins_streaming(
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
 
     std::thread::spawn(move || {
-        let store = match PinStore::open(&bucket_path.join("meta.sqlite")) {
+        let store = match PinStore::open(&bucket_path) {
             Ok(s) => s,
             Err(e) => {
                 let err = json!({ "event": "error", "message": format!("{e}") });

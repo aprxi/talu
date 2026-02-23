@@ -137,6 +137,20 @@ pub const DocumentTagFieldIds = struct {
     pub const added_at_ms: u16 = 3;
 };
 
+/// Stable field IDs for Repo Pin KvBuf encoding (Schema 20).
+///
+/// These IDs are persisted on disk — never change or reuse an existing value.
+pub const RepoPinFieldIds = struct {
+    /// Model URI string (canonical identity).
+    pub const model_uri: u16 = 1;
+    /// Initial pin timestamp (ms since epoch).
+    pub const pinned_at_ms: u16 = 2;
+    /// Cached local size in bytes (optional).
+    pub const size_bytes: u16 = 3;
+    /// Timestamp when size was last updated (optional, ms since epoch).
+    pub const size_updated_at_ms: u16 = 4;
+};
+
 /// Stable field IDs for TagDocumentIndex (inverted index) KvBuf encoding (Schema 14).
 ///
 /// This is the INVERTED index: tag → documents (for O(1) tag lookups).
@@ -198,4 +212,11 @@ test "DocumentFieldIds include doc_json_ref" {
     try std.testing.expectEqual(@as(u16, 13), DocumentFieldIds.base_doc_id);
     try std.testing.expectEqual(@as(u16, 14), DocumentFieldIds.doc_json_ref);
     try std.testing.expectEqual(@as(u16, 15), DocumentFieldIds.doc_json_trigram_bloom);
+}
+
+test "RepoPinFieldIds are stable" {
+    try std.testing.expectEqual(@as(u16, 1), RepoPinFieldIds.model_uri);
+    try std.testing.expectEqual(@as(u16, 2), RepoPinFieldIds.pinned_at_ms);
+    try std.testing.expectEqual(@as(u16, 3), RepoPinFieldIds.size_bytes);
+    try std.testing.expectEqual(@as(u16, 4), RepoPinFieldIds.size_updated_at_ms);
 }

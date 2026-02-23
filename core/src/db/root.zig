@@ -16,7 +16,9 @@
 //! - `manifest` - Sealed segment index (JSON)
 //! - `blob` - Blob subsystem (content-addressable store + offline GC)
 //! - `vector` - Vector search domain (storage, search, indexing)
-//! - `table` - Table storage domain (chat, future structured storage)
+//! - `kv` - Key/value state domain (tiny mutable state)
+//! - `sql` - SQLite compute/query bindings (virtual table integration layer)
+//! - `table` - Table storage domain (structured records)
 
 // =============================================================================
 // Public API
@@ -61,6 +63,12 @@ pub const jobs = @import("jobs.zig");
 
 /// Vector search domain (storage, search, indexing).
 pub const vector = @import("vector/root.zig");
+
+/// Key/value state domain (tiny mutable state).
+pub const kv = @import("kv/root.zig");
+
+/// SQL compute/query integration layer.
+pub const sql = @import("sql/root.zig");
 
 /// Table storage domain (session-scoped item persistence).
 pub const table = @import("table/root.zig");

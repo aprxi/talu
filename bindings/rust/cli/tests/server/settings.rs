@@ -92,11 +92,7 @@ fn patch_sets_model() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "test-model"}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model": "test-model"}));
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.json()["model"], "test-model");
 }
@@ -137,11 +133,7 @@ fn patch_sets_context_length() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"context_length": 8192}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"context_length": 8192}));
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.json()["context_length"], 8192);
 }
@@ -187,11 +179,7 @@ fn patch_sets_auto_title() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"auto_title": false}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"auto_title": false}));
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.json()["auto_title"], false);
 
@@ -251,18 +239,15 @@ fn patch_preserves_default_prompt_id() {
     );
 
     // Patch an unrelated field.
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "other-model"}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model": "other-model"}));
     assert_eq!(resp.status, 200);
 
     // Verify default_prompt_id survived.
     let resp = get(ctx.addr(), "/v1/settings");
     assert_eq!(resp.status, 200);
     assert_eq!(
-        resp.json()["default_prompt_id"], "prompt-keep",
+        resp.json()["default_prompt_id"],
+        "prompt-keep",
         "default_prompt_id should be preserved across unrelated patches"
     );
 }
@@ -277,27 +262,20 @@ fn patch_preserves_auto_title_false() {
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
     // Set auto_title to false.
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"auto_title": false}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"auto_title": false}));
     assert_eq!(resp.status, 200);
     assert_eq!(resp.json()["auto_title"], false);
 
     // Patch an unrelated field (forces a load → save → load round-trip).
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "some-model"}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model": "some-model"}));
     assert_eq!(resp.status, 200);
 
     // Verify auto_title survived as false.
     let resp = get(ctx.addr(), "/v1/settings");
     assert_eq!(resp.status, 200);
     assert_eq!(
-        resp.json()["auto_title"], false,
+        resp.json()["auto_title"],
+        false,
         "auto_title=false must survive an unrelated PATCH round-trip"
     );
 }
@@ -318,18 +296,15 @@ fn patch_preserves_system_prompt_enabled_false() {
     assert_eq!(resp.json()["system_prompt_enabled"], false);
 
     // Patch an unrelated field.
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "some-model"}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model": "some-model"}));
     assert_eq!(resp.status, 200);
 
     // Verify system_prompt_enabled survived as false.
     let resp = get(ctx.addr(), "/v1/settings");
     assert_eq!(resp.status, 200);
     assert_eq!(
-        resp.json()["system_prompt_enabled"], false,
+        resp.json()["system_prompt_enabled"],
+        false,
         "system_prompt_enabled=false must survive an unrelated PATCH round-trip"
     );
 }
@@ -394,11 +369,7 @@ fn patch_sequential_accumulates() {
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
     // First PATCH sets model
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "model-a"}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model": "model-a"}));
     assert_eq!(resp.status, 200);
 
     // Second PATCH sets system_prompt (model should be preserved)
@@ -424,11 +395,7 @@ fn patch_empty_body_noop() {
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
     // Set model first
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "keep-me"}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model": "keep-me"}));
     assert_eq!(resp.status, 200);
 
     // Empty PATCH
@@ -482,11 +449,7 @@ fn patch_model_overrides() {
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
     // Must set active model first (overrides are keyed to active model)
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "test-model"}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model": "test-model"}));
     assert_eq!(resp.status, 200);
 
     // Set overrides
@@ -512,11 +475,7 @@ fn patch_model_overrides_cleanup_on_all_null() {
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
     // Set model and overrides
-    patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "test-model"}),
-    );
+    patch_json(ctx.addr(), "/v1/settings", &json!({"model": "test-model"}));
     patch_json(
         ctx.addr(),
         "/v1/settings",
@@ -580,11 +539,7 @@ fn delete_model_overrides() {
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
     // Set model and overrides
-    patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "test-model"}),
-    );
+    patch_json(ctx.addr(), "/v1/settings", &json!({"model": "test-model"}));
     patch_json(
         ctx.addr(),
         "/v1/settings",
@@ -701,10 +656,7 @@ fn response_has_correct_fields() {
         obj.contains_key("context_length"),
         "missing 'context_length' field"
     );
-    assert!(
-        obj.contains_key("auto_title"),
-        "missing 'auto_title' field"
-    );
+    assert!(obj.contains_key("auto_title"), "missing 'auto_title' field");
     assert!(
         obj.contains_key("default_prompt_id"),
         "missing 'default_prompt_id' field"
@@ -740,11 +692,7 @@ fn bare_path_patch() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
-    let resp = patch_json(
-        ctx.addr(),
-        "/settings",
-        &json!({"model": "bare-model"}),
-    );
+    let resp = patch_json(ctx.addr(), "/settings", &json!({"model": "bare-model"}));
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.json()["model"], "bare-model");
 }
@@ -853,7 +801,8 @@ fn settings_tenant_isolation() {
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(
-        resp.json()["model"], "acme-model",
+        resp.json()["model"],
+        "acme-model",
         "acme's model should be unchanged after globex patch"
     );
 }
@@ -866,11 +815,7 @@ fn patch_empty_model_overrides_is_noop() {
     let ctx = ServerTestContext::new(settings_config(temp.path()));
 
     // Set model and overrides.
-    patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model": "test-model"}),
-    );
+    patch_json(ctx.addr(), "/v1/settings", &json!({"model": "test-model"}));
     patch_json(
         ctx.addr(),
         "/v1/settings",
@@ -878,19 +823,15 @@ fn patch_empty_model_overrides_is_noop() {
     );
 
     // Send empty overrides object — should be a no-op.
-    let resp = patch_json(
-        ctx.addr(),
-        "/v1/settings",
-        &json!({"model_overrides": {}}),
-    );
+    let resp = patch_json(ctx.addr(), "/v1/settings", &json!({"model_overrides": {}}));
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     // Verify overrides survived by reading the TOML file directly.
     // The GET/PATCH response doesn't include raw overrides — only
     // `available_models[].overrides` which requires a real managed model.
     let toml_path = temp.path().join("settings.toml");
-    let toml_str = std::fs::read_to_string(&toml_path)
-        .expect("settings.toml should exist after PATCH");
+    let toml_str =
+        std::fs::read_to_string(&toml_path).expect("settings.toml should exist after PATCH");
     let parsed: toml::Value =
         toml::from_str(&toml_str).expect("settings.toml should be valid TOML");
     let temp_val = parsed
