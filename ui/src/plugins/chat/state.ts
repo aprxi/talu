@@ -33,6 +33,7 @@ export interface ChatState {
   backgroundStreamDom: Map<string, DocumentFragment>;
   /** Whether system prompts are enabled (from settings). */
   systemPromptEnabled: boolean;
+  sidebarSearchQuery: string;
   pagination: {
     offset: number;
     hasMore: boolean;
@@ -53,6 +54,7 @@ export const chatState: ChatState = {
   backgroundStreamSessions: new Set(),
   backgroundStreamDom: new Map(),
   systemPromptEnabled: true,
+  sidebarSearchQuery: "",
   pagination: {
     offset: 0,
     hasMore: true,

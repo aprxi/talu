@@ -18,11 +18,7 @@ import {
 export async function loadModels(): Promise<void> {
   repoState.isLoading = true;
 
-  const qs: string[] = [];
-  if (repoState.tab === "pinned") qs.push("pinned=true");
-  const query = qs.length ? `?${qs.join("&")}` : "";
-
-  const res = await api.listRepoModels(query);
+  const res = await api.listRepoModels("");
   repoState.isLoading = false;
 
   if (res.ok && res.data) {

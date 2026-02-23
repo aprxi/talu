@@ -48,6 +48,13 @@
   pointer-events: auto;
 }
 
+/* Search wrapper in header toolbar — constrain width. */
+.browser-header .search-wrapper {
+  max-width: 240px;
+  min-width: 120px;
+  flex-shrink: 1;
+}
+
 .browser-clear-btn {
   position: absolute;
   right: 0.5rem;
@@ -69,6 +76,11 @@
 
 .browser-clear-btn.hidden {
   display: none;
+}
+
+/* Sidebar search (chat) */
+.sidebar-search {
+  padding: 0 0.75rem 0.5rem;
 }
 
 /* =============================================================================

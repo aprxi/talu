@@ -29,7 +29,7 @@ export function createDomRoot(
 
 /** Element IDs expected by getChatDom(). */
 export const CHAT_DOM_IDS = [
-  "sidebar-list", "loader-sentinel", "new-conversation", "transcript",
+  "sidebar-list", "loader-sentinel", "new-conversation", "sidebar-search", "sidebar-search-clear", "transcript",
   "welcome-state", "welcome-input", "welcome-send", "welcome-attach", "welcome-library", "welcome-attachment-list", "welcome-model", "welcome-prompt",
   "input-bar", "input-text", "input-send", "input-attach", "input-library", "input-attachment-list", "chat-file-input",
   "right-panel", "close-right-panel", "panel-model",
@@ -48,6 +48,8 @@ export const CHAT_DOM_TAGS: Record<string, string> = {
   "welcome-model": "select",
   "welcome-prompt": "select",
   "new-conversation": "button",
+  "sidebar-search": "input",
+  "sidebar-search-clear": "button",
   "input-text": "textarea",
   "input-send": "button",
   "input-attach": "button",
@@ -66,7 +68,7 @@ export const CHAT_DOM_TAGS: Record<string, string> = {
 
 /** Element IDs expected by getBrowserDom(). */
 export const BROWSER_DOM_IDS = [
-  "bp-cards", "bp-search", "bp-tab-all", "bp-tab-archived",
+  "bp-cards", "bp-search", "bp-search-clear", "bp-tab-all", "bp-tab-archived",
   "bp-tags", "bp-tags-section", "bp-select-all", "bp-delete",
   "bp-export", "bp-archive", "bp-restore", "bp-cancel",
   "bp-bulk-actions", "bp-toolbar", "bp-pagination",
@@ -75,6 +77,7 @@ export const BROWSER_DOM_IDS = [
 /** Tag overrides for browser DOM elements that need specific types. */
 export const BROWSER_DOM_TAGS: Record<string, string> = {
   "bp-search": "input",
+  "bp-search-clear": "button",
   "bp-tab-all": "button",
   "bp-tab-archived": "button",
   "bp-select-all": "button",
@@ -85,10 +88,8 @@ export const BROWSER_DOM_TAGS: Record<string, string> = {
   "bp-cancel": "button",
 };
 
-/** Extra class-based elements for getBrowserDom(). */
-export const BROWSER_DOM_EXTRAS: { tag: string; className: string }[] = [
-  { tag: "button", className: "browser-clear-btn" },
-];
+/** Extra class-based elements for getBrowserDom() — no longer needed. */
+export const BROWSER_DOM_EXTRAS: { tag: string; className: string }[] = [];
 
 /** Element IDs expected by getPromptsDom(). */
 export const PROMPTS_DOM_IDS = [
@@ -154,9 +155,12 @@ export const SETTINGS_DOM_TAGS: Record<string, string> = {
 /** Element IDs expected by getRepoDom(). */
 export const REPO_DOM_IDS = [
   "rp-search", "rp-search-clear",
-  "rp-tab-local", "rp-tab-pinned", "rp-tab-discover",
-  "rp-stats", "rp-thead", "rp-tbody",
-  "rp-table-container", "rp-discover-container", "rp-discover-results", "rp-downloads",
+  "rp-tab-discover", "rp-tab-local",
+  "rp-source-all", "rp-source-hub", "rp-source-managed",
+  "rp-stats",
+  "rp-discover-view", "rp-discover-toolbar", "rp-discover-container", "rp-discover-results",
+  "rp-local-view", "rp-local-toolbar", "rp-local-thead", "rp-local-tbody", "rp-local-table-container",
+  "rp-downloads",
   "rp-count", "rp-select-all", "rp-pin-all", "rp-delete", "rp-cancel",
   "rp-bulk-actions",
   "rp-sort", "rp-size-filter", "rp-task-filter", "rp-library-filter",
@@ -166,11 +170,13 @@ export const REPO_DOM_IDS = [
 export const REPO_DOM_TAGS: Record<string, string> = {
   "rp-search": "input",
   "rp-search-clear": "button",
-  "rp-tab-local": "button",
-  "rp-tab-pinned": "button",
   "rp-tab-discover": "button",
-  "rp-thead": "thead",
-  "rp-tbody": "tbody",
+  "rp-tab-local": "button",
+  "rp-source-all": "button",
+  "rp-source-hub": "button",
+  "rp-source-managed": "button",
+  "rp-local-thead": "thead",
+  "rp-local-tbody": "tbody",
   "rp-select-all": "button",
   "rp-pin-all": "button",
   "rp-delete": "button",

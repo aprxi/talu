@@ -7,8 +7,8 @@ import { createDomRoot, REPO_DOM_IDS, REPO_DOM_TAGS } from "../../helpers/dom.ts
 import { mockControllableTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 
 /**
- * Tests for repo event wiring — tab switching, search debouncing, column sort,
- * table row actions, discover card actions, bulk actions, and filter selects.
+ * Tests for repo event wiring — tab switching, source toggle, search debouncing,
+ * column sort, table row actions, discover card actions, bulk actions, and filter selects.
  */
 
 // -- Mock state --------------------------------------------------------------
@@ -23,7 +23,8 @@ beforeEach(() => {
   notif = mockNotifications();
 
   // Reset state.
-  repoState.tab = "local";
+  repoState.tab = "discover";
+  repoState.localSourceFilter = "all";
   repoState.models = [];
   repoState.totalSizeBytes = 0;
   repoState.searchResults = [];
@@ -42,9 +43,12 @@ beforeEach(() => {
   // DOM.
   const root = createDomRoot(REPO_DOM_IDS, undefined, REPO_DOM_TAGS);
   // Set data-tab attributes on tab buttons (events.ts reads these).
-  root.querySelector("#rp-tab-local")!.setAttribute("data-tab", "local");
-  root.querySelector("#rp-tab-pinned")!.setAttribute("data-tab", "pinned");
   root.querySelector("#rp-tab-discover")!.setAttribute("data-tab", "discover");
+  root.querySelector("#rp-tab-local")!.setAttribute("data-tab", "local");
+  // Set data-source attributes on source toggle buttons.
+  root.querySelector("#rp-source-all")!.setAttribute("data-source", "all");
+  root.querySelector("#rp-source-hub")!.setAttribute("data-source", "hub");
+  root.querySelector("#rp-source-managed")!.setAttribute("data-source", "managed");
   // Add options to filter selects so .value assignment works.
   const addOpts = (id: string, values: string[]) => {
     const sel = root.querySelector(`#${id}`) as HTMLSelectElement;
@@ -105,32 +109,34 @@ beforeEach(() => {
 
 // -- Helpers -----------------------------------------------------------------
 
-function makeModel(id: string, pinned = false): any {
+function makeModel(id: string, opts?: { pinned?: boolean; source?: string }): any {
   return {
-    id, path: `/models/${id}`, source: "hub", size_bytes: 1024,
-    mtime: 1700000000, architecture: "llama", quant_scheme: "Q4_K_M", pinned,
+    id, path: `/models/${id}`, source: opts?.source ?? "hub", size_bytes: 1024,
+    mtime: 1700000000, architecture: "llama", quant_scheme: "Q4_K_M",
+    pinned: opts?.pinned ?? false,
   };
 }
 
 // ── Tab switching ───────────────────────────────────────────────────────────
 
 describe("Tab switching", () => {
-  test("clicking pinned tab switches to pinned", () => {
+  test("clicking local tab switches to local", () => {
     wireRepoEvents();
-    getRepoDom().tabPinned.dispatchEvent(new Event("click"));
-    expect(repoState.tab).toBe("pinned");
+    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
+    expect(repoState.tab).toBe("local");
   });
 
   test("clicking discover tab switches to discover", () => {
+    repoState.tab = "local";
     wireRepoEvents();
     getRepoDom().tabDiscover.dispatchEvent(new Event("click"));
     expect(repoState.tab).toBe("discover");
   });
 
   test("clicking same tab does nothing", () => {
-    repoState.tab = "local";
+    repoState.tab = "discover";
     wireRepoEvents();
-    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
+    getRepoDom().tabDiscover.dispatchEvent(new Event("click"));
     // No API call should be made (no reload triggered).
     expect(apiCalls.length).toBe(0);
   });
@@ -139,31 +145,71 @@ describe("Tab switching", () => {
     repoState.selectedIds.add("m1");
     repoState.selectedIds.add("m2");
     wireRepoEvents();
-    getRepoDom().tabPinned.dispatchEvent(new Event("click"));
+    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
     expect(repoState.selectedIds.size).toBe(0);
   });
 
   test("tab switch clears search query", () => {
     repoState.searchQuery = "old query";
     wireRepoEvents();
-    getRepoDom().tabPinned.dispatchEvent(new Event("click"));
+    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
     expect(repoState.searchQuery).toBe("");
   });
 
-  test("switching to non-discover tab triggers loadModels", async () => {
+  test("switching to local tab does not call searchHub", async () => {
     wireRepoEvents();
-    getRepoDom().tabPinned.dispatchEvent(new Event("click"));
+    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
     await flushAsync();
 
-    expect(apiCalls.some((c) => c.method === "listRepoModels")).toBe(true);
+    expect(apiCalls.filter((c) => c.method === "searchRepoModels").length).toBe(0);
   });
 
-  test("switching to discover tab loads trending models", async () => {
+  test("switching to discover tab triggers searchHub", async () => {
+    repoState.tab = "local";
     wireRepoEvents();
     getRepoDom().tabDiscover.dispatchEvent(new Event("click"));
     await flushAsync();
 
     expect(apiCalls.some((c) => c.method === "searchRepoModels")).toBe(true);
+  });
+});
+
+// ── Source toggle ───────────────────────────────────────────────────────────
+
+describe("Source toggle", () => {
+  test("clicking hub source sets localSourceFilter to hub", () => {
+    wireRepoEvents();
+    getRepoDom().sourceHub.dispatchEvent(new Event("click"));
+    expect(repoState.localSourceFilter).toBe("hub");
+  });
+
+  test("clicking managed source sets localSourceFilter to managed", () => {
+    wireRepoEvents();
+    getRepoDom().sourceManaged.dispatchEvent(new Event("click"));
+    expect(repoState.localSourceFilter).toBe("managed");
+  });
+
+  test("clicking all source resets localSourceFilter", () => {
+    repoState.localSourceFilter = "hub";
+    wireRepoEvents();
+    getRepoDom().sourceAll.dispatchEvent(new Event("click"));
+    expect(repoState.localSourceFilter).toBe("all");
+  });
+
+  test("clicking same source does nothing", () => {
+    repoState.localSourceFilter = "hub";
+    wireRepoEvents();
+    getRepoDom().sourceHub.dispatchEvent(new Event("click"));
+    // No API call or state change beyond what was already set.
+    expect(apiCalls.length).toBe(0);
+  });
+
+  test("source toggle clears selections", () => {
+    repoState.selectedIds.add("m1");
+    repoState.selectedIds.add("m2");
+    wireRepoEvents();
+    getRepoDom().sourceHub.dispatchEvent(new Event("click"));
+    expect(repoState.selectedIds.size).toBe(0);
   });
 });
 
@@ -196,7 +242,7 @@ describe("Search debouncing", () => {
     expect(ct.pending[2]!.disposed).toBe(false);
   });
 
-  test("debounce callback in discover mode calls searchHub", () => {
+  test("debounce callback on discover tab calls searchHub", () => {
     repoState.tab = "discover";
     wireRepoEvents();
     const dom = getRepoDom();
@@ -206,11 +252,10 @@ describe("Search debouncing", () => {
     // Fire the debounced callback.
     ct.pending[0]!.fn();
 
-    // searchHub is async and fires an API call.
     expect(repoState.searchQuery).toBe("llama");
   });
 
-  test("debounce callback in local mode does not call API", () => {
+  test("debounce callback on local tab does not call searchHub", () => {
     repoState.tab = "local";
     wireRepoEvents();
     const dom = getRepoDom();
@@ -219,8 +264,8 @@ describe("Search debouncing", () => {
 
     ct.pending[0]!.fn();
 
-    // Local mode: client-side filter, no API call.
-    expect(apiCalls.length).toBe(0);
+    // Local tab: client-side filter, no search API call.
+    expect(apiCalls.filter((c) => c.method === "searchRepoModels").length).toBe(0);
     expect(repoState.searchQuery).toBe("llama");
   });
 
@@ -236,7 +281,7 @@ describe("Search debouncing", () => {
     expect((dom.search as HTMLInputElement).value).toBe("");
   });
 
-  test("search clear in discover mode reloads trending models", async () => {
+  test("search clear on discover tab reloads trending models", async () => {
     repoState.tab = "discover";
     repoState.searchQuery = "llama";
     repoState.searchResults = [{ model_id: "r1" } as any];
@@ -302,7 +347,7 @@ describe("Column sort", () => {
     const dom = getRepoDom();
     const th = document.createElement("th");
     th.dataset["sort"] = "size";
-    dom.thead.appendChild(th);
+    dom.localThead.appendChild(th);
 
     th.dispatchEvent(new Event("click", { bubbles: true }));
 
@@ -317,7 +362,7 @@ describe("Column sort", () => {
     const dom = getRepoDom();
     const th = document.createElement("th");
     th.dataset["sort"] = "size";
-    dom.thead.appendChild(th);
+    dom.localThead.appendChild(th);
 
     th.dispatchEvent(new Event("click", { bubbles: true }));
 
@@ -338,19 +383,19 @@ describe("Table row actions", () => {
     const btn = document.createElement("button");
     btn.dataset["action"] = "toggle";
     row.appendChild(btn);
-    dom.tbody.appendChild(row);
+    dom.localTbody.appendChild(row);
 
     btn.dispatchEvent(new Event("click", { bubbles: true }));
     expect(repoState.selectedIds.has("m1")).toBe(true);
 
     // Re-render replaced the DOM; re-query the toggle button.
-    const btn2 = dom.tbody.querySelector<HTMLElement>("[data-action='toggle']")!;
+    const btn2 = dom.localTbody.querySelector<HTMLElement>("[data-action='toggle']")!;
     btn2.dispatchEvent(new Event("click", { bubbles: true }));
     expect(repoState.selectedIds.has("m1")).toBe(false);
   });
 
   test("pin action on unpinned model calls pinModel", async () => {
-    repoState.models = [makeModel("m1", false)];
+    repoState.models = [makeModel("m1", { pinned: false })];
     wireRepoEvents();
     const dom = getRepoDom();
 
@@ -359,7 +404,7 @@ describe("Table row actions", () => {
     const btn = document.createElement("button");
     btn.dataset["action"] = "pin";
     row.appendChild(btn);
-    dom.tbody.appendChild(row);
+    dom.localTbody.appendChild(row);
 
     btn.dispatchEvent(new Event("click", { bubbles: true }));
     await flushAsync();
@@ -368,7 +413,7 @@ describe("Table row actions", () => {
   });
 
   test("pin action on pinned model calls unpinModel", async () => {
-    repoState.models = [makeModel("m1", true)];
+    repoState.models = [makeModel("m1", { pinned: true })];
     wireRepoEvents();
     const dom = getRepoDom();
 
@@ -377,7 +422,7 @@ describe("Table row actions", () => {
     const btn = document.createElement("button");
     btn.dataset["action"] = "pin";
     row.appendChild(btn);
-    dom.tbody.appendChild(row);
+    dom.localTbody.appendChild(row);
 
     btn.dispatchEvent(new Event("click", { bubbles: true }));
     await flushAsync();
@@ -395,7 +440,7 @@ describe("Table row actions", () => {
     const btn = document.createElement("button");
     btn.dataset["action"] = "delete";
     row.appendChild(btn);
-    dom.tbody.appendChild(row);
+    dom.localTbody.appendChild(row);
 
     btn.dispatchEvent(new Event("click", { bubbles: true }));
     await flushAsync();
@@ -505,13 +550,49 @@ describe("Downloads strip cancel", () => {
 // ── Bulk actions ────────────────────────────────────────────────────────────
 
 describe("Bulk actions", () => {
-  test("select all adds all models to selection", () => {
-    repoState.models = [makeModel("m1"), makeModel("m2"), makeModel("m3")];
+  test("select all with filter=all selects all models", () => {
+    repoState.localSourceFilter = "all";
+    repoState.models = [
+      makeModel("m1", { source: "hub" }),
+      makeModel("m2", { source: "hub" }),
+      makeModel("m3", { source: "managed" }),
+    ];
     wireRepoEvents();
 
     getRepoDom().selectAllBtn.dispatchEvent(new Event("click"));
 
     expect(repoState.selectedIds.size).toBe(3);
+  });
+
+  test("select all with filter=hub selects only hub models", () => {
+    repoState.localSourceFilter = "hub";
+    repoState.models = [
+      makeModel("m1", { source: "hub" }),
+      makeModel("m2", { source: "hub" }),
+      makeModel("m3", { source: "managed" }),
+    ];
+    wireRepoEvents();
+
+    getRepoDom().selectAllBtn.dispatchEvent(new Event("click"));
+
+    expect(repoState.selectedIds.size).toBe(2);
+    expect(repoState.selectedIds.has("m1")).toBe(true);
+    expect(repoState.selectedIds.has("m2")).toBe(true);
+    expect(repoState.selectedIds.has("m3")).toBe(false);
+  });
+
+  test("select all with filter=managed selects only managed models", () => {
+    repoState.localSourceFilter = "managed";
+    repoState.models = [
+      makeModel("m1", { source: "hub" }),
+      makeModel("m2", { source: "managed" }),
+    ];
+    wireRepoEvents();
+
+    getRepoDom().selectAllBtn.dispatchEvent(new Event("click"));
+
+    expect(repoState.selectedIds.size).toBe(1);
+    expect(repoState.selectedIds.has("m2")).toBe(true);
   });
 
   test("select all when some are selected clears selection", () => {

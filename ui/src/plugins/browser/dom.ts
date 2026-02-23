@@ -35,7 +35,7 @@ export function getBrowserDom(): BrowserDom {
   cached = {
     cardsEl: q("#bp-cards"),
     searchInput: q("#bp-search") as HTMLInputElement,
-    clearBtn: q(".browser-clear-btn") as HTMLButtonElement,
+    clearBtn: q("#bp-search-clear") as HTMLButtonElement,
     tabAll: q("#bp-tab-all") as HTMLButtonElement,
     tabArchived: q("#bp-tab-archived") as HTMLButtonElement,
     tagsEl: q("#bp-tags"),

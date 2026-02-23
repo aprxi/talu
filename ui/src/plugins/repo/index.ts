@@ -63,10 +63,5 @@ function initRepoView(): void {
   repoState.selectedIds.clear();
   syncRepoTabs();
   updateRepoToolbar();
-
-  if (repoState.tab === "discover") {
-    // Keep discover results as-is (user may switch away and back).
-  } else {
-    loadModels();
-  }
+  loadModels();
 }

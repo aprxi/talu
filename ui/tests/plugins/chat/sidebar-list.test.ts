@@ -46,6 +46,7 @@ beforeEach(() => {
   chatState.isGenerating = false;
   chatState.streamAbort = null;
   chatState.backgroundStreamSessions = new Set();
+  chatState.sidebarSearchQuery = "";
   chatState.pagination = { cursor: null, hasMore: true, isLoading: false };
 
   // DOM — sentinel must be inside sidebarList.
@@ -378,6 +379,36 @@ describe("renderSidebar", () => {
     const item = sidebarItems()[0]!;
     const dot = item.querySelector(".sidebar-generating-dot");
     expect(dot).toBeNull();
+  });
+
+  test("filters sessions by search query (case insensitive)", () => {
+    chatState.sessions = [
+      makeConvo("c1", "Alpha chat"),
+      makeConvo("c2", "Beta chat"),
+      makeConvo("c3", "Alpha two"),
+    ];
+    chatState.sidebarSearchQuery = "alpha";
+    renderSidebar();
+
+    expect(sidebarItems().length).toBe(2);
+    expect(sidebarItems().map((el) => el.dataset["id"])).toEqual(["c1", "c3"]);
+  });
+
+  test("shows empty state when search has no matches", () => {
+    chatState.sessions = [makeConvo("c1", "Hello")];
+    chatState.sidebarSearchQuery = "zzz";
+    renderSidebar();
+
+    expect(sidebarItems().length).toBe(0);
+    const empty = getChatDom().sidebarList.querySelector(".empty-state");
+    expect(empty).not.toBeNull();
+  });
+
+  test("shows all sessions when search query is empty", () => {
+    chatState.sessions = [makeConvo("c1", "A"), makeConvo("c2", "B")];
+    chatState.sidebarSearchQuery = "";
+    renderSidebar();
+    expect(sidebarItems().length).toBe(2);
   });
 });
 

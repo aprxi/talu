@@ -3,15 +3,21 @@
 export interface RepoDom {
   search: HTMLInputElement;
   searchClear: HTMLButtonElement;
-  tabLocal: HTMLButtonElement;
-  tabPinned: HTMLButtonElement;
   tabDiscover: HTMLButtonElement;
+  tabLocal: HTMLButtonElement;
+  sourceAll: HTMLButtonElement;
+  sourceHub: HTMLButtonElement;
+  sourceManaged: HTMLButtonElement;
   stats: HTMLElement;
-  thead: HTMLTableSectionElement;
-  tbody: HTMLTableSectionElement;
-  tableContainer: HTMLElement;
+  discoverView: HTMLElement;
+  discoverToolbar: HTMLElement;
   discoverContainer: HTMLElement;
   discoverResults: HTMLElement;
+  localView: HTMLElement;
+  localToolbar: HTMLElement;
+  localThead: HTMLTableSectionElement;
+  localTbody: HTMLTableSectionElement;
+  localTableContainer: HTMLElement;
   downloads: HTMLElement;
   count: HTMLElement;
   selectAllBtn: HTMLButtonElement;
@@ -38,15 +44,21 @@ export function getRepoDom(): RepoDom {
   cached = {
     search: root.querySelector<HTMLInputElement>("#rp-search")!,
     searchClear: root.querySelector<HTMLButtonElement>("#rp-search-clear")!,
-    tabLocal: root.querySelector<HTMLButtonElement>("#rp-tab-local")!,
-    tabPinned: root.querySelector<HTMLButtonElement>("#rp-tab-pinned")!,
     tabDiscover: root.querySelector<HTMLButtonElement>("#rp-tab-discover")!,
+    tabLocal: root.querySelector<HTMLButtonElement>("#rp-tab-local")!,
+    sourceAll: root.querySelector<HTMLButtonElement>("#rp-source-all")!,
+    sourceHub: root.querySelector<HTMLButtonElement>("#rp-source-hub")!,
+    sourceManaged: root.querySelector<HTMLButtonElement>("#rp-source-managed")!,
     stats: root.querySelector<HTMLElement>("#rp-stats")!,
-    thead: root.querySelector<HTMLTableSectionElement>("#rp-thead")!,
-    tbody: root.querySelector<HTMLTableSectionElement>("#rp-tbody")!,
-    tableContainer: root.querySelector<HTMLElement>("#rp-table-container")!,
+    discoverView: root.querySelector<HTMLElement>("#rp-discover-view")!,
+    discoverToolbar: root.querySelector<HTMLElement>("#rp-discover-toolbar")!,
     discoverContainer: root.querySelector<HTMLElement>("#rp-discover-container")!,
     discoverResults: root.querySelector<HTMLElement>("#rp-discover-results")!,
+    localView: root.querySelector<HTMLElement>("#rp-local-view")!,
+    localToolbar: root.querySelector<HTMLElement>("#rp-local-toolbar")!,
+    localThead: root.querySelector<HTMLTableSectionElement>("#rp-local-thead")!,
+    localTbody: root.querySelector<HTMLTableSectionElement>("#rp-local-tbody")!,
+    localTableContainer: root.querySelector<HTMLElement>("#rp-local-table-container")!,
     downloads: root.querySelector<HTMLElement>("#rp-downloads")!,
     count: root.querySelector<HTMLElement>("#rp-count")!,
     selectAllBtn: root.querySelector<HTMLButtonElement>("#rp-select-all")!,

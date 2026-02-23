@@ -1,6 +1,7 @@
 /** Plugin-local state for the repository manager. */
 
-export type RepoTab = "local" | "pinned" | "discover";
+export type RepoTab = "discover" | "local";
+export type LocalSourceFilter = "all" | "hub" | "managed";
 export type SortColumn = "name" | "size" | "date";
 export type SortDir = "asc" | "desc";
 
@@ -59,7 +60,8 @@ export interface DownloadProgress {
 }
 
 export const repoState = {
-  tab: "local" as RepoTab,
+  tab: "discover" as RepoTab,
+  localSourceFilter: "all" as LocalSourceFilter,
   models: [] as CachedModel[],
   totalSizeBytes: 0,
   searchResults: [] as SearchResult[],

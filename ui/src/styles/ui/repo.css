@@ -54,6 +54,46 @@
   color: var(--secondary);
 }
 
+/* ── Source toggle (All / HuggingFace / Managed) ─────────────────────── */
+
+.repo-source-toggle {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.repo-source-toggle button {
+  padding: 3px 10px;
+  font-size: 11px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.repo-source-toggle button + button {
+  border-left: 1px solid var(--border);
+}
+
+.repo-source-toggle button:hover {
+  color: var(--text);
+}
+
+.repo-source-toggle button.active {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+}
+
+/* Per-tab toolbar groups */
+.repo-toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
 /* Filter bar */
 .repo-filter-bar {
   display: flex;

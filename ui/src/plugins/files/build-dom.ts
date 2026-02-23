@@ -16,13 +16,6 @@ export function buildFilesDOM(root: HTMLElement): void {
     <div style="display: flex; height: 100%; overflow: hidden;">
       <!-- Left sidebar -->
       <div class="browser-sidebar">
-        <div class="panel-section">
-          <div class="search-wrapper">
-            ${ICON_SEARCH}
-            <input id="fp-search" type="text" placeholder="Search files..." class="search-input">
-          </div>
-        </div>
-
         <!-- Status tabs -->
         <div class="panel-section">
           <div class="panel-heading">Status</div>
@@ -50,6 +43,12 @@ export function buildFilesDOM(root: HTMLElement): void {
       <div class="browser-main files-main-drop">
         <!-- Top bar -->
         <div class="browser-header">
+          <div class="search-wrapper">
+            ${ICON_SEARCH}
+            <input id="fp-search" type="text" placeholder="Search files..." class="search-input">
+            <button id="fp-search-clear" class="browser-clear-btn hidden">${ICON_CLEAR}</button>
+          </div>
+          <div class="flex-1"></div>
           <button id="fp-select-all" class="btn btn-ghost btn-sm">Select All</button>
           <div id="fp-bulk-actions" class="browser-bulk-actions">
             <button id="fp-archive" class="btn btn-ghost btn-sm" disabled>Archive</button>
@@ -57,7 +56,6 @@ export function buildFilesDOM(root: HTMLElement): void {
             <button id="fp-delete" class="btn btn-danger btn-sm" disabled>Delete</button>
           </div>
           <button id="fp-cancel" class="btn btn-ghost btn-sm hidden">Cancel</button>
-          <div class="flex-1"></div>
           <span id="fp-count" class="files-count"></span>
           <button id="fp-upload" class="btn btn-ghost btn-sm">
             ${ICON_UPLOAD} Upload
@@ -97,11 +95,4 @@ export function buildFilesDOM(root: HTMLElement): void {
     </div>
   `;
 
-  // Create clear button for search.
-  const searchInput = root.querySelector("#fp-search")!;
-  const clearBtn = document.createElement("button");
-  clearBtn.className = "browser-clear-btn hidden";
-  clearBtn.id = "fp-search-clear";
-  clearBtn.innerHTML = ICON_CLEAR;
-  searchInput.parentElement!.appendChild(clearBtn);
 }
