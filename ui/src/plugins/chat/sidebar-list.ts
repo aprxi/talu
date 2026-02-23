@@ -44,10 +44,23 @@ export function renderSidebar(): void {
     return;
   }
 
-  // Filter out archived, then split into pinned / unpinned
+  // Filter out archived, then apply search, then split into pinned / unpinned
   const visible = chatState.sessions.filter((s) => !isArchived(s));
-  const pinned = visible.filter(isPinned);
-  const unpinned = visible.filter((s) => !isPinned(s));
+  const query = chatState.sidebarSearchQuery.toLowerCase();
+  const filtered = query
+    ? visible.filter((s) => (s.title ?? "").toLowerCase().includes(query))
+    : visible;
+
+  if (query && filtered.length === 0) {
+    dom.sidebarList.insertBefore(
+      renderEmptyState("No matches"),
+      dom.sidebarSentinel,
+    );
+    return;
+  }
+
+  const pinned = filtered.filter(isPinned);
+  const unpinned = filtered.filter((s) => !isPinned(s));
 
   const isSessionGenerating = (id: string) =>
     (id === chatState.activeSessionId && chatState.isGenerating) ||

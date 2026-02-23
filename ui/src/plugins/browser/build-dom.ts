@@ -14,14 +14,6 @@ export function buildBrowserDOM(root: HTMLElement): void {
     <div style="display: flex; height: 100%; overflow: hidden;">
       <!-- Left sidebar: filters -->
       <div class="browser-sidebar">
-        <!-- Search -->
-        <div class="panel-section">
-          <div class="search-wrapper">
-            ${ICON_SEARCH}
-            <input id="bp-search" type="text" placeholder="Search..." class="search-input">
-          </div>
-        </div>
-
         <!-- Status tabs -->
         <div class="panel-section">
           <div class="panel-heading">Status</div>
@@ -51,6 +43,12 @@ export function buildBrowserDOM(root: HTMLElement): void {
       <div class="browser-main">
         <!-- Top bar: actions -->
         <div class="browser-header" id="bp-toolbar">
+          <div class="search-wrapper">
+            ${ICON_SEARCH}
+            <input id="bp-search" type="text" placeholder="Search..." class="search-input">
+            <button id="bp-search-clear" class="browser-clear-btn hidden">${ICON_CLEAR}</button>
+          </div>
+          <div class="flex-1"></div>
           <button id="bp-select-all" class="btn btn-ghost btn-sm">Select All</button>
           <div id="bp-bulk-actions" class="browser-bulk-actions">
             <button id="bp-export" class="btn btn-ghost btn-sm" disabled>Export</button>
@@ -60,7 +58,6 @@ export function buildBrowserDOM(root: HTMLElement): void {
           </div>
           <button id="bp-cancel" class="btn btn-ghost btn-sm hidden">Cancel</button>
           <div data-slot="browser:toolbar" class="menu-slot"></div>
-          <div class="flex-1"></div>
         </div>
 
         <!-- Cards grid -->
@@ -72,10 +69,4 @@ export function buildBrowserDOM(root: HTMLElement): void {
     </div>
   `;
 
-  // Create clear button for search.
-  const searchInput = root.querySelector("#bp-search")!;
-  const clearBtn = document.createElement("button");
-  clearBtn.className = "browser-clear-btn hidden";
-  clearBtn.innerHTML = ICON_CLEAR;
-  searchInput.parentElement!.appendChild(clearBtn);
 }

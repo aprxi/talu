@@ -8,6 +8,8 @@ export interface ChatDom {
   sidebarList: HTMLElement;
   sidebarSentinel: HTMLElement;
   newConversationBtn: HTMLButtonElement;
+  sidebarSearch: HTMLInputElement;
+  sidebarSearchClear: HTMLButtonElement;
 
   // Transcript
   transcriptContainer: HTMLElement;
@@ -69,6 +71,8 @@ export function getChatDom(): ChatDom {
     sidebarList: q("#sidebar-list"),
     sidebarSentinel: q("#loader-sentinel"),
     newConversationBtn: q<HTMLButtonElement>("#new-conversation"),
+    sidebarSearch: q<HTMLInputElement>("#sidebar-search"),
+    sidebarSearchClear: q<HTMLButtonElement>("#sidebar-search-clear"),
 
     transcriptContainer: q("#transcript"),
 

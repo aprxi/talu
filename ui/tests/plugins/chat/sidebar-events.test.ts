@@ -43,6 +43,7 @@ beforeEach(() => {
   chatState.activeSessionId = null;
   chatState.lastResponseId = null;
   chatState.sessions = [makeConvo("chat-1"), makeConvo("chat-2")];
+  chatState.sidebarSearchQuery = "";
   chatState.pagination = { offset: 0, hasMore: false, isLoading: false };
 
   initChatDeps({
@@ -143,5 +144,47 @@ describe("setupSidebarEvents — new conversation", () => {
 
     expect(chatState.activeSessionId).toBeNull();
     expect(chatState.activeChat).toBeNull();
+  });
+});
+
+// ── Sidebar search ──────────────────────────────────────────────────────────
+
+describe("setupSidebarEvents — sidebar search", () => {
+  test("typing in search input updates state", () => {
+    const dom = getChatDom();
+    dom.sidebarSearch.value = "hello";
+    dom.sidebarSearch.dispatchEvent(new Event("input"));
+
+    expect(chatState.sidebarSearchQuery).toBe("hello");
+  });
+
+  test("typing shows clear button", () => {
+    const dom = getChatDom();
+    dom.sidebarSearch.value = "test";
+    dom.sidebarSearch.dispatchEvent(new Event("input"));
+
+    expect(dom.sidebarSearchClear.classList.contains("hidden")).toBe(false);
+  });
+
+  test("clearing input hides clear button", () => {
+    const dom = getChatDom();
+    dom.sidebarSearch.value = "test";
+    dom.sidebarSearch.dispatchEvent(new Event("input"));
+    dom.sidebarSearch.value = "";
+    dom.sidebarSearch.dispatchEvent(new Event("input"));
+
+    expect(dom.sidebarSearchClear.classList.contains("hidden")).toBe(true);
+  });
+
+  test("clicking clear button resets search", () => {
+    const dom = getChatDom();
+    dom.sidebarSearch.value = "test";
+    dom.sidebarSearch.dispatchEvent(new Event("input"));
+
+    dom.sidebarSearchClear.click();
+
+    expect(dom.sidebarSearch.value).toBe("");
+    expect(chatState.sidebarSearchQuery).toBe("");
+    expect(dom.sidebarSearchClear.classList.contains("hidden")).toBe(true);
   });
 });

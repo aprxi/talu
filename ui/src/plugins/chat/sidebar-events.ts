@@ -1,7 +1,9 @@
 import { getChatDom } from "./dom.ts";
+import { chatState } from "./state.ts";
 import { handleTogglePin } from "./sidebar-actions.ts";
 import { selectChat } from "./selection.ts";
 import { startNewConversation } from "./welcome.ts";
+import { renderSidebar } from "./sidebar-list.ts";
 
 export function setupSidebarEvents(): void {
   const dom = getChatDom();
@@ -25,5 +27,19 @@ export function setupSidebarEvents(): void {
 
   dom.newConversationBtn.addEventListener("click", () => {
     startNewConversation();
+  });
+
+  // Sidebar search
+  dom.sidebarSearch.addEventListener("input", () => {
+    chatState.sidebarSearchQuery = dom.sidebarSearch.value;
+    dom.sidebarSearchClear.classList.toggle("hidden", !dom.sidebarSearch.value);
+    renderSidebar();
+  });
+
+  dom.sidebarSearchClear.addEventListener("click", () => {
+    dom.sidebarSearch.value = "";
+    chatState.sidebarSearchQuery = "";
+    dom.sidebarSearchClear.classList.add("hidden");
+    renderSidebar();
   });
 }

@@ -52,27 +52,32 @@ function sortModels(models: CachedModel[]): CachedModel[] {
   });
 }
 
+/** Get the source filter value(s) for the local tab. */
+function sourceFilter(): string | null {
+  const f = repoState.localSourceFilter;
+  return f === "all" ? null : f;
+}
+
 // ---------------------------------------------------------------------------
-// Table (Local / Pinned)
+// Table (renders into the active tab's tbody)
 // ---------------------------------------------------------------------------
 
 export function renderModelsTable(): void {
   const dom = getRepoDom();
-  dom.tbody.innerHTML = "";
+  const tbody = dom.localTbody;
+  tbody.innerHTML = "";
 
-  let models = repoState.models;
+  const source = sourceFilter();
+  let models = source
+    ? repoState.models.filter((m) => m.source === source)
+    : repoState.models;
 
   // Client-side search filter.
-  if (repoState.searchQuery && repoState.tab !== "discover") {
+  if (repoState.searchQuery) {
     const q = repoState.searchQuery.toLowerCase();
     models = models.filter(
       (m) => m.id.toLowerCase().includes(q) || (m.architecture ?? "").toLowerCase().includes(q),
     );
-  }
-
-  // Pinned tab: show only pinned models.
-  if (repoState.tab === "pinned") {
-    models = models.filter((m) => m.pinned);
   }
 
   models = sortModels(models);
@@ -80,13 +85,10 @@ export function renderModelsTable(): void {
   dom.count.textContent = `${models.length} model${models.length !== 1 ? "s" : ""}`;
 
   if (models.length === 0) {
-    const msg =
-      repoState.tab === "pinned"
-        ? "No pinned models. Pin models to keep them available."
-        : repoState.searchQuery
-          ? `No models matching "${repoState.searchQuery}".`
-          : "No cached models. Use the Discover tab to download models.";
-    dom.tbody.appendChild(renderEmptyState(msg));
+    const msg = repoState.searchQuery
+      ? `No models matching "${repoState.searchQuery}".`
+      : "No local models. Use Discover to find and download models.";
+    tbody.appendChild(renderEmptyState(msg));
     return;
   }
 
@@ -156,7 +158,7 @@ export function renderModelsTable(): void {
     delTd.appendChild(delBtn);
     row.appendChild(delTd);
 
-    dom.tbody.appendChild(row);
+    tbody.appendChild(row);
   }
 }
 
@@ -195,11 +197,8 @@ export function renderDiscoverResults(): void {
         renderEmptyState("Search HuggingFace Hub for models to download."),
       );
     }
-    dom.count.textContent = "";
     return;
   }
-
-  dom.count.textContent = `${results.length} result${results.length !== 1 ? "s" : ""}`;
 
   for (const result of results) {
     const item = el("div", "repo-discover-item");
@@ -329,7 +328,8 @@ export function renderStats(): void {
 
 export function renderSortIndicators(): void {
   const dom = getRepoDom();
-  for (const th of dom.thead.querySelectorAll<HTMLElement>("[data-sort]")) {
+  const thead = dom.localThead;
+  for (const th of thead.querySelectorAll<HTMLElement>("[data-sort]")) {
     const col = th.dataset["sort"];
     th.classList.toggle("files-th-sorted", col === repoState.sortBy);
     // Remove old arrow.
@@ -365,15 +365,20 @@ export function syncRepoTabs(): void {
   const dom = getRepoDom();
   const { tab } = repoState;
 
-  dom.tabLocal.classList.toggle("active", tab === "local");
-  dom.tabPinned.classList.toggle("active", tab === "pinned");
   dom.tabDiscover.classList.toggle("active", tab === "discover");
+  dom.tabLocal.classList.toggle("active", tab === "local");
 
-  const isTable = tab === "local" || tab === "pinned";
-  dom.tableContainer.classList.toggle("hidden", !isTable);
-  dom.discoverContainer.classList.toggle("hidden", isTable);
+  dom.discoverView.classList.toggle("hidden", tab !== "discover");
+  dom.discoverToolbar.classList.toggle("hidden", tab !== "discover");
+  dom.localView.classList.toggle("hidden", tab !== "local");
+  dom.localToolbar.classList.toggle("hidden", tab !== "local");
+}
 
-  // Toolbar: hide bulk actions in discover mode.
-  dom.selectAllBtn.classList.toggle("hidden", !isTable);
-  dom.bulkActions.classList.toggle("hidden", !isTable);
+export function syncSourceToggle(): void {
+  const dom = getRepoDom();
+  const { localSourceFilter } = repoState;
+
+  dom.sourceAll.classList.toggle("active", localSourceFilter === "all");
+  dom.sourceHub.classList.toggle("active", localSourceFilter === "hub");
+  dom.sourceManaged.classList.toggle("active", localSourceFilter === "managed");
 }

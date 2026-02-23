@@ -1,3 +1,5 @@
+import { SEARCH_ICON as ICON_SEARCH, CLOSE_ICON as ICON_CLEAR } from "../../icons.ts";
+
 /** Build the full chat DOM into the plugin's shadow root container. */
 export function buildChatDOM(container: HTMLElement): void {
   // Apply mode-view layout directly on the container since the
@@ -13,6 +15,13 @@ export function buildChatDOM(container: HTMLElement): void {
           <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
           New Chat
         </button>
+      </div>
+      <div class="sidebar-search">
+        <div class="search-wrapper">
+          ${ICON_SEARCH}
+          <input id="sidebar-search" type="text" placeholder="Search..." class="search-input">
+          <button id="sidebar-search-clear" class="browser-clear-btn hidden">${ICON_CLEAR}</button>
+        </div>
       </div>
       <div class="sidebar-content scroll-thin">
         <div class="sidebar-section-label">Recent</div>

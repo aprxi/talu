@@ -49,7 +49,8 @@ beforeEach(() => {
   unpinRepoModelResult = { ok: true };
 
   // Reset state.
-  repoState.tab = "local";
+  repoState.tab = "discover";
+  repoState.localSourceFilter = "all";
   repoState.models = [];
   repoState.totalSizeBytes = 0;
   repoState.searchResults = [];
@@ -160,11 +161,11 @@ describe("loadModels", () => {
     expect(repoState.totalSizeBytes).toBe(2048);
   });
 
-  test("passes pinned query when on pinned tab", async () => {
-    repoState.tab = "pinned";
+  test("always loads all models (no query filter)", async () => {
+    repoState.tab = "local";
     await loadModels();
 
-    expect(apiCalls[0]!.args[0]).toBe("?pinned=true");
+    expect(apiCalls[0]!.args[0]).toBe("");
   });
 
   test("clears models on API failure", async () => {
