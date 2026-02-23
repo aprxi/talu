@@ -6,6 +6,7 @@ const report = @import("report.zig");
 
 const registry = main.models.dispatcher.registry;
 const op_types = main.models.dispatcher.op_types;
+const cfg_loader = main.models.dispatcher.config;
 const WeightSpec = op_types.WeightSpec;
 
 fn hasWeightId(specs: []const WeightSpec, id: []const u8) bool {
@@ -110,6 +111,43 @@ test "weight spec ids are unique in each declared scope" {
             }
         }
     }
+}
+
+test "lfm2 layer_types aliases map conv/full_attention to declared variants" {
+    const arch = registry.runtimeArchitectureById("lfm2") orelse return error.MissingArchitecture;
+    const variants = arch.block_variants orelse return error.MissingBlockVariants;
+    try std.testing.expect(arch.variant_aliases != null);
+    try std.testing.expect(variants.len >= 2);
+
+    const allocator = std.testing.allocator;
+    var variant_names = try allocator.alloc([]const u8, variants.len);
+    defer allocator.free(variant_names);
+    for (variants, 0..) |variant, i| {
+        variant_names[i] = variant.name;
+    }
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.json",
+        .data =
+        \\{
+        \\  "layer_types": ["conv", "full_attention"]
+        \\}
+        ,
+    });
+
+    const config_path = try tmp.dir.realpathAlloc(allocator, "config.json");
+    defer allocator.free(config_path);
+
+    const parsed_opt = try cfg_loader.parseLayerTypes(allocator, config_path, variant_names, arch.variant_aliases);
+    try std.testing.expect(parsed_opt != null);
+    const parsed = parsed_opt.?;
+    defer allocator.free(parsed);
+
+    try std.testing.expectEqual(@as(usize, 2), parsed.len);
+    try std.testing.expectEqual(@as(u8, 0), parsed[0]);
+    try std.testing.expectEqual(@as(u8, 1), parsed[1]);
 }
 
 test "architectures declare token_embeddings in global weights" {
