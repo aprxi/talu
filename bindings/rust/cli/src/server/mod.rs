@@ -1,4 +1,4 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -40,7 +40,11 @@ pub struct ServerArgs {
     #[arg(short, long, env = "MODEL_URI")]
     pub model: Option<String>,
 
-    /// TCP port to bind (127.0.0.1)
+    /// Address to bind [default: 127.0.0.1]
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: IpAddr,
+
+    /// TCP port to bind
     #[arg(long, default_value_t = 8258)]
     pub port: u16,
 
@@ -146,7 +150,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         code_session_ttl: listen::CODE_SESSION_TTL,
     };
 
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), args.port);
+    let addr = SocketAddr::new(args.host, args.port);
     log::info!(target: "server::init", "talu server starting");
     if let Some(ref bucket) = state.bucket_path {
         let bucket_for_gc = bucket.clone();

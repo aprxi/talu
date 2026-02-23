@@ -99,7 +99,7 @@ talu serve
 By default, the server listens on `http://127.0.0.1:8258`:
 - Console UI: `http://127.0.0.1:8258/`
 - OpenResponses-compatible API: `http://127.0.0.1:8258/v1`
-- Override port with: `talu serve --port 9000`
+- Override host/port: `talu serve --host 0.0.0.0 --port 9000`
 
 API compatibility target: [OpenResponses](https://openresponses.org).
 
