@@ -186,6 +186,64 @@ pub const Model = struct {
         deepstack: ?DeepstackAdditions,
         runtime_rope: ?RuntimeRoPEOverride,
     ) !ArrayHandle {
+        const hidden = try forwardHiddenWithEmbeddingOverride(
+            allocator,
+            weight_handles,
+            input_ids,
+            config,
+            cache,
+            shortconv_cache,
+            mamba_cache,
+            pos_offset,
+            use_compiled,
+            embedding_override,
+            deepstack,
+            runtime_rope,
+        );
+        return block_executor.TransformerBlock.projectLogits(hidden, weight_handles, config.norm_eps);
+    }
+
+    pub fn forwardHidden(
+        allocator: std.mem.Allocator,
+        weight_handles: anytype,
+        input_ids: []const u32,
+        config: anytype,
+        cache: ?Cache,
+        shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
+        pos_offset: usize,
+        use_compiled: bool,
+    ) !ArrayHandle {
+        return forwardHiddenWithEmbeddingOverride(
+            allocator,
+            weight_handles,
+            input_ids,
+            config,
+            cache,
+            shortconv_cache,
+            mamba_cache,
+            pos_offset,
+            use_compiled,
+            null,
+            null,
+            null,
+        );
+    }
+
+    pub fn forwardHiddenWithEmbeddingOverride(
+        allocator: std.mem.Allocator,
+        weight_handles: anytype,
+        input_ids: []const u32,
+        config: anytype,
+        cache: ?Cache,
+        shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
+        pos_offset: usize,
+        use_compiled: bool,
+        embedding_override: ?[]const f32,
+        deepstack: ?DeepstackAdditions,
+        runtime_rope: ?RuntimeRoPEOverride,
+    ) !ArrayHandle {
         if (builtin.os.tag != .macos) {
             return error.MLXNotAvailable;
         }
@@ -238,23 +296,36 @@ pub const Model = struct {
         for (0..layer_count) |layer_idx| {
             if (use_compiled_effective and weight_handles.compiled_layers != null and sequence_len == 1) {
                 const compiled = weight_handles.compiled_layers.?;
-                used_fusion = true;
+                used_fusion = false;
 
-                if (cache) |c| {
-                    if (c.use_bfloat16) {
-                        hidden = compiled[layer_idx].forward(hidden, c.handle, layer_idx, pos_offset);
+                if (compiled[layer_idx].isAvailable()) {
+                    if (cache) |c| {
+                        if (c.use_bfloat16) {
+                            used_fusion = true;
+                            hidden = compiled[layer_idx].forward(
+                                hidden,
+                                c.handle,
+                                if (shortconv_cache) |sc| sc.handle else null,
+                                layer_idx,
+                                pos_offset,
+                            );
+                        }
                     } else {
-                        used_fusion = false;
+                        used_fusion = true;
+                        hidden = compiled[layer_idx].forward(
+                            hidden,
+                            null,
+                            if (shortconv_cache) |sc| sc.handle else null,
+                            layer_idx,
+                            pos_offset,
+                        );
                     }
-                } else {
-                    hidden = compiled[layer_idx].forward(hidden, null, layer_idx, pos_offset);
-                }
-
-                if (used_fusion) {
-                    if (trace) {
-                        try traceLastHiddenVector(allocator, "metal", phase, layer_idx, hidden, sequence_len, @intCast(weight_handles.d_model));
+                    if (used_fusion) {
+                        if (trace) {
+                            try traceLastHiddenVector(allocator, "metal", phase, layer_idx, hidden, sequence_len, @intCast(weight_handles.d_model));
+                        }
+                        continue;
                     }
-                    continue;
                 }
             }
 
@@ -281,7 +352,7 @@ pub const Model = struct {
             }
         }
 
-        return block_executor.TransformerBlock.projectLogits(hidden, weight_handles, norm_eps);
+        return block_executor.TransformerBlock.projectHidden(hidden, weight_handles, norm_eps);
     }
 
     pub fn forwardFromGPUToken(
@@ -354,4 +425,14 @@ test "buildDeepstackLayerAdditions rejects misaligned feature rows" {
             layer_features[0..],
         ),
     );
+}
+
+test "Model.forwardHidden exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(Model.forwardHidden)).@"fn";
+    try std.testing.expectEqual(@as(usize, 9), fn_info.params.len);
+}
+
+test "Model.forwardHiddenWithEmbeddingOverride exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(Model.forwardHiddenWithEmbeddingOverride)).@"fn";
+    try std.testing.expectEqual(@as(usize, 12), fn_info.params.len);
 }

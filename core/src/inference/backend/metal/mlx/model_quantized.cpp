@@ -5,6 +5,8 @@
 
 #include "compute_common.h"
 #include "model_state.h"
+#include <mutex>
+#include <unordered_map>
 
 // ============================================================================
 // Quantized Model Structure
@@ -115,8 +117,101 @@ static FusedModelWeights::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
     }
 }
 
-// Pipeline state
-static thread_local std::optional<array> g_current_token;
+static inline void gqa_expand_attention_kv(
+    const array& q,
+    const array& k_in,
+    const array& v_in,
+    array* k_out,
+    array* v_out
+) {
+    if (k_out == nullptr || v_out == nullptr) {
+        throw std::invalid_argument("null gqa output");
+    }
+    const int q_heads = q.shape(1);
+    const int kv_heads = k_in.shape(1);
+    if (q_heads == kv_heads) {
+        *k_out = k_in;
+        *v_out = v_in;
+        return;
+    }
+    if (kv_heads <= 0 || q_heads <= 0 || (q_heads % kv_heads) != 0 || v_in.shape(1) != kv_heads) {
+        throw std::invalid_argument("invalid GQA head layout");
+    }
+
+    const int heads_per_kv = q_heads / kv_heads;
+    std::vector<int32_t> gather_idx(static_cast<size_t>(q_heads));
+    for (int head_idx = 0; head_idx < q_heads; head_idx++) {
+        gather_idx[static_cast<size_t>(head_idx)] = static_cast<int32_t>(head_idx / heads_per_kv);
+    }
+    array idx = array(gather_idx.data(), {q_heads}, int32);
+    *k_out = take(k_in, idx, 1);
+    *v_out = take(v_in, idx, 1);
+}
+
+struct QuantizedPipelineState {
+    std::optional<array> current_token;
+};
+
+static std::mutex g_quant_pipeline_mu;
+static std::unordered_map<void*, QuantizedPipelineState> g_quant_pipeline_states;
+
+static inline void* quant_decode_state_key(void* cache_ptr, void* model_ptr) {
+    return cache_ptr != nullptr ? cache_ptr : model_ptr;
+}
+
+static int round_up_step(size_t value, int step) {
+    const size_t s = static_cast<size_t>(step);
+    return static_cast<int>(((value + s - 1) / s) * s);
+}
+
+static int next_cache_capacity(const CacheLayer& layer, size_t required, int current_capacity) {
+    if (required == 0) return current_capacity;
+
+    const size_t current = current_capacity > 0 ? static_cast<size_t>(current_capacity) : 0;
+    const size_t step = static_cast<size_t>(layer.step);
+
+    if (layer.max_seq_len > 0) {
+        const size_t max_cap = layer.max_seq_len;
+        if (required > max_cap) {
+            throw std::invalid_argument("[fused] kv cache capacity exceeded");
+        }
+
+        size_t capacity = current;
+        if (capacity == 0) {
+            const size_t base = std::max(required, step);
+            capacity = std::min(max_cap, static_cast<size_t>(round_up_step(base, layer.step)));
+        }
+        while (capacity < required) {
+            const size_t doubled = capacity * 2;
+            if (doubled <= capacity) {
+                capacity = max_cap;
+                break;
+            }
+            capacity = std::min(max_cap, doubled);
+        }
+        if (capacity < required) {
+            throw std::invalid_argument("[fused] kv cache capacity exceeded");
+        }
+        return static_cast<int>(capacity);
+    }
+
+    size_t capacity = current;
+    if (capacity == 0) {
+        const size_t base = std::max(required, step);
+        capacity = static_cast<size_t>(round_up_step(base, layer.step));
+    }
+    while (capacity < required) {
+        const size_t doubled = capacity * 2;
+        if (doubled <= capacity) {
+            throw std::invalid_argument("[fused] kv cache capacity exceeded");
+        }
+        capacity = doubled;
+    }
+    return static_cast<int>(capacity);
+}
+
+// Async decode API keeps a single thread-local pending token. This path is not
+// used by the scheduler pipeline; scheduler state is keyed by cache/model above.
 static thread_local std::optional<array> g_pending_token;
 
 extern "C" void* mlx_lazy_fused_moe_ffn_mxfp4(
@@ -300,21 +395,24 @@ static array fused_forward_logits_from_token(
             size_t prev = cl.offset;
             int offset = static_cast<int>(prev + 1);
 
-            if (cl.k_bfloat16 == nullptr || offset > cl.k_bfloat16->shape(2)) {
-                int new_size = ((offset + cl.step - 1) / cl.step) * cl.step;
-                Shape shape = {1, fused_weights->n_kv_heads, new_size, fused_weights->head_dim};
-                if (cl.k_bfloat16) {
-                    array new_k = zeros(shape, bfloat16);
-                    array new_v = zeros(shape, bfloat16);
-                    Shape stop = {1, fused_weights->n_kv_heads, static_cast<int>(prev), fused_weights->head_dim};
-                    new_k = slice_update(new_k, slice(*cl.k_bfloat16, g_slice_start, stop), g_slice_start, stop);
-                    new_v = slice_update(new_v, slice(*cl.v_bfloat16, g_slice_start, stop), g_slice_start, stop);
-                    *cl.k_bfloat16 = new_k;
-                    *cl.v_bfloat16 = new_v;
-                } else {
-                    cl.k_bfloat16 = new array(zeros(shape, bfloat16));
-                    cl.v_bfloat16 = new array(zeros(shape, bfloat16));
+            if (cl.k_bfloat16 == nullptr) {
+                const int capacity = next_cache_capacity(cl, static_cast<size_t>(offset), 0);
+                Shape shape = {1, fused_weights->n_kv_heads, capacity, fused_weights->head_dim};
+                cl.k_bfloat16 = new array(zeros(shape, bfloat16));
+                cl.v_bfloat16 = new array(zeros(shape, bfloat16));
+            } else if (offset > cl.k_bfloat16->shape(2)) {
+                const int current_capacity = cl.k_bfloat16->shape(2);
+                const int new_capacity = next_cache_capacity(cl, static_cast<size_t>(offset), current_capacity);
+                Shape shape = {1, fused_weights->n_kv_heads, new_capacity, fused_weights->head_dim};
+                array new_k = zeros(shape, bfloat16);
+                array new_v = zeros(shape, bfloat16);
+                if (prev > 0) {
+                    Shape copy_stop = {1, fused_weights->n_kv_heads, static_cast<int>(prev), fused_weights->head_dim};
+                    new_k = slice_update(new_k, slice(*cl.k_bfloat16, g_slice_start, copy_stop), g_slice_start, copy_stop);
+                    new_v = slice_update(new_v, slice(*cl.v_bfloat16, g_slice_start, copy_stop), g_slice_start, copy_stop);
                 }
+                *cl.k_bfloat16 = new_k;
+                *cl.v_bfloat16 = new_v;
             }
 
             Shape update_start = {0, 0, static_cast<int>(prev), 0};
@@ -327,7 +425,10 @@ static array fused_forward_logits_from_token(
             array k_full = slice(*cl.k_bfloat16, g_slice_start, slice_stop);
             array v_full = slice(*cl.v_bfloat16, g_slice_start, slice_stop);
 
-            array attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, attn_scale, "");
+            array attn_k(0.0f, float32);
+            array attn_v(0.0f, float32);
+            gqa_expand_attention_kv(q, k_full, v_full, &attn_k, &attn_v);
+            array attn_out = fast::scaled_dot_product_attention(q, attn_k, attn_v, attn_scale, "");
 
             attn_out = transpose(attn_out, g_transpose_perm);
             attn_out = reshape(attn_out, attn_out_shape);
@@ -800,7 +901,10 @@ void mlx_fused_model_compile(void* model) {
             new_v_caches.push_back(new_v);
 
             // Attention
-            array attn_out = fast::scaled_dot_product_attention(q, new_k, new_v, attn_scale, "");
+            array attn_k(0.0f, float32);
+            array attn_v(0.0f, float32);
+            gqa_expand_attention_kv(q, new_k, new_v, &attn_k, &attn_v);
+            array attn_out = fast::scaled_dot_product_attention(q, attn_k, attn_v, attn_scale, "");
             attn_out = transpose(attn_out, {0, 2, 1, 3});
             attn_out = reshape(attn_out, {1, 1, fused_weights->n_heads * fused_weights->head_dim});
 
@@ -913,8 +1017,13 @@ void mlx_pipeline_prime(
     int32_t token_id_i32 = static_cast<int32_t>(first_token_id);
     array first_token = array(&token_id_i32, {1}, int32);
 
-    g_current_token = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, first_token, pos_offset);
-    async_eval(*g_current_token);
+    array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, first_token, pos_offset);
+    async_eval(next);
+
+    void* key = quant_decode_state_key(cache_ptr, model);
+    std::lock_guard<std::mutex> lock(g_quant_pipeline_mu);
+    auto& state = g_quant_pipeline_states[key];
+    state.current_token = std::move(next);
 }
 
 uint32_t mlx_pipeline_step(
@@ -923,35 +1032,52 @@ uint32_t mlx_pipeline_step(
     void* shortconv_cache_ptr,
     size_t pos_offset
 ) {
-    if (!g_current_token) return 0;
-
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
 
-    // Build next graph using current (lazy) token
-    array& current = *g_current_token;
+    array current(0.0f, float32);
+    {
+        void* key = quant_decode_state_key(cache_ptr, model);
+        std::lock_guard<std::mutex> lock(g_quant_pipeline_mu);
+        auto it = g_quant_pipeline_states.find(key);
+        if (it == g_quant_pipeline_states.end() || !it->second.current_token) return 0;
+        current = *it->second.current_token;
+    }
+
+    // Build next graph using current (lazy) token.
     array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, current, pos_offset);
 
-    // Queue next
+    // Queue next.
     async_eval(next);
 
-    // Materialize current
+    // Materialize current.
     eval(current);
+    const uint32_t result = static_cast<uint32_t>(current.item<int32_t>());
 
-    uint32_t result = static_cast<uint32_t>(*current.data<int32_t>());
-
-    // Rotate
-    g_current_token = next;
+    // Rotate cached state.
+    {
+        void* key = quant_decode_state_key(cache_ptr, model);
+        std::lock_guard<std::mutex> lock(g_quant_pipeline_mu);
+        auto& state = g_quant_pipeline_states[key];
+        state.current_token = std::move(next);
+    }
 
     return result;
 }
 
-uint32_t mlx_pipeline_flush() {
-    if (!g_current_token) return 0;
-    uint32_t result = static_cast<uint32_t>(g_current_token->item<int32_t>());
-    g_current_token.reset();
-    return result;
+uint32_t mlx_pipeline_flush(void* model, void* cache_ptr) {
+    std::optional<array> current_token;
+    {
+        void* key = quant_decode_state_key(cache_ptr, model);
+        std::lock_guard<std::mutex> lock(g_quant_pipeline_mu);
+        auto it = g_quant_pipeline_states.find(key);
+        if (it == g_quant_pipeline_states.end() || !it->second.current_token) return 0;
+        current_token = std::move(it->second.current_token);
+        g_quant_pipeline_states.erase(it);
+    }
+    eval(*current_token);
+    return static_cast<uint32_t>((*current_token).item<int32_t>());
 }
 
 // ============================================================================
@@ -1069,7 +1195,10 @@ void* mlx_compile_layer(
         array v_full = is_prefill ? v : concatenate({v_cache_in, v}, 2);
 
         float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        auto attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, scale, is_prefill ? "causal" : "");
+        array attn_k(0.0f, float32);
+        array attn_v(0.0f, float32);
+        gqa_expand_attention_kv(q, k_full, v_full, &attn_k, &attn_v);
+        auto attn_out = fast::scaled_dot_product_attention(q, attn_k, attn_v, scale, is_prefill ? "causal" : "");
 
         attn_out = transpose(attn_out, {0, 2, 1, 3});
         attn_out = reshape(attn_out, {batch_size, seq_len, static_cast<int>(n_heads * head_dim)});
@@ -1090,15 +1219,22 @@ void* mlx_compile_layer(
     auto* compiled = new CompiledLayer();
     compiled->fn = compile(layer_fn, /* shapeless= */ true);
     g_compiled_layers.push_back(compiled);
-    return reinterpret_cast<void*>(g_compiled_layers.size() - 1);
+    return compiled;
 }
 
 void* mlx_layer_forward(
     void* compiled_handle,
-    const void* hidden, void* cache_ptr, size_t layer_idx, size_t pos_offset
+    const void* hidden,
+    void* cache_ptr,
+    void* shortconv_cache_ptr,
+    size_t layer_idx,
+    size_t pos_offset
 ) {
-    size_t compiled_idx = reinterpret_cast<size_t>(compiled_handle);
-    auto& compiled_layer = g_compiled_layers[compiled_idx];
+    (void)shortconv_cache_ptr;
+    auto* compiled_layer = static_cast<CompiledLayer*>(compiled_handle);
+    if (compiled_layer == nullptr) {
+        throw std::invalid_argument("null compiled layer handle");
+    }
     const auto& h = *static_cast<const array*>(hidden);
 
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
@@ -1132,29 +1268,27 @@ void* mlx_layer_forward(
     const int step_count = k_new.shape(2);
     const int new_offset = prev_offset + step_count;
 
-    const bool need_expand = !layer.k_bfloat16 ||
-                             (prev_offset + step_count) > static_cast<size_t>(layer.k_bfloat16->shape(2));
-
-    if (need_expand) {
-        const int step = 256;
-        const int n_steps = ((prev_offset + step_count + step - 1) / step) * step;
-        Shape new_shape = {batch_size, kv_heads, n_steps, head_dim};
-
-        if (layer.k_bfloat16) {
-            array new_k = zeros(new_shape, bfloat16);
-            array new_v = zeros(new_shape, bfloat16);
+    if (!layer.k_bfloat16) {
+        const int capacity = next_cache_capacity(layer, static_cast<size_t>(new_offset), 0);
+        Shape new_shape = {batch_size, kv_heads, capacity, head_dim};
+        layer.k_bfloat16 = new array(zeros(new_shape, bfloat16));
+        layer.v_bfloat16 = new array(zeros(new_shape, bfloat16));
+    } else if (new_offset > layer.k_bfloat16->shape(2)) {
+        const int current_capacity = layer.k_bfloat16->shape(2);
+        const int new_capacity = next_cache_capacity(layer, static_cast<size_t>(new_offset), current_capacity);
+        Shape new_shape = {batch_size, kv_heads, new_capacity, head_dim};
+        array new_k = zeros(new_shape, bfloat16);
+        array new_v = zeros(new_shape, bfloat16);
+        if (prev_offset > 0) {
             Shape copy_start = {0, 0, 0, 0};
             Shape copy_stop = {batch_size, kv_heads, static_cast<int>(prev_offset), head_dim};
             array k_existing = slice(*layer.k_bfloat16, copy_start, copy_stop);
             array v_existing = slice(*layer.v_bfloat16, copy_start, copy_stop);
             new_k = slice_update(new_k, k_existing, copy_start, copy_stop);
             new_v = slice_update(new_v, v_existing, copy_start, copy_stop);
-            *layer.k_bfloat16 = new_k;
-            *layer.v_bfloat16 = new_v;
-        } else {
-            layer.k_bfloat16 = new array(zeros(new_shape, bfloat16));
-            layer.v_bfloat16 = new array(zeros(new_shape, bfloat16));
         }
+        *layer.k_bfloat16 = new_k;
+        *layer.v_bfloat16 = new_v;
     }
 
     Shape start = {0, 0, static_cast<int>(prev_offset), 0};

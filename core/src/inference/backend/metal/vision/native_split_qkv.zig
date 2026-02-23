@@ -606,13 +606,20 @@ pub const VisionRuntime = struct {
             try self.allocator.alloc([]const f32, deepstack_count)
         else
             try self.allocator.alloc([]const f32, 0);
+        var deepstack_layer_handles: []ArrayHandle = if (deepstack_count > 0)
+            try self.allocator.alloc(ArrayHandle, deepstack_count)
+        else
+            try self.allocator.alloc(ArrayHandle, 0);
         errdefer self.allocator.free(deepstack_layer_embeddings);
+        errdefer self.allocator.free(deepstack_layer_handles);
+        defer self.allocator.free(deepstack_layer_handles);
         errdefer {
             for (deepstack_layer_embeddings) |layer_embed| {
                 if (layer_embed.len > 0) self.allocator.free(layer_embed);
             }
         }
         for (0..deepstack_layer_embeddings.len) |i| deepstack_layer_embeddings[i] = &.{};
+        for (0..deepstack_layer_handles.len) |i| deepstack_layer_handles[i] = null;
 
         const attention_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.vision_hidden_size / self.vision_num_heads)));
         for (self.layer_weights, 0..) |*lw, layer_idx| {
@@ -668,10 +675,30 @@ pub const VisionRuntime = struct {
                 );
 
             if (self.deepstackLayerToMergerIndex(layer_idx)) |merger_idx| {
-                graph.eval(&[_]ArrayHandle{hidden_handle});
+                deepstack_layer_handles[merger_idx] = hidden_handle;
+            }
+        }
+
+        if (deepstack_count > 0) {
+            for (deepstack_layer_handles) |layer_handle| {
+                if (layer_handle == null) return error.InvalidState;
+            }
+        }
+
+        const eval_handle_count = 1 + deepstack_count;
+        var eval_handles = try self.allocator.alloc(ArrayHandle, eval_handle_count);
+        defer self.allocator.free(eval_handles);
+        eval_handles[0] = hidden_handle;
+        for (deepstack_layer_handles, 0..) |layer_handle, idx| {
+            eval_handles[idx + 1] = layer_handle;
+        }
+        graph.eval(eval_handles);
+
+        if (deepstack_count > 0) {
+            for (deepstack_layer_handles, 0..) |layer_handle, merger_idx| {
                 const hidden_host = try self.allocator.alloc(f32, patch_count * self.vision_hidden_size);
                 defer self.allocator.free(hidden_host);
-                graph.copyToHost(hidden_handle, hidden_host);
+                graph.copyToHost(layer_handle, hidden_host);
                 deepstack_layer_embeddings[merger_idx] = try self.runDeepstackMerger(
                     image.grid,
                     hidden_host,
@@ -680,13 +707,6 @@ pub const VisionRuntime = struct {
             }
         }
 
-        if (deepstack_count > 0) {
-            for (deepstack_layer_embeddings) |layer_embed| {
-                if (layer_embed.len == 0) return error.InvalidState;
-            }
-        }
-
-        graph.eval(&[_]ArrayHandle{hidden_handle});
         const final_hidden = try self.allocator.alloc(f32, patch_count * self.vision_hidden_size);
         defer self.allocator.free(final_hidden);
         graph.copyToHost(hidden_handle, final_hidden);

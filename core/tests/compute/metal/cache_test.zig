@@ -20,7 +20,7 @@ test "Cache init creates valid cache" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
-    const cache = Cache.init(12, true); // 12 layers, bfloat16
+    const cache = Cache.init(12, true, 0); // 12 layers, bfloat16
     defer cache.deinit();
 
     try std.testing.expect(cache.handle != null);
@@ -31,7 +31,7 @@ test "Cache init with quantized format" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
-    const cache = Cache.init(8, false); // 8 layers, quantized
+    const cache = Cache.init(8, false, 0); // 8 layers, quantized
     defer cache.deinit();
 
     try std.testing.expect(cache.handle != null);
@@ -44,7 +44,7 @@ test "Cache init various layer counts" {
 
     const layer_counts = [_]usize{ 1, 4, 12, 24, 32 };
     for (layer_counts) |n_layers| {
-        const cache = Cache.init(n_layers, true);
+        const cache = Cache.init(n_layers, true, 0);
         defer cache.deinit();
         try std.testing.expect(cache.handle != null);
     }
@@ -58,7 +58,7 @@ test "Cache updateAndFetch stores KV data" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
-    const cache = Cache.init(2, true);
+    const cache = Cache.init(2, true, 0);
     defer cache.deinit();
 
     // Create K/V arrays
@@ -81,7 +81,7 @@ test "Cache updateAndFetch accumulates across calls" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
-    const cache = Cache.init(2, true);
+    const cache = Cache.init(2, true, 0);
     defer cache.deinit();
 
     const shape = [_]i64{ 1, 1, 1, 64 };
@@ -113,7 +113,7 @@ test "Cache get retrieves stored data" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
-    const cache = Cache.init(2, true);
+    const cache = Cache.init(2, true, 0);
     defer cache.deinit();
 
     // Store data
@@ -135,7 +135,7 @@ test "Cache setFull stores complete cache" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
-    const cache = Cache.init(2, true);
+    const cache = Cache.init(2, true, 0);
     defer cache.deinit();
 
     const k_data = [_]f32{1.0} ** 64;
@@ -163,7 +163,7 @@ test "Cache evalAll forces evaluation" {
     if (!device_mod.isAvailable()) return;
 
     const n_layers: usize = 2;
-    const cache = Cache.init(n_layers, true);
+    const cache = Cache.init(n_layers, true, 0);
     defer cache.deinit();
 
     // Store data in all layers
@@ -194,7 +194,7 @@ test "Cache getQuantized returns triplets" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
-    const cache = Cache.init(2, false); // quantized mode
+    const cache = Cache.init(2, false, 0); // quantized mode
     defer cache.deinit();
 
     // Store data

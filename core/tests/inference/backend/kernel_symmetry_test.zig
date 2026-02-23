@@ -143,11 +143,12 @@ test "metal kernel symbols expose symmetric struct names" {
     try std.testing.expect(@hasDecl(backend.metal.kernels.ffn.SwiGLU, "forward"));
 }
 
-test "metal unsupported kernel declarations stay explicit" {
+test "metal kernel capability declarations stay explicit" {
     if (comptime !has_metal) return;
     try std.testing.expect(backend.metal.kernels.mamba.supported);
-    try std.testing.expect(!backend.metal.kernels.mla_attention.supported);
-    try std.testing.expectError(error.MLANotSupportedOnMetal, backend.metal.kernels.mla_attention.unsupported());
+    try std.testing.expect(backend.metal.kernels.mla_attention.supported);
+    try std.testing.expect(@hasDecl(backend.metal.kernels.mla_attention, "MLAttention"));
+    try std.testing.expect(@hasDecl(backend.metal.kernels.mla_attention.MLAttention, "forward"));
 }
 
 test "cuda kernel symbols expose symmetric struct names" {

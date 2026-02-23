@@ -20,6 +20,7 @@ struct CacheLayer {
     array* v_view = nullptr;
 
     size_t offset = 0; // Current position in cache.
+    size_t max_seq_len = 0; // Optional preallocated cache capacity.
     static constexpr int step = 256; // Pre-allocation chunk size.
 };
 

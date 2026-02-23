@@ -42,7 +42,7 @@ pub const MetalBackend = struct {
         .vision_prefill = true,
         .decode_batch = true,
         .decode_streaming = true,
-        .embedding = false,
+        .embedding = true,
         .warmup = false,
     };
 
@@ -86,69 +86,40 @@ pub const MetalBackend = struct {
         rope_position_delta: isize = 0,
     };
 
-    const DecodeExecutionMode = enum {
-        non_fused,
-        fused,
-    };
-
     const DecodePath = enum {
-        non_fused,
         pipeline_fused,
         batch_fused,
     };
 
     const DecodePlan = struct {
-        mode: DecodeExecutionMode,
         path: DecodePath,
     };
-
-    fn decodeExecutionModeFromModel(
-        force_non_fused_path: bool,
-        decode_model: ?model_runtime.DecodeModel,
-    ) DecodeExecutionMode {
-        if (force_non_fused_path) return .non_fused;
-        return if (decode_model != null) .fused else .non_fused;
-    }
-
-    fn decodeExecutionMode(self: *const MetalBackend, force_non_fused_path: bool) DecodeExecutionMode {
-        return decodeExecutionModeFromModel(force_non_fused_path, self.decode_model);
-    }
 
     fn shouldUseBatchDecode(
         env_batch_decode: bool,
         callback: ?*const fn (u32, ?*anyopaque) void,
-        mode: DecodeExecutionMode,
     ) bool {
         if (env_batch_decode) return true;
-        return callback == null and mode == .fused;
+        return callback == null;
     }
 
     fn selectDecodePlan(
-        mode: DecodeExecutionMode,
         env_batch_decode: bool,
         callback: ?*const fn (u32, ?*anyopaque) void,
     ) DecodePlan {
-        const batch_decode_enabled = shouldUseBatchDecode(env_batch_decode, callback, mode);
-        const path: DecodePath = switch (mode) {
-            .fused => if (batch_decode_enabled) .batch_fused else .pipeline_fused,
-            .non_fused => .non_fused,
-        };
-        return .{ .mode = mode, .path = path };
+        const batch_decode_enabled = shouldUseBatchDecode(env_batch_decode, callback);
+        return .{ .path = if (batch_decode_enabled) .batch_fused else .pipeline_fused };
     }
 
     fn decodePathLabel(path: DecodePath) []const u8 {
         return switch (path) {
-            .non_fused => "non_fused",
             .pipeline_fused => "pipeline_fused",
             .batch_fused => "batch_fused",
         };
     }
 
     fn isBatchDecodePath(path: DecodePath) bool {
-        return switch (path) {
-            .batch_fused => true,
-            .non_fused, .pipeline_fused => false,
-        };
+        return path == .batch_fused;
     }
 
     fn resolveMaxBatchSize() usize {
@@ -207,7 +178,11 @@ pub const MetalBackend = struct {
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
         slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
+        slot_cache.* = runtime_graph_mod.Cache.init(
+            @intCast(self.config.n_layers),
+            true,
+            @intCast(self.config.max_seq_len),
+        );
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
         slot_position.* = 0;
@@ -227,7 +202,11 @@ pub const MetalBackend = struct {
 
         // Reset cache for new sequence in this scheduler slot.
         slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
+        slot_cache.* = runtime_graph_mod.Cache.init(
+            @intCast(self.config.n_layers),
+            true,
+            @intCast(self.config.max_seq_len),
+        );
         slot_shortconv_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazy(
@@ -271,46 +250,19 @@ pub const MetalBackend = struct {
     ) !void {
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
-        const slot_mamba_cache = try self.slotMambaCache(slot_index);
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
-        const mode = self.decodeExecutionMode(false);
-
-        switch (mode) {
-            .fused => {
-                const decode_model = self.decode_model orelse return error.InvalidArgument;
-                const logits_handle = model_runtime.decodeStepLogits(
-                    decode_model,
-                    slot_cache.handle,
-                    slot_shortconv_cache.handle,
-                    token,
-                    effective_position,
-                );
-                graph.copyToHost(logits_handle, logits_out);
-                slot_position.* = position + 1;
-                return;
-            },
-            .non_fused => {},
-        }
-
-        const token_id_slice = &[_]u32{token};
-        const logits_handle = try runtime_trait.transformerForwardLazy(
-            self.allocator,
-            self.weights,
-            token_id_slice,
-            self.config,
-            slot_cache.*,
-            slot_shortconv_cache.*,
-            slot_mamba_cache.*,
+        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        const logits_handle = model_runtime.decodeStepLogits(
+            decode_model,
+            slot_cache.handle,
+            slot_shortconv_cache.handle,
+            token,
             effective_position,
-            false,
         );
-
-        graph.eval(&[_]graph.ArrayHandle{logits_handle});
         graph.copyToHost(logits_handle, logits_out);
-        graph.freeArray(logits_handle);
         slot_position.* = position + 1;
     }
 
@@ -334,10 +286,8 @@ pub const MetalBackend = struct {
         errdefer weights_trait.freeWeights(allocator, weight_handles);
 
         // Create decode model for low-FFI decode optimization.
-        weights_trait.createDecodeModel(allocator, weight_handles, loaded.config) catch |err| {
-            log.warn("inference", "Failed to create decode model", .{ .err = @errorName(err) });
-            // Continue without decode model - will fall back to per-layer calls.
-        };
+        try weights_trait.createDecodeModel(allocator, weight_handles, loaded.config);
+        if (weight_handles.decode_model == null) return error.DecodeModelUnavailable;
 
         log.debug("inference", "Metal decode model selection", .{
             .decode_model = @as(u8, @intFromBool(weight_handles.decode_model != null)),
@@ -350,7 +300,8 @@ pub const MetalBackend = struct {
 
         // Initialize slot 0 cache (single-sequence compatibility path).
         const layer_count: usize = @intCast(loaded.config.n_layers);
-        const kv_cache = runtime_graph_mod.Cache.init(layer_count, true);
+        const max_seq_len: usize = @intCast(loaded.config.max_seq_len);
+        const kv_cache = runtime_graph_mod.Cache.init(layer_count, true, max_seq_len);
         const shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count);
         const mamba_cache = runtime_graph_mod.MambaCache.init(layer_count);
         errdefer mamba_cache.deinit();
@@ -364,7 +315,7 @@ pub const MetalBackend = struct {
         errdefer allocator.free(extra_slots);
         for (extra_slots) |*slot| {
             slot.* = .{
-                .cache = runtime_graph_mod.Cache.init(layer_count, true),
+                .cache = runtime_graph_mod.Cache.init(layer_count, true, max_seq_len),
                 .shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count),
                 .mamba_cache = runtime_graph_mod.MambaCache.init(layer_count),
                 .in_use = false,
@@ -443,6 +394,74 @@ pub const MetalBackend = struct {
         // Single-sequence compatibility path always uses slot 0.
         self.slot_in_use = true;
         try self.prefillSlotImpl(0, tokens, logits_out);
+    }
+
+    pub fn embed(
+        self: *MetalBackend,
+        tokens: []const u32,
+        pooling: contract.PoolingStrategy,
+        normalize: bool,
+        embedding_out: []f32,
+    ) !void {
+        if (tokens.len == 0) return error.EmptyInput;
+        if (embedding_out.len < self.d_model) return error.BufferTooSmall;
+
+        const hidden_handle = try runtime_trait.transformerForwardHiddenLazy(
+            self.allocator,
+            self.weights,
+            tokens,
+            self.config,
+            null,
+            null,
+            null,
+            0,
+            false,
+        );
+        defer graph.freeArray(hidden_handle);
+
+        graph.eval(&[_]graph.ArrayHandle{hidden_handle});
+
+        const seq_len = tokens.len;
+        const hidden_values = try self.allocator.alloc(f32, seq_len * self.d_model);
+        defer self.allocator.free(hidden_values);
+        graph.copyToHost(hidden_handle, hidden_values);
+
+        const out = embedding_out[0..self.d_model];
+        switch (pooling) {
+            .last => {
+                const last_offset = (seq_len - 1) * self.d_model;
+                @memcpy(out, hidden_values[last_offset .. last_offset + self.d_model]);
+            },
+            .first => {
+                @memcpy(out, hidden_values[0..self.d_model]);
+            },
+            .mean => {
+                @memset(out, 0);
+                for (0..seq_len) |row_idx| {
+                    const row = hidden_values[row_idx * self.d_model ..][0..self.d_model];
+                    for (out, row) |*dst, value| {
+                        dst.* += value;
+                    }
+                }
+                const inv_n = 1.0 / @as(f32, @floatFromInt(seq_len));
+                for (out) |*v| v.* *= inv_n;
+            },
+        }
+
+        if (normalize) {
+            var sum_sq: f64 = 0;
+            for (out) |v| {
+                sum_sq += @as(f64, v) * @as(f64, v);
+            }
+            if (sum_sq > 0) {
+                const inv_norm = @as(f32, @floatCast(1.0 / @sqrt(sum_sq)));
+                for (out) |*v| v.* *= inv_norm;
+            }
+        }
+    }
+
+    pub fn embeddingDim(self: *const MetalBackend) usize {
+        return self.d_model;
     }
 
     /// Allocate scheduler slot.
@@ -606,7 +625,11 @@ pub const MetalBackend = struct {
 
         // Reset selected slot cache for new sequence.
         slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(@intCast(self.config.n_layers), true);
+        slot_cache.* = runtime_graph_mod.Cache.init(
+            @intCast(self.config.n_layers),
+            true,
+            @intCast(self.config.max_seq_len),
+        );
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
 
@@ -649,55 +672,42 @@ pub const MetalBackend = struct {
     pub fn decodeBatch(self: *MetalBackend, requests: []const contract.DecodeRequest, results: []contract.DecodeResult) !void {
         if (requests.len == 0) return;
         if (results.len < requests.len) return error.InvalidArgument;
+        if (requests.len > self.max_batch_size) return error.InvalidArgument;
 
-        const mode = self.decodeExecutionMode(false);
-        if (mode == .fused and self.decode_model != null and requests.len > 1 and requests.len <= self.max_batch_size) {
-            const decode_model = self.decode_model.?;
-            for (requests, 0..) |request, idx| {
-                const logits = try self.slotLogits(request.slot_index);
-                const slot_cache = try self.slotCache(request.slot_index);
-                const slot_shortconv_cache = try self.slotShortConvCache(request.slot_index);
-                const slot_position = try self.slotPositionPtr(request.slot_index);
-                const slot_rope_delta = try self.slotRopeDeltaPtr(request.slot_index);
-                const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
-
-                self.decode_batch_cache_handles[idx] = slot_cache.handle;
-                self.decode_batch_shortconv_handles[idx] = slot_shortconv_cache.handle;
-                self.decode_batch_tokens[idx] = request.token;
-                self.decode_batch_positions[idx] = effective_position;
-                self.decode_batch_logits_handles[idx] = null;
-
-                results[idx] = .{
-                    .slot_index = request.slot_index,
-                    .logits = logits,
-                };
-            }
-
-            model_runtime.decodeStepLogitsBatch(
-                decode_model,
-                self.decode_batch_cache_handles[0..requests.len],
-                self.decode_batch_shortconv_handles[0..requests.len],
-                self.decode_batch_tokens[0..requests.len],
-                self.decode_batch_positions[0..requests.len],
-                self.decode_batch_logits_handles[0..requests.len],
-            );
-
-            for (requests, 0..) |request, idx| {
-                graph.copyToHost(self.decode_batch_logits_handles[idx], results[idx].logits);
-                const slot_position = try self.slotPositionPtr(request.slot_index);
-                slot_position.* += 1;
-            }
-            return;
-        }
-
-        for (requests, 0..) |request, index| {
+        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        for (requests, 0..) |request, idx| {
             const logits = try self.slotLogits(request.slot_index);
-            const position = self.getPosition(request.slot_index);
-            try self.decodeSlot(request.slot_index, request.token, position, logits);
-            results[index] = .{
+            const slot_cache = try self.slotCache(request.slot_index);
+            const slot_shortconv_cache = try self.slotShortConvCache(request.slot_index);
+            const slot_position = try self.slotPositionPtr(request.slot_index);
+            const slot_rope_delta = try self.slotRopeDeltaPtr(request.slot_index);
+            const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
+
+            self.decode_batch_cache_handles[idx] = slot_cache.handle;
+            self.decode_batch_shortconv_handles[idx] = slot_shortconv_cache.handle;
+            self.decode_batch_tokens[idx] = request.token;
+            self.decode_batch_positions[idx] = effective_position;
+            self.decode_batch_logits_handles[idx] = null;
+
+            results[idx] = .{
                 .slot_index = request.slot_index,
                 .logits = logits,
             };
+        }
+
+        model_runtime.decodeStepLogitsBatch(
+            decode_model,
+            self.decode_batch_cache_handles[0..requests.len],
+            self.decode_batch_shortconv_handles[0..requests.len],
+            self.decode_batch_tokens[0..requests.len],
+            self.decode_batch_positions[0..requests.len],
+            self.decode_batch_logits_handles[0..requests.len],
+        );
+
+        for (requests, 0..) |request, idx| {
+            graph.copyToHost(self.decode_batch_logits_handles[idx], results[idx].logits);
+            const slot_position = try self.slotPositionPtr(request.slot_index);
+            slot_position.* += 1;
         }
     }
 
@@ -719,19 +729,15 @@ pub const MetalBackend = struct {
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
     ) !usize {
-        // Allow forcing non-fused path for debugging
-        const force_non_fused_path = std.process.hasEnvVar(self.allocator, "TALU_NO_FUSED") catch false;
         const env_batch_decode = std.process.hasEnvVar(self.allocator, "TALU_BATCH_DECODE") catch false;
-        const mode = self.decodeExecutionMode(force_non_fused_path);
-        const decode_plan = selectDecodePlan(mode, env_batch_decode, callback);
+        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        const decode_plan = selectDecodePlan(env_batch_decode, callback);
         const decode_path = decodePathLabel(decode_plan.path);
         const batch_decode_enabled = isBatchDecodePath(decode_plan.path);
         log.debug("inference", "Metal decode path", .{
-            .decode_model = @as(u8, @intFromBool(self.decode_model != null)),
+            .decode_model = @as(u8, @intFromBool(true)),
             .decode_model_quantized = 0,
             .decode_model_dense = 0,
-            .selected_decode_model_path = @as(u8, @intFromBool(decode_plan.mode != .non_fused)),
-            .force_non_fused_path = @as(u8, @intFromBool(force_non_fused_path)),
             .batch_decode_enabled = @as(u8, @intFromBool(batch_decode_enabled)),
             .path = decode_path,
         }, @src());
@@ -741,21 +747,18 @@ pub const MetalBackend = struct {
         if (batch_decode_enabled) {
             const effective_start_position = try common_mrope.applyPositionDelta(start_position, self.slot_rope_position_delta);
             const generated_count = switch (decode_plan.path) {
-                .batch_fused => blk: {
-                    const decode_model = self.decode_model orelse return error.InvalidArgument;
-                    break :blk model_runtime.decodeBatch(
-                        decode_model,
-                        self.cache.handle,
-                        self.shortconv_cache.handle,
-                        first_token,
-                        effective_start_position,
-                        output_tokens.ptr,
-                        max_tokens,
-                        eos_token_ids.ptr,
-                        eos_token_ids.len,
-                    );
-                },
-                .non_fused, .pipeline_fused => return error.InvalidState,
+                .batch_fused => model_runtime.decodeBatch(
+                    decode_model,
+                    self.cache.handle,
+                    self.shortconv_cache.handle,
+                    first_token,
+                    effective_start_position,
+                    output_tokens.ptr,
+                    max_tokens,
+                    eos_token_ids.ptr,
+                    eos_token_ids.len,
+                ),
+                .pipeline_fused => return error.InvalidState,
             };
 
             if (generated_count > 0) {
@@ -780,18 +783,8 @@ pub const MetalBackend = struct {
                     output_tokens,
                     callback,
                     callback_data,
-                    decode_plan.mode,
                 );
             },
-            .non_fused => return self.decodeStreamingNonFused(
-                first_token,
-                start_position,
-                max_tokens,
-                eos_token_ids,
-                output_tokens,
-                callback,
-                callback_data,
-            ),
             .batch_fused => return error.InvalidState,
         }
     }
@@ -806,24 +799,20 @@ pub const MetalBackend = struct {
         output_tokens: []u32,
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
-        mode: DecodeExecutionMode,
     ) !usize {
         var generated_count: usize = 0;
         var position_index = start_position;
 
         // Prime the pipeline
         const effective_start_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
-        const decode_model = self.decode_model orelse return error.InvalidArgument;
-        switch (mode) {
-            .fused => model_runtime.pipelinePrime(
-                decode_model,
-                self.cache.handle,
-                self.shortconv_cache.handle,
-                first_token,
-                effective_start_position,
-            ),
-            .non_fused => return error.InvalidArgument,
-        }
+        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        model_runtime.pipelinePrime(
+            decode_model,
+            self.cache.handle,
+            self.shortconv_cache.handle,
+            first_token,
+            effective_start_position,
+        );
         position_index += 1;
 
         while (generated_count < max_tokens) : (generated_count += 1) {
@@ -832,21 +821,19 @@ pub const MetalBackend = struct {
             if (generated_count + 1 < max_tokens) {
                 // Normal step: returns current, queues next
                 const effective_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
-                switch (mode) {
-                    .fused => sampled_token_id = model_runtime.pipelineStep(
-                        decode_model,
-                        self.cache.handle,
-                        self.shortconv_cache.handle,
-                        effective_position,
-                    ),
-                    .non_fused => return error.InvalidArgument,
-                }
+                sampled_token_id = model_runtime.pipelineStep(
+                    decode_model,
+                    self.cache.handle,
+                    self.shortconv_cache.handle,
+                    effective_position,
+                );
             } else {
                 // Last iteration: flush
-                sampled_token_id = switch (mode) {
-                    .fused => model_runtime.pipelineFlush(decode_model),
-                    .non_fused => return error.InvalidArgument,
-                };
+                sampled_token_id = model_runtime.pipelineFlushWithCache(
+                    decode_model,
+                    self.cache.handle,
+                    self.shortconv_cache.handle,
+                );
             }
             position_index += 1;
 
@@ -866,115 +853,6 @@ pub const MetalBackend = struct {
             // Invoke callback
             if (callback) |cb| {
                 cb(sampled_token_id, callback_data);
-            }
-
-            if (is_eos_token) {
-                generated_count += 1;
-                break;
-            }
-        }
-
-        self.current_position = position_index;
-        return generated_count;
-    }
-
-    /// Non decode-model path - uses lazy graph API with pipelining
-    fn decodeStreamingNonFused(
-        self: *MetalBackend,
-        first_token: u32,
-        start_position: usize,
-        max_tokens: usize,
-        eos_token_ids: []const u32,
-        output_tokens: []u32,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-        callback_data: ?*anyopaque,
-    ) !usize {
-        var generated_count: usize = 0;
-        var position_index = start_position;
-
-        // Prime: Build first token graph
-        const first_token_ids = &[_]u32{first_token};
-        const effective_start_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
-        var current_logits_handle = try runtime_trait.transformerForwardLazy(
-            self.allocator,
-            self.weights,
-            first_token_ids,
-            self.config,
-            self.cache,
-            self.shortconv_cache,
-            self.mamba_cache,
-            effective_start_position,
-            false,
-        );
-        var current_logits_last = graph.mlx_lazy_slice_last(current_logits_handle);
-        var current_token_handle = graph.mlx_lazy_argmax(current_logits_last, -1);
-        graph.asyncEval(&[_]graph.ArrayHandle{current_token_handle});
-        position_index += 1;
-
-        while (generated_count < max_tokens) : (generated_count += 1) {
-            var sampled_token_id: u32 = undefined; // Safe: both branches assign before use
-
-            if (generated_count + 1 < max_tokens) {
-                // Build graph for NEXT token using current (lazy) token
-                const effective_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
-                const next_logits_handle = try runtime_trait.transformerForwardFromGPUToken(
-                    self.allocator,
-                    self.weights,
-                    current_token_handle,
-                    self.config,
-                    self.cache,
-                    self.shortconv_cache,
-                    self.mamba_cache,
-                    effective_position,
-                );
-                const next_logits_last = graph.mlx_lazy_slice_last(next_logits_handle);
-                const next_token_handle = graph.mlx_lazy_argmax(next_logits_last, -1);
-
-                // Queue next token computation
-                graph.asyncEval(&[_]graph.ArrayHandle{next_token_handle});
-
-                // Materialize current token
-                sampled_token_id = graph.mlx_array_item_u32(current_token_handle);
-
-                // Free old handles
-                graph.freeArray(current_logits_handle);
-
-                // Rotate
-                current_logits_handle = next_logits_handle;
-                current_logits_last = next_logits_last;
-                current_token_handle = next_token_handle;
-            } else {
-                // Last iteration - just materialize current
-                sampled_token_id = graph.mlx_array_item_u32(current_token_handle);
-                graph.freeArray(current_logits_handle);
-            }
-            position_index += 1;
-
-            // Reset pool periodically
-            if (generated_count != 0 and generated_count % 64 == 0) {
-                graph.mlx_pool_reset();
-            }
-
-            // Store token
-            output_tokens[generated_count] = sampled_token_id;
-
-            // Check for EOS
-            var is_eos_token = false;
-            for (eos_token_ids) |eos_id| {
-                if (sampled_token_id == eos_id) {
-                    is_eos_token = true;
-                    break;
-                }
-            }
-
-            // Invoke callback
-            if (callback) |cb| {
-                cb(sampled_token_id, callback_data);
-            }
-
-            // Clear memory cache periodically
-            if (generated_count != 0 and generated_count % 256 == 0) {
-                graph.mlx_clear_memory_cache();
             }
 
             if (is_eos_token) {
@@ -1092,45 +970,10 @@ pub const MetalBackend = struct {
     }
 };
 
-test "decodeExecutionModeFromModel returns non_fused when forced" {
-    try std.testing.expectEqual(
-        MetalBackend.DecodeExecutionMode.non_fused,
-        MetalBackend.decodeExecutionModeFromModel(true, .{
-            .handle = @ptrFromInt(1),
-        }),
-    );
-}
-
-test "decodeExecutionModeFromModel returns non_fused when no decode model exists" {
-    try std.testing.expectEqual(
-        MetalBackend.DecodeExecutionMode.non_fused,
-        MetalBackend.decodeExecutionModeFromModel(false, null),
-    );
-}
-
-test "decodeExecutionModeFromModel returns fused for quantized decode model" {
-    try std.testing.expectEqual(
-        MetalBackend.DecodeExecutionMode.fused,
-        MetalBackend.decodeExecutionModeFromModel(false, .{
-            .handle = @ptrFromInt(1),
-        }),
-    );
-}
-
-test "decodeExecutionModeFromModel returns fused for dense decode model" {
-    try std.testing.expectEqual(
-        MetalBackend.DecodeExecutionMode.fused,
-        MetalBackend.decodeExecutionModeFromModel(false, .{
-            .handle = @ptrFromInt(2),
-        }),
-    );
-}
-
-test "shouldUseBatchDecode enables auto batch for decode model without callback" {
+test "shouldUseBatchDecode enables auto batch without callback" {
     try std.testing.expect(MetalBackend.shouldUseBatchDecode(
         false,
         null,
-        .fused,
     ));
 }
 
@@ -1141,7 +984,6 @@ test "shouldUseBatchDecode keeps streaming path when callback is set" {
     try std.testing.expect(!MetalBackend.shouldUseBatchDecode(
         false,
         TestCallback.cb,
-        .fused,
     ));
 }
 
@@ -1149,7 +991,6 @@ test "shouldUseBatchDecode honors env override" {
     try std.testing.expect(MetalBackend.shouldUseBatchDecode(
         true,
         null,
-        .non_fused,
     ));
 }
 
@@ -1163,37 +1004,31 @@ test "extraSlotIndexFor rejects slot 0 and out-of-range slots" {
     try std.testing.expectError(error.InvalidArgument, MetalBackend.extraSlotIndexFor(4, 4));
 }
 
-test "selectDecodePlan returns pipeline path for fused mode with callback" {
+test "selectDecodePlan returns pipeline path when callback is set" {
     const TestCallback = struct {
         fn cb(_: u32, _: ?*anyopaque) void {}
     };
     const plan = MetalBackend.selectDecodePlan(
-        .fused,
         false,
         TestCallback.cb,
     );
-    try std.testing.expectEqual(MetalBackend.DecodeExecutionMode.fused, plan.mode);
     try std.testing.expectEqual(MetalBackend.DecodePath.pipeline_fused, plan.path);
 }
 
-test "selectDecodePlan returns batch path for fused mode without callback" {
+test "selectDecodePlan returns batch path without callback" {
     const plan = MetalBackend.selectDecodePlan(
-        .fused,
         false,
         null,
     );
-    try std.testing.expectEqual(MetalBackend.DecodeExecutionMode.fused, plan.mode);
     try std.testing.expectEqual(MetalBackend.DecodePath.batch_fused, plan.path);
 }
 
-test "selectDecodePlan returns non_fused path for non_fused mode" {
+test "selectDecodePlan returns batch path when env override is set" {
     const plan = MetalBackend.selectDecodePlan(
-        .non_fused,
         true,
         null,
     );
-    try std.testing.expectEqual(MetalBackend.DecodeExecutionMode.non_fused, plan.mode);
-    try std.testing.expectEqual(MetalBackend.DecodePath.non_fused, plan.path);
+    try std.testing.expectEqual(MetalBackend.DecodePath.batch_fused, plan.path);
 }
 
 test "applyPositionDelta rejects negative resulting positions" {

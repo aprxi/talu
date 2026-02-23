@@ -18,15 +18,20 @@ pub const DecodeModel = struct {
 pub const CompiledLayer = struct {
     handle: CompiledLayerHandle,
 
+    pub fn isAvailable(self: CompiledLayer) bool {
+        return self.handle != null;
+    }
+
     pub fn forward(
         self: CompiledLayer,
         hidden: ArrayHandle,
         cache_ptr: CacheHandle,
+        shortconv_cache_ptr: ShortConvCacheHandle,
         layer_idx: usize,
         pos_offset: usize,
     ) ArrayHandle {
         if (self.handle == null) return null;
-        return mlx_layer_forward(self.handle, hidden, cache_ptr, layer_idx, pos_offset);
+        return mlx_layer_forward(self.handle, hidden, cache_ptr, shortconv_cache_ptr, layer_idx, pos_offset);
     }
 };
 
@@ -118,8 +123,12 @@ pub fn pipelineStep(
     return mlx_decode_model_pipeline_step(model.handle, cache, shortconv_cache, pos_offset);
 }
 
-pub fn pipelineFlush(model: DecodeModel) u32 {
-    return mlx_decode_model_pipeline_flush(model.handle);
+pub fn pipelineFlushWithCache(
+    model: DecodeModel,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+) u32 {
+    return mlx_decode_model_pipeline_flush(model.handle, cache, shortconv_cache);
 }
 
 pub extern fn mlx_decode_model_wrap_fused(model: *anyopaque) ?*anyopaque;
@@ -165,7 +174,11 @@ pub extern fn mlx_decode_model_pipeline_step(
     shortconv_cache: ShortConvCacheHandle,
     pos_offset: usize,
 ) u32;
-pub extern fn mlx_decode_model_pipeline_flush(model: *anyopaque) u32;
+pub extern fn mlx_decode_model_pipeline_flush(
+    model: *anyopaque,
+    cache: CacheHandle,
+    shortconv_cache: ShortConvCacheHandle,
+) u32;
 
 pub extern fn mlx_compile_layer(
     q_weight: ArrayHandle,
@@ -203,10 +216,83 @@ pub extern fn mlx_compile_layer(
     rms_eps: f32,
 ) CompiledLayerHandle;
 
+pub extern fn mlx_compile_layer_moe(
+    q_weight: ArrayHandle,
+    q_scales: ArrayHandle,
+    q_biases: ArrayHandle,
+    k_weight: ArrayHandle,
+    k_scales: ArrayHandle,
+    k_biases: ArrayHandle,
+    v_weight: ArrayHandle,
+    v_scales: ArrayHandle,
+    v_biases: ArrayHandle,
+    o_weight: ArrayHandle,
+    o_scales: ArrayHandle,
+    o_biases: ArrayHandle,
+    attn_norm: ArrayHandle,
+    ffn_norm: ArrayHandle,
+    q_norm: ArrayHandle,
+    k_norm: ArrayHandle,
+    moe_router_w: ArrayHandle,
+    moe_router_s: ArrayHandle,
+    moe_router_b: ArrayHandle,
+    moe_router_bias: ArrayHandle,
+    moe_gate_w: ArrayHandle,
+    moe_gate_s: ArrayHandle,
+    moe_up_w: ArrayHandle,
+    moe_up_s: ArrayHandle,
+    moe_down_w: ArrayHandle,
+    moe_down_s: ArrayHandle,
+    moe_gate_bias: ArrayHandle,
+    moe_up_bias: ArrayHandle,
+    moe_down_bias: ArrayHandle,
+    moe_num_experts: usize,
+    moe_experts_per_token: usize,
+    moe_router_group_size: usize,
+    moe_expert_group_size: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    hidden_dim: usize,
+    group_size: usize,
+    bits: usize,
+    rope_theta: f32,
+    rms_eps: f32,
+) CompiledLayerHandle;
+
+pub extern fn mlx_compile_layer_shortconv(
+    ln1_weight: ArrayHandle,
+    shortconv_in_weight: ArrayHandle,
+    shortconv_in_scales: ArrayHandle,
+    shortconv_in_biases: ArrayHandle,
+    shortconv_out_weight: ArrayHandle,
+    shortconv_out_scales: ArrayHandle,
+    shortconv_out_biases: ArrayHandle,
+    shortconv_conv_weight: ArrayHandle,
+    shortconv_conv_bias: ArrayHandle,
+    ln2_weight: ArrayHandle,
+    gate_weight: ArrayHandle,
+    gate_scales: ArrayHandle,
+    gate_biases: ArrayHandle,
+    up_weight: ArrayHandle,
+    up_scales: ArrayHandle,
+    up_biases: ArrayHandle,
+    down_weight: ArrayHandle,
+    down_scales: ArrayHandle,
+    down_biases: ArrayHandle,
+    shortconv_d_conv: usize,
+    shortconv_conv_dim: usize,
+    group_size: usize,
+    bits: usize,
+    rms_eps: f32,
+    use_gelu: bool,
+) CompiledLayerHandle;
+
 pub extern fn mlx_layer_forward(
     compiled_handle: CompiledLayerHandle,
     hidden: ArrayHandle,
     cache_ptr: CacheHandle,
+    shortconv_cache_ptr: ShortConvCacheHandle,
     layer_idx: usize,
     pos_offset: usize,
 ) ArrayHandle;
@@ -293,6 +379,7 @@ pub extern fn mlx_fused_model_set_layer(
     moe_expert_group_size: usize,
 ) void;
 pub extern fn mlx_fused_model_optimize(model: FusedModelHandle) void;
+pub extern fn mlx_fused_model_compile(model: FusedModelHandle) void;
 pub extern fn mlx_fused_model_free(model: FusedModelHandle) void;
 
 pub extern fn mlx_fused_decode_step_logits(
@@ -326,7 +413,10 @@ pub extern fn mlx_pipeline_step(
     shortconv_cache: ShortConvCacheHandle,
     pos_offset: usize,
 ) u32;
-pub extern fn mlx_pipeline_flush() u32;
+pub extern fn mlx_pipeline_flush(
+    model: FusedModelHandle,
+    cache: CacheHandle,
+) u32;
 
 pub extern fn mlx_dense_model_create(
     n_layers: usize,
@@ -376,7 +466,10 @@ pub extern fn mlx_dense_pipeline_step(
     shortconv_cache: ShortConvCacheHandle,
     pos_offset: usize,
 ) u32;
-pub extern fn mlx_dense_pipeline_flush() u32;
+pub extern fn mlx_dense_pipeline_flush(
+    model: DenseModelHandle,
+    cache: CacheHandle,
+) u32;
 pub extern fn mlx_dense_decode_step_logits(
     model: DenseModelHandle,
     cache: CacheHandle,
@@ -395,3 +488,43 @@ pub extern fn mlx_dense_decode_batch(
     eos_ids: [*]const u32,
     n_eos_ids: usize,
 ) u32;
+
+test "pipelineFlushWithCache exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(pipelineFlushWithCache)).@"fn";
+    try std.testing.expectEqual(@as(usize, 3), fn_info.params.len);
+    const f = pipelineFlushWithCache;
+    _ = f;
+}
+
+test "mlx_fused_model_compile exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(mlx_fused_model_compile)).@"fn";
+    try std.testing.expectEqual(@as(usize, 1), fn_info.params.len);
+    const f = mlx_fused_model_compile;
+    _ = f;
+}
+
+test "mlx_compile_layer_moe exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(mlx_compile_layer_moe)).@"fn";
+    try std.testing.expectEqual(@as(usize, 41), fn_info.params.len);
+    const f = mlx_compile_layer_moe;
+    _ = f;
+}
+
+test "mlx_compile_layer_shortconv exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(mlx_compile_layer_shortconv)).@"fn";
+    try std.testing.expectEqual(@as(usize, 25), fn_info.params.len);
+    const f = mlx_compile_layer_shortconv;
+    _ = f;
+}
+
+test "mlx_layer_forward exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(mlx_layer_forward)).@"fn";
+    try std.testing.expectEqual(@as(usize, 6), fn_info.params.len);
+    const f = mlx_layer_forward;
+    _ = f;
+}
+
+test "CompiledLayer.isAvailable returns false for null handle" {
+    const layer = CompiledLayer{ .handle = null };
+    try std.testing.expect(!layer.isAvailable());
+}

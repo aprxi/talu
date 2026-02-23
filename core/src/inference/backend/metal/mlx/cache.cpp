@@ -5,21 +5,79 @@
 
 #include "model_state.h"
 
+namespace {
+
+static int round_up_step(size_t value, int step) {
+    const size_t s = static_cast<size_t>(step);
+    return static_cast<int>(((value + s - 1) / s) * s);
+}
+
+static int next_cache_capacity(const CacheLayer& layer, size_t required, int current_capacity) {
+    if (required == 0) return current_capacity;
+
+    const size_t current = current_capacity > 0 ? static_cast<size_t>(current_capacity) : 0;
+    const size_t step = static_cast<size_t>(layer.step);
+
+    if (layer.max_seq_len > 0) {
+        const size_t max_cap = layer.max_seq_len;
+        if (required > max_cap) {
+            throw std::invalid_argument("[cache] kv cache capacity exceeded");
+        }
+
+        size_t capacity = current;
+        if (capacity == 0) {
+            const size_t base = std::max(required, step);
+            capacity = std::min(max_cap, static_cast<size_t>(round_up_step(base, layer.step)));
+        }
+        while (capacity < required) {
+            const size_t doubled = capacity * 2;
+            if (doubled <= capacity) {
+                capacity = max_cap;
+                break;
+            }
+            capacity = std::min(max_cap, doubled);
+        }
+        if (capacity < required) {
+            throw std::invalid_argument("[cache] kv cache capacity exceeded");
+        }
+        return static_cast<int>(capacity);
+    }
+
+    size_t capacity = current;
+    if (capacity == 0) {
+        const size_t base = std::max(required, step);
+        capacity = static_cast<size_t>(round_up_step(base, layer.step));
+    }
+    while (capacity < required) {
+        const size_t doubled = capacity * 2;
+        if (doubled <= capacity) {
+            throw std::invalid_argument("[cache] kv cache capacity exceeded");
+        }
+        capacity = doubled;
+    }
+    return static_cast<int>(capacity);
+}
+
+} // namespace
+
 extern "C" {
 
 // ============================================================================
 // Cache Lifecycle
 // ============================================================================
 
-void* mlx_cache_create(size_t n_layers) {
+void* mlx_cache_create(size_t n_layers, size_t max_seq_len) {
     auto cache_state = new MLXCache();
     cache_state->layers.resize(n_layers);
+    for (auto& layer : cache_state->layers) {
+        layer.max_seq_len = max_seq_len;
+    }
     return cache_state;
 }
 
-void* mlx_cache_create_bfloat16(size_t n_layers) {
+void* mlx_cache_create_bfloat16(size_t n_layers, size_t max_seq_len) {
     // Same as mlx_cache_create - cache type determined by usage
-    return mlx_cache_create(n_layers);
+    return mlx_cache_create(n_layers, max_seq_len);
 }
 
 void mlx_cache_free(void* cache_ptr) {
@@ -36,10 +94,11 @@ void mlx_cache_free(void* cache_ptr) {
 // ============================================================================
 // BFloat16 Cache Operations
 // ============================================================================
-// Matches Python's mlx_lm KVCache pattern:
-//   1. Pre-allocate 256-token buffers
-//   2. Use slice_update for in-place writes
-//   3. Return slice [0:offset]
+// Cache policy:
+//   1. Allocate backing buffers once (prefer max_seq_len when provided).
+//   2. Use slice_update for in-place writes.
+//   3. Never grow buffers after allocation (fail fast on capacity overflow).
+//   4. Return slice [0:offset].
 
 void mlx_cache_update_and_fetch_bfloat16(
     void* cache_ptr, size_t layer_idx,
@@ -61,30 +120,34 @@ void mlx_cache_update_and_fetch_bfloat16(
     size_t prev = layer.offset;
     *is_prefill_out = (prev == 0);
 
-    // Expand buffer if needed
-    if (layer.k_bfloat16 == nullptr ||
-        (prev + num_steps) > static_cast<size_t>(layer.k_bfloat16->shape(2))) {
+    const size_t required = prev + static_cast<size_t>(num_steps);
 
-        int n_steps = (layer.step + num_steps - 1) / layer.step;
-        Shape k_shape = {batch, n_kv_heads, n_steps * layer.step, k_head_dim};
-        Shape v_shape = {batch, n_kv_heads, n_steps * layer.step, v_head_dim};
-        auto new_k = zeros(k_shape, k_new_arr.dtype());
-        auto new_v = zeros(v_shape, v_new_arr.dtype());
-
-        if (layer.k_bfloat16 != nullptr) {
-            // Trim if not aligned to step boundary
-            if (prev % layer.step != 0) {
-                Shape start = {0, 0, 0, 0};
-                Shape stop_k = {batch, n_kv_heads, static_cast<int>(prev), k_head_dim};
-                Shape stop_v = {batch, n_kv_heads, static_cast<int>(prev), v_head_dim};
-                *layer.k_bfloat16 = slice(*layer.k_bfloat16, start, stop_k);
-                *layer.v_bfloat16 = slice(*layer.v_bfloat16, start, stop_v);
+    // Initialize backing storage or grow geometrically as needed.
+    if (layer.k_bfloat16 == nullptr) {
+        const int capacity = next_cache_capacity(layer, required, 0);
+        Shape k_shape = {batch, n_kv_heads, capacity, k_head_dim};
+        Shape v_shape = {batch, n_kv_heads, capacity, v_head_dim};
+        layer.k_bfloat16 = new array(zeros(k_shape, k_new_arr.dtype()));
+        layer.v_bfloat16 = new array(zeros(v_shape, v_new_arr.dtype()));
+    } else {
+        const int current_capacity = layer.k_bfloat16->shape(2);
+        if (required > static_cast<size_t>(current_capacity)) {
+            const int new_capacity = next_cache_capacity(layer, required, current_capacity);
+            Shape new_k_shape = {batch, n_kv_heads, new_capacity, k_head_dim};
+            Shape new_v_shape = {batch, n_kv_heads, new_capacity, v_head_dim};
+            array new_k = zeros(new_k_shape, layer.k_bfloat16->dtype());
+            array new_v = zeros(new_v_shape, layer.v_bfloat16->dtype());
+            if (prev > 0) {
+                Shape copy_start = {0, 0, 0, 0};
+                Shape copy_stop_k = {batch, n_kv_heads, static_cast<int>(prev), k_head_dim};
+                Shape copy_stop_v = {batch, n_kv_heads, static_cast<int>(prev), v_head_dim};
+                array k_existing = slice(*layer.k_bfloat16, copy_start, copy_stop_k);
+                array v_existing = slice(*layer.v_bfloat16, copy_start, copy_stop_v);
+                new_k = slice_update(new_k, k_existing, copy_start, copy_stop_k);
+                new_v = slice_update(new_v, v_existing, copy_start, copy_stop_v);
             }
-            *layer.k_bfloat16 = concatenate({*layer.k_bfloat16, new_k}, 2);
-            *layer.v_bfloat16 = concatenate({*layer.v_bfloat16, new_v}, 2);
-        } else {
-            layer.k_bfloat16 = new array(new_k);
-            layer.v_bfloat16 = new array(new_v);
+            *layer.k_bfloat16 = new_k;
+            *layer.v_bfloat16 = new_v;
         }
     }
 

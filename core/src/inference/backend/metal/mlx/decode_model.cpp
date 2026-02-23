@@ -11,8 +11,8 @@ extern "C" {
 void mlx_fused_model_free(void* model);
 void mlx_dense_model_free(void* model);
 
-array mlx_fused_decode_step_logits(void* model, void* cache, void* shortconv_cache, uint32_t token_id, size_t pos_offset);
-array mlx_dense_decode_step_logits(void* model, void* cache, void* shortconv_cache, uint32_t token_id, size_t pos_offset);
+void* mlx_fused_decode_step_logits(void* model, void* cache, void* shortconv_cache, uint32_t token_id, size_t pos_offset);
+void* mlx_dense_decode_step_logits(void* model, void* cache, void* shortconv_cache, uint32_t token_id, size_t pos_offset);
 
 uint32_t mlx_fused_decode_batch(
     void* model,
@@ -42,8 +42,8 @@ void mlx_dense_pipeline_prime(void* model, void* cache, void* shortconv_cache, u
 uint32_t mlx_pipeline_step(void* model, void* cache, void* shortconv_cache, size_t pos_offset);
 uint32_t mlx_dense_pipeline_step(void* model, void* cache, void* shortconv_cache, size_t pos_offset);
 
-uint32_t mlx_pipeline_flush();
-uint32_t mlx_dense_pipeline_flush();
+uint32_t mlx_pipeline_flush(void* model, void* cache);
+uint32_t mlx_dense_pipeline_flush(void* model, void* cache);
 
 } // extern "C"
 
@@ -90,7 +90,7 @@ void mlx_decode_model_free(void* model) {
     delete wrapper;
 }
 
-array mlx_decode_model_step_logits(
+void* mlx_decode_model_step_logits(
     void* model,
     void* cache,
     void* shortconv_cache,
@@ -118,11 +118,11 @@ void mlx_decode_model_step_logits_batch(
     for (size_t idx = 0; idx < count; idx++) {
         const uint32_t token_id = token_ids[idx];
         const size_t pos_offset = pos_offsets[idx];
-        array logits = (wrapper->flavor == DecodeModelFlavor::quantized)
+        void* logits = (wrapper->flavor == DecodeModelFlavor::quantized)
             ? mlx_fused_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], token_id, pos_offset)
             : mlx_dense_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], token_id, pos_offset);
-        out_logits[idx] = pool_array(std::move(logits));
-        pending_eval.push_back(*static_cast<array*>(out_logits[idx]));
+        out_logits[idx] = logits;
+        pending_eval.push_back(*static_cast<array*>(logits));
     }
 
     if (!pending_eval.empty()) {
@@ -191,12 +191,16 @@ uint32_t mlx_decode_model_pipeline_step(
     return mlx_dense_pipeline_step(wrapper->impl, cache, shortconv_cache, pos_offset);
 }
 
-uint32_t mlx_decode_model_pipeline_flush(void* model) {
+uint32_t mlx_decode_model_pipeline_flush(
+    void* model,
+    void* cache,
+    void* shortconv_cache) {
+    (void)shortconv_cache;
     auto* wrapper = as_wrapper(model);
     if (wrapper->flavor == DecodeModelFlavor::quantized) {
-        return mlx_pipeline_flush();
+        return mlx_pipeline_flush(wrapper->impl, cache);
     }
-    return mlx_dense_pipeline_flush();
+    return mlx_dense_pipeline_flush(wrapper->impl, cache);
 }
 
 } // extern "C"

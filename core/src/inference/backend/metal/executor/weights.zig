@@ -13,7 +13,6 @@ const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
 const runtime_graph = @import("../runtime_graph.zig");
 const model_runtime = @import("../model_runtime.zig");
-const mla_kernel = @import("../kernels/mla_attention.zig");
 const topology = @import("../../../../models/op_types.zig");
 
 const builtin = @import("builtin");
@@ -280,10 +279,8 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     for (model_blocks, 0..) |*block, layer_idx| {
         switch (block.*) {
             .attention_mlp => |*attn_block| {
-                if (attn_block.isMLA()) {
-                    return mla_kernel.unsupported();
-                }
                 weight_handles.layers[layer_idx].kind = .attention_mlp;
+                const is_mla = attn_block.isMLA();
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
                 var ln1_arr = try loadNormWeight(attn_block.ln1_weight);
@@ -301,44 +298,105 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 }
                 weight_handles.layers[layer_idx].ln2_weight = ln2_arr;
 
-                const attention_layout = try resolveAttentionMixerLayout(
-                    attn_block.q_proj.?.dtype,
-                    attn_block.k_proj.?.dtype,
-                    attn_block.v_proj.?.dtype,
-                    attn_block.o_proj.dtype,
-                );
+                if (is_mla) {
+                    const mla_cfg = attn_block.mla_config orelse return error.MissingField;
+                    weight_handles.layers[layer_idx].mla_config = .{
+                        .q_lora_rank = mla_cfg.q_lora_rank,
+                        .kv_lora_rank = mla_cfg.kv_lora_rank,
+                        .qk_head_dim = mla_cfg.qk_head_dim,
+                        .qk_rope_head_dim = mla_cfg.qk_rope_head_dim,
+                        .qk_nope_head_dim = mla_cfg.qk_nope_head_dim,
+                        .v_head_dim = mla_cfg.v_head_dim,
+                        .rope_interleave = mla_cfg.rope_interleave,
+                    };
 
-                switch (attention_layout) {
-                    .quantized => {
-                        // Detect bits from quantized Q projection dtype.
-                        const quant_bits = try quantBitsFor(attn_block.q_proj.?.dtype);
+                    // MLA layernorm weights use their native formulation; do not apply (1+w) offset.
+                    weight_handles.layers[layer_idx].mla_q_a_norm = try loadNormWeight(attn_block.q_a_norm orelse return error.MissingField);
+                    weight_handles.layers[layer_idx].mla_kv_a_norm = try loadNormWeight(attn_block.kv_a_norm orelse return error.MissingField);
+
+                    const q_a_proj = attn_block.q_a_proj orelse return error.MissingField;
+                    const q_b_proj = attn_block.q_b_proj orelse return error.MissingField;
+                    const kv_a_proj = attn_block.kv_a_proj orelse return error.MissingField;
+                    const kv_b_proj = attn_block.kv_b_proj orelse return error.MissingField;
+
+                    const mla_core_quantized = isGroupedAffineDType(q_a_proj.dtype) and
+                        isGroupedAffineDType(q_b_proj.dtype) and
+                        isGroupedAffineDType(kv_a_proj.dtype) and
+                        isGroupedAffineDType(kv_b_proj.dtype);
+                    const mla_core_dense = isDenseNumericDType(q_a_proj.dtype) and
+                        isDenseNumericDType(q_b_proj.dtype) and
+                        isDenseNumericDType(kv_a_proj.dtype) and
+                        isDenseNumericDType(kv_b_proj.dtype);
+                    if (mla_core_quantized == mla_core_dense) return error.InvalidTensorType;
+
+                    if (mla_core_quantized) {
+                        const quant_bits = try quantBitsFor(q_a_proj.dtype);
+                        if (try quantBitsFor(q_b_proj.dtype) != quant_bits or
+                            try quantBitsFor(kv_a_proj.dtype) != quant_bits or
+                            try quantBitsFor(kv_b_proj.dtype) != quant_bits)
+                        {
+                            return error.InvalidTensorType;
+                        }
+                        if (!isGroupedAffineDType(attn_block.o_proj.dtype) or try quantBitsFor(attn_block.o_proj.dtype) != quant_bits) {
+                            return error.InvalidTensorType;
+                        }
+
                         weight_handles.layers[layer_idx].is_quantized = true;
-
-                        // Q/K/V/O projections (quantized)
-                        weight_handles.layers[layer_idx].q_proj = try loadQuantizedWeight(attn_block.q_proj.?, quant_bits);
-                        weight_handles.layers[layer_idx].k_proj = try loadQuantizedWeight(attn_block.k_proj.?, quant_bits);
-                        weight_handles.layers[layer_idx].v_proj = try loadQuantizedWeight(attn_block.v_proj.?, quant_bits);
+                        weight_handles.layers[layer_idx].mla_q_a_proj = try loadQuantizedWeight(q_a_proj, quant_bits);
+                        weight_handles.layers[layer_idx].mla_q_b_proj = try loadQuantizedWeight(q_b_proj, quant_bits);
+                        weight_handles.layers[layer_idx].mla_kv_a_proj = try loadQuantizedWeight(kv_a_proj, quant_bits);
+                        weight_handles.layers[layer_idx].mla_kv_b_proj = try loadQuantizedWeight(kv_b_proj, quant_bits);
                         weight_handles.layers[layer_idx].o_proj = try loadQuantizedWeight(attn_block.o_proj, quant_bits);
-                    },
-                    .mixed_qkv_quantized_o_dense => {
-                        const quant_bits = try quantBitsFor(attn_block.q_proj.?.dtype);
-                        weight_handles.layers[layer_idx].is_quantized = false;
+                    } else {
+                        if (!isDenseNumericDType(attn_block.o_proj.dtype)) return error.InvalidTensorType;
 
-                        // Mixed attention path: quantized Q/K/V with dense output projection.
-                        weight_handles.layers[layer_idx].q_proj = try loadQuantizedWeight(attn_block.q_proj.?, quant_bits);
-                        weight_handles.layers[layer_idx].k_proj = try loadQuantizedWeight(attn_block.k_proj.?, quant_bits);
-                        weight_handles.layers[layer_idx].v_proj = try loadQuantizedWeight(attn_block.v_proj.?, quant_bits);
-                        weight_handles.layers[layer_idx].o_proj_bf16 = try tensorToArray(attn_block.o_proj);
-                    },
-                    .dense => {
                         weight_handles.layers[layer_idx].is_quantized = false;
-
-                        // Dense attention path (BF16/F16/F32).
-                        weight_handles.layers[layer_idx].q_proj_bf16 = try tensorToArray(attn_block.q_proj.?);
-                        weight_handles.layers[layer_idx].k_proj_bf16 = try tensorToArray(attn_block.k_proj.?);
-                        weight_handles.layers[layer_idx].v_proj_bf16 = try tensorToArray(attn_block.v_proj.?);
+                        weight_handles.layers[layer_idx].mla_q_a_proj_bf16 = try tensorToArray(q_a_proj);
+                        weight_handles.layers[layer_idx].mla_q_b_proj_bf16 = try tensorToArray(q_b_proj);
+                        weight_handles.layers[layer_idx].mla_kv_a_proj_bf16 = try tensorToArray(kv_a_proj);
+                        weight_handles.layers[layer_idx].mla_kv_b_proj_bf16 = try tensorToArray(kv_b_proj);
                         weight_handles.layers[layer_idx].o_proj_bf16 = try tensorToArray(attn_block.o_proj);
-                    },
+                    }
+                } else {
+                    const attention_layout = try resolveAttentionMixerLayout(
+                        attn_block.q_proj.?.dtype,
+                        attn_block.k_proj.?.dtype,
+                        attn_block.v_proj.?.dtype,
+                        attn_block.o_proj.dtype,
+                    );
+
+                    switch (attention_layout) {
+                        .quantized => {
+                            // Detect bits from quantized Q projection dtype.
+                            const quant_bits = try quantBitsFor(attn_block.q_proj.?.dtype);
+                            weight_handles.layers[layer_idx].is_quantized = true;
+
+                            // Q/K/V/O projections (quantized)
+                            weight_handles.layers[layer_idx].q_proj = try loadQuantizedWeight(attn_block.q_proj.?, quant_bits);
+                            weight_handles.layers[layer_idx].k_proj = try loadQuantizedWeight(attn_block.k_proj.?, quant_bits);
+                            weight_handles.layers[layer_idx].v_proj = try loadQuantizedWeight(attn_block.v_proj.?, quant_bits);
+                            weight_handles.layers[layer_idx].o_proj = try loadQuantizedWeight(attn_block.o_proj, quant_bits);
+                        },
+                        .mixed_qkv_quantized_o_dense => {
+                            const quant_bits = try quantBitsFor(attn_block.q_proj.?.dtype);
+                            weight_handles.layers[layer_idx].is_quantized = false;
+
+                            // Mixed attention path: quantized Q/K/V with dense output projection.
+                            weight_handles.layers[layer_idx].q_proj = try loadQuantizedWeight(attn_block.q_proj.?, quant_bits);
+                            weight_handles.layers[layer_idx].k_proj = try loadQuantizedWeight(attn_block.k_proj.?, quant_bits);
+                            weight_handles.layers[layer_idx].v_proj = try loadQuantizedWeight(attn_block.v_proj.?, quant_bits);
+                            weight_handles.layers[layer_idx].o_proj_bf16 = try tensorToArray(attn_block.o_proj);
+                        },
+                        .dense => {
+                            weight_handles.layers[layer_idx].is_quantized = false;
+
+                            // Dense attention path (BF16/F16/F32).
+                            weight_handles.layers[layer_idx].q_proj_bf16 = try tensorToArray(attn_block.q_proj.?);
+                            weight_handles.layers[layer_idx].k_proj_bf16 = try tensorToArray(attn_block.k_proj.?);
+                            weight_handles.layers[layer_idx].v_proj_bf16 = try tensorToArray(attn_block.v_proj.?);
+                            weight_handles.layers[layer_idx].o_proj_bf16 = try tensorToArray(attn_block.o_proj);
+                        },
+                    }
                 }
 
                 // FFN weights can be quantized or dense independently of attention projections.
@@ -1120,8 +1178,6 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
             }
         }
 
-        weight_handles.decode_model = model_runtime.decodeModelFromFused(fused);
-
         // Set architecture-specific config for quantized decode-model path
         if (weight_handles.has_norm_weight_offset or config.use_gelu or config.query_pre_attn_scalar != 0) {
             model_runtime.mlx_fused_model_set_arch_config(
@@ -1178,6 +1234,9 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
 
         // Pre-evaluate all weights to ensure GPU transfer happens upfront
         model_runtime.mlx_fused_model_optimize(fused);
+        // Compile decode step graph for fused path (no-op for unsupported topologies).
+        model_runtime.mlx_fused_model_compile(fused);
+        weight_handles.decode_model = model_runtime.decodeModelFromFused(fused);
     } else {
         // DENSE PATH: Use FusedDenseModel with dense matmul (BF16)
         const dense = model_runtime.mlx_dense_model_create(
@@ -1299,6 +1358,18 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
         if (layer.shortconv_out_proj_bf16) |h| mlx_graph.freeArray(h);
         if (layer.shortconv_conv_weight) |h| mlx_graph.freeArray(h);
         if (layer.shortconv_conv_bias) |h| mlx_graph.freeArray(h);
+
+        // MLA attention fields
+        if (layer.mla_q_a_proj) |quantized_weight| freeQuantizedWeight(quantized_weight);
+        if (layer.mla_q_b_proj) |quantized_weight| freeQuantizedWeight(quantized_weight);
+        if (layer.mla_kv_a_proj) |quantized_weight| freeQuantizedWeight(quantized_weight);
+        if (layer.mla_kv_b_proj) |quantized_weight| freeQuantizedWeight(quantized_weight);
+        if (layer.mla_q_a_proj_bf16) |h| mlx_graph.freeArray(h);
+        if (layer.mla_q_b_proj_bf16) |h| mlx_graph.freeArray(h);
+        if (layer.mla_kv_a_proj_bf16) |h| mlx_graph.freeArray(h);
+        if (layer.mla_kv_b_proj_bf16) |h| mlx_graph.freeArray(h);
+        if (layer.mla_q_a_norm) |h| mlx_graph.freeArray(h);
+        if (layer.mla_kv_a_norm) |h| mlx_graph.freeArray(h);
 
         // Free quantized weights if present
         if (layer.q_proj) |quantized_weight| freeQuantizedWeight(quantized_weight);
@@ -1425,9 +1496,6 @@ fn freeQuantizedWeight(quantized_weight: WeightHandles.QuantizedWeight) void {
 fn compileLayersForFusion(allocator: std.mem.Allocator, weight_handles: *WeightHandles, config: anytype) !void {
     if (weight_handles.compiled_layers != null) return; // Already compiled
     if (!weight_handles.is_quantized) return; // BF16 models don't use compiled layers
-    // ShortConv layers require conv-state cache side effects that this compiled layer path
-    // does not model. Keep this guard to avoid incorrect decode behavior and silent regressions.
-    if (weight_handles.has_shortconv) return;
 
     const head_count: usize = @intCast(config.n_heads);
     const kv_head_count: usize = @intCast(config.n_kv_groups);
@@ -1438,47 +1506,143 @@ fn compileLayersForFusion(allocator: std.mem.Allocator, weight_handles: *WeightH
 
     const compiled_layers = try allocator.alloc(model_runtime.CompiledLayer, weight_handles.layers.len);
     errdefer allocator.free(compiled_layers);
+    @memset(compiled_layers, .{ .handle = null });
 
+    var compiled_any = false;
     for (weight_handles.layers, 0..) |*layer, layer_idx| {
-        if (layer.kind != .attention_mlp) return;
-        const compiled_handle = model_runtime.mlx_compile_layer(
-            layer.q_proj.?.weights,
-            layer.q_proj.?.scales,
-            layer.q_proj.?.biases,
-            layer.k_proj.?.weights,
-            layer.k_proj.?.scales,
-            layer.k_proj.?.biases,
-            layer.v_proj.?.weights,
-            layer.v_proj.?.scales,
-            layer.v_proj.?.biases,
-            layer.o_proj.?.weights,
-            layer.o_proj.?.scales,
-            layer.o_proj.?.biases,
-            layer.w1.?.weights,
-            layer.w1.?.scales,
-            layer.w1.?.biases, // gate
-            layer.w3.?.weights,
-            layer.w3.?.scales,
-            layer.w3.?.biases, // up
-            layer.w2.?.weights,
-            layer.w2.?.scales,
-            layer.w2.?.biases, // down
-            layer.ln1_weight,
-            layer.ln2_weight,
-            layer.q_norm orelse null,
-            layer.k_norm orelse null,
-            head_count,
-            kv_head_count,
-            head_dim,
-            model_width,
-            layer.q_proj.?.group_size,
-            layer.q_proj.?.bits,
-            rope_theta,
-            norm_epsilon,
-        );
+        const compiled_handle = switch (layer.kind) {
+            .attention_mlp => blk: {
+                if (layer.attentionStorageKind() != .quantized) continue;
+                const ffn_storage = layer.ffnStorageKind();
+                break :blk switch (ffn_storage) {
+                    .quantized => model_runtime.mlx_compile_layer(
+                        layer.q_proj.?.weights,
+                        layer.q_proj.?.scales,
+                        layer.q_proj.?.biases,
+                        layer.k_proj.?.weights,
+                        layer.k_proj.?.scales,
+                        layer.k_proj.?.biases,
+                        layer.v_proj.?.weights,
+                        layer.v_proj.?.scales,
+                        layer.v_proj.?.biases,
+                        layer.o_proj.?.weights,
+                        layer.o_proj.?.scales,
+                        layer.o_proj.?.biases,
+                        layer.w1.?.weights,
+                        layer.w1.?.scales,
+                        layer.w1.?.biases, // gate
+                        layer.w3.?.weights,
+                        layer.w3.?.scales,
+                        layer.w3.?.biases, // up
+                        layer.w2.?.weights,
+                        layer.w2.?.scales,
+                        layer.w2.?.biases, // down
+                        layer.ln1_weight,
+                        layer.ln2_weight,
+                        layer.q_norm orelse null,
+                        layer.k_norm orelse null,
+                        head_count,
+                        kv_head_count,
+                        head_dim,
+                        model_width,
+                        layer.q_proj.?.group_size,
+                        layer.q_proj.?.bits,
+                        rope_theta,
+                        norm_epsilon,
+                    ),
+                    .moe => moe_blk: {
+                        const moe = layer.moe orelse continue;
+                        break :moe_blk model_runtime.mlx_compile_layer_moe(
+                            layer.q_proj.?.weights,
+                            layer.q_proj.?.scales,
+                            layer.q_proj.?.biases,
+                            layer.k_proj.?.weights,
+                            layer.k_proj.?.scales,
+                            layer.k_proj.?.biases,
+                            layer.v_proj.?.weights,
+                            layer.v_proj.?.scales,
+                            layer.v_proj.?.biases,
+                            layer.o_proj.?.weights,
+                            layer.o_proj.?.scales,
+                            layer.o_proj.?.biases,
+                            layer.ln1_weight,
+                            layer.ln2_weight,
+                            layer.q_norm orelse null,
+                            layer.k_norm orelse null,
+                            moe.router_w,
+                            moe.router_s orelse null,
+                            moe.router_b orelse null,
+                            moe.router_bias orelse null,
+                            moe.gate_w,
+                            moe.gate_s,
+                            moe.up_w,
+                            moe.up_s,
+                            moe.down_w,
+                            moe.down_s,
+                            moe.gate_bias orelse null,
+                            moe.up_bias orelse null,
+                            moe.down_bias orelse null,
+                            moe.num_experts,
+                            moe.experts_per_token,
+                            moe.router_group_size,
+                            moe.expert_group_size,
+                            head_count,
+                            kv_head_count,
+                            head_dim,
+                            model_width,
+                            layer.q_proj.?.group_size,
+                            layer.q_proj.?.bits,
+                            rope_theta,
+                            norm_epsilon,
+                        );
+                    },
+                    else => continue,
+                };
+            },
+            .shortconv => blk: {
+                if (layer.shortconvStorageKind() != .quantized) continue;
+                if (layer.ffnStorageKind() != .quantized) continue;
+                const shortconv_in = layer.shortconv_in_proj orelse continue;
+                const shortconv_out = layer.shortconv_out_proj orelse continue;
+                const shortconv_conv = layer.shortconv_conv_weight orelse continue;
+                break :blk model_runtime.mlx_compile_layer_shortconv(
+                    layer.ln1_weight,
+                    shortconv_in.weights,
+                    shortconv_in.scales,
+                    shortconv_in.biases,
+                    shortconv_out.weights,
+                    shortconv_out.scales,
+                    shortconv_out.biases,
+                    shortconv_conv,
+                    layer.shortconv_conv_bias orelse null,
+                    layer.ln2_weight,
+                    layer.w1.?.weights,
+                    layer.w1.?.scales,
+                    layer.w1.?.biases,
+                    layer.w3.?.weights,
+                    layer.w3.?.scales,
+                    layer.w3.?.biases,
+                    layer.w2.?.weights,
+                    layer.w2.?.scales,
+                    layer.w2.?.biases,
+                    layer.shortconv_d_conv,
+                    layer.shortconv_conv_dim,
+                    shortconv_in.group_size,
+                    shortconv_in.bits,
+                    norm_epsilon,
+                    weight_handles.use_gelu,
+                );
+            },
+            .mamba => continue,
+        };
         compiled_layers[layer_idx] = .{ .handle = compiled_handle };
+        compiled_any = true;
     }
 
+    if (!compiled_any) {
+        allocator.free(compiled_layers);
+        return;
+    }
     weight_handles.compiled_layers = compiled_layers;
 }
 
@@ -1560,6 +1724,16 @@ pub const WeightHandles = struct {
         experts_per_token: usize,
     };
 
+    pub const MLAConfig = struct {
+        q_lora_rank: usize,
+        kv_lora_rank: usize,
+        qk_head_dim: usize,
+        qk_rope_head_dim: usize,
+        qk_nope_head_dim: usize,
+        v_head_dim: usize,
+        rope_interleave: bool,
+    };
+
     pub const LayerWeights = struct {
         pub const LayerKind = topology.BlockKind;
         pub const AttentionStorageKind = enum {
@@ -1570,6 +1744,12 @@ pub const WeightHandles = struct {
             invalid,
         };
         pub const ShortConvStorageKind = enum {
+            quantized,
+            dense,
+            missing,
+            invalid,
+        };
+        pub const MLAStorageKind = enum {
             quantized,
             dense,
             missing,
@@ -1596,6 +1776,19 @@ pub const WeightHandles = struct {
         shortconv_out_proj_bf16: ?ArrayHandle = null,
         shortconv_conv_weight: ?ArrayHandle = null,
         shortconv_conv_bias: ?ArrayHandle = null,
+
+        // MLA attention fields (used when kind == .attention_mlp and mla_config != null)
+        mla_config: ?MLAConfig = null,
+        mla_q_a_proj: ?QuantizedWeight = null,
+        mla_q_b_proj: ?QuantizedWeight = null,
+        mla_kv_a_proj: ?QuantizedWeight = null,
+        mla_kv_b_proj: ?QuantizedWeight = null,
+        mla_q_a_proj_bf16: ?ArrayHandle = null,
+        mla_q_b_proj_bf16: ?ArrayHandle = null,
+        mla_kv_a_proj_bf16: ?ArrayHandle = null,
+        mla_kv_b_proj_bf16: ?ArrayHandle = null,
+        mla_q_a_norm: ?ArrayHandle = null,
+        mla_kv_a_norm: ?ArrayHandle = null,
 
         // Quantized weights (grouped-affine u4/u8)
         q_proj: ?QuantizedWeight = null,
@@ -1741,6 +1934,35 @@ pub const WeightHandles = struct {
             return if (has_any_shortconv_field) .invalid else .missing;
         }
 
+        pub fn isMLA(self: *const LayerWeights) bool {
+            return self.mla_config != null;
+        }
+
+        pub fn mlaStorageKind(self: *const LayerWeights) MLAStorageKind {
+            if (!self.isMLA()) return .missing;
+
+            const quantized_mla_complete = self.mla_q_a_proj != null and
+                self.mla_q_b_proj != null and
+                self.mla_kv_a_proj != null and
+                self.mla_kv_b_proj != null and
+                self.mla_q_a_proj_bf16 == null and
+                self.mla_q_b_proj_bf16 == null and
+                self.mla_kv_a_proj_bf16 == null and
+                self.mla_kv_b_proj_bf16 == null;
+            const dense_mla_complete = self.mla_q_a_proj == null and
+                self.mla_q_b_proj == null and
+                self.mla_kv_a_proj == null and
+                self.mla_kv_b_proj == null and
+                self.mla_q_a_proj_bf16 != null and
+                self.mla_q_b_proj_bf16 != null and
+                self.mla_kv_a_proj_bf16 != null and
+                self.mla_kv_b_proj_bf16 != null;
+            if (quantized_mla_complete and dense_mla_complete) return .invalid;
+            if (quantized_mla_complete) return .quantized;
+            if (dense_mla_complete) return .dense;
+            return .invalid;
+        }
+
         pub fn ffnStorageKind(self: *const LayerWeights) FfnStorageKind {
             const quantized_ffn_complete = self.w1 != null and self.w2 != null and self.w3 != null and
                 self.w1_bf16 == null and self.w2_bf16 == null and self.w3_bf16 == null;
@@ -1877,6 +2099,56 @@ test "LayerWeights storage helpers classify moe ffn path" {
         .moe = &moe,
     };
     try testing.expectEqual(WeightHandles.LayerWeights.FfnStorageKind.moe, layer.ffnStorageKind());
+}
+
+test "LayerWeights storage helpers classify MLA quantized path" {
+    const layer = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(1),
+        .ln2_weight = testHandle(2),
+        .mla_config = .{
+            .q_lora_rank = 8,
+            .kv_lora_rank = 8,
+            .qk_head_dim = 16,
+            .qk_rope_head_dim = 4,
+            .qk_nope_head_dim = 12,
+            .v_head_dim = 12,
+            .rope_interleave = true,
+        },
+        .mla_q_a_proj = testQuantizedWeight(10, 64, 4),
+        .mla_q_b_proj = testQuantizedWeight(20, 64, 4),
+        .mla_kv_a_proj = testQuantizedWeight(30, 64, 4),
+        .mla_kv_b_proj = testQuantizedWeight(40, 64, 4),
+        .mla_q_a_norm = testHandle(50),
+        .mla_kv_a_norm = testHandle(51),
+        .o_proj = testQuantizedWeight(60, 64, 4),
+    };
+    try testing.expect(layer.isMLA());
+    try testing.expectEqual(WeightHandles.LayerWeights.MLAStorageKind.quantized, layer.mlaStorageKind());
+}
+
+test "LayerWeights storage helpers classify MLA dense path" {
+    const layer = WeightHandles.LayerWeights{
+        .ln1_weight = testHandle(1),
+        .ln2_weight = testHandle(2),
+        .mla_config = .{
+            .q_lora_rank = 8,
+            .kv_lora_rank = 8,
+            .qk_head_dim = 16,
+            .qk_rope_head_dim = 4,
+            .qk_nope_head_dim = 12,
+            .v_head_dim = 12,
+            .rope_interleave = true,
+        },
+        .mla_q_a_proj_bf16 = testHandle(10),
+        .mla_q_b_proj_bf16 = testHandle(11),
+        .mla_kv_a_proj_bf16 = testHandle(12),
+        .mla_kv_b_proj_bf16 = testHandle(13),
+        .mla_q_a_norm = testHandle(14),
+        .mla_kv_a_norm = testHandle(15),
+        .o_proj_bf16 = testHandle(16),
+    };
+    try testing.expect(layer.isMLA());
+    try testing.expectEqual(WeightHandles.LayerWeights.MLAStorageKind.dense, layer.mlaStorageKind());
 }
 
 test "classifyDecodeModelCandidate returns quantized for mixed attention/shortconv quantized layers" {
@@ -2301,7 +2573,7 @@ test "Model.forward produces logits from input tokens" {
     defer freeWeights(testing.allocator, weight_handles);
 
     // Create KV cache
-    const cache = runtime_graph.Cache.init(1, true);
+    const cache = runtime_graph.Cache.init(1, true, 0);
     defer cache.deinit();
 
     // Run forward pass with single token
@@ -2344,7 +2616,7 @@ test "Model.forwardFromGPUToken produces logits from GPU token" {
     defer freeWeights(testing.allocator, weight_handles);
 
     // Create KV cache
-    const cache = runtime_graph.Cache.init(1, true);
+    const cache = runtime_graph.Cache.init(1, true, 0);
     defer cache.deinit();
 
     // First do a prefill to populate cache and get a token

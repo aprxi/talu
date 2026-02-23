@@ -8,6 +8,7 @@ const runtime_graph = @import("../runtime_graph.zig");
 const attention_kernel = @import("../kernels/attention.zig");
 const ffn_kernel = @import("../kernels/ffn.zig");
 const mamba_kernel = @import("../kernels/mamba.zig");
+const mla_kernel = @import("../kernels/mla_attention.zig");
 const moe_kernel = @import("../kernels/moe.zig");
 const norm_kernel = @import("../kernels/norm.zig");
 const shortconv_kernel = @import("../kernels/shortconv.zig");
@@ -98,6 +99,54 @@ pub const TransformerBlock = struct {
 
         const mixer_out = switch (lw.kind) {
             .attention_mlp => blk: {
+                if (lw.isMLA()) {
+                    const mla_cfg = lw.mla_config orelse return error.MissingField;
+                    const mla_attention = mla_kernel.MLAttention{
+                        .n_heads = head_count,
+                        .rope_theta = config.rope_theta,
+                        .norm_eps = norm_eps,
+                        .q_lora_rank = mla_cfg.q_lora_rank,
+                        .kv_lora_rank = mla_cfg.kv_lora_rank,
+                        .qk_head_dim = mla_cfg.qk_head_dim,
+                        .qk_rope_head_dim = mla_cfg.qk_rope_head_dim,
+                        .qk_nope_head_dim = mla_cfg.qk_nope_head_dim,
+                        .v_head_dim = mla_cfg.v_head_dim,
+                        .q_a_proj = lw.mla_q_a_proj,
+                        .q_b_proj = lw.mla_q_b_proj,
+                        .kv_a_proj = lw.mla_kv_a_proj,
+                        .kv_b_proj = lw.mla_kv_b_proj,
+                        .q_a_proj_bf16 = lw.mla_q_a_proj_bf16,
+                        .q_b_proj_bf16 = lw.mla_q_b_proj_bf16,
+                        .kv_a_proj_bf16 = lw.mla_kv_a_proj_bf16,
+                        .kv_b_proj_bf16 = lw.mla_kv_b_proj_bf16,
+                        .q_a_norm = lw.mla_q_a_norm,
+                        .kv_a_norm = lw.mla_kv_a_norm,
+                        .o_proj = lw.o_proj,
+                        .o_proj_bf16 = lw.o_proj_bf16,
+                    };
+                    var mla_cache = mla_kernel.AttnCache{
+                        .cache = cache,
+                        .layer_idx = layer_idx,
+                        .pos_offset = pos_offset,
+                    };
+                    var mla_scratch = mla_kernel.AttnTemp{
+                        .runtime_rope_cos_handle = runtime_rope_cos_handle,
+                        .runtime_rope_sin_handle = runtime_rope_sin_handle,
+                        .runtime_rope_dim = runtime_rope_dim,
+                    };
+                    var mla_matmul_scratch = mla_kernel.MatmulScratch{};
+                    var mla_out: mlx_graph.ArrayHandle = undefined;
+                    try mla_attention.forward(
+                        normed,
+                        &mla_out,
+                        &mla_cache,
+                        &mla_scratch,
+                        &mla_matmul_scratch,
+                        cache != null,
+                    );
+                    break :blk mla_out;
+                }
+
                 if (attention_storage == .invalid) return error.InvalidTensorType;
                 if (attention_storage == .missing) return error.MissingField;
                 const attention = attention_kernel.MultiHeadAttention{
@@ -266,12 +315,7 @@ pub const TransformerBlock = struct {
         weight_handles: anytype,
         norm_eps: f32,
     ) mlx_graph.ArrayHandle {
-        const final_norm = norm_kernel.RMSNorm{
-            .weight = weight_handles.ln_final,
-            .eps = norm_eps,
-        };
-        var final_normed: mlx_graph.ArrayHandle = undefined;
-        final_norm.forward(hidden, &final_normed);
+        const final_normed = projectHidden(hidden, weight_handles, norm_eps);
         const logits = if (weight_handles.lm_head_quantized) |quantized_lm_head| blk: {
             break :blk mlx_graph.mlx_lazy_quantized_matmul(
                 final_normed,
@@ -295,5 +339,19 @@ pub const TransformerBlock = struct {
             mlx_graph.mlx_lazy_multiply_scalar(logits, 1.0 / weight_handles.logits_scaling)
         else
             logits;
+    }
+
+    pub fn projectHidden(
+        hidden: mlx_graph.ArrayHandle,
+        weight_handles: anytype,
+        norm_eps: f32,
+    ) mlx_graph.ArrayHandle {
+        const final_norm = norm_kernel.RMSNorm{
+            .weight = weight_handles.ln_final,
+            .eps = norm_eps,
+        };
+        var final_normed: mlx_graph.ArrayHandle = undefined;
+        final_norm.forward(hidden, &final_normed);
+        return final_normed;
     }
 };

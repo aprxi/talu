@@ -50,6 +50,30 @@ pub fn transformerForwardLazy(
     );
 }
 
+pub fn transformerForwardHiddenLazy(
+    allocator: std.mem.Allocator,
+    weight_handles: *const WeightHandles,
+    input_ids: []const u32,
+    config: anytype,
+    cache: ?Cache,
+    shortconv_cache: ?ShortConvCache,
+    mamba_cache: ?MambaCache,
+    pos_offset: usize,
+    use_compiled: bool,
+) !ArrayHandle {
+    return model_executor.Model.forwardHidden(
+        allocator,
+        weight_handles,
+        input_ids,
+        config,
+        cache,
+        shortconv_cache,
+        mamba_cache,
+        pos_offset,
+        use_compiled,
+    );
+}
+
 pub fn transformerForwardLazyWithEmbeddingOverride(
     allocator: std.mem.Allocator,
     weight_handles: *const WeightHandles,
@@ -106,6 +130,13 @@ test "transformerForwardLazy exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardLazy)).@"fn";
     try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
     const f = transformerForwardLazy;
+    _ = f;
+}
+
+test "transformerForwardHiddenLazy exposes stable callable signature" {
+    const fn_info = @typeInfo(@TypeOf(transformerForwardHiddenLazy)).@"fn";
+    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    const f = transformerForwardHiddenLazy;
     _ = f;
 }
 

@@ -787,7 +787,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 const tail_count = if (comptime @hasDecl(BackendType, "decodeStreaming"))
                     try self.backend.decodeStreaming(
                         current_token,
-                        prompt_tokens.len + generated.items.len,
+                        // start_position is the position index for first_token.
+                        // First generated token comes from prefill, so subtract 1.
+                        prompt_tokens.len + generated.items.len - 1,
                         remaining_token_budget,
                         eos_token_ids,
                         generated_tail,
@@ -2167,7 +2169,7 @@ const MockStreamingBackend = struct {
         _ = callback_data;
         self.decode_streaming_calls += 1;
         for (output_tokens[0..max_tokens], 0..) |*out_token, idx| {
-            out_token.* = first_token + @as(u32, @intCast(start_position + idx + 1));
+            out_token.* = first_token + @as(u32, @intCast(start_position + idx));
         }
         return max_tokens;
     }
@@ -2202,6 +2204,7 @@ test "generateSync uses decodeStreaming fast path when backend supports it" {
     try std.testing.expectEqual(@as(usize, 1), backend.decode_streaming_calls);
     try std.testing.expectEqual(@as(usize, 0), backend.decode_batch_calls);
     try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
+    try std.testing.expectEqualSlices(u32, &.{ 42, 44, 45, 46 }, result.tokens);
 }
 
 test "generateSync falls back to decodeBatch when stop sequences are configured" {

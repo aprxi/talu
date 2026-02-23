@@ -2,10 +2,15 @@
 
 pub const supported = true;
 
+const std = @import("std");
+const builtin = @import("builtin");
+const compute = @import("../../../../compute/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const weights = @import("../executor/weights.zig");
 const mlx_fused = @import("../mlx/ffi.zig");
 
+const device_mod = compute.metal.device;
+const graph = compute.metal.graph;
 const ArrayHandle = mlx_fused.ArrayHandle;
 
 pub const Cache = runtime_graph.Cache;
@@ -206,3 +211,71 @@ pub const MultiHeadAttention = struct {
 };
 
 pub const FusedAttention = MultiHeadAttention;
+
+test "MultiHeadAttention.forward preallocates cache to max_seq_len" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const max_seq_len: usize = 1024;
+    const cache = runtime_graph.Cache.init(1, true, max_seq_len);
+    defer cache.deinit();
+
+    const input_data = [_]f32{ 1.0, 2.0 };
+    const input_shape = [_]i64{ 1, 1, 2 };
+    const input_handle = graph.createArrayF32(&input_data, &input_shape);
+    defer graph.freeArray(input_handle);
+
+    const weight_data = [_]f32{
+        1.0, 0.0,
+        0.0, 1.0,
+    };
+    const weight_shape = [_]i64{ 2, 2 };
+    const q_weight = graph.createArrayF32(&weight_data, &weight_shape);
+    defer graph.freeArray(q_weight);
+    const k_weight = graph.createArrayF32(&weight_data, &weight_shape);
+    defer graph.freeArray(k_weight);
+    const v_weight = graph.createArrayF32(&weight_data, &weight_shape);
+    defer graph.freeArray(v_weight);
+    const o_weight = graph.createArrayF32(&weight_data, &weight_shape);
+    defer graph.freeArray(o_weight);
+
+    const attention = MultiHeadAttention{
+        .n_heads = 1,
+        .n_kv_heads = 1,
+        .head_dim = 2,
+        .rope_theta = 10000.0,
+        .norm_eps = 1e-5,
+        .q_proj_bf16 = q_weight,
+        .k_proj_bf16 = k_weight,
+        .v_proj_bf16 = v_weight,
+        .o_proj_bf16 = o_weight,
+    };
+
+    var output_handle: ArrayHandle = null;
+    var attn_cache = AttnCache{
+        .cache = cache,
+        .layer_idx = 0,
+        .pos_offset = 0,
+    };
+    var attn_temp = AttnTemp{};
+    var matmul_scratch = MatmulScratch{};
+    try attention.forward(
+        input_handle,
+        &output_handle,
+        &attn_cache,
+        &attn_temp,
+        &matmul_scratch,
+        true,
+    );
+    defer graph.freeArray(output_handle);
+
+    graph.eval(&[_]ArrayHandle{output_handle});
+
+    const cached = cache.get(0);
+    try std.testing.expect(cached.k != null);
+
+    var shape_buffer: [8]usize = undefined;
+    const rank = graph.getShape(cached.k, &shape_buffer);
+    try std.testing.expectEqual(@as(usize, 4), rank);
+    try std.testing.expectEqual(max_seq_len, shape_buffer[2]);
+}

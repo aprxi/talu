@@ -146,16 +146,26 @@ fn mlx_scaled_dot_product_attention_impl(
     const kv_shape = [_]usize{ batch, n_kv_heads, kv_seq_len, head_dim };
     const k_array = mlx_graph.mlx_array_from_float32(k_data, &kv_shape, 4);
     const v_array = mlx_graph.mlx_array_from_float32(v_data, &kv_shape, 4);
-
-    // Handle grouped-query form.
-    // If n_kv_heads < n_heads, source groups may need repetition.
-    // For now, call attention directly and let MLX handle GQA.
-    // Note: If MLX does not repeat source groups internally, add a repeat op here.
     defer mlx_graph.mlx_array_free(k_array);
     defer mlx_graph.mlx_array_free(v_array);
 
+    var k_for_attn = k_array;
+    var v_for_attn = v_array;
+
+    // Handle grouped-query form explicitly by repeating KV heads.
+    // This avoids shape-dependent backend behavior and keeps semantics
+    // deterministic when n_kv_heads < n_heads.
+    if (n_kv_heads < n_heads) {
+        if (n_kv_heads == 0 or n_heads % n_kv_heads != 0) return false;
+        const repeats = n_heads / n_kv_heads;
+        k_for_attn = mlx_graph.mlx_lazy_repeat(k_array, repeats, 1);
+        v_for_attn = mlx_graph.mlx_lazy_repeat(v_array, repeats, 1);
+        defer mlx_graph.mlx_array_free(k_for_attn);
+        defer mlx_graph.mlx_array_free(v_for_attn);
+    }
+
     // Call attention
-    const result_handle = mlx_graph.mlx_lazy_attention(q_array, k_array, v_array, scale, true);
+    const result_handle = mlx_graph.mlx_lazy_attention(q_array, k_for_attn, v_for_attn, scale, true);
     defer mlx_graph.mlx_array_free(result_handle);
 
     // Evaluate
@@ -594,4 +604,87 @@ test "silu applies activation function" {
     try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[2], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.7311), out[3], 0.01);
     try std.testing.expectApproxEqAbs(@as(f32, 1.7616), out[4], 0.01);
+}
+
+test "scaledDotProductAttention repeats KV heads for GQA" {
+    if (comptime builtin.os.tag != .macos) return;
+
+    const batch: usize = 1;
+    const n_heads: usize = 4;
+    const n_kv_heads: usize = 2;
+    const seq_len: usize = 1;
+    const kv_seq_len: usize = 3;
+    const head_dim: usize = 2;
+    const scale: f32 = 1.0;
+
+    var q = [_]f32{
+        // head 0
+        0.1, 0.2,
+        // head 1
+        0.3, 0.4,
+        // head 2
+        0.5, 0.6,
+        // head 3
+        0.7, 0.8,
+    };
+
+    // K/V for 2 KV heads, each with kv_seq_len=3, head_dim=2.
+    var k = [_]f32{
+        // kv head 0
+        0.1,  0.0, 0.2,  0.1, 0.3,  0.2,
+        // kv head 1
+        -0.1, 0.0, -0.2, 0.1, -0.3, 0.2,
+    };
+    var v = [_]f32{
+        // kv head 0
+        1.0,  0.0, 0.5,  0.5, 0.0, 1.0,
+        // kv head 1
+        -1.0, 0.0, -0.5, 0.5, 0.0, -1.0,
+    };
+
+    var out_gqa: [batch * n_heads * seq_len * head_dim]f32 = undefined;
+    try scaledDotProductAttention(
+        q[0..],
+        k[0..],
+        v[0..],
+        batch,
+        n_heads,
+        n_kv_heads,
+        seq_len,
+        kv_seq_len,
+        head_dim,
+        scale,
+        out_gqa[0..],
+    );
+
+    // Build explicit repeated KV tensors: repeat each KV head twice.
+    var k_rep: [batch * n_heads * kv_seq_len * head_dim]f32 = undefined;
+    var v_rep: [batch * n_heads * kv_seq_len * head_dim]f32 = undefined;
+    const kv_block = kv_seq_len * head_dim;
+    for (0..n_heads) |head_idx| {
+        const src_head = head_idx / 2;
+        const src_start = src_head * kv_block;
+        const dst_start = head_idx * kv_block;
+        @memcpy(k_rep[dst_start .. dst_start + kv_block], k[src_start .. src_start + kv_block]);
+        @memcpy(v_rep[dst_start .. dst_start + kv_block], v[src_start .. src_start + kv_block]);
+    }
+
+    var out_explicit: [batch * n_heads * seq_len * head_dim]f32 = undefined;
+    try scaledDotProductAttention(
+        q[0..],
+        k_rep[0..],
+        v_rep[0..],
+        batch,
+        n_heads,
+        n_heads,
+        seq_len,
+        kv_seq_len,
+        head_dim,
+        scale,
+        out_explicit[0..],
+    );
+
+    for (out_gqa, out_explicit) |actual, expected| {
+        try std.testing.expectApproxEqAbs(expected, actual, 1e-4);
+    }
 }

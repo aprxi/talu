@@ -8,6 +8,8 @@
 
 #include "compute_common.h"
 #include "model_state.h"
+#include <mutex>
+#include <unordered_map>
 
 // ============================================================================
 // Dense Model Structure
@@ -52,21 +54,105 @@ struct FusedDenseModel {
     float rope_theta = 0.0f;
     float rms_eps = 0.0f;
     bool topology_initialized = false;
+
+    // Per-model decode constants (avoid thread-local cross-thread/model drift).
+    bool decode_shapes_initialized = false;
+    Shape q_shape = {1, 1, 1, 1};
+    Shape kv_shape = {1, 1, 1, 1};
+    Shape attn_out_shape = {1, 1, 1};
+    Shape token_shape = {1, 1};
+    float attn_scale = 1.0f;
 };
 
 // Global model pointer (for pipeline access)
 static FusedDenseModel* g_fused_dense = nullptr;
 
-// Pipeline state
-static thread_local array* g_dense_current_token = nullptr;
-static thread_local size_t g_dense_step_count = 0;
+struct DensePipelineState {
+    std::optional<array> current_token;
+};
 
-// Pre-computed shapes (avoid allocation per call)
-static thread_local Shape g_dense_q_shape, g_dense_kv_shape, g_dense_attn_out_shape;
-static thread_local Shape g_dense_token_shape = {1, 1};
-static thread_local float g_dense_attn_scale = 0.0f;
-static thread_local int g_dense_n_kv_heads = 0;
-static thread_local int g_dense_head_dim = 0;
+static std::mutex g_dense_pipeline_mu;
+static std::unordered_map<void*, DensePipelineState> g_dense_pipeline_states;
+
+static inline void* dense_decode_state_key(void* cache_ptr, void* model_ptr) {
+    return cache_ptr != nullptr ? cache_ptr : model_ptr;
+}
+
+static int round_up_step(size_t value, int step) {
+    const size_t s = static_cast<size_t>(step);
+    return static_cast<int>(((value + s - 1) / s) * s);
+}
+
+static int next_cache_capacity(const CacheLayer& layer, size_t required, int current_capacity) {
+    if (required == 0) return current_capacity;
+
+    const size_t current = current_capacity > 0 ? static_cast<size_t>(current_capacity) : 0;
+    const size_t step = static_cast<size_t>(layer.step);
+
+    if (layer.max_seq_len > 0) {
+        const size_t max_cap = layer.max_seq_len;
+        if (required > max_cap) {
+            throw std::invalid_argument("[dense] kv cache capacity exceeded");
+        }
+
+        size_t capacity = current;
+        if (capacity == 0) {
+            const size_t base = std::max(required, step);
+            capacity = std::min(max_cap, static_cast<size_t>(round_up_step(base, layer.step)));
+        }
+        while (capacity < required) {
+            const size_t doubled = capacity * 2;
+            if (doubled <= capacity) {
+                capacity = max_cap;
+                break;
+            }
+            capacity = std::min(max_cap, doubled);
+        }
+        if (capacity < required) {
+            throw std::invalid_argument("[dense] kv cache capacity exceeded");
+        }
+        return static_cast<int>(capacity);
+    }
+
+    size_t capacity = current;
+    if (capacity == 0) {
+        const size_t base = std::max(required, step);
+        capacity = static_cast<size_t>(round_up_step(base, layer.step));
+    }
+    while (capacity < required) {
+        const size_t doubled = capacity * 2;
+        if (doubled <= capacity) {
+            throw std::invalid_argument("[dense] kv cache capacity exceeded");
+        }
+        capacity = doubled;
+    }
+    return static_cast<int>(capacity);
+}
+
+static inline void gqa_expand_attention_kv(const array& q, const array& k_in, const array& v_in, array* k_out, array* v_out) {
+    if (k_out == nullptr || v_out == nullptr) {
+        throw std::invalid_argument("null gqa output");
+    }
+    const int q_heads = q.shape(1);
+    const int kv_heads = k_in.shape(1);
+    if (q_heads == kv_heads) {
+        *k_out = k_in;
+        *v_out = v_in;
+        return;
+    }
+    if (kv_heads <= 0 || q_heads <= 0 || (q_heads % kv_heads) != 0 || v_in.shape(1) != kv_heads) {
+        throw std::invalid_argument("invalid GQA head layout");
+    }
+
+    const int heads_per_kv = q_heads / kv_heads;
+    std::vector<int32_t> gather_idx(static_cast<size_t>(q_heads));
+    for (int head_idx = 0; head_idx < q_heads; head_idx++) {
+        gather_idx[static_cast<size_t>(head_idx)] = static_cast<int32_t>(head_idx / heads_per_kv);
+    }
+    array idx = array(gather_idx.data(), {q_heads}, int32);
+    *k_out = take(k_in, idx, 1);
+    *v_out = take(v_in, idx, 1);
+}
 
 static constexpr uint8_t kLayerKindAttentionMlp = 0;
 static constexpr uint8_t kLayerKindShortConv = 1;
@@ -128,9 +214,19 @@ static inline array ensure_float32(const array& arr) {
     return arr.dtype() == float32 ? arr : astype(arr, float32);
 }
 
-// ============================================================================
+// ============================================================================ 
 // Forward Pass Implementation
 // ============================================================================
+
+static inline void ensure_dense_decode_shapes(FusedDenseModel* m) {
+    if (m->decode_shapes_initialized) return;
+    m->attn_scale = 1.0f / std::sqrt(static_cast<float>(m->head_dim));
+    m->q_shape = {1, 1, m->n_heads, m->head_dim};
+    m->kv_shape = {1, 1, m->n_kv_heads, m->head_dim};
+    m->attn_out_shape = {1, 1, m->n_heads * m->head_dim};
+    m->token_shape = {1, 1};
+    m->decode_shapes_initialized = true;
+}
 
 static array dense_forward_logits_from_token(
     FusedDenseModel* m,
@@ -140,19 +236,10 @@ static array dense_forward_logits_from_token(
     size_t pos_offset
 ) {
     const int n_layers = static_cast<int>(m->layers.size());
-
-    // Lazy init cached shapes
-    if (g_dense_attn_scale == 0.0f) {
-        g_dense_attn_scale = 1.0f / std::sqrt(static_cast<float>(m->head_dim));
-        g_dense_q_shape = {1, 1, m->n_heads, m->head_dim};
-        g_dense_kv_shape = {1, 1, m->n_kv_heads, m->head_dim};
-        g_dense_attn_out_shape = {1, 1, m->n_heads * m->head_dim};
-        g_dense_n_kv_heads = m->n_kv_heads;
-        g_dense_head_dim = m->head_dim;
-    }
+    ensure_dense_decode_shapes(m);
 
     // Embedding lookup
-    array hidden = take(m->embed_tokens, reshape(token_idx, g_dense_token_shape), 0);
+    array hidden = take(m->embed_tokens, reshape(token_idx, m->token_shape), 0);
 
     for (int layer_idx = 0; layer_idx < n_layers; layer_idx++) {
         const auto& l = m->layers[layer_idx];
@@ -246,9 +333,9 @@ static array dense_forward_logits_from_token(
             // Single matmul for Q+K+V (weights pre-concatenated)
             array qkv = matmul(normed, l.qkv_proj);
             auto qkv_parts = split(qkv, {l.q_size, l.q_size + l.kv_size}, -1);
-            array q = reshape(qkv_parts[0], g_dense_q_shape);
-            array k = reshape(qkv_parts[1], g_dense_kv_shape);
-            array v = reshape(qkv_parts[2], g_dense_kv_shape);
+            array q = reshape(qkv_parts[0], m->q_shape);
+            array k = reshape(qkv_parts[1], m->kv_shape);
+            array v = reshape(qkv_parts[2], m->kv_shape);
 
             if (l.q_norm) q = fast::rms_norm(q, *l.q_norm, m->rms_eps);
             if (l.k_norm) k = fast::rms_norm(k, *l.k_norm, m->rms_eps);
@@ -266,37 +353,44 @@ static array dense_forward_logits_from_token(
 
             // Dense decode keeps KV cache in float16 so q/k/v updates do not
             // cast on every token before attention.
-            if (cl.k_bfloat16 == nullptr || offset > cl.k_bfloat16->shape(2)) {
-                int new_size = ((offset + cl.step - 1) / cl.step) * cl.step;
-                Shape shape = {1, g_dense_n_kv_heads, new_size, g_dense_head_dim};
-                if (cl.k_bfloat16) {
-                    array new_k = zeros(shape, float16);
-                    array new_v = zeros(shape, float16);
-                    Shape stop = {1, g_dense_n_kv_heads, static_cast<int>(prev), g_dense_head_dim};
-                    new_k = slice_update(new_k, slice(*cl.k_bfloat16, g_slice_start, stop), g_slice_start, stop);
-                    new_v = slice_update(new_v, slice(*cl.v_bfloat16, g_slice_start, stop), g_slice_start, stop);
-                    *cl.k_bfloat16 = new_k;
-                    *cl.v_bfloat16 = new_v;
-                } else {
-                    cl.k_bfloat16 = new array(zeros(shape, float16));
-                    cl.v_bfloat16 = new array(zeros(shape, float16));
+            if (cl.k_bfloat16 == nullptr) {
+                const int capacity = next_cache_capacity(cl, static_cast<size_t>(offset), 0);
+                Shape shape = {1, m->n_kv_heads, capacity, m->head_dim};
+                cl.k_bfloat16 = new array(zeros(shape, float16));
+                cl.v_bfloat16 = new array(zeros(shape, float16));
+            } else if (offset > cl.k_bfloat16->shape(2)) {
+                const int current_capacity = cl.k_bfloat16->shape(2);
+                const int new_capacity = next_cache_capacity(cl, static_cast<size_t>(offset), current_capacity);
+                Shape new_shape = {1, m->n_kv_heads, new_capacity, m->head_dim};
+                array new_k = zeros(new_shape, cl.k_bfloat16->dtype());
+                array new_v = zeros(new_shape, cl.v_bfloat16->dtype());
+                const int prev_capacity = current_capacity;
+                if (prev_capacity > 0) {
+                    const Shape copy_start = {0, 0, 0, 0};
+                    const Shape copy_stop = {1, m->n_kv_heads, prev_capacity, m->head_dim};
+                    new_k = slice_update(new_k, slice(*cl.k_bfloat16, copy_start, copy_stop), copy_start, copy_stop);
+                    new_v = slice_update(new_v, slice(*cl.v_bfloat16, copy_start, copy_stop), copy_start, copy_stop);
                 }
+                *cl.k_bfloat16 = new_k;
+                *cl.v_bfloat16 = new_v;
             }
 
             Shape update_start = {0, 0, static_cast<int>(prev), 0};
-            Shape update_stop = {1, g_dense_n_kv_heads, offset, g_dense_head_dim};
+            Shape update_stop = {1, m->n_kv_heads, offset, m->head_dim};
             *cl.k_bfloat16 = slice_update(*cl.k_bfloat16, k, update_start, update_stop);
             *cl.v_bfloat16 = slice_update(*cl.v_bfloat16, v, update_start, update_stop);
             cl.offset = offset;
 
-            const Shape slice_stop = {1, g_dense_n_kv_heads, offset, g_dense_head_dim};
+            const Shape slice_stop = {1, m->n_kv_heads, offset, m->head_dim};
             array k_full = slice(*cl.k_bfloat16, g_slice_start, slice_stop);
             array v_full = slice(*cl.v_bfloat16, g_slice_start, slice_stop);
-
-            array attn_out = fast::scaled_dot_product_attention(q, k_full, v_full, g_dense_attn_scale, "");
+            array attn_k(0.0f, float32);
+            array attn_v(0.0f, float32);
+            gqa_expand_attention_kv(q, k_full, v_full, &attn_k, &attn_v);
+            array attn_out = fast::scaled_dot_product_attention(q, attn_k, attn_v, m->attn_scale, "");
 
             attn_out = transpose(attn_out, g_transpose_perm);
-            attn_out = reshape(attn_out, g_dense_attn_out_shape);
+            attn_out = reshape(attn_out, m->attn_out_shape);
 
             mixer_out = matmul(attn_out, l.o_proj);
         }
@@ -562,13 +656,13 @@ void mlx_dense_pipeline_prime(
     int32_t token_id_i32 = static_cast<int32_t>(first_token_id);
     array first_token = array(&token_id_i32, {1}, int32);
 
-    array result = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, first_token, pos_offset);
-    if (!g_dense_current_token) {
-        g_dense_current_token = new array(std::move(result));
-    } else {
-        *g_dense_current_token = std::move(result);
-    }
-    async_eval(*g_dense_current_token);
+    array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, first_token, pos_offset);
+    async_eval(next);
+
+    void* key = dense_decode_state_key(cache_ptr, model);
+    std::lock_guard<std::mutex> lock(g_dense_pipeline_mu);
+    auto& state = g_dense_pipeline_states[key];
+    state.current_token = std::move(next);
 }
 
 uint32_t mlx_dense_pipeline_step(
@@ -577,14 +671,20 @@ uint32_t mlx_dense_pipeline_step(
     void* shortconv_cache_ptr,
     size_t pos_offset
 ) {
-    if (!g_dense_current_token) return 0;
-
     auto* fused_model = static_cast<FusedDenseModel*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
 
+    array current(0.0f, float32);
+    {
+        void* key = dense_decode_state_key(cache_ptr, model);
+        std::lock_guard<std::mutex> lock(g_dense_pipeline_mu);
+        auto it = g_dense_pipeline_states.find(key);
+        if (it == g_dense_pipeline_states.end() || !it->second.current_token) return 0;
+        current = *it->second.current_token;
+    }
+
     // Build graph for NEXT token using current (lazy) token
-    array& current = *g_dense_current_token;
     array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, current, pos_offset);
 
     // Queue next token computation
@@ -592,24 +692,31 @@ uint32_t mlx_dense_pipeline_step(
 
     // NOW materialize current token
     eval(current);
-    uint32_t result = static_cast<uint32_t>(*current.data<int32_t>());
+    uint32_t result = static_cast<uint32_t>(current.item<int32_t>());
 
     // Rotate buffers
-    *g_dense_current_token = std::move(next);
-
-    // Clear memory cache periodically (like Python mlx-lm)
-    if (++g_dense_step_count % 256 == 0) {
-        clear_cache();
+    {
+        void* key = dense_decode_state_key(cache_ptr, model);
+        std::lock_guard<std::mutex> lock(g_dense_pipeline_mu);
+        auto& state = g_dense_pipeline_states[key];
+        state.current_token = std::move(next);
     }
 
     return result;
 }
 
-uint32_t mlx_dense_pipeline_flush() {
-    if (!g_dense_current_token) return 0;
-    eval(*g_dense_current_token);
-    uint32_t result = static_cast<uint32_t>(*g_dense_current_token->data<int32_t>());
-    return result;
+uint32_t mlx_dense_pipeline_flush(void* model, void* cache_ptr) {
+    std::optional<array> current_token;
+    {
+        void* key = dense_decode_state_key(cache_ptr, model);
+        std::lock_guard<std::mutex> lock(g_dense_pipeline_mu);
+        auto it = g_dense_pipeline_states.find(key);
+        if (it == g_dense_pipeline_states.end() || !it->second.current_token) return 0;
+        current_token = std::move(it->second.current_token);
+        g_dense_pipeline_states.erase(it);
+    }
+    eval(*current_token);
+    return static_cast<uint32_t>((*current_token).item<int32_t>());
 }
 
 uint32_t mlx_dense_decode_batch(

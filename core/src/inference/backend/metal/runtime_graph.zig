@@ -12,8 +12,8 @@ pub const CacheHandle = ?*anyopaque;
 pub const ShortConvCacheHandle = ?*anyopaque;
 pub const MambaCacheHandle = ?*anyopaque;
 
-extern fn mlx_cache_create(n_layers: usize) CacheHandle;
-extern fn mlx_cache_create_bfloat16(n_layers: usize) CacheHandle;
+extern fn mlx_cache_create(n_layers: usize, max_seq_len: usize) CacheHandle;
+extern fn mlx_cache_create_bfloat16(n_layers: usize, max_seq_len: usize) CacheHandle;
 extern fn mlx_cache_free(cache: CacheHandle) void;
 extern fn mlx_cache_update_and_fetch_bfloat16(
     cache: CacheHandle,
@@ -68,11 +68,11 @@ pub const Cache = struct {
     handle: CacheHandle,
     use_bfloat16: bool,
 
-    pub fn init(n_layers: usize, use_bfloat16: bool) Cache {
+    pub fn init(n_layers: usize, use_bfloat16: bool, max_seq_len: usize) Cache {
         const handle = if (use_bfloat16)
-            mlx_cache_create_bfloat16(n_layers)
+            mlx_cache_create_bfloat16(n_layers, max_seq_len)
         else
-            mlx_cache_create(n_layers);
+            mlx_cache_create(n_layers, max_seq_len);
         return .{ .handle = handle, .use_bfloat16 = use_bfloat16 };
     }
 
