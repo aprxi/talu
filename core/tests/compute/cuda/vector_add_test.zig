@@ -60,7 +60,7 @@ test "vector_add.run computes expected output on CUDA" {
         &out_dev,
         @intCast(lhs.len),
     );
-    try std.testing.expectEqual(cuda.registry.KernelSource.embedded_ptx, source);
+    try std.testing.expectEqual(cuda.registry.KernelSource.embedded_module, source);
     try device.synchronize();
     try out_dev.download(&device, std.mem.sliceAsBytes(actual[0..]));
 

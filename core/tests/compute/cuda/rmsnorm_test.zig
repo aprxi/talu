@@ -82,7 +82,7 @@ test "rmsnorm.run computes expected output on CUDA" {
         eps,
         0.0,
     );
-    try std.testing.expectEqual(cuda.registry.KernelSource.embedded_ptx, source);
+    try std.testing.expectEqual(cuda.registry.KernelSource.embedded_module, source);
     try device.synchronize();
     try output_dev.download(&device, std.mem.sliceAsBytes(actual[0..]));
 

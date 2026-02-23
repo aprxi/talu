@@ -13,7 +13,7 @@ test "manifest.parse parses v1 schema" {
         \\  "driver_min": "550.00",
         \\  "sha256": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         \\  "kernels": [
-        \\    {"op":"vector_add_f32","symbol":"talu_vector_add_f32_v1"}
+        \\    {"op":"vector_add_f32","symbol":"talu_vector_add_f32"}
         \\  ]
         \\}
     ;
@@ -21,7 +21,7 @@ test "manifest.parse parses v1 schema" {
     var parsed = try cuda.manifest.parse(std.testing.allocator, bytes);
     defer parsed.deinit();
 
-    try std.testing.expectEqualStrings("talu_vector_add_f32_v1", parsed.manifest.findSymbol("vector_add_f32").?);
+    try std.testing.expectEqualStrings("talu_vector_add_f32", parsed.manifest.findSymbol("vector_add_f32").?);
 }
 
 test "manifest.validate rejects unsupported schema" {
