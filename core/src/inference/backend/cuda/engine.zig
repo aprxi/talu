@@ -4,6 +4,7 @@
 //! for unimplemented execution methods.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const models = @import("../../../models/root.zig");
 const contract = @import("../contract.zig");
 const cpu_vision = @import("../cpu/vision/root.zig");
@@ -27,12 +28,21 @@ const prototype_low_token_band: usize = 4096;
 const initial_kv_cache_tokens: usize = 256;
 const kv_cache_dtype_fp16: bool = true;
 const enable_fused_attention_f16_kv: bool = true;
+const enable_device_embedding_lookup: bool = true;
 const max_supported_fused_f16_kv_head_dim = 512;
+const run_startup_selftests = build_options.cuda_startup_selftests;
 const gaffine_scales_dtype_f16 = compute.cuda.gaffine_u4_matvec.scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
 const DenseU16Dtype = enum(u8) {
     f16,
     bf16,
+};
+
+const EmbeddingLookupKind = enum(u8) {
+    f32,
+    f16,
+    bf16,
+    gaffine_u4,
 };
 
 const KernelSlot = enum {
@@ -41,6 +51,9 @@ const KernelSlot = enum {
     copy,
     copy_u16,
     cast_f32_to_f16,
+    embedding_lookup_f32,
+    embedding_lookup_u16,
+    embedding_lookup_gaffine_u4,
     kv_write_f16,
     rmsnorm,
     rope,
@@ -103,6 +116,9 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .copy, .op_name = compute.cuda.copy.op_name, .embedded_symbol = compute.cuda.copy.embedded_symbol },
     .{ .slot = .copy_u16, .op_name = compute.cuda.copy_u16.op_name, .embedded_symbol = compute.cuda.copy_u16.embedded_symbol },
     .{ .slot = .cast_f32_to_f16, .op_name = compute.cuda.cast_f32_to_f16.op_name, .embedded_symbol = compute.cuda.cast_f32_to_f16.embedded_symbol },
+    .{ .slot = .embedding_lookup_f32, .op_name = compute.cuda.embedding_lookup_f32.op_name, .embedded_symbol = compute.cuda.embedding_lookup_f32.embedded_symbol },
+    .{ .slot = .embedding_lookup_u16, .op_name = compute.cuda.embedding_lookup_u16.op_name, .embedded_symbol = compute.cuda.embedding_lookup_u16.embedded_symbol },
+    .{ .slot = .embedding_lookup_gaffine_u4, .op_name = compute.cuda.embedding_lookup_gaffine_u4.op_name, .embedded_symbol = compute.cuda.embedding_lookup_gaffine_u4.embedded_symbol },
     .{ .slot = .kv_write_f16, .op_name = compute.cuda.kv_write_f16.op_name, .embedded_symbol = compute.cuda.kv_write_f16.embedded_symbol },
     .{ .slot = .rmsnorm, .op_name = compute.cuda.rmsnorm.op_name, .embedded_symbol = compute.cuda.rmsnorm.embedded_symbol },
     .{ .slot = .rope, .op_name = compute.cuda.rope.op_name, .embedded_symbol = compute.cuda.rope.embedded_symbol },
@@ -143,6 +159,32 @@ const DeviceTensor = struct {
 
     fn byteSize(self: *const DeviceTensor) usize {
         return self.buffer.size;
+    }
+};
+
+const EmbeddingLookup = struct {
+    kind: EmbeddingLookupKind,
+    dim0: u32,
+    dim1: u32,
+    hidden_dim: u32,
+    layout_tag: u32,
+    group_size: u32 = 0,
+    scales_dtype_tag: u32 = 0,
+    scales: ?compute.cuda.Buffer = null,
+    biases: ?compute.cuda.Buffer = null,
+    multiplier: f32,
+    buffer: compute.cuda.Buffer,
+
+    fn deinit(self: *EmbeddingLookup, device: *compute.cuda.Device) void {
+        if (self.biases) |*buf| buf.deinit(device);
+        if (self.scales) |*buf| buf.deinit(device);
+        self.buffer.deinit(device);
+    }
+
+    fn byteSize(self: *const EmbeddingLookup) usize {
+        return self.buffer.size +
+            (if (self.scales) |buf| buf.size else 0) +
+            (if (self.biases) |buf| buf.size else 0);
     }
 };
 
@@ -230,6 +272,7 @@ const PrototypeRuntime = struct {
     using_model_projection: bool,
     projection_from_lm_head: bool,
     using_model_embeddings: bool,
+    embedding_lookup: ?EmbeddingLookup,
     hidden_host: []f32,
     projected_logits_host: []f32,
     input_dev: compute.cuda.Buffer,
@@ -333,6 +376,8 @@ const PrototypeRuntime = struct {
         const projected_logits_host = try allocator.alloc(f32, projected_vocab);
         errdefer allocator.free(projected_logits_host);
         const logits_bytes = std.math.mul(usize, projected_vocab, @sizeOf(f32)) catch return error.InvalidArgument;
+        var embedding_lookup = try tryUploadEmbeddingLookup(device, loaded, d_model);
+        errdefer if (embedding_lookup) |*lookup| lookup.deinit(device);
 
         var input_dev = try device.allocBuffer(d_model_bytes);
         errdefer input_dev.deinit(device);
@@ -386,6 +431,7 @@ const PrototypeRuntime = struct {
             .using_model_projection = using_model_projection,
             .projection_from_lm_head = projection_from_lm_head,
             .using_model_embeddings = canUseModelEmbeddings(loaded),
+            .embedding_lookup = embedding_lookup,
             .hidden_host = hidden_host,
             .projected_logits_host = projected_logits_host,
             .input_dev = input_dev,
@@ -412,6 +458,7 @@ const PrototypeRuntime = struct {
     fn deinit(self: *PrototypeRuntime, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
         self.logits_dev.deinit(device);
         self.projection_weight.deinit(device);
+        if (self.embedding_lookup) |*lookup| lookup.deinit(device);
         self.shortconv_conv_dev.deinit(device);
         self.shortconv_proj_dev.deinit(device);
         self.ffn_down_dev.deinit(device);
@@ -450,6 +497,7 @@ const PrototypeRuntime = struct {
             self.shortconv_proj_dev.size +
             self.shortconv_conv_dev.size +
             self.logits_dev.size +
+            (if (self.embedding_lookup) |lookup| lookup.byteSize() else 0) +
             self.projection_weight.byteSize();
     }
 
@@ -1145,6 +1193,12 @@ pub const CudaBackend = struct {
     copy_u16_source: ?compute.cuda.registry.KernelSource = null,
     cast_f32_to_f16_function: ?compute.cuda.Function = null,
     cast_f32_to_f16_source: ?compute.cuda.registry.KernelSource = null,
+    embedding_lookup_f32_function: ?compute.cuda.Function = null,
+    embedding_lookup_f32_source: ?compute.cuda.registry.KernelSource = null,
+    embedding_lookup_u16_function: ?compute.cuda.Function = null,
+    embedding_lookup_u16_source: ?compute.cuda.registry.KernelSource = null,
+    embedding_lookup_gaffine_u4_function: ?compute.cuda.Function = null,
+    embedding_lookup_gaffine_u4_source: ?compute.cuda.registry.KernelSource = null,
     kv_write_f16_function: ?compute.cuda.Function = null,
     kv_write_f16_source: ?compute.cuda.registry.KernelSource = null,
     rmsnorm_function: ?compute.cuda.Function = null,
@@ -1317,14 +1371,16 @@ pub const CudaBackend = struct {
         errdefer backend.prototype.deinit(allocator, &backend.device);
         try backend.initKernelFunctions();
 
-        try smoke_checks.runMatmulSmoke(&backend);
-        try smoke_checks.runKernelSmoke(&backend);
-        runCpuParityProbe(&backend) catch |err| switch (err) {
-            error.CudaParityMismatch => return err,
-            else => log.warn("inference", "CUDA parity probe unavailable", .{
-                .reason = @errorName(err),
-            }),
-        };
+        if (run_startup_selftests) {
+            try smoke_checks.runMatmulSmoke(&backend);
+            try smoke_checks.runKernelSmoke(&backend);
+            runCpuParityProbe(&backend) catch |err| switch (err) {
+                error.CudaParityMismatch => return err,
+                else => log.warn("inference", "CUDA parity probe unavailable", .{
+                    .reason = @errorName(err),
+                }),
+            };
+        }
         log.info("inference", "CUDA layered decode path ready", .{
             .d_model = backend.d_model,
             .projected_vocab = backend.prototype.projected_vocab,
@@ -1347,6 +1403,9 @@ pub const CudaBackend = struct {
             .copy_kernel = @as(u8, @intFromBool(backend.copy_function != null)),
             .copy_u16_kernel = @as(u8, @intFromBool(backend.copy_u16_function != null)),
             .cast_f32_to_f16_kernel = @as(u8, @intFromBool(backend.cast_f32_to_f16_function != null)),
+            .embedding_lookup_f32_kernel = @as(u8, @intFromBool(backend.embedding_lookup_f32_function != null)),
+            .embedding_lookup_u16_kernel = @as(u8, @intFromBool(backend.embedding_lookup_u16_function != null)),
+            .embedding_lookup_gaffine_u4_kernel = @as(u8, @intFromBool(backend.embedding_lookup_gaffine_u4_function != null)),
             .kv_write_f16_kernel = @as(u8, @intFromBool(backend.kv_write_f16_function != null)),
             .rope_kernel = @as(u8, @intFromBool(backend.rope_function != null)),
             .rope_store_f16_kernel = @as(u8, @intFromBool(backend.rope_store_f16_function != null)),
@@ -1392,6 +1451,7 @@ pub const CudaBackend = struct {
             .projection_lm_head = @as(u8, @intFromBool(backend.prototype.projection_from_lm_head)),
             .has_lm_head = @as(u8, @intFromBool(loaded.lm_head != null)),
             .model_embeddings = @as(u8, @intFromBool(backend.prototype.using_model_embeddings)),
+            .embedding_lookup_device = @as(u8, @intFromBool(backend.prototype.embedding_lookup != null)),
             .embed_dtype = @tagName(loaded.token_embeddings.dtype),
             .embed_shape_0 = loaded.token_embeddings.shape[0],
             .embed_shape_1 = loaded.token_embeddings.shape[1],
@@ -1450,11 +1510,25 @@ pub const CudaBackend = struct {
         }
         if (tokens.len > self.max_seq_len) return error.InvalidArgument;
         self.slot_rope_position_delta = 0;
+        const prefill_start_ns: i128 = std.time.nanoTimestamp();
+        try self.ensureKvCapacity(tokens.len);
 
         var i: usize = 0;
         while (i < tokens.len) : (i += 1) {
-            try self.computeGpuPrototypeLogits(tokens[i], i, self.slot_logits);
+            const download_logits = shouldDownloadPrefillLogits(i, tokens.len);
+            try self.computeGpuPrototypeLogitsWithLayerLimit(
+                tokens[i],
+                i,
+                if (download_logits) self.slot_logits else null,
+                self.block_runtime.blocks.len,
+                download_logits,
+                download_logits,
+                false,
+                null,
+            );
         }
+        const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
+        logPrefillTiming(self, "prefill", tokens.len, prefill_elapsed_ns);
         @memcpy(logits_out, self.slot_logits);
         self.slot_position = tokens.len;
     }
@@ -1500,7 +1574,9 @@ pub const CudaBackend = struct {
                 effective_position,
                 null,
                 self.block_runtime.blocks.len,
+                true,
                 false,
+                true,
                 null,
             );
             const next_token = try selectNextTokenFromDeviceLogits(self);
@@ -1575,13 +1651,26 @@ pub const CudaBackend = struct {
             });
             return error.InvalidArgument;
         }
-
         if (tokens.len > self.max_seq_len) return error.InvalidArgument;
         self.slot_rope_position_delta = 0;
+        const prefill_start_ns: i128 = std.time.nanoTimestamp();
+        try self.ensureKvCapacity(tokens.len);
         var i: usize = 0;
         while (i < tokens.len) : (i += 1) {
-            try self.computeGpuPrototypeLogits(tokens[i], i, self.slot_logits);
+            const download_logits = shouldDownloadPrefillLogits(i, tokens.len);
+            try self.computeGpuPrototypeLogitsWithLayerLimit(
+                tokens[i],
+                i,
+                if (download_logits) self.slot_logits else null,
+                self.block_runtime.blocks.len,
+                download_logits,
+                download_logits,
+                false,
+                null,
+            );
         }
+        const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
+        logPrefillTiming(self, "prefill_slot", tokens.len, prefill_elapsed_ns);
         @memcpy(logits_out, self.slot_logits);
         self.slot_position = tokens.len;
     }
@@ -1659,20 +1748,27 @@ pub const CudaBackend = struct {
             return error.UnsupportedModel;
         }
         self.slot_rope_position_delta = 0;
+        const prefill_start_ns: i128 = std.time.nanoTimestamp();
+        try self.ensureKvCapacity(tokens.len);
 
         var i: usize = 0;
         while (i < tokens.len) : (i += 1) {
             const offset = std.math.mul(usize, i, self.d_model) catch return error.InvalidArgument;
             const hidden_row = prefill_hidden[offset .. offset + self.d_model];
+            const download_logits = shouldDownloadPrefillLogits(i, tokens.len);
             try self.computeGpuPrototypeLogitsWithLayerLimit(
                 tokens[i],
                 i,
-                self.slot_logits,
+                if (download_logits) self.slot_logits else null,
                 self.block_runtime.blocks.len,
-                true,
+                download_logits,
+                download_logits,
+                false,
                 hidden_row,
             );
         }
+        const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
+        logPrefillTiming(self, "prefill_slot_vision", tokens.len, prefill_elapsed_ns);
         @memcpy(logits_out, self.slot_logits);
         self.slot_position = tokens.len;
     }
@@ -1725,6 +1821,8 @@ pub const CudaBackend = struct {
             logits_out,
             self.block_runtime.blocks.len,
             true,
+            true,
+            true,
             null,
         );
     }
@@ -1735,9 +1833,12 @@ pub const CudaBackend = struct {
         position: usize,
         logits_out_opt: ?[]f32,
         layer_limit: usize,
+        compute_logits: bool,
         download_logits: bool,
+        ensure_kv_capacity: bool,
         hidden_override: ?[]const f32,
     ) !void {
+        if (!compute_logits and download_logits) return error.InvalidArgument;
         if (download_logits) {
             const logits_out = logits_out_opt orelse return error.InvalidArgument;
             if (logits_out.len != self.vocab_size) return error.InvalidArgument;
@@ -1747,7 +1848,9 @@ pub const CudaBackend = struct {
         if (position == 0 and self.block_runtime.shortconv_block_count > 0) {
             try self.resetShortConvStates();
         }
-        try self.ensureKvCapacity(position + 1);
+        if (ensure_kv_capacity) {
+            try self.ensureKvCapacity(position + 1);
+        }
 
         const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
         const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
@@ -1758,6 +1861,9 @@ pub const CudaBackend = struct {
         }
         const shortconv_step_function = self.shortconv_step_function orelse return error.CudaKernelUnavailable;
         const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
+        const embedding_lookup_f32_function = self.embedding_lookup_f32_function;
+        const embedding_lookup_u16_function = self.embedding_lookup_u16_function;
+        const embedding_lookup_gaffine_u4_function = self.embedding_lookup_gaffine_u4_function;
         const cast_f32_to_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
             (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
         else
@@ -1812,28 +1918,117 @@ pub const CudaBackend = struct {
         if (hidden_override) |hidden| {
             if (hidden.len != self.d_model) return error.InvalidArgument;
             @memcpy(self.prototype.hidden_host, hidden);
+            try self.prototype.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.prototype.hidden_host));
         } else {
-            const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.prototype.hidden_host) catch |err| switch (err) {
-                error.InvalidArgument => return error.InvalidArgument,
-                else => return err,
-            };
-            if (!used_model_embeddings) fillPrototypeInput(self.prototype.hidden_host, token);
-            if (!used_model_embeddings and position == 0) {
-                log.warn("inference", "CUDA using synthetic embedding fallback", .{
-                    .token = token,
-                    .embed_shape_0 = self.loaded.token_embeddings.shape[0],
-                    .embed_shape_1 = self.loaded.token_embeddings.shape[1],
-                    .embed_dtype = @tagName(self.loaded.token_embeddings.dtype),
-                    .embed_ndim = self.loaded.token_embeddings.n_dims,
-                });
-            }
-            if (self.loaded.config.embedding_multiplier != 1.0) {
-                for (self.prototype.hidden_host) |*v| {
-                    v.* *= self.loaded.config.embedding_multiplier;
+            var used_device_lookup = false;
+            if (enable_device_embedding_lookup and self.prototype.embedding_lookup != null) {
+                const lookup = &self.prototype.embedding_lookup.?;
+                switch (lookup.kind) {
+                    .f32 => {
+                        if (embedding_lookup_f32_function) |kernel| {
+                            try compute.cuda.embedding_lookup_f32.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                kernel,
+                                &self.prototype.input_dev,
+                                &lookup.buffer,
+                                lookup.dim0,
+                                lookup.dim1,
+                                lookup.hidden_dim,
+                                token,
+                                lookup.layout_tag,
+                                lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .f16 => {
+                        if (embedding_lookup_u16_function) |kernel| {
+                            try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                kernel,
+                                &self.prototype.input_dev,
+                                &lookup.buffer,
+                                lookup.dim0,
+                                lookup.dim1,
+                                lookup.hidden_dim,
+                                token,
+                                lookup.layout_tag,
+                                compute.cuda.embedding_lookup_u16.dtype_f16,
+                                lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .bf16 => {
+                        if (embedding_lookup_u16_function) |kernel| {
+                            try compute.cuda.embedding_lookup_u16.runWithFunction(
+                                &self.kernel_arg_pack,
+                                &self.device,
+                                kernel,
+                                &self.prototype.input_dev,
+                                &lookup.buffer,
+                                lookup.dim0,
+                                lookup.dim1,
+                                lookup.hidden_dim,
+                                token,
+                                lookup.layout_tag,
+                                compute.cuda.embedding_lookup_u16.dtype_bf16,
+                                lookup.multiplier,
+                            );
+                            used_device_lookup = true;
+                        }
+                    },
+                    .gaffine_u4 => {
+                        if (embedding_lookup_gaffine_u4_function) |kernel| {
+                            if (lookup.scales) |*scales_buf| {
+                                if (lookup.biases) |*biases_buf| {
+                                    try compute.cuda.embedding_lookup_gaffine_u4.runWithFunction(
+                                        &self.kernel_arg_pack,
+                                        &self.device,
+                                        kernel,
+                                        &self.prototype.input_dev,
+                                        &lookup.buffer,
+                                        scales_buf,
+                                        biases_buf,
+                                        lookup.dim0,
+                                        lookup.hidden_dim,
+                                        token,
+                                        lookup.group_size,
+                                        lookup.scales_dtype_tag,
+                                        lookup.multiplier,
+                                    );
+                                    used_device_lookup = true;
+                                }
+                            }
+                        }
+                    },
                 }
             }
+            if (!used_device_lookup) {
+                const used_model_embeddings = tryPopulateHiddenFromToken(self.loaded, token, self.prototype.hidden_host) catch |err| switch (err) {
+                    error.InvalidArgument => return error.InvalidArgument,
+                    else => return err,
+                };
+                if (!used_model_embeddings) fillPrototypeInput(self.prototype.hidden_host, token);
+                if (!used_model_embeddings and position == 0) {
+                    log.warn("inference", "CUDA using synthetic embedding fallback", .{
+                        .token = token,
+                        .embed_shape_0 = self.loaded.token_embeddings.shape[0],
+                        .embed_shape_1 = self.loaded.token_embeddings.shape[1],
+                        .embed_dtype = @tagName(self.loaded.token_embeddings.dtype),
+                        .embed_ndim = self.loaded.token_embeddings.n_dims,
+                    });
+                }
+                if (self.loaded.config.embedding_multiplier != 1.0) {
+                    for (self.prototype.hidden_host) |*v| {
+                        v.* *= self.loaded.config.embedding_multiplier;
+                    }
+                }
+                try self.prototype.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.prototype.hidden_host));
+            }
         }
-        try self.prototype.input_dev.upload(&self.device, std.mem.sliceAsBytes(self.prototype.hidden_host));
 
         var layer_idx: usize = 0;
         while (layer_idx < layer_limit) : (layer_idx += 1) {
@@ -2190,6 +2385,8 @@ pub const CudaBackend = struct {
                 return error.InvalidArgument;
             }
         }
+
+        if (!compute_logits) return;
 
         try compute.cuda.rmsnorm.runWithFunction(
             &self.kernel_arg_pack,
@@ -2847,6 +3044,18 @@ pub const CudaBackend = struct {
                 self.cast_f32_to_f16_function = resolved.function;
                 self.cast_f32_to_f16_source = resolved.source;
             },
+            .embedding_lookup_f32 => {
+                self.embedding_lookup_f32_function = resolved.function;
+                self.embedding_lookup_f32_source = resolved.source;
+            },
+            .embedding_lookup_u16 => {
+                self.embedding_lookup_u16_function = resolved.function;
+                self.embedding_lookup_u16_source = resolved.source;
+            },
+            .embedding_lookup_gaffine_u4 => {
+                self.embedding_lookup_gaffine_u4_function = resolved.function;
+                self.embedding_lookup_gaffine_u4_source = resolved.source;
+            },
             .kv_write_f16 => {
                 self.kv_write_f16_function = resolved.function;
                 self.kv_write_f16_source = resolved.source;
@@ -3218,6 +3427,28 @@ fn kvHeadForQueryHead(query_head: usize, kv_group: usize) usize {
     return query_head / kv_group;
 }
 
+fn shouldDownloadPrefillLogits(token_index: usize, token_count: usize) bool {
+    std.debug.assert(token_count > 0);
+    return token_index + 1 == token_count;
+}
+
+fn logPrefillTiming(self: *const CudaBackend, mode: []const u8, token_count: usize, elapsed_ns: u64) void {
+    const elapsed_ms: f64 = @as(f64, @floatFromInt(elapsed_ns)) / 1_000_000.0;
+    const tok_per_s: f64 = if (elapsed_ns == 0)
+        0.0
+    else
+        (@as(f64, @floatFromInt(token_count)) * 1_000_000_000.0) / @as(f64, @floatFromInt(elapsed_ns));
+    log.info("inference", "CUDA prefill timing", .{
+        .mode = mode,
+        .tokens = token_count,
+        .elapsed_ms = elapsed_ms,
+        .tok_per_s = tok_per_s,
+        .layers = self.block_runtime.blocks.len,
+        .attention_blocks = self.block_runtime.attention_block_count,
+        .shortconv_blocks = self.block_runtime.shortconv_block_count,
+    });
+}
+
 const DenseLinearLayout = struct {
     in_dim: usize,
     out_dim: usize,
@@ -3529,6 +3760,120 @@ fn allocZeroedF32Buffer(
     errdefer buffer.deinit(device);
     try buffer.upload(device, std.mem.sliceAsBytes(zeros));
     return buffer;
+}
+
+fn tryUploadEmbeddingLookup(
+    device: *compute.cuda.Device,
+    loaded: *const LoadedModel,
+    d_model: usize,
+) !?EmbeddingLookup {
+    const embeddings = &loaded.token_embeddings;
+    if (embeddings.data_ptr == null) return null;
+    if (embeddings.n_dims != 2) return null;
+    if (embeddings.shape[0] <= 0 or embeddings.shape[1] <= 0) return null;
+    const kind: EmbeddingLookupKind = switch (embeddings.dtype) {
+        .f32 => .f32,
+        .f16 => .f16,
+        .bf16 => .bf16,
+        .grouped_affine_u4 => .gaffine_u4,
+        else => return null,
+    };
+
+    const dim0: usize = @intCast(embeddings.shape[0]);
+    const dim1: usize = @intCast(embeddings.shape[1]);
+    var layout_tag: u32 = undefined;
+    var hidden_dim: usize = undefined;
+    if (dim1 == d_model) {
+        layout_tag = compute.cuda.embedding_lookup_f32.layout_vocab_hidden;
+        hidden_dim = dim1;
+    } else if (dim0 == d_model) {
+        if (kind == .gaffine_u4) return null;
+        layout_tag = compute.cuda.embedding_lookup_f32.layout_hidden_vocab;
+        hidden_dim = dim0;
+    } else {
+        return null;
+    }
+    const dim0_u32 = std.math.cast(u32, dim0) orelse return error.InvalidArgument;
+    const dim1_u32 = std.math.cast(u32, dim1) orelse return error.InvalidArgument;
+    const hidden_dim_u32 = std.math.cast(u32, hidden_dim) orelse return error.InvalidArgument;
+
+    if (kind == .gaffine_u4) {
+        const gaffine = embeddings.gaffine orelse return null;
+        if (gaffine.group_size == 0) return null;
+        const group_size: usize = gaffine.group_size;
+        if ((hidden_dim % group_size) != 0 or (group_size % 8) != 0) return null;
+        const groups_per_row = hidden_dim / group_size;
+        const packed_words_per_row = hidden_dim / 8;
+        const packed_words_total = std.math.mul(usize, dim0, packed_words_per_row) catch return error.InvalidArgument;
+        const sb_count = std.math.mul(usize, dim0, groups_per_row) catch return error.InvalidArgument;
+        const packed_bytes = std.math.mul(usize, packed_words_total, @sizeOf(u32)) catch return error.InvalidArgument;
+        const sb_bytes = std.math.mul(usize, sb_count, @sizeOf(u16)) catch return error.InvalidArgument;
+        const packed_vals = embeddings.asSliceUnaligned(u32);
+        if (packed_vals.len < packed_words_total) return error.InvalidArgument;
+        if (gaffine.scales.len < sb_bytes or gaffine.biases.len < sb_bytes) return error.InvalidArgument;
+        const scales_dtype_tag = switch (gaffine.scales_dtype) {
+            .f16 => gaffine_scales_dtype_f16,
+            .bf16 => gaffine_scales_dtype_bf16,
+            else => return error.UnsupportedModel,
+        };
+
+        var packed_dev = try device.allocBuffer(packed_bytes);
+        errdefer packed_dev.deinit(device);
+        var scales_dev = try device.allocBuffer(sb_bytes);
+        errdefer scales_dev.deinit(device);
+        var biases_dev = try device.allocBuffer(sb_bytes);
+        errdefer biases_dev.deinit(device);
+        try packed_dev.upload(device, std.mem.sliceAsBytes(packed_vals[0..packed_words_total]));
+        try scales_dev.upload(device, gaffine.scales[0..sb_bytes]);
+        try biases_dev.upload(device, gaffine.biases[0..sb_bytes]);
+
+        return .{
+            .kind = .gaffine_u4,
+            .dim0 = dim0_u32,
+            .dim1 = dim1_u32,
+            .hidden_dim = hidden_dim_u32,
+            .layout_tag = layout_tag,
+            .group_size = std.math.cast(u32, group_size) orelse return error.InvalidArgument,
+            .scales_dtype_tag = scales_dtype_tag,
+            .scales = scales_dev,
+            .biases = biases_dev,
+            .multiplier = loaded.config.embedding_multiplier,
+            .buffer = packed_dev,
+        };
+    }
+
+    const elem_count = std.math.mul(usize, dim0, dim1) catch return error.InvalidArgument;
+    const elem_bytes: usize = switch (kind) {
+        .f32 => @sizeOf(f32),
+        .f16, .bf16 => @sizeOf(u16),
+        .gaffine_u4 => unreachable,
+    };
+    const bytes = std.math.mul(usize, elem_count, elem_bytes) catch return error.InvalidArgument;
+    var buffer = try device.allocBuffer(bytes);
+    errdefer buffer.deinit(device);
+    switch (kind) {
+        .f32 => {
+            const src = embeddings.asSlice(f32);
+            if (src.len < elem_count) return error.InvalidArgument;
+            try buffer.upload(device, std.mem.sliceAsBytes(src[0..elem_count]));
+        },
+        .f16, .bf16 => {
+            const src_u16 = embeddings.asSliceUnaligned(u16);
+            if (src_u16.len < elem_count) return error.InvalidArgument;
+            try buffer.upload(device, std.mem.sliceAsBytes(src_u16[0..elem_count]));
+        },
+        .gaffine_u4 => unreachable,
+    }
+
+    return .{
+        .kind = kind,
+        .dim0 = dim0_u32,
+        .dim1 = dim1_u32,
+        .hidden_dim = hidden_dim_u32,
+        .layout_tag = layout_tag,
+        .multiplier = loaded.config.embedding_multiplier,
+        .buffer = buffer,
+    };
 }
 
 fn uploadShortConvWeightTimeMajor(
@@ -4280,4 +4625,15 @@ test "suppressPrototypeLowTokenBand keeps logits when projected vocab is small" 
     var logits = [_]f32{2.0} ** 128;
     suppressPrototypeLowTokenBand(logits[0..], 128);
     for (logits) |v| try std.testing.expectApproxEqAbs(@as(f32, 2.0), v, 0.0);
+}
+
+test "shouldDownloadPrefillLogits only on final token" {
+    try std.testing.expect(!shouldDownloadPrefillLogits(0, 4));
+    try std.testing.expect(!shouldDownloadPrefillLogits(1, 4));
+    try std.testing.expect(!shouldDownloadPrefillLogits(2, 4));
+    try std.testing.expect(shouldDownloadPrefillLogits(3, 4));
+}
+
+test "shouldDownloadPrefillLogits true for single-token prefill" {
+    try std.testing.expect(shouldDownloadPrefillLogits(0, 1));
 }

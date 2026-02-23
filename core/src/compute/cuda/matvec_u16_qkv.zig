@@ -12,6 +12,8 @@ pub const embedded_symbol_f16: [:0]const u8 = "talu_matvec_qkv_f16_f32";
 pub const embedded_symbol_bf16: [:0]const u8 = "talu_matvec_qkv_bf16_f32";
 pub const op_name_f16: []const u8 = "matvec_qkv_f16_f32";
 pub const op_name_bf16: []const u8 = "matvec_qkv_bf16_f32";
+const warp_size: u32 = 32;
+const block_x: u32 = 256;
 
 pub fn runWithFunction(
     arg_pack: *args_mod.ArgPack,
@@ -58,9 +60,9 @@ pub fn runWithFunction(
 
     const qk = std.math.add(u32, q_out_dim, k_out_dim) catch return error.InvalidArgument;
     const total = std.math.add(u32, qk, v_out_dim) catch return error.InvalidArgument;
-    const block_x: u32 = 256;
+    const rows_per_block = block_x / warp_size;
     try launch_mod.launch(device, function, .{
-        .grid_x = ceilDiv(total, block_x),
+        .grid_x = ceilDiv(total, rows_per_block),
         .block_x = block_x,
     }, arg_pack);
 }

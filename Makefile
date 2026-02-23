@@ -28,6 +28,9 @@ endif
 ifdef TALU_ENABLE_CUDA
 	ZIG_BUILD_FLAGS += -Dcuda=true
 endif
+ifdef TALU_CUDA_STARTUP_SELFTESTS
+	ZIG_BUILD_FLAGS += -Dcuda-startup-selftests=true
+endif
 
 CUDA_BUILD_FLAGS := $(ZIG_BUILD_FLAGS)
 ifeq ($(findstring -Dcuda=true,$(CUDA_BUILD_FLAGS)),)

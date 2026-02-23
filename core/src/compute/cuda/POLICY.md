@@ -61,6 +61,7 @@ This policy defines how CUDA kernels are authored, built, named, loaded, and tes
    `zig build gen-cuda-kernels -Dcuda=true`
    `zig build release -Drelease -Dcuda=true` (or `make cuda`)
 3. Runtime smoke checks in CUDA backend init must remain deterministic and bounded.
+   They are opt-in via build flag `-Dcuda-startup-selftests=true` (default: disabled).
 
 ## 9. Policy Compliance Checklist
 
