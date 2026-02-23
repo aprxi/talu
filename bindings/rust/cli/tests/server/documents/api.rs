@@ -165,7 +165,7 @@ fn delete_json(uri: &str, body: &Value) -> Request<Full<Bytes>> {
 #[tokio::test]
 async fn test_documents_requires_storage() {
     let app = build_app_no_storage();
-    let resp = send_request(&app, get("/v1/documents")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents")).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
     let error = json.get("error").expect("should have error");
@@ -189,7 +189,7 @@ async fn test_create_document_minimal() {
         "title": "Test Note",
         "content": "This is test content."
     });
-    let resp = send_request(&app, post_json("/v1/documents", &body)).await;
+    let resp = send_request(&app, post_json("/v1/db/tables/documents", &body)).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(
@@ -225,7 +225,7 @@ async fn test_create_document_with_all_fields() {
             "priority": 5
         }
     });
-    let resp = send_request(&app, post_json("/v1/documents", &body)).await;
+    let resp = send_request(&app, post_json("/v1/db/tables/documents", &body)).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::CREATED);
@@ -249,7 +249,7 @@ async fn test_create_document_missing_doc_type() {
         "title": "No Type",
         "content": "Content without doc_type"
     });
-    let resp = send_request(&app, post_json("/v1/documents", &body)).await;
+    let resp = send_request(&app, post_json("/v1/db/tables/documents", &body)).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::BAD_REQUEST);
@@ -275,12 +275,12 @@ async fn test_get_document() {
         "title": "Get Test",
         "content": "Content to retrieve"
     });
-    let create_resp = send_request(&app, post_json("/v1/documents", &create_body)).await;
+    let create_resp = send_request(&app, post_json("/v1/db/tables/documents", &create_body)).await;
     let (_, create_json) = body_json(create_resp).await;
     let doc_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
 
     // Get the document
-    let get_resp = send_request(&app, get(&format!("/v1/documents/{}", doc_id))).await;
+    let get_resp = send_request(&app, get(&format!("/v1/db/tables/documents/{}", doc_id))).await;
     let (status, json) = body_json(get_resp).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -293,7 +293,7 @@ async fn test_get_document_not_found() {
     let temp_dir = TempDir::new().unwrap();
     let app = build_app_with_storage(&temp_dir);
 
-    let resp = send_request(&app, get("/v1/documents/nonexistent-id")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents/nonexistent-id")).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -319,7 +319,7 @@ async fn test_update_document() {
         "title": "Original Title",
         "content": "Original content"
     });
-    let create_resp = send_request(&app, post_json("/v1/documents", &create_body)).await;
+    let create_resp = send_request(&app, post_json("/v1/db/tables/documents", &create_body)).await;
     let (_, create_json) = body_json(create_resp).await;
     let doc_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
 
@@ -330,7 +330,7 @@ async fn test_update_document() {
     });
     let update_resp = send_request(
         &app,
-        patch_json(&format!("/v1/documents/{}", doc_id), &update_body),
+        patch_json(&format!("/v1/db/tables/documents/{}", doc_id), &update_body),
     )
     .await;
     let (status, json) = body_json(update_resp).await;
@@ -352,7 +352,7 @@ async fn test_update_document_not_found() {
     });
     let resp = send_request(
         &app,
-        patch_json("/v1/documents/nonexistent-id", &update_body),
+        patch_json("/v1/db/tables/documents/nonexistent-id", &update_body),
     )
     .await;
     let (status, _) = body_json(resp).await;
@@ -375,17 +375,18 @@ async fn test_delete_document() {
         "title": "To Delete",
         "content": "This will be deleted"
     });
-    let create_resp = send_request(&app, post_json("/v1/documents", &create_body)).await;
+    let create_resp = send_request(&app, post_json("/v1/db/tables/documents", &create_body)).await;
     let (_, create_json) = body_json(create_resp).await;
     let doc_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
 
     // Delete the document
-    let delete_resp = send_request(&app, delete(&format!("/v1/documents/{}", doc_id))).await;
+    let delete_resp =
+        send_request(&app, delete(&format!("/v1/db/tables/documents/{}", doc_id))).await;
     let (status, _) = body_bytes(delete_resp).await;
     assert_eq!(status, StatusCode::NO_CONTENT);
 
     // Verify it's gone
-    let get_resp = send_request(&app, get(&format!("/v1/documents/{}", doc_id))).await;
+    let get_resp = send_request(&app, get(&format!("/v1/db/tables/documents/{}", doc_id))).await;
     let (get_status, _) = body_json(get_resp).await;
     assert_eq!(get_status, StatusCode::NOT_FOUND);
 }
@@ -399,7 +400,7 @@ async fn test_list_documents_empty() {
     let temp_dir = TempDir::new().unwrap();
     let app = build_app_with_storage(&temp_dir);
 
-    let resp = send_request(&app, get("/v1/documents")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents")).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -423,10 +424,10 @@ async fn test_list_documents_with_items() {
             "title": format!("Item {}", i),
             "content": format!("Content {}", i)
         });
-        send_request(&app, post_json("/v1/documents", &body)).await;
+        send_request(&app, post_json("/v1/db/tables/documents", &body)).await;
     }
 
-    let resp = send_request(&app, get("/v1/documents")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents")).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -446,12 +447,12 @@ async fn test_list_documents_filter_by_type() {
     let body1 = serde_json::json!({"type": "note", "title": "Note 1", "content": "c"});
     let body2 = serde_json::json!({"type": "article", "title": "Article 1", "content": "c"});
     let body3 = serde_json::json!({"type": "note", "title": "Note 2", "content": "c"});
-    send_request(&app, post_json("/v1/documents", &body1)).await;
-    send_request(&app, post_json("/v1/documents", &body2)).await;
-    send_request(&app, post_json("/v1/documents", &body3)).await;
+    send_request(&app, post_json("/v1/db/tables/documents", &body1)).await;
+    send_request(&app, post_json("/v1/db/tables/documents", &body2)).await;
+    send_request(&app, post_json("/v1/db/tables/documents", &body3)).await;
 
     // Filter by type (API uses 'type' not 'doc_type')
-    let resp = send_request(&app, get("/v1/documents?type=note")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents?type=note")).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -477,11 +478,11 @@ async fn test_list_documents_pagination() {
             "title": format!("Page {}", i),
             "content": format!("Content {}", i)
         });
-        send_request(&app, post_json("/v1/documents", &body)).await;
+        send_request(&app, post_json("/v1/db/tables/documents", &body)).await;
     }
 
     // Get first page with limit 2
-    let resp = send_request(&app, get("/v1/documents?limit=2")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents?limit=2")).await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -513,14 +514,18 @@ async fn test_search_documents() {
         "title": "Python Guide",
         "content": "Python is a great language"
     });
-    send_request(&app, post_json("/v1/documents", &body1)).await;
-    send_request(&app, post_json("/v1/documents", &body2)).await;
+    send_request(&app, post_json("/v1/db/tables/documents", &body1)).await;
+    send_request(&app, post_json("/v1/db/tables/documents", &body2)).await;
 
     // Search for "Rust"
     let search_body = serde_json::json!({
         "query": "Rust"
     });
-    let resp = send_request(&app, post_json("/v1/documents/search", &search_body)).await;
+    let resp = send_request(
+        &app,
+        post_json("/v1/db/tables/documents/search", &search_body),
+    )
+    .await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::OK, "search should succeed: {json}");
@@ -547,15 +552,19 @@ async fn test_search_documents_with_type_filter() {
         "title": "Programming Article",
         "content": "Article about programming"
     });
-    send_request(&app, post_json("/v1/documents", &body1)).await;
-    send_request(&app, post_json("/v1/documents", &body2)).await;
+    send_request(&app, post_json("/v1/db/tables/documents", &body1)).await;
+    send_request(&app, post_json("/v1/db/tables/documents", &body2)).await;
 
     // Search with type filter
     let search_body = serde_json::json!({
         "query": "programming",
         "type": "note"
     });
-    let resp = send_request(&app, post_json("/v1/documents/search", &search_body)).await;
+    let resp = send_request(
+        &app,
+        post_json("/v1/db/tables/documents/search", &search_body),
+    )
+    .await;
     let (status, json) = body_json(resp).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -584,7 +593,7 @@ async fn test_add_tags() {
         "title": "Tag Test",
         "content": "Content"
     });
-    let create_resp = send_request(&app, post_json("/v1/documents", &create_body)).await;
+    let create_resp = send_request(&app, post_json("/v1/db/tables/documents", &create_body)).await;
     let (_, create_json) = body_json(create_resp).await;
     let doc_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
 
@@ -594,7 +603,10 @@ async fn test_add_tags() {
     });
     let add_resp = send_request(
         &app,
-        post_json(&format!("/v1/documents/{}/tags", doc_id), &tags_body),
+        post_json(
+            &format!("/v1/db/tables/documents/{}/tags", doc_id),
+            &tags_body,
+        ),
     )
     .await;
     let (status, body) = body_bytes(add_resp).await;
@@ -606,7 +618,11 @@ async fn test_add_tags() {
     );
 
     // Get tags
-    let get_resp = send_request(&app, get(&format!("/v1/documents/{}/tags", doc_id))).await;
+    let get_resp = send_request(
+        &app,
+        get(&format!("/v1/db/tables/documents/{}/tags", doc_id)),
+    )
+    .await;
     let (get_status, json) = body_json(get_resp).await;
 
     assert_eq!(get_status, StatusCode::OK);
@@ -629,7 +645,7 @@ async fn test_remove_tags() {
         "title": "Remove Tag Test",
         "content": "Content"
     });
-    let create_resp = send_request(&app, post_json("/v1/documents", &create_body)).await;
+    let create_resp = send_request(&app, post_json("/v1/db/tables/documents", &create_body)).await;
     let (_, create_json) = body_json(create_resp).await;
     let doc_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
 
@@ -639,7 +655,10 @@ async fn test_remove_tags() {
     });
     let add_resp = send_request(
         &app,
-        post_json(&format!("/v1/documents/{}/tags", doc_id), &add_body),
+        post_json(
+            &format!("/v1/db/tables/documents/{}/tags", doc_id),
+            &add_body,
+        ),
     )
     .await;
     let (add_status, _) = body_bytes(add_resp).await;
@@ -651,7 +670,10 @@ async fn test_remove_tags() {
     });
     let remove_resp = send_request(
         &app,
-        delete_json(&format!("/v1/documents/{}/tags", doc_id), &remove_body),
+        delete_json(
+            &format!("/v1/db/tables/documents/{}/tags", doc_id),
+            &remove_body,
+        ),
     )
     .await;
     let (status, body) = body_bytes(remove_resp).await;
@@ -663,7 +685,11 @@ async fn test_remove_tags() {
     );
 
     // Verify the tag was removed
-    let get_resp = send_request(&app, get(&format!("/v1/documents/{}/tags", doc_id))).await;
+    let get_resp = send_request(
+        &app,
+        get(&format!("/v1/db/tables/documents/{}/tags", doc_id)),
+    )
+    .await;
     let (_, json) = body_json(get_resp).await;
     let tags = json
         .get("tags")
@@ -692,12 +718,16 @@ async fn test_get_tags_empty() {
         "title": "No Tags",
         "content": "Content"
     });
-    let create_resp = send_request(&app, post_json("/v1/documents", &create_body)).await;
+    let create_resp = send_request(&app, post_json("/v1/db/tables/documents", &create_body)).await;
     let (_, create_json) = body_json(create_resp).await;
     let doc_id = create_json.get("id").and_then(|v| v.as_str()).unwrap();
 
     // Get tags
-    let get_resp = send_request(&app, get(&format!("/v1/documents/{}/tags", doc_id))).await;
+    let get_resp = send_request(
+        &app,
+        get(&format!("/v1/db/tables/documents/{}/tags", doc_id)),
+    )
+    .await;
     let (status, json) = body_json(get_resp).await;
 
     assert_eq!(status, StatusCode::OK);
@@ -709,23 +739,23 @@ async fn test_get_tags_empty() {
 }
 
 // ===========================================================================
-// D9. URL prefix variations
+// D9. Canonical path only
 // ===========================================================================
 
 #[tokio::test]
-async fn test_documents_with_v1_prefix() {
+async fn test_documents_requires_canonical_db_path() {
     let temp_dir = TempDir::new().unwrap();
     let app = build_app_with_storage(&temp_dir);
 
-    // Both /v1/documents and /documents should work
-    let resp_v1 = send_request(&app, get("/v1/documents")).await;
-    let resp_bare = send_request(&app, get("/documents")).await;
+    let resp_v1 = send_request(&app, get("/v1/db/tables/documents")).await;
+    let resp_legacy = send_request(&app, get("/documents")).await;
 
     let (s1, _) = body_json(resp_v1).await;
-    let (s2, _) = body_json(resp_bare).await;
+    let (s2, body_legacy) = body_bytes(resp_legacy).await;
 
     assert_eq!(s1, StatusCode::OK);
-    assert_eq!(s2, StatusCode::OK);
+    assert_eq!(s2, StatusCode::NOT_FOUND);
+    assert_eq!(body_legacy, Bytes::from_static(b"not found"));
 }
 
 // ===========================================================================
@@ -737,7 +767,7 @@ async fn test_error_json_structure() {
     let temp_dir = TempDir::new().unwrap();
     let app = build_app_with_storage(&temp_dir);
 
-    let resp = send_request(&app, get("/v1/documents/nonexistent")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents/nonexistent")).await;
     let (status, json) = body_json(resp).await;
 
     assert!(status.is_client_error());
@@ -757,7 +787,7 @@ async fn test_error_content_type() {
     let temp_dir = TempDir::new().unwrap();
     let app = build_app_with_storage(&temp_dir);
 
-    let resp = send_request(&app, get("/v1/documents/nonexistent")).await;
+    let resp = send_request(&app, get("/v1/db/tables/documents/nonexistent")).await;
     let ct = resp
         .headers()
         .get("content-type")

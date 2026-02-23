@@ -285,7 +285,7 @@ fn batch_alias_route() {
 // ---------------------------------------------------------------------------
 
 /// Batch delete via /v1/files/batch must not affect non-file documents.
-/// A "prompt" document created via /v1/documents must survive a file batch delete.
+/// A "prompt" document created via /v1/db/tables/documents must survive a file batch delete.
 #[test]
 fn batch_delete_does_not_affect_non_file_documents() {
     let temp = TempDir::new().expect("temp dir");
@@ -294,7 +294,7 @@ fn batch_delete_does_not_affect_non_file_documents() {
     // Create a non-file document (type = "prompt") via the documents API.
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &json!({
             "type": "prompt",
             "title": "My Prompt",
@@ -330,7 +330,7 @@ fn batch_delete_does_not_affect_non_file_documents() {
     assert_eq!(file_resp.status, 404, "file should be deleted");
 
     // The prompt document must still exist.
-    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{prompt_id}"));
+    let doc_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{prompt_id}"));
     assert_eq!(
         doc_resp.status, 200,
         "prompt document must survive file batch delete"
@@ -346,7 +346,7 @@ fn batch_archive_does_not_affect_non_file_documents() {
     // Create a non-file document (type = "prompt").
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &json!({
             "type": "prompt",
             "title": "Safe Prompt",
@@ -379,7 +379,7 @@ fn batch_archive_does_not_affect_non_file_documents() {
     assert_eq!(file_resp.json()["marker"], "archived");
 
     // Prompt should remain unmodified (marker should not be "archived").
-    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{prompt_id}"));
+    let doc_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{prompt_id}"));
     assert_eq!(doc_resp.status, 200);
     let doc_marker = &doc_resp.json()["marker"];
     assert_ne!(

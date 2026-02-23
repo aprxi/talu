@@ -32,19 +32,19 @@ macro_rules! assert_fn_signature {
 // the struct to the stack before calling, and the C code will try to free
 // memory at the wrong address, causing corruption.
 //
-// CORRECT:   fn talu_storage_free_string_list(list: *mut CStringList)
-// INCORRECT: fn talu_storage_free_string_list(list: CStringList)
+// CORRECT:   fn talu_db_table_free_relation_string_list(list: *mut CStringList)
+// INCORRECT: fn talu_db_table_free_relation_string_list(list: CStringList)
 //
 // If the generator produces the incorrect signature, these assertions will
 // fail to compile with a type mismatch error.
 
 assert_fn_signature!(
-    talu_sys::talu_storage_free_string_list,
+    talu_sys::talu_db_table_free_relation_string_list,
     unsafe extern "C" fn(*mut CStringList)
 );
 
 assert_fn_signature!(
-    talu_sys::talu_storage_free_tags,
+    talu_sys::talu_db_table_tag_free_list,
     unsafe extern "C" fn(*mut CTagList)
 );
 
@@ -55,22 +55,22 @@ assert_fn_signature!(
 // a struct by value, the C code writes to stack memory that Rust thinks it owns,
 // causing memory corruption when Rust frees it.
 //
-// CORRECT:   fn talu_storage_get_tag(..., out_tag: *mut CTagRecord) -> c_int
-// INCORRECT: fn talu_storage_get_tag(..., out_tag: CTagRecord) -> c_int
+// CORRECT:   fn talu_db_table_tag_get(..., out_tag: *mut CTagRecord) -> c_int
+// INCORRECT: fn talu_db_table_tag_get(..., out_tag: CTagRecord) -> c_int
 
 assert_fn_signature!(
-    talu_sys::talu_storage_get_tag,
+    talu_sys::talu_db_table_tag_get,
     unsafe extern "C" fn(*const c_char, *const c_char, *mut CTagRecord) -> c_int
 );
 
 assert_fn_signature!(
-    talu_sys::talu_storage_get_tag_by_name,
+    talu_sys::talu_db_table_tag_get_by_name,
     unsafe extern "C" fn(*const c_char, *const c_char, *const c_char, *mut CTagRecord) -> c_int
 );
 
 // Session info (db_path, session_id, out_session)
 assert_fn_signature!(
-    talu_sys::talu_storage_get_session_info,
+    talu_sys::talu_db_table_session_get,
     unsafe extern "C" fn(*const c_char, *const c_char, *mut CSessionRecord) -> c_int
 );
 
@@ -94,8 +94,8 @@ fn free_functions_take_pointers() {
     // Additional runtime check: verify pointer size assumptions.
     // Free functions taking pointers should have function pointers the same size
     // as any other function pointer (8 bytes on 64-bit systems).
-    let free_string_list_ptr = talu_sys::talu_storage_free_string_list as usize;
-    let free_tags_ptr = talu_sys::talu_storage_free_tags as usize;
+    let free_string_list_ptr = talu_sys::talu_db_table_free_relation_string_list as usize;
+    let free_tags_ptr = talu_sys::talu_db_table_tag_free_list as usize;
 
     // Both should be valid function addresses (non-zero)
     assert_ne!(
@@ -112,12 +112,12 @@ fn document_incorrect_signature() {
     // This comment shows what the BAD signature looks like:
     //
     // WRONG (struct by value - causes memory corruption):
-    //   pub fn talu_storage_free_string_list(list: CStringList);
-    //   pub fn talu_storage_free_tags(tags: CTagList);
+    //   pub fn talu_db_table_free_relation_string_list(list: CStringList);
+    //   pub fn talu_db_table_tag_free_list(tags: CTagList);
     //
     // CORRECT (pointer - safe):
-    //   pub fn talu_storage_free_string_list(list: *mut CStringList);
-    //   pub fn talu_storage_free_tags(tags: *mut CTagList);
+    //   pub fn talu_db_table_free_relation_string_list(list: *mut CStringList);
+    //   pub fn talu_db_table_tag_free_list(tags: *mut CTagList);
     //
     // The compile-time assertions in this file catch the wrong signature
     // by failing to compile when the types don't match.

@@ -263,7 +263,7 @@ struct CollectionsDisk {
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections",
+    path = "/v1/db/vectors/collections",
     tag = "DB",
     request_body = CreateCollectionRequest,
     responses(
@@ -271,7 +271,7 @@ struct CollectionsDisk {
         (status = 200, body = CollectionResponse)
     )
 )]
-/// POST /v1/db/collections - Create a collection.
+/// POST /v1/db/vectors/collections - Create a collection.
 pub async fn handle_create_collection(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -371,11 +371,11 @@ pub async fn handle_create_collection(
 
 #[utoipa::path(
     get,
-    path = "/v1/db/collections",
+    path = "/v1/db/vectors/collections",
     tag = "DB",
     responses((status = 200, body = CollectionListResponse))
 )]
-/// GET /v1/db/collections - List collections.
+/// GET /v1/db/vectors/collections - List collections.
 pub async fn handle_list_collections(
     state: Arc<AppState>,
     _req: Request<Incoming>,
@@ -402,12 +402,12 @@ pub async fn handle_list_collections(
 
 #[utoipa::path(
     get,
-    path = "/v1/db/collections/{name}",
+    path = "/v1/db/vectors/collections/{name}",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     responses((status = 200, body = CollectionResponse))
 )]
-/// GET /v1/db/collections/{name} - Get a collection by name.
+/// GET /v1/db/vectors/collections/{name} - Get a collection by name.
 pub async fn handle_get_collection(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -440,12 +440,12 @@ pub async fn handle_get_collection(
 
 #[utoipa::path(
     delete,
-    path = "/v1/db/collections/{name}",
+    path = "/v1/db/vectors/collections/{name}",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     responses((status = 204))
 )]
-/// DELETE /v1/db/collections/{name} - Delete a collection.
+/// DELETE /v1/db/vectors/collections/{name} - Delete a collection.
 pub async fn handle_delete_collection(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -501,13 +501,13 @@ pub async fn handle_delete_collection(
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections/{name}/points/append",
+    path = "/v1/db/vectors/collections/{name}/points/append",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     request_body = AppendPointsRequest,
     responses((status = 200, body = AppendPointsResponse))
 )]
-/// POST /v1/db/collections/{name}/points/append - Append vectors to a collection.
+/// POST /v1/db/vectors/collections/{name}/points/append - Append vectors to a collection.
 pub async fn handle_append_points(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -612,13 +612,13 @@ pub async fn handle_append_points(
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections/{name}/points/upsert",
+    path = "/v1/db/vectors/collections/{name}/points/upsert",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     request_body = UpsertPointsRequest,
     responses((status = 200, body = UpsertPointsResponse))
 )]
-/// POST /v1/db/collections/{name}/points/upsert - Upsert vectors in a collection.
+/// POST /v1/db/vectors/collections/{name}/points/upsert - Upsert vectors in a collection.
 pub async fn handle_upsert_points(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -714,13 +714,13 @@ pub async fn handle_upsert_points(
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections/{name}/points/delete",
+    path = "/v1/db/vectors/collections/{name}/points/delete",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     request_body = IdListRequest,
     responses((status = 200, body = DeletePointsResponse))
 )]
-/// POST /v1/db/collections/{name}/points/delete - Delete vectors by ID.
+/// POST /v1/db/vectors/collections/{name}/points/delete - Delete vectors by ID.
 pub async fn handle_delete_points(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -788,13 +788,13 @@ pub async fn handle_delete_points(
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections/{name}/points/fetch",
+    path = "/v1/db/vectors/collections/{name}/points/fetch",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     request_body = FetchPointsRequest,
     responses((status = 200, body = FetchPointsResponse))
 )]
-/// POST /v1/db/collections/{name}/points/fetch - Fetch vectors by ID.
+/// POST /v1/db/vectors/collections/{name}/points/fetch - Fetch vectors by ID.
 pub async fn handle_fetch_points(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -873,13 +873,13 @@ pub async fn handle_fetch_points(
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections/{name}/points/query",
+    path = "/v1/db/vectors/collections/{name}/points/query",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     request_body = QueryPointsRequest,
     responses((status = 200, body = QueryPointsResponse))
 )]
-/// POST /v1/db/collections/{name}/points/query - Query vectors from a collection.
+/// POST /v1/db/vectors/collections/{name}/points/query - Query vectors from a collection.
 pub async fn handle_query_points(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1010,12 +1010,12 @@ pub async fn handle_query_points(
 
 #[utoipa::path(
     get,
-    path = "/v1/db/collections/{name}/stats",
+    path = "/v1/db/vectors/collections/{name}/stats",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     responses((status = 200, body = CollectionStatsResponse))
 )]
-/// GET /v1/db/collections/{name}/stats - Get collection stats.
+/// GET /v1/db/vectors/collections/{name}/stats - Get collection stats.
 pub async fn handle_collection_stats(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1065,13 +1065,13 @@ pub async fn handle_collection_stats(
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections/{name}/compact",
+    path = "/v1/db/vectors/collections/{name}/compact",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     request_body = CompactCollectionRequest,
     responses((status = 200, body = CompactResponse))
 )]
-/// POST /v1/db/collections/{name}/compact - Compact collection state and vector store.
+/// POST /v1/db/vectors/collections/{name}/compact - Compact collection state and vector store.
 pub async fn handle_compact_collection(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1164,13 +1164,13 @@ pub async fn handle_compact_collection(
 
 #[utoipa::path(
     post,
-    path = "/v1/db/collections/{name}/indexes/build",
+    path = "/v1/db/vectors/collections/{name}/indexes/build",
     tag = "DB",
     params(("name" = String, Path, description = "Collection name")),
     request_body = BuildIndexesRequest,
     responses((status = 200, body = BuildIndexesResponse))
 )]
-/// POST /v1/db/collections/{name}/indexes/build - Build pending ANN indexes.
+/// POST /v1/db/vectors/collections/{name}/indexes/build - Build pending ANN indexes.
 pub async fn handle_build_collection_indexes(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1246,7 +1246,7 @@ pub async fn handle_build_collection_indexes(
 
 #[utoipa::path(
     get,
-    path = "/v1/db/collections/{name}/changes",
+    path = "/v1/db/vectors/collections/{name}/changes",
     tag = "DB",
     params(
         ("name" = String, Path, description = "Collection name"),
@@ -1255,7 +1255,7 @@ pub async fn handle_build_collection_indexes(
     ),
     responses((status = 200, body = ChangesResponse))
 )]
-/// GET /v1/db/collections/{name}/changes - Read collection change feed.
+/// GET /v1/db/vectors/collections/{name}/changes - Read collection change feed.
 pub async fn handle_collection_changes(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1537,9 +1537,7 @@ fn validate_collection_name(name: &str) -> Result<(), String> {
 }
 
 fn extract_collection_name(path: &str) -> Option<&str> {
-    let stripped = path
-        .strip_prefix("/v1/db/collections/")
-        .or_else(|| path.strip_prefix("/db/collections/"))?;
+    let stripped = path.strip_prefix("/v1/db/vectors/collections/")?;
     if stripped.is_empty() || stripped.contains('/') {
         return None;
     }
@@ -1547,9 +1545,7 @@ fn extract_collection_name(path: &str) -> Option<&str> {
 }
 
 fn extract_collection_name_with_suffix<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
-    let stripped = path
-        .strip_prefix("/v1/db/collections/")
-        .or_else(|| path.strip_prefix("/db/collections/"))?;
+    let stripped = path.strip_prefix("/v1/db/vectors/collections/")?;
     let name = stripped.strip_suffix(suffix)?;
     if name.is_empty() || name.contains('/') {
         return None;

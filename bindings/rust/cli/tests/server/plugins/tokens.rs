@@ -246,7 +246,7 @@ fn plugin_storage_list_without_token_returns_403() {
     fs::write(dir.path().join("test.js"), "// test").unwrap();
 
     let ctx = ServerTestContext::new(plugins_config_with_bucket(dir.path(), bucket.path()));
-    let resp = get(ctx.addr(), "/v1/documents?type=plugin_storage");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?type=plugin_storage");
     assert_eq!(resp.status, 403);
 }
 
@@ -267,7 +267,7 @@ fn plugin_storage_list_with_token_returns_200() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/documents?type=plugin_storage",
+        "/v1/db/tables/documents?type=plugin_storage",
         &[("Authorization", &auth)],
         None,
     );
@@ -293,7 +293,7 @@ fn plugin_storage_create_without_token_returns_403() {
         "title": "test doc",
         "content": {"key": "value"}
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 403);
 }
 
@@ -320,7 +320,7 @@ fn plugin_storage_create_with_token_sets_owner_id() {
     let resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[
             ("Content-Type", "application/json"),
             ("Authorization", &auth),
@@ -408,7 +408,7 @@ fn plugin_storage_isolation_between_plugins() {
     let resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[
             ("Content-Type", "application/json"),
             ("Authorization", &auth_a),
@@ -421,7 +421,7 @@ fn plugin_storage_isolation_between_plugins() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/documents?type=plugin_storage",
+        "/v1/db/tables/documents?type=plugin_storage",
         &[("Authorization", &auth_a)],
         None,
     );
@@ -434,7 +434,7 @@ fn plugin_storage_isolation_between_plugins() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/documents?type=plugin_storage",
+        "/v1/db/tables/documents?type=plugin_storage",
         &[("Authorization", &auth_b)],
         None,
     );
@@ -471,7 +471,7 @@ fn plugin_storage_ignores_client_owner_id() {
     let resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[
             ("Content-Type", "application/json"),
             ("Authorization", &auth),
@@ -512,7 +512,7 @@ fn plugin_storage_create_then_list_roundtrip() {
         let resp = send_request(
             ctx.addr(),
             "POST",
-            "/v1/documents",
+            "/v1/db/tables/documents",
             &[
                 ("Content-Type", "application/json"),
                 ("Authorization", &auth),
@@ -526,7 +526,7 @@ fn plugin_storage_create_then_list_roundtrip() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/documents?type=plugin_storage",
+        "/v1/db/tables/documents?type=plugin_storage",
         &[("Authorization", &auth)],
         None,
     );
@@ -553,14 +553,14 @@ fn non_plugin_storage_type_works_without_token() {
         "title": "regular doc",
         "content": {"data": true}
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(
         resp.status, 201,
         "non-plugin_storage should work without token"
     );
 
     // List regular documents — no token needed.
-    let resp = get(ctx.addr(), "/v1/documents?type=note");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?type=note");
     assert_eq!(resp.status, 200);
     let data = resp.json()["data"].as_array().unwrap().clone();
     assert_eq!(data.len(), 1);

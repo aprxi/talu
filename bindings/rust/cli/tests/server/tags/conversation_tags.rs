@@ -456,14 +456,14 @@ fn tag_usage_counts_conversations() {
 /// if the tag is deleted, `get_tag()` returns `None` and the reference is
 /// silently skipped.
 ///
-/// **Known issue**: `talu_storage_delete_tag` (Zig core) returns error 999
+/// **Known issue**: `talu_db_table_tag_delete` (Zig core) returns error 999
 /// (internal_error) when the tag has conversation associations, even though
 /// `deleteTagAndAssociations` is designed to cascade-remove them.  Verified
 /// the failure reproduces via direct FFI (no HTTP handler involved).
 /// This test is `#[ignore]`d until the storage bug is fixed; once
 /// `DELETE /v1/tags/:id` returns 204, remove the `#[ignore]` attribute.
 #[test]
-#[ignore = "storage bug: talu_storage_delete_tag returns 999 for tags with conversation associations"]
+#[ignore = "storage bug: talu_db_table_tag_delete returns 999 for tags with conversation associations"]
 fn deleted_tag_silently_dropped_from_conversation() {
     let temp = TempDir::new().expect("temp dir");
     seed_session_with_tags(

@@ -396,7 +396,7 @@ fn tag_usage_counts_documents() {
     // Create two documents.
     let doc1_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Doc One",
@@ -408,7 +408,7 @@ fn tag_usage_counts_documents() {
 
     let doc2_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Doc Two",
@@ -422,12 +422,12 @@ fn tag_usage_counts_documents() {
     let tag_body = serde_json::json!({"tags": [&tag_id]});
     post_json(
         ctx.addr(),
-        &format!("/v1/documents/{}/tags", doc1_id),
+        &format!("/v1/db/tables/documents/{}/tags", doc1_id),
         &tag_body,
     );
     post_json(
         ctx.addr(),
-        &format!("/v1/documents/{}/tags", doc2_id),
+        &format!("/v1/db/tables/documents/{}/tags", doc2_id),
         &tag_body,
     );
 

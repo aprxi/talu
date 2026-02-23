@@ -8,13 +8,13 @@ use crate::error;
 const ERROR_CODE_OK: i32 = 0;
 
 unsafe extern "C" {
-    #[link_name = "talu_sql_query"]
+    #[link_name = "talu_db_sql_query"]
     fn talu_sql_query_raw(
         db_path: *const c_char,
         query: *const c_char,
         out_json: *mut *mut c_char,
     ) -> c_int;
-    #[link_name = "talu_sql_query_free"]
+    #[link_name = "talu_db_sql_query_free"]
     fn talu_sql_query_free_raw(ptr: *mut c_char);
 }
 

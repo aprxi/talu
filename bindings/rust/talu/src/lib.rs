@@ -52,6 +52,7 @@ pub mod convert;
 pub mod documents;
 pub mod error;
 pub mod file;
+pub mod kv;
 pub mod logging;
 pub mod model;
 pub mod plugins;
@@ -63,6 +64,7 @@ pub mod responses;
 pub mod router;
 pub mod sql;
 pub mod storage;
+pub mod table;
 pub mod treesitter;
 pub mod vector;
 mod wrappers;
@@ -87,6 +89,7 @@ pub use file::{
     FileInfo, FileKind, FitMode, ImageFormat, ImageInfo, Limits as FileLimits, OutputFormat,
     ResizeFilter, ResizeOptions, TransformOptions as FileTransformOptions, TransformResult,
 };
+pub use kv::{KvEntry, KvError, KvHandle};
 pub use logging::{LogFormat, LogLevel};
 pub use model::{GenerationConfigInfo, ModelInfo, QuantMethod};
 pub use repo::{
@@ -96,6 +99,7 @@ pub use repo::{
 pub use repo_meta::{RepoMetaError, RepoMetaStore, RepoPinEntry};
 pub use sql::{SqlEngine, SqlError};
 pub use storage::{SessionRecord, StorageError, StorageHandle};
+pub use table::{TableError, TableHandle, TableRecord, TableSearchResult, TableSummary};
 pub use vector::{SearchBatchResult, VectorError, VectorStore};
 pub use xray::{TraceRecord, TraceStats, XrayCaptureHandle};
 

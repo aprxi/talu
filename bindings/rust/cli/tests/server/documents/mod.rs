@@ -1,15 +1,15 @@
-//! Integration tests for `/v1/documents` endpoints.
+//! Integration tests for `/v1/db/tables/documents` endpoints.
 //!
 //! Tests the Documents API endpoints:
-//! - GET /v1/documents (list)
-//! - GET /v1/documents/:id (get)
-//! - POST /v1/documents (create)
-//! - PATCH /v1/documents/:id (update)
-//! - DELETE /v1/documents/:id (delete)
-//! - POST /v1/documents/search (search)
-//! - GET /v1/documents/:id/tags (get tags)
-//! - POST /v1/documents/:id/tags (add tags)
-//! - DELETE /v1/documents/:id/tags (remove tags)
+//! - GET /v1/db/tables/documents (list)
+//! - GET /v1/db/tables/documents/:id (get)
+//! - POST /v1/db/tables/documents (create)
+//! - PATCH /v1/db/tables/documents/:id (update)
+//! - DELETE /v1/db/tables/documents/:id (delete)
+//! - POST /v1/db/tables/documents/search (search)
+//! - GET /v1/db/tables/documents/:id/tags (get tags)
+//! - POST /v1/db/tables/documents/:id/tags (add tags)
+//! - DELETE /v1/db/tables/documents/:id/tags (remove tags)
 
 mod api;
 mod crud;

@@ -207,7 +207,7 @@ impl VectorStore {
 
         // SAFETY: path_cstr is valid, ptr is a valid output location.
         let rc = unsafe {
-            talu_sys::talu_vector_store_init(path_cstr.as_ptr(), &mut ptr as *mut _ as *mut c_void)
+            talu_sys::talu_db_vector_init(path_cstr.as_ptr(), &mut ptr as *mut _ as *mut c_void)
         };
 
         if rc != 0 {
@@ -263,7 +263,7 @@ impl VectorStore {
         // ids and vectors slices are valid for their stated lengths.
         // The C API reads ids as *const u64 and vectors as *const f32.
         let rc = unsafe {
-            talu_sys::talu_vector_store_append_ex(
+            talu_sys::talu_db_vector_append_ex(
                 self.ptr,
                 ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
@@ -306,7 +306,7 @@ impl VectorStore {
         }
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_append_idempotent_ex(
+            talu_sys::talu_db_vector_append_idempotent_ex(
                 self.ptr,
                 ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
@@ -352,7 +352,7 @@ impl VectorStore {
         }
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_upsert_ex(
+            talu_sys::talu_db_vector_upsert_ex(
                 self.ptr,
                 ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
@@ -392,7 +392,7 @@ impl VectorStore {
         }
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_upsert_idempotent_ex(
+            talu_sys::talu_db_vector_upsert_idempotent_ex(
                 self.ptr,
                 ids.as_ptr() as *mut c_void,
                 vectors.as_ptr(),
@@ -415,7 +415,7 @@ impl VectorStore {
         let mut not_found_count: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_delete(
+            talu_sys::talu_db_vector_delete(
                 self.ptr,
                 ids.as_ptr() as *mut c_void,
                 ids.len(),
@@ -444,7 +444,7 @@ impl VectorStore {
         let mut not_found_count: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_delete_idempotent(
+            talu_sys::talu_db_vector_delete_idempotent(
                 self.ptr,
                 ids.as_ptr() as *mut c_void,
                 ids.len(),
@@ -474,7 +474,7 @@ impl VectorStore {
         let mut out_missing_count: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_fetch(
+            talu_sys::talu_db_vector_fetch(
                 self.ptr,
                 ids.as_ptr() as *mut c_void,
                 ids.len(),
@@ -514,7 +514,7 @@ impl VectorStore {
         };
 
         unsafe {
-            talu_sys::talu_vector_store_free_fetch(
+            talu_sys::talu_db_vector_free_fetch(
                 out_ids as *mut c_void,
                 out_vectors,
                 out_found_count,
@@ -544,7 +544,7 @@ impl VectorStore {
         let mut index_failed_segments: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_stats(
+            talu_sys::talu_db_vector_stats(
                 self.ptr,
                 &mut visible_count as *mut usize as *mut c_void,
                 &mut tombstone_count as *mut usize as *mut c_void,
@@ -578,7 +578,7 @@ impl VectorStore {
         let mut removed_tombstones: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_compact(
+            talu_sys::talu_db_vector_compact(
                 self.ptr,
                 dims,
                 &mut kept_count as *mut usize as *mut c_void,
@@ -606,7 +606,7 @@ impl VectorStore {
         let mut removed_tombstones: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_compact_idempotent(
+            talu_sys::talu_db_vector_compact_idempotent(
                 self.ptr,
                 dims,
                 key_hash,
@@ -636,7 +636,7 @@ impl VectorStore {
         let mut out_next_since: u64 = since;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_changes(
+            talu_sys::talu_db_vector_changes(
                 self.ptr,
                 since,
                 limit,
@@ -668,7 +668,7 @@ impl VectorStore {
         }
 
         unsafe {
-            talu_sys::talu_vector_store_free_changes(
+            talu_sys::talu_db_vector_free_changes(
                 out_seqs as *mut c_void,
                 out_ops,
                 out_ids as *mut c_void,
@@ -700,7 +700,7 @@ impl VectorStore {
         // SAFETY: ptr is valid. Output pointers are valid stack locations.
         // The C API writes newly allocated arrays into out_ids/out_scores.
         let rc = unsafe {
-            talu_sys::talu_vector_store_search(
+            talu_sys::talu_db_vector_search(
                 self.ptr,
                 query.as_ptr(),
                 query.len(),
@@ -730,9 +730,9 @@ impl VectorStore {
             unsafe { std::slice::from_raw_parts(out_scores, out_count) }.to_vec()
         };
 
-        // SAFETY: Freeing buffers allocated by talu_vector_store_search.
+        // SAFETY: Freeing buffers allocated by talu_db_vector_search.
         unsafe {
-            talu_sys::talu_vector_store_free_search(out_ids as *mut c_void, out_scores, out_count);
+            talu_sys::talu_db_vector_free_search(out_ids as *mut c_void, out_scores, out_count);
         }
 
         Ok(SearchResult { ids, scores })
@@ -788,7 +788,7 @@ impl VectorStore {
 
         // SAFETY: ptr is valid. Output pointers are valid stack locations.
         let rc = unsafe {
-            talu_sys::talu_vector_store_search_batch_ex(
+            talu_sys::talu_db_vector_search_batch_ex(
                 self.ptr,
                 queries.as_ptr(),
                 queries.len(),
@@ -823,9 +823,9 @@ impl VectorStore {
             unsafe { std::slice::from_raw_parts(out_scores, total) }.to_vec()
         };
 
-        // SAFETY: Freeing buffers allocated by talu_vector_store_search_batch.
+        // SAFETY: Freeing buffers allocated by talu_db_vector_search_batch.
         unsafe {
-            talu_sys::talu_vector_store_free_search_batch(
+            talu_sys::talu_db_vector_free_search_batch(
                 out_ids as *mut c_void,
                 out_scores,
                 out_count_per_query,
@@ -851,7 +851,7 @@ impl VectorStore {
         let mut removed_tombstones: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_compact_with_generation(
+            talu_sys::talu_db_vector_compact_with_generation(
                 self.ptr,
                 dims,
                 expected_generation,
@@ -881,7 +881,7 @@ impl VectorStore {
         let mut pending_segments: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_build_indexes_with_generation(
+            talu_sys::talu_db_vector_build_indexes_with_generation(
                 self.ptr,
                 expected_generation,
                 max_segments,
@@ -913,7 +913,7 @@ impl VectorStore {
         let mut removed_tombstones: usize = 0;
 
         let rc = unsafe {
-            talu_sys::talu_vector_store_compact_expired_tombstones(
+            talu_sys::talu_db_vector_compact_expired_tombstones(
                 self.ptr,
                 dims,
                 now_ms,
@@ -944,7 +944,7 @@ impl VectorStore {
 
         // SAFETY: ptr is valid. Output pointers are valid stack locations.
         let rc = unsafe {
-            talu_sys::talu_vector_store_load(
+            talu_sys::talu_db_vector_load(
                 self.ptr,
                 &mut out_ids as *mut *mut u64 as *mut c_void,
                 &mut out_vectors as *mut *mut f32 as *mut c_void,
@@ -973,9 +973,9 @@ impl VectorStore {
             unsafe { std::slice::from_raw_parts(out_vectors, total_floats) }.to_vec()
         };
 
-        // SAFETY: Freeing buffers allocated by talu_vector_store_load.
+        // SAFETY: Freeing buffers allocated by talu_db_vector_load.
         unsafe {
-            talu_sys::talu_vector_store_free_load(
+            talu_sys::talu_db_vector_free_load(
                 out_ids as *mut c_void,
                 out_vectors,
                 out_count,
@@ -997,8 +997,8 @@ impl VectorStore {
     /// store handle is invalidated and Drop becomes a no-op.
     pub fn simulate_crash(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: ptr is non-null (checked above) and was created by talu_vector_store_init.
-            unsafe { talu_sys::talu_vector_store_simulate_crash(self.ptr) };
+            // SAFETY: ptr is non-null (checked above) and was created by talu_db_vector_init.
+            unsafe { talu_sys::talu_db_vector_simulate_crash(self.ptr) };
             self.ptr = std::ptr::null_mut();
         }
     }
@@ -1008,8 +1008,8 @@ impl VectorStore {
     /// Controls whether writes are fsynced to disk on every append
     /// (full durability) or buffered in the OS page cache (async durability).
     pub fn set_durability(&self, mode: crate::Durability) -> std::result::Result<(), VectorError> {
-        // SAFETY: ptr is valid (created by talu_vector_store_init, not yet freed).
-        let rc = unsafe { talu_sys::talu_vector_store_set_durability(self.ptr, mode as u8) };
+        // SAFETY: ptr is valid (created by talu_db_vector_init, not yet freed).
+        let rc = unsafe { talu_sys::talu_db_vector_set_durability(self.ptr, mode as u8) };
         if rc != 0 {
             return Err(VectorError::from_last("failed to set durability"));
         }
@@ -1020,8 +1020,8 @@ impl VectorStore {
 impl Drop for VectorStore {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: ptr was created by talu_vector_store_init and not yet freed.
-            unsafe { talu_sys::talu_vector_store_free(self.ptr) };
+            // SAFETY: ptr was created by talu_db_vector_init and not yet freed.
+            unsafe { talu_sys::talu_db_vector_free(self.ptr) };
         }
     }
 }

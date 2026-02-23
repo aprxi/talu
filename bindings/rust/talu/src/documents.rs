@@ -30,7 +30,7 @@
 //! ```
 
 use std::ffi::{CStr, CString};
-use std::os::raw::c_char;
+use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -220,7 +220,7 @@ impl DocumentsHandle {
         let owner_c = to_optional_cstring(owner_id)?;
 
         let code = unsafe {
-            talu_sys::talu_documents_create(
+            talu_sys::talu_db_table_create(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
                 doc_type_c.as_ptr(),
@@ -247,7 +247,11 @@ impl DocumentsHandle {
         let mut out_doc = talu_sys::CDocumentRecord::default();
 
         let code = unsafe {
-            talu_sys::talu_documents_get(self.path_cstr.as_ptr(), doc_id_c.as_ptr(), &mut out_doc)
+            talu_sys::talu_db_table_get(
+                self.path_cstr.as_ptr(),
+                doc_id_c.as_ptr(),
+                &mut out_doc as *mut _ as *mut c_void,
+            )
         };
 
         if code == 1 {
@@ -277,7 +281,7 @@ impl DocumentsHandle {
         let marker_c = to_optional_cstring(marker)?;
 
         let code = unsafe {
-            talu_sys::talu_documents_update(
+            talu_sys::talu_db_table_update(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
                 opt_ptr(&title_c),
@@ -298,7 +302,7 @@ impl DocumentsHandle {
         let doc_id_c = to_cstring(doc_id)?;
 
         let code =
-            unsafe { talu_sys::talu_documents_delete(self.path_cstr.as_ptr(), doc_id_c.as_ptr()) };
+            unsafe { talu_sys::talu_db_table_delete(self.path_cstr.as_ptr(), doc_id_c.as_ptr()) };
 
         if code != ERROR_CODE_OK {
             return Err(DocumentError::from_code(code, doc_id));
@@ -324,7 +328,7 @@ impl DocumentsHandle {
 
         let mut deleted_count: usize = 0;
         let code = unsafe {
-            talu_sys::talu_documents_delete_batch(
+            talu_sys::talu_db_table_delete_batch(
                 self.path_cstr.as_ptr(),
                 c_ptrs.as_ptr(),
                 c_ptrs.len(),
@@ -359,7 +363,7 @@ impl DocumentsHandle {
 
         let mut updated_count: usize = 0;
         let code = unsafe {
-            talu_sys::talu_documents_set_marker_batch(
+            talu_sys::talu_db_table_set_marker_batch(
                 self.path_cstr.as_ptr(),
                 c_ptrs.as_ptr(),
                 c_ptrs.len(),
@@ -393,7 +397,7 @@ impl DocumentsHandle {
         let mut out_list: *mut talu_sys::CDocumentList = ptr::null_mut();
 
         let code = unsafe {
-            talu_sys::talu_documents_list(
+            talu_sys::talu_db_table_list(
                 self.path_cstr.as_ptr(),
                 opt_ptr(&type_c),
                 opt_ptr(&group_c),
@@ -420,7 +424,7 @@ impl DocumentsHandle {
                         docs.push(summary_from_c(item));
                     }
                 }
-                talu_sys::talu_documents_free_list(out_list);
+                talu_sys::talu_db_table_free_list(out_list as *mut c_void);
                 docs
             }
         };
@@ -445,7 +449,7 @@ impl DocumentsHandle {
         let mut out_list: *mut talu_sys::CSearchResultList = ptr::null_mut();
 
         let code = unsafe {
-            talu_sys::talu_documents_search(
+            talu_sys::talu_db_table_search(
                 self.path_cstr.as_ptr(),
                 query_c.as_ptr(),
                 opt_ptr(&type_c),
@@ -475,7 +479,7 @@ impl DocumentsHandle {
                         });
                     }
                 }
-                talu_sys::talu_documents_free_search_results(out_list);
+                talu_sys::talu_db_table_free_search_results(out_list as *mut c_void);
                 results
             }
         };
@@ -499,7 +503,7 @@ impl DocumentsHandle {
         let group_c = to_optional_cstring(group_id)?;
 
         let code = unsafe {
-            talu_sys::talu_documents_add_tag(
+            talu_sys::talu_db_table_add_tag(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
                 tag_id_c.as_ptr(),
@@ -525,7 +529,7 @@ impl DocumentsHandle {
         let group_c = to_optional_cstring(group_id)?;
 
         let code = unsafe {
-            talu_sys::talu_documents_remove_tag(
+            talu_sys::talu_db_table_remove_tag(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
                 tag_id_c.as_ptr(),
@@ -546,7 +550,7 @@ impl DocumentsHandle {
         let mut out_list: *mut talu_sys::CStringList = ptr::null_mut();
 
         let code = unsafe {
-            talu_sys::talu_documents_get_tags(
+            talu_sys::talu_db_table_get_tags(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
                 &mut out_list as *mut _ as *mut std::ffi::c_void,
@@ -559,7 +563,7 @@ impl DocumentsHandle {
 
         let result = extract_string_list(out_list);
         if !out_list.is_null() {
-            unsafe { talu_sys::talu_documents_free_string_list(out_list) };
+            unsafe { talu_sys::talu_db_table_free_string_list(out_list as *mut c_void) };
         }
 
         Ok(result)
@@ -572,7 +576,7 @@ impl DocumentsHandle {
         let mut out_list: *mut talu_sys::CStringList = ptr::null_mut();
 
         let code = unsafe {
-            talu_sys::talu_documents_get_by_tag(
+            talu_sys::talu_db_table_get_by_tag(
                 self.path_cstr.as_ptr(),
                 tag_id_c.as_ptr(),
                 &mut out_list as *mut _ as *mut std::ffi::c_void,
@@ -585,7 +589,7 @@ impl DocumentsHandle {
 
         let result = extract_string_list(out_list);
         if !out_list.is_null() {
-            unsafe { talu_sys::talu_documents_free_string_list(out_list) };
+            unsafe { talu_sys::talu_db_table_free_string_list(out_list as *mut c_void) };
         }
 
         Ok(result)
@@ -601,11 +605,7 @@ impl DocumentsHandle {
         let doc_id_c = to_cstring(doc_id)?;
 
         let code = unsafe {
-            talu_sys::talu_documents_set_ttl(
-                self.path_cstr.as_ptr(),
-                doc_id_c.as_ptr(),
-                ttl_seconds,
-            )
+            talu_sys::talu_db_table_set_ttl(self.path_cstr.as_ptr(), doc_id_c.as_ptr(), ttl_seconds)
         };
 
         if code != ERROR_CODE_OK {
@@ -619,7 +619,7 @@ impl DocumentsHandle {
         let mut count: usize = 0;
 
         let code = unsafe {
-            talu_sys::talu_documents_count_expired(
+            talu_sys::talu_db_table_count_expired(
                 self.path_cstr.as_ptr(),
                 &mut count as *mut _ as *mut std::ffi::c_void,
             )
@@ -647,7 +647,7 @@ impl DocumentsHandle {
         let mut out_list: *mut talu_sys::CChangeList = ptr::null_mut();
 
         let code = unsafe {
-            talu_sys::talu_documents_get_changes(
+            talu_sys::talu_db_table_get_changes(
                 self.path_cstr.as_ptr(),
                 since_seq,
                 opt_ptr(&group_c),
@@ -679,7 +679,7 @@ impl DocumentsHandle {
                         });
                     }
                 }
-                talu_sys::talu_documents_free_changes(out_list);
+                talu_sys::talu_db_table_free_changes(out_list as *mut c_void);
                 changes
             }
         };
@@ -710,7 +710,7 @@ impl DocumentsHandle {
         let marker_c = to_optional_cstring(marker)?;
 
         let code = unsafe {
-            talu_sys::talu_documents_create_delta(
+            talu_sys::talu_db_table_create_delta(
                 self.path_cstr.as_ptr(),
                 base_c.as_ptr(),
                 new_c.as_ptr(),
@@ -733,7 +733,7 @@ impl DocumentsHandle {
         let mut is_delta: bool = false;
 
         let code = unsafe {
-            talu_sys::talu_documents_is_delta(
+            talu_sys::talu_db_table_is_delta(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
                 &mut is_delta as *mut _ as *mut std::ffi::c_void,
@@ -753,7 +753,7 @@ impl DocumentsHandle {
         let mut buf = [0u8; 256];
 
         let code = unsafe {
-            talu_sys::talu_documents_get_base_id(
+            talu_sys::talu_db_table_get_base_id(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
                 buf.as_mut_ptr(),
@@ -797,7 +797,10 @@ impl DocumentsHandle {
         };
 
         let code = unsafe {
-            talu_sys::talu_documents_get_compaction_stats(self.path_cstr.as_ptr(), &mut stats)
+            talu_sys::talu_db_table_get_compaction_stats(
+                self.path_cstr.as_ptr(),
+                &mut stats as *mut _ as *mut c_void,
+            )
         };
 
         if code != ERROR_CODE_OK {
@@ -821,7 +824,7 @@ impl DocumentsHandle {
         let mut count: usize = 0;
 
         let code = unsafe {
-            talu_sys::talu_documents_purge_expired(
+            talu_sys::talu_db_table_purge_expired(
                 self.path_cstr.as_ptr(),
                 &mut count as *mut _ as *mut std::ffi::c_void,
             )
@@ -838,7 +841,7 @@ impl DocumentsHandle {
         let mut out_list: *mut talu_sys::CStringList = ptr::null_mut();
 
         let code = unsafe {
-            talu_sys::talu_documents_get_garbage_candidates(
+            talu_sys::talu_db_table_get_garbage_candidates(
                 self.path_cstr.as_ptr(),
                 &mut out_list as *mut _ as *mut std::ffi::c_void,
             )
@@ -850,7 +853,7 @@ impl DocumentsHandle {
 
         let result = extract_string_list(out_list);
         if !out_list.is_null() {
-            unsafe { talu_sys::talu_documents_free_string_list(out_list) };
+            unsafe { talu_sys::talu_db_table_free_string_list(out_list as *mut c_void) };
         }
 
         Ok(result)

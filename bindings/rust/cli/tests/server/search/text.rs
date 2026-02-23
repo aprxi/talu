@@ -1164,7 +1164,7 @@ fn federated_search_returns_both_conversations_and_documents() {
     // Create a document with "Quantum" in the title so both backends match.
     let doc_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &json!({
             "type": "prompt",
             "title": "Quantum physics notes",
@@ -1235,7 +1235,7 @@ fn federated_search_respects_limit() {
     for i in 0..5 {
         post_json(
             ctx.addr(),
-            "/v1/documents",
+            "/v1/db/tables/documents",
             &json!({
                 "type": "note",
                 "title": format!("Federated note {}", i),

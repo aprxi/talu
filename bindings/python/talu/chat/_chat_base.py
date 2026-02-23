@@ -178,7 +178,7 @@ class ChatBase:
             if not db_path:
                 raise ValidationError("TaluDB location must include a path after 'talu://'.")
 
-            result = self._lib.talu_chat_set_storage_db(
+            result = self._lib.talu_db_ops_set_storage_db(
                 self._chat_ptr,
                 db_path.encode("utf-8"),
                 self._session_id.encode("utf-8"),

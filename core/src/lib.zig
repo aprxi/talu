@@ -347,49 +347,49 @@ comptime {
     _ = &capi.talu_plugins_list_free;
 
     // Documents API (universal document storage)
-    _ = &capi.talu_documents_create;
-    _ = &capi.talu_documents_get;
-    _ = &capi.talu_documents_update;
-    _ = &capi.talu_documents_delete;
-    _ = &capi.talu_documents_delete_batch;
-    _ = &capi.talu_documents_set_marker_batch;
-    _ = &capi.talu_documents_list;
-    _ = &capi.talu_documents_free_list;
-    _ = &capi.talu_documents_search;
-    _ = &capi.talu_documents_free_search_results;
-    _ = &capi.talu_documents_search_batch;
-    _ = &capi.talu_documents_free_json;
-    _ = &capi.talu_documents_get_changes;
-    _ = &capi.talu_documents_free_changes;
-    _ = &capi.talu_documents_set_ttl;
-    _ = &capi.talu_documents_count_expired;
-    _ = &capi.talu_documents_create_delta;
-    _ = &capi.talu_documents_get_delta_chain;
-    _ = &capi.talu_documents_free_delta_chain;
-    _ = &capi.talu_documents_is_delta;
-    _ = &capi.talu_documents_get_base_id;
-    _ = &capi.talu_documents_get_compaction_stats;
-    _ = &capi.talu_documents_purge_expired;
-    _ = &capi.talu_documents_get_garbage_candidates;
-    _ = &capi.talu_documents_add_tag;
-    _ = &capi.talu_documents_remove_tag;
-    _ = &capi.talu_documents_get_tags;
-    _ = &capi.talu_documents_get_by_tag;
-    _ = &capi.talu_documents_free_string_list;
-    _ = &capi.talu_documents_get_blob_ref;
+    _ = &capi.talu_db_table_create;
+    _ = &capi.talu_db_table_get;
+    _ = &capi.talu_db_table_update;
+    _ = &capi.talu_db_table_delete;
+    _ = &capi.talu_db_table_delete_batch;
+    _ = &capi.talu_db_table_set_marker_batch;
+    _ = &capi.talu_db_table_list;
+    _ = &capi.talu_db_table_free_list;
+    _ = &capi.talu_db_table_search;
+    _ = &capi.talu_db_table_free_search_results;
+    _ = &capi.talu_db_table_search_batch;
+    _ = &capi.talu_db_table_free_json;
+    _ = &capi.talu_db_table_get_changes;
+    _ = &capi.talu_db_table_free_changes;
+    _ = &capi.talu_db_table_set_ttl;
+    _ = &capi.talu_db_table_count_expired;
+    _ = &capi.talu_db_table_create_delta;
+    _ = &capi.talu_db_table_get_delta_chain;
+    _ = &capi.talu_db_table_free_delta_chain;
+    _ = &capi.talu_db_table_is_delta;
+    _ = &capi.talu_db_table_get_base_id;
+    _ = &capi.talu_db_table_get_compaction_stats;
+    _ = &capi.talu_db_table_purge_expired;
+    _ = &capi.talu_db_table_get_garbage_candidates;
+    _ = &capi.talu_db_table_add_tag;
+    _ = &capi.talu_db_table_remove_tag;
+    _ = &capi.talu_db_table_get_tags;
+    _ = &capi.talu_db_table_get_by_tag;
+    _ = &capi.talu_db_table_free_string_list;
+    _ = &capi.talu_db_table_get_blob_ref;
 
     // Blob API (raw content-addressable blob storage)
-    _ = &capi.talu_blobs_put;
-    _ = &capi.talu_blobs_open_stream;
-    _ = &capi.talu_blobs_stream_read;
-    _ = &capi.talu_blobs_stream_total_size;
-    _ = &capi.talu_blobs_stream_close;
+    _ = &capi.talu_db_blob_put;
+    _ = &capi.talu_db_blob_open_stream;
+    _ = &capi.talu_db_blob_stream_read;
+    _ = &capi.talu_db_blob_stream_total_size;
+    _ = &capi.talu_db_blob_stream_close;
 
     // Vector DB idempotent write API
-    _ = &capi.talu_vector_store_append_idempotent_ex;
-    _ = &capi.talu_vector_store_upsert_idempotent_ex;
-    _ = &capi.talu_vector_store_delete_idempotent;
-    _ = &capi.talu_vector_store_compact_idempotent;
+    _ = &capi.talu_db_vector_append_idempotent_ex;
+    _ = &capi.talu_db_vector_upsert_idempotent_ex;
+    _ = &capi.talu_db_vector_delete_idempotent;
+    _ = &capi.talu_db_vector_compact_idempotent;
 
     // Agent API (tool registry + agent loop)
     _ = &capi.talu_agent_registry_create;

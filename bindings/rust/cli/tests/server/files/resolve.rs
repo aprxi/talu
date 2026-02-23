@@ -31,7 +31,7 @@ fn upload_file(
     assert_eq!(resp.status, 200, "upload failed: {}", resp.body);
     let file_id = resp.json()["id"].as_str().expect("file id").to_string();
 
-    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{}", file_id));
+    let doc_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", file_id));
     assert_eq!(doc_resp.status, 200, "doc lookup failed: {}", doc_resp.body);
     let blob_ref = doc_resp.json()["content"]["blob_ref"]
         .as_str()

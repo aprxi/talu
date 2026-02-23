@@ -63,7 +63,7 @@ impl ChatHandle {
 
         // SAFETY: self.ptr is a valid chat handle; CStrings are valid.
         let rc = unsafe {
-            talu_sys::talu_chat_set_storage_db(self.ptr, c_db_path.as_ptr(), c_session_id.as_ptr())
+            talu_sys::talu_db_ops_set_storage_db(self.ptr, c_db_path.as_ptr(), c_session_id.as_ptr())
         };
 
         if rc != 0 {
@@ -87,7 +87,7 @@ impl ChatHandle {
     /// Returns an error if no TaluDB storage backend is set.
     pub fn set_max_segment_size(&self, max_bytes: u64) -> Result<()> {
         // SAFETY: self.ptr is a valid chat handle.
-        let rc = unsafe { talu_sys::talu_chat_set_max_segment_size(self.ptr, max_bytes) };
+        let rc = unsafe { talu_sys::talu_db_ops_set_max_segment_size(self.ptr, max_bytes) };
 
         if rc != 0 {
             return Err(error_from_last_or("Failed to set max segment size"));
@@ -107,7 +107,7 @@ impl ChatHandle {
     /// Returns an error if no TaluDB storage backend is set or the mode is invalid.
     pub fn set_durability(&self, mode: crate::Durability) -> Result<()> {
         // SAFETY: self.ptr is a valid chat handle.
-        let rc = unsafe { talu_sys::talu_chat_set_durability(self.ptr, mode as u8) };
+        let rc = unsafe { talu_sys::talu_db_ops_set_durability(self.ptr, mode as u8) };
         if rc != 0 {
             return Err(error_from_last_or("Failed to set durability"));
         }
@@ -130,7 +130,7 @@ impl ChatHandle {
     /// Returns an error if no TaluDB storage backend is set.
     pub fn simulate_crash(&self) -> Result<()> {
         // SAFETY: self.ptr is a valid chat handle.
-        let rc = unsafe { talu_sys::talu_chat_simulate_crash(self.ptr) };
+        let rc = unsafe { talu_sys::talu_db_ops_simulate_crash(self.ptr) };
         if rc != 0 {
             return Err(error_from_last_or("Failed to simulate crash"));
         }

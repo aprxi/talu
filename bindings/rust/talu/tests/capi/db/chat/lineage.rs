@@ -1,8 +1,8 @@
 //! C API tests for session lineage tracking via source_doc_id.
 //!
 //! Tests:
-//! - source_doc_id filter in talu_storage_list_sessions_ex
-//! - talu_storage_list_sessions_by_source convenience function
+//! - source_doc_id filter in talu_db_table_session_list_ex
+//! - talu_db_table_session_list_by_source convenience function
 //! - talu_chat_inherit_tags for copying document tags to conversations
 
 use crate::capi::db::common::TestContext;
@@ -52,7 +52,7 @@ fn list_sessions_by_source_ex(db_path: &str, source_doc_id: &str) -> Vec<String>
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_storage_list_sessions_ex(
+        talu_sys::talu_db_table_session_list_ex(
             c_db_path.as_ptr(),
             0,                        // limit
             0,                        // before_updated_at_ms
@@ -74,7 +74,7 @@ fn list_sessions_by_source_ex(db_path: &str, source_doc_id: &str) -> Vec<String>
         )
     };
 
-    assert_eq!(result, 0, "talu_storage_list_sessions_ex failed");
+    assert_eq!(result, 0, "talu_db_table_session_list_ex failed");
 
     extract_session_ids(c_list)
 }
@@ -87,7 +87,7 @@ fn list_sessions_by_source(db_path: &str, source_doc_id: &str) -> Vec<String> {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_storage_list_sessions_by_source(
+        talu_sys::talu_db_table_session_list_by_source(
             c_db_path.as_ptr(),
             c_source_doc_id.as_ptr(),
             0,           // no limit
@@ -97,7 +97,7 @@ fn list_sessions_by_source(db_path: &str, source_doc_id: &str) -> Vec<String> {
         )
     };
 
-    assert_eq!(result, 0, "talu_storage_list_sessions_by_source failed");
+    assert_eq!(result, 0, "talu_db_table_session_list_by_source failed");
 
     extract_session_ids(c_list)
 }
@@ -118,7 +118,7 @@ fn extract_session_ids(c_list: *mut CSessionList) -> Vec<String> {
                 }
             }
         }
-        unsafe { talu_sys::talu_storage_free_sessions(c_list) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
     }
     ids
 }
@@ -189,7 +189,7 @@ fn capi_list_sessions_by_source_null_source() {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_storage_list_sessions_by_source(
+        talu_sys::talu_db_table_session_list_by_source(
             c_db_path.as_ptr(),
             ptr::null(), // null source_doc_id
             0,

@@ -1,20 +1,20 @@
 //! Document search tests.
 //!
-//! Tests POST /v1/documents/search endpoint.
+//! Tests POST /v1/db/tables/documents/search endpoint.
 
 use super::{documents_config, no_bucket_config};
 use crate::server::common::*;
 use tempfile::TempDir;
 
 // =============================================================================
-// POST /v1/documents/search
+// POST /v1/db/tables/documents/search
 // =============================================================================
 
 #[test]
 fn search_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
     let body = serde_json::json!({"query": "test"});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -26,7 +26,7 @@ fn search_returns_empty_for_no_matches() {
     // Create a document
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Test Document",
@@ -36,7 +36,7 @@ fn search_returns_empty_for_no_matches() {
 
     // Search for something that doesn't match
     let body = serde_json::json!({"query": "xyznonexistent"});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -52,7 +52,7 @@ fn search_finds_matching_title() {
     // Create documents
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Rust Programming Guide",
@@ -61,7 +61,7 @@ fn search_finds_matching_title() {
     );
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Python Tutorial",
@@ -71,7 +71,7 @@ fn search_finds_matching_title() {
 
     // Search for "Rust"
     let body = serde_json::json!({"query": "Rust"});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -89,7 +89,7 @@ fn search_finds_matching_content() {
 
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Generic Title",
@@ -98,7 +98,7 @@ fn search_finds_matching_content() {
     );
 
     let body = serde_json::json!({"query": "Rust programming"});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -114,7 +114,7 @@ fn search_filters_by_type() {
     // Create documents of different types with same keyword
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Coding Prompt",
@@ -123,7 +123,7 @@ fn search_filters_by_type() {
     );
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "persona",
             "title": "Coding Persona",
@@ -136,7 +136,7 @@ fn search_filters_by_type() {
         "query": "Coding",
         "type": "prompt"
     });
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -155,7 +155,7 @@ fn search_respects_limit() {
     for i in 0..10 {
         post_json(
             ctx.addr(),
-            "/v1/documents",
+            "/v1/db/tables/documents",
             &serde_json::json!({
                 "type": "note",
                 "title": format!("Common Note {}", i),
@@ -168,7 +168,7 @@ fn search_respects_limit() {
         "query": "Common",
         "limit": 3
     });
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -183,7 +183,7 @@ fn search_case_insensitive() {
 
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "UPPERCASE Title",
@@ -193,7 +193,7 @@ fn search_case_insensitive() {
 
     // Search with lowercase
     let body = serde_json::json!({"query": "uppercase"});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -209,7 +209,7 @@ fn search_deleted_not_found() {
     // Create and delete
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Deleted Document Unique",
@@ -217,11 +217,11 @@ fn search_deleted_not_found() {
         }),
     );
     let doc_id = create_resp.json()["id"].as_str().expect("id").to_string();
-    delete(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    delete(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
 
     // Search should not find deleted
     let body = serde_json::json!({"query": "Deleted Document Unique"});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -238,7 +238,7 @@ fn search_requires_query() {
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
     let body = serde_json::json!({});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     // Should either require query or return all documents
     // Implementation may vary - just ensure it doesn't crash
     assert!(resp.status == 200 || resp.status == 400);
@@ -250,7 +250,7 @@ fn search_empty_query_handled() {
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
     let body = serde_json::json!({"query": ""});
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     // Should handle empty query gracefully
     assert!(resp.status == 200 || resp.status == 400);
 }
@@ -263,7 +263,7 @@ fn search_with_group_id_filter() {
     // Create documents in different groups
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Team A Document",
@@ -273,7 +273,7 @@ fn search_with_group_id_filter() {
     );
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt",
             "title": "Team B Document",
@@ -287,7 +287,7 @@ fn search_with_group_id_filter() {
         "query": "Team",
         "group_id": "team-a"
     });
-    let resp = post_json(ctx.addr(), "/v1/documents/search", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     // Should only return team-a documents
@@ -314,7 +314,7 @@ fn expired_document_still_appears_in_search() {
     // Create an ephemeral document with a unique searchable term.
     let ephemeral = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "Ephemeral Search Target",
@@ -328,7 +328,7 @@ fn expired_document_still_appears_in_search() {
     // Create a permanent document with different content.
     let permanent = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "Permanent Search Doc",
@@ -341,7 +341,10 @@ fn expired_document_still_appears_in_search() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Direct GET should return 404 (Zig layer filters by TTL).
-    let get_expired = get(ctx.addr(), &format!("/v1/documents/{}", ephemeral_id));
+    let get_expired = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", ephemeral_id),
+    );
     assert_eq!(
         get_expired.status, 404,
         "expired doc should return 404 on direct GET"
@@ -350,7 +353,7 @@ fn expired_document_still_appears_in_search() {
     // Search for the ephemeral document's unique content.
     let search_resp = post_json(
         ctx.addr(),
-        "/v1/documents/search",
+        "/v1/db/tables/documents/search",
         &serde_json::json!({"query": "alpha_kappa_search_term_unique"}),
     );
     assert_eq!(search_resp.status, 200, "body: {}", search_resp.body);

@@ -1333,9 +1333,7 @@ fn parseExportedFunctions(
 
         // Look for: pub export fn talu_function_name(
         // This may be a multi-line function signature
-        if (!std.mem.startsWith(u8, trimmed, "pub export fn talu_") and
-            !std.mem.startsWith(u8, trimmed, "pub fn talu_"))
-        {
+        if (!std.mem.startsWith(u8, trimmed, "pub export fn talu_")) {
             continue;
         }
 

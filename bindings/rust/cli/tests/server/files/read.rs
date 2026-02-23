@@ -168,7 +168,7 @@ fn list_only_includes_file_documents() {
         "title": "plain note",
         "content": { "hello": "world" }
     });
-    let doc_resp = post_json(ctx.addr(), "/v1/documents", &doc_body);
+    let doc_resp = post_json(ctx.addr(), "/v1/db/tables/documents", &doc_body);
     assert_eq!(doc_resp.status, 201, "body: {}", doc_resp.body);
     let note_id = doc_resp.json()["id"].as_str().expect("note id").to_string();
 
@@ -190,7 +190,7 @@ fn get_file_returns_500_when_metadata_missing_blob_ref() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "file",
             "title": "broken-file-metadata",
@@ -237,7 +237,7 @@ fn upload_requires_multipart_content_type_header() {
 }
 
 // ---------------------------------------------------------------------------
-// GET /v1/blobs/:hash — blob serving
+// GET /v1/db/blobs/:hash — blob serving
 // ---------------------------------------------------------------------------
 
 /// Upload a file, extract blob_ref via document API, then GET the blob by hash.
@@ -250,7 +250,7 @@ fn get_blob_returns_uploaded_content() {
     let file_id = upload_text_file(&ctx, "blob-test.txt", "text/plain", payload);
 
     // blob_ref lives in the underlying document content, not in the files API response.
-    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{}", file_id));
+    let doc_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", file_id));
     assert_eq!(doc_resp.status, 200, "body: {}", doc_resp.body);
     let doc_json = doc_resp.json();
     let blob_ref = doc_json["content"]["blob_ref"]
@@ -261,7 +261,7 @@ fn get_blob_returns_uploaded_content() {
     let hash = blob_ref.strip_prefix("sha256:").expect("sha256: prefix");
     assert_eq!(hash.len(), 64, "hash should be 64 chars");
 
-    let blob_resp = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    let blob_resp = get(ctx.addr(), &format!("/v1/db/blobs/{}", hash));
     assert_eq!(blob_resp.status, 200, "body: {}", blob_resp.body);
 
     let ct = blob_resp.header("content-type").unwrap_or("");
@@ -286,7 +286,7 @@ fn get_blob_invalid_hash_returns_400() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(files_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/blobs/tooshort");
+    let resp = get(ctx.addr(), "/v1/db/blobs/tooshort");
     assert_eq!(resp.status, 400, "body: {}", resp.body);
 }
 
@@ -298,7 +298,7 @@ fn get_blob_nonexistent_hash_returns_error() {
 
     // 64 valid hex chars, but no such blob exists.
     let fake_hash = "a".repeat(64);
-    let resp = get(ctx.addr(), &format!("/v1/blobs/{}", fake_hash));
+    let resp = get(ctx.addr(), &format!("/v1/db/blobs/{}", fake_hash));
     // Expect 404 or another non-200 error.
     assert_ne!(resp.status, 200, "non-existent blob should not return 200");
 }
@@ -309,7 +309,7 @@ fn get_blob_no_bucket_returns_404() {
     let ctx = ServerTestContext::new(no_bucket_config());
 
     let hash = "b".repeat(64);
-    let resp = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    let resp = get(ctx.addr(), &format!("/v1/db/blobs/{}", hash));
     assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
@@ -453,7 +453,7 @@ fn deleted_file_returns_404_for_metadata_and_content() {
 // ---------------------------------------------------------------------------
 
 /// After deleting file metadata, the CAS blob is still accessible via
-/// `GET /v1/blobs/:hash`.
+/// `GET /v1/db/blobs/:hash`.
 ///
 /// `DELETE /v1/files/:id` removes the metadata document only. The blob
 /// store uses content-addressed storage and retains blobs for GC, not
@@ -467,7 +467,7 @@ fn deleted_file_blob_still_accessible_via_blob_endpoint() {
     let file_id = upload_text_file(&ctx, "cas-test.txt", "text/plain", payload);
 
     // Extract blob_ref from the underlying document.
-    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{}", file_id));
+    let doc_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", file_id));
     assert_eq!(doc_resp.status, 200, "body: {}", doc_resp.body);
     let doc_json = doc_resp.json();
     let blob_ref = doc_json["content"]["blob_ref"]
@@ -476,7 +476,7 @@ fn deleted_file_blob_still_accessible_via_blob_endpoint() {
     let hash = blob_ref.strip_prefix("sha256:").expect("sha256: prefix");
 
     // Blob is accessible before deletion.
-    let blob_before = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    let blob_before = get(ctx.addr(), &format!("/v1/db/blobs/{}", hash));
     assert_eq!(blob_before.status, 200, "blob should exist before delete");
     assert_eq!(blob_before.body, payload);
 
@@ -489,7 +489,7 @@ fn deleted_file_blob_still_accessible_via_blob_endpoint() {
     assert_eq!(meta_resp.status, 404, "metadata should be 404 after delete");
 
     // Blob is still accessible (CAS retention).
-    let blob_after = get(ctx.addr(), &format!("/v1/blobs/{}", hash));
+    let blob_after = get(ctx.addr(), &format!("/v1/db/blobs/{}", hash));
     assert_eq!(
         blob_after.status, 200,
         "CAS blob should survive file deletion, body: {}",

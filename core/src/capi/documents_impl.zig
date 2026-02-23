@@ -339,7 +339,7 @@ fn buildChangeList(records: []documents.ChangeRecord, limit: usize) !*CChangeLis
 ///
 /// Returns: 0 on success, negative error code on failure.
 // lint:ignore capi-callconv - callconv(.c) on closing line
-pub export fn talu_documents_create(
+pub fn talu_documents_create(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     doc_type: ?[*:0]const u8,
@@ -392,7 +392,7 @@ pub export fn talu_documents_create(
 ///
 /// Note: String fields use borrowed pointers stored in a thread-local buffer.
 /// They are valid only until the next talu_documents_get call.
-pub export fn talu_documents_get(
+pub fn talu_documents_get(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_doc: *CDocumentRecord,
@@ -433,7 +433,7 @@ pub export fn talu_documents_get(
 /// Notes:
 ///   - For inline documents, `out_has_external_ref=false` and `out_blob_ref` is set to empty if provided.
 ///   - If `out_has_external_ref=true`, `out_blob_ref` must be large enough for ref + NUL.
-pub export fn talu_documents_get_blob_ref(
+pub fn talu_documents_get_blob_ref(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_blob_ref: ?[*]u8,
@@ -488,7 +488,7 @@ pub export fn talu_documents_get_blob_ref(
 ///   - marker: New marker (null = no change)
 ///
 /// Returns: 0 on success, storage_error if document not found.
-pub export fn talu_documents_update(
+pub fn talu_documents_update(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     title: ?[*:0]const u8,
@@ -527,7 +527,7 @@ pub export fn talu_documents_update(
 ///   - doc_id: Document UUID to delete (null-terminated)
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_delete(
+pub fn talu_documents_delete(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
 ) callconv(.c) i32 {
@@ -561,7 +561,7 @@ pub export fn talu_documents_delete(
 ///   - out_deleted_count: Output parameter to receive the number of actually deleted documents (may be null)
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_delete_batch(
+pub fn talu_documents_delete_batch(
     db_path: ?[*:0]const u8,
     doc_ids: ?[*]const ?[*:0]const u8,
     doc_ids_count: usize,
@@ -613,7 +613,7 @@ pub export fn talu_documents_delete_batch(
 ///   - out_updated_count: Output parameter to receive the number of actually updated documents (may be null)
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_set_marker_batch(
+pub fn talu_documents_set_marker_batch(
     db_path: ?[*:0]const u8,
     doc_ids: ?[*]const ?[*:0]const u8,
     doc_ids_count: usize,
@@ -673,7 +673,7 @@ pub export fn talu_documents_set_marker_batch(
 ///
 /// Returns: 0 on success, negative error code on failure.
 /// On success, caller must free the handle with talu_documents_free_list().
-pub export fn talu_documents_list(
+pub fn talu_documents_list(
     db_path: ?[*:0]const u8,
     doc_type: ?[*:0]const u8,
     group_id: ?[*:0]const u8,
@@ -718,7 +718,7 @@ pub export fn talu_documents_list(
 ///
 /// Parameters:
 ///   - list: Document list handle to free (may be null)
-pub export fn talu_documents_free_list(list: ?*CDocumentList) callconv(.c) void {
+pub fn talu_documents_free_list(list: ?*CDocumentList) callconv(.c) void {
     capi_error.clearError();
     const l = list orelse return;
 
@@ -746,7 +746,7 @@ pub export fn talu_documents_free_list(list: ?*CDocumentList) callconv(.c) void 
 ///
 /// Returns: 0 on success, negative error code on failure.
 /// On success, caller must free the handle with talu_documents_free_search_results().
-pub export fn talu_documents_search(
+pub fn talu_documents_search(
     db_path: ?[*:0]const u8,
     query: ?[*:0]const u8,
     doc_type: ?[*:0]const u8,
@@ -788,7 +788,7 @@ pub export fn talu_documents_search(
 ///
 /// Parameters:
 ///   - list: Search result list handle to free (may be null)
-pub export fn talu_documents_free_search_results(list: ?*CSearchResultList) callconv(.c) void {
+pub fn talu_documents_free_search_results(list: ?*CSearchResultList) callconv(.c) void {
     capi_error.clearError();
     const l = list orelse return;
 
@@ -821,7 +821,7 @@ fn searchBatchImpl(db_path_slice: []const u8, queries_slice: []const u8) ![]u8 {
 ///
 /// Returns: 0 on success, negative error code on failure.
 /// On success, caller must free the results with talu_documents_free_json().
-pub export fn talu_documents_search_batch(
+pub fn talu_documents_search_batch(
     db_path: ?[*:0]const u8,
     queries_json: ?[*]const u8,
     queries_len: usize,
@@ -854,7 +854,7 @@ pub export fn talu_documents_search_batch(
 }
 
 /// Free JSON output from talu_documents_search_batch.
-pub export fn talu_documents_free_json(ptr: ?[*]u8, len: usize) callconv(.c) void {
+pub fn talu_documents_free_json(ptr: ?[*]u8, len: usize) callconv(.c) void {
     capi_error.clearError();
     if (ptr) |p| {
         allocator.free(p[0..len]);
@@ -882,7 +882,7 @@ pub export fn talu_documents_free_json(ptr: ?[*]u8, len: usize) callconv(.c) voi
 ///   2. Process list.items[0..list.count]
 ///   3. Next call: talu_documents_get_changes(db, list.next_seq, NULL, 100, &list)
 ///   4. Repeat until list.count == 0
-pub export fn talu_documents_get_changes(
+pub fn talu_documents_get_changes(
     db_path: ?[*:0]const u8,
     since_seq: u64,
     group_id: ?[*:0]const u8,
@@ -924,7 +924,7 @@ pub export fn talu_documents_get_changes(
 ///
 /// Parameters:
 ///   - list: Change list handle to free (may be null)
-pub export fn talu_documents_free_changes(list: ?*CChangeList) callconv(.c) void {
+pub fn talu_documents_free_changes(list: ?*CChangeList) callconv(.c) void {
     capi_error.clearError();
     const l = list orelse return;
 
@@ -956,7 +956,7 @@ pub export fn talu_documents_free_changes(list: ?*CChangeList) callconv(.c) void
 ///
 ///   // Remove TTL (document never expires)
 ///   talu_documents_set_ttl(db, doc_id, 0);
-pub export fn talu_documents_set_ttl(
+pub fn talu_documents_set_ttl(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     ttl_seconds: u64,
@@ -987,7 +987,7 @@ pub export fn talu_documents_set_ttl(
 ///
 /// Note: This counts documents that have an expires_at > 0 and expires_at < current time.
 /// These documents are automatically filtered out of read operations but still exist in storage.
-pub export fn talu_documents_count_expired(
+pub fn talu_documents_count_expired(
     db_path: ?[*:0]const u8,
     out_count: ?*usize,
 ) callconv(.c) i32 {
@@ -1025,7 +1025,7 @@ pub export fn talu_documents_count_expired(
 ///
 /// Returns: 0 on success, negative error code on failure.
 /// The delta version will have version_type="delta" and base_doc_id set to the base document.
-pub export fn talu_documents_create_delta(
+pub fn talu_documents_create_delta(
     db_path: ?[*:0]const u8,
     base_doc_id: ?[*:0]const u8,
     new_doc_id: ?[*:0]const u8,
@@ -1103,7 +1103,7 @@ fn getDeltaChainImpl(db_path_slice: []const u8, doc_id_slice: []const u8) !*CDel
 
 /// Returns: 0 on success, negative error code on failure.
 /// Caller must free with talu_documents_free_delta_chain().
-pub export fn talu_documents_get_delta_chain(
+pub fn talu_documents_get_delta_chain(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_chain: ?*?*CDeltaChain,
@@ -1128,7 +1128,7 @@ pub export fn talu_documents_get_delta_chain(
 ///
 /// Parameters:
 ///   - chain: Delta chain handle to free (may be null)
-pub export fn talu_documents_free_delta_chain(chain: ?*CDeltaChain) callconv(.c) void {
+pub fn talu_documents_free_delta_chain(chain: ?*CDeltaChain) callconv(.c) void {
     capi_error.clearError();
     const c = chain orelse return;
 
@@ -1149,7 +1149,7 @@ pub export fn talu_documents_free_delta_chain(chain: ?*CDeltaChain) callconv(.c)
 ///   - out_is_delta: Output parameter to receive true if delta, false otherwise
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_is_delta(
+pub fn talu_documents_is_delta(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_is_delta: ?*bool,
@@ -1186,7 +1186,7 @@ pub export fn talu_documents_is_delta(
 ///
 /// Returns: 0 on success (base_id written to buffer), 1 if not a delta (buffer empty),
 ///          negative error code on failure.
-pub export fn talu_documents_get_base_id(
+pub fn talu_documents_get_base_id(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_base_id: ?[*]u8,
@@ -1244,7 +1244,7 @@ pub const CCompactionStats = extern struct {
 ///   - out_stats: Output parameter to receive the statistics
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_get_compaction_stats(
+pub fn talu_documents_get_compaction_stats(
     db_path: ?[*:0]const u8,
     out_stats: ?*CCompactionStats,
 ) callconv(.c) i32 {
@@ -1280,7 +1280,7 @@ pub export fn talu_documents_get_compaction_stats(
 ///   - out_count: Output parameter to receive the number of documents purged
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_purge_expired(
+pub fn talu_documents_purge_expired(
     db_path: ?[*:0]const u8,
     out_count: ?*usize,
 ) callconv(.c) i32 {
@@ -1309,7 +1309,7 @@ pub export fn talu_documents_purge_expired(
 ///
 /// Returns: 0 on success, negative error code on failure.
 /// Caller must free with talu_documents_free_string_list().
-pub export fn talu_documents_get_garbage_candidates(
+pub fn talu_documents_get_garbage_candidates(
     db_path: ?[*:0]const u8,
     out_ids: ?*?*CStringList,
 ) callconv(.c) i32 {
@@ -1379,7 +1379,7 @@ fn buildBatchResultJson(results: []const documents.BatchSearchResult) ![]u8 {
 ///   - group_id: Group ID for isolation (null = no group)
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_add_tag(
+pub fn talu_documents_add_tag(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
@@ -1407,7 +1407,7 @@ pub export fn talu_documents_add_tag(
 ///   - group_id: Group ID for isolation (null = no group)
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_documents_remove_tag(
+pub fn talu_documents_remove_tag(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
@@ -1435,7 +1435,7 @@ pub export fn talu_documents_remove_tag(
 ///
 /// Returns: 0 on success, negative error code on failure.
 /// On success, caller must free the handle with talu_documents_free_string_list().
-pub export fn talu_documents_get_tags(
+pub fn talu_documents_get_tags(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_tag_ids: ?*?*CStringList,
@@ -1473,7 +1473,7 @@ pub export fn talu_documents_get_tags(
 ///
 /// Returns: 0 on success, negative error code on failure.
 /// On success, caller must free the handle with talu_documents_free_string_list().
-pub export fn talu_documents_get_by_tag(
+pub fn talu_documents_get_by_tag(
     db_path: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
     out_doc_ids: ?*?*CStringList,
@@ -1506,7 +1506,7 @@ pub export fn talu_documents_get_by_tag(
 ///
 /// Parameters:
 ///   - list: String list handle to free (may be null)
-pub export fn talu_documents_free_string_list(list: ?*CStringList) callconv(.c) void {
+pub fn talu_documents_free_string_list(list: ?*CStringList) callconv(.c) void {
     capi_error.clearError();
     const l = list orelse return;
 

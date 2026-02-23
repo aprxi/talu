@@ -54,7 +54,7 @@ fn create_prompt_document(ctx: &ServerTestContext, system_prompt: &str, title: &
             "system_prompt": system_prompt
         }
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &doc_body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &doc_body);
     assert_eq!(resp.status, 201, "create document: {}", resp.body);
     let json = resp.json();
     json["id"]
@@ -72,7 +72,7 @@ fn create_document_without_system_prompt(ctx: &ServerTestContext, title: &str) -
             "description": "A prompt without system_prompt field"
         }
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &doc_body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &doc_body);
     assert_eq!(resp.status, 201, "create document: {}", resp.body);
     let json = resp.json();
     json["id"]

@@ -579,7 +579,7 @@ fn auth_group_id_injected_into_created_document() {
     let resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -597,7 +597,7 @@ fn auth_group_id_injected_into_created_document() {
     let get_resp = send_request(
         ctx.addr(),
         "GET",
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -646,7 +646,7 @@ fn auth_tenant_document_isolation() {
     let create_resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -661,7 +661,7 @@ fn auth_tenant_document_isolation() {
     let get_resp = send_request(
         ctx.addr(),
         "GET",
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "globex"),
@@ -677,7 +677,7 @@ fn auth_tenant_document_isolation() {
     let list_resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "globex"),
@@ -696,7 +696,7 @@ fn auth_tenant_document_isolation() {
     let acme_get = send_request(
         ctx.addr(),
         "GET",
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -737,7 +737,7 @@ fn auth_user_id_does_not_inject_owner_id() {
     let resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -755,7 +755,7 @@ fn auth_user_id_does_not_inject_owner_id() {
     let get_resp = send_request(
         ctx.addr(),
         "GET",
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),

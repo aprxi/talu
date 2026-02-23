@@ -7,7 +7,7 @@
 const std = @import("std");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");
-const capi_documents = @import("documents.zig");
+const capi_documents = @import("documents_impl.zig");
 const db_blob_gc = @import("../db/blob/gc.zig");
 const db_blob_store = @import("../db/blob/store.zig");
 
@@ -135,7 +135,7 @@ fn buildBlobRefList(digests: []const [db_blob_store.digest_hex_len]u8) !*CString
 ///   - out_blob_ref_capacity: Output buffer capacity in bytes
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_put(
+pub fn talu_blobs_put(
     db_path: ?[*:0]const u8,
     bytes: ?[*]const u8,
     bytes_len: usize,
@@ -184,7 +184,7 @@ pub export fn talu_blobs_put(
 ///   - out_stats: Output sweep statistics
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_gc(
+pub fn talu_blobs_gc(
     db_path: ?[*:0]const u8,
     min_blob_age_seconds: u64,
     out_stats: ?*anyopaque,
@@ -226,7 +226,7 @@ pub export fn talu_blobs_gc(
 ///   - out_exists: Output boolean flag
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_exists(
+pub fn talu_blobs_exists(
     db_path: ?[*:0]const u8,
     blob_ref: ?[*:0]const u8,
     out_exists: ?*bool,
@@ -260,7 +260,7 @@ pub export fn talu_blobs_exists(
 ///
 /// This returns `sha256:<hex>` references for stored shard files.
 /// Caller must free with `talu_blobs_free_string_list()`.
-pub export fn talu_blobs_list(
+pub fn talu_blobs_list(
     db_path: ?[*:0]const u8,
     limit: usize,
     out_refs: ?*?*CStringList,
@@ -295,7 +295,7 @@ pub export fn talu_blobs_list(
     return 0;
 }
 
-pub export fn talu_blobs_free_string_list(list: ?*CStringList) callconv(.c) void {
+pub fn talu_blobs_free_string_list(list: ?*CStringList) callconv(.c) void {
     capi_error.clearError();
     const l = list orelse return;
     if (l._arena) |arena_ptr| {
@@ -314,7 +314,7 @@ pub export fn talu_blobs_free_string_list(list: ?*CStringList) callconv(.c) void
 ///   - out_stream: Output write stream handle, close with talu_blobs_write_stream_close()
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_open_write_stream(
+pub fn talu_blobs_open_write_stream(
     db_path: ?[*:0]const u8,
     out_stream: ?*?*BlobWriteStreamHandle,
 ) callconv(.c) i32 {
@@ -354,7 +354,7 @@ pub export fn talu_blobs_open_write_stream(
 ///   - bytes_len: Payload chunk length
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_write_stream_write(
+pub fn talu_blobs_write_stream_write(
     stream_handle: ?*BlobWriteStreamHandle,
     bytes: ?[*]const u8,
     bytes_len: usize,
@@ -391,7 +391,7 @@ pub export fn talu_blobs_write_stream_write(
 ///   - out_blob_ref_capacity: Output buffer capacity in bytes
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_write_stream_finish(
+pub fn talu_blobs_write_stream_finish(
     stream_handle: ?*BlobWriteStreamHandle,
     out_blob_ref: ?[*]u8,
     out_blob_ref_capacity: usize,
@@ -435,7 +435,7 @@ pub export fn talu_blobs_write_stream_finish(
 ///   - out_stream: Output stream handle, close with talu_blobs_stream_close()
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_open_stream(
+pub fn talu_blobs_open_stream(
     db_path: ?[*:0]const u8,
     blob_ref: ?[*:0]const u8,
     out_stream: ?*?*BlobStreamHandle,
@@ -484,7 +484,7 @@ pub export fn talu_blobs_open_stream(
 ///   - out_read_len: Number of bytes read (0 on EOF)
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_stream_read(
+pub fn talu_blobs_stream_read(
     stream_handle: ?*BlobStreamHandle,
     out_buffer: ?[*]u8,
     out_buffer_len: usize,
@@ -519,7 +519,7 @@ pub export fn talu_blobs_stream_read(
 }
 
 /// Get total byte length for a blob stream.
-pub export fn talu_blobs_stream_total_size(
+pub fn talu_blobs_stream_total_size(
     stream_handle: ?*BlobStreamHandle,
     out_total_size: ?*u64,
 ) callconv(.c) i32 {
@@ -547,7 +547,7 @@ pub export fn talu_blobs_stream_total_size(
 ///   - offset_bytes: Absolute offset from start of blob
 ///
 /// Returns: 0 on success, negative error code on failure.
-pub export fn talu_blobs_stream_seek(
+pub fn talu_blobs_stream_seek(
     stream_handle: ?*BlobStreamHandle,
     offset_bytes: u64,
 ) callconv(.c) i32 {
@@ -568,7 +568,7 @@ pub export fn talu_blobs_stream_seek(
 
 /// Close a blob stream handle and release resources.
 /// Safe to call with null.
-pub export fn talu_blobs_stream_close(stream_handle: ?*BlobStreamHandle) callconv(.c) void {
+pub fn talu_blobs_stream_close(stream_handle: ?*BlobStreamHandle) callconv(.c) void {
     capi_error.clearError();
     const handle = stream_handle orelse return;
     const state: *BlobStreamState = @ptrCast(@alignCast(handle));
@@ -579,7 +579,7 @@ pub export fn talu_blobs_stream_close(stream_handle: ?*BlobStreamHandle) callcon
 
 /// Close a blob write stream handle and release resources.
 /// Safe to call with null.
-pub export fn talu_blobs_write_stream_close(stream_handle: ?*BlobWriteStreamHandle) callconv(.c) void {
+pub fn talu_blobs_write_stream_close(stream_handle: ?*BlobWriteStreamHandle) callconv(.c) void {
     capi_error.clearError();
     const handle = stream_handle orelse return;
     const state: *BlobWriteStreamState = @ptrCast(@alignCast(handle));

@@ -661,12 +661,12 @@ pub async fn handle_get_content(
     response_builder.body(body).unwrap()
 }
 
-/// GET /v1/blobs/:hash - Serve raw blob content by sha256 hex digest.
+/// GET /v1/db/blobs/:hash - Serve raw blob content by sha256 hex digest.
 ///
 /// Used by the UI to display images from stored conversations where the
 /// `image_url` field contains a `file://` blob path.  The UI extracts the
-/// 64-char hex hash and fetches `/v1/blobs/{hash}`.
-#[utoipa::path(get, path = "/v1/blobs/{blob_ref}", tag = "Files",
+/// 64-char hex hash and fetches `/v1/db/blobs/{hash}`.
+#[utoipa::path(get, path = "/v1/db/blobs/{blob_ref}", tag = "Files",
     params(("blob_ref" = String, Path, description = "Blob reference")),
     responses((status = 200, description = "Raw blob bytes")))]
 pub async fn handle_get_blob(
@@ -675,10 +675,7 @@ pub async fn handle_get_blob(
     _auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = _req.uri().path();
-    let hash = path
-        .strip_prefix("/v1/blobs/")
-        .or_else(|| path.strip_prefix("/blobs/"))
-        .unwrap_or("");
+    let hash = path.strip_prefix("/v1/db/blobs/").unwrap_or("");
 
     if hash.len() != 64 || !hash.chars().all(|c| c.is_ascii_hexdigit()) {
         return json_error(

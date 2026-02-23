@@ -21,8 +21,7 @@ use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
 use crate::server::conversations;
-use crate::server::db_vector;
-use crate::server::documents;
+use crate::server::db;
 use crate::server::file;
 use crate::server::files;
 use crate::server::handlers;
@@ -264,88 +263,72 @@ impl Service<Request<Incoming>> for Router {
                         (Method::POST, "/v1/search") | (Method::POST, "/search") => {
                             search::handle_search(state, req, auth).await
                         }
-                        // DB vector collections and points (low-level API)
-                        (Method::POST, "/v1/db/collections")
-                        | (Method::POST, "/db/collections") => {
-                            db_vector::handle_create_collection(state, req, auth).await
+                        // DB vector plane endpoints
+                        (Method::POST, "/v1/db/vectors/collections") => {
+                            db::vector::handle_create_collection(state, req, auth).await
                         }
-                        (Method::GET, "/v1/db/collections") | (Method::GET, "/db/collections") => {
-                            db_vector::handle_list_collections(state, req, auth).await
+                        (Method::GET, "/v1/db/vectors/collections") => {
+                            db::vector::handle_list_collections(state, req, auth).await
                         }
                         (Method::POST, p)
                             if p.ends_with("/points/append")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_append_points(state, req, auth).await
+                            db::vector::handle_append_points(state, req, auth).await
                         }
                         (Method::POST, p)
                             if p.ends_with("/points/upsert")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_upsert_points(state, req, auth).await
+                            db::vector::handle_upsert_points(state, req, auth).await
                         }
                         (Method::POST, p)
                             if p.ends_with("/points/delete")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_delete_points(state, req, auth).await
+                            db::vector::handle_delete_points(state, req, auth).await
                         }
                         (Method::POST, p)
                             if p.ends_with("/points/fetch")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_fetch_points(state, req, auth).await
+                            db::vector::handle_fetch_points(state, req, auth).await
                         }
                         (Method::POST, p)
                             if p.ends_with("/points/query")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_query_points(state, req, auth).await
+                            db::vector::handle_query_points(state, req, auth).await
                         }
                         (Method::POST, p)
                             if p.ends_with("/indexes/build")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_build_collection_indexes(state, req, auth).await
+                            db::vector::handle_build_collection_indexes(state, req, auth).await
                         }
                         (Method::POST, p)
                             if p.ends_with("/compact")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_compact_collection(state, req, auth).await
+                            db::vector::handle_compact_collection(state, req, auth).await
                         }
                         (Method::GET, p)
                             if p.ends_with("/stats")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_collection_stats(state, req, auth).await
+                            db::vector::handle_collection_stats(state, req, auth).await
                         }
                         (Method::GET, p)
                             if p.ends_with("/changes")
-                                && (p.starts_with("/v1/db/collections/")
-                                    || p.starts_with("/db/collections/")) =>
+                                && p.starts_with("/v1/db/vectors/collections/") =>
                         {
-                            db_vector::handle_collection_changes(state, req, auth).await
+                            db::vector::handle_collection_changes(state, req, auth).await
                         }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/db/collections/")
-                                || p.starts_with("/db/collections/") =>
-                        {
-                            db_vector::handle_get_collection(state, req, auth).await
+                        (Method::GET, p) if p.starts_with("/v1/db/vectors/collections/") => {
+                            db::vector::handle_get_collection(state, req, auth).await
                         }
-                        (Method::DELETE, p)
-                            if p.starts_with("/v1/db/collections/")
-                                || p.starts_with("/db/collections/") =>
-                        {
-                            db_vector::handle_delete_collection(state, req, auth).await
+                        (Method::DELETE, p) if p.starts_with("/v1/db/vectors/collections/") => {
+                            db::vector::handle_delete_collection(state, req, auth).await
                         }
                         // Tag management endpoints
                         (Method::GET, "/v1/tags") | (Method::GET, "/tags") => {
@@ -398,12 +381,35 @@ impl Service<Request<Incoming>> for Router {
                         {
                             conversations::handle_remove_tags(state, req, auth).await
                         }
-                        // Document management endpoints
-                        (Method::GET, "/v1/documents") | (Method::GET, "/documents") => {
-                            documents::handle_list(state, req, auth, plugin_owner).await
+                        // Document/table plane endpoints
+                        (Method::GET, p) if is_db_table_root_path(p) => {
+                            db::table::handle_list(state, req, auth, plugin_owner).await
                         }
-                        (Method::POST, "/v1/documents") | (Method::POST, "/documents") => {
-                            documents::handle_create(state, req, auth, plugin_owner).await
+                        (Method::POST, p)
+                            if is_db_table_root_path(p) || is_db_table_insert_path(p) =>
+                        {
+                            db::table::handle_create(state, req, auth, plugin_owner).await
+                        }
+                        (Method::POST, p) if is_db_table_search_path(p) => {
+                            db::table::handle_search(state, req, auth).await
+                        }
+                        (Method::GET, p) if is_db_table_tags_path(p) => {
+                            db::table::handle_get_tags(state, req, auth).await
+                        }
+                        (Method::POST, p) if is_db_table_tags_path(p) => {
+                            db::table::handle_add_tags(state, req, auth).await
+                        }
+                        (Method::DELETE, p) if is_db_table_tags_path(p) => {
+                            db::table::handle_remove_tags(state, req, auth).await
+                        }
+                        (Method::GET, p) if is_db_table_item_path(p) => {
+                            db::table::handle_get(state, req, auth).await
+                        }
+                        (Method::PATCH, p) if is_db_table_item_path(p) => {
+                            db::table::handle_update(state, req, auth).await
+                        }
+                        (Method::DELETE, p) if is_db_table_item_path(p) => {
+                            db::table::handle_delete(state, req, auth).await
                         }
                         // Stateless file inspect/transform (no storage required)
                         (Method::POST, "/v1/file/inspect") | (Method::POST, "/file/inspect") => {
@@ -423,10 +429,11 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/files") | (Method::GET, "/files") => {
                             files::handle_list(state, req, auth).await
                         }
-                        (Method::GET, p)
-                            if p.starts_with("/v1/blobs/") || p.starts_with("/blobs/") =>
-                        {
-                            files::handle_get_blob(state, req, auth).await
+                        (Method::GET, "/v1/db/blobs") => {
+                            db::blob::handle_list(state, req, auth).await
+                        }
+                        (Method::GET, p) if p.starts_with("/v1/db/blobs/") => {
+                            db::blob::handle_get(state, req, auth).await
                         }
                         (Method::GET, p)
                             if (p.starts_with("/v1/files/") || p.starts_with("/files/"))
@@ -527,52 +534,23 @@ impl Service<Request<Incoming>> for Router {
                                 .body(Full::new(Bytes::new()).boxed())
                                 .unwrap()
                         }
-                        (Method::POST, "/v1/documents/search")
-                        | (Method::POST, "/documents/search") => {
-                            documents::handle_search(state, req, auth).await
+                        // DB KV plane endpoints
+                        (Method::GET, "/v1/db/kv/pins") => {
+                            db::kv::handle_list(state, req, auth).await
                         }
-                        (Method::GET, p)
-                            if (p.starts_with("/v1/documents/")
-                                || p.starts_with("/documents/"))
-                                && !p.ends_with("/tags") =>
-                        {
-                            documents::handle_get(state, req, auth).await
+                        (Method::POST, "/v1/db/kv/pins") => {
+                            db::kv::handle_put(state, req, auth).await
                         }
-                        (Method::PATCH, p)
-                            if (p.starts_with("/v1/documents/")
-                                || p.starts_with("/documents/"))
-                                && !p.ends_with("/tags") =>
-                        {
-                            documents::handle_update(state, req, auth).await
+                        (Method::DELETE, p) if p.starts_with("/v1/db/kv/pins/") => {
+                            db::kv::handle_delete(state, req, auth).await
                         }
-                        (Method::DELETE, p)
-                            if (p.starts_with("/v1/documents/")
-                                || p.starts_with("/documents/"))
-                                && !p.ends_with("/tags") =>
-                        {
-                            documents::handle_delete(state, req, auth).await
+                        // DB SQL plane endpoints
+                        (Method::POST, "/v1/db/sql/query") => {
+                            db::sql::handle_query(state, req, auth).await
                         }
-                        // Document tag endpoints
-                        (Method::GET, p)
-                            if (p.starts_with("/v1/documents/")
-                                || p.starts_with("/documents/"))
-                                && p.ends_with("/tags") =>
-                        {
-                            documents::handle_get_tags(state, req, auth).await
-                        }
-                        (Method::POST, p)
-                            if (p.starts_with("/v1/documents/")
-                                || p.starts_with("/documents/"))
-                                && p.ends_with("/tags") =>
-                        {
-                            documents::handle_add_tags(state, req, auth).await
-                        }
-                        (Method::DELETE, p)
-                            if (p.starts_with("/v1/documents/")
-                                || p.starts_with("/documents/"))
-                                && p.ends_with("/tags") =>
-                        {
-                            documents::handle_remove_tags(state, req, auth).await
+                        // DB ops plane endpoints
+                        (Method::POST, p) if p.starts_with("/v1/db/ops/") => {
+                            db::ops::handle(state, req, auth).await
                         }
                         // Plugin discovery
                         (Method::GET, "/v1/plugins") | (Method::GET, "/plugins") => {
@@ -726,6 +704,54 @@ fn authenticate(
             "Unknown tenant id",
         )),
     }
+}
+
+fn is_db_table_root_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
+        return false;
+    };
+    !stripped.is_empty() && !stripped.contains('/')
+}
+
+fn is_db_table_insert_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
+        return false;
+    };
+    let mut parts = stripped.split('/');
+    let table = parts.next().unwrap_or("");
+    let action = parts.next().unwrap_or("");
+    table != "" && action == "insert" && parts.next().is_none()
+}
+
+fn is_db_table_search_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
+        return false;
+    };
+    let mut parts = stripped.split('/');
+    let table = parts.next().unwrap_or("");
+    let action = parts.next().unwrap_or("");
+    table != "" && action == "search" && parts.next().is_none()
+}
+
+fn is_db_table_item_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
+        return false;
+    };
+    let mut parts = stripped.split('/');
+    let table = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    table != "" && id != "" && id != "search" && id != "insert" && parts.next().is_none()
+}
+
+fn is_db_table_tags_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
+        return false;
+    };
+    let mut parts = stripped.split('/');
+    let table = parts.next().unwrap_or("");
+    let id = parts.next().unwrap_or("");
+    let tags = parts.next().unwrap_or("");
+    table != "" && id != "" && tags == "tags" && parts.next().is_none()
 }
 
 fn is_known_path(path: &str) -> bool {

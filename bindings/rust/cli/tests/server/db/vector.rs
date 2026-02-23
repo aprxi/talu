@@ -8,7 +8,7 @@ use tempfile::TempDir;
 fn create_collection(ctx: &ServerTestContext, name: &str, dims: u32) {
     let resp = post_json(
         ctx.addr(),
-        "/v1/db/collections",
+        "/v1/db/vectors/collections",
         &json!({
             "name": name,
             "dims": dims
@@ -50,7 +50,7 @@ fn create_collection_minimal_defaults() {
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/db/collections",
+        "/v1/db/vectors/collections",
         &json!({
             "name": "docs-1536",
             "dims": 1536
@@ -81,10 +81,10 @@ fn create_collection_idempotent_same_config() {
         "id_type": "u64"
     });
 
-    let first = post_json(ctx.addr(), "/v1/db/collections", &body);
+    let first = post_json(ctx.addr(), "/v1/db/vectors/collections", &body);
     assert_eq!(first.status, 201, "body: {}", first.body);
 
-    let second = post_json(ctx.addr(), "/v1/db/collections", &body);
+    let second = post_json(ctx.addr(), "/v1/db/vectors/collections", &body);
     assert_eq!(second.status, 200, "body: {}", second.body);
 
     let second_json = second.json();
@@ -100,7 +100,7 @@ fn create_collection_conflict_different_config() {
 
     let first = post_json(
         ctx.addr(),
-        "/v1/db/collections",
+        "/v1/db/vectors/collections",
         &json!({
             "name": "embeddings",
             "dims": 768
@@ -110,7 +110,7 @@ fn create_collection_conflict_different_config() {
 
     let second = post_json(
         ctx.addr(),
-        "/v1/db/collections",
+        "/v1/db/vectors/collections",
         &json!({
             "name": "embeddings",
             "dims": 1536
@@ -128,23 +128,23 @@ fn list_get_and_delete_collection() {
 
     create_collection(&ctx, "c1", 256);
 
-    let list = get(ctx.addr(), "/v1/db/collections");
+    let list = get(ctx.addr(), "/v1/db/vectors/collections");
     assert_eq!(list.status, 200, "body: {}", list.body);
     let list_json = list.json();
     let data = list_json["data"].as_array().expect("data array");
     assert_eq!(data.len(), 1);
     assert_eq!(data[0]["name"], "c1");
 
-    let get_one = get(ctx.addr(), "/v1/db/collections/c1");
+    let get_one = get(ctx.addr(), "/v1/db/vectors/collections/c1");
     assert_eq!(get_one.status, 200, "body: {}", get_one.body);
     let one_json = get_one.json();
     assert_eq!(one_json["name"], "c1");
     assert_eq!(one_json["dims"], 256);
 
-    let del = delete(ctx.addr(), "/v1/db/collections/c1");
+    let del = delete(ctx.addr(), "/v1/db/vectors/collections/c1");
     assert_eq!(del.status, 204, "body: {}", del.body);
 
-    let missing = get(ctx.addr(), "/v1/db/collections/c1");
+    let missing = get(ctx.addr(), "/v1/db/vectors/collections/c1");
     assert_eq!(missing.status, 404, "body: {}", missing.body);
     let missing_json = missing.json();
     assert_eq!(missing_json["error"]["code"], "collection_not_found");
@@ -159,7 +159,7 @@ fn append_and_query_single_vector() {
 
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 1, "values": [1.0, 0.0, 0.0] },
@@ -173,7 +173,7 @@ fn append_and_query_single_vector() {
 
     let query = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/query",
+        "/v1/db/vectors/collections/emb/points/query",
         &json!({
             "vector": [1.0, 0.0, 0.0],
             "top_k": 1
@@ -197,7 +197,7 @@ fn append_rejects_dimension_mismatch_and_duplicate_request_ids() {
 
     let mismatch = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 1, "values": [1.0, 0.0] }
@@ -210,7 +210,7 @@ fn append_rejects_dimension_mismatch_and_duplicate_request_ids() {
 
     let duplicate = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 42, "values": [1.0, 0.0, 0.0] },
@@ -232,7 +232,7 @@ fn query_batch_returns_per_query_matches() {
 
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 10, "values": [1.0, 0.0, 0.0] },
@@ -244,7 +244,7 @@ fn query_batch_returns_per_query_matches() {
 
     let query = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/query",
+        "/v1/db/vectors/collections/emb/points/query",
         &json!({
             "queries": [
                 [1.0, 0.0, 0.0],
@@ -270,7 +270,7 @@ fn query_accepts_approximate_flag() {
 
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 10, "values": [1.0, 0.0, 0.0] },
@@ -282,7 +282,7 @@ fn query_accepts_approximate_flag() {
 
     let query = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/query",
+        "/v1/db/vectors/collections/emb/points/query",
         &json!({
             "vector": [1.0, 0.0, 0.0],
             "top_k": 1,
@@ -302,7 +302,7 @@ fn query_rejects_invalid_shape_and_top_k_zero() {
 
     let invalid_shape = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/query",
+        "/v1/db/vectors/collections/emb/points/query",
         &json!({
             "vector": [1.0, 0.0, 0.0],
             "queries": [[1.0, 0.0, 0.0]],
@@ -319,7 +319,7 @@ fn query_rejects_invalid_shape_and_top_k_zero() {
 
     let zero_top_k = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/query",
+        "/v1/db/vectors/collections/emb/points/query",
         &json!({
             "vector": [1.0, 0.0, 0.0],
             "top_k": 0
@@ -375,12 +375,10 @@ fn db_openapi_includes_query_compact_and_index_build_request_fields() {
             .is_some(),
         "missing BuildIndexesRequest.max_segments"
     );
-    assert!(
-        json["paths"]
-            .get("/v1/db/collections/{name}/indexes/build")
-            .is_some(),
-        "missing indexes/build path"
-    );
+    let has_indexes_build_path = json["paths"]
+        .as_object()
+        .is_some_and(|paths| paths.keys().any(|key| key.contains("/indexes/build")));
+    assert!(has_indexes_build_path, "missing indexes/build path");
     assert!(
         schemas["CollectionStatsResponse"]["properties"]
             .get("manifest_generation")
@@ -416,7 +414,7 @@ fn fetch_delete_and_upsert_work_with_tombstone_visibility() {
 
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 1, "values": [1.0, 0.0, 0.0] },
@@ -428,7 +426,7 @@ fn fetch_delete_and_upsert_work_with_tombstone_visibility() {
 
     let fetch_without_values = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/fetch",
+        "/v1/db/vectors/collections/emb/points/fetch",
         &json!({
             "ids": [1, "2"],
             "include_values": false
@@ -448,7 +446,7 @@ fn fetch_delete_and_upsert_work_with_tombstone_visibility() {
 
     let delete_resp = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/delete",
+        "/v1/db/vectors/collections/emb/points/delete",
         &json!({ "ids": [2, 999] }),
     );
     assert_eq!(delete_resp.status, 200, "body: {}", delete_resp.body);
@@ -458,7 +456,7 @@ fn fetch_delete_and_upsert_work_with_tombstone_visibility() {
 
     let fetch_after_delete = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/fetch",
+        "/v1/db/vectors/collections/emb/points/fetch",
         &json!({ "ids": [1, 2] }),
     );
     assert_eq!(
@@ -473,7 +471,7 @@ fn fetch_delete_and_upsert_work_with_tombstone_visibility() {
 
     let upsert = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/upsert",
+        "/v1/db/vectors/collections/emb/points/upsert",
         &json!({
             "vectors": [
                 { "id": 2, "values": [0.0, 0.0, 1.0] }
@@ -485,7 +483,7 @@ fn fetch_delete_and_upsert_work_with_tombstone_visibility() {
 
     let fetch_after_upsert = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/fetch",
+        "/v1/db/vectors/collections/emb/points/fetch",
         &json!({ "ids": [2] }),
     );
     assert_eq!(
@@ -508,7 +506,7 @@ fn stats_changes_and_compact_reflect_lifecycle() {
 
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 1, "values": [1.0, 0.0, 0.0] },
@@ -520,12 +518,12 @@ fn stats_changes_and_compact_reflect_lifecycle() {
 
     let delete_resp = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/delete",
+        "/v1/db/vectors/collections/emb/points/delete",
         &json!({ "ids": [2] }),
     );
     assert_eq!(delete_resp.status, 200, "body: {}", delete_resp.body);
 
-    let stats_before = get(ctx.addr(), "/v1/db/collections/emb/stats");
+    let stats_before = get(ctx.addr(), "/v1/db/vectors/collections/emb/stats");
     assert_eq!(stats_before.status, 200, "body: {}", stats_before.body);
     let stats_json = stats_before.json();
     assert_eq!(stats_json["visible_count"], 1);
@@ -538,20 +536,24 @@ fn stats_changes_and_compact_reflect_lifecycle() {
 
     let changes = get(
         ctx.addr(),
-        "/v1/db/collections/emb/changes?since=0&limit=10",
+        "/v1/db/vectors/collections/emb/changes?since=0&limit=10",
     );
     assert_eq!(changes.status, 200, "body: {}", changes.body);
     let changes_json = changes.json();
     let data = changes_json["data"].as_array().expect("changes data");
     assert_eq!(data.len(), 3, "append, append, delete");
 
-    let compact = post_json(ctx.addr(), "/v1/db/collections/emb/compact", &json!({}));
+    let compact = post_json(
+        ctx.addr(),
+        "/v1/db/vectors/collections/emb/compact",
+        &json!({}),
+    );
     assert_eq!(compact.status, 200, "body: {}", compact.body);
     let compact_json = compact.json();
     assert_eq!(compact_json["kept_count"], 1);
     assert_eq!(compact_json["removed_tombstones"], 1);
 
-    let stats_after = get(ctx.addr(), "/v1/db/collections/emb/stats");
+    let stats_after = get(ctx.addr(), "/v1/db/vectors/collections/emb/stats");
     assert_eq!(stats_after.status, 200, "body: {}", stats_after.body);
     let stats_json = stats_after.json();
     assert_eq!(stats_json["visible_count"], 1);
@@ -563,7 +565,7 @@ fn stats_changes_and_compact_reflect_lifecycle() {
 
     let changes_after = get(
         ctx.addr(),
-        "/v1/db/collections/emb/changes?since=0&limit=10",
+        "/v1/db/vectors/collections/emb/changes?since=0&limit=10",
     );
     assert_eq!(changes_after.status, 200, "body: {}", changes_after.body);
     let data = changes_after.json()["data"]
@@ -584,7 +586,7 @@ fn compact_with_expected_generation_returns_generation_conflict() {
     create_collection(&ctx, "emb", 3);
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 1, "values": [1.0, 0.0, 0.0] }
@@ -595,7 +597,7 @@ fn compact_with_expected_generation_returns_generation_conflict() {
 
     let compact = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/compact",
+        "/v1/db/vectors/collections/emb/compact",
         &json!({
             "expected_generation": u64::MAX
         }),
@@ -613,7 +615,7 @@ fn compact_with_ttl_removes_expired_tombstones() {
 
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &json!({
             "vectors": [
                 { "id": 1, "values": [1.0, 0.0, 0.0] },
@@ -625,14 +627,14 @@ fn compact_with_ttl_removes_expired_tombstones() {
 
     let delete_resp = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/points/delete",
+        "/v1/db/vectors/collections/emb/points/delete",
         &json!({ "ids": [2] }),
     );
     assert_eq!(delete_resp.status, 200, "body: {}", delete_resp.body);
 
     let compact = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/compact",
+        "/v1/db/vectors/collections/emb/compact",
         &json!({
             "ttl_max_age_ms": 0,
             "now_ms": 4_102_444_800_000_i64
@@ -643,7 +645,7 @@ fn compact_with_ttl_removes_expired_tombstones() {
     assert_eq!(compact_json["kept_count"], 1);
     assert_eq!(compact_json["removed_tombstones"], 1);
 
-    let stats = get(ctx.addr(), "/v1/db/collections/emb/stats");
+    let stats = get(ctx.addr(), "/v1/db/vectors/collections/emb/stats");
     assert_eq!(stats.status, 200, "body: {}", stats.body);
     assert_eq!(stats.json()["tombstone_count"], 0);
 }
@@ -656,7 +658,7 @@ fn compact_rejects_combined_ttl_and_generation_options() {
     create_collection(&ctx, "emb", 3);
     let compact = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/compact",
+        "/v1/db/vectors/collections/emb/compact",
         &json!({
             "expected_generation": 1,
             "ttl_max_age_ms": 0
@@ -674,7 +676,7 @@ fn build_indexes_with_expected_generation_returns_generation_conflict() {
     create_collection(&ctx, "emb", 3);
     let build = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/indexes/build",
+        "/v1/db/vectors/collections/emb/indexes/build",
         &json!({
             "expected_generation": u64::MAX,
             "max_segments": 8
@@ -692,7 +694,7 @@ fn build_indexes_with_expected_generation_succeeds_for_current_manifest() {
     create_collection(&ctx, "emb", 3);
     let build = post_json(
         ctx.addr(),
-        "/v1/db/collections/emb/indexes/build",
+        "/v1/db/vectors/collections/emb/indexes/build",
         &json!({
             "expected_generation": 0,
             "max_segments": 8
@@ -715,7 +717,7 @@ fn write_endpoints_support_idempotency_replay_and_conflict() {
 
     let first = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &[("Idempotency-Key", "append-key-1")],
         &json!({
             "vectors": [
@@ -727,7 +729,7 @@ fn write_endpoints_support_idempotency_replay_and_conflict() {
 
     let replay = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &[("Idempotency-Key", "append-key-1")],
         &json!({
             "vectors": [
@@ -739,7 +741,7 @@ fn write_endpoints_support_idempotency_replay_and_conflict() {
 
     let conflict = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections/emb/points/append",
+        "/v1/db/vectors/collections/emb/points/append",
         &[("Idempotency-Key", "append-key-1")],
         &json!({
             "vectors": [
@@ -752,7 +754,7 @@ fn write_endpoints_support_idempotency_replay_and_conflict() {
 
     let changes = get(
         ctx.addr(),
-        "/v1/db/collections/emb/changes?since=0&limit=20",
+        "/v1/db/vectors/collections/emb/changes?since=0&limit=20",
     );
     assert_eq!(changes.status, 200, "body: {}", changes.body);
     let changes_json = changes.json();
@@ -770,7 +772,7 @@ fn oversized_payload_is_rejected_with_resource_exhausted() {
     let response = send_request(
         ctx.addr(),
         "POST",
-        "/v1/db/collections",
+        "/v1/db/vectors/collections",
         &[("Content-Type", "application/json")],
         Some(&oversized),
     );
@@ -810,7 +812,7 @@ fn db_routes_are_tenant_isolated_by_storage_prefix() {
 
     let create_a = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections",
+        "/v1/db/vectors/collections",
         &tenant_a,
         &json!({ "name": "shared", "dims": 3 }),
     );
@@ -818,7 +820,7 @@ fn db_routes_are_tenant_isolated_by_storage_prefix() {
 
     let append_a = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections/shared/points/append",
+        "/v1/db/vectors/collections/shared/points/append",
         &tenant_a,
         &json!({
             "vectors": [
@@ -830,7 +832,7 @@ fn db_routes_are_tenant_isolated_by_storage_prefix() {
 
     let query_b_before_create = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections/shared/points/query",
+        "/v1/db/vectors/collections/shared/points/query",
         &tenant_b,
         &json!({
             "vector": [1.0, 0.0, 0.0],
@@ -849,7 +851,7 @@ fn db_routes_are_tenant_isolated_by_storage_prefix() {
 
     let create_b = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections",
+        "/v1/db/vectors/collections",
         &tenant_b,
         &json!({ "name": "shared", "dims": 3 }),
     );
@@ -857,7 +859,7 @@ fn db_routes_are_tenant_isolated_by_storage_prefix() {
 
     let query_b_after_create = post_json_with_headers(
         ctx.addr(),
-        "/v1/db/collections/shared/points/query",
+        "/v1/db/vectors/collections/shared/points/query",
         &tenant_b,
         &json!({
             "vector": [1.0, 0.0, 0.0],
@@ -874,9 +876,9 @@ fn db_routes_are_tenant_isolated_by_storage_prefix() {
         .expect("matches")
         .is_empty());
 
-    let list_a = get_with_headers(ctx.addr(), "/v1/db/collections", &tenant_a);
+    let list_a = get_with_headers(ctx.addr(), "/v1/db/vectors/collections", &tenant_a);
     assert_eq!(list_a.status, 200, "body: {}", list_a.body);
-    let list_b = get_with_headers(ctx.addr(), "/v1/db/collections", &tenant_b);
+    let list_b = get_with_headers(ctx.addr(), "/v1/db/vectors/collections", &tenant_b);
     assert_eq!(list_b.status, 200, "body: {}", list_b.body);
 
     let data_a = list_a.json()["data"]
@@ -898,7 +900,7 @@ fn append_to_missing_collection_returns_404() {
 
     let append = post_json(
         ctx.addr(),
-        "/v1/db/collections/missing/points/append",
+        "/v1/db/vectors/collections/missing/points/append",
         &json!({
             "vectors": [
                 { "id": 1, "values": [1.0, 0.0, 0.0] }

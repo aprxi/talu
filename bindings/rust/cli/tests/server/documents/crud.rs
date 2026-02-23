@@ -7,13 +7,13 @@ use crate::server::common::*;
 use tempfile::TempDir;
 
 // =============================================================================
-// GET /v1/documents (list)
+// GET /v1/db/tables/documents (list)
 // =============================================================================
 
 #[test]
 fn list_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = get(ctx.addr(), "/v1/documents");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents");
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -22,7 +22,7 @@ fn list_returns_empty_array_initially() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/documents");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -45,11 +45,11 @@ fn list_returns_created_documents() {
         "title": "Test Prompt",
         "content": {"system": "You are helpful."}
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &create_body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &create_body);
     assert_eq!(resp.status, 201, "create: {}", resp.body);
 
     // List should return the document
-    let resp = get(ctx.addr(), "/v1/documents");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents");
     assert_eq!(resp.status, 200, "list: {}", resp.body);
 
     let json = resp.json();
@@ -67,28 +67,28 @@ fn list_filters_by_type() {
     // Create documents of different types
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Prompt 1", "content": {}
         }),
     );
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "persona", "title": "Persona 1", "content": {}
         }),
     );
     post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Prompt 2", "content": {}
         }),
     );
 
     // Filter by type
-    let resp = get(ctx.addr(), "/v1/documents?type=prompt");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?type=prompt");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -108,7 +108,7 @@ fn list_respects_limit() {
     for i in 0..5 {
         post_json(
             ctx.addr(),
-            "/v1/documents",
+            "/v1/db/tables/documents",
             &serde_json::json!({
                 "type": "note", "title": format!("Note {}", i), "content": {}
             }),
@@ -116,7 +116,7 @@ fn list_respects_limit() {
     }
 
     // List with limit
-    let resp = get(ctx.addr(), "/v1/documents?limit=2");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?limit=2");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -125,7 +125,7 @@ fn list_respects_limit() {
 }
 
 // =============================================================================
-// POST /v1/documents (create)
+// POST /v1/db/tables/documents (create)
 // =============================================================================
 
 #[test]
@@ -136,7 +136,7 @@ fn create_returns_503_without_bucket() {
         "title": "Test",
         "content": {}
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -150,7 +150,7 @@ fn create_returns_document_with_id() {
         "title": "My Prompt",
         "content": {"system": "Be helpful."}
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 201, "body: {}", resp.body);
 
     let json = resp.json();
@@ -172,7 +172,7 @@ fn create_with_tags() {
         "content": {},
         "tags": ["coding", "rust"]
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 201, "body: {}", resp.body);
 
     let json = resp.json();
@@ -191,7 +191,7 @@ fn create_with_owner_id() {
         "content": {"text": "Personal note"},
         "owner_id": "user-123"
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 201, "body: {}", resp.body);
 }
 
@@ -206,7 +206,7 @@ fn create_with_group_id() {
         "content": {},
         "group_id": "team-alpha"
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 201, "body: {}", resp.body);
 }
 
@@ -219,7 +219,7 @@ fn create_requires_type() {
         "title": "No Type",
         "content": {}
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 400, "should reject missing type");
 }
 
@@ -232,18 +232,18 @@ fn create_requires_title() {
         "type": "prompt",
         "content": {}
     });
-    let resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 400, "should reject missing title");
 }
 
 // =============================================================================
-// GET /v1/documents/:id (get)
+// GET /v1/db/tables/documents/:id (get)
 // =============================================================================
 
 #[test]
 fn get_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = get(ctx.addr(), "/v1/documents/some-id");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents/some-id");
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -252,7 +252,7 @@ fn get_returns_404_for_missing() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/documents/nonexistent-id");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents/nonexistent-id");
     assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
@@ -267,12 +267,12 @@ fn get_returns_created_document() {
         "title": "Get Test",
         "content": {"system": "Test content"}
     });
-    let create_resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let create_resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(create_resp.status, 201);
     let doc_id = create_resp.json()["id"].as_str().expect("id").to_string();
 
     // Get
-    let resp = get(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    let resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -296,10 +296,10 @@ fn get_returns_full_content() {
         "title": "Full Content",
         "content": content
     });
-    let create_resp = post_json(ctx.addr(), "/v1/documents", &body);
+    let create_resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     let doc_id = create_resp.json()["id"].as_str().expect("id").to_string();
 
-    let resp = get(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    let resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -308,14 +308,14 @@ fn get_returns_full_content() {
 }
 
 // =============================================================================
-// PATCH /v1/documents/:id (update)
+// PATCH /v1/db/tables/documents/:id (update)
 // =============================================================================
 
 #[test]
 fn patch_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
     let body = serde_json::json!({"title": "Updated"});
-    let resp = patch_json(ctx.addr(), "/v1/documents/some-id", &body);
+    let resp = patch_json(ctx.addr(), "/v1/db/tables/documents/some-id", &body);
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -325,7 +325,7 @@ fn patch_returns_404_for_missing() {
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
     let body = serde_json::json!({"title": "Updated"});
-    let resp = patch_json(ctx.addr(), "/v1/documents/nonexistent", &body);
+    let resp = patch_json(ctx.addr(), "/v1/db/tables/documents/nonexistent", &body);
     assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
@@ -337,7 +337,7 @@ fn patch_updates_title() {
     // Create
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Before", "content": {}
         }),
@@ -347,13 +347,13 @@ fn patch_updates_title() {
     // Patch
     let resp = patch_json(
         ctx.addr(),
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &serde_json::json!({"title": "After"}),
     );
     assert_eq!(resp.status, 200, "patch: {}", resp.body);
 
     // Verify
-    let get_resp = get(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    let get_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert_eq!(get_resp.json()["title"], "After");
 }
 
@@ -364,7 +364,7 @@ fn patch_updates_content() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Content Test", "content": {"v": 1}
         }),
@@ -373,7 +373,7 @@ fn patch_updates_content() {
 
     let resp = patch_json(
         ctx.addr(),
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &serde_json::json!({"content": {"v": 2}}),
     );
     assert_eq!(resp.status, 200, "patch: {}", resp.body);
@@ -386,7 +386,7 @@ fn patch_updates_marker() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Marker Test", "content": {}
         }),
@@ -395,20 +395,20 @@ fn patch_updates_marker() {
 
     let resp = patch_json(
         ctx.addr(),
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &serde_json::json!({"marker": "archived"}),
     );
     assert_eq!(resp.status, 200, "patch: {}", resp.body);
 }
 
 // =============================================================================
-// DELETE /v1/documents/:id (delete)
+// DELETE /v1/db/tables/documents/:id (delete)
 // =============================================================================
 
 #[test]
 fn delete_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = delete(ctx.addr(), "/v1/documents/some-id");
+    let resp = delete(ctx.addr(), "/v1/db/tables/documents/some-id");
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -417,7 +417,7 @@ fn delete_returns_404_for_missing() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let resp = delete(ctx.addr(), "/v1/documents/nonexistent");
+    let resp = delete(ctx.addr(), "/v1/db/tables/documents/nonexistent");
     // May return 404 or 200 depending on implementation (soft delete)
     assert!(
         resp.status == 404 || resp.status == 200,
@@ -434,7 +434,7 @@ fn delete_removes_document() {
     // Create
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "To Delete", "content": {}
         }),
@@ -442,7 +442,7 @@ fn delete_removes_document() {
     let doc_id = create_resp.json()["id"].as_str().expect("id").to_string();
 
     // Delete
-    let resp = delete(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    let resp = delete(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert!(
         resp.status == 200 || resp.status == 204,
         "delete: {}",
@@ -450,7 +450,7 @@ fn delete_removes_document() {
     );
 
     // Verify gone (or marked deleted)
-    let get_resp = get(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    let get_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     // Either 404 (hard delete) or marker=deleted (soft delete)
     assert!(get_resp.status == 404 || get_resp.json()["marker"] == "deleted");
 }
@@ -463,14 +463,14 @@ fn delete_removed_from_list() {
     // Create two documents
     let _keep = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note", "title": "Keep", "content": {}
         }),
     );
     let create2 = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note", "title": "Delete", "content": {}
         }),
@@ -478,10 +478,10 @@ fn delete_removed_from_list() {
     let doc_id2 = create2.json()["id"].as_str().expect("id").to_string();
 
     // Delete second
-    delete(ctx.addr(), &format!("/v1/documents/{}", doc_id2));
+    delete(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id2));
 
     // List should not include deleted (by default)
-    let list_resp = get(ctx.addr(), "/v1/documents");
+    let list_resp = get(ctx.addr(), "/v1/db/tables/documents");
     let json = list_resp.json();
     let data = json["data"].as_array().expect("data");
     // Should only have 1 document now (or 2 if soft-delete without filter)
@@ -504,7 +504,7 @@ fn invalid_json_returns_400() {
     let resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &[("Content-Type", "application/json")],
         Some("not valid json"),
     );
@@ -516,7 +516,7 @@ fn error_responses_have_json_body() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/documents/nonexistent");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents/nonexistent");
     assert_eq!(resp.status, 404);
 
     let json = resp.json();
@@ -544,7 +544,7 @@ fn create_with_ttl_sets_expires_at() {
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "TTL document",
@@ -559,7 +559,7 @@ fn create_with_ttl_sets_expires_at() {
 
     // The create response may or may not include expires_at depending on
     // storage backend read-after-write semantics. Use GET to verify.
-    let get_resp = get(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    let get_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
 
     let get_json = get_resp.json();
@@ -594,7 +594,7 @@ fn create_without_ttl_has_null_expires_at() {
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "No TTL document",
@@ -626,7 +626,7 @@ fn expired_document_returns_404_on_get() {
     // Create a document with a 1-second TTL.
     let ephemeral = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "Ephemeral doc",
@@ -640,7 +640,7 @@ fn expired_document_returns_404_on_get() {
     // Also create a permanent document to ensure non-TTL docs are unaffected.
     let permanent = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "Permanent doc",
@@ -651,7 +651,10 @@ fn expired_document_returns_404_on_get() {
     let permanent_id = permanent.json()["id"].as_str().unwrap().to_string();
 
     // Immediately after creation, the ephemeral document should be visible.
-    let get_before = get(ctx.addr(), &format!("/v1/documents/{}", ephemeral_id));
+    let get_before = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", ephemeral_id),
+    );
     assert_eq!(
         get_before.status, 200,
         "ephemeral doc should be visible before expiration"
@@ -661,7 +664,10 @@ fn expired_document_returns_404_on_get() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // GET should now return 404 for the expired document.
-    let get_after = get(ctx.addr(), &format!("/v1/documents/{}", ephemeral_id));
+    let get_after = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", ephemeral_id),
+    );
     assert_eq!(
         get_after.status, 404,
         "expired document should return 404, body: {}",
@@ -669,7 +675,10 @@ fn expired_document_returns_404_on_get() {
     );
 
     // Permanent document should still be accessible.
-    let get_permanent = get(ctx.addr(), &format!("/v1/documents/{}", permanent_id));
+    let get_permanent = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", permanent_id),
+    );
     assert_eq!(
         get_permanent.status, 200,
         "permanent document should still be accessible"
@@ -697,7 +706,7 @@ fn expired_document_still_appears_in_list() {
     // Create a document with 1-second TTL.
     let ephemeral = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "Ephemeral in list",
@@ -711,7 +720,7 @@ fn expired_document_still_appears_in_list() {
     // Create a permanent document.
     let permanent = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "Permanent in list",
@@ -725,20 +734,26 @@ fn expired_document_still_appears_in_list() {
     std::thread::sleep(std::time::Duration::from_secs(2));
 
     // Direct GET of expired doc → 404.
-    let get_expired = get(ctx.addr(), &format!("/v1/documents/{}", ephemeral_id));
+    let get_expired = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", ephemeral_id),
+    );
     assert_eq!(
         get_expired.status, 404,
         "expired doc should return 404 on direct GET"
     );
 
     // Permanent doc still accessible.
-    let get_permanent = get(ctx.addr(), &format!("/v1/documents/{}", permanent_id));
+    let get_permanent = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}", permanent_id),
+    );
     assert_eq!(get_permanent.status, 200);
 
     // List returns both — expired doc is NOT filtered from list results.
     // NOTE: If this assertion starts failing, TTL filtering was added to
     // list — update to assert the expired doc is absent instead.
-    let list_resp = get(ctx.addr(), "/v1/documents");
+    let list_resp = get(ctx.addr(), "/v1/db/tables/documents");
     assert_eq!(list_resp.status, 200, "body: {}", list_resp.body);
     let data = list_resp.json()["data"]
         .as_array()
@@ -772,7 +787,7 @@ fn patch_null_title_preserves_existing() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "note",
             "title": "Original Title",
@@ -785,7 +800,7 @@ fn patch_null_title_preserves_existing() {
     // PATCH with title: null — should be a no-op for the title.
     let patch_resp = patch_json(
         ctx.addr(),
-        &format!("/v1/documents/{}", doc_id),
+        &format!("/v1/db/tables/documents/{}", doc_id),
         &serde_json::json!({"title": null}),
     );
     assert_eq!(patch_resp.status, 200, "body: {}", patch_resp.body);
@@ -796,7 +811,7 @@ fn patch_null_title_preserves_existing() {
     );
 
     // Verify via GET.
-    let get_resp = get(ctx.addr(), &format!("/v1/documents/{}", doc_id));
+    let get_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
     assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
     assert_eq!(get_resp.json()["title"], "Original Title");
 }
@@ -819,7 +834,7 @@ fn list_has_more_reflects_total_vs_limit() {
     for i in 0..5 {
         let resp = post_json(
             ctx.addr(),
-            "/v1/documents",
+            "/v1/db/tables/documents",
             &serde_json::json!({
                 "type": "note",
                 "title": format!("Doc {}", i),
@@ -830,7 +845,7 @@ fn list_has_more_reflects_total_vs_limit() {
     }
 
     // limit=2 when 5 exist → has_more=true, exactly 2 returned.
-    let resp = get(ctx.addr(), "/v1/documents?limit=2");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?limit=2");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -841,7 +856,7 @@ fn list_has_more_reflects_total_vs_limit() {
     );
 
     // limit=10 when 5 exist → has_more=false, all 5 returned.
-    let resp = get(ctx.addr(), "/v1/documents?limit=10");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?limit=10");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");

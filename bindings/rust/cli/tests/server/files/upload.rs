@@ -54,7 +54,7 @@ fn upload_multipart_creates_file_document() {
     );
 
     // Verify metadata document was created and includes blob_ref.
-    let doc_resp = get(ctx.addr(), &format!("/v1/documents/{}", file_id));
+    let doc_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", file_id));
     assert_eq!(doc_resp.status, 200, "body: {}", doc_resp.body);
     let doc_json = doc_resp.json();
     assert_eq!(doc_json["type"], "file");

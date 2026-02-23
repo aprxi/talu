@@ -1,6 +1,6 @@
 //! C API tests for session search functionality.
 //!
-//! Tests the search_query parameter in talu_storage_list_sessions to ensure
+//! Tests the search_query parameter in talu_db_table_session_list to ensure
 //! sessions can be filtered by title/content text search.
 
 use crate::capi::db::common::TestContext;
@@ -32,7 +32,7 @@ fn list_sessions_with_search(db_path: &str, search_query: &str) -> Vec<String> {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_storage_list_sessions(
+        talu_sys::talu_db_table_session_list(
             c_db_path.as_ptr(),
             0,                       // no limit
             0,                       // no cursor timestamp
@@ -47,7 +47,7 @@ fn list_sessions_with_search(db_path: &str, search_query: &str) -> Vec<String> {
 
     assert_eq!(
         result, 0,
-        "talu_storage_list_sessions with search_query failed"
+        "talu_db_table_session_list with search_query failed"
     );
 
     let mut ids = Vec::new();
@@ -64,7 +64,7 @@ fn list_sessions_with_search(db_path: &str, search_query: &str) -> Vec<String> {
                 }
             }
         }
-        unsafe { talu_sys::talu_storage_free_sessions(c_list) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
     }
 
     ids
@@ -77,7 +77,7 @@ fn list_all_sessions(db_path: &str) -> Vec<String> {
     let mut c_list: *mut CSessionList = ptr::null_mut();
 
     let result = unsafe {
-        talu_sys::talu_storage_list_sessions(
+        talu_sys::talu_db_table_session_list(
             c_db_path.as_ptr(),
             0,           // no limit
             0,           // no cursor timestamp
@@ -90,7 +90,7 @@ fn list_all_sessions(db_path: &str) -> Vec<String> {
         )
     };
 
-    assert_eq!(result, 0, "talu_storage_list_sessions failed");
+    assert_eq!(result, 0, "talu_db_table_session_list failed");
 
     let mut ids = Vec::new();
     if !c_list.is_null() {
@@ -106,7 +106,7 @@ fn list_all_sessions(db_path: &str) -> Vec<String> {
                 }
             }
         }
-        unsafe { talu_sys::talu_storage_free_sessions(c_list) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
     }
 
     ids
@@ -257,7 +257,7 @@ fn search_sessions_stress_alloc_free() {
             let mut c_list: *mut CSessionList = ptr::null_mut();
 
             let result = unsafe {
-                talu_sys::talu_storage_list_sessions(
+                talu_sys::talu_db_table_session_list(
                     c_db_path.as_ptr(),
                     0,
                     0,
@@ -277,7 +277,7 @@ fn search_sessions_stress_alloc_free() {
             );
 
             if !c_list.is_null() {
-                unsafe { talu_sys::talu_storage_free_sessions(c_list) };
+                unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
             }
         }
     }

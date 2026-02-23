@@ -81,7 +81,7 @@ fn sequential_open_close_no_corruption() {
 
 /// Concurrent get_session calls must not return corrupted session_ids.
 ///
-/// Regression test for a static-buffer race in talu_storage_get_session_info.
+/// Regression test for a static-buffer race in talu_db_table_session_get.
 /// The C function copies output strings into process-global static buffers.
 /// Without thread-local storage, concurrent calls overwrite each other's
 /// output between the C return and the Rust cstr_to_string copy.

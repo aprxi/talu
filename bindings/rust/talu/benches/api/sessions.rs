@@ -4,7 +4,7 @@
 //! Content is varied by topic so we can benchmark partial matches vs full scans.
 //!
 //! Search path: StorageHandle::list_sessions_paginated(query=...)
-//!   → FFI talu_storage_list_sessions → core scanSessionsFiltered
+//!   → FFI talu_db_table_session_list → core scanSessionsFiltered
 //!   → collectContentMatchHashes (content scan) + metadata substring match.
 
 use criterion::Criterion;

@@ -186,7 +186,7 @@ pub(crate) struct DocumentTagsRequest {
 // Handlers
 // =============================================================================
 
-#[utoipa::path(get, path = "/v1/documents", tag = "Documents",
+#[utoipa::path(get, path = "/v1/db/tables/documents", tag = "Documents",
     params(
         ("limit" = Option<u32>, Query, description = "Max items to return (default 100)"),
         ("type" = Option<String>, Query, description = "Filter by document type"),
@@ -195,13 +195,17 @@ pub(crate) struct DocumentTagsRequest {
         ("owner_id" = Option<String>, Query, description = "Filter by owner ID"),
     ),
     responses((status = 200, body = DocumentListResponse)))]
-/// GET /v1/documents - List documents
+/// GET /v1/db/tables/documents - List documents
 pub async fn handle_list(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
     plugin_owner: Option<String>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let bucket = match state.bucket_path.as_ref() {
         Some(p) => p,
         None => {
@@ -272,18 +276,22 @@ pub async fn handle_list(
     json_response(StatusCode::OK, &response)
 }
 
-#[utoipa::path(get, path = "/v1/documents/{doc_id}", tag = "Documents",
+#[utoipa::path(get, path = "/v1/db/tables/documents/{doc_id}", tag = "Documents",
     params(("doc_id" = String, Path, description = "Document ID")),
     responses(
         (status = 200, body = DocumentResponse),
         (status = 404, body = http::ErrorResponse, description = "Document not found"),
     ))]
-/// GET /v1/documents/:id - Get a document
+/// GET /v1/db/tables/documents/:id - Get a document
 pub async fn handle_get(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let path = req.uri().path();
     let doc_id = extract_doc_id(path);
 
@@ -323,19 +331,23 @@ pub async fn handle_get(
     json_response(StatusCode::OK, &DocumentResponse::from(doc))
 }
 
-#[utoipa::path(post, path = "/v1/documents", tag = "Documents",
+#[utoipa::path(post, path = "/v1/db/tables/documents", tag = "Documents",
     request_body = CreateDocumentRequest,
     responses(
         (status = 201, body = DocumentResponse),
         (status = 400, body = http::ErrorResponse, description = "Invalid request body"),
     ))]
-/// POST /v1/documents - Create a document
+/// POST /v1/db/tables/documents - Create a document
 pub async fn handle_create(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
     plugin_owner: Option<String>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let bucket = match state.bucket_path.as_ref() {
         Some(p) => p,
         None => {
@@ -436,16 +448,20 @@ pub async fn handle_create(
     json_response(StatusCode::CREATED, &DocumentResponse::from(doc))
 }
 
-#[utoipa::path(patch, path = "/v1/documents/{doc_id}", tag = "Documents",
+#[utoipa::path(patch, path = "/v1/db/tables/documents/{doc_id}", tag = "Documents",
     params(("doc_id" = String, Path, description = "Document ID")),
     request_body = UpdateDocumentRequest,
     responses((status = 200, body = DocumentResponse)))]
-/// PATCH /v1/documents/:id - Update a document
+/// PATCH /v1/db/tables/documents/:id - Update a document
 pub async fn handle_update(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let path = req.uri().path().to_string();
     let doc_id = extract_doc_id(&path);
 
@@ -508,15 +524,19 @@ pub async fn handle_update(
     json_response(StatusCode::OK, &DocumentResponse::from(doc))
 }
 
-#[utoipa::path(delete, path = "/v1/documents/{doc_id}", tag = "Documents",
+#[utoipa::path(delete, path = "/v1/db/tables/documents/{doc_id}", tag = "Documents",
     params(("doc_id" = String, Path, description = "Document ID")),
     responses((status = 204)))]
-/// DELETE /v1/documents/:id - Delete a document
+/// DELETE /v1/db/tables/documents/:id - Delete a document
 pub async fn handle_delete(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let path = req.uri().path();
     let doc_id = extract_doc_id(path);
 
@@ -551,15 +571,19 @@ pub async fn handle_delete(
         .unwrap()
 }
 
-#[utoipa::path(post, path = "/v1/documents/search", tag = "Documents",
+#[utoipa::path(post, path = "/v1/db/tables/documents/search", tag = "Documents",
     request_body = DocumentSearchRequest,
     responses((status = 200, body = DocumentSearchResponse)))]
-/// POST /v1/documents/search - Search documents
+/// POST /v1/db/tables/documents/search - Search documents
 pub async fn handle_search(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let bucket = match state.bucket_path.as_ref() {
         Some(p) => p,
         None => {
@@ -607,15 +631,19 @@ pub async fn handle_search(
     json_response(StatusCode::OK, &response)
 }
 
-#[utoipa::path(get, path = "/v1/documents/{doc_id}/tags", tag = "Documents",
+#[utoipa::path(get, path = "/v1/db/tables/documents/{doc_id}/tags", tag = "Documents",
     params(("doc_id" = String, Path, description = "Document ID")),
     responses((status = 200)))]
-/// GET /v1/documents/:id/tags - Get document tags
+/// GET /v1/db/tables/documents/:id/tags - Get document tags
 pub async fn handle_get_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let path = req.uri().path();
     let doc_id = extract_doc_id_before_tags(path);
 
@@ -648,16 +676,20 @@ pub async fn handle_get_tags(
     json_response(StatusCode::OK, &serde_json::json!({ "tags": tags }))
 }
 
-#[utoipa::path(post, path = "/v1/documents/{doc_id}/tags", tag = "Documents",
+#[utoipa::path(post, path = "/v1/db/tables/documents/{doc_id}/tags", tag = "Documents",
     params(("doc_id" = String, Path, description = "Document ID")),
     request_body = DocumentTagsRequest,
     responses((status = 200)))]
-/// POST /v1/documents/:id/tags - Add tags to document
+/// POST /v1/db/tables/documents/:id/tags - Add tags to document
 pub async fn handle_add_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let path = req.uri().path().to_string();
     let doc_id = extract_doc_id_before_tags(&path);
 
@@ -709,16 +741,20 @@ pub async fn handle_add_tags(
     json_response(StatusCode::OK, &serde_json::json!({ "tags": tags }))
 }
 
-#[utoipa::path(delete, path = "/v1/documents/{doc_id}/tags", tag = "Documents",
+#[utoipa::path(delete, path = "/v1/db/tables/documents/{doc_id}/tags", tag = "Documents",
     params(("doc_id" = String, Path, description = "Document ID")),
     request_body = DocumentTagsRequest,
     responses((status = 200)))]
-/// DELETE /v1/documents/:id/tags - Remove tags from document
+/// DELETE /v1/db/tables/documents/:id/tags - Remove tags from document
 pub async fn handle_remove_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    if let Err(resp) = ensure_documents_table(req.uri().path()) {
+        return resp;
+    }
+
     let path = req.uri().path().to_string();
     let doc_id = extract_doc_id_before_tags(&path);
 
@@ -775,28 +811,48 @@ pub async fn handle_remove_tags(
 // =============================================================================
 
 fn extract_doc_id(path: &str) -> &str {
-    // Path is /v1/documents/:id or /documents/:id
-    let stripped = path
-        .strip_prefix("/v1/documents/")
-        .or_else(|| path.strip_prefix("/documents/"))
-        .unwrap_or("");
-    // Remove any trailing path segments
-    stripped.split('/').next().unwrap_or("")
+    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
+        return "";
+    };
+    let mut parts = stripped.split('/');
+    let _table_name = parts.next();
+    parts.next().unwrap_or("")
 }
 
 fn extract_doc_id_before_tags(path: &str) -> &str {
-    // Path is /v1/documents/:id/tags or /documents/:id/tags
-    let stripped = path
-        .strip_prefix("/v1/documents/")
-        .or_else(|| path.strip_prefix("/documents/"))
-        .unwrap_or("");
-    // Get the ID before /tags
-    stripped
-        .strip_suffix("/tags")
-        .unwrap_or(stripped)
-        .split('/')
-        .next()
-        .unwrap_or("")
+    let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
+        return "";
+    };
+    let without_tags = stripped.strip_suffix("/tags").unwrap_or(stripped);
+    let mut parts = without_tags.split('/');
+    let _table_name = parts.next();
+    parts.next().unwrap_or("")
+}
+
+fn extract_table_name(path: &str) -> Option<&str> {
+    let stripped = path.strip_prefix("/v1/db/tables/")?;
+    let table_name = stripped.split('/').next().unwrap_or("");
+    if table_name.is_empty() {
+        None
+    } else {
+        Some(table_name)
+    }
+}
+
+fn ensure_documents_table(path: &str) -> Result<(), Response<BoxBody>> {
+    match extract_table_name(path) {
+        Some("documents") => Ok(()),
+        Some(table) => Err(json_error(
+            StatusCode::NOT_IMPLEMENTED,
+            "table_not_supported",
+            &format!("table '{table}' is not supported yet"),
+        )),
+        None => Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "missing table name in path",
+        )),
+    }
 }
 
 /// Simple query parameter parser.

@@ -114,7 +114,7 @@ class VectorStore:
         path_bytes = path_str.encode("utf-8")
 
         handle = c_void_p()
-        rc = self._lib.talu_vector_store_init(path_bytes, byref(handle))
+        rc = self._lib.talu_db_vector_init(path_bytes, byref(handle))
         check(rc, {"operation": "vector_store_init", "path": path_str})
 
         self._handle = handle
@@ -127,7 +127,7 @@ class VectorStore:
         """
         if self._closed or self._handle is None:
             return
-        self._lib.talu_vector_store_free(self._handle)
+        self._lib.talu_db_vector_free(self._handle)
         self._handle = None
         self._closed = True
 
@@ -195,7 +195,7 @@ class VectorStore:
         ids_ptr = (c_uint64 * count).from_buffer(ids)
         vectors_ptr = (c_float * len(vectors)).from_buffer(vectors)
 
-        rc = self._lib.talu_vector_store_append(
+        rc = self._lib.talu_db_vector_append(
             self._handle,
             ids_ptr,
             vectors_ptr,
@@ -226,7 +226,7 @@ class VectorStore:
         out_count = c_size_t()
         out_dims = c_uint32()
 
-        rc = self._lib.talu_vector_store_load(
+        rc = self._lib.talu_db_vector_load(
             self._handle,
             byref(out_ids),
             byref(out_vectors),
@@ -251,7 +251,7 @@ class VectorStore:
             vectors.extend(vectors_array)
 
             # Free Zig-allocated buffers
-            self._lib.talu_vector_store_free_load(
+            self._lib.talu_db_vector_free_load(
                 out_ids,
                 cast(out_vectors, POINTER(c_float)),
                 c_size_t(count),
@@ -293,7 +293,7 @@ class VectorStore:
         out_scores = c_void_p()
         out_count = c_size_t()
 
-        rc = self._lib.talu_vector_store_search(
+        rc = self._lib.talu_db_vector_search(
             self._handle,
             query_ptr,
             c_size_t(len(query)),
@@ -318,7 +318,7 @@ class VectorStore:
             scores.extend(scores_array)
 
             # Free Zig-allocated buffers
-            self._lib.talu_vector_store_free_search(
+            self._lib.talu_db_vector_free_search(
                 out_ids,
                 cast(out_scores, POINTER(c_float)),
                 c_size_t(count),
@@ -368,7 +368,7 @@ class VectorStore:
         out_scores = c_void_p()
         out_count_per_query = c_uint32()
 
-        rc = self._lib.talu_vector_store_search_batch(
+        rc = self._lib.talu_db_vector_search_batch(
             self._handle,
             query_ptr,
             c_size_t(len(queries)),
@@ -396,7 +396,7 @@ class VectorStore:
             scores.extend(scores_array)
 
             # Free Zig-allocated buffers
-            self._lib.talu_vector_store_free_search_batch(
+            self._lib.talu_db_vector_free_search_batch(
                 out_ids,
                 cast(out_scores, POINTER(c_float)),
                 c_uint32(count_per_query),
@@ -425,7 +425,7 @@ class VectorStore:
         if mode not in values:
             raise ValueError(f"invalid durability mode {mode!r}, expected 'full' or 'async_os'")
 
-        rc = self._lib.talu_vector_store_set_durability(self._handle, c_uint8(values[mode]))
+        rc = self._lib.talu_db_vector_set_durability(self._handle, c_uint8(values[mode]))
         check(rc, {"operation": "vector_store_set_durability"})
 
     def scan(self, query: array[float]) -> Iterator[tuple[int, float]]:
@@ -500,7 +500,7 @@ class VectorStore:
         out_total_rows = c_size_t()
 
         # First call to get total_rows without allocating buffers
-        rc = self._lib.talu_vector_store_scan_batch(
+        rc = self._lib.talu_db_vector_scan_batch(
             self._handle,
             query_ptr,
             c_size_t(len(queries)),
@@ -525,7 +525,7 @@ class VectorStore:
         ids_ptr = (c_uint64 * total_rows).from_buffer(ids)
         scores_ptr = (c_float * (total_rows * query_count)).from_buffer(scores)
 
-        rc = self._lib.talu_vector_store_scan_batch(
+        rc = self._lib.talu_db_vector_scan_batch(
             self._handle,
             query_ptr,
             c_size_t(len(queries)),
@@ -693,7 +693,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_documents_create(
+        rc = self._lib.talu_db_table_create(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(doc_type),
@@ -730,7 +730,7 @@ class DocumentStore:
 
         out_doc = CDocumentRecord()
 
-        rc = self._lib.talu_documents_get(
+        rc = self._lib.talu_db_table_get(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_doc),
@@ -795,7 +795,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_documents_update(
+        rc = self._lib.talu_db_table_update(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(title),
@@ -833,7 +833,7 @@ class DocumentStore:
         out_has_external = c_bool(False)
         out_ref = ctypes.create_string_buffer(128)
 
-        rc = self._lib.talu_documents_get_blob_ref(
+        rc = self._lib.talu_db_table_get_blob_ref(
             self._path_bytes,
             _to_bytes(doc_id),
             out_ref,
@@ -872,7 +872,7 @@ class DocumentStore:
             raise ValidationError("chunk_size must be > 0")
 
         stream = c_void_p()
-        rc = self._lib.talu_blobs_open_stream(
+        rc = self._lib.talu_db_blob_open_stream(
             self._path_bytes,
             _to_bytes(blob_ref),
             byref(stream),
@@ -883,7 +883,7 @@ class DocumentStore:
             buf = (ctypes.c_ubyte * chunk_size)()
             while True:
                 out_read = c_size_t()
-                rc = self._lib.talu_blobs_stream_read(
+                rc = self._lib.talu_db_blob_stream_read(
                     stream,
                     cast(buf, c_void_p),
                     chunk_size,
@@ -895,7 +895,7 @@ class DocumentStore:
                 yield bytes(buf[0 : out_read.value])
         finally:
             if stream.value:
-                self._lib.talu_blobs_stream_close(stream)
+                self._lib.talu_db_blob_stream_close(stream)
 
     def read_blob(self, blob_ref: str, *, chunk_size: int = 64 * 1024) -> bytes:
         """
@@ -930,7 +930,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_documents_delete(
+        rc = self._lib.talu_db_table_delete(
             self._path_bytes,
             _to_bytes(doc_id),
         )
@@ -971,7 +971,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_documents_list(
+        rc = self._lib.talu_db_table_list(
             self._path_bytes,
             _to_bytes(doc_type),
             _to_bytes(group_id),
@@ -1003,7 +1003,7 @@ class DocumentStore:
                     )
 
             # Free the list - pass as pointer
-            self._lib.talu_documents_free_list(c_void_p(out_list.value))
+            self._lib.talu_db_table_free_list(c_void_p(out_list.value))
 
         return results
 
@@ -1042,7 +1042,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_documents_search(
+        rc = self._lib.talu_db_table_search(
             self._path_bytes,
             _to_bytes(query),
             _to_bytes(doc_type),
@@ -1068,7 +1068,7 @@ class DocumentStore:
                         )
                     )
 
-            self._lib.talu_documents_free_search_results(c_void_p(out_list.value))
+            self._lib.talu_db_table_free_search_results(c_void_p(out_list.value))
 
         return results
 
@@ -1119,7 +1119,7 @@ class DocumentStore:
         out_results_json = c_void_p()
         out_results_len = c_size_t()
 
-        rc = self._lib.talu_documents_search_batch(
+        rc = self._lib.talu_db_table_search_batch(
             self._path_bytes,
             queries_json,
             len(queries_json),
@@ -1136,7 +1136,7 @@ class DocumentStore:
             results = json.loads(result_bytes.decode("utf-8"))
 
             # Free the JSON buffer
-            self._lib.talu_documents_free_json(out_results_json, out_results_len)
+            self._lib.talu_db_table_free_json(out_results_json, out_results_len)
 
         return results
 
@@ -1168,7 +1168,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_documents_add_tag(
+        rc = self._lib.talu_db_table_add_tag(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(tag_id),
@@ -1200,7 +1200,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_documents_remove_tag(
+        rc = self._lib.talu_db_table_remove_tag(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(tag_id),
@@ -1230,7 +1230,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_documents_get_tags(
+        rc = self._lib.talu_db_table_get_tags(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_list),
@@ -1261,7 +1261,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_documents_get_by_tag(
+        rc = self._lib.talu_db_table_get_by_tag(
             self._path_bytes,
             _to_bytes(tag_id),
             byref(out_list),
@@ -1287,7 +1287,7 @@ class DocumentStore:
                     if item:
                         results.append(item.decode("utf-8", errors="replace"))
 
-            self._lib.talu_documents_free_string_list(c_void_p(out_list.value))
+            self._lib.talu_db_table_free_string_list(c_void_p(out_list.value))
 
         return results
 
@@ -1312,7 +1312,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_documents_set_ttl(
+        rc = self._lib.talu_db_table_set_ttl(
             self._path_bytes,
             _to_bytes(doc_id),
             ttl_seconds,
@@ -1338,7 +1338,7 @@ class DocumentStore:
 
         out_count = c_size_t()
 
-        rc = self._lib.talu_documents_count_expired(
+        rc = self._lib.talu_db_table_count_expired(
             self._path_bytes,
             byref(out_count),
         )
@@ -1365,7 +1365,7 @@ class DocumentStore:
 
         out_count = c_size_t()
 
-        rc = self._lib.talu_documents_purge_expired(
+        rc = self._lib.talu_db_table_purge_expired(
             self._path_bytes,
             byref(out_count),
         )
@@ -1408,7 +1408,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_documents_get_changes(
+        rc = self._lib.talu_db_table_get_changes(
             self._path_bytes,
             since_seq,
             _to_bytes(group_id),
@@ -1436,7 +1436,7 @@ class DocumentStore:
                         )
                     )
 
-            self._lib.talu_documents_free_changes(c_void_p(out_list.value))
+            self._lib.talu_db_table_free_changes(c_void_p(out_list.value))
 
         return results
 
@@ -1477,7 +1477,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_documents_create_delta(
+        rc = self._lib.talu_db_table_create_delta(
             self._path_bytes,
             _to_bytes(base_doc_id),
             _to_bytes(new_doc_id),
@@ -1510,7 +1510,7 @@ class DocumentStore:
 
         out_is_delta = c_bool()
 
-        rc = self._lib.talu_documents_is_delta(
+        rc = self._lib.talu_db_table_is_delta(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_is_delta),
@@ -1542,7 +1542,7 @@ class DocumentStore:
         buf_size = 256
         out_buf = ctypes.create_string_buffer(buf_size)
 
-        rc = self._lib.talu_documents_get_base_id(
+        rc = self._lib.talu_db_table_get_base_id(
             self._path_bytes,
             _to_bytes(doc_id),
             out_buf,
@@ -1590,7 +1590,7 @@ class DocumentStore:
 
         out_chain = c_void_p()
 
-        rc = self._lib.talu_documents_get_delta_chain(
+        rc = self._lib.talu_db_table_get_delta_chain(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_chain),
@@ -1624,7 +1624,7 @@ class DocumentStore:
                         )
                     )
 
-            self._lib.talu_documents_free_delta_chain(c_void_p(out_chain.value))
+            self._lib.talu_db_table_free_delta_chain(c_void_p(out_chain.value))
 
         return results
 
@@ -1652,7 +1652,7 @@ class DocumentStore:
 
         out_stats = CCompactionStats()
 
-        rc = self._lib.talu_documents_get_compaction_stats(
+        rc = self._lib.talu_db_table_get_compaction_stats(
             self._path_bytes,
             byref(out_stats),
         )
@@ -1687,7 +1687,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_documents_get_garbage_candidates(
+        rc = self._lib.talu_db_table_get_garbage_candidates(
             self._path_bytes,
             byref(out_list),
         )

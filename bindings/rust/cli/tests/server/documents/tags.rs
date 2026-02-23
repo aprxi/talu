@@ -1,22 +1,22 @@
 //! Document tag operations tests.
 //!
 //! Tests tag endpoints for documents:
-//! - GET /v1/documents/:id/tags
-//! - POST /v1/documents/:id/tags
-//! - DELETE /v1/documents/:id/tags
+//! - GET /v1/db/tables/documents/:id/tags
+//! - POST /v1/db/tables/documents/:id/tags
+//! - DELETE /v1/db/tables/documents/:id/tags
 
 use super::{documents_config, no_bucket_config};
 use crate::server::common::*;
 use tempfile::TempDir;
 
 // =============================================================================
-// GET /v1/documents/:id/tags
+// GET /v1/db/tables/documents/:id/tags
 // =============================================================================
 
 #[test]
 fn get_tags_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = get(ctx.addr(), "/v1/documents/some-id/tags");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents/some-id/tags");
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -25,7 +25,7 @@ fn get_tags_returns_empty_for_missing_document() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/documents/nonexistent/tags");
+    let resp = get(ctx.addr(), "/v1/db/tables/documents/nonexistent/tags");
     // Server returns empty tags for non-existent documents (permissive behavior)
     assert!(
         resp.status == 200 || resp.status == 404,
@@ -42,7 +42,7 @@ fn get_tags_returns_empty_initially() {
     // Create document
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "No Tags", "content": {}
         }),
@@ -50,7 +50,10 @@ fn get_tags_returns_empty_initially() {
     let doc_id = create_resp.json()["id"].as_str().expect("id").to_string();
 
     // Get tags
-    let resp = get(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id));
+    let resp = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -66,7 +69,7 @@ fn get_tags_returns_added_tags() {
     // Create document
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Tagged Doc", "content": {}
         }),
@@ -76,14 +79,17 @@ fn get_tags_returns_added_tags() {
     // Add tags
     post_json(
         ctx.addr(),
-        &format!("/v1/documents/{}/tags", doc_id),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
         &serde_json::json!({
             "tags": ["coding", "rust"]
         }),
     );
 
     // Get tags
-    let resp = get(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id));
+    let resp = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
@@ -93,14 +99,14 @@ fn get_tags_returns_added_tags() {
 }
 
 // =============================================================================
-// POST /v1/documents/:id/tags
+// POST /v1/db/tables/documents/:id/tags
 // =============================================================================
 
 #[test]
 fn add_tags_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
     let body = serde_json::json!({"tags": ["test"]});
-    let resp = post_json(ctx.addr(), "/v1/documents/some-id/tags", &body);
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/some-id/tags", &body);
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -110,7 +116,11 @@ fn add_tags_handles_missing_document() {
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
     let body = serde_json::json!({"tags": ["test"]});
-    let resp = post_json(ctx.addr(), "/v1/documents/nonexistent/tags", &body);
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents/nonexistent/tags",
+        &body,
+    );
     // Server may return 404 or accept and store tags (permissive behavior)
     assert!(
         resp.status == 200 || resp.status == 404,
@@ -127,7 +137,7 @@ fn add_tags_succeeds() {
     // Create document
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Add Tags Test", "content": {}
         }),
@@ -136,7 +146,11 @@ fn add_tags_succeeds() {
 
     // Add tags
     let body = serde_json::json!({"tags": ["important", "urgent"]});
-    let resp = post_json(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id), &body);
+    let resp = post_json(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+        &body,
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 }
 
@@ -147,7 +161,7 @@ fn add_tags_idempotent() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Idempotent Test", "content": {}
         }),
@@ -156,12 +170,23 @@ fn add_tags_idempotent() {
 
     // Add same tag twice
     let body = serde_json::json!({"tags": ["duplicate"]});
-    post_json(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id), &body);
-    let resp = post_json(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id), &body);
+    post_json(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+        &body,
+    );
+    let resp = post_json(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+        &body,
+    );
     assert_eq!(resp.status, 200, "adding same tag twice should succeed");
 
     // Should only have one instance
-    let get_resp = get(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id));
+    let get_resp = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+    );
     let json = get_resp.json();
     let tags = json["tags"].as_array().expect("tags");
     // Count occurrences of "duplicate" - should be 1
@@ -186,7 +211,7 @@ fn add_multiple_tags_at_once() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Multi Tags", "content": {}
         }),
@@ -194,17 +219,24 @@ fn add_multiple_tags_at_once() {
     let doc_id = create_resp.json()["id"].as_str().expect("id").to_string();
 
     let body = serde_json::json!({"tags": ["tag1", "tag2", "tag3"]});
-    let resp = post_json(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id), &body);
+    let resp = post_json(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+        &body,
+    );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
-    let get_resp = get(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id));
+    let get_resp = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+    );
     let json = get_resp.json();
     let tags = json["tags"].as_array().expect("tags");
     assert!(tags.len() >= 3, "should have all tags added");
 }
 
 // =============================================================================
-// DELETE /v1/documents/:id/tags
+// DELETE /v1/db/tables/documents/:id/tags
 // =============================================================================
 
 #[test]
@@ -212,7 +244,7 @@ fn remove_tags_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
     let resp = delete_json(
         ctx.addr(),
-        "/v1/documents/some-id/tags",
+        "/v1/db/tables/documents/some-id/tags",
         &serde_json::json!({"tags": ["test"]}),
     );
     assert_eq!(resp.status, 503, "body: {}", resp.body);
@@ -225,7 +257,7 @@ fn remove_tags_handles_missing_document() {
 
     let resp = delete_json(
         ctx.addr(),
-        "/v1/documents/nonexistent/tags",
+        "/v1/db/tables/documents/nonexistent/tags",
         &serde_json::json!({"tags": ["test"]}),
     );
     // Server may return 404 or succeed silently (permissive behavior)
@@ -243,7 +275,7 @@ fn remove_tags_succeeds() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Remove Tags Test", "content": {}
         }),
@@ -253,20 +285,23 @@ fn remove_tags_succeeds() {
     // Add tags
     post_json(
         ctx.addr(),
-        &format!("/v1/documents/{}/tags", doc_id),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
         &serde_json::json!({"tags": ["keep", "remove"]}),
     );
 
     // Remove one tag
     let resp = delete_json(
         ctx.addr(),
-        &format!("/v1/documents/{}/tags", doc_id),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
         &serde_json::json!({"tags": ["remove"]}),
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     // Verify
-    let get_resp = get(ctx.addr(), &format!("/v1/documents/{}/tags", doc_id));
+    let get_resp = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
+    );
     let json = get_resp.json();
     let tags = json["tags"].as_array().expect("tags");
     // "remove" should be gone, "keep" should remain
@@ -283,7 +318,7 @@ fn remove_nonexistent_tag_safe() {
 
     let create_resp = post_json(
         ctx.addr(),
-        "/v1/documents",
+        "/v1/db/tables/documents",
         &serde_json::json!({
             "type": "prompt", "title": "Safe Remove Test", "content": {}
         }),
@@ -293,7 +328,7 @@ fn remove_nonexistent_tag_safe() {
     // Remove tag that was never added - should not error
     let resp = delete_json(
         ctx.addr(),
-        &format!("/v1/documents/{}/tags", doc_id),
+        &format!("/v1/db/tables/documents/{}/tags", doc_id),
         &serde_json::json!({"tags": ["never-existed"]}),
     );
     // Should succeed or return 404 for the tag - not 500

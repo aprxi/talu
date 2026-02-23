@@ -1,6 +1,6 @@
 //! Raw blob storage wrappers for TaluDB content-addressable storage.
 //!
-//! Provides safe Rust access to `talu_blobs_*` C-API functions.
+//! Provides safe Rust access to `talu_db_blob_*` C-API functions.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_void};
@@ -113,7 +113,7 @@ impl BlobsHandle {
         // SAFETY: `path_cstr` and `blob_ref_buf` are valid for the duration of the call.
         // `bytes_ptr` is either null with len=0 or points to `bytes` memory with `bytes.len()`.
         let code = unsafe {
-            talu_sys::talu_blobs_put(
+            talu_sys::talu_db_blob_put(
                 self.path_cstr.as_ptr(),
                 bytes_ptr,
                 bytes.len(),
@@ -146,7 +146,7 @@ impl BlobsHandle {
         // SAFETY: `path_cstr` and `blob_ref_c` are valid C strings, and `out_exists`
         // points to writable memory for the output flag.
         let code = unsafe {
-            talu_sys::talu_blobs_exists(
+            talu_sys::talu_db_blob_exists(
                 self.path_cstr.as_ptr(),
                 blob_ref_c.as_ptr(),
                 &mut out_exists as *mut _ as *mut c_void,
@@ -167,7 +167,7 @@ impl BlobsHandle {
 
         // SAFETY: `path_cstr` is valid and `out_list` points to writable memory.
         let code = unsafe {
-            talu_sys::talu_blobs_list(
+            talu_sys::talu_db_blob_list(
                 self.path_cstr.as_ptr(),
                 limit,
                 &mut out_list as *mut _ as *mut c_void,
@@ -182,7 +182,7 @@ impl BlobsHandle {
         }
         let refs = extract_string_list(out_list);
         // SAFETY: list handle is owned by this function on success.
-        unsafe { talu_sys::talu_blobs_free_string_list(out_list) };
+        unsafe { talu_sys::talu_db_blob_free_string_list(out_list as *mut c_void) };
         Ok(refs)
     }
 
@@ -197,7 +197,7 @@ impl BlobsHandle {
 
         // SAFETY: `path_cstr` is a valid C string and `stats` points to writable output memory.
         let code = unsafe {
-            talu_sys::talu_blobs_gc(
+            talu_sys::talu_db_blob_gc(
                 self.path_cstr.as_ptr(),
                 min_blob_age_seconds,
                 &mut stats as *mut _ as *mut c_void,
@@ -215,7 +215,7 @@ impl BlobsHandle {
 
         // SAFETY: `path_cstr` is a valid C string and `stream_handle` points to writable memory.
         let code = unsafe {
-            talu_sys::talu_blobs_open_write_stream(
+            talu_sys::talu_db_blob_open_write_stream(
                 self.path_cstr.as_ptr(),
                 &mut stream_handle as *mut _ as *mut c_void,
             )
@@ -242,7 +242,7 @@ impl BlobsHandle {
         // SAFETY: `path_cstr` and `blob_ref_c` are valid C strings, and `stream_handle`
         // points to writable memory for the output handle.
         let code = unsafe {
-            talu_sys::talu_blobs_open_stream(
+            talu_sys::talu_db_blob_open_stream(
                 self.path_cstr.as_ptr(),
                 blob_ref_c.as_ptr(),
                 &mut stream_handle as *mut _ as *mut c_void,
@@ -298,10 +298,10 @@ impl BlobReadStream {
         }
         let mut out_read: usize = 0;
 
-        // SAFETY: `self.handle` is a valid handle created by `talu_blobs_open_stream`.
+        // SAFETY: `self.handle` is a valid handle created by `talu_db_blob_open_stream`.
         // `buffer` is writable and alive for the call.
         let code = unsafe {
-            talu_sys::talu_blobs_stream_read(
+            talu_sys::talu_db_blob_stream_read(
                 self.handle,
                 buffer.as_mut_ptr() as *const u8,
                 buffer.len(),
@@ -319,7 +319,10 @@ impl BlobReadStream {
         let mut size: u64 = 0;
         // SAFETY: `self.handle` is valid and `size` points to writable memory.
         let code = unsafe {
-            talu_sys::talu_blobs_stream_total_size(self.handle, &mut size as *mut _ as *mut c_void)
+            talu_sys::talu_db_blob_stream_total_size(
+                self.handle,
+                &mut size as *mut _ as *mut c_void,
+            )
         };
         if code != ERROR_CODE_OK {
             return Err(BlobError::from_code(code, "blob stream total_size failed"));
@@ -330,7 +333,7 @@ impl BlobReadStream {
     /// Seek to an absolute byte offset from stream start.
     pub fn seek(&mut self, offset_bytes: u64) -> Result<(), BlobError> {
         // SAFETY: `self.handle` is valid and owned by this stream.
-        let code = unsafe { talu_sys::talu_blobs_stream_seek(self.handle, offset_bytes) };
+        let code = unsafe { talu_sys::talu_db_blob_stream_seek(self.handle, offset_bytes) };
         if code != ERROR_CODE_OK {
             return Err(BlobError::from_code(code, "blob stream seek failed"));
         }
@@ -343,8 +346,8 @@ impl Drop for BlobReadStream {
         if self.handle.is_null() {
             return;
         }
-        // SAFETY: `handle` was returned by `talu_blobs_open_stream` and is owned by this struct.
-        unsafe { talu_sys::talu_blobs_stream_close(self.handle) };
+        // SAFETY: `handle` was returned by `talu_db_blob_open_stream` and is owned by this struct.
+        unsafe { talu_sys::talu_db_blob_stream_close(self.handle) };
         self.handle = ptr::null_mut();
     }
 }
@@ -368,8 +371,9 @@ impl BlobWriteStream {
             bytes.as_ptr()
         };
         // SAFETY: `handle` is valid and `bytes_ptr` is null for len=0 or points to `bytes`.
-        let code =
-            unsafe { talu_sys::talu_blobs_write_stream_write(self.handle, bytes_ptr, bytes.len()) };
+        let code = unsafe {
+            talu_sys::talu_db_blob_write_stream_write(self.handle, bytes_ptr, bytes.len())
+        };
         if code != ERROR_CODE_OK {
             return Err(BlobError::from_code(code, "blob write stream write failed"));
         }
@@ -383,7 +387,7 @@ impl BlobWriteStream {
         let mut blob_ref_buf = [0u8; 129];
         // SAFETY: `handle` is valid and output buffer is writable.
         let code = unsafe {
-            talu_sys::talu_blobs_write_stream_finish(
+            talu_sys::talu_db_blob_write_stream_finish(
                 self.handle,
                 blob_ref_buf.as_mut_ptr() as *const u8,
                 blob_ref_buf.len(),
@@ -413,8 +417,8 @@ impl Drop for BlobWriteStream {
         if self.handle.is_null() {
             return;
         }
-        // SAFETY: `handle` was returned by `talu_blobs_open_write_stream` and is owned here.
-        unsafe { talu_sys::talu_blobs_write_stream_close(self.handle) };
+        // SAFETY: `handle` was returned by `talu_db_blob_open_write_stream` and is owned here.
+        unsafe { talu_sys::talu_db_blob_write_stream_close(self.handle) };
         self.handle = ptr::null_mut();
     }
 }
