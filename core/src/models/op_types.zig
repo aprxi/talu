@@ -382,6 +382,7 @@ pub const MAX_SUPPORTED_GAFFINE_GROUPS: usize = 1024;
 pub const FusedLayerKindId = enum(u8) {
     attention_mlp = 0,
     shortconv = 1,
+    mamba = 2,
 };
 
 /// Returns the fused-model layer id for kinds supported by fused Metal decode.
@@ -390,7 +391,7 @@ pub fn fusedLayerKindId(kind: BlockKind) ?FusedLayerKindId {
     return switch (kind) {
         .attention_mlp => .attention_mlp,
         .shortconv => .shortconv,
-        .mamba => null,
+        .mamba => .mamba,
     };
 }
 

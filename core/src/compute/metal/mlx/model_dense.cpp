@@ -20,12 +20,29 @@ struct FusedDenseModel {
         enum class LayerKind : int {
             attention_mlp = 0,
             shortconv = 1,
+            mamba = 2,
         };
         LayerKind kind = LayerKind::attention_mlp;
 
         array ln1_w = array(0.0f, float32);      // attention norm
         array qkv_proj = array(0.0f, bfloat16);  // Pre-concatenated Q+K+V
         array o_proj = array(0.0f, bfloat16);
+        // MLA attention (dense)
+        bool use_mla = false;
+        int mla_n_heads = 0;
+        int mla_q_lora_rank = 0;
+        int mla_kv_lora_rank = 0;
+        int mla_qk_head_dim = 0;
+        int mla_qk_rope_head_dim = 0;
+        int mla_qk_nope_head_dim = 0;
+        int mla_v_head_dim = 0;
+        array mla_q_a_w = array(0.0f, bfloat16);
+        array mla_q_b_w = array(0.0f, bfloat16);
+        array mla_kv_a_w = array(0.0f, bfloat16);
+        array mla_kv_b_w = array(0.0f, bfloat16);
+        array mla_q_a_norm = array(0.0f, float32);
+        array mla_kv_a_norm = array(0.0f, float32);
+        array mla_o_w = array(0.0f, bfloat16);
         // ShortConv mixer (dense): in-proj/out-proj are pre-transposed.
         int shortconv_d_conv = 0;
         int shortconv_conv_dim = 0;
@@ -33,6 +50,23 @@ struct FusedDenseModel {
         array shortconv_out_proj_t = array(0.0f, bfloat16);
         std::optional<array> shortconv_kernel_broadcast;
         std::optional<array> shortconv_bias_row;
+        // Mamba mixer (dense core; optional dense FFN)
+        int mamba_d_state = 0;
+        int mamba_d_conv = 0;
+        int mamba_n_heads = 0;
+        int mamba_d_head = 0;
+        int mamba_n_groups = 1;
+        uint8_t mamba_gate_up_layout = 0;
+        array mamba_conv_weight = array(0.0f, float32);
+        std::optional<array> mamba_conv_bias;
+        array mamba_a_log = array(0.0f, float32);
+        array mamba_d_skip = array(0.0f, float32);
+        std::optional<array> mamba_dt_bias;
+        std::optional<array> mamba_norm_weight;
+        array mamba_in_proj = array(0.0f, bfloat16);
+        array mamba_out_proj = array(0.0f, bfloat16);
+        std::optional<array> mamba_gate_up;
+        std::optional<array> mamba_down_proj;
         array ln2_w = array(0.0f, float32);      // ffn norm
         array gate_up_proj = array(0.0f, bfloat16);  // Pre-concatenated gate+up
         array down_proj = array(0.0f, bfloat16);
@@ -54,6 +88,13 @@ struct FusedDenseModel {
     float rope_theta = 0.0f;
     float rms_eps = 0.0f;
     bool topology_initialized = false;
+    bool has_norm_weight_offset = false;
+    bool use_gelu = false;
+    float query_pre_attn_scalar = 0.0f;
+    float embedding_multiplier = 1.0f;
+    float attention_multiplier = 0.0f;
+    float residual_multiplier = 1.0f;
+    float logits_scaling = 1.0f;
 
     // Per-model decode constants (avoid thread-local cross-thread/model drift).
     bool decode_shapes_initialized = false;
@@ -87,33 +128,18 @@ static int next_cache_capacity(const CacheLayer& layer, size_t required, int cur
     if (required == 0) return current_capacity;
 
     const size_t current = current_capacity > 0 ? static_cast<size_t>(current_capacity) : 0;
-    const size_t step = static_cast<size_t>(layer.step);
 
     if (layer.max_seq_len > 0) {
         const size_t max_cap = layer.max_seq_len;
         if (required > max_cap) {
             throw std::invalid_argument("[dense] kv cache capacity exceeded");
         }
-
-        size_t capacity = current;
-        if (capacity == 0) {
-            const size_t base = std::max(required, step);
-            capacity = std::min(max_cap, static_cast<size_t>(round_up_step(base, layer.step)));
-        }
-        while (capacity < required) {
-            const size_t doubled = capacity * 2;
-            if (doubled <= capacity) {
-                capacity = max_cap;
-                break;
-            }
-            capacity = std::min(max_cap, doubled);
-        }
-        if (capacity < required) {
-            throw std::invalid_argument("[dense] kv cache capacity exceeded");
-        }
-        return static_cast<int>(capacity);
+        if (current == 0) return static_cast<int>(max_cap);
+        if (required > current) return static_cast<int>(max_cap);
+        return static_cast<int>(current);
     }
 
+    const size_t step = static_cast<size_t>(layer.step);
     size_t capacity = current;
     if (capacity == 0) {
         const size_t base = std::max(required, step);
@@ -156,6 +182,7 @@ static inline void gqa_expand_attention_kv(const array& q, const array& k_in, co
 
 static constexpr uint8_t kLayerKindAttentionMlp = 0;
 static constexpr uint8_t kLayerKindShortConv = 1;
+static constexpr uint8_t kLayerKindMamba = 2;
 
 static FusedDenseModel::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
     switch (kind_id) {
@@ -163,6 +190,8 @@ static FusedDenseModel::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
             return FusedDenseModel::Layer::LayerKind::attention_mlp;
         case kLayerKindShortConv:
             return FusedDenseModel::Layer::LayerKind::shortconv;
+        case kLayerKindMamba:
+            return FusedDenseModel::Layer::LayerKind::mamba;
         default:
             throw std::invalid_argument("Unsupported dense layer kind id");
     }
@@ -214,13 +243,58 @@ static inline array ensure_float32(const array& arr) {
     return arr.dtype() == float32 ? arr : astype(arr, float32);
 }
 
+extern "C" void* mlx_lazy_mla_attention_bf16(
+    const void* input,
+    const void* q_a_w, const void* q_a_norm_w, const void* q_b_w,
+    const void* kv_a_w, const void* kv_a_norm_w, const void* kv_b_w,
+    const void* o_w,
+    void* cache_ptr, size_t layer_idx,
+    size_t n_heads,
+    size_t q_lora_rank, size_t kv_lora_rank,
+    size_t qk_head_dim, size_t qk_rope_head_dim, size_t qk_nope_head_dim, size_t v_head_dim,
+    size_t pos_offset, float rope_theta,
+    const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
+    float rms_eps
+);
+
+extern "C" void* mlx_lazy_mamba_block_bf16(
+    const void* input,
+    const void* ln1_weight,
+    const void* in_proj,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* d_skip,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* out_proj,
+    const void* ln2_weight,
+    const void* gate_up,
+    const void* down_proj,
+    bool use_gelu,
+    float residual_multiplier,
+    float norm_eps,
+    void* mamba_cache_ptr,
+    size_t layer_idx,
+    size_t d_state,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head,
+    size_t n_groups,
+    uint8_t gate_up_layout
+);
+
 // ============================================================================ 
 // Forward Pass Implementation
 // ============================================================================
 
 static inline void ensure_dense_decode_shapes(FusedDenseModel* m) {
     if (m->decode_shapes_initialized) return;
-    m->attn_scale = 1.0f / std::sqrt(static_cast<float>(m->head_dim));
+    m->attn_scale = (m->attention_multiplier > 0.0f)
+        ? m->attention_multiplier
+        : (m->query_pre_attn_scalar > 0.0f)
+            ? (1.0f / std::sqrt(m->query_pre_attn_scalar))
+            : (1.0f / std::sqrt(static_cast<float>(m->head_dim)));
     m->q_shape = {1, 1, m->n_heads, m->head_dim};
     m->kv_shape = {1, 1, m->n_kv_heads, m->head_dim};
     m->attn_out_shape = {1, 1, m->n_heads * m->head_dim};
@@ -232,6 +306,7 @@ static array dense_forward_logits_from_token(
     FusedDenseModel* m,
     MLXCache* cache,
     MLXShortConvCache* shortconv_cache,
+    MLXMambaCache* mamba_cache,
     const array& token_idx,
     size_t pos_offset
 ) {
@@ -240,9 +315,44 @@ static array dense_forward_logits_from_token(
 
     // Embedding lookup
     array hidden = take(m->embed_tokens, reshape(token_idx, m->token_shape), 0);
+    if (m->embedding_multiplier != 1.0f) {
+        hidden = hidden * m->embedding_multiplier;
+    } else if (m->has_norm_weight_offset) {
+        hidden = hidden * std::sqrt(static_cast<float>(m->hidden_dim));
+    }
 
     for (int layer_idx = 0; layer_idx < n_layers; layer_idx++) {
         const auto& l = m->layers[layer_idx];
+        if (l.kind == FusedDenseModel::Layer::LayerKind::mamba) {
+            auto* mamba_out = static_cast<const array*>(mlx_lazy_mamba_block_bf16(
+                &hidden,
+                &l.ln1_w,
+                &l.mamba_in_proj,
+                &l.mamba_conv_weight,
+                l.mamba_conv_bias ? &*l.mamba_conv_bias : nullptr,
+                &l.mamba_a_log,
+                &l.mamba_d_skip,
+                l.mamba_dt_bias ? &*l.mamba_dt_bias : nullptr,
+                l.mamba_norm_weight ? &*l.mamba_norm_weight : nullptr,
+                &l.mamba_out_proj,
+                &l.ln2_w,
+                l.mamba_gate_up ? &*l.mamba_gate_up : nullptr,
+                l.mamba_down_proj ? &*l.mamba_down_proj : nullptr,
+                m->use_gelu,
+                m->residual_multiplier,
+                m->rms_eps,
+                mamba_cache,
+                static_cast<size_t>(layer_idx),
+                static_cast<size_t>(l.mamba_d_state),
+                static_cast<size_t>(l.mamba_d_conv),
+                static_cast<size_t>(l.mamba_n_heads),
+                static_cast<size_t>(l.mamba_d_head),
+                static_cast<size_t>(l.mamba_n_groups),
+                l.mamba_gate_up_layout
+            ));
+            hidden = ensure_float16(*mamba_out);
+            continue;
+        }
 
         // RMS norm
         array normed = ensure_float16(fast::rms_norm(hidden, l.ln1_w, m->rms_eps));
@@ -327,6 +437,33 @@ static array dense_forward_logits_from_token(
             if (layer_state != nullptr) {
                 *layer_state->conv_state = conv_state;
             }
+        } else if (l.use_mla) {
+            auto* mla_out = static_cast<const array*>(mlx_lazy_mla_attention_bf16(
+                &normed,
+                &l.mla_q_a_w,
+                &l.mla_q_a_norm,
+                &l.mla_q_b_w,
+                &l.mla_kv_a_w,
+                &l.mla_kv_a_norm,
+                &l.mla_kv_b_w,
+                &l.mla_o_w,
+                cache,
+                static_cast<size_t>(layer_idx),
+                static_cast<size_t>(l.mla_n_heads),
+                static_cast<size_t>(l.mla_q_lora_rank),
+                static_cast<size_t>(l.mla_kv_lora_rank),
+                static_cast<size_t>(l.mla_qk_head_dim),
+                static_cast<size_t>(l.mla_qk_rope_head_dim),
+                static_cast<size_t>(l.mla_qk_nope_head_dim),
+                static_cast<size_t>(l.mla_v_head_dim),
+                pos_offset,
+                m->rope_theta,
+                nullptr,
+                nullptr,
+                0,
+                m->rms_eps
+            ));
+            mixer_out = ensure_float16(*mla_out);
         } else {
             auto& cl = cache->layers[layer_idx];
 
@@ -394,7 +531,13 @@ static array dense_forward_logits_from_token(
 
             mixer_out = matmul(attn_out, l.o_proj);
         }
-        array hidden_1 = ensure_float16(hidden + ensure_float16(mixer_out));
+        const array attn_for_residual = m->has_norm_weight_offset
+            ? ensure_float16(fast::rms_norm(mixer_out, l.ln2_w, m->rms_eps))
+            : ensure_float16(mixer_out);
+        const array scaled_attn = (m->residual_multiplier != 1.0f)
+            ? ensure_float16(attn_for_residual * m->residual_multiplier)
+            : attn_for_residual;
+        array hidden_1 = ensure_float16(hidden + scaled_attn);
 
         // FFN - single matmul for gate+up (weights pre-concatenated)
         array normed_2 = ensure_float16(fast::rms_norm(hidden_1, l.ln2_w, m->rms_eps));
@@ -402,14 +545,29 @@ static array dense_forward_logits_from_token(
         auto parts = split(gate_up, 2, -1);
         array& gate = parts[0];
         array& up = parts[1];
-        array down = matmul(ensure_float16(gate * sigmoid(gate) * up), l.down_proj);
+        const array ffn_mid = [&]() -> array {
+            if (m->use_gelu) {
+                const float sqrt_2_over_pi = 0.7978845608f;
+                const array x3 = gate * gate * gate;
+                const array inner = sqrt_2_over_pi * (gate + 0.044715f * x3);
+                return gate * 0.5f * (1.0f + tanh(inner)) * up;
+            }
+            return gate * sigmoid(gate) * up;
+        }();
+        const array down = matmul(ensure_float16(ffn_mid), l.down_proj);
+        const array scaled_down = (m->residual_multiplier != 1.0f)
+            ? ensure_float16(down * m->residual_multiplier)
+            : ensure_float16(down);
 
-        hidden = ensure_float16(hidden_1 + ensure_float16(down));
+        hidden = ensure_float16(hidden_1 + scaled_down);
     }
 
     // Final norm + LM head
     array final_normed = ensure_float16(fast::rms_norm(hidden, m->ln_final, m->rms_eps));
     array logits = matmul(final_normed, m->lm_head);
+    if (m->logits_scaling != 1.0f) {
+        logits = logits / m->logits_scaling;
+    }
     return reshape(logits, {-1});
 }
 
@@ -417,10 +575,11 @@ static array dense_forward_from_token(
     FusedDenseModel* m,
     MLXCache* cache,
     MLXShortConvCache* shortconv_cache,
+    MLXMambaCache* mamba_cache,
     const array& token_idx,
     size_t pos_offset
 ) {
-    array logits = dense_forward_logits_from_token(m, cache, shortconv_cache, token_idx, pos_offset);
+    array logits = dense_forward_logits_from_token(m, cache, shortconv_cache, mamba_cache, token_idx, pos_offset);
     return argmax(logits, 0);
 }
 
@@ -463,6 +622,34 @@ void mlx_dense_model_set_final(void* model, const void* ln_w, const void* lm_hea
     );
     fused_model->lm_head = to_fast_metal_dtype(fused_model->lm_head);
     eval(fused_model->lm_head);
+}
+
+void mlx_dense_model_set_arch_config(
+    void* model,
+    bool has_norm_weight_offset,
+    bool use_gelu,
+    float query_pre_attn_scalar
+) {
+    auto* fused_model = static_cast<FusedDenseModel*>(model);
+    fused_model->has_norm_weight_offset = has_norm_weight_offset;
+    fused_model->use_gelu = use_gelu;
+    fused_model->query_pre_attn_scalar = query_pre_attn_scalar;
+    fused_model->decode_shapes_initialized = false;
+}
+
+void mlx_dense_model_set_scaling_config(
+    void* model,
+    float embedding_multiplier,
+    float attention_multiplier,
+    float residual_multiplier,
+    float logits_scaling
+) {
+    auto* fused_model = static_cast<FusedDenseModel*>(model);
+    fused_model->embedding_multiplier = embedding_multiplier;
+    fused_model->attention_multiplier = attention_multiplier;
+    fused_model->residual_multiplier = residual_multiplier;
+    fused_model->logits_scaling = logits_scaling;
+    fused_model->decode_shapes_initialized = false;
 }
 
 void mlx_dense_model_set_topology(
@@ -556,31 +743,45 @@ void mlx_dense_model_set_layer(
             to_eval.push_back(*layer.shortconv_bias_row);
         }
     } else {
-        auto q_t = orient_matmul_rhs(*static_cast<const array*>(q_proj), fused_model->hidden_dim, std::nullopt, true);
-        auto k_t = orient_matmul_rhs(*static_cast<const array*>(k_proj), fused_model->hidden_dim, std::nullopt, true);
-        auto v_t = orient_matmul_rhs(*static_cast<const array*>(v_proj), fused_model->hidden_dim, std::nullopt, true);
-        // GQA models can have attention output width (n_heads * head_dim)
-        // different from hidden_dim. Orient o_proj using the actual Q width.
-        layer.o_proj = orient_matmul_rhs(
-            *static_cast<const array*>(o_proj),
-            q_t.shape(1),
-            fused_model->hidden_dim,
-            true
-        );
-        q_t = to_fast_metal_dtype(q_t);
-        k_t = to_fast_metal_dtype(k_t);
-        v_t = to_fast_metal_dtype(v_t);
-        layer.o_proj = to_fast_metal_dtype(layer.o_proj);
+        const bool has_standard_attention = q_proj != nullptr &&
+            k_proj != nullptr &&
+            v_proj != nullptr &&
+            o_proj != nullptr;
+        const bool has_partial_standard_attention = q_proj != nullptr ||
+            k_proj != nullptr ||
+            v_proj != nullptr ||
+            o_proj != nullptr;
+        if (has_partial_standard_attention && !has_standard_attention) {
+            throw std::invalid_argument("[dense] incomplete standard attention tensors");
+        }
 
-        // Pre-concatenate QKV for single matmul
-        layer.qkv_proj = concatenate({q_t, k_t, v_t}, 1);
-        layer.q_size = q_t.shape(1);
-        layer.kv_size = k_t.shape(1);
+        if (has_standard_attention) {
+            auto q_t = orient_matmul_rhs(*static_cast<const array*>(q_proj), fused_model->hidden_dim, std::nullopt, true);
+            auto k_t = orient_matmul_rhs(*static_cast<const array*>(k_proj), fused_model->hidden_dim, std::nullopt, true);
+            auto v_t = orient_matmul_rhs(*static_cast<const array*>(v_proj), fused_model->hidden_dim, std::nullopt, true);
+            // GQA models can have attention output width (n_heads * head_dim)
+            // different from hidden_dim. Orient o_proj using the actual Q width.
+            layer.o_proj = orient_matmul_rhs(
+                *static_cast<const array*>(o_proj),
+                q_t.shape(1),
+                fused_model->hidden_dim,
+                true
+            );
+            q_t = to_fast_metal_dtype(q_t);
+            k_t = to_fast_metal_dtype(k_t);
+            v_t = to_fast_metal_dtype(v_t);
+            layer.o_proj = to_fast_metal_dtype(layer.o_proj);
 
-        if (q_norm) layer.q_norm = *static_cast<const array*>(q_norm);
-        if (k_norm) layer.k_norm = *static_cast<const array*>(k_norm);
+            // Pre-concatenate QKV for single matmul
+            layer.qkv_proj = concatenate({q_t, k_t, v_t}, 1);
+            layer.q_size = q_t.shape(1);
+            layer.kv_size = k_t.shape(1);
 
-        to_eval = {layer.qkv_proj, layer.o_proj};
+            if (q_norm) layer.q_norm = *static_cast<const array*>(q_norm);
+            if (k_norm) layer.k_norm = *static_cast<const array*>(k_norm);
+
+            to_eval = {layer.qkv_proj, layer.o_proj};
+        }
     }
 
     auto gate_t = orient_matmul_rhs(*static_cast<const array*>(gate_proj), fused_model->hidden_dim, std::nullopt, true);
@@ -608,6 +809,204 @@ void mlx_dense_model_set_layer(
     eval(to_eval);
 }
 
+void mlx_dense_model_set_layer_mla_bf16(
+    void* model,
+    size_t layer_idx,
+    size_t n_heads,
+    size_t q_lora_rank,
+    size_t kv_lora_rank,
+    size_t qk_head_dim,
+    size_t qk_rope_head_dim,
+    size_t qk_nope_head_dim,
+    size_t v_head_dim,
+    const void* q_a_w,
+    const void* q_b_w,
+    const void* kv_a_w,
+    const void* kv_b_w,
+    const void* q_a_norm,
+    const void* kv_a_norm,
+    const void* o_w
+) {
+    auto* fused_model = static_cast<FusedDenseModel*>(model);
+    if (!fused_model->topology_initialized) {
+        throw std::invalid_argument("mlx_dense_model_set_topology must be called before mlx_dense_model_set_layer_mla_bf16");
+    }
+    if (q_a_w == nullptr || q_b_w == nullptr || kv_a_w == nullptr || kv_b_w == nullptr ||
+        q_a_norm == nullptr || kv_a_norm == nullptr || o_w == nullptr) {
+        throw std::invalid_argument("mlx_dense_model_set_layer_mla_bf16 requires non-null MLA tensors");
+    }
+    auto& layer = fused_model->layers[layer_idx];
+    if (layer.kind != FusedDenseModel::Layer::LayerKind::attention_mlp) {
+        throw std::invalid_argument("mlx_dense_model_set_layer_mla_bf16 requires attention_mlp layer kind");
+    }
+
+    const int n_heads_i = static_cast<int>(n_heads);
+    const int q_lora_rank_i = static_cast<int>(q_lora_rank);
+    const int kv_lora_rank_i = static_cast<int>(kv_lora_rank);
+    const int qk_head_dim_i = static_cast<int>(qk_head_dim);
+    const int qk_rope_head_dim_i = static_cast<int>(qk_rope_head_dim);
+    const int qk_nope_head_dim_i = static_cast<int>(qk_nope_head_dim);
+    const int v_head_dim_i = static_cast<int>(v_head_dim);
+
+    layer.use_mla = true;
+    layer.mla_n_heads = n_heads_i;
+    layer.mla_q_lora_rank = q_lora_rank_i;
+    layer.mla_kv_lora_rank = kv_lora_rank_i;
+    layer.mla_qk_head_dim = qk_head_dim_i;
+    layer.mla_qk_rope_head_dim = qk_rope_head_dim_i;
+    layer.mla_qk_nope_head_dim = qk_nope_head_dim_i;
+    layer.mla_v_head_dim = v_head_dim_i;
+
+    layer.mla_q_a_w = to_fast_metal_dtype(orient_matmul_rhs(
+        *static_cast<const array*>(q_a_w),
+        fused_model->hidden_dim,
+        q_lora_rank_i,
+        true
+    ));
+    layer.mla_q_b_w = to_fast_metal_dtype(orient_matmul_rhs(
+        *static_cast<const array*>(q_b_w),
+        q_lora_rank_i,
+        n_heads_i * qk_head_dim_i,
+        true
+    ));
+    layer.mla_kv_a_w = to_fast_metal_dtype(orient_matmul_rhs(
+        *static_cast<const array*>(kv_a_w),
+        fused_model->hidden_dim,
+        kv_lora_rank_i + qk_rope_head_dim_i,
+        true
+    ));
+    layer.mla_kv_b_w = to_fast_metal_dtype(orient_matmul_rhs(
+        *static_cast<const array*>(kv_b_w),
+        kv_lora_rank_i,
+        n_heads_i * (qk_nope_head_dim_i + v_head_dim_i),
+        true
+    ));
+    layer.mla_q_a_norm = *static_cast<const array*>(q_a_norm);
+    layer.mla_kv_a_norm = *static_cast<const array*>(kv_a_norm);
+    layer.mla_o_w = to_fast_metal_dtype(orient_matmul_rhs(
+        *static_cast<const array*>(o_w),
+        n_heads_i * v_head_dim_i,
+        fused_model->hidden_dim,
+        true
+    ));
+
+    eval({
+        layer.mla_q_a_w,
+        layer.mla_q_b_w,
+        layer.mla_kv_a_w,
+        layer.mla_kv_b_w,
+        layer.mla_q_a_norm,
+        layer.mla_kv_a_norm,
+        layer.mla_o_w,
+    });
+}
+
+void mlx_dense_model_set_layer_mamba_bf16(
+    void* model,
+    size_t layer_idx,
+    size_t d_state,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head,
+    size_t n_groups,
+    uint8_t gate_up_layout,
+    const void* ln1_w,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* d_skip,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* in_proj,
+    const void* out_proj,
+    const void* ln2_w,
+    const void* gate_up,
+    const void* down_proj
+) {
+    auto* fused_model = static_cast<FusedDenseModel*>(model);
+    if (!fused_model->topology_initialized) {
+        throw std::invalid_argument("mlx_dense_model_set_topology must be called before mlx_dense_model_set_layer_mamba_bf16");
+    }
+    if (ln1_w == nullptr || conv_weight == nullptr || a_log == nullptr || d_skip == nullptr ||
+        in_proj == nullptr || out_proj == nullptr || ln2_w == nullptr) {
+        throw std::invalid_argument("mlx_dense_model_set_layer_mamba_bf16 requires non-null Mamba core tensors");
+    }
+
+    auto& layer = fused_model->layers[layer_idx];
+    if (layer.kind != FusedDenseModel::Layer::LayerKind::mamba) {
+        throw std::invalid_argument("mlx_dense_model_set_layer_mamba_bf16 requires mamba layer kind");
+    }
+
+    layer.ln1_w = *static_cast<const array*>(ln1_w);
+    layer.mamba_d_state = static_cast<int>(d_state);
+    layer.mamba_d_conv = static_cast<int>(d_conv);
+    layer.mamba_n_heads = static_cast<int>(n_heads);
+    layer.mamba_d_head = static_cast<int>(d_head);
+    layer.mamba_n_groups = static_cast<int>(n_groups);
+    layer.mamba_gate_up_layout = gate_up_layout;
+    layer.mamba_conv_weight = *static_cast<const array*>(conv_weight);
+    layer.mamba_conv_bias = conv_bias ? std::make_optional(*static_cast<const array*>(conv_bias)) : std::nullopt;
+    layer.mamba_a_log = *static_cast<const array*>(a_log);
+    layer.mamba_d_skip = *static_cast<const array*>(d_skip);
+    layer.mamba_dt_bias = dt_bias ? std::make_optional(*static_cast<const array*>(dt_bias)) : std::nullopt;
+    layer.mamba_norm_weight = norm_weight ? std::make_optional(*static_cast<const array*>(norm_weight)) : std::nullopt;
+    layer.mamba_in_proj = to_fast_metal_dtype(orient_matmul_rhs(
+        *static_cast<const array*>(in_proj),
+        fused_model->hidden_dim,
+        std::nullopt,
+        true
+    ));
+    layer.mamba_out_proj = to_fast_metal_dtype(orient_matmul_rhs(
+        *static_cast<const array*>(out_proj),
+        layer.mamba_n_heads * layer.mamba_d_head,
+        fused_model->hidden_dim,
+        true
+    ));
+    layer.ln2_w = *static_cast<const array*>(ln2_w);
+
+    const bool has_dense_ffn = gate_up != nullptr || down_proj != nullptr;
+    if (has_dense_ffn) {
+        if (gate_up == nullptr || down_proj == nullptr) {
+            throw std::invalid_argument("mlx_dense_model_set_layer_mamba_bf16 requires complete dense FFN tensors");
+        }
+        layer.mamba_gate_up = to_fast_metal_dtype(orient_matmul_rhs(
+            *static_cast<const array*>(gate_up),
+            fused_model->hidden_dim,
+            std::nullopt,
+            true
+        ));
+        const int gate_up_width = layer.mamba_gate_up->shape(1);
+        if ((gate_up_width % 2) != 0) {
+            throw std::invalid_argument("mlx_dense_model_set_layer_mamba_bf16 expects gate_up width divisible by 2");
+        }
+        const int ffn_width = gate_up_width / 2;
+        layer.mamba_down_proj = to_fast_metal_dtype(orient_matmul_rhs(
+            *static_cast<const array*>(down_proj),
+            ffn_width,
+            fused_model->hidden_dim,
+            true
+        ));
+    } else {
+        layer.mamba_gate_up = std::nullopt;
+        layer.mamba_down_proj = std::nullopt;
+    }
+
+    std::vector<array> to_eval = {
+        layer.mamba_conv_weight,
+        layer.mamba_a_log,
+        layer.mamba_d_skip,
+        layer.mamba_in_proj,
+        layer.mamba_out_proj,
+        layer.ln2_w,
+    };
+    if (layer.mamba_conv_bias) to_eval.push_back(*layer.mamba_conv_bias);
+    if (layer.mamba_dt_bias) to_eval.push_back(*layer.mamba_dt_bias);
+    if (layer.mamba_norm_weight) to_eval.push_back(*layer.mamba_norm_weight);
+    if (layer.mamba_gate_up) to_eval.push_back(*layer.mamba_gate_up);
+    if (layer.mamba_down_proj) to_eval.push_back(*layer.mamba_down_proj);
+    eval(to_eval);
+}
+
 void mlx_dense_model_free(void* model) {
     delete static_cast<FusedDenseModel*>(model);
     if (g_fused_dense == model) g_fused_dense = nullptr;
@@ -617,12 +1016,14 @@ void* mlx_dense_decode_step_logits(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t token_id,
     size_t pos_offset
 ) {
     auto* fused_model = static_cast<FusedDenseModel*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     int32_t token_id_i32 = static_cast<int32_t>(token_id);
     array token = array(&token_id_i32, {1}, int32);
@@ -631,6 +1032,7 @@ void* mlx_dense_decode_step_logits(
         fused_model,
         cache_state,
         shortconv_cache_state,
+        mamba_cache_state,
         token,
         pos_offset
     );
@@ -646,17 +1048,19 @@ void mlx_dense_pipeline_prime(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t first_token_id,
     size_t pos_offset
 ) {
     auto* fused_model = static_cast<FusedDenseModel*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     int32_t token_id_i32 = static_cast<int32_t>(first_token_id);
     array first_token = array(&token_id_i32, {1}, int32);
 
-    array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, first_token, pos_offset);
+    array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, mamba_cache_state, first_token, pos_offset);
     async_eval(next);
 
     void* key = dense_decode_state_key(cache_ptr, model);
@@ -669,11 +1073,13 @@ uint32_t mlx_dense_pipeline_step(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     size_t pos_offset
 ) {
     auto* fused_model = static_cast<FusedDenseModel*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     array current(0.0f, float32);
     {
@@ -685,7 +1091,7 @@ uint32_t mlx_dense_pipeline_step(
     }
 
     // Build graph for NEXT token using current (lazy) token
-    array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, current, pos_offset);
+    array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, mamba_cache_state, current, pos_offset);
 
     // Queue next token computation
     async_eval(next);
@@ -705,7 +1111,9 @@ uint32_t mlx_dense_pipeline_step(
     return result;
 }
 
-uint32_t mlx_dense_pipeline_flush(void* model, void* cache_ptr) {
+uint32_t mlx_dense_pipeline_flush(void* model, void* cache_ptr, void* shortconv_cache_ptr, void* mamba_cache_ptr) {
+    (void)shortconv_cache_ptr;
+    (void)mamba_cache_ptr;
     std::optional<array> current_token;
     {
         void* key = dense_decode_state_key(cache_ptr, model);
@@ -723,6 +1131,7 @@ uint32_t mlx_dense_decode_batch(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t first_token,
     size_t start_pos,
     uint32_t* out_tokens,
@@ -733,6 +1142,7 @@ uint32_t mlx_dense_decode_batch(
     auto* fused_model = static_cast<FusedDenseModel*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     auto is_eos = [&](uint32_t token) {
         for (size_t idx = 0; idx < n_eos_ids; idx++) {
@@ -748,7 +1158,7 @@ uint32_t mlx_dense_decode_batch(
     while (generated_count < max_tokens) {
         int32_t token_id_i32 = static_cast<int32_t>(current_token);
         array token = array(&token_id_i32, {1}, int32);
-        array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, token, pos);
+        array next = dense_forward_from_token(fused_model, cache_state, shortconv_cache_state, mamba_cache_state, token, pos);
         eval(next);
         current_token = static_cast<uint32_t>(next.item<int32_t>());
         out_tokens[generated_count++] = current_token;

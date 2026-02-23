@@ -247,7 +247,7 @@ pub const Backend = union(enum) {
         const has_unsupported_runtime_features = runtimeHasMetalUnsupportedFeatures(&loaded.runtime);
         if (has_metal and isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
             const metal_backend_state = metal.BackendType.init(allocator, loaded) catch |err| {
-                if (err == error.MoENotSupported or err == error.MLXNotAvailable or err == error.UnsupportedDType or err == error.ShortConvNotSupportedOnMetal or err == error.MLANotSupportedOnMetal or err == error.InvalidTensorType) {
+                if (err == error.MoENotSupported or err == error.MLXNotAvailable or err == error.UnsupportedDType or err == error.ShortConvNotSupportedOnMetal or err == error.MLANotSupportedOnMetal or err == error.InvalidTensorType or err == error.UnsupportedModel) {
                     log.info("inference", "Metal backend unavailable, using CPU", .{
                         .reason = @errorName(err),
                         .detail = getMetalUnsupportedReason(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features),
@@ -384,7 +384,7 @@ pub const Backend = union(enum) {
     ) !void {
         switch (self.*) {
             .cpu => |*b| try b.embed(tokens, pooling, normalize, embedding_buffer),
-            .metal => return error.EmbeddingNotSupported, // Metal backend doesn't support embedding yet
+            .metal => |*b| if (has_metal) try b.embed(tokens, pooling, normalize, embedding_buffer) else unreachable,
             .cuda => return error.EmbeddingNotSupported,
         }
     }
@@ -528,15 +528,18 @@ fn getMetalUnsupportedReason(
         return "Weight dtype not supported by Metal (requires Q4/U8/BF16)";
     }
     _ = config;
-    _ = runtime;
+    if (runtime.has_mla) {
+        return "Metal decode-model path requires a supported MLA tensor layout";
+    }
     if (has_unsupported_runtime_features) {
-        return "MLA models not supported by Metal backend";
+        return "Model runtime topology is not yet supported by Metal decode-model path";
     }
     return "Unknown Metal incompatibility";
 }
 
 fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool {
-    return runtime.has_mla;
+    _ = runtime;
+    return false;
 }
 
 fn initCpu(
@@ -557,6 +560,13 @@ fn initMetal(
 ) !Backend {
     if (!has_metal) {
         return error.MetalNotEnabled;
+    }
+    const has_unsupported_runtime_features = runtimeHasMetalUnsupportedFeatures(&loaded.runtime);
+    if (!isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
+        log.info("inference", "Metal backend rejected model", .{
+            .reason = getMetalUnsupportedReason(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features),
+        });
+        return error.UnsupportedModel;
     }
     const metal_backend_state = try metal.BackendType.init(allocator, loaded);
     log.info("inference", "Backend selected: metal", .{ .reason = reason });
@@ -622,13 +632,25 @@ test "getMetalUnsupportedReason mentions dtype" {
     try std.testing.expect(std.mem.indexOf(u8, reason, "dtype") != null);
 }
 
-test "isMetalSupported allows mamba models" {
+test "isMetalSupported allows mamba models on supported dtypes" {
     var config = std.mem.zeroes(ModelConfig);
     var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 0;
     runtime.has_mamba = true;
 
     try std.testing.expect(isMetalSupported(&config, &runtime, .grouped_affine_u4, false));
+}
+
+test "runtimeHasMetalUnsupportedFeatures currently has no model-level blockers" {
+    var runtime = std.mem.zeroes(tensor.ModelRuntime);
+    try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
+
+    runtime.has_mla = true;
+    try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
+
+    runtime.has_mla = false;
+    runtime.has_mamba = true;
+    try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
 }
 
 test "defaultModelLoadOptions follows platform capability" {
@@ -860,7 +882,6 @@ test "kernel parity: embedding lookup cpu vs metal" {
         .embed_tokens = metal_embed,
         .embed_tokens_quantized = null,
         .layers = empty_layers[0..],
-        .compiled_layers = null,
         .decode_model = null,
         .ln_final = dummy_ln,
         .lm_head = null,
@@ -907,7 +928,6 @@ test "kernel parity: weight access error semantics cpu vs metal" {
         .embed_tokens = null,
         .embed_tokens_quantized = null,
         .layers = empty_layers[0..],
-        .compiled_layers = null,
         .decode_model = null,
         .ln_final = dummy_ln,
         .lm_head = null,

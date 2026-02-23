@@ -89,14 +89,14 @@ void* mlx_lazy_reshape(const void* input, const size_t* shape, size_t ndim) {
 void* mlx_persistent_reshape(const void* input, const size_t* shape, size_t ndim) {
     const auto& input_arr = *static_cast<const array*>(input);
     if (ndim == 2) {
-        return new array(contiguous(reshape(input_arr,
+        return make_owned_array(contiguous(reshape(input_arr,
             {static_cast<int>(shape[0]), static_cast<int>(shape[1])})));
     } else if (ndim == 3) {
-        return new array(contiguous(reshape(input_arr,
+        return make_owned_array(contiguous(reshape(input_arr,
             {static_cast<int>(shape[0]), static_cast<int>(shape[1]),
              static_cast<int>(shape[2])})));
     } else if (ndim == 4) {
-        return new array(contiguous(reshape(input_arr,
+        return make_owned_array(contiguous(reshape(input_arr,
             {static_cast<int>(shape[0]), static_cast<int>(shape[1]),
              static_cast<int>(shape[2]), static_cast<int>(shape[3])})));
     }
@@ -104,7 +104,7 @@ void* mlx_persistent_reshape(const void* input, const size_t* shape, size_t ndim
     for (size_t dim_idx = 0; dim_idx < ndim; dim_idx++) {
         shape_dims.push_back(static_cast<int>(shape[dim_idx]));
     }
-    return new array(contiguous(reshape(input_arr, shape_dims)));
+    return make_owned_array(contiguous(reshape(input_arr, shape_dims)));
 }
 
 void* mlx_lazy_transpose(const void* input, const size_t* axes, size_t ndim) {
@@ -165,7 +165,7 @@ void* mlx_persistent_slice(const void* input, const int* starts, const int* ends
     Shape start(starts, starts + ndim);
     Shape stop(ends, ends + ndim);
     // Use contiguous() to force a copy - ensures the slice is independent of the source
-    return new array(contiguous(slice(input_arr, start, stop)));
+    return make_owned_array(contiguous(slice(input_arr, start, stop)));
 }
 
 void* mlx_lazy_slice_last(const void* input) {

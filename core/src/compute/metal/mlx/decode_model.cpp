@@ -11,13 +11,14 @@ extern "C" {
 void mlx_fused_model_free(void* model);
 void mlx_dense_model_free(void* model);
 
-void* mlx_fused_decode_step_logits(void* model, void* cache, void* shortconv_cache, uint32_t token_id, size_t pos_offset);
-void* mlx_dense_decode_step_logits(void* model, void* cache, void* shortconv_cache, uint32_t token_id, size_t pos_offset);
+void* mlx_fused_decode_step_logits(void* model, void* cache, void* shortconv_cache, void* mamba_cache, uint32_t token_id, size_t pos_offset);
+void* mlx_dense_decode_step_logits(void* model, void* cache, void* shortconv_cache, void* mamba_cache, uint32_t token_id, size_t pos_offset);
 
 uint32_t mlx_fused_decode_batch(
     void* model,
     void* cache,
     void* shortconv_cache,
+    void* mamba_cache,
     uint32_t first_token,
     size_t start_pos,
     uint32_t* out_tokens,
@@ -29,6 +30,7 @@ uint32_t mlx_dense_decode_batch(
     void* model,
     void* cache,
     void* shortconv_cache,
+    void* mamba_cache,
     uint32_t first_token,
     size_t start_pos,
     uint32_t* out_tokens,
@@ -36,14 +38,14 @@ uint32_t mlx_dense_decode_batch(
     const uint32_t* eos_ids,
     size_t n_eos_ids);
 
-void mlx_pipeline_prime(void* model, void* cache, void* shortconv_cache, uint32_t first_token_id, size_t pos_offset);
-void mlx_dense_pipeline_prime(void* model, void* cache, void* shortconv_cache, uint32_t first_token_id, size_t pos_offset);
+void mlx_pipeline_prime(void* model, void* cache, void* shortconv_cache, void* mamba_cache, uint32_t first_token_id, size_t pos_offset);
+void mlx_dense_pipeline_prime(void* model, void* cache, void* shortconv_cache, void* mamba_cache, uint32_t first_token_id, size_t pos_offset);
 
-uint32_t mlx_pipeline_step(void* model, void* cache, void* shortconv_cache, size_t pos_offset);
-uint32_t mlx_dense_pipeline_step(void* model, void* cache, void* shortconv_cache, size_t pos_offset);
+uint32_t mlx_pipeline_step(void* model, void* cache, void* shortconv_cache, void* mamba_cache, size_t pos_offset);
+uint32_t mlx_dense_pipeline_step(void* model, void* cache, void* shortconv_cache, void* mamba_cache, size_t pos_offset);
 
-uint32_t mlx_pipeline_flush(void* model, void* cache);
-uint32_t mlx_dense_pipeline_flush(void* model, void* cache);
+uint32_t mlx_pipeline_flush(void* model, void* cache, void* shortconv_cache, void* mamba_cache);
+uint32_t mlx_dense_pipeline_flush(void* model, void* cache, void* shortconv_cache, void* mamba_cache);
 
 } // extern "C"
 
@@ -94,19 +96,21 @@ void* mlx_decode_model_step_logits(
     void* model,
     void* cache,
     void* shortconv_cache,
+    void* mamba_cache,
     uint32_t token_id,
     size_t pos_offset) {
     auto* wrapper = as_wrapper(model);
     if (wrapper->flavor == DecodeModelFlavor::quantized) {
-        return mlx_fused_decode_step_logits(wrapper->impl, cache, shortconv_cache, token_id, pos_offset);
+        return mlx_fused_decode_step_logits(wrapper->impl, cache, shortconv_cache, mamba_cache, token_id, pos_offset);
     }
-    return mlx_dense_decode_step_logits(wrapper->impl, cache, shortconv_cache, token_id, pos_offset);
+    return mlx_dense_decode_step_logits(wrapper->impl, cache, shortconv_cache, mamba_cache, token_id, pos_offset);
 }
 
 void mlx_decode_model_step_logits_batch(
     void* model,
     void* const* caches,
     void* const* shortconv_caches,
+    void* const* mamba_caches,
     const uint32_t* token_ids,
     const size_t* pos_offsets,
     void** out_logits,
@@ -119,8 +123,8 @@ void mlx_decode_model_step_logits_batch(
         const uint32_t token_id = token_ids[idx];
         const size_t pos_offset = pos_offsets[idx];
         void* logits = (wrapper->flavor == DecodeModelFlavor::quantized)
-            ? mlx_fused_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], token_id, pos_offset)
-            : mlx_dense_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], token_id, pos_offset);
+            ? mlx_fused_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], mamba_caches[idx], token_id, pos_offset)
+            : mlx_dense_decode_step_logits(wrapper->impl, caches[idx], shortconv_caches[idx], mamba_caches[idx], token_id, pos_offset);
         out_logits[idx] = logits;
         pending_eval.push_back(*static_cast<array*>(logits));
     }
@@ -134,6 +138,7 @@ uint32_t mlx_decode_model_decode_batch(
     void* model,
     void* cache,
     void* shortconv_cache,
+    void* mamba_cache,
     uint32_t first_token,
     size_t start_pos,
     uint32_t* out_tokens,
@@ -146,6 +151,7 @@ uint32_t mlx_decode_model_decode_batch(
             wrapper->impl,
             cache,
             shortconv_cache,
+            mamba_cache,
             first_token,
             start_pos,
             out_tokens,
@@ -157,6 +163,7 @@ uint32_t mlx_decode_model_decode_batch(
         wrapper->impl,
         cache,
         shortconv_cache,
+        mamba_cache,
         first_token,
         start_pos,
         out_tokens,
@@ -169,13 +176,14 @@ void mlx_decode_model_pipeline_prime(
     void* model,
     void* cache,
     void* shortconv_cache,
+    void* mamba_cache,
     uint32_t first_token_id,
     size_t pos_offset) {
     auto* wrapper = as_wrapper(model);
     if (wrapper->flavor == DecodeModelFlavor::quantized) {
-        mlx_pipeline_prime(wrapper->impl, cache, shortconv_cache, first_token_id, pos_offset);
+        mlx_pipeline_prime(wrapper->impl, cache, shortconv_cache, mamba_cache, first_token_id, pos_offset);
     } else {
-        mlx_dense_pipeline_prime(wrapper->impl, cache, shortconv_cache, first_token_id, pos_offset);
+        mlx_dense_pipeline_prime(wrapper->impl, cache, shortconv_cache, mamba_cache, first_token_id, pos_offset);
     }
 }
 
@@ -183,24 +191,25 @@ uint32_t mlx_decode_model_pipeline_step(
     void* model,
     void* cache,
     void* shortconv_cache,
+    void* mamba_cache,
     size_t pos_offset) {
     auto* wrapper = as_wrapper(model);
     if (wrapper->flavor == DecodeModelFlavor::quantized) {
-        return mlx_pipeline_step(wrapper->impl, cache, shortconv_cache, pos_offset);
+        return mlx_pipeline_step(wrapper->impl, cache, shortconv_cache, mamba_cache, pos_offset);
     }
-    return mlx_dense_pipeline_step(wrapper->impl, cache, shortconv_cache, pos_offset);
+    return mlx_dense_pipeline_step(wrapper->impl, cache, shortconv_cache, mamba_cache, pos_offset);
 }
 
 uint32_t mlx_decode_model_pipeline_flush(
     void* model,
     void* cache,
-    void* shortconv_cache) {
-    (void)shortconv_cache;
+    void* shortconv_cache,
+    void* mamba_cache) {
     auto* wrapper = as_wrapper(model);
     if (wrapper->flavor == DecodeModelFlavor::quantized) {
-        return mlx_pipeline_flush(wrapper->impl, cache);
+        return mlx_pipeline_flush(wrapper->impl, cache, shortconv_cache, mamba_cache);
     }
-    return mlx_dense_pipeline_flush(wrapper->impl, cache);
+    return mlx_dense_pipeline_flush(wrapper->impl, cache, shortconv_cache, mamba_cache);
 }
 
 } // extern "C"

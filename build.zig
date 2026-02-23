@@ -291,11 +291,11 @@ fn addMetalSupport(
         .files = &.{
             "core/src/compute/metal/mlx/array_pool.cpp",
             "core/src/compute/metal/mlx/ops.cpp",
-            "core/src/inference/backend/metal/mlx/cache.cpp",
-            "core/src/inference/backend/metal/mlx/fused_ops.cpp",
-            "core/src/inference/backend/metal/mlx/decode_model.cpp",
-            "core/src/inference/backend/metal/mlx/model_dense.cpp",
-            "core/src/inference/backend/metal/mlx/model_quantized.cpp",
+            "core/src/compute/metal/mlx/cache.cpp",
+            "core/src/compute/metal/mlx/fused_ops.cpp",
+            "core/src/compute/metal/mlx/decode_model.cpp",
+            "core/src/compute/metal/mlx/model_dense.cpp",
+            "core/src/compute/metal/mlx/model_quantized.cpp",
         },
         .flags = &.{
             "-std=c++17",

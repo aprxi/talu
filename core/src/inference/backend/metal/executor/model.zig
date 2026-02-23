@@ -255,7 +255,7 @@ pub const Model = struct {
         const norm_eps = config.norm_eps;
         const layer_count: usize = @intCast(config.n_layers);
         const sequence_len = input_ids.len;
-        const use_compiled_effective = use_compiled and !trace;
+        _ = use_compiled;
         const hidden_dim = @as(usize, @intCast(weight_handles.d_model));
 
         var runtime_rope_cos_handle: ArrayHandle = null;
@@ -292,43 +292,7 @@ pub const Model = struct {
             try traceLastHiddenVector(allocator, "metal", phase, null, hidden, sequence_len, @intCast(weight_handles.d_model));
         }
 
-        var used_fusion: bool = false;
         for (0..layer_count) |layer_idx| {
-            if (use_compiled_effective and weight_handles.compiled_layers != null and sequence_len == 1) {
-                const compiled = weight_handles.compiled_layers.?;
-                used_fusion = false;
-
-                if (compiled[layer_idx].isAvailable()) {
-                    if (cache) |c| {
-                        if (c.use_bfloat16) {
-                            used_fusion = true;
-                            hidden = compiled[layer_idx].forward(
-                                hidden,
-                                c.handle,
-                                if (shortconv_cache) |sc| sc.handle else null,
-                                layer_idx,
-                                pos_offset,
-                            );
-                        }
-                    } else {
-                        used_fusion = true;
-                        hidden = compiled[layer_idx].forward(
-                            hidden,
-                            null,
-                            if (shortconv_cache) |sc| sc.handle else null,
-                            layer_idx,
-                            pos_offset,
-                        );
-                    }
-                    if (used_fusion) {
-                        if (trace) {
-                            try traceLastHiddenVector(allocator, "metal", phase, layer_idx, hidden, sequence_len, @intCast(weight_handles.d_model));
-                        }
-                        continue;
-                    }
-                }
-            }
-
             hidden = try block_executor.TransformerBlock.forward(
                 hidden,
                 &weight_handles.layers[layer_idx],

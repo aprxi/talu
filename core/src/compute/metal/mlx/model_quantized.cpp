@@ -17,6 +17,7 @@ struct FusedModelWeights {
         enum class LayerKind : int {
             attention_mlp = 0,
             shortconv = 1,
+            mamba = 2,
         };
         LayerKind kind = LayerKind::attention_mlp;
 
@@ -25,6 +26,21 @@ struct FusedModelWeights {
         array k_w = array(0.0f, float32), k_s = array(0.0f, float32), k_b = array(0.0f, float32);
         array v_w = array(0.0f, float32), v_s = array(0.0f, float32), v_b = array(0.0f, float32);
         array o_w = array(0.0f, float32), o_s = array(0.0f, float32), o_b = array(0.0f, float32);
+        // MLA attention (quantized)
+        bool use_mla = false;
+        int mla_n_heads = 0;
+        int mla_q_lora_rank = 0;
+        int mla_kv_lora_rank = 0;
+        int mla_qk_head_dim = 0;
+        int mla_qk_rope_head_dim = 0;
+        int mla_qk_nope_head_dim = 0;
+        int mla_v_head_dim = 0;
+        array mla_q_a_w = array(0.0f, float32), mla_q_a_s = array(0.0f, float32), mla_q_a_b = array(0.0f, float32);
+        array mla_q_b_w = array(0.0f, float32), mla_q_b_s = array(0.0f, float32), mla_q_b_b = array(0.0f, float32);
+        array mla_kv_a_w = array(0.0f, float32), mla_kv_a_s = array(0.0f, float32), mla_kv_a_b = array(0.0f, float32);
+        array mla_kv_b_w = array(0.0f, float32), mla_kv_b_s = array(0.0f, float32), mla_kv_b_b = array(0.0f, float32);
+        array mla_q_a_norm = array(0.0f, float32), mla_kv_a_norm = array(0.0f, float32);
+        array mla_o_w = array(0.0f, float32), mla_o_s = array(0.0f, float32), mla_o_b = array(0.0f, float32);
         // ShortConv mixer projections (quantized) and convolution weights.
         int shortconv_d_conv = 0;
         int shortconv_conv_dim = 0;
@@ -34,6 +50,23 @@ struct FusedModelWeights {
         std::optional<array> shortconv_conv_b;
         std::optional<array> shortconv_kernel_broadcast;
         std::optional<array> shortconv_bias_row;
+        // Mamba mixer (quantized core; optional quantized FFN)
+        int mamba_d_state = 0;
+        int mamba_d_conv = 0;
+        int mamba_n_heads = 0;
+        int mamba_d_head = 0;
+        int mamba_n_groups = 1;
+        uint8_t mamba_gate_up_layout = 0;
+        array mamba_conv_w = array(0.0f, float32);
+        std::optional<array> mamba_conv_b;
+        array mamba_a_log = array(0.0f, float32);
+        array mamba_d_skip = array(0.0f, float32);
+        std::optional<array> mamba_dt_bias;
+        std::optional<array> mamba_norm_weight;
+        array mamba_in_w = array(0.0f, float32), mamba_in_s = array(0.0f, float32), mamba_in_b = array(0.0f, float32);
+        array mamba_out_w = array(0.0f, float32), mamba_out_s = array(0.0f, float32), mamba_out_b = array(0.0f, float32);
+        std::optional<array> mamba_gate_up_w, mamba_gate_up_s, mamba_gate_up_b;
+        std::optional<array> mamba_down_w, mamba_down_s, mamba_down_b;
         array ln2_w = array(0.0f, float32);  // ffn norm (or post_attention_layernorm)
         array gate_w = array(0.0f, float32), gate_s = array(0.0f, float32), gate_b = array(0.0f, float32);
         array up_w = array(0.0f, float32), up_s = array(0.0f, float32), up_b = array(0.0f, float32);
@@ -95,9 +128,6 @@ struct FusedModelWeights {
     float residual_multiplier = 1.0f;   // Scales residual connections
     float logits_scaling = 1.0f;        // Scales output logits
 
-    // Compiled forward function for decode (eliminates graph rebuild overhead)
-    std::function<std::vector<array>(const std::vector<array>&)> compiled_decode;
-    bool is_compiled = false;
     bool topology_initialized = false;
 };
 
@@ -105,6 +135,7 @@ static FusedModelWeights* g_fused_weights = nullptr;
 
 static constexpr uint8_t kLayerKindAttentionMlp = 0;
 static constexpr uint8_t kLayerKindShortConv = 1;
+static constexpr uint8_t kLayerKindMamba = 2;
 
 static FusedModelWeights::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
     switch (kind_id) {
@@ -112,6 +143,8 @@ static FusedModelWeights::Layer::LayerKind decode_layer_kind(uint8_t kind_id) {
             return FusedModelWeights::Layer::LayerKind::attention_mlp;
         case kLayerKindShortConv:
             return FusedModelWeights::Layer::LayerKind::shortconv;
+        case kLayerKindMamba:
+            return FusedModelWeights::Layer::LayerKind::mamba;
         default:
             throw std::invalid_argument("Unsupported fused layer kind id");
     }
@@ -168,33 +201,18 @@ static int next_cache_capacity(const CacheLayer& layer, size_t required, int cur
     if (required == 0) return current_capacity;
 
     const size_t current = current_capacity > 0 ? static_cast<size_t>(current_capacity) : 0;
-    const size_t step = static_cast<size_t>(layer.step);
 
     if (layer.max_seq_len > 0) {
         const size_t max_cap = layer.max_seq_len;
         if (required > max_cap) {
             throw std::invalid_argument("[fused] kv cache capacity exceeded");
         }
-
-        size_t capacity = current;
-        if (capacity == 0) {
-            const size_t base = std::max(required, step);
-            capacity = std::min(max_cap, static_cast<size_t>(round_up_step(base, layer.step)));
-        }
-        while (capacity < required) {
-            const size_t doubled = capacity * 2;
-            if (doubled <= capacity) {
-                capacity = max_cap;
-                break;
-            }
-            capacity = std::min(max_cap, doubled);
-        }
-        if (capacity < required) {
-            throw std::invalid_argument("[fused] kv cache capacity exceeded");
-        }
-        return static_cast<int>(capacity);
+        if (current == 0) return static_cast<int>(max_cap);
+        if (required > current) return static_cast<int>(max_cap);
+        return static_cast<int>(current);
     }
 
+    const size_t step = static_cast<size_t>(layer.step);
     size_t capacity = current;
     if (capacity == 0) {
         const size_t base = std::max(required, step);
@@ -234,6 +252,60 @@ extern "C" void* mlx_lazy_fused_moe_ffn_mxfp4(
     size_t router_group_size,
     size_t expert_group_size);
 
+extern "C" void* mlx_lazy_mla_attention_quantized(
+    const void* input,
+    const void* q_a_w, const void* q_a_s, const void* q_a_b, const void* q_a_norm_w,
+    const void* q_b_w, const void* q_b_s, const void* q_b_b,
+    const void* kv_a_w, const void* kv_a_s, const void* kv_a_b, const void* kv_a_norm_w,
+    const void* kv_b_w, const void* kv_b_s, const void* kv_b_b,
+    const void* o_w, const void* o_s, const void* o_b,
+    void* cache_ptr, size_t layer_idx,
+    size_t n_heads,
+    size_t q_lora_rank, size_t kv_lora_rank,
+    size_t qk_head_dim, size_t qk_rope_head_dim, size_t qk_nope_head_dim, size_t v_head_dim,
+    size_t pos_offset, float rope_theta,
+    const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
+    float rms_eps,
+    size_t group_size, size_t bits
+);
+
+extern "C" void* mlx_lazy_mamba_block_quantized(
+    const void* input,
+    const void* ln1_weight,
+    const void* in_w,
+    const void* in_s,
+    const void* in_b,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* d_skip,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* out_w,
+    const void* out_s,
+    const void* out_b,
+    const void* ln2_weight,
+    const void* gate_up_w,
+    const void* gate_up_s,
+    const void* gate_up_b,
+    const void* down_w,
+    const void* down_s,
+    const void* down_b,
+    size_t group_size,
+    size_t bits,
+    bool use_gelu,
+    float residual_multiplier,
+    float norm_eps,
+    void* mamba_cache_ptr,
+    size_t layer_idx,
+    size_t d_state,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head,
+    size_t n_groups,
+    uint8_t gate_up_layout
+);
+
 // ============================================================================
 // Forward Pass Implementation
 // ============================================================================
@@ -242,6 +314,7 @@ static array fused_forward_logits_from_token(
     FusedModelWeights* fused_weights,
     MLXCache* cache_state,
     MLXShortConvCache* shortconv_cache_state,
+    MLXMambaCache* mamba_cache_state,
     const array& token_idx,
     size_t pos_offset
 ) {
@@ -279,6 +352,46 @@ static array fused_forward_logits_from_token(
 
     for (int layer_idx = 0; layer_idx < n_layers; layer_idx++) {
         const auto& l = fused_weights->layers[layer_idx];
+        if (l.kind == FusedModelWeights::Layer::LayerKind::mamba) {
+            auto* mamba_out = static_cast<const array*>(mlx_lazy_mamba_block_quantized(
+                &hidden,
+                &l.ln1_w,
+                &l.mamba_in_w,
+                &l.mamba_in_s,
+                &l.mamba_in_b,
+                &l.mamba_conv_w,
+                l.mamba_conv_b ? &*l.mamba_conv_b : nullptr,
+                &l.mamba_a_log,
+                &l.mamba_d_skip,
+                l.mamba_dt_bias ? &*l.mamba_dt_bias : nullptr,
+                l.mamba_norm_weight ? &*l.mamba_norm_weight : nullptr,
+                &l.mamba_out_w,
+                &l.mamba_out_s,
+                &l.mamba_out_b,
+                &l.ln2_w,
+                l.mamba_gate_up_w ? &*l.mamba_gate_up_w : nullptr,
+                l.mamba_gate_up_s ? &*l.mamba_gate_up_s : nullptr,
+                l.mamba_gate_up_b ? &*l.mamba_gate_up_b : nullptr,
+                l.mamba_down_w ? &*l.mamba_down_w : nullptr,
+                l.mamba_down_s ? &*l.mamba_down_s : nullptr,
+                l.mamba_down_b ? &*l.mamba_down_b : nullptr,
+                static_cast<size_t>(group_size),
+                static_cast<size_t>(bit_width),
+                fused_weights->use_gelu,
+                fused_weights->residual_multiplier,
+                fused_weights->rms_eps,
+                mamba_cache_state,
+                static_cast<size_t>(layer_idx),
+                static_cast<size_t>(l.mamba_d_state),
+                static_cast<size_t>(l.mamba_d_conv),
+                static_cast<size_t>(l.mamba_n_heads),
+                static_cast<size_t>(l.mamba_d_head),
+                static_cast<size_t>(l.mamba_n_groups),
+                l.mamba_gate_up_layout
+            ));
+            hidden = *mamba_out;
+            continue;
+        }
         auto& cl = cache_state->layers[layer_idx];
 
         array normed = fast::rms_norm(hidden, l.ln1_w, fused_weights->rms_eps);
@@ -354,6 +467,45 @@ static array fused_forward_logits_from_token(
                 layer_idx < static_cast<int>(shortconv_cache_state->layers.size())) {
                 *shortconv_cache_state->layers[layer_idx].conv_state = conv_state;
             }
+        } else if (l.use_mla) {
+            auto* mla_out = static_cast<const array*>(mlx_lazy_mla_attention_quantized(
+                &normed,
+                &l.mla_q_a_w,
+                &l.mla_q_a_s,
+                &l.mla_q_a_b,
+                &l.mla_q_a_norm,
+                &l.mla_q_b_w,
+                &l.mla_q_b_s,
+                &l.mla_q_b_b,
+                &l.mla_kv_a_w,
+                &l.mla_kv_a_s,
+                &l.mla_kv_a_b,
+                &l.mla_kv_a_norm,
+                &l.mla_kv_b_w,
+                &l.mla_kv_b_s,
+                &l.mla_kv_b_b,
+                &l.mla_o_w,
+                &l.mla_o_s,
+                &l.mla_o_b,
+                cache_state,
+                static_cast<size_t>(layer_idx),
+                static_cast<size_t>(l.mla_n_heads),
+                static_cast<size_t>(l.mla_q_lora_rank),
+                static_cast<size_t>(l.mla_kv_lora_rank),
+                static_cast<size_t>(l.mla_qk_head_dim),
+                static_cast<size_t>(l.mla_qk_rope_head_dim),
+                static_cast<size_t>(l.mla_qk_nope_head_dim),
+                static_cast<size_t>(l.mla_v_head_dim),
+                pos_offset,
+                fused_weights->rope_theta,
+                nullptr,
+                nullptr,
+                0,
+                fused_weights->rms_eps,
+                static_cast<size_t>(group_size),
+                static_cast<size_t>(bit_width)
+            ));
+            attn_proj = *mla_out;
         } else {
             array q(0.0f), k(0.0f), v(0.0f);
             if (l.use_fused_qkv && l.qkv_w) {
@@ -526,6 +678,7 @@ static array fused_forward_from_token(
     FusedModelWeights* fused_weights,
     MLXCache* cache_state,
     MLXShortConvCache* shortconv_cache_state,
+    MLXMambaCache* mamba_cache_state,
     const array& token_idx,
     size_t pos_offset
 ) {
@@ -533,6 +686,7 @@ static array fused_forward_from_token(
         fused_weights,
         cache_state,
         shortconv_cache_state,
+        mamba_cache_state,
         token_idx,
         pos_offset
     );
@@ -743,6 +897,169 @@ void mlx_fused_model_set_layer(
     }
 }
 
+void mlx_fused_model_set_layer_mla_quantized(
+    void* model,
+    size_t layer_idx,
+    size_t n_heads,
+    size_t q_lora_rank,
+    size_t kv_lora_rank,
+    size_t qk_head_dim,
+    size_t qk_rope_head_dim,
+    size_t qk_nope_head_dim,
+    size_t v_head_dim,
+    const void* q_a_w,
+    const void* q_a_s,
+    const void* q_a_b,
+    const void* q_b_w,
+    const void* q_b_s,
+    const void* q_b_b,
+    const void* kv_a_w,
+    const void* kv_a_s,
+    const void* kv_a_b,
+    const void* kv_b_w,
+    const void* kv_b_s,
+    const void* kv_b_b,
+    const void* q_a_norm,
+    const void* kv_a_norm,
+    const void* o_w,
+    const void* o_s,
+    const void* o_b
+) {
+    auto* fused_weights = static_cast<FusedModelWeights*>(model);
+    if (!fused_weights->topology_initialized) {
+        throw std::invalid_argument("mlx_fused_model_set_topology must be called before mlx_fused_model_set_layer_mla_quantized");
+    }
+    if (q_a_w == nullptr || q_a_s == nullptr || q_a_b == nullptr ||
+        q_b_w == nullptr || q_b_s == nullptr || q_b_b == nullptr ||
+        kv_a_w == nullptr || kv_a_s == nullptr || kv_a_b == nullptr ||
+        kv_b_w == nullptr || kv_b_s == nullptr || kv_b_b == nullptr ||
+        q_a_norm == nullptr || kv_a_norm == nullptr ||
+        o_w == nullptr || o_s == nullptr || o_b == nullptr) {
+        throw std::invalid_argument("mlx_fused_model_set_layer_mla_quantized requires non-null MLA tensors");
+    }
+    auto& layer = fused_weights->layers[layer_idx];
+    if (layer.kind != FusedModelWeights::Layer::LayerKind::attention_mlp) {
+        throw std::invalid_argument("mlx_fused_model_set_layer_mla_quantized requires attention_mlp layer kind");
+    }
+
+    layer.use_mla = true;
+    layer.mla_n_heads = static_cast<int>(n_heads);
+    layer.mla_q_lora_rank = static_cast<int>(q_lora_rank);
+    layer.mla_kv_lora_rank = static_cast<int>(kv_lora_rank);
+    layer.mla_qk_head_dim = static_cast<int>(qk_head_dim);
+    layer.mla_qk_rope_head_dim = static_cast<int>(qk_rope_head_dim);
+    layer.mla_qk_nope_head_dim = static_cast<int>(qk_nope_head_dim);
+    layer.mla_v_head_dim = static_cast<int>(v_head_dim);
+
+    layer.mla_q_a_w = *static_cast<const array*>(q_a_w);
+    layer.mla_q_a_s = *static_cast<const array*>(q_a_s);
+    layer.mla_q_a_b = *static_cast<const array*>(q_a_b);
+    layer.mla_q_b_w = *static_cast<const array*>(q_b_w);
+    layer.mla_q_b_s = *static_cast<const array*>(q_b_s);
+    layer.mla_q_b_b = *static_cast<const array*>(q_b_b);
+    layer.mla_kv_a_w = *static_cast<const array*>(kv_a_w);
+    layer.mla_kv_a_s = *static_cast<const array*>(kv_a_s);
+    layer.mla_kv_a_b = *static_cast<const array*>(kv_a_b);
+    layer.mla_kv_b_w = *static_cast<const array*>(kv_b_w);
+    layer.mla_kv_b_s = *static_cast<const array*>(kv_b_s);
+    layer.mla_kv_b_b = *static_cast<const array*>(kv_b_b);
+    layer.mla_q_a_norm = *static_cast<const array*>(q_a_norm);
+    layer.mla_kv_a_norm = *static_cast<const array*>(kv_a_norm);
+    layer.mla_o_w = *static_cast<const array*>(o_w);
+    layer.mla_o_s = *static_cast<const array*>(o_s);
+    layer.mla_o_b = *static_cast<const array*>(o_b);
+}
+
+void mlx_fused_model_set_layer_mamba_quantized(
+    void* model,
+    size_t layer_idx,
+    size_t d_state,
+    size_t d_conv,
+    size_t n_heads,
+    size_t d_head,
+    size_t n_groups,
+    uint8_t gate_up_layout,
+    const void* ln1_w,
+    const void* conv_weight,
+    const void* conv_bias,
+    const void* a_log,
+    const void* d_skip,
+    const void* dt_bias,
+    const void* norm_weight,
+    const void* in_w,
+    const void* in_s,
+    const void* in_b,
+    const void* out_w,
+    const void* out_s,
+    const void* out_b,
+    const void* ln2_w,
+    const void* gate_up_w,
+    const void* gate_up_s,
+    const void* gate_up_b,
+    const void* down_w,
+    const void* down_s,
+    const void* down_b
+) {
+    auto* fused_weights = static_cast<FusedModelWeights*>(model);
+    if (!fused_weights->topology_initialized) {
+        throw std::invalid_argument("mlx_fused_model_set_topology must be called before mlx_fused_model_set_layer_mamba_quantized");
+    }
+    if (ln1_w == nullptr || conv_weight == nullptr || a_log == nullptr || d_skip == nullptr ||
+        in_w == nullptr || in_s == nullptr || in_b == nullptr ||
+        out_w == nullptr || out_s == nullptr || out_b == nullptr ||
+        ln2_w == nullptr) {
+        throw std::invalid_argument("mlx_fused_model_set_layer_mamba_quantized requires non-null Mamba core tensors");
+    }
+
+    auto& layer = fused_weights->layers[layer_idx];
+    if (layer.kind != FusedModelWeights::Layer::LayerKind::mamba) {
+        throw std::invalid_argument("mlx_fused_model_set_layer_mamba_quantized requires mamba layer kind");
+    }
+
+    layer.ln1_w = *static_cast<const array*>(ln1_w);
+    layer.mamba_d_state = static_cast<int>(d_state);
+    layer.mamba_d_conv = static_cast<int>(d_conv);
+    layer.mamba_n_heads = static_cast<int>(n_heads);
+    layer.mamba_d_head = static_cast<int>(d_head);
+    layer.mamba_n_groups = static_cast<int>(n_groups);
+    layer.mamba_gate_up_layout = gate_up_layout;
+    layer.mamba_conv_w = *static_cast<const array*>(conv_weight);
+    layer.mamba_conv_b = conv_bias ? std::make_optional(*static_cast<const array*>(conv_bias)) : std::nullopt;
+    layer.mamba_a_log = *static_cast<const array*>(a_log);
+    layer.mamba_d_skip = *static_cast<const array*>(d_skip);
+    layer.mamba_dt_bias = dt_bias ? std::make_optional(*static_cast<const array*>(dt_bias)) : std::nullopt;
+    layer.mamba_norm_weight = norm_weight ? std::make_optional(*static_cast<const array*>(norm_weight)) : std::nullopt;
+    layer.mamba_in_w = *static_cast<const array*>(in_w);
+    layer.mamba_in_s = *static_cast<const array*>(in_s);
+    layer.mamba_in_b = *static_cast<const array*>(in_b);
+    layer.mamba_out_w = *static_cast<const array*>(out_w);
+    layer.mamba_out_s = *static_cast<const array*>(out_s);
+    layer.mamba_out_b = *static_cast<const array*>(out_b);
+    layer.ln2_w = *static_cast<const array*>(ln2_w);
+
+    const bool has_quantized_ffn = gate_up_w != nullptr || gate_up_s != nullptr || gate_up_b != nullptr ||
+        down_w != nullptr || down_s != nullptr || down_b != nullptr;
+    if (has_quantized_ffn) {
+        if (gate_up_w == nullptr || gate_up_s == nullptr || gate_up_b == nullptr ||
+            down_w == nullptr || down_s == nullptr || down_b == nullptr) {
+            throw std::invalid_argument("mlx_fused_model_set_layer_mamba_quantized requires complete quantized FFN tensors");
+        }
+        layer.mamba_gate_up_w = *static_cast<const array*>(gate_up_w);
+        layer.mamba_gate_up_s = *static_cast<const array*>(gate_up_s);
+        layer.mamba_gate_up_b = *static_cast<const array*>(gate_up_b);
+        layer.mamba_down_w = *static_cast<const array*>(down_w);
+        layer.mamba_down_s = *static_cast<const array*>(down_s);
+        layer.mamba_down_b = *static_cast<const array*>(down_b);
+    } else {
+        layer.mamba_gate_up_w = std::nullopt;
+        layer.mamba_gate_up_s = std::nullopt;
+        layer.mamba_gate_up_b = std::nullopt;
+        layer.mamba_down_w = std::nullopt;
+        layer.mamba_down_s = std::nullopt;
+        layer.mamba_down_b = std::nullopt;
+    }
+}
+
 void mlx_fused_model_free(void* model) {
     delete static_cast<FusedModelWeights*>(model);
     if (g_fused_weights == model) g_fused_weights = nullptr;
@@ -777,6 +1094,43 @@ void mlx_fused_model_optimize(void* model) {
             if (layer.shortconv_conv_b) to_eval.push_back(*layer.shortconv_conv_b);
             if (layer.shortconv_kernel_broadcast) to_eval.push_back(*layer.shortconv_kernel_broadcast);
             if (layer.shortconv_bias_row) to_eval.push_back(*layer.shortconv_bias_row);
+        } else if (layer.kind == FusedModelWeights::Layer::LayerKind::mamba) {
+            to_eval.push_back(layer.mamba_conv_w);
+            if (layer.mamba_conv_b) to_eval.push_back(*layer.mamba_conv_b);
+            to_eval.push_back(layer.mamba_a_log);
+            to_eval.push_back(layer.mamba_d_skip);
+            if (layer.mamba_dt_bias) to_eval.push_back(*layer.mamba_dt_bias);
+            if (layer.mamba_norm_weight) to_eval.push_back(*layer.mamba_norm_weight);
+            to_eval.push_back(layer.mamba_in_w);
+            to_eval.push_back(layer.mamba_in_s);
+            to_eval.push_back(layer.mamba_in_b);
+            to_eval.push_back(layer.mamba_out_w);
+            to_eval.push_back(layer.mamba_out_s);
+            to_eval.push_back(layer.mamba_out_b);
+            if (layer.mamba_gate_up_w) to_eval.push_back(*layer.mamba_gate_up_w);
+            if (layer.mamba_gate_up_s) to_eval.push_back(*layer.mamba_gate_up_s);
+            if (layer.mamba_gate_up_b) to_eval.push_back(*layer.mamba_gate_up_b);
+            if (layer.mamba_down_w) to_eval.push_back(*layer.mamba_down_w);
+            if (layer.mamba_down_s) to_eval.push_back(*layer.mamba_down_s);
+            if (layer.mamba_down_b) to_eval.push_back(*layer.mamba_down_b);
+        } else if (layer.use_mla) {
+            to_eval.push_back(layer.mla_q_a_w);
+            to_eval.push_back(layer.mla_q_a_s);
+            to_eval.push_back(layer.mla_q_a_b);
+            to_eval.push_back(layer.mla_q_b_w);
+            to_eval.push_back(layer.mla_q_b_s);
+            to_eval.push_back(layer.mla_q_b_b);
+            to_eval.push_back(layer.mla_kv_a_w);
+            to_eval.push_back(layer.mla_kv_a_s);
+            to_eval.push_back(layer.mla_kv_a_b);
+            to_eval.push_back(layer.mla_kv_b_w);
+            to_eval.push_back(layer.mla_kv_b_s);
+            to_eval.push_back(layer.mla_kv_b_b);
+            to_eval.push_back(layer.mla_q_a_norm);
+            to_eval.push_back(layer.mla_kv_a_norm);
+            to_eval.push_back(layer.mla_o_w);
+            to_eval.push_back(layer.mla_o_s);
+            to_eval.push_back(layer.mla_o_b);
         } else {
             to_eval.push_back(layer.q_w);
             to_eval.push_back(layer.q_s);
@@ -821,135 +1175,12 @@ void mlx_fused_model_optimize(void* model) {
     eval(to_eval);
 }
 
-// Global compiled step function (set once, reused for all decode steps)
-static std::function<std::vector<array>(const std::vector<array>&)> g_compiled_step;
-
-// Compile the decode step for maximum performance
-// This traces the forward pass once and reuses the compiled graph
+// Compile hook retained for ABI compatibility.
+// Decode executes through fused_forward_from_token() / fused_forward_logits_from_token().
+// Do not keep dead alternative execution paths here.
 void mlx_fused_model_compile(void* model) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
-    if (fused_weights->is_compiled) return;
-
-    // Compiled-step path only models attention cache updates today.
-    // Keep shortconv models on the direct fused_forward_from_token path, which
-    // correctly updates both KV cache and shortconv conv-state cache.
-    for (const auto& layer : fused_weights->layers) {
-        if (layer.kind == FusedModelWeights::Layer::LayerKind::shortconv || layer.use_moe) {
-            return;
-        }
-    }
-
-    const int group_size = fused_weights->group_size;
-    const int bits = fused_weights->bits;
-    const int n_layers = static_cast<int>(fused_weights->layers.size());
-
-    // Create step function that takes: [hidden, k_caches..., v_caches..., pos]
-    // Returns: [next_token, new_k_caches..., new_v_caches...]
-    auto step_fn = [fused_weights, group_size, bits, n_layers](const std::vector<array>& inputs) -> std::vector<array> {
-        // inputs[0] = hidden state [1, 1, hidden_dim]
-        // inputs[1..n_layers] = k_cache for each layer
-        // inputs[n_layers+1..2*n_layers] = v_cache for each layer
-        // inputs[2*n_layers+1] = position offset scalar
-
-        array hidden = inputs[0];
-        int pos_idx = static_cast<int>(inputs[2 * n_layers + 1].item<int32_t>());
-
-        const float attn_scale = (fused_weights->attention_multiplier > 0.0f)
-            ? fused_weights->attention_multiplier
-            : (fused_weights->query_pre_attn_scalar > 0.0f)
-                ? 1.0f / std::sqrt(fused_weights->query_pre_attn_scalar)
-                : 1.0f / std::sqrt(static_cast<float>(fused_weights->head_dim));
-
-        std::vector<array> new_k_caches, new_v_caches;
-
-        for (int layer_idx = 0; layer_idx < n_layers; layer_idx++) {
-            const auto& l = fused_weights->layers[layer_idx];
-            array k_cache = inputs[1 + layer_idx];
-            array v_cache = inputs[1 + n_layers + layer_idx];
-
-            array normed = fast::rms_norm(hidden, l.ln1_w, fused_weights->rms_eps);
-
-            array q = quantized_matmul(normed, l.q_w, l.q_s, l.q_b, true, group_size, bits, "affine");
-            array k = quantized_matmul(normed, l.k_w, l.k_s, l.k_b, true, group_size, bits, "affine");
-            array v = quantized_matmul(normed, l.v_w, l.v_s, l.v_b, true, group_size, bits, "affine");
-
-            // Reshape for attention
-            q = reshape(q, {1, 1, fused_weights->n_heads, fused_weights->head_dim});
-            k = reshape(k, {1, 1, fused_weights->n_kv_heads, fused_weights->head_dim});
-            v = reshape(v, {1, 1, fused_weights->n_kv_heads, fused_weights->head_dim});
-
-            if (l.q_norm) q = fast::rms_norm(q, *l.q_norm, fused_weights->rms_eps);
-            if (l.k_norm) k = fast::rms_norm(k, *l.k_norm, fused_weights->rms_eps);
-
-            q = transpose(q, {0, 2, 1, 3});
-            k = transpose(k, {0, 2, 1, 3});
-            v = transpose(v, {0, 2, 1, 3});
-
-            // RoPE
-            if (fused_weights->rope_freqs) {
-                q = fast::rope(q, fused_weights->head_dim, false, std::nullopt, 1.0f, pos_idx, fused_weights->rope_freqs);
-                k = fast::rope(k, fused_weights->head_dim, false, std::nullopt, 1.0f, pos_idx, fused_weights->rope_freqs);
-            } else {
-                q = fast::rope(q, fused_weights->head_dim, false, fused_weights->rope_theta, 1.0f, pos_idx);
-                k = fast::rope(k, fused_weights->head_dim, false, fused_weights->rope_theta, 1.0f, pos_idx);
-            }
-
-            // Update cache (concatenate)
-            array new_k = concatenate({k_cache, k}, 2);
-            array new_v = concatenate({v_cache, v}, 2);
-            new_k_caches.push_back(new_k);
-            new_v_caches.push_back(new_v);
-
-            // Attention
-            array attn_k(0.0f, float32);
-            array attn_v(0.0f, float32);
-            gqa_expand_attention_kv(q, new_k, new_v, &attn_k, &attn_v);
-            array attn_out = fast::scaled_dot_product_attention(q, attn_k, attn_v, attn_scale, "");
-            attn_out = transpose(attn_out, {0, 2, 1, 3});
-            attn_out = reshape(attn_out, {1, 1, fused_weights->n_heads * fused_weights->head_dim});
-
-            array attn_proj = quantized_matmul(attn_out, l.o_w, l.o_s, l.o_b, true, group_size, bits, "affine");
-
-            // Apply post-attention norm to attn output before residual (if architecture uses it)
-            if (fused_weights->has_norm_weight_offset) {
-                attn_proj = fast::rms_norm(attn_proj, l.ln2_w, fused_weights->rms_eps);
-            }
-
-            array hidden_1 = hidden + attn_proj;
-
-            // FFN normalization: use pre_ffn_norm if present, otherwise use ln2
-            array normed_2 = (fused_weights->has_norm_weight_offset && l.pre_ffn_norm)
-                ? fast::rms_norm(hidden_1, *l.pre_ffn_norm, fused_weights->rms_eps)
-                : fast::rms_norm(hidden_1, l.ln2_w, fused_weights->rms_eps);
-
-            array gate = quantized_matmul(normed_2, l.gate_w, l.gate_s, l.gate_b, true, group_size, bits, "affine");
-            array up = quantized_matmul(normed_2, l.up_w, l.up_s, l.up_b, true, group_size, bits, "affine");
-            array mid = (gate * sigmoid(gate)) * up;
-            array down = quantized_matmul(mid, l.down_w, l.down_s, l.down_b, true, group_size, bits, "affine");
-
-            hidden = hidden_1 + down;
-        }
-
-        // Final norm + LM head
-        array final_normed = fast::rms_norm(hidden, fused_weights->ln_final, fused_weights->rms_eps);
-        array logits = quantized_matmul(final_normed, fused_weights->lm_head_w, fused_weights->lm_head_s, fused_weights->lm_head_b, true, group_size, bits, "affine");
-
-        // Argmax
-        array next_token = argmax(logits, -1);
-        next_token = reshape(next_token, {1});
-
-        // Build output: [next_token, k_caches..., v_caches...]
-        std::vector<array> outputs;
-        outputs.push_back(next_token);
-        for (auto& k : new_k_caches) outputs.push_back(k);
-        for (auto& v : new_v_caches) outputs.push_back(v);
-
-        return outputs;
-    };
-
-    // Compile with shapeless=true to handle variable cache sizes
-    g_compiled_step = compile(step_fn, /* shapeless= */ true);
-    fused_weights->is_compiled = true;
+    (void)fused_weights;
 }
 
 // ============================================================================
@@ -960,17 +1191,19 @@ uint32_t mlx_fused_decode_step(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t token_id,
     size_t pos_offset
 ) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     int32_t token_id_i32 = static_cast<int32_t>(token_id);
     array token = array(&token_id_i32, {1}, int32);
 
-    array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, token, pos_offset);
+    array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, mamba_cache_state, token, pos_offset);
     eval(next);
     return static_cast<uint32_t>(next.item<int32_t>());
 }
@@ -979,12 +1212,14 @@ void* mlx_fused_decode_step_logits(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t token_id,
     size_t pos_offset
 ) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     int32_t token_id_i32 = static_cast<int32_t>(token_id);
     array token = array(&token_id_i32, {1}, int32);
@@ -993,6 +1228,7 @@ void* mlx_fused_decode_step_logits(
         fused_weights,
         cache_state,
         shortconv_cache_state,
+        mamba_cache_state,
         token,
         pos_offset
     );
@@ -1007,17 +1243,19 @@ void mlx_pipeline_prime(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t first_token_id,
     size_t pos_offset
 ) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     int32_t token_id_i32 = static_cast<int32_t>(first_token_id);
     array first_token = array(&token_id_i32, {1}, int32);
 
-    array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, first_token, pos_offset);
+    array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, mamba_cache_state, first_token, pos_offset);
     async_eval(next);
 
     void* key = quant_decode_state_key(cache_ptr, model);
@@ -1030,11 +1268,13 @@ uint32_t mlx_pipeline_step(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     size_t pos_offset
 ) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     array current(0.0f, float32);
     {
@@ -1046,7 +1286,7 @@ uint32_t mlx_pipeline_step(
     }
 
     // Build next graph using current (lazy) token.
-    array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, current, pos_offset);
+    array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, mamba_cache_state, current, pos_offset);
 
     // Queue next.
     async_eval(next);
@@ -1066,7 +1306,9 @@ uint32_t mlx_pipeline_step(
     return result;
 }
 
-uint32_t mlx_pipeline_flush(void* model, void* cache_ptr) {
+uint32_t mlx_pipeline_flush(void* model, void* cache_ptr, void* shortconv_cache_ptr, void* mamba_cache_ptr) {
+    (void)shortconv_cache_ptr;
+    (void)mamba_cache_ptr;
     std::optional<array> current_token;
     {
         void* key = quant_decode_state_key(cache_ptr, model);
@@ -1088,17 +1330,19 @@ void* mlx_fused_decode_async_start(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t token_id,
     size_t pos_offset
 ) {
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     int32_t token_id_i32 = static_cast<int32_t>(token_id);
     array token = array(&token_id_i32, {1}, int32);
 
-    g_pending_token = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, token, pos_offset);
+    g_pending_token = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, mamba_cache_state, token, pos_offset);
     async_eval(*g_pending_token);
 
     return nullptr;
@@ -1110,199 +1354,6 @@ uint32_t mlx_fused_decode_async_get() {
 }
 
 // ============================================================================
-// C API - Compiled Layer (uses MLX compile() for fusion)
-// ============================================================================
-// These functions compile entire transformer layers for better GPU fusion.
-
-struct CompiledLayer {
-    std::function<std::vector<array>(const std::vector<array>&)> fn;
-};
-static std::vector<CompiledLayer*> g_compiled_layers;
-
-void* mlx_compile_layer(
-    const void* q_weight, const void* q_scales, const void* q_biases,
-    const void* k_weight, const void* k_scales, const void* k_biases,
-    const void* v_weight, const void* v_scales, const void* v_biases,
-    const void* o_weight, const void* o_scales, const void* o_biases,
-    const void* gate_weight, const void* gate_scales, const void* gate_biases,
-    const void* up_weight, const void* up_scales, const void* up_biases,
-    const void* down_weight, const void* down_scales, const void* down_biases,
-    const void* attn_norm, const void* ffn_norm,
-    const void* q_norm, const void* k_norm,
-    size_t n_heads, size_t n_kv_heads, size_t head_dim, size_t hidden_dim,
-    size_t group_size, size_t bits, float rope_theta, float rms_eps
-) {
-    // Capture weights by value
-    const array w_q = *static_cast<const array*>(q_weight);
-    const array s_q = *static_cast<const array*>(q_scales);
-    const array b_q = *static_cast<const array*>(q_biases);
-    const array w_k = *static_cast<const array*>(k_weight);
-    const array s_k = *static_cast<const array*>(k_scales);
-    const array b_k = *static_cast<const array*>(k_biases);
-    const array w_v = *static_cast<const array*>(v_weight);
-    const array s_v = *static_cast<const array*>(v_scales);
-    const array b_v = *static_cast<const array*>(v_biases);
-    const array w_o = *static_cast<const array*>(o_weight);
-    const array s_o = *static_cast<const array*>(o_scales);
-    const array b_o = *static_cast<const array*>(o_biases);
-    const array w_gate = *static_cast<const array*>(gate_weight);
-    const array s_gate = *static_cast<const array*>(gate_scales);
-    const array b_gate = *static_cast<const array*>(gate_biases);
-    const array w_up = *static_cast<const array*>(up_weight);
-    const array s_up = *static_cast<const array*>(up_scales);
-    const array b_up = *static_cast<const array*>(up_biases);
-    const array w_down = *static_cast<const array*>(down_weight);
-    const array s_down = *static_cast<const array*>(down_scales);
-    const array b_down = *static_cast<const array*>(down_biases);
-    const array norm_attn = *static_cast<const array*>(attn_norm);
-    const array norm_ffn = *static_cast<const array*>(ffn_norm);
-    const std::optional<array> q_norm_arr = q_norm ? std::optional<array>(*static_cast<const array*>(q_norm)) : std::nullopt;
-    const std::optional<array> k_norm_arr = k_norm ? std::optional<array>(*static_cast<const array*>(k_norm)) : std::nullopt;
-
-    auto layer_fn = [=](const std::vector<array>& inputs) -> std::vector<array> {
-        const auto& hidden = inputs[0];
-        const auto& k_cache_in = inputs[1];
-        const auto& v_cache_in = inputs[2];
-        int pos_offset = inputs[3].shape(0) - 1;
-
-        int batch_size = hidden.shape(0);
-        int seq_len = hidden.shape(1);
-        int group_size_int = static_cast<int>(group_size);
-        int bits_int = static_cast<int>(bits);
-
-        auto normed = fast::rms_norm(hidden, norm_attn, rms_eps);
-
-        auto q_proj = quantized_matmul(normed, w_q, s_q, b_q, true, group_size_int, bits_int, "affine");
-        auto k_proj = quantized_matmul(normed, w_k, s_k, b_k, true, group_size_int, bits_int, "affine");
-        auto v_proj = quantized_matmul(normed, w_v, s_v, b_v, true, group_size_int, bits_int, "affine");
-
-        auto q = reshape(q_proj, {batch_size, seq_len, static_cast<int>(n_heads), static_cast<int>(head_dim)});
-        auto k = reshape(k_proj, {batch_size, seq_len, static_cast<int>(n_kv_heads), static_cast<int>(head_dim)});
-        auto v = reshape(v_proj, {batch_size, seq_len, static_cast<int>(n_kv_heads), static_cast<int>(head_dim)});
-
-        if (q_norm_arr) q = fast::rms_norm(q, *q_norm_arr, rms_eps);
-        if (k_norm_arr) k = fast::rms_norm(k, *k_norm_arr, rms_eps);
-
-        q = transpose(q, {0, 2, 1, 3});
-        k = transpose(k, {0, 2, 1, 3});
-        v = transpose(v, {0, 2, 1, 3});
-
-        q = fast::rope(q, static_cast<int>(head_dim), false, rope_theta, 1.0f, pos_offset);
-        k = fast::rope(k, static_cast<int>(head_dim), false, rope_theta, 1.0f, pos_offset);
-
-        bool is_prefill = (k_cache_in.ndim() == 0 || k_cache_in.size() == 0);
-        array k_full = is_prefill ? k : concatenate({k_cache_in, k}, 2);
-        array v_full = is_prefill ? v : concatenate({v_cache_in, v}, 2);
-
-        float scale = 1.0f / std::sqrt(static_cast<float>(head_dim));
-        array attn_k(0.0f, float32);
-        array attn_v(0.0f, float32);
-        gqa_expand_attention_kv(q, k_full, v_full, &attn_k, &attn_v);
-        auto attn_out = fast::scaled_dot_product_attention(q, attn_k, attn_v, scale, is_prefill ? "causal" : "");
-
-        attn_out = transpose(attn_out, {0, 2, 1, 3});
-        attn_out = reshape(attn_out, {batch_size, seq_len, static_cast<int>(n_heads * head_dim)});
-
-        auto attn_proj = quantized_matmul(attn_out, w_o, s_o, b_o, true, group_size_int, bits_int, "affine");
-        auto hidden_1 = hidden + attn_proj;
-
-        auto normed_2 = fast::rms_norm(hidden_1, norm_ffn, rms_eps);
-        auto gate = quantized_matmul(normed_2, w_gate, s_gate, b_gate, true, group_size_int, bits_int, "affine");
-        auto up = quantized_matmul(normed_2, w_up, s_up, b_up, true, group_size_int, bits_int, "affine");
-        auto ffn_hidden = (gate * sigmoid(gate)) * up;
-        auto down = quantized_matmul(ffn_hidden, w_down, s_down, b_down, true, group_size_int, bits_int, "affine");
-
-        auto output = hidden_1 + down;
-        return {output, k, v};
-    };
-
-    auto* compiled = new CompiledLayer();
-    compiled->fn = compile(layer_fn, /* shapeless= */ true);
-    g_compiled_layers.push_back(compiled);
-    return compiled;
-}
-
-void* mlx_layer_forward(
-    void* compiled_handle,
-    const void* hidden,
-    void* cache_ptr,
-    void* shortconv_cache_ptr,
-    size_t layer_idx,
-    size_t pos_offset
-) {
-    (void)shortconv_cache_ptr;
-    auto* compiled_layer = static_cast<CompiledLayer*>(compiled_handle);
-    if (compiled_layer == nullptr) {
-        throw std::invalid_argument("null compiled layer handle");
-    }
-    const auto& h = *static_cast<const array*>(hidden);
-
-    auto* cache_state = static_cast<MLXCache*>(cache_ptr);
-    auto& layer = cache_state->layers[layer_idx];
-
-    size_t prev_offset = layer.offset;
-    bool is_prefill = (prev_offset == 0);
-
-    array kc = array(0.0f, float32);
-    array vc = array(0.0f, float32);
-
-    if (!is_prefill && layer.k_bfloat16) {
-        const auto& k_full = *layer.k_bfloat16;
-        const auto& v_full = *layer.v_bfloat16;
-        Shape start = {0, 0, 0, 0};
-        Shape stop = {k_full.shape(0), k_full.shape(1), static_cast<int>(prev_offset), k_full.shape(3)};
-        kc = slice(k_full, start, stop);
-        vc = slice(v_full, start, stop);
-    }
-
-    array pos_arr = zeros({static_cast<int>(pos_offset + 1)}, float32);
-    auto results = compiled_layer->fn({h, kc, vc, pos_arr});
-
-    const auto& hidden_out = results[0];
-    const auto& k_new = results[1];
-    const auto& v_new = results[2];
-
-    const int batch_size = k_new.shape(0);
-    const int kv_heads = k_new.shape(1);
-    const int head_dim = k_new.shape(3);
-    const int step_count = k_new.shape(2);
-    const int new_offset = prev_offset + step_count;
-
-    if (!layer.k_bfloat16) {
-        const int capacity = next_cache_capacity(layer, static_cast<size_t>(new_offset), 0);
-        Shape new_shape = {batch_size, kv_heads, capacity, head_dim};
-        layer.k_bfloat16 = new array(zeros(new_shape, bfloat16));
-        layer.v_bfloat16 = new array(zeros(new_shape, bfloat16));
-    } else if (new_offset > layer.k_bfloat16->shape(2)) {
-        const int current_capacity = layer.k_bfloat16->shape(2);
-        const int new_capacity = next_cache_capacity(layer, static_cast<size_t>(new_offset), current_capacity);
-        Shape new_shape = {batch_size, kv_heads, new_capacity, head_dim};
-        array new_k = zeros(new_shape, bfloat16);
-        array new_v = zeros(new_shape, bfloat16);
-        if (prev_offset > 0) {
-            Shape copy_start = {0, 0, 0, 0};
-            Shape copy_stop = {batch_size, kv_heads, static_cast<int>(prev_offset), head_dim};
-            array k_existing = slice(*layer.k_bfloat16, copy_start, copy_stop);
-            array v_existing = slice(*layer.v_bfloat16, copy_start, copy_stop);
-            new_k = slice_update(new_k, k_existing, copy_start, copy_stop);
-            new_v = slice_update(new_v, v_existing, copy_start, copy_stop);
-        }
-        *layer.k_bfloat16 = new_k;
-        *layer.v_bfloat16 = new_v;
-    }
-
-    Shape start = {0, 0, static_cast<int>(prev_offset), 0};
-    Shape stop = {batch_size, kv_heads, static_cast<int>(new_offset), head_dim};
-    array k_old = *layer.k_bfloat16;
-    array v_old = *layer.v_bfloat16;
-    *layer.k_bfloat16 = slice_update(k_old, k_new, start, stop);
-    *layer.v_bfloat16 = slice_update(v_old, v_new, start, stop);
-    layer.offset = new_offset;
-
-    return pool_array(array(hidden_out));
-}
-
-// ============================================================================
 // C API - Batch Decode (runs entire generation loop in C++)
 // ============================================================================
 
@@ -1310,6 +1361,7 @@ uint32_t mlx_fused_decode_batch(
     void* model,
     void* cache_ptr,
     void* shortconv_cache_ptr,
+    void* mamba_cache_ptr,
     uint32_t first_token,
     size_t start_pos,
     uint32_t* out_tokens,
@@ -1320,6 +1372,7 @@ uint32_t mlx_fused_decode_batch(
     auto* fused_weights = static_cast<FusedModelWeights*>(model);
     auto* cache_state = static_cast<MLXCache*>(cache_ptr);
     auto* shortconv_cache_state = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
+    auto* mamba_cache_state = static_cast<MLXMambaCache*>(mamba_cache_ptr);
 
     auto is_eos = [&](uint32_t tok) {
         for (size_t i = 0; i < n_eos_ids; i++) {
@@ -1335,7 +1388,7 @@ uint32_t mlx_fused_decode_batch(
     while (gen_count < max_tokens) {
         int32_t token_id_i32 = static_cast<int32_t>(current_token);
         array token = array(&token_id_i32, {1}, int32);
-        array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, token, pos);
+        array next = fused_forward_from_token(fused_weights, cache_state, shortconv_cache_state, mamba_cache_state, token, pos);
         eval(next);
         current_token = static_cast<uint32_t>(next.item<int32_t>());
         out_tokens[gen_count++] = current_token;
