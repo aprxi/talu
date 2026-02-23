@@ -39,6 +39,7 @@ pub const matvec_u16_qkv = @import("matvec_u16_qkv.zig");
 pub const gaffine_u4_matvec = @import("gaffine_u4_matvec.zig");
 pub const gaffine_u4_matvec_gate_up = @import("gaffine_u4_matvec_gate_up.zig");
 pub const gaffine_u4_matvec_qkv = @import("gaffine_u4_matvec_qkv.zig");
+pub const shortconv_step = @import("shortconv_step.zig");
 
 pub const Device = device.Device;
 pub const Buffer = device.Buffer;
@@ -89,4 +90,5 @@ test {
     _ = gaffine_u4_matvec;
     _ = gaffine_u4_matvec_gate_up;
     _ = gaffine_u4_matvec_qkv;
+    _ = shortconv_step;
 }

@@ -10,3 +10,4 @@
 #include "ops/common_decode.cuh"
 #include "ops/matvec_ops.cu"
 #include "ops/quant_ops.cu"
+#include "ops/shortconv_ops.cu"
