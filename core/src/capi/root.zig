@@ -27,6 +27,7 @@ pub const types = @import("types.zig");
 pub const provider = @import("provider.zig");
 pub const db_storage = @import("db.zig");
 pub const repo_meta = @import("repo_meta.zig");
+pub const sql_api = @import("sql.zig");
 pub const log_api = @import("log.zig");
 pub const progress = @import("progress.zig");
 pub const memory = @import("memory.zig");
@@ -212,6 +213,10 @@ pub const talu_repo_meta_free_list = repo_meta.talu_repo_meta_free_list;
 pub const PinAdapterHandle = repo_meta.PinAdapterHandle;
 pub const CPinRecord = repo_meta.CPinRecord;
 pub const CPinList = repo_meta.CPinList;
+
+// Re-export SQL C API functions.
+pub const talu_sql_query = sql_api.talu_sql_query;
+pub const talu_sql_query_free = sql_api.talu_sql_query_free;
 
 // Re-export error C API functions.
 pub const talu_last_error = err.talu_last_error;

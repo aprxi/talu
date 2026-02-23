@@ -61,6 +61,7 @@ pub mod repo;
 pub mod repo_meta;
 pub mod responses;
 pub mod router;
+pub mod sql;
 pub mod storage;
 pub mod treesitter;
 pub mod vector;
@@ -93,6 +94,7 @@ pub use repo::{
     ProgressAction as RepoProgressAction, SearchDirection, SearchSort,
 };
 pub use repo_meta::{RepoMetaError, RepoMetaStore, RepoPinEntry};
+pub use sql::{SqlEngine, SqlError};
 pub use storage::{SessionRecord, StorageError, StorageHandle};
 pub use vector::{SearchBatchResult, VectorError, VectorStore};
 pub use xray::{TraceRecord, TraceStats, XrayCaptureHandle};

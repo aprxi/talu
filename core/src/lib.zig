@@ -206,6 +206,8 @@ comptime {
     _ = &capi.talu_repo_meta_clear_size;
     _ = &capi.talu_repo_meta_list_pins;
     _ = &capi.talu_repo_meta_free_list;
+    _ = &capi.talu_sql_query;
+    _ = &capi.talu_sql_query_free;
 
     // Validate API (high-level sampler)
     _ = &capi.talu_validate_create;

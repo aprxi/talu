@@ -6,6 +6,7 @@ mod models;
 mod repo;
 mod sessions;
 mod shell;
+mod sql;
 mod util;
 mod xray;
 
@@ -83,6 +84,8 @@ pub(super) enum Commands {
     Set(SetArgs),
     /// Inspect and transform input files for inference
     File(FileArgs),
+    /// Execute SQL queries against TaluDB virtual tables
+    Sql(SqlArgs),
 }
 
 #[derive(Args)]
@@ -168,6 +171,24 @@ pub(super) struct DbDeleteArgs {
     /// Skip confirmation prompt
     #[arg(short, long)]
     pub force: bool,
+}
+
+#[derive(Args)]
+pub(super) struct SqlArgs {
+    /// SQL query to execute
+    pub query: String,
+
+    /// Storage profile name
+    #[arg(long, env = "TALU_PROFILE", default_value = "default")]
+    pub profile: String,
+
+    /// Override bucket path (bypasses profile resolution)
+    #[arg(long, env = "TALU_BUCKET")]
+    pub bucket: Option<PathBuf>,
+
+    /// Disable storage entirely (not supported for SQL command)
+    #[arg(long)]
+    pub no_bucket: bool,
 }
 
 #[derive(Args)]
@@ -578,7 +599,7 @@ fn should_implicit_ask(args: &[String], stdin_is_pipe: bool) -> bool {
     // If first arg is a known subcommand, don't add implicit ask
     let subcommands = [
         "ask", "help", "serve", "convert", "tokenize", "ls", "get", "rm", "describe", "xray",
-        "agent", "set", "sample", "file",
+        "agent", "set", "sample", "file", "sql",
     ];
     if subcommands.iter().any(|&cmd| cmd == first) {
         return false;
@@ -648,6 +669,7 @@ fn run_inner() -> Result<()> {
         Some(Commands::Agent(args)) => shell::cmd_agent(args, stdin_is_pipe),
         Some(Commands::Set(args)) => cmd_set(args),
         Some(Commands::File(args)) => file::cmd_file(args),
+        Some(Commands::Sql(args)) => sql::cmd_sql(args),
     }
 }
 
@@ -885,6 +907,21 @@ mod tests {
                 assert_eq!(args.prompt, vec!["hello"]);
             }
             _ => panic!("expected ask command"),
+        }
+    }
+
+    #[test]
+    fn parse_sql_command() {
+        let cli = parse(&["talu", "sql", "SELECT doc_id FROM docs"]).expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Sql(args)) => {
+                assert_eq!(args.query, "SELECT doc_id FROM docs");
+                assert_eq!(args.profile, "default");
+                assert!(args.bucket.is_none());
+                assert!(!args.no_bucket);
+            }
+            _ => panic!("expected sql command"),
         }
     }
 
