@@ -7,30 +7,34 @@ const std = @import("std");
 const build_options = @import("build_options");
 const models = @import("../../../models/root.zig");
 const contract = @import("../contract.zig");
-const cpu_vision = @import("../cpu/vision/root.zig");
-const common_mrope = @import("../cpu/vision/mrope.zig");
-const cpu_engine = @import("../cpu/engine.zig");
-const progress = @import("../../../progress.zig");
 const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
 const dtype = @import("../../../dtype.zig");
 const log = @import("../../../log.zig");
 const load_transforms = @import("../../../models/load/transforms.zig");
-const parity_probe = @import("parity_probe.zig");
+const vision_types = @import("../../vision_types.zig");
 const smoke_checks = @import("smoke_checks.zig");
+const attention_policy = @import("attention_policy.zig");
+const attention_mod = @import("attention.zig");
+const decode_mod = @import("decode.zig");
+const prefill_mod = @import("prefill.zig");
+const vision_runtime_mod = @import("vision/root.zig");
 
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 const prototype_eps: f32 = 1e-5;
-const parity_probe_max_mean_abs_diff: f32 = 1.0;
-const parity_probe_max_abs_diff: f32 = 25.0;
-const prototype_low_token_band: usize = 4096;
 const initial_kv_cache_tokens: usize = 256;
 const kv_cache_dtype_fp16: bool = true;
 const enable_fused_attention_f16_kv: bool = true;
 const max_fused_attention_f16_kv_seq_len: u32 = 384;
 const enable_device_embedding_lookup: bool = true;
 const max_supported_fused_f16_kv_head_dim = 512;
+const attention_policy_config = attention_policy.Config{
+    .kv_cache_dtype_fp16 = kv_cache_dtype_fp16,
+    .enable_fused_attention_f16_kv = enable_fused_attention_f16_kv,
+    .max_fused_attention_f16_kv_seq_len = max_fused_attention_f16_kv_seq_len,
+    .max_supported_fused_f16_kv_head_dim = max_supported_fused_f16_kv_head_dim,
+};
 const run_startup_selftests = build_options.cuda_startup_selftests;
 const gaffine_scales_dtype_f16 = compute.cuda.gaffine_u4_matvec.scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
@@ -318,10 +322,11 @@ const PrototypeRuntime = struct {
         const shortconv_dim = if (max_shortconv_dim > 0) max_shortconv_dim else 1;
         const shortconv_proj_bytes = std.math.mul(usize, shortconv_dim * 3, @sizeOf(f32)) catch return error.InvalidArgument;
         const shortconv_conv_bytes = std.math.mul(usize, shortconv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
-        const need_attention_score_buffers = !kv_cache_dtype_fp16 or
-            !enable_fused_attention_f16_kv or
-            head_dim > max_supported_fused_f16_kv_head_dim or
-            max_seq_len > max_fused_attention_f16_kv_seq_len;
+        const need_attention_score_buffers = attention_policy.needAttentionScoreBuffers(
+            attention_policy_config,
+            max_seq_len,
+            head_dim,
+        );
         const attn_rows = std.math.mul(usize, max_seq_len, n_heads) catch return error.InvalidArgument;
         const attn_rows_bytes = std.math.mul(usize, attn_rows, @sizeOf(f32)) catch return error.InvalidArgument;
         const hidden_host = try allocator.alloc(f32, d_model);
@@ -330,7 +335,13 @@ const PrototypeRuntime = struct {
         const norm_weight_host = try allocator.alloc(f32, d_model);
         defer allocator.free(norm_weight_host);
         const using_model_norm = tryPopulateFinalNormWeight(loaded, norm_weight_host);
-        if (!using_model_norm) fillPrototypeNormWeight(norm_weight_host);
+        if (!using_model_norm) {
+            log.warn("inference", "CUDA final norm weight unsupported", .{
+                .has_ln_final = @as(u8, @intFromBool(loaded.ln_final != null)),
+                .dtype = if (loaded.ln_final) |ln_final| @tagName(ln_final.dtype) else "none",
+            });
+            return error.UnsupportedModel;
+        }
         var projection_from_lm_head = false;
         var projection_weight_opt: ?LinearWeight = null;
         errdefer if (projection_weight_opt) |*w| w.deinit(device);
@@ -349,32 +360,33 @@ const PrototypeRuntime = struct {
             };
         }
 
-        var using_model_projection = projection_weight_opt != null;
         if (projection_weight_opt == null) {
-            const projected_vocab_fallback = vocab_size;
-            const projection_elements = std.math.mul(usize, d_model, projected_vocab_fallback) catch return error.InvalidArgument;
-            const projection_host = try allocator.alloc(f32, projection_elements);
-            defer allocator.free(projection_host);
-            fillPrototypeProjection(projection_host, d_model, projected_vocab_fallback);
-
-            var projection_buffer = try device.allocBuffer(projection_elements * @sizeOf(f32));
-            errdefer projection_buffer.deinit(device);
-            try projection_buffer.upload(device, std.mem.sliceAsBytes(projection_host));
-            projection_weight_opt = .{
-                .dense_f32 = .{
-                    .rows = d_model,
-                    .cols = projected_vocab_fallback,
-                    .buffer = projection_buffer,
-                },
-            };
-            using_model_projection = false;
-            projection_from_lm_head = false;
+            log.warn("inference", "CUDA projection weight unsupported", .{
+                .d_model = d_model,
+                .vocab_size = vocab_size,
+                .has_lm_head = @as(u8, @intFromBool(loaded.lm_head != null)),
+                .embed_dtype = @tagName(loaded.token_embeddings.dtype),
+                .embed_ndim = loaded.token_embeddings.n_dims,
+            });
+            return error.UnsupportedModel;
         }
+        const using_model_projection = true;
         const projection_weight = projection_weight_opt.?;
         const projected_vocab = projection_weight.cols();
         const projected_logits_host = try allocator.alloc(f32, projected_vocab);
         errdefer allocator.free(projected_logits_host);
         const logits_bytes = std.math.mul(usize, projected_vocab, @sizeOf(f32)) catch return error.InvalidArgument;
+        const using_model_embeddings = canUseModelEmbeddings(loaded, d_model);
+        if (!using_model_embeddings) {
+            log.warn("inference", "CUDA token embeddings unsupported", .{
+                .d_model = d_model,
+                .embed_dtype = @tagName(loaded.token_embeddings.dtype),
+                .embed_ndim = loaded.token_embeddings.n_dims,
+                .embed_shape_0 = loaded.token_embeddings.shape[0],
+                .embed_shape_1 = loaded.token_embeddings.shape[1],
+            });
+            return error.UnsupportedModel;
+        }
         var embedding_lookup = try tryUploadEmbeddingLookup(device, loaded, d_model);
         errdefer if (embedding_lookup) |*lookup| lookup.deinit(device);
 
@@ -429,7 +441,7 @@ const PrototypeRuntime = struct {
             .using_model_norm = using_model_norm,
             .using_model_projection = using_model_projection,
             .projection_from_lm_head = projection_from_lm_head,
-            .using_model_embeddings = canUseModelEmbeddings(loaded),
+            .using_model_embeddings = using_model_embeddings,
             .embedding_lookup = embedding_lookup,
             .hidden_host = hidden_host,
             .projected_logits_host = projected_logits_host,
@@ -1279,10 +1291,11 @@ pub const CudaBackend = struct {
         .warmup = false,
     };
 
-    pub const PrefillVisionInput = cpu_vision.PrefillVisionInput;
+    pub const PrefillVisionInput = vision_types.PrefillVisionInput;
 
     allocator: std.mem.Allocator,
     loaded: *LoadedModel,
+    vision_runtime: ?vision_runtime_mod.VisionRuntime = null,
     device: compute.cuda.Device,
     compute_stream: ?compute.cuda.StreamHandle = null,
     kernel_registry: compute.cuda.Registry,
@@ -1356,7 +1369,6 @@ pub const CudaBackend = struct {
     gaffine_u4_matvec_qkv_source: ?compute.cuda.registry.KernelSource = null,
     kernel_arg_pack: compute.cuda.ArgPack,
     blas: compute.cuda.Blas,
-    vision_runtime: ?cpu_vision.VisionRuntime = null,
     prototype: PrototypeRuntime,
     block_runtime: BlockRuntime,
     d_model: usize,
@@ -1383,6 +1395,7 @@ pub const CudaBackend = struct {
         var backend = CudaBackend{
             .allocator = allocator,
             .loaded = loaded,
+            .vision_runtime = null,
             .device = device,
             .compute_stream = null,
             .kernel_registry = undefined,
@@ -1436,10 +1449,10 @@ pub const CudaBackend = struct {
         errdefer allocator.free(backend.slot_logits);
         backend.argmax_index_dev = try backend.device.allocBuffer(@sizeOf(u32));
         errdefer backend.argmax_index_dev.deinit(&backend.device);
-        backend.vision_runtime = try cpu_vision.VisionRuntime.init(allocator, loaded);
-        errdefer if (backend.vision_runtime) |*rt| rt.deinit();
         backend.block_runtime = try BlockRuntime.init(allocator, &backend.device, loaded);
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
+        backend.vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
+        errdefer if (backend.vision_runtime) |*rt| rt.deinit();
         if (loaded.config.use_qk_norm and
             (backend.block_runtime.q_norm_blocks != backend.block_runtime.attention_block_count or
                 backend.block_runtime.k_norm_blocks != backend.block_runtime.attention_block_count))
@@ -1475,12 +1488,6 @@ pub const CudaBackend = struct {
         if (run_startup_selftests) {
             try smoke_checks.runMatmulSmoke(&backend);
             try smoke_checks.runKernelSmoke(&backend);
-            runCpuParityProbe(&backend) catch |err| switch (err) {
-                error.CudaParityMismatch => return err,
-                else => log.warn("inference", "CUDA parity probe unavailable", .{
-                    .reason = @errorName(err),
-                }),
-            };
         }
         log.info("inference", "CUDA layered decode path ready", .{
             .d_model = backend.d_model,
@@ -1561,13 +1568,13 @@ pub const CudaBackend = struct {
     }
 
     pub fn deinit(self: *CudaBackend) void {
+        if (self.vision_runtime) |*rt| rt.deinit();
         self.device.setLaunchStream(null);
         if (self.compute_stream) |stream| {
             _ = self.device.synchronizeStream(stream) catch {};
             self.device.destroyStream(stream);
             self.compute_stream = null;
         }
-        if (self.vision_runtime) |*rt| rt.deinit();
         self.argmax_index_dev.deinit(&self.device);
         self.allocator.free(self.slot_logits);
         self.block_runtime.deinit(self.allocator, &self.device);
@@ -1595,61 +1602,11 @@ pub const CudaBackend = struct {
     }
 
     pub fn prefill(self: *CudaBackend, tokens: []const u32, logits_out: []f32) !void {
-        if (tokens.len == 0) {
-            log.warn("inference", "CUDA prefill invalid args", .{
-                .reason = "empty_tokens",
-            });
-            return error.InvalidArgument;
-        }
-        if (logits_out.len != self.vocab_size) {
-            log.warn("inference", "CUDA prefill invalid args", .{
-                .reason = "logits_len_mismatch",
-                .logits_len = logits_out.len,
-                .vocab_size = self.vocab_size,
-            });
-            return error.InvalidArgument;
-        }
-        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-        self.slot_rope_position_delta = 0;
-        if (try self.trySequencePrefill(tokens, logits_out, "prefill_seq")) {
-            self.slot_position = tokens.len;
-            return;
-        }
-        const prefill_start_ns: i128 = std.time.nanoTimestamp();
-        try self.ensureKvCapacity(tokens.len);
-
-        var i: usize = 0;
-        while (i < tokens.len) : (i += 1) {
-            const download_logits = shouldDownloadPrefillLogits(i, tokens.len);
-            try self.computeGpuPrototypeLogitsWithLayerLimit(
-                tokens[i],
-                i,
-                if (download_logits) self.slot_logits else null,
-                self.block_runtime.blocks.len,
-                download_logits,
-                download_logits,
-                false,
-                null,
-            );
-        }
-        const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
-        logPrefillTiming(self, "prefill", tokens.len, prefill_elapsed_ns);
-        @memcpy(logits_out, self.slot_logits);
-        self.slot_position = tokens.len;
+        return prefill_mod.prefill(self, tokens, logits_out);
     }
 
     pub fn decode(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
-        if (logits_out.len != self.vocab_size) {
-            log.warn("inference", "CUDA decode invalid args", .{
-                .reason = "logits_len_mismatch",
-                .logits_len = logits_out.len,
-                .vocab_size = self.vocab_size,
-            });
-            return error.InvalidArgument;
-        }
-        const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_delta);
-        try self.computeGpuPrototypeLogits(token, effective_position, logits_out);
-        self.slot_position = position + 1;
+        return decode_mod.decode(self, token, position, logits_out);
     }
 
     pub fn decodeStreaming(
@@ -1662,68 +1619,32 @@ pub const CudaBackend = struct {
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
     ) !usize {
-        if (max_tokens == 0 or output_tokens.len == 0) return 0;
-        if (!self.slot_in_use) {
-            self.slot_in_use = true;
-            self.slot_position = start_position;
-        }
-
-        var current_token = first_token;
-        var generated: usize = 0;
-        var position = self.slot_position;
-        const budget = @min(max_tokens, output_tokens.len);
-        while (generated < budget) : (generated += 1) {
-            const effective_position = try common_mrope.applyPositionDelta(position, self.slot_rope_position_delta);
-            try self.computeGpuPrototypeLogitsWithLayerLimit(
-                current_token,
-                effective_position,
-                null,
-                self.block_runtime.blocks.len,
-                true,
-                false,
-                true,
-                null,
-            );
-            const next_token = try selectNextTokenFromDeviceLogits(self);
-            output_tokens[generated] = next_token;
-            position += 1;
-            self.slot_position = position;
-            if (callback) |cb| cb(next_token, callback_data);
-
-            for (eos_token_ids) |eos_id| {
-                if (next_token == eos_id) {
-                    return generated + 1;
-                }
-            }
-            current_token = next_token;
-        }
-        return generated;
+        return decode_mod.decodeStreaming(
+            self,
+            first_token,
+            start_position,
+            max_tokens,
+            eos_token_ids,
+            output_tokens,
+            callback,
+            callback_data,
+        );
     }
 
     pub fn allocSlot(self: *CudaBackend) ?usize {
-        if (self.slot_in_use) return null;
-        self.slot_in_use = true;
-        self.slot_position = 0;
-        self.slot_rope_position_delta = 0;
-        return 0;
+        return decode_mod.allocSlot(self);
     }
 
     pub fn freeSlot(self: *CudaBackend, slot_index: usize) void {
-        if (slot_index != 0) return;
-        self.slot_in_use = false;
-        self.slot_position = 0;
-        self.slot_rope_position_delta = 0;
+        decode_mod.freeSlot(self, slot_index);
     }
 
     pub fn resetSlot(self: *CudaBackend, slot_index: usize) void {
-        if (slot_index != 0) return;
-        self.slot_position = 0;
-        self.slot_rope_position_delta = 0;
+        decode_mod.resetSlot(self, slot_index);
     }
 
     pub fn getPosition(self: *const CudaBackend, slot_index: usize) usize {
-        if (slot_index != 0) return 0;
-        return self.slot_position;
+        return decode_mod.getPosition(self, slot_index);
     }
 
     pub fn prefillSlot(
@@ -1732,56 +1653,7 @@ pub const CudaBackend = struct {
         tokens: []const u32,
         logits_out: []f32,
     ) !void {
-        if (tokens.len == 0) {
-            log.warn("inference", "CUDA prefillSlot invalid args", .{
-                .reason = "empty_tokens",
-                .slot_index = slot_index,
-            });
-            return error.InvalidArgument;
-        }
-        if (logits_out.len != self.vocab_size) {
-            log.warn("inference", "CUDA prefillSlot invalid args", .{
-                .reason = "logits_len_mismatch",
-                .slot_index = slot_index,
-                .logits_len = logits_out.len,
-                .vocab_size = self.vocab_size,
-            });
-            return error.InvalidArgument;
-        }
-        if (!self.slot_in_use or slot_index != 0) {
-            log.warn("inference", "CUDA prefillSlot invalid args", .{
-                .reason = "slot_state",
-                .slot_index = slot_index,
-                .slot_in_use = @as(u8, @intFromBool(self.slot_in_use)),
-            });
-            return error.InvalidArgument;
-        }
-        if (tokens.len > self.max_seq_len) return error.InvalidArgument;
-        self.slot_rope_position_delta = 0;
-        if (try self.trySequencePrefill(tokens, logits_out, "prefill_slot_seq")) {
-            self.slot_position = tokens.len;
-            return;
-        }
-        const prefill_start_ns: i128 = std.time.nanoTimestamp();
-        try self.ensureKvCapacity(tokens.len);
-        var i: usize = 0;
-        while (i < tokens.len) : (i += 1) {
-            const download_logits = shouldDownloadPrefillLogits(i, tokens.len);
-            try self.computeGpuPrototypeLogitsWithLayerLimit(
-                tokens[i],
-                i,
-                if (download_logits) self.slot_logits else null,
-                self.block_runtime.blocks.len,
-                download_logits,
-                download_logits,
-                false,
-                null,
-            );
-        }
-        const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
-        logPrefillTiming(self, "prefill_slot", tokens.len, prefill_elapsed_ns);
-        @memcpy(logits_out, self.slot_logits);
-        self.slot_position = tokens.len;
+        return prefill_mod.prefillSlot(self, slot_index, tokens, logits_out);
     }
 
     pub fn prefillSlotWithVision(
@@ -1792,6 +1664,7 @@ pub const CudaBackend = struct {
         logits_out: []f32,
     ) !void {
         if (vision_input == null) return self.prefillSlot(slot_index, tokens, logits_out);
+
         if (tokens.len == 0) {
             log.warn("inference", "CUDA prefillSlotWithVision invalid args", .{
                 .reason = "empty_tokens",
@@ -1818,53 +1691,51 @@ pub const CudaBackend = struct {
         }
         if (tokens.len > self.max_seq_len) return error.InvalidArgument;
 
-        const vi = vision_input.?;
         const vision = if (self.vision_runtime) |*rt|
             rt
-        else
+        else {
+            log.warn("inference", "CUDA vision prefill requested but vision runtime is unavailable", .{
+                .slot_index = slot_index,
+                .tokens = tokens.len,
+            });
             return error.UnsupportedContentType;
+        };
 
-        const prefill_count = std.math.mul(usize, tokens.len, self.d_model) catch return error.InvalidArgument;
-        const prefill_hidden = try self.allocator.alloc(f32, prefill_count);
-        defer self.allocator.free(prefill_hidden);
+        const vi = vision_input.?;
+        var encoded_vision_output = try vision.encodeImages(vi.images);
+        defer encoded_vision_output.deinit(self.allocator);
 
-        try populatePrefillHiddenFromTokens(self.loaded, tokens, self.d_model, prefill_hidden);
-
-        var encoded = try vision.encodeImages(vi.images);
-        defer encoded.deinit(self.allocator);
-        try cpu_vision.scatterVisionEmbeddings(
-            prefill_hidden,
-            tokens.len,
-            self.d_model,
-            tokens,
-            vi.image_token_id,
-            encoded.merged_embeddings,
-        );
-        if (encoded.deepstack_layer_embeddings.len > 0) {
-            log.warn("inference", "CUDA vision deepstack unsupported", .{
-                .layers = encoded.deepstack_layer_embeddings.len,
+        if (encoded_vision_output.deepstack_layer_embeddings.len > 0) {
+            log.warn("inference", "CUDA vision deepstack layers are not supported yet", .{
+                .slot_index = slot_index,
+                .deepstack_layers = encoded_vision_output.deepstack_layer_embeddings.len,
             });
             return error.UnsupportedModel;
         }
 
-        const mrope_section = common_mrope.resolveMropeSection(&self.loaded.config, self.head_dim);
-        if (mrope_section[0] + mrope_section[1] + mrope_section[2] > 0) {
-            log.warn("inference", "CUDA vision mRoPE prefill unsupported", .{
-                .section_t = mrope_section[0],
-                .section_h = mrope_section[1],
-                .section_w = mrope_section[2],
-            });
-            return error.UnsupportedModel;
-        }
         self.slot_rope_position_delta = 0;
         const prefill_start_ns: i128 = std.time.nanoTimestamp();
         try self.ensureKvCapacity(tokens.len);
 
+        const hidden_count = std.math.mul(usize, tokens.len, self.d_model) catch return error.InvalidArgument;
+        const hidden_host = try self.allocator.alloc(f32, hidden_count);
+        defer self.allocator.free(hidden_host);
+
+        try populatePrefillHiddenFromTokens(self.loaded, tokens, self.d_model, hidden_host);
+        try vision_runtime_mod.scatterVisionEmbeddings(
+            hidden_host,
+            tokens.len,
+            self.d_model,
+            tokens,
+            vi.image_token_id,
+            encoded_vision_output.merged_embeddings,
+        );
+
         var i: usize = 0;
         while (i < tokens.len) : (i += 1) {
-            const offset = std.math.mul(usize, i, self.d_model) catch return error.InvalidArgument;
-            const hidden_row = prefill_hidden[offset .. offset + self.d_model];
-            const download_logits = shouldDownloadPrefillLogits(i, tokens.len);
+            const row_start = std.math.mul(usize, i, self.d_model) catch return error.InvalidArgument;
+            const hidden_override = hidden_host[row_start .. row_start + self.d_model];
+            const download_logits = self.shouldDownloadPrefillLogitsImpl(i, tokens.len);
             try self.computeGpuPrototypeLogitsWithLayerLimit(
                 tokens[i],
                 i,
@@ -1873,16 +1744,17 @@ pub const CudaBackend = struct {
                 download_logits,
                 download_logits,
                 false,
-                hidden_row,
+                hidden_override,
             );
         }
+
         const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
-        logPrefillTiming(self, "prefill_slot_vision", tokens.len, prefill_elapsed_ns);
+        self.logPrefillTimingImpl("prefill_slot_vision", tokens.len, prefill_elapsed_ns);
         @memcpy(logits_out, self.slot_logits);
         self.slot_position = tokens.len;
     }
 
-    fn trySequencePrefill(
+    pub fn trySequencePrefill(
         self: *CudaBackend,
         tokens: []const u32,
         logits_out: []f32,
@@ -2412,43 +2284,23 @@ pub const CudaBackend = struct {
         requests: []const contract.DecodeRequest,
         results: []contract.DecodeResult,
     ) !void {
-        if (results.len < requests.len) {
-            log.warn("inference", "CUDA decodeBatch invalid args", .{
-                .reason = "results_short",
-                .requests = requests.len,
-                .results = results.len,
-            });
-            return error.InvalidArgument;
-        }
-        if (requests.len == 0) return;
-        if (requests.len > 1) {
-            log.warn("inference", "CUDA decodeBatch invalid args", .{
-                .reason = "batch_gt_one",
-                .requests = requests.len,
-            });
-            return error.InvalidArgument;
-        }
-
-        const req = requests[0];
-        if (!self.slot_in_use or req.slot_index != 0) {
-            log.warn("inference", "CUDA decodeBatch invalid args", .{
-                .reason = "slot_state",
-                .slot_index = req.slot_index,
-                .slot_in_use = @as(u8, @intFromBool(self.slot_in_use)),
-            });
-            return error.InvalidArgument;
-        }
-
-        const effective_position = try common_mrope.applyPositionDelta(self.slot_position, self.slot_rope_position_delta);
-        try self.computeGpuPrototypeLogits(req.token, effective_position, self.slot_logits);
-        results[0] = .{
-            .slot_index = req.slot_index,
-            .logits = self.slot_logits,
-        };
-        self.slot_position += 1;
+        return decode_mod.decodeBatch(self, requests, results);
     }
 
-    fn computeGpuPrototypeLogits(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
+    pub fn selectNextTokenFromDeviceLogitsImpl(self: *CudaBackend) !u32 {
+        return selectNextTokenFromDeviceLogits(self);
+    }
+
+    pub fn shouldDownloadPrefillLogitsImpl(self: *const CudaBackend, token_index: usize, token_count: usize) bool {
+        _ = self;
+        return shouldDownloadPrefillLogits(token_index, token_count);
+    }
+
+    pub fn logPrefillTimingImpl(self: *const CudaBackend, mode: []const u8, token_count: usize, elapsed_ns: u64) void {
+        logPrefillTiming(self, mode, token_count, elapsed_ns);
+    }
+
+    pub fn computeGpuPrototypeLogits(self: *CudaBackend, token: u32, position: usize, logits_out: []f32) !void {
         return self.computeGpuPrototypeLogitsWithLayerLimit(
             token,
             position,
@@ -2461,7 +2313,7 @@ pub const CudaBackend = struct {
         );
     }
 
-    fn computeGpuPrototypeLogitsWithLayerLimit(
+    pub fn computeGpuPrototypeLogitsWithLayerLimit(
         self: *CudaBackend,
         token: u32,
         position: usize,
@@ -2644,15 +2496,15 @@ pub const CudaBackend = struct {
                     error.InvalidArgument => return error.InvalidArgument,
                     else => return err,
                 };
-                if (!used_model_embeddings) fillPrototypeInput(self.prototype.hidden_host, token);
-                if (!used_model_embeddings and position == 0) {
-                    log.warn("inference", "CUDA using synthetic embedding fallback", .{
+                if (!used_model_embeddings) {
+                    log.warn("inference", "CUDA embedding layout unsupported", .{
                         .token = token,
                         .embed_shape_0 = self.loaded.token_embeddings.shape[0],
                         .embed_shape_1 = self.loaded.token_embeddings.shape[1],
                         .embed_dtype = @tagName(self.loaded.token_embeddings.dtype),
                         .embed_ndim = self.loaded.token_embeddings.n_dims,
                     });
+                    return error.UnsupportedModel;
                 }
                 if (self.loaded.config.embedding_multiplier != 1.0) {
                     for (self.prototype.hidden_host) |*v| {
@@ -2712,11 +2564,13 @@ pub const CudaBackend = struct {
                     );
                 }
 
-                const effective_seq_len_u32 = effectiveAttentionSeqLen(block, seq_len_u32);
-                const use_fused_attention_heads_f16_kv = canUseFusedAttentionHeadsF16Kv(
-                    effective_seq_len_u32,
+                const use_fused_attention_heads_f16_kv = attention_mod.useFusedHeadsF16Kv(
+                    attention_policy_config,
+                    seq_len_u32,
+                    block.sliding_window,
+                    block.is_causal,
                     head_dim_u32,
-                    attn_fused_heads_f16_kv_function,
+                    attn_fused_heads_f16_kv_function != null,
                 );
                 if (!use_fused_attention_heads_f16_kv) {
                     try compute.cuda.rope.runWithFunction(
@@ -3053,7 +2907,7 @@ pub const CudaBackend = struct {
         }
     }
 
-    fn ensureKvCapacity(self: *CudaBackend, required_tokens: usize) !void {
+    pub fn ensureKvCapacity(self: *CudaBackend, required_tokens: usize) !void {
         if (required_tokens == 0) return;
         if (required_tokens > self.max_seq_len) return error.InvalidArgument;
         const copy_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
@@ -3321,10 +3175,13 @@ pub const CudaBackend = struct {
         }
 
         if (kv_cache_dtype_fp16) {
-            if (canUseFusedAttentionHeadsF16Kv(
-                effective_seq_len_u32,
+            if (attention_mod.useFusedHeadsF16Kv(
+                attention_policy_config,
+                seq_len_u32,
+                block.sliding_window,
+                block.is_causal,
                 head_dim_u32,
-                kernels.attn_fused_heads_f16_kv_function,
+                kernels.attn_fused_heads_f16_kv_function != null,
             )) {
                 try compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
                     &self.kernel_arg_pack,
@@ -3430,24 +3287,6 @@ pub const CudaBackend = struct {
             head_dim_u32,
         );
         return .heads_f32_kv;
-    }
-
-    fn effectiveAttentionSeqLen(block: *const AttentionMlpBlockRuntime, seq_len_u32: u32) u32 {
-        if (!(block.sliding_window > 0 and block.is_causal)) return seq_len_u32;
-        const window_u32 = std.math.cast(u32, block.sliding_window) orelse std.math.maxInt(u32);
-        return if (seq_len_u32 > window_u32) window_u32 else seq_len_u32;
-    }
-
-    fn canUseFusedAttentionHeadsF16Kv(
-        effective_seq_len_u32: u32,
-        head_dim_u32: u32,
-        fused_kernel: ?compute.cuda.Function,
-    ) bool {
-        return kv_cache_dtype_fp16 and
-            enable_fused_attention_f16_kv and
-            effective_seq_len_u32 <= max_fused_attention_f16_kv_seq_len and
-            head_dim_u32 <= max_supported_fused_f16_kv_head_dim and
-            fused_kernel != null;
     }
 
     fn tryFusedQkvForward(
@@ -3898,88 +3737,6 @@ pub const CudaBackend = struct {
     }
 };
 
-fn runCpuParityProbe(backend: *CudaBackend) !void {
-    const probe_tokens = [_]u32{ 42, 17, 99, 7 };
-    var cpu_backend = try cpu_engine.FusedCpuBackend.init(
-        backend.allocator,
-        backend.loaded,
-        1,
-        progress.Context.NONE,
-    );
-    defer cpu_backend.deinit();
-
-    const vocab = backend.vocab_size;
-    const cpu_logits = try backend.allocator.alloc(f32, vocab);
-    defer backend.allocator.free(cpu_logits);
-    const cuda_logits = try backend.allocator.alloc(f32, vocab);
-    defer backend.allocator.free(cuda_logits);
-
-    const cpu_slot = cpu_backend.allocSlot() orelse return error.OutOfMemory;
-    defer cpu_backend.freeSlot(cpu_slot);
-    try cpu_backend.prefillSlot(cpu_slot, probe_tokens[0..1], cpu_logits);
-    try backend.computeGpuPrototypeLogits(probe_tokens[0], 0, cuda_logits);
-
-    const prefill = try parity_probe.summarize(cpu_logits, cuda_logits);
-    log.info("inference", "CUDA parity probe prefill", .{
-        .token = probe_tokens[0],
-        .layers = backend.block_runtime.blocks.len,
-        .cpu_top = prefill.cpu_top,
-        .cuda_top = prefill.cuda_top,
-        .same_top = @as(u8, @intFromBool(prefill.cpu_top == prefill.cuda_top)),
-        .mean_abs_diff = prefill.mean_abs_diff,
-        .max_abs_diff = prefill.max_abs_diff,
-        .finite_count = prefill.finite_count,
-        .cpu_nan_count = prefill.cpu_nan_count,
-        .cuda_nan_count = prefill.cuda_nan_count,
-    });
-    try parity_probe.enforce(
-        prefill,
-        parity_probe_max_mean_abs_diff,
-        parity_probe_max_abs_diff,
-    );
-
-    var requests = [_]contract.DecodeRequest{
-        .{ .slot_index = cpu_slot, .token = 0 },
-    };
-    var results = [_]contract.DecodeResult{
-        .{ .slot_index = cpu_slot, .logits = &.{} },
-    };
-    var step: usize = 1;
-    while (step < probe_tokens.len) : (step += 1) {
-        requests[0] = .{
-            .slot_index = cpu_slot,
-            .token = probe_tokens[step],
-        };
-        results[0] = .{
-            .slot_index = cpu_slot,
-            .logits = &.{},
-        };
-        try cpu_backend.decodeBatch(requests[0..], results[0..]);
-        if (results[0].logits.len != cpu_logits.len) return error.InvalidShape;
-        @memcpy(cpu_logits, results[0].logits);
-
-        try backend.computeGpuPrototypeLogits(probe_tokens[step], step, cuda_logits);
-        const decode = try parity_probe.summarize(cpu_logits, cuda_logits);
-        log.info("inference", "CUDA parity probe decode", .{
-            .step = step,
-            .token = probe_tokens[step],
-            .cpu_top = decode.cpu_top,
-            .cuda_top = decode.cuda_top,
-            .same_top = @as(u8, @intFromBool(decode.cpu_top == decode.cuda_top)),
-            .mean_abs_diff = decode.mean_abs_diff,
-            .max_abs_diff = decode.max_abs_diff,
-            .finite_count = decode.finite_count,
-            .cpu_nan_count = decode.cpu_nan_count,
-            .cuda_nan_count = decode.cuda_nan_count,
-        });
-        try parity_probe.enforce(
-            decode,
-            parity_probe_max_mean_abs_diff,
-            parity_probe_max_abs_diff,
-        );
-    }
-}
-
 fn argmaxHost(values: []const f32) u32 {
     var best_idx: usize = 0;
     var best_val: f32 = -std.math.inf(f32);
@@ -4008,15 +3765,6 @@ fn bytesToMiB(bytes: usize) f32 {
     return @as(f32, @floatFromInt(bytes)) / (1024.0 * 1024.0);
 }
 
-fn fillPrototypeInput(out: []f32, token: u32) void {
-    for (out, 0..) |*value, i| {
-        const i_u32: u32 = @intCast(i);
-        const hashed = token +% (i_u32 *% 2654435761);
-        const centered: i32 = @intCast(hashed & 0x3ff);
-        value.* = (@as(f32, @floatFromInt(centered)) - 512.0) / 512.0;
-    }
-}
-
 fn populatePrefillHiddenFromTokens(
     loaded: *const LoadedModel,
     tokens: []const u32,
@@ -4035,19 +3783,11 @@ fn populatePrefillHiddenFromTokens(
             error.InvalidArgument => return error.InvalidArgument,
             else => return err,
         };
-        if (!used_model_embeddings) fillPrototypeInput(row, tokens[idx]);
+        if (!used_model_embeddings) return error.UnsupportedModel;
         if (loaded.config.embedding_multiplier != 1.0) {
             for (row) |*value| value.* *= loaded.config.embedding_multiplier;
         }
     }
-}
-
-fn suppressPrototypeLowTokenBand(logits_out: []f32, projected_vocab: usize) void {
-    if (projected_vocab <= prototype_low_token_band) return;
-    const masked = @min(projected_vocab, logits_out.len);
-    const band = @min(masked, prototype_low_token_band);
-    if (band == 0) return;
-    @memset(logits_out[0..band], -1.0e9);
 }
 
 fn selectNextTokenFromLogits(self: *CudaBackend, logits: []const f32) !u32 {
@@ -4645,14 +4385,19 @@ fn materializeTensorF32(allocator: std.mem.Allocator, src: *const Tensor) ![]f32
     return out;
 }
 
-fn canUseModelEmbeddings(loaded: *const LoadedModel) bool {
+fn canUseModelEmbeddings(loaded: *const LoadedModel, d_model: usize) bool {
+    if (d_model == 0) return false;
     const embeddings = loaded.token_embeddings;
     if (embeddings.data_ptr == null) return false;
-    return embeddings.dtype == .f32 or
-        embeddings.dtype == .f16 or
-        embeddings.dtype == .bf16 or
-        embeddings.dtype == .grouped_affine_u4 or
-        embeddings.dtype == .grouped_affine_u8;
+    if (embeddings.n_dims != 2) return false;
+    if (embeddings.shape[0] <= 0 or embeddings.shape[1] <= 0) return false;
+    const dim0: usize = @intCast(embeddings.shape[0]);
+    const dim1: usize = @intCast(embeddings.shape[1]);
+    if (dim0 != d_model and dim1 != d_model) return false;
+    return switch (embeddings.dtype) {
+        .f32, .f16, .bf16, .grouped_affine_u4, .grouped_affine_u8 => true,
+        else => false,
+    };
 }
 
 fn tryPopulateHiddenFromToken(
@@ -4723,38 +4468,7 @@ fn tryPopulateHiddenFromToken(
             // Common layout: [vocab, d_model].
             if (dim1 == hidden_dim) {
                 if (token_idx >= dim0) return error.InvalidArgument;
-                const gaffine = embeddings.gaffine orelse return false;
-                const scales: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine.scales.ptr))[0 .. gaffine.scales.len / @sizeOf(u16)];
-                const biases: []align(1) const u16 = @as([*]align(1) const u16, @ptrCast(gaffine.biases.ptr))[0 .. gaffine.biases.len / @sizeOf(u16)];
-                const rows = dim0;
-                const row_ids = [_]u32{@intCast(token_idx)};
-                if (embeddings.dtype == .grouped_affine_u4) {
-                    const packed_vals = embeddings.asSliceUnaligned(u32);
-                    try compute.cpu.quant_decode.gatherDecodeGroupedAffineU4Rows(
-                        packed_vals,
-                        scales,
-                        biases,
-                        gaffine.scales_dtype,
-                        gaffine.group_size,
-                        rows,
-                        hidden_dim,
-                        &row_ids,
-                        out,
-                    );
-                } else {
-                    const packed_vals = embeddings.asSliceUnaligned(u32);
-                    try compute.cpu.quant_decode.gatherDecodeGroupedAffineU8Rows(
-                        packed_vals,
-                        scales,
-                        biases,
-                        gaffine.scales_dtype,
-                        gaffine.group_size,
-                        rows,
-                        hidden_dim,
-                        &row_ids,
-                        out,
-                    );
-                }
+                try decodeGaffineRow(embeddings, token_idx, out);
                 return true;
             }
 
@@ -4774,24 +4488,47 @@ fn tryPopulateHiddenFromToken(
     }
 }
 
-fn fillPrototypeNormWeight(out: []f32) void {
-    for (out, 0..) |*value, i| {
-        const i_u32: u32 = @intCast(i);
-        value.* = 1.0 + @as(f32, @floatFromInt(i_u32 % 7)) * 0.01;
-    }
-}
+fn decodeGaffineRow(weight: *const Tensor, row: usize, out: []f32) !void {
+    if (weight.dtype != .grouped_affine_u4 and weight.dtype != .grouped_affine_u8) return error.InvalidArgument;
+    const gaffine = weight.gaffine orelse return error.InvalidArgument;
+    if (weight.n_dims != 2) return error.InvalidArgument;
+    if (weight.shape[0] <= 0 or weight.shape[1] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(weight.shape[0]);
+    const cols: usize = @intCast(weight.shape[1]);
+    if (row >= rows) return error.InvalidArgument;
+    if (out.len != cols) return error.InvalidArgument;
 
-fn fillPrototypeProjection(out: []f32, hidden_dim: usize, projected_vocab: usize) void {
-    var row: usize = 0;
-    while (row < hidden_dim) : (row += 1) {
-        const row_u32: u32 = @intCast(row + 1);
-        var col: usize = 0;
-        while (col < projected_vocab) : (col += 1) {
-            const col_u32: u32 = @intCast(col + 1);
-            const mixed = (row_u32 *% 1664525) +% (col_u32 *% 1013904223) +% 12345;
-            const centered: i32 = @intCast(mixed & 0x1ff);
-            out[row * projected_vocab + col] = (@as(f32, @floatFromInt(centered)) - 256.0) * 0.0005;
+    const values_per_word: usize = if (weight.dtype == .grouped_affine_u4) 8 else 4;
+    const bits: u5 = if (weight.dtype == .grouped_affine_u4) 4 else 8;
+    const mask: u32 = if (weight.dtype == .grouped_affine_u4) 0xF else 0xFF;
+    if (values_per_word == 0 or cols % values_per_word != 0) return error.InvalidArgument;
+    if (gaffine.group_size == 0 or cols % gaffine.group_size != 0) return error.InvalidArgument;
+
+    const packed_stride = cols / values_per_word;
+    const group_stride = cols / gaffine.group_size;
+    if (group_stride == 0) return error.InvalidArgument;
+    const packed_words = weight.asSliceUnaligned(u32);
+    const required_words = std.math.mul(usize, rows, packed_stride) catch return error.InvalidArgument;
+    if (packed_words.len < required_words) return error.InvalidArgument;
+
+    var current_group_idx: usize = std.math.maxInt(usize);
+    var current_scale: f32 = 0.0;
+    var current_bias: f32 = 0.0;
+    var col: usize = 0;
+    while (col < cols) : (col += 1) {
+        const group_idx = col / gaffine.group_size;
+        if (group_idx != current_group_idx) {
+            current_group_idx = group_idx;
+            const sb_idx = row * group_stride + group_idx;
+            current_scale = try gaffineScaleBiasToF32(gaffine.scales_dtype, gaffine.scales, sb_idx);
+            current_bias = try gaffineScaleBiasToF32(gaffine.scales_dtype, gaffine.biases, sb_idx);
         }
+
+        const pack_idx = row * packed_stride + (col / values_per_word);
+        const packed_word = packed_words[pack_idx];
+        const shift: u5 = @intCast((col % values_per_word) * bits);
+        const quant = (packed_word >> shift) & mask;
+        out[col] = @as(f32, @floatFromInt(quant)) * current_scale + current_bias;
     }
 }
 
@@ -4818,19 +4555,6 @@ fn tryPopulateFinalNormWeight(loaded: *const LoadedModel, out: []f32) bool {
         }
     }
     return false;
-}
-
-fn tryPopulateProjectionFromLoadedModel(
-    allocator: std.mem.Allocator,
-    loaded: *const LoadedModel,
-    d_model: usize,
-    projected_vocab: usize,
-    out: []f32,
-) bool {
-    if (loaded.lm_head) |lm_head| {
-        if (tryPopulateProjectionFromWeight(allocator, &lm_head, d_model, projected_vocab, out)) return true;
-    }
-    return tryPopulateProjectionFromWeight(allocator, &loaded.token_embeddings, d_model, projected_vocab, out);
 }
 
 fn tryPopulateProjectionFromWeight(
@@ -5290,44 +5014,22 @@ test "tryPopulateFinalNormWeight supports bf16 weights" {
     try std.testing.expectApproxEqAbs(@as(f32, -0.5), out[1], 0.01);
 }
 
-test "fillPrototypeInput is deterministic for token id" {
-    var a: [8]f32 = undefined;
-    var b: [8]f32 = undefined;
-    fillPrototypeInput(a[0..], 42);
-    fillPrototypeInput(b[0..], 42);
+test "populatePrefillHiddenFromTokens rejects missing embeddings" {
+    var loaded = LoadedModel{
+        .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
+        .config = std.mem.zeroes(tensor.ModelConfig),
+        .token_embeddings = std.mem.zeroes(Tensor),
+        .blocks = &.{},
+        .original_weight_dtype = .f32,
+    };
+    defer loaded.arena.deinit();
 
-    for (a, b) |lhs, rhs| {
-        try std.testing.expectApproxEqAbs(lhs, rhs, 0.0);
-    }
-}
-
-test "fillPrototypeProjection writes non-zero coefficients" {
-    var coeffs: [4 * 6]f32 = undefined;
-    fillPrototypeProjection(coeffs[0..], 4, 6);
-
-    var has_non_zero = false;
-    for (coeffs) |value| {
-        if (value != 0.0) {
-            has_non_zero = true;
-            break;
-        }
-    }
-    try std.testing.expect(has_non_zero);
-}
-
-test "suppressPrototypeLowTokenBand masks first band when projected vocab is large" {
-    var logits = [_]f32{1.0} ** (prototype_low_token_band + 32);
-    suppressPrototypeLowTokenBand(logits[0..], logits.len);
-
-    try std.testing.expectApproxEqAbs(@as(f32, -1.0e9), logits[0], 0.0);
-    try std.testing.expectApproxEqAbs(@as(f32, -1.0e9), logits[prototype_low_token_band - 1], 0.0);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.0), logits[prototype_low_token_band], 0.0);
-}
-
-test "suppressPrototypeLowTokenBand keeps logits when projected vocab is small" {
-    var logits = [_]f32{2.0} ** 128;
-    suppressPrototypeLowTokenBand(logits[0..], 128);
-    for (logits) |v| try std.testing.expectApproxEqAbs(@as(f32, 2.0), v, 0.0);
+    const tokens = [_]u32{0};
+    var out = [_]f32{0.0} ** 4;
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        populatePrefillHiddenFromTokens(&loaded, tokens[0..], 4, out[0..]),
+    );
 }
 
 test "shouldDownloadPrefillLogits only on final token" {

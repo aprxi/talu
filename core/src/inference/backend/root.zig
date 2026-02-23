@@ -676,6 +676,24 @@ test "probeCudaRuntime returns disabled when CUDA backend is unsupported by targ
     try std.testing.expectEqual(CudaProbe.disabled, probeCudaRuntime());
 }
 
+test "initCuda returns CudaNotEnabled when build target has no CUDA backend" {
+    if (has_cuda) return;
+    const undefined_loaded: *LoadedModel = undefined;
+    try std.testing.expectError(
+        error.CudaNotEnabled,
+        initCuda(std.testing.allocator, undefined_loaded, "test", .disabled),
+    );
+}
+
+test "initCuda returns CudaUnavailable when runtime probe is unavailable" {
+    if (!has_cuda) return;
+    const undefined_loaded: *LoadedModel = undefined;
+    try std.testing.expectError(
+        error.CudaUnavailable,
+        initCuda(std.testing.allocator, undefined_loaded, "test", .driver_not_found),
+    );
+}
+
 test "backend selection" {
     // This test just verifies the module compiles correctly
     // Actual backend tests require model files
