@@ -474,17 +474,42 @@ describe("renderDiscoverResults", () => {
     expect(items.length).toBe(2);
   });
 
-  test("size filter excludes models with params_total=0 (unknown)", () => {
-    repoState.discoverSize = "8";
+  test("size filter includes models with no size info at all", () => {
+    repoState.discoverSize = "1";
     repoState.searchResults = [
-      makeSearchResult("known", 3_000_000_000),
-      makeSearchResult("unknown", 0),
+      makeSearchResult("known-small", 500_000_000),
+      makeSearchResult("no-size-info", 0),
+    ];
+    renderDiscoverResults();
+
+    const dom = getRepoDom();
+    const items = dom.discoverResults.querySelectorAll(".repo-discover-item");
+    expect(items.length).toBe(2);
+  });
+
+  test("size filter estimates params from model name when params_total=0", () => {
+    repoState.discoverSize = "1";
+    repoState.searchResults = [
+      makeSearchResult("Qwen/Qwen3-0.6B", 0),  // 0.6B from name → passes ≤1B
+      makeSearchResult("Qwen/Qwen3-4B", 0),     // 4B from name → excluded by ≤1B
     ];
     renderDiscoverResults();
 
     const dom = getRepoDom();
     const items = dom.discoverResults.querySelectorAll(".repo-discover-item");
     expect(items.length).toBe(1);
+  });
+
+  test("size filter uses params_total over name estimate when available", () => {
+    repoState.discoverSize = "1";
+    repoState.searchResults = [
+      makeSearchResult("some-model-8B", 500_000_000),  // name says 8B but metadata says 0.5B
+    ];
+    renderDiscoverResults();
+
+    const dom = getRepoDom();
+    const items = dom.discoverResults.querySelectorAll(".repo-discover-item");
+    expect(items.length).toBe(1); // passes because params_total (500M) is used, not name (8B)
   });
 
   test("size filter ≤1B uses correct threshold", () => {

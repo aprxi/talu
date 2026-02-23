@@ -11,6 +11,16 @@ import type { CachedModel, SearchResult } from "./state.ts";
 const ICON_CHECKED = CHECK_CIRCLE_ICON;
 const ICON_UNCHECKED = CIRCLE_ICON;
 
+/** Regex to extract parameter size from model IDs like "Qwen3-0.6B", "Llama-3-8B". */
+const PARAMS_RE = /[\-_](\d+(?:\.\d+)?)[Bb]\b/;
+
+/** Estimate params from model ID when metadata is missing (params_total=0). */
+function estimateParams(modelId: string): number {
+  const m = PARAMS_RE.exec(modelId);
+  if (!m) return 0;
+  return parseFloat(m[1]!) * 1_000_000_000;
+}
+
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -169,7 +179,10 @@ export function renderDiscoverResults(): void {
   const maxParams = SIZE_MAX_PARAMS[repoState.discoverSize] ?? null;
   let results = repoState.searchResults;
   if (maxParams !== null) {
-    results = results.filter((r) => r.params_total > 0 && r.params_total <= maxParams);
+    results = results.filter((r) => {
+      const params = r.params_total || estimateParams(r.model_id);
+      return params === 0 || params <= maxParams;
+    });
   }
 
   if (results.length === 0) {
