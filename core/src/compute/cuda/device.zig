@@ -32,6 +32,12 @@ const CuDeviceGetAttributeFn = *const fn (*c_int, c_int, c_int) callconv(.c) c_i
 const CuModuleLoadDataFn = *const fn (*?*anyopaque, *const anyopaque) callconv(.c) c_int;
 const CuModuleGetFunctionFn = *const fn (*?*anyopaque, ?*anyopaque, [*:0]const u8) callconv(.c) c_int;
 const CuModuleUnloadFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuStreamCreateFn = *const fn (*?*anyopaque, u32) callconv(.c) c_int;
+const CuStreamDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuStreamSynchronizeFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuGraphInstantiateWithFlagsFn = *const fn (*?*anyopaque, ?*anyopaque, u64) callconv(.c) c_int;
+const CuGraphExecDestroyFn = *const fn (?*anyopaque) callconv(.c) c_int;
+const CuGraphLaunchFn = *const fn (?*anyopaque, ?*anyopaque) callconv(.c) c_int;
 const CuLaunchKernelFn = *const fn (
     ?*anyopaque,
     u32,
@@ -48,6 +54,9 @@ const CuLaunchKernelFn = *const fn (
 
 pub const ModuleHandle = *anyopaque;
 pub const FunctionHandle = *anyopaque;
+pub const StreamHandle = *anyopaque;
+pub const GraphHandle = *anyopaque;
+pub const GraphExecHandle = *anyopaque;
 
 pub const Probe = enum {
     disabled,
@@ -76,6 +85,12 @@ const DriverApi = struct {
     cu_module_load_data: ?CuModuleLoadDataFn,
     cu_module_get_function: ?CuModuleGetFunctionFn,
     cu_module_unload: ?CuModuleUnloadFn,
+    cu_stream_create: ?CuStreamCreateFn,
+    cu_stream_destroy: ?CuStreamDestroyFn,
+    cu_stream_synchronize: ?CuStreamSynchronizeFn,
+    cu_graph_instantiate_with_flags: ?CuGraphInstantiateWithFlagsFn,
+    cu_graph_exec_destroy: ?CuGraphExecDestroyFn,
+    cu_graph_launch: ?CuGraphLaunchFn,
     cu_launch_kernel: ?CuLaunchKernelFn,
 };
 
@@ -114,6 +129,7 @@ pub const Device = struct {
     context: ?*anyopaque,
     device_index: c_int,
     name_buffer: [128]u8,
+    launch_stream: ?StreamHandle,
 
     pub fn init() !Device {
         if (!isRuntimeSupported()) return error.CudaNotEnabled;
@@ -151,6 +167,7 @@ pub const Device = struct {
             .context = context,
             .device_index = device_index,
             .name_buffer = name_buffer,
+            .launch_stream = null,
         };
     }
 
@@ -165,6 +182,14 @@ pub const Device = struct {
     pub fn name(self: *const Device) []const u8 {
         const end = std.mem.indexOfScalar(u8, self.name_buffer[0..], 0) orelse self.name_buffer.len;
         return self.name_buffer[0..end];
+    }
+
+    pub fn setLaunchStream(self: *Device, stream: ?StreamHandle) void {
+        self.launch_stream = stream;
+    }
+
+    pub fn getLaunchStream(self: *const Device) ?StreamHandle {
+        return self.launch_stream;
     }
 
     pub fn synchronize(self: *Device) !void {
@@ -223,6 +248,66 @@ pub const Device = struct {
             self.api.cu_launch_kernel != null;
     }
 
+    pub fn supportsStreams(self: *const Device) bool {
+        return self.api.cu_stream_create != null and
+            self.api.cu_stream_destroy != null and
+            self.api.cu_stream_synchronize != null;
+    }
+
+    pub fn supportsGraphLaunch(self: *const Device) bool {
+        return self.api.cu_graph_instantiate_with_flags != null and
+            self.api.cu_graph_exec_destroy != null and
+            self.api.cu_graph_launch != null;
+    }
+
+    pub fn createStream(self: *Device) !StreamHandle {
+        const cu_stream_create = self.api.cu_stream_create orelse return error.CudaStreamApiUnavailable;
+        try self.makeCurrent();
+
+        var stream: ?*anyopaque = null;
+        if (cu_stream_create(&stream, 0) != cuda_success or stream == null) {
+            return error.CudaStreamCreateFailed;
+        }
+        return stream.?;
+    }
+
+    pub fn destroyStream(self: *Device, stream: StreamHandle) void {
+        const cu_stream_destroy = self.api.cu_stream_destroy orelse return;
+        self.makeCurrent() catch return;
+        _ = cu_stream_destroy(stream);
+    }
+
+    pub fn synchronizeStream(self: *Device, stream: StreamHandle) !void {
+        const cu_stream_synchronize = self.api.cu_stream_synchronize orelse return error.CudaStreamApiUnavailable;
+        try self.makeCurrent();
+        if (cu_stream_synchronize(stream) != cuda_success) return error.CudaSynchronizeFailed;
+    }
+
+    pub fn graphInstantiate(self: *Device, graph: GraphHandle) !GraphExecHandle {
+        const cu_graph_instantiate_with_flags = self.api.cu_graph_instantiate_with_flags orelse return error.CudaGraphApiUnavailable;
+        try self.makeCurrent();
+
+        var exec: ?*anyopaque = null;
+        if (cu_graph_instantiate_with_flags(&exec, graph, 0) != cuda_success or exec == null) {
+            return error.CudaGraphInstantiateFailed;
+        }
+        return exec.?;
+    }
+
+    pub fn graphExecDestroy(self: *Device, exec: GraphExecHandle) void {
+        const cu_graph_exec_destroy = self.api.cu_graph_exec_destroy orelse return;
+        self.makeCurrent() catch return;
+        _ = cu_graph_exec_destroy(exec);
+    }
+
+    pub fn graphLaunch(self: *Device, exec: GraphExecHandle, stream: ?StreamHandle) !void {
+        const cu_graph_launch = self.api.cu_graph_launch orelse return error.CudaGraphApiUnavailable;
+        try self.makeCurrent();
+        if (cu_graph_launch(exec, if (stream) |s| s else null) != cuda_success) {
+            return error.CudaGraphLaunchFailed;
+        }
+    }
+
     pub fn moduleLoadData(self: *Device, image: *const anyopaque) !ModuleHandle {
         const cu_module_load_data = self.api.cu_module_load_data orelse return error.CudaModuleApiUnavailable;
         try self.makeCurrent();
@@ -263,6 +348,33 @@ pub const Device = struct {
         shared_mem_bytes: u32,
         kernel_params: ?[*]const ?*anyopaque,
     ) !void {
+        return self.launchKernelOnStream(
+            function,
+            grid_x,
+            grid_y,
+            grid_z,
+            block_x,
+            block_y,
+            block_z,
+            shared_mem_bytes,
+            self.launch_stream,
+            kernel_params,
+        );
+    }
+
+    pub fn launchKernelOnStream(
+        self: *Device,
+        function: FunctionHandle,
+        grid_x: u32,
+        grid_y: u32,
+        grid_z: u32,
+        block_x: u32,
+        block_y: u32,
+        block_z: u32,
+        shared_mem_bytes: u32,
+        stream: ?StreamHandle,
+        kernel_params: ?[*]const ?*anyopaque,
+    ) !void {
         const cu_launch_kernel = self.api.cu_launch_kernel orelse return error.CudaModuleApiUnavailable;
         try self.makeCurrent();
 
@@ -280,7 +392,7 @@ pub const Device = struct {
             block_y,
             block_z,
             shared_mem_bytes,
-            null, // stream
+            if (stream) |s| s else null,
             params_ptr,
             null, // extra
         ) != cuda_success) {
@@ -376,6 +488,12 @@ fn loadDriverApi(lib: *std.DynLib) !DriverApi {
         .cu_module_load_data = lookupOptional(CuModuleLoadDataFn, lib, "cuModuleLoadData"),
         .cu_module_get_function = lookupOptional(CuModuleGetFunctionFn, lib, "cuModuleGetFunction"),
         .cu_module_unload = lookupOptional(CuModuleUnloadFn, lib, "cuModuleUnload"),
+        .cu_stream_create = lookupOptional(CuStreamCreateFn, lib, "cuStreamCreate"),
+        .cu_stream_destroy = lookupOptionalAny(CuStreamDestroyFn, lib, &.{ "cuStreamDestroy_v2", "cuStreamDestroy" }),
+        .cu_stream_synchronize = lookupOptional(CuStreamSynchronizeFn, lib, "cuStreamSynchronize"),
+        .cu_graph_instantiate_with_flags = lookupOptional(CuGraphInstantiateWithFlagsFn, lib, "cuGraphInstantiateWithFlags"),
+        .cu_graph_exec_destroy = lookupOptional(CuGraphExecDestroyFn, lib, "cuGraphExecDestroy"),
+        .cu_graph_launch = lookupOptional(CuGraphLaunchFn, lib, "cuGraphLaunch"),
         .cu_launch_kernel = lookupOptional(CuLaunchKernelFn, lib, "cuLaunchKernel"),
     };
 }
@@ -444,6 +562,16 @@ test "Device.supportsModuleLaunch reports availability after Device.init" {
     defer device.deinit();
 
     _ = device.supportsModuleLaunch();
+}
+
+test "Device graph/stream support probes are callable" {
+    if (probeRuntime() != .available) return error.SkipZigTest;
+
+    var device = try Device.init();
+    defer device.deinit();
+
+    _ = device.supportsStreams();
+    _ = device.supportsGraphLaunch();
 }
 
 test "Device.computeCapability returns non-zero major when available" {

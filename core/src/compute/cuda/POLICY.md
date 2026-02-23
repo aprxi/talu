@@ -30,8 +30,9 @@ This policy defines how CUDA kernels are authored, built, named, loaded, and tes
 
 1. `zig build gen-cuda-kernels` is the canonical kernel generation step.
 2. Kernel module generation must be reproducible and checked in with source updates.
-3. Kernel source file is `core/src/compute/cuda/kernels/kernels.cu`.
-4. Generated module file is `core/assets/cuda/kernels.fatbin`.
+3. Kernel compilation entrypoint is `core/src/compute/cuda/kernels/kernels.cu`.
+4. Kernel implementations should live under `core/src/compute/cuda/kernels/ops/` and be aggregated by the entrypoint.
+5. Generated module file is `core/assets/cuda/kernels.fatbin`.
 
 ## 5. Naming Rules
 
@@ -66,7 +67,8 @@ This policy defines how CUDA kernels are authored, built, named, loaded, and tes
 Use this checklist in every CUDA compute change before review:
 
 - [ ] Runtime dependency check: no new runtime link dependency beyond CUDA driver API (`libcuda`).
-- [ ] Artifact check: changes keep `kernels.cu` as canonical source and `kernels.fatbin` as canonical embedded module.
+- [ ] Artifact check: changes keep `kernels.cu` as canonical compile entrypoint and `kernels.fatbin` as canonical embedded module.
+- [ ] Source layout check: kernel logic lives in `kernels/ops/` modules, not a growing monolithic entrypoint file.
 - [ ] Build command check: `zig build gen-cuda-kernels -Dcuda=true` succeeds.
 - [ ] Build command check: `zig build release -Drelease -Dcuda=true` succeeds (or `make cuda` succeeds).
 - [ ] Naming check: no kernel symbol ends with version suffixes (forbidden: `_v1`).

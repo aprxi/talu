@@ -33,11 +33,10 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, out_dim);
 
     const block_x: u32 = 256;
-    const shared_mem_bytes: u32 = block_x * @sizeOf(f32);
     try launch_mod.launch(device, function, .{
         .grid_x = ceilDiv(out_dim, block_x),
         .block_x = block_x,
-        .shared_mem_bytes = shared_mem_bytes,
+        .shared_mem_bytes = 0,
     }, arg_pack);
 }
 

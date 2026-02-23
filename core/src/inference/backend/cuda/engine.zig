@@ -18,10 +18,13 @@ const load_transforms = @import("../../../models/load/transforms.zig");
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
 const prototype_eps: f32 = 1e-5;
+const parity_probe_max_mean_abs_diff: f32 = 1.0;
+const parity_probe_max_abs_diff: f32 = 25.0;
 const prototype_low_token_band: usize = 4096;
 const initial_kv_cache_tokens: usize = 256;
 const kv_cache_dtype_fp16: bool = true;
-const enable_fused_attention_f16_kv: bool = false;
+const enable_fused_attention_f16_kv: bool = true;
+const max_supported_fused_f16_kv_head_dim = 512;
 const gaffine_scales_dtype_f16 = compute.cuda.gaffine_u4_matvec.scales_dtype_f16;
 const gaffine_scales_dtype_bf16 = compute.cuda.gaffine_u4_matvec.scales_dtype_bf16;
 const DenseU16Dtype = enum(u8) {
@@ -35,8 +38,10 @@ const KernelSlot = enum {
     copy,
     copy_u16,
     cast_f32_to_f16,
+    kv_write_f16,
     rmsnorm,
     rope,
+    rope_store_f16,
     attn_scores,
     attn_scores_f16_kv,
     attn_scores_heads_f16_kv,
@@ -47,9 +52,14 @@ const KernelSlot = enum {
     attn_weighted_sum_f16_kv,
     attn_weighted_sum_heads_f16_kv,
     silu,
+    silu_mul,
     argmax,
     matvec_f16,
     matvec_bf16,
+    matvec_gate_up_f16,
+    matvec_gate_up_bf16,
+    matvec_qkv_f16,
+    matvec_qkv_bf16,
     gaffine_u4_matvec,
     gaffine_u4_matvec_gate_up,
     gaffine_u4_matvec_qkv,
@@ -88,8 +98,10 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .copy, .op_name = compute.cuda.copy.op_name, .embedded_symbol = compute.cuda.copy.embedded_symbol },
     .{ .slot = .copy_u16, .op_name = compute.cuda.copy_u16.op_name, .embedded_symbol = compute.cuda.copy_u16.embedded_symbol },
     .{ .slot = .cast_f32_to_f16, .op_name = compute.cuda.cast_f32_to_f16.op_name, .embedded_symbol = compute.cuda.cast_f32_to_f16.embedded_symbol },
+    .{ .slot = .kv_write_f16, .op_name = compute.cuda.kv_write_f16.op_name, .embedded_symbol = compute.cuda.kv_write_f16.embedded_symbol },
     .{ .slot = .rmsnorm, .op_name = compute.cuda.rmsnorm.op_name, .embedded_symbol = compute.cuda.rmsnorm.embedded_symbol },
     .{ .slot = .rope, .op_name = compute.cuda.rope.op_name, .embedded_symbol = compute.cuda.rope.embedded_symbol },
+    .{ .slot = .rope_store_f16, .op_name = compute.cuda.rope_store_f16.op_name, .embedded_symbol = compute.cuda.rope_store_f16.embedded_symbol },
     .{ .slot = .attn_scores, .op_name = compute.cuda.attn_scores.op_name, .embedded_symbol = compute.cuda.attn_scores.embedded_symbol },
     .{ .slot = .attn_scores_f16_kv, .op_name = compute.cuda.attn_scores_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_scores_f16_kv.embedded_symbol },
     .{ .slot = .attn_scores_heads_f16_kv, .op_name = compute.cuda.attn_scores_heads_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_scores_heads_f16_kv.embedded_symbol },
@@ -100,9 +112,14 @@ const required_kernels = [_]RequiredKernel{
     .{ .slot = .attn_weighted_sum_f16_kv, .op_name = compute.cuda.attn_weighted_sum_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_f16_kv.embedded_symbol },
     .{ .slot = .attn_weighted_sum_heads_f16_kv, .op_name = compute.cuda.attn_weighted_sum_heads_f16_kv.op_name, .embedded_symbol = compute.cuda.attn_weighted_sum_heads_f16_kv.embedded_symbol },
     .{ .slot = .silu, .op_name = compute.cuda.silu.op_name, .embedded_symbol = compute.cuda.silu.embedded_symbol },
+    .{ .slot = .silu_mul, .op_name = compute.cuda.silu_mul.op_name, .embedded_symbol = compute.cuda.silu_mul.embedded_symbol },
     .{ .slot = .argmax, .op_name = compute.cuda.argmax.op_name, .embedded_symbol = compute.cuda.argmax.embedded_symbol },
     .{ .slot = .matvec_f16, .op_name = compute.cuda.matvec_u16.op_name_f16, .embedded_symbol = compute.cuda.matvec_u16.embedded_symbol_f16 },
     .{ .slot = .matvec_bf16, .op_name = compute.cuda.matvec_u16.op_name_bf16, .embedded_symbol = compute.cuda.matvec_u16.embedded_symbol_bf16 },
+    .{ .slot = .matvec_gate_up_f16, .op_name = compute.cuda.matvec_u16_gate_up.op_name_f16, .embedded_symbol = compute.cuda.matvec_u16_gate_up.embedded_symbol_f16 },
+    .{ .slot = .matvec_gate_up_bf16, .op_name = compute.cuda.matvec_u16_gate_up.op_name_bf16, .embedded_symbol = compute.cuda.matvec_u16_gate_up.embedded_symbol_bf16 },
+    .{ .slot = .matvec_qkv_f16, .op_name = compute.cuda.matvec_u16_qkv.op_name_f16, .embedded_symbol = compute.cuda.matvec_u16_qkv.embedded_symbol_f16 },
+    .{ .slot = .matvec_qkv_bf16, .op_name = compute.cuda.matvec_u16_qkv.op_name_bf16, .embedded_symbol = compute.cuda.matvec_u16_qkv.embedded_symbol_bf16 },
     .{ .slot = .gaffine_u4_matvec, .op_name = compute.cuda.gaffine_u4_matvec.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec.embedded_symbol },
     .{ .slot = .gaffine_u4_matvec_gate_up, .op_name = compute.cuda.gaffine_u4_matvec_gate_up.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_gate_up.embedded_symbol },
     .{ .slot = .gaffine_u4_matvec_qkv, .op_name = compute.cuda.gaffine_u4_matvec_qkv.op_name, .embedded_symbol = compute.cuda.gaffine_u4_matvec_qkv.embedded_symbol },
@@ -215,9 +232,8 @@ const PrototypeRuntime = struct {
     attn_k_dev: compute.cuda.Buffer,
     attn_v_dev: compute.cuda.Buffer,
     attn_context_dev: compute.cuda.Buffer,
-    attn_scores_dev: compute.cuda.Buffer,
-    attn_probs_dev: compute.cuda.Buffer,
-    attn_head_dev: compute.cuda.Buffer,
+    attn_scores_dev: ?compute.cuda.Buffer,
+    attn_probs_dev: ?compute.cuda.Buffer,
     attn_out_dev: compute.cuda.Buffer,
     ffn_gate_dev: compute.cuda.Buffer,
     ffn_up_dev: compute.cuda.Buffer,
@@ -248,9 +264,11 @@ const PrototypeRuntime = struct {
         const d_ff_bytes = std.math.mul(usize, max_dff, @sizeOf(f32)) catch return error.InvalidArgument;
         const d_attn_bytes = std.math.mul(usize, max_attn, @sizeOf(f32)) catch return error.InvalidArgument;
         const d_kv_bytes = std.math.mul(usize, max_kv, @sizeOf(f32)) catch return error.InvalidArgument;
+        const need_attention_score_buffers = !kv_cache_dtype_fp16 or
+            !enable_fused_attention_f16_kv or
+            head_dim > max_supported_fused_f16_kv_head_dim;
         const attn_rows = std.math.mul(usize, max_seq_len, n_heads) catch return error.InvalidArgument;
         const attn_rows_bytes = std.math.mul(usize, attn_rows, @sizeOf(f32)) catch return error.InvalidArgument;
-        const head_bytes = std.math.mul(usize, head_dim, @sizeOf(f32)) catch return error.InvalidArgument;
         const hidden_host = try allocator.alloc(f32, d_model);
         errdefer allocator.free(hidden_host);
 
@@ -317,12 +335,14 @@ const PrototypeRuntime = struct {
         errdefer attn_v_dev.deinit(device);
         var attn_context_dev = try device.allocBuffer(d_attn_bytes);
         errdefer attn_context_dev.deinit(device);
-        var attn_scores_dev = try device.allocBuffer(attn_rows_bytes);
-        errdefer attn_scores_dev.deinit(device);
-        var attn_probs_dev = try device.allocBuffer(attn_rows_bytes);
-        errdefer attn_probs_dev.deinit(device);
-        var attn_head_dev = try device.allocBuffer(head_bytes);
-        errdefer attn_head_dev.deinit(device);
+        var attn_scores_dev: ?compute.cuda.Buffer = null;
+        errdefer if (attn_scores_dev) |*buf| buf.deinit(device);
+        var attn_probs_dev: ?compute.cuda.Buffer = null;
+        errdefer if (attn_probs_dev) |*buf| buf.deinit(device);
+        if (need_attention_score_buffers) {
+            attn_scores_dev = try device.allocBuffer(attn_rows_bytes);
+            attn_probs_dev = try device.allocBuffer(attn_rows_bytes);
+        }
         var attn_out_dev = try device.allocBuffer(d_model_bytes);
         errdefer attn_out_dev.deinit(device);
         var ffn_gate_dev = try device.allocBuffer(d_ff_bytes);
@@ -360,7 +380,6 @@ const PrototypeRuntime = struct {
             .attn_context_dev = attn_context_dev,
             .attn_scores_dev = attn_scores_dev,
             .attn_probs_dev = attn_probs_dev,
-            .attn_head_dev = attn_head_dev,
             .attn_out_dev = attn_out_dev,
             .ffn_gate_dev = ffn_gate_dev,
             .ffn_up_dev = ffn_up_dev,
@@ -379,9 +398,8 @@ const PrototypeRuntime = struct {
         self.ffn_up_dev.deinit(device);
         self.ffn_gate_dev.deinit(device);
         self.attn_out_dev.deinit(device);
-        self.attn_head_dev.deinit(device);
-        self.attn_probs_dev.deinit(device);
-        self.attn_scores_dev.deinit(device);
+        if (self.attn_probs_dev) |*buf| buf.deinit(device);
+        if (self.attn_scores_dev) |*buf| buf.deinit(device);
         self.attn_context_dev.deinit(device);
         self.attn_v_dev.deinit(device);
         self.attn_k_dev.deinit(device);
@@ -401,9 +419,8 @@ const PrototypeRuntime = struct {
             self.attn_k_dev.size +
             self.attn_v_dev.size +
             self.attn_context_dev.size +
-            self.attn_scores_dev.size +
-            self.attn_probs_dev.size +
-            self.attn_head_dev.size +
+            (if (self.attn_scores_dev) |buf| buf.size else 0) +
+            (if (self.attn_probs_dev) |buf| buf.size else 0) +
             self.attn_out_dev.size +
             self.ffn_gate_dev.size +
             self.ffn_up_dev.size +
@@ -411,6 +428,16 @@ const PrototypeRuntime = struct {
             self.ffn_down_dev.size +
             self.logits_dev.size +
             self.projection_weight.byteSize();
+    }
+
+    fn requireAttentionScoresDev(self: *PrototypeRuntime) !*compute.cuda.Buffer {
+        if (self.attn_scores_dev) |*buf| return buf;
+        return error.CudaKernelUnavailable;
+    }
+
+    fn requireAttentionProbsDev(self: *PrototypeRuntime) !*compute.cuda.Buffer {
+        if (self.attn_probs_dev) |*buf| return buf;
+        return error.CudaKernelUnavailable;
     }
 };
 
@@ -779,6 +806,7 @@ pub const CudaBackend = struct {
     allocator: std.mem.Allocator,
     loaded: *LoadedModel,
     device: compute.cuda.Device,
+    compute_stream: ?compute.cuda.StreamHandle = null,
     kernel_registry: compute.cuda.Registry,
     vector_add_function: ?compute.cuda.Function = null,
     vector_add_source: ?compute.cuda.registry.KernelSource = null,
@@ -790,10 +818,14 @@ pub const CudaBackend = struct {
     copy_u16_source: ?compute.cuda.registry.KernelSource = null,
     cast_f32_to_f16_function: ?compute.cuda.Function = null,
     cast_f32_to_f16_source: ?compute.cuda.registry.KernelSource = null,
+    kv_write_f16_function: ?compute.cuda.Function = null,
+    kv_write_f16_source: ?compute.cuda.registry.KernelSource = null,
     rmsnorm_function: ?compute.cuda.Function = null,
     rmsnorm_source: ?compute.cuda.registry.KernelSource = null,
     rope_function: ?compute.cuda.Function = null,
     rope_source: ?compute.cuda.registry.KernelSource = null,
+    rope_store_f16_function: ?compute.cuda.Function = null,
+    rope_store_f16_source: ?compute.cuda.registry.KernelSource = null,
     attn_scores_function: ?compute.cuda.Function = null,
     attn_scores_source: ?compute.cuda.registry.KernelSource = null,
     attn_scores_f16_kv_function: ?compute.cuda.Function = null,
@@ -814,12 +846,22 @@ pub const CudaBackend = struct {
     attn_weighted_sum_heads_f16_kv_source: ?compute.cuda.registry.KernelSource = null,
     silu_function: ?compute.cuda.Function = null,
     silu_source: ?compute.cuda.registry.KernelSource = null,
+    silu_mul_function: ?compute.cuda.Function = null,
+    silu_mul_source: ?compute.cuda.registry.KernelSource = null,
     argmax_function: ?compute.cuda.Function = null,
     argmax_source: ?compute.cuda.registry.KernelSource = null,
     matvec_f16_function: ?compute.cuda.Function = null,
     matvec_f16_source: ?compute.cuda.registry.KernelSource = null,
     matvec_bf16_function: ?compute.cuda.Function = null,
     matvec_bf16_source: ?compute.cuda.registry.KernelSource = null,
+    matvec_gate_up_f16_function: ?compute.cuda.Function = null,
+    matvec_gate_up_f16_source: ?compute.cuda.registry.KernelSource = null,
+    matvec_gate_up_bf16_function: ?compute.cuda.Function = null,
+    matvec_gate_up_bf16_source: ?compute.cuda.registry.KernelSource = null,
+    matvec_qkv_f16_function: ?compute.cuda.Function = null,
+    matvec_qkv_f16_source: ?compute.cuda.registry.KernelSource = null,
+    matvec_qkv_bf16_function: ?compute.cuda.Function = null,
+    matvec_qkv_bf16_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_gate_up_function: ?compute.cuda.Function = null,
@@ -854,6 +896,7 @@ pub const CudaBackend = struct {
             .allocator = allocator,
             .loaded = loaded,
             .device = device,
+            .compute_stream = null,
             .kernel_registry = undefined,
             .kernel_arg_pack = compute.cuda.ArgPack.init(allocator),
             .blas = undefined,
@@ -887,6 +930,16 @@ pub const CudaBackend = struct {
         else
             1.0 / std.math.sqrt(@as(f32, @floatFromInt(backend.head_dim)));
         backend.norm_eps = if (loaded.config.norm_eps > 0.0) loaded.config.norm_eps else prototype_eps;
+        if (backend.device.supportsStreams()) {
+            const stream = try backend.device.createStream();
+            backend.compute_stream = stream;
+            backend.device.setLaunchStream(stream);
+        }
+        errdefer {
+            backend.device.setLaunchStream(null);
+            if (backend.compute_stream) |stream| backend.device.destroyStream(stream);
+            backend.compute_stream = null;
+        }
         backend.kernel_registry = compute.cuda.Registry.init(allocator, &backend.device);
         errdefer backend.kernel_registry.deinit();
         backend.slot_logits = try allocator.alloc(f32, backend.vocab_size);
@@ -926,10 +979,11 @@ pub const CudaBackend = struct {
 
         try runMatmulSmoke(&backend);
         try runKernelSmoke(&backend);
-        runCpuParityProbe(&backend) catch |err| {
-            log.warn("inference", "CUDA parity probe unavailable", .{
+        runCpuParityProbe(&backend) catch |err| switch (err) {
+            error.CudaParityMismatch => return err,
+            else => log.warn("inference", "CUDA parity probe unavailable", .{
                 .reason = @errorName(err),
-            });
+            }),
         };
         log.info("inference", "CUDA layered decode path ready", .{
             .d_model = backend.d_model,
@@ -953,7 +1007,9 @@ pub const CudaBackend = struct {
             .copy_kernel = @as(u8, @intFromBool(backend.copy_function != null)),
             .copy_u16_kernel = @as(u8, @intFromBool(backend.copy_u16_function != null)),
             .cast_f32_to_f16_kernel = @as(u8, @intFromBool(backend.cast_f32_to_f16_function != null)),
+            .kv_write_f16_kernel = @as(u8, @intFromBool(backend.kv_write_f16_function != null)),
             .rope_kernel = @as(u8, @intFromBool(backend.rope_function != null)),
+            .rope_store_f16_kernel = @as(u8, @intFromBool(backend.rope_store_f16_function != null)),
             .attn_scores_kernel = @as(u8, @intFromBool(backend.attn_scores_function != null)),
             .attn_scores_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_scores_f16_kv_function != null)),
             .attn_scores_heads_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_scores_heads_f16_kv_function != null)),
@@ -964,10 +1020,16 @@ pub const CudaBackend = struct {
             .attn_weighted_sum_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_function != null)),
             .attn_weighted_sum_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_f16_kv_function != null)),
             .attn_weighted_sum_heads_f16_kv_kernel = @as(u8, @intFromBool(backend.attn_weighted_sum_heads_f16_kv_function != null)),
+            .attn_score_buffers = @as(u8, @intFromBool(backend.prototype.attn_scores_dev != null and backend.prototype.attn_probs_dev != null)),
             .silu_kernel = @as(u8, @intFromBool(backend.silu_function != null)),
+            .silu_mul_kernel = @as(u8, @intFromBool(backend.silu_mul_function != null)),
             .argmax_kernel = @as(u8, @intFromBool(backend.argmax_function != null)),
             .matvec_f16_kernel = @as(u8, @intFromBool(backend.matvec_f16_function != null)),
             .matvec_bf16_kernel = @as(u8, @intFromBool(backend.matvec_bf16_function != null)),
+            .matvec_gate_up_f16_kernel = @as(u8, @intFromBool(backend.matvec_gate_up_f16_function != null)),
+            .matvec_gate_up_bf16_kernel = @as(u8, @intFromBool(backend.matvec_gate_up_bf16_function != null)),
+            .matvec_qkv_f16_kernel = @as(u8, @intFromBool(backend.matvec_qkv_f16_function != null)),
+            .matvec_qkv_bf16_kernel = @as(u8, @intFromBool(backend.matvec_qkv_bf16_function != null)),
             .gaffine_u4_matvec_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_function != null)),
             .gaffine_u4_matvec_gate_up_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_gate_up_function != null)),
             .gaffine_u4_matvec_qkv_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_qkv_function != null)),
@@ -978,6 +1040,7 @@ pub const CudaBackend = struct {
             .prototype_mib = bytesToMiB(backend.prototype.deviceByteSize()),
             .slot_logits_mib = bytesToMiB(std.math.mul(usize, backend.slot_logits.len, @sizeOf(f32)) catch 0),
             .stream_token_select = "gpu_argmax",
+            .stream_enabled = @as(u8, @intFromBool(backend.compute_stream != null)),
             .device_blocks = backend.block_runtime.blocks.len,
             .model_norm = @as(u8, @intFromBool(backend.prototype.using_model_norm)),
             .model_projection = @as(u8, @intFromBool(backend.prototype.using_model_projection)),
@@ -992,6 +1055,12 @@ pub const CudaBackend = struct {
     }
 
     pub fn deinit(self: *CudaBackend) void {
+        self.device.setLaunchStream(null);
+        if (self.compute_stream) |stream| {
+            _ = self.device.synchronizeStream(stream) catch {};
+            self.device.destroyStream(stream);
+            self.compute_stream = null;
+        }
         self.argmax_index_dev.deinit(&self.device);
         self.allocator.free(self.slot_logits);
         self.block_runtime.deinit(self.allocator, &self.device);
@@ -1235,10 +1304,18 @@ pub const CudaBackend = struct {
 
         const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
         const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
-        const mul_function = self.mul_function orelse return error.CudaKernelUnavailable;
+        const silu_mul_function = self.silu_mul_function orelse return error.CudaKernelUnavailable;
         const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
         const cast_f32_to_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
             (self.cast_f32_to_f16_function orelse return error.CudaKernelUnavailable)
+        else
+            null;
+        const kv_write_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            self.kv_write_f16_function
+        else
+            null;
+        const rope_store_f16_function: ?compute.cuda.Function = if (kv_cache_dtype_fp16)
+            self.rope_store_f16_function
         else
             null;
         const rope_function = self.rope_function orelse return error.CudaKernelUnavailable;
@@ -1267,7 +1344,6 @@ pub const CudaBackend = struct {
             (self.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable)
         else
             null;
-        const silu_function = self.silu_function orelse return error.CudaKernelUnavailable;
         const d_model_u32: u32 = @intCast(self.d_model);
         const head_dim_u32: u32 = @intCast(self.head_dim);
         const rope_dim_u32: u32 = @intCast(self.rope_dim);
@@ -1345,28 +1421,37 @@ pub const CudaBackend = struct {
                 );
             }
 
-            try compute.cuda.rope.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                rope_function,
-                &self.prototype.attn_q_dev,
-                n_heads_u32,
-                head_dim_u32,
-                rope_dim_u32,
-                position_u32,
-                theta,
-            );
-            try compute.cuda.rope.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                rope_function,
-                &self.prototype.attn_k_dev,
-                n_kv_heads_u32,
-                head_dim_u32,
-                rope_dim_u32,
-                position_u32,
-                theta,
-            );
+            const use_fused_attention_heads_f16_kv = kv_cache_dtype_fp16 and
+                enable_fused_attention_f16_kv and
+                head_dim_u32 <= max_supported_fused_f16_kv_head_dim and
+                attn_fused_heads_f16_kv_function != null;
+            if (!use_fused_attention_heads_f16_kv) {
+                try compute.cuda.rope.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    rope_function,
+                    &self.prototype.attn_q_dev,
+                    n_heads_u32,
+                    head_dim_u32,
+                    rope_dim_u32,
+                    position_u32,
+                    theta,
+                );
+            }
+            const use_k_write_fused = kv_cache_dtype_fp16 and (kv_write_f16_function != null or rope_store_f16_function != null);
+            if (!use_k_write_fused) {
+                try compute.cuda.rope.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    rope_function,
+                    &self.prototype.attn_k_dev,
+                    n_kv_heads_u32,
+                    head_dim_u32,
+                    rope_dim_u32,
+                    position_u32,
+                    theta,
+                );
+            }
 
             const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
             const kv_row_bytes = std.math.mul(usize, block.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
@@ -1374,22 +1459,60 @@ pub const CudaBackend = struct {
             var k_row = try bufferSlice(&block.k_cache, kv_row_offset, kv_row_bytes);
             var v_row = try bufferSlice(&block.v_cache, kv_row_offset, kv_row_bytes);
             if (kv_cache_dtype_fp16) {
-                try compute.cuda.cast_f32_to_f16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    cast_f32_to_f16_function.?,
-                    &self.prototype.attn_k_dev,
-                    &k_row,
-                    @intCast(block.kv_dim),
-                );
-                try compute.cuda.cast_f32_to_f16.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    cast_f32_to_f16_function.?,
-                    &self.prototype.attn_v_dev,
-                    &v_row,
-                    @intCast(block.kv_dim),
-                );
+                if (kv_write_f16_function) |kv_write_f16| {
+                    try compute.cuda.kv_write_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kv_write_f16,
+                        &self.prototype.attn_k_dev,
+                        &self.prototype.attn_v_dev,
+                        &k_row,
+                        &v_row,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_u32,
+                        theta,
+                    );
+                } else if (rope_store_f16_function) |rope_store_f16| {
+                    try compute.cuda.rope_store_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        rope_store_f16,
+                        &self.prototype.attn_k_dev,
+                        &k_row,
+                        n_kv_heads_u32,
+                        head_dim_u32,
+                        rope_dim_u32,
+                        position_u32,
+                        theta,
+                    );
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        cast_f32_to_f16_function.?,
+                        &self.prototype.attn_v_dev,
+                        &v_row,
+                        @intCast(block.kv_dim),
+                    );
+                } else {
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        cast_f32_to_f16_function.?,
+                        &self.prototype.attn_k_dev,
+                        &k_row,
+                        @intCast(block.kv_dim),
+                    );
+                    try compute.cuda.cast_f32_to_f16.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        cast_f32_to_f16_function.?,
+                        &self.prototype.attn_v_dev,
+                        &v_row,
+                        @intCast(block.kv_dim),
+                    );
+                }
             } else {
                 try compute.cuda.copy.runWithFunction(
                     &self.kernel_arg_pack,
@@ -1429,6 +1552,9 @@ pub const CudaBackend = struct {
                 kv_dim_u32,
                 kv_groups,
                 kv_groups_u32,
+                rope_dim_u32,
+                position_u32,
+                theta,
             );
 
             try self.linearForward(&self.prototype.attn_context_dev, &block.o_proj, &self.prototype.attn_out_dev);
@@ -1457,18 +1583,10 @@ pub const CudaBackend = struct {
 
             _ = try self.runGateUpProjection(&self.prototype.norm_out_dev, block);
             const d_ff_u32: u32 = @intCast(block.d_ff);
-            try compute.cuda.silu.runWithFunction(
+            try compute.cuda.silu_mul.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
-                silu_function,
-                &self.prototype.ffn_gate_dev,
-                &self.prototype.ffn_gate_dev,
-                d_ff_u32,
-            );
-            try compute.cuda.mul.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                mul_function,
+                silu_mul_function,
                 &self.prototype.ffn_gate_dev,
                 &self.prototype.ffn_up_dev,
                 &self.prototype.ffn_mul_dev,
@@ -1687,9 +1805,12 @@ pub const CudaBackend = struct {
         kv_dim_u32: u32,
         kv_groups: usize,
         kv_groups_u32: u32,
+        rope_dim_u32: u32,
+        position_u32: u32,
+        theta: f32,
     ) !AttentionPath {
         if (kv_cache_dtype_fp16) {
-            if (enable_fused_attention_f16_kv and head_dim_u32 <= 512 and kernels.attn_fused_heads_f16_kv_function != null) {
+            if (enable_fused_attention_f16_kv and head_dim_u32 <= max_supported_fused_f16_kv_head_dim and kernels.attn_fused_heads_f16_kv_function != null) {
                 try compute.cuda.attn_fused_heads_f16_kv.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -1704,17 +1825,22 @@ pub const CudaBackend = struct {
                     kv_groups_u32,
                     head_dim_u32,
                     self.attention_scale,
+                    rope_dim_u32,
+                    position_u32,
+                    theta,
                 );
                 return .fused_heads_f16_kv;
             }
 
+            const attn_scores_dev = try self.prototype.requireAttentionScoresDev();
+            const attn_probs_dev = try self.prototype.requireAttentionProbsDev();
             try compute.cuda.attn_scores_heads_f16_kv.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_scores_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
                 &self.prototype.attn_q_dev,
                 &block.k_cache,
-                &self.prototype.attn_scores_dev,
+                attn_scores_dev,
                 @intCast(self.n_heads),
                 seq_len_u32,
                 kv_dim_u32,
@@ -1726,8 +1852,8 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.softmax_rows_function orelse return error.CudaKernelUnavailable,
-                &self.prototype.attn_scores_dev,
-                &self.prototype.attn_probs_dev,
+                attn_scores_dev,
+                attn_probs_dev,
                 @intCast(self.n_heads),
                 seq_len_u32,
             );
@@ -1735,7 +1861,7 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.attn_weighted_sum_heads_f16_kv_function orelse return error.CudaKernelUnavailable,
-                &self.prototype.attn_probs_dev,
+                attn_probs_dev,
                 &block.v_cache,
                 &self.prototype.attn_context_dev,
                 @intCast(self.n_heads),
@@ -1749,6 +1875,8 @@ pub const CudaBackend = struct {
 
         const attn_scores_function = kernels.attn_scores_function orelse return error.CudaKernelUnavailable;
         const attn_weighted_sum_function = kernels.attn_weighted_sum_function orelse return error.CudaKernelUnavailable;
+        const attn_scores_dev = try self.prototype.requireAttentionScoresDev();
+        const attn_probs_dev = try self.prototype.requireAttentionProbsDev();
 
         var head_idx: usize = 0;
         while (head_idx < self.n_heads) : (head_idx += 1) {
@@ -1768,7 +1896,7 @@ pub const CudaBackend = struct {
                 attn_scores_function,
                 &q_head,
                 &block.k_cache,
-                &self.prototype.attn_scores_dev,
+                attn_scores_dev,
                 seq_len_u32,
                 kv_dim_u32,
                 kv_offset_u32,
@@ -1779,15 +1907,15 @@ pub const CudaBackend = struct {
                 &self.kernel_arg_pack,
                 &self.device,
                 kernels.softmax_function,
-                &self.prototype.attn_scores_dev,
-                &self.prototype.attn_probs_dev,
+                attn_scores_dev,
+                attn_probs_dev,
                 seq_len_u32,
             );
             try compute.cuda.attn_weighted_sum.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
                 attn_weighted_sum_function,
-                &self.prototype.attn_probs_dev,
+                attn_probs_dev,
                 &block.v_cache,
                 &ctx_head,
                 seq_len_u32,
@@ -1804,6 +1932,8 @@ pub const CudaBackend = struct {
         input: *const compute.cuda.Buffer,
         block: *const AttentionMlpBlockRuntime,
     ) !bool {
+        if (try self.tryFusedDenseU16QkvForward(input, block)) return true;
+
         const fused_kernel = self.gaffine_u4_matvec_qkv_function orelse return false;
         const q = switch (block.q_proj) {
             .gaffine_u4 => |w| w,
@@ -1859,11 +1989,63 @@ pub const CudaBackend = struct {
         return true;
     }
 
+    fn tryFusedDenseU16QkvForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        block: *const AttentionMlpBlockRuntime,
+    ) !bool {
+        const q = switch (block.q_proj) {
+            .dense_u16 => |w| w,
+            else => return false,
+        };
+        const k = switch (block.k_proj) {
+            .dense_u16 => |w| w,
+            else => return false,
+        };
+        const v = switch (block.v_proj) {
+            .dense_u16 => |w| w,
+            else => return false,
+        };
+        if (q.rows != self.d_model or k.rows != self.d_model or v.rows != self.d_model) return false;
+        if (q.dtype != k.dtype or q.dtype != v.dtype) return false;
+        if (q.cols > std.math.maxInt(u32) or
+            k.cols > std.math.maxInt(u32) or
+            v.cols > std.math.maxInt(u32) or
+            q.rows > std.math.maxInt(u32))
+        {
+            return false;
+        }
+
+        const fused_kernel = switch (q.dtype) {
+            .f16 => self.matvec_qkv_f16_function orelse return false,
+            .bf16 => self.matvec_qkv_bf16_function orelse return false,
+        };
+        try compute.cuda.matvec_u16_qkv.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &q.buffer,
+            &self.prototype.attn_q_dev,
+            @intCast(q.cols),
+            &k.buffer,
+            &self.prototype.attn_k_dev,
+            @intCast(k.cols),
+            &v.buffer,
+            &self.prototype.attn_v_dev,
+            @intCast(v.cols),
+            @intCast(q.rows),
+        );
+        return true;
+    }
+
     fn tryFusedGateUpForward(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
         block: *const AttentionMlpBlockRuntime,
     ) !bool {
+        if (try self.tryFusedDenseU16GateUpForward(input, block)) return true;
+
         const fused_kernel = self.gaffine_u4_matvec_gate_up_function orelse return false;
         const gate = switch (block.w1) {
             .gaffine_u4 => |w| w,
@@ -1902,6 +2084,48 @@ pub const CudaBackend = struct {
             @intCast(up.cols),
             up.group_size,
             up.scales_dtype_tag,
+            @intCast(gate.rows),
+        );
+        return true;
+    }
+
+    fn tryFusedDenseU16GateUpForward(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        block: *const AttentionMlpBlockRuntime,
+    ) !bool {
+        const gate = switch (block.w1) {
+            .dense_u16 => |w| w,
+            else => return false,
+        };
+        const up = switch (block.w3) {
+            .dense_u16 => |w| w,
+            else => return false,
+        };
+        if (gate.rows != self.d_model or up.rows != self.d_model) return false;
+        if (gate.dtype != up.dtype) return false;
+        if (gate.cols > std.math.maxInt(u32) or
+            up.cols > std.math.maxInt(u32) or
+            gate.rows > std.math.maxInt(u32))
+        {
+            return false;
+        }
+
+        const fused_kernel = switch (gate.dtype) {
+            .f16 => self.matvec_gate_up_f16_function orelse return false,
+            .bf16 => self.matvec_gate_up_bf16_function orelse return false,
+        };
+        try compute.cuda.matvec_u16_gate_up.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &gate.buffer,
+            &self.prototype.ffn_gate_dev,
+            @intCast(gate.cols),
+            &up.buffer,
+            &self.prototype.ffn_up_dev,
+            @intCast(up.cols),
             @intCast(gate.rows),
         );
         return true;
@@ -1960,6 +2184,10 @@ pub const CudaBackend = struct {
                 self.cast_f32_to_f16_function = resolved.function;
                 self.cast_f32_to_f16_source = resolved.source;
             },
+            .kv_write_f16 => {
+                self.kv_write_f16_function = resolved.function;
+                self.kv_write_f16_source = resolved.source;
+            },
             .rmsnorm => {
                 self.rmsnorm_function = resolved.function;
                 self.rmsnorm_source = resolved.source;
@@ -1967,6 +2195,10 @@ pub const CudaBackend = struct {
             .rope => {
                 self.rope_function = resolved.function;
                 self.rope_source = resolved.source;
+            },
+            .rope_store_f16 => {
+                self.rope_store_f16_function = resolved.function;
+                self.rope_store_f16_source = resolved.source;
             },
             .attn_scores => {
                 self.attn_scores_function = resolved.function;
@@ -2008,6 +2240,10 @@ pub const CudaBackend = struct {
                 self.silu_function = resolved.function;
                 self.silu_source = resolved.source;
             },
+            .silu_mul => {
+                self.silu_mul_function = resolved.function;
+                self.silu_mul_source = resolved.source;
+            },
             .argmax => {
                 self.argmax_function = resolved.function;
                 self.argmax_source = resolved.source;
@@ -2019,6 +2255,22 @@ pub const CudaBackend = struct {
             .matvec_bf16 => {
                 self.matvec_bf16_function = resolved.function;
                 self.matvec_bf16_source = resolved.source;
+            },
+            .matvec_gate_up_f16 => {
+                self.matvec_gate_up_f16_function = resolved.function;
+                self.matvec_gate_up_f16_source = resolved.source;
+            },
+            .matvec_gate_up_bf16 => {
+                self.matvec_gate_up_bf16_function = resolved.function;
+                self.matvec_gate_up_bf16_source = resolved.source;
+            },
+            .matvec_qkv_f16 => {
+                self.matvec_qkv_f16_function = resolved.function;
+                self.matvec_qkv_f16_source = resolved.source;
+            },
+            .matvec_qkv_bf16 => {
+                self.matvec_qkv_bf16_function = resolved.function;
+                self.matvec_qkv_bf16_source = resolved.source;
             },
             .gaffine_u4_matvec => {
                 self.gaffine_u4_matvec_function = resolved.function;
@@ -2151,6 +2403,14 @@ fn runCpuParityProbe(backend: *CudaBackend) !void {
         .cpu_nan_count = cpu_nan_count,
         .cuda_nan_count = cuda_nan_count,
     });
+
+    if (cuda_nan_count != 0 or
+        cpu_top != cuda_top or
+        mean_abs_diff > parity_probe_max_mean_abs_diff or
+        max_abs_diff > parity_probe_max_abs_diff)
+    {
+        return error.CudaParityMismatch;
+    }
 }
 
 fn argmaxHost(values: []const f32) u32 {
@@ -2237,8 +2497,10 @@ fn runKernelSmoke(
         backend.copy_function == null or
         backend.copy_u16_function == null or
         backend.cast_f32_to_f16_function == null or
+        backend.kv_write_f16_function == null or
         backend.rmsnorm_function == null or
         backend.rope_function == null or
+        backend.rope_store_f16_function == null or
         backend.attn_scores_function == null or
         backend.attn_scores_f16_kv_function == null or
         backend.softmax_function == null or
@@ -2249,9 +2511,14 @@ fn runKernelSmoke(
         backend.attn_weighted_sum_f16_kv_function == null or
         backend.attn_weighted_sum_heads_f16_kv_function == null or
         backend.silu_function == null or
+        backend.silu_mul_function == null or
         backend.argmax_function == null or
         backend.matvec_f16_function == null or
         backend.matvec_bf16_function == null or
+        backend.matvec_gate_up_f16_function == null or
+        backend.matvec_gate_up_bf16_function == null or
+        backend.matvec_qkv_f16_function == null or
+        backend.matvec_qkv_bf16_function == null or
         backend.gaffine_u4_matvec_function == null or
         backend.gaffine_u4_matvec_gate_up_function == null or
         backend.gaffine_u4_matvec_qkv_function == null)
@@ -2289,17 +2556,35 @@ fn runKernelSmoke(
         backend.cast_f32_to_f16_function.?,
         backend.cast_f32_to_f16_source orelse .embedded_module,
     );
+    try runKvWriteF16Smoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.kv_write_f16_function.?,
+        backend.kv_write_f16_source orelse .embedded_module,
+    );
     try runRmsNormSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.rmsnorm_function.?,
         backend.rmsnorm_source orelse .embedded_module,
     );
+    try runRopeStoreF16Smoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.rope_store_f16_function.?,
+        backend.rope_store_f16_source orelse .embedded_module,
+    );
     try runSiluSmoke(
         &backend.kernel_arg_pack,
         &backend.device,
         backend.silu_function.?,
         backend.silu_source orelse .embedded_module,
+    );
+    try runSiluMulSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.silu_mul_function.?,
+        backend.silu_mul_source orelse .embedded_module,
     );
     try runAttentionSmoke(
         &backend.kernel_arg_pack,
@@ -2330,6 +2615,22 @@ fn runKernelSmoke(
         backend.matvec_f16_source orelse .embedded_module,
         backend.matvec_bf16_function.?,
         backend.matvec_bf16_source orelse .embedded_module,
+    );
+    try runMatvecU16GateUpSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.matvec_gate_up_f16_function.?,
+        backend.matvec_gate_up_f16_source orelse .embedded_module,
+        backend.matvec_gate_up_bf16_function.?,
+        backend.matvec_gate_up_bf16_source orelse .embedded_module,
+    );
+    try runMatvecU16QkvSmoke(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        backend.matvec_qkv_f16_function.?,
+        backend.matvec_qkv_f16_source orelse .embedded_module,
+        backend.matvec_qkv_bf16_function.?,
+        backend.matvec_qkv_bf16_source orelse .embedded_module,
     );
     try runGaffineU4MatvecSmoke(
         &backend.kernel_arg_pack,
@@ -2559,6 +2860,155 @@ fn runCastF32ToF16Smoke(
     });
 }
 
+fn runKvWriteF16Smoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const n_heads: u32 = 1;
+    const head_dim: u32 = 4;
+    const rope_dim: u32 = 4;
+    const position: u32 = 3;
+    const theta: f32 = 10000.0;
+
+    const k_input = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const v_input = [_]f32{ 5.0, -1.0, 0.5, 2.0 };
+    var expected_k = k_input;
+    const half: usize = @intCast(rope_dim / 2);
+    var pair: usize = 0;
+    while (pair < half) : (pair += 1) {
+        const pair_f: f32 = @floatFromInt(pair);
+        const rope_dim_f: f32 = @floatFromInt(rope_dim);
+        const inv_freq = std.math.pow(f32, theta, -2.0 * pair_f / rope_dim_f);
+        const angle = @as(f32, @floatFromInt(position)) * inv_freq;
+        const s = @sin(angle);
+        const c = @cos(angle);
+        const lo = pair;
+        const hi = half + pair;
+        const x0 = k_input[lo];
+        const x1 = k_input[hi];
+        expected_k[lo] = x0 * c - x1 * s;
+        expected_k[hi] = x0 * s + x1 * c;
+    }
+
+    var out_k_bits = [_]u16{0} ** k_input.len;
+    var out_v_bits = [_]u16{0} ** v_input.len;
+    var out_k = [_]f32{0.0} ** k_input.len;
+    var out_v = [_]f32{0.0} ** v_input.len;
+
+    var input_k_dev = try device.allocBuffer(k_input.len * @sizeOf(f32));
+    defer input_k_dev.deinit(device);
+    var input_v_dev = try device.allocBuffer(v_input.len * @sizeOf(f32));
+    defer input_v_dev.deinit(device);
+    var out_k_dev = try device.allocBuffer(out_k_bits.len * @sizeOf(u16));
+    defer out_k_dev.deinit(device);
+    var out_v_dev = try device.allocBuffer(out_v_bits.len * @sizeOf(u16));
+    defer out_v_dev.deinit(device);
+
+    try input_k_dev.upload(device, std.mem.sliceAsBytes(k_input[0..]));
+    try input_v_dev.upload(device, std.mem.sliceAsBytes(v_input[0..]));
+    try compute.cuda.kv_write_f16.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &input_k_dev,
+        &input_v_dev,
+        &out_k_dev,
+        &out_v_dev,
+        n_heads,
+        head_dim,
+        rope_dim,
+        position,
+        theta,
+    );
+    try out_k_dev.download(device, std.mem.sliceAsBytes(out_k_bits[0..]));
+    try out_v_dev.download(device, std.mem.sliceAsBytes(out_v_bits[0..]));
+
+    for (out_k_bits, 0..) |bits, i| out_k[i] = dtype.fp16ToF32(bits);
+    for (out_v_bits, 0..) |bits, i| out_v[i] = dtype.fp16ToF32(bits);
+
+    for (expected_k, out_k) |want, got| {
+        if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
+    }
+    for (v_input, out_v) |want, got| {
+        if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA kv_write_f16 smoke passed", .{
+        .source = @tagName(source),
+        .k0 = out_k[0],
+        .v0 = out_v[0],
+    });
+}
+
+fn runRopeStoreF16Smoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const n_heads: u32 = 1;
+    const head_dim: u32 = 4;
+    const rope_dim: u32 = 4;
+    const position: u32 = 3;
+    const theta: f32 = 10000.0;
+
+    const input = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    var expected = input;
+    const half: usize = @intCast(rope_dim / 2);
+    var pair: usize = 0;
+    while (pair < half) : (pair += 1) {
+        const pair_f: f32 = @floatFromInt(pair);
+        const rope_dim_f: f32 = @floatFromInt(rope_dim);
+        const inv_freq = std.math.pow(f32, theta, -2.0 * pair_f / rope_dim_f);
+        const angle = @as(f32, @floatFromInt(position)) * inv_freq;
+        const s = @sin(angle);
+        const c = @cos(angle);
+        const lo = pair;
+        const hi = half + pair;
+        const x0 = input[lo];
+        const x1 = input[hi];
+        expected[lo] = x0 * c - x1 * s;
+        expected[hi] = x0 * s + x1 * c;
+    }
+
+    var output_bits = [_]u16{0} ** input.len;
+    var output = [_]f32{0.0} ** input.len;
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var output_dev = try device.allocBuffer(output_bits.len * @sizeOf(u16));
+    defer output_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try compute.cuda.rope_store_f16.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &input_dev,
+        &output_dev,
+        n_heads,
+        head_dim,
+        rope_dim,
+        position,
+        theta,
+    );
+    try output_dev.download(device, std.mem.sliceAsBytes(output_bits[0..]));
+
+    for (output_bits, 0..) |bits, i| {
+        output[i] = dtype.fp16ToF32(bits);
+    }
+    for (expected, output) |want, got| {
+        if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA rope_store_f16 smoke passed", .{
+        .source = @tagName(source),
+        .out0 = output[0],
+    });
+}
+
 fn runRmsNormSmoke(
     arg_pack: *compute.cuda.ArgPack,
     device: *compute.cuda.Device,
@@ -2651,6 +3101,53 @@ fn runSiluSmoke(
 
     log.info("inference", "CUDA silu smoke passed", .{
         .n = input.len,
+        .source = @tagName(source),
+        .out0 = actual[0],
+    });
+}
+
+fn runSiluMulSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function: compute.cuda.Function,
+    source: compute.cuda.registry.KernelSource,
+) !void {
+    const gate = [_]f32{ -1.0, 0.0, 1.0, 2.0 };
+    const up = [_]f32{ 2.0, 3.0, 4.0, 5.0 };
+    const expected = [_]f32{
+        -0.26894143 * 2.0,
+        0.0 * 3.0,
+        0.7310586 * 4.0,
+        1.7615942 * 5.0,
+    };
+    var actual = [_]f32{0.0} ** gate.len;
+
+    var gate_dev = try device.allocBuffer(gate.len * @sizeOf(f32));
+    defer gate_dev.deinit(device);
+    var up_dev = try device.allocBuffer(up.len * @sizeOf(f32));
+    defer up_dev.deinit(device);
+    var out_dev = try device.allocBuffer(actual.len * @sizeOf(f32));
+    defer out_dev.deinit(device);
+
+    try gate_dev.upload(device, std.mem.sliceAsBytes(gate[0..]));
+    try up_dev.upload(device, std.mem.sliceAsBytes(up[0..]));
+    try compute.cuda.silu_mul.runWithFunction(
+        arg_pack,
+        device,
+        function,
+        &gate_dev,
+        &up_dev,
+        &out_dev,
+        @intCast(gate.len),
+    );
+    try out_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (expected, actual) |want, got| {
+        if (@abs(want - got) > 0.001) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA silu_mul smoke passed", .{
+        .n = gate.len,
         .source = @tagName(source),
         .out0 = actual[0],
     });
@@ -2994,6 +3491,9 @@ fn runF16KvAttentionFusedSmoke(
     const seq_len: u32 = 2;
     const row_stride: u32 = 4;
     const scale: f32 = 0.5;
+    const rope_dim: u32 = head_dim;
+    const position: u32 = 0;
+    const theta: f32 = 10000.0;
 
     const query = [_]f32{
         1.0, 0.0, 0.0, 0.0,
@@ -3056,6 +3556,9 @@ fn runF16KvAttentionFusedSmoke(
         kv_groups,
         head_dim,
         scale,
+        rope_dim,
+        position,
+        theta,
     );
     try out_dev.download(device, std.mem.sliceAsBytes(out[0..]));
 
@@ -3121,21 +3624,31 @@ fn runMatvecU16Smoke(
     function_bf16: compute.cuda.Function,
     source_bf16: compute.cuda.registry.KernelSource,
 ) !void {
-    const in_dim: u32 = 2;
-    const out_dim: u32 = 2;
-    const input = [_]f32{ 1.0, 1.0 };
-    // Weight is [out, in] = [[1,2],[3,4]] encoded as bf16/f16.
-    const weights_bf16 = [_]u16{
-        dtype.f32ToBf16(1.0), dtype.f32ToBf16(2.0),
-        dtype.f32ToBf16(3.0), dtype.f32ToBf16(4.0),
-    };
-    const weights_f16 = [_]u16{
-        @bitCast(@as(f16, 1.0)), @bitCast(@as(f16, 2.0)),
-        @bitCast(@as(f16, 3.0)), @bitCast(@as(f16, 4.0)),
-    };
-    const expected = [_]f32{ 3.0, 7.0 };
-    var actual_bf16 = [_]f32{0.0} ** out_dim;
-    var actual_f16 = [_]f32{0.0} ** out_dim;
+    const in_dim_usize: usize = 8;
+    const out_dim_usize: usize = 3;
+    const in_dim: u32 = in_dim_usize;
+    const out_dim: u32 = out_dim_usize;
+
+    var input: [in_dim_usize]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+
+    var weights_bf16: [out_dim_usize * in_dim_usize]u16 = undefined;
+    var weights_f16: [out_dim_usize * in_dim_usize]u16 = undefined;
+    var expected: [out_dim_usize]f32 = [_]f32{0.0} ** out_dim_usize;
+    for (0..out_dim_usize) |row| {
+        var acc: f32 = 0.0;
+        for (0..in_dim_usize) |col| {
+            const w: f32 = @floatFromInt((row + 1) * (col + 1));
+            const idx = row * in_dim_usize + col;
+            weights_bf16[idx] = dtype.f32ToBf16(w);
+            weights_f16[idx] = @bitCast(@as(f16, @floatCast(w)));
+            acc += input[col] * w;
+        }
+        expected[row] = acc;
+    }
+
+    var actual_bf16 = [_]f32{0.0} ** out_dim_usize;
+    var actual_f16 = [_]f32{0.0} ** out_dim_usize;
 
     var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
     defer input_dev.deinit(device);
@@ -3181,6 +3694,45 @@ fn runMatvecU16Smoke(
         if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
     }
 
+    // Exercise non-vectorized fallback path with intentionally unaligned input/weight pointers.
+    const input_bytes = input.len * @sizeOf(f32);
+    const weight_bytes = weights_bf16.len * @sizeOf(u16);
+    const input_pad: usize = 4;
+    const weight_pad: usize = 2;
+
+    var input_unaligned_raw_dev = try device.allocBuffer(input_bytes + input_pad);
+    defer input_unaligned_raw_dev.deinit(device);
+    var weight_unaligned_raw_dev = try device.allocBuffer(weight_bytes + weight_pad);
+    defer weight_unaligned_raw_dev.deinit(device);
+    var out_unaligned_dev = try device.allocBuffer(actual_bf16.len * @sizeOf(f32));
+    defer out_unaligned_dev.deinit(device);
+    var actual_unaligned = [_]f32{0.0} ** out_dim_usize;
+
+    var input_blob: [input_pad + input_bytes]u8 = [_]u8{0} ** (input_pad + input_bytes);
+    @memcpy(input_blob[input_pad..], std.mem.sliceAsBytes(input[0..]));
+    var weight_blob: [weight_pad + weight_bytes]u8 = [_]u8{0} ** (weight_pad + weight_bytes);
+    @memcpy(weight_blob[weight_pad..], std.mem.sliceAsBytes(weights_bf16[0..]));
+
+    try input_unaligned_raw_dev.upload(device, input_blob[0..]);
+    try weight_unaligned_raw_dev.upload(device, weight_blob[0..]);
+
+    var input_unaligned_dev = try bufferSlice(&input_unaligned_raw_dev, input_pad, input_bytes);
+    var weight_unaligned_dev = try bufferSlice(&weight_unaligned_raw_dev, weight_pad, weight_bytes);
+    try compute.cuda.matvec_u16.runWithFunction(
+        arg_pack,
+        device,
+        function_bf16,
+        &input_unaligned_dev,
+        &weight_unaligned_dev,
+        &out_unaligned_dev,
+        in_dim,
+        out_dim,
+    );
+    try out_unaligned_dev.download(device, std.mem.sliceAsBytes(actual_unaligned[0..]));
+    for (expected, actual_unaligned) |want, got| {
+        if (@abs(want - got) > 0.01) return error.CudaKernelSmokeMismatch;
+    }
+
     log.info("inference", "CUDA matvec_u16 smoke passed", .{
         .in_dim = in_dim,
         .out_dim = out_dim,
@@ -3188,6 +3740,443 @@ fn runMatvecU16Smoke(
         .source_bf16 = @tagName(source_bf16),
         .out0_f16 = actual_f16[0],
         .out0_bf16 = actual_bf16[0],
+    });
+}
+
+fn runMatvecU16GateUpSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function_f16: compute.cuda.Function,
+    source_f16: compute.cuda.registry.KernelSource,
+    function_bf16: compute.cuda.Function,
+    source_bf16: compute.cuda.registry.KernelSource,
+) !void {
+    const in_dim_usize: usize = 8;
+    const gate_out_dim_usize: usize = 3;
+    const up_out_dim_usize: usize = 4;
+    const in_dim: u32 = in_dim_usize;
+    const gate_out_dim: u32 = gate_out_dim_usize;
+    const up_out_dim: u32 = up_out_dim_usize;
+
+    var input: [in_dim_usize]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+
+    var gate_weights_bf16: [gate_out_dim_usize * in_dim_usize]u16 = undefined;
+    var gate_weights_f16: [gate_out_dim_usize * in_dim_usize]u16 = undefined;
+    var up_weights_bf16: [up_out_dim_usize * in_dim_usize]u16 = undefined;
+    var up_weights_f16: [up_out_dim_usize * in_dim_usize]u16 = undefined;
+    var expected_gate: [gate_out_dim_usize]f32 = [_]f32{0.0} ** gate_out_dim_usize;
+    var expected_up: [up_out_dim_usize]f32 = [_]f32{0.0} ** up_out_dim_usize;
+
+    for (0..gate_out_dim_usize) |row| {
+        var acc: f32 = 0.0;
+        for (0..in_dim_usize) |col| {
+            const w: f32 = @floatFromInt((row + 1) * (col + 2));
+            const idx = row * in_dim_usize + col;
+            gate_weights_bf16[idx] = dtype.f32ToBf16(w);
+            gate_weights_f16[idx] = @bitCast(@as(f16, @floatCast(w)));
+            acc += input[col] * w;
+        }
+        expected_gate[row] = acc;
+    }
+    for (0..up_out_dim_usize) |row| {
+        var acc: f32 = 0.0;
+        for (0..in_dim_usize) |col| {
+            const w: f32 = @floatFromInt((row + 2) * (col + 1));
+            const idx = row * in_dim_usize + col;
+            up_weights_bf16[idx] = dtype.f32ToBf16(w);
+            up_weights_f16[idx] = @bitCast(@as(f16, @floatCast(w)));
+            acc += input[col] * w;
+        }
+        expected_up[row] = acc;
+    }
+
+    var gate_actual_f16 = [_]f32{0.0} ** gate_out_dim_usize;
+    var up_actual_f16 = [_]f32{0.0} ** up_out_dim_usize;
+    var gate_actual_bf16 = [_]f32{0.0} ** gate_out_dim_usize;
+    var up_actual_bf16 = [_]f32{0.0} ** up_out_dim_usize;
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var gate_weight_bf16_dev = try device.allocBuffer(gate_weights_bf16.len * @sizeOf(u16));
+    defer gate_weight_bf16_dev.deinit(device);
+    var up_weight_bf16_dev = try device.allocBuffer(up_weights_bf16.len * @sizeOf(u16));
+    defer up_weight_bf16_dev.deinit(device);
+    var gate_weight_f16_dev = try device.allocBuffer(gate_weights_f16.len * @sizeOf(u16));
+    defer gate_weight_f16_dev.deinit(device);
+    var up_weight_f16_dev = try device.allocBuffer(up_weights_f16.len * @sizeOf(u16));
+    defer up_weight_f16_dev.deinit(device);
+    var gate_out_bf16_dev = try device.allocBuffer(gate_actual_bf16.len * @sizeOf(f32));
+    defer gate_out_bf16_dev.deinit(device);
+    var up_out_bf16_dev = try device.allocBuffer(up_actual_bf16.len * @sizeOf(f32));
+    defer up_out_bf16_dev.deinit(device);
+    var gate_out_f16_dev = try device.allocBuffer(gate_actual_f16.len * @sizeOf(f32));
+    defer gate_out_f16_dev.deinit(device);
+    var up_out_f16_dev = try device.allocBuffer(up_actual_f16.len * @sizeOf(f32));
+    defer up_out_f16_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try gate_weight_bf16_dev.upload(device, std.mem.sliceAsBytes(gate_weights_bf16[0..]));
+    try up_weight_bf16_dev.upload(device, std.mem.sliceAsBytes(up_weights_bf16[0..]));
+    try gate_weight_f16_dev.upload(device, std.mem.sliceAsBytes(gate_weights_f16[0..]));
+    try up_weight_f16_dev.upload(device, std.mem.sliceAsBytes(up_weights_f16[0..]));
+
+    try compute.cuda.matvec_u16_gate_up.runWithFunction(
+        arg_pack,
+        device,
+        function_bf16,
+        &input_dev,
+        &gate_weight_bf16_dev,
+        &gate_out_bf16_dev,
+        gate_out_dim,
+        &up_weight_bf16_dev,
+        &up_out_bf16_dev,
+        up_out_dim,
+        in_dim,
+    );
+    try compute.cuda.matvec_u16_gate_up.runWithFunction(
+        arg_pack,
+        device,
+        function_f16,
+        &input_dev,
+        &gate_weight_f16_dev,
+        &gate_out_f16_dev,
+        gate_out_dim,
+        &up_weight_f16_dev,
+        &up_out_f16_dev,
+        up_out_dim,
+        in_dim,
+    );
+    try gate_out_bf16_dev.download(device, std.mem.sliceAsBytes(gate_actual_bf16[0..]));
+    try up_out_bf16_dev.download(device, std.mem.sliceAsBytes(up_actual_bf16[0..]));
+    try gate_out_f16_dev.download(device, std.mem.sliceAsBytes(gate_actual_f16[0..]));
+    try up_out_f16_dev.download(device, std.mem.sliceAsBytes(up_actual_f16[0..]));
+
+    for (expected_gate, gate_actual_bf16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_gate, gate_actual_f16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_up, up_actual_bf16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_up, up_actual_f16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+
+    // Exercise non-vectorized fallback path with intentionally unaligned pointers.
+    const input_bytes = input.len * @sizeOf(f32);
+    const gate_weight_bytes = gate_weights_bf16.len * @sizeOf(u16);
+    const up_weight_bytes = up_weights_bf16.len * @sizeOf(u16);
+    const input_pad: usize = 4;
+    const weight_pad: usize = 2;
+
+    var input_unaligned_raw_dev = try device.allocBuffer(input_bytes + input_pad);
+    defer input_unaligned_raw_dev.deinit(device);
+    var gate_weight_unaligned_raw_dev = try device.allocBuffer(gate_weight_bytes + weight_pad);
+    defer gate_weight_unaligned_raw_dev.deinit(device);
+    var up_weight_unaligned_raw_dev = try device.allocBuffer(up_weight_bytes + weight_pad);
+    defer up_weight_unaligned_raw_dev.deinit(device);
+    var gate_out_unaligned_dev = try device.allocBuffer(gate_actual_bf16.len * @sizeOf(f32));
+    defer gate_out_unaligned_dev.deinit(device);
+    var up_out_unaligned_dev = try device.allocBuffer(up_actual_bf16.len * @sizeOf(f32));
+    defer up_out_unaligned_dev.deinit(device);
+
+    var gate_actual_unaligned = [_]f32{0.0} ** gate_out_dim_usize;
+    var up_actual_unaligned = [_]f32{0.0} ** up_out_dim_usize;
+
+    var input_blob: [input_pad + input_bytes]u8 = [_]u8{0} ** (input_pad + input_bytes);
+    @memcpy(input_blob[input_pad..], std.mem.sliceAsBytes(input[0..]));
+    var gate_weight_blob: [weight_pad + gate_weight_bytes]u8 = [_]u8{0} ** (weight_pad + gate_weight_bytes);
+    @memcpy(gate_weight_blob[weight_pad..], std.mem.sliceAsBytes(gate_weights_bf16[0..]));
+    var up_weight_blob: [weight_pad + up_weight_bytes]u8 = [_]u8{0} ** (weight_pad + up_weight_bytes);
+    @memcpy(up_weight_blob[weight_pad..], std.mem.sliceAsBytes(up_weights_bf16[0..]));
+
+    try input_unaligned_raw_dev.upload(device, input_blob[0..]);
+    try gate_weight_unaligned_raw_dev.upload(device, gate_weight_blob[0..]);
+    try up_weight_unaligned_raw_dev.upload(device, up_weight_blob[0..]);
+
+    var input_unaligned_dev = try bufferSlice(&input_unaligned_raw_dev, input_pad, input_bytes);
+    var gate_weight_unaligned_dev = try bufferSlice(&gate_weight_unaligned_raw_dev, weight_pad, gate_weight_bytes);
+    var up_weight_unaligned_dev = try bufferSlice(&up_weight_unaligned_raw_dev, weight_pad, up_weight_bytes);
+    try compute.cuda.matvec_u16_gate_up.runWithFunction(
+        arg_pack,
+        device,
+        function_bf16,
+        &input_unaligned_dev,
+        &gate_weight_unaligned_dev,
+        &gate_out_unaligned_dev,
+        gate_out_dim,
+        &up_weight_unaligned_dev,
+        &up_out_unaligned_dev,
+        up_out_dim,
+        in_dim,
+    );
+    try gate_out_unaligned_dev.download(device, std.mem.sliceAsBytes(gate_actual_unaligned[0..]));
+    try up_out_unaligned_dev.download(device, std.mem.sliceAsBytes(up_actual_unaligned[0..]));
+
+    for (expected_gate, gate_actual_unaligned) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_up, up_actual_unaligned) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA matvec_u16_gate_up smoke passed", .{
+        .source_f16 = @tagName(source_f16),
+        .source_bf16 = @tagName(source_bf16),
+        .gate0 = gate_actual_f16[0],
+        .up0 = up_actual_f16[0],
+    });
+}
+
+fn runMatvecU16QkvSmoke(
+    arg_pack: *compute.cuda.ArgPack,
+    device: *compute.cuda.Device,
+    function_f16: compute.cuda.Function,
+    source_f16: compute.cuda.registry.KernelSource,
+    function_bf16: compute.cuda.Function,
+    source_bf16: compute.cuda.registry.KernelSource,
+) !void {
+    const in_dim_usize: usize = 8;
+    const q_out_dim_usize: usize = 3;
+    const k_out_dim_usize: usize = 2;
+    const v_out_dim_usize: usize = 4;
+    const in_dim: u32 = in_dim_usize;
+    const q_out_dim: u32 = q_out_dim_usize;
+    const k_out_dim: u32 = k_out_dim_usize;
+    const v_out_dim: u32 = v_out_dim_usize;
+
+    var input: [in_dim_usize]f32 = undefined;
+    for (&input, 0..) |*v, i| v.* = @floatFromInt(i + 1);
+
+    var q_weights_bf16: [q_out_dim_usize * in_dim_usize]u16 = undefined;
+    var q_weights_f16: [q_out_dim_usize * in_dim_usize]u16 = undefined;
+    var k_weights_bf16: [k_out_dim_usize * in_dim_usize]u16 = undefined;
+    var k_weights_f16: [k_out_dim_usize * in_dim_usize]u16 = undefined;
+    var v_weights_bf16: [v_out_dim_usize * in_dim_usize]u16 = undefined;
+    var v_weights_f16: [v_out_dim_usize * in_dim_usize]u16 = undefined;
+
+    var expected_q: [q_out_dim_usize]f32 = [_]f32{0.0} ** q_out_dim_usize;
+    var expected_k: [k_out_dim_usize]f32 = [_]f32{0.0} ** k_out_dim_usize;
+    var expected_v: [v_out_dim_usize]f32 = [_]f32{0.0} ** v_out_dim_usize;
+
+    for (0..q_out_dim_usize) |row| {
+        var acc: f32 = 0.0;
+        for (0..in_dim_usize) |col| {
+            const w: f32 = @floatFromInt((row + 1) * (col + 1));
+            const idx = row * in_dim_usize + col;
+            q_weights_bf16[idx] = dtype.f32ToBf16(w);
+            q_weights_f16[idx] = @bitCast(@as(f16, @floatCast(w)));
+            acc += input[col] * w;
+        }
+        expected_q[row] = acc;
+    }
+    for (0..k_out_dim_usize) |row| {
+        var acc: f32 = 0.0;
+        for (0..in_dim_usize) |col| {
+            const w: f32 = @floatFromInt((row + 2) * (col + 1));
+            const idx = row * in_dim_usize + col;
+            k_weights_bf16[idx] = dtype.f32ToBf16(w);
+            k_weights_f16[idx] = @bitCast(@as(f16, @floatCast(w)));
+            acc += input[col] * w;
+        }
+        expected_k[row] = acc;
+    }
+    for (0..v_out_dim_usize) |row| {
+        var acc: f32 = 0.0;
+        for (0..in_dim_usize) |col| {
+            const w: f32 = @floatFromInt((row + 3) * (col + 1));
+            const idx = row * in_dim_usize + col;
+            v_weights_bf16[idx] = dtype.f32ToBf16(w);
+            v_weights_f16[idx] = @bitCast(@as(f16, @floatCast(w)));
+            acc += input[col] * w;
+        }
+        expected_v[row] = acc;
+    }
+
+    var q_actual_f16 = [_]f32{0.0} ** q_out_dim_usize;
+    var k_actual_f16 = [_]f32{0.0} ** k_out_dim_usize;
+    var v_actual_f16 = [_]f32{0.0} ** v_out_dim_usize;
+    var q_actual_bf16 = [_]f32{0.0} ** q_out_dim_usize;
+    var k_actual_bf16 = [_]f32{0.0} ** k_out_dim_usize;
+    var v_actual_bf16 = [_]f32{0.0} ** v_out_dim_usize;
+
+    var input_dev = try device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(device);
+    var q_weight_bf16_dev = try device.allocBuffer(q_weights_bf16.len * @sizeOf(u16));
+    defer q_weight_bf16_dev.deinit(device);
+    var k_weight_bf16_dev = try device.allocBuffer(k_weights_bf16.len * @sizeOf(u16));
+    defer k_weight_bf16_dev.deinit(device);
+    var v_weight_bf16_dev = try device.allocBuffer(v_weights_bf16.len * @sizeOf(u16));
+    defer v_weight_bf16_dev.deinit(device);
+    var q_weight_f16_dev = try device.allocBuffer(q_weights_f16.len * @sizeOf(u16));
+    defer q_weight_f16_dev.deinit(device);
+    var k_weight_f16_dev = try device.allocBuffer(k_weights_f16.len * @sizeOf(u16));
+    defer k_weight_f16_dev.deinit(device);
+    var v_weight_f16_dev = try device.allocBuffer(v_weights_f16.len * @sizeOf(u16));
+    defer v_weight_f16_dev.deinit(device);
+    var q_out_bf16_dev = try device.allocBuffer(q_actual_bf16.len * @sizeOf(f32));
+    defer q_out_bf16_dev.deinit(device);
+    var k_out_bf16_dev = try device.allocBuffer(k_actual_bf16.len * @sizeOf(f32));
+    defer k_out_bf16_dev.deinit(device);
+    var v_out_bf16_dev = try device.allocBuffer(v_actual_bf16.len * @sizeOf(f32));
+    defer v_out_bf16_dev.deinit(device);
+    var q_out_f16_dev = try device.allocBuffer(q_actual_f16.len * @sizeOf(f32));
+    defer q_out_f16_dev.deinit(device);
+    var k_out_f16_dev = try device.allocBuffer(k_actual_f16.len * @sizeOf(f32));
+    defer k_out_f16_dev.deinit(device);
+    var v_out_f16_dev = try device.allocBuffer(v_actual_f16.len * @sizeOf(f32));
+    defer v_out_f16_dev.deinit(device);
+
+    try input_dev.upload(device, std.mem.sliceAsBytes(input[0..]));
+    try q_weight_bf16_dev.upload(device, std.mem.sliceAsBytes(q_weights_bf16[0..]));
+    try k_weight_bf16_dev.upload(device, std.mem.sliceAsBytes(k_weights_bf16[0..]));
+    try v_weight_bf16_dev.upload(device, std.mem.sliceAsBytes(v_weights_bf16[0..]));
+    try q_weight_f16_dev.upload(device, std.mem.sliceAsBytes(q_weights_f16[0..]));
+    try k_weight_f16_dev.upload(device, std.mem.sliceAsBytes(k_weights_f16[0..]));
+    try v_weight_f16_dev.upload(device, std.mem.sliceAsBytes(v_weights_f16[0..]));
+
+    try compute.cuda.matvec_u16_qkv.runWithFunction(
+        arg_pack,
+        device,
+        function_bf16,
+        &input_dev,
+        &q_weight_bf16_dev,
+        &q_out_bf16_dev,
+        q_out_dim,
+        &k_weight_bf16_dev,
+        &k_out_bf16_dev,
+        k_out_dim,
+        &v_weight_bf16_dev,
+        &v_out_bf16_dev,
+        v_out_dim,
+        in_dim,
+    );
+    try compute.cuda.matvec_u16_qkv.runWithFunction(
+        arg_pack,
+        device,
+        function_f16,
+        &input_dev,
+        &q_weight_f16_dev,
+        &q_out_f16_dev,
+        q_out_dim,
+        &k_weight_f16_dev,
+        &k_out_f16_dev,
+        k_out_dim,
+        &v_weight_f16_dev,
+        &v_out_f16_dev,
+        v_out_dim,
+        in_dim,
+    );
+    try q_out_bf16_dev.download(device, std.mem.sliceAsBytes(q_actual_bf16[0..]));
+    try k_out_bf16_dev.download(device, std.mem.sliceAsBytes(k_actual_bf16[0..]));
+    try v_out_bf16_dev.download(device, std.mem.sliceAsBytes(v_actual_bf16[0..]));
+    try q_out_f16_dev.download(device, std.mem.sliceAsBytes(q_actual_f16[0..]));
+    try k_out_f16_dev.download(device, std.mem.sliceAsBytes(k_actual_f16[0..]));
+    try v_out_f16_dev.download(device, std.mem.sliceAsBytes(v_actual_f16[0..]));
+
+    for (expected_q, q_actual_bf16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_q, q_actual_f16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_k, k_actual_bf16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_k, k_actual_f16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_v, v_actual_bf16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_v, v_actual_f16) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+
+    // Exercise non-vectorized fallback path with intentionally unaligned pointers.
+    const input_bytes = input.len * @sizeOf(f32);
+    const q_weight_bytes = q_weights_bf16.len * @sizeOf(u16);
+    const k_weight_bytes = k_weights_bf16.len * @sizeOf(u16);
+    const v_weight_bytes = v_weights_bf16.len * @sizeOf(u16);
+    const input_pad: usize = 4;
+    const weight_pad: usize = 2;
+
+    var input_unaligned_raw_dev = try device.allocBuffer(input_bytes + input_pad);
+    defer input_unaligned_raw_dev.deinit(device);
+    var q_weight_unaligned_raw_dev = try device.allocBuffer(q_weight_bytes + weight_pad);
+    defer q_weight_unaligned_raw_dev.deinit(device);
+    var k_weight_unaligned_raw_dev = try device.allocBuffer(k_weight_bytes + weight_pad);
+    defer k_weight_unaligned_raw_dev.deinit(device);
+    var v_weight_unaligned_raw_dev = try device.allocBuffer(v_weight_bytes + weight_pad);
+    defer v_weight_unaligned_raw_dev.deinit(device);
+    var q_out_unaligned_dev = try device.allocBuffer(q_actual_bf16.len * @sizeOf(f32));
+    defer q_out_unaligned_dev.deinit(device);
+    var k_out_unaligned_dev = try device.allocBuffer(k_actual_bf16.len * @sizeOf(f32));
+    defer k_out_unaligned_dev.deinit(device);
+    var v_out_unaligned_dev = try device.allocBuffer(v_actual_bf16.len * @sizeOf(f32));
+    defer v_out_unaligned_dev.deinit(device);
+
+    var q_actual_unaligned = [_]f32{0.0} ** q_out_dim_usize;
+    var k_actual_unaligned = [_]f32{0.0} ** k_out_dim_usize;
+    var v_actual_unaligned = [_]f32{0.0} ** v_out_dim_usize;
+
+    var input_blob: [input_pad + input_bytes]u8 = [_]u8{0} ** (input_pad + input_bytes);
+    @memcpy(input_blob[input_pad..], std.mem.sliceAsBytes(input[0..]));
+    var q_weight_blob: [weight_pad + q_weight_bytes]u8 = [_]u8{0} ** (weight_pad + q_weight_bytes);
+    @memcpy(q_weight_blob[weight_pad..], std.mem.sliceAsBytes(q_weights_bf16[0..]));
+    var k_weight_blob: [weight_pad + k_weight_bytes]u8 = [_]u8{0} ** (weight_pad + k_weight_bytes);
+    @memcpy(k_weight_blob[weight_pad..], std.mem.sliceAsBytes(k_weights_bf16[0..]));
+    var v_weight_blob: [weight_pad + v_weight_bytes]u8 = [_]u8{0} ** (weight_pad + v_weight_bytes);
+    @memcpy(v_weight_blob[weight_pad..], std.mem.sliceAsBytes(v_weights_bf16[0..]));
+
+    try input_unaligned_raw_dev.upload(device, input_blob[0..]);
+    try q_weight_unaligned_raw_dev.upload(device, q_weight_blob[0..]);
+    try k_weight_unaligned_raw_dev.upload(device, k_weight_blob[0..]);
+    try v_weight_unaligned_raw_dev.upload(device, v_weight_blob[0..]);
+
+    var input_unaligned_dev = try bufferSlice(&input_unaligned_raw_dev, input_pad, input_bytes);
+    var q_weight_unaligned_dev = try bufferSlice(&q_weight_unaligned_raw_dev, weight_pad, q_weight_bytes);
+    var k_weight_unaligned_dev = try bufferSlice(&k_weight_unaligned_raw_dev, weight_pad, k_weight_bytes);
+    var v_weight_unaligned_dev = try bufferSlice(&v_weight_unaligned_raw_dev, weight_pad, v_weight_bytes);
+    try compute.cuda.matvec_u16_qkv.runWithFunction(
+        arg_pack,
+        device,
+        function_bf16,
+        &input_unaligned_dev,
+        &q_weight_unaligned_dev,
+        &q_out_unaligned_dev,
+        q_out_dim,
+        &k_weight_unaligned_dev,
+        &k_out_unaligned_dev,
+        k_out_dim,
+        &v_weight_unaligned_dev,
+        &v_out_unaligned_dev,
+        v_out_dim,
+        in_dim,
+    );
+    try q_out_unaligned_dev.download(device, std.mem.sliceAsBytes(q_actual_unaligned[0..]));
+    try k_out_unaligned_dev.download(device, std.mem.sliceAsBytes(k_actual_unaligned[0..]));
+    try v_out_unaligned_dev.download(device, std.mem.sliceAsBytes(v_actual_unaligned[0..]));
+
+    for (expected_q, q_actual_unaligned) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_k, k_actual_unaligned) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+    for (expected_v, v_actual_unaligned) |want, got| {
+        if (@abs(want - got) > 0.02) return error.CudaKernelSmokeMismatch;
+    }
+
+    log.info("inference", "CUDA matvec_u16_qkv smoke passed", .{
+        .source_f16 = @tagName(source_f16),
+        .source_bf16 = @tagName(source_bf16),
+        .q0 = q_actual_f16[0],
+        .k0 = k_actual_f16[0],
+        .v0 = v_actual_f16[0],
     });
 }
 
