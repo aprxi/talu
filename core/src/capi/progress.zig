@@ -8,7 +8,10 @@ const core_progress = @import("../progress.zig");
 
 pub const ProgressAction = core_progress.ProgressAction;
 pub const ProgressUpdate = core_progress.ProgressUpdate;
-pub const CProgressCallback = core_progress.Callback;
+pub const CProgressCallback = *const fn (
+    update: *const ProgressUpdate,
+    user_data: ?*anyopaque,
+) callconv(.c) void;
 pub const ProgressContext = core_progress.Context;
 
 test "ProgressContext.NONE is a safe no-op" {

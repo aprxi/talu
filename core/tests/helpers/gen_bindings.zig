@@ -256,10 +256,17 @@ pub fn main() !void {
     var callbacks = std.ArrayListUnmanaged(CallbackInfo){};
     defer callbacks.deinit(allocator);
 
-    // Directories to scan
+    // Directories to scan (walk recursively)
     const scan_dirs = [_][]const u8{
         "core/src/capi",
         "core/src/router",
+    };
+
+    // Individual core files whose types are re-exported by capi via aliases.
+    // The generator needs the original definitions (extern struct, enum, fn
+    // pointer) because aliases are invisible to the pattern matchers.
+    const extra_type_files = [_][]const u8{
+        "core/src/progress.zig",
     };
 
     for (scan_dirs) |rel_dir| {
@@ -298,6 +305,26 @@ pub fn main() !void {
                 try extractFunctions(allocator, source, entry.path, &functions);
             }
         }
+    }
+
+    // Scan extra type files (types only, no function extraction)
+    for (extra_type_files) |rel_file| {
+        const file_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ project_root, rel_file });
+        defer allocator.free(file_path);
+
+        const file = std.fs.cwd().openFile(file_path, .{}) catch |err| {
+            if (err == error.FileNotFound) continue;
+            std.debug.print("Error: Could not open '{s}': {}\n", .{ file_path, err });
+            return err;
+        };
+        defer file.close();
+
+        const source = try file.readToEndAlloc(allocator, 10 * 1024 * 1024);
+        defer allocator.free(source);
+
+        try extractStructs(allocator, source, rel_file, &structs);
+        try extractAliases(allocator, source, &aliases);
+        try extractCallbacks(allocator, source, rel_file, &callbacks);
     }
 
     // Sort functions
