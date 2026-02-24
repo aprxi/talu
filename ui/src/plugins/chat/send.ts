@@ -4,8 +4,9 @@ import { api, hooks, notifications, timers, getModelsService, getPromptsService 
 import { getSamplingParams } from "./panel-params.ts";
 import { refreshSidebar, renderSidebar } from "./sidebar-list.ts";
 import { setInputEnabled, showInputBar, hideWelcome } from "./welcome.ts";
-import { appendUserMessage, appendAssistantPlaceholder, addAssistantActionButtons, appendStoppedIndicator, scrollToBottom, removeGeneratingIndicator } from "./messages.ts";
+import { appendUserMessage, appendAssistantPlaceholder, addAssistantActionButtons, appendStoppedIndicator, scrollToBottom, removeGeneratingIndicator, removeProgressBar } from "./messages.ts";
 import { readSSEStream } from "./streaming.ts";
+import { clearEventsLog, startResponseEventsStream, stopResponseEventsStream } from "./events.ts";
 import { ensureChatHeader, renderChatView } from "./selection.ts";
 import {
   clearAttachments,
@@ -85,6 +86,8 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   const myViewId = chatState.activeViewId;
   const isActive = () => myViewId === chatState.activeViewId;
 
+  stopResponseEventsStream();
+  clearEventsLog();
   chatState.streamAbort = new AbortController();
   chatState.isGenerating = true;
   setInputEnabled(false);
@@ -168,7 +171,14 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       return;
     }
 
-    const result = await readSSEStream(resp, body, textEl, myViewId, onSessionDiscovered);
+    const result = await readSSEStream(
+      resp,
+      body,
+      textEl,
+      myViewId,
+      onSessionDiscovered,
+      (responseId) => startResponseEventsStream(responseId, myViewId),
+    );
     usageStats = result.usage;
     streamSessionId = result.sessionId ?? streamSessionId;
   } catch (e) {
@@ -179,6 +189,9 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       textEl.textContent = `Error: ${msg}`;
       notifications.error(msg);
     }
+  } finally {
+    stopResponseEventsStream();
+    if (isActive()) removeProgressBar();
   }
 
   if (streamSessionId) {

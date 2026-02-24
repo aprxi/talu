@@ -23,6 +23,18 @@ export interface ApiClient {
   patchSettings(patch: SettingsPatch): Promise<ApiResult<Settings>>;
   resetModelOverrides(modelId: string): Promise<ApiResult<Settings>>;
   createResponse(body: CreateResponseRequest, signal?: AbortSignal): Promise<Response>;
+  streamEvents(
+    opts: {
+      verbosity?: 1 | 2 | 3;
+      domains?: string;
+      topics?: string;
+      event_class?: string;
+      response_id?: string;
+      session_id?: string;
+      cursor?: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<Response>;
   listDocuments(type?: string): Promise<ApiResult<DocumentList>>;
   getDocument(id: string): Promise<ApiResult<Document>>;
   createDocument(doc: CreateDocumentRequest): Promise<ApiResult<Document>>;
@@ -138,6 +150,23 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
       body: JSON.stringify({ ...body, stream: true, store: true }),
       signal,
     }),
+    streamEvents: (opts, signal) => {
+      const params = new URLSearchParams();
+      if (opts.verbosity) params.set("verbosity", String(opts.verbosity));
+      if (opts.domains) params.set("domains", opts.domains);
+      if (opts.topics) params.set("topics", opts.topics);
+      if (opts.event_class) params.set("event_class", opts.event_class);
+      if (opts.response_id) params.set("response_id", opts.response_id);
+      if (opts.session_id) params.set("session_id", opts.session_id);
+      if (opts.cursor) params.set("cursor", opts.cursor);
+      const query = params.toString();
+      const path = query ? `/v1/events/stream?${query}` : "/v1/events/stream";
+      return fetchFn(`${BASE}${path}`, {
+        method: "GET",
+        headers: { "Accept": "text/event-stream" },
+        signal,
+      });
+    },
     listDocuments(type?: string) {
       const params = new URLSearchParams();
       if (type) params.set("type", type);

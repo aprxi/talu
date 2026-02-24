@@ -90,6 +90,8 @@ comptime {
     // Log API
     _ = &capi.talu_set_log_level;
     _ = &capi.talu_set_log_format;
+    _ = &capi.talu_set_log_filter;
+    _ = &capi.talu_set_log_callback;
     _ = &capi.talu_get_log_level;
     _ = &capi.talu_get_log_format;
 

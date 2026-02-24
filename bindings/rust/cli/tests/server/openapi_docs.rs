@@ -25,6 +25,7 @@ fn docs_hub_lists_non_db_sections() {
         "/docs/settings",
         "/docs/plugins",
         "/docs/code",
+        "/docs/events",
         "/docs/db/tables",
         "/docs/db/vectors",
         "/docs/db/kv",
@@ -51,6 +52,7 @@ fn scoped_docs_pages_point_to_scoped_specs() {
         ("/docs/settings", "/openapi/settings.json"),
         ("/docs/plugins", "/openapi/plugins.json"),
         ("/docs/code", "/openapi/code.json"),
+        ("/docs/events", "/openapi/events.json"),
     ] {
         let resp = get(ctx.addr(), path);
         assert_eq!(resp.status, 200, "path={path} body={}", resp.body);
@@ -85,6 +87,7 @@ fn scoped_openapi_specs_are_prefix_scoped() {
         ("/openapi/settings.json", vec!["/v1/settings"]),
         ("/openapi/plugins.json", vec!["/v1/plugins", "/v1/proxy"]),
         ("/openapi/code.json", vec!["/v1/code"]),
+        ("/openapi/events.json", vec!["/v1/events"]),
     ] {
         let resp = get(ctx.addr(), path);
         assert_eq!(resp.status, 200, "path={path} body={}", resp.body);

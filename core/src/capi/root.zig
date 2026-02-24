@@ -261,6 +261,7 @@ pub const talu_take_last_error = err.talu_take_last_error;
 pub const talu_set_log_level = log_api.talu_set_log_level;
 pub const talu_set_log_format = log_api.talu_set_log_format;
 pub const talu_set_log_filter = log_api.talu_set_log_filter;
+pub const talu_set_log_callback = log_api.talu_set_log_callback;
 pub const talu_get_log_level = log_api.talu_get_log_level;
 pub const talu_get_log_format = log_api.talu_get_log_format;
 

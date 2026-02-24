@@ -89,6 +89,21 @@ pub const SourceLocation = struct {
     line: u32,
 };
 
+/// C callback for bridging core logs into bindings.
+pub const CLogCallback = *const fn (
+    level: c_int,
+    scope_ptr: [*]const u8,
+    scope_len: usize,
+    body_ptr: [*]const u8,
+    body_len: usize,
+    attrs_json_ptr: [*]const u8,
+    attrs_json_len: usize,
+    file_ptr: [*]const u8,
+    file_len: usize,
+    line: u32,
+    user_data: ?*anyopaque,
+) callconv(.c) void;
+
 // =============================================================================
 // Cached Configuration
 // =============================================================================
@@ -105,6 +120,10 @@ var format_initialized: bool = false; // Single-threaded: set once at startup
 /// Cached log filter - empty means no filter (pass all)
 var filter_buf: [256]u8 = undefined;
 var cached_filter: []const u8 = &[_]u8{};
+
+/// Optional callback for forwarding logs across FFI.
+var log_callback: ?CLogCallback = null;
+var log_callback_user_data: ?*anyopaque = null;
 
 /// Get the current log level (cached after first call)
 pub fn getLogLevel() Level {
@@ -161,6 +180,12 @@ pub fn setLogFilter(filter: []const u8) void {
     if (filter.len > filter_buf.len) return;
     @memcpy(filter_buf[0..filter.len], filter);
     cached_filter = filter_buf[0..filter.len];
+}
+
+/// Set or clear the C log callback.
+pub fn setLogCallback(callback: ?CLogCallback, user_data: ?*anyopaque) void {
+    log_callback = callback;
+    log_callback_user_data = user_data;
 }
 
 /// Match a single glob pattern against a scope (trailing * = prefix match).
@@ -361,6 +386,37 @@ fn writeJsonRecord(
     try writer.writeAll("}}\n");
 }
 
+fn writeAttrsJson(writer: anytype, attrs: anytype) !void {
+    try writer.writeByte('{');
+    var first = true;
+    const AttrType = @TypeOf(attrs);
+    if (@typeInfo(AttrType) == .@"struct") {
+        inline for (std.meta.fields(AttrType)) |field| {
+            if (!first) try writer.writeByte(',');
+            first = false;
+
+            try writeJsonString(writer, field.name);
+            try writer.writeByte(':');
+            const value = @field(attrs, field.name);
+            const FieldType = @TypeOf(value);
+            if (FieldType == []const u8) {
+                try writeJsonString(writer, value);
+            } else if (comptime isStringLike(FieldType)) {
+                try writeJsonString(writer, value);
+            } else if (@typeInfo(FieldType) == .int) {
+                try writer.print("{d}", .{value});
+            } else if (@typeInfo(FieldType) == .float) {
+                try writer.print("{d}", .{value});
+            } else if (@typeInfo(FieldType) == .bool) {
+                try writer.writeAll(if (value) "true" else "false");
+            } else {
+                try writeJsonString(writer, @typeName(FieldType));
+            }
+        }
+    }
+    try writer.writeByte('}');
+}
+
 // =============================================================================
 // Human Output
 // =============================================================================
@@ -544,6 +600,41 @@ fn writeLogImpl(
     switch (format) {
         .json => writeJsonRecord(writer, level, scope, body, src, attrs) catch return,
         .human => writeHumanRecord(writer, level, scope, body, src, attrs, stderr.isTty()) catch return,
+    }
+
+    if (log_callback) |callback| {
+        var scope_buf3: [128]u8 = undefined;
+        const prefixed_scope = std.fmt.bufPrint(&scope_buf3, "core::{s}", .{scope}) catch scope;
+
+        var attrs_buf: [2048]u8 = undefined;
+        var attrs_fbs = std.io.fixedBufferStream(&attrs_buf);
+        const attrs_writer = attrs_fbs.writer();
+        writeAttrsJson(attrs_writer, attrs) catch {
+            attrs_fbs.reset();
+            _ = attrs_writer.writeAll("{}") catch {};
+        };
+        const attrs_json = attrs_fbs.getWritten();
+
+        var file_slice: []const u8 = "";
+        var line: u32 = 0;
+        if (src) |s| {
+            file_slice = s.file;
+            line = s.line;
+        }
+
+        callback(
+            @intFromEnum(level),
+            prefixed_scope.ptr,
+            prefixed_scope.len,
+            body.ptr,
+            body.len,
+            attrs_json.ptr,
+            attrs_json.len,
+            file_slice.ptr,
+            file_slice.len,
+            line,
+            log_callback_user_data,
+        );
     }
 
     stderr.writeAll(fbs.getWritten()) catch {};

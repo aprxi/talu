@@ -154,6 +154,20 @@ export function buildChatDOM(container: HTMLElement): void {
             <span id="panel-info-forked" class="info-value mono">-</span>
           </div>
         </div>
+
+        <div class="panel-divider"></div>
+        <h3 class="panel-heading">Events</h3>
+        <div class="chat-events-controls">
+          <select id="panel-events-verbosity" class="form-select form-select-sm" title="Events verbosity">
+            <option value="1">v</option>
+            <option value="2">vv</option>
+            <option value="3">vvv</option>
+          </select>
+          <button id="panel-events-clear" class="btn btn-ghost btn-icon" title="Clear events">
+            <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="M19 6l-1 14H6L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/></svg>
+          </button>
+        </div>
+        <div id="panel-events-log" class="chat-events-log" aria-live="polite"></div>
       </div>
     </aside>`;
 

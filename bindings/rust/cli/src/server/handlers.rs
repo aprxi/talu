@@ -17,6 +17,7 @@ use tokio_stream::StreamExt;
 use crate::bucket_settings;
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
+use crate::server::events;
 use crate::server::responses_types;
 use crate::server::state::{AppState, StoredResponse};
 use talu::documents::{DocumentError, DocumentsHandle};
@@ -923,6 +924,7 @@ async fn stream_response(
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
+    let request_id = format!("req_{}", random_id());
     let response_id = format!("resp_{}", random_id());
     let message_id = format!("msg_{}", random_id());
     let created_at = now_unix_seconds();
@@ -1155,6 +1157,10 @@ async fn stream_response(
     let title_bucket = bucket_path.clone();
     let title_session_id = session_id.clone();
     let title_backend = state.backend.clone();
+    let events_tenant_id = auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone());
+    let events_request_id = request_id.clone();
+    let events_response_id = response_id.clone();
+    let events_session_id = session_id.clone();
 
     let previous_response_id_for_ctx = previous_response_id.clone();
     tokio::task::spawn_blocking(move || {
@@ -1210,23 +1216,22 @@ async fn stream_response(
             let needs_load =
                 guard.current_model.as_deref() != Some(&model_id) || guard.backend.is_none();
             if needs_load {
-                let callback: Option<talu::LoadProgressCallback> = if strict_responses {
-                    None
-                } else {
-                    let tx_progress = tx.clone();
+                let progress_tenant_id = events_tenant_id.clone();
+                let progress_request_id = events_request_id.clone();
+                let progress_response_id = events_response_id.clone();
+                let progress_session_id = events_session_id.clone();
+                let callback: Option<talu::LoadProgressCallback> =
                     Some(Box::new(move |p: talu::LoadProgress| {
-                        let _ = send_event(
-                            &tx_progress,
-                            "response.progress",
-                            json!({
-                                "type": "response.progress",
-                                "phase": p.label,
-                                "current": p.current,
-                                "total": p.total,
-                            }),
+                        events::publish_inference_progress(
+                            progress_tenant_id.as_deref(),
+                            Some(progress_request_id.as_str()),
+                            Some(progress_response_id.as_str()),
+                            Some(progress_session_id.as_str()),
+                            &p.label,
+                            p.current,
+                            p.total,
                         );
-                    }))
-                };
+                    }));
                 match provider::create_backend_for_model_with_progress(&model_id, callback) {
                     Ok(new_backend) => {
                         guard.backend = Some(new_backend);
@@ -1336,11 +1341,6 @@ async fn stream_response(
         );
         seq += 1;
 
-        let progress_tx = if strict_responses {
-            None
-        } else {
-            Some(tx.clone())
-        };
         let ctx = Arc::new(std::sync::Mutex::new(StreamCtx {
             tx,
             seq,
@@ -1380,8 +1380,10 @@ async fn stream_response(
             file_storage_path,
             ctx,
             stop_flag_for_gen,
-            progress_tx,
-            strict_responses,
+            events_tenant_id.clone(),
+            Some(events_request_id.clone()),
+            Some(events_response_id.clone()),
+            Some(events_session_id.clone()),
         );
 
         // Store conversation for chaining after streaming completes.
@@ -1447,8 +1449,10 @@ fn run_streaming_generation(
     file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
-    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
-    strict_responses: bool,
+    event_tenant_id: Option<String>,
+    event_request_id: Option<String>,
+    event_response_id: Option<String>,
+    event_session_id: Option<String>,
 ) -> Result<StreamGenResult> {
     let mut backend = backend.blocking_lock();
     let backend = backend
@@ -1509,23 +1513,17 @@ fn run_streaming_generation(
     // Pass the stop flag for cooperative cancellation.
     cfg.stop_flag = Some(stop_flag);
 
-    // Prefill progress — emit response.progress events with phase "Prefill".
-    if !strict_responses {
-        if let Some(prefill_tx) = progress_tx {
-            cfg.prefill_progress = Some(Box::new(move |completed: usize, total: usize| {
-                let _ = send_event(
-                    &prefill_tx,
-                    "response.progress",
-                    json!({
-                        "type": "response.progress",
-                        "phase": "Prefill",
-                        "current": completed,
-                        "total": total,
-                    }),
-                );
-            }));
-        }
-    }
+    cfg.prefill_progress = Some(Box::new(move |completed: usize, total: usize| {
+        events::publish_inference_progress(
+            event_tenant_id.as_deref(),
+            event_request_id.as_deref(),
+            event_response_id.as_deref(),
+            event_session_id.as_deref(),
+            "prefill",
+            completed as u64,
+            total as u64,
+        );
+    }));
 
     log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
         model_id, max_output_tokens, temperature, top_p);

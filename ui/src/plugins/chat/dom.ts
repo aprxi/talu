@@ -51,6 +51,9 @@ export interface ChatDom {
   panelInfoCreated: HTMLElement;
   panelInfoForkedRow: HTMLElement;
   panelInfoForked: HTMLElement;
+  panelEventsVerbosity: HTMLSelectElement;
+  panelEventsClear: HTMLButtonElement;
+  panelEventsLog: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -110,6 +113,9 @@ export function getChatDom(): ChatDom {
     panelInfoCreated: q("#panel-info-created"),
     panelInfoForkedRow: q("#panel-info-forked-row"),
     panelInfoForked: q("#panel-info-forked"),
+    panelEventsVerbosity: q<HTMLSelectElement>("#panel-events-verbosity"),
+    panelEventsClear: q<HTMLButtonElement>("#panel-events-clear"),
+    panelEventsLog: q("#panel-events-log"),
   };
 
   return cached;

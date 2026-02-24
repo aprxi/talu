@@ -23,6 +23,9 @@ export interface ChatState {
   isUploadingAttachments: boolean;
   isGenerating: boolean;
   streamAbort: AbortController | null;
+  eventsAbort: AbortController | null;
+  eventsResponseId: string | null;
+  eventsVerbosity: 1 | 2 | 3;
   /** Incremented on each navigation (selectChat, startNewConversation). Streams
    *  capture this at start and only write to global state while it matches. */
   activeViewId: number;
@@ -50,6 +53,9 @@ export const chatState: ChatState = {
   isUploadingAttachments: false,
   isGenerating: false,
   streamAbort: null,
+  eventsAbort: null,
+  eventsResponseId: null,
+  eventsVerbosity: 1,
   activeViewId: 0,
   backgroundStreamSessions: new Set(),
   backgroundStreamDom: new Map(),

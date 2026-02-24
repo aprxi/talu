@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    code, db, file, files, handlers, http, plugins, proxy, repo, responses, responses_types,
-    search, sessions, settings, tags,
+    code, db, events, file, files, handlers, http, plugins, proxy, repo, responses,
+    responses_types, search, sessions, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -22,6 +22,7 @@ use crate::server::{
         (name = "Responses", description = "OpenResponses-compatible API surface"),
         (name = "Models", description = "Available model listing"),
         (name = "Chat", description = "Chat session state management"),
+        (name = "Events", description = "Unified observability stream and replay"),
         (name = "Files", description = "Binary file upload and management"),
         (name = "File", description = "Stateless file inspect/transform"),
         (name = "Tags", description = "Tag CRUD and assignment"),
@@ -46,6 +47,9 @@ use crate::server::{
         // Models + responses
         handlers::handle_models,
         responses::handle_create,
+        events::handle_replay,
+        events::handle_stream,
+        events::handle_topics,
         // Tags
         tags::handle_list,
         tags::handle_create,
@@ -151,6 +155,12 @@ use crate::server::{
         responses_types::ResponseResource,
         responses_types::ResponsesErrorResponse,
         responses_types::ResponsesErrorBody,
+        // Events
+        events::EventCorrelation,
+        events::EventEnvelope,
+        events::EventGap,
+        events::EventsReplayResponse,
+        events::EventFieldValuesResponse,
         // Tags
         tags::TagResponse,
         tags::TagUsage,

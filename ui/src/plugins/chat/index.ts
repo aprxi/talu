@@ -20,6 +20,7 @@ import { initChatDeps } from "./deps.ts";
 import { buildChatDOM } from "./build-dom.ts";
 import { initChatDom, getChatDom } from "./dom.ts";
 import { setupInputEvents, cancelGeneration } from "./send.ts";
+import { setupEventsPanelEvents } from "./events.ts";
 import { setupAttachmentEvents } from "./attachments.ts";
 import { setupTranscriptEvents } from "./transcript-events.ts";
 import { showWelcome, startNewConversation } from "./welcome.ts";
@@ -129,6 +130,7 @@ export const chatPlugin: PluginDefinition = {
 
     // Set up all event handlers.
     setupInputEvents();
+    setupEventsPanelEvents();
     setupAttachmentEvents();
     setupTranscriptEvents();
     setupSidebarEvents();

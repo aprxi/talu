@@ -22,6 +22,21 @@ pub const LogFormat = enum(c_int) {
     human = 1,
 };
 
+/// Callback receiving core log records.
+pub const CLogCallback = ?*const fn (
+    level: c_int,
+    scope_ptr: [*]const u8,
+    scope_len: usize,
+    body_ptr: [*]const u8,
+    body_len: usize,
+    attrs_json_ptr: [*]const u8,
+    attrs_json_len: usize,
+    file_ptr: [*]const u8,
+    file_len: usize,
+    line: u32,
+    user_data: ?*anyopaque,
+) callconv(.c) void;
+
 /// Set the log level.
 ///
 /// Levels:
@@ -76,4 +91,11 @@ pub export fn talu_get_log_format() callconv(.c) c_int {
 /// Note: this only filters Zig core logs. Rust server logs have their own filter.
 pub export fn talu_set_log_filter(ptr: [*]const u8, len: usize) callconv(.c) void {
     log.setLogFilter(ptr[0..len]);
+}
+
+/// Set a callback for core log records.
+///
+/// Passing `null` disables callback forwarding.
+pub export fn talu_set_log_callback(callback: CLogCallback, user_data: ?*anyopaque) callconv(.c) void {
+    log.setLogCallback(callback, user_data);
 }

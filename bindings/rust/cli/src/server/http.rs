@@ -21,6 +21,7 @@ use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
 use crate::server::db;
+use crate::server::events;
 use crate::server::file;
 use crate::server::files;
 use crate::server::handlers;
@@ -71,6 +72,8 @@ static OPENAPI_PLUGINS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/plugins", "/v1/proxy"]));
 static OPENAPI_CODE_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/code"]));
+static OPENAPI_EVENTS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/events"]));
 static OPENAPI_DB_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/"]));
 static OPENAPI_DB_TABLES_SPEC: Lazy<Vec<u8>> =
@@ -208,6 +211,11 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_CODE_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/events.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_EVENTS_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/openapi/db.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -273,6 +281,9 @@ impl Service<Request<Incoming>> for Router {
                 }
                 (Method::GET, "/docs/code") => {
                     swagger_ui_response("/openapi/code.json", "Talu API :: Code")
+                }
+                (Method::GET, "/docs/events") => {
+                    swagger_ui_response("/openapi/events.json", "Talu API :: Events")
                 }
                 (Method::GET, "/docs/db") => docs_hub_response(),
                 (Method::GET, "/docs/db/tables") => {
@@ -353,6 +364,15 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/responses") => {
                             responses::handle_create(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/events") => {
+                            events::handle_replay(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/events/stream") => {
+                            events::handle_stream(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/events/topics") => {
+                            events::handle_topics(state, req, auth).await
                         }
                         // Settings endpoints
                         (Method::GET, "/v1/settings") | (Method::GET, "/settings") => {
@@ -1176,7 +1196,7 @@ a:hover {
         <tr>
           <td class="mono"><a href="/docs/chat"><code>chat</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/chat.json" title="/openapi/chat.json">json</a><button class="copy-btn" data-url="/openapi/chat.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Chat API plane (`/v1/chat/*`), including generate and sessions endpoints.</td>
+          <td class="desc">Chat API plane (`/v1/chat/*`) for conversational session management.</td>
         </tr>
         <tr>
           <td class="mono"><a href="/docs/responses"><code>responses</code></a></td>
@@ -1222,6 +1242,11 @@ a:hover {
           <td class="mono"><a href="/docs/code"><code>code</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/code.json" title="/openapi/code.json">json</a><button class="copy-btn" data-url="/openapi/code.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Tree-sitter parse, highlight, query, graph, and code-session APIs.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/events"><code>events</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/events.json" title="/openapi/events.json">json</a><button class="copy-btn" data-url="/openapi/events.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Unified in-memory observability stream and replay APIs (`/v1/events*`).</td>
         </tr>
       </tbody>
     </table>

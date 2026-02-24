@@ -11,6 +11,7 @@ mod server {
     pub mod compliance;
     pub mod console;
     pub mod db;
+    pub mod events;
     pub mod file;
     pub mod files;
     pub mod openapi_docs;

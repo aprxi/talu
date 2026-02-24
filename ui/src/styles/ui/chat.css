@@ -650,6 +650,62 @@
   flex-shrink: 0;
 }
 
+/* Events panel (right side) */
+.chat-events-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  margin-bottom: 0.5rem;
+}
+
+.chat-events-controls .form-select {
+  flex: 1;
+}
+
+.chat-events-log {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-code);
+  padding: 0.5rem;
+  min-height: 7rem;
+  max-height: 12rem;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.4;
+}
+
+.chat-events-line {
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-events-line + .chat-events-line {
+  margin-top: 0.25rem;
+}
+
+.chat-events-level-error {
+  color: color-mix(in srgb, var(--danger) 85%, var(--text) 15%);
+}
+
+.chat-events-level-warn {
+  color: color-mix(in srgb, var(--warning, #d8a23c) 85%, var(--text) 15%);
+}
+
+.chat-events-level-info {
+  color: var(--text-secondary);
+}
+
+.chat-events-level-debug,
+.chat-events-level-trace {
+  color: var(--text-muted);
+}
+
+.chat-events-empty {
+  color: var(--text-muted);
+}
+
 /* Generating indicator (shown when navigating to a chat with a background stream) */
 .chat-generating {
   max-width: 768px;
