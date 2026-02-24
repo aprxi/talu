@@ -291,6 +291,7 @@ const PrototypeRuntime = struct {
     ffn_up_dev: compute.cuda.Buffer,
     ffn_mul_dev: compute.cuda.Buffer,
     ffn_down_dev: compute.cuda.Buffer,
+    deepstack_add_dev: compute.cuda.Buffer,
     shortconv_proj_dev: compute.cuda.Buffer,
     shortconv_conv_dev: compute.cuda.Buffer,
     projection_weight: LinearWeight,
@@ -422,6 +423,8 @@ const PrototypeRuntime = struct {
         errdefer ffn_mul_dev.deinit(device);
         var ffn_down_dev = try device.allocBuffer(d_model_bytes);
         errdefer ffn_down_dev.deinit(device);
+        var deepstack_add_dev = try device.allocBuffer(d_model_bytes);
+        errdefer deepstack_add_dev.deinit(device);
         var shortconv_proj_dev = try device.allocBuffer(shortconv_proj_bytes);
         errdefer shortconv_proj_dev.deinit(device);
         var shortconv_conv_dev = try device.allocBuffer(shortconv_conv_bytes);
@@ -459,6 +462,7 @@ const PrototypeRuntime = struct {
             .ffn_up_dev = ffn_up_dev,
             .ffn_mul_dev = ffn_mul_dev,
             .ffn_down_dev = ffn_down_dev,
+            .deepstack_add_dev = deepstack_add_dev,
             .shortconv_proj_dev = shortconv_proj_dev,
             .shortconv_conv_dev = shortconv_conv_dev,
             .projection_weight = projection_weight,
@@ -486,6 +490,7 @@ const PrototypeRuntime = struct {
         self.norm_out_dev.deinit(device);
         self.norm_weight_dev.deinit(device);
         self.input_dev.deinit(device);
+        self.deepstack_add_dev.deinit(device);
         allocator.free(self.projected_logits_host);
         allocator.free(self.hidden_host);
     }
@@ -505,6 +510,7 @@ const PrototypeRuntime = struct {
             self.ffn_up_dev.size +
             self.ffn_mul_dev.size +
             self.ffn_down_dev.size +
+            self.deepstack_add_dev.size +
             self.shortconv_proj_dev.size +
             self.shortconv_conv_dev.size +
             self.logits_dev.size +
@@ -1705,12 +1711,26 @@ pub const CudaBackend = struct {
         var encoded_vision_output = try vision.encodeImages(vi.images);
         defer encoded_vision_output.deinit(self.allocator);
 
+        var image_token_positions: []usize = &.{};
+        defer if (image_token_positions.len > 0) self.allocator.free(image_token_positions);
         if (encoded_vision_output.deepstack_layer_embeddings.len > 0) {
-            log.warn("inference", "CUDA vision deepstack layers are not supported yet", .{
-                .slot_index = slot_index,
-                .deepstack_layers = encoded_vision_output.deepstack_layer_embeddings.len,
-            });
-            return error.UnsupportedModel;
+            image_token_positions = try collectTokenPositions(self.allocator, tokens, vi.image_token_id);
+            if (image_token_positions.len == 0) return error.InvalidPromptImageTokens;
+
+            const expected_values = std.math.mul(usize, image_token_positions.len, self.d_model) catch return error.InvalidArgument;
+            for (encoded_vision_output.deepstack_layer_embeddings, 0..) |layer_features, layer_idx| {
+                if (layer_features.len != expected_values) {
+                    log.warn("inference", "CUDA vision deepstack shape mismatch", .{
+                        .slot_index = slot_index,
+                        .layer_index = layer_idx,
+                        .expected_values = expected_values,
+                        .actual_values = layer_features.len,
+                        .image_positions = image_token_positions.len,
+                        .d_model = self.d_model,
+                    });
+                    return error.InvalidArgument;
+                }
+            }
         }
 
         self.slot_rope_position_delta = 0;
@@ -1736,6 +1756,7 @@ pub const CudaBackend = struct {
             const row_start = std.math.mul(usize, i, self.d_model) catch return error.InvalidArgument;
             const hidden_override = hidden_host[row_start .. row_start + self.d_model];
             const download_logits = self.shouldDownloadPrefillLogitsImpl(i, tokens.len);
+            const deepstack_feature_index = if (image_token_positions.len > 0) findPositionIndex(image_token_positions, i) else null;
             try self.computeGpuPrototypeLogitsWithLayerLimit(
                 tokens[i],
                 i,
@@ -1745,6 +1766,8 @@ pub const CudaBackend = struct {
                 download_logits,
                 false,
                 hidden_override,
+                if (encoded_vision_output.deepstack_layer_embeddings.len > 0) encoded_vision_output.deepstack_layer_embeddings else null,
+                deepstack_feature_index,
             );
         }
 
@@ -2310,6 +2333,8 @@ pub const CudaBackend = struct {
             true,
             true,
             null,
+            null,
+            null,
         );
     }
 
@@ -2323,8 +2348,11 @@ pub const CudaBackend = struct {
         download_logits: bool,
         ensure_kv_capacity: bool,
         hidden_override: ?[]const f32,
+        deepstack_layer_features_opt: ?[]const []const f32,
+        deepstack_feature_index_opt: ?usize,
     ) !void {
         if (!compute_logits and download_logits) return error.InvalidArgument;
+        if (deepstack_feature_index_opt != null and deepstack_layer_features_opt == null) return error.InvalidArgument;
         if (download_logits) {
             const logits_out = logits_out_opt orelse return error.InvalidArgument;
             if (logits_out.len != self.vocab_size) return error.InvalidArgument;
@@ -2870,6 +2898,28 @@ pub const CudaBackend = struct {
                 }
             } else {
                 return error.InvalidArgument;
+            }
+
+            if (deepstack_layer_features_opt) |deepstack_layer_features| {
+                if (deepstack_feature_index_opt) |deepstack_feature_index| {
+                    if (layer_idx < deepstack_layer_features.len) {
+                        const layer_features = deepstack_layer_features[layer_idx];
+                        const feature_rows = std.math.divExact(usize, layer_features.len, self.d_model) catch return error.InvalidArgument;
+                        if (deepstack_feature_index >= feature_rows) return error.InvalidArgument;
+                        const row_start = std.math.mul(usize, deepstack_feature_index, self.d_model) catch return error.InvalidArgument;
+                        const feature_row = layer_features[row_start .. row_start + self.d_model];
+                        try self.prototype.deepstack_add_dev.upload(&self.device, std.mem.sliceAsBytes(feature_row));
+                        try compute.cuda.vector_add.runWithFunction(
+                            &self.kernel_arg_pack,
+                            &self.device,
+                            vector_add_function,
+                            &self.prototype.input_dev,
+                            &self.prototype.deepstack_add_dev,
+                            &self.prototype.input_dev,
+                            d_model_u32,
+                        );
+                    }
+                }
             }
         }
 
@@ -3856,6 +3906,37 @@ fn logPrefillTiming(self: *const CudaBackend, mode: []const u8, token_count: usi
         .attention_blocks = self.block_runtime.attention_block_count,
         .shortconv_blocks = self.block_runtime.shortconv_block_count,
     });
+}
+
+fn collectTokenPositions(
+    allocator: std.mem.Allocator,
+    token_ids: []const u32,
+    needle: u32,
+) ![]usize {
+    var count: usize = 0;
+    for (token_ids) |token| {
+        if (token == needle) count += 1;
+    }
+    if (count == 0) return &.{};
+
+    const positions = try allocator.alloc(usize, count);
+    errdefer allocator.free(positions);
+
+    var write_idx: usize = 0;
+    for (token_ids, 0..) |token, idx| {
+        if (token != needle) continue;
+        positions[write_idx] = idx;
+        write_idx += 1;
+    }
+    std.debug.assert(write_idx == count);
+    return positions;
+}
+
+fn findPositionIndex(positions: []const usize, position: usize) ?usize {
+    for (positions, 0..) |value, idx| {
+        if (value == position) return idx;
+    }
+    return null;
 }
 
 const DenseLinearLayout = struct {
@@ -5089,4 +5170,27 @@ test "canFuseDenseU16QkvWeights rejects mixed dtypes" {
     };
 
     try std.testing.expect(!CudaBackend.canFuseDenseU16QkvWeights(1024, q, k, v));
+}
+
+test "collectTokenPositions returns all matching positions" {
+    const tokens = [_]u32{ 7, 3, 7, 9, 7 };
+    const positions = try collectTokenPositions(std.testing.allocator, tokens[0..], 7);
+    defer if (positions.len > 0) std.testing.allocator.free(positions);
+
+    const expected = [_]usize{ 0, 2, 4 };
+    try std.testing.expectEqualSlices(usize, expected[0..], positions);
+}
+
+test "collectTokenPositions returns empty when token is absent" {
+    const tokens = [_]u32{ 1, 2, 3 };
+    const positions = try collectTokenPositions(std.testing.allocator, tokens[0..], 9);
+    try std.testing.expectEqual(@as(usize, 0), positions.len);
+}
+
+test "findPositionIndex locates mapped image feature index" {
+    const positions = [_]usize{ 2, 5, 9 };
+    try std.testing.expectEqual(@as(?usize, 0), findPositionIndex(positions[0..], 2));
+    try std.testing.expectEqual(@as(?usize, 1), findPositionIndex(positions[0..], 5));
+    try std.testing.expectEqual(@as(?usize, 2), findPositionIndex(positions[0..], 9));
+    try std.testing.expectEqual(@as(?usize, null), findPositionIndex(positions[0..], 7));
 }

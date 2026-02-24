@@ -90,6 +90,8 @@ pub fn decodeStreaming(
             false,
             true,
             null,
+            null,
+            null,
         );
         const next_token = try self.selectNextTokenFromDeviceLogitsImpl();
         output_tokens[generated] = next_token;

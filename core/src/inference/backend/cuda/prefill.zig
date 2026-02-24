@@ -39,6 +39,8 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
             download_logits,
             false,
             null,
+            null,
+            null,
         );
     }
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
@@ -96,6 +98,8 @@ pub fn prefillSlot(
             download_logits,
             download_logits,
             false,
+            null,
+            null,
             null,
         );
     }
