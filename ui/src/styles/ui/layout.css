@@ -80,6 +80,10 @@
   background: color-mix(in srgb, var(--text) 4%, transparent);
   border-radius: 4px;
 }
+.sidebar-group-label.active {
+  color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
+}
 .sidebar-group-label:first-child {
   border-top: none;
   margin-top: 0;

@@ -30,10 +30,6 @@ export function setupSidebarEvents(): void {
     }
   });
 
-  dom.newConversationBtn.addEventListener("click", () => {
-    startNewConversation();
-  });
-
   // Sidebar search
   dom.sidebarSearch.addEventListener("input", () => {
     chatState.sidebarSearchQuery = dom.sidebarSearch.value;

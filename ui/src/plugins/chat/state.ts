@@ -52,6 +52,13 @@ export interface ChatState {
   };
 }
 
+/** Get the project ID of the currently active context (active chat or draft). */
+export function getActiveProjectId(): string | null {
+  if (chatState.activeChat) return chatState.activeChat.project_id ?? null;
+  if (chatState.draftSession) return chatState.draftSession.projectId;
+  return null;
+}
+
 export const chatState: ChatState = {
   sessions: [],
   activeSessionId: null,

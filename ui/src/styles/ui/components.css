@@ -353,6 +353,13 @@
   opacity: 0.6;
 }
 
+/* When theme toggle lives in the activity bar, match icon sizing */
+.activity-btn.theme-toggle-btn .theme-icon {
+  width: 18px;
+  height: 18px;
+  opacity: 1;
+}
+
 /* =============================================================================
    Search Input
    ============================================================================= */

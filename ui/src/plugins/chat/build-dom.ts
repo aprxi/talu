@@ -10,12 +10,6 @@ export function buildChatDOM(container: HTMLElement): void {
 
   container.innerHTML = `
     <aside class="sidebar">
-      <div class="sidebar-header">
-        <button id="new-conversation" class="btn btn-primary btn-full" title="New conversation">
-          <svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14"/><path d="M5 12h14"/></svg>
-          New Chat
-        </button>
-      </div>
       <div class="sidebar-search">
         <div class="search-wrapper">
           ${ICON_SEARCH}
@@ -39,6 +33,7 @@ export function buildChatDOM(container: HTMLElement): void {
 
         <div id="welcome-state" class="welcome-state">
           <h2 class="welcome-title">Ask anything</h2>
+          <span class="welcome-brand">TALU</span>
           <div class="input-container">
             <div id="welcome-attachment-list" class="attachment-list hidden"></div>
             <textarea id="welcome-input" rows="1" placeholder="Send a message..." class="input-textarea"></textarea>

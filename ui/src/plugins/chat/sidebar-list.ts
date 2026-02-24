@@ -1,5 +1,5 @@
 import { getChatDom } from "./dom.ts";
-import { chatState } from "./state.ts";
+import { chatState, getActiveProjectId } from "./state.ts";
 import { api, notifications, observe, getModelsService } from "./deps.ts";
 import { renderSidebarItem, renderSectionLabel } from "../../render/sidebar.ts";
 import { renderEmptyState } from "../../render/common.ts";
@@ -135,7 +135,10 @@ function renderGroupedList(
 
     // Group header: [collapse toggle] name ... [+N / less toggle]
     const displayName = pValue === "__default__" ? "Default" : pValue;
+    const activeProject = getActiveProjectId();
+    const activeGroupKey = activeProject ?? "__default__";
     const label = el("div", "sidebar-group-label");
+    if (pValue === activeGroupKey) label.classList.add("active");
 
     const toggleCollapse = () => {
       if (isOpen) {

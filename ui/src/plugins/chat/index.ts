@@ -29,7 +29,7 @@ import { setStreamRenderers } from "./streaming.ts";
 import { setupSidebarEvents } from "./sidebar-events.ts";
 import { setupInfiniteScroll, loadSessions, refreshSidebar } from "./sidebar-list.ts";
 import { syncRightPanelParams, setupPanelEvents } from "./panel-params.ts";
-import { chatState } from "./state.ts";
+import { chatState, getActiveProjectId } from "./state.ts";
 import { getModelsService, getPromptsService } from "./deps.ts";
 
 function populatePromptSelect(
@@ -172,6 +172,28 @@ export const chatPlugin: PluginDefinition = {
     const promptsSvc = getPromptsService();
     if (promptsSvc) {
       populatePromptSelect(getChatDom().welcomePrompt, promptsSvc.getAll());
+    }
+
+    // Click Chat icon when already on chat mode → new conversation.
+    // - From an active chat in project X → new chat in project X
+    // - Already composing a draft in project X → switch to default
+    // - Already composing a draft in default → stay in default (reset)
+    const activityBar = document.getElementById("activity-bar");
+    if (activityBar) {
+      activityBar.addEventListener("click", (e) => {
+        const btn = (e.target as Element).closest<HTMLElement>(".activity-btn");
+        if (btn?.getAttribute("data-mode") === "chat" && ctx.mode.getActive() === "chat") {
+          const isDraft = chatState.draftSession !== null && chatState.activeSessionId === null;
+          const currentProject = getActiveProjectId();
+          if (isDraft && currentProject) {
+            // Already drafting in a project → cycle to default.
+            startNewConversation(null);
+          } else {
+            // Active chat or default draft → new chat in current project (or default).
+            startNewConversation(currentProject);
+          }
+        }
+      });
     }
 
     // Load initial data and show welcome state.

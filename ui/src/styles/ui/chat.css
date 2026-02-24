@@ -31,6 +31,17 @@
   letter-spacing: -0.02em;
 }
 
+.welcome-brand {
+  position: absolute;
+  bottom: 1.25rem;
+  right: 1.25rem;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  color: var(--text-muted);
+  opacity: 0.35;
+}
+
 /* Welcome input - bigger and more inviting */
 .welcome-state .input-container {
   padding: 0.75rem;
