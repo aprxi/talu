@@ -50,21 +50,38 @@ pub struct ErrorBody {
 }
 
 static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(openapi::build_openapi_json);
-
-const SWAGGER_UI_HTML: &[u8] = br##"<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8"/>
-<title>Talu API</title>
-<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
-</head>
-<body>
-<div id="swagger-ui"></div>
-<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
-<script>SwaggerUIBundle({url:"/openapi.json",dom_id:"#swagger-ui"});</script>
-</body>
-</html>
-"##;
+static OPENAPI_AI_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models", "/v1/responses"]));
+static OPENAPI_CONVERSATIONS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/conversations"]));
+static OPENAPI_FILES_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/files", "/v1/file"]));
+static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/repo"]));
+static OPENAPI_SEARCH_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/search"]));
+static OPENAPI_TAGS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/tags"]));
+static OPENAPI_SETTINGS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/settings"]));
+static OPENAPI_PLUGINS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/plugins", "/v1/proxy"]));
+static OPENAPI_CODE_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/code"]));
+static OPENAPI_DB_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/"]));
+static OPENAPI_DB_TABLES_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/tables/"]));
+static OPENAPI_DB_VECTORS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/vectors/"]));
+static OPENAPI_DB_KV_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/kv/"]));
+static OPENAPI_DB_BLOBS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/blobs/"]));
+static OPENAPI_DB_SQL_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/sql/"]));
+static OPENAPI_DB_OPS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/ops/"]));
 
 // Console UI assets — only compiled in when `make ui` has been run.
 // build.rs sets cfg(bundled_ui) when ui/dist/ contains the required files.
@@ -138,11 +155,133 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_SPEC.clone())).boxed())
                     .unwrap(),
-                (Method::GET, "/docs") => Response::builder()
+                (Method::GET, "/openapi/ai.json") => Response::builder()
                     .status(StatusCode::OK)
-                    .header("content-type", "text/html; charset=utf-8")
-                    .body(Full::new(Bytes::from_static(SWAGGER_UI_HTML)).boxed())
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AI_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/conversations.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_CONVERSATIONS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/files.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_FILES_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/repo.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_REPO_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/search.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_SEARCH_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/tags.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_TAGS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/settings.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_SETTINGS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/plugins.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_PLUGINS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/code.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_CODE_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/db.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_DB_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/db/tables.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_DB_TABLES_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/db/vectors.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_DB_VECTORS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/db/kv.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_DB_KV_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/db/blobs.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_DB_BLOBS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/db/sql.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_DB_SQL_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/db/ops.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_DB_OPS_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/docs") => docs_hub_response(),
+                (Method::GET, "/docs/ai") => {
+                    swagger_ui_response("/openapi/ai.json", "Talu API :: AI")
+                }
+                (Method::GET, "/docs/conversations") => {
+                    swagger_ui_response("/openapi/conversations.json", "Talu API :: Conversations")
+                }
+                (Method::GET, "/docs/files") => {
+                    swagger_ui_response("/openapi/files.json", "Talu API :: Files")
+                }
+                (Method::GET, "/docs/repo") => {
+                    swagger_ui_response("/openapi/repo.json", "Talu API :: Repository")
+                }
+                (Method::GET, "/docs/search") => {
+                    swagger_ui_response("/openapi/search.json", "Talu API :: Search")
+                }
+                (Method::GET, "/docs/tags") => {
+                    swagger_ui_response("/openapi/tags.json", "Talu API :: Tags")
+                }
+                (Method::GET, "/docs/settings") => {
+                    swagger_ui_response("/openapi/settings.json", "Talu API :: Settings")
+                }
+                (Method::GET, "/docs/plugins") => {
+                    swagger_ui_response("/openapi/plugins.json", "Talu API :: Plugins")
+                }
+                (Method::GET, "/docs/code") => {
+                    swagger_ui_response("/openapi/code.json", "Talu API :: Code")
+                }
+                (Method::GET, "/docs/db") => docs_hub_response(),
+                (Method::GET, "/docs/db/tables") => {
+                    swagger_ui_response("/openapi/db/tables.json", "Talu API :: DB::Tables")
+                }
+                (Method::GET, "/docs/db/vectors") => {
+                    swagger_ui_response("/openapi/db/vectors.json", "Talu API :: DB::Vectors")
+                }
+                (Method::GET, "/docs/db/kv") => {
+                    swagger_ui_response("/openapi/db/kv.json", "Talu API :: DB::KV")
+                }
+                (Method::GET, "/docs/db/blobs") => {
+                    swagger_ui_response("/openapi/db/blobs.json", "Talu API :: DB::Blobs")
+                }
+                (Method::GET, "/docs/db/sql") => {
+                    swagger_ui_response("/openapi/db/sql.json", "Talu API :: DB::SQL")
+                }
+                (Method::GET, "/docs/db/ops") => {
+                    swagger_ui_response("/openapi/db/ops.json", "Talu API :: DB::Ops")
+                }
                 // Console UI (auth-exempt)
                 (Method::GET, "/") => {
                     let mut resp = serve_ui_asset(&state, "index.html", "text/html; charset=utf-8");
@@ -854,6 +993,356 @@ fn static_response(content_type: &str, body: &'static [u8]) -> Response<BoxBody>
         .header("referrer-policy", "no-referrer")
         .body(Full::new(Bytes::from_static(body)).boxed())
         .unwrap()
+}
+
+fn swagger_ui_response(spec_url: &str, title: &str) -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(swagger_ui_html(spec_url, title))).boxed())
+        .unwrap()
+}
+
+fn docs_hub_response() -> Response<BoxBody> {
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "text/html; charset=utf-8")
+        .body(Full::new(Bytes::from(docs_hub_html())).boxed())
+        .unwrap()
+}
+
+fn swagger_ui_html(spec_url: &str, title: &str) -> String {
+    format!(
+        r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>{title}</title>
+<link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5/swagger-ui.css"/>
+<style>
+body {{ margin: 0; }}
+.talu-docs-nav {{
+  display: flex;
+  align-items: center;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid #e5e7eb;
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+}}
+.talu-docs-nav a {{
+  font-weight: 700;
+  color: #0f172a;
+  text-decoration: none;
+}}
+.talu-docs-nav a:hover {{ text-decoration: underline; }}
+.swagger-ui .info {{ display: none; }}
+</style>
+</head>
+<body>
+<div class="talu-docs-nav">
+  <a href="/docs">Docs Home</a>
+</div>
+<div id="swagger-ui"></div>
+<script src="https://unpkg.com/swagger-ui-dist@5/swagger-ui-bundle.js"></script>
+<script>SwaggerUIBundle({{url:"{spec_url}",dom_id:"#swagger-ui"}});</script>
+</body>
+</html>
+"##
+    )
+}
+
+fn docs_hub_html() -> String {
+    r##"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>Talu Docs</title>
+<style>
+body {
+  font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+  margin: 0;
+  background: #f8fafc;
+  color: #0f172a;
+}
+.page {
+  max-width: 78rem;
+  margin: 0 auto;
+  padding: 2rem 1.25rem 2.5rem;
+}
+h1 {
+  margin: 0 0 0.4rem;
+  font-size: 1.9rem;
+}
+.muted {
+  color: #475569;
+  margin: 0 0 1.2rem;
+}
+.table-wrap {
+  background: #fff;
+  border: 1px solid #e2e8f0;
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 1rem;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th, td {
+  text-align: left;
+  vertical-align: top;
+  padding: 0.62rem 0.8rem;
+  border-bottom: 1px solid #e2e8f0;
+  border-right: 1px solid #e2e8f0;
+}
+th:last-child, td:last-child {
+  border-right: none;
+}
+th {
+  background: #f1f5f9;
+  color: #0f172a;
+  font-weight: 700;
+  font-size: 0.92rem;
+}
+th .header-link {
+  font-weight: 600;
+  margin-left: 0;
+}
+tbody tr:last-child td {
+  border-bottom: none;
+}
+td {
+  font-size: 0.95rem;
+}
+td.desc {
+  color: #334155;
+}
+.json-cell {
+  white-space: nowrap;
+  width: 8.5rem;
+}
+.mono {
+  white-space: nowrap;
+}
+.json-link {
+  display: inline-block;
+  padding: 0.08rem 0.4rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  font-size: 0.82rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+.copy-btn {
+  margin-left: 0.35rem;
+  width: 1.55rem;
+  height: 1.55rem;
+  line-height: 1.35rem;
+  border: 1px solid #cbd5e1;
+  border-radius: 6px;
+  background: #fff;
+  color: #334155;
+  cursor: pointer;
+  font-size: 0.88rem;
+}
+.copy-btn:hover {
+  background: #f8fafc;
+}
+.copy-btn.copied {
+  border-color: #16a34a;
+  color: #166534;
+}
+code {
+  background: #f1f5f9;
+  padding: 0.1rem 0.32rem;
+  border-radius: 4px;
+}
+a {
+  color: #0f172a;
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+</style>
+</head>
+<body>
+<main class="page">
+  <h1>Talu API Docs</h1>
+  <p class="muted">Single index for interactive docs and scoped OpenAPI JSON contracts.</p>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th><a class="header-link" href="/docs"><code>/docs</code></a></th>
+          <th class="json-cell"><a class="json-link" href="/openapi.json" title="/openapi.json">json</a><button class="copy-btn" data-url="/openapi.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono"><a href="/docs/ai"><code>ai</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/ai.json" title="/openapi/ai.json">json</a><button class="copy-btn" data-url="/openapi/ai.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Model listing and response generation endpoints.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/conversations"><code>conversations</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/conversations.json" title="/openapi/conversations.json">json</a><button class="copy-btn" data-url="/openapi/conversations.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Conversation CRUD, list, fork, and batch operations.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/files"><code>files</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/files.json" title="/openapi/files.json">json</a><button class="copy-btn" data-url="/openapi/files.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">File upload/list/get plus stateless inspect and transform APIs.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/repo"><code>repo</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/repo.json" title="/openapi/repo.json">json</a><button class="copy-btn" data-url="/openapi/repo.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Repository model management, pin lifecycle, and sync endpoints.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/search"><code>search</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/search.json" title="/openapi/search.json">json</a><button class="copy-btn" data-url="/openapi/search.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Cross-domain search with text and filter capabilities.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/tags"><code>tags</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/tags.json" title="/openapi/tags.json">json</a><button class="copy-btn" data-url="/openapi/tags.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Tag CRUD and tag-association endpoints.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/settings"><code>settings</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/settings.json" title="/openapi/settings.json">json</a><button class="copy-btn" data-url="/openapi/settings.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Server and model-default settings APIs.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/plugins"><code>plugins</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/plugins.json" title="/openapi/plugins.json">json</a><button class="copy-btn" data-url="/openapi/plugins.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Plugin discovery, plugin assets, and proxy operations.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/code"><code>code</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/code.json" title="/openapi/code.json">json</a><button class="copy-btn" data-url="/openapi/code.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Tree-sitter parse, highlight, query, graph, and code-session APIs.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th><a class="header-link" href="/docs/db"><code>/docs/db</code></a></th>
+          <th class="json-cell"><a class="json-link" href="/openapi/db.json" title="/openapi/db.json">json</a><button class="copy-btn" data-url="/openapi/db.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></th>
+          <th>Description</th>
+        </tr>
+      </thead>
+      <tbody>
+        <tr>
+          <td class="mono"><a href="/docs/db/tables"><code>tables</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/db/tables.json" title="/openapi/db/tables.json">json</a><button class="copy-btn" data-url="/openapi/db/tables.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Table-plane CRUD/search routes (currently documents-backed).</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/db/vectors"><code>vectors</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/db/vectors.json" title="/openapi/db/vectors.json">json</a><button class="copy-btn" data-url="/openapi/db/vectors.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Vector collection, points mutation/query, and index workflows.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/db/kv"><code>kv</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/db/kv.json" title="/openapi/db/kv.json">json</a><button class="copy-btn" data-url="/openapi/db/kv.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Generic namespaced key/value entry and maintenance operations.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/db/blobs"><code>blobs</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/db/blobs.json" title="/openapi/db/blobs.json">json</a><button class="copy-btn" data-url="/openapi/db/blobs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Blob-plane listing and content retrieval endpoints.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/db/sql"><code>sql</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/db/sql.json" title="/openapi/db/sql.json">json</a><button class="copy-btn" data-url="/openapi/db/sql.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Compute SQL query plane over database-backed resources.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/db/ops"><code>ops</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/db/ops.json" title="/openapi/db/ops.json">json</a><button class="copy-btn" data-url="/openapi/db/ops.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Operational DB actions such as compaction and maintenance.</td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+<script>
+document.querySelectorAll('.copy-btn').forEach((button) => {
+  button.addEventListener('click', async () => {
+    const path = button.getAttribute('data-url') || '';
+    if (!path) return;
+    const url = `${window.location.origin}${path}`;
+    try {
+      await navigator.clipboard.writeText(url);
+      button.classList.add('copied');
+      const prev = button.textContent;
+      button.textContent = '✓';
+      setTimeout(() => {
+        button.classList.remove('copied');
+        button.textContent = prev;
+      }, 1000);
+    } catch {
+      // Best-effort copy; no-op on clipboard errors.
+    }
+  });
+});
+</script>
+</body>
+</html>
+"##
+    .to_string()
+}
+
+fn filter_openapi_paths(spec: &[u8], prefixes: &[&str]) -> Vec<u8> {
+    let mut doc: Value = match serde_json::from_slice(spec) {
+        Ok(v) => v,
+        Err(_) => return spec.to_vec(),
+    };
+
+    let Some(paths) = doc.get_mut("paths").and_then(Value::as_object_mut) else {
+        return spec.to_vec();
+    };
+
+    paths.retain(|path, _| prefixes.iter().any(|prefix| path.starts_with(prefix)));
+
+    let mut used_tags: HashSet<String> = HashSet::new();
+    for item in paths.values() {
+        let Some(item_obj) = item.as_object() else {
+            continue;
+        };
+        for method in [
+            "get", "post", "put", "patch", "delete", "head", "options", "trace",
+        ] {
+            let Some(operation) = item_obj.get(method) else {
+                continue;
+            };
+            if let Some(tags) = operation.get("tags").and_then(Value::as_array) {
+                for tag in tags {
+                    if let Some(tag_name) = tag.as_str() {
+                        let _ = used_tags.insert(tag_name.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(tags) = doc.get_mut("tags").and_then(Value::as_array_mut) {
+        tags.retain(|tag| {
+            let Some(name) = tag.get("name").and_then(Value::as_str) else {
+                return false;
+            };
+            used_tags.contains(name)
+        });
+    }
+
+    serde_json::to_vec_pretty(&doc).unwrap_or_else(|_| spec.to_vec())
 }
 
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody> {

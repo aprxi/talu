@@ -55,7 +55,7 @@ pub struct KvCompactResponse {
 #[utoipa::path(
     get,
     path = "/v1/db/kv/namespaces/{namespace}/entries",
-    tag = "DB",
+    tag = "DB::KV",
     responses(
         (status = 200, description = "List KV entries", body = KvListResponse),
         (status = 400, description = "Invalid request", body = crate::server::http::ErrorResponse),
@@ -107,7 +107,7 @@ pub async fn handle_list(
 #[utoipa::path(
     put,
     path = "/v1/db/kv/namespaces/{namespace}/entries/{key}",
-    tag = "DB",
+    tag = "DB::KV",
     request_body(content = String, content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "KV entry upserted", body = KvPutResponse),
@@ -162,7 +162,7 @@ pub async fn handle_put(
 #[utoipa::path(
     get,
     path = "/v1/db/kv/namespaces/{namespace}/entries/{key}",
-    tag = "DB",
+    tag = "DB::KV",
     responses(
         (status = 200, description = "KV entry fetched", body = KvEntryResponse),
         (status = 404, description = "Entry not found", body = crate::server::http::ErrorResponse),
@@ -215,7 +215,7 @@ pub async fn handle_get(
 #[utoipa::path(
     delete,
     path = "/v1/db/kv/namespaces/{namespace}/entries/{key}",
-    tag = "DB",
+    tag = "DB::KV",
     responses(
         (status = 200, description = "KV entry deleted", body = KvDeleteResponse),
         (status = 400, description = "Invalid request", body = crate::server::http::ErrorResponse),
@@ -259,7 +259,7 @@ pub async fn handle_delete(
 #[utoipa::path(
     post,
     path = "/v1/db/kv/namespaces/{namespace}/flush",
-    tag = "DB",
+    tag = "DB::KV",
     responses(
         (status = 200, description = "KV namespace flushed", body = KvCompactResponse),
         (status = 400, description = "Invalid request", body = crate::server::http::ErrorResponse),
@@ -280,7 +280,7 @@ pub async fn handle_flush(
 #[utoipa::path(
     post,
     path = "/v1/db/kv/namespaces/{namespace}/compact",
-    tag = "DB",
+    tag = "DB::KV",
     responses(
         (status = 200, description = "KV namespace compacted", body = KvCompactResponse),
         (status = 400, description = "Invalid request", body = crate::server::http::ErrorResponse),

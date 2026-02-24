@@ -1,6 +1,7 @@
 //! Integration tests for low-level `/v1/db/*` endpoints.
 
 mod kv;
+mod openapi_docs;
 mod vector;
 
 use std::path::Path;

@@ -264,7 +264,7 @@ struct CollectionsDisk {
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections",
-    tag = "DB",
+    tag = "DB::Vectors",
     request_body = CreateCollectionRequest,
     responses(
         (status = 201, body = CollectionResponse),
@@ -372,7 +372,7 @@ pub async fn handle_create_collection(
 #[utoipa::path(
     get,
     path = "/v1/db/vectors/collections",
-    tag = "DB",
+    tag = "DB::Vectors",
     responses((status = 200, body = CollectionListResponse))
 )]
 /// GET /v1/db/vectors/collections - List collections.
@@ -403,7 +403,7 @@ pub async fn handle_list_collections(
 #[utoipa::path(
     get,
     path = "/v1/db/vectors/collections/{name}",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     responses((status = 200, body = CollectionResponse))
 )]
@@ -441,7 +441,7 @@ pub async fn handle_get_collection(
 #[utoipa::path(
     delete,
     path = "/v1/db/vectors/collections/{name}",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     responses((status = 204))
 )]
@@ -502,7 +502,7 @@ pub async fn handle_delete_collection(
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections/{name}/points/append",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     request_body = AppendPointsRequest,
     responses((status = 200, body = AppendPointsResponse))
@@ -613,7 +613,7 @@ pub async fn handle_append_points(
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections/{name}/points/upsert",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     request_body = UpsertPointsRequest,
     responses((status = 200, body = UpsertPointsResponse))
@@ -715,7 +715,7 @@ pub async fn handle_upsert_points(
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections/{name}/points/delete",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     request_body = IdListRequest,
     responses((status = 200, body = DeletePointsResponse))
@@ -789,7 +789,7 @@ pub async fn handle_delete_points(
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections/{name}/points/fetch",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     request_body = FetchPointsRequest,
     responses((status = 200, body = FetchPointsResponse))
@@ -874,7 +874,7 @@ pub async fn handle_fetch_points(
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections/{name}/points/query",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     request_body = QueryPointsRequest,
     responses((status = 200, body = QueryPointsResponse))
@@ -1011,7 +1011,7 @@ pub async fn handle_query_points(
 #[utoipa::path(
     get,
     path = "/v1/db/vectors/collections/{name}/stats",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     responses((status = 200, body = CollectionStatsResponse))
 )]
@@ -1066,7 +1066,7 @@ pub async fn handle_collection_stats(
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections/{name}/compact",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     request_body = CompactCollectionRequest,
     responses((status = 200, body = CompactResponse))
@@ -1165,7 +1165,7 @@ pub async fn handle_compact_collection(
 #[utoipa::path(
     post,
     path = "/v1/db/vectors/collections/{name}/indexes/build",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
     request_body = BuildIndexesRequest,
     responses((status = 200, body = BuildIndexesResponse))
@@ -1247,7 +1247,7 @@ pub async fn handle_build_collection_indexes(
 #[utoipa::path(
     get,
     path = "/v1/db/vectors/collections/{name}/changes",
-    tag = "DB",
+    tag = "DB::Vectors",
     params(
         ("name" = String, Path, description = "Collection name"),
         ("since" = Option<u64>, Query, description = "Return changes with seq > since"),

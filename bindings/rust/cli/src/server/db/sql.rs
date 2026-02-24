@@ -7,6 +7,7 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use serde::Deserialize;
+use utoipa::ToSchema;
 
 use crate::server::auth_gateway::AuthContext;
 use crate::server::state::AppState;
@@ -15,11 +16,22 @@ use talu::sql::SqlEngine;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
-#[derive(Debug, Deserialize)]
-struct SqlQueryRequest {
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct SqlQueryRequest {
     query: String,
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/db/sql/query",
+    tag = "DB::SQL",
+    request_body = SqlQueryRequest,
+    responses(
+        (status = 200, description = "SQL query results as JSON"),
+        (status = 400, description = "Invalid query or request", body = crate::server::http::ErrorResponse),
+        (status = 503, description = "Storage unavailable", body = crate::server::http::ErrorResponse)
+    )
+)]
 pub async fn handle_query(
     state: Arc<AppState>,
     req: Request<Incoming>,

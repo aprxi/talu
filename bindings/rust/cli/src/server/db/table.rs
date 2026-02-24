@@ -186,8 +186,9 @@ pub(crate) struct DocumentTagsRequest {
 // Handlers
 // =============================================================================
 
-#[utoipa::path(get, path = "/v1/db/tables/documents", tag = "Documents",
+#[utoipa::path(get, path = "/v1/db/tables/{table}", tag = "DB::Tables",
     params(
+        ("table" = String, Path, description = "Table name (currently only 'documents')"),
         ("limit" = Option<u32>, Query, description = "Max items to return (default 100)"),
         ("type" = Option<String>, Query, description = "Filter by document type"),
         ("marker" = Option<String>, Query, description = "Filter by marker value"),
@@ -276,8 +277,11 @@ pub async fn handle_list(
     json_response(StatusCode::OK, &response)
 }
 
-#[utoipa::path(get, path = "/v1/db/tables/documents/{doc_id}", tag = "Documents",
-    params(("doc_id" = String, Path, description = "Document ID")),
+#[utoipa::path(get, path = "/v1/db/tables/{table}/{doc_id}", tag = "DB::Tables",
+    params(
+        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("doc_id" = String, Path, description = "Document ID")
+    ),
     responses(
         (status = 200, body = DocumentResponse),
         (status = 404, body = http::ErrorResponse, description = "Document not found"),
@@ -331,7 +335,8 @@ pub async fn handle_get(
     json_response(StatusCode::OK, &DocumentResponse::from(doc))
 }
 
-#[utoipa::path(post, path = "/v1/db/tables/documents", tag = "Documents",
+#[utoipa::path(post, path = "/v1/db/tables/{table}", tag = "DB::Tables",
+    params(("table" = String, Path, description = "Table name (currently only 'documents')")),
     request_body = CreateDocumentRequest,
     responses(
         (status = 201, body = DocumentResponse),
@@ -448,8 +453,28 @@ pub async fn handle_create(
     json_response(StatusCode::CREATED, &DocumentResponse::from(doc))
 }
 
-#[utoipa::path(patch, path = "/v1/db/tables/documents/{doc_id}", tag = "Documents",
-    params(("doc_id" = String, Path, description = "Document ID")),
+#[utoipa::path(post, path = "/v1/db/tables/{table}/insert", tag = "DB::Tables",
+    params(("table" = String, Path, description = "Table name (currently only 'documents')")),
+    request_body = CreateDocumentRequest,
+    responses(
+        (status = 201, body = DocumentResponse),
+        (status = 400, body = http::ErrorResponse, description = "Invalid request body"),
+    ))]
+/// POST /v1/db/tables/{table}/insert - Alias for insert/create
+pub async fn handle_insert(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth: Option<AuthContext>,
+    plugin_owner: Option<String>,
+) -> Response<BoxBody> {
+    handle_create(state, req, auth, plugin_owner).await
+}
+
+#[utoipa::path(patch, path = "/v1/db/tables/{table}/{doc_id}", tag = "DB::Tables",
+    params(
+        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("doc_id" = String, Path, description = "Document ID")
+    ),
     request_body = UpdateDocumentRequest,
     responses((status = 200, body = DocumentResponse)))]
 /// PATCH /v1/db/tables/documents/:id - Update a document
@@ -524,8 +549,11 @@ pub async fn handle_update(
     json_response(StatusCode::OK, &DocumentResponse::from(doc))
 }
 
-#[utoipa::path(delete, path = "/v1/db/tables/documents/{doc_id}", tag = "Documents",
-    params(("doc_id" = String, Path, description = "Document ID")),
+#[utoipa::path(delete, path = "/v1/db/tables/{table}/{doc_id}", tag = "DB::Tables",
+    params(
+        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("doc_id" = String, Path, description = "Document ID")
+    ),
     responses((status = 204)))]
 /// DELETE /v1/db/tables/documents/:id - Delete a document
 pub async fn handle_delete(
@@ -571,7 +599,8 @@ pub async fn handle_delete(
         .unwrap()
 }
 
-#[utoipa::path(post, path = "/v1/db/tables/documents/search", tag = "Documents",
+#[utoipa::path(post, path = "/v1/db/tables/{table}/search", tag = "DB::Tables",
+    params(("table" = String, Path, description = "Table name (currently only 'documents')")),
     request_body = DocumentSearchRequest,
     responses((status = 200, body = DocumentSearchResponse)))]
 /// POST /v1/db/tables/documents/search - Search documents
@@ -631,8 +660,11 @@ pub async fn handle_search(
     json_response(StatusCode::OK, &response)
 }
 
-#[utoipa::path(get, path = "/v1/db/tables/documents/{doc_id}/tags", tag = "Documents",
-    params(("doc_id" = String, Path, description = "Document ID")),
+#[utoipa::path(get, path = "/v1/db/tables/{table}/{doc_id}/tags", tag = "DB::Tables",
+    params(
+        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("doc_id" = String, Path, description = "Document ID")
+    ),
     responses((status = 200)))]
 /// GET /v1/db/tables/documents/:id/tags - Get document tags
 pub async fn handle_get_tags(
@@ -676,8 +708,11 @@ pub async fn handle_get_tags(
     json_response(StatusCode::OK, &serde_json::json!({ "tags": tags }))
 }
 
-#[utoipa::path(post, path = "/v1/db/tables/documents/{doc_id}/tags", tag = "Documents",
-    params(("doc_id" = String, Path, description = "Document ID")),
+#[utoipa::path(post, path = "/v1/db/tables/{table}/{doc_id}/tags", tag = "DB::Tables",
+    params(
+        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("doc_id" = String, Path, description = "Document ID")
+    ),
     request_body = DocumentTagsRequest,
     responses((status = 200)))]
 /// POST /v1/db/tables/documents/:id/tags - Add tags to document
@@ -741,8 +776,11 @@ pub async fn handle_add_tags(
     json_response(StatusCode::OK, &serde_json::json!({ "tags": tags }))
 }
 
-#[utoipa::path(delete, path = "/v1/db/tables/documents/{doc_id}/tags", tag = "Documents",
-    params(("doc_id" = String, Path, description = "Document ID")),
+#[utoipa::path(delete, path = "/v1/db/tables/{table}/{doc_id}/tags", tag = "DB::Tables",
+    params(
+        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("doc_id" = String, Path, description = "Document ID")
+    ),
     request_body = DocumentTagsRequest,
     responses((status = 200)))]
 /// DELETE /v1/db/tables/documents/:id/tags - Remove tags from document

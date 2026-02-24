@@ -6,6 +6,8 @@ use bytes::Bytes;
 use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
+use serde::Serialize;
+use utoipa::ToSchema;
 
 use talu::blobs::{BlobError, BlobsHandle};
 
@@ -15,6 +17,25 @@ use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infallible>;
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BlobListResponse {
+    pub data: Vec<String>,
+    pub count: usize,
+}
+
+#[utoipa::path(
+    get,
+    path = "/v1/db/blobs/{blob_ref}",
+    tag = "DB::Blobs",
+    params(
+        ("blob_ref" = String, Path, description = "Blob reference hash")
+    ),
+    responses(
+        (status = 200, description = "Raw blob bytes"),
+        (status = 400, description = "Invalid blob reference", body = crate::server::http::ErrorResponse),
+        (status = 404, description = "Blob not found", body = crate::server::http::ErrorResponse)
+    )
+)]
 pub async fn handle_get(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -23,6 +44,18 @@ pub async fn handle_get(
     files::handle_get_blob(state, req, auth).await
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/db/blobs",
+    tag = "DB::Blobs",
+    params(
+        ("limit" = Option<usize>, Query, description = "Maximum blobs to return")
+    ),
+    responses(
+        (status = 200, description = "List blobs", body = BlobListResponse),
+        (status = 503, description = "Storage unavailable", body = crate::server::http::ErrorResponse)
+    )
+)]
 pub async fn handle_list(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -60,15 +93,17 @@ pub async fn handle_list(
     };
 
     let count = refs.len();
-    let body = serde_json::json!({
-        "data": refs,
-        "count": count,
-    });
+    let body = BlobListResponse { data: refs, count };
 
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/json")
-        .body(Full::new(Bytes::from(body.to_string())).boxed())
+        .body(
+            Full::new(Bytes::from(
+                serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec()),
+            ))
+            .boxed(),
+        )
         .unwrap()
 }
 

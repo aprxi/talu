@@ -8,6 +8,8 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde::Deserialize;
+use serde::Serialize;
+use utoipa::ToSchema;
 
 use talu::vector::{VectorError, VectorStore};
 
@@ -19,15 +21,29 @@ type BoxBody = http_body_util::combinators::BoxBody<Bytes, std::convert::Infalli
 const COLLECTIONS_DIR: &str = "vector";
 const COLLECTION_STORES_DIR: &str = "collections";
 
-#[derive(Debug, Deserialize)]
-struct CompactRequest {
-    collection: String,
-    dims: u32,
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct CompactRequest {
+    pub collection: String,
+    pub dims: u32,
 }
 
-#[derive(Debug, Deserialize)]
-struct SimulateCrashRequest {
-    collection: String,
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct CompactResponse {
+    pub collection: String,
+    pub dims: u32,
+    pub kept_count: usize,
+    pub removed_tombstones: usize,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub(crate) struct SimulateCrashRequest {
+    pub collection: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub(crate) struct SimulateCrashResponse {
+    pub collection: String,
+    pub status: String,
 }
 
 pub async fn handle(
@@ -48,7 +64,18 @@ pub async fn handle(
     }
 }
 
-async fn handle_compact(
+#[utoipa::path(
+    post,
+    path = "/v1/db/ops/compact",
+    tag = "DB::Ops",
+    request_body = CompactRequest,
+    responses(
+        (status = 200, description = "Compaction completed", body = CompactResponse),
+        (status = 400, description = "Invalid request", body = crate::server::http::ErrorResponse),
+        (status = 503, description = "Storage unavailable", body = crate::server::http::ErrorResponse)
+    )
+)]
+pub async fn handle_compact(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
@@ -97,16 +124,27 @@ async fn handle_compact(
 
     json_response(
         StatusCode::OK,
-        &serde_json::json!({
-            "collection": compact_req.collection,
-            "dims": compact_req.dims,
-            "kept_count": compact.kept_count,
-            "removed_tombstones": compact.removed_tombstones,
-        }),
+        &CompactResponse {
+            collection: compact_req.collection,
+            dims: compact_req.dims,
+            kept_count: compact.kept_count,
+            removed_tombstones: compact.removed_tombstones,
+        },
     )
 }
 
-async fn handle_simulate_crash(
+#[utoipa::path(
+    post,
+    path = "/v1/db/ops/simulate_crash",
+    tag = "DB::Ops",
+    request_body = SimulateCrashRequest,
+    responses(
+        (status = 200, description = "Crash simulation completed", body = SimulateCrashResponse),
+        (status = 400, description = "Invalid request", body = crate::server::http::ErrorResponse),
+        (status = 503, description = "Storage unavailable", body = crate::server::http::ErrorResponse)
+    )
+)]
+pub async fn handle_simulate_crash(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
@@ -145,10 +183,10 @@ async fn handle_simulate_crash(
 
     json_response(
         StatusCode::OK,
-        &serde_json::json!({
-            "collection": crash_req.collection,
-            "status": "simulated_crash",
-        }),
+        &SimulateCrashResponse {
+            collection: crash_req.collection,
+            status: "simulated_crash".to_string(),
+        },
     )
 }
 
