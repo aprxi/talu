@@ -167,11 +167,7 @@ impl BlobsHandle {
 
         // SAFETY: `path_cstr` is valid and `out_list` points to writable memory.
         let code = unsafe {
-            talu_sys::talu_db_blob_list(
-                self.path_cstr.as_ptr(),
-                limit,
-                &mut out_list as *mut _,
-            )
+            talu_sys::talu_db_blob_list(self.path_cstr.as_ptr(), limit, &mut out_list as *mut _)
         };
         if code != ERROR_CODE_OK {
             return Err(BlobError::from_code(code, "blob list failed"));

@@ -1,5 +1,5 @@
 use super::common::{send_request, ServerConfig, ServerTestContext, TenantSpec};
-use super::conversations::{seed_session, seed_session_with_group};
+use super::sessions::{seed_session, seed_session_with_group};
 use tempfile::TempDir;
 
 #[test]
@@ -198,7 +198,7 @@ fn auth_tenant_storage_isolation() {
         ("X-Talu-Gateway-Secret", "secret"),
         ("X-Talu-Tenant-Id", "acme"),
     ];
-    let resp = send_request(ctx.addr(), "GET", "/v1/conversations", &headers_acme, None);
+    let resp = send_request(ctx.addr(), "GET", "/v1/chat/sessions", &headers_acme, None);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -213,7 +213,7 @@ fn auth_tenant_storage_isolation() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations",
+        "/v1/chat/sessions",
         &headers_globex,
         None,
     );
@@ -251,7 +251,7 @@ fn auth_group_id_header_filters_conversation_list() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations",
+        "/v1/chat/sessions",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -271,7 +271,7 @@ fn auth_group_id_header_filters_conversation_list() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations",
+        "/v1/chat/sessions",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -310,7 +310,7 @@ fn auth_query_param_group_id_overrides_header() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations?group_id=query-group",
+        "/v1/chat/sessions?group_id=query-group",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -349,7 +349,7 @@ fn auth_without_group_id_returns_all_tenant_sessions() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations",
+        "/v1/chat/sessions",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -403,7 +403,7 @@ fn auth_cross_tenant_get_returns_404() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations/sess-secret",
+        "/v1/chat/sessions/sess-secret",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -416,7 +416,7 @@ fn auth_cross_tenant_get_returns_404() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations/sess-secret",
+        "/v1/chat/sessions/sess-secret",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "globex"),
@@ -460,7 +460,7 @@ fn auth_cross_tenant_delete_returns_204_without_effect() {
     let resp = send_request(
         ctx.addr(),
         "DELETE",
-        "/v1/conversations/sess-keep",
+        "/v1/chat/sessions/sess-keep",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -476,7 +476,7 @@ fn auth_cross_tenant_delete_returns_204_without_effect() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations/sess-keep",
+        "/v1/chat/sessions/sess-keep",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "globex"),
@@ -519,7 +519,7 @@ fn auth_cross_tenant_patch_returns_404() {
     let resp = send_request(
         ctx.addr(),
         "PATCH",
-        "/v1/conversations/sess-immutable",
+        "/v1/chat/sessions/sess-immutable",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "acme"),
@@ -536,7 +536,7 @@ fn auth_cross_tenant_patch_returns_404() {
     let resp = send_request(
         ctx.addr(),
         "GET",
-        "/v1/conversations/sess-immutable",
+        "/v1/chat/sessions/sess-immutable",
         &[
             ("X-Talu-Gateway-Secret", "secret"),
             ("X-Talu-Tenant-Id", "globex"),

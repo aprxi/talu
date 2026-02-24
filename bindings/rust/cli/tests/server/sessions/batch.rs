@@ -1,6 +1,6 @@
-//! Integration tests for `POST /v1/conversations/batch` endpoint.
+//! Integration tests for `POST /v1/chat/sessions/batch` endpoint.
 
-use super::{conversation_config, no_bucket_config, seed_session};
+use super::{no_bucket_config, seed_session, session_config};
 use crate::server::common::*;
 use serde_json::json;
 use tempfile::TempDir;
@@ -17,12 +17,12 @@ fn batch_delete_removes_conversations() {
     seed_session(temp.path(), "sess-2", "Chat 2", "model");
     seed_session(temp.path(), "sess-3", "Chat 3", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Delete sess-1 and sess-2
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "delete",
             "ids": ["sess-1", "sess-2"]
@@ -31,7 +31,7 @@ fn batch_delete_removes_conversations() {
     assert_eq!(resp.status, 204, "body: {}", resp.body);
 
     // Verify only sess-3 remains
-    let list_resp = get(ctx.addr(), "/v1/conversations");
+    let list_resp = get(ctx.addr(), "/v1/chat/sessions");
     let list_json = list_resp.json();
     let data = list_json["data"].as_array().expect("data array");
     assert_eq!(data.len(), 1);
@@ -44,12 +44,12 @@ fn batch_delete_idempotent() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat 1", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Delete sess-1 and non-existent sess-99
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "delete",
             "ids": ["sess-1", "sess-99"]
@@ -69,12 +69,12 @@ fn batch_archive_sets_marker() {
     seed_session(temp.path(), "sess-1", "Chat 1", "model");
     seed_session(temp.path(), "sess-2", "Chat 2", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Archive sess-1
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "archive",
             "ids": ["sess-1"]
@@ -83,12 +83,12 @@ fn batch_archive_sets_marker() {
     assert_eq!(resp.status, 204);
 
     // Verify sess-1 has marker "archived"
-    let get_resp = get(ctx.addr(), "/v1/conversations/sess-1");
+    let get_resp = get(ctx.addr(), "/v1/chat/sessions/sess-1");
     let get_json = get_resp.json();
     assert_eq!(get_json["marker"], "archived");
 
     // sess-2 should still have "active" marker
-    let get_resp2 = get(ctx.addr(), "/v1/conversations/sess-2");
+    let get_resp2 = get(ctx.addr(), "/v1/chat/sessions/sess-2");
     let get_json2 = get_resp2.json();
     assert_eq!(get_json2["marker"], "active");
 }
@@ -99,12 +99,12 @@ fn batch_unarchive_clears_marker() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat 1", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // First archive
     post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "archive",
             "ids": ["sess-1"]
@@ -114,7 +114,7 @@ fn batch_unarchive_clears_marker() {
     // Then unarchive
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "unarchive",
             "ids": ["sess-1"]
@@ -123,7 +123,7 @@ fn batch_unarchive_clears_marker() {
     assert_eq!(resp.status, 204);
 
     // Verify marker is cleared (empty string or null, not "archived")
-    let get_resp = get(ctx.addr(), "/v1/conversations/sess-1");
+    let get_resp = get(ctx.addr(), "/v1/chat/sessions/sess-1");
     let get_json = get_resp.json();
     let marker = &get_json["marker"];
     let is_cleared = marker.is_null() || marker.as_str().map_or(false, |s| s.is_empty());
@@ -145,7 +145,7 @@ fn batch_add_tags() {
     seed_session(temp.path(), "sess-1", "Chat 1", "model");
     seed_session(temp.path(), "sess-2", "Chat 2", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // First create tag via API
     let create_resp = post_json(ctx.addr(), "/v1/tags", &json!({"name": "work"}));
@@ -155,7 +155,7 @@ fn batch_add_tags() {
     // Add tag to both conversations using tag ID
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "add_tags",
             "ids": ["sess-1", "sess-2"],
@@ -165,13 +165,13 @@ fn batch_add_tags() {
     assert_eq!(resp.status, 204, "body: {}", resp.body);
 
     // Verify both have the tag
-    let get1 = get(ctx.addr(), "/v1/conversations/sess-1");
+    let get1 = get(ctx.addr(), "/v1/chat/sessions/sess-1");
     let json1 = get1.json();
     let tags1 = json1["tags"].as_array().expect("tags array");
     assert_eq!(tags1.len(), 1);
     assert_eq!(tags1[0]["name"], "work");
 
-    let get2 = get(ctx.addr(), "/v1/conversations/sess-2");
+    let get2 = get(ctx.addr(), "/v1/chat/sessions/sess-2");
     let json2 = get2.json();
     let tags2 = json2["tags"].as_array().expect("tags array");
     assert_eq!(tags2.len(), 1);
@@ -185,7 +185,7 @@ fn batch_remove_tags() {
     seed_session(temp.path(), "sess-1", "Chat 1", "model");
     seed_session(temp.path(), "sess-2", "Chat 2", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Create tags via API first
     let work_resp = post_json(ctx.addr(), "/v1/tags", &json!({"name": "work"}));
@@ -199,7 +199,7 @@ fn batch_remove_tags() {
     // Add both tags to both conversations
     let add_resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "add_tags",
             "ids": ["sess-1", "sess-2"],
@@ -211,7 +211,7 @@ fn batch_remove_tags() {
     // Remove "work" tag from both
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "remove_tags",
             "ids": ["sess-1", "sess-2"],
@@ -221,7 +221,7 @@ fn batch_remove_tags() {
     assert_eq!(resp.status, 204);
 
     // Verify only "urgent" remains
-    let get1 = get(ctx.addr(), "/v1/conversations/sess-1");
+    let get1 = get(ctx.addr(), "/v1/chat/sessions/sess-1");
     let json1 = get1.json();
     let tags1 = json1["tags"].as_array().expect("tags array");
     assert_eq!(tags1.len(), 1);
@@ -236,11 +236,11 @@ fn batch_remove_tags() {
 #[test]
 fn batch_invalid_action() {
     let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "invalid_action",
             "ids": ["sess-1"]
@@ -255,11 +255,11 @@ fn batch_invalid_action() {
 #[test]
 fn batch_empty_ids() {
     let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "delete",
             "ids": []
@@ -274,11 +274,11 @@ fn batch_empty_ids() {
 #[test]
 fn batch_add_tags_missing_tags() {
     let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "add_tags",
             "ids": ["sess-1"]
@@ -293,14 +293,14 @@ fn batch_add_tags_missing_tags() {
 #[test]
 fn batch_size_limit() {
     let temp = TempDir::new().expect("temp dir");
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Create 101 IDs (over the 100 limit)
     let ids: Vec<String> = (0..101).map(|i| format!("sess-{}", i)).collect();
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "delete",
             "ids": ids
@@ -318,7 +318,7 @@ fn batch_no_bucket_returns_503() {
 
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "delete",
             "ids": ["sess-1"]
@@ -335,12 +335,12 @@ fn batch_archive_idempotent() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat 1", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Archive twice
     let resp1 = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "archive",
             "ids": ["sess-1"]
@@ -350,7 +350,7 @@ fn batch_archive_idempotent() {
 
     let resp2 = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "archive",
             "ids": ["sess-1"]
@@ -359,7 +359,7 @@ fn batch_archive_idempotent() {
     assert_eq!(resp2.status, 204);
 
     // Verify still archived
-    let get_resp = get(ctx.addr(), "/v1/conversations/sess-1");
+    let get_resp = get(ctx.addr(), "/v1/chat/sessions/sess-1");
     let get_json = get_resp.json();
     assert_eq!(get_json["marker"], "archived");
 }
@@ -370,7 +370,7 @@ fn batch_remove_tags_idempotent() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat 1", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Create a tag but don't assign it
     let create_resp = post_json(ctx.addr(), "/v1/tags", &json!({"name": "unused"}));
@@ -380,7 +380,7 @@ fn batch_remove_tags_idempotent() {
     // Remove tag that was never assigned (should be OK)
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/batch",
+        "/v1/chat/sessions/batch",
         &json!({
             "action": "remove_tags",
             "ids": ["sess-1"],

@@ -158,7 +158,7 @@ fn get_tag_by_id() {
     assert_eq!(json["color"], "#9b59b6");
 }
 
-/// Get tag by ID includes usage statistics with zero counts when no conversations/documents.
+/// Get tag by ID includes usage statistics with zero counts when no sessions/documents.
 #[test]
 fn get_tag_includes_usage_stats() {
     let temp = TempDir::new().expect("temp dir");
@@ -186,7 +186,7 @@ fn get_tag_includes_usage_stats() {
     // Verify usage field exists with correct structure
     let usage = &json["usage"];
     assert!(usage.is_object(), "usage should be an object");
-    assert_eq!(usage["conversations"], 0, "conversations should be 0");
+    assert_eq!(usage["sessions"], 0, "sessions should be 0");
     assert_eq!(usage["documents"], 0, "documents should be 0");
     assert_eq!(usage["total"], 0, "total should be 0");
 }

@@ -18,7 +18,7 @@ use talu::{ChatHandle, StorageHandle};
 ///   1. Build a deterministic 2MB payload (repeating pattern, verifiable).
 ///   2. Append it as a single user message via ChatHandle.
 ///   3. Drop the handle (flushes to disk).
-///   4. Reopen via StorageHandle::load_conversation and verify full content.
+///   4. Reopen via StorageHandle::load_session and verify full content.
 #[test]
 fn huge_message_payload() {
     let ctx = TestContext::new();
@@ -56,7 +56,7 @@ fn huge_message_payload() {
 
     // Read back via StorageHandle (independent read path).
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
 
     assert_eq!(conv.item_count(), 1, "expected 1 item after reload");
 
@@ -116,7 +116,7 @@ fn multiple_large_messages() {
 
     // Read back and verify each message.
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
 
     assert_eq!(conv.item_count(), 3, "expected 3 items after reload");
 

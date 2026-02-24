@@ -59,7 +59,7 @@ fn reader_sees_completed_writes() {
 
         // Reader: verify accumulated count.
         let storage = StorageHandle::open(ctx.db_path()).expect("open");
-        let conv = storage.load_conversation(&sid).expect("load");
+        let conv = storage.load_session(&sid).expect("load");
         assert_eq!(
             conv.item_count(),
             round + 1,
@@ -116,9 +116,7 @@ fn writer_and_reader_threads_interleave() {
         for _ in 0..rounds {
             let expected_count = rx.recv().expect("reader: recv");
             let storage = StorageHandle::open(&reader_path).expect("reader: open");
-            let conv = storage
-                .load_conversation(&reader_sid)
-                .expect("reader: load");
+            let conv = storage.load_session(&reader_sid).expect("reader: load");
             assert_eq!(
                 conv.item_count(),
                 expected_count,
@@ -181,7 +179,7 @@ fn parallel_writers_different_sessions() {
     // Verify each session independently.
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
     for (i, sid) in session_ids.iter().enumerate() {
-        let conv = storage.load_conversation(sid).expect("load");
+        let conv = storage.load_session(sid).expect("load");
         assert_eq!(
             conv.item_count(),
             messages_per_writer,
@@ -241,7 +239,7 @@ fn concurrent_readers_consistent() {
             std::thread::spawn(move || {
                 bar.wait(); // Maximize read contention.
                 let storage = StorageHandle::open(&path).expect("open");
-                let conv = storage.load_conversation(&session).expect("load");
+                let conv = storage.load_session(&session).expect("load");
 
                 assert_eq!(
                     conv.item_count(),

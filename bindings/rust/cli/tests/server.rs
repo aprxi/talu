@@ -9,7 +9,6 @@ mod server {
     pub mod common;
     pub mod compliance;
     pub mod console;
-    pub mod conversations;
     pub mod db;
     pub mod file;
     pub mod files;
@@ -18,6 +17,7 @@ mod server {
     pub mod repo;
     pub mod responses;
     pub mod search;
+    pub mod sessions;
     pub mod settings;
     pub mod tags;
 }

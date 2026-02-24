@@ -16,7 +16,7 @@ fn docs_hub_lists_non_db_sections() {
 
     for link in [
         "/docs/ai",
-        "/docs/conversations",
+        "/docs/chat",
         "/docs/files",
         "/docs/repo",
         "/docs/search",
@@ -41,7 +41,7 @@ fn scoped_docs_pages_point_to_scoped_specs() {
 
     for (path, expected_spec) in [
         ("/docs/ai", "/openapi/ai.json"),
-        ("/docs/conversations", "/openapi/conversations.json"),
+        ("/docs/chat", "/openapi/chat.json"),
         ("/docs/files", "/openapi/files.json"),
         ("/docs/repo", "/openapi/repo.json"),
         ("/docs/search", "/openapi/search.json"),
@@ -74,7 +74,7 @@ fn scoped_openapi_specs_are_prefix_scoped() {
 
     for (path, prefixes) in [
         ("/openapi/ai.json", vec!["/v1/models", "/v1/responses"]),
-        ("/openapi/conversations.json", vec!["/v1/conversations"]),
+        ("/openapi/chat.json", vec!["/v1/chat/sessions"]),
         ("/openapi/files.json", vec!["/v1/files", "/v1/file"]),
         ("/openapi/repo.json", vec!["/v1/repo"]),
         ("/openapi/search.json", vec!["/v1/search"]),

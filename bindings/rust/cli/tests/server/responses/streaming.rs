@@ -623,7 +623,7 @@ fn streaming_session_visible_during_generation() {
 
     // While the stream is still active, check that the session exists via
     // a separate HTTP connection. This proves early session creation works.
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(
         conv_resp.status, 200,
         "session should be visible via GET during streaming, got {}: {}",
@@ -637,7 +637,7 @@ fn streaming_session_visible_during_generation() {
     );
 
     // Also check the list endpoint.
-    let list_resp = get(ctx.addr(), "/v1/conversations");
+    let list_resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(list_resp.status, 200);
     let list = list_resp.json();
     let data = list["data"].as_array().expect("data array");
@@ -683,7 +683,7 @@ fn streaming_session_title_derived_from_input() {
     let session_id = session_id_from_event(&events, "response.created")
         .expect("response.created should have session_id");
 
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(conv_resp.status, 200);
 
     let conv_json = conv_resp.json();
@@ -719,7 +719,7 @@ fn non_streaming_response_has_session_id() {
     assert!(!session_id.is_empty(), "session_id should be non-empty");
 
     // Session should be accessible via GET with correct properties.
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(
         conv_resp.status, 200,
         "GET conversation should return 200 for non-streaming session",
@@ -734,7 +734,7 @@ fn non_streaming_response_has_session_id() {
     );
 
     // Session should appear in the list.
-    let list_resp = get(ctx.addr(), "/v1/conversations");
+    let list_resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(list_resp.status, 200);
     let list = list_resp.json();
     let found = list["data"]
@@ -846,7 +846,7 @@ fn streaming_session_listed_with_active_marker_at_created() {
 
     let (tcp, _acc, session_id) = stream_until_created(ctx.addr(), &body);
 
-    let list_resp = get(ctx.addr(), "/v1/conversations");
+    let list_resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(list_resp.status, 200);
     let list = list_resp.json();
     let data = list["data"].as_array().expect("data array");
@@ -886,7 +886,7 @@ fn streaming_session_has_metadata_at_created() {
 
     let (tcp, _acc, session_id) = stream_until_created(ctx.addr(), &body);
 
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(
         conv_resp.status, 200,
         "session should be accessible via GET at response.created time, got {}: {}",

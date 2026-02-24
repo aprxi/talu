@@ -243,25 +243,25 @@ pub(super) fn cmd_db_show(args: DbShowArgs) -> Result<()> {
         DbShowFormat::Pretty => {
             print_session_pretty(&session);
 
-            // Load and display conversation items
+            // Load and display session items
             println!("\nTRANSCRIPT");
             println!("{}", "-".repeat(80));
 
-            match handle.load_conversation(&args.session_id) {
-                Ok(conv) => print_conversation(&conv, args.raw, 0)?,
-                Err(e) => eprintln!("(Could not load conversation: {})", e),
+            match handle.load_session(&args.session_id) {
+                Ok(conv) => print_session_items(&conv, args.raw, 0)?,
+                Err(e) => eprintln!("(Could not load session: {})", e),
             }
         }
         DbShowFormat::Json => {
             if args.raw {
-                // Full conversation JSON
-                match handle.load_conversation(&args.session_id) {
+                // Full session JSON
+                match handle.load_session(&args.session_id) {
                     Ok(conv) => {
                         use talu::responses::ResponsesView;
                         let json = conv.to_responses_json(1)?; // 1 = response format
                         println!("{}", json);
                     }
-                    Err(e) => bail!("Failed to load conversation: {}", e),
+                    Err(e) => bail!("Failed to load session: {}", e),
                 }
             } else {
                 // Just session metadata
@@ -295,7 +295,7 @@ fn print_session_json(session: &SessionRecord) {
     );
 }
 
-pub(super) fn print_conversation(
+pub(super) fn print_session_items(
     conv: &talu::responses::ResponsesHandle,
     raw: bool,
     verbose: u8,
@@ -304,7 +304,7 @@ pub(super) fn print_conversation(
 
     let count = conv.item_count();
     if count == 0 {
-        println!("(No items in conversation)");
+        println!("(No items in session)");
         return Ok(());
     }
 

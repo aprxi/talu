@@ -49,7 +49,7 @@ fn append_message(chat: &ChatHandle, content: &[u8]) {
 ///   5. Open a NEW ChatHandle on the same DB+session.
 ///      Writer.open replays WAL → rows recovered in memory.
 ///   6. Drop the new handle (flush occurs).
-///   7. Verify message via StorageHandle.load_conversation.
+///   7. Verify message via StorageHandle.load_session.
 #[test]
 fn chat_wal_replay_after_crash() {
     let ctx = TestContext::new();
@@ -90,7 +90,7 @@ fn chat_wal_replay_after_crash() {
 
     // Phase 4: Verify data survived the crash via read-only path.
     let storage = StorageHandle::open(ctx.db_path()).expect("open storage");
-    let conv = storage.load_conversation(&sid).expect("load conversation");
+    let conv = storage.load_session(&sid).expect("load conversation");
 
     assert_eq!(
         conv.item_count(),
@@ -140,7 +140,7 @@ fn chat_multiple_messages_survive_crash() {
 
     // Phase 3: Verify all messages recovered.
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
 
     assert_eq!(
         conv.item_count(),
@@ -252,7 +252,7 @@ fn flushed_and_unflushed_coexist_after_crash() {
 
     // Phase 5: Verify ALL messages present.
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
 
     // 60 flushed + 1 unflushed = 61 total.
     assert_eq!(

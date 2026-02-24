@@ -61,7 +61,7 @@ pub fn run() -> Vec<BenchResult> {
         let indices: Vec<usize> = (0..20).map(|i| i * 50).collect();
         let start = Instant::now();
         let storage = StorageHandle::open(db_path).unwrap();
-        let conv = storage.load_conversation(&sid).unwrap();
+        let conv = storage.load_session(&sid).unwrap();
         for &idx in &indices {
             let _ = conv.message_text(idx).unwrap();
         }

@@ -20,7 +20,6 @@ use utoipa::ToSchema;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
-use crate::server::conversations;
 use crate::server::db;
 use crate::server::file;
 use crate::server::files;
@@ -30,6 +29,7 @@ use crate::server::plugins;
 use crate::server::proxy;
 use crate::server::repo;
 use crate::server::search;
+use crate::server::sessions;
 use crate::server::settings;
 use crate::server::state::AppState;
 use crate::server::tags;
@@ -52,8 +52,8 @@ pub struct ErrorBody {
 static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(openapi::build_openapi_json);
 static OPENAPI_AI_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models", "/v1/responses"]));
-static OPENAPI_CONVERSATIONS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/conversations"]));
+static OPENAPI_SESSIONS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/sessions"]));
 static OPENAPI_FILES_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/files", "/v1/file"]));
 static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
@@ -160,10 +160,10 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_AI_SPEC.clone())).boxed())
                     .unwrap(),
-                (Method::GET, "/openapi/conversations.json") => Response::builder()
+                (Method::GET, "/openapi/chat.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_CONVERSATIONS_SPEC.clone())).boxed())
+                    .body(Full::new(Bytes::from(OPENAPI_SESSIONS_SPEC.clone())).boxed())
                     .unwrap(),
                 (Method::GET, "/openapi/files.json") => Response::builder()
                     .status(StatusCode::OK)
@@ -239,8 +239,8 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/docs/ai") => {
                     swagger_ui_response("/openapi/ai.json", "Talu API :: AI")
                 }
-                (Method::GET, "/docs/conversations") => {
-                    swagger_ui_response("/openapi/conversations.json", "Talu API :: Conversations")
+                (Method::GET, "/docs/chat") => {
+                    swagger_ui_response("/openapi/chat.json", "Talu API :: Chat")
                 }
                 (Method::GET, "/docs/files") => {
                     swagger_ui_response("/openapi/files.json", "Talu API :: Files")
@@ -362,41 +362,31 @@ impl Service<Request<Incoming>> for Router {
                             let model_id = &p[prefix.len()..];
                             settings::handle_reset_model(state, req, auth, model_id).await
                         }
-                        // Conversation management endpoints
-                        (Method::GET, "/v1/conversations") | (Method::GET, "/conversations") => {
-                            conversations::handle_list(state, req, auth).await
+                        // Session management endpoints
+                        (Method::GET, "/v1/chat/sessions") => {
+                            sessions::handle_list(state, req, auth).await
                         }
-                        // Batch operations (must be before single-conversation routes)
-                        (Method::POST, "/v1/conversations/batch")
-                        | (Method::POST, "/conversations/batch") => {
-                            conversations::handle_batch(state, req, auth).await
+                        // Batch operations (must be before single-session routes)
+                        (Method::POST, "/v1/chat/sessions/batch") => {
+                            sessions::handle_batch(state, req, auth).await
                         }
                         (Method::GET, p)
-                            if (p.starts_with("/v1/conversations/")
-                                || p.starts_with("/conversations/"))
-                                && !p.ends_with("/fork") =>
+                            if p.starts_with("/v1/chat/sessions/") && !p.ends_with("/fork") =>
                         {
-                            conversations::handle_get(state, req, auth).await
+                            sessions::handle_get(state, req, auth).await
                         }
                         (Method::DELETE, p)
-                            if (p.starts_with("/v1/conversations/")
-                                || p.starts_with("/conversations/"))
-                                && !p.ends_with("/tags") =>
+                            if p.starts_with("/v1/chat/sessions/") && !p.ends_with("/tags") =>
                         {
-                            conversations::handle_delete(state, req, auth).await
+                            sessions::handle_delete(state, req, auth).await
                         }
-                        (Method::PATCH, p)
-                            if p.starts_with("/v1/conversations/")
-                                || p.starts_with("/conversations/") =>
-                        {
-                            conversations::handle_patch(state, req, auth).await
+                        (Method::PATCH, p) if p.starts_with("/v1/chat/sessions/") => {
+                            sessions::handle_patch(state, req, auth).await
                         }
                         (Method::POST, p)
-                            if p.ends_with("/fork")
-                                && (p.starts_with("/v1/conversations/")
-                                    || p.starts_with("/conversations/")) =>
+                            if p.ends_with("/fork") && p.starts_with("/v1/chat/sessions/") =>
                         {
-                            conversations::handle_fork(state, req, auth).await
+                            sessions::handle_fork(state, req, auth).await
                         }
                         // Search endpoint
                         (Method::POST, "/v1/search") | (Method::POST, "/search") => {
@@ -491,34 +481,26 @@ impl Service<Request<Incoming>> for Router {
                         {
                             tags::handle_delete(state, req, auth).await
                         }
-                        // Conversation tag endpoints
+                        // Session tag endpoints
                         (Method::GET, p)
-                            if (p.starts_with("/v1/conversations/")
-                                || p.starts_with("/conversations/"))
-                                && p.ends_with("/tags") =>
+                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
                         {
-                            conversations::handle_get_tags(state, req, auth).await
+                            sessions::handle_get_tags(state, req, auth).await
                         }
                         (Method::POST, p)
-                            if (p.starts_with("/v1/conversations/")
-                                || p.starts_with("/conversations/"))
-                                && p.ends_with("/tags") =>
+                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
                         {
-                            conversations::handle_add_tags(state, req, auth).await
+                            sessions::handle_add_tags(state, req, auth).await
                         }
                         (Method::PUT, p)
-                            if (p.starts_with("/v1/conversations/")
-                                || p.starts_with("/conversations/"))
-                                && p.ends_with("/tags") =>
+                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
                         {
-                            conversations::handle_set_tags(state, req, auth).await
+                            sessions::handle_set_tags(state, req, auth).await
                         }
                         (Method::DELETE, p)
-                            if (p.starts_with("/v1/conversations/")
-                                || p.starts_with("/conversations/"))
-                                && p.ends_with("/tags") =>
+                            if p.starts_with("/v1/chat/sessions/") && p.ends_with("/tags") =>
                         {
-                            conversations::handle_remove_tags(state, req, auth).await
+                            sessions::handle_remove_tags(state, req, auth).await
                         }
                         // Document/table plane endpoints
                         (Method::GET, p) if is_db_table_root_path(p) => {
@@ -1186,9 +1168,9 @@ a:hover {
           <td class="desc">Model listing and response generation endpoints.</td>
         </tr>
         <tr>
-          <td class="mono"><a href="/docs/conversations"><code>conversations</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/conversations.json" title="/openapi/conversations.json">json</a><button class="copy-btn" data-url="/openapi/conversations.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Conversation CRUD, list, fork, and batch operations.</td>
+          <td class="mono"><a href="/docs/chat"><code>chat</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/chat.json" title="/openapi/chat.json">json</a><button class="copy-btn" data-url="/openapi/chat.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Session CRUD, list, fork, and batch operations.</td>
         </tr>
         <tr>
           <td class="mono"><a href="/docs/files"><code>files</code></a></td>

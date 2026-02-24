@@ -163,7 +163,7 @@ fn rotation_creates_segment_file() {
 /// Data is readable across the rotation boundary.
 ///
 /// Writes enough data to trigger rotation, then verifies
-/// load_conversation returns ALL messages from all segments.
+/// load_session returns ALL messages from all segments.
 #[test]
 fn read_across_rotated_segments() {
     let ctx = TestContext::new();
@@ -192,7 +192,7 @@ fn read_across_rotated_segments() {
 
     // Read all messages back.
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
 
     assert_eq!(
         conv.item_count(),
@@ -281,7 +281,7 @@ fn multiple_rotations_accumulate() {
 
     // All 250 messages should be readable.
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
     assert_eq!(
         conv.item_count(),
         250,
@@ -328,7 +328,7 @@ fn session_isolation_across_rotation() {
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
 
     // Session A: all messages readable across segments.
-    let conv_a = storage.load_conversation(&sid_a).expect("load A");
+    let conv_a = storage.load_session(&sid_a).expect("load A");
     assert_eq!(
         conv_a.item_count(),
         session_a_count,
@@ -337,7 +337,7 @@ fn session_isolation_across_rotation() {
     );
 
     // Session B: exactly 1 message.
-    let conv_b = storage.load_conversation(&sid_b).expect("load B");
+    let conv_b = storage.load_session(&sid_b).expect("load B");
     assert_eq!(
         conv_b.item_count(),
         1,

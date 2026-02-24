@@ -1,4 +1,4 @@
-//! Conversation management handlers for `/v1/conversations` endpoints.
+//! Session management handlers for `/v1/chat/sessions` endpoints.
 
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -20,61 +20,61 @@ use crate::server::state::AppState;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
 
-/// Tag object embedded in conversation responses.
+/// Tag object embedded in session responses.
 #[derive(Serialize, ToSchema)]
-pub(crate) struct ConversationTag {
+pub(crate) struct SessionTag {
     pub id: String,
     pub name: String,
     pub color: Option<String>,
 }
 
-/// Documentation-only: shape returned by conversation list/get endpoints.
+/// Documentation-only: shape returned by session list/get endpoints.
 #[derive(Serialize, ToSchema)]
-pub(crate) struct ConversationResponse {
+pub(crate) struct SessionResponse {
     pub id: String,
     pub title: Option<String>,
     pub model: Option<String>,
     pub marker: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-    pub tags: Vec<ConversationTag>,
-    /// Conversation items (messages). Present on single-get, absent on list.
+    pub tags: Vec<SessionTag>,
+    /// Session items (messages). Present on single-get, absent on list.
     #[schema(value_type = Option<Vec<Object>>)]
     pub items: Option<Vec<serde_json::Value>>,
 }
 
-/// Documentation-only: shape returned by GET /v1/conversations.
+/// Documentation-only: shape returned by GET /v1/chat/sessions.
 #[derive(Serialize, ToSchema)]
-pub(crate) struct ConversationListResponse {
+pub(crate) struct SessionListResponse {
     pub object: String,
-    pub data: Vec<ConversationResponse>,
+    pub data: Vec<SessionResponse>,
     pub has_more: bool,
     pub cursor: Option<String>,
     pub total: usize,
 }
 
-/// Request body for PATCH /v1/conversations/:id.
+/// Request body for PATCH /v1/chat/sessions/:id.
 #[derive(Serialize, ToSchema)]
-pub(crate) struct ConversationPatchRequest {
+pub(crate) struct SessionPatchRequest {
     pub title: Option<String>,
     pub marker: Option<String>,
     pub pinned: Option<bool>,
 }
 
-/// Request body for POST /v1/conversations/batch.
+/// Request body for POST /v1/chat/sessions/batch.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct BatchRequest {
     pub action: String,
     pub ids: Vec<String>,
 }
 
-/// Request body for POST /v1/conversations/:id/fork.
+/// Request body for POST /v1/chat/sessions/:id/fork.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct ForkRequest {
     pub after_item: Option<u64>,
 }
 
-/// Request body for tag operations on conversations.
+/// Request body for tag operations on sessions.
 #[derive(Serialize, ToSchema)]
 pub(crate) struct TagsRequest {
     pub tags: Vec<String>,
@@ -125,11 +125,9 @@ fn open_storage(
     })
 }
 
-/// Extract conversation ID from path like `/v1/conversations/{id}` or `/conversations/{id}`.
-fn extract_conversation_id(path: &str) -> Option<&str> {
-    let rest = path
-        .strip_prefix("/v1/conversations/")
-        .or_else(|| path.strip_prefix("/conversations/"))?;
+/// Extract session ID from path like `/v1/chat/sessions/{id}`.
+fn extract_session_id(path: &str) -> Option<&str> {
+    let rest = path.strip_prefix("/v1/chat/sessions/")?;
     // Take everything up to the next '/' (or end) as the ID
     let id = rest.split('/').next()?;
     if id.is_empty() {
@@ -262,9 +260,9 @@ fn base64_decode(input: &str) -> Option<Vec<u8>> {
     Some(result)
 }
 
-/// Convert a SessionRecordFull to a JSON conversation resource (without items).
+/// Convert a SessionRecordFull to a JSON session resource (without items).
 /// Fields are aligned with CSessionRecord in core/src/capi/db.zig.
-pub(crate) fn session_to_conversation_json(
+pub(crate) fn session_to_session_json(
     rec: &talu::storage::SessionRecordFull,
     tags: Option<Vec<serde_json::Value>>,
 ) -> serde_json::Value {
@@ -282,7 +280,7 @@ pub(crate) fn session_to_conversation_json(
 
     json!({
         "id": rec.session_id,
-        "object": "conversation",
+        "object": "session",
         "model": rec.model,
         "title": rec.title,
         "system_prompt": rec.system_prompt,
@@ -301,16 +299,16 @@ pub(crate) fn session_to_conversation_json(
     })
 }
 
-/// Convert a slim SessionRecord to a JSON conversation resource (without items).
+/// Convert a slim SessionRecord to a JSON session resource (without items).
 /// Fields are aligned with CSessionRecord in core/src/capi/db.zig.
 /// Fields not available in the slim record are set to null/default.
-fn session_slim_to_conversation_json(
+fn session_slim_to_session_json(
     rec: &talu::storage::SessionRecord,
     tags: Option<Vec<serde_json::Value>>,
 ) -> serde_json::Value {
     json!({
         "id": rec.session_id,
-        "object": "conversation",
+        "object": "session",
         "model": rec.model,
         "title": rec.title,
         "system_prompt": null,
@@ -332,7 +330,7 @@ pub(crate) fn resolve_tags_for_session(
     storage: &StorageHandle,
     session_id: &str,
 ) -> Vec<serde_json::Value> {
-    let tag_ids = match storage.get_conversation_tags(session_id) {
+    let tag_ids = match storage.get_session_tags(session_id) {
         Ok(ids) => ids,
         Err(_) => return Vec::new(),
     };
@@ -354,7 +352,7 @@ pub(crate) fn resolve_tags_for_session(
 // Handlers
 // ---------------------------------------------------------------------------
 
-#[utoipa::path(get, path = "/v1/conversations", tag = "Conversations",
+#[utoipa::path(get, path = "/v1/chat/sessions", tag = "Chat",
     params(
         ("limit" = Option<usize>, Query, description = "Max items to return (default 50, max 100)"),
         ("offset" = Option<usize>, Query, description = "Number of items to skip"),
@@ -363,8 +361,8 @@ pub(crate) fn resolve_tags_for_session(
         ("search" = Option<String>, Query, description = "Full-text search on titles"),
         ("tags_any" = Option<String>, Query, description = "Comma-separated tag IDs (OR filter)"),
     ),
-    responses((status = 200, body = ConversationListResponse)))]
-/// GET /v1/conversations — list sessions with offset-based pagination.
+    responses((status = 200, body = SessionListResponse)))]
+/// GET /v1/chat/sessions — list sessions with offset-based pagination.
 pub async fn handle_list(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -429,7 +427,7 @@ pub async fn handle_list(
             .iter()
             .map(|session| {
                 let tags = resolve_tags_for_session(&storage, &session.session_id);
-                session_to_conversation_json(session, Some(tags))
+                session_to_session_json(session, Some(tags))
             })
             .collect();
 
@@ -478,26 +476,26 @@ pub async fn handle_list(
     json_response(StatusCode::OK, &payload)
 }
 
-#[utoipa::path(get, path = "/v1/conversations/{conversation_id}", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
+#[utoipa::path(get, path = "/v1/chat/sessions/{session_id}", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
     responses(
-        (status = 200, body = ConversationResponse),
-        (status = 404, body = http::ErrorResponse, description = "Conversation not found"),
+        (status = 200, body = SessionResponse),
+        (status = 404, body = http::ErrorResponse, description = "Session not found"),
     ))]
-/// GET /v1/conversations/{id} — retrieve full conversation.
+/// GET /v1/chat/sessions/{id} — retrieve full session.
 pub async fn handle_get(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
-    let conversation_id = match extract_conversation_id(&path) {
+    let session_id = match extract_session_id(&path) {
         Some(id) => id.to_string(),
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -507,16 +505,16 @@ pub async fn handle_get(
         Err(resp) => return resp,
     };
 
-    let id_for_session = conversation_id.clone();
-    let id_for_conv = conversation_id.clone();
-    let id_for_tags = conversation_id.clone();
+    let id_for_session = session_id.clone();
+    let id_for_conv = session_id.clone();
+    let id_for_tags = session_id.clone();
 
     let result: Result<Result<_, StorageError>, _> = tokio::task::spawn_blocking(move || {
         // Get session metadata (full record with source_doc_id)
         let session = storage.get_session_full(&id_for_session)?;
 
-        // Load conversation items
-        let conv = storage.load_conversation(&id_for_conv)?;
+        // Load session items
+        let conv = storage.load_session(&id_for_conv)?;
         let items_json: String = conv
             .to_responses_json(1)
             .map_err(|e| StorageError::IoError(format!("serialization failed: {e}")))?;
@@ -545,29 +543,29 @@ pub async fn handle_get(
 
     let items: serde_json::Value = serde_json::from_str(&items_json).unwrap_or_else(|_| json!([]));
 
-    let mut conversation = session_to_conversation_json(&session, Some(tags));
-    conversation["items"] = items;
+    let mut session_payload = session_to_session_json(&session, Some(tags));
+    session_payload["items"] = items;
 
-    json_response(StatusCode::OK, &conversation)
+    json_response(StatusCode::OK, &session_payload)
 }
 
-#[utoipa::path(delete, path = "/v1/conversations/{conversation_id}", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
+#[utoipa::path(delete, path = "/v1/chat/sessions/{session_id}", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
     responses((status = 204)))]
-/// DELETE /v1/conversations/{id} — delete session (idempotent).
+/// DELETE /v1/chat/sessions/{id} — delete session (idempotent).
 pub async fn handle_delete(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
-    let conversation_id = match extract_conversation_id(&path) {
+    let session_id = match extract_session_id(&path) {
         Some(id) => id.to_string(),
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -577,8 +575,7 @@ pub async fn handle_delete(
         Err(resp) => return resp,
     };
 
-    let result =
-        tokio::task::spawn_blocking(move || storage.delete_session(&conversation_id)).await;
+    let result = tokio::task::spawn_blocking(move || storage.delete_session(&session_id)).await;
 
     match result {
         Ok(Ok(())) | Ok(Err(StorageError::SessionNotFound(_))) => {
@@ -597,24 +594,24 @@ pub async fn handle_delete(
     }
 }
 
-#[utoipa::path(patch, path = "/v1/conversations/{conversation_id}", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
-    request_body = ConversationPatchRequest,
-    responses((status = 200, body = ConversationResponse)))]
-/// PATCH /v1/conversations/{id} — update session metadata.
+#[utoipa::path(patch, path = "/v1/chat/sessions/{session_id}", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
+    request_body = SessionPatchRequest,
+    responses((status = 200, body = SessionResponse)))]
+/// PATCH /v1/chat/sessions/{id} — update session metadata.
 pub async fn handle_patch(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
-    let conversation_id = match extract_conversation_id(&path) {
+    let session_id = match extract_session_id(&path) {
         Some(id) => id.to_string(),
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -653,9 +650,9 @@ pub async fn handle_patch(
         Err(resp) => return resp,
     };
 
-    let id_for_update = conversation_id.clone();
-    let id_for_get = conversation_id.clone();
-    let id_for_tags = conversation_id.clone();
+    let id_for_update = session_id.clone();
+    let id_for_get = session_id.clone();
+    let id_for_tags = session_id.clone();
 
     let result = tokio::task::spawn_blocking(move || {
         storage.update_session(&id_for_update, &updates)?;
@@ -681,28 +678,28 @@ pub async fn handle_patch(
         }
     };
 
-    let conversation = session_slim_to_conversation_json(&session, Some(tags));
-    json_response(StatusCode::OK, &conversation)
+    let session_payload = session_slim_to_session_json(&session, Some(tags));
+    json_response(StatusCode::OK, &session_payload)
 }
 
-#[utoipa::path(post, path = "/v1/conversations/{conversation_id}/fork", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
+#[utoipa::path(post, path = "/v1/chat/sessions/{session_id}/fork", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
     request_body = ForkRequest,
-    responses((status = 200, body = ConversationResponse)))]
-/// POST /v1/conversations/{id}/fork — fork conversation at item.
+    responses((status = 200, body = SessionResponse)))]
+/// POST /v1/chat/sessions/{id}/fork — fork session at item.
 pub async fn handle_fork(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
-    let conversation_id = match extract_conversation_id(&path) {
+    let session_id = match extract_session_id(&path) {
         Some(id) => id.to_string(),
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -742,7 +739,7 @@ pub async fn handle_fork(
         Err(resp) => return resp,
     };
 
-    let source_id = conversation_id.clone();
+    let source_id = session_id.clone();
     let new_id = new_session_id.clone();
     let new_id_for_tags = new_session_id.clone();
 
@@ -780,8 +777,8 @@ pub async fn handle_fork(
         }
     };
 
-    let conversation = session_slim_to_conversation_json(&session, Some(tags));
-    json_response(StatusCode::CREATED, &conversation)
+    let session_payload = session_slim_to_session_json(&session, Some(tags));
+    json_response(StatusCode::CREATED, &session_payload)
 }
 
 // ---------------------------------------------------------------------------
@@ -826,25 +823,25 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody
 }
 
 // ---------------------------------------------------------------------------
-// Conversation Tag Handlers
+// Session Tag Handlers
 // ---------------------------------------------------------------------------
 
-#[utoipa::path(get, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
+#[utoipa::path(get, path = "/v1/chat/sessions/{session_id}/tags", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
     responses((status = 200)))]
-/// GET /v1/conversations/:id/tags - Get tags for a conversation
+/// GET /v1/chat/sessions/:id/tags - Get tags for a session
 pub async fn handle_get_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    let conversation_id = match extract_conversation_id(req.uri().path()) {
+    let session_id = match extract_session_id(req.uri().path()) {
         Some(id) => id,
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -854,7 +851,7 @@ pub async fn handle_get_tags(
         Err(resp) => return resp,
     };
 
-    let tag_ids = match storage.get_conversation_tags(conversation_id) {
+    let tag_ids = match storage.get_session_tags(session_id) {
         Ok(ids) => ids,
         Err(e) => return storage_error_response(e),
     };
@@ -874,24 +871,24 @@ pub async fn handle_get_tags(
     json_response(StatusCode::OK, &json!({ "tags": tags }))
 }
 
-#[utoipa::path(post, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
+#[utoipa::path(post, path = "/v1/chat/sessions/{session_id}/tags", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
     request_body = TagsRequest,
     responses((status = 200)))]
-/// POST /v1/conversations/:id/tags - Add tags to a conversation
+/// POST /v1/chat/sessions/:id/tags - Add tags to a session
 pub async fn handle_add_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
-    let conversation_id = match extract_conversation_id(&path) {
+    let session_id = match extract_session_id(&path) {
         Some(id) => id.to_string(),
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -946,13 +943,13 @@ pub async fn handle_add_tags(
             }
         };
 
-        if let Err(e) = storage.add_conversation_tag(&conversation_id, &tag_id) {
+        if let Err(e) = storage.add_session_tag(&session_id, &tag_id) {
             return storage_error_response(e);
         }
     }
 
     // Return current tags
-    let tag_ids = match storage.get_conversation_tags(&conversation_id) {
+    let tag_ids = match storage.get_session_tags(&session_id) {
         Ok(ids) => ids,
         Err(e) => return storage_error_response(e),
     };
@@ -970,24 +967,24 @@ pub async fn handle_add_tags(
     json_response(StatusCode::OK, &json!({ "tags": tags }))
 }
 
-#[utoipa::path(delete, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
+#[utoipa::path(delete, path = "/v1/chat/sessions/{session_id}/tags", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
     request_body = TagsRequest,
     responses((status = 200)))]
-/// DELETE /v1/conversations/:id/tags - Remove tags from a conversation
+/// DELETE /v1/chat/sessions/:id/tags - Remove tags from a session
 pub async fn handle_remove_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
-    let conversation_id = match extract_conversation_id(&path) {
+    let session_id = match extract_session_id(&path) {
         Some(id) => id.to_string(),
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -1013,7 +1010,7 @@ pub async fn handle_remove_tags(
     };
 
     for tag_id in &remove_req.tags {
-        if let Err(e) = storage.remove_conversation_tag(&conversation_id, tag_id) {
+        if let Err(e) = storage.remove_session_tag(&session_id, tag_id) {
             // Ignore "not found" errors when removing
             if !matches!(e, StorageError::TagNotFound(_)) {
                 return storage_error_response(e);
@@ -1022,7 +1019,7 @@ pub async fn handle_remove_tags(
     }
 
     // Return remaining tags
-    let tag_ids = match storage.get_conversation_tags(&conversation_id) {
+    let tag_ids = match storage.get_session_tags(&session_id) {
         Ok(ids) => ids,
         Err(e) => return storage_error_response(e),
     };
@@ -1040,24 +1037,24 @@ pub async fn handle_remove_tags(
     json_response(StatusCode::OK, &json!({ "tags": tags }))
 }
 
-#[utoipa::path(put, path = "/v1/conversations/{conversation_id}/tags", tag = "Conversations",
-    params(("conversation_id" = String, Path, description = "Conversation ID")),
+#[utoipa::path(put, path = "/v1/chat/sessions/{session_id}/tags", tag = "Chat",
+    params(("session_id" = String, Path, description = "Session ID")),
     request_body = TagsRequest,
     responses((status = 200)))]
-/// PUT /v1/conversations/:id/tags - Replace all tags on a conversation
+/// PUT /v1/chat/sessions/:id/tags - Replace all tags on a session
 pub async fn handle_set_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
-    let conversation_id = match extract_conversation_id(&path) {
+    let session_id = match extract_session_id(&path) {
         Some(id) => id.to_string(),
         None => {
             return json_error(
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Missing conversation ID",
+                "Missing session ID",
             )
         }
     };
@@ -1085,13 +1082,13 @@ pub async fn handle_set_tags(
     let group_id = auth.as_ref().and_then(|a| a.group_id.clone());
 
     // Remove all existing tags
-    let existing_tags = match storage.get_conversation_tags(&conversation_id) {
+    let existing_tags = match storage.get_session_tags(&session_id) {
         Ok(ids) => ids,
         Err(e) => return storage_error_response(e),
     };
 
     for tag_id in existing_tags {
-        let _ = storage.remove_conversation_tag(&conversation_id, &tag_id);
+        let _ = storage.remove_session_tag(&session_id, &tag_id);
     }
 
     // Add the new tags
@@ -1122,13 +1119,13 @@ pub async fn handle_set_tags(
             }
         };
 
-        if let Err(e) = storage.add_conversation_tag(&conversation_id, &tag_id) {
+        if let Err(e) = storage.add_session_tag(&session_id, &tag_id) {
             return storage_error_response(e);
         }
     }
 
     // Return final tags
-    let tag_ids = match storage.get_conversation_tags(&conversation_id) {
+    let tag_ids = match storage.get_session_tags(&session_id) {
         Ok(ids) => ids,
         Err(e) => return storage_error_response(e),
     };
@@ -1159,17 +1156,17 @@ async fn read_body(req: Request<Incoming>) -> Result<Vec<u8>, String> {
 // Batch Operations Handler
 // ---------------------------------------------------------------------------
 
-#[utoipa::path(post, path = "/v1/conversations/batch", tag = "Conversations",
+#[utoipa::path(post, path = "/v1/chat/sessions/batch", tag = "Chat",
     request_body = BatchRequest,
     responses((status = 200)))]
-/// POST /v1/conversations/batch - Perform batch operations on conversations.
+/// POST /v1/chat/sessions/batch - Perform batch operations on sessions.
 ///
 /// Supported actions:
-/// - "delete": Delete multiple conversations
-/// - "archive": Set marker="archived" on multiple conversations
-/// - "unarchive": Remove marker from multiple conversations
-/// - "add_tags": Add tags to multiple conversations (requires `tags` field)
-/// - "remove_tags": Remove tags from multiple conversations (requires `tags` field)
+/// - "delete": Delete multiple sessions
+/// - "archive": Set marker="archived" on multiple sessions
+/// - "unarchive": Remove marker from multiple sessions
+/// - "add_tags": Add tags to multiple sessions (requires `tags` field)
+/// - "remove_tags": Remove tags from multiple sessions (requires `tags` field)
 pub async fn handle_batch(
     state: Arc<AppState>,
     req: Request<Incoming>,
@@ -1223,7 +1220,7 @@ pub async fn handle_batch(
         return json_error(
             StatusCode::BAD_REQUEST,
             "missing_ids",
-            "'ids' field must contain at least one conversation ID",
+            "'ids' field must contain at least one session ID",
         );
     }
 
@@ -1232,7 +1229,7 @@ pub async fn handle_batch(
         return json_error(
             StatusCode::BAD_REQUEST,
             "batch_too_large",
-            "Batch operations are limited to 100 conversations at a time",
+            "Batch operations are limited to 100 sessions at a time",
         );
     }
 
@@ -1303,10 +1300,10 @@ pub async fn handle_batch(
                     tag_ids.push(tag_id);
                 }
 
-                // Add tags to all conversations
+                // Add tags to all sessions
                 for id in &ids {
                     for tag_id in &tag_ids {
-                        let _ = storage.add_conversation_tag(id, tag_id);
+                        let _ = storage.add_session_tag(id, tag_id);
                     }
                 }
                 Ok(())
@@ -1316,11 +1313,11 @@ pub async fn handle_batch(
                     for tag_ref in &tags {
                         // Try as ID first, then as name
                         if storage.get_tag(tag_ref).is_ok() {
-                            let _ = storage.remove_conversation_tag(id, tag_ref);
+                            let _ = storage.remove_session_tag(id, tag_ref);
                         } else if let Ok(tag) =
                             storage.get_tag_by_name(tag_ref, group_id.as_deref())
                         {
-                            let _ = storage.remove_conversation_tag(id, &tag.tag_id);
+                            let _ = storage.remove_session_tag(id, &tag.tag_id);
                         }
                     }
                 }
@@ -1350,37 +1347,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_extract_conversation_id_v1_prefix() {
+    fn test_extract_session_id_v1_prefix() {
         assert_eq!(
-            extract_conversation_id("/v1/conversations/abc123"),
+            extract_session_id("/v1/chat/sessions/abc123"),
             Some("abc123")
         );
     }
 
     #[test]
-    fn test_extract_conversation_id_no_prefix() {
+    fn test_extract_session_id_without_v1_prefix() {
+        assert_eq!(extract_session_id("/sessions/abc123"), None);
+    }
+
+    #[test]
+    fn test_extract_session_id_with_fork_suffix() {
         assert_eq!(
-            extract_conversation_id("/conversations/abc123"),
+            extract_session_id("/v1/chat/sessions/abc123/fork"),
             Some("abc123")
         );
     }
 
     #[test]
-    fn test_extract_conversation_id_with_fork_suffix() {
-        assert_eq!(
-            extract_conversation_id("/v1/conversations/abc123/fork"),
-            Some("abc123")
-        );
+    fn test_extract_session_id_empty() {
+        assert_eq!(extract_session_id("/v1/chat/sessions/"), None);
     }
 
     #[test]
-    fn test_extract_conversation_id_empty() {
-        assert_eq!(extract_conversation_id("/v1/conversations/"), None);
-    }
-
-    #[test]
-    fn test_extract_conversation_id_no_match() {
-        assert_eq!(extract_conversation_id("/v1/responses/abc"), None);
+    fn test_extract_session_id_no_match() {
+        assert_eq!(extract_session_id("/v1/responses/abc"), None);
     }
 
     #[test]

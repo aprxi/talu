@@ -285,8 +285,8 @@ fn capi_inherit_tags_basic() {
     // Verify tags were inherited
     let storage = StorageHandle::open(ctx.db_path()).expect("reopen storage");
     let tags = storage
-        .get_conversation_tags("sess-inherit-test")
-        .expect("get_conversation_tags");
+        .get_session_tags("sess-inherit-test")
+        .expect("get_session_tags");
 
     assert!(tags.contains(&"rust".to_string()), "should have rust tag");
     assert!(
@@ -369,8 +369,8 @@ fn capi_inherit_tags_document_not_found() {
     // Verify no tags were added
     let storage = StorageHandle::open(ctx.db_path()).expect("reopen storage");
     let tags = storage
-        .get_conversation_tags("sess-missing-doc")
-        .expect("get_conversation_tags");
+        .get_session_tags("sess-missing-doc")
+        .expect("get_session_tags");
     assert!(
         tags.is_empty(),
         "should have no tags when document doesn't exist"

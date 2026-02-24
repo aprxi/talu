@@ -2,7 +2,7 @@
 //!
 //! Validates the Dual-Delete Protocol:
 //! - Schema 4 session tombstone (hides from list_sessions)
-//! - Schema 2 clear marker (hides items from load_conversation)
+//! - Schema 2 clear marker (hides items from load_session)
 
 use crate::capi::db::common::TestContext;
 use talu::responses::{MessageRole, ResponsesView};
@@ -57,7 +57,7 @@ fn tombstone_survives_reopen() {
     }
 }
 
-/// load_conversation on a deleted session still returns items.
+/// load_session on a deleted session still returns items.
 ///
 /// Core's loadAll scans only schema_chat_items blocks (schema 3) and
 /// skips schema_chat_deletes blocks (schema 2). The ClearItems marker
@@ -65,10 +65,10 @@ fn tombstone_survives_reopen() {
 ///
 /// Deletion is enforced at the session level: get_session returns an
 /// error for tombstoned sessions, and list_sessions omits them. But
-/// load_conversation is a low-level item scan that does not check
+/// load_session is a low-level item scan that does not check
 /// session tombstones.
 #[test]
-fn load_conversation_after_delete_returns_items() {
+fn load_session_after_delete_returns_items() {
     let ctx = TestContext::new();
     let session_id = TestContext::unique_session_id();
 
@@ -77,7 +77,7 @@ fn load_conversation_after_delete_returns_items() {
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
 
     // Verify message exists before delete.
-    let conv_before = storage.load_conversation(&session_id).expect("load before");
+    let conv_before = storage.load_session(&session_id).expect("load before");
     assert_eq!(conv_before.item_count(), 1);
 
     storage.delete_session(&session_id).expect("delete");
@@ -88,8 +88,8 @@ fn load_conversation_after_delete_returns_items() {
         "Tombstoned session should not be returned by get_session",
     );
 
-    // But load_conversation still returns items (clear marker not honored).
-    let conv_after = storage.load_conversation(&session_id).expect("load after");
+    // But load_session still returns items (clear marker not honored).
+    let conv_after = storage.load_session(&session_id).expect("load after");
     assert_eq!(
         conv_after.item_count(),
         1,
@@ -113,7 +113,7 @@ fn delete_does_not_affect_siblings() {
     // Kept session should be intact.
     let kept = storage.get_session(&sid_keep).expect("get kept");
     assert_eq!(kept.title.as_deref(), Some("To Delete")); // from helper
-    let conv = storage.load_conversation(&sid_keep).expect("load kept");
+    let conv = storage.load_session(&sid_keep).expect("load kept");
     assert_eq!(conv.item_count(), 1);
     assert_eq!(conv.message_text(0).unwrap(), "Keep me");
 
@@ -203,7 +203,7 @@ fn multi_message_conversation_persists() {
 
     // Verify via StorageHandle
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&session_id).expect("load");
+    let conv = storage.load_session(&session_id).expect("load");
 
     assert_eq!(conv.item_count(), 4, "Should have 4 user messages");
     assert_eq!(conv.message_text(0).unwrap(), "What is 2+2?");

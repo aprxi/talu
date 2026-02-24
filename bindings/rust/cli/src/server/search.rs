@@ -1,15 +1,15 @@
 //! Search API handlers for POST /v1/search.
 //!
-//! Provides unified federated search across conversations and documents with multiple modes:
+//! Provides unified federated search across sessions and documents with multiple modes:
 //! - `text`: Case-insensitive substring search
 //! - `regex`: Pattern matching (future)
 //! - `vector`: Semantic similarity search (future)
 //!
 //! Supported scopes:
-//! - `conversations`: Search conversation metadata and content
+//! - `sessions`: Search session metadata and content
 //! - `documents`: Search document metadata and content
-//! - `items`: Search conversation items
-//! - `all`: Federated search across both conversations and documents
+//! - `items`: Search session items
+//! - `all`: Federated search across both sessions and documents
 
 use std::collections::HashMap;
 use std::convert::Infallible;
@@ -26,8 +26,8 @@ use talu::documents::DocumentsHandle;
 use talu::storage::{SearchParams, SessionRecordFull, StorageError, StorageHandle};
 
 use crate::server::auth_gateway::AuthContext;
-use crate::server::conversations::{
-    decode_cursor, encode_cursor, resolve_tags_for_session, session_to_conversation_json,
+use crate::server::sessions::{
+    decode_cursor, encode_cursor, resolve_tags_for_session, session_to_session_json,
 };
 use crate::server::state::AppState;
 
@@ -38,7 +38,7 @@ use crate::server::state::AppState;
 /// Search request body.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct SearchRequest {
-    /// Scope of search: "conversations" or "items"
+    /// Scope of search: "sessions" or "items"
     pub scope: String,
 
     /// Text search (case-insensitive substring)
@@ -69,7 +69,7 @@ pub struct SearchRequest {
     #[serde(default)]
     pub cursor: Option<String>,
 
-    /// Include conversation items in response
+    /// Include session items in response
     #[serde(default)]
     pub include_items: Option<bool>,
 
@@ -85,7 +85,7 @@ pub struct VectorSearch {
     pub text: Option<String>,
     /// Pre-computed embedding vector
     pub embedding: Option<Vec<f32>>,
-    /// Find similar to this conversation ID
+    /// Find similar to this session ID
     pub similar_to: Option<String>,
     /// Minimum similarity score threshold
     pub min_score: Option<f32>,
@@ -200,12 +200,12 @@ pub async fn handle_search(
     };
 
     // Validate scope
-    let valid_scopes = ["conversations", "documents", "items", "all"];
+    let valid_scopes = ["sessions", "documents", "items", "all"];
     if !valid_scopes.contains(&search_req.scope.as_str()) {
         return json_error(
             StatusCode::BAD_REQUEST,
             "invalid_scope",
-            "scope must be 'conversations', 'documents', 'items', or 'all'",
+            "scope must be 'sessions', 'documents', 'items', or 'all'",
         );
     }
 
@@ -363,7 +363,7 @@ pub async fn handle_search(
             .iter()
             .map(|session| {
                 let tags = resolve_tags_for_session(&storage, &session.session_id);
-                session_to_conversation_json(session, Some(tags))
+                session_to_session_json(session, Some(tags))
             })
             .collect();
 
@@ -486,7 +486,7 @@ fn compute_tags_aggregation(
 
     for session in sessions {
         // Get tags for this session
-        if let Ok(tag_ids) = storage.get_conversation_tags(&session.session_id) {
+        if let Ok(tag_ids) = storage.get_session_tags(&session.session_id) {
             for tag_id in tag_ids {
                 *tag_counts.entry(tag_id).or_insert(0) += 1;
             }
@@ -607,16 +607,16 @@ use talu::responses::{ItemType, ResponsesView};
 /// Search result for an individual item/message.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct ItemSearchResult {
-    conversation_id: String,
+    session_id: String,
     item_id: u64,
     role: String,
     snippet: String,
-    conversation_title: Option<String>,
+    session_title: Option<String>,
 }
 
 /// Handle item-level search (scope: "items").
 ///
-/// Searches within message content across all conversations, returning
+/// Searches within message content across all sessions, returning
 /// matching items with snippets.
 async fn handle_items_search(
     state: Arc<AppState>,
@@ -661,7 +661,7 @@ async fn handle_items_search(
 
         // Get all sessions (up to a reasonable limit for item search)
         let sessions_result = storage.list_sessions_paginated_ex(
-            500, // Search across up to 500 conversations
+            500, // Search across up to 500 sessions
             None,
             group_id.as_deref(),
             &SearchParams::default(),
@@ -675,8 +675,8 @@ async fn handle_items_search(
                 break;
             }
 
-            // Load conversation items
-            let conv = match storage.load_conversation(&session.session_id) {
+            // Load session items
+            let conv = match storage.load_session(&session.session_id) {
                 Ok(c) => c,
                 Err(_) => continue, // Skip sessions that can't be loaded
             };
@@ -734,11 +734,11 @@ async fn handle_items_search(
                     };
 
                     results.push(ItemSearchResult {
-                        conversation_id: session.session_id.clone(),
+                        session_id: session.session_id.clone(),
                         item_id: item.id,
                         role: role_str.to_string(),
                         snippet,
-                        conversation_title: session.title.clone(),
+                        session_title: session.title.clone(),
                     });
                 }
             }
@@ -991,7 +991,7 @@ async fn handle_documents_search(
     json_response(StatusCode::OK, &response)
 }
 
-/// Handle federated search across conversations and documents (scope: "all").
+/// Handle federated search across sessions and documents (scope: "all").
 ///
 /// Searches both storage backends and merges results.
 async fn handle_federated_search(
@@ -1051,7 +1051,7 @@ async fn handle_federated_search(
     let group_id_clone = group_id.clone();
     let query_clone = query.clone();
 
-    // Execute conversation search
+    // Execute session search
     let conv_result = tokio::task::spawn_blocking(move || {
         let storage = StorageHandle::open(&bucket)?;
 
@@ -1071,7 +1071,7 @@ async fn handle_federated_search(
         };
 
         let list_result = storage.list_sessions_paginated_ex(
-            limit / 2 + 1, // Split limit between conversations and documents
+            limit / 2 + 1, // Split limit between sessions and documents
             cursor.as_ref(),
             group_id.as_deref(),
             &search_params,
@@ -1083,7 +1083,7 @@ async fn handle_federated_search(
             .iter()
             .map(|session| {
                 let tags = resolve_tags_for_session(&storage, &session.session_id);
-                session_to_conversation_json(session, Some(tags))
+                session_to_session_json(session, Some(tags))
             })
             .collect();
 
@@ -1130,11 +1130,11 @@ async fn handle_federated_search(
 
     let doc_data = match doc_result {
         Ok(Ok(d)) => d,
-        Ok(Err(_)) => Vec::new(), // Documents search failed, continue with conversations only
+        Ok(Err(_)) => Vec::new(), // Documents search failed, continue with sessions only
         Err(_) => Vec::new(),
     };
 
-    // Interleave results (conversations first, then documents)
+    // Interleave results (sessions first, then documents)
     let mut merged: Vec<serde_json::Value> = Vec::with_capacity(conv_data.len() + doc_data.len());
     merged.extend(conv_data);
     merged.extend(doc_data);
@@ -1143,7 +1143,7 @@ async fn handle_federated_search(
     let has_more = merged.len() > limit || conv_has_more;
     merged.truncate(limit);
 
-    // Encode cursor for next page (conversations only for now)
+    // Encode cursor for next page (sessions only for now)
     let next_cursor = conv_cursor.map(|c| encode_cursor(&c));
 
     let response = SearchResponse {

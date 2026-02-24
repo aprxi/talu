@@ -60,7 +60,7 @@ pub struct AppState {
     pub response_store: Mutex<HashMap<String, StoredResponse>>,
     pub gateway_secret: Option<String>,
     pub tenant_registry: Option<TenantRegistry>,
-    /// TaluDB storage bucket for `/v1/conversations` endpoints.
+    /// TaluDB storage bucket for `/v1/chat/sessions` endpoints.
     pub bucket_path: Option<PathBuf>,
     /// Serve console UI from this directory instead of bundled assets.
     pub html_dir: Option<PathBuf>,

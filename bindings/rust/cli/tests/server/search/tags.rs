@@ -42,7 +42,7 @@ fn tag_filter_single_tag() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["rust"]
             }
@@ -77,7 +77,7 @@ fn tag_filter_and_logic() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["rust", "python"]
             }
@@ -104,7 +104,7 @@ fn tag_filter_case_insensitive() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["rust"]
             }
@@ -120,7 +120,7 @@ fn tag_filter_case_insensitive() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["PYTHON"]
             }
@@ -143,7 +143,7 @@ fn tag_filter_no_match() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["java"]
             }
@@ -167,7 +167,7 @@ fn tag_filter_excludes_untagged() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["rust"]
             }
@@ -198,7 +198,7 @@ fn tag_any_filter_or_logic() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags_any": ["rust", "python"]
             }
@@ -227,7 +227,7 @@ fn tag_any_single_tag() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags_any": ["work"]
             }
@@ -251,7 +251,7 @@ fn tag_any_no_match() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags_any": ["java", "kotlin"]
             }
@@ -279,7 +279,7 @@ fn tag_filter_empty_returns_all() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": []
             }
@@ -303,7 +303,7 @@ fn tag_any_empty_returns_all() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags_any": []
             }
@@ -351,7 +351,7 @@ fn tag_filter_with_text_search() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "rust",
             "filters": {
                 "tags": ["work"]
@@ -392,7 +392,7 @@ fn tag_filter_with_group_id() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["rust"],
                 "group_id": "group1"
@@ -431,7 +431,7 @@ fn tag_filter_with_pagination() {
 
     for _ in 0..10 {
         let mut req = json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["rust"]
             },
@@ -462,7 +462,7 @@ fn tag_filter_with_pagination() {
 // ---------------------------------------------------------------------------
 // Tags API vs. search index integration
 //
-// Search resolves tag filters via the relational `conversation_tags` table.
+// Search resolves tag filters via the relational `session_tags` table.
 // Tags added via the dedicated API are the single source of truth for both
 // search filtering and response display.
 // ---------------------------------------------------------------------------
@@ -478,13 +478,13 @@ fn tags_via_api_searchable() {
     // Add tag via dedicated tags API
     let resp = post_json(
         ctx.addr(),
-        "/v1/conversations/sess-api-tag/tags",
+        "/v1/chat/sessions/sess-api-tag/tags",
         &json!({"tags": ["api-tag"]}),
     );
     assert_eq!(resp.status, 200, "add tag failed: {}", resp.body);
 
-    // Tag visible in conversation response
-    let resp = get(ctx.addr(), "/v1/conversations/sess-api-tag");
+    // Tag visible in session response
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-api-tag");
     assert_eq!(resp.status, 200);
     let conv = resp.json();
     let tags = conv["tags"].as_array().expect("tags array");
@@ -496,7 +496,7 @@ fn tags_via_api_searchable() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["api-tag"]
             }
@@ -517,7 +517,7 @@ fn tags_via_api_searchable() {
 /// Tags created via seed helper must be searchable and visible in responses.
 ///
 /// Verifies that relational tags created by `seed_session_with_tags` are
-/// both filterable in search and visible in the conversation response.
+/// both filterable in search and visible in the session response.
 #[test]
 fn metadata_tags_visible_in_response() {
     let temp = TempDir::new().expect("temp dir");
@@ -536,7 +536,7 @@ fn metadata_tags_visible_in_response() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "tags": ["meta-tag"]
             }
@@ -548,8 +548,8 @@ fn metadata_tags_visible_in_response() {
     assert_eq!(data.len(), 1, "metadata tags must be searchable");
     assert_eq!(data[0]["id"], "sess-meta");
 
-    // Tag must also appear in the conversation response tags array
-    let resp = get(ctx.addr(), "/v1/conversations/sess-meta");
+    // Tag must also appear in the session response tags array
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-meta");
     assert_eq!(resp.status, 200);
     let conv = resp.json();
     let tags = conv["tags"].as_array().expect("tags array");

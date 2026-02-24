@@ -1,4 +1,4 @@
-//! Integration tests for `/v1/conversations` endpoints.
+//! Integration tests for `/v1/chat/sessions` endpoints.
 //!
 //! Note: Search and tag filtering tests are now in `server/search/` module,
 //! which tests the `POST /v1/search` endpoint.
@@ -141,7 +141,7 @@ pub fn seed_session_with_group(
 }
 
 /// Create a ServerConfig with bucket set.
-pub fn conversation_config(bucket: &Path) -> crate::server::common::ServerConfig {
+pub fn session_config(bucket: &Path) -> crate::server::common::ServerConfig {
     let mut config = crate::server::common::ServerConfig::new();
     config.bucket = Some(bucket.to_path_buf());
     config

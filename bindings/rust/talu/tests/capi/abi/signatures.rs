@@ -13,9 +13,7 @@
 //! function can be assigned to a variable with the expected type signature.
 
 use std::os::raw::{c_char, c_int};
-use talu_sys::{
-    CRelationStringList, CSessionRecord, CTagList, CTagRecord, GenerationConfigInfo,
-};
+use talu_sys::{CRelationStringList, CSessionRecord, CTagList, CTagRecord, GenerationConfigInfo};
 
 /// Assert that a function has the expected signature at compile time.
 ///

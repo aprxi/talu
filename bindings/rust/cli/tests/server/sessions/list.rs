@@ -1,6 +1,5 @@
 use super::{
-    conversation_config, no_bucket_config, seed_session, seed_session_with_group,
-    seed_session_with_tags,
+    no_bucket_config, seed_session, seed_session_with_group, seed_session_with_tags, session_config,
 };
 use crate::server::common::*;
 use tempfile::TempDir;
@@ -8,7 +7,7 @@ use tempfile::TempDir;
 #[test]
 fn list_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
@@ -16,8 +15,8 @@ fn list_returns_503_without_bucket() {
 fn list_empty_db() {
     let temp = TempDir::new().expect("temp dir");
     std::fs::create_dir_all(temp.path()).ok();
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["object"], "list");
@@ -31,8 +30,8 @@ fn list_returns_seeded_sessions() {
     seed_session(temp.path(), "sess-a", "First chat", "test-model");
     seed_session(temp.path(), "sess-b", "Second chat", "test-model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=10");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=10");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
@@ -40,7 +39,7 @@ fn list_returns_seeded_sessions() {
 
     // All sessions should have "chat" object type
     for item in data {
-        assert_eq!(item["object"], "conversation");
+        assert_eq!(item["object"], "session");
     }
 }
 
@@ -51,8 +50,8 @@ fn list_respects_limit() {
         seed_session(temp.path(), &format!("sess-{i}"), &format!("Chat {i}"), "m");
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=2");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=2");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
@@ -73,10 +72,10 @@ fn list_offset_pagination_round_trip() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Page 1: offset=0, limit=3
-    let resp1 = get(ctx.addr(), "/v1/conversations?limit=3");
+    let resp1 = get(ctx.addr(), "/v1/chat/sessions?limit=3");
     assert_eq!(resp1.status, 200);
     let json1 = resp1.json();
     let page1 = json1["data"].as_array().expect("page1 data");
@@ -85,7 +84,7 @@ fn list_offset_pagination_round_trip() {
     assert_eq!(json1["total"], 5);
 
     // Page 2: offset=3, limit=3
-    let resp2 = get(ctx.addr(), "/v1/conversations?offset=3&limit=3");
+    let resp2 = get(ctx.addr(), "/v1/chat/sessions?offset=3&limit=3");
     assert_eq!(resp2.status, 200);
     let json2 = resp2.json();
     let page2 = json2["data"].as_array().expect("page2 data");
@@ -108,8 +107,8 @@ fn list_without_prefix() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/conversations");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
@@ -122,8 +121,8 @@ fn list_has_more_false_when_exact_limit() {
         seed_session(temp.path(), &format!("sess-{i}"), &format!("Chat {i}"), "m");
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=3");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=3");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 3);
@@ -143,9 +142,9 @@ fn list_default_limit_is_50() {
         std::thread::sleep(std::time::Duration::from_millis(5));
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     // No limit= param — should default to 50
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -158,9 +157,9 @@ fn list_clamps_limit_to_100() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     // Request limit=999 — server should clamp to 100 and not error
-    let resp = get(ctx.addr(), "/v1/conversations?limit=999");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=999");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 }
 
@@ -169,9 +168,9 @@ fn list_clamps_limit_to_1_minimum() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     // Request limit=0 — server should clamp to 1
-    let resp = get(ctx.addr(), "/v1/conversations?limit=0");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=0");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -183,8 +182,8 @@ fn list_cursor_null_when_no_more() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=10");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=10");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     assert_eq!(json["has_more"], false);
@@ -204,8 +203,8 @@ fn list_sessions_have_expected_fields() {
         "test-model-v1",
     );
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -213,7 +212,7 @@ fn list_sessions_have_expected_fields() {
 
     let session = &data[0];
     assert_eq!(session["id"], "sess-fields");
-    assert_eq!(session["object"], "conversation");
+    assert_eq!(session["object"], "session");
     assert_eq!(session["title"], "Field Test Chat");
     assert_eq!(session["model"], "test-model-v1");
     assert_eq!(session["marker"], "active");
@@ -238,10 +237,10 @@ fn list_unknown_cursor_param_ignored() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     // cursor param is no longer consumed (offset-based pagination);
     // passing it should not cause errors.
-    let resp = get(ctx.addr(), "/v1/conversations?cursor=not-valid-base64!!!");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?cursor=not-valid-base64!!!");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -259,13 +258,13 @@ fn list_pagination_covers_all_sessions() {
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     let mut collected_ids: Vec<String> = Vec::new();
 
     // Walk all pages with limit=2 using offset pagination
     let mut offset = 0;
     for _ in 0..10 {
-        let url = format!("/v1/conversations?limit=2&offset={offset}");
+        let url = format!("/v1/chat/sessions?limit=2&offset={offset}");
         let resp = get(ctx.addr(), &url);
         assert_eq!(resp.status, 200);
         let json = resp.json();
@@ -300,9 +299,9 @@ fn list_negative_limit_uses_default() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     // Negative limit can't parse to usize, falls back to default (20)
-    let resp = get(ctx.addr(), "/v1/conversations?limit=-1");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=-1");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 }
 
@@ -311,8 +310,8 @@ fn list_non_numeric_limit_uses_default() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=abc");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=abc");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     // Should still return data (uses default limit)
@@ -324,8 +323,8 @@ fn list_empty_limit_uses_default() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 }
 
@@ -334,8 +333,8 @@ fn list_float_limit_uses_default() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=2.5");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=2.5");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 }
 
@@ -344,15 +343,15 @@ fn list_stale_cursor_param_ignored() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     // cursor param is no longer consumed; passing empty or stale values
     // should have no effect on results.
-    let resp = get(ctx.addr(), "/v1/conversations?cursor=");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?cursor=");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
 
-    let resp = get(ctx.addr(), "/v1/conversations?cursor=aGVsbG8=");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?cursor=aGVsbG8=");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
@@ -363,8 +362,8 @@ fn list_empty_query_string_same_as_no_query() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
@@ -375,8 +374,8 @@ fn list_unknown_query_params_ignored() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?foo=bar&baz=qux&limit=10");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?foo=bar&baz=qux&limit=10");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["data"].as_array().unwrap().len(), 1);
@@ -389,8 +388,8 @@ fn list_limit_1_returns_single_session() {
         seed_session(temp.path(), &format!("sess-{i}"), &format!("Chat {i}"), "m");
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=1");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=1");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -403,8 +402,8 @@ fn list_response_object_field() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-1", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     assert_eq!(json["object"], "list", "top-level object should be 'list'");
@@ -423,10 +422,10 @@ fn list_group_id_filters_sessions() {
     seed_session_with_group(temp.path(), "sess-g1b", "Chat B", "m", "tenant-1");
     seed_session_with_group(temp.path(), "sess-g2a", "Chat C", "m", "tenant-2");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Filter by tenant-1
-    let resp = get(ctx.addr(), "/v1/conversations?group_id=tenant-1");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?group_id=tenant-1");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -442,9 +441,9 @@ fn list_group_id_excludes_other_tenants() {
     seed_session_with_group(temp.path(), "sess-ga", "Chat", "m", "tenant-1");
     seed_session_with_group(temp.path(), "sess-gb", "Chat", "m", "tenant-2");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/conversations?group_id=tenant-2");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?group_id=tenant-2");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -457,9 +456,9 @@ fn list_group_id_nonexistent_returns_empty() {
     let temp = TempDir::new().expect("temp dir");
     seed_session_with_group(temp.path(), "sess-ga", "Chat", "m", "tenant-1");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/conversations?group_id=nonexistent-tenant");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?group_id=nonexistent-tenant");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -476,9 +475,9 @@ fn list_without_group_id_returns_all() {
     seed_session_with_group(temp.path(), "sess-x2", "Chat", "m", "tenant-2");
     seed_session(temp.path(), "sess-x3", "Chat", "m"); // no group_id
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -505,12 +504,12 @@ fn list_group_id_with_pagination() {
     // Add sessions from another group that should not appear
     seed_session_with_group(temp.path(), "sess-other", "Other", "m", "other-tenant");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Page 1
     let resp = get(
         ctx.addr(),
-        "/v1/conversations?group_id=paged-tenant&limit=3",
+        "/v1/chat/sessions?group_id=paged-tenant&limit=3",
     );
     assert_eq!(resp.status, 200);
     let json = resp.json();
@@ -522,7 +521,7 @@ fn list_group_id_with_pagination() {
     // Page 2: offset=3
     let resp = get(
         ctx.addr(),
-        "/v1/conversations?group_id=paged-tenant&offset=3&limit=3",
+        "/v1/chat/sessions?group_id=paged-tenant&offset=3&limit=3",
     );
     assert_eq!(resp.status, 200);
     let json = resp.json();
@@ -536,8 +535,8 @@ fn list_group_id_shown_in_response() {
     let temp = TempDir::new().expect("temp dir");
     seed_session_with_group(temp.path(), "sess-gshow", "Chat", "m", "my-group");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -561,8 +560,8 @@ fn list_sessions_ordered_by_updated_at_descending() {
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=5");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=5");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -595,13 +594,13 @@ fn list_ordering_stable_across_pages() {
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
     let mut all_timestamps: Vec<i64> = Vec::new();
 
     // Walk pages with limit=2 using offset pagination
     let mut offset = 0;
     for _ in 0..5 {
-        let url = format!("/v1/conversations?limit=2&offset={offset}");
+        let url = format!("/v1/chat/sessions?limit=2&offset={offset}");
         let resp = get(ctx.addr(), &url);
         assert_eq!(resp.status, 200);
         let json = resp.json();
@@ -635,18 +634,18 @@ fn list_sessions_include_metadata_when_set() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-lm", "Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Set metadata via PATCH
     let resp = patch_json(
         ctx.addr(),
-        "/v1/conversations/sess-lm",
+        "/v1/chat/sessions/sess-lm",
         &serde_json::json!({"metadata": {"key": "value"}}),
     );
     assert_eq!(resp.status, 200);
 
     // Verify list includes the metadata
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
@@ -673,8 +672,8 @@ fn list_includes_tags_for_tagged_session() {
         &["rust", "python", "work"],
     );
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
@@ -705,8 +704,8 @@ fn list_untagged_session_has_empty_tags() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-u", "Untagged Chat", "m");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
@@ -736,8 +735,8 @@ fn list_total_field_present() {
         );
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?limit=3");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=3");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(
@@ -762,10 +761,10 @@ fn list_offset_skips_sessions() {
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Full list (newest first) to know the expected order.
-    let resp_all = get(ctx.addr(), "/v1/conversations?limit=10");
+    let resp_all = get(ctx.addr(), "/v1/chat/sessions?limit=10");
     assert_eq!(resp_all.status, 200);
     let all_ids: Vec<String> = resp_all.json()["data"]
         .as_array()
@@ -776,7 +775,7 @@ fn list_offset_skips_sessions() {
     assert_eq!(all_ids.len(), 5);
 
     // Fetch with offset=2, limit=2 — should return 3rd and 4th items.
-    let resp = get(ctx.addr(), "/v1/conversations?offset=2&limit=2");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?offset=2&limit=2");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().unwrap();
@@ -810,8 +809,8 @@ fn list_offset_beyond_total_returns_empty() {
         );
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations?offset=999&limit=10");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions?offset=999&limit=10");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let data = json["data"].as_array().unwrap();
@@ -836,24 +835,24 @@ fn list_marker_filter_with_offset() {
         std::thread::sleep(std::time::Duration::from_millis(15));
     }
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Archive 2 sessions via PATCH.
     let r1 = patch_json(
         ctx.addr(),
-        "/v1/conversations/sess-mf-0",
+        "/v1/chat/sessions/sess-mf-0",
         &serde_json::json!({"marker": "archived"}),
     );
     assert_eq!(r1.status, 200);
     let r2 = patch_json(
         ctx.addr(),
-        "/v1/conversations/sess-mf-1",
+        "/v1/chat/sessions/sess-mf-1",
         &serde_json::json!({"marker": "archived"}),
     );
     assert_eq!(r2.status, 200);
 
     // List archived: should see 2 total.
-    let resp = get(ctx.addr(), "/v1/conversations?marker=archived");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?marker=archived");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["total"], 2, "2 sessions archived");
@@ -862,7 +861,7 @@ fn list_marker_filter_with_offset() {
     // List archived with offset=1, limit=1: should see 1 item, total still 2.
     let resp = get(
         ctx.addr(),
-        "/v1/conversations?marker=archived&offset=1&limit=1",
+        "/v1/chat/sessions?marker=archived&offset=1&limit=1",
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
@@ -874,14 +873,14 @@ fn list_marker_filter_with_offset() {
     );
 
     // List active only (marker=active): should see 3.
-    let resp = get(ctx.addr(), "/v1/conversations?marker=active&limit=10");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?marker=active&limit=10");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     assert_eq!(json["total"], 3, "3 sessions have marker=active");
     assert_eq!(json["data"].as_array().unwrap().len(), 3);
 
     // List all (no marker filter): should see all 5.
-    let resp = get(ctx.addr(), "/v1/conversations?limit=10");
+    let resp = get(ctx.addr(), "/v1/chat/sessions?limit=10");
     assert_eq!(resp.status, 200);
     let json = resp.json();
     assert_eq!(

@@ -66,7 +66,7 @@ fn seed_session_with_tags(ctx: &TestContext, session_id: &str, title: &str, tags
                 c_tag_id.as_ptr(),
             )
         };
-        assert_eq!(rc, 0, "add_conversation_tag failed for tag '{}'", tag_name);
+        assert_eq!(rc, 0, "add_session_tag failed for tag '{}'", tag_name);
     }
 }
 
@@ -258,7 +258,7 @@ fn capi_null_filters_return_all() {
 // Stress tests for tag list memory management
 // ---------------------------------------------------------------------------
 
-/// Stress test for list_tags and get_conversation_tags.
+/// Stress test for list_tags and get_session_tags.
 /// Exercises talu_db_table_tag_free_list and talu_db_table_free_relation_string_list
 /// through many alloc/free cycles to detect memory corruption.
 /// This is a regression test for the fix where these free functions
@@ -296,11 +296,11 @@ fn capi_tags_stress_alloc_free() {
 
         // Add tags to session
         for tag in &tag_names {
-            let _ = storage.add_conversation_tag(&session_id, tag);
+            let _ = storage.add_session_tag(&session_id, tag);
         }
     }
 
-    // Rapid list_tags/get_conversation_tags cycles
+    // Rapid list_tags/get_session_tags cycles
     for iteration in 0..100 {
         // list_tags exercises talu_db_table_tag_free_list
         let tags = storage.list_tags(None).expect("list_tags failed");
@@ -310,20 +310,20 @@ fn capi_tags_stress_alloc_free() {
             iteration
         );
 
-        // get_conversation_tags exercises talu_db_table_free_relation_string_list
+        // get_session_tags exercises talu_db_table_free_relation_string_list
         let conv_tags = storage
-            .get_conversation_tags("stress-sess-0")
-            .expect("get_conversation_tags failed");
+            .get_session_tags("stress-sess-0")
+            .expect("get_session_tags failed");
         assert!(
             !conv_tags.is_empty(),
             "iteration {}: should have conversation tags",
             iteration
         );
 
-        // get_tag_conversations also exercises talu_db_table_free_relation_string_list
+        // get_tag_sessions also exercises talu_db_table_free_relation_string_list
         let sessions = storage
-            .get_tag_conversations("rust")
-            .expect("get_tag_conversations failed");
+            .get_tag_sessions("rust")
+            .expect("get_tag_sessions failed");
         assert!(
             !sessions.is_empty(),
             "iteration {}: should have sessions with rust tag",
@@ -376,7 +376,7 @@ fn capi_tags_stress_multithreaded() {
 
         // Add tags to session
         for tag in &tag_names {
-            let _ = storage.add_conversation_tag(&session_id, tag);
+            let _ = storage.add_session_tag(&session_id, tag);
         }
     }
     drop(storage);
@@ -395,12 +395,12 @@ fn capi_tags_stress_multithreaded() {
                 let tags = storage.list_tags(None).expect("list_tags");
                 assert!(!tags.is_empty(), "thread {} iter {}: tags", thread_id, i);
 
-                // get_conversation_tags
+                // get_session_tags
                 let session_idx = (thread_id + i) % 10;
                 let session_id = format!("mt-stress-sess-{}", session_idx);
                 let conv_tags = storage
-                    .get_conversation_tags(&session_id)
-                    .expect("get_conversation_tags");
+                    .get_session_tags(&session_id)
+                    .expect("get_session_tags");
                 assert!(
                     !conv_tags.is_empty(),
                     "thread {} iter {}: conv_tags",
@@ -408,12 +408,10 @@ fn capi_tags_stress_multithreaded() {
                     i
                 );
 
-                // get_tag_conversations
+                // get_tag_sessions
                 let tag_names = ["rust", "python", "go", "java"];
                 let tag = tag_names[(thread_id + i) % tag_names.len()];
-                let sessions = storage
-                    .get_tag_conversations(tag)
-                    .expect("get_tag_conversations");
+                let sessions = storage.get_tag_sessions(tag).expect("get_tag_sessions");
                 assert!(
                     !sessions.is_empty(),
                     "thread {} iter {}: sessions for {}",

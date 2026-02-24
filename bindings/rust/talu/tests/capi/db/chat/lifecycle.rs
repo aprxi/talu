@@ -99,9 +99,9 @@ fn message_persists_across_sessions() {
     }
 }
 
-/// Verify StorageHandle::load_conversation returns persisted items.
+/// Verify StorageHandle::load_session returns persisted items.
 #[test]
-fn load_conversation_returns_items() {
+fn load_session_returns_items() {
     let ctx = TestContext::new();
     let session_id = TestContext::unique_session_id();
 
@@ -126,8 +126,8 @@ fn load_conversation_returns_items() {
     // Phase 2: Load via StorageHandle (independent read path)
     let storage = StorageHandle::open(ctx.db_path()).expect("StorageHandle::open failed");
     let conv = storage
-        .load_conversation(&session_id)
-        .expect("load_conversation failed");
+        .load_session(&session_id)
+        .expect("load_session failed");
 
     assert_eq!(conv.item_count(), 1);
     assert_eq!(conv.message_text(0).unwrap(), "Stored via ChatHandle",);
@@ -229,11 +229,11 @@ fn multiple_sessions_isolated() {
     // Verify isolation
     let storage = StorageHandle::open(ctx.db_path()).unwrap();
 
-    let conv_a = storage.load_conversation(&sid_a).unwrap();
+    let conv_a = storage.load_session(&sid_a).unwrap();
     assert_eq!(conv_a.item_count(), 1);
     assert_eq!(conv_a.message_text(0).unwrap(), "Message A");
 
-    let conv_b = storage.load_conversation(&sid_b).unwrap();
+    let conv_b = storage.load_session(&sid_b).unwrap();
     assert_eq!(conv_b.item_count(), 1);
     assert_eq!(conv_b.message_text(0).unwrap(), "Message B");
 

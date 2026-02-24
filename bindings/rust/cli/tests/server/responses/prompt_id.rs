@@ -187,7 +187,7 @@ fn prompt_id_lineage_tracking() {
         .as_str()
         .expect("should have session_id");
 
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(
         conv_resp.status, 200,
         "get conversation: {}",
@@ -231,7 +231,7 @@ fn prompt_id_streaming_lineage_tracking() {
         .as_str()
         .expect("should have session_id");
 
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(
         conv_resp.status, 200,
         "get conversation: {}",
@@ -361,7 +361,7 @@ fn prompt_id_document_without_system_prompt() {
     assert_eq!(json["object"].as_str(), Some("response"));
 
     let session_id = json["metadata"]["session_id"].as_str().expect("session_id");
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(conv_resp.status, 200);
     assert_eq!(
         conv_resp.json()["source_doc_id"].as_str(),
@@ -413,7 +413,7 @@ fn prompt_id_with_chaining() {
         "chained request should use same session"
     );
 
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(conv_resp.status, 200);
     assert_eq!(
         conv_resp.json()["source_doc_id"].as_str(),
@@ -477,7 +477,7 @@ fn prompt_id_streaming_with_chaining() {
         "streaming chain should use same session"
     );
 
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(conv_resp.status, 200);
     assert_eq!(
         conv_resp.json()["source_doc_id"].as_str(),
@@ -525,7 +525,7 @@ fn prompt_id_multiple_conversations_same_document() {
     );
 
     for session_id in &session_ids {
-        let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+        let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
         assert_eq!(conv_resp.status, 200);
         assert_eq!(
             conv_resp.json()["source_doc_id"].as_str(),
@@ -573,7 +573,7 @@ fn list_conversations_by_source_doc_id() {
     });
     post_json(ctx.addr(), "/v1/responses", &body);
 
-    let list_resp = get(ctx.addr(), "/v1/conversations");
+    let list_resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(
         list_resp.status, 200,
         "list conversations: {}",

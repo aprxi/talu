@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    code, conversations, db, file, files, handlers, http, plugins, proxy, repo, responses_types,
-    search, settings, tags,
+    code, db, file, files, handlers, http, plugins, proxy, repo, responses_types, search, sessions,
+    settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -21,7 +21,7 @@ use crate::server::{
     tags(
         (name = "Responses", description = "LLM inference (chat completions)"),
         (name = "Models", description = "Available model listing"),
-        (name = "Conversations", description = "Chat session management"),
+        (name = "Chat", description = "Chat session state management"),
         (name = "Files", description = "Binary file upload and management"),
         (name = "File", description = "Stateless file inspect/transform"),
         (name = "Tags", description = "Tag CRUD and assignment"),
@@ -56,17 +56,17 @@ use crate::server::{
         settings::handle_get,
         settings::handle_patch,
         settings::handle_reset_model,
-        // Conversations
-        conversations::handle_list,
-        conversations::handle_get,
-        conversations::handle_delete,
-        conversations::handle_patch,
-        conversations::handle_batch,
-        conversations::handle_fork,
-        conversations::handle_get_tags,
-        conversations::handle_add_tags,
-        conversations::handle_set_tags,
-        conversations::handle_remove_tags,
+        // Sessions
+        sessions::handle_list,
+        sessions::handle_get,
+        sessions::handle_delete,
+        sessions::handle_patch,
+        sessions::handle_batch,
+        sessions::handle_fork,
+        sessions::handle_get_tags,
+        sessions::handle_add_tags,
+        sessions::handle_set_tags,
+        sessions::handle_remove_tags,
         // Documents
         db::table::handle_list,
         db::table::handle_create,
@@ -162,14 +162,14 @@ use crate::server::{
         settings::ModelEntry,
         settings::ModelDefaults,
         settings::OverridesJson,
-        // Conversations (doc-only)
-        conversations::ConversationTag,
-        conversations::ConversationResponse,
-        conversations::ConversationListResponse,
-        conversations::ConversationPatchRequest,
-        conversations::BatchRequest,
-        conversations::ForkRequest,
-        conversations::TagsRequest,
+        // Sessions (doc-only)
+        sessions::SessionTag,
+        sessions::SessionResponse,
+        sessions::SessionListResponse,
+        sessions::SessionPatchRequest,
+        sessions::BatchRequest,
+        sessions::ForkRequest,
+        sessions::TagsRequest,
         // Documents
         db::table::DocumentResponse,
         db::table::DocumentSummaryResponse,

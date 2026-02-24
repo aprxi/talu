@@ -48,7 +48,7 @@ export async function loadBrowserConversations(page?: number): Promise<void> {
 
 export async function loadAvailableTags(): Promise<void> {
   const result = await api.search({
-    scope: "conversations",
+    scope: "sessions",
     aggregations: ["tags"],
     limit: 1,
   });

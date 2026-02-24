@@ -21,7 +21,7 @@ fn filter_model_exact_match() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "model": "qwen3-0.6b" }
         }),
     );
@@ -46,7 +46,7 @@ fn filter_model_wildcard_suffix() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "model": "qwen*" }
         }),
     );
@@ -69,7 +69,7 @@ fn filter_model_wildcard_prefix() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "model": "*llama" }
         }),
     );
@@ -94,7 +94,7 @@ fn filter_model_wildcard_contains() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "model": "*llama*" }
         }),
     );
@@ -116,7 +116,7 @@ fn filter_model_case_insensitive() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "model": "qwen*" }
         }),
     );
@@ -144,7 +144,7 @@ fn filter_marker_exact_match() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "marker": "pinned" }
         }),
     );
@@ -169,7 +169,7 @@ fn filter_marker_any_or_logic() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "marker_any": ["pinned", "archived"] }
         }),
     );
@@ -202,7 +202,7 @@ fn filter_has_tags_true() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "has_tags": true }
         }),
     );
@@ -232,7 +232,7 @@ fn filter_has_tags_false() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "has_tags": false }
         }),
     );
@@ -267,7 +267,7 @@ fn filter_created_after() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "created_after": now }
         }),
     );
@@ -297,7 +297,7 @@ fn filter_created_before() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "created_before": now }
         }),
     );
@@ -326,7 +326,7 @@ fn filter_combined_and_logic() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": {
                 "model": "qwen*",
                 "marker": "pinned"
@@ -366,7 +366,7 @@ fn filter_with_text_search() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "rust",
             "filters": {
                 "marker": "pinned"
@@ -407,7 +407,7 @@ fn filter_tags_empty_array_returns_all() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "tags": [] }
         }),
     );
@@ -440,7 +440,7 @@ fn filter_tags_any_empty_array_returns_all() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "tags_any": [] }
         }),
     );
@@ -473,7 +473,7 @@ fn filter_marker_any_empty_array_returns_all() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "filters": { "marker_any": [] }
         }),
     );

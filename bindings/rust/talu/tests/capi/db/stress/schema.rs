@@ -65,7 +65,7 @@ fn interleaved_messages_and_metadata() {
 
     // Verify messages.
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
     assert_eq!(
         conv.item_count(),
         2,
@@ -113,7 +113,7 @@ fn rapid_schema_alternation() {
     }
 
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
 
     assert_eq!(
         conv.item_count(),
@@ -179,7 +179,7 @@ fn deletion_interleaved_with_writes() {
 
     // Verify session B is intact (not corrupted by A's deletion).
     let storage = StorageHandle::open(ctx.db_path()).expect("open");
-    let conv_b = storage.load_conversation(&sid_b).expect("load B");
+    let conv_b = storage.load_session(&sid_b).expect("load B");
     assert_eq!(
         conv_b.item_count(),
         3,
@@ -253,7 +253,7 @@ fn all_schemas_in_sequence() {
     assert!(storage.get_session(&sid_x).is_err(), "X should be deleted");
 
     // Y is intact with all messages.
-    let conv_y = storage.load_conversation(&sid_y).expect("load Y");
+    let conv_y = storage.load_session(&sid_y).expect("load Y");
     assert_eq!(conv_y.item_count(), 2, "Y should have 2 messages");
     assert_eq!(conv_y.message_text(0).unwrap(), "Y msg 1");
     assert_eq!(conv_y.message_text(1).unwrap(), "Y msg 2");

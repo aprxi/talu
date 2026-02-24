@@ -5,7 +5,7 @@ use talu::responses::MessageRole;
 use talu::responses::ResponsesView;
 use talu::{SessionRecord, StorageError, StorageHandle};
 
-use super::db::{print_conversation, print_session_pretty};
+use super::db::{print_session_items, print_session_pretty};
 use super::util::truncate_str;
 
 /// Print sessions (newest first) with item counts.
@@ -40,7 +40,7 @@ pub(super) fn print_sessions_with_stats(handle: &StorageHandle, sessions: &[Sess
 }
 
 fn session_stats(handle: &StorageHandle, session_id: &str) -> (String, String, String) {
-    let conv = match handle.load_conversation(session_id) {
+    let conv = match handle.load_session(session_id) {
         Ok(conv) => conv,
         Err(_) => return ("-".to_string(), "-".to_string(), "-".to_string()),
     };
@@ -143,9 +143,9 @@ pub(super) fn show_session_transcript(
             println!("\nTRANSCRIPT");
             println!("{}", "-".repeat(80));
 
-            match handle.load_conversation(session_id) {
-                Ok(conv) => print_conversation(&conv, false, verbose)?,
-                Err(e) => eprintln!("(Could not load conversation: {})", e),
+            match handle.load_session(session_id) {
+                Ok(conv) => print_session_items(&conv, false, verbose)?,
+                Err(e) => eprintln!("(Could not load session: {})", e),
             }
         }
         Err(StorageError::SessionNotFound(_)) => {

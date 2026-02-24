@@ -10,7 +10,7 @@ export interface ConversationTag {
 /** Conversation session summary (from list) or full (from get, with items). */
 export interface Conversation {
   id: string;
-  object: "conversation";
+  object: "session";
   created_at: number;
   updated_at: number;
   model: string;
@@ -27,7 +27,7 @@ export interface Conversation {
   items?: Item[];
 }
 
-/** Paginated list response from GET /v1/sessions. */
+/** Paginated list response from GET /v1/chat/sessions. */
 export interface ConversationList {
   object: "list";
   data: Conversation[];
@@ -36,14 +36,14 @@ export interface ConversationList {
   total: number;
 }
 
-/** Patch body for PATCH /v1/sessions/{id}. */
+/** Patch body for PATCH /v1/chat/sessions/{id}. */
 export interface ConversationPatch {
   title?: string;
   marker?: string;
   metadata?: Record<string, unknown>;
 }
 
-/** Fork body for POST /v1/sessions/{id}/fork. */
+/** Fork body for POST /v1/chat/sessions/{id}/fork. */
 export interface ForkRequest {
   target_item_id?: number;
 }
@@ -264,8 +264,8 @@ export interface ApiResult<T> {
 
 /** Search request body for POST /v1/search. */
 export interface SearchRequest {
-  /** Scope: "conversations" or "items" */
-  scope: "conversations" | "items";
+  /** Scope: "sessions" or "items" */
+  scope: "sessions" | "items";
   /** Text search (case-insensitive substring) */
   text?: string;
   /** Structured filters */
@@ -339,7 +339,7 @@ export interface ValueAggregation {
 // Batch Operations API types
 // ---------------------------------------------------------------------------
 
-/** Batch operation request for POST /v1/sessions/batch. */
+/** Batch operation request for POST /v1/chat/sessions/batch. */
 export interface BatchRequest {
   action: "delete" | "archive" | "unarchive" | "add_tags" | "remove_tags";
   ids: string[];

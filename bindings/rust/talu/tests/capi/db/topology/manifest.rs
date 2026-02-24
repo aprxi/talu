@@ -233,7 +233,7 @@ fn empty_manifest_does_not_block_reads() {
 
     // Data should still be readable.
     let storage = talu::StorageHandle::open(ctx.db_path()).expect("open");
-    let conv = storage.load_conversation(&sid).expect("load");
+    let conv = storage.load_session(&sid).expect("load");
     assert_eq!(conv.item_count(), 1);
 
     use talu::responses::ResponsesView;

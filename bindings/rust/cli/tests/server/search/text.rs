@@ -26,7 +26,7 @@ fn text_search_by_title() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "rust"
         }),
     );
@@ -50,7 +50,7 @@ fn text_search_by_model() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "qwen"
         }),
     );
@@ -86,7 +86,7 @@ fn text_search_by_system_prompt() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "coding"
         }),
     );
@@ -116,7 +116,7 @@ fn text_search_case_insensitive() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "important"
         }),
     );
@@ -131,7 +131,7 @@ fn text_search_case_insensitive() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "CASUAL"
         }),
     );
@@ -157,7 +157,7 @@ fn text_search_no_match() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "nonexistent"
         }),
     );
@@ -184,7 +184,7 @@ fn filter_only_returns_all() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations"
+            "scope": "sessions"
         }),
     );
     assert_eq!(resp.status, 200);
@@ -216,7 +216,7 @@ fn text_search_with_limit() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "rust",
             "limit": 2
         }),
@@ -260,7 +260,7 @@ fn text_search_pagination_covers_all() {
 
     for _ in 0..10 {
         let mut req = json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "matching",
             "limit": 2
         });
@@ -303,7 +303,7 @@ fn text_search_with_group_id_filter() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "rust",
             "filters": {
                 "group_id": "group1"
@@ -347,7 +347,7 @@ fn multiple_search_modes_returns_error() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "hello",
             "regex": "world"
         }),
@@ -366,7 +366,7 @@ fn regex_mode_not_implemented() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "regex": "hello.*world"
         }),
     );
@@ -384,7 +384,7 @@ fn vector_mode_not_implemented() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "vector": {
                 "text": "semantic query"
             }
@@ -428,7 +428,7 @@ fn items_scope_searches_message_content() {
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
     assert_eq!(data.len(), 1);
-    assert_eq!(data[0]["conversation_id"], "sess-1");
+    assert_eq!(data[0]["session_id"], "sess-1");
     assert!(data[0]["snippet"]
         .as_str()
         .unwrap()
@@ -493,7 +493,7 @@ fn items_scope_requires_text() {
 #[test]
 fn items_scope_with_limit() {
     let temp = TempDir::new().expect("temp dir");
-    // Create multiple conversations with the keyword
+    // Create multiple sessions with the keyword
     for i in 0..4 {
         seed_session_with_messages(
             temp.path(),
@@ -565,7 +565,7 @@ fn text_search_by_message_content() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "xyzzy123"
         }),
     );
@@ -594,7 +594,7 @@ fn text_search_content_returns_snippet() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "ABC123"
         }),
     );
@@ -637,7 +637,7 @@ fn text_search_snippet_deep_in_long_message() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "UNIQUE_MARKER_DEEP"
         }),
     );
@@ -656,7 +656,7 @@ fn text_search_snippet_deep_in_long_message() {
     );
 }
 
-/// Snippet is extracted from second message in conversation.
+/// Snippet is extracted from second message in session.
 #[test]
 fn text_search_snippet_in_second_message() {
     let temp = TempDir::new().expect("temp dir");
@@ -676,7 +676,7 @@ fn text_search_snippet_in_second_message() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "TARGET_WORD"
         }),
     );
@@ -712,7 +712,7 @@ fn text_search_no_snippet_for_title_match() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "UniqueTitle12345"
         }),
     );
@@ -747,7 +747,7 @@ fn text_search_content_no_match() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "nonexistent_keyword_xyz"
         }),
     );
@@ -792,7 +792,7 @@ fn text_search_matches_title_or_content() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "SearchKeyword"
         }),
     );
@@ -823,7 +823,7 @@ fn search_no_bucket_returns_503() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "text": "anything"
         }),
     );
@@ -1029,7 +1029,7 @@ fn pagination_limit_zero_clamped_to_one() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "limit": 0
         }),
     );
@@ -1055,7 +1055,7 @@ fn pagination_limit_large_clamped_to_max() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "limit": 99999
         }),
     );
@@ -1078,7 +1078,7 @@ fn pagination_limit_negative_returns_400() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "limit": -1
         }),
     );
@@ -1148,9 +1148,9 @@ fn validation_invalid_json_returns_400() {
 // Federated search (scope: "all")
 // ---------------------------------------------------------------------------
 
-/// Federated search returns both conversation and document results.
+/// Federated search returns both session and document results.
 #[test]
-fn federated_search_returns_both_conversations_and_documents() {
+fn federated_search_returns_both_sessions_and_documents() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(
         temp.path(),
@@ -1191,9 +1191,9 @@ fn federated_search_returns_both_conversations_and_documents() {
         data.len()
     );
 
-    let has_conversation = data.iter().any(|d| d["object"] == "conversation");
+    let has_session = data.iter().any(|d| d["object"] == "session");
     let has_document = data.iter().any(|d| d["object"] == "document");
-    assert!(has_conversation, "should include conversation results");
+    assert!(has_session, "should include session results");
     assert!(has_document, "should include document results");
 }
 
@@ -1219,7 +1219,7 @@ fn federated_search_requires_text() {
 #[test]
 fn federated_search_respects_limit() {
     let temp = TempDir::new().expect("temp dir");
-    // Seed several conversations with matching keyword.
+    // Seed several sessions with matching keyword.
     for i in 0..5 {
         seed_session(
             temp.path(),
@@ -1261,14 +1261,14 @@ fn federated_search_respects_limit() {
     assert_eq!(json["has_more"], true);
 }
 
-/// Federated search works when only conversations match (no documents).
+/// Federated search works when only sessions match (no documents).
 #[test]
 fn federated_search_graceful_without_documents() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(
         temp.path(),
         "sess-fed-only",
-        "Unique conversation topic",
+        "Unique session topic",
         "gpt-4",
     );
 
@@ -1279,15 +1279,15 @@ fn federated_search_graceful_without_documents() {
         "/v1/search",
         &json!({
             "scope": "all",
-            "text": "Unique conversation"
+            "text": "Unique session"
         }),
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert!(!data.is_empty(), "should still return conversation results");
-    assert!(data.iter().any(|d| d["object"] == "conversation"));
+    assert!(!data.is_empty(), "should still return session results");
+    assert!(data.iter().any(|d| d["object"] == "session"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1307,7 +1307,7 @@ fn aggregations_models_returns_counts() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "aggregations": ["models"]
         }),
     );
@@ -1360,7 +1360,7 @@ fn aggregations_markers_returns_counts() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "aggregations": ["markers"]
         }),
     );
@@ -1395,7 +1395,7 @@ fn aggregations_tags_returns_counts() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "aggregations": ["tags"]
         }),
     );
@@ -1427,7 +1427,7 @@ fn aggregations_empty_array_returns_no_aggregations() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "aggregations": []
         }),
     );
@@ -1451,7 +1451,7 @@ fn aggregations_unknown_type_skipped() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "aggregations": ["nonexistent_type"]
         }),
     );
@@ -1480,7 +1480,7 @@ fn aggregations_tags_empty_when_no_tags() {
         ctx.addr(),
         "/v1/search",
         &json!({
-            "scope": "conversations",
+            "scope": "sessions",
             "aggregations": ["tags"]
         }),
     );

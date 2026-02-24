@@ -1,7 +1,7 @@
 //! Integration tests for `/v1/tags` endpoints.
 
-mod conversation_tags;
 mod crud;
+mod session_tags;
 
 use std::path::Path;
 

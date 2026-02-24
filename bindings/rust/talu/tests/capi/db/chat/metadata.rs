@@ -141,8 +141,8 @@ fn metadata_only_session_listed() {
         "Session with metadata-only should appear in list",
     );
 
-    // load_conversation should succeed but return empty.
-    let conv = storage.load_conversation(&session_id).expect("load");
+    // load_session should succeed but return empty.
+    let conv = storage.load_session(&session_id).expect("load");
     assert_eq!(conv.item_count(), 0, "No messages = empty conversation");
 }
 

@@ -435,16 +435,16 @@ impl StorageHandle {
         Ok(())
     }
 
-    /// Load the full conversation (all items) for a session.
+    /// Load the full item history for a session.
     ///
-    /// Returns a read-only snapshot of the conversation. The returned handle
+    /// Returns a read-only snapshot of the session items. The returned handle
     /// is independent of the storage - items are fully materialized in memory.
     ///
     /// # Errors
     ///
     /// Returns `StorageError::StorageCorrupted` if loading fails.
-    /// Returns an empty conversation if the session exists but has no items.
-    pub fn load_conversation(
+    /// Returns an empty handle if the session exists but has no items.
+    pub fn load_session(
         &self,
         session_id: &str,
     ) -> Result<crate::responses::ResponsesHandle, StorageError> {
@@ -906,7 +906,7 @@ impl StorageHandle {
         Ok(())
     }
 
-    /// Fork a conversation at a specific item, creating a new session.
+    /// Fork a session at a specific item, creating a new session.
     ///
     /// Creates a new session containing items up to and including `target_item_id`
     /// from the source session. The new session's `parent_session_id` references
@@ -1185,8 +1185,8 @@ impl StorageHandle {
         Ok(())
     }
 
-    /// Add a tag to a conversation.
-    pub fn add_conversation_tag(&self, session_id: &str, tag_id: &str) -> Result<(), StorageError> {
+    /// Add a tag to a session.
+    pub fn add_session_tag(&self, session_id: &str, tag_id: &str) -> Result<(), StorageError> {
         let session_cstr = CString::new(session_id).map_err(|_| {
             StorageError::InvalidArgument("Session ID contains null bytes".to_string())
         })?;
@@ -1209,12 +1209,8 @@ impl StorageHandle {
         Ok(())
     }
 
-    /// Remove a tag from a conversation.
-    pub fn remove_conversation_tag(
-        &self,
-        session_id: &str,
-        tag_id: &str,
-    ) -> Result<(), StorageError> {
+    /// Remove a tag from a session.
+    pub fn remove_session_tag(&self, session_id: &str, tag_id: &str) -> Result<(), StorageError> {
         let session_cstr = CString::new(session_id).map_err(|_| {
             StorageError::InvalidArgument("Session ID contains null bytes".to_string())
         })?;
@@ -1237,8 +1233,8 @@ impl StorageHandle {
         Ok(())
     }
 
-    /// Get all tag IDs for a conversation.
-    pub fn get_conversation_tags(&self, session_id: &str) -> Result<Vec<String>, StorageError> {
+    /// Get all tag IDs for a session.
+    pub fn get_session_tags(&self, session_id: &str) -> Result<Vec<String>, StorageError> {
         let session_cstr = CString::new(session_id).map_err(|_| {
             StorageError::InvalidArgument("Session ID contains null bytes".to_string())
         })?;
@@ -1270,7 +1266,7 @@ impl StorageHandle {
     }
 
     /// Get all session IDs that have a specific tag.
-    pub fn get_tag_conversations(&self, tag_id: &str) -> Result<Vec<String>, StorageError> {
+    pub fn get_tag_sessions(&self, tag_id: &str) -> Result<Vec<String>, StorageError> {
         let tag_cstr = CString::new(tag_id)
             .map_err(|_| StorageError::InvalidArgument("Tag ID contains null bytes".to_string()))?;
 
@@ -1338,9 +1334,7 @@ impl StorageHandle {
     }
 
     /// Convert CRelationStringList to Vec<String>.
-    unsafe fn convert_relation_string_list(
-        c_list: *const CRelationStringList,
-    ) -> Vec<String> {
+    unsafe fn convert_relation_string_list(c_list: *const CRelationStringList) -> Vec<String> {
         if c_list.is_null() {
             return Vec::new();
         }

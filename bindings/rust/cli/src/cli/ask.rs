@@ -464,8 +464,8 @@ pub(super) fn cmd_ask(args: AskArgs, stdin_is_pipe: bool, verbose: u8) -> Result
             }
             if use_json {
                 let conv = handle
-                    .load_conversation(&session_id)
-                    .map_err(|e| anyhow!("Error: Failed to load conversation: {}", e))?;
+                    .load_session(&session_id)
+                    .map_err(|e| anyhow!("Error: Failed to load session: {}", e))?;
                 let json = conv.to_responses_json(1)?;
                 emit_output(&json)?;
                 return Ok(());

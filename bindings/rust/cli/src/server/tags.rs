@@ -37,7 +37,7 @@ pub(crate) struct TagResponse {
 /// Tag usage statistics.
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct TagUsage {
-    conversations: usize,
+    sessions: usize,
     documents: usize,
     total: usize,
 }
@@ -180,8 +180,8 @@ pub async fn handle_get(
         Err(e) => return storage_error_response(e),
     };
 
-    // Get conversation count for this tag
-    let conversation_count = match handle.get_tag_conversations(tag_id) {
+    // Get session count for this tag
+    let session_count = match handle.get_tag_sessions(tag_id) {
         Ok(ids) => ids.len(),
         Err(_) => 0, // On error, report 0 instead of failing the request
     };
@@ -203,9 +203,9 @@ pub async fn handle_get(
         created_at: tag.created_at,
         updated_at: tag.updated_at,
         usage: TagUsage {
-            conversations: conversation_count,
+            sessions: session_count,
             documents: document_count,
-            total: conversation_count + document_count,
+            total: session_count + document_count,
         },
     };
 

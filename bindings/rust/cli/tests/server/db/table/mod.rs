@@ -23,4 +23,3 @@ pub fn no_bucket_config() -> ServerConfig {
     config.no_bucket = true;
     config
 }
-

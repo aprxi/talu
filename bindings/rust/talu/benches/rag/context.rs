@@ -28,7 +28,7 @@ pub fn bench_context_retrieval(c: &mut Criterion) {
     c.bench_function("rag_context_retrieval_20_of_50", |b| {
         b.iter(|| {
             let storage = StorageHandle::open(&db_path).unwrap();
-            let conv = storage.load_conversation(SESSION_ID).unwrap();
+            let conv = storage.load_session(SESSION_ID).unwrap();
             assert_eq!(conv.item_count(), MSGS_PER_SESSION);
 
             let mut total_len = 0usize;

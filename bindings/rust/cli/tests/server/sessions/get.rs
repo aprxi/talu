@@ -1,4 +1,4 @@
-use super::{conversation_config, no_bucket_config, seed_session, seed_session_with_messages};
+use super::{no_bucket_config, seed_session, seed_session_with_messages, session_config};
 use crate::server::common::*;
 use tempfile::TempDir;
 
@@ -13,14 +13,14 @@ fn model_and_bucket_config(bucket: &std::path::Path) -> ServerConfig {
 #[test]
 fn get_returns_503_without_bucket() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = get(ctx.addr(), "/v1/conversations/some-id");
+    let resp = get(ctx.addr(), "/v1/chat/sessions/some-id");
     assert_eq!(resp.status, 503, "body: {}", resp.body);
 }
 
 #[test]
 fn get_503_error_body_is_json() {
     let ctx = ServerTestContext::new(no_bucket_config());
-    let resp = get(ctx.addr(), "/v1/conversations/some-id");
+    let resp = get(ctx.addr(), "/v1/chat/sessions/some-id");
     assert_eq!(resp.status, 503);
     let json = resp.json();
     assert!(
@@ -38,11 +38,11 @@ fn get_returns_session_with_items() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-get-1", "My Chat", "test-model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-get-1");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-get-1");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(json["object"], "conversation");
+    assert_eq!(json["object"], "session");
     assert_eq!(json["id"], "sess-get-1");
     assert_eq!(json["title"], "My Chat");
 
@@ -57,8 +57,8 @@ fn get_returns_404_for_missing_session() {
     // Seed one session so the DB exists
     seed_session(temp.path(), "sess-exists", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/nonexistent-session");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/nonexistent-session");
     assert_eq!(resp.status, 404, "body: {}", resp.body);
 }
 
@@ -67,8 +67,8 @@ fn get_without_prefix() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-noprefix", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/conversations/sess-noprefix");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-noprefix");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(resp.json()["id"], "sess-noprefix");
 }
@@ -78,12 +78,12 @@ fn get_returns_all_metadata_fields() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-meta-get", "Full Meta Chat", "model-x");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-meta-get");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-meta-get");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
-    assert_eq!(json["object"], "conversation");
+    assert_eq!(json["object"], "session");
     assert_eq!(json["id"], "sess-meta-get");
     assert_eq!(json["title"], "Full Meta Chat");
     assert_eq!(json["model"], "model-x");
@@ -99,8 +99,8 @@ fn get_items_contain_user_message() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-item-check", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-item-check");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-item-check");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -132,8 +132,8 @@ fn get_multiple_items_preserved() {
         &["First message", "Second message", "Third message"],
     );
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-multi");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-multi");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -155,8 +155,8 @@ fn get_404_error_body_is_json() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-x", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/nonexistent");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/nonexistent");
     assert_eq!(resp.status, 404);
     let json = resp.json();
     assert!(
@@ -174,8 +174,8 @@ fn get_timestamps_are_consistent() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-ts", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-ts");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-ts");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -194,8 +194,8 @@ fn get_items_have_id_and_type() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-item-fields", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-item-fields");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-item-fields");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -214,8 +214,8 @@ fn get_items_is_array_even_when_single_message() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-single", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-single");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-single");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -227,8 +227,8 @@ fn get_response_includes_model() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-model-check", "Chat", "my-specific-model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-model-check");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-model-check");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.json()["model"], "my-specific-model");
 }
@@ -238,8 +238,8 @@ fn get_response_includes_marker() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-marker-check", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-marker-check");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-marker-check");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.json()["marker"], "active");
 }
@@ -253,8 +253,8 @@ fn get_response_includes_parent_session_id_null() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-parent", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-parent");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-parent");
     assert_eq!(resp.status, 200);
     // Root session should have null parent_session_id
     assert!(
@@ -268,8 +268,8 @@ fn get_response_includes_group_id_null() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-group", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-group");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-group");
     assert_eq!(resp.status, 200);
     // Session without group should have null group_id
     assert!(
@@ -283,8 +283,8 @@ fn get_response_includes_metadata_empty_object() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-meta-empty", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-meta-empty");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-meta-empty");
     assert_eq!(resp.status, 200);
     // Default metadata should be empty object {}
     let metadata = &resp.json()["metadata"];
@@ -300,18 +300,18 @@ fn get_patched_title_reflected() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-get-patch", "Before", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     // Patch the title
     let resp = patch_json(
         ctx.addr(),
-        "/v1/conversations/sess-get-patch",
+        "/v1/chat/sessions/sess-get-patch",
         &serde_json::json!({"title": "After"}),
     );
     assert_eq!(resp.status, 200);
 
     // GET should show the new title
-    let resp = get(ctx.addr(), "/v1/conversations/sess-get-patch");
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-get-patch");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.json()["title"], "After");
     // Items should still be present
@@ -325,16 +325,16 @@ fn get_patched_marker_reflected() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-get-marker", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
+    let ctx = ServerTestContext::new(session_config(temp.path()));
 
     let resp = patch_json(
         ctx.addr(),
-        "/v1/conversations/sess-get-marker",
+        "/v1/chat/sessions/sess-get-marker",
         &serde_json::json!({"marker": "completed"}),
     );
     assert_eq!(resp.status, 200);
 
-    let resp = get(ctx.addr(), "/v1/conversations/sess-get-marker");
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-get-marker");
     assert_eq!(resp.status, 200);
     assert_eq!(resp.json()["marker"], "completed");
 }
@@ -348,8 +348,8 @@ fn get_manual_items_have_no_generation() {
     let temp = TempDir::new().expect("temp dir");
     seed_session(temp.path(), "sess-gen-none", "Chat", "model");
 
-    let ctx = ServerTestContext::new(conversation_config(temp.path()));
-    let resp = get(ctx.addr(), "/v1/conversations/sess-gen-none");
+    let ctx = ServerTestContext::new(session_config(temp.path()));
+    let resp = get(ctx.addr(), "/v1/chat/sessions/sess-gen-none");
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
@@ -391,7 +391,7 @@ fn get_generated_item_has_generation_metadata() {
         .expect("response should have session_id in metadata");
 
     // Get the conversation
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(
         conv_resp.status, 200,
         "get conversation: {}",
@@ -466,7 +466,7 @@ fn get_generation_metadata_has_sampling_params() {
         .as_str()
         .expect("session_id");
 
-    let conv_resp = get(ctx.addr(), &format!("/v1/conversations/{}", session_id));
+    let conv_resp = get(ctx.addr(), &format!("/v1/chat/sessions/{}", session_id));
     assert_eq!(conv_resp.status, 200);
 
     let conv_json = conv_resp.json();

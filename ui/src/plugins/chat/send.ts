@@ -106,7 +106,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       const now = Math.floor(Date.now() / 1000);
       chatState.sessions.unshift({
         id: sid,
-        object: "conversation",
+        object: "session",
         created_at: now,
         updated_at: now,
         model: getModelsService()?.getActiveModel() ?? "",
