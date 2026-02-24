@@ -9,6 +9,18 @@ extern "C" __global__ void talu_vector_add_f32(
     out[index] = a[index] + b[index];
 }
 
+extern "C" __global__ void talu_vector_add_scaled_f32(
+    float* out,
+    const float* a,
+    const float* b,
+    float scale,
+    unsigned int count
+) {
+    const unsigned int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index >= count) return;
+    out[index] = a[index] + b[index] * scale;
+}
+
 extern "C" __global__ void talu_mul_f32(
     float* out,
     const float* a,

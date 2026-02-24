@@ -4,7 +4,7 @@
 !/.github
 
 # Ignore all Markdown files unless permitted
-#**/*.md
+**/*.md
 !/README.md
 !/CONTRIBUTING.md
 !/GUIDELINES.md

@@ -13,6 +13,7 @@ pub const manifest = @import("manifest.zig");
 pub const sideload = @import("sideload.zig");
 pub const registry = @import("registry.zig");
 pub const vector_add = @import("vector_add.zig");
+pub const vector_add_scaled = @import("vector_add_scaled.zig");
 pub const mul = @import("mul.zig");
 pub const copy = @import("copy.zig");
 pub const copy_u16 = @import("copy_u16.zig");
@@ -66,6 +67,7 @@ test {
     _ = sideload;
     _ = registry;
     _ = vector_add;
+    _ = vector_add_scaled;
     _ = mul;
     _ = copy;
     _ = copy_u16;

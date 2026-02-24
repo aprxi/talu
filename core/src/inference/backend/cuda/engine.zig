@@ -19,6 +19,7 @@ const attention_mod = @import("attention.zig");
 const decode_mod = @import("decode.zig");
 const prefill_mod = @import("prefill.zig");
 const vision_runtime_mod = @import("vision/root.zig");
+const GateUpLayout = models.runtime_blocks.GateUpLayout;
 
 const LoadedModel = models.LoadedModel;
 const Tensor = tensor.Tensor;
@@ -52,6 +53,7 @@ const EmbeddingLookupKind = enum(u8) {
 
 const KernelSlot = enum {
     vector_add,
+    vector_add_scaled,
     mul,
     copy,
     copy_u16,
@@ -115,6 +117,7 @@ const AttentionKernelSet = struct {
 
 const required_kernels = [_]RequiredKernel{
     .{ .slot = .vector_add, .op_name = compute.cuda.vector_add.op_name, .embedded_symbol = compute.cuda.vector_add.embedded_symbol },
+    .{ .slot = .vector_add_scaled, .op_name = compute.cuda.vector_add_scaled.op_name, .embedded_symbol = compute.cuda.vector_add_scaled.embedded_symbol },
     .{ .slot = .mul, .op_name = compute.cuda.mul.op_name, .embedded_symbol = compute.cuda.mul.embedded_symbol },
     .{ .slot = .copy, .op_name = compute.cuda.copy.op_name, .embedded_symbol = compute.cuda.copy.embedded_symbol },
     .{ .slot = .copy_u16, .op_name = compute.cuda.copy_u16.op_name, .embedded_symbol = compute.cuda.copy_u16.embedded_symbol },
@@ -673,43 +676,53 @@ const BlockRuntime = struct {
                         log.warn("inference", "CUDA block runtime MoE not supported yet", .{ .layer = layer_idx });
                         return error.UnsupportedModel;
                     }
-                    if (attn.fused.qkv_proj != null or attn.fused.gate_up != null) {
-                        log.warn("inference", "CUDA block runtime fused attention/ffn weights not supported yet", .{ .layer = layer_idx });
-                        return error.UnsupportedModel;
-                    }
-
-                    const q_proj = attn.q_proj orelse return error.MissingWeight;
-                    const k_proj = attn.k_proj orelse return error.MissingWeight;
-                    const v_proj = attn.v_proj orelse return error.MissingWeight;
-                    const w1 = attn.w1 orelse return error.MissingWeight;
                     const w2 = attn.w2 orelse return error.MissingWeight;
-                    const w3 = attn.w3 orelse return error.MissingWeight;
+                    const q_out = n_heads * head_dim;
+                    const kv_out = n_kv_heads * head_dim;
                     if (attention_block_count == 0) {
-                        log.info("inference", "CUDA block0 weight dtypes", .{
-                            .q_proj = @tagName(q_proj.dtype),
-                            .k_proj = @tagName(k_proj.dtype),
-                            .v_proj = @tagName(v_proj.dtype),
-                            .o_proj = @tagName(attn.o_proj.dtype),
-                            .w1 = @tagName(w1.dtype),
-                            .w2 = @tagName(w2.dtype),
-                            .w3 = @tagName(w3.dtype),
-                        });
-                        log.info("inference", "CUDA block0 weight shapes", .{
-                            .q0 = q_proj.shape[0],
-                            .q1 = q_proj.shape[1],
-                            .k0 = k_proj.shape[0],
-                            .k1 = k_proj.shape[1],
-                            .v0 = v_proj.shape[0],
-                            .v1 = v_proj.shape[1],
-                            .o0 = attn.o_proj.shape[0],
-                            .o1 = attn.o_proj.shape[1],
-                            .w10 = w1.shape[0],
-                            .w11 = w1.shape[1],
-                            .w20 = w2.shape[0],
-                            .w21 = w2.shape[1],
-                            .w30 = w3.shape[0],
-                            .w31 = w3.shape[1],
-                        });
+                        if (attn.fused.qkv_proj != null or attn.fused.gate_up != null) {
+                            log.info("inference", "CUDA block0 fused weight mode", .{
+                                .qkv_fused = @as(u8, @intFromBool(attn.fused.qkv_proj != null)),
+                                .gate_up_fused = @as(u8, @intFromBool(attn.fused.gate_up != null)),
+                                .gate_up_layout = @tagName(attn.fused.gate_up_layout),
+                                .qkv_dtype = if (attn.fused.qkv_proj) |qkv| @tagName(qkv.dtype) else "none",
+                                .gate_up_dtype = if (attn.fused.gate_up) |gate_up| @tagName(gate_up.dtype) else "none",
+                                .w2_dtype = @tagName(w2.dtype),
+                                .q_out = q_out,
+                                .kv_out = kv_out,
+                            });
+                        } else {
+                            const q_proj = attn.q_proj orelse return error.MissingWeight;
+                            const k_proj = attn.k_proj orelse return error.MissingWeight;
+                            const v_proj = attn.v_proj orelse return error.MissingWeight;
+                            const w1 = attn.w1 orelse return error.MissingWeight;
+                            const w3 = attn.w3 orelse return error.MissingWeight;
+                            log.info("inference", "CUDA block0 weight dtypes", .{
+                                .q_proj = @tagName(q_proj.dtype),
+                                .k_proj = @tagName(k_proj.dtype),
+                                .v_proj = @tagName(v_proj.dtype),
+                                .o_proj = @tagName(attn.o_proj.dtype),
+                                .w1 = @tagName(w1.dtype),
+                                .w2 = @tagName(w2.dtype),
+                                .w3 = @tagName(w3.dtype),
+                            });
+                            log.info("inference", "CUDA block0 weight shapes", .{
+                                .q0 = q_proj.shape[0],
+                                .q1 = q_proj.shape[1],
+                                .k0 = k_proj.shape[0],
+                                .k1 = k_proj.shape[1],
+                                .v0 = v_proj.shape[0],
+                                .v1 = v_proj.shape[1],
+                                .o0 = attn.o_proj.shape[0],
+                                .o1 = attn.o_proj.shape[1],
+                                .w10 = w1.shape[0],
+                                .w11 = w1.shape[1],
+                                .w20 = w2.shape[0],
+                                .w21 = w2.shape[1],
+                                .w30 = w3.shape[0],
+                                .w31 = w3.shape[1],
+                            });
+                        }
                     }
 
                     var ln1_weight = try uploadTensor(device, allocator, attn.ln1_weight);
@@ -805,18 +818,57 @@ const BlockRuntime = struct {
                     }
                     errdefer if (k_norm_weight) |*w| w.deinit(device);
 
-                    var q_proj_dev = try uploadLinearWeight(device, allocator, q_proj, d_model);
+                    var q_proj_dev: LinearWeight = undefined;
+                    var k_proj_dev: LinearWeight = undefined;
+                    var v_proj_dev: LinearWeight = undefined;
+                    if (attn.fused.qkv_proj) |qkv_proj| {
+                        const fused_qkv = try uploadFusedQkvWeights(
+                            device,
+                            allocator,
+                            &qkv_proj,
+                            d_model,
+                            q_out,
+                            kv_out,
+                        );
+                        q_proj_dev = fused_qkv.q;
+                        k_proj_dev = fused_qkv.k;
+                        v_proj_dev = fused_qkv.v;
+                    } else {
+                        const q_proj = attn.q_proj orelse return error.MissingWeight;
+                        const k_proj = attn.k_proj orelse return error.MissingWeight;
+                        const v_proj = attn.v_proj orelse return error.MissingWeight;
+                        q_proj_dev = try uploadLinearWeight(device, allocator, q_proj, d_model);
+                        k_proj_dev = try uploadLinearWeight(device, allocator, k_proj, d_model);
+                        v_proj_dev = try uploadLinearWeight(device, allocator, v_proj, d_model);
+                    }
                     errdefer q_proj_dev.deinit(device);
-                    var k_proj_dev = try uploadLinearWeight(device, allocator, k_proj, d_model);
                     errdefer k_proj_dev.deinit(device);
-                    var v_proj_dev = try uploadLinearWeight(device, allocator, v_proj, d_model);
                     errdefer v_proj_dev.deinit(device);
+
                     var o_proj_dev = try uploadLinearWeight(device, allocator, attn.o_proj, q_proj_dev.cols());
                     errdefer o_proj_dev.deinit(device);
-                    var w1_dev = try uploadLinearWeight(device, allocator, w1, d_model);
+
+                    var w1_dev: LinearWeight = undefined;
+                    var w3_dev: LinearWeight = undefined;
+                    if (attn.fused.gate_up) |gate_up| {
+                        const fused_gate_up = try uploadFusedGateUpWeights(
+                            device,
+                            allocator,
+                            &gate_up,
+                            d_model,
+                            attn.fused.gate_up_layout,
+                        );
+                        w1_dev = fused_gate_up.gate;
+                        w3_dev = fused_gate_up.up;
+                    } else {
+                        const w1 = attn.w1 orelse return error.MissingWeight;
+                        const w3 = attn.w3 orelse return error.MissingWeight;
+                        w1_dev = try uploadLinearWeight(device, allocator, w1, d_model);
+                        w3_dev = try uploadLinearWeight(device, allocator, w3, d_model);
+                    }
                     errdefer w1_dev.deinit(device);
-                    var w3_dev = try uploadLinearWeight(device, allocator, w3, d_model);
                     errdefer w3_dev.deinit(device);
+
                     if (w1_dev.cols() != w3_dev.cols()) {
                         log.warn("inference", "CUDA block runtime gate/up dim mismatch", .{
                             .layer = layer_idx,
@@ -1307,6 +1359,8 @@ pub const CudaBackend = struct {
     kernel_registry: compute.cuda.Registry,
     vector_add_function: ?compute.cuda.Function = null,
     vector_add_source: ?compute.cuda.registry.KernelSource = null,
+    vector_add_scaled_function: ?compute.cuda.Function = null,
+    vector_add_scaled_source: ?compute.cuda.registry.KernelSource = null,
     mul_function: ?compute.cuda.Function = null,
     mul_source: ?compute.cuda.registry.KernelSource = null,
     copy_function: ?compute.cuda.Function = null,
@@ -1512,6 +1566,8 @@ pub const CudaBackend = struct {
             .qk_norm_weight_offset = loaded.runtime.qk_norm_weight_offset,
             .q_norm_blocks = backend.block_runtime.q_norm_blocks,
             .k_norm_blocks = backend.block_runtime.k_norm_blocks,
+            .vector_add_kernel = @as(u8, @intFromBool(backend.vector_add_function != null)),
+            .vector_add_scaled_kernel = @as(u8, @intFromBool(backend.vector_add_scaled_function != null)),
             .rmsnorm_kernel = @as(u8, @intFromBool(backend.rmsnorm_function != null)),
             .mul_kernel = @as(u8, @intFromBool(backend.mul_function != null)),
             .copy_kernel = @as(u8, @intFromBool(backend.copy_function != null)),
@@ -1799,7 +1855,6 @@ pub const CudaBackend = struct {
 
         const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
         const rope_function = self.rope_function orelse return error.CudaKernelUnavailable;
-        const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
         const softmax_rows_function = self.softmax_rows_function orelse return error.CudaKernelUnavailable;
         const copy_function = self.copy_function orelse return error.CudaKernelUnavailable;
         const cast_f32_to_f16_function = self.cast_f32_to_f16_function;
@@ -2092,15 +2147,7 @@ pub const CudaBackend = struct {
                     self.norm_eps,
                     self.loaded.runtime.weight_offset,
                 );
-                try compute.cuda.vector_add.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    vector_add_function,
-                    &ws.hidden_dev,
-                    &ws.attn_out_dev,
-                    &ws.hidden_dev,
-                    hidden_count_u32,
-                );
+                try self.addResidualWithModelScale(&ws.hidden_dev, &ws.attn_out_dev, hidden_count_u32);
 
                 const pre_ffn_norm = if (block.pre_ffn_norm_weight) |*w| &w.buffer else &block.ln2_weight.buffer;
                 try compute.cuda.rmsnorm.runWithFunction(
@@ -2116,15 +2163,7 @@ pub const CudaBackend = struct {
                     self.loaded.runtime.weight_offset,
                 );
             } else {
-                try compute.cuda.vector_add.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    vector_add_function,
-                    &ws.hidden_dev,
-                    &ws.attn_out_dev,
-                    &ws.hidden_dev,
-                    hidden_count_u32,
-                );
+                try self.addResidualWithModelScale(&ws.hidden_dev, &ws.attn_out_dev, hidden_count_u32);
 
                 try compute.cuda.rmsnorm.runWithFunction(
                     &self.kernel_arg_pack,
@@ -2182,15 +2221,7 @@ pub const CudaBackend = struct {
                     self.loaded.runtime.weight_offset,
                 );
             }
-            try compute.cuda.vector_add.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                vector_add_function,
-                &ws.hidden_dev,
-                &ws.ffn_down_dev,
-                &ws.hidden_dev,
-                hidden_count_u32,
-            );
+            try self.addResidualWithModelScale(&ws.hidden_dev, &ws.ffn_down_dev, hidden_count_u32);
         }
 
         const last_row_offset = std.math.mul(usize, tokens.len - 1, self.d_model * @sizeOf(f32)) catch return error.InvalidArgument;
@@ -2250,6 +2281,9 @@ pub const CudaBackend = struct {
             self.vector_add_function == null or
             self.softmax_rows_function == null)
         {
+            return .missing_core_kernels;
+        }
+        if (self.loaded.config.residual_multiplier != 1.0 and self.vector_add_scaled_function == null) {
             return .missing_core_kernels;
         }
         if (self.loaded.config.use_gelu) {
@@ -2368,6 +2402,9 @@ pub const CudaBackend = struct {
 
         const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
         const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
+        if (self.loaded.config.residual_multiplier != 1.0 and self.vector_add_scaled_function == null) {
+            return error.CudaKernelUnavailable;
+        }
         if (self.loaded.config.use_gelu) {
             if (self.gelu_mul_function == null) return error.CudaKernelUnavailable;
         } else {
@@ -2746,15 +2783,7 @@ pub const CudaBackend = struct {
                         self.norm_eps,
                         self.loaded.runtime.weight_offset,
                     );
-                    try compute.cuda.vector_add.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        vector_add_function,
-                        &self.prototype.input_dev,
-                        &self.prototype.attn_out_dev,
-                        &self.prototype.input_dev,
-                        d_model_u32,
-                    );
+                    try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.attn_out_dev, d_model_u32);
 
                     const pre_ffn_norm = if (block.pre_ffn_norm_weight) |*w| &w.buffer else &block.ln2_weight.buffer;
                     try compute.cuda.rmsnorm.runWithFunction(
@@ -2772,15 +2801,7 @@ pub const CudaBackend = struct {
                 } else {
                     // Standard topology:
                     // attn_out -> add residual -> ln2 -> mlp -> add residual
-                    try compute.cuda.vector_add.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        vector_add_function,
-                        &self.prototype.input_dev,
-                        &self.prototype.attn_out_dev,
-                        &self.prototype.input_dev,
-                        d_model_u32,
-                    );
+                    try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.attn_out_dev, d_model_u32);
 
                     try compute.cuda.rmsnorm.runWithFunction(
                         &self.kernel_arg_pack,
@@ -2814,15 +2835,7 @@ pub const CudaBackend = struct {
                         self.loaded.runtime.weight_offset,
                     );
                 }
-                try compute.cuda.vector_add.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    vector_add_function,
-                    &self.prototype.input_dev,
-                    &self.prototype.ffn_down_dev,
-                    &self.prototype.input_dev,
-                    d_model_u32,
-                );
+                try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.ffn_down_dev, d_model_u32);
             } else if (layer.shortconv) |*block| {
                 try compute.cuda.rmsnorm.runWithFunction(
                     &self.kernel_arg_pack,
@@ -2859,15 +2872,7 @@ pub const CudaBackend = struct {
                 );
 
                 try self.linearForward(&self.prototype.shortconv_conv_dev, &block.out_proj, &self.prototype.attn_out_dev);
-                try compute.cuda.vector_add.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    vector_add_function,
-                    &self.prototype.input_dev,
-                    &self.prototype.attn_out_dev,
-                    &self.prototype.input_dev,
-                    d_model_u32,
-                );
+                try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.attn_out_dev, d_model_u32);
 
                 if (block.ln2_weight != null and block.ffn_w1 != null and block.ffn_w2 != null and block.ffn_w3 != null) {
                     try compute.cuda.rmsnorm.runWithFunction(
@@ -2886,15 +2891,7 @@ pub const CudaBackend = struct {
                     const d_ff_u32: u32 = @intCast(block.d_ff);
                     try self.runFfnActivationMul(d_ff_u32);
                     try self.linearForward(&self.prototype.ffn_mul_dev, &block.ffn_w2.?, &self.prototype.ffn_down_dev);
-                    try compute.cuda.vector_add.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        vector_add_function,
-                        &self.prototype.input_dev,
-                        &self.prototype.ffn_down_dev,
-                        &self.prototype.input_dev,
-                        d_model_u32,
-                    );
+                    try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.ffn_down_dev, d_model_u32);
                 }
             } else {
                 return error.InvalidArgument;
@@ -3191,6 +3188,39 @@ pub const CudaBackend = struct {
             &self.prototype.ffn_gate_dev,
             &self.prototype.ffn_up_dev,
             &self.prototype.ffn_mul_dev,
+            count,
+        );
+    }
+
+    fn addResidualWithModelScale(
+        self: *CudaBackend,
+        residual: *compute.cuda.Buffer,
+        branch: *compute.cuda.Buffer,
+        count: u32,
+    ) !void {
+        if (self.loaded.config.residual_multiplier == 1.0) {
+            const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
+            try compute.cuda.vector_add.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                vector_add_function,
+                residual,
+                branch,
+                residual,
+                count,
+            );
+            return;
+        }
+
+        const vector_add_scaled_function = self.vector_add_scaled_function orelse return error.CudaKernelUnavailable;
+        try compute.cuda.vector_add_scaled.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            vector_add_scaled_function,
+            residual,
+            branch,
+            residual,
+            self.loaded.config.residual_multiplier,
             count,
         );
     }
@@ -3593,6 +3623,10 @@ pub const CudaBackend = struct {
             .vector_add => {
                 self.vector_add_function = resolved.function;
                 self.vector_add_source = resolved.source;
+            },
+            .vector_add_scaled => {
+                self.vector_add_scaled_function = resolved.function;
+                self.vector_add_scaled_source = resolved.source;
             },
             .mul => {
                 self.mul_function = resolved.function;
@@ -4045,6 +4079,277 @@ fn uploadLinearWeight(
         return uploadLinearWeightGroupedAffineU4(device, src, input_dim);
     }
     return uploadLinearWeightDense(device, allocator, src, input_dim);
+}
+
+const DenseOutInU16 = struct {
+    values: []align(1) const u16,
+    owned: ?[]u16 = null,
+
+    fn deinit(self: *DenseOutInU16, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
+        self.* = .{ .values = &.{}, .owned = null };
+    }
+};
+
+const DenseOutInF32 = struct {
+    values: []const f32,
+    owned: ?[]f32 = null,
+
+    fn deinit(self: *DenseOutInF32, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
+        self.* = .{ .values = &.{}, .owned = null };
+    }
+};
+
+const FusedQkvUpload = struct {
+    q: LinearWeight,
+    k: LinearWeight,
+    v: LinearWeight,
+};
+
+const FusedGateUpUpload = struct {
+    gate: LinearWeight,
+    up: LinearWeight,
+};
+
+fn materializeDenseOutInU16(
+    allocator: std.mem.Allocator,
+    src: *const Tensor,
+    input_dim: usize,
+    out_dim: usize,
+) !DenseOutInU16 {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    if (src.shape[0] <= 0 or src.shape[1] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(src.shape[0]);
+    const cols: usize = @intCast(src.shape[1]);
+    const logical_count = std.math.mul(usize, rows, cols) catch return error.InvalidArgument;
+    const view = src.asSliceUnaligned(u16);
+    if (view.len < logical_count) return error.InvalidArgument;
+    const values = view[0..logical_count];
+
+    if (rows == out_dim and cols == input_dim) {
+        return .{ .values = values };
+    }
+    if (rows == input_dim and cols == out_dim) {
+        const transposed = try transposeRowMajor(u16, allocator, values, rows, cols);
+        return .{ .values = transposed, .owned = transposed };
+    }
+    return error.UnsupportedModel;
+}
+
+fn materializeDenseOutInF32(
+    allocator: std.mem.Allocator,
+    src: *const Tensor,
+    input_dim: usize,
+    out_dim: usize,
+) !DenseOutInF32 {
+    if (src.n_dims != 2) return error.UnsupportedModel;
+    if (src.shape[0] <= 0 or src.shape[1] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(src.shape[0]);
+    const cols: usize = @intCast(src.shape[1]);
+    const logical_count = std.math.mul(usize, rows, cols) catch return error.InvalidArgument;
+    const view = src.asSlice(f32);
+    if (view.len < logical_count) return error.InvalidArgument;
+    const values = view[0..logical_count];
+
+    if (rows == out_dim and cols == input_dim) {
+        return .{ .values = values };
+    }
+    if (rows == input_dim and cols == out_dim) {
+        const transposed = try transposeRowMajor(f32, allocator, values, rows, cols);
+        return .{ .values = transposed, .owned = transposed };
+    }
+    return error.UnsupportedModel;
+}
+
+fn uploadFusedQkvWeights(
+    device: *compute.cuda.Device,
+    allocator: std.mem.Allocator,
+    fused_qkv: *const Tensor,
+    input_dim: usize,
+    q_out: usize,
+    kv_out: usize,
+) !FusedQkvUpload {
+    const total_out = std.math.add(usize, q_out, std.math.mul(usize, kv_out, 2) catch return error.InvalidArgument) catch return error.InvalidArgument;
+    if (fused_qkv.dtype == .f16 or fused_qkv.dtype == .bf16) {
+        var out_in = try materializeDenseOutInU16(allocator, fused_qkv, input_dim, total_out);
+        defer out_in.deinit(allocator);
+
+        const q_count = std.math.mul(usize, q_out, input_dim) catch return error.InvalidArgument;
+        const kv_count = std.math.mul(usize, kv_out, input_dim) catch return error.InvalidArgument;
+        const expected = std.math.add(usize, q_count, std.math.mul(usize, kv_count, 2) catch return error.InvalidArgument) catch return error.InvalidArgument;
+        if (out_in.values.len != expected) return error.InvalidArgument;
+
+        const q_vals = out_in.values[0..q_count];
+        const k_vals = out_in.values[q_count .. q_count + kv_count];
+        const v_vals = out_in.values[q_count + kv_count .. q_count + kv_count + kv_count];
+        const q_bytes = std.mem.sliceAsBytes(q_vals);
+        const k_bytes = std.mem.sliceAsBytes(k_vals);
+        const v_bytes = std.mem.sliceAsBytes(v_vals);
+        var q_tensor = Tensor.view(@constCast(q_bytes.ptr), &.{ q_out, input_dim }, fused_qkv.dtype, q_bytes.len);
+        var k_tensor = Tensor.view(@constCast(k_bytes.ptr), &.{ kv_out, input_dim }, fused_qkv.dtype, k_bytes.len);
+        var v_tensor = Tensor.view(@constCast(v_bytes.ptr), &.{ kv_out, input_dim }, fused_qkv.dtype, v_bytes.len);
+        const q = try uploadLinearWeight(device, allocator, &q_tensor, input_dim);
+        errdefer {
+            var q_mut = q;
+            q_mut.deinit(device);
+        }
+        const k = try uploadLinearWeight(device, allocator, &k_tensor, input_dim);
+        errdefer {
+            var k_mut = k;
+            k_mut.deinit(device);
+        }
+        const v = try uploadLinearWeight(device, allocator, &v_tensor, input_dim);
+        return .{ .q = q, .k = k, .v = v };
+    }
+    if (fused_qkv.dtype == .f32) {
+        var out_in = try materializeDenseOutInF32(allocator, fused_qkv, input_dim, total_out);
+        defer out_in.deinit(allocator);
+
+        const q_count = std.math.mul(usize, q_out, input_dim) catch return error.InvalidArgument;
+        const kv_count = std.math.mul(usize, kv_out, input_dim) catch return error.InvalidArgument;
+        const expected = std.math.add(usize, q_count, std.math.mul(usize, kv_count, 2) catch return error.InvalidArgument) catch return error.InvalidArgument;
+        if (out_in.values.len != expected) return error.InvalidArgument;
+
+        const q_vals = out_in.values[0..q_count];
+        const k_vals = out_in.values[q_count .. q_count + kv_count];
+        const v_vals = out_in.values[q_count + kv_count .. q_count + kv_count + kv_count];
+        const q_bytes = std.mem.sliceAsBytes(q_vals);
+        const k_bytes = std.mem.sliceAsBytes(k_vals);
+        const v_bytes = std.mem.sliceAsBytes(v_vals);
+        var q_tensor = Tensor.view(@constCast(q_bytes.ptr), &.{ q_out, input_dim }, .f32, q_bytes.len);
+        var k_tensor = Tensor.view(@constCast(k_bytes.ptr), &.{ kv_out, input_dim }, .f32, k_bytes.len);
+        var v_tensor = Tensor.view(@constCast(v_bytes.ptr), &.{ kv_out, input_dim }, .f32, v_bytes.len);
+        const q = try uploadLinearWeight(device, allocator, &q_tensor, input_dim);
+        errdefer {
+            var q_mut = q;
+            q_mut.deinit(device);
+        }
+        const k = try uploadLinearWeight(device, allocator, &k_tensor, input_dim);
+        errdefer {
+            var k_mut = k;
+            k_mut.deinit(device);
+        }
+        const v = try uploadLinearWeight(device, allocator, &v_tensor, input_dim);
+        return .{ .q = q, .k = k, .v = v };
+    }
+    return error.UnsupportedModel;
+}
+
+fn uploadFusedGateUpWeights(
+    device: *compute.cuda.Device,
+    allocator: std.mem.Allocator,
+    fused_gate_up: *const Tensor,
+    input_dim: usize,
+    layout: GateUpLayout,
+) !FusedGateUpUpload {
+    if (fused_gate_up.n_dims != 2) return error.UnsupportedModel;
+    if (fused_gate_up.shape[0] <= 0 or fused_gate_up.shape[1] <= 0) return error.InvalidArgument;
+    const rows: usize = @intCast(fused_gate_up.shape[0]);
+    const cols: usize = @intCast(fused_gate_up.shape[1]);
+    const out_dim = if (rows == input_dim) cols else if (cols == input_dim) rows else return error.UnsupportedModel;
+    if ((out_dim % 2) != 0) return error.InvalidArgument;
+    const d_ff = out_dim / 2;
+
+    if (fused_gate_up.dtype == .f16 or fused_gate_up.dtype == .bf16) {
+        var out_in = try materializeDenseOutInU16(allocator, fused_gate_up, input_dim, out_dim);
+        defer out_in.deinit(allocator);
+
+        const part_count = std.math.mul(usize, d_ff, input_dim) catch return error.InvalidArgument;
+        var gate_vals: []align(1) const u16 = undefined;
+        var up_vals: []align(1) const u16 = undefined;
+        var gate_owned: ?[]u16 = null;
+        var up_owned: ?[]u16 = null;
+        defer if (gate_owned) |buf| allocator.free(buf);
+        defer if (up_owned) |buf| allocator.free(buf);
+        switch (layout) {
+            .concat => {
+                gate_vals = out_in.values[0..part_count];
+                up_vals = out_in.values[part_count .. part_count * 2];
+            },
+            .interleaved => {
+                const gate_tmp = try allocator.alloc(u16, part_count);
+                errdefer allocator.free(gate_tmp);
+                const up_tmp = try allocator.alloc(u16, part_count);
+                errdefer allocator.free(up_tmp);
+                var row: usize = 0;
+                while (row < d_ff) : (row += 1) {
+                    const gate_src_row = (2 * row) * input_dim;
+                    const up_src_row = (2 * row + 1) * input_dim;
+                    const dst_row = row * input_dim;
+                    @memcpy(gate_tmp[dst_row .. dst_row + input_dim], out_in.values[gate_src_row .. gate_src_row + input_dim]);
+                    @memcpy(up_tmp[dst_row .. dst_row + input_dim], out_in.values[up_src_row .. up_src_row + input_dim]);
+                }
+                gate_vals = gate_tmp;
+                up_vals = up_tmp;
+                gate_owned = gate_tmp;
+                up_owned = up_tmp;
+            },
+        }
+
+        const gate_bytes = std.mem.sliceAsBytes(gate_vals);
+        const up_bytes = std.mem.sliceAsBytes(up_vals);
+        var gate_tensor = Tensor.view(@constCast(gate_bytes.ptr), &.{ d_ff, input_dim }, fused_gate_up.dtype, gate_bytes.len);
+        var up_tensor = Tensor.view(@constCast(up_bytes.ptr), &.{ d_ff, input_dim }, fused_gate_up.dtype, up_bytes.len);
+        const gate = try uploadLinearWeight(device, allocator, &gate_tensor, input_dim);
+        errdefer {
+            var gate_mut = gate;
+            gate_mut.deinit(device);
+        }
+        const up = try uploadLinearWeight(device, allocator, &up_tensor, input_dim);
+        return .{ .gate = gate, .up = up };
+    }
+
+    if (fused_gate_up.dtype == .f32) {
+        var out_in = try materializeDenseOutInF32(allocator, fused_gate_up, input_dim, out_dim);
+        defer out_in.deinit(allocator);
+
+        const part_count = std.math.mul(usize, d_ff, input_dim) catch return error.InvalidArgument;
+        var gate_vals: []const f32 = undefined;
+        var up_vals: []const f32 = undefined;
+        var gate_owned: ?[]f32 = null;
+        var up_owned: ?[]f32 = null;
+        defer if (gate_owned) |buf| allocator.free(buf);
+        defer if (up_owned) |buf| allocator.free(buf);
+        switch (layout) {
+            .concat => {
+                gate_vals = out_in.values[0..part_count];
+                up_vals = out_in.values[part_count .. part_count * 2];
+            },
+            .interleaved => {
+                const gate_tmp = try allocator.alloc(f32, part_count);
+                errdefer allocator.free(gate_tmp);
+                const up_tmp = try allocator.alloc(f32, part_count);
+                errdefer allocator.free(up_tmp);
+                var row: usize = 0;
+                while (row < d_ff) : (row += 1) {
+                    const gate_src_row = (2 * row) * input_dim;
+                    const up_src_row = (2 * row + 1) * input_dim;
+                    const dst_row = row * input_dim;
+                    @memcpy(gate_tmp[dst_row .. dst_row + input_dim], out_in.values[gate_src_row .. gate_src_row + input_dim]);
+                    @memcpy(up_tmp[dst_row .. dst_row + input_dim], out_in.values[up_src_row .. up_src_row + input_dim]);
+                }
+                gate_vals = gate_tmp;
+                up_vals = up_tmp;
+                gate_owned = gate_tmp;
+                up_owned = up_tmp;
+            },
+        }
+
+        const gate_bytes = std.mem.sliceAsBytes(gate_vals);
+        const up_bytes = std.mem.sliceAsBytes(up_vals);
+        var gate_tensor = Tensor.view(@constCast(gate_bytes.ptr), &.{ d_ff, input_dim }, .f32, gate_bytes.len);
+        var up_tensor = Tensor.view(@constCast(up_bytes.ptr), &.{ d_ff, input_dim }, .f32, up_bytes.len);
+        const gate = try uploadLinearWeight(device, allocator, &gate_tensor, input_dim);
+        errdefer {
+            var gate_mut = gate;
+            gate_mut.deinit(device);
+        }
+        const up = try uploadLinearWeight(device, allocator, &up_tensor, input_dim);
+        return .{ .gate = gate, .up = up };
+    }
+
+    return error.UnsupportedModel;
 }
 
 fn uploadLinearWeightDense(
@@ -5193,4 +5498,70 @@ test "findPositionIndex locates mapped image feature index" {
     try std.testing.expectEqual(@as(?usize, 1), findPositionIndex(positions[0..], 5));
     try std.testing.expectEqual(@as(?usize, 2), findPositionIndex(positions[0..], 9));
     try std.testing.expectEqual(@as(?usize, null), findPositionIndex(positions[0..], 7));
+}
+
+test "materializeDenseOutInU16 handles out-in and in-out source layouts" {
+    var out_in_data = [_]u16{
+        1,  2,  3,
+        4,  5,  6,
+        7,  8,  9,
+        10, 11, 12,
+    };
+    var out_in_tensor = Tensor.view(std.mem.sliceAsBytes(out_in_data[0..]).ptr, &.{ 4, 3 }, .bf16, std.mem.sliceAsBytes(out_in_data[0..]).len);
+    var out_in_view = try materializeDenseOutInU16(std.testing.allocator, &out_in_tensor, 3, 4);
+    defer out_in_view.deinit(std.testing.allocator);
+    try std.testing.expect(out_in_view.owned == null);
+    for (out_in_data, out_in_view.values) |want, got| {
+        try std.testing.expectEqual(want, got);
+    }
+
+    var in_out_data = [_]u16{
+        1, 2,  3,  4,
+        5, 6,  7,  8,
+        9, 10, 11, 12,
+    };
+    var in_out_tensor = Tensor.view(std.mem.sliceAsBytes(in_out_data[0..]).ptr, &.{ 3, 4 }, .bf16, std.mem.sliceAsBytes(in_out_data[0..]).len);
+    var in_out_view = try materializeDenseOutInU16(std.testing.allocator, &in_out_tensor, 3, 4);
+    defer in_out_view.deinit(std.testing.allocator);
+    try std.testing.expect(in_out_view.owned != null);
+    const expected = [_]u16{
+        1, 5, 9,
+        2, 6, 10,
+        3, 7, 11,
+        4, 8, 12,
+    };
+    for (expected, in_out_view.values) |want, got| {
+        try std.testing.expectEqual(want, got);
+    }
+}
+
+test "materializeDenseOutInF32 handles out-in and in-out source layouts" {
+    var out_in_data = [_]f32{
+        1,  2,  3,
+        4,  5,  6,
+        7,  8,  9,
+        10, 11, 12,
+    };
+    var out_in_tensor = Tensor.view(std.mem.sliceAsBytes(out_in_data[0..]).ptr, &.{ 4, 3 }, .f32, std.mem.sliceAsBytes(out_in_data[0..]).len);
+    var out_in_view = try materializeDenseOutInF32(std.testing.allocator, &out_in_tensor, 3, 4);
+    defer out_in_view.deinit(std.testing.allocator);
+    try std.testing.expect(out_in_view.owned == null);
+    try std.testing.expectEqualSlices(f32, out_in_data[0..], out_in_view.values);
+
+    var in_out_data = [_]f32{
+        1, 2,  3,  4,
+        5, 6,  7,  8,
+        9, 10, 11, 12,
+    };
+    var in_out_tensor = Tensor.view(std.mem.sliceAsBytes(in_out_data[0..]).ptr, &.{ 3, 4 }, .f32, std.mem.sliceAsBytes(in_out_data[0..]).len);
+    var in_out_view = try materializeDenseOutInF32(std.testing.allocator, &in_out_tensor, 3, 4);
+    defer in_out_view.deinit(std.testing.allocator);
+    try std.testing.expect(in_out_view.owned != null);
+    const expected = [_]f32{
+        1, 5, 9,
+        2, 6, 10,
+        3, 7, 11,
+        4, 8, 12,
+    };
+    try std.testing.expectEqualSlices(f32, expected[0..], in_out_view.values);
 }
