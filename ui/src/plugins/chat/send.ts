@@ -100,6 +100,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   let usageStats: UsageStats | null = null;
   let streamSessionId: string | null = chatState.activeSessionId;
   let sidebarRefreshed = false;
+  const projectIdForSession = chatState.pendingProjectId;
 
   const onSessionDiscovered = (sid: string) => {
     streamSessionId = sid;
@@ -108,6 +109,9 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
     } else {
       chatState.backgroundStreamSessions.add(sid);
     }
+    // Clear draft placeholder now that the real session exists.
+    const draftWasPinned = chatState.draftSession?.pinned ?? false;
+    chatState.draftSession = null;
     // Optimistically add to the sidebar so the session is navigable immediately,
     // without waiting for the full API refresh round-trip.
     if (!chatState.sessions.some(s => s.id === sid)) {
@@ -119,14 +123,18 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
         updated_at: now,
         model: getModelsService()?.getActiveModel() ?? "",
         title: opts.text.slice(0, 47) || null,
-        marker: "active",
+        marker: draftWasPinned ? "pinned" : "active",
         group_id: null,
         parent_session_id: null,
         source_doc_id: null,
-        project_id: undefined,
+        project_id: projectIdForSession ?? undefined,
         metadata: {},
       });
       renderSidebar();
+    }
+    // Persist draft pin to server.
+    if (draftWasPinned) {
+      void api.patchConversation(sid, { marker: "pinned" });
     }
     if (!sidebarRefreshed) {
       sidebarRefreshed = true;
@@ -142,6 +150,12 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       instructions: resolveInstructions(opts.promptId),
       ...getSamplingParams(),
     };
+
+    // Inject pending project so the server creates the session under that project.
+    if (chatState.pendingProjectId) {
+      requestBody.metadata = { ...requestBody.metadata, project_id: chatState.pendingProjectId };
+      chatState.pendingProjectId = null;
+    }
 
     // Run chat.send.before hook — plugins can modify the request or block it.
     const hookResult = await hooks.run<CreateResponseRequest>("chat.send.before", requestBody);

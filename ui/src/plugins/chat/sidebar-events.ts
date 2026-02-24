@@ -3,9 +3,10 @@ import { chatState } from "./state.ts";
 import { handleTogglePin, showProjectContextMenu } from "./sidebar-actions.ts";
 import { selectChat } from "./selection.ts";
 import { startNewConversation } from "./welcome.ts";
-import { renderSidebar } from "./sidebar-list.ts";
+import { renderSidebar, setNewChatHandler } from "./sidebar-list.ts";
 
 export function setupSidebarEvents(): void {
+  setNewChatHandler((projectId) => startNewConversation(projectId));
   const dom = getChatDom();
 
   dom.sidebarList.addEventListener("click", (e) => {
@@ -18,10 +19,14 @@ export function setupSidebarEvents(): void {
       return;
     }
 
-    // Click on sidebar item → open chat
+    // Click on sidebar item → open chat (or restore draft)
     const item = target.closest<HTMLElement>(".sidebar-item");
     if (item?.dataset["id"]) {
-      selectChat(item.dataset["id"]);
+      if (item.dataset["id"] === "__draft__") {
+        startNewConversation(chatState.draftSession?.projectId);
+      } else {
+        selectChat(item.dataset["id"]);
+      }
     }
   });
 

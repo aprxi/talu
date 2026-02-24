@@ -17,6 +17,13 @@ function getKnownProjects(): { value: string; count: number }[] {
 }
 
 export async function handleTogglePin(chatId: string): Promise<void> {
+  // Draft pin is local-only (no API call).
+  if (chatId === "__draft__" && chatState.draftSession) {
+    chatState.draftSession.pinned = !chatState.draftSession.pinned;
+    renderSidebar();
+    return;
+  }
+
   const session = chatState.sessions.find((s) => s.id === chatId);
   if (!session) return;
 

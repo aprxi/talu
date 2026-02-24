@@ -29,7 +29,7 @@ export function hideInputBar(): void {
   getChatDom().inputBar.classList.add("hidden");
 }
 
-export function startNewConversation(): void {
+export function startNewConversation(projectId?: string | null): void {
   // If the current view has an active stream, save the transcript DOM so the
   // stream can continue writing to detached elements while backgrounded.
   const currentId = chatState.activeSessionId;
@@ -51,6 +51,12 @@ export function startNewConversation(): void {
   chatState.activeSessionId = null;
   chatState.activeChat = null;
   chatState.lastResponseId = null;
+  chatState.pendingProjectId = projectId ?? null;
+  chatState.draftSession = { projectId: projectId ?? null, pinned: false };
+
+  // Ensure the project group is open so the draft item is visible.
+  const groupKey = projectId ?? "__default__";
+  chatState.collapsedGroups.delete(groupKey);
   renderSidebar();
 
   dom.transcriptContainer.innerHTML = "";

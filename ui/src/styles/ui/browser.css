@@ -109,6 +109,10 @@
   color: var(--primary);
 }
 
+.sidebar-item.draft {
+  opacity: 0.45;
+}
+
 .sidebar-item.forked {
   border-left: 2px solid #a855f7;
   padding-left: calc(0.75rem - 2px);

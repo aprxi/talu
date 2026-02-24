@@ -1,11 +1,17 @@
 import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
-import { api, notifications, observe } from "./deps.ts";
+import { api, notifications, observe, getModelsService } from "./deps.ts";
 import { renderSidebarItem, renderSectionLabel } from "../../render/sidebar.ts";
 import { renderEmptyState } from "../../render/common.ts";
 import { el, isPinned, isArchived } from "../../render/helpers.ts";
 import { CHEVRON_DOWN_ICON, CHEVRON_RIGHT_ICON } from "../../icons.ts";
 import type { Conversation } from "../../types.ts";
+
+/** Callback for "New Chat" in a project group. Set by sidebar-events to avoid circular imports. */
+let onNewChat: ((projectId: string | null) => void) | null = null;
+export function setNewChatHandler(handler: (projectId: string | null) => void): void {
+  onNewChat = handler;
+}
 
 const COLLAPSED_LIMIT = 3;
 
@@ -101,16 +107,24 @@ function renderGroupedList(
   }
 
   // Group by project, discovering groups from data.
-  const groups = new Map<string, Conversation[]>();
+  const groupMap = new Map<string, Conversation[]>();
   for (const s of filtered) {
     const key = projectKey(s);
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key)!.push(s);
+    if (!groupMap.has(key)) groupMap.set(key, []);
+    groupMap.get(key)!.push(s);
   }
 
-  const multiGroup = groups.size > 1;
+  // Stable sort: "__default__" first, then alphabetical.
+  const sortedKeys = [...groupMap.keys()].sort((a, b) => {
+    if (a === "__default__") return -1;
+    if (b === "__default__") return 1;
+    return a.localeCompare(b);
+  });
 
-  for (const [pValue, sessions] of groups) {
+  const multiGroup = sortedKeys.length > 1;
+
+  for (const pValue of sortedKeys) {
+    const sessions = groupMap.get(pValue)!;
     if (sessions.length === 0) continue;
 
     const pinned = sessions.filter(isPinned);
@@ -150,7 +164,9 @@ function renderGroupedList(
       label.addEventListener("click", toggleCollapse);
     }
 
-    // Show-more toggle on the right (only when open and has enough items).
+    const controls = el("span", "sidebar-group-controls");
+
+    // Show-more/less toggle (only when open and has enough items).
     if (isOpen && canShowMore) {
       const hiddenCount = isFullyExpanded ? 0 : unpinned.length - COLLAPSED_LIMIT;
       const moreBtn = el("button", "sidebar-group-toggle", isFullyExpanded ? "less" : `+${hiddenCount}`);
@@ -163,21 +179,63 @@ function renderGroupedList(
         }
         renderSidebar();
       });
-      label.appendChild(moreBtn);
+      controls.appendChild(moreBtn);
     }
+
+    // "+" new chat button.
+    if (onNewChat) {
+      const projectForNew = pValue === "__default__" ? null : pValue;
+      const addBtn = el("button", "sidebar-group-add");
+      addBtn.textContent = "+";
+      addBtn.title = "New chat in this project";
+      addBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        onNewChat!(projectForNew);
+      });
+      controls.appendChild(addBtn);
+    }
+
+    label.appendChild(controls);
 
     dom.sidebarList.insertBefore(label, dom.sidebarSentinel);
 
     // If collapsed, skip rendering items.
     if (!isOpen) continue;
 
-    // Pinned items always shown.
+    // Draft item for this group (if any).
+    const draftGroupKey = chatState.draftSession?.projectId ?? "__default__";
+    const hasDraft = chatState.draftSession && draftGroupKey === pValue;
+    const insertDraft = () => {
+      const now = Math.floor(Date.now() / 1000);
+      const draftItem = renderSidebarItem({
+        id: "__draft__",
+        object: "session",
+        created_at: now,
+        updated_at: now,
+        model: getModelsService()?.getActiveModel() ?? "",
+        title: "New Chat",
+        marker: chatState.draftSession!.pinned ? "pinned" : "",
+        group_id: null,
+        parent_session_id: null,
+        source_doc_id: null,
+        project_id: chatState.draftSession!.projectId,
+        metadata: {},
+      }, true, false);
+      draftItem.classList.add("draft");
+      dom.sidebarList.insertBefore(draftItem, dom.sidebarSentinel);
+    };
+
+    // Pinned items + pinned draft first.
+    if (hasDraft && chatState.draftSession!.pinned) insertDraft();
     for (const session of pinned) {
       dom.sidebarList.insertBefore(
         renderSidebarItem(session, session.id === chatState.activeSessionId, isGen(session.id)),
         dom.sidebarSentinel,
       );
     }
+
+    // Unpinned draft, then unpinned items.
+    if (hasDraft && !chatState.draftSession!.pinned) insertDraft();
 
     // Unpinned: limited when multi-group and not fully expanded.
     const showAll = !multiGroup || isFullyExpanded;

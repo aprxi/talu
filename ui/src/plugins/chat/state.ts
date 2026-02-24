@@ -37,6 +37,10 @@ export interface ChatState {
   /** Whether system prompts are enabled (from settings). */
   systemPromptEnabled: boolean;
   sidebarSearchQuery: string;
+  /** Project ID to assign to the next new session (set by "New Chat" in a project group). */
+  pendingProjectId: string | null;
+  /** Draft sidebar item shown while composing a new chat (before first send). */
+  draftSession: { projectId: string | null; pinned: boolean } | null;
   /** Project groups collapsed in the sidebar (items hidden). */
   collapsedGroups: Set<string>;
   /** Project groups fully expanded (showing all items, not just 3). */
@@ -65,6 +69,8 @@ export const chatState: ChatState = {
   backgroundStreamDom: new Map(),
   systemPromptEnabled: true,
   sidebarSearchQuery: "",
+  pendingProjectId: null,
+  draftSession: null,
   collapsedGroups: (() => {
     try {
       const raw = localStorage.getItem("talu-collapsed-groups");
