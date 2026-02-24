@@ -1,8 +1,20 @@
 import { chatState } from "./state.ts";
 import { api, notifications, layout } from "./deps.ts";
-import { renderSidebar, loadAvailableProjects } from "./sidebar-list.ts";
+import { renderSidebar } from "./sidebar-list.ts";
 import { isPinned } from "../../render/helpers.ts";
 import { renderProjectPicker } from "../../render/project-picker.ts";
+
+/** Derive project list from loaded sessions (for the right-click project picker). */
+function getKnownProjects(): { value: string; count: number }[] {
+  const counts = new Map<string, number>();
+  for (const s of chatState.sessions) {
+    const key = s.project_id ?? "__default__";
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([value, count]) => ({ value, count }))
+    .sort((a, b) => b.count - a.count);
+}
 
 export async function handleTogglePin(chatId: string): Promise<void> {
   const session = chatState.sessions.find((s) => s.id === chatId);
@@ -73,7 +85,7 @@ export function showProjectContextMenu(anchor: HTMLElement, chatId: string): voi
     anchor,
     content: renderProjectPicker({
       currentProjectId,
-      projects: chatState.availableProjects,
+      projects: getKnownProjects(),
       onSelect: (projectId) => {
         popoverDisposable.dispose();
         void handleSetProject(chatId, projectId);
@@ -108,6 +120,5 @@ export async function handleSetProject(chatId: string, projectId: string | null)
     return;
   }
 
-  // Refresh aggregations so combo-box counts update.
-  void loadAvailableProjects();
+  renderSidebar();
 }

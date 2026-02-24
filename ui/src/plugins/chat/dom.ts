@@ -8,7 +8,6 @@ export interface ChatDom {
   sidebarList: HTMLElement;
   sidebarSentinel: HTMLElement;
   newConversationBtn: HTMLButtonElement;
-  sidebarProjectCombo: HTMLElement;
   sidebarSearch: HTMLInputElement;
   sidebarSearchClear: HTMLButtonElement;
 
@@ -75,7 +74,6 @@ export function getChatDom(): ChatDom {
     sidebarList: q("#sidebar-list"),
     sidebarSentinel: q("#loader-sentinel"),
     newConversationBtn: q<HTMLButtonElement>("#new-conversation"),
-    sidebarProjectCombo: q<HTMLElement>("#sidebar-project-combo"),
     sidebarSearch: q<HTMLInputElement>("#sidebar-search"),
     sidebarSearchClear: q<HTMLButtonElement>("#sidebar-search-clear"),
 

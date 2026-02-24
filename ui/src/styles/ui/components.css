@@ -604,6 +604,7 @@
   color: var(--text-muted);
 }
 
+.project-list-clear,
 .project-list-add {
   font-size: 14px;
   color: var(--text-muted);
@@ -615,6 +616,7 @@
   font-family: inherit;
 }
 
+.project-list-clear:hover,
 .project-list-add:hover {
   color: var(--primary);
 }

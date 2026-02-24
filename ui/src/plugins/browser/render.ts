@@ -164,8 +164,8 @@ export function updateBrowserProjectSelector(): void {
   const dom = getBrowserDom();
   dom.projectCombo.innerHTML = "";
 
-  const applyFilter = (value: string) => {
-    search.projectFilter = value || null;
+  const applyFilter = (values: string[]) => {
+    search.projectFilter = values.length > 0 ? values[values.length - 1]! : null;
     bState.pagination.currentPage = 1;
     bState.selectedIds.clear();
     updateBrowserToolbar();
@@ -174,10 +174,10 @@ export function updateBrowserProjectSelector(): void {
 
   dom.projectCombo.appendChild(
     renderProjectList({
-      currentValue: search.projectFilter ?? "",
+      currentValues: search.projectFilter ? [search.projectFilter] : [],
       projects: search.availableProjects,
       onSelect: applyFilter,
-      onCreate: (name) => applyFilter(name),
+      onCreate: (name) => applyFilter([name]),
     }),
   );
 }

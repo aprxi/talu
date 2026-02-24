@@ -42,24 +42,31 @@ export function removeUserProject(name: string): void {
 }
 
 export interface ProjectListOptions {
-  /** Current project filter ("" = All, "__default__" = Default, or project name). */
-  currentValue: string;
+  /** Currently selected project IDs (empty = All). */
+  currentValues: string[];
   /** Available projects from search aggregation (includes __default__). */
   projects: { value: string; count: number }[];
-  /** Called when user selects a project. "" = clear filter. */
-  onSelect: (projectId: string) => void;
+  /** Called with the updated selection array after a toggle. */
+  onSelect: (projectIds: string[]) => void;
   /** Called when user creates a new project via the "+" input. */
   onCreate: (name: string) => void;
 }
 
 export function renderProjectList(options: ProjectListOptions): HTMLElement {
-  const { currentValue, projects, onSelect, onCreate } = options;
+  const { currentValues, projects, onSelect, onCreate } = options;
   const root = el("div", "project-list");
 
   // Header: "Projects" label + "+" button.
   const header = el("div", "project-list-header");
   const label = el("span", undefined, "Projects");
   header.appendChild(label);
+
+  if (currentValues.length > 0) {
+    const clearBtn = el("button", "project-list-clear", "\u00d7");
+    clearBtn.title = "Clear selection";
+    clearBtn.addEventListener("click", () => onSelect([]));
+    header.appendChild(clearBtn);
+  }
 
   const addBtn = el("button", "project-list-add", "+");
   addBtn.title = "New project";
@@ -69,18 +76,12 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
   // Items container.
   const items = el("div", "project-list-items");
 
-  // "All" button (no filter).
-  const allBtn = el("button", currentValue === "" ? "project-list-item active" : "project-list-item");
-  allBtn.dataset["value"] = "";
-  allBtn.textContent = "All";
-  items.appendChild(allBtn);
-
   // Collect project names already in the aggregation.
   const aggValues = new Set(projects.map((p) => p.value));
 
   // Render __default__ and named projects from aggregation.
   for (const p of projects) {
-    const isActive = p.value === currentValue;
+    const isActive = currentValues.includes(p.value);
     const btn = el("button", isActive ? "project-list-item active" : "project-list-item");
     btn.dataset["value"] = p.value;
 
@@ -97,7 +98,7 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
   // Merge user-created projects that aren't yet in the aggregation (0 sessions).
   for (const name of loadUserProjects()) {
     if (aggValues.has(name)) continue;
-    const isActive = name === currentValue;
+    const isActive = currentValues.includes(name);
     const btn = el("button", isActive ? "project-list-item active" : "project-list-item");
     btn.dataset["value"] = name;
     btn.appendChild(document.createTextNode(name));
@@ -122,12 +123,15 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
     if (!target || target.dataset["value"] == null) return;
 
     const value = target.dataset["value"]!;
-    // Clicking the already-active item deselects (clears filter).
-    if (value === currentValue && value !== "") {
-      onSelect("");
+    // Toggle: add if not present, remove if present.
+    const next = [...currentValues];
+    const idx = next.indexOf(value);
+    if (idx >= 0) {
+      next.splice(idx, 1);
     } else {
-      onSelect(value);
+      next.push(value);
     }
+    onSelect(next);
   });
 
   addBtn.addEventListener("click", () => {

@@ -37,10 +37,10 @@ export interface ChatState {
   /** Whether system prompts are enabled (from settings). */
   systemPromptEnabled: boolean;
   sidebarSearchQuery: string;
-  /** Active project filter — only sessions in this project are shown/created. */
-  activeProjectId: string | null;
-  /** Available projects from search aggregation (complete, not limited by pagination). */
-  availableProjects: { value: string; count: number }[];
+  /** Project groups collapsed in the sidebar (items hidden). */
+  collapsedGroups: Set<string>;
+  /** Project groups fully expanded (showing all items, not just 3). */
+  expandedGroups: Set<string>;
   pagination: {
     offset: number;
     hasMore: boolean;
@@ -65,8 +65,15 @@ export const chatState: ChatState = {
   backgroundStreamDom: new Map(),
   systemPromptEnabled: true,
   sidebarSearchQuery: "",
-  activeProjectId: localStorage.getItem("talu-active-project") || null,
-  availableProjects: [],
+  collapsedGroups: (() => {
+    try {
+      const raw = localStorage.getItem("talu-collapsed-groups");
+      return raw ? new Set(JSON.parse(raw) as string[]) : new Set<string>();
+    } catch {
+      return new Set<string>();
+    }
+  })(),
+  expandedGroups: new Set(),
   pagination: {
     offset: 0,
     hasMore: true,
