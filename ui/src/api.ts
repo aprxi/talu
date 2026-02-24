@@ -119,16 +119,16 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
       if (opts?.marker) params.set("marker", opts.marker);
       if (opts?.search) params.set("search", opts.search);
       if (opts?.tags_any) params.set("tags_any", opts.tags_any);
-      return requestJson<ConversationList>("GET", `/v1/conversations?${params}`);
+      return requestJson<ConversationList>("GET", `/v1/sessions?${params}`);
     },
     search: (req) => requestJson<SearchResponse>("POST", "/v1/search", req),
-    getConversation: (id) => requestJson<Conversation>("GET", `/v1/conversations/${encodeURIComponent(id)}`),
-    patchConversation: (id, patch) => requestJson<Conversation>("PATCH", `/v1/conversations/${encodeURIComponent(id)}`, patch),
-    deleteConversation: (id) => requestJson<void>("DELETE", `/v1/conversations/${encodeURIComponent(id)}`),
-    batchConversations: (req) => requestJson<void>("POST", "/v1/conversations/batch", req),
-    forkConversation: (id, body) => requestJson<Conversation>("POST", `/v1/conversations/${encodeURIComponent(id)}/fork`, body),
-    addConversationTags: (id, tags) => requestJson<{ tags: ConversationTag[] }>("POST", `/v1/conversations/${encodeURIComponent(id)}/tags`, { tags }),
-    removeConversationTags: (id, tags) => requestJson<{ tags: ConversationTag[] }>("DELETE", `/v1/conversations/${encodeURIComponent(id)}/tags`, { tags }),
+    getConversation: (id) => requestJson<Conversation>("GET", `/v1/sessions/${encodeURIComponent(id)}`),
+    patchConversation: (id, patch) => requestJson<Conversation>("PATCH", `/v1/sessions/${encodeURIComponent(id)}`, patch),
+    deleteConversation: (id) => requestJson<void>("DELETE", `/v1/sessions/${encodeURIComponent(id)}`),
+    batchConversations: (req) => requestJson<void>("POST", "/v1/sessions/batch", req),
+    forkConversation: (id, body) => requestJson<Conversation>("POST", `/v1/sessions/${encodeURIComponent(id)}/fork`, body),
+    addConversationTags: (id, tags) => requestJson<{ tags: ConversationTag[] }>("POST", `/v1/sessions/${encodeURIComponent(id)}/tags`, { tags }),
+    removeConversationTags: (id, tags) => requestJson<{ tags: ConversationTag[] }>("DELETE", `/v1/sessions/${encodeURIComponent(id)}/tags`, { tags }),
     getSettings: () => requestJson<Settings>("GET", "/v1/settings"),
     patchSettings: (patch) => requestJson<Settings>("PATCH", "/v1/settings", patch),
     resetModelOverrides: (modelId) => requestJson<Settings>("DELETE", `/v1/settings/models/${modelId}`),

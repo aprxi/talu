@@ -27,7 +27,7 @@ export interface Conversation {
   items?: Item[];
 }
 
-/** Paginated list response from GET /v1/conversations. */
+/** Paginated list response from GET /v1/sessions. */
 export interface ConversationList {
   object: "list";
   data: Conversation[];
@@ -36,14 +36,14 @@ export interface ConversationList {
   total: number;
 }
 
-/** Patch body for PATCH /v1/conversations/{id}. */
+/** Patch body for PATCH /v1/sessions/{id}. */
 export interface ConversationPatch {
   title?: string;
   marker?: string;
   metadata?: Record<string, unknown>;
 }
 
-/** Fork body for POST /v1/conversations/{id}/fork. */
+/** Fork body for POST /v1/sessions/{id}/fork. */
 export interface ForkRequest {
   target_item_id?: number;
 }
@@ -339,7 +339,7 @@ export interface ValueAggregation {
 // Batch Operations API types
 // ---------------------------------------------------------------------------
 
-/** Batch operation request for POST /v1/conversations/batch. */
+/** Batch operation request for POST /v1/sessions/batch. */
 export interface BatchRequest {
   action: "delete" | "archive" | "unarchive" | "add_tags" | "remove_tags";
   ids: string[];
