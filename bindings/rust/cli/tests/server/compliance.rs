@@ -262,8 +262,8 @@ async fn test_unknown_path_404() {
 #[tokio::test]
 async fn test_known_unimplemented_501() {
     let app = build_app_no_model();
-    // GET /v1/chat/generate is a known OpenAPI path (POST is implemented) but GET is not
-    let resp = send_request(&app, get("/v1/chat/generate")).await;
+    // GET /v1/responses is a known OpenAPI path (POST is implemented) but GET is not
+    let resp = send_request(&app, get("/v1/responses")).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::NOT_IMPLEMENTED);
     let error = json.get("error").expect("should have error object");
@@ -274,13 +274,13 @@ async fn test_known_unimplemented_501() {
 }
 
 // ===========================================================================
-// J2. POST /v1/chat/generate — request validation
+// J2. POST /v1/responses — request validation
 // ===========================================================================
 
 #[tokio::test]
 async fn test_invalid_json_400() {
     let app = build_app_no_model();
-    let resp = send_request(&app, post_raw("/v1/chat/generate", b"{not json")).await;
+    let resp = send_request(&app, post_raw("/v1/responses", b"{not json")).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let error = json.get("error").expect("should have error");
@@ -299,7 +299,7 @@ async fn test_invalid_json_400() {
 async fn test_missing_input_400() {
     let app = build_app_no_model();
     let body = serde_json::json!({"model": "test"});
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, _json) = body_json(resp).await;
     assert_eq!(
         status,
@@ -317,7 +317,7 @@ async fn test_string_input_accepted() {
         "input": "Hello",
         "max_output_tokens": 5,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(
         status,
@@ -335,7 +335,7 @@ async fn test_message_array_input_accepted() {
         "input": [{"type": "message", "role": "user", "content": "Hi"}],
         "max_output_tokens": 5,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, _json) = body_json(resp).await;
     assert_eq!(
         status,
@@ -345,7 +345,7 @@ async fn test_message_array_input_accepted() {
 }
 
 // ===========================================================================
-// J3. POST /v1/chat/generate — response envelope (non-streaming)
+// J3. POST /v1/responses — response envelope (non-streaming)
 // ===========================================================================
 
 #[tokio::test]
@@ -357,7 +357,7 @@ async fn test_response_envelope() {
         "input": "Say hello",
         "max_output_tokens": 10,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::OK);
 
@@ -389,7 +389,7 @@ async fn test_response_model_matches() {
         "input": "Hi",
         "max_output_tokens": 5,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (_, json) = body_json(resp).await;
     let resp_model = json
         .get("model")
@@ -407,7 +407,7 @@ async fn test_response_output_shape() {
         "input": "Hello",
         "max_output_tokens": 200,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (_, json) = body_json(resp).await;
 
     let output = json
@@ -445,7 +445,7 @@ async fn test_response_content_shape() {
         "input": "Say hi",
         "max_output_tokens": 200,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (_, json) = body_json(resp).await;
 
     let output = json.get("output").and_then(|v| v.as_array()).unwrap();
@@ -478,7 +478,7 @@ async fn test_response_usage() {
         "input": "Count to three",
         "max_output_tokens": 20,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (_, json) = body_json(resp).await;
 
     let usage = json.get("usage").expect("should have usage");
@@ -508,7 +508,7 @@ async fn test_response_content_type_header() {
         "input": "Hi",
         "max_output_tokens": 5,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let ct = resp
         .headers()
         .get("content-type")
@@ -522,7 +522,7 @@ async fn test_response_content_type_header() {
 }
 
 // ===========================================================================
-// J4. POST /v1/chat/generate — streaming (SSE)
+// J4. POST /v1/responses — streaming (SSE)
 // ===========================================================================
 
 /// Collect SSE events from a streaming response.
@@ -565,7 +565,7 @@ async fn test_streaming_content_type() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hi")),
+        post_json("/v1/responses", &streaming_request(&model, "Hi")),
     )
     .await;
     let ct = resp
@@ -586,7 +586,7 @@ async fn test_streaming_cache_headers() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hi")),
+        post_json("/v1/responses", &streaming_request(&model, "Hi")),
     )
     .await;
     let cc = resp
@@ -606,7 +606,7 @@ async fn test_streaming_sequence() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -636,7 +636,7 @@ async fn test_streaming_created_event() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -658,7 +658,7 @@ async fn test_streaming_delta_events() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -682,7 +682,7 @@ async fn test_streaming_done_event() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -704,7 +704,7 @@ async fn test_streaming_completed_event() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -752,7 +752,7 @@ async fn test_streaming_sequence_numbers() {
     let app = build_app_with_model(&model);
     let resp = send_request(
         &app,
-        post_json("/v1/chat/generate", &streaming_request(&model, "Hello")),
+        post_json("/v1/responses", &streaming_request(&model, "Hello")),
     )
     .await;
     let events = collect_sse_events(resp).await;
@@ -779,7 +779,7 @@ async fn test_streaming_sequence_numbers() {
 #[tokio::test]
 async fn test_error_json_structure() {
     let app = build_app_no_model();
-    let resp = send_request(&app, post_raw("/v1/chat/generate", b"invalid")).await;
+    let resp = send_request(&app, post_raw("/v1/responses", b"invalid")).await;
     let (status, json) = body_json(resp).await;
     assert!(status.is_client_error(), "should be 4xx error");
     let error = json.get("error").expect("should have error object");
@@ -796,7 +796,7 @@ async fn test_error_json_structure() {
 #[tokio::test]
 async fn test_error_content_type() {
     let app = build_app_no_model();
-    let resp = send_request(&app, post_raw("/v1/chat/generate", b"invalid")).await;
+    let resp = send_request(&app, post_raw("/v1/responses", b"invalid")).await;
     let ct = resp
         .headers()
         .get("content-type")
@@ -812,7 +812,7 @@ async fn test_error_content_type() {
 #[tokio::test]
 async fn test_400_invalid_body() {
     let app = build_app_no_model();
-    let resp = send_request(&app, post_raw("/v1/chat/generate", b"not json at all")).await;
+    let resp = send_request(&app, post_raw("/v1/responses", b"not json at all")).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(
@@ -836,7 +836,7 @@ async fn test_structured_user_message_input() {
         "input": [{"type": "message", "role": "user", "content": "Say hello"}],
         "max_output_tokens": 200,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::OK, "structured input should succeed");
     assert_eq!(
@@ -862,7 +862,7 @@ async fn test_system_and_user_message_input() {
         ],
         "max_output_tokens": 200,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::OK, "system+user input should succeed");
     let output = json
@@ -884,7 +884,7 @@ async fn test_developer_message_input() {
         ],
         "max_output_tokens": 200,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, _) = body_json(resp).await;
     assert_eq!(
         status,
@@ -908,7 +908,7 @@ async fn test_conversation_chaining() {
         "input": "Hello, my name is Alice.",
         "max_output_tokens": 50,
     });
-    let resp1 = send_request(&app, post_json("/v1/chat/generate", &body1)).await;
+    let resp1 = send_request(&app, post_json("/v1/responses", &body1)).await;
     let (status1, json1) = body_json(resp1).await;
     assert_eq!(status1, StatusCode::OK, "first request should succeed");
     let response_id = json1
@@ -923,7 +923,7 @@ async fn test_conversation_chaining() {
         "previous_response_id": response_id,
         "max_output_tokens": 50,
     });
-    let resp2 = send_request(&app, post_json("/v1/chat/generate", &body2)).await;
+    let resp2 = send_request(&app, post_json("/v1/responses", &body2)).await;
     let (status2, json2) = body_json(resp2).await;
     assert_eq!(status2, StatusCode::OK, "chained request should succeed");
     assert_eq!(
@@ -946,7 +946,7 @@ async fn test_multi_item_output() {
         "input": "What is 2+2?",
         "max_output_tokens": 200,
     });
-    let resp = send_request(&app, post_json("/v1/chat/generate", &body)).await;
+    let resp = send_request(&app, post_json("/v1/responses", &body)).await;
     let (status, json) = body_json(resp).await;
     assert_eq!(status, StatusCode::OK);
 

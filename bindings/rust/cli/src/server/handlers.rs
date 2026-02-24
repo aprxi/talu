@@ -17,8 +17,6 @@ use tokio_stream::StreamExt;
 use crate::bucket_settings;
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
-use crate::server::chat_generate_types;
-use crate::server::http;
 use crate::server::responses_types;
 use crate::server::state::{AppState, StoredResponse};
 use talu::documents::{DocumentError, DocumentsHandle};
@@ -26,18 +24,6 @@ use talu::responses::{ContentType, ItemType};
 use talu::{ChatHandle, FinishReason};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-enum ApiSurface {
-    Chat,
-    Responses,
-}
-
-impl ApiSurface {
-    fn strict_responses(self) -> bool {
-        matches!(self, Self::Responses)
-    }
-}
 
 #[derive(Debug, Clone)]
 struct GenerationRequest {
@@ -103,37 +89,21 @@ impl From<anyhow::Error> for ResponseError {
     }
 }
 
-#[utoipa::path(post, path = "/v1/chat/generate", tag = "Chat::Generate",
-    request_body = chat_generate_types::CreateChatGenerateBody,
-    responses(
-        (status = 200, body = chat_generate_types::ChatGenerateResponseResource),
-        (status = 400, body = http::ErrorResponse, description = "Invalid request"),
-        (status = 500, body = http::ErrorResponse, description = "Generation failed"),
-    ))]
-pub async fn handle_chat_generate(
-    state: Arc<AppState>,
-    req: Request<Incoming>,
-    auth_ctx: Option<AuthContext>,
-) -> Response<BoxBody> {
-    handle_generate(state, req, auth_ctx, ApiSurface::Chat).await
-}
-
 pub async fn handle_responses(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    handle_generate(state, req, auth_ctx, ApiSurface::Responses).await
+    handle_generate(state, req, auth_ctx).await
 }
 
 async fn handle_generate(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth_ctx: Option<AuthContext>,
-    surface: ApiSurface,
 ) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
-    let strict_responses = surface.strict_responses();
+    let strict_responses = true;
     if let Some(ctx) = auth_ctx.as_ref() {
         log::info!(
             target: "server::gen",
@@ -178,29 +148,17 @@ async fn handle_generate(
             &format!("Invalid JSON: {err}"),
         )
     };
-    match surface {
-        ApiSurface::Chat => {
-            if let Err(err) =
-                serde_json::from_slice::<chat_generate_types::CreateChatGenerateBody>(&body_bytes)
-            {
-                return parse_error(err);
-            }
-        }
-        ApiSurface::Responses => {
-            let parsed =
-                match serde_json::from_slice::<responses_types::CreateResponseBody>(&body_bytes) {
-                    Ok(val) => val,
-                    Err(err) => return parse_error(err),
-                };
-            if let Err(message) = validate_responses_request(&parsed) {
-                return api_error(
-                    strict_responses,
-                    StatusCode::BAD_REQUEST,
-                    "invalid_request",
-                    &message,
-                );
-            }
-        }
+    let parsed = match serde_json::from_slice::<responses_types::CreateResponseBody>(&body_bytes) {
+        Ok(val) => val,
+        Err(err) => return parse_error(err),
+    };
+    if let Err(message) = validate_responses_request(&parsed) {
+        return api_error(
+            strict_responses,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &message,
+        );
     }
 
     let request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
@@ -2306,11 +2264,7 @@ fn build_response_resource_value(
 }
 
 fn normalize_response_value(value: serde_json::Value) -> serde_json::Value {
-    match serde_json::from_value::<chat_generate_types::ChatGenerateResponseResource>(value.clone())
-    {
-        Ok(val) => serde_json::to_value(val).unwrap_or(value),
-        Err(_) => value,
-    }
+    value
 }
 
 async fn select_model_id(state: Arc<AppState>, request_model: Option<String>) -> Result<String> {

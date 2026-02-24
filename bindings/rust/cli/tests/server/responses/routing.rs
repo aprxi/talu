@@ -25,6 +25,31 @@ fn responses_rejects_non_spec_fields() {
 }
 
 #[test]
+fn responses_rejects_chat_only_prompt_id_field() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "prompt_id": "doc_legacy_prompt"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_legacy_sampling_fields() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "top_k": 40,
+        "min_p": 0.05,
+        "repetition_penalty": 1.1,
+        "seed": 42
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
 fn responses_alias_is_not_exposed() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
@@ -61,6 +86,75 @@ fn responses_rejects_invalid_tool_choice() {
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_non_array_tools() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tools": { "type": "function", "name": "lookup" }
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_non_string_non_object_tool_choice() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "tool_choice": 7
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_invalid_tool_choice_object_shapes() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+
+    let missing_type = serde_json::json!({
+        "input": "hello",
+        "tool_choice": { "name": "lookup" }
+    });
+    let missing_type_resp = post_json(ctx.addr(), "/v1/responses", &missing_type);
+    assert_eq!(
+        missing_type_resp.status, 400,
+        "body: {}",
+        missing_type_resp.body
+    );
+
+    let allowed_tools_empty = serde_json::json!({
+        "input": "hello",
+        "tool_choice": {
+            "type": "allowed_tools",
+            "tools": [],
+            "mode": "auto"
+        }
+    });
+    let allowed_tools_empty_resp = post_json(ctx.addr(), "/v1/responses", &allowed_tools_empty);
+    assert_eq!(
+        allowed_tools_empty_resp.status, 400,
+        "body: {}",
+        allowed_tools_empty_resp.body
+    );
+
+    let allowed_tools_bad_mode = serde_json::json!({
+        "input": "hello",
+        "tool_choice": {
+            "type": "allowed_tools",
+            "tools": [{ "type": "function", "name": "lookup" }],
+            "mode": "sometimes"
+        }
+    });
+    let allowed_tools_bad_mode_resp =
+        post_json(ctx.addr(), "/v1/responses", &allowed_tools_bad_mode);
+    assert_eq!(
+        allowed_tools_bad_mode_resp.status, 400,
+        "body: {}",
+        allowed_tools_bad_mode_resp.body
+    );
 }
 
 #[test]
@@ -132,6 +226,24 @@ fn responses_input_array_accepts_all_itemparam_variants() {
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_ne!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_accepts_string_input_shorthand() {
+    let model = require_model!();
+    let mut cfg = model_config();
+    cfg.model = Some(model.clone());
+    let ctx = ServerTestContext::new(cfg);
+    let body = serde_json::json!({
+        "model": model,
+        "input": "hello",
+        "max_output_tokens": 8
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(json["object"].as_str(), Some("response"));
+    assert!(json["output"].is_array(), "output should be array");
 }
 
 #[test]

@@ -351,9 +351,6 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/models") | (Method::GET, "/models") => {
                             handlers::handle_models(state, req, auth).await
                         }
-                        (Method::POST, "/v1/chat/generate") => {
-                            handlers::handle_chat_generate(state, req, auth).await
-                        }
                         (Method::POST, "/v1/responses") => {
                             responses::handle_create(state, req, auth).await
                         }

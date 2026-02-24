@@ -5,13 +5,7 @@ use tempfile::TempDir;
 #[test]
 fn no_auth_allows_request_without_headers() {
     let ctx = ServerTestContext::new(ServerConfig::new());
-    let response = send_request(
-        ctx.addr(),
-        "POST",
-        "/v1/chat/generate",
-        &[],
-        Some("not-json"),
-    );
+    let response = send_request(ctx.addr(), "POST", "/v1/responses", &[], Some("not-json"));
     assert_eq!(response.status, 400);
 }
 
