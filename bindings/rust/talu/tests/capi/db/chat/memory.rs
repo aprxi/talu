@@ -32,7 +32,7 @@ fn null_db_path_returns_error() {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 
@@ -106,7 +106,7 @@ fn double_free_session_list_does_not_crash() {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
     assert_eq!(result, 0, "list_sessions should succeed");
@@ -221,7 +221,7 @@ fn very_long_search_query_handled_safely() {
             c_query.as_ptr(),
             ptr::null(),
             ptr::null(),
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 
@@ -272,7 +272,7 @@ fn nonexistent_db_path_returns_error() {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 
@@ -336,7 +336,7 @@ fn concurrent_operations_with_errors() {
                             c_query.as_ptr(),
                             ptr::null(),
                             ptr::null(),
-                            &mut c_list as *mut _ as *mut std::ffi::c_void,
+                            &mut c_list as *mut _,
                         )
                     };
 
@@ -359,7 +359,7 @@ fn concurrent_operations_with_errors() {
                             c_query.as_ptr(),
                             ptr::null(),
                             ptr::null(),
-                            &mut c_list as *mut _ as *mut std::ffi::c_void,
+                            &mut c_list as *mut _,
                         )
                     };
 
@@ -382,7 +382,7 @@ fn concurrent_operations_with_errors() {
                             c_query.as_ptr(),
                             ptr::null(),
                             ptr::null(),
-                            &mut c_list as *mut _ as *mut std::ffi::c_void,
+                            &mut c_list as *mut _,
                         )
                     };
 
@@ -416,7 +416,7 @@ fn concurrent_operations_with_errors() {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 

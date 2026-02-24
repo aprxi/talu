@@ -13,7 +13,9 @@
 //! function can be assigned to a variable with the expected type signature.
 
 use std::os::raw::{c_char, c_int};
-use talu_sys::{CSessionRecord, CStringList, CTagList, CTagRecord, GenerationConfigInfo};
+use talu_sys::{
+    CRelationStringList, CSessionRecord, CTagList, CTagRecord, GenerationConfigInfo,
+};
 
 /// Assert that a function has the expected signature at compile time.
 ///
@@ -40,7 +42,7 @@ macro_rules! assert_fn_signature {
 
 assert_fn_signature!(
     talu_sys::talu_db_table_free_relation_string_list,
-    unsafe extern "C" fn(*mut CStringList)
+    unsafe extern "C" fn(*mut CRelationStringList)
 );
 
 assert_fn_signature!(

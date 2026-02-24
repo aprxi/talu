@@ -25,11 +25,11 @@
 //! # Ok::<(), StorageError>(())
 //! ```
 
-use std::ffi::{c_void, CStr, CString};
+use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 
-use talu_sys::{CSessionList, CSessionRecord, CTagList, CTagRecord};
+use talu_sys::{CRelationStringList, CSessionList, CSessionRecord, CTagList, CTagRecord};
 
 /// Error codes from the C API (must match error_codes.zig)
 const ERROR_CODE_OK: i32 = 0;
@@ -185,7 +185,7 @@ impl StorageHandle {
                 std::ptr::null(), // no search_query
                 std::ptr::null(), // no tags_filter
                 std::ptr::null(), // no tags_filter_any
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -206,7 +206,7 @@ impl StorageHandle {
 
         // Free C memory BEFORE returning - arena handles all cleanup
         // SAFETY: c_list was returned by talu_db_table_session_list
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
 
         Ok(rust_vec)
     }
@@ -229,7 +229,7 @@ impl StorageHandle {
             talu_sys::talu_db_table_session_get(
                 self.path_cstr.as_ptr(),
                 session_id_cstr.as_ptr(),
-                &mut c_record as *mut _ as *mut c_void,
+                &mut c_record as *mut _,
             )
         };
 
@@ -256,7 +256,7 @@ impl StorageHandle {
             talu_sys::talu_db_table_session_get(
                 self.path_cstr.as_ptr(),
                 session_id_cstr.as_ptr(),
-                &mut c_record as *mut _ as *mut c_void,
+                &mut c_record as *mut _,
             )
         };
 
@@ -287,7 +287,7 @@ impl StorageHandle {
                 std::ptr::null(), // no search_query
                 std::ptr::null(), // no tags_filter
                 std::ptr::null(), // no tags_filter_any
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -307,7 +307,7 @@ impl StorageHandle {
 
         // Free C memory
         // SAFETY: c_list was returned by talu_db_table_session_list
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
 
         Ok(count)
     }
@@ -365,7 +365,7 @@ impl StorageHandle {
                 marker_ptr,
                 search_ptr,
                 tags_ptr,
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -393,7 +393,7 @@ impl StorageHandle {
 
         // Free C memory
         // SAFETY: c_list was returned by talu_db_table_session_list_batch
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
 
         let has_more = (offset + limit) < total;
 
@@ -659,7 +659,7 @@ impl StorageHandle {
                 updated_before_ms,
                 has_tags_int,
                 source_doc_id_ptr,
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -683,7 +683,7 @@ impl StorageHandle {
 
         // Free C memory before returning
         // SAFETY: c_list was returned by talu_db_table_session_list_ex
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
 
         let has_more = all_records.len() > limit;
         let sessions: Vec<SessionRecordFull> = all_records.into_iter().take(limit).collect();
@@ -798,7 +798,7 @@ impl StorageHandle {
                 query_ptr,
                 tags_filter_ptr,
                 tags_filter_any_ptr,
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -822,7 +822,7 @@ impl StorageHandle {
 
         // Free C memory before returning
         // SAFETY: c_list was returned by talu_db_table_session_list
-        unsafe { talu_sys::talu_db_table_session_free_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_session_free_list(c_list) };
 
         let has_more = all_records.len() > limit;
         let sessions: Vec<SessionRecordFull> = all_records.into_iter().take(limit).collect();
@@ -993,7 +993,7 @@ impl StorageHandle {
             talu_sys::talu_db_table_tag_list(
                 self.path_cstr.as_ptr(),
                 group_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -1011,7 +1011,7 @@ impl StorageHandle {
         let rust_vec = unsafe { Self::convert_tag_list(c_list) };
 
         // Free C memory
-        unsafe { talu_sys::talu_db_table_tag_free_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_tag_free_list(c_list) };
 
         Ok(rust_vec)
     }
@@ -1027,7 +1027,7 @@ impl StorageHandle {
             talu_sys::talu_db_table_tag_get(
                 self.path_cstr.as_ptr(),
                 tag_id_cstr.as_ptr(),
-                &mut c_record as *mut _ as *mut c_void,
+                &mut c_record as *mut _,
             )
         };
 
@@ -1059,7 +1059,7 @@ impl StorageHandle {
                 self.path_cstr.as_ptr(),
                 name_cstr.as_ptr(),
                 group_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr()),
-                &mut c_record as *mut _ as *mut c_void,
+                &mut c_record as *mut _,
             )
         };
 
@@ -1243,13 +1243,13 @@ impl StorageHandle {
             StorageError::InvalidArgument("Session ID contains null bytes".to_string())
         })?;
 
-        let mut c_list: *mut talu_sys::CStringList = std::ptr::null_mut();
+        let mut c_list: *mut talu_sys::CRelationStringList = std::ptr::null_mut();
 
         let result = unsafe {
             talu_sys::talu_db_table_session_get_tags(
                 self.path_cstr.as_ptr(),
                 session_cstr.as_ptr(),
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -1261,10 +1261,10 @@ impl StorageHandle {
             return Ok(Vec::new());
         }
 
-        let rust_vec = unsafe { Self::convert_string_list(c_list) };
+        let rust_vec = unsafe { Self::convert_relation_string_list(c_list) };
 
         // Free C memory
-        unsafe { talu_sys::talu_db_table_free_relation_string_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_free_relation_string_list(c_list) };
 
         Ok(rust_vec)
     }
@@ -1274,13 +1274,13 @@ impl StorageHandle {
         let tag_cstr = CString::new(tag_id)
             .map_err(|_| StorageError::InvalidArgument("Tag ID contains null bytes".to_string()))?;
 
-        let mut c_list: *mut talu_sys::CStringList = std::ptr::null_mut();
+        let mut c_list: *mut talu_sys::CRelationStringList = std::ptr::null_mut();
 
         let result = unsafe {
             talu_sys::talu_db_table_tag_get_conversations(
                 self.path_cstr.as_ptr(),
                 tag_cstr.as_ptr(),
-                &mut c_list as *mut _ as *mut c_void,
+                &mut c_list as *mut _,
             )
         };
 
@@ -1292,10 +1292,10 @@ impl StorageHandle {
             return Ok(Vec::new());
         }
 
-        let rust_vec = unsafe { Self::convert_string_list(c_list) };
+        let rust_vec = unsafe { Self::convert_relation_string_list(c_list) };
 
         // Free C memory
-        unsafe { talu_sys::talu_db_table_free_relation_string_list(c_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_table_free_relation_string_list(c_list) };
 
         Ok(rust_vec)
     }
@@ -1337,19 +1337,21 @@ impl StorageHandle {
         }
     }
 
-    /// Convert CStringList to Vec<String>.
-    unsafe fn convert_string_list(c_list: *const talu_sys::CStringList) -> Vec<String> {
+    /// Convert CRelationStringList to Vec<String>.
+    unsafe fn convert_relation_string_list(
+        c_list: *const CRelationStringList,
+    ) -> Vec<String> {
         if c_list.is_null() {
             return Vec::new();
         }
 
         let list = &*c_list;
-        if list.items.is_null() || list.count == 0 {
+        if list.strings.is_null() || list.count == 0 {
             return Vec::new();
         }
 
         let mut result = Vec::with_capacity(list.count);
-        let strings_ptr = list.items;
+        let strings_ptr = list.strings;
         for i in 0..list.count {
             let str_ptr = *strings_ptr.add(i);
             if !str_ptr.is_null() {

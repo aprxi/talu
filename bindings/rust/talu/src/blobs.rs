@@ -170,7 +170,7 @@ impl BlobsHandle {
             talu_sys::talu_db_blob_list(
                 self.path_cstr.as_ptr(),
                 limit,
-                &mut out_list as *mut _ as *mut c_void,
+                &mut out_list as *mut _,
             )
         };
         if code != ERROR_CODE_OK {
@@ -182,7 +182,7 @@ impl BlobsHandle {
         }
         let refs = extract_string_list(out_list);
         // SAFETY: list handle is owned by this function on success.
-        unsafe { talu_sys::talu_db_blob_free_string_list(out_list as *mut c_void) };
+        unsafe { talu_sys::talu_db_blob_free_string_list(out_list) };
         Ok(refs)
     }
 

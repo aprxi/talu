@@ -117,6 +117,37 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
     if (eql(zig_type, "RouterGenerateResult")) return "CGenerateResult";
     if (eql(zig_type, "RouterGenerateConfig")) return "CGenerateConfig";
 
+    // Check for double-pointer output param pattern: ?*?*Type or *?*Type
+    // These are output parameters where the caller passes a pointer to receive a pointer.
+    // Only match known struct types; opaque (?*?*anyopaque) falls through to *mut c_void.
+    if (std.mem.startsWith(u8, zig_type, "?*?*") or std.mem.startsWith(u8, zig_type, "*?*")) {
+        const start_idx: usize = if (std.mem.startsWith(u8, zig_type, "?*?*")) 4 else 3;
+        var inner = zig_type[start_idx..];
+        // Strip 'const ' prefix if present
+        if (std.mem.startsWith(u8, inner, "const ")) {
+            inner = inner[6..];
+        }
+        // Strip module prefix (e.g. "docs.CDocumentList" -> "CDocumentList")
+        if (std.mem.lastIndexOfScalar(u8, inner, '.')) |dot| {
+            inner = inner[dot + 1 ..];
+        }
+        if (known_structs.contains(inner)) {
+            // Return double-pointer for known structs
+            if (eql(inner, "CSessionList")) return "*mut *mut CSessionList";
+            if (eql(inner, "CTagList")) return "*mut *mut CTagList";
+            if (eql(inner, "CDocumentList")) return "*mut *mut CDocumentList";
+            if (eql(inner, "CDocumentRecord")) return "*mut *mut CDocumentRecord";
+            if (eql(inner, "CSearchResultList")) return "*mut *mut CSearchResultList";
+            if (eql(inner, "CChangeList")) return "*mut *mut CChangeList";
+            if (eql(inner, "CStringList")) return "*mut *mut CStringList";
+            if (eql(inner, "CRelationStringList")) return "*mut *mut CRelationStringList";
+            if (eql(inner, "CDeltaChain")) return "*mut *mut CDeltaChain";
+            if (eql(inner, "CPluginList")) return "*mut *mut CPluginList";
+        }
+        // Opaque or unknown double-pointer types (e.g., ?*?*anyopaque) -> *mut c_void
+        // This preserves the existing behavior for opaque output handles.
+    }
+
     // Check for optional or regular pointer to opaque handle: ?*HandleName or *HandleName
     if (std.mem.startsWith(u8, zig_type, "?*") or std.mem.startsWith(u8, zig_type, "*")) {
         const start_idx: usize = if (std.mem.startsWith(u8, zig_type, "?*")) 2 else 1;
@@ -125,6 +156,10 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         const is_const = std.mem.startsWith(u8, pointee, "const ");
         if (is_const) {
             pointee = pointee[6..]; // Skip "const "
+        }
+        // Strip module prefix (e.g. "ops.CSessionRecord" -> "CSessionRecord")
+        if (std.mem.lastIndexOfScalar(u8, pointee, '.')) |dot| {
+            pointee = pointee[dot + 1 ..];
         }
         if (isOpaqueHandle(pointee)) {
             // Return a formatted string like "*mut ResponsesHandle"
@@ -198,6 +233,10 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             // Plugin types
             if (eql(pointee, "CPluginInfo")) return if (is_const) "*const CPluginInfo" else "*mut CPluginInfo";
             if (eql(pointee, "CPluginList")) return if (is_const) "*const CPluginList" else "*mut CPluginList";
+            // Relation types
+            if (eql(pointee, "CRelationStringList")) return if (is_const) "*const CRelationStringList" else "*mut CRelationStringList";
+            // Blob types
+            if (eql(pointee, "BlobGcStats")) return if (is_const) "*const BlobGcStats" else "*mut BlobGcStats";
             // Fallback: return without wrapper (will cause compile error if used)
             return pointee;
         }

@@ -70,7 +70,7 @@ fn list_sessions_by_source_ex(db_path: &str, source_doc_id: &str) -> Vec<String>
             0,                        // updated_before_ms
             -1,                       // has_tags (-1 = don't filter)
             c_source_doc_id.as_ptr(), // source_doc_id filter
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 
@@ -93,7 +93,7 @@ fn list_sessions_by_source(db_path: &str, source_doc_id: &str) -> Vec<String> {
             0,           // no limit
             0,           // no cursor timestamp
             ptr::null(), // no cursor session_id
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 
@@ -195,7 +195,7 @@ fn capi_list_sessions_by_source_null_source() {
             0,
             0,
             ptr::null(),
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 

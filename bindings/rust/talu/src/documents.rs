@@ -30,7 +30,7 @@
 //! ```
 
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_void};
+use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
 use std::ptr;
 
@@ -250,7 +250,7 @@ impl DocumentsHandle {
             talu_sys::talu_db_table_get(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
-                &mut out_doc as *mut _ as *mut c_void,
+                &mut out_doc as *mut _,
             )
         };
 
@@ -404,7 +404,7 @@ impl DocumentsHandle {
                 opt_ptr(&owner_c),
                 opt_ptr(&marker_c),
                 limit,
-                &mut out_list as *mut _ as *mut std::ffi::c_void,
+                &mut out_list as *mut _,
             )
         };
 
@@ -424,7 +424,7 @@ impl DocumentsHandle {
                         docs.push(summary_from_c(item));
                     }
                 }
-                talu_sys::talu_db_table_free_list(out_list as *mut c_void);
+                talu_sys::talu_db_table_free_list(out_list);
                 docs
             }
         };
@@ -454,7 +454,7 @@ impl DocumentsHandle {
                 query_c.as_ptr(),
                 opt_ptr(&type_c),
                 limit,
-                &mut out_list as *mut _ as *mut std::ffi::c_void,
+                &mut out_list as *mut _,
             )
         };
 
@@ -479,7 +479,7 @@ impl DocumentsHandle {
                         });
                     }
                 }
-                talu_sys::talu_db_table_free_search_results(out_list as *mut c_void);
+                talu_sys::talu_db_table_free_search_results(out_list);
                 results
             }
         };
@@ -553,7 +553,7 @@ impl DocumentsHandle {
             talu_sys::talu_db_table_get_tags(
                 self.path_cstr.as_ptr(),
                 doc_id_c.as_ptr(),
-                &mut out_list as *mut _ as *mut std::ffi::c_void,
+                &mut out_list as *mut _,
             )
         };
 
@@ -563,7 +563,7 @@ impl DocumentsHandle {
 
         let result = extract_string_list(out_list);
         if !out_list.is_null() {
-            unsafe { talu_sys::talu_db_table_free_string_list(out_list as *mut c_void) };
+            unsafe { talu_sys::talu_db_table_free_string_list(out_list) };
         }
 
         Ok(result)
@@ -579,7 +579,7 @@ impl DocumentsHandle {
             talu_sys::talu_db_table_get_by_tag(
                 self.path_cstr.as_ptr(),
                 tag_id_c.as_ptr(),
-                &mut out_list as *mut _ as *mut std::ffi::c_void,
+                &mut out_list as *mut _,
             )
         };
 
@@ -589,7 +589,7 @@ impl DocumentsHandle {
 
         let result = extract_string_list(out_list);
         if !out_list.is_null() {
-            unsafe { talu_sys::talu_db_table_free_string_list(out_list as *mut c_void) };
+            unsafe { talu_sys::talu_db_table_free_string_list(out_list) };
         }
 
         Ok(result)
@@ -652,7 +652,7 @@ impl DocumentsHandle {
                 since_seq,
                 opt_ptr(&group_c),
                 limit,
-                &mut out_list as *mut _ as *mut std::ffi::c_void,
+                &mut out_list as *mut _,
             )
         };
 
@@ -679,7 +679,7 @@ impl DocumentsHandle {
                         });
                     }
                 }
-                talu_sys::talu_db_table_free_changes(out_list as *mut c_void);
+                talu_sys::talu_db_table_free_changes(out_list);
                 changes
             }
         };
@@ -799,7 +799,7 @@ impl DocumentsHandle {
         let code = unsafe {
             talu_sys::talu_db_table_get_compaction_stats(
                 self.path_cstr.as_ptr(),
-                &mut stats as *mut _ as *mut c_void,
+                &mut stats as *mut _,
             )
         };
 
@@ -843,7 +843,7 @@ impl DocumentsHandle {
         let code = unsafe {
             talu_sys::talu_db_table_get_garbage_candidates(
                 self.path_cstr.as_ptr(),
-                &mut out_list as *mut _ as *mut std::ffi::c_void,
+                &mut out_list as *mut _,
             )
         };
 
@@ -853,7 +853,7 @@ impl DocumentsHandle {
 
         let result = extract_string_list(out_list);
         if !out_list.is_null() {
-            unsafe { talu_sys::talu_db_table_free_string_list(out_list as *mut c_void) };
+            unsafe { talu_sys::talu_db_table_free_string_list(out_list) };
         }
 
         Ok(result)

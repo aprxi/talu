@@ -94,7 +94,7 @@ fn list_sessions_with_tags(
             c_tags_filter_any
                 .as_ref()
                 .map_or(ptr::null(), |c| c.as_ptr()),
-            &mut c_list as *mut _ as *mut std::ffi::c_void,
+            &mut c_list as *mut _,
         )
     };
 

@@ -62,7 +62,7 @@ pub fn scan_plugins(plugins_dir: Option<&Path>) -> Result<Vec<PluginInfo>> {
     // SAFETY: dir_ptr is either null (use default) or a valid C string.
     // list is a valid out pointer.
     let rc = unsafe {
-        talu_sys::talu_plugins_scan(dir_ptr, &mut list as *mut _ as *mut std::ffi::c_void)
+        talu_sys::talu_plugins_scan(dir_ptr, &mut list as *mut _)
     };
     if rc != 0 {
         return Err(error_from_last_or("Failed to scan plugins"));

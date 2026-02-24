@@ -20,7 +20,7 @@ const responses_mod = @import("../responses/root.zig");
 const session_id_mod = responses_mod.session_id;
 const backend_mod = @import("../responses/backend.zig");
 const router_mod = @import("../router/root.zig");
-const db_capi = @import("db.zig");
+const db_capi = @import("db/ops.zig");
 const Conversation = responses_mod.Conversation;
 const Item = responses_mod.Item;
 const ItemType = responses_mod.ItemType;
@@ -2230,6 +2230,68 @@ pub export fn talu_chat_max_context_length(model: ?[*:0]const u8) callconv(.c) u
     };
 
     return engine.maxContextLength() orelse 0;
+}
+
+// =============================================================================
+// Session Update Notification
+// =============================================================================
+
+/// Notify the session that metadata fields have changed.
+///
+/// This is a lightweight notification to the conversation's storage backend.
+/// The session record itself is stored by the table-plane APIs; this call
+/// just pushes a `session_update` storage event so that backends can react.
+///
+/// Args:
+///   chat_handle: Opaque Chat handle
+///   model, title, system_prompt, config_json, marker,
+///   parent_session_id, group_id, metadata_json, source_doc_id:
+///     New values (or null to leave unchanged).
+///
+/// Returns: 0 on success, negative error code on failure.
+// lint:ignore capi-callconv - callconv(.c) on closing line
+pub export fn talu_chat_notify_session_update(
+    chat_handle: ?*ChatHandle,
+    model: ?[*:0]const u8,
+    title: ?[*:0]const u8,
+    system_prompt: ?[*:0]const u8,
+    config_json: ?[*:0]const u8,
+    marker: ?[*:0]const u8,
+    parent_session_id: ?[*:0]const u8,
+    group_id: ?[*:0]const u8,
+    metadata_json: ?[*:0]const u8,
+    source_doc_id: ?[*:0]const u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const chat: *Chat = @ptrCast(@alignCast(chat_handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "chat_handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    const model_slice: ?[]const u8 = if (model) |m| std.mem.span(m) else null;
+    const title_slice: ?[]const u8 = if (title) |t| std.mem.span(t) else null;
+    const system_slice: ?[]const u8 = if (system_prompt) |s| std.mem.span(s) else null;
+    const config_slice: ?[]const u8 = if (config_json) |c| std.mem.span(c) else null;
+    const marker_slice: ?[]const u8 = if (marker) |s| std.mem.span(s) else null;
+    const parent_session_id_slice: ?[]const u8 = if (parent_session_id) |p| std.mem.span(p) else null;
+    const group_id_slice: ?[]const u8 = if (group_id) |g| std.mem.span(g) else null;
+    const metadata_json_slice: ?[]const u8 = if (metadata_json) |m| std.mem.span(m) else null;
+    const source_doc_id_slice: ?[]const u8 = if (source_doc_id) |s| std.mem.span(s) else null;
+
+    chat.conv.notifySessionUpdate(
+        model_slice,
+        title_slice,
+        system_slice,
+        config_slice,
+        marker_slice,
+        parent_session_id_slice,
+        group_id_slice,
+        metadata_json_slice,
+        source_doc_id_slice,
+    );
+
+    return 0;
 }
 
 // =============================================================================
