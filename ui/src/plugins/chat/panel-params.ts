@@ -1,11 +1,11 @@
 import { getChatDom } from "./dom.ts";
 import { api, notifications, getModelsService, format, timers } from "./deps.ts";
 import { isPanelReadOnly, restoreEditableParams, hideRightPanel } from "./panel-readonly.ts";
-import type { Conversation, CreateChatGenerateRequest, SettingsPatch } from "../../types.ts";
+import type { Conversation, CreateResponseRequest, SettingsPatch } from "../../types.ts";
 import type { Disposable } from "../../kernel/types.ts";
 
 /** Get current sampling parameters from the right panel inputs. */
-export function getSamplingParams(): Partial<CreateChatGenerateRequest> {
+export function getSamplingParams(): Partial<CreateResponseRequest> {
   const dom = getChatDom();
   const temp = dom.panelTemperature.value.trim();
   const topP = dom.panelTopP.value.trim();
@@ -15,14 +15,10 @@ export function getSamplingParams(): Partial<CreateChatGenerateRequest> {
   const repPen = dom.panelRepetitionPenalty.value.trim();
   const seed = dom.panelSeed.value.trim();
 
-  const params: Partial<CreateChatGenerateRequest> = {};
+  const params: Partial<CreateResponseRequest> = {};
   if (temp) params.temperature = parseFloat(temp);
   if (topP) params.top_p = parseFloat(topP);
-  if (topK) params.top_k = parseInt(topK, 10);
-  if (minP) params.min_p = parseFloat(minP);
   if (maxTok) params.max_output_tokens = parseInt(maxTok, 10);
-  if (repPen) params.repetition_penalty = parseFloat(repPen);
-  if (seed) params.seed = parseInt(seed, 10);
   return params;
 }
 

@@ -23,6 +23,9 @@ pub struct StoredResponse {
     pub tool_choice_json: Option<serde_json::Value>,
     /// Session ID in TaluDB storage (for persistence across chained requests).
     pub session_id: Option<String>,
+    /// Tenant scope for secure `previous_response_id` chaining.
+    /// `None` means gateway auth is disabled (single-tenant server mode).
+    pub tenant_id: Option<String>,
 }
 
 /// Per-plugin capability token entry.

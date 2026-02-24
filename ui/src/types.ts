@@ -181,23 +181,23 @@ export type InputContentPart =
   | { type: "input_image"; image_url: string }
   | { type: "input_file"; file_url: string; filename?: string };
 
-/** Request body for POST /v1/chat/generate. */
-export interface CreateChatGenerateRequest {
+/** Request body for POST /v1/responses. */
+export interface CreateResponseRequest {
   model: string;
   input?: string | InputContentItem[];
   previous_response_id?: string | null;
-  /** TaluDB session ID — used to continue an existing stored conversation. */
-  session_id?: string | null;
-  /** Prompt document ID to use as system prompt. */
-  prompt_id?: string | null;
-  /** Sampling parameters */
+  /** OpenResponses instructions field. */
+  instructions?: string | null;
+  /** Sampling parameters supported by OpenResponses. */
   temperature?: number;
   top_p?: number;
-  top_k?: number;
-  min_p?: number;
   max_output_tokens?: number;
-  repetition_penalty?: number;
-  seed?: number;
+  /** Optional tool configuration passthrough. */
+  tools?: unknown;
+  tool_choice?: unknown;
+  metadata?: Record<string, unknown>;
+  store?: boolean;
+  stream?: boolean;
 }
 
 /** Model generation_config.json defaults. */
@@ -522,6 +522,7 @@ export interface PromptsService {
   getSelectedPromptId(): string | null;
   getDefaultPromptId(): string | null;
   getPromptNameById(id: string): string | null;
+  getPromptContentById(id: string): string | null;
   getAll(): { id: string; name: string }[];
 }
 

@@ -16,6 +16,7 @@ mod server {
     pub mod openapi_docs;
     pub mod plugins;
     pub mod repo;
+    pub mod responses;
     pub mod search;
     pub mod settings;
     pub mod tags;

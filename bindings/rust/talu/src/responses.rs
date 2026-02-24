@@ -21,6 +21,39 @@ use talu_sys;
 // Re-export enums from talu_sys for convenience
 pub use talu_sys::{ContentType, ImageDetail, ItemStatus, ItemType, MessageRole};
 
+/// Returns the OpenResponses SSE delta event name for a streamed token.
+pub fn stream_delta_event_name(item_type: ItemType, content_type: ContentType) -> &'static str {
+    match content_type {
+        ContentType::ReasoningText => "response.reasoning.delta",
+        ContentType::SummaryText => "response.reasoning_summary_text.delta",
+        ContentType::Refusal => "response.refusal.delta",
+        _ if item_type == ItemType::FunctionCall => "response.function_call_arguments.delta",
+        _ => "response.output_text.delta",
+    }
+}
+
+/// Returns the OpenResponses SSE done event name for a completed content part.
+pub fn stream_done_event_name(item_type: ItemType, content_type: ContentType) -> &'static str {
+    match content_type {
+        ContentType::ReasoningText => "response.reasoning.done",
+        ContentType::SummaryText => "response.reasoning_summary_text.done",
+        ContentType::Refusal => "response.refusal.done",
+        _ if item_type == ItemType::FunctionCall => "response.function_call_arguments.done",
+        _ => "response.output_text.done",
+    }
+}
+
+/// Maps a content type to the OpenResponses content part discriminator.
+pub fn stream_content_part_type(content_type: ContentType) -> &'static str {
+    match content_type {
+        ContentType::ReasoningText => "reasoning_text",
+        ContentType::OutputText => "output_text",
+        ContentType::Refusal => "refusal",
+        ContentType::SummaryText => "summary_text",
+        _ => "output_text",
+    }
+}
+
 // =============================================================================
 // Trait for shared read-only operations
 // =============================================================================
@@ -1281,5 +1314,62 @@ fn content_part_ref_from_c<'a>(c_part: &talu_sys::CResponsesContentPart) -> Cont
         secondary_data,
         tertiary_data,
         quaternary_data,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        stream_content_part_type, stream_delta_event_name, stream_done_event_name, ContentType,
+        ItemType,
+    };
+
+    #[test]
+    fn stream_event_name_maps_function_call() {
+        assert_eq!(
+            stream_delta_event_name(ItemType::FunctionCall, ContentType::OutputText),
+            "response.function_call_arguments.delta"
+        );
+        assert_eq!(
+            stream_done_event_name(ItemType::FunctionCall, ContentType::OutputText),
+            "response.function_call_arguments.done"
+        );
+    }
+
+    #[test]
+    fn stream_event_name_maps_reasoning_and_summary() {
+        assert_eq!(
+            stream_delta_event_name(ItemType::Reasoning, ContentType::ReasoningText),
+            "response.reasoning.delta"
+        );
+        assert_eq!(
+            stream_done_event_name(ItemType::Reasoning, ContentType::ReasoningText),
+            "response.reasoning.done"
+        );
+        assert_eq!(
+            stream_delta_event_name(ItemType::Reasoning, ContentType::SummaryText),
+            "response.reasoning_summary_text.delta"
+        );
+        assert_eq!(
+            stream_done_event_name(ItemType::Reasoning, ContentType::SummaryText),
+            "response.reasoning_summary_text.done"
+        );
+    }
+
+    #[test]
+    fn stream_content_part_type_maps_expected_values() {
+        assert_eq!(
+            stream_content_part_type(ContentType::ReasoningText),
+            "reasoning_text"
+        );
+        assert_eq!(
+            stream_content_part_type(ContentType::OutputText),
+            "output_text"
+        );
+        assert_eq!(stream_content_part_type(ContentType::Refusal), "refusal");
+        assert_eq!(
+            stream_content_part_type(ContentType::SummaryText),
+            "summary_text"
+        );
     }
 }

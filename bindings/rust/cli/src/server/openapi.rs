@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    chat_generate_types, code, db, file, files, handlers, http, plugins, proxy, repo, search,
-    sessions, settings, tags,
+    chat_generate_types, code, db, file, files, handlers, http, plugins, proxy, repo, responses,
+    responses_types, search, sessions, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -20,6 +20,7 @@ use crate::server::{
     ),
     tags(
         (name = "Chat::Generate", description = "Current chat generation endpoint"),
+        (name = "Responses", description = "OpenResponses-compatible API surface"),
         (name = "Models", description = "Available model listing"),
         (name = "Chat", description = "Chat session state management"),
         (name = "Files", description = "Binary file upload and management"),
@@ -46,6 +47,7 @@ use crate::server::{
         // Models + chat generation
         handlers::handle_models,
         handlers::handle_chat_generate,
+        responses::handle_create,
         // Tags
         tags::handle_list,
         tags::handle_create,
@@ -149,6 +151,10 @@ use crate::server::{
         // Chat generate
         chat_generate_types::CreateChatGenerateBody,
         chat_generate_types::ChatGenerateResponseResource,
+        responses_types::CreateResponseBody,
+        responses_types::ResponseResource,
+        responses_types::ResponsesErrorResponse,
+        responses_types::ResponsesErrorBody,
         // Tags
         tags::TagResponse,
         tags::TagUsage,

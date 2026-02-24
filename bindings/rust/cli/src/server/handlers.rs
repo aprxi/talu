@@ -19,12 +19,34 @@ use crate::provider;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::chat_generate_types;
 use crate::server::http;
+use crate::server::responses_types;
 use crate::server::state::{AppState, StoredResponse};
 use talu::documents::{DocumentError, DocumentsHandle};
 use talu::responses::{ContentType, ItemType};
 use talu::{ChatHandle, FinishReason};
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum ApiSurface {
+    Chat,
+    Responses,
+}
+
+impl ApiSurface {
+    fn strict_responses(self) -> bool {
+        matches!(self, Self::Responses)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct GenerationRequest {
+    model: Option<String>,
+    max_output_tokens: Option<i64>,
+    temperature: Option<f64>,
+    top_p: Option<f64>,
+    instructions: Option<String>,
+}
 
 /// Error type for response generation with HTTP status code information.
 #[derive(Debug)]
@@ -93,7 +115,25 @@ pub async fn handle_chat_generate(
     req: Request<Incoming>,
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
+    handle_generate(state, req, auth_ctx, ApiSurface::Chat).await
+}
+
+pub async fn handle_responses(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth_ctx: Option<AuthContext>,
+) -> Response<BoxBody> {
+    handle_generate(state, req, auth_ctx, ApiSurface::Responses).await
+}
+
+async fn handle_generate(
+    state: Arc<AppState>,
+    req: Request<Incoming>,
+    auth_ctx: Option<AuthContext>,
+    surface: ApiSurface,
+) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
+    let strict_responses = surface.strict_responses();
     if let Some(ctx) = auth_ctx.as_ref() {
         log::info!(
             target: "server::gen",
@@ -105,7 +145,14 @@ pub async fn handle_chat_generate(
 
     let body_bytes = match body.collect().await {
         Ok(body) => body.to_bytes(),
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Invalid body"),
+        Err(_) => {
+            return api_error(
+                strict_responses,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Invalid body",
+            )
+        }
     };
 
     // Log reproducible curl command at DEBUG for replay/debugging.
@@ -123,21 +170,64 @@ pub async fn handle_chat_generate(
         );
     }
 
-    let request: chat_generate_types::CreateChatGenerateBody =
-        match serde_json::from_slice(&body_bytes) {
-            Ok(val) => val,
-            Err(err) => {
-                return json_error(
+    let parse_error = |err: serde_json::Error| {
+        api_error(
+            strict_responses,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            &format!("Invalid JSON: {err}"),
+        )
+    };
+    match surface {
+        ApiSurface::Chat => {
+            if let Err(err) =
+                serde_json::from_slice::<chat_generate_types::CreateChatGenerateBody>(&body_bytes)
+            {
+                return parse_error(err);
+            }
+        }
+        ApiSurface::Responses => {
+            let parsed =
+                match serde_json::from_slice::<responses_types::CreateResponseBody>(&body_bytes) {
+                    Ok(val) => val,
+                    Err(err) => return parse_error(err),
+                };
+            if let Err(message) = validate_responses_request(&parsed) {
+                return api_error(
+                    strict_responses,
                     StatusCode::BAD_REQUEST,
                     "invalid_request",
-                    &format!("Invalid JSON: {err}"),
-                )
+                    &message,
+                );
             }
-        };
+        }
+    }
 
     let request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(val) => val,
-        Err(_) => return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Invalid JSON"),
+        Err(_) => {
+            return api_error(
+                strict_responses,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                "Invalid JSON",
+            )
+        }
+    };
+    let request = GenerationRequest {
+        model: request_value
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+        max_output_tokens: request_value
+            .get("max_output_tokens")
+            .and_then(|v| v.as_i64()),
+        temperature: request_value.get("temperature").and_then(|v| v.as_f64()),
+        top_p: request_value.get("top_p").and_then(|v| v.as_f64()),
+        instructions: request_value
+            .get("instructions")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
     };
 
     let stream = request_value
@@ -156,14 +246,22 @@ pub async fn handle_chat_generate(
         .get("store")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
-    let request_session_id = request_value
-        .get("session_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let prompt_id = request_value
-        .get("prompt_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let request_session_id = if strict_responses {
+        None
+    } else {
+        request_value
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
+    let prompt_id = if strict_responses {
+        None
+    } else {
+        request_value
+            .get("prompt_id")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    };
 
     log::debug!(
         target: "server::gen",
@@ -174,7 +272,12 @@ pub async fn handle_chat_generate(
 
     // Validate that input is present (string, array, or null with previous_response_id).
     if input_value.is_none() && previous_response_id.is_none() {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "Missing input");
+        return api_error(
+            strict_responses,
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "Missing input",
+        );
     }
 
     if stream {
@@ -188,6 +291,7 @@ pub async fn handle_chat_generate(
             store,
             request_session_id,
             prompt_id,
+            strict_responses,
             auth_ctx,
         )
         .await;
@@ -203,12 +307,20 @@ pub async fn handle_chat_generate(
         store,
         request_session_id,
         prompt_id,
+        strict_responses,
         auth_ctx.as_ref(),
     )
     .await
     {
         Ok(val) => val,
-        Err(err) => return json_error(err.status_code(), err.error_code(), err.error_message()),
+        Err(err) => {
+            return api_error(
+                strict_responses,
+                err.status_code(),
+                err.error_code(),
+                err.error_message(),
+            )
+        }
     };
     if let Some(ctx) = auth_ctx.as_ref() {
         log_generation_completed(ctx);
@@ -217,7 +329,8 @@ pub async fn handle_chat_generate(
     let response_body = match serde_json::to_vec(&response_json) {
         Ok(body) => body,
         Err(_) => {
-            return json_error(
+            return api_error(
+                strict_responses,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "serialization_error",
                 "Failed to serialize response",
@@ -464,7 +577,7 @@ fn resolve_file_references(input_json: &str, storage_path: &std::path::Path) -> 
 
 async fn generate_response(
     state: Arc<AppState>,
-    request: chat_generate_types::CreateChatGenerateBody,
+    request: GenerationRequest,
     input_value: Option<serde_json::Value>,
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
@@ -472,24 +585,31 @@ async fn generate_response(
     store: bool,
     request_session_id: Option<String>,
     prompt_id: Option<String>,
+    strict_responses: bool,
     auth_ctx: Option<&AuthContext>,
 ) -> Result<serde_json::Value, ResponseError> {
     let request_max_output_tokens = request.max_output_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
+    let instructions = request.instructions;
 
     let model_id = select_model_id(state.clone(), request.model.clone()).await?;
 
     // Load previous conversation state if chaining.
+    let requester_tenant = auth_ctx.map(|ctx| ctx.tenant_id.as_str());
     let prev_state = if let Some(ref prev_id) = previous_response_id {
         let store = state.response_store.lock().await;
-        store.get(prev_id).map(|s| {
-            (
-                s.responses_json.clone(),
-                s.tools_json.clone(),
-                s.tool_choice_json.clone(),
-                s.session_id.clone(),
-            )
+        store.get(prev_id).and_then(|s| {
+            if s.tenant_id.as_deref() == requester_tenant {
+                Some((
+                    s.responses_json.clone(),
+                    s.tools_json.clone(),
+                    s.tool_choice_json.clone(),
+                    s.session_id.clone(),
+                ))
+            } else {
+                None
+            }
         })
     } else {
         None
@@ -613,6 +733,11 @@ async fn generate_response(
     } else {
         None
     };
+    let effective_system_prompt = if strict_responses {
+        instructions.clone()
+    } else {
+        system_prompt_from_doc.clone()
+    };
 
     let response_id = format!("resp_{}", random_id());
     let created_at = now_unix_seconds();
@@ -646,7 +771,7 @@ async fn generate_response(
     let session_id_for_task = session_id.clone();
     let bucket_for_task = bucket_path.clone();
     let model_id_for_task = model_id.clone();
-    let system_prompt_for_task = system_prompt_from_doc.clone();
+    let system_prompt_for_task = effective_system_prompt.clone();
     let prompt_id_for_task = prompt_id.clone();
     let (output_items, prompt_tokens, completion_tokens, responses_json) =
         tokio::task::spawn_blocking(move || {
@@ -761,6 +886,7 @@ async fn generate_response(
 
     // Store conversation for future `previous_response_id` lookups.
     let session_id_for_response = session_id.clone();
+    let tenant_id_for_store = auth_ctx.map(|ctx| ctx.tenant_id.clone());
     {
         let mut store = state.response_store.lock().await;
         store.insert(
@@ -770,6 +896,7 @@ async fn generate_response(
                 tools_json: effective_tools.clone(),
                 tool_choice_json: effective_tool_choice.clone(),
                 session_id: Some(session_id),
+                tenant_id: tenant_id_for_store,
             },
         );
     }
@@ -791,6 +918,8 @@ async fn generate_response(
         Some(&usage),
         effective_tools.as_ref(),
         effective_tool_choice.as_ref(),
+        store,
+        instructions.as_deref(),
     );
 
     // Set previous_response_id on the response resource.
@@ -798,11 +927,13 @@ async fn generate_response(
         response_value["previous_response_id"] = json!(prev_id);
     }
 
-    // Include session_id in metadata so the UI can adopt it for follow-ups.
-    response_value["metadata"] = json!({ "session_id": session_id_for_response });
+    if !strict_responses {
+        // Include session_id in metadata so the UI can adopt it for follow-ups.
+        response_value["metadata"] = json!({ "session_id": session_id_for_response });
+    }
 
     // Auto-generate a descriptive title for new conversations in the background.
-    if is_new_conversation && auto_title {
+    if !strict_responses && is_new_conversation && auto_title {
         let title_input = input_value
             .as_ref()
             .and_then(|v| v.as_str())
@@ -822,7 +953,7 @@ async fn generate_response(
 
 async fn stream_response(
     state: Arc<AppState>,
-    request: chat_generate_types::CreateChatGenerateBody,
+    request: GenerationRequest,
     input_value: Option<serde_json::Value>,
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
@@ -830,6 +961,7 @@ async fn stream_response(
     store: bool,
     request_session_id: Option<String>,
     prompt_id: Option<String>,
+    strict_responses: bool,
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
@@ -840,12 +972,14 @@ async fn stream_response(
     let request_max_output_tokens = request.max_output_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
+    let instructions = request.instructions;
     // Resolve model ID without loading — loading happens inside spawn_blocking
     // so that progress events can be streamed through the SSE channel.
     let model_id = match resolve_model_id(state.clone(), request.model.clone()).await {
         Ok(val) => val,
         Err(err) => {
-            return json_error(
+            return api_error(
+                strict_responses,
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "model_error",
                 &format!("{err}"),
@@ -854,15 +988,20 @@ async fn stream_response(
     };
 
     // Load previous conversation state if chaining.
+    let requester_tenant = auth_ctx.as_ref().map(|ctx| ctx.tenant_id.as_str());
     let prev_state = if let Some(ref prev_id) = previous_response_id {
         let rstore = state.response_store.lock().await;
-        rstore.get(prev_id).map(|s| {
-            (
-                s.responses_json.clone(),
-                s.tools_json.clone(),
-                s.tool_choice_json.clone(),
-                s.session_id.clone(),
-            )
+        rstore.get(prev_id).and_then(|s| {
+            if s.tenant_id.as_deref() == requester_tenant {
+                Some((
+                    s.responses_json.clone(),
+                    s.tools_json.clone(),
+                    s.tool_choice_json.clone(),
+                    s.session_id.clone(),
+                ))
+            } else {
+                None
+            }
         })
     } else {
         None
@@ -954,21 +1093,24 @@ async fn stream_response(
                         }
                     }
                     Ok(None) => {
-                        return json_error(
+                        return api_error(
+                            strict_responses,
                             StatusCode::BAD_REQUEST,
                             "invalid_request",
                             &format!("prompt_id '{}' not found", pid),
                         );
                     }
                     Err(DocumentError::DocumentNotFound(_)) => {
-                        return json_error(
+                        return api_error(
+                            strict_responses,
                             StatusCode::BAD_REQUEST,
                             "invalid_request",
                             &format!("prompt_id '{}' not found", pid),
                         );
                     }
                     Err(e) => {
-                        return json_error(
+                        return api_error(
+                            strict_responses,
                             StatusCode::INTERNAL_SERVER_ERROR,
                             "storage_error",
                             &format!("failed to fetch prompt document: {}", e),
@@ -976,7 +1118,8 @@ async fn stream_response(
                     }
                 },
                 Err(e) => {
-                    return json_error(
+                    return api_error(
+                        strict_responses,
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "storage_error",
                         &format!("failed to open documents store: {}", e),
@@ -984,7 +1127,8 @@ async fn stream_response(
                 }
             }
         } else {
-            return json_error(
+            return api_error(
+                strict_responses,
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
                 "prompt_id requires storage to be configured",
@@ -992,6 +1136,11 @@ async fn stream_response(
         }
     } else {
         None
+    };
+    let effective_system_prompt = if strict_responses {
+        instructions.clone()
+    } else {
+        system_prompt_from_doc.clone()
     };
 
     // Only pass prev_json for in-memory chaining when storage is NOT active.
@@ -1029,6 +1178,7 @@ async fn stream_response(
     // Clones for the blocking task to store response after completion.
     let state_for_store = state.clone();
     let session_id_for_store = session_id.clone();
+    let tenant_id_for_store = auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone());
     let store_tools = effective_tools.clone();
     let store_tool_choice = effective_tool_choice.clone();
     let response_id_for_store = response_id.clone();
@@ -1048,15 +1198,64 @@ async fn stream_response(
     let title_session_id = session_id.clone();
     let title_backend = state.backend.clone();
 
+    let previous_response_id_for_ctx = previous_response_id.clone();
     tokio::task::spawn_blocking(move || {
+        let mut seq = 0u64;
+        if strict_responses {
+            let _ = send_event(
+                &tx,
+                "response.queued",
+                json!({
+                    "type": "response.queued",
+                    "sequence_number": seq,
+                    "response": {
+                        "id": &response_id,
+                        "object": "response",
+                        "created_at": created_at,
+                        "completed_at": null,
+                        "status": "queued",
+                        "incomplete_details": null,
+                        "model": &model_id,
+                        "previous_response_id": previous_response_id_for_ctx,
+                        "instructions": instructions,
+                        "output": [],
+                        "error": null,
+                        "tools": tools_for_events.as_ref().cloned().unwrap_or_else(|| json!([])),
+                        "tool_choice": tool_choice_for_events.as_ref().cloned().unwrap_or_else(|| json!("none")),
+                        "truncation": "auto",
+                        "parallel_tool_calls": false,
+                        "text": { "format": { "type": "text" } },
+                        "top_p": top_p.unwrap_or(1.0),
+                        "presence_penalty": 0.0,
+                        "frequency_penalty": 0.0,
+                        "top_logprobs": 0,
+                        "temperature": temperature.unwrap_or(0.0),
+                        "reasoning": { "effort": null, "summary": null },
+                        "usage": null,
+                        "max_output_tokens": max_output_tokens,
+                        "max_tool_calls": null,
+                        "store": store,
+                        "background": false,
+                        "service_tier": "default",
+                        "metadata": {},
+                        "safety_identifier": null,
+                        "prompt_cache_key": null
+                    }
+                }),
+            );
+            seq += 1;
+        }
+
         // Load/switch backend if needed, emitting progress events through SSE.
         {
             let mut guard = backend.blocking_lock();
             let needs_load =
                 guard.current_model.as_deref() != Some(&model_id) || guard.backend.is_none();
             if needs_load {
-                let tx_progress = tx.clone();
-                let callback: Option<talu::LoadProgressCallback> =
+                let callback: Option<talu::LoadProgressCallback> = if strict_responses {
+                    None
+                } else {
+                    let tx_progress = tx.clone();
                     Some(Box::new(move |p: talu::LoadProgress| {
                         let _ = send_event(
                             &tx_progress,
@@ -1068,18 +1267,37 @@ async fn stream_response(
                                 "total": p.total,
                             }),
                         );
-                    }));
+                    }))
+                };
                 match provider::create_backend_for_model_with_progress(&model_id, callback) {
                     Ok(new_backend) => {
                         guard.backend = Some(new_backend);
                         guard.current_model = Some(model_id.clone());
                     }
                     Err(e) => {
+                        if strict_responses {
+                            let _ = send_event(
+                                &tx,
+                                "error",
+                                json!({
+                                    "type": "error",
+                                    "sequence_number": seq,
+                                    "error": {
+                                        "type": "server_error",
+                                        "code": "model_error",
+                                        "message": format!("Failed to load model: {e}"),
+                                        "param": null
+                                    }
+                                }),
+                            );
+                            seq += 1;
+                        }
                         let _ = send_event(
                             &tx,
                             "response.failed",
                             json!({
                                 "type": "response.failed",
+                                "sequence_number": seq,
                                 "response": {
                                     "error": {
                                         "code": "model_error",
@@ -1097,8 +1315,8 @@ async fn stream_response(
         // Persist session metadata for new conversations BEFORE sending
         // response.created — the client refreshes the sidebar on receipt and
         // the session must already be in list_sessions at that point.
-        if is_new_conversation && bucket_path.is_some() {
-            if let Ok(temp_chat) = ChatHandle::new(system_prompt_from_doc.as_deref()) {
+        if !strict_responses && is_new_conversation && bucket_path.is_some() {
+            if let Ok(temp_chat) = ChatHandle::new(effective_system_prompt.as_deref()) {
                 if let Some(bp_str) = bucket_path.as_ref().and_then(|p| p.to_str()) {
                     if temp_chat.set_storage_db(bp_str, &session_id).is_ok() {
                         let t = input_string.as_deref().unwrap_or("Untitled");
@@ -1114,7 +1332,6 @@ async fn stream_response(
             }
         }
 
-        let mut seq = 0u64;
         let mut created_response = normalize_response_value(build_response_resource_value(
             &response_id,
             &model_id,
@@ -1128,10 +1345,17 @@ async fn stream_response(
             None,
             tools_for_events.as_ref(),
             tool_choice_for_events.as_ref(),
+            store,
+            instructions.as_deref(),
         ));
-        // Include session_id in the very first event so the UI can track
-        // the conversation immediately (before generation completes).
-        created_response["metadata"] = json!({ "session_id": session_id });
+        if let Some(ref prev_id) = previous_response_id_for_ctx {
+            created_response["previous_response_id"] = json!(prev_id);
+        }
+        if !strict_responses {
+            // Include session_id in the very first event so the UI can track
+            // the conversation immediately (before generation completes).
+            created_response["metadata"] = json!({ "session_id": session_id });
+        }
         let _ = send_event(
             &tx,
             "response.created",
@@ -1154,7 +1378,11 @@ async fn stream_response(
         );
         seq += 1;
 
-        let progress_tx = tx.clone();
+        let progress_tx = if strict_responses {
+            None
+        } else {
+            Some(tx.clone())
+        };
         let ctx = Arc::new(std::sync::Mutex::new(StreamCtx {
             tx,
             seq,
@@ -1171,6 +1399,10 @@ async fn stream_response(
             tenant_id: auth_ctx.as_ref().map(|ctx| ctx.tenant_id.clone()),
             user_id: auth_ctx.and_then(|ctx| ctx.user_id),
             session_id: session_id.clone(),
+            strict_responses,
+            request_store: store,
+            previous_response_id: previous_response_id_for_ctx.clone(),
+            instructions: instructions.clone(),
         }));
         let ctx_for_complete = ctx.clone();
 
@@ -1185,12 +1417,13 @@ async fn stream_response(
             max_output_tokens,
             temperature,
             top_p,
-            system_prompt_from_doc,
+            effective_system_prompt,
             prompt_id,
             file_storage_path,
             ctx,
             stop_flag_for_gen,
             progress_tx,
+            strict_responses,
         );
 
         // Store conversation for chaining after streaming completes.
@@ -1203,6 +1436,7 @@ async fn stream_response(
                     tools_json: store_tools,
                     tool_choice_json: store_tool_choice,
                     session_id: Some(session_id_for_store),
+                    tenant_id: tenant_id_for_store,
                 },
             );
         }
@@ -1219,7 +1453,7 @@ async fn stream_response(
         };
 
         // Auto-generate a descriptive title for new conversations.
-        if is_new_conversation && auto_title {
+        if !strict_responses && is_new_conversation && auto_title {
             if let Some(ref input) = title_input {
                 let _ = generate_title(&title_backend, &title_bucket, &title_session_id, input);
             }
@@ -1255,7 +1489,8 @@ fn run_streaming_generation(
     file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
-    progress_tx: tokio::sync::mpsc::UnboundedSender<Bytes>,
+    progress_tx: Option<tokio::sync::mpsc::UnboundedSender<Bytes>>,
+    strict_responses: bool,
 ) -> Result<StreamGenResult> {
     let mut backend = backend.blocking_lock();
     let backend = backend
@@ -1317,19 +1552,22 @@ fn run_streaming_generation(
     cfg.stop_flag = Some(stop_flag);
 
     // Prefill progress — emit response.progress events with phase "Prefill".
-    let prefill_tx = progress_tx;
-    cfg.prefill_progress = Some(Box::new(move |completed: usize, total: usize| {
-        let _ = send_event(
-            &prefill_tx,
-            "response.progress",
-            json!({
-                "type": "response.progress",
-                "phase": "Prefill",
-                "current": completed,
-                "total": total,
-            }),
-        );
-    }));
+    if !strict_responses {
+        if let Some(prefill_tx) = progress_tx {
+            cfg.prefill_progress = Some(Box::new(move |completed: usize, total: usize| {
+                let _ = send_event(
+                    &prefill_tx,
+                    "response.progress",
+                    json!({
+                        "type": "response.progress",
+                        "phase": "Prefill",
+                        "current": completed,
+                        "total": total,
+                    }),
+                );
+            }));
+        }
+    }
 
     log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
         model_id, max_output_tokens, temperature, top_p);
@@ -1499,6 +1737,14 @@ struct StreamCtx {
     user_id: Option<String>,
     /// TaluDB session ID (returned in metadata so the UI can chain follow-ups).
     session_id: String,
+    /// Whether this stream is serving strict `/v1/responses`.
+    strict_responses: bool,
+    /// Request `store` flag.
+    request_store: bool,
+    /// Previous response chain id from the request.
+    previous_response_id: Option<String>,
+    /// Request instructions field for OpenResponses response resources.
+    instructions: Option<String>,
 }
 
 impl StreamCtx {
@@ -1537,16 +1783,54 @@ impl StreamCtx {
         self.accumulated_text.push_str(token.text);
 
         // Emit the delta event.
-        let event_name = delta_event_name(token.item_type, token.content_type);
-        let payload = json!({
-            "type": event_name,
-            "sequence_number": self.seq,
-            "item_id": self.cur_item_id,
-            "output_index": self.output_index,
-            "content_index": self.content_index,
-            "delta": token.text,
-            "logprobs": []
-        });
+        let event_name =
+            talu::responses::stream_delta_event_name(token.item_type, token.content_type);
+        let payload = match event_name {
+            "response.function_call_arguments.delta" => json!({
+                "type": event_name,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "delta": token.text,
+                "obfuscation": ""
+            }),
+            "response.reasoning_summary_text.delta" => json!({
+                "type": event_name,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "summary_index": self.content_index,
+                "delta": token.text,
+                "obfuscation": ""
+            }),
+            "response.refusal.delta" => json!({
+                "type": event_name,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "delta": token.text
+            }),
+            "response.reasoning.delta" => json!({
+                "type": event_name,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "delta": token.text,
+                "obfuscation": ""
+            }),
+            _ => json!({
+                "type": event_name,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "delta": token.text,
+                "logprobs": [],
+                "obfuscation": ""
+            }),
+        };
         self.seq += 1;
 
         // Detect client disconnect: if send fails, the client has disconnected.
@@ -1596,22 +1880,37 @@ impl StreamCtx {
 
     /// Emit `response.content_part.added` for a new content part.
     fn emit_content_part_added(&mut self, content_type: ContentType) -> Result<()> {
-        let part_type = content_part_type(content_type);
+        let part_type = talu::responses::stream_content_part_type(content_type);
         let payload = json!({
             "type": "response.content_part.added",
             "sequence_number": self.seq,
             "item_id": self.cur_item_id,
             "output_index": self.output_index,
             "content_index": self.content_index,
-            "part": {
-                "type": part_type,
-                "text": "",
-                "annotations": [],
-                "logprobs": []
-            }
+            "part": content_part_done_payload(part_type, "")
         });
         self.seq += 1;
-        self.try_send("response.content_part.added", payload)
+        self.try_send("response.content_part.added", payload)?;
+
+        if matches!(content_type, ContentType::SummaryText) {
+            let summary_added_payload = json!({
+                "type": "response.reasoning_summary_part.added",
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "summary_index": self.content_index,
+                "part": {
+                    "type": "summary_text",
+                    "text": ""
+                }
+            });
+            self.seq += 1;
+            self.try_send(
+                "response.reasoning_summary_part.added",
+                summary_added_payload,
+            )?;
+        }
+        Ok(())
     }
 
     /// Emit the type-specific `.done` event and `response.content_part.done`
@@ -1623,36 +1922,81 @@ impl StreamCtx {
         };
 
         // Type-specific done event (e.g. response.output_text.done).
-        let done_event = done_event_name(item_type, content_type);
-        let done_payload = json!({
-            "type": done_event,
-            "sequence_number": self.seq,
-            "item_id": self.cur_item_id,
-            "output_index": self.output_index,
-            "content_index": self.content_index,
-            "text": self.accumulated_text,
-            "logprobs": []
-        });
+        let done_event = talu::responses::stream_done_event_name(item_type, content_type);
+        let done_payload = match done_event {
+            "response.function_call_arguments.done" => json!({
+                "type": done_event,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "arguments": self.accumulated_text
+            }),
+            "response.reasoning_summary_text.done" => json!({
+                "type": done_event,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "summary_index": self.content_index,
+                "text": self.accumulated_text
+            }),
+            "response.refusal.done" => json!({
+                "type": done_event,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "refusal": self.accumulated_text
+            }),
+            "response.reasoning.done" => json!({
+                "type": done_event,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "text": self.accumulated_text
+            }),
+            _ => json!({
+                "type": done_event,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "text": self.accumulated_text,
+                "logprobs": []
+            }),
+        };
         self.seq += 1;
         self.try_send(done_event, done_payload)?;
 
         // content_part.done
-        let part_type = content_part_type(content_type);
+        let part_type = talu::responses::stream_content_part_type(content_type);
         let part_payload = json!({
             "type": "response.content_part.done",
             "sequence_number": self.seq,
             "item_id": self.cur_item_id,
             "output_index": self.output_index,
             "content_index": self.content_index,
-            "part": {
-                "type": part_type,
-                "text": self.accumulated_text,
-                "annotations": [],
-                "logprobs": []
-            }
+            "part": content_part_done_payload(part_type, &self.accumulated_text)
         });
         self.seq += 1;
-        self.try_send("response.content_part.done", part_payload)
+        self.try_send("response.content_part.done", part_payload)?;
+
+        if matches!(content_type, ContentType::SummaryText) {
+            let summary_done_payload = json!({
+                "type": "response.reasoning_summary_part.done",
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "summary_index": self.content_index,
+                "part": {
+                    "type": "summary_text",
+                    "text": self.accumulated_text
+                }
+            });
+            self.seq += 1;
+            self.try_send("response.reasoning_summary_part.done", summary_done_payload)?;
+        }
+        Ok(())
     }
 
     /// Emit `response.output_item.done` for the current output item.
@@ -1682,11 +2026,17 @@ impl StreamCtx {
                 "id": self.cur_item_id,
                 "role": "assistant",
                 "status": "completed",
-                "content": [{
-                    "type": "output_text",
-                    "text": self.accumulated_text,
-                    "annotations": [],
-                    "logprobs": []
+                "content": [match self.cur_content_type {
+                    Some(ContentType::Refusal) => json!({
+                        "type": "refusal",
+                        "refusal": self.accumulated_text
+                    }),
+                    _ => json!({
+                        "type": "output_text",
+                        "text": self.accumulated_text,
+                        "annotations": [],
+                        "logprobs": []
+                    }),
                 }]
             }),
         };
@@ -1747,7 +2097,12 @@ impl StreamCtx {
                     Some(&r.usage),
                     self.tools_json.as_ref(),
                     self.tool_choice_json.as_ref(),
+                    self.request_store,
+                    self.instructions.as_deref(),
                 );
+                if let Some(ref prev_id) = self.previous_response_id {
+                    response["previous_response_id"] = json!(prev_id);
+                }
                 if status == "incomplete" {
                     let reason = match r.finish_reason {
                         FinishReason::Cancelled => "cancelled",
@@ -1757,7 +2112,9 @@ impl StreamCtx {
                         "reason": reason
                     });
                 }
-                response["metadata"] = json!({ "session_id": self.session_id });
+                if !self.strict_responses {
+                    response["metadata"] = json!({ "session_id": self.session_id });
+                }
                 let response = normalize_response_value(response);
                 let payload = json!({
                     "type": event_type,
@@ -1769,6 +2126,20 @@ impl StreamCtx {
                 self.log_generation_completed();
             }
             Err(err) => {
+                if self.strict_responses {
+                    let payload = json!({
+                        "type": "error",
+                        "sequence_number": self.seq,
+                        "error": {
+                            "type": "server_error",
+                            "code": "server_error",
+                            "message": format!("{err}"),
+                            "param": null
+                        }
+                    });
+                    self.seq += 1;
+                    send_event(&self.tx, "error", payload)?;
+                }
                 let mut response = build_response_resource_value(
                     &self.response_id,
                     &model_id,
@@ -1782,11 +2153,19 @@ impl StreamCtx {
                     None,
                     self.tools_json.as_ref(),
                     self.tool_choice_json.as_ref(),
+                    self.request_store,
+                    self.instructions.as_deref(),
                 );
+                if let Some(ref prev_id) = self.previous_response_id {
+                    response["previous_response_id"] = json!(prev_id);
+                }
                 response["error"] = json!({
                     "code": "server_error",
                     "message": format!("{err}")
                 });
+                if !self.strict_responses {
+                    response["metadata"] = json!({ "session_id": self.session_id });
+                }
                 let response = normalize_response_value(response);
                 let payload = json!({
                     "type": "response.failed",
@@ -1828,32 +2207,26 @@ fn send_event(
     Ok(())
 }
 
-/// Returns the SSE event name for a streaming delta token.
-fn delta_event_name(item_type: ItemType, content_type: ContentType) -> &'static str {
-    match content_type {
-        ContentType::ReasoningText => "response.reasoning.delta",
-        _ if item_type == ItemType::FunctionCall => "response.function_call_arguments.delta",
-        _ => "response.output_text.delta",
-    }
-}
-
-/// Returns the SSE event name for a content-part done event.
-fn done_event_name(item_type: ItemType, content_type: ContentType) -> &'static str {
-    match content_type {
-        ContentType::ReasoningText => "response.reasoning.done",
-        _ if item_type == ItemType::FunctionCall => "response.function_call_arguments.done",
-        _ => "response.output_text.done",
-    }
-}
-
-/// Maps a content type to the OpenResponses content part type string.
-fn content_part_type(content_type: ContentType) -> &'static str {
-    match content_type {
-        ContentType::ReasoningText => "reasoning",
-        ContentType::OutputText => "output_text",
-        ContentType::Refusal => "refusal",
-        ContentType::SummaryText => "summary_text",
-        _ => "output_text",
+fn content_part_done_payload(part_type: &str, text: &str) -> serde_json::Value {
+    match part_type {
+        "refusal" => json!({
+            "type": "refusal",
+            "refusal": text
+        }),
+        "summary_text" => json!({
+            "type": "summary_text",
+            "text": text
+        }),
+        "reasoning_text" => json!({
+            "type": "reasoning_text",
+            "text": text
+        }),
+        _ => json!({
+            "type": part_type,
+            "text": text,
+            "annotations": [],
+            "logprobs": []
+        }),
     }
 }
 
@@ -1876,6 +2249,8 @@ fn build_response_resource_value(
     usage: Option<&UsageStats>,
     tools: Option<&serde_json::Value>,
     tool_choice: Option<&serde_json::Value>,
+    store: bool,
+    instructions: Option<&str>,
 ) -> serde_json::Value {
     let usage_value = match usage {
         Some(u) => json!({
@@ -1904,7 +2279,7 @@ fn build_response_resource_value(
         "incomplete_details": null,
         "model": model_id,
         "previous_response_id": null,
-        "instructions": null,
+        "instructions": instructions,
         "output": output_items,
         "error": null,
         "tools": tools_value,
@@ -1921,7 +2296,7 @@ fn build_response_resource_value(
         "usage": usage_value,
         "max_output_tokens": max_output_tokens,
         "max_tool_calls": null,
-        "store": false,
+        "store": store,
         "background": false,
         "service_tier": "default",
         "metadata": {},
@@ -2071,6 +2446,97 @@ fn now_unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
+fn validate_responses_request(request: &responses_types::CreateResponseBody) -> Result<(), String> {
+    if let Some(input) = request.input.as_ref() {
+        if !(input.is_string() || input.is_array() || input.is_null()) {
+            return Err("`input` must be a string, an array, or null".to_string());
+        }
+        if input.is_array() {
+            let serialized = serde_json::to_string(input)
+                .map_err(|_| "failed to serialize `input` array".to_string())?;
+            let mut conv = talu::responses::ResponsesHandle::new()
+                .map_err(|e| format!("failed to validate `input` items: {e}"))?;
+            conv.load_responses_json(&serialized).map_err(|e| {
+                format!("`input` array contains unsupported item/content shape: {e}")
+            })?;
+        }
+    }
+
+    if let Some(metadata) = request.metadata.as_ref() {
+        if !metadata.is_object() {
+            return Err("`metadata` must be an object".to_string());
+        }
+    }
+
+    if let Some(tools) = request.tools.as_ref() {
+        if !tools.is_array() {
+            return Err("`tools` must be an array".to_string());
+        }
+    }
+
+    if let Some(tool_choice) = request.tool_choice.as_ref() {
+        validate_tool_choice(tool_choice)?;
+    }
+
+    Ok(())
+}
+
+fn validate_tool_choice(tool_choice: &serde_json::Value) -> Result<(), String> {
+    if let Some(choice) = tool_choice.as_str() {
+        if matches!(choice, "none" | "auto" | "required") {
+            return Ok(());
+        }
+        return Err("`tool_choice` string must be one of: none, auto, required".to_string());
+    }
+
+    let obj = tool_choice
+        .as_object()
+        .ok_or_else(|| "`tool_choice` must be a string or object".to_string())?;
+    let choice_type = obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "`tool_choice.type` must be a string".to_string())?;
+
+    match choice_type {
+        "function" => {
+            if obj.get("name").and_then(|v| v.as_str()).is_none() {
+                return Err("`tool_choice` of type `function` requires a string `name`".to_string());
+            }
+            Ok(())
+        }
+        "allowed_tools" => {
+            let tools = obj.get("tools").and_then(|v| v.as_array()).ok_or_else(|| {
+                "`tool_choice` of type `allowed_tools` requires `tools` array".to_string()
+            })?;
+            if tools.is_empty() {
+                return Err("`tool_choice.tools` must contain at least one tool".to_string());
+            }
+            for tool in tools {
+                let tool_obj = tool
+                    .as_object()
+                    .ok_or_else(|| "`tool_choice.tools[*]` must be an object".to_string())?;
+                if tool_obj.get("type").and_then(|v| v.as_str()) != Some("function")
+                    || tool_obj.get("name").and_then(|v| v.as_str()).is_none()
+                {
+                    return Err(
+                        "`tool_choice.tools[*]` must be `{ \"type\": \"function\", \"name\": \"...\" }`"
+                            .to_string(),
+                    );
+                }
+            }
+            if let Some(mode) = obj.get("mode").and_then(|v| v.as_str()) {
+                if !matches!(mode, "none" | "auto" | "required") {
+                    return Err(
+                        "`tool_choice.mode` must be one of: none, auto, required".to_string()
+                    );
+                }
+            }
+            Ok(())
+        }
+        _ => Err("`tool_choice.type` must be `function` or `allowed_tools`".to_string()),
+    }
+}
+
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody> {
     let payload = json!({
         "error": {
@@ -2084,4 +2550,77 @@ fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody
         .header("content-type", "application/json")
         .body(Full::new(Bytes::from(body)).boxed())
         .unwrap()
+}
+
+fn api_error(
+    strict_responses: bool,
+    status: StatusCode,
+    code: &str,
+    message: &str,
+) -> Response<BoxBody> {
+    if !strict_responses {
+        return json_error(status, code, message);
+    }
+    let error_type = if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "server_error"
+    };
+    let payload = json!({
+        "error": {
+            "type": error_type,
+            "code": code,
+            "message": message,
+            "param": null
+        }
+    });
+    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    Response::builder()
+        .status(status)
+        .header("content-type", "application/json")
+        .body(Full::new(Bytes::from(body)).boxed())
+        .unwrap()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validate_responses_request_rejects_object_input() {
+        let req = responses_types::CreateResponseBody {
+            background: None,
+            frequency_penalty: None,
+            include: None,
+            input: Some(json!({"bad": "shape"})),
+            instructions: None,
+            max_output_tokens: None,
+            max_tool_calls: None,
+            metadata: None,
+            model: None,
+            parallel_tool_calls: None,
+            presence_penalty: None,
+            previous_response_id: None,
+            prompt_cache_key: None,
+            reasoning: None,
+            safety_identifier: None,
+            service_tier: None,
+            store: None,
+            stream: None,
+            stream_options: None,
+            temperature: None,
+            text: None,
+            tool_choice: None,
+            tools: None,
+            top_logprobs: None,
+            top_p: None,
+            truncation: None,
+        };
+        assert!(validate_responses_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_tool_choice_rejects_invalid_string() {
+        assert!(validate_tool_choice(&json!("sometimes")).is_err());
+    }
 }

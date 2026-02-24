@@ -197,6 +197,15 @@ function handleSSEEvent(
   }
 
   switch (event) {
+    case "response.queued": {
+      const response = parsed["response"] as Record<string, unknown> | undefined;
+      if (response && typeof response["id"] === "string") {
+        streamMeta.lastResponseId = response["id"] as string;
+        if (isActive()) chatState.lastResponseId = response["id"] as string;
+      }
+      callbacks.onProgress?.("Queued", 0, 1);
+      break;
+    }
     case "response.created":
     case "response.in_progress": {
       const response = parsed["response"] as Record<string, unknown> | undefined;
@@ -212,6 +221,9 @@ function handleSSEEvent(
           onSessionDiscovered?.(sid);
         }
         if (isActive()) chatState.activeSessionId = sid;
+      }
+      if (event === "response.in_progress") {
+        callbacks.onProgress?.("Generating", 0, 1);
       }
       break;
     }

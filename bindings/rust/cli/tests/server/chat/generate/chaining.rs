@@ -210,15 +210,9 @@ fn streaming_continue_has_session_metadata() {
     );
 }
 
-/// Cross-tenant `response_store` leak: the store is a global `HashMap` with no
-/// tenant scoping, so Tenant B can chain off Tenant A's `response_id` and
-/// inherit Tenant A's `session_id`.
-///
-/// If this assertion starts failing (i.e. the sessions differ or the request
-/// returns an error), tenant isolation was added to `response_store` — update
-/// this test to assert that cross-tenant chaining is correctly rejected.
+/// Cross-tenant chaining must not leak response/session state.
 #[test]
-fn cross_tenant_chaining_inherits_session_id() {
+fn cross_tenant_chaining_is_isolated() {
     let model = require_model!();
     let temp = tempfile::TempDir::new().expect("temp dir");
     let bucket = temp.path().join("bucket");
@@ -294,10 +288,9 @@ fn cross_tenant_chaining_inherits_session_id() {
         .as_str()
         .expect("beta should have session_id");
 
-    // Documents known vulnerability: Beta inherits Alpha's session_id because
-    // response_store has no tenant scoping.
-    assert_eq!(
+    // Tenant Beta must not inherit Tenant Alpha's chained session.
+    assert_ne!(
         alpha_session_id, beta_session_id,
-        "cross-tenant chaining leaks session_id (known: response_store is global)"
+        "cross-tenant chaining must not share session_id across tenants"
     );
 }

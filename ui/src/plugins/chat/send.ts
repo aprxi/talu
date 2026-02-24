@@ -14,7 +14,7 @@ import {
   isAttachmentUploadInProgress,
   uploadFiles,
 } from "./attachments.ts";
-import type { Conversation, CreateChatGenerateRequest, InputContentItem, UsageStats } from "../../types.ts";
+import type { Conversation, CreateResponseRequest, InputContentItem, UsageStats } from "../../types.ts";
 
 export function setupInputEvents(): void {
   const dom = getChatDom();
@@ -75,6 +75,11 @@ export interface StreamOptions {
   afterResponse?: (chat: Conversation) => void;
 }
 
+function resolveInstructions(promptId?: string | null): string | null {
+  if (!promptId) return null;
+  return getPromptsService()?.getPromptContentById(promptId) ?? null;
+}
+
 /** Shared streaming pipeline used by send, welcome-send, and rerun. */
 export async function streamResponse(opts: StreamOptions): Promise<void> {
   const myViewId = chatState.activeViewId;
@@ -126,17 +131,16 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   };
 
   try {
-    let requestBody: CreateChatGenerateRequest = {
+    let requestBody: CreateResponseRequest = {
       model: getModelsService()?.getActiveModel() ?? "",
       input: opts.input,
       previous_response_id: chatState.lastResponseId,
-      session_id: chatState.activeSessionId,
-      prompt_id: opts.promptId ?? undefined,
+      instructions: resolveInstructions(opts.promptId),
       ...getSamplingParams(),
     };
 
     // Run chat.send.before hook — plugins can modify the request or block it.
-    const hookResult = await hooks.run<CreateChatGenerateRequest>("chat.send.before", requestBody);
+    const hookResult = await hooks.run<CreateResponseRequest>("chat.send.before", requestBody);
     if (hookResult && typeof hookResult === "object" && "$block" in hookResult) {
       notifications.warning((hookResult as { reason: string }).reason ?? "Send blocked by plugin");
       chatState.isGenerating = false;
@@ -144,9 +148,8 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       setInputEnabled(true);
       return;
     }
-    requestBody = hookResult as CreateChatGenerateRequest;
-
-    const resp = await api.createChatGenerate(requestBody, chatState.streamAbort.signal);
+    requestBody = hookResult as CreateResponseRequest;
+    const resp = await api.createResponse(requestBody, chatState.streamAbort.signal);
 
     if (!resp.ok) {
       if (isActive()) {

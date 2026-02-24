@@ -47,6 +47,8 @@ export const promptsPlugin: PluginDefinition = {
       getSelectedPromptId: () => promptsState.selectedId,
       getDefaultPromptId: () => promptsState.defaultId ?? promptsState.builtinId,
       getPromptNameById: (id) => promptsState.prompts.find((p) => p.id === id)?.name ?? null,
+      getPromptContentById: (id) =>
+        promptsState.prompts.find((p) => p.id === id)?.content ?? null,
       getAll: () => promptsState.prompts,
     };
     ctx.subscriptions.add(ctx.services.provide("talu.prompts", service));

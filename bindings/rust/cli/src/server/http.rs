@@ -28,6 +28,7 @@ use crate::server::openapi;
 use crate::server::plugins;
 use crate::server::proxy;
 use crate::server::repo;
+use crate::server::responses;
 use crate::server::search;
 use crate::server::sessions;
 use crate::server::settings;
@@ -52,6 +53,8 @@ pub struct ErrorBody {
 static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(openapi::build_openapi_json);
 static OPENAPI_CHAT_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/"]));
+static OPENAPI_RESPONSES_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/responses"]));
 static OPENAPI_MODELS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models"]));
 static OPENAPI_FILES_SPEC: Lazy<Vec<u8>> =
@@ -160,6 +163,11 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_CHAT_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/responses.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_RESPONSES_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/openapi/models.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -238,6 +246,9 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/docs") => docs_hub_response(),
                 (Method::GET, "/docs/chat") => {
                     swagger_ui_response("/openapi/chat.json", "Talu API :: Chat")
+                }
+                (Method::GET, "/docs/responses") => {
+                    swagger_ui_response("/openapi/responses.json", "Talu API :: Responses")
                 }
                 (Method::GET, "/docs/models") => {
                     swagger_ui_response("/openapi/models.json", "Talu API :: Models")
@@ -342,6 +353,9 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/chat/generate") => {
                             handlers::handle_chat_generate(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/responses") => {
+                            responses::handle_create(state, req, auth).await
                         }
                         // Settings endpoints
                         (Method::GET, "/v1/settings") | (Method::GET, "/settings") => {
@@ -1166,6 +1180,11 @@ a:hover {
           <td class="mono"><a href="/docs/chat"><code>chat</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/chat.json" title="/openapi/chat.json">json</a><button class="copy-btn" data-url="/openapi/chat.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Chat API plane (`/v1/chat/*`), including generate and sessions endpoints.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/responses"><code>responses</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/responses.json" title="/openapi/responses.json">json</a><button class="copy-btn" data-url="/openapi/responses.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">OpenResponses-compatible API surface (`/v1/responses`).</td>
         </tr>
         <tr>
           <td class="mono"><a href="/docs/models"><code>models</code></a></td>
