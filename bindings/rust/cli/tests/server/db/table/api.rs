@@ -3,7 +3,7 @@
 //! Tests for the Documents HTTP API endpoints.
 //! Uses in-process hyper connections (no TCP socket) for speed and determinism.
 //!
-//! Run: `cargo test -p talu-cli --test server server::documents::api`
+//! Run: `cargo test -p talu-cli --test server server::db::table::api`
 
 use std::collections::HashMap;
 use std::sync::Arc;

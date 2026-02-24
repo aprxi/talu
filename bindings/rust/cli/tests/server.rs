@@ -11,7 +11,6 @@ mod server {
     pub mod console;
     pub mod conversations;
     pub mod db;
-    pub mod documents;
     pub mod file;
     pub mod files;
     pub mod openapi_docs;

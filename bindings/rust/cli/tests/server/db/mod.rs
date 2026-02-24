@@ -2,6 +2,7 @@
 
 mod kv;
 mod openapi_docs;
+mod table;
 mod vector;
 
 use std::path::Path;
