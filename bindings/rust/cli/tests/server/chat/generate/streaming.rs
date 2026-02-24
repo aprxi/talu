@@ -47,7 +47,7 @@ fn streaming_in_progress_event() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -70,7 +70,7 @@ fn streaming_output_item_added() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -106,7 +106,7 @@ fn streaming_content_part_added() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -137,7 +137,7 @@ fn streaming_content_part_done() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -165,7 +165,7 @@ fn streaming_output_item_done() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -196,7 +196,7 @@ fn streaming_terminal_response_schema() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -265,7 +265,7 @@ fn streaming_full_lifecycle_order() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -340,7 +340,7 @@ fn streaming_delta_event_fields() {
     let ctx = ServerTestContext::new(model_config());
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body(&model, "Hello"),
     );
     let events = parse_sse_events(&resp.body);
@@ -379,7 +379,7 @@ fn streaming_incomplete_on_max_tokens() {
         "stream": true,
         "max_output_tokens": 1,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200);
     let events = parse_sse_events(&resp.body);
 
@@ -411,7 +411,7 @@ fn non_streaming_incomplete_on_max_tokens() {
         "input": "Write a very long story about dragons and wizards",
         "max_output_tokens": 1,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     // Non-streaming may or may not report incomplete (handler always sets "completed").
@@ -469,7 +469,7 @@ fn streaming_created_event_has_session_id() {
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body_with_store(&model, "Hello"),
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -497,7 +497,7 @@ fn streaming_in_progress_event_has_session_id() {
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body_with_store(&model, "Hello"),
     );
     assert_eq!(resp.status, 200);
@@ -522,7 +522,7 @@ fn streaming_session_id_consistent_across_lifecycle() {
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body_with_store(&model, "Hello"),
     );
     assert_eq!(resp.status, 200);
@@ -573,7 +573,7 @@ fn streaming_session_visible_during_generation() {
 
     // Open a raw TCP connection and send the POST manually.
     let request = format!(
-        "POST /v1/responses HTTP/1.1\r\n\
+        "POST /v1/chat/generate HTTP/1.1\r\n\
          Host: {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
@@ -674,7 +674,7 @@ fn streaming_session_title_derived_from_input() {
     let ctx = ServerTestContext::new(model_and_bucket_config(temp.path()));
     let resp = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body_with_store(&model, "Tell me about penguins"),
     );
     assert_eq!(resp.status, 200);
@@ -709,7 +709,7 @@ fn non_streaming_response_has_session_id() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
 
@@ -763,7 +763,7 @@ fn stream_until_created(
 ) -> (TcpStream, String, String) {
     let body_str = serde_json::to_string(body).unwrap();
     let request = format!(
-        "POST /v1/responses HTTP/1.1\r\n\
+        "POST /v1/chat/generate HTTP/1.1\r\n\
          Host: {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
@@ -918,7 +918,7 @@ fn streaming_chained_response_preserves_session() {
     // First request: create a new session.
     let resp1 = post_json(
         ctx.addr(),
-        "/v1/responses",
+        "/v1/chat/generate",
         &streaming_body_with_store(&model, "Hello"),
     );
     assert_eq!(resp1.status, 200);
@@ -945,7 +945,7 @@ fn streaming_chained_response_preserves_session() {
         "max_output_tokens": 10,
         "previous_response_id": response_id,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200);
     let events2 = parse_sse_events(&resp2.body);
 

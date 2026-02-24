@@ -8,6 +8,7 @@ use log::LevelFilter;
 use talu::blobs::BlobsHandle;
 
 pub mod auth_gateway;
+pub mod chat_generate_types;
 pub mod code;
 pub mod code_ws;
 pub mod db;
@@ -21,7 +22,6 @@ pub mod openapi;
 pub mod plugins;
 pub mod proxy;
 pub mod repo;
-pub mod responses_types;
 pub mod search;
 pub mod sessions;
 pub mod settings;

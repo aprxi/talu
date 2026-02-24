@@ -1,8 +1,8 @@
 //! Integration tests for `/v1/chat/sessions/:id/tags` endpoints.
 
 use super::tags_config;
+use crate::server::chat::sessions::{seed_session, seed_session_with_tags};
 use crate::server::common::*;
-use crate::server::sessions::{seed_session, seed_session_with_tags};
 use tempfile::TempDir;
 
 // ---------------------------------------------------------------------------

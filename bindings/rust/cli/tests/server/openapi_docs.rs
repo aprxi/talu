@@ -15,8 +15,8 @@ fn docs_hub_lists_non_db_sections() {
     );
 
     for link in [
-        "/docs/ai",
         "/docs/chat",
+        "/docs/models",
         "/docs/files",
         "/docs/repo",
         "/docs/search",
@@ -40,8 +40,8 @@ fn scoped_docs_pages_point_to_scoped_specs() {
     let ctx = ServerTestContext::new(ServerConfig::new());
 
     for (path, expected_spec) in [
-        ("/docs/ai", "/openapi/ai.json"),
         ("/docs/chat", "/openapi/chat.json"),
+        ("/docs/models", "/openapi/models.json"),
         ("/docs/files", "/openapi/files.json"),
         ("/docs/repo", "/openapi/repo.json"),
         ("/docs/search", "/openapi/search.json"),
@@ -73,8 +73,8 @@ fn scoped_openapi_specs_are_prefix_scoped() {
     let ctx = ServerTestContext::new(ServerConfig::new());
 
     for (path, prefixes) in [
-        ("/openapi/ai.json", vec!["/v1/models", "/v1/responses"]),
-        ("/openapi/chat.json", vec!["/v1/chat/sessions"]),
+        ("/openapi/chat.json", vec!["/v1/chat/"]),
+        ("/openapi/models.json", vec!["/v1/models"]),
         ("/openapi/files.json", vec!["/v1/files", "/v1/file"]),
         ("/openapi/repo.json", vec!["/v1/repo"]),
         ("/openapi/search.json", vec!["/v1/search"]),

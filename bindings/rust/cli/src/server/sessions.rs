@@ -1374,7 +1374,7 @@ mod tests {
 
     #[test]
     fn test_extract_session_id_no_match() {
-        assert_eq!(extract_session_id("/v1/responses/abc"), None);
+        assert_eq!(extract_session_id("/v1/chat/generate/abc"), None);
     }
 
     #[test]

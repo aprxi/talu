@@ -18,7 +18,7 @@ fn generate_with(
             body[k.clone()] = v.clone();
         }
     }
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     resp.json()
 }
@@ -113,9 +113,9 @@ fn default_top_p() {
     );
 }
 
-/// Bare /responses path (without /v1 prefix) works.
+/// Primary chat/generate endpoint works.
 #[test]
-fn bare_responses_path() {
+fn chat_generate_path_works() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
@@ -123,10 +123,10 @@ fn bare_responses_path() {
         "input": "Hello",
         "max_output_tokens": 5,
     });
-    let resp = post_json(ctx.addr(), "/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(
         resp.status, 200,
-        "bare /responses should work: {}",
+        "/v1/chat/generate should work: {}",
         resp.body
     );
     let json = resp.json();
@@ -173,9 +173,9 @@ fn default_penalty_and_logprobs_fields() {
     );
 }
 
-/// Streaming with bare /responses path works.
+/// Streaming on chat/generate endpoint works.
 #[test]
-fn bare_responses_streaming() {
+fn chat_generate_streaming_works() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
@@ -184,7 +184,7 @@ fn bare_responses_streaming() {
         "stream": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200);
     let ct = resp.header("content-type").expect("Content-Type");
     assert!(ct.contains("text/event-stream"), "should be SSE: {ct}");

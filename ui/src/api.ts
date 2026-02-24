@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection, RepoModelList, RepoSearchResponse } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateChatGenerateRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection, RepoModelList, RepoSearchResponse } from "./types.ts";
 
 const BASE = "";
 
@@ -22,7 +22,7 @@ export interface ApiClient {
   getSettings(): Promise<ApiResult<Settings>>;
   patchSettings(patch: SettingsPatch): Promise<ApiResult<Settings>>;
   resetModelOverrides(modelId: string): Promise<ApiResult<Settings>>;
-  createResponse(body: CreateResponseRequest, signal?: AbortSignal): Promise<Response>;
+  createChatGenerate(body: CreateChatGenerateRequest, signal?: AbortSignal): Promise<Response>;
   listDocuments(type?: string): Promise<ApiResult<DocumentList>>;
   getDocument(id: string): Promise<ApiResult<Document>>;
   createDocument(doc: CreateDocumentRequest): Promise<ApiResult<Document>>;
@@ -132,7 +132,7 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     getSettings: () => requestJson<Settings>("GET", "/v1/settings"),
     patchSettings: (patch) => requestJson<Settings>("PATCH", "/v1/settings", patch),
     resetModelOverrides: (modelId) => requestJson<Settings>("DELETE", `/v1/settings/models/${modelId}`),
-    createResponse: (body, signal) => fetchFn(`${BASE}/v1/responses`, {
+    createChatGenerate: (body, signal) => fetchFn(`${BASE}/v1/chat/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ ...body, stream: true, store: true }),

@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    code, db, file, files, handlers, http, plugins, proxy, repo, responses_types, search, sessions,
-    settings, tags,
+    chat_generate_types, code, db, file, files, handlers, http, plugins, proxy, repo, search,
+    sessions, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -19,7 +19,7 @@ use crate::server::{
         description = "Local-first LLM inference and knowledge management API"
     ),
     tags(
-        (name = "Responses", description = "LLM inference (chat completions)"),
+        (name = "Chat::Generate", description = "Current chat generation endpoint"),
         (name = "Models", description = "Available model listing"),
         (name = "Chat", description = "Chat session state management"),
         (name = "Files", description = "Binary file upload and management"),
@@ -43,9 +43,9 @@ use crate::server::{
         ("tenant_id" = []),
     ),
     paths(
-        // Models + Responses
+        // Models + chat generation
         handlers::handle_models,
-        handlers::handle_responses,
+        handlers::handle_chat_generate,
         // Tags
         tags::handle_list,
         tags::handle_create,
@@ -146,9 +146,9 @@ use crate::server::{
         // Shared
         http::ErrorResponse,
         http::ErrorBody,
-        // Responses
-        responses_types::CreateResponseBody,
-        responses_types::ResponseResource,
+        // Chat generate
+        chat_generate_types::CreateChatGenerateBody,
+        chat_generate_types::ChatGenerateResponseResource,
         // Tags
         tags::TagResponse,
         tags::TagUsage,

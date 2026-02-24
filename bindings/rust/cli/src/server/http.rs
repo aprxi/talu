@@ -50,10 +50,10 @@ pub struct ErrorBody {
 }
 
 static OPENAPI_SPEC: Lazy<Vec<u8>> = Lazy::new(openapi::build_openapi_json);
-static OPENAPI_AI_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models", "/v1/responses"]));
-static OPENAPI_SESSIONS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/sessions"]));
+static OPENAPI_CHAT_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/chat/"]));
+static OPENAPI_MODELS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/models"]));
 static OPENAPI_FILES_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/files", "/v1/file"]));
 static OPENAPI_REPO_SPEC: Lazy<Vec<u8>> =
@@ -155,15 +155,15 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_SPEC.clone())).boxed())
                     .unwrap(),
-                (Method::GET, "/openapi/ai.json") => Response::builder()
-                    .status(StatusCode::OK)
-                    .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_AI_SPEC.clone())).boxed())
-                    .unwrap(),
                 (Method::GET, "/openapi/chat.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
-                    .body(Full::new(Bytes::from(OPENAPI_SESSIONS_SPEC.clone())).boxed())
+                    .body(Full::new(Bytes::from(OPENAPI_CHAT_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/models.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_MODELS_SPEC.clone())).boxed())
                     .unwrap(),
                 (Method::GET, "/openapi/files.json") => Response::builder()
                     .status(StatusCode::OK)
@@ -236,11 +236,11 @@ impl Service<Request<Incoming>> for Router {
                     .body(Full::new(Bytes::from(OPENAPI_DB_OPS_SPEC.clone())).boxed())
                     .unwrap(),
                 (Method::GET, "/docs") => docs_hub_response(),
-                (Method::GET, "/docs/ai") => {
-                    swagger_ui_response("/openapi/ai.json", "Talu API :: AI")
-                }
                 (Method::GET, "/docs/chat") => {
                     swagger_ui_response("/openapi/chat.json", "Talu API :: Chat")
+                }
+                (Method::GET, "/docs/models") => {
+                    swagger_ui_response("/openapi/models.json", "Talu API :: Models")
                 }
                 (Method::GET, "/docs/files") => {
                     swagger_ui_response("/openapi/files.json", "Talu API :: Files")
@@ -340,8 +340,8 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/models") | (Method::GET, "/models") => {
                             handlers::handle_models(state, req, auth).await
                         }
-                        (Method::POST, "/v1/responses") | (Method::POST, "/responses") => {
-                            handlers::handle_responses(state, req, auth).await
+                        (Method::POST, "/v1/chat/generate") => {
+                            handlers::handle_chat_generate(state, req, auth).await
                         }
                         // Settings endpoints
                         (Method::GET, "/v1/settings") | (Method::GET, "/settings") => {
@@ -1163,14 +1163,14 @@ a:hover {
       </thead>
       <tbody>
         <tr>
-          <td class="mono"><a href="/docs/ai"><code>ai</code></a></td>
-          <td class="json-cell"><a class="json-link" href="/openapi/ai.json" title="/openapi/ai.json">json</a><button class="copy-btn" data-url="/openapi/ai.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Model listing and response generation endpoints.</td>
-        </tr>
-        <tr>
           <td class="mono"><a href="/docs/chat"><code>chat</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/chat.json" title="/openapi/chat.json">json</a><button class="copy-btn" data-url="/openapi/chat.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
-          <td class="desc">Session CRUD, list, fork, and batch operations.</td>
+          <td class="desc">Chat API plane (`/v1/chat/*`), including generate and sessions endpoints.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/models"><code>models</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/models.json" title="/openapi/models.json">json</a><button class="copy-btn" data-url="/openapi/models.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Model discovery and listing endpoints.</td>
         </tr>
         <tr>
           <td class="mono"><a href="/docs/files"><code>files</code></a></td>

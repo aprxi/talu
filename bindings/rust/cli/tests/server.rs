@@ -5,6 +5,7 @@
 
 mod server {
     pub mod auth;
+    pub mod chat;
     pub mod code;
     pub mod common;
     pub mod compliance;
@@ -15,9 +16,7 @@ mod server {
     pub mod openapi_docs;
     pub mod plugins;
     pub mod repo;
-    pub mod responses;
     pub mod search;
-    pub mod sessions;
     pub mod settings;
     pub mod tags;
 }

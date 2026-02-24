@@ -289,7 +289,7 @@ function buildAttachmentContentParts(attachments: ChatAttachment[]): InputConten
 }
 
 /**
- * Build structured input for the /v1/responses endpoint.
+ * Build structured input for the /v1/chat/generate endpoint.
  *
  * When attachments are present, returns an array of InputContentItem objects
  * so the server can resolve file references into actual multimodal content.

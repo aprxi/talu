@@ -381,7 +381,7 @@ fn get_generated_item_has_generation_metadata() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "generate failed: {}", resp.body);
 
     // Extract session_id from response metadata
@@ -458,7 +458,7 @@ fn get_generation_metadata_has_sampling_params() {
         "temperature": 0.5,
         "top_p": 0.8,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200);
 
     let resp_json = resp.json();

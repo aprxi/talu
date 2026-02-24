@@ -19,7 +19,7 @@ fn model_not_available_500() {
         "input": "Hello",
         "max_output_tokens": 5,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 500, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["error"]["code"].as_str(), Some("inference_error"));
@@ -40,7 +40,7 @@ fn streaming_model_not_available() {
         "stream": true,
         "max_output_tokens": 5,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 500, "body: {}", resp.body);
     let json = resp.json();
     assert!(
@@ -56,7 +56,7 @@ fn empty_body_400() {
     let resp = send_request(
         ctx.addr(),
         "POST",
-        "/v1/responses",
+        "/v1/chat/generate",
         &[("Content-Type", "application/json")],
         Some(""),
     );
@@ -72,7 +72,7 @@ fn no_model_field_uses_default() {
         "input": "Hello",
         "max_output_tokens": 5,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(
         resp.status, 200,
         "should use configured model: {}",
@@ -85,11 +85,11 @@ fn no_model_field_uses_default() {
     );
 }
 
-/// PUT on /v1/responses returns appropriate error.
+/// PUT on /v1/chat/generate returns appropriate error.
 #[test]
 fn put_method_not_supported() {
     let ctx = ServerTestContext::new(ServerConfig::new());
-    let resp = send_request(ctx.addr(), "PUT", "/v1/responses", &[], None);
+    let resp = send_request(ctx.addr(), "PUT", "/v1/chat/generate", &[], None);
     assert!(
         resp.status == 501 || resp.status == 405,
         "PUT should be rejected: {}",
@@ -97,11 +97,11 @@ fn put_method_not_supported() {
     );
 }
 
-/// DELETE on /v1/responses returns appropriate error.
+/// DELETE on /v1/chat/generate returns appropriate error.
 #[test]
 fn delete_method_not_supported() {
     let ctx = ServerTestContext::new(ServerConfig::new());
-    let resp = send_request(ctx.addr(), "DELETE", "/v1/responses", &[], None);
+    let resp = send_request(ctx.addr(), "DELETE", "/v1/chat/generate", &[], None);
     assert!(
         resp.status == 501 || resp.status == 405,
         "DELETE should be rejected: {}",
@@ -133,7 +133,7 @@ fn previous_response_id_without_input() {
         "input": "Remember: the answer is 42.",
         "max_output_tokens": 10,
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200);
     let response_id = resp1.json()["id"].as_str().expect("id").to_string();
 
@@ -143,7 +143,7 @@ fn previous_response_id_without_input() {
         "previous_response_id": response_id,
         "max_output_tokens": 10,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(
         resp2.status, 200,
         "should succeed with just previous_response_id: {}",

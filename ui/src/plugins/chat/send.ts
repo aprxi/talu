@@ -14,7 +14,7 @@ import {
   isAttachmentUploadInProgress,
   uploadFiles,
 } from "./attachments.ts";
-import type { Conversation, CreateResponseRequest, InputContentItem, UsageStats } from "../../types.ts";
+import type { Conversation, CreateChatGenerateRequest, InputContentItem, UsageStats } from "../../types.ts";
 
 export function setupInputEvents(): void {
   const dom = getChatDom();
@@ -126,7 +126,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   };
 
   try {
-    let requestBody: CreateResponseRequest = {
+    let requestBody: CreateChatGenerateRequest = {
       model: getModelsService()?.getActiveModel() ?? "",
       input: opts.input,
       previous_response_id: chatState.lastResponseId,
@@ -136,7 +136,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
     };
 
     // Run chat.send.before hook — plugins can modify the request or block it.
-    const hookResult = await hooks.run<CreateResponseRequest>("chat.send.before", requestBody);
+    const hookResult = await hooks.run<CreateChatGenerateRequest>("chat.send.before", requestBody);
     if (hookResult && typeof hookResult === "object" && "$block" in hookResult) {
       notifications.warning((hookResult as { reason: string }).reason ?? "Send blocked by plugin");
       chatState.isGenerating = false;
@@ -144,9 +144,9 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       setInputEnabled(true);
       return;
     }
-    requestBody = hookResult as CreateResponseRequest;
+    requestBody = hookResult as CreateChatGenerateRequest;
 
-    const resp = await api.createResponse(requestBody, chatState.streamAbort.signal);
+    const resp = await api.createChatGenerate(requestBody, chatState.streamAbort.signal);
 
     if (!resp.ok) {
       if (isActive()) {

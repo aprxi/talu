@@ -12,7 +12,7 @@ fn generate(ctx: &ServerTestContext, model: &str) -> serde_json::Value {
         "input": "Hello",
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     resp.json()
 }

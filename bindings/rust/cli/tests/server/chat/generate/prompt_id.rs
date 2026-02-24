@@ -1,4 +1,4 @@
-//! Tests for `prompt_id` parameter in `/v1/responses`.
+//! Tests for `prompt_id` parameter in `/v1/chat/generate`.
 //!
 //! The `prompt_id` feature allows referencing a stored Document as the source
 //! of the system prompt. This enables:
@@ -105,7 +105,7 @@ fn prompt_id_non_streaming_success() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "response request: {}", resp.body);
 
     let json = resp.json();
@@ -139,7 +139,7 @@ fn prompt_id_streaming_success() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "streaming request: {}", resp.body);
 
     let ct = resp
@@ -179,7 +179,7 @@ fn prompt_id_lineage_tracking() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "response request: {}", resp.body);
 
     let json = resp.json();
@@ -219,7 +219,7 @@ fn prompt_id_streaming_lineage_tracking() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "streaming request: {}", resp.body);
 
     let events = parse_sse_events(&resp.body);
@@ -263,7 +263,7 @@ fn prompt_id_document_not_found() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(
         resp.status, 400,
         "should return 400 for missing document: {}",
@@ -291,7 +291,7 @@ fn prompt_id_requires_storage() {
         "input": "Hello",
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(
         resp.status, 400,
         "should return 400 without storage: {}",
@@ -322,7 +322,7 @@ fn prompt_id_streaming_document_not_found() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(
         resp.status, 400,
         "streaming should return 400 for missing doc: {}",
@@ -350,7 +350,7 @@ fn prompt_id_document_without_system_prompt() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(
         resp.status, 200,
         "should succeed without system_prompt: {}",
@@ -385,7 +385,7 @@ fn prompt_id_with_chaining() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200, "first request: {}", resp1.body);
     let json1 = resp1.json();
     let response_id = json1["id"].as_str().expect("should have response id");
@@ -400,7 +400,7 @@ fn prompt_id_with_chaining() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200, "chained request: {}", resp2.body);
 
     let json2 = resp2.json();
@@ -439,7 +439,7 @@ fn prompt_id_streaming_with_chaining() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200, "first streaming: {}", resp1.body);
 
     let events1 = parse_sse_events(&resp1.body);
@@ -460,7 +460,7 @@ fn prompt_id_streaming_with_chaining() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200, "chained streaming: {}", resp2.body);
 
     let events2 = parse_sse_events(&resp2.body);
@@ -505,7 +505,7 @@ fn prompt_id_multiple_conversations_same_document() {
             "store": true,
             "max_output_tokens": 10,
         });
-        let resp = post_json(ctx.addr(), "/v1/responses", &body);
+        let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
         assert_eq!(resp.status, 200, "request {}: {}", i, resp.body);
 
         let session_id = resp.json()["metadata"]["session_id"]
@@ -553,7 +553,7 @@ fn list_conversations_by_source_doc_id() {
             "store": true,
             "max_output_tokens": 10,
         });
-        post_json(ctx.addr(), "/v1/responses", &body);
+        post_json(ctx.addr(), "/v1/chat/generate", &body);
     }
 
     let body = serde_json::json!({
@@ -563,7 +563,7 @@ fn list_conversations_by_source_doc_id() {
         "store": true,
         "max_output_tokens": 10,
     });
-    post_json(ctx.addr(), "/v1/responses", &body);
+    post_json(ctx.addr(), "/v1/chat/generate", &body);
 
     let body = serde_json::json!({
         "model": &model,
@@ -571,7 +571,7 @@ fn list_conversations_by_source_doc_id() {
         "store": true,
         "max_output_tokens": 10,
     });
-    post_json(ctx.addr(), "/v1/responses", &body);
+    post_json(ctx.addr(), "/v1/chat/generate", &body);
 
     let list_resp = get(ctx.addr(), "/v1/chat/sessions");
     assert_eq!(
@@ -625,7 +625,7 @@ fn prompt_id_rapid_sequential_requests() {
             "store": true,
             "max_output_tokens": 10,
         });
-        let resp = post_json(ctx.addr(), "/v1/responses", &body);
+        let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
         assert_eq!(resp.status, 200, "request {} failed: {}", i, resp.body);
     }
 }
@@ -653,7 +653,7 @@ Instructions:
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "special chars request: {}", resp.body);
 }
 
@@ -674,6 +674,6 @@ fn prompt_id_long_system_prompt() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "long prompt request: {}", resp.body);
 }

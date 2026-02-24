@@ -74,7 +74,7 @@ fn file_reference_resolved_in_generation() {
             ]
         }]
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(
         resp.status, 200,
         "structured input with file reference should succeed, body: {}",
@@ -113,7 +113,7 @@ fn image_reference_resolved_in_generation() {
             ]
         }]
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     // The image branch resolves file_id → file:// URL in image_url.
     // Generation should accept it (the model may not produce meaningful
     // output for fake bytes, but it must not 400/500).
@@ -151,7 +151,7 @@ fn dangling_file_reference_returns_error() {
             ]
         }]
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     // The unresolved file_nonexistent_999 is passed through to the Zig core.
     // Lock in the current behavior: the request should NOT crash (no 500).
     // It may succeed (200) if the core ignores unrecognized URLs, or fail

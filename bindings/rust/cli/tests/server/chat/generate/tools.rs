@@ -29,7 +29,7 @@ fn tools_echo_in_response() {
         "max_output_tokens": 10,
         "tools": tools,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let resp_tools = json["tools"].as_array().expect("tools should be array");
@@ -49,7 +49,7 @@ fn tool_choice_echo_in_response() {
         "tools": tool_definition(),
         "tool_choice": "auto",
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["tool_choice"].as_str(), Some("auto"));
@@ -65,7 +65,7 @@ fn default_tool_choice() {
         "input": "Hello",
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200);
     let json = resp.json();
     assert_eq!(json["tool_choice"].as_str(), Some("none"));
@@ -81,7 +81,7 @@ fn default_tools_empty() {
         "input": "Hello",
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let tools = json["tools"].as_array().expect("tools array");
@@ -102,7 +102,7 @@ fn tools_chaining_merge() {
         "tools": tool_definition(),
         "tool_choice": "auto",
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200);
     let json1 = resp1.json();
     let response_id = json1["id"].as_str().expect("id");
@@ -114,7 +114,7 @@ fn tools_chaining_merge() {
         "max_output_tokens": 10,
         "previous_response_id": response_id,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200, "body: {}", resp2.body);
     let json2 = resp2.json();
     let resp_tools = json2["tools"].as_array().expect("tools array");
@@ -140,7 +140,7 @@ fn tools_chaining_override() {
         "max_output_tokens": 10,
         "tools": tool_definition(),
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200);
     let json1 = resp1.json();
     let response_id = json1["id"].as_str().expect("id");
@@ -160,7 +160,7 @@ fn tools_chaining_override() {
         "tools": new_tools,
         "tool_choice": "required",
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200, "body: {}", resp2.body);
     let json2 = resp2.json();
     let resp_tools = json2["tools"].as_array().expect("tools array");
@@ -190,7 +190,7 @@ fn streaming_tools_echo() {
         "tools": tool_definition(),
         "tool_choice": "auto",
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200);
 
     // Find terminal event and check tools in its response resource.
@@ -220,7 +220,7 @@ fn streaming_created_includes_tools() {
         "tools": tool_definition(),
         "tool_choice": "auto",
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200);
     let events = parse_sse_events(&resp.body);
     let (_, data) = &events[0];
@@ -261,7 +261,7 @@ fn object_tool_choice_echo_in_response() {
             "function": { "name": "get_weather" }
         },
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     let tc = &json["tool_choice"];

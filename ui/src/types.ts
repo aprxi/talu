@@ -181,8 +181,8 @@ export type InputContentPart =
   | { type: "input_image"; image_url: string }
   | { type: "input_file"; file_url: string; filename?: string };
 
-/** Request body for POST /v1/responses. */
-export interface CreateResponseRequest {
+/** Request body for POST /v1/chat/generate. */
+export interface CreateChatGenerateRequest {
   model: string;
   input?: string | InputContentItem[];
   previous_response_id?: string | null;

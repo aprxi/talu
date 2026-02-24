@@ -1,11 +1,17 @@
+use super::chat::sessions::{seed_session, seed_session_with_group};
 use super::common::{send_request, ServerConfig, ServerTestContext, TenantSpec};
-use super::sessions::{seed_session, seed_session_with_group};
 use tempfile::TempDir;
 
 #[test]
 fn no_auth_allows_request_without_headers() {
     let ctx = ServerTestContext::new(ServerConfig::new());
-    let response = send_request(ctx.addr(), "POST", "/v1/responses", &[], Some("not-json"));
+    let response = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/chat/generate",
+        &[],
+        Some("not-json"),
+    );
     assert_eq!(response.status, 400);
 }
 

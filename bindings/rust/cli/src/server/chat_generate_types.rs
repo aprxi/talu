@@ -1,13 +1,13 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
-/// Request body for POST /v1/responses.
+/// Request body for POST /v1/chat/generate.
 ///
 /// The full request JSON is forwarded to the Zig core as-is; the fields
 /// listed here are the ones the server inspects or that Swagger UI needs
 /// to render useful input forms.
 #[derive(Debug, Deserialize, ToSchema)]
-pub struct CreateResponseBody {
+pub struct CreateChatGenerateBody {
     pub model: Option<String>,
     /// The prompt. Can be a plain string or an array of structured messages.
     #[schema(example = "What is the capital of France?")]
@@ -28,13 +28,13 @@ pub struct CreateResponseBody {
     pub seed: Option<u32>,
 }
 
-/// Canonical response shape for POST /v1/responses (non-streaming).
+/// Canonical response shape for POST /v1/chat/generate (non-streaming).
 ///
 /// Used for round-trip normalization (deserialize then re-serialize strips
 /// unknown fields). With `serde(flatten)` + `Value` this is effectively a
 /// pass-through — the schema documents the response shape for OpenAPI.
 #[derive(Debug, Serialize, Deserialize, ToSchema)]
-pub struct ResponseResource {
+pub struct ChatGenerateResponseResource {
     #[serde(flatten)]
     pub fields: serde_json::Value,
 }

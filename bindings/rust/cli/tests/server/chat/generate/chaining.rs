@@ -39,7 +39,7 @@ fn chaining_unknown_id_succeeds() {
         "previous_response_id": "resp_nonexistent_00000000",
         "max_output_tokens": 10,
     });
-    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    let resp = post_json(ctx.addr(), "/v1/chat/generate", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["object"].as_str(), Some("response"));
@@ -57,7 +57,7 @@ fn streaming_chaining() {
         "input": "Remember: the secret word is banana.",
         "max_output_tokens": 10,
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200);
     let json1 = resp1.json();
     let response_id = json1["id"].as_str().expect("should have id");
@@ -70,7 +70,7 @@ fn streaming_chaining() {
         "stream": true,
         "max_output_tokens": 10,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200, "streaming chained: {}", resp2.body);
     let ct = resp2
         .header("content-type")
@@ -98,7 +98,7 @@ fn streaming_continue_no_input() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200, "initial: {}", resp1.body);
     let events1 = parse_sse_events(&resp1.body);
     let terminal1 = events1
@@ -117,7 +117,7 @@ fn streaming_continue_no_input() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200, "continue: {}", resp2.body);
 
     let events2 = parse_sse_events(&resp2.body);
@@ -172,7 +172,7 @@ fn streaming_continue_has_session_metadata() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp1 = post_json(ctx.addr(), "/v1/responses", &body1);
+    let resp1 = post_json(ctx.addr(), "/v1/chat/generate", &body1);
     assert_eq!(resp1.status, 200);
     let events1 = parse_sse_events(&resp1.body);
     let terminal1 = events1
@@ -194,7 +194,7 @@ fn streaming_continue_has_session_metadata() {
         "store": true,
         "max_output_tokens": 10,
     });
-    let resp2 = post_json(ctx.addr(), "/v1/responses", &body2);
+    let resp2 = post_json(ctx.addr(), "/v1/chat/generate", &body2);
     assert_eq!(resp2.status, 200);
     let events2 = parse_sse_events(&resp2.body);
     let terminal2 = events2
@@ -253,7 +253,7 @@ fn cross_tenant_chaining_inherits_session_id() {
     let resp_a = send_request(
         ctx.addr(),
         "POST",
-        "/v1/responses",
+        "/v1/chat/generate",
         &[
             ("Content-Type", "application/json"),
             ("X-Talu-Gateway-Secret", "secret"),
@@ -280,7 +280,7 @@ fn cross_tenant_chaining_inherits_session_id() {
     let resp_b = send_request(
         ctx.addr(),
         "POST",
-        "/v1/responses",
+        "/v1/chat/generate",
         &[
             ("Content-Type", "application/json"),
             ("X-Talu-Gateway-Secret", "secret"),

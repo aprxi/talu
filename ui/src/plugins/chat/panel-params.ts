@@ -1,11 +1,11 @@
 import { getChatDom } from "./dom.ts";
 import { api, notifications, getModelsService, format, timers } from "./deps.ts";
 import { isPanelReadOnly, restoreEditableParams, hideRightPanel } from "./panel-readonly.ts";
-import type { Conversation, CreateResponseRequest, SettingsPatch } from "../../types.ts";
+import type { Conversation, CreateChatGenerateRequest, SettingsPatch } from "../../types.ts";
 import type { Disposable } from "../../kernel/types.ts";
 
 /** Get current sampling parameters from the right panel inputs. */
-export function getSamplingParams(): Partial<CreateResponseRequest> {
+export function getSamplingParams(): Partial<CreateChatGenerateRequest> {
   const dom = getChatDom();
   const temp = dom.panelTemperature.value.trim();
   const topP = dom.panelTopP.value.trim();
@@ -15,7 +15,7 @@ export function getSamplingParams(): Partial<CreateResponseRequest> {
   const repPen = dom.panelRepetitionPenalty.value.trim();
   const seed = dom.panelSeed.value.trim();
 
-  const params: Partial<CreateResponseRequest> = {};
+  const params: Partial<CreateChatGenerateRequest> = {};
   if (temp) params.temperature = parseFloat(temp);
   if (topP) params.top_p = parseFloat(topP);
   if (topK) params.top_k = parseInt(topK, 10);

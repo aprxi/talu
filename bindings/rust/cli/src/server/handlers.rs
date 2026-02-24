@@ -17,8 +17,8 @@ use tokio_stream::StreamExt;
 use crate::bucket_settings;
 use crate::provider;
 use crate::server::auth_gateway::AuthContext;
+use crate::server::chat_generate_types;
 use crate::server::http;
-use crate::server::responses_types;
 use crate::server::state::{AppState, StoredResponse};
 use talu::documents::{DocumentError, DocumentsHandle};
 use talu::responses::{ContentType, ItemType};
@@ -81,14 +81,14 @@ impl From<anyhow::Error> for ResponseError {
     }
 }
 
-#[utoipa::path(post, path = "/v1/responses", tag = "Responses",
-    request_body = responses_types::CreateResponseBody,
+#[utoipa::path(post, path = "/v1/chat/generate", tag = "Chat::Generate",
+    request_body = chat_generate_types::CreateChatGenerateBody,
     responses(
-        (status = 200, body = responses_types::ResponseResource),
+        (status = 200, body = chat_generate_types::ChatGenerateResponseResource),
         (status = 400, body = http::ErrorResponse, description = "Invalid request"),
         (status = 500, body = http::ErrorResponse, description = "Generation failed"),
     ))]
-pub async fn handle_responses(
+pub async fn handle_chat_generate(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth_ctx: Option<AuthContext>,
@@ -123,16 +123,17 @@ pub async fn handle_responses(
         );
     }
 
-    let request: responses_types::CreateResponseBody = match serde_json::from_slice(&body_bytes) {
-        Ok(val) => val,
-        Err(err) => {
-            return json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request",
-                &format!("Invalid JSON: {err}"),
-            )
-        }
-    };
+    let request: chat_generate_types::CreateChatGenerateBody =
+        match serde_json::from_slice(&body_bytes) {
+            Ok(val) => val,
+            Err(err) => {
+                return json_error(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_request",
+                    &format!("Invalid JSON: {err}"),
+                )
+            }
+        };
 
     let request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
         Ok(val) => val,
@@ -463,7 +464,7 @@ fn resolve_file_references(input_json: &str, storage_path: &std::path::Path) -> 
 
 async fn generate_response(
     state: Arc<AppState>,
-    request: responses_types::CreateResponseBody,
+    request: chat_generate_types::CreateChatGenerateBody,
     input_value: Option<serde_json::Value>,
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
@@ -821,7 +822,7 @@ async fn generate_response(
 
 async fn stream_response(
     state: Arc<AppState>,
-    request: responses_types::CreateResponseBody,
+    request: chat_generate_types::CreateChatGenerateBody,
     input_value: Option<serde_json::Value>,
     tools_json: Option<serde_json::Value>,
     tool_choice_json: Option<serde_json::Value>,
@@ -1930,7 +1931,8 @@ fn build_response_resource_value(
 }
 
 fn normalize_response_value(value: serde_json::Value) -> serde_json::Value {
-    match serde_json::from_value::<responses_types::ResponseResource>(value.clone()) {
+    match serde_json::from_value::<chat_generate_types::ChatGenerateResponseResource>(value.clone())
+    {
         Ok(val) => serde_json::to_value(val).unwrap_or(value),
         Err(_) => value,
     }
