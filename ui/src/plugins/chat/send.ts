@@ -123,6 +123,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
         group_id: null,
         parent_session_id: null,
         source_doc_id: null,
+        project_id: (chatState.activeProjectId && chatState.activeProjectId !== "__default__") ? chatState.activeProjectId : undefined,
         metadata: {},
       });
       renderSidebar();
@@ -141,6 +142,15 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
       instructions: resolveInstructions(opts.promptId),
       ...getSamplingParams(),
     };
+
+    // Inject project_id into request metadata when a named project is active.
+    // "__default__" means "no project" — don't inject project_id.
+    if (chatState.activeProjectId && chatState.activeProjectId !== "__default__") {
+      requestBody.metadata = {
+        ...requestBody.metadata,
+        project_id: chatState.activeProjectId,
+      };
+    }
 
     // Run chat.send.before hook — plugins can modify the request or block it.
     const hookResult = await hooks.run<CreateResponseRequest>("chat.send.before", requestBody);

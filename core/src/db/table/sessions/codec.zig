@@ -60,6 +60,8 @@ pub const ScannedSessionRecord = struct {
     /// Source document ID for lineage tracking.
     /// Links this session to the prompt/persona document that spawned it.
     source_doc_id: ?[]const u8 = null,
+    /// Project identifier for organizing sessions into projects.
+    project_id: ?[]const u8 = null,
     created_at_ms: i64,
     updated_at_ms: i64,
 };
@@ -77,6 +79,7 @@ pub fn freeScannedSessionRecord(alloc: Allocator, record: *ScannedSessionRecord)
     if (record.metadata_json) |m| alloc.free(m);
     if (record.search_snippet) |s| alloc.free(s);
     if (record.source_doc_id) |d| alloc.free(d);
+    if (record.project_id) |p| alloc.free(p);
     record.* = .{
         .session_id = "",
         .model = null,
@@ -91,6 +94,7 @@ pub fn freeScannedSessionRecord(alloc: Allocator, record: *ScannedSessionRecord)
         .metadata_json = null,
         .search_snippet = null,
         .source_doc_id = null,
+        .project_id = null,
         .created_at_ms = 0,
         .updated_at_ms = 0,
     };
@@ -113,7 +117,7 @@ pub fn encodeSessionRecordMsgpack(allocator: Allocator, record: SessionRecord) !
     errdefer buffer.deinit(allocator);
     const writer = buffer.writer(allocator);
 
-    const field_count: u32 = 13;
+    const field_count: u32 = 14;
     try writeMsgpackMapHeader(writer, field_count);
 
     try writeMsgpackString(writer, "session_id");
@@ -155,6 +159,9 @@ pub fn encodeSessionRecordMsgpack(allocator: Allocator, record: SessionRecord) !
     try writeMsgpackString(writer, "updated_at_ms");
     try writeMsgpackI64(writer, record.updated_at_ms);
 
+    try writeMsgpackString(writer, "project_id");
+    try writeMsgpackOptionalString(writer, record.project_id);
+
     return buffer.toOwnedSlice(allocator);
 }
 
@@ -179,6 +186,7 @@ pub fn encodeSessionRecordKvBuf(allocator: Allocator, record: SessionRecord) ![]
     try w.addI64(allocator, SFIds.created_at_ms, record.created_at_ms);
     try w.addI64(allocator, SFIds.updated_at_ms, record.updated_at_ms);
     try w.addOptionalString(allocator, SFIds.source_doc_id, record.source_doc_id);
+    try w.addOptionalString(allocator, SFIds.project_id, record.project_id);
 
     return w.finish(allocator);
 }
@@ -240,6 +248,8 @@ pub fn decodeSessionRecordMsgpack(alloc: Allocator, payload: []const u8) !Scanne
             record.created_at_ms = try readMsgpackI64(payload, &index);
         } else if (std.mem.eql(u8, key, "updated_at_ms")) {
             record.updated_at_ms = try readMsgpackI64(payload, &index);
+        } else if (std.mem.eql(u8, key, "project_id")) {
+            record.project_id = try readMsgpackOptionalStringAlloc(alloc, payload, &index);
         } else {
             try skipMsgpackValue(payload, &index);
         }
@@ -286,6 +296,7 @@ pub fn decodeSessionRecordKvBuf(alloc: Allocator, payload: []const u8) !ScannedS
     if (reader.get(SFIds.group_id)) |s| record.group_id = try alloc.dupe(u8, s);
     if (reader.get(SFIds.metadata_json)) |s| record.metadata_json = try alloc.dupe(u8, s);
     if (reader.get(SFIds.source_doc_id)) |s| record.source_doc_id = try alloc.dupe(u8, s);
+    if (reader.get(SFIds.project_id)) |s| record.project_id = try alloc.dupe(u8, s);
 
     // Integer fields
     record.head_item_id = reader.getU64(SFIds.head_item_id) orelse 0;

@@ -20,6 +20,8 @@ export interface Conversation {
   parent_session_id: string | null;
   /** Source document ID (e.g., prompt) that created this conversation. */
   source_doc_id: string | null;
+  /** Project this session belongs to (null if unassigned). */
+  project_id?: string | null;
   metadata: Record<string, unknown>;
   /** Tags from the relational tags table (source of truth for search). */
   tags?: ConversationTag[];
@@ -41,6 +43,7 @@ export interface ConversationPatch {
   title?: string;
   marker?: string;
   metadata?: Record<string, unknown>;
+  project_id?: string | null;
 }
 
 /** Fork body for POST /v1/chat/sessions/{id}/fork. */
@@ -306,6 +309,8 @@ export interface SearchFilters {
   has_tags?: boolean;
   /** Group ID (multi-tenant filter) */
   group_id?: string;
+  /** Project ID filter */
+  project_id?: string;
 }
 
 /** Search response from POST /v1/search. */
@@ -322,6 +327,7 @@ export interface SearchAggregations {
   tags?: TagAggregation[];
   models?: ValueAggregation[];
   markers?: ValueAggregation[];
+  projects?: ValueAggregation[];
 }
 
 export interface TagAggregation {

@@ -10,7 +10,7 @@ const BASE = "";
 type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
 
 export interface ApiClient {
-  listConversations(opts?: { offset?: number; limit?: number; marker?: string; search?: string; tags_any?: string }): Promise<ApiResult<ConversationList>>;
+  listConversations(opts?: { offset?: number; limit?: number; marker?: string; search?: string; tags_any?: string; project_id?: string }): Promise<ApiResult<ConversationList>>;
   search(req: SearchRequest): Promise<ApiResult<SearchResponse>>;
   getConversation(id: string): Promise<ApiResult<Conversation>>;
   patchConversation(id: string, patch: ConversationPatch): Promise<ApiResult<Conversation>>;
@@ -125,12 +125,13 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
   }
 
   return {
-    listConversations(opts?: { offset?: number; limit?: number; marker?: string; search?: string; tags_any?: string }) {
+    listConversations(opts?: { offset?: number; limit?: number; marker?: string; search?: string; tags_any?: string; project_id?: string }) {
       const params = new URLSearchParams({ limit: String(opts?.limit ?? 50) });
       if (opts?.offset !== undefined) params.set("offset", String(opts.offset));
       if (opts?.marker) params.set("marker", opts.marker);
       if (opts?.search) params.set("search", opts.search);
       if (opts?.tags_any) params.set("tags_any", opts.tags_any);
+      if (opts?.project_id) params.set("project_id", opts.project_id);
       return requestJson<ConversationList>("GET", `/v1/chat/sessions?${params}`);
     },
     search: (req) => requestJson<SearchResponse>("POST", "/v1/search", req),

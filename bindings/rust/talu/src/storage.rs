@@ -185,6 +185,8 @@ impl StorageHandle {
                 std::ptr::null(), // no search_query
                 std::ptr::null(), // no tags_filter
                 std::ptr::null(), // no tags_filter_any
+                std::ptr::null(), // no project_id
+                0,                // no project_id_null
                 &mut c_list as *mut _,
             )
         };
@@ -287,6 +289,8 @@ impl StorageHandle {
                 std::ptr::null(), // no search_query
                 std::ptr::null(), // no tags_filter
                 std::ptr::null(), // no tags_filter_any
+                std::ptr::null(), // no project_id
+                0,                // no project_id_null
                 &mut c_list as *mut _,
             )
         };
@@ -324,6 +328,8 @@ impl StorageHandle {
         marker: Option<&str>,
         search: Option<&str>,
         tags_any: Option<&str>,
+        project_id: Option<&str>,
+        project_id_null: bool,
     ) -> Result<SessionBatchResult, StorageError> {
         let limit = limit.clamp(1, 100);
 
@@ -343,6 +349,12 @@ impl StorageHandle {
             .map(|t| CString::new(t))
             .transpose()
             .map_err(|_| StorageError::InvalidArgument("tags_any contains null bytes".into()))?;
+        let project_cstr = project_id
+            .map(|p| CString::new(p))
+            .transpose()
+            .map_err(|_| {
+                StorageError::InvalidArgument("project_id contains null bytes".into())
+            })?;
 
         let group_ptr = group_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let marker_ptr = marker_cstr
@@ -352,6 +364,9 @@ impl StorageHandle {
             .as_ref()
             .map_or(std::ptr::null(), |c| c.as_ptr());
         let tags_ptr = tags_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
+        let project_ptr = project_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
 
         let mut c_list: *mut CSessionList = std::ptr::null_mut();
 
@@ -365,6 +380,8 @@ impl StorageHandle {
                 marker_ptr,
                 search_ptr,
                 tags_ptr,
+                project_ptr,
+                project_id_null as std::os::raw::c_int,
                 &mut c_list as *mut _,
             )
         };
@@ -539,6 +556,7 @@ impl StorageHandle {
             metadata_json: optional_cstr_to_string(c_record.metadata_json),
             search_snippet: optional_cstr_to_string(c_record.search_snippet),
             source_doc_id: optional_cstr_to_string(c_record.source_doc_id),
+            project_id: optional_cstr_to_string(c_record.project_id),
             created_at: c_record.created_at_ms,
             updated_at: c_record.updated_at_ms,
         }
@@ -597,6 +615,7 @@ impl StorageHandle {
         let marker_filter_any_cstr = opt_cstring(params.marker_filter_any, "marker_filter_any")?;
         let model_filter_cstr = opt_cstring(params.model_filter, "model_filter")?;
         let source_doc_id_cstr = opt_cstring(params.source_doc_id, "source_doc_id")?;
+        let project_id_cstr = opt_cstring(params.project_id, "project_id")?;
 
         let cursor_ptr = cursor_session_cstr
             .as_ref()
@@ -621,6 +640,9 @@ impl StorageHandle {
             .as_ref()
             .map_or(std::ptr::null(), |c| c.as_ptr());
         let source_doc_id_ptr = source_doc_id_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
+        let project_id_ptr = project_id_cstr
             .as_ref()
             .map_or(std::ptr::null(), |c| c.as_ptr());
 
@@ -659,6 +681,8 @@ impl StorageHandle {
                 updated_before_ms,
                 has_tags_int,
                 source_doc_id_ptr,
+                project_id_ptr,
+                params.project_id_null as std::os::raw::c_int,
                 &mut c_list as *mut _,
             )
         };
@@ -798,6 +822,8 @@ impl StorageHandle {
                 query_ptr,
                 tags_filter_ptr,
                 tags_filter_any_ptr,
+                std::ptr::null(), // no project_id
+                0,                // no project_id_null
                 &mut c_list as *mut _,
             )
         };
@@ -879,6 +905,18 @@ impl StorageHandle {
             })?),
             None => None,
         };
+        let source_doc_id_cstr = match &updates.source_doc_id {
+            Some(s) => Some(CString::new(s.as_str()).map_err(|_| {
+                StorageError::InvalidArgument("Source doc ID contains null bytes".to_string())
+            })?),
+            None => None,
+        };
+        let project_id_cstr = match &updates.project_id {
+            Some(p) => Some(CString::new(p.as_str()).map_err(|_| {
+                StorageError::InvalidArgument("Project ID contains null bytes".to_string())
+            })?),
+            None => None,
+        };
 
         let title_ptr = title_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let marker_ptr = marker_cstr
@@ -887,15 +925,24 @@ impl StorageHandle {
         let metadata_ptr = metadata_cstr
             .as_ref()
             .map_or(std::ptr::null(), |c| c.as_ptr());
+        let source_doc_id_ptr = source_doc_id_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
+        let project_id_ptr = project_id_cstr
+            .as_ref()
+            .map_or(std::ptr::null(), |c| c.as_ptr());
 
         // SAFETY: all pointers are valid CStrings or null
         let result = unsafe {
-            talu_sys::talu_db_table_session_update(
+            talu_sys::talu_db_table_session_update_ex(
                 self.path_cstr.as_ptr(),
                 session_id_cstr.as_ptr(),
                 title_ptr,
                 marker_ptr,
                 metadata_ptr,
+                source_doc_id_ptr,
+                project_id_ptr,
+                if updates.clear_project_id { 1 } else { 0 },
             )
         };
 
@@ -1296,6 +1343,74 @@ impl StorageHandle {
         Ok(rust_vec)
     }
 
+    /// Get tags for multiple sessions in a single scan.
+    ///
+    /// Returns a map from session_id to list of tag_ids. Sessions with no tags
+    /// are omitted from the result.
+    pub fn get_sessions_tags_batch(
+        &self,
+        session_ids: &[&str],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, StorageError> {
+        use std::collections::HashMap;
+
+        if session_ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        // Build null-terminated C strings for each session ID.
+        let c_strings: Vec<CString> = session_ids
+            .iter()
+            .map(|s| {
+                CString::new(*s).map_err(|_| {
+                    StorageError::InvalidArgument(
+                        "Session ID contains null bytes".to_string(),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let c_ptrs: Vec<*const std::os::raw::c_char> =
+            c_strings.iter().map(|c| c.as_ptr()).collect();
+
+        let mut c_batch: *mut talu_sys::CSessionTagBatch = std::ptr::null_mut();
+
+        let result = unsafe {
+            talu_sys::talu_db_table_sessions_get_tags_batch(
+                self.path_cstr.as_ptr(),
+                c_ptrs.as_ptr(),
+                session_ids.len() as u32,
+                &mut c_batch as *mut _,
+            )
+        };
+
+        if result != ERROR_CODE_OK {
+            return Err(StorageError::from_code(result, "batch_tags"));
+        }
+
+        let mut map: HashMap<String, Vec<String>> = HashMap::new();
+
+        if !c_batch.is_null() {
+            let batch = unsafe { &*c_batch };
+            if batch.count > 0 && !batch.session_ids.is_null() && !batch.tag_ids.is_null() {
+                for i in 0..batch.count {
+                    let sid_ptr = unsafe { *batch.session_ids.add(i) };
+                    let tid_ptr = unsafe { *batch.tag_ids.add(i) };
+                    if !sid_ptr.is_null() && !tid_ptr.is_null() {
+                        let sid = unsafe { std::ffi::CStr::from_ptr(sid_ptr) }
+                            .to_string_lossy()
+                            .into_owned();
+                        let tid = unsafe { std::ffi::CStr::from_ptr(tid_ptr) }
+                            .to_string_lossy()
+                            .into_owned();
+                        map.entry(sid).or_default().push(tid);
+                    }
+                }
+            }
+            unsafe { talu_sys::talu_db_table_free_session_tag_batch(c_batch) };
+        }
+
+        Ok(map)
+    }
+
     // =========================================================================
     // Tag Conversion Helpers
     // =========================================================================
@@ -1399,6 +1514,8 @@ pub struct SessionRecordFull {
     /// Source document ID for lineage tracking.
     /// Links this session to the prompt/persona document that spawned it.
     pub source_doc_id: Option<String>,
+    /// Project identifier for multi-project session organization.
+    pub project_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -1442,6 +1559,13 @@ pub struct SessionUpdate {
     pub title: Option<String>,
     pub marker: Option<String>,
     pub metadata_json: Option<String>,
+    /// Source document ID for lineage tracking.
+    pub source_doc_id: Option<String>,
+    /// Project ID for multi-project session organization.
+    /// Set to `Some(id)` to update, `None` to leave unchanged.
+    pub project_id: Option<String>,
+    /// When true, clears the project_id field (sets it to null in storage).
+    pub clear_project_id: bool,
 }
 
 // =============================================================================
@@ -1475,6 +1599,10 @@ pub struct SearchParams<'a> {
     pub has_tags: Option<bool>,
     /// Source document ID filter: exact match on sessions created from this prompt document.
     pub source_doc_id: Option<&'a str>,
+    /// Project ID filter: exact match on sessions belonging to this project.
+    pub project_id: Option<&'a str>,
+    /// Project null filter: include only sessions with no project_id.
+    pub project_id_null: bool,
 }
 
 // =============================================================================

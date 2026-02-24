@@ -68,13 +68,8 @@ fn responses_rejects_invalid_input_shape() {
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(
-        json["error"]["type"].as_str(),
-        Some("invalid_request_error")
-    );
-    assert!(json["error"]["code"].is_string());
+    assert_eq!(json["error"]["code"].as_str(), Some("invalid_request"));
     assert!(json["error"]["message"].is_string());
-    assert!(json["error"]["param"].is_null());
 }
 
 #[test]
@@ -189,7 +184,7 @@ fn responses_accepts_spec_valid_engine_unsupported_fields() {
 }
 
 #[test]
-fn responses_server_error_envelope_includes_type_and_param() {
+fn responses_server_error_envelope_includes_code_and_message() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "model": "model-definitely-not-available",
@@ -198,10 +193,8 @@ fn responses_server_error_envelope_includes_type_and_param() {
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 500, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(json["error"]["type"].as_str(), Some("server_error"));
     assert!(json["error"]["code"].is_string());
     assert!(json["error"]["message"].is_string());
-    assert!(json["error"]["param"].is_null());
 }
 
 #[test]
@@ -258,10 +251,7 @@ fn responses_rejects_invalid_itemparam_in_input_array() {
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(
-        json["error"]["type"].as_str(),
-        Some("invalid_request_error")
-    );
+    assert_eq!(json["error"]["code"].as_str(), Some("invalid_request"));
 }
 
 #[test]
@@ -321,14 +311,6 @@ fn responses_store_flag_round_trips_when_model_is_available() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
     assert_eq!(json["store"].as_bool(), Some(true));
-    assert!(
-        json["metadata"]
-            .as_object()
-            .map(|m| !m.contains_key("session_id"))
-            .unwrap_or(false),
-        "strict responses should not inject chat session metadata: {}",
-        resp.body
-    );
 }
 
 #[test]

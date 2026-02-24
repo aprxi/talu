@@ -621,6 +621,9 @@ pub const talu_db_table_session_remove_tag = db_table.talu_db_table_session_remo
 pub const talu_db_table_session_get_tags = db_table.talu_db_table_session_get_tags;
 pub const talu_db_table_tag_get_conversations = db_table.talu_db_table_tag_get_conversations;
 pub const talu_db_table_free_relation_string_list = db_table.talu_db_table_free_relation_string_list;
+pub const talu_db_table_sessions_get_tags_batch = db_table.talu_db_table_sessions_get_tags_batch;
+pub const talu_db_table_free_session_tag_batch = db_table.talu_db_table_free_session_tag_batch;
+pub const CSessionTagBatch = db_table.CSessionTagBatch;
 pub const talu_chat_inherit_tags = db_table.talu_chat_inherit_tags;
 pub const talu_chat_notify_session_update = responses.talu_chat_notify_session_update;
 

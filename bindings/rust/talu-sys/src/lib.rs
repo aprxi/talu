@@ -625,9 +625,10 @@ pub struct CSessionRecord {
     pub metadata_json: *const c_char,
     pub search_snippet: *const c_char,
     pub source_doc_id: *const c_char,
+    pub project_id: *const c_char,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub _reserved: [u8; 16],
+    pub _reserved: [u8; 8],
 }
 
 impl Default for CSessionRecord {
@@ -646,9 +647,10 @@ impl Default for CSessionRecord {
             metadata_json: std::ptr::null(),
             search_snippet: std::ptr::null(),
             source_doc_id: std::ptr::null(),
+            project_id: std::ptr::null(),
             created_at_ms: 0,
             updated_at_ms: 0,
-            _reserved: [0; 16],
+            _reserved: [0; 8],
         }
     }
 }
@@ -1196,6 +1198,25 @@ impl Default for CRelationStringList {
     fn default() -> Self {
         Self {
             strings: std::ptr::null(),
+            count: 0,
+            _arena: std::ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct CSessionTagBatch {
+    pub session_ids: *const *const c_char,
+    pub tag_ids: *const *const c_char,
+    pub count: usize,
+    pub _arena: *mut c_void,
+}
+
+impl Default for CSessionTagBatch {
+    fn default() -> Self {
+        Self {
+            session_ids: std::ptr::null(),
+            tag_ids: std::ptr::null(),
             count: 0,
             _arena: std::ptr::null_mut(),
         }
@@ -3498,6 +3519,7 @@ extern "C" {
         group_id: *const c_char,
         metadata_json: *const c_char,
         source_doc_id: *const c_char,
+        project_id: *const c_char,
     ) -> c_int;
     // core/src/capi/responses.zig
     pub fn talu_chat_reset(handle: *mut c_void);
@@ -3765,6 +3787,15 @@ extern "C" {
     // core/src/capi/db/table.zig
     pub fn talu_db_table_free_relation_string_list(list: *mut CRelationStringList);
     // core/src/capi/db/table.zig
+    pub fn talu_db_table_sessions_get_tags_batch(
+        db_path: *const c_char,
+        session_ids: *const *const c_char,
+        session_count: u32,
+        out_result: *mut *mut CSessionTagBatch,
+    ) -> c_int;
+    // core/src/capi/db/table.zig
+    pub fn talu_db_table_free_session_tag_batch(batch: *mut CSessionTagBatch);
+    // core/src/capi/db/table.zig
     pub fn talu_db_table_free_search_results(list: *mut CSearchResultList);
     // core/src/capi/db/table.zig
     pub fn talu_db_table_free_string_list(list: *mut CStringList);
@@ -3906,6 +3937,8 @@ extern "C" {
         search_query: *const c_char,
         tags_filter: *const c_char,
         tags_filter_any: *const c_char,
+        project_id: *const c_char,
+        project_id_null: c_int,
         out_sessions: *mut *mut CSessionList,
     ) -> c_int;
     // core/src/capi/db/table.zig
@@ -3917,6 +3950,8 @@ extern "C" {
         marker_filter: *const c_char,
         search_query: *const c_char,
         tags_filter_any: *const c_char,
+        project_id: *const c_char,
+        project_id_null: c_int,
         out_sessions: *mut *mut CSessionList,
     ) -> c_int;
     // core/src/capi/db/table.zig
@@ -3947,6 +3982,8 @@ extern "C" {
         updated_before_ms: i64,
         has_tags: c_int,
         source_doc_id: *const c_char,
+        project_id: *const c_char,
+        project_id_null: c_int,
         out_sessions: *mut *mut CSessionList,
     ) -> c_int;
     // core/src/capi/db/table.zig
@@ -3976,6 +4013,8 @@ extern "C" {
         marker: *const c_char,
         metadata_json: *const c_char,
         source_doc_id: *const c_char,
+        project_id: *const c_char,
+        clear_project_id: c_int,
     ) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_table_set_marker_batch(

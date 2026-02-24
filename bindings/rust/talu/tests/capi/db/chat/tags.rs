@@ -32,6 +32,7 @@ fn seed_session_with_tags(ctx: &TestContext, session_id: &str, title: &str, tags
             ptr::null(), // group_id
             ptr::null(), // metadata_json
             ptr::null(), // source_doc_id
+            ptr::null(), // project_id
         )
     };
     assert_eq!(rc, 0, "notify_session_update failed");
@@ -94,6 +95,8 @@ fn list_sessions_with_tags(
             c_tags_filter_any
                 .as_ref()
                 .map_or(ptr::null(), |c| c.as_ptr()),
+            ptr::null(), // no project_id
+            0,           // no project_id_null
             &mut c_list as *mut _,
         )
     };

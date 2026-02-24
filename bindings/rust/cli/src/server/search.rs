@@ -26,8 +26,10 @@ use talu::documents::DocumentsHandle;
 use talu::storage::{SearchParams, SessionRecordFull, StorageError, StorageHandle};
 
 use crate::server::auth_gateway::AuthContext;
+use serde_json::json;
+
 use crate::server::sessions::{
-    decode_cursor, encode_cursor, resolve_tags_for_session, session_to_session_json,
+    decode_cursor, encode_cursor, session_to_session_json,
 };
 use crate::server::state::AppState;
 
@@ -137,6 +139,10 @@ pub struct SearchFilters {
     /// Group ID (multi-tenant filter)
     #[serde(default)]
     pub group_id: Option<String>,
+
+    /// Project ID filter
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// Search response.
@@ -307,6 +313,13 @@ pub async fn handle_search(
     let updated_after = filters.as_ref().and_then(|f| f.updated_after);
     let updated_before = filters.as_ref().and_then(|f| f.updated_before);
     let has_tags = filters.as_ref().and_then(|f| f.has_tags);
+    let project_id_filter_raw = filters.as_ref().and_then(|f| f.project_id.clone());
+    let project_id_null = project_id_filter_raw.as_deref() == Some("__default__");
+    let project_id_filter = if project_id_null {
+        None
+    } else {
+        project_id_filter_raw
+    };
 
     // Execute search
     let result = tokio::task::spawn_blocking(move || {
@@ -325,6 +338,8 @@ pub async fn handle_search(
             updated_before_ms: updated_before,
             has_tags,
             source_doc_id: None,
+            project_id: project_id_filter.as_deref(),
+            project_id_null,
         };
 
         let list_result = storage.list_sessions_paginated_ex(
@@ -357,12 +372,23 @@ pub async fn handle_search(
             None
         };
 
-        // Resolve tags for each session
+        // Batch-resolve tags for all sessions on this page.
+        let session_ids: Vec<&str> = list_result.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        let tags_by_session = storage.get_sessions_tags_batch(&session_ids).unwrap_or_default();
+        let tag_details: std::collections::HashMap<String, serde_json::Value> =
+            storage.list_tags(None).unwrap_or_default().into_iter().map(|t| {
+                let val = json!({ "id": t.tag_id, "name": t.name, "color": t.color });
+                (t.tag_id, val)
+            }).collect();
+
         let data: Vec<serde_json::Value> = list_result
             .sessions
             .iter()
             .map(|session| {
-                let tags = resolve_tags_for_session(&storage, &session.session_id);
+                let tags: Vec<serde_json::Value> = tags_by_session
+                    .get(&session.session_id)
+                    .map(|tag_ids| tag_ids.iter().filter_map(|tid| tag_details.get(tid).cloned()).collect())
+                    .unwrap_or_default();
                 session_to_session_json(session, Some(tags))
             })
             .collect();
@@ -467,6 +493,12 @@ fn compute_aggregations(
             "markers" => {
                 result.insert("markers".to_string(), compute_markers_aggregation(sessions));
             }
+            "projects" => {
+                result.insert(
+                    "projects".to_string(),
+                    compute_projects_aggregation(sessions),
+                );
+            }
             _ => {
                 // Unknown aggregation type - skip silently
             }
@@ -563,6 +595,53 @@ fn compute_models_aggregation(sessions: &[SessionRecordFull]) -> serde_json::Val
     serde_json::Value::Array(model_aggs)
 }
 
+/// Compute project aggregation: count sessions per project_id.
+///
+/// Sessions with null/empty project_id are counted under `__default__`,
+/// which is always prepended as the first entry.
+fn compute_projects_aggregation(sessions: &[SessionRecordFull]) -> serde_json::Value {
+    let mut proj_counts: HashMap<String, u64> = HashMap::new();
+    let mut default_count: u64 = 0;
+
+    for session in sessions {
+        match session.project_id.as_deref() {
+            Some(pid) if !pid.is_empty() => {
+                *proj_counts.entry(pid.to_string()).or_insert(0) += 1;
+            }
+            _ => {
+                default_count += 1;
+            }
+        }
+    }
+
+    let mut proj_aggs: Vec<serde_json::Value> = proj_counts
+        .into_iter()
+        .map(|(value, count)| {
+            serde_json::json!({
+                "value": value,
+                "count": count
+            })
+        })
+        .collect();
+
+    // Sort by count descending
+    proj_aggs.sort_by(|a, b| {
+        let count_a = a["count"].as_u64().unwrap_or(0);
+        let count_b = b["count"].as_u64().unwrap_or(0);
+        count_b.cmp(&count_a)
+    });
+
+    proj_aggs.truncate(100);
+
+    // Prepend __default__ entry.
+    proj_aggs.insert(
+        0,
+        serde_json::json!({ "value": "__default__", "count": default_count }),
+    );
+
+    serde_json::Value::Array(proj_aggs)
+}
+
 /// Compute marker aggregation: count sessions per marker.
 fn compute_markers_aggregation(sessions: &[SessionRecordFull]) -> serde_json::Value {
     let mut marker_counts: HashMap<String, u64> = HashMap::new();
@@ -656,15 +735,31 @@ async fn handle_items_search(
         .and_then(|f| f.group_id.clone())
         .or_else(|| auth.and_then(|a| a.group_id));
 
+    let project_id_filter_raw = search_req
+        .filters
+        .as_ref()
+        .and_then(|f| f.project_id.clone());
+    let project_id_null_items = project_id_filter_raw.as_deref() == Some("__default__");
+    let project_id_filter = if project_id_null_items {
+        None
+    } else {
+        project_id_filter_raw
+    };
+
     let result = tokio::task::spawn_blocking(move || {
         let storage = StorageHandle::open(&bucket)?;
 
         // Get all sessions (up to a reasonable limit for item search)
+        let search_params = SearchParams {
+            project_id: project_id_filter.as_deref(),
+            project_id_null: project_id_null_items,
+            ..Default::default()
+        };
         let sessions_result = storage.list_sessions_paginated_ex(
             500, // Search across up to 500 sessions
             None,
             group_id.as_deref(),
-            &SearchParams::default(),
+            &search_params,
         )?;
 
         let mut results: Vec<ItemSearchResult> = Vec::new();
@@ -1046,6 +1141,13 @@ async fn handle_federated_search(
     let updated_after = filters.as_ref().and_then(|f| f.updated_after);
     let updated_before = filters.as_ref().and_then(|f| f.updated_before);
     let has_tags = filters.as_ref().and_then(|f| f.has_tags);
+    let project_id_filter_raw = filters.as_ref().and_then(|f| f.project_id.clone());
+    let project_id_null_fed = project_id_filter_raw.as_deref() == Some("__default__");
+    let project_id_filter = if project_id_null_fed {
+        None
+    } else {
+        project_id_filter_raw
+    };
 
     let bucket_clone = bucket.clone();
     let group_id_clone = group_id.clone();
@@ -1068,6 +1170,8 @@ async fn handle_federated_search(
             updated_before_ms: updated_before,
             has_tags,
             source_doc_id: None,
+            project_id: project_id_filter.as_deref(),
+            project_id_null: project_id_null_fed,
         };
 
         let list_result = storage.list_sessions_paginated_ex(
@@ -1077,12 +1181,23 @@ async fn handle_federated_search(
             &search_params,
         )?;
 
-        // Convert to search results
+        // Batch-resolve tags for all sessions.
+        let session_ids: Vec<&str> = list_result.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        let tags_by_session = storage.get_sessions_tags_batch(&session_ids).unwrap_or_default();
+        let tag_details: std::collections::HashMap<String, serde_json::Value> =
+            storage.list_tags(None).unwrap_or_default().into_iter().map(|t| {
+                let val = json!({ "id": t.tag_id, "name": t.name, "color": t.color });
+                (t.tag_id, val)
+            }).collect();
+
         let data: Vec<serde_json::Value> = list_result
             .sessions
             .iter()
             .map(|session| {
-                let tags = resolve_tags_for_session(&storage, &session.session_id);
+                let tags: Vec<serde_json::Value> = tags_by_session
+                    .get(&session.session_id)
+                    .map(|tag_ids| tag_ids.iter().filter_map(|tid| tag_details.get(tid).cloned()).collect())
+                    .unwrap_or_default();
                 session_to_session_json(session, Some(tags))
             })
             .collect();

@@ -72,6 +72,7 @@ pub fn seed_session_with_system_prompt(
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null(), // source_doc_id
+            std::ptr::null(), // project_id
         )
     };
     assert_eq!(rc, 0, "notify_session_update with system_prompt failed");
@@ -110,6 +111,7 @@ pub fn seed_session_with_group(
             c_group.as_ptr(),
             std::ptr::null(),
             std::ptr::null(), // source_doc_id
+            std::ptr::null(), // project_id
         )
     };
     assert_eq!(rc, 0, "notify_session_update with group_id failed");
@@ -147,6 +149,7 @@ pub fn seed_session_with_tags(
             std::ptr::null(),
             std::ptr::null(), // metadata_json
             std::ptr::null(), // source_doc_id
+            std::ptr::null(), // project_id
         )
     };
     assert_eq!(rc, 0, "notify_session_update failed");
@@ -221,6 +224,7 @@ pub fn seed_session_with_tags_and_group(
             c_group.as_ptr(),
             std::ptr::null(), // metadata_json
             std::ptr::null(), // source_doc_id
+            std::ptr::null(), // project_id
         )
     };
     assert_eq!(rc, 0, "notify_session_update with group_id failed");
@@ -262,6 +266,45 @@ pub fn seed_session_with_tags_and_group(
         );
     }
 
+    session_id.to_string()
+}
+
+/// Seed a session with a specific project_id.
+pub fn seed_session_with_project(
+    db_path: &Path,
+    session_id: &str,
+    title: &str,
+    model: &str,
+    project_id: &str,
+) -> String {
+    let db_str = db_path.to_str().expect("db_path to str");
+    let chat = ChatHandle::new(None).expect("create chat");
+    chat.set_storage_db(db_str, session_id)
+        .expect("set storage db");
+
+    let c_model = CString::new(model).expect("model cstr");
+    let c_title = CString::new(title).expect("title cstr");
+    let c_status = CString::new("active").expect("status cstr");
+    let c_project = CString::new(project_id).expect("project cstr");
+    let rc = unsafe {
+        talu_sys::talu_chat_notify_session_update(
+            chat.as_ptr(),
+            c_model.as_ptr(),
+            c_title.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(),
+            c_status.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null(), // group_id
+            std::ptr::null(),
+            std::ptr::null(), // source_doc_id
+            c_project.as_ptr(),
+        )
+    };
+    assert_eq!(rc, 0, "notify_session_update with project_id failed");
+    chat.append_user_message("Hello, world!")
+        .expect("append user message");
+    drop(chat);
     session_id.to_string()
 }
 

@@ -8,7 +8,7 @@ import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
 import { syncBrowserTabs, renderBrowserCards, updateBrowserToolbar } from "./render.ts";
 import { loadBrowserConversations } from "./data.ts";
-import { handleBrowserDelete, handleBrowserExport, handleBrowserArchive, handleBrowserBulkRestore, handleCardRestore } from "./actions.ts";
+import { handleBrowserDelete, handleBrowserExport, handleBrowserArchive, handleBrowserBulkRestore, handleCardRestore, showBrowserProjectContextMenu } from "./actions.ts";
 import { filterByTag, removeTagFilter } from "./tags.ts";
 
 export function wireEvents(): void {
@@ -134,5 +134,13 @@ export function wireEvents(): void {
     dom.searchInput.value = "";
     dom.clearBtn.classList.add("hidden");
     dom.searchInput.dispatchEvent(new Event("input"));
+  });
+
+  // Right-click on cards to assign project.
+  dom.cardsEl.addEventListener("contextmenu", (e) => {
+    const card = (e.target as HTMLElement).closest<HTMLElement>(".browser-card");
+    if (!card?.dataset["id"]) return;
+    e.preventDefault();
+    showBrowserProjectContextMenu(card, card.dataset["id"]);
   });
 }

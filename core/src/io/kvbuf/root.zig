@@ -55,6 +55,8 @@ pub const SessionFieldIds = struct {
     /// Source document ID for lineage tracking.
     /// Links this session to the prompt/persona document that spawned it.
     pub const source_doc_id: u16 = 15;
+    /// Project identifier for organizing sessions into projects.
+    pub const project_id: u16 = 16;
 };
 
 /// Stable field IDs for Tag entity KvBuf encoding (Schema 6).

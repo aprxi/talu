@@ -65,6 +65,22 @@ pub const ConversationTagRecord = struct {
     }
 };
 
+/// Flat parallel arrays of (session_id, tag_id) pairs from a batch lookup.
+pub const BatchTagResult = struct {
+    /// session_ids[i] is paired with tag_ids[i].
+    session_ids: [][]const u8,
+    /// tag_ids[i] belongs to session_ids[i].
+    tag_ids: [][]const u8,
+
+    /// Free all owned strings and the slices.
+    pub fn deinit(self: *BatchTagResult, alloc: Allocator) void {
+        for (self.session_ids) |s| alloc.free(s);
+        for (self.tag_ids) |t| alloc.free(t);
+        alloc.free(self.session_ids);
+        alloc.free(self.tag_ids);
+    }
+};
+
 /// TagAdapter - TaluDB adapter for tag persistence.
 ///
 /// Provides CRUD operations for tags and conversation-tag associations.
@@ -675,6 +691,127 @@ pub const TagAdapter = struct {
         return results.toOwnedSlice(allocator);
     }
 
+    /// Get tag IDs for multiple sessions in a single block scan.
+    ///
+    /// Scans conversation-tag blocks once for all target sessions instead of
+    /// opening/closing the reader per session. Returns flat (session_id, tag_id)
+    /// pairs. Caller owns all strings in the returned BatchTagResult.
+    pub fn getConversationTagsBatch(self: *TagAdapter, alloc: Allocator, session_ids: []const []const u8) !BatchTagResult {
+        const empty: BatchTagResult = .{ .session_ids = &.{}, .tag_ids = &.{} };
+        if (session_ids.len == 0) return empty;
+
+        // Map session hash → index into session_ids for O(1) row filtering.
+        var hash_to_idx = std.AutoHashMap(u64, usize).init(alloc);
+        defer hash_to_idx.deinit();
+        for (session_ids, 0..) |sid, i| {
+            try hash_to_idx.put(computeHash(sid), i);
+        }
+
+        // Per-session tag states: tag_id → timestamp (positive = active).
+        const TagStates = std.StringHashMap(i64);
+        var per_session = try alloc.alloc(TagStates, session_ids.len);
+        defer {
+            for (per_session) |*st| {
+                var it = st.keyIterator();
+                while (it.next()) |k| alloc.free(k.*);
+                st.deinit();
+            }
+            alloc.free(per_session);
+        }
+        for (per_session) |*st| st.* = TagStates.init(alloc);
+
+        const blocks = try self.fs_reader.getBlocks(alloc);
+        defer alloc.free(blocks);
+
+        for (blocks) |block| {
+            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            defer file.close();
+
+            const reader = block_reader.BlockReader.init(file, alloc);
+            const header = reader.readHeader(block.offset) catch continue;
+            if (header.schema_id != schema_conversation_tags) continue;
+
+            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
+            defer alloc.free(descs);
+
+            const row_count = header.row_count;
+            if (row_count == 0) continue;
+
+            const session_desc = findColumn(descs, col_session_hash) orelse continue;
+            const ts_desc = findColumn(descs, col_ts) orelse continue;
+            const payload_desc = findColumn(descs, col_payload) orelse continue;
+
+            const session_bytes = reader.readColumnData(block.offset, session_desc, alloc) catch continue;
+            defer alloc.free(session_bytes);
+
+            const ts_bytes = reader.readColumnData(block.offset, ts_desc, alloc) catch continue;
+            defer alloc.free(ts_bytes);
+
+            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, alloc) catch continue;
+            defer payload_buffers.deinit(alloc);
+
+            for (0..row_count) |row_idx| {
+                const session_hash = readU64At(session_bytes, row_idx) catch continue;
+                const idx = hash_to_idx.get(session_hash) orelse continue;
+
+                const ts = readI64At(ts_bytes, row_idx) catch continue;
+                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
+
+                const record_opt = decodeConversationTagRecord(alloc, payload) catch continue;
+                if (record_opt) |record| {
+                    defer alloc.free(record.session_id);
+
+                    const abs_ts = if (ts >= 0) ts else -ts;
+                    var st = &per_session[idx];
+                    if (st.get(record.tag_id)) |existing_ts| {
+                        const existing_abs = if (existing_ts >= 0) existing_ts else -existing_ts;
+                        if (abs_ts <= existing_abs) {
+                            alloc.free(record.tag_id);
+                            continue;
+                        }
+                        if (st.fetchRemove(record.tag_id)) |kv| {
+                            alloc.free(kv.key);
+                        }
+                    }
+
+                    st.put(record.tag_id, record.added_at_ms) catch {
+                        alloc.free(record.tag_id);
+                        continue;
+                    };
+                }
+            }
+        }
+
+        // Collect active tags into flat pairs.
+        var result_sids = std.ArrayList([]const u8).empty;
+        var result_tids = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (result_sids.items) |s| alloc.free(s);
+            result_sids.deinit(alloc);
+            for (result_tids.items) |t| alloc.free(t);
+            result_tids.deinit(alloc);
+        }
+
+        for (session_ids, 0..) |sid, idx| {
+            var st = &per_session[idx];
+            var it = st.iterator();
+            while (it.next()) |entry| {
+                if (entry.value_ptr.* > 0) {
+                    const sid_copy = try alloc.dupe(u8, sid);
+                    errdefer alloc.free(sid_copy);
+                    const tag_copy = try alloc.dupe(u8, entry.key_ptr.*);
+                    try result_sids.append(alloc, sid_copy);
+                    try result_tids.append(alloc, tag_copy);
+                }
+            }
+        }
+
+        return .{
+            .session_ids = try result_sids.toOwnedSlice(alloc),
+            .tag_ids = try result_tids.toOwnedSlice(alloc),
+        };
+    }
+
     /// Flush pending writes to disk.
     pub fn flush(self: *TagAdapter) !void {
         if (!self.read_only) {
@@ -979,6 +1116,88 @@ test "computeOptionalHash handles null" {
     try std.testing.expect(h2 != 0);
 }
 
+test "getConversationTagsBatch returns correct per-session tags" {
+    const allocator = std.testing.allocator;
+
+    // Create a temporary directory for the test database.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    // Write some conversation-tag associations.
+    {
+        var adapter = try TagAdapter.init(allocator, db_path);
+        defer adapter.deinit();
+
+        try adapter.addConversationTag("sess-a", "tag-1", 1000);
+        try adapter.addConversationTag("sess-a", "tag-2", 1001);
+        try adapter.addConversationTag("sess-b", "tag-2", 1002);
+        // sess-c has no tags.
+        try adapter.flush();
+    }
+
+    // Read-only batch query.
+    var adapter = try TagAdapter.initReadOnly(allocator, db_path);
+    defer adapter.deinitReadOnly();
+
+    const session_ids = [_][]const u8{ "sess-a", "sess-b", "sess-c" };
+    var result = try adapter.getConversationTagsBatch(allocator, &session_ids);
+    defer result.deinit(allocator);
+
+    // Total pairs: sess-a gets 2 tags, sess-b gets 1, sess-c gets 0.
+    try std.testing.expectEqual(@as(usize, 3), result.session_ids.len);
+
+    // Count per session.
+    var a_count: usize = 0;
+    var b_count: usize = 0;
+    var c_count: usize = 0;
+    for (result.session_ids, result.tag_ids) |sid, tid| {
+        if (std.mem.eql(u8, sid, "sess-a")) {
+            a_count += 1;
+            try std.testing.expect(
+                std.mem.eql(u8, tid, "tag-1") or std.mem.eql(u8, tid, "tag-2"),
+            );
+        } else if (std.mem.eql(u8, sid, "sess-b")) {
+            b_count += 1;
+            try std.testing.expectEqualStrings("tag-2", tid);
+        } else if (std.mem.eql(u8, sid, "sess-c")) {
+            c_count += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), a_count);
+    try std.testing.expectEqual(@as(usize, 1), b_count);
+    try std.testing.expectEqual(@as(usize, 0), c_count);
+}
+
+test "getConversationTagsBatch with empty input returns empty result" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const db_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(db_path);
+
+    // Create a database with some data so the reader has something to open.
+    {
+        var adapter = try TagAdapter.init(allocator, db_path);
+        defer adapter.deinit();
+        try adapter.addConversationTag("sess-x", "tag-x", 1000);
+        try adapter.flush();
+    }
+
+    var adapter = try TagAdapter.initReadOnly(allocator, db_path);
+    defer adapter.deinitReadOnly();
+
+    const empty = [_][]const u8{};
+    var result = try adapter.getConversationTagsBatch(allocator, &empty);
+    defer result.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), result.session_ids.len);
+}
+
 // =============================================================================
 // High-Level API Functions (for capi thin wrappers)
 // =============================================================================
@@ -1119,6 +1338,15 @@ pub fn getTagConversationIds(alloc: Allocator, db_path: []const u8, tag_id: []co
     var adapter = try TagAdapter.initReadOnly(alloc, db_path);
     defer adapter.deinitReadOnly();
     return adapter.getTagConversations(alloc, tag_id);
+}
+
+/// Get tag IDs for multiple sessions in a single block scan.
+/// Handles adapter lifecycle internally.
+/// Caller owns the returned BatchTagResult; call deinit() to free.
+pub fn getConversationTagIdsBatch(alloc: Allocator, db_path: []const u8, session_ids: []const []const u8) !BatchTagResult {
+    var adapter = try TagAdapter.initReadOnly(alloc, db_path);
+    defer adapter.deinitReadOnly();
+    return adapter.getConversationTagsBatch(alloc, session_ids);
 }
 
 /// Free a slice of TagRecords.

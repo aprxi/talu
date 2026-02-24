@@ -39,6 +39,7 @@ fn seed_session_with_source(
             ptr::null(), // group_id
             ptr::null(), // metadata_json
             c_source_doc_id.as_ref().map_or(ptr::null(), |c| c.as_ptr()),
+            ptr::null(), // project_id
         )
     };
     assert_eq!(rc, 0, "notify_session_update with source_doc_id failed");
@@ -70,6 +71,8 @@ fn list_sessions_by_source_ex(db_path: &str, source_doc_id: &str) -> Vec<String>
             0,                        // updated_before_ms
             -1,                       // has_tags (-1 = don't filter)
             c_source_doc_id.as_ptr(), // source_doc_id filter
+            ptr::null(),              // project_id
+            0,                        // project_id_null
             &mut c_list as *mut _,
         )
     };

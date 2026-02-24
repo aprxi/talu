@@ -29,6 +29,12 @@ export function buildBrowserDOM(root: HTMLElement): void {
           </div>
         </div>
 
+        <!-- Projects section -->
+        <div id="bp-projects-section" class="panel-section">
+          <div class="panel-heading">Project</div>
+          <div id="bp-project-combo"></div>
+        </div>
+
         <!-- Tags section -->
         <div id="bp-tags-section" class="panel-section hidden">
           <div class="panel-heading">Tags</div>

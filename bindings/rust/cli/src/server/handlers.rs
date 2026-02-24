@@ -104,7 +104,7 @@ async fn handle_generate(
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
-    let strict_responses = true;
+    let strict_responses = false;
     if let Some(ctx) = auth_ctx.as_ref() {
         log::info!(
             target: "server::gen",
@@ -222,6 +222,21 @@ async fn handle_generate(
             .map(|s| s.to_string())
     };
 
+    // Extract project_id from request metadata (non-strict mode only).
+    let project_id: Option<String> = if strict_responses {
+        parsed.metadata
+            .as_ref()
+            .and_then(|m| m.get("project_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    } else {
+        request_value
+            .get("metadata")
+            .and_then(|m| m.get("project_id"))
+            .and_then(|v| v.as_str())
+            .map(String::from)
+    };
+
     log::debug!(
         target: "server::gen",
         "model={} stream={} store={} session_id={:?} prompt_id={:?} prev_response_id={:?}",
@@ -250,6 +265,7 @@ async fn handle_generate(
             store,
             request_session_id,
             prompt_id,
+            project_id,
             strict_responses,
             auth_ctx,
         )
@@ -266,6 +282,7 @@ async fn handle_generate(
         store,
         request_session_id,
         prompt_id,
+        project_id,
         strict_responses,
         auth_ctx.as_ref(),
     )
@@ -544,6 +561,7 @@ async fn generate_response(
     store: bool,
     request_session_id: Option<String>,
     prompt_id: Option<String>,
+    project_id: Option<String>,
     strict_responses: bool,
     auth_ctx: Option<&AuthContext>,
 ) -> Result<serde_json::Value, ResponseError> {
@@ -732,6 +750,7 @@ async fn generate_response(
     let model_id_for_task = model_id.clone();
     let system_prompt_for_task = effective_system_prompt.clone();
     let prompt_id_for_task = prompt_id.clone();
+    let project_id_for_task = project_id.clone();
     let (output_items, prompt_tokens, completion_tokens, responses_json) =
         tokio::task::spawn_blocking(move || {
             let mut backend = backend.blocking_lock();
@@ -792,6 +811,7 @@ async fn generate_response(
                     Some(&title),
                     Some("active"),
                     prompt_id_for_task.as_deref(),
+                    project_id_for_task.as_deref(),
                 );
             }
 
@@ -887,8 +907,13 @@ async fn generate_response(
     }
 
     if !strict_responses {
-        // Include session_id in metadata so the UI can adopt it for follow-ups.
-        response_value["metadata"] = json!({ "session_id": session_id_for_response });
+        // Include session_id (and project_id if set) in metadata so the UI
+        // can adopt them for follow-ups.
+        let mut meta = json!({ "session_id": session_id_for_response });
+        if let Some(ref pid) = project_id {
+            meta["project_id"] = json!(pid);
+        }
+        response_value["metadata"] = meta;
     }
 
     // Auto-generate a descriptive title for new conversations in the background.
@@ -920,6 +945,7 @@ async fn stream_response(
     store: bool,
     request_session_id: Option<String>,
     prompt_id: Option<String>,
+    project_id: Option<String>,
     strict_responses: bool,
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
@@ -1152,6 +1178,9 @@ async fn stream_response(
     let tools_for_events = effective_tools.clone();
     let tool_choice_for_events = effective_tool_choice.clone();
 
+    // Clone project_id for the streaming blocking task.
+    let project_id_for_stream = project_id.clone();
+
     // Clones for post-generation title generation.
     let title_input = input_string.clone();
     let title_bucket = bucket_path.clone();
@@ -1289,6 +1318,7 @@ async fn stream_response(
                             Some(&title),
                             Some("active"),
                             prompt_id.as_deref(),
+                            project_id_for_stream.as_deref(),
                         );
                     }
                 }
@@ -1315,9 +1345,13 @@ async fn stream_response(
             created_response["previous_response_id"] = json!(prev_id);
         }
         if !strict_responses {
-            // Include session_id in the very first event so the UI can track
-            // the conversation immediately (before generation completes).
-            created_response["metadata"] = json!({ "session_id": session_id });
+            // Include session_id (and project_id if set) in the very first
+            // event so the UI can track the conversation immediately.
+            let mut meta = json!({ "session_id": session_id });
+            if let Some(ref pid) = project_id_for_stream {
+                meta["project_id"] = json!(pid);
+            }
+            created_response["metadata"] = meta;
         }
         let _ = send_event(
             &tx,
@@ -1361,6 +1395,7 @@ async fn stream_response(
             request_store: store,
             previous_response_id: previous_response_id_for_ctx.clone(),
             instructions: instructions.clone(),
+            project_id: project_id.clone(),
         }));
         let ctx_for_complete = ctx.clone();
 
@@ -1377,6 +1412,7 @@ async fn stream_response(
             top_p,
             effective_system_prompt,
             prompt_id,
+            project_id_for_stream,
             file_storage_path,
             ctx,
             stop_flag_for_gen,
@@ -1446,6 +1482,7 @@ fn run_streaming_generation(
     top_p: Option<f64>,
     system_prompt: Option<String>,
     prompt_id: Option<String>,
+    project_id: Option<String>,
     file_storage_path: Option<std::path::PathBuf>,
     ctx: Arc<std::sync::Mutex<StreamCtx>>,
     stop_flag: Arc<AtomicBool>,
@@ -1553,6 +1590,7 @@ fn run_streaming_generation(
             Some(&title),
             Some("active"),
             prompt_id.as_deref(),
+            project_id.as_deref(),
         );
     }
 
@@ -1701,6 +1739,8 @@ struct StreamCtx {
     previous_response_id: Option<String>,
     /// Request instructions field for OpenResponses response resources.
     instructions: Option<String>,
+    /// Project ID from request metadata (returned in response metadata).
+    project_id: Option<String>,
 }
 
 impl StreamCtx {
@@ -2069,7 +2109,11 @@ impl StreamCtx {
                     });
                 }
                 if !self.strict_responses {
-                    response["metadata"] = json!({ "session_id": self.session_id });
+                    let mut meta = json!({ "session_id": self.session_id });
+                    if let Some(ref pid) = self.project_id {
+                        meta["project_id"] = json!(pid);
+                    }
+                    response["metadata"] = meta;
                 }
                 let response = normalize_response_value(response);
                 let payload = json!({
@@ -2120,7 +2164,11 @@ impl StreamCtx {
                     "message": format!("{err}")
                 });
                 if !self.strict_responses {
-                    response["metadata"] = json!({ "session_id": self.session_id });
+                    let mut meta = json!({ "session_id": self.session_id });
+                    if let Some(ref pid) = self.project_id {
+                        meta["project_id"] = json!(pid);
+                    }
+                    response["metadata"] = meta;
                 }
                 let response = normalize_response_value(response);
                 let payload = json!({

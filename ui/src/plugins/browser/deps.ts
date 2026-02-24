@@ -3,7 +3,7 @@
  */
 
 import type { ApiClient } from "../../api.ts";
-import type { Notifications, StandardDialogs, EventBus, DownloadAccess, ManagedTimers, MenuAccess } from "../../kernel/types.ts";
+import type { Notifications, StandardDialogs, EventBus, DownloadAccess, ManagedTimers, MenuAccess, LayoutAccess } from "../../kernel/types.ts";
 import type { ChatService } from "../../types.ts";
 
 export let api: ApiClient;
@@ -14,6 +14,7 @@ export let chatService: ChatService;
 export let pluginDownload: DownloadAccess;
 export let pluginTimers: ManagedTimers;
 export let menus: MenuAccess;
+export let layout: LayoutAccess;
 
 export function initBrowserDeps(deps: {
   api: ApiClient;
@@ -24,6 +25,7 @@ export function initBrowserDeps(deps: {
   download: DownloadAccess;
   timers: ManagedTimers;
   menus: MenuAccess;
+  layout: LayoutAccess;
 }): void {
   api = deps.api;
   notify = deps.notify;
@@ -33,4 +35,5 @@ export function initBrowserDeps(deps: {
   pluginDownload = deps.download;
   pluginTimers = deps.timers;
   menus = deps.menus;
+  layout = deps.layout;
 }

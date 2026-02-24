@@ -293,6 +293,11 @@
   color: var(--text-muted);
 }
 
+.browser-card-badge.project {
+  background: color-mix(in srgb, var(--accent, var(--primary)) 12%, transparent);
+  color: var(--accent, var(--primary));
+}
+
 .browser-card-action {
   padding: 0.375rem;
   border-radius: 6px;

@@ -35,6 +35,7 @@ pub(crate) struct SessionResponse {
     pub title: Option<String>,
     pub model: Option<String>,
     pub marker: Option<String>,
+    pub project_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     pub tags: Vec<SessionTag>,
@@ -59,6 +60,7 @@ pub(crate) struct SessionPatchRequest {
     pub title: Option<String>,
     pub marker: Option<String>,
     pub pinned: Option<bool>,
+    pub project_id: Option<String>,
 }
 
 /// Request body for POST /v1/chat/sessions/batch.
@@ -294,6 +296,7 @@ pub(crate) fn session_to_session_json(
         "tags": tags.unwrap_or_default(),
         "search_snippet": rec.search_snippet,
         "source_doc_id": rec.source_doc_id,
+        "project_id": rec.project_id,
         "created_at": rec.created_at,
         "updated_at": rec.updated_at
     })
@@ -360,6 +363,7 @@ pub(crate) fn resolve_tags_for_session(
         ("marker" = Option<String>, Query, description = "Filter by marker value"),
         ("search" = Option<String>, Query, description = "Full-text search on titles"),
         ("tags_any" = Option<String>, Query, description = "Comma-separated tag IDs (OR filter)"),
+        ("project_id" = Option<String>, Query, description = "Filter by project ID"),
     ),
     responses((status = 200, body = SessionListResponse)))]
 /// GET /v1/chat/sessions — list sessions with offset-based pagination.
@@ -411,6 +415,19 @@ pub async fn handle_list(
         .map(|(_, v)| v.clone())
         .filter(|v| !v.is_empty());
 
+    let project_id_raw: Option<String> = query
+        .iter()
+        .find(|(k, _)| k == "project_id")
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty());
+
+    let project_id_null = project_id_raw.as_deref() == Some("__default__");
+    let project_id: Option<String> = if project_id_null {
+        None
+    } else {
+        project_id_raw
+    };
+
     let result = tokio::task::spawn_blocking(move || {
         let batch = storage.list_sessions_batch(
             offset,
@@ -419,14 +436,31 @@ pub async fn handle_list(
             marker_filter.as_deref(),
             search_query.as_deref(),
             tags_any.as_deref(),
+            project_id.as_deref(),
+            project_id_null,
         )?;
 
-        // Only resolve tags and convert for the current page.
+        // Batch-resolve tags: one scan for all sessions on this page.
+        let session_ids: Vec<&str> = batch.sessions.iter().map(|s| s.session_id.as_str()).collect();
+        let tags_by_session = storage.get_sessions_tags_batch(&session_ids).unwrap_or_default();
+
+        // Pre-fetch all tag records for detail lookup (name, color).
+        let tag_details: std::collections::HashMap<String, serde_json::Value> =
+            storage.list_tags(None).unwrap_or_default().into_iter().map(|t| {
+                let val = json!({ "id": t.tag_id, "name": t.name, "color": t.color });
+                (t.tag_id, val)
+            }).collect();
+
         let page_data: Vec<serde_json::Value> = batch
             .sessions
             .iter()
             .map(|session| {
-                let tags = resolve_tags_for_session(&storage, &session.session_id);
+                let tags: Vec<serde_json::Value> = tags_by_session
+                    .get(&session.session_id)
+                    .map(|tag_ids| {
+                        tag_ids.iter().filter_map(|tid| tag_details.get(tid).cloned()).collect()
+                    })
+                    .unwrap_or_default();
                 session_to_session_json(session, Some(tags))
             })
             .collect();
@@ -633,6 +667,32 @@ pub async fn handle_patch(
         }
     };
 
+    // Extract project_id from metadata or top-level patch body.
+    // If metadata.project_id is a string, set it. If explicitly null, clear it.
+    let (patch_project_id, clear_project_id) = if let Some(meta) = patch.get("metadata") {
+        if let Some(pid_val) = meta.get("project_id") {
+            if pid_val.is_null() {
+                (None, true)
+            } else if let Some(pid_str) = pid_val.as_str() {
+                (Some(pid_str.to_string()), false)
+            } else {
+                (None, false)
+            }
+        } else {
+            (None, false)
+        }
+    } else if let Some(pid_val) = patch.get("project_id") {
+        if pid_val.is_null() {
+            (None, true)
+        } else if let Some(pid_str) = pid_val.as_str() {
+            (Some(pid_str.to_string()), false)
+        } else {
+            (None, false)
+        }
+    } else {
+        (None, false)
+    };
+
     let updates = SessionUpdate {
         title: patch
             .get("title")
@@ -643,6 +703,9 @@ pub async fn handle_patch(
             .and_then(|v| v.as_str())
             .map(String::from),
         metadata_json: patch.get("metadata").map(|v| v.to_string()),
+        project_id: patch_project_id,
+        clear_project_id,
+        ..Default::default()
     };
 
     let storage = match open_storage(&state, &auth) {

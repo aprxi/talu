@@ -2,8 +2,8 @@
 
 use super::{
     no_bucket_config, search_config, seed_session, seed_session_with_group,
-    seed_session_with_marker, seed_session_with_messages, seed_session_with_system_prompt,
-    seed_session_with_tags,
+    seed_session_with_marker, seed_session_with_messages, seed_session_with_project,
+    seed_session_with_system_prompt, seed_session_with_tags,
 };
 use crate::server::common::*;
 use serde_json::json;
@@ -1629,4 +1629,49 @@ fn items_search_has_more_with_limit() {
         json["has_more"], true,
         "has_more should be true when more results exist"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Projects aggregation
+// ---------------------------------------------------------------------------
+
+/// Projects aggregation returns counts grouped by project_id.
+#[test]
+fn aggregations_projects_returns_counts() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session_with_project(temp.path(), "agg-p1", "Chat P1", "m", "proj_alpha");
+    seed_session_with_project(temp.path(), "agg-p2", "Chat P2", "m", "proj_alpha");
+    seed_session_with_project(temp.path(), "agg-p3", "Chat P3", "m", "proj_beta");
+    seed_session(temp.path(), "agg-p4", "Chat P4", "m"); // no project
+
+    let ctx = ServerTestContext::new(search_config(temp.path()));
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/search",
+        &json!({
+            "scope": "sessions",
+            "aggregations": ["projects"]
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let projects = json["aggregations"]["projects"]
+        .as_array()
+        .expect("projects array");
+    assert_eq!(projects.len(), 3, "should have 3 entries (__default__ + 2 projects)");
+
+    for entry in projects {
+        assert!(entry["value"].is_string(), "entry should have 'value'");
+        assert!(entry["count"].is_u64(), "entry should have 'count'");
+    }
+
+    // __default__ bucket is always prepended first (sessions with no project_id).
+    assert_eq!(projects[0]["value"], "__default__");
+    assert_eq!(projects[0]["count"], 1);
+    // proj_alpha has 2 sessions → should be next (sorted by count desc).
+    assert_eq!(projects[1]["value"], "proj_alpha");
+    assert_eq!(projects[1]["count"], 2);
+    assert_eq!(projects[2]["value"], "proj_beta");
+    assert_eq!(projects[2]["count"], 1);
 }

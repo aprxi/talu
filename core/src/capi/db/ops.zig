@@ -189,6 +189,9 @@ pub const CSessionRecord = extern struct {
     /// Links this session to the prompt/persona document that spawned it.
     source_doc_id: ?[*:0]const u8,
 
+    /// Project identifier for multi-project session organization (null-terminated, may be null).
+    project_id: ?[*:0]const u8,
+
     /// Creation timestamp (Unix milliseconds).
     created_at_ms: i64,
 
@@ -196,7 +199,7 @@ pub const CSessionRecord = extern struct {
     updated_at_ms: i64,
 
     /// Reserved for future expansion.
-    _reserved: [16]u8 = [_]u8{0} ** 16,
+    _reserved: [8]u8 = [_]u8{0} ** 8,
 };
 
 /// Storage event type discriminator.

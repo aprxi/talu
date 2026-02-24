@@ -330,6 +330,72 @@ fn session_list_includes_tags() {
     }
 }
 
+/// Batch tag resolution: multiple sessions, mixed tags and no tags.
+///
+/// The listing handler resolves tags for all sessions in a single batch call.
+/// This test verifies correct per-session assignment when some sessions have
+/// tags, some have different tags, and some have none.
+#[test]
+fn session_list_batch_resolves_tags_correctly() {
+    let temp = TempDir::new().expect("temp dir");
+    seed_session(temp.path(), "sess-a", "Chat A", "model");
+    seed_session(temp.path(), "sess-b", "Chat B", "model");
+    seed_session(temp.path(), "sess-c", "Chat C", "model");
+
+    let ctx = ServerTestContext::new(tags_config(temp.path()));
+
+    // Tag sess-a with "work" and "urgent"
+    post_json(
+        ctx.addr(),
+        "/v1/chat/sessions/sess-a/tags",
+        &serde_json::json!({ "tags": ["work", "urgent"] }),
+    );
+
+    // Tag sess-b with "personal" only
+    post_json(
+        ctx.addr(),
+        "/v1/chat/sessions/sess-b/tags",
+        &serde_json::json!({ "tags": ["personal"] }),
+    );
+
+    // sess-c has no tags
+
+    // List all sessions
+    let resp = get(ctx.addr(), "/v1/chat/sessions");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let json = resp.json();
+    let data = json["data"].as_array().expect("data array");
+    assert_eq!(data.len(), 3);
+
+    // Build a map of id -> tag names for easy assertion
+    let tag_map: std::collections::HashMap<&str, Vec<&str>> = data
+        .iter()
+        .map(|s| {
+            let sid = s["id"].as_str().unwrap();
+            let names: Vec<&str> = s["tags"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|t| t["name"].as_str().unwrap())
+                .collect();
+            (sid, names)
+        })
+        .collect();
+
+    let a_tags = &tag_map["sess-a"];
+    assert_eq!(a_tags.len(), 2, "sess-a should have 2 tags");
+    assert!(a_tags.contains(&"work"));
+    assert!(a_tags.contains(&"urgent"));
+
+    let b_tags = &tag_map["sess-b"];
+    assert_eq!(b_tags.len(), 1, "sess-b should have 1 tag");
+    assert!(b_tags.contains(&"personal"));
+
+    let c_tags = &tag_map["sess-c"];
+    assert!(c_tags.is_empty(), "sess-c should have no tags");
+}
+
 /// GET /v1/chat/sessions/:id includes resolved tags array.
 #[test]
 fn session_get_includes_tags() {

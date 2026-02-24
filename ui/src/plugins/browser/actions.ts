@@ -2,11 +2,12 @@
  * Browser plugin actions — delete, export, archive, restore.
  */
 
-import { api, notify, dialogs, chatService, pluginDownload } from "./deps.ts";
-import { bState } from "./state.ts";
+import { renderProjectPicker } from "../../render/project-picker.ts";
+import { api, notify, dialogs, chatService, pluginDownload, layout } from "./deps.ts";
+import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
 import { updateBrowserToolbar } from "./render.ts";
-import { loadBrowserConversations } from "./data.ts";
+import { loadBrowserConversations, loadAvailableTags } from "./data.ts";
 
 export async function handleBrowserDelete(): Promise<void> {
   if (bState.selectedIds.size === 0) return;
@@ -122,4 +123,35 @@ export async function handleBrowserBulkRestore(): Promise<void> {
   updateBrowserToolbar();
   await loadBrowserConversations();
   await chatService.refreshSidebar();
+}
+
+export function showBrowserProjectContextMenu(anchor: HTMLElement, chatId: string): void {
+  const session = bState.conversations.find((c) => c.id === chatId);
+  if (!session) return;
+
+  const currentProjectId = session.project_id ?? null;
+  const popoverDisposable = layout.showPopover({
+    anchor,
+    content: renderProjectPicker({
+      currentProjectId,
+      projects: search.availableProjects,
+      onSelect: (projectId) => {
+        popoverDisposable.dispose();
+        void handleSetBrowserProject(chatId, projectId);
+      },
+    }),
+    placement: "right",
+  });
+}
+
+export async function handleSetBrowserProject(chatId: string, projectId: string | null): Promise<void> {
+  const result = await api.patchConversation(chatId, { project_id: projectId });
+  if (!result.ok) {
+    notify.error(result.error ?? "Failed to update project");
+    return;
+  }
+
+  // Refresh data.
+  await loadBrowserConversations();
+  await loadAvailableTags();
 }

@@ -2245,7 +2245,8 @@ pub export fn talu_chat_max_context_length(model: ?[*:0]const u8) callconv(.c) u
 /// Args:
 ///   chat_handle: Opaque Chat handle
 ///   model, title, system_prompt, config_json, marker,
-///   parent_session_id, group_id, metadata_json, source_doc_id:
+///   parent_session_id, group_id, metadata_json, source_doc_id,
+///   project_id:
 ///     New values (or null to leave unchanged).
 ///
 /// Returns: 0 on success, negative error code on failure.
@@ -2261,6 +2262,7 @@ pub export fn talu_chat_notify_session_update(
     group_id: ?[*:0]const u8,
     metadata_json: ?[*:0]const u8,
     source_doc_id: ?[*:0]const u8,
+    project_id: ?[*:0]const u8,
 ) callconv(.c) i32 {
     capi_error.clearError();
 
@@ -2278,6 +2280,7 @@ pub export fn talu_chat_notify_session_update(
     const group_id_slice: ?[]const u8 = if (group_id) |g| std.mem.span(g) else null;
     const metadata_json_slice: ?[]const u8 = if (metadata_json) |m| std.mem.span(m) else null;
     const source_doc_id_slice: ?[]const u8 = if (source_doc_id) |s| std.mem.span(s) else null;
+    const project_id_slice: ?[]const u8 = if (project_id) |p| std.mem.span(p) else null;
 
     chat.conv.notifySessionUpdate(
         model_slice,
@@ -2289,6 +2292,7 @@ pub export fn talu_chat_notify_session_update(
         group_id_slice,
         metadata_json_slice,
         source_doc_id_slice,
+        project_id_slice,
     );
 
     return 0;

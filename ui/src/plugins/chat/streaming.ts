@@ -219,6 +219,17 @@ function handleSSEEvent(
         }
         if (isActive()) chatState.activeSessionId = sid;
       }
+      // Pick up project_id from response metadata and propagate to the active session.
+      if (meta && typeof meta["project_id"] === "string" && isActive()) {
+        const projectId = meta["project_id"] as string;
+        if (chatState.activeChat) {
+          chatState.activeChat.project_id = projectId;
+        }
+        const session = chatState.sessions.find(s => s.id === chatState.activeSessionId);
+        if (session) {
+          session.project_id = projectId;
+        }
+      }
       break;
     }
     case "response.output_text.delta": {
@@ -252,6 +263,17 @@ function handleSSEEvent(
           onSessionDiscovered?.(sid);
         }
         if (isActive()) chatState.activeSessionId = sid;
+      }
+      // Pick up project_id from completed response metadata.
+      if (meta && typeof meta["project_id"] === "string" && isActive()) {
+        const projectId = meta["project_id"] as string;
+        if (chatState.activeChat) {
+          chatState.activeChat.project_id = projectId;
+        }
+        const session = chatState.sessions.find(s => s.id === chatState.activeSessionId);
+        if (session) {
+          session.project_id = projectId;
+        }
       }
       const usage = response?.["usage"] as Record<string, unknown> | undefined;
       if (usage && callbacks.onComplete) {

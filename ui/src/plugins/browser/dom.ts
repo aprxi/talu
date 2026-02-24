@@ -10,6 +10,8 @@ export interface BrowserDom {
   tabArchived: HTMLButtonElement;
   tagsEl: HTMLElement;
   tagsSection: HTMLElement;
+  projectCombo: HTMLElement;
+  projectsSection: HTMLElement;
   selectAllBtn: HTMLButtonElement;
   deleteBtn: HTMLButtonElement;
   exportBtn: HTMLButtonElement;
@@ -40,6 +42,8 @@ export function getBrowserDom(): BrowserDom {
     tabArchived: q("#bp-tab-archived") as HTMLButtonElement,
     tagsEl: q("#bp-tags"),
     tagsSection: q("#bp-tags-section"),
+    projectCombo: q("#bp-project-combo") as HTMLElement,
+    projectsSection: q("#bp-projects-section"),
     selectAllBtn: q("#bp-select-all") as HTMLButtonElement,
     deleteBtn: q("#bp-delete") as HTMLButtonElement,
     exportBtn: q("#bp-export") as HTMLButtonElement,

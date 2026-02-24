@@ -6,7 +6,7 @@ import { renderLoadingSpinner } from "../../render/common.ts";
 import { api } from "./deps.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
-import { renderBrowserCards, renderBrowserTags, renderBrowserPagination } from "./render.ts";
+import { renderBrowserCards, renderBrowserTags, renderBrowserPagination, updateBrowserProjectSelector } from "./render.ts";
 
 export async function loadBrowserConversations(page?: number): Promise<void> {
   if (bState.isLoading) return;
@@ -33,6 +33,7 @@ export async function loadBrowserConversations(page?: number): Promise<void> {
     marker: marker || undefined,
     search: searchText,
     tags_any: tagsAny,
+    project_id: search.projectFilter || undefined,
   });
 
   bState.isLoading = false;
@@ -49,12 +50,18 @@ export async function loadBrowserConversations(page?: number): Promise<void> {
 export async function loadAvailableTags(): Promise<void> {
   const result = await api.search({
     scope: "sessions",
-    aggregations: ["tags"],
+    aggregations: ["tags", "projects"],
     limit: 1,
   });
 
-  if (result.ok && result.data?.aggregations?.tags) {
-    search.availableTags = result.data.aggregations.tags;
-    renderBrowserTags();
+  if (result.ok && result.data?.aggregations) {
+    if (result.data.aggregations.tags) {
+      search.availableTags = result.data.aggregations.tags;
+      renderBrowserTags();
+    }
+    if (result.data.aggregations.projects) {
+      search.availableProjects = result.data.aggregations.projects;
+      updateBrowserProjectSelector();
+    }
   }
 }

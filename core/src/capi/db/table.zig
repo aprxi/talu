@@ -77,6 +77,16 @@ pub const CRelationStringList = extern struct {
     _arena: ?*anyopaque,
 };
 
+/// Batch tag lookup result — flat parallel arrays of (session_id, tag_id) pairs.
+pub const CSessionTagBatch = extern struct {
+    /// session_ids[i] is paired with tag_ids[i]. Sentinel-terminated strings.
+    session_ids: ?[*]?[*:0]const u8,
+    /// tag_ids[i] belongs to session_ids[i]. Sentinel-terminated strings.
+    tag_ids: ?[*]?[*:0]const u8,
+    count: usize,
+    _arena: ?*anyopaque,
+};
+
 // =============================================================================
 // Documents
 // =============================================================================
@@ -415,13 +425,21 @@ fn buildSessionScanParams(
     before_updated_at_ms: i64,
     before_session_id: ?[*:0]const u8,
     group_id: ?[*:0]const u8,
+    project_id: ?[*:0]const u8,
+    project_id_null: i32,
 ) db.table.sessions.TableAdapter.ScanParams {
-    return db.table.sessions.TableAdapter.ScanParams.fromArgs(
+    var params = db.table.sessions.TableAdapter.ScanParams.fromArgs(
         limit,
         before_updated_at_ms,
         optSlice(before_session_id),
         optSlice(group_id),
     );
+    if (project_id_null != 0) params.target_project_null = true;
+    if (optSlice(project_id)) |pid| {
+        params.target_project_hash = db.table.sessions.computeGroupHash(pid);
+        params.target_project_id = pid;
+    }
+    return params;
 }
 
 fn listSessionsImpl(
@@ -469,6 +487,7 @@ fn buildSessionList(records: []db.table.sessions.ScannedSessionRecord) !*CSessio
         sessions_buf[i].metadata_json = if (record.metadata_json) |m| (arena.dupeZ(u8, m) catch return error.OutOfMemory).ptr else null;
         sessions_buf[i].search_snippet = if (record.search_snippet) |s| (arena.dupeZ(u8, s) catch return error.OutOfMemory).ptr else null;
         sessions_buf[i].source_doc_id = if (record.source_doc_id) |d| (arena.dupeZ(u8, d) catch return error.OutOfMemory).ptr else null;
+        sessions_buf[i].project_id = if (record.project_id) |p| (arena.dupeZ(u8, p) catch return error.OutOfMemory).ptr else null;
         sessions_buf[i].created_at_ms = record.created_at_ms;
         sessions_buf[i].updated_at_ms = record.updated_at_ms;
     }
@@ -547,6 +566,7 @@ fn populateSessionRecord(out: *CSessionRecord, record: db.table.sessions.Scanned
         threadlocal var metadata_json_buf: [4096]u8 = .{0} ** 4096;
         threadlocal var search_snippet_buf: [4096]u8 = .{0} ** 4096;
         threadlocal var source_doc_id_buf: [256]u8 = .{0} ** 256;
+        threadlocal var project_id_buf: [256]u8 = .{0} ** 256;
     };
     out.session_id = copyToStaticBuf(&S.session_id_buf, record.session_id);
     out.model = copyToStaticBufOpt(&S.model_buf, record.model);
@@ -561,6 +581,7 @@ fn populateSessionRecord(out: *CSessionRecord, record: db.table.sessions.Scanned
     out.metadata_json = copyToStaticBufOpt(&S.metadata_json_buf, record.metadata_json);
     out.search_snippet = copyToStaticBufOpt(&S.search_snippet_buf, record.search_snippet);
     out.source_doc_id = copyToStaticBufOpt(&S.source_doc_id_buf, record.source_doc_id);
+    out.project_id = copyToStaticBufOpt(&S.project_id_buf, record.project_id);
     out.created_at_ms = record.created_at_ms;
     out.updated_at_ms = record.updated_at_ms;
 }
@@ -728,6 +749,95 @@ fn getTagConversationsImpl(db_path_slice: []const u8, tag_id_slice: []const u8, 
     return 0;
 }
 
+fn buildEmptySessionTagBatch(out: *?*CSessionTagBatch) i32 {
+    const batch = allocator.create(CSessionTagBatch) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate batch", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    batch.* = std.mem.zeroes(CSessionTagBatch);
+    out.* = batch;
+    return 0;
+}
+
+fn getSessionsTagsBatchImpl(
+    db_path_slice: []const u8,
+    ids_ptr: [*]const ?[*:0]const u8,
+    session_count: u32,
+    out: *?*CSessionTagBatch,
+) i32 {
+    // Convert C string array to Zig slices.
+    var zig_ids = allocator.alloc([]const u8, session_count) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate id array", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    defer allocator.free(zig_ids);
+
+    for (0..session_count) |i| {
+        const c_str = ids_ptr[i] orelse {
+            capi_error.setErrorWithCode(.invalid_argument, "session_ids contains null", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        };
+        zig_ids[i] = std.mem.span(c_str);
+    }
+
+    var result = db.table.tags.getConversationTagIdsBatch(allocator, db_path_slice, zig_ids) catch |err| {
+        capi_error.setError(err, "failed to batch get session tags", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    defer result.deinit(allocator);
+
+    const batch = allocator.create(CSessionTagBatch) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate batch", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    errdefer allocator.destroy(batch);
+
+    const count = result.session_ids.len;
+    if (count == 0) {
+        batch.* = std.mem.zeroes(CSessionTagBatch);
+        out.* = batch;
+        return 0;
+    }
+
+    const arena_ptr = allocator.create(std.heap.ArenaAllocator) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate arena", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    errdefer allocator.destroy(arena_ptr);
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer arena_ptr.deinit();
+    const arena = arena_ptr.allocator();
+
+    const c_sids = arena.alloc(?[*:0]const u8, count) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate session_ids", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+    const c_tids = arena.alloc(?[*:0]const u8, count) catch {
+        capi_error.setErrorWithCode(.out_of_memory, "failed to allocate tag_ids", .{});
+        return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+    };
+
+    for (0..count) |i| {
+        c_sids[i] = (arena.dupeZ(u8, result.session_ids[i]) catch {
+            capi_error.setErrorWithCode(.out_of_memory, "failed to copy session_id", .{});
+            return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+        }).ptr;
+        c_tids[i] = (arena.dupeZ(u8, result.tag_ids[i]) catch {
+            capi_error.setErrorWithCode(.out_of_memory, "failed to copy tag_id", .{});
+            return @intFromEnum(error_codes.ErrorCode.out_of_memory);
+        }).ptr;
+    }
+
+    batch.* = .{
+        .session_ids = c_sids.ptr,
+        .tag_ids = c_tids.ptr,
+        .count = count,
+        ._arena = @ptrCast(arena_ptr),
+    };
+    out.* = batch;
+    return 0;
+}
+
 // =============================================================================
 // Sessions: List / Get / Update / Fork / Delete
 // =============================================================================
@@ -741,6 +851,8 @@ pub export fn talu_db_table_session_list(
     search_query: ?[*:0]const u8,
     tags_filter: ?[*:0]const u8,
     tags_filter_any: ?[*:0]const u8,
+    project_id: ?[*:0]const u8,
+    project_id_null: i32,
     out_sessions: ?*?*CSessionList,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -750,7 +862,7 @@ pub export fn talu_db_table_session_list(
     };
     out.* = null;
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, group_id);
+    var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, group_id, project_id, project_id_null);
     params.search_query = optSlice(search_query);
     if (params.search_query != null) params.max_scan = 5000;
     var allowed_hashes = std.AutoHashMap(u64, void).init(allocator);
@@ -794,6 +906,8 @@ pub export fn talu_db_table_session_list_ex(
     updated_before_ms: i64,
     has_tags: i32,
     source_doc_id: ?[*:0]const u8,
+    project_id: ?[*:0]const u8,
+    project_id_null: i32,
     out_sessions: ?*?*CSessionList,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -803,7 +917,7 @@ pub export fn talu_db_table_session_list_ex(
     };
     out.* = null;
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, group_id);
+    var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, group_id, project_id, project_id_null);
     params.search_query = optSlice(search_query);
     params.marker_filter = optSlice(marker_filter);
     params.marker_filter_any = optSlice(marker_filter_any);
@@ -882,7 +996,7 @@ pub export fn talu_db_table_session_list_by_source(
     out.* = null;
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const source_doc_slice = validateRequiredArg(source_doc_id, "source_doc_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, null);
+    var params = buildSessionScanParams(limit, before_updated_at_ms, before_session_id, null, null, 0);
     params.source_doc_id = source_doc_slice;
     return listSessionsImpl(db_path_slice, params, out);
 }
@@ -895,6 +1009,8 @@ pub export fn talu_db_table_session_list_batch(
     marker_filter: ?[*:0]const u8,
     search_query: ?[*:0]const u8,
     tags_filter_any: ?[*:0]const u8,
+    project_id: ?[*:0]const u8,
+    project_id_null: i32,
     out_sessions: ?*?*CSessionList,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -905,9 +1021,14 @@ pub export fn talu_db_table_session_list_batch(
     out.* = null;
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     var params = db.table.sessions.TableAdapter.ScanParams{};
+    if (project_id_null != 0) params.target_project_null = true;
     if (optSlice(group_id)) |gid| {
         params.target_group_hash = db.table.sessions.computeGroupHash(gid);
         params.target_group_id = gid;
+    }
+    if (optSlice(project_id)) |pid| {
+        params.target_project_hash = db.table.sessions.computeGroupHash(pid);
+        params.target_project_id = pid;
     }
     params.marker_filter = optSlice(marker_filter);
     params.search_query = optSlice(search_query);
@@ -998,6 +1119,8 @@ pub export fn talu_db_table_session_update_ex(
     marker: ?[*:0]const u8,
     metadata_json: ?[*:0]const u8,
     source_doc_id: ?[*:0]const u8,
+    project_id: ?[*:0]const u8,
+    clear_project_id: i32,
 ) callconv(.c) i32 {
     capi_error.clearError();
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
@@ -1011,7 +1134,7 @@ pub export fn talu_db_table_session_update_ex(
         return @intFromEnum(error_codes.errorToCode(err));
     };
     defer adapter.backend().deinit();
-    adapter.updateSessionEx(allocator, session_id_slice, optSlice(title), optSlice(marker), optSlice(metadata_json), optSlice(source_doc_id)) catch |err| {
+    adapter.updateSessionEx(allocator, session_id_slice, optSlice(title), optSlice(marker), optSlice(metadata_json), optSlice(source_doc_id), optSlice(project_id), clear_project_id != 0) catch |err| {
         capi_error.setError(err, "failed to update session", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -1250,6 +1373,44 @@ pub export fn talu_db_table_free_relation_string_list(list: ?*CRelationStringLis
         allocator.destroy(arena);
     }
     allocator.destroy(l);
+}
+
+/// Get tag IDs for multiple sessions in a single scan.
+///
+/// Returns flat parallel arrays: out_result.session_ids[i] paired with
+/// out_result.tag_ids[i]. Free with talu_db_table_free_session_tag_batch.
+pub export fn talu_db_table_sessions_get_tags_batch(
+    db_path: ?[*:0]const u8,
+    session_ids: ?[*]const ?[*:0]const u8,
+    session_count: u32,
+    out_result: ?*?*CSessionTagBatch,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_result orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_result is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = null;
+    const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    if (session_count == 0) {
+        return buildEmptySessionTagBatch(out);
+    }
+    const ids_ptr = session_ids orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "session_ids is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    return getSessionsTagsBatchImpl(db_path_slice, ids_ptr, session_count, out);
+}
+
+pub export fn talu_db_table_free_session_tag_batch(batch: ?*CSessionTagBatch) callconv(.c) void {
+    capi_error.clearError();
+    const b = batch orelse return;
+    if (b._arena) |arena_ptr| {
+        const arena: *std.heap.ArenaAllocator = @ptrCast(@alignCast(arena_ptr));
+        arena.deinit();
+        allocator.destroy(arena);
+    }
+    allocator.destroy(b);
 }
 
 // =============================================================================

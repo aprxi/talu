@@ -23,4 +23,8 @@ export const search = {
   query: "",
   tagFilters: [] as string[],
   availableTags: [] as { name: string; count: number }[],
+  /** Available projects from search aggregation (complete, not limited by pagination). */
+  availableProjects: [] as { value: string; count: number }[],
+  /** Project filter — only show sessions in this project (null = all). */
+  projectFilter: null as string | null,
 };

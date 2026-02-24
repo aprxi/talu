@@ -37,6 +37,10 @@ export interface ChatState {
   /** Whether system prompts are enabled (from settings). */
   systemPromptEnabled: boolean;
   sidebarSearchQuery: string;
+  /** Active project filter — only sessions in this project are shown/created. */
+  activeProjectId: string | null;
+  /** Available projects from search aggregation (complete, not limited by pagination). */
+  availableProjects: { value: string; count: number }[];
   pagination: {
     offset: number;
     hasMore: boolean;
@@ -61,6 +65,8 @@ export const chatState: ChatState = {
   backgroundStreamDom: new Map(),
   systemPromptEnabled: true,
   sidebarSearchQuery: "",
+  activeProjectId: localStorage.getItem("talu-active-project") || null,
+  availableProjects: [],
   pagination: {
     offset: 0,
     hasMore: true,

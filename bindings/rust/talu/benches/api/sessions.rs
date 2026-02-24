@@ -24,7 +24,7 @@ pub fn bench_list_sessions(c: &mut Criterion) {
         b.iter(|| {
             let storage = StorageHandle::open(&db_path).unwrap();
             let result = storage
-                .list_sessions_paginated(100, None, None, None)
+                .list_sessions_paginated(100, None, None, None, None, None)
                 .unwrap();
             assert!(!result.sessions.is_empty());
         });
@@ -35,7 +35,7 @@ pub fn bench_list_sessions(c: &mut Criterion) {
         b.iter(|| {
             let storage = StorageHandle::open(&db_path).unwrap();
             let result = storage
-                .list_sessions_paginated(100, None, None, Some("Session 19"))
+                .list_sessions_paginated(100, None, None, Some("Session 19"), None, None)
                 .unwrap();
             // "Session 19", "Session 190"..."Session 199" = 11 matches
             assert_eq!(result.sessions.len(), 11);
@@ -48,7 +48,7 @@ pub fn bench_list_sessions(c: &mut Criterion) {
         b.iter(|| {
             let storage = StorageHandle::open(&db_path).unwrap();
             let result = storage
-                .list_sessions_paginated(100, None, None, Some("quantum"))
+                .list_sessions_paginated(100, None, None, Some("quantum"), None, None)
                 .unwrap();
             // 200 sessions / 5 topics = 40 sessions contain "quantum"
             assert_eq!(result.sessions.len(), 40);
@@ -61,7 +61,7 @@ pub fn bench_list_sessions(c: &mut Criterion) {
         b.iter(|| {
             let storage = StorageHandle::open(&db_path).unwrap();
             let result = storage
-                .list_sessions_paginated(100, None, None, Some("benchmark payload"))
+                .list_sessions_paginated(100, None, None, Some("benchmark payload"), None, None)
                 .unwrap();
             assert_eq!(result.sessions.len(), 100); // clamped by limit
             assert!(result.sessions[0].search_snippet.is_some());
@@ -73,7 +73,7 @@ pub fn bench_list_sessions(c: &mut Criterion) {
         b.iter(|| {
             let storage = StorageHandle::open(&db_path).unwrap();
             let result = storage
-                .list_sessions_paginated(100, None, None, Some("zzzznotfound"))
+                .list_sessions_paginated(100, None, None, Some("zzzznotfound"), None, None)
                 .unwrap();
             assert_eq!(result.sessions.len(), 0);
         });

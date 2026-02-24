@@ -123,10 +123,14 @@ export function renderBrowserCard(
   titleRow.appendChild(titleSpan);
   titleArea.appendChild(titleRow);
 
-  // Badges row (model + archived status)
+  // Badges row (model + project + archived status)
   const badgesRow = el("div", "browser-card-badges");
   if (chat.model) {
     badgesRow.appendChild(el("span", "browser-card-badge", chat.model));
+  }
+  const projectId = chat.project_id ?? (chat.metadata?.project_id as string | undefined);
+  if (projectId) {
+    badgesRow.appendChild(el("span", "browser-card-badge project", projectId));
   }
   if (showStatusBadge && archived) {
     badgesRow.appendChild(el("span", "browser-card-badge archived", "Archived"));

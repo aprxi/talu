@@ -16,8 +16,8 @@ fn responses_model_not_available_returns_500_server_error() {
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 500, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(json["error"]["type"].as_str(), Some("server_error"));
     assert_eq!(json["error"]["code"].as_str(), Some("inference_error"));
+    assert!(json["error"]["message"].is_string());
 }
 
 #[test]
@@ -35,7 +35,7 @@ fn responses_streaming_model_not_available_returns_json_error() {
     let ct = resp.header("content-type").unwrap_or_default();
     assert!(
         ct.contains("application/json"),
-        "strict responses errors should be JSON, got Content-Type {ct}"
+        "response errors should be JSON, got Content-Type {ct}"
     );
     let json = resp.json();
     assert!(json["error"]["code"].is_string());
@@ -53,10 +53,8 @@ fn responses_empty_body_returns_400() {
     );
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(
-        json["error"]["type"].as_str(),
-        Some("invalid_request_error")
-    );
+    assert_eq!(json["error"]["code"].as_str(), Some("invalid_request"));
+    assert!(json["error"]["message"].is_string());
 }
 
 #[test]

@@ -452,6 +452,7 @@ pub const Conversation = struct {
         group_id: ?[]const u8,
         metadata_json: ?[]const u8,
         source_doc_id: ?[]const u8,
+        project_id: ?[]const u8,
     ) void {
         if (self.storage_backend) |sb| {
             // session_id is required for PutSession
@@ -475,6 +476,7 @@ pub const Conversation = struct {
                 .ttl_ts = self.ttl_ts,
                 .metadata_json = metadata_json,
                 .source_doc_id = source_doc_id,
+                .project_id = project_id,
                 // New session events use now for both timestamps; storage can preserve prior created_at_ms.
                 .created_at_ms = now_ms,
                 .updated_at_ms = now_ms,

@@ -1,6 +1,6 @@
 import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
-import { handleTogglePin } from "./sidebar-actions.ts";
+import { handleTogglePin, showProjectContextMenu } from "./sidebar-actions.ts";
 import { selectChat } from "./selection.ts";
 import { startNewConversation } from "./welcome.ts";
 import { renderSidebar } from "./sidebar-list.ts";
@@ -41,5 +41,12 @@ export function setupSidebarEvents(): void {
     chatState.sidebarSearchQuery = "";
     dom.sidebarSearchClear.classList.add("hidden");
     renderSidebar();
+  });
+
+  dom.sidebarList.addEventListener("contextmenu", (e) => {
+    const item = (e.target as HTMLElement).closest<HTMLElement>(".sidebar-item");
+    if (!item?.dataset["id"]) return;
+    e.preventDefault();
+    showProjectContextMenu(item, item.dataset["id"]);
   });
 }

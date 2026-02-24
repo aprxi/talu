@@ -5,6 +5,7 @@
 import { renderBrowserCard } from "../../render/browser.ts";
 import { renderEmptyState } from "../../render/common.ts";
 import { computePagination, renderPagination } from "../../render/pagination.ts";
+import { renderProjectList } from "../../render/project-combo.ts";
 import { TAG_ICON as ICON_TAG } from "../../icons.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
@@ -50,6 +51,16 @@ export function renderBrowserCards(): void {
         : "No conversations";
     dom.cardsEl.appendChild(renderEmptyState(emptyMsg));
     return;
+  }
+
+  // Show active project filter indicator.
+  if (search.projectFilter) {
+    const indicator = document.createElement("div");
+    indicator.className = "search-indicator";
+    const strong = document.createElement("strong");
+    strong.textContent = search.projectFilter;
+    indicator.append("Project: ", strong);
+    dom.cardsEl.appendChild(indicator);
   }
 
   if (search.query.trim().length > 0) {
@@ -145,5 +156,28 @@ export function renderBrowserPagination(): void {
   const state = computePagination(totalItems, pageSize, currentPage);
   dom.paginationEl.appendChild(
     renderPagination(state, (page) => loadBrowserConversations(page)),
+  );
+}
+
+/** Populate the browser project filter list from search aggregations. */
+export function updateBrowserProjectSelector(): void {
+  const dom = getBrowserDom();
+  dom.projectCombo.innerHTML = "";
+
+  const applyFilter = (value: string) => {
+    search.projectFilter = value || null;
+    bState.pagination.currentPage = 1;
+    bState.selectedIds.clear();
+    updateBrowserToolbar();
+    void loadBrowserConversations();
+  };
+
+  dom.projectCombo.appendChild(
+    renderProjectList({
+      currentValue: search.projectFilter ?? "",
+      projects: search.availableProjects,
+      onSelect: applyFilter,
+      onCreate: (name) => applyFilter(name),
+    }),
   );
 }

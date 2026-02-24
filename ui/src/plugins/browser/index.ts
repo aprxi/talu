@@ -27,6 +27,7 @@ function initConversationsBrowser(): void {
   dom.searchInput.value = "";
   search.query = "";
   search.tagFilters = [];
+  search.projectFilter = null;
   bState.tab = "all";
   bState.pagination.currentPage = 1;
   bState.pagination.totalItems = 0;
@@ -64,6 +65,7 @@ export const browserPlugin: PluginDefinition = {
       download: ctx.download,
       timers: ctx.timers,
       menus: ctx.menus,
+      layout: ctx.layout,
     });
 
     ctx.services.provide("talu.sessions", {

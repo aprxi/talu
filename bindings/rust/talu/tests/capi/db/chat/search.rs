@@ -41,6 +41,8 @@ fn list_sessions_with_search(db_path: &str, search_query: &str) -> Vec<String> {
             c_search_query.as_ptr(), // search query
             ptr::null(),             // no tags_filter
             ptr::null(),             // no tags_filter_any
+            ptr::null(),             // no project_id
+            0,                       // no project_id_null
             &mut c_list as *mut _,
         )
     };
@@ -86,6 +88,8 @@ fn list_all_sessions(db_path: &str) -> Vec<String> {
             ptr::null(), // no search query
             ptr::null(), // no tags_filter
             ptr::null(), // no tags_filter_any
+            ptr::null(), // no project_id
+            0,           // no project_id_null
             &mut c_list as *mut _,
         )
     };
@@ -266,6 +270,8 @@ fn search_sessions_stress_alloc_free() {
                     c_query.as_ptr(),
                     ptr::null(),
                     ptr::null(),
+                    ptr::null(), // no project_id
+                    0,           // no project_id_null
                     &mut c_list as *mut _,
                 )
             };

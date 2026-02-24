@@ -26,6 +26,7 @@ const record_json_trigram_bloom_bytes: usize = 64;
 const col_session_hash: u32 = 3;
 const col_ts: u32 = 2;
 const col_group_hash: u32 = 6;
+const col_project_hash: u32 = 11;
 const col_payload: u32 = 20;
 
 fn isSessionSchema(schema_id: u16) bool {
@@ -48,6 +49,12 @@ pub const ScanParams = struct {
     target_group_hash: ?u64 = null,
     /// Group filter: exact string verification after deserialization.
     target_group_id: ?[]const u8 = null,
+    /// Project filter: scalar prune on col_project_hash.
+    target_project_hash: ?u64 = null,
+    /// Project filter: exact string verification after deserialization.
+    target_project_id: ?[]const u8 = null,
+    /// Project null filter: include only sessions with no project_id.
+    target_project_null: bool = false,
     /// Maximum number of results (0 = no limit).
     limit: u32 = 0,
     /// Case-insensitive substring filter on session metadata and item content.
@@ -267,6 +274,14 @@ fn processBlock(
     } else null;
     defer if (group_hash_bytes) |b| alloc.free(b);
 
+    // Project hash column may not exist in old blocks — graceful fallback.
+    const needs_project_hash = params.target_project_hash != null;
+    const project_hash_bytes: ?[]const u8 = if (needs_project_hash) blk: {
+        const ph_desc = helpers.findColumn(descs, col_project_hash) orelse break :blk null;
+        break :blk try reader.readColumnData(block_offset, ph_desc, alloc);
+    } else null;
+    defer if (project_hash_bytes) |b| alloc.free(b);
+
     var new_indices = std.ArrayList(usize).empty;
     defer new_indices.deinit(alloc);
 
@@ -297,6 +312,15 @@ fn processBlock(
         if (params.target_group_hash) |gh| {
             const row_gh = try helpers.readU64At(group_hash_bytes.?, row_idx);
             if (row_gh != gh) continue;
+        }
+
+        // Project hash filter (scalar prune, graceful for old blocks)
+        if (params.target_project_hash) |ph| {
+            if (project_hash_bytes) |phb| {
+                const row_ph = try helpers.readU64At(phb, row_idx);
+                if (row_ph != ph) continue;
+            }
+            // When column missing (old blocks), skip scalar prune — verification handles it.
         }
 
         // Session hash whitelist (e.g., pre-computed from tag filters)
@@ -346,6 +370,25 @@ fn processBlock(
         if (params.target_group_id) |target_gid| {
             const record_gid = record.group_id orelse "";
             if (!std.mem.eql(u8, record_gid, target_gid)) {
+                codec.freeScannedSessionRecord(alloc, &record);
+                if (params.max_scan > 0 and scanned.* >= params.max_scan) return true;
+                continue;
+            }
+        }
+
+        // 7b. Project ID exact string verification (hash collision + old block safety)
+        if (params.target_project_id) |target_pid| {
+            const record_pid = record.project_id orelse "";
+            if (!std.mem.eql(u8, record_pid, target_pid)) {
+                codec.freeScannedSessionRecord(alloc, &record);
+                if (params.max_scan > 0 and scanned.* >= params.max_scan) return true;
+                continue;
+            }
+        }
+
+        // 7c. Project null filter: include only sessions with no project_id.
+        if (params.target_project_null) {
+            if (record.project_id != null) {
                 codec.freeScannedSessionRecord(alloc, &record);
                 if (params.max_scan > 0 and scanned.* >= params.max_scan) return true;
                 continue;

@@ -834,6 +834,8 @@ pub const SessionRecord = struct {
     marker: ?[]const u8 = null,
     parent_session_id: ?[]const u8 = null,
     group_id: ?[]const u8 = null,
+    /// Project identifier for organizing sessions into projects.
+    project_id: ?[]const u8 = null,
     head_item_id: u64 = 0,
     ttl_ts: i64 = 0,
     metadata_json: ?[]const u8 = null,

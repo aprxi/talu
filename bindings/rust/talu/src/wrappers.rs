@@ -158,10 +158,10 @@ impl ChatHandle {
         title: Option<&str>,
         marker: Option<&str>,
     ) -> Result<()> {
-        self.notify_session_update_ex(model, title, marker, None)
+        self.notify_session_update_ex(model, title, marker, None, None)
     }
 
-    /// Extended session update with source document ID for lineage tracking.
+    /// Extended session update with source document ID and project ID.
     ///
     /// Call this after generation completes to persist session metadata
     /// to TaluDB. This writes a Schema 5 session record that enables
@@ -173,17 +173,20 @@ impl ChatHandle {
     /// * `title` - Optional session title (derived from first message if None)
     /// * `marker` - Session marker (e.g., "pinned", "archived", "deleted")
     /// * `source_doc_id` - Source document ID for lineage tracking (prompt_id)
+    /// * `project_id` - Project identifier for multi-project session organization
     pub fn notify_session_update_ex(
         &self,
         model: Option<&str>,
         title: Option<&str>,
         marker: Option<&str>,
         source_doc_id: Option<&str>,
+        project_id: Option<&str>,
     ) -> Result<()> {
         let c_model = model.map(|s| CString::new(s)).transpose()?;
         let c_title = title.map(|s| CString::new(s)).transpose()?;
         let c_marker = marker.map(|s| CString::new(s)).transpose()?;
         let c_source_doc_id = source_doc_id.map(|s| CString::new(s)).transpose()?;
+        let c_project_id = project_id.map(|s| CString::new(s)).transpose()?;
 
         // SAFETY: self.ptr is a valid chat handle; CStrings/nulls are valid.
         let rc = unsafe {
@@ -207,6 +210,10 @@ impl ChatHandle {
                 std::ptr::null(), // group_id
                 std::ptr::null(), // metadata_json
                 c_source_doc_id
+                    .as_ref()
+                    .map(|s| s.as_ptr())
+                    .unwrap_or(std::ptr::null()),
+                c_project_id
                     .as_ref()
                     .map(|s| s.as_ptr())
                     .unwrap_or(std::ptr::null()),

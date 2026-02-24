@@ -4,12 +4,19 @@ import { api, notifications, observe } from "./deps.ts";
 import { renderSidebarItem, renderSectionLabel } from "../../render/sidebar.ts";
 import { renderEmptyState } from "../../render/common.ts";
 import { isPinned, isArchived } from "../../render/helpers.ts";
+import { renderProjectList, removeUserProject } from "../../render/project-combo.ts";
 
 export async function loadSessions(): Promise<void> {
   if (chatState.pagination.isLoading || !chatState.pagination.hasMore) return;
   chatState.pagination.isLoading = true;
 
-  const result = await api.listConversations({ offset: chatState.pagination.offset, limit: 100 });
+  const opts: { offset: number; limit: number; project_id?: string } = {
+    offset: chatState.pagination.offset,
+    limit: 100,
+  };
+  if (chatState.activeProjectId) opts.project_id = chatState.activeProjectId;
+
+  const result = await api.listConversations(opts);
   chatState.pagination.isLoading = false;
 
   if (!result.ok || !result.data) {
@@ -23,6 +30,7 @@ export async function loadSessions(): Promise<void> {
   chatState.pagination.hasMore = list.has_more;
 
   renderSidebar();
+  loadAvailableProjects();
 }
 
 export function renderSidebar(): void {
@@ -76,8 +84,13 @@ export function renderSidebar(): void {
     }
   }
 
-  if (unpinned.length > 0 && pinned.length > 0) {
-    dom.sidebarList.insertBefore(renderSectionLabel("Recent"), dom.sidebarSentinel);
+  // Section label: show project name when filtering, otherwise "Recent".
+  const sectionName = chatState.activeProjectId
+    ? (chatState.activeProjectId === "__default__" ? "Default" : chatState.activeProjectId)
+    : "Recent";
+
+  if (unpinned.length > 0) {
+    dom.sidebarList.insertBefore(renderSectionLabel(sectionName), dom.sidebarSentinel);
   }
 
   for (const session of unpinned) {
@@ -92,7 +105,14 @@ export async function refreshSidebar(): Promise<void> {
   // Fetch fresh data before replacing — avoids a flash of empty sidebar
   // while the API call is in flight.
   chatState.pagination.isLoading = true;
-  const result = await api.listConversations({ offset: 0, limit: 100 });
+
+  const opts: { offset: number; limit: number; project_id?: string } = {
+    offset: 0,
+    limit: 100,
+  };
+  if (chatState.activeProjectId) opts.project_id = chatState.activeProjectId;
+
+  const result = await api.listConversations(opts);
   chatState.pagination.isLoading = false;
 
   if (!result.ok || !result.data) {
@@ -104,6 +124,53 @@ export async function refreshSidebar(): Promise<void> {
   chatState.pagination.offset = result.data.data.length;
   chatState.pagination.hasMore = result.data.has_more;
   renderSidebar();
+  loadAvailableProjects();
+}
+
+/** Fetch the complete project list via search aggregation and populate the dropdown. */
+export async function loadAvailableProjects(): Promise<void> {
+  const result = await api.search({
+    scope: "sessions",
+    aggregations: ["projects"],
+    limit: 1,
+  });
+
+  if (result.ok && result.data?.aggregations?.projects) {
+    chatState.availableProjects = result.data.aggregations.projects;
+    // Clean up localStorage entries for projects that now have real sessions.
+    for (const p of chatState.availableProjects) {
+      if (p.value !== "__default__") removeUserProject(p.value);
+    }
+  }
+  updateProjectSelector();
+}
+
+/** Populate the project selector list from search aggregations. */
+export function updateProjectSelector(): void {
+  const dom = getChatDom();
+  dom.sidebarProjectCombo.innerHTML = "";
+
+  const applyFilter = (value: string) => {
+    chatState.activeProjectId = value || null;
+    if (value) {
+      localStorage.setItem("talu-active-project", value);
+    } else {
+      localStorage.removeItem("talu-active-project");
+    }
+    chatState.sessions = [];
+    chatState.pagination.offset = 0;
+    chatState.pagination.hasMore = true;
+    void refreshSidebar();
+  };
+
+  dom.sidebarProjectCombo.appendChild(
+    renderProjectList({
+      currentValue: chatState.activeProjectId ?? "",
+      projects: chatState.availableProjects,
+      onSelect: applyFilter,
+      onCreate: (name) => applyFilter(name),
+    }),
+  );
 }
 
 export function setupInfiniteScroll(): void {

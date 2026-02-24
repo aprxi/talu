@@ -89,6 +89,7 @@ const col_group_hash: u32 = 6;
 const col_head_item_id: u32 = 7;
 const col_created_ts: u32 = 8;
 const col_ttl_ts: u32 = 9;
+const col_project_hash: u32 = 11;
 const col_payload: u32 = 20;
 
 fn resolveItemJsonExternalizeThresholdBytes() usize {
@@ -468,9 +469,11 @@ pub const TableAdapter = struct {
         defer self.allocator.free(payload);
 
         const group_hash = computeOptionalHash(record.group_id);
+        const project_hash = computeOptionalHash(record.project_id);
         var session_hash_value = self.session_hash;
         var ts_value = record.updated_at_ms;
         var group_hash_value = group_hash;
+        var project_hash_value = project_hash;
         var head_item_id_value = record.head_item_id;
         var created_ts_value = record.created_at_ms;
         var ttl_ts_value = record.ttl_ts;
@@ -479,6 +482,7 @@ pub const TableAdapter = struct {
             .{ .column_id = col_session_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&session_hash_value) },
             .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ts_value) },
             .{ .column_id = col_group_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&group_hash_value) },
+            .{ .column_id = col_project_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&project_hash_value) },
             .{ .column_id = col_head_item_id, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&head_item_id_value) },
             .{ .column_id = col_created_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&created_ts_value) },
             .{ .column_id = col_ttl_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ttl_ts_value) },
@@ -599,11 +603,13 @@ pub const TableAdapter = struct {
         new_marker: ?[]const u8,
         new_metadata_json: ?[]const u8,
     ) !void {
-        return self.updateSessionEx(alloc, session_id, new_title, new_marker, new_metadata_json, null);
+        return self.updateSessionEx(alloc, session_id, new_title, new_marker, new_metadata_json, null, null, false);
     }
 
-    /// Extended update session with source_doc_id support.
-    /// Same as updateSession but allows setting the source document link.
+    /// Extended update session with source_doc_id and project_id support.
+    /// Same as updateSession but allows setting the source document link
+    /// and project assignment. Set `clear_project_id` to explicitly remove
+    /// a session from its project.
     pub fn updateSessionEx(
         self: *TableAdapter,
         alloc: Allocator,
@@ -612,6 +618,8 @@ pub const TableAdapter = struct {
         new_marker: ?[]const u8,
         new_metadata_json: ?[]const u8,
         new_source_doc_id: ?[]const u8,
+        new_project_id: ?[]const u8,
+        clear_project_id: bool,
     ) !void {
         // Read current session head
         const current = try self.lookupSession(alloc, session_id);
@@ -631,6 +639,7 @@ pub const TableAdapter = struct {
             .marker = if (new_marker) |s| s else current.marker,
             .parent_session_id = current.parent_session_id,
             .group_id = current.group_id,
+            .project_id = if (clear_project_id) null else if (new_project_id) |p| p else current.project_id,
             .head_item_id = current.head_item_id,
             .ttl_ts = current.ttl_ts,
             .metadata_json = if (new_metadata_json) |m| m else current.metadata_json,
@@ -953,6 +962,7 @@ pub fn forkSession(
         .marker = "active",
         .parent_session_id = source_session_id,
         .group_id = if (source_session) |s| s.group_id else null,
+        .project_id = if (source_session) |s| s.project_id else null,
         .head_item_id = head_item_id,
         .ttl_ts = 0,
         .metadata_json = null,
