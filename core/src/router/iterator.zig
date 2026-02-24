@@ -133,6 +133,10 @@ pub const TokenIterator = struct {
     // trailing incomplete sequence.
     utf8_pending: [3]u8, // max incomplete = 3 bytes (4-byte seq missing last byte)
     utf8_pending_len: u2, // 0..3
+    // Last token that produced visible decoded bytes.
+    // Used as decode context so per-call "strip leading space" logic only
+    // applies to true stream start, not every token.
+    decode_context_token: ?u32,
 
     // Backend type (local or HTTP)
     backend_type: BackendType,
@@ -205,6 +209,7 @@ pub const TokenIterator = struct {
             .raw_output = options.raw_output,
             .utf8_pending = undefined,
             .utf8_pending_len = 0,
+            .decode_context_token = null,
             .backend_type = .local,
             .engine = engine,
             .chat = chat,
@@ -290,6 +295,7 @@ pub const TokenIterator = struct {
             .raw_output = options.raw_output,
             .utf8_pending = undefined,
             .utf8_pending_len = 0,
+            .decode_context_token = null,
             .backend_type = .http,
             .engine = null,
             .chat = null,
@@ -665,15 +671,20 @@ pub const TokenIterator = struct {
 
         // Decode token to raw bytes (no UTF-8 sanitization).
         //
-        // Byte-level BPE tokens can produce incomplete UTF-8 sequences when
-        // decoded individually.  We get the raw bytes here and assemble
-        // complete codepoints using the utf8_pending buffer.
+        // Important: many tokenizers apply decoder "strip_start"/prefix-space
+        // logic at decode-call start. Decoding each token in isolation causes
+        // those rules to fire on every token and swallow spaces. We decode
+        // with one-token left context and emit only the delta bytes.
+        //
+        // Byte-level BPE tokens can still produce incomplete UTF-8 sequences
+        // when decoded; we assemble complete codepoints via utf8_pending.
         const engine = self.engine.?;
-        const raw = engine.tok.decodeRawBytes(
-            &[_]u32{token_id},
-            .{ .skip_special_tokens = true },
-        ) catch return;
+        const raw = try self.decodeRawWithContext(engine, token_id);
         defer engine.allocator.free(raw);
+
+        if (raw.len > 0) {
+            self.decode_context_token = token_id;
+        }
 
         // Build combined buffer: pending bytes from previous token + new raw bytes.
         var combined_buf: [3 + MAX_TOKEN_LEN]u8 = undefined;
@@ -743,6 +754,59 @@ pub const TokenIterator = struct {
             // Normal mode: run reasoning tag filter.
             try self.filterAndPush(valid, token_id);
         }
+    }
+
+    fn decodeRawWithContext(self: *TokenIterator, engine: *LocalEngine, token_id: u32) ![]u8 {
+        if (self.decode_context_token) |ctx_token| {
+            const ctx_raw = engine.tok.decodeRawBytes(
+                &[_]u32{ctx_token},
+                .{ .skip_special_tokens = true },
+            ) catch return engine.tok.decodeRawBytes(
+                &[_]u32{token_id},
+                .{ .skip_special_tokens = true },
+            );
+            defer engine.allocator.free(ctx_raw);
+
+            const pair_raw = engine.tok.decodeRawBytes(
+                &[_]u32{ ctx_token, token_id },
+                .{ .skip_special_tokens = true },
+            ) catch return engine.tok.decodeRawBytes(
+                &[_]u32{token_id},
+                .{ .skip_special_tokens = true },
+            );
+            errdefer engine.allocator.free(pair_raw);
+
+            const prefix = longestCommonPrefixLen(ctx_raw, pair_raw);
+            if (prefix < ctx_raw.len) {
+                // Context decode does not prefix pair decode (unexpected).
+                // Fall back to single-token decode for correctness.
+                engine.allocator.free(pair_raw);
+                return engine.tok.decodeRawBytes(
+                    &[_]u32{token_id},
+                    .{ .skip_special_tokens = true },
+                );
+            }
+
+            const delta = pair_raw[prefix..];
+            if (delta.len == pair_raw.len) {
+                // No overlap at all: fallback to single decode.
+                engine.allocator.free(pair_raw);
+                return engine.tok.decodeRawBytes(
+                    &[_]u32{token_id},
+                    .{ .skip_special_tokens = true },
+                );
+            }
+
+            const out = try engine.allocator.alloc(u8, delta.len);
+            @memcpy(out, delta);
+            engine.allocator.free(pair_raw);
+            return out;
+        }
+
+        return engine.tok.decodeRawBytes(
+            &[_]u32{token_id},
+            .{ .skip_special_tokens = true },
+        );
     }
 
     /// Run the reasoning tag filter on decoded text and push typed slot(s).
@@ -975,6 +1039,13 @@ fn utf8ValidPrefix(bytes: []const u8) usize {
     return last_valid;
 }
 
+fn longestCommonPrefixLen(a: []const u8, b: []const u8) usize {
+    const n = @min(a.len, b.len);
+    var i: usize = 0;
+    while (i < n and a[i] == b[i]) : (i += 1) {}
+    return i;
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1053,6 +1124,13 @@ test "FinishReason discriminator values" {
 
 test "utf8ValidPrefix pure ASCII" {
     try std.testing.expectEqual(@as(usize, 5), utf8ValidPrefix("hello"));
+}
+
+test "longestCommonPrefixLen basic cases" {
+    try std.testing.expectEqual(@as(usize, 0), longestCommonPrefixLen("", ""));
+    try std.testing.expectEqual(@as(usize, 3), longestCommonPrefixLen("abc", "abc"));
+    try std.testing.expectEqual(@as(usize, 2), longestCommonPrefixLen("abX", "abY"));
+    try std.testing.expectEqual(@as(usize, 0), longestCommonPrefixLen("x", "abc"));
 }
 
 test "utf8ValidPrefix empty" {

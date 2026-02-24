@@ -227,6 +227,7 @@ fn inferDff(
     model_config: *ModelConfig,
     weight_map: *const runtime_blocks.WeightMap,
     source_weight_ids: []const []const u8,
+    has_fused_gate_up: bool,
 ) !void {
     if (source_weight_ids.len == 0) return error.MissingDffSourceWeightIds;
 
@@ -237,7 +238,15 @@ fn inferDff(
     for (source_weight_ids) |id| {
         if (weight_map.get(id)) |w| {
             found_source_weight = true;
-            if (inferDffFromWeight(w.*, d_model)) |inferred| {
+            if (inferDffFromWeight(w.*, d_model)) |raw_inferred| {
+                const inferred = blk: {
+                    if (has_fused_gate_up) {
+                        // Fused gate_up packs [gate, up], so tensor width is 2*d_ff.
+                        if ((raw_inferred % 2) != 0) return error.InvalidDffSourceWeightShape;
+                        break :blk raw_inferred / 2;
+                    }
+                    break :blk raw_inferred;
+                };
                 if (inferred != config_d_ff) {
                     log.info("load", "Corrected d_ff from weight shape", .{
                         .config_d_ff = config_d_ff,
@@ -443,7 +452,7 @@ pub fn loadModelWithArchitecture(
 
         // Optional weight-driven d_ff correction, explicitly enabled by architecture metadata.
         if (arch.resolve_d_ff_from_weights and layer_idx == 0 and (block_type == .attention_mlp or block_type == .shortconv)) {
-            try inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids);
+            try inferDff(&model_config, &weight_map, arch.d_ff_source_weight_ids, arch.has_fused_gate_up);
         }
 
         if (env_flags.enable_cpu_fusion and arch.enable_loader_fusions) {
@@ -729,7 +738,7 @@ test "inferDff returns missing source list error" {
     var map: runtime_blocks.WeightMap = .{};
     defer map.deinit(std.testing.allocator);
 
-    try std.testing.expectError(error.MissingDffSourceWeightIds, inferDff(&cfg, &map, &.{}));
+    try std.testing.expectError(error.MissingDffSourceWeightIds, inferDff(&cfg, &map, &.{}, false));
 }
 
 test "inferDff returns missing source weight error when ids do not resolve" {
@@ -751,7 +760,7 @@ test "inferDff returns missing source weight error when ids do not resolve" {
 
     try std.testing.expectError(
         error.MissingDffSourceWeight,
-        inferDff(&cfg, &map, &.{"mlp.gate_proj.weight"}),
+        inferDff(&cfg, &map, &.{"mlp.gate_proj.weight"}, false),
     );
 }
 
@@ -781,7 +790,67 @@ test "inferDff updates config from source weight shape" {
     };
     try map.put(std.testing.allocator, "mlp.gate_proj.weight", &gate_weight);
 
-    try inferDff(&cfg, &map, &.{"mlp.gate_proj.weight"});
+    try inferDff(&cfg, &map, &.{"mlp.gate_proj.weight"}, false);
+    try std.testing.expectEqual(@as(i32, 320), cfg.d_ff);
+}
+
+test "inferDff halves fused gate_up width for fused-gate architectures" {
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 128;
+    cfg.d_ff = 256;
+    cfg.vocab_size = 1000;
+    cfg.n_layers = 1;
+    cfg.n_heads = 4;
+    cfg.n_kv_groups = 4;
+    cfg.head_dim = 32;
+    cfg.max_seq_len = 128;
+    cfg.rope_theta = 10000.0;
+    cfg.norm_eps = 1e-5;
+    cfg.gaffine_group_size = 128;
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    var gate_up_weight = Tensor{
+        .dtype = .f32,
+        .n_dims = 2,
+        .shape = .{ 128, 640, 0, 0, 0, 0, 0, 0 },
+        .data_ptr = null,
+        .data_size = 0,
+    };
+    try map.put(std.testing.allocator, "mlp.gate_up_proj.weight", &gate_up_weight);
+
+    try inferDff(&cfg, &map, &.{"mlp.gate_up_proj.weight"}, true);
+    try std.testing.expectEqual(@as(i32, 320), cfg.d_ff);
+}
+
+test "inferDff halves fused input_linear width for fused-gate architectures" {
+    var cfg = std.mem.zeroes(ModelConfig);
+    cfg.model_arch = .custom;
+    cfg.d_model = 128;
+    cfg.d_ff = 256;
+    cfg.vocab_size = 1000;
+    cfg.n_layers = 1;
+    cfg.n_heads = 4;
+    cfg.n_kv_groups = 4;
+    cfg.head_dim = 32;
+    cfg.max_seq_len = 128;
+    cfg.rope_theta = 10000.0;
+    cfg.norm_eps = 1e-5;
+    cfg.gaffine_group_size = 128;
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    var input_linear_weight = Tensor{
+        .dtype = .f32,
+        .n_dims = 2,
+        .shape = .{ 128, 640, 0, 0, 0, 0, 0, 0 },
+        .data_ptr = null,
+        .data_size = 0,
+    };
+    try map.put(std.testing.allocator, "mlp.input_linear.weight", &input_linear_weight);
+
+    try inferDff(&cfg, &map, &.{"mlp.input_linear.weight"}, true);
     try std.testing.expectEqual(@as(i32, 320), cfg.d_ff);
 }
 
