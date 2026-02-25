@@ -441,15 +441,25 @@ pub async fn handle_list(
         )?;
 
         // Batch-resolve tags: one scan for all sessions on this page.
-        let session_ids: Vec<&str> = batch.sessions.iter().map(|s| s.session_id.as_str()).collect();
-        let tags_by_session = storage.get_sessions_tags_batch(&session_ids).unwrap_or_default();
+        let session_ids: Vec<&str> = batch
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        let tags_by_session = storage
+            .get_sessions_tags_batch(&session_ids)
+            .unwrap_or_default();
 
         // Pre-fetch all tag records for detail lookup (name, color).
-        let tag_details: std::collections::HashMap<String, serde_json::Value> =
-            storage.list_tags(None).unwrap_or_default().into_iter().map(|t| {
+        let tag_details: std::collections::HashMap<String, serde_json::Value> = storage
+            .list_tags(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
                 let val = json!({ "id": t.tag_id, "name": t.name, "color": t.color });
                 (t.tag_id, val)
-            }).collect();
+            })
+            .collect();
 
         let page_data: Vec<serde_json::Value> = batch
             .sessions
@@ -458,7 +468,10 @@ pub async fn handle_list(
                 let tags: Vec<serde_json::Value> = tags_by_session
                     .get(&session.session_id)
                     .map(|tag_ids| {
-                        tag_ids.iter().filter_map(|tid| tag_details.get(tid).cloned()).collect()
+                        tag_ids
+                            .iter()
+                            .filter_map(|tid| tag_details.get(tid).cloned())
+                            .collect()
                     })
                     .unwrap_or_default();
                 session_to_session_json(session, Some(tags))

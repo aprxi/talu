@@ -1,8 +1,6 @@
 //! Integration tests for project_id support on sessions.
 
-use super::{
-    seed_session, seed_session_with_project, session_config,
-};
+use super::{seed_session, seed_session_with_project, session_config};
 use crate::server::common::*;
 use serde_json::json;
 use tempfile::TempDir;
@@ -59,7 +57,10 @@ fn list_project_id_nonexistent_returns_empty() {
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
-    assert!(data.is_empty(), "no sessions should match nonexistent project_id");
+    assert!(
+        data.is_empty(),
+        "no sessions should match nonexistent project_id"
+    );
 }
 
 #[test]
@@ -75,7 +76,11 @@ fn list_without_project_id_returns_all() {
     assert_eq!(resp.status, 200);
     let json = resp.json();
     let data = json["data"].as_array().expect("data");
-    assert_eq!(data.len(), 3, "all sessions returned without project_id filter");
+    assert_eq!(
+        data.len(),
+        3,
+        "all sessions returned without project_id filter"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -116,7 +121,10 @@ fn get_session_without_project_id_has_null() {
     let resp = get(ctx.addr(), "/v1/chat/sessions/sess-noproj");
     assert_eq!(resp.status, 200);
     let json = resp.json();
-    assert!(json["project_id"].is_null(), "project_id should be null when unset");
+    assert!(
+        json["project_id"].is_null(),
+        "project_id should be null when unset"
+    );
 }
 
 // ---------------------------------------------------------------------------

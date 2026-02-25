@@ -28,9 +28,7 @@ use talu::storage::{SearchParams, SessionRecordFull, StorageError, StorageHandle
 use crate::server::auth_gateway::AuthContext;
 use serde_json::json;
 
-use crate::server::sessions::{
-    decode_cursor, encode_cursor, session_to_session_json,
-};
+use crate::server::sessions::{decode_cursor, encode_cursor, session_to_session_json};
 use crate::server::state::AppState;
 
 // ---------------------------------------------------------------------------
@@ -373,13 +371,23 @@ pub async fn handle_search(
         };
 
         // Batch-resolve tags for all sessions on this page.
-        let session_ids: Vec<&str> = list_result.sessions.iter().map(|s| s.session_id.as_str()).collect();
-        let tags_by_session = storage.get_sessions_tags_batch(&session_ids).unwrap_or_default();
-        let tag_details: std::collections::HashMap<String, serde_json::Value> =
-            storage.list_tags(None).unwrap_or_default().into_iter().map(|t| {
+        let session_ids: Vec<&str> = list_result
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        let tags_by_session = storage
+            .get_sessions_tags_batch(&session_ids)
+            .unwrap_or_default();
+        let tag_details: std::collections::HashMap<String, serde_json::Value> = storage
+            .list_tags(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
                 let val = json!({ "id": t.tag_id, "name": t.name, "color": t.color });
                 (t.tag_id, val)
-            }).collect();
+            })
+            .collect();
 
         let data: Vec<serde_json::Value> = list_result
             .sessions
@@ -387,7 +395,12 @@ pub async fn handle_search(
             .map(|session| {
                 let tags: Vec<serde_json::Value> = tags_by_session
                     .get(&session.session_id)
-                    .map(|tag_ids| tag_ids.iter().filter_map(|tid| tag_details.get(tid).cloned()).collect())
+                    .map(|tag_ids| {
+                        tag_ids
+                            .iter()
+                            .filter_map(|tid| tag_details.get(tid).cloned())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 session_to_session_json(session, Some(tags))
             })
@@ -1182,13 +1195,23 @@ async fn handle_federated_search(
         )?;
 
         // Batch-resolve tags for all sessions.
-        let session_ids: Vec<&str> = list_result.sessions.iter().map(|s| s.session_id.as_str()).collect();
-        let tags_by_session = storage.get_sessions_tags_batch(&session_ids).unwrap_or_default();
-        let tag_details: std::collections::HashMap<String, serde_json::Value> =
-            storage.list_tags(None).unwrap_or_default().into_iter().map(|t| {
+        let session_ids: Vec<&str> = list_result
+            .sessions
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect();
+        let tags_by_session = storage
+            .get_sessions_tags_batch(&session_ids)
+            .unwrap_or_default();
+        let tag_details: std::collections::HashMap<String, serde_json::Value> = storage
+            .list_tags(None)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|t| {
                 let val = json!({ "id": t.tag_id, "name": t.name, "color": t.color });
                 (t.tag_id, val)
-            }).collect();
+            })
+            .collect();
 
         let data: Vec<serde_json::Value> = list_result
             .sessions
@@ -1196,7 +1219,12 @@ async fn handle_federated_search(
             .map(|session| {
                 let tags: Vec<serde_json::Value> = tags_by_session
                     .get(&session.session_id)
-                    .map(|tag_ids| tag_ids.iter().filter_map(|tid| tag_details.get(tid).cloned()).collect())
+                    .map(|tag_ids| {
+                        tag_ids
+                            .iter()
+                            .filter_map(|tid| tag_details.get(tid).cloned())
+                            .collect()
+                    })
                     .unwrap_or_default();
                 session_to_session_json(session, Some(tags))
             })

@@ -1,4 +1,6 @@
 use crate::server::common::{model_config, post_json, require_model, ServerTestContext};
+use std::collections::BTreeSet;
+use std::path::PathBuf;
 
 fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
     let mut events = Vec::new();
@@ -16,49 +18,28 @@ fn parse_sse_events(body: &str) -> Vec<(String, serde_json::Value)> {
     events
 }
 
-fn is_allowed_responses_stream_event(event_type: &str) -> bool {
-    matches!(
-        event_type,
-        "response.queued"
-            | "response.created"
-            | "response.in_progress"
-            | "response.output_item.added"
-            | "response.content_part.added"
-            | "response.output_text.delta"
-            | "response.output_text.done"
-            | "response.refusal.delta"
-            | "response.refusal.done"
-            | "response.reasoning.delta"
-            | "response.reasoning.done"
-            | "response.reasoning_summary_part.added"
-            | "response.reasoning_summary_part.done"
-            | "response.reasoning_summary_text.delta"
-            | "response.reasoning_summary_text.done"
-            | "response.function_call_arguments.delta"
-            | "response.function_call_arguments.done"
-            | "response.output_text.annotation.added"
-            | "response.output_text.annotation.done"
-            | "response.code_interpreter_call.code.delta"
-            | "response.code_interpreter_call.code.done"
-            | "response.code_interpreter_call.interpreting"
-            | "response.code_interpreter_call.completed"
-            | "response.code_interpreter_call.in_progress"
-            | "response.image_generation_call.completed"
-            | "response.image_generation_call.generating"
-            | "response.image_generation_call.in_progress"
-            | "response.web_search_call.completed"
-            | "response.web_search_call.in_progress"
-            | "response.web_search_call.searching"
-            | "response.file_search_call.completed"
-            | "response.file_search_call.in_progress"
-            | "response.file_search_call.searching"
-            | "response.content_part.done"
-            | "response.output_item.done"
-            | "response.completed"
-            | "response.incomplete"
-            | "response.failed"
-            | "error"
-    )
+fn openapi_stream_event_types() -> BTreeSet<String> {
+    let spec_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../issues/responses-openapi.json")
+        .canonicalize()
+        .expect("canonicalize responses-openapi.json path");
+    let raw = std::fs::read_to_string(spec_path).expect("read responses-openapi.json");
+    let json: serde_json::Value = serde_json::from_str(&raw).expect("parse responses-openapi.json");
+    let schemas = json["components"]["schemas"]
+        .as_object()
+        .expect("components.schemas object");
+
+    schemas
+        .iter()
+        .filter(|(name, _)| name.ends_with("StreamingEvent") || *name == "ErrorStreamingEvent")
+        .filter_map(|(_, schema)| {
+            schema["properties"]["type"]["enum"]
+                .as_array()
+                .and_then(|arr| arr.first())
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+        })
+        .collect()
 }
 
 fn streaming_body(model: &str, input: &str) -> serde_json::Value {
@@ -66,7 +47,7 @@ fn streaming_body(model: &str, input: &str) -> serde_json::Value {
         "model": model,
         "input": input,
         "stream": true,
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     })
 }
 
@@ -121,6 +102,14 @@ fn validate_stream_state_machine(events: &[(String, serde_json::Value)]) -> Resu
             | "response.function_call_arguments.delta" => {
                 if !part_open {
                     return Err(format!("{event_type} emitted without open content part"));
+                }
+            }
+            "response.output_text.annotation.added" => {
+                if !part_open {
+                    return Err(
+                        "response.output_text.annotation.added emitted without open content part"
+                            .to_string(),
+                    );
                 }
             }
             "response.output_text.done"
@@ -188,7 +177,7 @@ fn responses_stream_emits_queued_and_omits_progress() {
         "model": model,
         "input": "hello",
         "stream": true,
-        "max_output_tokens": 12
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -213,7 +202,7 @@ fn responses_stream_does_not_inject_session_metadata() {
         "model": model,
         "input": "hello",
         "stream": true,
-        "max_output_tokens": 12
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -278,7 +267,7 @@ fn responses_stream_delta_obfuscation_fields_are_spec_compatible() {
         "model": model,
         "input": "hello",
         "stream": true,
-        "max_output_tokens": 12
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -314,7 +303,7 @@ fn responses_stream_includes_instructions_in_response_resources() {
         "input": "hello",
         "instructions": "be concise",
         "stream": true,
-        "max_output_tokens": 12
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -463,6 +452,31 @@ fn responses_stream_delta_events_have_indices_and_sequence() {
 }
 
 #[test]
+fn responses_stream_rejects_logprobs_request_until_core_supports_it() {
+    let model = require_model!();
+    let ctx = ServerTestContext::new(model_config());
+    let body = serde_json::json!({
+        "model": model,
+        "input": "hello",
+        "stream": true,
+        "max_output_tokens": 16,
+        "include": ["message.output_text.logprobs"],
+        "top_logprobs": 2
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("include.message.output_text.logprobs"),
+        "body: {}",
+        resp.body
+    );
+}
+
+#[test]
 fn responses_stream_full_lifecycle_order() {
     let model = require_model!();
     let ctx = ServerTestContext::new(model_config());
@@ -594,7 +608,7 @@ fn responses_stream_incomplete_event_contains_incomplete_details() {
         "model": model,
         "input": "Write a very long story about dragons and wizards",
         "stream": true,
-        "max_output_tokens": 1
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -631,9 +645,10 @@ fn responses_stream_emits_only_spec_event_types() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let events = parse_sse_events(&resp.body);
     assert!(!events.is_empty(), "stream should emit events");
+    let spec_event_types = openapi_stream_event_types();
     for (event_type, _) in events {
         assert!(
-            is_allowed_responses_stream_event(&event_type),
+            spec_event_types.contains(&event_type),
             "non-spec stream event emitted on /v1/responses: {event_type}"
         );
     }

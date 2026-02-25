@@ -268,6 +268,25 @@ pub fn send_request(
     body: Option<&str>,
 ) -> HttpResponse {
     let body = body.unwrap_or("");
+    let mut request_preview = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
+        host = addr
+    );
+    for (name, value) in headers {
+        request_preview.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request_preview.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    if body.len() > 4096 {
+        let preview: String = body.chars().take(4096).collect();
+        request_preview.push_str(&preview);
+        request_preview.push_str(&format!(
+            "\n...[truncated request body: {} bytes omitted]",
+            body.len().saturating_sub(preview.len())
+        ));
+    } else {
+        request_preview.push_str(body);
+    }
+
     let mut request = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n",
         host = addr
@@ -288,7 +307,7 @@ pub fn send_request(
     stream
         .set_write_timeout(Some(Duration::from_secs(5)))
         .expect("set write timeout");
-    eprintln!("[DEBUG] Request:\n{request}");
+    eprintln!("[DEBUG] Request:\n{request_preview}");
     stream.write_all(request.as_bytes()).expect("write request");
     stream.flush().expect("flush");
     eprintln!("[DEBUG] Request sent to {addr}");

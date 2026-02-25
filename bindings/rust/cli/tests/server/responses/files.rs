@@ -50,7 +50,7 @@ fn responses_file_reference_resolved_in_generation() {
 
     let body = serde_json::json!({
         "model": &model,
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "input": [{
             "type": "message",
             "role": "user",
@@ -78,7 +78,7 @@ fn responses_image_reference_resolved_in_generation() {
 
     let body = serde_json::json!({
         "model": &model,
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "input": [{
             "type": "message",
             "role": "user",
@@ -105,7 +105,7 @@ fn responses_dangling_file_reference_does_not_crash_server() {
 
     let body = serde_json::json!({
         "model": &model,
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "input": [{
             "type": "message",
             "role": "user",

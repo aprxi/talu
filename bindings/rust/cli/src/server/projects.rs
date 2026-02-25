@@ -239,7 +239,11 @@ pub async fn handle_create(
 
     let name = create_req.name.trim();
     if name.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "name is required");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "name is required",
+        );
     }
 
     let project_id = format!("proj_{}", uuid::Uuid::new_v4());
@@ -254,11 +258,11 @@ pub async fn handle_create(
         DOC_TYPE,
         name,
         &content.to_string(),
-        None,  // tags_text
-        None,  // parent_id
-        None,  // marker
+        None, // tags_text
+        None, // parent_id
+        None, // marker
         group_id,
-        None,  // owner_id
+        None, // owner_id
     ) {
         return document_error_response(e);
     }
@@ -294,7 +298,11 @@ pub async fn handle_get(
 ) -> Response<BoxBody> {
     let project_id = extract_project_id(req.uri().path());
     if project_id.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "missing project ID");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing project ID",
+        );
     }
 
     let handle = match open_documents(&state, &auth) {
@@ -343,7 +351,11 @@ pub async fn handle_update(
     let path = req.uri().path().to_string();
     let project_id = extract_project_id(&path);
     if project_id.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "missing project ID");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing project ID",
+        );
     }
 
     let handle = match open_documents(&state, &auth) {
@@ -419,12 +431,12 @@ pub async fn handle_update(
                 let batch = match storage.list_sessions_batch(
                     offset,
                     100,
-                    None,              // group_id
-                    None,              // marker
-                    None,              // search
-                    None,              // tags_any
-                    Some(&old_name),   // project_id (old name)
-                    false,             // project_id_null
+                    None,            // group_id
+                    None,            // marker
+                    None,            // search
+                    None,            // tags_any
+                    Some(&old_name), // project_id (old name)
+                    false,           // project_id_null
                 ) {
                     Ok(b) => b,
                     Err(_) => break,
@@ -485,7 +497,11 @@ pub async fn handle_delete(
 ) -> Response<BoxBody> {
     let project_id = extract_project_id(req.uri().path());
     if project_id.is_empty() {
-        return json_error(StatusCode::BAD_REQUEST, "invalid_request", "missing project ID");
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_request",
+            "missing project ID",
+        );
     }
 
     let handle = match open_documents(&state, &auth) {
@@ -516,12 +532,12 @@ pub async fn handle_delete(
             let batch = match storage.list_sessions_batch(
                 offset,
                 100,
-                None,                    // group_id
-                None,                    // marker
-                None,                    // search
-                None,                    // tags_any
-                Some(project_id),        // project_id
-                false,                   // project_id_null
+                None,             // group_id
+                None,             // marker
+                None,             // search
+                None,             // tags_any
+                Some(project_id), // project_id
+                false,            // project_id_null
             ) {
                 Ok(b) => b,
                 Err(_) => break,

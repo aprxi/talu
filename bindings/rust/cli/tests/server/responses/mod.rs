@@ -1,8 +1,17 @@
 mod chaining;
 mod errors;
 mod files;
+mod openapi_contract;
+mod openapi_item_variants;
+mod openapi_nested_contract;
+mod openapi_payload_contract;
+mod openapi_schema;
+mod openapi_top_level_variants;
 mod parameters;
+mod responses_target_conformance_gaps;
 mod routing;
 mod schema;
 mod streaming;
+mod target_compliance;
+mod target_polymorphic_compliance;
 mod tools;

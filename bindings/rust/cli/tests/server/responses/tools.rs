@@ -40,7 +40,7 @@ fn responses_tools_echo_in_response() {
     let body = serde_json::json!({
         "model": model,
         "input": "Hello",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "tools": tool_definition()
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
@@ -59,7 +59,7 @@ fn responses_tool_choice_string_echo_and_defaults() {
     let body = serde_json::json!({
         "model": model,
         "input": "Hello",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "tools": tool_definition(),
         "tool_choice": "auto"
     });
@@ -70,7 +70,7 @@ fn responses_tool_choice_string_echo_and_defaults() {
     let default_body = serde_json::json!({
         "model": model,
         "input": "Hello",
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     });
     let default_resp = post_json(ctx.addr(), "/v1/responses", &default_body);
     assert_eq!(default_resp.status, 200, "body: {}", default_resp.body);
@@ -90,7 +90,7 @@ fn responses_object_tool_choice_echo_in_response() {
     let body = serde_json::json!({
         "model": model,
         "input": "Hello",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "tools": tool_definition(),
         "tool_choice": {
             "type": "function",
@@ -146,7 +146,7 @@ fn responses_tools_chaining_merge_and_override() {
     let first = serde_json::json!({
         "model": &model,
         "input": "Hello",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "tools": tool_definition(),
         "tool_choice": "auto"
     });
@@ -160,7 +160,7 @@ fn responses_tools_chaining_merge_and_override() {
     let merged = serde_json::json!({
         "model": &model,
         "input": "What tools do you have?",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "previous_response_id": response_id
     });
     let merged_resp = post_json(ctx.addr(), "/v1/responses", &merged);
@@ -182,7 +182,7 @@ fn responses_tools_chaining_merge_and_override() {
     let overridden = serde_json::json!({
         "model": &model,
         "input": "Search for something",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "previous_response_id": merged_json["id"].as_str().expect("response id"),
         "tools": override_tools,
         "tool_choice": "required"
@@ -208,7 +208,7 @@ fn responses_streaming_events_include_tools_on_created_and_terminal() {
         "model": model,
         "input": "Hello",
         "stream": true,
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "tools": tool_definition(),
         "tool_choice": "auto"
     });

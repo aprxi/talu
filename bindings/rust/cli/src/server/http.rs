@@ -442,20 +442,17 @@ impl Service<Request<Incoming>> for Router {
                             projects::handle_create(state, req, auth).await
                         }
                         (Method::GET, p)
-                            if p.starts_with("/v1/projects/")
-                                || p.starts_with("/projects/") =>
+                            if p.starts_with("/v1/projects/") || p.starts_with("/projects/") =>
                         {
                             projects::handle_get(state, req, auth).await
                         }
                         (Method::PATCH, p)
-                            if p.starts_with("/v1/projects/")
-                                || p.starts_with("/projects/") =>
+                            if p.starts_with("/v1/projects/") || p.starts_with("/projects/") =>
                         {
                             projects::handle_update(state, req, auth).await
                         }
                         (Method::DELETE, p)
-                            if p.starts_with("/v1/projects/")
-                                || p.starts_with("/projects/") =>
+                            if p.starts_with("/v1/projects/") || p.starts_with("/projects/") =>
                         {
                             projects::handle_delete(state, req, auth).await
                         }

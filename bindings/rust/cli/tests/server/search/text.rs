@@ -1659,7 +1659,11 @@ fn aggregations_projects_returns_counts() {
     let projects = json["aggregations"]["projects"]
         .as_array()
         .expect("projects array");
-    assert_eq!(projects.len(), 3, "should have 3 entries (__default__ + 2 projects)");
+    assert_eq!(
+        projects.len(),
+        3,
+        "should have 3 entries (__default__ + 2 projects)"
+    );
 
     for entry in projects {
         assert!(entry["value"].is_string(), "entry should have 'value'");

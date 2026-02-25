@@ -6,7 +6,7 @@ fn generate(ctx: &ServerTestContext, model: &str) -> serde_json::Value {
     let body = serde_json::json!({
         "model": model,
         "input": "Hello",
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);

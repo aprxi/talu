@@ -11,7 +11,7 @@ fn responses_model_not_available_returns_500_server_error() {
     let body = serde_json::json!({
         "model": "nonexistent-model-that-does-not-exist",
         "input": "Hello",
-        "max_output_tokens": 5
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 500, "body: {}", resp.body);
@@ -28,7 +28,7 @@ fn responses_streaming_model_not_available_returns_json_error() {
         "model": "nonexistent-model-that-does-not-exist",
         "input": "Hello",
         "stream": true,
-        "max_output_tokens": 5
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 500, "body: {}", resp.body);
@@ -63,7 +63,7 @@ fn responses_no_model_uses_default_configured_model() {
     let ctx = ServerTestContext::new(model_config());
     let body = serde_json::json!({
         "input": "Hello",
-        "max_output_tokens": 5
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(

@@ -95,6 +95,228 @@ fn responses_rejects_non_array_tools() {
 }
 
 #[test]
+fn responses_rejects_json_schema_text_configuration_until_core_supports_it() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "reply",
+                "schema": { "type": "object" }
+            }
+        }
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("text.format.json_schema"),
+        "body: {}",
+        resp.body
+    );
+}
+
+#[test]
+fn responses_rejects_logprobs_include_until_core_supports_it() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "include": ["message.output_text.logprobs"]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("include.message.output_text.logprobs"),
+        "body: {}",
+        resp.body
+    );
+}
+
+#[test]
+fn responses_rejects_stream_options_include_obfuscation_until_supported() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "stream_options": {
+            "include_obfuscation": true
+        }
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("stream_options.include_obfuscation"),
+        "body: {}",
+        resp.body
+    );
+}
+
+#[test]
+fn responses_rejects_unknown_include_values() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "include": ["message.output_text.unknown"]
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_out_of_range_top_logprobs() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "top_logprobs": 21
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_out_of_range_presence_penalty() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+
+    let high = serde_json::json!({
+        "input": "hello",
+        "presence_penalty": 2.1
+    });
+    let high_resp = post_json(ctx.addr(), "/v1/responses", &high);
+    assert_eq!(high_resp.status, 400, "body: {}", high_resp.body);
+
+    let low = serde_json::json!({
+        "input": "hello",
+        "presence_penalty": -2.1
+    });
+    let low_resp = post_json(ctx.addr(), "/v1/responses", &low);
+    assert_eq!(low_resp.status, 400, "body: {}", low_resp.body);
+}
+
+#[test]
+fn responses_rejects_out_of_range_frequency_penalty() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+
+    let high = serde_json::json!({
+        "input": "hello",
+        "frequency_penalty": 2.1
+    });
+    let high_resp = post_json(ctx.addr(), "/v1/responses", &high);
+    assert_eq!(high_resp.status, 400, "body: {}", high_resp.body);
+
+    let low = serde_json::json!({
+        "input": "hello",
+        "frequency_penalty": -2.1
+    });
+    let low_resp = post_json(ctx.addr(), "/v1/responses", &low);
+    assert_eq!(low_resp.status, 400, "body: {}", low_resp.body);
+}
+
+#[test]
+fn responses_rejects_out_of_range_temperature() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+
+    let high = serde_json::json!({
+        "input": "hello",
+        "temperature": 2.1
+    });
+    let high_resp = post_json(ctx.addr(), "/v1/responses", &high);
+    assert_eq!(high_resp.status, 400, "body: {}", high_resp.body);
+
+    let low = serde_json::json!({
+        "input": "hello",
+        "temperature": -0.1
+    });
+    let low_resp = post_json(ctx.addr(), "/v1/responses", &low);
+    assert_eq!(low_resp.status, 400, "body: {}", low_resp.body);
+}
+
+#[test]
+fn responses_rejects_out_of_range_top_p() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+
+    let high = serde_json::json!({
+        "input": "hello",
+        "top_p": 1.1
+    });
+    let high_resp = post_json(ctx.addr(), "/v1/responses", &high);
+    assert_eq!(high_resp.status, 400, "body: {}", high_resp.body);
+
+    let low = serde_json::json!({
+        "input": "hello",
+        "top_p": -0.1
+    });
+    let low_resp = post_json(ctx.addr(), "/v1/responses", &low);
+    assert_eq!(low_resp.status, 400, "body: {}", low_resp.body);
+}
+
+#[test]
+fn responses_rejects_too_small_max_output_tokens() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "max_output_tokens": 15
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_safety_identifier_longer_than_64_chars() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let too_long = "a".repeat(65);
+    let body = serde_json::json!({
+        "input": "hello",
+        "safety_identifier": too_long
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_invalid_service_tier_enum_value() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "service_tier": "standard"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_invalid_truncation_enum_value() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "truncation": "manual"
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
+fn responses_rejects_invalid_reasoning_effort() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": "hello",
+        "reasoning": { "effort": "max" }
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+}
+
+#[test]
 fn responses_rejects_non_string_non_object_tool_choice() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
@@ -170,7 +392,7 @@ fn responses_accepts_valid_allowed_tools_tool_choice_shape() {
 }
 
 #[test]
-fn responses_accepts_spec_valid_engine_unsupported_fields() {
+fn responses_rejects_engine_unimplemented_fields() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let body = serde_json::json!({
         "input": "hello",
@@ -180,7 +402,22 @@ fn responses_accepts_spec_valid_engine_unsupported_fields() {
         "prompt_cache_key": "cache-key-1"
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
-    assert_ne!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(
+        json["error"]["code"].as_str(),
+        Some("invalid_request"),
+        "body: {}",
+        resp.body
+    );
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("parallel_tool_calls"),
+        "body: {}",
+        resp.body
+    );
 }
 
 #[test]
@@ -193,8 +430,28 @@ fn responses_server_error_envelope_includes_code_and_message() {
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 500, "body: {}", resp.body);
     let json = resp.json();
+    assert_eq!(json["error"]["type"].as_str(), Some("server_error"));
     assert!(json["error"]["code"].is_string());
     assert!(json["error"]["message"].is_string());
+    assert!(json["error"]["param"].is_null());
+}
+
+#[test]
+fn responses_client_error_envelope_uses_openresponses_shape() {
+    let ctx = ServerTestContext::new(ServerConfig::new());
+    let body = serde_json::json!({
+        "input": { "bad": "shape" }
+    });
+    let resp = post_json(ctx.addr(), "/v1/responses", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    let json = resp.json();
+    assert_eq!(
+        json["error"]["type"].as_str(),
+        Some("invalid_request_error")
+    );
+    assert!(json["error"]["code"].is_string());
+    assert!(json["error"]["message"].is_string());
+    assert!(json["error"]["param"].is_null());
 }
 
 #[test]
@@ -205,7 +462,7 @@ fn responses_input_array_accepts_all_itemparam_variants() {
     let ctx = ServerTestContext::new(cfg);
     let body = serde_json::json!({
         "model": model,
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "input": [
             { "type": "message", "role": "user", "content": "hello" },
             { "type": "message", "role": "assistant", "content": [ { "type": "output_text", "text": "prior" } ] },
@@ -230,7 +487,7 @@ fn responses_accepts_string_input_shorthand() {
     let body = serde_json::json!({
         "model": model,
         "input": "hello",
-        "max_output_tokens": 8
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -264,7 +521,7 @@ fn responses_store_false_still_allows_previous_response_id_chaining_in_process()
     let first = serde_json::json!({
         "model": model,
         "input": "hello",
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "store": false,
         "tools": [{
             "type": "function",
@@ -281,7 +538,7 @@ fn responses_store_false_still_allows_previous_response_id_chaining_in_process()
     let second = serde_json::json!({
         "model": model,
         "input": "follow-up",
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "store": false,
         "previous_response_id": prev_id
     });
@@ -304,7 +561,7 @@ fn responses_store_flag_round_trips_when_model_is_available() {
     let body = serde_json::json!({
         "model": model,
         "input": "hello",
-        "max_output_tokens": 8,
+        "max_output_tokens": 16,
         "store": true
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
@@ -323,7 +580,7 @@ fn responses_instructions_round_trip_when_model_is_available() {
         "model": model,
         "input": "hello",
         "instructions": "answer in one sentence",
-        "max_output_tokens": 8
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -363,7 +620,7 @@ fn responses_cross_tenant_previous_response_id_does_not_inherit_tools() {
     let alpha_body = serde_json::json!({
         "model": &model,
         "input": "Hello from alpha",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "tools": [{
             "type": "function",
             "name": "alpha_lookup",
@@ -399,7 +656,7 @@ fn responses_cross_tenant_previous_response_id_does_not_inherit_tools() {
     let beta_body = serde_json::json!({
         "model": &model,
         "input": "Hello from beta",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "previous_response_id": alpha_response_id
     });
     let beta_body_str = serde_json::to_string(&beta_body).unwrap();

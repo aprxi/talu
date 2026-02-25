@@ -32,7 +32,35 @@ struct GenerationRequest {
     max_output_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    presence_penalty: Option<f64>,
+    frequency_penalty: Option<f64>,
+    logprobs: LogprobConfig,
+    reasoning: ReasoningConfig,
     instructions: Option<String>,
+    text_format: Option<TextFormatConfig>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LogprobConfig {
+    top_logprobs: usize,
+}
+
+impl Default for LogprobConfig {
+    fn default() -> Self {
+        Self { top_logprobs: 0 }
+    }
+}
+
+#[derive(Debug, Clone)]
+enum TextFormatConfig {
+    Text,
+    JsonObject,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ReasoningConfig {
+    effort: Option<String>,
+    summary: Option<String>,
 }
 
 /// Error type for response generation with HTTP status code information.
@@ -104,7 +132,8 @@ async fn handle_generate(
     auth_ctx: Option<AuthContext>,
 ) -> Response<BoxBody> {
     let (parts, body) = req.into_parts();
-    let strict_responses = false;
+    // `/v1/responses` serves the strict OpenResponses contract only.
+    let strict_responses = true;
     if let Some(ctx) = auth_ctx.as_ref() {
         log::info!(
             target: "server::gen",
@@ -161,81 +190,70 @@ async fn handle_generate(
             &message,
         );
     }
-
-    let request_value: serde_json::Value = match serde_json::from_slice(&body_bytes) {
-        Ok(val) => val,
-        Err(_) => {
+    let text_format = match parse_requested_text_format(parsed.text.as_ref()) {
+        Ok(value) => value,
+        Err(message) => {
             return api_error(
                 strict_responses,
                 StatusCode::BAD_REQUEST,
                 "invalid_request",
-                "Invalid JSON",
+                &message,
             )
         }
     };
+    let logprobs = match parse_logprob_config(parsed.include.as_ref(), parsed.top_logprobs) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                strict_responses,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &message,
+            )
+        }
+    };
+    let reasoning = match parse_reasoning_config(parsed.reasoning.as_ref()) {
+        Ok(value) => value,
+        Err(message) => {
+            return api_error(
+                strict_responses,
+                StatusCode::BAD_REQUEST,
+                "invalid_request",
+                &message,
+            )
+        }
+    };
+
     let request = GenerationRequest {
-        model: request_value
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
-        max_output_tokens: request_value
-            .get("max_output_tokens")
-            .and_then(|v| v.as_i64()),
-        temperature: request_value.get("temperature").and_then(|v| v.as_f64()),
-        top_p: request_value.get("top_p").and_then(|v| v.as_f64()),
-        instructions: request_value
-            .get("instructions")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string()),
+        model: parsed.model.clone(),
+        max_output_tokens: parsed.max_output_tokens,
+        temperature: parsed.temperature,
+        top_p: parsed.top_p,
+        presence_penalty: parsed.presence_penalty,
+        frequency_penalty: parsed.frequency_penalty,
+        logprobs,
+        reasoning,
+        instructions: parsed.instructions.clone(),
+        text_format,
     };
 
-    let stream = request_value
-        .get("stream")
-        .and_then(|val| val.as_bool())
-        .unwrap_or(false);
+    let stream = parsed.stream.unwrap_or(false);
 
-    let tools_json = request_value.get("tools").cloned();
-    let tool_choice_json = request_value.get("tool_choice").cloned();
-    let previous_response_id = request_value
-        .get("previous_response_id")
+    let tools_json = parsed.tools.clone();
+    let tool_choice_json = parsed.tool_choice.clone();
+    let previous_response_id = parsed.previous_response_id.clone();
+    let input_value = parsed.input.clone();
+    let store = parsed.store.unwrap_or(false);
+    let request_session_id = None;
+    let prompt_id = None;
+
+    // Internal project scoping hint (if present in metadata).
+    let project_id: Option<String> = parsed
+        .metadata
+        .as_ref()
+        .and_then(|m| m.get("project_id"))
         .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let input_value = request_value.get("input").cloned();
-    let store = request_value
-        .get("store")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-    let request_session_id = if strict_responses {
-        None
-    } else {
-        request_value
-            .get("session_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
-    let prompt_id = if strict_responses {
-        None
-    } else {
-        request_value
-            .get("prompt_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    };
-
-    // Extract project_id from request metadata (non-strict mode only).
-    let project_id: Option<String> = if strict_responses {
-        parsed.metadata
-            .as_ref()
-            .and_then(|m| m.get("project_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    } else {
-        request_value
-            .get("metadata")
-            .and_then(|m| m.get("project_id"))
-            .and_then(|v| v.as_str())
-            .map(String::from)
-    };
+        .map(String::from);
 
     log::debug!(
         target: "server::gen",
@@ -568,7 +586,12 @@ async fn generate_response(
     let request_max_output_tokens = request.max_output_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
+    let presence_penalty = request.presence_penalty;
+    let frequency_penalty = request.frequency_penalty;
+    let logprobs = request.logprobs;
+    let reasoning = request.reasoning;
     let instructions = request.instructions;
+    let text_format = request.text_format;
 
     let model_id = select_model_id(state.clone(), request.model.clone()).await?;
 
@@ -751,6 +774,8 @@ async fn generate_response(
     let system_prompt_for_task = effective_system_prompt.clone();
     let prompt_id_for_task = prompt_id.clone();
     let project_id_for_task = project_id.clone();
+    let tools_json_for_generation = effective_tools.as_ref().map(|v| v.to_string());
+    let tool_choice_for_generation = effective_tool_choice.as_ref().map(|v| v.to_string());
     let (output_items, prompt_tokens, completion_tokens, responses_json) =
         tokio::task::spawn_blocking(move || {
             let mut backend = backend.blocking_lock();
@@ -797,7 +822,6 @@ async fn generate_response(
                 chat.append_user_message(text)
                     .map_err(|e| anyhow!("failed to append user message: {}", e))?;
             }
-
             // Record item count before generation to extract only new output items.
             let pre_gen_count = chat.item_count();
 
@@ -825,6 +849,8 @@ async fn generate_response(
             if let Some(top_p) = top_p {
                 cfg.top_p = top_p as f32;
             }
+            cfg.tools_json = tools_json_for_generation;
+            cfg.tool_choice = tool_choice_for_generation;
 
             log::debug!(target: "server::gen", "generating: model={} max_tokens={:?} temp={:?} top_p={:?}",
                 model_id_for_task, max_output_tokens, temperature, top_p);
@@ -893,12 +919,18 @@ async fn generate_response(
         max_output_tokens,
         temperature.unwrap_or(0.0),
         top_p.unwrap_or(1.0),
+        presence_penalty.unwrap_or(0.0),
+        frequency_penalty.unwrap_or(0.0),
+        logprobs.top_logprobs as i64,
+        reasoning.effort.as_deref(),
+        reasoning.summary.as_deref(),
         "completed",
         Some(&usage),
         effective_tools.as_ref(),
         effective_tool_choice.as_ref(),
         store,
         instructions.as_deref(),
+        text_format.as_ref(),
     );
 
     // Set previous_response_id on the response resource.
@@ -958,7 +990,12 @@ async fn stream_response(
     let request_max_output_tokens = request.max_output_tokens;
     let temperature = request.temperature;
     let top_p = request.top_p;
+    let presence_penalty = request.presence_penalty;
+    let frequency_penalty = request.frequency_penalty;
+    let logprobs = request.logprobs;
+    let reasoning = request.reasoning;
     let instructions = request.instructions;
+    let text_format = request.text_format;
     // Resolve model ID without loading — loading happens inside spawn_blocking
     // so that progress events can be streamed through the SSE channel.
     let model_id = match resolve_model_id(state.clone(), request.model.clone()).await {
@@ -1177,6 +1214,8 @@ async fn stream_response(
     let backend = state.backend.clone();
     let tools_for_events = effective_tools.clone();
     let tool_choice_for_events = effective_tool_choice.clone();
+    let text_format_for_events = text_format.clone();
+    let reasoning_for_events = reasoning.clone();
 
     // Clone project_id for the streaming blocking task.
     let project_id_for_stream = project_id.clone();
@@ -1217,13 +1256,16 @@ async fn stream_response(
                         "tool_choice": tool_choice_for_events.as_ref().cloned().unwrap_or_else(|| json!("none")),
                         "truncation": "auto",
                         "parallel_tool_calls": false,
-                        "text": { "format": { "type": "text" } },
+                        "text": { "format": response_text_format_value(text_format_for_events.as_ref()) },
                         "top_p": top_p.unwrap_or(1.0),
-                        "presence_penalty": 0.0,
-                        "frequency_penalty": 0.0,
-                        "top_logprobs": 0,
+                        "presence_penalty": presence_penalty.unwrap_or(0.0),
+                        "frequency_penalty": frequency_penalty.unwrap_or(0.0),
+                        "top_logprobs": logprobs.top_logprobs as i64,
                         "temperature": temperature.unwrap_or(0.0),
-                        "reasoning": { "effort": null, "summary": null },
+                        "reasoning": {
+                            "effort": reasoning_for_events.effort.as_deref(),
+                            "summary": reasoning_for_events.summary.as_deref()
+                        },
                         "usage": null,
                         "max_output_tokens": max_output_tokens,
                         "max_tool_calls": null,
@@ -1334,12 +1376,18 @@ async fn stream_response(
             max_output_tokens,
             temperature.unwrap_or(0.0),
             top_p.unwrap_or(1.0),
+            presence_penalty.unwrap_or(0.0),
+            frequency_penalty.unwrap_or(0.0),
+            logprobs.top_logprobs as i64,
+            reasoning_for_events.effort.as_deref(),
+            reasoning_for_events.summary.as_deref(),
             "in_progress",
             None,
             tools_for_events.as_ref(),
             tool_choice_for_events.as_ref(),
             store,
             instructions.as_deref(),
+            text_format_for_events.as_ref(),
         ));
         if let Some(ref prev_id) = previous_response_id_for_ctx {
             created_response["previous_response_id"] = json!(prev_id);
@@ -1385,6 +1433,10 @@ async fn stream_response(
             cur_item_type: None,
             cur_content_type: None,
             accumulated_text: String::new(),
+            accumulated_logprobs: Vec::new(),
+            accumulated_annotations: Vec::new(),
+            annotation_keys: HashSet::new(),
+            output_items: Vec::new(),
             cur_item_id: message_id,
             tools_json: tools_for_events,
             tool_choice_json: tool_choice_for_events,
@@ -1395,7 +1447,13 @@ async fn stream_response(
             request_store: store,
             previous_response_id: previous_response_id_for_ctx.clone(),
             instructions: instructions.clone(),
+            text_format: text_format_for_events.clone(),
             project_id: project_id.clone(),
+            top_logprobs: logprobs.top_logprobs,
+            presence_penalty: presence_penalty.unwrap_or(0.0),
+            frequency_penalty: frequency_penalty.unwrap_or(0.0),
+            reasoning_effort: reasoning_for_events.effort.clone(),
+            reasoning_summary: reasoning_for_events.summary.clone(),
         }));
         let ctx_for_complete = ctx.clone();
 
@@ -1403,6 +1461,9 @@ async fn stream_response(
             backend,
             input_json,
             input_string,
+            store_tools.clone(),
+            store_tool_choice.clone(),
+            text_format_for_events.clone(),
             prev_json,
             bucket_path,
             session_id,
@@ -1410,6 +1471,8 @@ async fn stream_response(
             max_output_tokens,
             temperature,
             top_p,
+            presence_penalty,
+            frequency_penalty,
             effective_system_prompt,
             prompt_id,
             project_id_for_stream,
@@ -1473,6 +1536,9 @@ fn run_streaming_generation(
     backend: Arc<tokio::sync::Mutex<crate::server::state::BackendState>>,
     input_json: Option<String>,
     input_string: Option<String>,
+    tools_json: Option<serde_json::Value>,
+    tool_choice_json: Option<serde_json::Value>,
+    _text_format: Option<TextFormatConfig>,
     prev_json: Option<String>,
     bucket_path: Option<std::path::PathBuf>,
     session_id: String,
@@ -1480,6 +1546,8 @@ fn run_streaming_generation(
     max_output_tokens: Option<i64>,
     temperature: Option<f64>,
     top_p: Option<f64>,
+    _presence_penalty: Option<f64>,
+    _frequency_penalty: Option<f64>,
     system_prompt: Option<String>,
     prompt_id: Option<String>,
     project_id: Option<String>,
@@ -1535,7 +1603,6 @@ fn run_streaming_generation(
         chat.append_user_message(text)
             .map_err(|e| anyhow!("failed to append user message: {}", e))?;
     }
-
     let mut cfg = talu::router::GenerateConfig::default();
     if let Some(max_tokens) = max_output_tokens {
         cfg.max_tokens = max_tokens as usize;
@@ -1546,6 +1613,8 @@ fn run_streaming_generation(
     if let Some(top_p) = top_p {
         cfg.top_p = top_p as f32;
     }
+    cfg.tools_json = tools_json.map(|v| v.to_string());
+    cfg.tool_choice = tool_choice_json.map(|v| v.to_string());
 
     // Pass the stop flag for cooperative cancellation.
     cfg.stop_flag = Some(stop_flag);
@@ -1718,6 +1787,14 @@ struct StreamCtx {
     cur_content_type: Option<ContentType>,
     /// Accumulated text for the current content part (for .done events).
     accumulated_text: String,
+    /// Accumulated sampled logprobs for the current output_text content part.
+    accumulated_logprobs: Vec<serde_json::Value>,
+    /// Accumulated URL-citation annotations for the current output_text content part.
+    accumulated_annotations: Vec<serde_json::Value>,
+    /// De-duplication keys for emitted annotations in the current content part.
+    annotation_keys: HashSet<String>,
+    /// Completed output items emitted during this stream.
+    output_items: Vec<serde_json::Value>,
     /// Item ID for the current output item (may differ from message_id for
     /// multi-item responses, e.g. reasoning + message).
     cur_item_id: String,
@@ -1739,8 +1816,18 @@ struct StreamCtx {
     previous_response_id: Option<String>,
     /// Request instructions field for OpenResponses response resources.
     instructions: Option<String>,
+    /// Request text format configuration for response resource round-tripping.
+    text_format: Option<TextFormatConfig>,
     /// Project ID from request metadata (returned in response metadata).
     project_id: Option<String>,
+    /// Requested top_logprobs count from the API request.
+    top_logprobs: usize,
+    /// Request sampling penalties echoed in response resources.
+    presence_penalty: f64,
+    frequency_penalty: f64,
+    /// Reasoning config echoed in response resources.
+    reasoning_effort: Option<String>,
+    reasoning_summary: Option<String>,
 }
 
 impl StreamCtx {
@@ -1773,6 +1860,9 @@ impl StreamCtx {
             }
             self.cur_content_type = Some(token.content_type);
             self.accumulated_text.clear();
+            self.accumulated_logprobs.clear();
+            self.accumulated_annotations.clear();
+            self.annotation_keys.clear();
             self.emit_content_part_added(token.content_type)?;
         }
 
@@ -1781,7 +1871,22 @@ impl StreamCtx {
         // Emit the delta event.
         let event_name =
             talu::responses::stream_delta_event_name(token.item_type, token.content_type);
+        let delta_logprobs = self.delta_logprobs(token);
+        if event_name == "response.output_text.delta" && !delta_logprobs.is_empty() {
+            self.accumulated_logprobs
+                .extend(delta_logprobs.iter().cloned());
+        }
         let payload = match event_name {
+            "response.output_text.delta" => json!({
+                "type": event_name,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "delta": token.text,
+                "logprobs": delta_logprobs,
+                "obfuscation": ""
+            }),
             "response.function_call_arguments.delta" => json!({
                 "type": event_name,
                 "sequence_number": self.seq,
@@ -1835,6 +1940,7 @@ impl StreamCtx {
             self.stop_flag.store(true, Ordering::Release);
             return Err(anyhow!("client disconnected"));
         }
+        self.emit_output_text_annotations(token)?;
         Ok(())
     }
 
@@ -1883,7 +1989,7 @@ impl StreamCtx {
             "item_id": self.cur_item_id,
             "output_index": self.output_index,
             "content_index": self.content_index,
-            "part": content_part_done_payload(part_type, "")
+            "part": content_part_done_payload(part_type, "", &[], &[])
         });
         self.seq += 1;
         self.try_send("response.content_part.added", payload)?;
@@ -1920,6 +2026,15 @@ impl StreamCtx {
         // Type-specific done event (e.g. response.output_text.done).
         let done_event = talu::responses::stream_done_event_name(item_type, content_type);
         let done_payload = match done_event {
+            "response.output_text.done" => json!({
+                "type": done_event,
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "text": self.accumulated_text,
+                "logprobs": self.accumulated_logprobs.clone()
+            }),
             "response.function_call_arguments.done" => json!({
                 "type": done_event,
                 "sequence_number": self.seq,
@@ -1972,7 +2087,12 @@ impl StreamCtx {
             "item_id": self.cur_item_id,
             "output_index": self.output_index,
             "content_index": self.content_index,
-            "part": content_part_done_payload(part_type, &self.accumulated_text)
+            "part": content_part_done_payload(
+                part_type,
+                &self.accumulated_text,
+                &self.accumulated_annotations,
+                &self.accumulated_logprobs,
+            )
         });
         self.seq += 1;
         self.try_send("response.content_part.done", part_payload)?;
@@ -2030,12 +2150,13 @@ impl StreamCtx {
                     _ => json!({
                         "type": "output_text",
                         "text": self.accumulated_text,
-                        "annotations": [],
-                        "logprobs": []
+                        "annotations": self.accumulated_annotations.clone(),
+                        "logprobs": self.accumulated_logprobs.clone()
                     }),
                 }]
             }),
         };
+        self.output_items.push(item_object.clone());
 
         let payload = json!({
             "type": "response.output_item.done",
@@ -2052,6 +2173,49 @@ impl StreamCtx {
         if send_event(&self.tx, event, payload).is_err() {
             self.stop_flag.store(true, Ordering::Release);
             return Err(anyhow!("client disconnected"));
+        }
+        Ok(())
+    }
+
+    fn delta_logprobs(&self, token: &talu::router::StreamToken) -> Vec<serde_json::Value> {
+        let _ = token;
+        Vec::new()
+    }
+
+    fn emit_output_text_annotations(&mut self, token: &talu::router::StreamToken) -> Result<()> {
+        if token.item_type != ItemType::Message || token.content_type != ContentType::OutputText {
+            return Ok(());
+        }
+        let chunk_start = self.accumulated_text.len().saturating_sub(token.text.len());
+        for (local_start, local_end, url) in extract_urls_with_offsets(token.text) {
+            let start_index = chunk_start + local_start;
+            let end_index = chunk_start + local_end;
+            let dedupe_key = format!("{start_index}:{end_index}:{url}");
+            if !self.annotation_keys.insert(dedupe_key) {
+                continue;
+            }
+
+            let annotation = json!({
+                "type": "url_citation",
+                "url": url,
+                "start_index": start_index,
+                "end_index": end_index,
+                "title": ""
+            });
+            let annotation_index = self.accumulated_annotations.len();
+            self.accumulated_annotations.push(annotation.clone());
+
+            let payload = json!({
+                "type": "response.output_text.annotation.added",
+                "sequence_number": self.seq,
+                "item_id": self.cur_item_id,
+                "output_index": self.output_index,
+                "content_index": self.content_index,
+                "annotation_index": annotation_index,
+                "annotation": annotation
+            });
+            self.seq += 1;
+            self.try_send("response.output_text.annotation.added", payload)?;
         }
         Ok(())
     }
@@ -2079,7 +2243,11 @@ impl StreamCtx {
                 // Build output items from streaming accumulated state.
                 // For streaming, output items are already sent as individual events.
                 // The terminal response resource needs the output array for completeness.
-                let output_items = r.output_items;
+                let output_items = if self.output_items.is_empty() {
+                    r.output_items
+                } else {
+                    serde_json::Value::Array(self.output_items.clone())
+                };
                 let mut response = build_response_resource_value(
                     &self.response_id,
                     &model_id,
@@ -2089,12 +2257,18 @@ impl StreamCtx {
                     max_output_tokens,
                     temperature,
                     top_p,
+                    self.presence_penalty,
+                    self.frequency_penalty,
+                    self.top_logprobs as i64,
+                    self.reasoning_effort.as_deref(),
+                    self.reasoning_summary.as_deref(),
                     status,
                     Some(&r.usage),
                     self.tools_json.as_ref(),
                     self.tool_choice_json.as_ref(),
                     self.request_store,
                     self.instructions.as_deref(),
+                    self.text_format.as_ref(),
                 );
                 if let Some(ref prev_id) = self.previous_response_id {
                     response["previous_response_id"] = json!(prev_id);
@@ -2149,12 +2323,18 @@ impl StreamCtx {
                     max_output_tokens,
                     temperature,
                     top_p,
+                    self.presence_penalty,
+                    self.frequency_penalty,
+                    self.top_logprobs as i64,
+                    self.reasoning_effort.as_deref(),
+                    self.reasoning_summary.as_deref(),
                     "failed",
                     None,
                     self.tools_json.as_ref(),
                     self.tool_choice_json.as_ref(),
                     self.request_store,
                     self.instructions.as_deref(),
+                    self.text_format.as_ref(),
                 );
                 if let Some(ref prev_id) = self.previous_response_id {
                     response["previous_response_id"] = json!(prev_id);
@@ -2211,7 +2391,50 @@ fn send_event(
     Ok(())
 }
 
-fn content_part_done_payload(part_type: &str, text: &str) -> serde_json::Value {
+fn extract_urls_with_offsets(text: &str) -> Vec<(usize, usize, String)> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let rest = &bytes[i..];
+        let prefix_len = if rest.starts_with(b"http://") {
+            7
+        } else if rest.starts_with(b"https://") {
+            8
+        } else {
+            i += 1;
+            continue;
+        };
+
+        let start = i;
+        i += prefix_len;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let mut end = i;
+        while end > start
+            && matches!(
+                bytes[end - 1],
+                b'.' | b',' | b';' | b':' | b'!' | b'?' | b')' | b']' | b'}'
+            )
+        {
+            end -= 1;
+        }
+        if end > start {
+            if let Some(url) = text.get(start..end) {
+                out.push((start, end, url.to_string()));
+            }
+        }
+    }
+    out
+}
+
+fn content_part_done_payload(
+    part_type: &str,
+    text: &str,
+    annotations: &[serde_json::Value],
+    logprobs: &[serde_json::Value],
+) -> serde_json::Value {
     match part_type {
         "refusal" => json!({
             "type": "refusal",
@@ -2228,9 +2451,16 @@ fn content_part_done_payload(part_type: &str, text: &str) -> serde_json::Value {
         _ => json!({
             "type": part_type,
             "text": text,
-            "annotations": [],
-            "logprobs": []
+            "annotations": annotations,
+            "logprobs": logprobs
         }),
+    }
+}
+
+fn response_text_format_value(text_format: Option<&TextFormatConfig>) -> serde_json::Value {
+    match text_format {
+        Some(TextFormatConfig::JsonObject) => json!({ "type": "json_object" }),
+        _ => json!({ "type": "text" }),
     }
 }
 
@@ -2249,12 +2479,18 @@ fn build_response_resource_value(
     max_output_tokens: Option<i64>,
     temperature: f64,
     top_p: f64,
+    presence_penalty: f64,
+    frequency_penalty: f64,
+    top_logprobs: i64,
+    reasoning_effort: Option<&str>,
+    reasoning_summary: Option<&str>,
     status: &str,
     usage: Option<&UsageStats>,
     tools: Option<&serde_json::Value>,
     tool_choice: Option<&serde_json::Value>,
     store: bool,
     instructions: Option<&str>,
+    text_format: Option<&TextFormatConfig>,
 ) -> serde_json::Value {
     let usage_value = match usage {
         Some(u) => json!({
@@ -2290,13 +2526,13 @@ fn build_response_resource_value(
         "tool_choice": tool_choice_value,
         "truncation": "auto",
         "parallel_tool_calls": false,
-        "text": { "format": { "type": "text" } },
+        "text": { "format": response_text_format_value(text_format) },
         "top_p": top_p,
-        "presence_penalty": 0.0,
-        "frequency_penalty": 0.0,
-        "top_logprobs": 0,
+        "presence_penalty": presence_penalty,
+        "frequency_penalty": frequency_penalty,
+        "top_logprobs": top_logprobs,
         "temperature": temperature,
-        "reasoning": { "effort": null, "summary": null },
+        "reasoning": { "effort": reasoning_effort, "summary": reasoning_summary },
         "usage": usage_value,
         "max_output_tokens": max_output_tokens,
         "max_tool_calls": null,
@@ -2446,6 +2682,238 @@ fn now_unix_seconds() -> i64 {
         .as_secs() as i64
 }
 
+fn parse_requested_text_format(
+    text: Option<&serde_json::Value>,
+) -> std::result::Result<Option<TextFormatConfig>, String> {
+    let Some(text_value) = text else {
+        return Ok(None);
+    };
+    let text_obj = text_value
+        .as_object()
+        .ok_or_else(|| "`text` must be an object".to_string())?;
+
+    if text_obj.contains_key("verbosity") {
+        return reject_unimplemented_field("text.verbosity").map(|_| None);
+    }
+
+    let Some(format_value) = text_obj.get("format") else {
+        return Ok(None);
+    };
+    let format_obj = format_value
+        .as_object()
+        .ok_or_else(|| "`text.format` must be an object".to_string())?;
+    let format_type = format_obj
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "`text.format.type` must be a string".to_string())?;
+
+    match format_type {
+        "text" => Ok(Some(TextFormatConfig::Text)),
+        "json_object" => Ok(Some(TextFormatConfig::JsonObject)),
+        "json_schema" => reject_unimplemented_field("text.format.json_schema").map(|_| None),
+        _ => Err("`text.format.type` must be `text`, `json_object`, or `json_schema`".to_string()),
+    }
+}
+
+fn parse_include_config(include: Option<&serde_json::Value>) -> std::result::Result<(), String> {
+    let Some(include_value) = include else {
+        return Ok(());
+    };
+    let values = include_value
+        .as_array()
+        .ok_or_else(|| "`include` must be an array of strings".to_string())?;
+
+    for value in values {
+        let key = value
+            .as_str()
+            .ok_or_else(|| "`include` entries must be strings".to_string())?;
+        match key {
+            "message.output_text.logprobs" => {
+                return reject_unimplemented_field("include.message.output_text.logprobs");
+            }
+            "reasoning.encrypted_content" => {
+                return reject_unimplemented_field("include.reasoning.encrypted_content");
+            }
+            _ => {
+                return Err(format!("`include` contains unsupported value `{key}`"));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_logprob_config(
+    include: Option<&serde_json::Value>,
+    top_logprobs: Option<i64>,
+) -> std::result::Result<LogprobConfig, String> {
+    parse_include_config(include)?;
+    let top_logprobs_value = match top_logprobs {
+        Some(value) if (0..=20).contains(&value) => value as usize,
+        Some(_) => return Err("`top_logprobs` must be between 0 and 20".to_string()),
+        None => 0,
+    };
+    if top_logprobs_value > 0 {
+        return reject_unimplemented_field("top_logprobs").map(|_| LogprobConfig::default());
+    }
+    Ok(LogprobConfig {
+        top_logprobs: top_logprobs_value,
+    })
+}
+
+fn parse_reasoning_config(
+    reasoning: Option<&serde_json::Value>,
+) -> std::result::Result<ReasoningConfig, String> {
+    let Some(reasoning_value) = reasoning else {
+        return Ok(ReasoningConfig::default());
+    };
+    let obj = reasoning_value
+        .as_object()
+        .ok_or_else(|| "`reasoning` must be an object".to_string())?;
+    for key in obj.keys() {
+        if key != "effort" && key != "summary" {
+            return Err(format!("`reasoning.{key}` is not supported"));
+        }
+    }
+
+    let effort = match obj.get("effort") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(v) => {
+            let effort = v
+                .as_str()
+                .ok_or_else(|| "`reasoning.effort` must be a string or null".to_string())?;
+            if !matches!(effort, "none" | "low" | "medium" | "high" | "xhigh") {
+                return Err(
+                    "`reasoning.effort` must be one of: none, low, medium, high, xhigh".to_string(),
+                );
+            }
+            Some(effort.to_string())
+        }
+    };
+
+    let summary = match obj.get("summary") {
+        Some(serde_json::Value::Null) | None => None,
+        Some(v) => {
+            let summary = v
+                .as_str()
+                .ok_or_else(|| "`reasoning.summary` must be a string or null".to_string())?;
+            if !matches!(summary, "auto" | "concise" | "detailed") {
+                return Err(
+                    "`reasoning.summary` must be one of: auto, concise, detailed".to_string(),
+                );
+            }
+            Some(summary.to_string())
+        }
+    };
+
+    if effort.is_some() || summary.is_some() {
+        return reject_unimplemented_field("reasoning").map(|_| ReasoningConfig::default());
+    }
+
+    Ok(ReasoningConfig { effort, summary })
+}
+
+fn validate_penalty_bounds(field: &str, value: Option<f64>) -> std::result::Result<(), String> {
+    let Some(value) = value else {
+        return Ok(());
+    };
+    if !(-2.0..=2.0).contains(&value) {
+        return Err(format!("`{field}` must be between -2 and 2"));
+    }
+    Ok(())
+}
+
+fn validate_temperature(temperature: Option<f64>) -> std::result::Result<(), String> {
+    let Some(temperature) = temperature else {
+        return Ok(());
+    };
+    if !(0.0..=2.0).contains(&temperature) {
+        return Err("`temperature` must be between 0 and 2".to_string());
+    }
+    Ok(())
+}
+
+fn validate_top_p(top_p: Option<f64>) -> std::result::Result<(), String> {
+    let Some(top_p) = top_p else {
+        return Ok(());
+    };
+    if !(0.0..=1.0).contains(&top_p) {
+        return Err("`top_p` must be between 0 and 1".to_string());
+    }
+    Ok(())
+}
+
+fn validate_max_output_tokens(max_output_tokens: Option<i64>) -> std::result::Result<(), String> {
+    let Some(max_output_tokens) = max_output_tokens else {
+        return Ok(());
+    };
+    if max_output_tokens < 16 {
+        return Err("`max_output_tokens` must be at least 16".to_string());
+    }
+    Ok(())
+}
+
+fn parse_stream_options_config(
+    stream_options: Option<&serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let Some(stream_options_value) = stream_options else {
+        return Ok(());
+    };
+    let obj = stream_options_value
+        .as_object()
+        .ok_or_else(|| "`stream_options` must be an object".to_string())?;
+
+    let mut has_include_obfuscation = false;
+    for (key, value) in obj {
+        match key.as_str() {
+            "include_obfuscation" => {
+                has_include_obfuscation = true;
+                if !value.is_boolean() {
+                    return Err(
+                        "`stream_options.include_obfuscation` must be a boolean".to_string()
+                    );
+                }
+            }
+            _ => return Err(format!("`stream_options.{key}` is not supported")),
+        }
+    }
+
+    if has_include_obfuscation {
+        return reject_unimplemented_field("stream_options.include_obfuscation");
+    }
+    reject_unimplemented_field("stream_options")
+}
+
+fn validate_service_tier(service_tier: Option<&str>) -> std::result::Result<(), String> {
+    let Some(service_tier) = service_tier else {
+        return Ok(());
+    };
+    if matches!(service_tier, "auto" | "default" | "flex" | "priority") {
+        return Ok(());
+    }
+    Err("`service_tier` must be one of: auto, default, flex, priority".to_string())
+}
+
+fn validate_safety_identifier(safety_identifier: Option<&str>) -> std::result::Result<(), String> {
+    let Some(safety_identifier) = safety_identifier else {
+        return Ok(());
+    };
+    if safety_identifier.chars().count() <= 64 {
+        return Ok(());
+    }
+    Err("`safety_identifier` must be at most 64 characters".to_string())
+}
+
+fn validate_truncation(truncation: Option<&str>) -> std::result::Result<(), String> {
+    let Some(truncation) = truncation else {
+        return Ok(());
+    };
+    match truncation {
+        "auto" => Ok(()),
+        "disabled" => reject_unimplemented_field("truncation.disabled"),
+        _ => Err("`truncation` must be one of: auto, disabled".to_string()),
+    }
+}
+
 fn validate_responses_request(request: &responses_types::CreateResponseBody) -> Result<(), String> {
     if let Some(input) = request.input.as_ref() {
         if !(input.is_string() || input.is_array() || input.is_null()) {
@@ -2478,7 +2946,46 @@ fn validate_responses_request(request: &responses_types::CreateResponseBody) -> 
         validate_tool_choice(tool_choice)?;
     }
 
+    parse_requested_text_format(request.text.as_ref())?;
+    let _ = parse_logprob_config(request.include.as_ref(), request.top_logprobs)?;
+    let _ = parse_reasoning_config(request.reasoning.as_ref())?;
+    validate_temperature(request.temperature)?;
+    validate_top_p(request.top_p)?;
+    validate_max_output_tokens(request.max_output_tokens)?;
+    validate_penalty_bounds("presence_penalty", request.presence_penalty)?;
+    validate_penalty_bounds("frequency_penalty", request.frequency_penalty)?;
+    parse_stream_options_config(request.stream_options.as_ref())?;
+    validate_service_tier(request.service_tier.as_deref())?;
+    validate_safety_identifier(request.safety_identifier.as_deref())?;
+    validate_truncation(request.truncation.as_deref())?;
+    if request.presence_penalty.is_some() {
+        return reject_unimplemented_field("presence_penalty");
+    }
+    if request.frequency_penalty.is_some() {
+        return reject_unimplemented_field("frequency_penalty");
+    }
+    if request.max_tool_calls.is_some() {
+        return reject_unimplemented_field("max_tool_calls");
+    }
+    if request.parallel_tool_calls.is_some() {
+        return reject_unimplemented_field("parallel_tool_calls");
+    }
+    if request.background.is_some() {
+        return reject_unimplemented_field("background");
+    }
+    if request.service_tier.is_some() {
+        return reject_unimplemented_field("service_tier");
+    }
+    if request.prompt_cache_key.is_some() {
+        return reject_unimplemented_field("prompt_cache_key");
+    }
     Ok(())
+}
+
+fn reject_unimplemented_field(field: &str) -> Result<(), String> {
+    Err(format!(
+        "`{field}` is accepted by the schema but not implemented yet"
+    ))
 }
 
 fn validate_tool_choice(tool_choice: &serde_json::Value) -> Result<(), String> {
@@ -2622,5 +3129,108 @@ mod tests {
     #[test]
     fn validate_tool_choice_rejects_invalid_string() {
         assert!(validate_tool_choice(&json!("sometimes")).is_err());
+    }
+
+    #[test]
+    fn parse_logprob_config_rejects_message_output_text_include() {
+        let include = json!(["message.output_text.logprobs"]);
+        assert!(parse_logprob_config(Some(&include), None).is_err());
+    }
+
+    #[test]
+    fn parse_logprob_config_rejects_unknown_include_value() {
+        let include = json!(["message.output_text.unknown"]);
+        assert!(parse_logprob_config(Some(&include), None).is_err());
+    }
+
+    #[test]
+    fn parse_logprob_config_rejects_out_of_range_top_logprobs() {
+        assert!(parse_logprob_config(None, Some(21)).is_err());
+    }
+
+    #[test]
+    fn parse_logprob_config_rejects_positive_top_logprobs() {
+        assert!(parse_logprob_config(None, Some(3)).is_err());
+    }
+
+    #[test]
+    fn parse_reasoning_config_rejects_known_values_until_supported() {
+        let reasoning = json!({
+            "effort": "medium",
+            "summary": "concise"
+        });
+        assert!(parse_reasoning_config(Some(&reasoning)).is_err());
+    }
+
+    #[test]
+    fn parse_reasoning_config_rejects_unknown_effort() {
+        let reasoning = json!({ "effort": "max" });
+        assert!(parse_reasoning_config(Some(&reasoning)).is_err());
+    }
+
+    #[test]
+    fn parse_requested_text_format_accepts_json_object() {
+        let text = json!({
+            "format": {
+                "type": "json_object"
+            }
+        });
+        let parsed = parse_requested_text_format(Some(&text)).expect("valid format");
+        assert!(matches!(parsed, Some(TextFormatConfig::JsonObject)));
+    }
+
+    #[test]
+    fn parse_stream_options_rejects_include_obfuscation_until_supported() {
+        let stream_options = json!({
+            "include_obfuscation": true
+        });
+        let err = parse_stream_options_config(Some(&stream_options)).expect_err("must reject");
+        assert!(err.contains("stream_options.include_obfuscation"));
+    }
+
+    #[test]
+    fn parse_stream_options_rejects_legacy_include_usage_key() {
+        let stream_options = json!({
+            "include_usage": true
+        });
+        let err = parse_stream_options_config(Some(&stream_options)).expect_err("must reject");
+        assert!(err.contains("stream_options.include_usage"));
+    }
+
+    #[test]
+    fn validate_truncation_rejects_disabled_until_supported() {
+        let err = validate_truncation(Some("disabled")).expect_err("must reject");
+        assert!(err.contains("truncation.disabled"));
+    }
+
+    #[test]
+    fn validate_temperature_rejects_out_of_range_values() {
+        assert!(validate_temperature(Some(-0.1)).is_err());
+        assert!(validate_temperature(Some(2.1)).is_err());
+        assert!(validate_temperature(Some(0.0)).is_ok());
+        assert!(validate_temperature(Some(2.0)).is_ok());
+    }
+
+    #[test]
+    fn validate_top_p_rejects_out_of_range_values() {
+        assert!(validate_top_p(Some(-0.1)).is_err());
+        assert!(validate_top_p(Some(1.1)).is_err());
+        assert!(validate_top_p(Some(0.0)).is_ok());
+        assert!(validate_top_p(Some(1.0)).is_ok());
+    }
+
+    #[test]
+    fn validate_max_output_tokens_rejects_values_below_minimum() {
+        assert!(validate_max_output_tokens(Some(15)).is_err());
+        assert!(validate_max_output_tokens(Some(16)).is_ok());
+    }
+
+    #[test]
+    fn extract_urls_with_offsets_detects_urls_and_trims_trailing_punctuation() {
+        let text = "See https://example.com/a, and http://foo.test/x.";
+        let urls = extract_urls_with_offsets(text);
+        assert_eq!(urls.len(), 2);
+        assert_eq!(urls[0].2, "https://example.com/a");
+        assert_eq!(urls[1].2, "http://foo.test/x");
     }
 }

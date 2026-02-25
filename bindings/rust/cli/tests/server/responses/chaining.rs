@@ -29,7 +29,7 @@ fn responses_chaining_unknown_id_succeeds() {
         "model": &model,
         "input": "Hello",
         "previous_response_id": "resp_nonexistent_00000000",
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     });
     let resp = post_json(ctx.addr(), "/v1/responses", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
@@ -44,7 +44,7 @@ fn responses_previous_response_id_without_input_succeeds() {
     let first = serde_json::json!({
         "model": &model,
         "input": "Remember: the answer is 42.",
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     });
     let first_resp = post_json(ctx.addr(), "/v1/responses", &first);
     assert_eq!(first_resp.status, 200, "body: {}", first_resp.body);
@@ -56,7 +56,7 @@ fn responses_previous_response_id_without_input_succeeds() {
     let second = serde_json::json!({
         "model": &model,
         "previous_response_id": response_id,
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     });
     let second_resp = post_json(ctx.addr(), "/v1/responses", &second);
     assert_eq!(second_resp.status, 200, "body: {}", second_resp.body);
@@ -78,7 +78,7 @@ fn responses_streaming_continue_no_input_emits_lifecycle() {
         "input": "Tell me about the weather.",
         "stream": true,
         "store": true,
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     });
     let initial_resp = post_json(ctx.addr(), "/v1/responses", &initial);
     assert_eq!(initial_resp.status, 200, "body: {}", initial_resp.body);
@@ -96,7 +96,7 @@ fn responses_streaming_continue_no_input_emits_lifecycle() {
         "previous_response_id": response_id,
         "stream": true,
         "store": true,
-        "max_output_tokens": 10
+        "max_output_tokens": 16
     });
     let continue_resp = post_json(ctx.addr(), "/v1/responses", &continue_body);
     assert_eq!(continue_resp.status, 200, "body: {}", continue_resp.body);
@@ -153,7 +153,7 @@ fn responses_cross_tenant_chaining_does_not_share_response_state() {
     let alpha_body = serde_json::json!({
         "model": &model,
         "input": "Hello from alpha",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "tools": [{
             "type": "function",
             "name": "alpha_lookup",
@@ -180,7 +180,7 @@ fn responses_cross_tenant_chaining_does_not_share_response_state() {
     let beta_body = serde_json::json!({
         "model": &model,
         "input": "Hello from beta",
-        "max_output_tokens": 10,
+        "max_output_tokens": 16,
         "previous_response_id": alpha_response_id
     });
     let beta_resp = send_request(
