@@ -20,6 +20,7 @@ pub mod listen;
 mod logger;
 pub mod openapi;
 pub mod plugins;
+pub mod projects;
 pub mod proxy;
 pub mod repo;
 pub mod responses;

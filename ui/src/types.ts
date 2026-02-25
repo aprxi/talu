@@ -342,6 +342,25 @@ export interface ValueAggregation {
 }
 
 // ---------------------------------------------------------------------------
+// Projects API types
+// ---------------------------------------------------------------------------
+
+/** Project record from /v1/projects endpoints. */
+export interface Project {
+  id: string;
+  name: string;
+  description?: string | null;
+  created_at: number;
+  updated_at: number;
+}
+
+/** Project list response from GET /v1/projects. */
+export interface ProjectList {
+  data: Project[];
+  has_more: boolean;
+}
+
+// ---------------------------------------------------------------------------
 // Batch Operations API types
 // ---------------------------------------------------------------------------
 

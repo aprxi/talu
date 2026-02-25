@@ -27,6 +27,7 @@ use crate::server::files;
 use crate::server::handlers;
 use crate::server::openapi;
 use crate::server::plugins;
+use crate::server::projects;
 use crate::server::proxy;
 use crate::server::repo;
 use crate::server::responses;
@@ -74,6 +75,8 @@ static OPENAPI_CODE_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/code"]));
 static OPENAPI_EVENTS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/events"]));
+static OPENAPI_PROJECTS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/projects"]));
 static OPENAPI_DB_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/"]));
 static OPENAPI_DB_TABLES_SPEC: Lazy<Vec<u8>> =
@@ -216,6 +219,11 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_EVENTS_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/projects.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_PROJECTS_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/openapi/db.json") => Response::builder()
                     .status(StatusCode::OK)
                     .header("content-type", "application/json")
@@ -284,6 +292,9 @@ impl Service<Request<Incoming>> for Router {
                 }
                 (Method::GET, "/docs/events") => {
                     swagger_ui_response("/openapi/events.json", "Talu API :: Events")
+                }
+                (Method::GET, "/docs/projects") => {
+                    swagger_ui_response("/openapi/projects.json", "Talu API :: Projects")
                 }
                 (Method::GET, "/docs/db") => docs_hub_response(),
                 (Method::GET, "/docs/db/tables") => {
@@ -422,6 +433,31 @@ impl Service<Request<Incoming>> for Router {
                         // Search endpoint
                         (Method::POST, "/v1/search") | (Method::POST, "/search") => {
                             search::handle_search(state, req, auth).await
+                        }
+                        // Project management endpoints
+                        (Method::GET, "/v1/projects") | (Method::GET, "/projects") => {
+                            projects::handle_list(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/projects") | (Method::POST, "/projects") => {
+                            projects::handle_create(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/projects/")
+                                || p.starts_with("/projects/") =>
+                        {
+                            projects::handle_get(state, req, auth).await
+                        }
+                        (Method::PATCH, p)
+                            if p.starts_with("/v1/projects/")
+                                || p.starts_with("/projects/") =>
+                        {
+                            projects::handle_update(state, req, auth).await
+                        }
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/projects/")
+                                || p.starts_with("/projects/") =>
+                        {
+                            projects::handle_delete(state, req, auth).await
                         }
                         // DB vector plane endpoints
                         (Method::POST, "/v1/db/vectors/collections") => {

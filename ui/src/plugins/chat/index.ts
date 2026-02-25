@@ -31,6 +31,7 @@ import { setupInfiniteScroll, loadSessions, refreshSidebar } from "./sidebar-lis
 import { syncRightPanelParams, setupPanelEvents } from "./panel-params.ts";
 import { chatState, getActiveProjectId } from "./state.ts";
 import { getModelsService, getPromptsService } from "./deps.ts";
+import { initProjectStore, loadApiProjects, migrateLocalStorageProjects } from "../../render/project-combo.ts";
 
 function populatePromptSelect(
   sel: HTMLSelectElement,
@@ -103,6 +104,7 @@ export const chatPlugin: PluginDefinition = {
 
     // Initialize shared dependencies for all chat modules.
     const api = createApiClient((url, init) => ctx.network.fetch(url, init));
+    initProjectStore(api);
     initChatDeps({
       api,
       notifications: ctx.notifications,
@@ -196,9 +198,15 @@ export const chatPlugin: PluginDefinition = {
       });
     }
 
+    // Prime project cache from API so empty projects appear in sidebar.
+    await loadApiProjects().catch(() => {});
+
     // Load initial data and show welcome state.
     showWelcome();
     await loadSessions();
+
+    // Migrate localStorage projects → API (one-time, non-blocking).
+    migrateLocalStorageProjects().catch(() => {});
 
     ctx.log.info("Chat plugin ready.");
   },

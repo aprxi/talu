@@ -600,68 +600,114 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 0.25rem;
-  margin-bottom: 0.25rem;
+  padding: 0 0.5rem;
+  margin-bottom: 0.375rem;
 }
 
 .project-list-header span {
   font-size: 11px;
   font-weight: 600;
   text-transform: uppercase;
+  letter-spacing: 0.05em;
   color: var(--text-muted);
 }
 
-.project-list-clear,
 .project-list-add {
-  font-size: 14px;
+  font-size: 11px;
+  font-weight: 500;
   color: var(--text-muted);
   background: none;
   border: none;
   cursor: pointer;
-  padding: 0 0.25rem;
-  line-height: 1;
+  padding: 0.125rem 0.375rem;
+  border-radius: 4px;
   font-family: inherit;
 }
 
-.project-list-clear:hover,
 .project-list-add:hover {
   color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, transparent);
 }
 
 .project-list-items {
   display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem;
-  max-height: 5.5rem;
+  flex-direction: column;
+  gap: 1px;
   overflow-y: auto;
 }
 
-.project-list-item {
-  padding: 0.25rem 0.5rem;
-  font-size: 11px;
-  border: 1px solid var(--border);
+.project-list-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.375rem 0.5rem;
   border-radius: 4px;
-  background: none;
-  color: var(--text-muted);
   cursor: pointer;
-  font-family: inherit;
+  font-size: 13px;
+  color: var(--text-muted);
+  position: relative;
 }
 
-.project-list-item:hover {
-  border-color: var(--text-muted);
+.project-list-row:hover {
+  background: color-mix(in srgb, white 5%, transparent);
   color: var(--text);
 }
 
-.project-list-item.active {
-  border-color: var(--primary);
+.project-list-row.active {
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
   color: var(--primary);
-  font-weight: 600;
 }
 
-.project-list-item .count {
-  font-size: 10px;
-  opacity: 0.7;
-  margin-left: 0.25rem;
+.project-list-row-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-list-row-count {
+  font-size: 11px;
+  opacity: 0.6;
+  flex-shrink: 0;
+  min-width: 1.25rem;
+  text-align: right;
+}
+
+.project-list-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+  opacity: 0;
+  flex-shrink: 0;
+}
+
+.project-list-row:hover .project-list-row-actions {
+  opacity: 1;
+}
+
+.project-list-row-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 3px;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+
+.project-list-row-btn:hover {
+  color: var(--text);
+  background: var(--bg-code);
+}
+
+.project-list-row-btn[data-action="delete"]:hover {
+  color: var(--error, #e55);
+  background: color-mix(in srgb, var(--error, #e55) 10%, transparent);
 }
 
 .project-list-create input {
@@ -760,3 +806,39 @@
 .project-picker-remove:hover {
   color: var(--text);
 }
+
+/* ── Context menu (popover) ──────────────────────────────────── */
+
+.context-menu {
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  padding: 0.25rem;
+}
+
+.context-menu-item {
+  display: block;
+  width: 100%;
+  padding: 0.375rem 0.625rem;
+  font-size: 13px;
+  text-align: left;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+}
+
+.context-menu-item:hover {
+  background: var(--bg-code);
+}
+
+.context-menu-item.destructive {
+  color: var(--error, #e55);
+}
+
+.context-menu-item.destructive:hover {
+  background: color-mix(in srgb, var(--error, #e55) 10%, transparent);
+}
+

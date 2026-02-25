@@ -7,7 +7,7 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    code, db, events, file, files, handlers, http, plugins, proxy, repo, responses,
+    code, db, events, file, files, handlers, http, plugins, projects, proxy, repo, responses,
     responses_types, search, sessions, settings, tags,
 };
 
@@ -26,6 +26,7 @@ use crate::server::{
         (name = "Files", description = "Binary file upload and management"),
         (name = "File", description = "Stateless file inspect/transform"),
         (name = "Tags", description = "Tag CRUD and assignment"),
+        (name = "Projects", description = "Project management"),
         (name = "Search", description = "Full-text and vector search"),
         (name = "DB::Tables", description = "Table-plane operations (currently documents table)"),
         (name = "DB::Vectors", description = "Vector-plane operations"),
@@ -93,6 +94,12 @@ use crate::server::{
         // File (stateless)
         file::handle_inspect,
         file::handle_transform,
+        // Projects
+        projects::handle_list,
+        projects::handle_create,
+        projects::handle_get,
+        projects::handle_update,
+        projects::handle_delete,
         // Search
         search::handle_search,
         // DB
@@ -208,6 +215,11 @@ use crate::server::{
         // File (stateless)
         file::FileInspectResponse,
         file::ImageMetadata,
+        // Projects
+        projects::CreateProjectRequest,
+        projects::UpdateProjectRequest,
+        projects::ProjectResponse,
+        projects::ProjectListResponse,
         // Search
         search::SearchRequest,
         search::SearchResponse,

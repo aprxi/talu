@@ -1,13 +1,16 @@
 import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
-import { handleTogglePin, showProjectContextMenu } from "./sidebar-actions.ts";
+import { handleTogglePin, showProjectContextMenu, showGroupContextMenu } from "./sidebar-actions.ts";
 import { selectChat } from "./selection.ts";
 import { startNewConversation } from "./welcome.ts";
-import { renderSidebar, setNewChatHandler } from "./sidebar-list.ts";
+import { renderSidebar, setNewChatHandler, setGroupContextMenuHandler, showNewProjectInput } from "./sidebar-list.ts";
 
 export function setupSidebarEvents(): void {
   setNewChatHandler((projectId) => startNewConversation(projectId));
+  setGroupContextMenuHandler((anchor, name, nameSpan) => showGroupContextMenu(anchor, name, nameSpan));
   const dom = getChatDom();
+
+  dom.sidebarNewProject.addEventListener("click", () => showNewProjectInput());
 
   dom.sidebarList.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;

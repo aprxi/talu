@@ -10,6 +10,7 @@ import { TAG_ICON as ICON_TAG } from "../../icons.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
 import { loadBrowserConversations } from "./data.ts";
+import { handleRenameProject, handleDeleteProject } from "./actions.ts";
 
 export function syncBrowserTabs(): void {
   const dom = getBrowserDom();
@@ -178,6 +179,8 @@ export function updateBrowserProjectSelector(): void {
       projects: search.availableProjects,
       onSelect: applyFilter,
       onCreate: (name) => applyFilter([name]),
+      onRename: (oldName, newName) => void handleRenameProject(oldName, newName),
+      onDelete: (name) => void handleDeleteProject(name),
     }),
   );
 }

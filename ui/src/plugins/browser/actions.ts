@@ -3,10 +3,11 @@
  */
 
 import { renderProjectPicker } from "../../render/project-picker.ts";
+import { deleteApiProject, getCachedProjects } from "../../render/project-combo.ts";
 import { api, notify, dialogs, chatService, pluginDownload, layout } from "./deps.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
-import { updateBrowserToolbar } from "./render.ts";
+import { updateBrowserToolbar, updateBrowserProjectSelector } from "./render.ts";
 import { loadBrowserConversations, loadAvailableTags } from "./data.ts";
 
 export async function handleBrowserDelete(): Promise<void> {
@@ -154,4 +155,56 @@ export async function handleSetBrowserProject(chatId: string, projectId: string 
   // Refresh data.
   await loadBrowserConversations();
   await loadAvailableTags();
+}
+
+// ---------------------------------------------------------------------------
+// Project management (rename / delete)
+// ---------------------------------------------------------------------------
+
+export async function handleRenameProject(oldName: string, newName: string): Promise<void> {
+  const project = getCachedProjects().find((p) => p.name === oldName);
+  if (!project) {
+    notify.error("Project not found");
+    return;
+  }
+
+  const result = await api.updateProject(project.id, { name: newName });
+  if (!result.ok) {
+    notify.error(result.error ?? "Failed to rename project");
+    return;
+  }
+
+  // Server-side handler updates linked sessions' project_id.
+  project.name = newName;
+
+  // If filtering by old name, update filter.
+  if (search.projectFilter === oldName) {
+    search.projectFilter = newName;
+  }
+
+  await loadAvailableTags();
+  await loadBrowserConversations();
+  await chatService.refreshSidebar();
+}
+
+export async function handleDeleteProject(name: string): Promise<void> {
+  const confirmed = confirm(`Delete project "${name}"?\n\nConversations will be moved to Default.`);
+  if (!confirmed) return;
+
+  try {
+    await deleteApiProject(name);
+  } catch {
+    notify.error("Failed to delete project");
+    return;
+  }
+
+  // Clear filter if we were filtering by this project.
+  if (search.projectFilter === name) {
+    search.projectFilter = null;
+  }
+
+  notify.info(`Deleted project "${name}"`);
+  await loadAvailableTags();
+  await loadBrowserConversations();
+  await chatService.refreshSidebar();
 }

@@ -17,6 +17,7 @@ export function buildChatDOM(container: HTMLElement): void {
           <button id="sidebar-search-clear" class="browser-clear-btn hidden">${ICON_CLEAR}</button>
         </div>
       </div>
+      <button id="sidebar-new-project-btn" class="sidebar-new-project-btn">+ New Project</button>
       <div class="sidebar-content scroll-thin">
         <div id="sidebar-list">
           <div id="loader-sentinel" class="empty-state hidden">

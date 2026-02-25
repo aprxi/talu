@@ -1,8 +1,9 @@
 import { chatState } from "./state.ts";
 import { api, notifications, layout } from "./deps.ts";
-import { renderSidebar } from "./sidebar-list.ts";
-import { isPinned } from "../../render/helpers.ts";
+import { renderSidebar, refreshSidebar } from "./sidebar-list.ts";
+import { isPinned, el } from "../../render/helpers.ts";
 import { renderProjectPicker } from "../../render/project-picker.ts";
+import { getCachedProjects, deleteApiProject } from "../../render/project-combo.ts";
 
 /** Derive project list from loaded sessions (for the right-click project picker). */
 function getKnownProjects(): { value: string; count: number }[] {
@@ -100,6 +101,99 @@ export function showProjectContextMenu(anchor: HTMLElement, chatId: string): voi
     }),
     placement: "right",
   });
+}
+
+// ---------------------------------------------------------------------------
+// Project group management (right-click on sidebar group headers)
+// ---------------------------------------------------------------------------
+
+/** Show a right-click context menu on a project group header. */
+export function showGroupContextMenu(anchor: HTMLElement, projectName: string, nameSpan: HTMLElement): void {
+  const menu = el("div", "context-menu");
+
+  const renameBtn = el("button", "context-menu-item", "Rename");
+  const deleteBtn = el("button", "context-menu-item destructive", "Delete");
+  menu.appendChild(renameBtn);
+  menu.appendChild(deleteBtn);
+
+  const popover = layout.showPopover({ anchor, content: menu, placement: "right" });
+
+  renameBtn.addEventListener("click", () => {
+    popover.dispose();
+    beginInlineRename(nameSpan, projectName);
+  });
+
+  deleteBtn.addEventListener("click", () => {
+    popover.dispose();
+    void handleGroupDelete(projectName);
+  });
+}
+
+/** Make the group name span editable inline (same pattern as chat title rename). */
+function beginInlineRename(nameSpan: HTMLElement, oldName: string): void {
+  nameSpan.contentEditable = "plaintext-only";
+  nameSpan.focus();
+
+  // Select all text.
+  const range = document.createRange();
+  range.selectNodeContents(nameSpan);
+  const sel = window.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+
+  let committed = false;
+  const commit = () => {
+    if (committed) return;
+    committed = true;
+    nameSpan.removeEventListener("keydown", onKey);
+    nameSpan.contentEditable = "false";
+    const newName = (nameSpan.textContent ?? "").trim();
+    if (!newName || newName === oldName) {
+      nameSpan.textContent = oldName;
+      return;
+    }
+    void submitGroupRename(oldName, newName, nameSpan);
+  };
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); nameSpan.blur(); }
+    else if (e.key === "Escape") { e.preventDefault(); nameSpan.textContent = oldName; nameSpan.blur(); }
+  };
+
+  nameSpan.addEventListener("keydown", onKey);
+  nameSpan.addEventListener("blur", commit, { once: true });
+}
+
+async function submitGroupRename(oldName: string, newName: string, nameSpan: HTMLElement): Promise<void> {
+  const project = getCachedProjects().find((p) => p.name === oldName);
+  if (!project) {
+    notifications.error("Project not found");
+    nameSpan.textContent = oldName;
+    return;
+  }
+
+  const result = await api.updateProject(project.id, { name: newName });
+  if (!result.ok) {
+    notifications.error(result.error ?? "Failed to rename project");
+    nameSpan.textContent = oldName;
+    return;
+  }
+
+  project.name = newName;
+  await refreshSidebar();
+}
+
+async function handleGroupDelete(name: string): Promise<void> {
+  if (!confirm(`Delete "${name}"? Conversations will move to Default.`)) return;
+
+  try {
+    await deleteApiProject(name);
+  } catch {
+    notifications.error("Failed to delete project");
+    return;
+  }
+
+  await refreshSidebar();
 }
 
 export async function handleSetProject(chatId: string, projectId: string | null): Promise<void> {

@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection, RepoModelList, RepoSearchResponse } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection, RepoModelList, RepoSearchResponse, Project, ProjectList } from "./types.ts";
 
 const BASE = "";
 
@@ -55,6 +55,10 @@ export interface ApiClient {
   deleteRepoModel(modelId: string): Promise<ApiResult<void>>;
   pinRepoModel(modelId: string): Promise<ApiResult<void>>;
   unpinRepoModel(modelId: string): Promise<ApiResult<void>>;
+  listProjects(opts?: { limit?: number; search?: string }): Promise<ApiResult<ProjectList>>;
+  createProject(body: { name: string; description?: string }): Promise<ApiResult<Project>>;
+  updateProject(id: string, body: { name?: string; description?: string }): Promise<ApiResult<Project>>;
+  deleteProject(id: string): Promise<ApiResult<void>>;
 }
 
 export function createApiClient(fetchFn: FetchFn): ApiClient {
@@ -245,5 +249,13 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     deleteRepoModel: (modelId) => requestJson<void>("DELETE", `/v1/repo/models/${encodeURIComponent(modelId)}`),
     pinRepoModel: (modelId) => requestJson<void>("POST", `/v1/repo/pins`, { model_id: modelId }),
     unpinRepoModel: (modelId) => requestJson<void>("DELETE", `/v1/repo/pins/${encodeURIComponent(modelId)}`),
+    listProjects(opts?: { limit?: number; search?: string }) {
+      const params = new URLSearchParams({ limit: String(opts?.limit ?? 100) });
+      if (opts?.search) params.set("search", opts.search);
+      return requestJson<ProjectList>("GET", `/v1/projects?${params}`);
+    },
+    createProject: (body) => requestJson<Project>("POST", "/v1/projects", body),
+    updateProject: (id, body) => requestJson<Project>("PATCH", `/v1/projects/${encodeURIComponent(id)}`, body),
+    deleteProject: (id) => requestJson<void>("DELETE", `/v1/projects/${encodeURIComponent(id)}`),
   };
 }

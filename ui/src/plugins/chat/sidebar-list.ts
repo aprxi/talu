@@ -4,6 +4,7 @@ import { api, notifications, observe, getModelsService } from "./deps.ts";
 import { renderSidebarItem, renderSectionLabel } from "../../render/sidebar.ts";
 import { renderEmptyState } from "../../render/common.ts";
 import { el, isPinned, isArchived } from "../../render/helpers.ts";
+import { getCachedProjects, createApiProject, loadApiProjects } from "../../render/project-combo.ts";
 import { CHEVRON_DOWN_ICON, CHEVRON_RIGHT_ICON } from "../../icons.ts";
 import type { Conversation } from "../../types.ts";
 
@@ -11,6 +12,12 @@ import type { Conversation } from "../../types.ts";
 let onNewChat: ((projectId: string | null) => void) | null = null;
 export function setNewChatHandler(handler: (projectId: string | null) => void): void {
   onNewChat = handler;
+}
+
+/** Callback for right-click on project group headers. Set by sidebar-events. */
+let onGroupContextMenu: ((anchor: HTMLElement, projectName: string, nameSpan: HTMLElement) => void) | null = null;
+export function setGroupContextMenuHandler(handler: (anchor: HTMLElement, projectName: string, nameSpan: HTMLElement) => void): void {
+  onGroupContextMenu = handler;
 }
 
 const COLLAPSED_LIMIT = 3;
@@ -48,14 +55,6 @@ export function renderSidebar(): void {
 
   // Show/hide sentinel
   dom.sidebarSentinel.style.display = chatState.pagination.hasMore ? "flex" : "none";
-
-  if (chatState.sessions.length === 0) {
-    dom.sidebarList.insertBefore(
-      renderEmptyState("No conversations"),
-      dom.sidebarSentinel,
-    );
-    return;
-  }
 
   // Filter out archived, then apply search
   const visible = chatState.sessions.filter((s) => !isArchived(s));
@@ -101,17 +100,24 @@ function renderGroupedList(
   filtered: Conversation[],
   isGen: (id: string) => boolean,
 ): void {
-  if (filtered.length === 0) {
-    dom.sidebarList.insertBefore(renderEmptyState("No conversations"), dom.sidebarSentinel);
-    return;
-  }
-
   // Group by project, discovering groups from data.
   const groupMap = new Map<string, Conversation[]>();
   for (const s of filtered) {
     const key = projectKey(s);
     if (!groupMap.has(key)) groupMap.set(key, []);
     groupMap.get(key)!.push(s);
+  }
+
+  // Merge empty projects from API cache so they appear as groups.
+  for (const project of getCachedProjects()) {
+    if (!groupMap.has(project.name)) {
+      groupMap.set(project.name, []);
+    }
+  }
+
+  if (groupMap.size === 0) {
+    dom.sidebarList.insertBefore(renderEmptyState("No conversations"), dom.sidebarSentinel);
+    return;
   }
 
   // Stable sort: "__default__" first, then alphabetical.
@@ -125,7 +131,6 @@ function renderGroupedList(
 
   for (const pValue of sortedKeys) {
     const sessions = groupMap.get(pValue)!;
-    if (sessions.length === 0) continue;
 
     const pinned = sessions.filter(isPinned);
     const unpinned = sessions.filter((s) => !isPinned(s));
@@ -159,12 +164,25 @@ function renderGroupedList(
       label.appendChild(collapseBtn);
     }
 
-    label.appendChild(el("span", "sidebar-group-name", displayName));
+    const nameSpan = el("span", "sidebar-group-name", displayName);
+    label.appendChild(nameSpan);
+
+    // Conversation count badge.
+    label.appendChild(el("span", "sidebar-group-count", String(sessions.length)));
 
     // Clicking anywhere on the header row toggles collapse.
     if (multiGroup) {
       label.style.cursor = "pointer";
       label.addEventListener("click", toggleCollapse);
+    }
+
+    // Right-click on group header → context menu (skip for Default).
+    if (onGroupContextMenu && pValue !== "__default__") {
+      label.addEventListener("contextmenu", (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        onGroupContextMenu!(label, pValue, nameSpan);
+      });
     }
 
     const controls = el("span", "sidebar-group-controls");
@@ -267,12 +285,17 @@ function renderGroupedList(
       dom.sidebarList.insertBefore(showMoreLine, dom.sidebarSentinel);
     }
   }
+
 }
 
 export async function refreshSidebar(): Promise<void> {
   chatState.pagination.isLoading = true;
 
-  const result = await api.listConversations({ offset: 0, limit: 100 });
+  // Reload both sessions and project cache in parallel so empty projects persist.
+  const [result] = await Promise.all([
+    api.listConversations({ offset: 0, limit: 100 }),
+    loadApiProjects(),
+  ]);
   chatState.pagination.isLoading = false;
 
   if (!result.ok || !result.data) {
@@ -284,6 +307,36 @@ export async function refreshSidebar(): Promise<void> {
   chatState.pagination.offset = result.data.data.length;
   chatState.pagination.hasMore = result.data.has_more;
   renderSidebar();
+}
+
+/** Show an inline input at the top of the sidebar list for creating a new project. */
+export function showNewProjectInput(): void {
+  const dom = getChatDom();
+  const existing = dom.sidebarList.querySelector(".sidebar-new-project-input");
+  if (existing) { (existing as HTMLInputElement).focus(); return; }
+
+  const input = el("input", "sidebar-new-project-input");
+  input.type = "text";
+  input.placeholder = "Project name\u2026";
+  dom.sidebarList.insertBefore(input, dom.sidebarList.firstChild);
+  input.focus();
+
+  let submitted = false;
+  const submit = () => {
+    if (submitted) return;
+    submitted = true;
+    const name = input.value.trim();
+    input.remove();
+    if (name) {
+      void createApiProject(name).then(() => renderSidebar());
+    }
+  };
+
+  input.addEventListener("keydown", (e) => {
+    if (e.key === "Enter") { e.preventDefault(); submit(); }
+    else if (e.key === "Escape") { e.preventDefault(); input.remove(); }
+  });
+  input.addEventListener("blur", () => submit());
 }
 
 export function setupInfiniteScroll(): void {

@@ -4,42 +4,96 @@
  * Displays "All", "Default" (sessions with no project), and named projects
  * with counts. A "+" button reveals an inline input for creating new projects.
  *
- * User-created project names are persisted in localStorage so they survive
- * page refreshes even before any sessions are assigned to them.
+ * Projects are persisted via the /v1/projects API. A module-level cache
+ * avoids blocking renders; call `loadApiProjects()` to prime it.
  */
 
 import { el } from "./helpers.ts";
+import type { ApiClient } from "../api.ts";
+import type { Project } from "../types.ts";
 
-const STORAGE_KEY = "talu-user-projects";
+// ---------------------------------------------------------------------------
+// Module-level project cache (loaded from API, used synchronously at render)
+// ---------------------------------------------------------------------------
 
-/** Read user-created project names from localStorage. */
-function loadUserProjects(): string[] {
+let cachedProjects: Project[] = [];
+let apiRef: ApiClient | null = null;
+
+/** Set the API client used for project CRUD. Call once at boot. */
+export function initProjectStore(api: ApiClient): void {
+  apiRef = api;
+}
+
+/** Load projects from the API into the cache. Returns the project list. */
+export async function loadApiProjects(): Promise<Project[]> {
+  if (!apiRef) return cachedProjects;
+  const result = await apiRef.listProjects({ limit: 100 });
+  if (result.ok && result.data) {
+    cachedProjects = result.data.data;
+  }
+  return cachedProjects;
+}
+
+/** Get cached project list (synchronous — call loadApiProjects first). */
+export function getCachedProjects(): Project[] {
+  return cachedProjects;
+}
+
+/** Create a project via the API and add to cache. Returns the new project name. */
+export async function createApiProject(name: string): Promise<string> {
+  if (!apiRef) return name;
+  const result = await apiRef.createProject({ name });
+  if (result.ok && result.data) {
+    // Avoid duplicates in cache.
+    if (!cachedProjects.some((p) => p.id === result.data!.id)) {
+      cachedProjects.push(result.data);
+    }
+  }
+  return name;
+}
+
+/** Delete a project by name via the API and remove from cache. */
+export async function deleteApiProject(name: string): Promise<void> {
+  if (!apiRef) return;
+  const project = cachedProjects.find((p) => p.name === name);
+  if (project) {
+    await apiRef.deleteProject(project.id);
+    cachedProjects = cachedProjects.filter((p) => p.id !== project.id);
+  }
+}
+
+/** One-time migration: move localStorage projects to the API. */
+export async function migrateLocalStorageProjects(): Promise<void> {
+  const STORAGE_KEY = "talu-user-projects";
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
-    return [];
-  }
-}
+    if (!raw) return;
+    const names: string[] = JSON.parse(raw);
+    if (!Array.isArray(names) || names.length === 0) return;
 
-/** Save a user-created project name to localStorage. */
-export function addUserProject(name: string): void {
-  const list = loadUserProjects();
-  if (!list.includes(name)) {
-    list.push(name);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-  }
-}
+    // Load existing API projects first to avoid duplicates.
+    await loadApiProjects();
+    const existingNames = new Set(cachedProjects.map((p) => p.name));
 
-/** Remove a user-created project name from localStorage. */
-export function removeUserProject(name: string): void {
-  const list = loadUserProjects().filter((n) => n !== name);
-  if (list.length > 0) {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(list));
-  } else {
+    for (const name of names) {
+      if (name && !existingNames.has(name)) {
+        await createApiProject(name);
+      }
+    }
+
+    // Clear localStorage after successful migration.
     localStorage.removeItem(STORAGE_KEY);
+  } catch {
+    // Migration is best-effort; don't block startup.
   }
 }
+
+// ---------------------------------------------------------------------------
+// Render
+// ---------------------------------------------------------------------------
+
+const EDIT_ICON_SM = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>`;
+const DELETE_ICON_SM = `<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M19 6v14c0 1-1 2-2 2H7c-1 0-2-1-2-2V6"/><path d="M8 6V4c0-1 1-2 2-2h4c1 0 2 1 2 2v2"/></svg>`;
 
 export interface ProjectListOptions {
   /** Currently selected project IDs (empty = All). */
@@ -48,27 +102,23 @@ export interface ProjectListOptions {
   projects: { value: string; count: number }[];
   /** Called with the updated selection array after a toggle. */
   onSelect: (projectIds: string[]) => void;
-  /** Called when user creates a new project via the "+" input. */
+  /** Called when user creates a new project via the "+ New" input. */
   onCreate: (name: string) => void;
+  /** Called after inline rename is committed. Receives old and new name. */
+  onRename?: (oldName: string, newName: string) => void;
+  /** Called when user clicks the delete action on a project row. */
+  onDelete?: (projectName: string) => void;
 }
 
 export function renderProjectList(options: ProjectListOptions): HTMLElement {
   const { currentValues, projects, onSelect, onCreate } = options;
   const root = el("div", "project-list");
 
-  // Header: "Projects" label + "+" button.
+  // Header: "Projects" label + "+ New" button.
   const header = el("div", "project-list-header");
-  const label = el("span", undefined, "Projects");
-  header.appendChild(label);
+  header.appendChild(el("span", undefined, "Projects"));
 
-  if (currentValues.length > 0) {
-    const clearBtn = el("button", "project-list-clear", "\u00d7");
-    clearBtn.title = "Clear selection";
-    clearBtn.addEventListener("click", () => onSelect([]));
-    header.appendChild(clearBtn);
-  }
-
-  const addBtn = el("button", "project-list-add", "+");
+  const addBtn = el("button", "project-list-add", "+ New");
   addBtn.title = "New project";
   header.appendChild(addBtn);
   root.appendChild(header);
@@ -76,34 +126,28 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
   // Items container.
   const items = el("div", "project-list-items");
 
+  // "All" row — clears filter.
+  let totalCount = 0;
+  for (const p of projects) totalCount += p.count;
+  const isAllActive = currentValues.length === 0;
+  const allRow = el("div", isAllActive ? "project-list-row active" : "project-list-row");
+  allRow.appendChild(el("span", "project-list-row-name", "All"));
+  allRow.appendChild(el("span", "project-list-row-count", String(totalCount)));
+  allRow.addEventListener("click", () => onSelect([]));
+  items.appendChild(allRow);
+
   // Collect project names already in the aggregation.
   const aggValues = new Set(projects.map((p) => p.value));
 
   // Render __default__ and named projects from aggregation.
   for (const p of projects) {
-    const isActive = currentValues.includes(p.value);
-    const btn = el("button", isActive ? "project-list-item active" : "project-list-item");
-    btn.dataset["value"] = p.value;
-
-    const displayName = p.value === "__default__" ? "Default" : p.value;
-    const nameText = document.createTextNode(displayName);
-    btn.appendChild(nameText);
-
-    const count = el("span", "count", String(p.count));
-    btn.appendChild(count);
-
-    items.appendChild(btn);
+    items.appendChild(buildProjectRow(p.value, p.count, currentValues, onSelect, options));
   }
 
-  // Merge user-created projects that aren't yet in the aggregation (0 sessions).
-  for (const name of loadUserProjects()) {
-    if (aggValues.has(name)) continue;
-    const isActive = currentValues.includes(name);
-    const btn = el("button", isActive ? "project-list-item active" : "project-list-item");
-    btn.dataset["value"] = name;
-    btn.appendChild(document.createTextNode(name));
-    btn.appendChild(el("span", "count", "0"));
-    items.appendChild(btn);
+  // Merge API-cached projects that aren't yet in the aggregation (0 sessions).
+  for (const project of cachedProjects) {
+    if (aggValues.has(project.name)) continue;
+    items.appendChild(buildProjectRow(project.name, 0, currentValues, onSelect, options));
   }
 
   root.appendChild(items);
@@ -117,22 +161,6 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
   root.appendChild(createSection);
 
   // -- Events --
-
-  items.addEventListener("click", (e) => {
-    const target = (e.target as HTMLElement).closest<HTMLElement>(".project-list-item");
-    if (!target || target.dataset["value"] == null) return;
-
-    const value = target.dataset["value"]!;
-    // Toggle: add if not present, remove if present.
-    const next = [...currentValues];
-    const idx = next.indexOf(value);
-    if (idx >= 0) {
-      next.splice(idx, 1);
-    } else {
-      next.push(value);
-    }
-    onSelect(next);
-  });
 
   addBtn.addEventListener("click", () => {
     createSection.classList.toggle("hidden");
@@ -148,7 +176,7 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
       const name = createInput.value.trim();
       if (name) {
         createSection.classList.add("hidden");
-        addUserProject(name);
+        void createApiProject(name);
         onCreate(name);
       }
     } else if (e.key === "Escape") {
@@ -158,11 +186,107 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
   });
 
   createInput.addEventListener("blur", () => {
-    // Small delay so that Enter can fire before blur hides the input.
     setTimeout(() => createSection.classList.add("hidden"), 150);
   });
 
   return root;
+}
+
+function buildProjectRow(
+  value: string,
+  count: number,
+  currentValues: string[],
+  onSelect: (ids: string[]) => void,
+  options: ProjectListOptions,
+): HTMLElement {
+  const isActive = currentValues.includes(value);
+  const row = el("div", isActive ? "project-list-row active" : "project-list-row");
+  row.dataset["value"] = value;
+
+  const displayName = value === "__default__" ? "Default" : value;
+  const nameSpan = el("span", "project-list-row-name", displayName);
+  row.appendChild(nameSpan);
+  row.appendChild(el("span", "project-list-row-count", String(count)));
+
+  // Named projects (not __default__) get edit/delete actions on hover.
+  const isManageable = value !== "__default__" && (options.onRename || options.onDelete);
+  if (isManageable) {
+    const actions = el("span", "project-list-row-actions");
+    if (options.onRename) {
+      const editBtn = el("button", "project-list-row-btn");
+      editBtn.dataset["action"] = "edit";
+      editBtn.title = "Rename";
+      editBtn.innerHTML = EDIT_ICON_SM;
+      editBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        beginRowRename(nameSpan, value, options.onRename!);
+      });
+      actions.appendChild(editBtn);
+    }
+    if (options.onDelete) {
+      const delBtn = el("button", "project-list-row-btn");
+      delBtn.dataset["action"] = "delete";
+      delBtn.title = "Delete";
+      delBtn.innerHTML = DELETE_ICON_SM;
+      delBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        options.onDelete!(value);
+      });
+      actions.appendChild(delBtn);
+    }
+    row.appendChild(actions);
+  }
+
+  row.addEventListener("click", () => {
+    const next = [...currentValues];
+    const idx = next.indexOf(value);
+    if (idx >= 0) {
+      next.splice(idx, 1);
+    } else {
+      next.push(value);
+    }
+    onSelect(next);
+  });
+
+  return row;
+}
+
+/** Make a project row name editable inline. */
+function beginRowRename(
+  nameSpan: HTMLElement,
+  oldName: string,
+  onCommit: (oldName: string, newName: string) => void,
+): void {
+  nameSpan.contentEditable = "plaintext-only";
+  nameSpan.focus();
+
+  const range = document.createRange();
+  range.selectNodeContents(nameSpan);
+  const sel = window.getSelection();
+  sel?.removeAllRanges();
+  sel?.addRange(range);
+
+  let committed = false;
+  const commit = () => {
+    if (committed) return;
+    committed = true;
+    nameSpan.removeEventListener("keydown", onKey);
+    nameSpan.contentEditable = "false";
+    const newName = (nameSpan.textContent ?? "").trim();
+    if (!newName || newName === oldName) {
+      nameSpan.textContent = oldName;
+      return;
+    }
+    onCommit(oldName, newName);
+  };
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === "Enter" || e.key === "Tab") { e.preventDefault(); nameSpan.blur(); }
+    else if (e.key === "Escape") { e.preventDefault(); nameSpan.textContent = oldName; nameSpan.blur(); }
+  };
+
+  nameSpan.addEventListener("keydown", onKey);
+  nameSpan.addEventListener("blur", commit, { once: true });
 }
 
 // Keep old name as alias for any stale imports during transition.

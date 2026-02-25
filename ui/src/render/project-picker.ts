@@ -6,6 +6,7 @@
  */
 
 import { el } from "./helpers.ts";
+import { createApiProject } from "./project-combo.ts";
 
 export interface ProjectPickerOptions {
   /** Current project_id of the session (null if unassigned). */
@@ -86,7 +87,12 @@ export function renderProjectPicker(options: ProjectPickerOptions): HTMLElement 
     if (e.key === "Enter") {
       e.preventDefault();
       const val = input.value.trim();
-      if (val) onSelect(val);
+      if (val) {
+        // Create project via API if it's a new name.
+        const isNew = !projects.some((p) => p.value === val);
+        if (isNew) void createApiProject(val);
+        onSelect(val);
+      }
     }
   });
 
@@ -97,6 +103,10 @@ export function renderProjectPicker(options: ProjectPickerOptions): HTMLElement 
     if (target?.dataset["value"] != null) {
       // __default__ means "remove from project" (set project_id to null).
       const val = target.dataset["value"];
+      // Create via API if this is the "Create" row.
+      if (target.classList.contains("project-picker-create")) {
+        void createApiProject(val);
+      }
       onSelect(val === "__default__" ? null : val);
     }
   });
