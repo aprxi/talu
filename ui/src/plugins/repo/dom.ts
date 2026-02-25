@@ -3,8 +3,6 @@
 export interface RepoDom {
   search: HTMLInputElement;
   searchClear: HTMLButtonElement;
-  tabDiscover: HTMLButtonElement;
-  tabLocal: HTMLButtonElement;
   sourceAll: HTMLButtonElement;
   sourceHub: HTMLButtonElement;
   sourceManaged: HTMLButtonElement;
@@ -44,8 +42,6 @@ export function getRepoDom(): RepoDom {
   cached = {
     search: root.querySelector<HTMLInputElement>("#rp-search")!,
     searchClear: root.querySelector<HTMLButtonElement>("#rp-search-clear")!,
-    tabDiscover: root.querySelector<HTMLButtonElement>("#rp-tab-discover")!,
-    tabLocal: root.querySelector<HTMLButtonElement>("#rp-tab-local")!,
     sourceAll: root.querySelector<HTMLButtonElement>("#rp-source-all")!,
     sourceHub: root.querySelector<HTMLButtonElement>("#rp-source-hub")!,
     sourceManaged: root.querySelector<HTMLButtonElement>("#rp-source-managed")!,

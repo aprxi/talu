@@ -6,39 +6,11 @@ import {
   SEARCH_ICON as ICON_SEARCH,
   CLOSE_ICON as ICON_CLEAR,
   EXPORT_ICON as ICON_UPLOAD,
-  ARCHIVE_BOX_ICON as ICON_ARCHIVE,
 } from "../../icons.ts";
-
-const ICON_FILE = `<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7.5L14.5 2z"/><polyline points="14 2 14 8 20 8"/></svg>`;
 
 export function buildFilesDOM(root: HTMLElement): void {
   root.innerHTML = `
-    <div style="display: flex; height: 100%; overflow: hidden;">
-      <!-- Left sidebar -->
-      <div class="browser-sidebar">
-        <!-- Status tabs -->
-        <div class="panel-section">
-          <div class="panel-heading">Status</div>
-          <div>
-            <button id="fp-tab-all" class="browser-tab active" data-tab="all">
-              ${ICON_FILE}
-              Active
-            </button>
-            <button id="fp-tab-archived" class="browser-tab" data-tab="archived">
-              ${ICON_ARCHIVE}
-              Archived
-            </button>
-          </div>
-        </div>
-
-        <div class="panel-section">
-          <div class="panel-heading">Storage</div>
-          <div id="fp-stats" class="files-stats">Loading...</div>
-        </div>
-
-        <div class="flex-1"></div>
-      </div>
-
+    <div style="display: flex; flex: 1; min-height: 0; overflow: hidden;">
       <!-- Main content -->
       <div class="browser-main files-main-drop">
         <!-- Top bar -->
@@ -61,6 +33,7 @@ export function buildFilesDOM(root: HTMLElement): void {
             ${ICON_UPLOAD} Upload
           </button>
           <input id="fp-file-input" type="file" multiple style="display:none">
+          <span id="fp-stats" class="files-stats"></span>
         </div>
 
         <!-- Table -->
@@ -92,7 +65,7 @@ export function buildFilesDOM(root: HTMLElement): void {
         </div>
         <div id="fp-preview-content" class="files-preview-body"></div>
       </div>
-    </div>
+      </div>
   `;
 
 }

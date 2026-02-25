@@ -7,31 +7,11 @@ import type { Disposable } from "../../kernel/types.ts";
 import { timers } from "./deps.ts";
 import { fState, type SortColumn } from "./state.ts";
 import { getFilesDom } from "./dom.ts";
-import { renderFilesTable, renderPreview, syncFilesTabs, updateFilesToolbar } from "./render.ts";
-import { loadFiles, refreshFiles, renameFile, deleteFile, uploadFiles, archiveFiles, restoreFiles, deleteFiles } from "./data.ts";
+import { renderFilesTable, renderPreview, updateFilesToolbar } from "./render.ts";
+import { loadFiles, renameFile, deleteFile, uploadFiles, archiveFiles, restoreFiles, deleteFiles } from "./data.ts";
 
 export function wireFileEvents(): void {
   const dom = getFilesDom();
-
-  // -- Tabs -----------------------------------------------------------------
-
-  dom.tabAll.addEventListener("click", () => {
-    if (fState.tab === "all") return;
-    fState.tab = "all";
-    fState.selectedIds.clear();
-    fState.selectedFileId = null;
-    syncFilesTabs();
-    refreshFiles();
-  });
-
-  dom.tabArchived.addEventListener("click", () => {
-    if (fState.tab === "archived") return;
-    fState.tab = "archived";
-    fState.selectedIds.clear();
-    fState.selectedFileId = null;
-    syncFilesTabs();
-    refreshFiles();
-  });
 
   // -- Bulk actions ---------------------------------------------------------
 

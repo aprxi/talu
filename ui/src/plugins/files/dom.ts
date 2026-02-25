@@ -16,8 +16,6 @@ export interface FilesDom {
   dropOverlay: HTMLElement;
   previewPanel: HTMLElement;
   previewContent: HTMLElement;
-  tabAll: HTMLButtonElement;
-  tabArchived: HTMLButtonElement;
   selectAllBtn: HTMLButtonElement;
   archiveBtn: HTMLButtonElement;
   restoreBtn: HTMLButtonElement;
@@ -52,8 +50,6 @@ export function getFilesDom(): FilesDom {
     dropOverlay: q("#fp-drop-overlay"),
     previewPanel: q("#fp-preview"),
     previewContent: q("#fp-preview-content"),
-    tabAll: q("#fp-tab-all") as HTMLButtonElement,
-    tabArchived: q("#fp-tab-archived") as HTMLButtonElement,
     selectAllBtn: q("#fp-select-all") as HTMLButtonElement,
     archiveBtn: q("#fp-archive") as HTMLButtonElement,
     restoreBtn: q("#fp-restore") as HTMLButtonElement,

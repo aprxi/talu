@@ -7,13 +7,14 @@ import { buildRepoDOM } from "./build-dom.ts";
 import { initRepoDom } from "./dom.ts";
 import { wireRepoEvents } from "./events.ts";
 import { repoState } from "./state.ts";
-import { loadModels } from "./data.ts";
+import { loadModels, searchHub } from "./data.ts";
 import {
   renderModelsTable,
   renderStats,
   syncRepoTabs,
   updateRepoToolbar,
 } from "./render.ts";
+import { getRepoDom } from "./dom.ts";
 
 export const repoPlugin: PluginDefinition = {
   manifest: {
@@ -51,6 +52,24 @@ export const repoPlugin: PluginDefinition = {
     ctx.events.on<{ to: string }>("mode.changed", ({ to }) => {
       if (to === "models") {
         initRepoView();
+      }
+    });
+
+    ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
+      if (tab !== "discover" && tab !== "local") return;
+      if (tab === repoState.tab) return;
+      const dom = getRepoDom();
+      repoState.tab = tab;
+      repoState.selectedIds.clear();
+      repoState.searchQuery = "";
+      dom.search.value = "";
+      dom.searchClear.classList.add("hidden");
+      syncRepoTabs();
+      updateRepoToolbar();
+      if (tab === "discover") {
+        searchHub(repoState.searchQuery);
+      } else {
+        renderModelsTable();
       }
     });
 

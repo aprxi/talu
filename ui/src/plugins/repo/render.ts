@@ -365,9 +365,6 @@ export function syncRepoTabs(): void {
   const dom = getRepoDom();
   const { tab } = repoState;
 
-  dom.tabDiscover.classList.toggle("active", tab === "discover");
-  dom.tabLocal.classList.toggle("active", tab === "local");
-
   dom.discoverView.classList.toggle("hidden", tab !== "discover");
   dom.discoverToolbar.classList.toggle("hidden", tab !== "discover");
   dom.localView.classList.toggle("hidden", tab !== "local");

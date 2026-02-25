@@ -11,6 +11,7 @@ import type { EventBusImpl } from "../system/event-bus.ts";
 import { updateProvenance } from "./provenance.ts";
 
 const STORAGE_KEY = "talu-last-active-mode";
+const CHAT_GROUP_MODES = new Set(["chat", "conversations", "prompts"]);
 
 export class ModeManager {
   private active: string;
@@ -53,9 +54,20 @@ export class ModeManager {
     }
 
     // Update activity bar button states.
+    // Keep the chat button active for all chat-group sub-modes.
     for (const btn of document.querySelectorAll<HTMLElement>(".activity-btn")) {
       const btnMode = btn.getAttribute("data-mode");
-      if (btnMode === mode) {
+      if (btnMode === mode || (btnMode === "chat" && CHAT_GROUP_MODES.has(mode))) {
+        btn.classList.add("active");
+      } else {
+        btn.classList.remove("active");
+      }
+    }
+
+    // Update subnav button active states (only mode-switching buttons;
+    // tab-switching buttons are managed by their own click handlers).
+    for (const btn of document.querySelectorAll<HTMLElement>(".subnav-btn[data-nav-mode]")) {
+      if (btn.getAttribute("data-nav-mode") === mode) {
         btn.classList.add("active");
       } else {
         btn.classList.remove("active");
@@ -98,16 +110,71 @@ export class ModeManager {
       const btn = e.target.closest<HTMLElement>(".activity-btn");
       if (!btn) return;
       const mode = btn.getAttribute("data-mode");
-      if (mode) {
-        this.switchMode(mode);
-      }
+      if (!mode) return;
+
+      this.switchMode(mode);
     };
 
     const bar = document.getElementById("activity-bar");
     if (bar) {
       bar.addEventListener("click", handler);
+
+      // Logo click → new chat (delegates to the chat activity button).
+      const logo = bar.querySelector<HTMLElement>(".topnav-logo");
+      const logoHandler = () => {
+        document.querySelector<HTMLElement>('.activity-btn[data-mode="chat"]')?.click();
+      };
+      if (logo) logo.addEventListener("click", logoHandler);
+
       return {
-        dispose: () => bar.removeEventListener("click", handler),
+        dispose: () => {
+          bar.removeEventListener("click", handler);
+          if (logo) logo.removeEventListener("click", logoHandler);
+        },
+      };
+    }
+    return { dispose() {} };
+  }
+
+  /** Install click handlers on the subnav sidebar buttons. Returns a Disposable for cleanup. */
+  installChatGroupNavListeners(): Disposable {
+    const handler = (e: Event) => {
+      if (!(e.target instanceof Element)) return;
+      const btn = e.target.closest<HTMLElement>(".subnav-btn");
+      if (!btn) return;
+
+      // Mode-switching buttons (chat group).
+      const mode = btn.getAttribute("data-nav-mode");
+      if (mode) {
+        // For chat mode: delegate to the activity-bar chat button so the
+        // chat plugin's "new conversation" handler also fires.
+        if (mode === "chat") {
+          document.querySelector<HTMLElement>('.activity-btn[data-mode="chat"]')?.click();
+          return;
+        }
+        this.switchMode(mode);
+        return;
+      }
+
+      // Tab-switching buttons (files, models).
+      const tab = btn.getAttribute("data-nav-tab");
+      if (tab) {
+        const group = btn.closest<HTMLElement>(".subnav-group");
+        // Sync active state within this group.
+        if (group) {
+          for (const b of group.querySelectorAll<HTMLElement>(".subnav-btn")) {
+            b.classList.toggle("active", b === btn);
+          }
+        }
+        this.eventBus.emit("subnav.tab", { tab });
+      }
+    };
+
+    const nav = document.getElementById("subnav");
+    if (nav) {
+      nav.addEventListener("click", handler);
+      return {
+        dispose: () => nav.removeEventListener("click", handler),
       };
     }
     return { dispose() {} };

@@ -71,8 +71,6 @@ function kindLabel(kind?: string, mimeType?: string): string {
 
 export function syncFilesTabs(): void {
   const dom = getFilesDom();
-  dom.tabAll.className = `browser-tab${fState.tab === "all" ? " active" : ""}`;
-  dom.tabArchived.className = `browser-tab${fState.tab === "archived" ? " active" : ""}`;
 
   if (fState.tab === "all") {
     dom.archiveBtn.classList.remove("hidden");

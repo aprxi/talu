@@ -2,9 +2,6 @@
 
 import { SEARCH_ICON as ICON_SEARCH, CLOSE_ICON as ICON_CLEAR } from "../../icons.ts";
 
-const ICON_DB_SM = `<svg xmlns="http://www.w3.org/2000/svg" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>`;
-const ICON_HUB = `<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>`;
-
 const TABLE_HEADER = `<tr>
   <th class="files-th files-th-check"></th>
   <th class="files-th" style="min-width:200px" data-sort="name">Model</th>
@@ -18,25 +15,7 @@ const TABLE_HEADER = `<tr>
 
 export function buildRepoDOM(container: HTMLElement): void {
   container.innerHTML = `
-<div style="display: flex; height: 100%; overflow: hidden;">
-  <!-- Left sidebar -->
-  <div class="browser-sidebar">
-    <div class="panel-section">
-      <div class="panel-heading">View</div>
-      <div>
-        <button id="rp-tab-discover" class="browser-tab active" data-tab="discover">${ICON_HUB} Discover</button>
-        <button id="rp-tab-local" class="browser-tab" data-tab="local">${ICON_DB_SM} Local</button>
-      </div>
-    </div>
-    <div class="panel-section">
-      <div class="panel-heading">Storage</div>
-      <div id="rp-stats" class="files-stats">Loading...</div>
-    </div>
-    <div class="flex-1"></div>
-  </div>
-
-  <!-- Main content -->
-  <div class="browser-main">
+<div class="browser-main" style="height: 100%; overflow: hidden;">
     <!-- Header toolbar -->
     <div class="browser-header">
       <div class="search-wrapper">
@@ -97,6 +76,7 @@ export function buildRepoDOM(container: HTMLElement): void {
         <button id="rp-cancel" class="btn btn-ghost btn-sm hidden">Cancel</button>
         <span id="rp-count" class="files-count"></span>
       </div>
+      <span id="rp-stats" class="files-stats"></span>
     </div>
 
     <!-- Active downloads strip -->
@@ -118,7 +98,6 @@ export function buildRepoDOM(container: HTMLElement): void {
         </table>
       </div>
     </div>
-  </div>
-</div>`;
+  </div>`;
 
 }

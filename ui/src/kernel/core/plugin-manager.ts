@@ -482,6 +482,7 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
 
   // Activate mode manager after plugins are running (so they can listen for mode.changed).
   kernelDisposables.track(modeManager.installActivityBarListeners());
+  kernelDisposables.track(modeManager.installChatGroupNavListeners());
   modeManager.restoreLastMode();
 
   // Load third-party plugins (skipped in safe mode).

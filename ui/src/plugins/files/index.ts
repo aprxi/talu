@@ -67,6 +67,16 @@ export const filesPlugin: PluginDefinition = {
       }
     });
 
+    ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
+      if (tab !== "all" && tab !== "archived") return;
+      if (tab === fState.tab) return;
+      fState.tab = tab;
+      fState.selectedIds.clear();
+      fState.selectedFileId = null;
+      syncFilesTabs();
+      refreshFiles();
+    });
+
     ctx.log.info("Files plugin ready.");
   },
 };

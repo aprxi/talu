@@ -6,7 +6,6 @@ import { getRepoDom } from "./dom.ts";
 import { repoState } from "./state.ts";
 import type { LocalSourceFilter } from "./state.ts";
 import {
-  loadModels,
   searchHub,
   deleteModel,
   pinModel,
@@ -19,36 +18,12 @@ import {
 import {
   renderModelsTable,
   renderDiscoverResults,
-  syncRepoTabs,
   syncSourceToggle,
   updateRepoToolbar,
 } from "./render.ts";
 
 export function wireRepoEvents(): void {
   const dom = getRepoDom();
-
-  // -----------------------------------------------------------------------
-  // Tabs (Discover / Local)
-  // -----------------------------------------------------------------------
-
-  for (const btn of [dom.tabDiscover, dom.tabLocal]) {
-    btn.addEventListener("click", () => {
-      const tab = btn.dataset["tab"] as typeof repoState.tab;
-      if (tab === repoState.tab) return;
-      repoState.tab = tab;
-      repoState.selectedIds.clear();
-      repoState.searchQuery = "";
-      dom.search.value = "";
-      dom.searchClear.classList.add("hidden");
-      syncRepoTabs();
-      updateRepoToolbar();
-      if (tab === "discover") {
-        searchHub(repoState.searchQuery);
-      } else {
-        renderModelsTable();
-      }
-    });
-  }
 
   // -----------------------------------------------------------------------
   // Source toggle (All / HuggingFace / Managed)
