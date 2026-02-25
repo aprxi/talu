@@ -2852,6 +2852,50 @@ fn validate_max_output_tokens(max_output_tokens: Option<i64>) -> std::result::Re
     Ok(())
 }
 
+fn validate_max_tool_calls(max_tool_calls: Option<i64>) -> std::result::Result<(), String> {
+    let Some(max_tool_calls) = max_tool_calls else {
+        return Ok(());
+    };
+    if max_tool_calls < 1 {
+        return Err("`max_tool_calls` must be at least 1".to_string());
+    }
+    Ok(())
+}
+
+fn validate_prompt_cache_key(prompt_cache_key: Option<&str>) -> std::result::Result<(), String> {
+    let Some(prompt_cache_key) = prompt_cache_key else {
+        return Ok(());
+    };
+    if prompt_cache_key.chars().count() <= 64 {
+        return Ok(());
+    }
+    Err("`prompt_cache_key` must be at most 64 characters".to_string())
+}
+
+fn validate_metadata(metadata: Option<&serde_json::Value>) -> std::result::Result<(), String> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    let obj = metadata
+        .as_object()
+        .ok_or_else(|| "`metadata` must be an object".to_string())?;
+    if obj.len() > 16 {
+        return Err("`metadata` must have at most 16 entries".to_string());
+    }
+    for (key, value) in obj {
+        if key.chars().count() > 64 {
+            return Err("`metadata` keys must be at most 64 characters".to_string());
+        }
+        let value = value
+            .as_str()
+            .ok_or_else(|| "`metadata` values must be strings".to_string())?;
+        if value.chars().count() > 512 {
+            return Err("`metadata` values must be at most 512 characters".to_string());
+        }
+    }
+    Ok(())
+}
+
 fn parse_stream_options_config(
     stream_options: Option<&serde_json::Value>,
 ) -> std::result::Result<(), String> {
@@ -2919,6 +2963,11 @@ fn validate_responses_request(request: &responses_types::CreateResponseBody) -> 
         if !(input.is_string() || input.is_array() || input.is_null()) {
             return Err("`input` must be a string, an array, or null".to_string());
         }
+        if let Some(text) = input.as_str() {
+            if text.chars().count() > 10_485_760 {
+                return Err("`input` string must be at most 10485760 characters".to_string());
+            }
+        }
         if input.is_array() {
             let serialized = serde_json::to_string(input)
                 .map_err(|_| "failed to serialize `input` array".to_string())?;
@@ -2930,11 +2979,7 @@ fn validate_responses_request(request: &responses_types::CreateResponseBody) -> 
         }
     }
 
-    if let Some(metadata) = request.metadata.as_ref() {
-        if !metadata.is_object() {
-            return Err("`metadata` must be an object".to_string());
-        }
-    }
+    validate_metadata(request.metadata.as_ref())?;
 
     if let Some(tools) = request.tools.as_ref() {
         if !tools.is_array() {
@@ -2952,11 +2997,13 @@ fn validate_responses_request(request: &responses_types::CreateResponseBody) -> 
     validate_temperature(request.temperature)?;
     validate_top_p(request.top_p)?;
     validate_max_output_tokens(request.max_output_tokens)?;
+    validate_max_tool_calls(request.max_tool_calls)?;
     validate_penalty_bounds("presence_penalty", request.presence_penalty)?;
     validate_penalty_bounds("frequency_penalty", request.frequency_penalty)?;
     parse_stream_options_config(request.stream_options.as_ref())?;
     validate_service_tier(request.service_tier.as_deref())?;
     validate_safety_identifier(request.safety_identifier.as_deref())?;
+    validate_prompt_cache_key(request.prompt_cache_key.as_deref())?;
     validate_truncation(request.truncation.as_deref())?;
     if request.presence_penalty.is_some() {
         return reject_unimplemented_field("presence_penalty");
@@ -3093,13 +3140,12 @@ fn api_error(
 mod tests {
     use super::*;
 
-    #[test]
-    fn validate_responses_request_rejects_object_input() {
-        let req = responses_types::CreateResponseBody {
+    fn empty_request() -> responses_types::CreateResponseBody {
+        responses_types::CreateResponseBody {
             background: None,
             frequency_penalty: None,
             include: None,
-            input: Some(json!({"bad": "shape"})),
+            input: None,
             instructions: None,
             max_output_tokens: None,
             max_tool_calls: None,
@@ -3122,8 +3168,47 @@ mod tests {
             top_logprobs: None,
             top_p: None,
             truncation: None,
-        };
+        }
+    }
+
+    #[test]
+    fn validate_responses_request_rejects_object_input() {
+        let mut req = empty_request();
+        req.input = Some(json!({"bad": "shape"}));
         assert!(validate_responses_request(&req).is_err());
+    }
+
+    #[test]
+    fn validate_responses_request_rejects_too_long_input_string() {
+        let mut req = empty_request();
+        req.input = Some(json!("a".repeat(10_485_761)));
+        let err = validate_responses_request(&req).expect_err("must reject");
+        assert!(err.contains("10485760"), "err={err}");
+    }
+
+    #[test]
+    fn validate_metadata_rejects_out_of_contract_values() {
+        let too_many = (0..17)
+            .map(|i| (format!("k{i}"), json!("v")))
+            .collect::<serde_json::Map<String, serde_json::Value>>();
+        assert!(validate_metadata(Some(&json!({"k": "v"}))).is_ok());
+        assert!(validate_metadata(Some(&json!("bad"))).is_err());
+        assert!(validate_metadata(Some(&json!(too_many))).is_err());
+        assert!(validate_metadata(Some(&json!({ "k".repeat(65): "v" }))).is_err());
+        assert!(validate_metadata(Some(&json!({ "k": "v".repeat(513) }))).is_err());
+        assert!(validate_metadata(Some(&json!({ "k": 1 }))).is_err());
+    }
+
+    #[test]
+    fn validate_prompt_cache_key_rejects_too_long_value() {
+        assert!(validate_prompt_cache_key(Some(&"p".repeat(64))).is_ok());
+        assert!(validate_prompt_cache_key(Some(&"p".repeat(65))).is_err());
+    }
+
+    #[test]
+    fn validate_max_tool_calls_rejects_values_below_minimum() {
+        assert!(validate_max_tool_calls(Some(0)).is_err());
+        assert!(validate_max_tool_calls(Some(1)).is_ok());
     }
 
     #[test]

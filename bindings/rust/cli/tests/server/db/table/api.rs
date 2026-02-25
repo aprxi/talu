@@ -800,3 +800,170 @@ async fn test_error_content_type() {
         ct
     );
 }
+
+// ===========================================================================
+// D11. Dynamic table names
+// ===========================================================================
+
+#[tokio::test]
+async fn test_custom_table_crud() {
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_app_with_storage(&temp_dir);
+
+    // Create document in a custom table
+    let body = serde_json::json!({
+        "type": "setting",
+        "title": "theme_id",
+        "content": {"value": "dark-talu"}
+    });
+    let resp = send_request(&app, post_json("/v1/db/tables/user_prefs", &body)).await;
+    let (status, json) = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "create in custom table: {json}"
+    );
+    let doc_id = json.get("id").and_then(|v| v.as_str()).unwrap().to_string();
+
+    // Get from the same custom table
+    let resp = send_request(&app, get(&format!("/v1/db/tables/user_prefs/{doc_id}"))).await;
+    let (status, json) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "get from custom table: {json}");
+    assert_eq!(json.get("title").and_then(|v| v.as_str()), Some("theme_id"));
+
+    // List from the custom table
+    let resp = send_request(&app, get("/v1/db/tables/user_prefs")).await;
+    let (status, json) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let data = json.get("data").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(data.len(), 1);
+
+    // Update in the custom table
+    let update_body = serde_json::json!({"title": "theme_id_updated"});
+    let resp = send_request(
+        &app,
+        patch_json(&format!("/v1/db/tables/user_prefs/{doc_id}"), &update_body),
+    )
+    .await;
+    let (status, json) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK, "update in custom table: {json}");
+    assert_eq!(
+        json.get("title").and_then(|v| v.as_str()),
+        Some("theme_id_updated")
+    );
+
+    // Delete from the custom table
+    let resp = send_request(&app, delete(&format!("/v1/db/tables/user_prefs/{doc_id}"))).await;
+    let (status, _) = body_bytes(resp).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+
+    // Verify deletion
+    let resp = send_request(&app, get(&format!("/v1/db/tables/user_prefs/{doc_id}"))).await;
+    let (status, _) = body_json(resp).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn test_custom_table_isolation() {
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_app_with_storage(&temp_dir);
+
+    // Create doc in "documents" table
+    let body1 = serde_json::json!({"type": "note", "title": "In Documents", "content": "c"});
+    let resp = send_request(&app, post_json("/v1/db/tables/documents", &body1)).await;
+    let (_, json1) = body_json(resp).await;
+    let doc_id = json1
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap()
+        .to_string();
+
+    // Create doc in "themes" table
+    let body2 = serde_json::json!({"type": "theme", "title": "In Themes", "content": "c"});
+    send_request(&app, post_json("/v1/db/tables/themes", &body2)).await;
+
+    // The documents-table doc should NOT be visible in the themes table
+    let resp = send_request(&app, get(&format!("/v1/db/tables/themes/{doc_id}"))).await;
+    let (status, _) = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "documents-table doc must not be visible in themes table"
+    );
+
+    // The themes table should have exactly 1 doc
+    let resp = send_request(&app, get("/v1/db/tables/themes")).await;
+    let (_, json) = body_json(resp).await;
+    let data = json.get("data").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(data.len(), 1);
+    assert_eq!(
+        data[0].get("title").and_then(|v| v.as_str()),
+        Some("In Themes")
+    );
+}
+
+#[tokio::test]
+async fn test_reserved_table_name_rejected() {
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_app_with_storage(&temp_dir);
+
+    let body = serde_json::json!({"type": "x", "title": "t", "content": "c"});
+
+    for reserved in &[
+        "docs", "blobs", "chat", "tables", "vector", "sql", "kv_state",
+    ] {
+        let resp = send_request(&app, post_json(&format!("/v1/db/tables/{reserved}"), &body)).await;
+        let (status, json) = body_json(resp).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "reserved name '{reserved}' should be rejected: {json}"
+        );
+        assert_eq!(
+            json["error"]["code"].as_str(),
+            Some("reserved_table_name"),
+            "error code for reserved name '{reserved}'"
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_invalid_table_name_rejected() {
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_app_with_storage(&temp_dir);
+
+    let body = serde_json::json!({"type": "x", "title": "t", "content": "c"});
+
+    // Spaces (URL-encoded)
+    let resp = send_request(&app, post_json("/v1/db/tables/bad%20name", &body)).await;
+    let (status, _) = body_json(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
+    // Dots (path traversal attempt)
+    let resp = send_request(&app, post_json("/v1/db/tables/..%2F..%2Fetc", &body)).await;
+    let (status, _) = body_json(resp).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn test_documents_table_backward_compatible() {
+    let temp_dir = TempDir::new().unwrap();
+    let app = build_app_with_storage(&temp_dir);
+
+    // The standard "documents" table must still work
+    let body =
+        serde_json::json!({"type": "prompt", "title": "System Prompt", "content": "You are..."});
+    let resp = send_request(&app, post_json("/v1/db/tables/documents", &body)).await;
+    let (status, json) = body_json(resp).await;
+    assert_eq!(
+        status,
+        StatusCode::CREATED,
+        "documents table must work: {json}"
+    );
+
+    let resp = send_request(&app, get("/v1/db/tables/documents")).await;
+    let (status, json) = body_json(resp).await;
+    assert_eq!(status, StatusCode::OK);
+    let data = json.get("data").and_then(|v| v.as_array()).unwrap();
+    assert_eq!(data.len(), 1);
+}

@@ -1,19 +1,23 @@
 /**
- * Keybinding Persistence — stores user keybinding overrides in localStorage.
+ * Keybinding Persistence — stores user keybinding overrides via KV backend.
  *
  * Overrides are keyed by command ID. When a command is registered, the
  * kernel checks for a user override before applying the manifest default.
+ * Reads KV first, falls back to localStorage. Writes to both KV (primary)
+ * and localStorage (sync cache).
  */
+
+import { getSetting, setSetting, deleteSetting } from "../system/kv-settings.ts";
 
 const STORAGE_KEY = "talu.keybindings";
 
 /** In-memory cache, loaded once on boot. */
 let overrides: Record<string, string> = {};
 
-/** Load user keybinding overrides from localStorage. */
-export function loadKeybindingOverrides(): void {
+/** Load user keybinding overrides from KV (falls back to localStorage). */
+export async function loadKeybindingOverrides(): Promise<void> {
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
+    const raw = await getSetting(STORAGE_KEY);
     if (raw) {
       const parsed = JSON.parse(raw);
       if (typeof parsed === "object" && parsed !== null) {
@@ -48,13 +52,19 @@ export function getKeybindingOverrides(): Readonly<Record<string, string>> {
 }
 
 function persistOverrides(): void {
-  try {
-    if (Object.keys(overrides).length === 0) {
-      localStorage.removeItem(STORAGE_KEY);
-    } else {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(overrides));
-    }
-  } catch {
-    // Storage full or unavailable — silent.
+  const json = Object.keys(overrides).length === 0 ? null : JSON.stringify(overrides);
+  // KV primary (fire-and-forget).
+  if (json) {
+    void setSetting(STORAGE_KEY, json);
+  } else {
+    void deleteSetting(STORAGE_KEY);
   }
+  // localStorage sync cache.
+  try {
+    if (json) {
+      localStorage.setItem(STORAGE_KEY, json);
+    } else {
+      localStorage.removeItem(STORAGE_KEY);
+    }
+  } catch { /* storage full or unavailable */ }
 }

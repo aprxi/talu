@@ -59,6 +59,18 @@ export interface ApiClient {
   createProject(body: { name: string; description?: string }): Promise<ApiResult<Project>>;
   updateProject(id: string, body: { name?: string; description?: string }): Promise<ApiResult<Project>>;
   deleteProject(id: string): Promise<ApiResult<void>>;
+  kvGet(namespace: string, key: string): Promise<ApiResult<{ value: string | null; updated_at_ms: number }>>;
+  kvPut(namespace: string, key: string, value: string): Promise<ApiResult<void>>;
+  kvDelete(namespace: string, key: string): Promise<ApiResult<{ deleted: boolean }>>;
+  kvList(namespace: string): Promise<ApiResult<{ count: number; data: Array<{ key: string; value_hex: string; updated_at_ms: number }> }>>;
+}
+
+function hexToUtf8(hex: string): string {
+  const bytes = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < hex.length; i += 2) {
+    bytes[i / 2] = parseInt(hex.substring(i, i + 2), 16);
+  }
+  return new TextDecoder().decode(bytes);
 }
 
 export function createApiClient(fetchFn: FetchFn): ApiClient {
@@ -257,5 +269,45 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     createProject: (body) => requestJson<Project>("POST", "/v1/projects", body),
     updateProject: (id, body) => requestJson<Project>("PATCH", `/v1/projects/${encodeURIComponent(id)}`, body),
     deleteProject: (id) => requestJson<void>("DELETE", `/v1/projects/${encodeURIComponent(id)}`),
+    async kvGet(namespace, key) {
+      try {
+        const path = `/v1/db/kv/namespaces/${encodeURIComponent(namespace)}/entries/${encodeURIComponent(key)}`;
+        const resp = await fetchFn(`${BASE}${path}`);
+        if (resp.status === 404) return { ok: true, data: { value: null, updated_at_ms: 0 } };
+        if (!resp.ok) return { ok: false, error: await parseErrorMessage(resp) };
+        const json = await resp.json();
+        return { ok: true, data: { value: hexToUtf8(json.value_hex), updated_at_ms: json.updated_at_ms } };
+      } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+    },
+    async kvPut(namespace, key, value) {
+      try {
+        const path = `/v1/db/kv/namespaces/${encodeURIComponent(namespace)}/entries/${encodeURIComponent(key)}`;
+        const resp = await fetchFn(`${BASE}${path}`, {
+          method: "PUT",
+          headers: { "Content-Type": "application/octet-stream" },
+          body: new TextEncoder().encode(value),
+        });
+        if (!resp.ok) return { ok: false, error: await parseErrorMessage(resp) };
+        return { ok: true };
+      } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+    },
+    async kvDelete(namespace, key) {
+      try {
+        const path = `/v1/db/kv/namespaces/${encodeURIComponent(namespace)}/entries/${encodeURIComponent(key)}`;
+        const resp = await fetchFn(`${BASE}${path}`, { method: "DELETE" });
+        if (!resp.ok) return { ok: false, error: await parseErrorMessage(resp) };
+        const json = await resp.json();
+        return { ok: true, data: { deleted: json.deleted } };
+      } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+    },
+    async kvList(namespace) {
+      try {
+        const path = `/v1/db/kv/namespaces/${encodeURIComponent(namespace)}/entries`;
+        const resp = await fetchFn(`${BASE}${path}`);
+        if (!resp.ok) return { ok: false, error: await parseErrorMessage(resp) };
+        const json = await resp.json();
+        return { ok: true, data: json };
+      } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
+    },
   };
 }

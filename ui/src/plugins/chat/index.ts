@@ -29,7 +29,7 @@ import { setStreamRenderers } from "./streaming.ts";
 import { setupSidebarEvents } from "./sidebar-events.ts";
 import { setupInfiniteScroll, loadSessions, refreshSidebar } from "./sidebar-list.ts";
 import { syncRightPanelParams, setupPanelEvents } from "./panel-params.ts";
-import { chatState, getActiveProjectId } from "./state.ts";
+import { chatState, getActiveProjectId, loadCollapsedGroups } from "./state.ts";
 import { getModelsService, getPromptsService } from "./deps.ts";
 import { initProjectStore, loadApiProjects, migrateLocalStorageProjects } from "../../render/project-combo.ts";
 
@@ -120,6 +120,9 @@ export const chatPlugin: PluginDefinition = {
       hooks: ctx.hooks,
       menus: ctx.menus,
     });
+
+    // Load collapsed sidebar groups from KV before first render.
+    await loadCollapsedGroups();
 
     // Initialize thinking state from storage (before any rendering).
     const thinkingExpanded = await ctx.storage.get<boolean>("thinkingExpanded") ?? false;

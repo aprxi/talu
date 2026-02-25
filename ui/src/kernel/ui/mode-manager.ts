@@ -9,6 +9,7 @@
 import type { Disposable } from "../types.ts";
 import type { EventBusImpl } from "../system/event-bus.ts";
 import { updateProvenance } from "./provenance.ts";
+import { getSetting, setSetting } from "../system/kv-settings.ts";
 
 const STORAGE_KEY = "talu-last-active-mode";
 const CHAT_GROUP_MODES = new Set(["chat", "conversations", "prompts"]);
@@ -80,26 +81,25 @@ export class ModeManager {
       updateProvenance(info.label, info.pluginId, true);
     }
 
-    // Persist to localStorage.
+    // Persist to KV (primary, fire-and-forget) and localStorage (sync cache).
+    void setSetting(STORAGE_KEY, mode);
     try {
       localStorage.setItem(STORAGE_KEY, mode);
-    } catch {
-      // Storage full or disabled — degrade silently.
-    }
+    } catch { /* storage full or disabled */ }
 
     // Notify plugins.
     this.eventBus.emit("mode.changed", { from, to: mode });
   }
 
-  /** Restore the last active mode from localStorage (synchronous). */
-  restoreLastMode(): void {
+  /** Restore the last active mode from KV (falls back to localStorage). */
+  async restoreLastMode(): Promise<void> {
     try {
-      const saved = localStorage.getItem(STORAGE_KEY);
+      const saved = await getSetting(STORAGE_KEY);
       if (saved && this.modes.has(saved) && saved !== this.active) {
         this.switchMode(saved);
       }
     } catch {
-      // Storage disabled — stay on default mode (chat).
+      // KV/storage disabled — stay on default mode (chat).
     }
   }
 

@@ -188,7 +188,7 @@ pub(crate) struct DocumentTagsRequest {
 
 #[utoipa::path(get, path = "/v1/db/tables/{table}", tag = "DB::Tables",
     params(
-        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)"),
         ("limit" = Option<u32>, Query, description = "Max items to return (default 100)"),
         ("type" = Option<String>, Query, description = "Filter by document type"),
         ("marker" = Option<String>, Query, description = "Filter by marker value"),
@@ -196,27 +196,18 @@ pub(crate) struct DocumentTagsRequest {
         ("owner_id" = Option<String>, Query, description = "Filter by owner ID"),
     ),
     responses((status = 200, body = DocumentListResponse)))]
-/// GET /v1/db/tables/documents - List documents
+/// GET /v1/db/tables/{table} - List documents
 pub async fn handle_list(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
     plugin_owner: Option<String>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
-    };
+    let (_table_name, table_path) =
+        match resolve_table_path(&state, req.uri().path(), auth.as_ref()) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     // Parse query params manually
     let query_str = req.uri().query().unwrap_or("");
@@ -244,12 +235,7 @@ pub async fn handle_list(
         parse_query_param(query_str, "owner_id")
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -279,43 +265,28 @@ pub async fn handle_list(
 
 #[utoipa::path(get, path = "/v1/db/tables/{table}/{doc_id}", tag = "DB::Tables",
     params(
-        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)"),
         ("doc_id" = String, Path, description = "Document ID")
     ),
     responses(
         (status = 200, body = DocumentResponse),
         (status = 404, body = http::ErrorResponse, description = "Document not found"),
     ))]
-/// GET /v1/db/tables/documents/:id - Get a document
+/// GET /v1/db/tables/{table}/:id - Get a document
 pub async fn handle_get(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
     let path = req.uri().path();
     let doc_id = extract_doc_id(path);
 
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
+    let (_table_name, table_path) = match resolve_table_path(&state, path, auth.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -336,33 +307,24 @@ pub async fn handle_get(
 }
 
 #[utoipa::path(post, path = "/v1/db/tables/{table}", tag = "DB::Tables",
-    params(("table" = String, Path, description = "Table name (currently only 'documents')")),
+    params(("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)")),
     request_body = CreateDocumentRequest,
     responses(
         (status = 201, body = DocumentResponse),
         (status = 400, body = http::ErrorResponse, description = "Invalid request body"),
     ))]
-/// POST /v1/db/tables/documents - Create a document
+/// POST /v1/db/tables/{table} - Create a document
 pub async fn handle_create(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
     plugin_owner: Option<String>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
-    };
+    let (_table_name, table_path) =
+        match resolve_table_path(&state, req.uri().path(), auth.as_ref()) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -403,12 +365,7 @@ pub async fn handle_create(
         .group_id
         .or_else(|| auth.as_ref().and_then(|a| a.group_id.clone()));
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -454,7 +411,7 @@ pub async fn handle_create(
 }
 
 #[utoipa::path(post, path = "/v1/db/tables/{table}/insert", tag = "DB::Tables",
-    params(("table" = String, Path, description = "Table name (currently only 'documents')")),
+    params(("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)")),
     request_body = CreateDocumentRequest,
     responses(
         (status = 201, body = DocumentResponse),
@@ -472,33 +429,23 @@ pub async fn handle_insert(
 
 #[utoipa::path(patch, path = "/v1/db/tables/{table}/{doc_id}", tag = "DB::Tables",
     params(
-        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)"),
         ("doc_id" = String, Path, description = "Document ID")
     ),
     request_body = UpdateDocumentRequest,
     responses((status = 200, body = DocumentResponse)))]
-/// PATCH /v1/db/tables/documents/:id - Update a document
+/// PATCH /v1/db/tables/{table}/:id - Update a document
 pub async fn handle_update(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
     let path = req.uri().path().to_string();
     let doc_id = extract_doc_id(&path);
 
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
+    let (_table_name, table_path) = match resolve_table_path(&state, &path, auth.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
     let body = match read_body(req).await {
@@ -511,12 +458,7 @@ pub async fn handle_update(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -551,40 +493,25 @@ pub async fn handle_update(
 
 #[utoipa::path(delete, path = "/v1/db/tables/{table}/{doc_id}", tag = "DB::Tables",
     params(
-        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)"),
         ("doc_id" = String, Path, description = "Document ID")
     ),
     responses((status = 204)))]
-/// DELETE /v1/db/tables/documents/:id - Delete a document
+/// DELETE /v1/db/tables/{table}/:id - Delete a document
 pub async fn handle_delete(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
     let path = req.uri().path();
     let doc_id = extract_doc_id(path);
 
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
+    let (_table_name, table_path) = match resolve_table_path(&state, path, auth.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -600,29 +527,20 @@ pub async fn handle_delete(
 }
 
 #[utoipa::path(post, path = "/v1/db/tables/{table}/search", tag = "DB::Tables",
-    params(("table" = String, Path, description = "Table name (currently only 'documents')")),
+    params(("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)")),
     request_body = DocumentSearchRequest,
     responses((status = 200, body = DocumentSearchResponse)))]
-/// POST /v1/db/tables/documents/search - Search documents
+/// POST /v1/db/tables/{table}/search - Search documents
 pub async fn handle_search(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
-    };
+    let (_table_name, table_path) =
+        match resolve_table_path(&state, req.uri().path(), auth.as_ref()) {
+            Ok(v) => v,
+            Err(resp) => return resp,
+        };
 
     let body = match read_body(req).await {
         Ok(b) => b,
@@ -634,12 +552,7 @@ pub async fn handle_search(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -662,40 +575,25 @@ pub async fn handle_search(
 
 #[utoipa::path(get, path = "/v1/db/tables/{table}/{doc_id}/tags", tag = "DB::Tables",
     params(
-        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)"),
         ("doc_id" = String, Path, description = "Document ID")
     ),
     responses((status = 200)))]
-/// GET /v1/db/tables/documents/:id/tags - Get document tags
+/// GET /v1/db/tables/{table}/:id/tags - Get document tags
 pub async fn handle_get_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
     let path = req.uri().path();
     let doc_id = extract_doc_id_before_tags(path);
 
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
+    let (_table_name, table_path) = match resolve_table_path(&state, path, auth.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -710,33 +608,23 @@ pub async fn handle_get_tags(
 
 #[utoipa::path(post, path = "/v1/db/tables/{table}/{doc_id}/tags", tag = "DB::Tables",
     params(
-        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)"),
         ("doc_id" = String, Path, description = "Document ID")
     ),
     request_body = DocumentTagsRequest,
     responses((status = 200)))]
-/// POST /v1/db/tables/documents/:id/tags - Add tags to document
+/// POST /v1/db/tables/{table}/:id/tags - Add tags to document
 pub async fn handle_add_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
     let path = req.uri().path().to_string();
     let doc_id = extract_doc_id_before_tags(&path);
 
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
+    let (_table_name, table_path) = match resolve_table_path(&state, &path, auth.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
     let body = match read_body(req).await {
@@ -749,14 +637,9 @@ pub async fn handle_add_tags(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
     let group_id = auth.as_ref().and_then(|a| a.group_id.clone());
 
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -778,33 +661,23 @@ pub async fn handle_add_tags(
 
 #[utoipa::path(delete, path = "/v1/db/tables/{table}/{doc_id}/tags", tag = "DB::Tables",
     params(
-        ("table" = String, Path, description = "Table name (currently only 'documents')"),
+        ("table" = String, Path, description = "Table name (alphanumeric, underscore, hyphen; 1-64 chars)"),
         ("doc_id" = String, Path, description = "Document ID")
     ),
     request_body = DocumentTagsRequest,
     responses((status = 200)))]
-/// DELETE /v1/db/tables/documents/:id/tags - Remove tags from document
+/// DELETE /v1/db/tables/{table}/:id/tags - Remove tags from document
 pub async fn handle_remove_tags(
     state: Arc<AppState>,
     req: Request<Incoming>,
     auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
-    if let Err(resp) = ensure_documents_table(req.uri().path()) {
-        return resp;
-    }
-
     let path = req.uri().path().to_string();
     let doc_id = extract_doc_id_before_tags(&path);
 
-    let bucket = match state.bucket_path.as_ref() {
-        Some(p) => p,
-        None => {
-            return json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "no_storage",
-                "Storage not configured",
-            )
-        }
+    let (_table_name, table_path) = match resolve_table_path(&state, &path, auth.as_ref()) {
+        Ok(v) => v,
+        Err(resp) => return resp,
     };
 
     let body = match read_body(req).await {
@@ -817,14 +690,9 @@ pub async fn handle_remove_tags(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()),
     };
 
-    let storage_path = match auth.as_ref() {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
-    };
-
     let group_id = auth.as_ref().and_then(|a| a.group_id.clone());
 
-    let handle = match DocumentsHandle::open(&storage_path) {
+    let handle = match DocumentsHandle::open(&table_path) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -877,20 +745,85 @@ fn extract_table_name(path: &str) -> Option<&str> {
     }
 }
 
-fn ensure_documents_table(path: &str) -> Result<(), Response<BoxBody>> {
-    match extract_table_name(path) {
-        Some("documents") => Ok(()),
-        Some(table) => Err(json_error(
-            StatusCode::NOT_IMPLEMENTED,
-            "table_not_supported",
-            &format!("table '{table}' is not supported yet"),
-        )),
-        None => Err(json_error(
+/// Reserved names that collide with internal storage directories.
+const RESERVED_TABLE_NAMES: &[&str] = &[
+    "docs", "blobs", "chat", "tables", "vector", "sql", "kv_state",
+];
+
+/// Validate that a table name is safe and well-formed.
+fn validate_table_name(name: &str) -> Result<(), Response<BoxBody>> {
+    if name.is_empty() || name.len() > 64 {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_table_name",
+            "table name must be 1-64 characters",
+        ));
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_table_name",
+            "table name may only contain alphanumeric characters, underscores, and hyphens",
+        ));
+    }
+    if RESERVED_TABLE_NAMES.contains(&name) {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "reserved_table_name",
+            &format!("table name '{name}' is reserved"),
+        ));
+    }
+    Ok(())
+}
+
+/// Map a table name to its on-disk storage path.
+///
+/// The legacy "documents" table uses the storage root directly (backward compatible).
+/// All other tables are isolated under `tables/{name}/`.
+fn resolve_table_storage_path(
+    storage_root: &std::path::Path,
+    table_name: &str,
+) -> std::path::PathBuf {
+    if table_name == "documents" {
+        storage_root.to_path_buf()
+    } else {
+        storage_root.join("tables").join(table_name)
+    }
+}
+
+/// Extract, validate, and resolve a table name + storage path from a request.
+fn resolve_table_path(
+    state: &AppState,
+    uri_path: &str,
+    auth: Option<&AuthContext>,
+) -> Result<(String, std::path::PathBuf), Response<BoxBody>> {
+    let table_name = extract_table_name(uri_path).ok_or_else(|| {
+        json_error(
             StatusCode::BAD_REQUEST,
             "invalid_path",
             "missing table name in path",
-        )),
-    }
+        )
+    })?;
+    validate_table_name(table_name)?;
+
+    let bucket = state.bucket_path.as_ref().ok_or_else(|| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "no_storage",
+            "Storage not configured",
+        )
+    })?;
+
+    let storage_root = match auth {
+        Some(ctx) => bucket.join(&ctx.storage_prefix),
+        None => bucket.to_path_buf(),
+    };
+
+    let table_path = resolve_table_storage_path(&storage_root, table_name);
+    Ok((table_name.to_string(), table_path))
 }
 
 /// Simple query parameter parser.

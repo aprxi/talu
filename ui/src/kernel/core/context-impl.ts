@@ -31,7 +31,7 @@ import { PluginStatusImpl } from "./status.ts";
 import { NotificationsImpl } from "../ui/notifications.ts";
 import { ManagedObserversImpl } from "../system/observers.ts";
 import { GlobalEventManager } from "../system/global-events.ts";
-import { StorageFacadeImpl, LocalStorageFacade } from "../system/storage.ts";
+import { StorageFacadeImpl, KvStorageFacade } from "../system/storage.ts";
 import { NetworkAccessImpl, type NetworkConnectivity } from "../system/network.ts";
 import { FormatAccessImpl } from "../system/format.ts";
 import { resolveKeybinding } from "../registries/keybindings.ts";
@@ -94,19 +94,19 @@ export function createPluginContext(
   const globalEvt = new GlobalEventManager(pluginId);
   disposables.track(globalEvt);
 
-  // Built-in plugins get localStorage-backed storage (no server token needed).
+  // Network + API must be created before storage (KvStorageFacade needs api).
+  const rawNetwork = new NetworkAccessImpl(pluginId, token, infra.networkConnectivity);
+  const api = createApiClient((url, init) => rawNetwork.fetch(url, init));
+
+  // Built-in plugins get KV-backed storage (no server token needed).
   // Third-party plugins get server-backed storage via /v1/db/tables/documents with a
   // capability token received from /v1/plugins during registration.
   const storage = isBuiltin
-    ? new LocalStorageFacade(pluginId)
+    ? new KvStorageFacade(pluginId, api)
     : new StorageFacadeImpl(pluginId, token);
   disposables.track(storage);
 
   const config = new ConfigurationAccessImpl();
-
-  // Permission-gated wrappers for sensitive APIs.
-  const rawNetwork = new NetworkAccessImpl(pluginId, token, infra.networkConnectivity);
-  const api = createApiClient((url, init) => rawNetwork.fetch(url, init));
   const networkAccess: { fetch(url: string, init?: RequestInit): Promise<Response> } = {
     fetch: (url, init) => { requirePermission("network"); return rawNetwork.fetch(url, init); },
   };

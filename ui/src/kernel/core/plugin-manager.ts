@@ -35,6 +35,8 @@ import { installFocusTracking } from "../ui/focus.ts";
 import { restoreThemeSync } from "../../styles/theme.ts";
 import { BUILTIN_SCHEMES } from "../../styles/color-schemes.ts";
 import { setupThemePicker } from "../ui/theme-picker.ts";
+import { createApiClient } from "../../api.ts";
+import { initKvSettings, migrateLocalStorageToKv } from "../system/kv-settings.ts";
 
 // --- Per-plugin state ---
 
@@ -444,8 +446,13 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
     menuRegistry,
   };
 
+  // Initialize KV settings backend and migrate localStorage data.
+  const kernelApi = createApiClient(fetch);
+  initKvSettings(kernelApi);
+  await migrateLocalStorageToKv();
+
   // Load persisted keybinding overrides before plugin registration.
-  loadKeybindingOverrides();
+  await loadKeybindingOverrides();
 
   // Install global interceptors.
   const kernelDisposables = new DisposableStore();
@@ -483,7 +490,7 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
   // Activate mode manager after plugins are running (so they can listen for mode.changed).
   kernelDisposables.track(modeManager.installActivityBarListeners());
   kernelDisposables.track(modeManager.installChatGroupNavListeners());
-  modeManager.restoreLastMode();
+  await modeManager.restoreLastMode();
 
   // Load third-party plugins (skipped in safe mode).
   if (!safeMode) {

@@ -8,6 +8,7 @@
 
 import type { Conversation } from "../../types.ts";
 import type { UploadFileReference } from "../../kernel/types.ts";
+import { getSetting } from "../../kernel/system/kv-settings.ts";
 
 export interface ChatAttachment {
   file: UploadFileReference;
@@ -52,6 +53,17 @@ export interface ChatState {
   };
 }
 
+/** Load collapsed groups from KV (falls back to localStorage). Call once during chat plugin init. */
+export async function loadCollapsedGroups(): Promise<void> {
+  try {
+    const raw = await getSetting("talu-collapsed-groups");
+    if (raw) {
+      const arr = JSON.parse(raw) as string[];
+      for (const key of arr) chatState.collapsedGroups.add(key);
+    }
+  } catch { /* ignore */ }
+}
+
 /** Get the project ID of the currently active context (active chat or draft). */
 export function getActiveProjectId(): string | null {
   if (chatState.activeChat) return chatState.activeChat.project_id ?? null;
@@ -78,14 +90,7 @@ export const chatState: ChatState = {
   sidebarSearchQuery: "",
   pendingProjectId: null,
   draftSession: null,
-  collapsedGroups: (() => {
-    try {
-      const raw = localStorage.getItem("talu-collapsed-groups");
-      return raw ? new Set(JSON.parse(raw) as string[]) : new Set<string>();
-    } catch {
-      return new Set<string>();
-    }
-  })(),
+  collapsedGroups: new Set<string>(),
   expandedGroups: new Set(),
   pagination: {
     offset: 0,

@@ -5,7 +5,11 @@
  * Uses SHA-256 via SubtleCrypto. If the manifest declares an `integrity`
  * field (format: "sha256-<base64>"), we fetch the module source, hash it,
  * and compare. On mismatch, the plugin is refused.
+ *
+ * Last-known-good hashes are stored in the KV backend (namespace "ui").
  */
+
+import { getSetting, setSetting } from "../system/kv-settings.ts";
 
 const HASH_CACHE_KEY = "talu:integrityHashes";
 
@@ -31,7 +35,7 @@ export async function verifyIntegrity(url: string, declaredIntegrity: string): P
       );
 
       // Check against last-known-good hash.
-      const lastGood = getLastKnownGoodHash(url);
+      const lastGood = await getLastKnownGoodHash(url);
       if (lastGood && lastGood !== expected) {
         console.warn(`[kernel] Last-known-good hash also differs — possible update or tampering.`);
       }
@@ -39,7 +43,7 @@ export async function verifyIntegrity(url: string, declaredIntegrity: string): P
     }
 
     // Store as last-known-good.
-    setLastKnownGoodHash(url, actual);
+    await setLastKnownGoodHash(url, actual);
     return true;
   } catch (err) {
     console.error(`[kernel] Integrity check failed for "${url}":`, err);
@@ -47,9 +51,9 @@ export async function verifyIntegrity(url: string, declaredIntegrity: string): P
   }
 }
 
-function getLastKnownGoodHash(url: string): string | null {
+async function getLastKnownGoodHash(url: string): Promise<string | null> {
   try {
-    const stored = localStorage.getItem(HASH_CACHE_KEY);
+    const stored = await getSetting(HASH_CACHE_KEY);
     if (!stored) return null;
     const map = JSON.parse(stored) as Record<string, string>;
     return map[url] ?? null;
@@ -58,11 +62,11 @@ function getLastKnownGoodHash(url: string): string | null {
   }
 }
 
-function setLastKnownGoodHash(url: string, hash: string): void {
+async function setLastKnownGoodHash(url: string, hash: string): Promise<void> {
   try {
-    const stored = localStorage.getItem(HASH_CACHE_KEY);
+    const stored = await getSetting(HASH_CACHE_KEY);
     const map = stored ? (JSON.parse(stored) as Record<string, string>) : {};
     map[url] = hash;
-    localStorage.setItem(HASH_CACHE_KEY, JSON.stringify(map));
-  } catch { /* storage full or unavailable */ }
+    await setSetting(HASH_CACHE_KEY, JSON.stringify(map));
+  } catch { /* KV unavailable */ }
 }
