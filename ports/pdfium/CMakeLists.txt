@@ -633,6 +633,7 @@ target_compile_definitions(pdfium PRIVATE
     COMPONENT_BUILD
     FPDF_IMPLEMENTATION
     OPJ_STATIC
+    PDF_USE_AGG
 )
 
 target_link_libraries(pdfium PRIVATE
