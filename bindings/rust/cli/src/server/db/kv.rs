@@ -423,10 +423,11 @@ fn resolve_storage_root(
             ))
         }
     };
-    let root = match auth {
+    let base = match auth {
         Some(ctx) => bucket.join(&ctx.storage_prefix),
         None => bucket.to_path_buf(),
     };
+    let root = base.join("kv");
     std::fs::create_dir_all(&root).map_err(|e| {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,

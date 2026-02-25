@@ -101,11 +101,11 @@ fn open_storage(
     })?;
 
     let path = match auth {
-        Some(ctx) => base.join(&ctx.storage_prefix),
-        None => base.to_path_buf(),
+        Some(ctx) => base.join(&ctx.storage_prefix).join("tables").join("chat"),
+        None => base.join("tables").join("chat"),
     };
 
-    // Auto-create the tenant directory on first access (same pattern as
+    // Auto-create the storage directory on first access (same pattern as
     // profile bucket initialization). A tenant that hasn't stored anything
     // yet should get an empty storage, not a 500.
     if !path.exists() {

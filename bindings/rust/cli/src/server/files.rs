@@ -245,7 +245,7 @@ pub async fn handle_upload(
     };
 
     log::trace!(target: "server::files", "DocumentsHandle::open({:?})", storage_path);
-    let docs = match DocumentsHandle::open(&storage_path) {
+    let docs = match DocumentsHandle::open(&storage_path.join("tables").join("documents")) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -411,7 +411,7 @@ pub async fn handle_list(
         None => bucket.to_path_buf(),
     };
 
-    let docs = match DocumentsHandle::open(&storage_path) {
+    let docs = match DocumentsHandle::open(&storage_path.join("tables").join("documents")) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -778,7 +778,7 @@ pub async fn handle_delete(
         );
     }
 
-    let docs = match DocumentsHandle::open(&storage_path) {
+    let docs = match DocumentsHandle::open(&storage_path.join("tables").join("documents")) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -817,7 +817,7 @@ fn load_file_doc(
         None => bucket.to_path_buf(),
     };
 
-    let docs = match DocumentsHandle::open(&storage_path) {
+    let docs = match DocumentsHandle::open(&storage_path.join("tables").join("documents")) {
         Ok(h) => h,
         Err(e) => return Err(document_error_response(e)),
     };
@@ -1103,7 +1103,7 @@ pub async fn handle_patch(
         None
     };
 
-    let docs = match DocumentsHandle::open(&storage_path) {
+    let docs = match DocumentsHandle::open(&storage_path.join("tables").join("documents")) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
@@ -1279,7 +1279,7 @@ pub async fn handle_batch(
         None => bucket.to_path_buf(),
     };
 
-    let docs = match DocumentsHandle::open(&storage_path) {
+    let docs = match DocumentsHandle::open(&storage_path.join("tables").join("documents")) {
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };

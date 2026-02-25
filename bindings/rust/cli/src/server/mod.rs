@@ -139,6 +139,10 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
 
     let bucket_path = crate::config::resolve_bucket(args.no_bucket, args.bucket, &args.profile)?;
 
+    if let Some(ref bucket) = bucket_path {
+        crate::bucket_settings::migrate_layout_if_needed(bucket)?;
+    }
+
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
         configured_model: model,

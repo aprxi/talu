@@ -99,8 +99,8 @@ fn open_documents(
     })?;
 
     let path = match auth {
-        Some(ctx) => bucket.join(&ctx.storage_prefix),
-        None => bucket.to_path_buf(),
+        Some(ctx) => bucket.join(&ctx.storage_prefix).join("tables").join("documents"),
+        None => bucket.join("tables").join("documents"),
     };
 
     DocumentsHandle::open(&path).map_err(|e| document_error_response(e))
@@ -119,8 +119,8 @@ fn open_storage(
     })?;
 
     let path = match auth {
-        Some(ctx) => base.join(&ctx.storage_prefix),
-        None => base.to_path_buf(),
+        Some(ctx) => base.join(&ctx.storage_prefix).join("tables").join("chat"),
+        None => base.join("tables").join("chat"),
     };
 
     StorageHandle::open(&path).map_err(|e| {

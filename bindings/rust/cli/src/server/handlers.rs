@@ -480,7 +480,7 @@ fn resolve_file_references(input_json: &str, storage_path: &std::path::Path) -> 
         return Ok(input_json.to_string());
     }
 
-    let docs = DocumentsHandle::open(storage_path)
+    let docs = DocumentsHandle::open(&storage_path.join("tables").join("documents"))
         .map_err(|e| anyhow!("failed to open documents for file resolution: {}", e))?;
 
     for item in arr.iter_mut() {
@@ -677,7 +677,7 @@ async fn generate_response(
     // If prompt_id is provided, fetch the document and extract system prompt.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
         if let Some(ref bp) = bucket_path {
-            match DocumentsHandle::open(bp) {
+            match DocumentsHandle::open(&bp.join("tables").join("documents")) {
                 Ok(docs) => match docs.get(pid) {
                     Ok(Some(doc)) => {
                         // Parse doc_json to extract system prompt
@@ -1094,7 +1094,7 @@ async fn stream_response(
     // If prompt_id is provided, fetch the document and extract system prompt.
     let system_prompt_from_doc: Option<String> = if let Some(ref pid) = prompt_id {
         if let Some(ref bp) = bucket_path {
-            match DocumentsHandle::open(bp) {
+            match DocumentsHandle::open(&bp.join("tables").join("documents")) {
                 Ok(docs) => match docs.get(pid) {
                     Ok(Some(doc)) => {
                         // Parse doc_json to extract system prompt
@@ -1747,7 +1747,7 @@ fn generate_title(
 
     // Update the session title in storage.
     if let Some(ref bp) = bucket_path {
-        if let Ok(storage) = talu::storage::StorageHandle::open(bp) {
+        if let Ok(storage) = talu::storage::StorageHandle::open(&bp.join("tables").join("chat")) {
             let update = talu::storage::SessionUpdate {
                 title: Some(title.clone()),
                 ..Default::default()

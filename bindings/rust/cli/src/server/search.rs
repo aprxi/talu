@@ -321,7 +321,7 @@ pub async fn handle_search(
 
     // Execute search
     let result = tokio::task::spawn_blocking(move || {
-        let storage = StorageHandle::open(&bucket)?;
+        let storage = StorageHandle::open(&bucket.join("tables").join("chat"))?;
 
         let search_params = SearchParams {
             query: text_query.as_deref(),
@@ -760,7 +760,7 @@ async fn handle_items_search(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let storage = StorageHandle::open(&bucket)?;
+        let storage = StorageHandle::open(&bucket.join("tables").join("chat"))?;
 
         // Get all sessions (up to a reasonable limit for item search)
         let search_params = SearchParams {
@@ -1047,7 +1047,7 @@ async fn handle_documents_search(
 
     let result = tokio::task::spawn_blocking(move || {
         let _ = group_id; // group_id filtering not yet supported in documents
-        let docs = DocumentsHandle::open(&bucket)?;
+        let docs = DocumentsHandle::open(&bucket.join("tables").join("documents"))?;
         let results = docs.search(&query, doc_type_filter.as_deref(), limit)?;
 
         // Convert to search response format
@@ -1168,7 +1168,7 @@ async fn handle_federated_search(
 
     // Execute session search
     let conv_result = tokio::task::spawn_blocking(move || {
-        let storage = StorageHandle::open(&bucket)?;
+        let storage = StorageHandle::open(&bucket.join("tables").join("chat"))?;
 
         let search_params = SearchParams {
             query: Some(&query),
@@ -1238,7 +1238,7 @@ async fn handle_federated_search(
     let doc_limit = (limit / 2 + 1) as u32;
     let doc_result = tokio::task::spawn_blocking(move || {
         let _ = group_id_clone; // group_id filtering not yet supported in documents
-        let docs = DocumentsHandle::open(&bucket_clone)?;
+        let docs = DocumentsHandle::open(&bucket_clone.join("tables").join("documents"))?;
         let results = docs.search(&query_clone, None, doc_limit)?;
 
         let data: Vec<serde_json::Value> = results

@@ -191,9 +191,16 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
     var store = try db_blob_store.BlobStore.init(allocator, db_root);
     defer store.deinit();
 
+    // After layout v1 migration, table data lives under tables/{table_name}/
+    // instead of at the bucket root. Construct the table-specific roots.
+    const docs_table_root = try std.fmt.allocPrint(allocator, "{s}/tables/documents", .{db_root});
+    defer allocator.free(docs_table_root);
+    const chat_table_root = try std.fmt.allocPrint(allocator, "{s}/tables/chat", .{db_root});
+    defer allocator.free(chat_table_root);
+
     try markNamespaceBlockRefs(
         allocator,
-        db_root,
+        docs_table_root,
         docs_namespace,
         schema_documents,
         kvbuf.DocumentFieldIds.doc_json_ref,
@@ -204,7 +211,7 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
     );
     try markNamespaceBlockRefs(
         allocator,
-        db_root,
+        chat_table_root,
         chat_namespace,
         schema_items,
         kvbuf.FieldIds.record_json_ref,
@@ -216,7 +223,7 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
 
     try markNamespaceWalRefs(
         allocator,
-        db_root,
+        docs_table_root,
         docs_namespace,
         schema_documents,
         kvbuf.DocumentFieldIds.doc_json_ref,
@@ -227,7 +234,7 @@ fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_
     );
     try markNamespaceWalRefs(
         allocator,
-        db_root,
+        chat_table_root,
         chat_namespace,
         schema_items,
         kvbuf.FieldIds.record_json_ref,
@@ -576,15 +583,26 @@ fn readBytes(bytes: []const u8, index: *usize, len: u32) ![]const u8 {
     return bytes[start..end];
 }
 
+/// Return the table-specific root for a namespace under the v1 layout.
+/// Caller owns the returned slice.
+fn tableRoot(allocator: Allocator, db_root: []const u8, table_name: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, "{s}/tables/{s}", .{ db_root, table_name });
+}
+
 fn appendPayloadRow(
     allocator: Allocator,
     db_root: []const u8,
+    table_name: []const u8,
     namespace: []const u8,
     schema_id: u16,
     payload: []const u8,
     flush: bool,
 ) !db_writer.Writer {
-    var writer = try db_writer.Writer.open(allocator, db_root, namespace);
+    // Write under tables/{table_name}/{namespace}/ (v1 layout).
+    const tbl_root = try tableRoot(allocator, db_root, table_name);
+    defer allocator.free(tbl_root);
+
+    var writer = try db_writer.Writer.open(allocator, tbl_root, namespace);
     writer.durability = .full;
 
     const col = db_writer.ColumnValue{
@@ -629,7 +647,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
         try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.refSlice());
         const doc_payload = try doc_payload_writer.finish(allocator);
         defer allocator.free(doc_payload);
-        var doc_writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, doc_payload, true);
+        var doc_writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, doc_payload, true);
         doc_writer.deinit();
     }
 
@@ -639,7 +657,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
         try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.refSlice());
         const chat_payload = try chat_payload_writer.finish(allocator);
         defer allocator.free(chat_payload);
-        var chat_writer = try appendPayloadRow(allocator, root_path, chat_namespace, schema_items, chat_payload, true);
+        var chat_writer = try appendPayloadRow(allocator, root_path, "chat", chat_namespace, schema_items, chat_payload, true);
         chat_writer.deinit();
     }
 
@@ -651,7 +669,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
         try wal_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, wal_blob.refSlice());
         const wal_payload = try wal_payload_writer.finish(allocator);
         defer allocator.free(wal_payload);
-        wal_writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, wal_payload, false);
+        wal_writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, wal_payload, false);
     }
 
     const refs = try collectReferencedBlobRefs(allocator, root_path);
@@ -685,7 +703,7 @@ test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced
         try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.refSlice());
         const doc_payload = try doc_payload_writer.finish(allocator);
         defer allocator.free(doc_payload);
-        var doc_writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, doc_payload, true);
+        var doc_writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, doc_payload, true);
         doc_writer.deinit();
     }
 
@@ -695,7 +713,7 @@ test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced
         try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.refSlice());
         const chat_payload = try chat_payload_writer.finish(allocator);
         defer allocator.free(chat_payload);
-        var chat_writer = try appendPayloadRow(allocator, root_path, chat_namespace, schema_items, chat_payload, true);
+        var chat_writer = try appendPayloadRow(allocator, root_path, "chat", chat_namespace, schema_items, chat_payload, true);
         chat_writer.deinit();
     }
 
@@ -736,7 +754,7 @@ test "sweepUnreferencedBlobs keeps blobs referenced only from WAL" {
     const payload = try payload_writer.finish(allocator);
     defer allocator.free(payload);
 
-    var writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, payload, false);
+    var writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, payload, false);
     defer writer.deinit();
 
     const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
@@ -781,7 +799,7 @@ test "sweepUnreferencedBlobs preserves blobs referenced by inline doc_json blob_
     const payload = try payload_writer.finish(allocator);
     defer allocator.free(payload);
 
-    var writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, payload, true);
+    var writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, payload, true);
     defer writer.deinit();
 
     const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
@@ -819,7 +837,7 @@ test "sweepUnreferencedBlobs preserves multipart manifest and chunk blobs" {
     const payload = try payload_writer.finish(allocator);
     defer allocator.free(payload);
 
-    var writer = try appendPayloadRow(allocator, root_path, docs_namespace, schema_documents, payload, true);
+    var writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, payload, true);
     defer writer.deinit();
 
     const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{

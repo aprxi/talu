@@ -781,17 +781,12 @@ fn validate_table_name(name: &str) -> Result<(), Response<BoxBody>> {
 
 /// Map a table name to its on-disk storage path.
 ///
-/// The legacy "documents" table uses the storage root directly (backward compatible).
-/// All other tables are isolated under `tables/{name}/`.
+/// All tables are isolated under `tables/{name}/`.
 fn resolve_table_storage_path(
     storage_root: &std::path::Path,
     table_name: &str,
 ) -> std::path::PathBuf {
-    if table_name == "documents" {
-        storage_root.to_path_buf()
-    } else {
-        storage_root.join("tables").join(table_name)
-    }
+    storage_root.join("tables").join(table_name)
 }
 
 /// Extract, validate, and resolve a table name + storage path from a request.

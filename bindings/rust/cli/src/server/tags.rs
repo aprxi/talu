@@ -118,7 +118,7 @@ pub async fn handle_list(
 
     let group_id = auth.as_ref().and_then(|a| a.group_id.as_deref());
 
-    let handle = match StorageHandle::open(bucket) {
+    let handle = match StorageHandle::open(&bucket.join("tables").join("chat")) {
         Ok(h) => h,
         Err(e) => {
             return json_error(
@@ -164,7 +164,7 @@ pub async fn handle_get(
         }
     };
 
-    let handle = match StorageHandle::open(bucket) {
+    let handle = match StorageHandle::open(&bucket.join("tables").join("chat")) {
         Ok(h) => h,
         Err(e) => {
             return json_error(
@@ -187,7 +187,7 @@ pub async fn handle_get(
     };
 
     // Get document count for this tag
-    let document_count = match DocumentsHandle::open(bucket) {
+    let document_count = match DocumentsHandle::open(&bucket.join("tables").join("documents")) {
         Ok(docs) => match docs.get_by_tag(tag_id) {
             Ok(ids) => ids.len(),
             Err(_) => 0,
@@ -254,7 +254,7 @@ pub async fn handle_create(
         group_id,
     };
 
-    let handle = match StorageHandle::open(bucket) {
+    let handle = match StorageHandle::open(&bucket.join("tables").join("chat")) {
         Ok(h) => h,
         Err(e) => {
             return json_error(
@@ -318,7 +318,7 @@ pub async fn handle_patch(
         description: update_req.description,
     };
 
-    let handle = match StorageHandle::open(bucket) {
+    let handle = match StorageHandle::open(&bucket.join("tables").join("chat")) {
         Ok(h) => h,
         Err(e) => {
             return json_error(
@@ -365,7 +365,7 @@ pub async fn handle_delete(
         }
     };
 
-    let handle = match StorageHandle::open(bucket) {
+    let handle = match StorageHandle::open(&bucket.join("tables").join("chat")) {
         Ok(h) => h,
         Err(e) => {
             return json_error(

@@ -77,6 +77,11 @@ pub struct BucketSettings {
     /// Per-model sampling parameter overrides, keyed by model ID.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub models: BTreeMap<String, ModelOverrides>,
+
+    /// On-disk layout version. `0` = legacy (KV namespaces at root, docs/chat
+    /// at root). `1` = consolidated (KV under `kv/`, tables under `tables/`).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub layout_version: u32,
 }
 
 impl Default for BucketSettings {
@@ -90,12 +95,17 @@ impl Default for BucketSettings {
             default_prompt_id: None,
             system_prompt_enabled: true,
             models: BTreeMap::new(),
+            layout_version: 0,
         }
     }
 }
 
 fn default_true() -> bool {
     true
+}
+
+fn is_zero(v: &u32) -> bool {
+    *v == 0
 }
 
 /// Load settings from `<bucket>/settings.toml`. Returns defaults if the file
@@ -110,6 +120,96 @@ pub fn load_bucket_settings(bucket: &Path) -> Result<BucketSettings> {
     let settings: BucketSettings =
         toml::from_str(&contents).with_context(|| format!("Failed to parse {}", path.display()))?;
     Ok(settings)
+}
+
+/// Known KV namespace directory names that exist at the bucket root in layout v0.
+const KNOWN_KV_NAMESPACES: &[&str] = &["ui", "repo_meta"];
+
+/// Migrate on-disk layout from v0 to v1 if needed.
+///
+/// v0 layout: KV namespaces (`ui/`, `plugin:*/`, `repo_meta/`) and table data
+/// (`docs/`, `chat/`) sit at the bucket root.
+///
+/// v1 layout: KV namespaces move under `kv/`, legacy tables move under `tables/`.
+///
+/// The migration is idempotent — each move checks if the source exists before
+/// attempting the rename. A partially completed migration will resume cleanly.
+pub fn migrate_layout_if_needed(bucket: &Path) -> Result<()> {
+    let settings = load_bucket_settings(bucket)?;
+    if settings.layout_version >= 1 {
+        return Ok(());
+    }
+
+    log::info!(target: "server::init", "migrating on-disk layout v0 → v1");
+
+    // 1. Move docs/ → tables/documents/docs/
+    let docs_src = bucket.join("docs");
+    if docs_src.is_dir() {
+        let docs_dst = bucket.join("tables").join("documents");
+        std::fs::create_dir_all(&docs_dst)
+            .with_context(|| format!("create {}", docs_dst.display()))?;
+        let docs_final = docs_dst.join("docs");
+        if !docs_final.exists() {
+            std::fs::rename(&docs_src, &docs_final)
+                .with_context(|| format!("move {} → {}", docs_src.display(), docs_final.display()))?;
+        }
+    }
+
+    // 2. Move chat/ → tables/chat/chat/
+    let chat_src = bucket.join("chat");
+    if chat_src.is_dir() {
+        let chat_dst = bucket.join("tables").join("chat");
+        std::fs::create_dir_all(&chat_dst)
+            .with_context(|| format!("create {}", chat_dst.display()))?;
+        let chat_final = chat_dst.join("chat");
+        if !chat_final.exists() {
+            std::fs::rename(&chat_src, &chat_final)
+                .with_context(|| format!("move {} → {}", chat_src.display(), chat_final.display()))?;
+        }
+    }
+
+    // 3. Move KV namespaces to kv/
+    let kv_dir = bucket.join("kv");
+
+    // Move known namespaces.
+    for ns in KNOWN_KV_NAMESPACES {
+        let src = bucket.join(ns);
+        if src.is_dir() {
+            std::fs::create_dir_all(&kv_dir)
+                .with_context(|| format!("create {}", kv_dir.display()))?;
+            let dst = kv_dir.join(ns);
+            if !dst.exists() {
+                std::fs::rename(&src, &dst)
+                    .with_context(|| format!("move {} → {}", src.display(), dst.display()))?;
+            }
+        }
+    }
+
+    // Move plugin:* namespaces.
+    if let Ok(entries) = std::fs::read_dir(bucket) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with("plugin:") && entry.path().is_dir() {
+                std::fs::create_dir_all(&kv_dir)
+                    .with_context(|| format!("create {}", kv_dir.display()))?;
+                let dst = kv_dir.join(&*name_str);
+                if !dst.exists() {
+                    std::fs::rename(&entry.path(), &dst).with_context(|| {
+                        format!("move {} → {}", entry.path().display(), dst.display())
+                    })?;
+                }
+            }
+        }
+    }
+
+    // 4. Persist layout_version = 1.
+    let mut updated = load_bucket_settings(bucket)?;
+    updated.layout_version = 1;
+    save_bucket_settings(bucket, &updated)?;
+
+    log::info!(target: "server::init", "layout migration complete (v1)");
+    Ok(())
 }
 
 /// Save settings to `<bucket>/settings.toml`.
@@ -177,5 +277,89 @@ top_k = 50
         let settings: BucketSettings = toml::from_str(toml_str).unwrap();
         assert_eq!(settings.max_output_tokens, Some(5000));
         assert_eq!(settings.model, Some("Qwen/Qwen3-0.6B-GAF4".to_string()));
+    }
+
+    #[test]
+    fn test_layout_version_defaults_to_zero() {
+        let settings: BucketSettings = toml::from_str("").unwrap();
+        assert_eq!(settings.layout_version, 0);
+    }
+
+    #[test]
+    fn test_layout_version_round_trip() {
+        let mut settings = BucketSettings::default();
+        settings.layout_version = 1;
+        let toml_str = toml::to_string_pretty(&settings).unwrap();
+        assert!(toml_str.contains("layout_version = 1"));
+        let loaded: BucketSettings = toml::from_str(&toml_str).unwrap();
+        assert_eq!(loaded.layout_version, 1);
+    }
+
+    #[test]
+    fn test_migrate_layout_v0_to_v1() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        // Create old-layout directories.
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs").join("block-0000.col"), b"d").unwrap();
+        std::fs::create_dir_all(root.join("chat")).unwrap();
+        std::fs::write(root.join("chat").join("block-0000.col"), b"c").unwrap();
+        std::fs::create_dir_all(root.join("ui")).unwrap();
+        std::fs::write(root.join("ui").join("kv.db"), b"u").unwrap();
+        std::fs::create_dir_all(root.join("plugin:talu.chat")).unwrap();
+        std::fs::write(root.join("plugin:talu.chat").join("kv.db"), b"p").unwrap();
+        std::fs::create_dir_all(root.join("repo_meta")).unwrap();
+        std::fs::write(root.join("repo_meta").join("kv.db"), b"r").unwrap();
+
+        // Existing tables/ dir with user table (should be preserved).
+        std::fs::create_dir_all(root.join("tables").join("my_table")).unwrap();
+        std::fs::write(root.join("tables").join("my_table").join("data"), b"t").unwrap();
+
+        // Run migration.
+        migrate_layout_if_needed(root).unwrap();
+
+        // Verify target layout.
+        assert!(root.join("tables/documents/docs/block-0000.col").exists());
+        assert!(root.join("tables/chat/chat/block-0000.col").exists());
+        assert!(root.join("kv/ui/kv.db").exists());
+        assert!(root.join("kv/plugin:talu.chat/kv.db").exists());
+        assert!(root.join("kv/repo_meta/kv.db").exists());
+        assert!(root.join("tables/my_table/data").exists());
+
+        // Old dirs should be gone.
+        assert!(!root.join("docs").exists());
+        assert!(!root.join("chat").exists());
+        assert!(!root.join("ui").exists());
+        assert!(!root.join("plugin:talu.chat").exists());
+        assert!(!root.join("repo_meta").exists());
+
+        // layout_version should be 1.
+        let settings = load_bucket_settings(root).unwrap();
+        assert_eq!(settings.layout_version, 1);
+    }
+
+    #[test]
+    fn test_migrate_layout_idempotent() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path();
+
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        std::fs::write(root.join("docs").join("data"), b"d").unwrap();
+
+        migrate_layout_if_needed(root).unwrap();
+        assert_eq!(load_bucket_settings(root).unwrap().layout_version, 1);
+
+        // Second run is a no-op.
+        migrate_layout_if_needed(root).unwrap();
+        assert!(root.join("tables/documents/docs/data").exists());
+    }
+
+    #[test]
+    fn test_migrate_layout_fresh_bucket() {
+        // No old directories — migration should succeed and set version.
+        let tmp = tempfile::TempDir::new().unwrap();
+        migrate_layout_if_needed(tmp.path()).unwrap();
+        assert_eq!(load_bucket_settings(tmp.path()).unwrap().layout_version, 1);
     }
 }
