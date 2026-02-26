@@ -100,6 +100,66 @@ fn list_filters_by_type() {
 }
 
 #[test]
+fn list_filters_by_owner_group_and_marker() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let docs = [
+        serde_json::json!({
+            "type": "note",
+            "title": "g1-u1-m1",
+            "content": {},
+            "group_id": "g1",
+            "owner_id": "u1",
+            "marker": "m1"
+        }),
+        serde_json::json!({
+            "type": "note",
+            "title": "g2-u1-m2",
+            "content": {},
+            "group_id": "g2",
+            "owner_id": "u1",
+            "marker": "m2"
+        }),
+        serde_json::json!({
+            "type": "note",
+            "title": "g1-u2-m1",
+            "content": {},
+            "group_id": "g1",
+            "owner_id": "u2",
+            "marker": "m1"
+        }),
+    ];
+
+    for body in docs {
+        let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
+        assert_eq!(resp.status, 201, "create: {}", resp.body);
+    }
+
+    let owner_resp = get(ctx.addr(), "/v1/db/tables/documents?owner_id=u1");
+    assert_eq!(owner_resp.status, 200, "body: {}", owner_resp.body);
+    assert_eq!(
+        owner_resp.json()["data"].as_array().expect("data").len(),
+        2,
+        "owner_id=u1 should return two docs"
+    );
+
+    let group_resp = get(ctx.addr(), "/v1/db/tables/documents?group_id=g1");
+    assert_eq!(group_resp.status, 200, "body: {}", group_resp.body);
+    assert_eq!(
+        group_resp.json()["data"].as_array().expect("data").len(),
+        2,
+        "group_id=g1 should return two docs"
+    );
+
+    let marker_resp = get(ctx.addr(), "/v1/db/tables/documents?marker=m2");
+    assert_eq!(marker_resp.status, 200, "body: {}", marker_resp.body);
+    let marker_data = marker_resp.json()["data"].as_array().expect("data").clone();
+    assert_eq!(marker_data.len(), 1, "marker=m2 should return one doc");
+    assert_eq!(marker_data[0]["title"], "g2-u1-m2");
+}
+
+#[test]
 fn list_respects_limit() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
@@ -121,7 +181,204 @@ fn list_respects_limit() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert!(data.len() <= 2, "should respect limit");
+    assert_eq!(data.len(), 2, "limit=2 should return exactly 2 items");
+    assert_eq!(json["has_more"], true, "limit=2 over 5 docs should set has_more=true");
+}
+
+#[test]
+fn list_invalid_limit_falls_back_to_default() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    for i in 0..3 {
+        let create = post_json(
+            ctx.addr(),
+            "/v1/db/tables/documents",
+            &serde_json::json!({
+                "type": "note",
+                "title": format!("Doc {}", i),
+                "content": {}
+            }),
+        );
+        assert_eq!(create.status, 201, "body: {}", create.body);
+    }
+
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?limit=not-a-number");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let data = resp.json()["data"].as_array().expect("data array").clone();
+    assert_eq!(data.len(), 3, "invalid limit should fall back to default");
+}
+
+#[test]
+fn list_negative_limit_falls_back_to_default() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    for i in 0..2 {
+        let create = post_json(
+            ctx.addr(),
+            "/v1/db/tables/documents",
+            &serde_json::json!({
+                "type": "note",
+                "title": format!("Doc {}", i),
+                "content": {}
+            }),
+        );
+        assert_eq!(create.status, 201, "body: {}", create.body);
+    }
+
+    let resp = get(ctx.addr(), "/v1/db/tables/documents?limit=-1");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    assert_eq!(
+        resp.json()["data"].as_array().expect("data").len(),
+        2,
+        "negative limit should be treated as invalid and use default"
+    );
+}
+
+#[test]
+fn list_query_params_decode_space_encodings_for_marker() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let create = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "Needs review doc",
+            "content": {},
+            "marker": "needs review"
+        }),
+    );
+    assert_eq!(create.status, 201, "body: {}", create.body);
+
+    let plus = get(ctx.addr(), "/v1/db/tables/documents?marker=needs+review");
+    assert_eq!(plus.status, 200, "body: {}", plus.body);
+    assert_eq!(
+        plus.json()["data"].as_array().expect("data").len(),
+        1,
+        "marker with '+' should be decoded as space"
+    );
+
+    let pct20 = get(ctx.addr(), "/v1/db/tables/documents?marker=needs%20review");
+    assert_eq!(pct20.status, 200, "body: {}", pct20.body);
+    assert_eq!(
+        pct20.json()["data"].as_array().expect("data").len(),
+        1,
+        "marker with %20 should be decoded as space"
+    );
+}
+
+#[test]
+fn list_query_params_percent_decode_reserved_characters_for_marker() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let marker = "a+b/c&d";
+    let create = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "Encoded marker doc",
+            "content": {},
+            "marker": marker
+        }),
+    );
+    assert_eq!(create.status, 201, "body: {}", create.body);
+
+    let encoded = get(ctx.addr(), "/v1/db/tables/documents?marker=a%2Bb%2Fc%26d");
+    assert_eq!(encoded.status, 200, "body: {}", encoded.body);
+    let data = encoded.json()["data"].as_array().expect("data").clone();
+    assert_eq!(
+        data.len(),
+        1,
+        "marker query value should follow standard percent-decoding"
+    );
+    assert_eq!(data[0]["title"], "Encoded marker doc");
+}
+
+#[test]
+fn list_query_params_percent_decode_reserved_characters_for_owner_id() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let owner = "team+alpha/beta&ops";
+    let create = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "note",
+            "title": "Encoded owner doc",
+            "content": {},
+            "owner_id": owner
+        }),
+    );
+    assert_eq!(create.status, 201, "body: {}", create.body);
+
+    let encoded = get(
+        ctx.addr(),
+        "/v1/db/tables/documents?owner_id=team%2Balpha%2Fbeta%26ops",
+    );
+    assert_eq!(encoded.status, 200, "body: {}", encoded.body);
+    let data = encoded.json()["data"].as_array().expect("data").clone();
+    assert_eq!(
+        data.len(),
+        1,
+        "owner_id query value should follow standard percent-decoding"
+    );
+    assert_eq!(data[0]["title"], "Encoded owner doc");
+}
+
+#[test]
+fn documents_are_isolated_per_table_name() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let a_create = post_json(
+        ctx.addr(),
+        "/v1/db/tables/team_a",
+        &serde_json::json!({
+            "type": "note",
+            "title": "A1",
+            "content": {"tenant": "a"}
+        }),
+    );
+    assert_eq!(a_create.status, 201, "body: {}", a_create.body);
+    let a_id = a_create.json()["id"].as_str().expect("a id").to_string();
+
+    let b_create = post_json(
+        ctx.addr(),
+        "/v1/db/tables/team_b",
+        &serde_json::json!({
+            "type": "note",
+            "title": "B1",
+            "content": {"tenant": "b"}
+        }),
+    );
+    assert_eq!(b_create.status, 201, "body: {}", b_create.body);
+    let b_id = b_create.json()["id"].as_str().expect("b id").to_string();
+
+    let list_a = get(ctx.addr(), "/v1/db/tables/team_a");
+    assert_eq!(list_a.status, 200, "body: {}", list_a.body);
+    let data_a = list_a.json()["data"].as_array().expect("data").clone();
+    assert_eq!(data_a.len(), 1, "team_a should contain exactly one doc");
+    assert_eq!(data_a[0]["title"], "A1");
+
+    let list_b = get(ctx.addr(), "/v1/db/tables/team_b");
+    assert_eq!(list_b.status, 200, "body: {}", list_b.body);
+    let data_b = list_b.json()["data"].as_array().expect("data").clone();
+    assert_eq!(data_b.len(), 1, "team_b should contain exactly one doc");
+    assert_eq!(data_b[0]["title"], "B1");
+
+    let cross_get_a = get(ctx.addr(), &format!("/v1/db/tables/team_b/{a_id}"));
+    assert_eq!(cross_get_a.status, 404, "body: {}", cross_get_a.body);
+    assert_eq!(cross_get_a.json()["error"]["code"], "not_found");
+
+    let cross_get_b = get(ctx.addr(), &format!("/v1/db/tables/team_a/{b_id}"));
+    assert_eq!(cross_get_b.status, 404, "body: {}", cross_get_b.body);
+    assert_eq!(cross_get_b.json()["error"]["code"], "not_found");
 }
 
 // =============================================================================
@@ -159,6 +416,51 @@ fn create_returns_document_with_id() {
     assert_eq!(json["title"], "My Prompt");
     assert_eq!(json["type"], "prompt");
     assert!(json["created_at"].as_i64().unwrap() > 0);
+}
+
+#[test]
+fn create_via_insert_alias_matches_primary_create() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let body = serde_json::json!({
+        "type": "prompt",
+        "title": "Insert Alias",
+        "content": {"text": "created via /insert"}
+    });
+
+    let create = post_json(ctx.addr(), "/v1/db/tables/documents/insert", &body);
+    assert_eq!(create.status, 201, "body: {}", create.body);
+    let create_json = create.json();
+    let doc_id = create_json["id"].as_str().expect("id");
+    assert_eq!(create_json["title"], "Insert Alias");
+    assert_eq!(create_json["type"], "prompt");
+
+    let get_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{doc_id}"));
+    assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
+    assert_eq!(get_resp.json()["title"], "Insert Alias");
+}
+
+#[test]
+fn plugin_storage_requires_capability_token() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let create_resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "type": "plugin_storage",
+            "title": "plugin object",
+            "content": {"k": "v"}
+        }),
+    );
+    assert_eq!(create_resp.status, 403, "body: {}", create_resp.body);
+    assert_eq!(create_resp.json()["error"]["code"], "forbidden");
+
+    let list_resp = get(ctx.addr(), "/v1/db/tables/documents?type=plugin_storage");
+    assert_eq!(list_resp.status, 403, "body: {}", list_resp.body);
+    assert_eq!(list_resp.json()["error"]["code"], "forbidden");
 }
 
 #[test]
@@ -211,6 +513,93 @@ fn create_with_group_id() {
 }
 
 #[test]
+fn create_rejects_duplicate_explicit_id() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let body = serde_json::json!({
+        "id": "fixed-id",
+        "type": "note",
+        "title": "first",
+        "content": {}
+    });
+    let first = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
+    assert_eq!(first.status, 201, "body: {}", first.body);
+
+    let second = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
+    assert_eq!(second.status, 400, "body: {}", second.body);
+    assert_eq!(second.json()["error"]["code"], "invalid_argument");
+}
+
+#[test]
+fn create_rejects_explicit_ids_that_conflict_with_reserved_route_segments() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let reserved_ids = ["search", "insert", "rows", "_meta"];
+    let mut failures = Vec::new();
+
+    for id in reserved_ids {
+        let resp = post_json(
+            ctx.addr(),
+            "/v1/db/tables/documents",
+            &serde_json::json!({
+                "id": id,
+                "type": "note",
+                "title": format!("reserved-id-{id}"),
+                "content": {}
+            }),
+        );
+        if resp.status != 400 {
+            failures.push(format!(
+                "id={id}: expected 400 rejection, got status={} body={}",
+                resp.status, resp.body
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "route-reserved explicit IDs must be rejected:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn create_rejects_explicit_ids_with_path_separators() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let invalid_ids = ["contains/slash", "nested/path/doc", "/leading", "trailing/"];
+    let mut failures = Vec::new();
+
+    for id in invalid_ids {
+        let resp = post_json(
+            ctx.addr(),
+            "/v1/db/tables/documents",
+            &serde_json::json!({
+                "id": id,
+                "type": "note",
+                "title": format!("invalid-id-{id}"),
+                "content": {}
+            }),
+        );
+        if resp.status != 400 {
+            failures.push(format!(
+                "id={id}: expected 400 rejection, got status={} body={}",
+                resp.status, resp.body
+            ));
+        }
+    }
+
+    assert!(
+        failures.is_empty(),
+        "explicit IDs containing path separators must be rejected:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
 fn create_requires_type() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
@@ -234,6 +623,75 @@ fn create_requires_title() {
     });
     let resp = post_json(ctx.addr(), "/v1/db/tables/documents", &body);
     assert_eq!(resp.status, 400, "should reject missing title");
+}
+
+#[test]
+fn table_name_validation_rejects_invalid_and_reserved_names() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let payload = serde_json::json!({
+        "type": "note",
+        "title": "x",
+        "content": {}
+    });
+
+    let invalid_chars = post_json(ctx.addr(), "/v1/db/tables/bad.name", &payload);
+    assert_eq!(invalid_chars.status, 400, "body: {}", invalid_chars.body);
+    assert_eq!(invalid_chars.json()["error"]["code"], "invalid_table_name");
+
+    let reserved = post_json(ctx.addr(), "/v1/db/tables/vector", &payload);
+    assert_eq!(reserved.status, 400, "body: {}", reserved.body);
+    assert_eq!(reserved.json()["error"]["code"], "reserved_table_name");
+
+    let reserved_meta = post_json(ctx.addr(), "/v1/db/tables/_meta", &payload);
+    assert_eq!(reserved_meta.status, 400, "body: {}", reserved_meta.body);
+    assert_eq!(reserved_meta.json()["error"]["code"], "reserved_table_name");
+
+    let too_long_name = format!("/v1/db/tables/{}", "a".repeat(65));
+    let too_long = post_json(ctx.addr(), &too_long_name, &payload);
+    assert_eq!(too_long.status, 400, "body: {}", too_long.body);
+    assert_eq!(too_long.json()["error"]["code"], "invalid_table_name");
+}
+
+#[test]
+fn table_name_validation_applies_to_list_and_get_paths() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let invalid_list = get(ctx.addr(), "/v1/db/tables/bad.name");
+    assert_eq!(invalid_list.status, 400, "body: {}", invalid_list.body);
+    assert_eq!(invalid_list.json()["error"]["code"], "invalid_table_name");
+
+    let reserved_list = get(ctx.addr(), "/v1/db/tables/vector");
+    assert_eq!(reserved_list.status, 400, "body: {}", reserved_list.body);
+    assert_eq!(reserved_list.json()["error"]["code"], "reserved_table_name");
+
+    let reserved_meta_list = get(ctx.addr(), "/v1/db/tables/_meta");
+    assert_eq!(
+        reserved_meta_list.status, 400,
+        "body: {}",
+        reserved_meta_list.body
+    );
+    assert_eq!(
+        reserved_meta_list.json()["error"]["code"],
+        "reserved_table_name"
+    );
+
+    let invalid_get = get(ctx.addr(), "/v1/db/tables/bad.name/doc-1");
+    assert_eq!(invalid_get.status, 400, "body: {}", invalid_get.body);
+    assert_eq!(invalid_get.json()["error"]["code"], "invalid_table_name");
+
+    let reserved_meta_get = get(ctx.addr(), "/v1/db/tables/_meta/doc-1");
+    assert_eq!(
+        reserved_meta_get.status, 400,
+        "body: {}",
+        reserved_meta_get.body
+    );
+    assert_eq!(
+        reserved_meta_get.json()["error"]["code"],
+        "reserved_table_name"
+    );
 }
 
 // =============================================================================
@@ -282,6 +740,55 @@ fn get_returns_created_document() {
 }
 
 #[test]
+fn doc_id_path_params_are_percent_decoded_for_get_patch_delete() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let create_resp = post_json(
+        ctx.addr(),
+        "/v1/db/tables/documents",
+        &serde_json::json!({
+            "id": "id with space",
+            "type": "note",
+            "title": "Percent Encoded ID",
+            "content": {"k": "v"}
+        }),
+    );
+    assert_eq!(create_resp.status, 201, "body: {}", create_resp.body);
+
+    let encoded_path = "/v1/db/tables/documents/id%20with%20space";
+
+    let get_resp = get(ctx.addr(), encoded_path);
+    assert_eq!(
+        get_resp.status, 200,
+        "doc path params should be percent-decoded for GET; body: {}",
+        get_resp.body
+    );
+    assert_eq!(get_resp.json()["id"], "id with space");
+
+    let patch_resp = patch_json(
+        ctx.addr(),
+        encoded_path,
+        &serde_json::json!({
+            "title": "Updated Title"
+        }),
+    );
+    assert_eq!(
+        patch_resp.status, 200,
+        "doc path params should be percent-decoded for PATCH; body: {}",
+        patch_resp.body
+    );
+    assert_eq!(patch_resp.json()["title"], "Updated Title");
+
+    let delete_resp = delete(ctx.addr(), encoded_path);
+    assert_eq!(
+        delete_resp.status, 204,
+        "doc path params should be percent-decoded for DELETE; body: {}",
+        delete_resp.body
+    );
+}
+
+#[test]
 fn get_returns_full_content() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
@@ -303,8 +810,9 @@ fn get_returns_full_content() {
     assert_eq!(resp.status, 200);
 
     let json = resp.json();
-    // Content should be preserved
-    assert!(json["content"].is_object() || json["data"].is_object());
+    assert_eq!(json["type"], "prompt");
+    assert_eq!(json["title"], "Full Content");
+    assert_eq!(json["content"], content, "content object should round-trip exactly");
 }
 
 // =============================================================================
@@ -327,6 +835,22 @@ fn patch_returns_404_for_missing() {
     let body = serde_json::json!({"title": "Updated"});
     let resp = patch_json(ctx.addr(), "/v1/db/tables/documents/nonexistent", &body);
     assert_eq!(resp.status, 404, "body: {}", resp.body);
+}
+
+#[test]
+fn patch_rejects_invalid_json_body() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let resp = send_request(
+        ctx.addr(),
+        "PATCH",
+        "/v1/db/tables/documents/some-id",
+        &[("Content-Type", "application/json")],
+        Some("{broken"),
+    );
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "invalid_json");
 }
 
 #[test]
@@ -418,12 +942,8 @@ fn delete_returns_404_for_missing() {
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
     let resp = delete(ctx.addr(), "/v1/db/tables/documents/nonexistent");
-    // May return 404 or 200 depending on implementation (soft delete)
-    assert!(
-        resp.status == 404 || resp.status == 200,
-        "body: {}",
-        resp.body
-    );
+    assert_eq!(resp.status, 404, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "not_found");
 }
 
 #[test]
@@ -443,16 +963,12 @@ fn delete_removes_document() {
 
     // Delete
     let resp = delete(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
-    assert!(
-        resp.status == 200 || resp.status == 204,
-        "delete: {}",
-        resp.body
-    );
+    assert_eq!(resp.status, 204, "delete: {}", resp.body);
 
-    // Verify gone (or marked deleted)
+    // Verify gone
     let get_resp = get(ctx.addr(), &format!("/v1/db/tables/documents/{}", doc_id));
-    // Either 404 (hard delete) or marker=deleted (soft delete)
-    assert!(get_resp.status == 404 || get_resp.json()["marker"] == "deleted");
+    assert_eq!(get_resp.status, 404, "body: {}", get_resp.body);
+    assert_eq!(get_resp.json()["error"]["code"], "not_found");
 }
 
 #[test]

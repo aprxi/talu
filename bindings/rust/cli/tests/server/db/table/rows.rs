@@ -24,6 +24,32 @@ fn write_row(
     post_json(addr, &format!("/v1/db/tables/{ns}/rows"), &body)
 }
 
+fn write_row_with_headers(
+    addr: std::net::SocketAddr,
+    ns: &str,
+    schema_id: u16,
+    columns: &[serde_json::Value],
+    headers: &[(&str, &str)],
+) -> HttpResponse {
+    let body = serde_json::json!({
+        "schema_id": schema_id,
+        "columns": columns,
+    })
+    .to_string();
+
+    let mut request_headers = Vec::with_capacity(headers.len() + 1);
+    request_headers.push(("Content-Type", "application/json"));
+    request_headers.extend_from_slice(headers);
+
+    send_request(
+        addr,
+        "POST",
+        &format!("/v1/db/tables/{ns}/rows"),
+        &request_headers,
+        Some(&body),
+    )
+}
+
 fn write_row_with_policy(
     addr: std::net::SocketAddr,
     ns: &str,
@@ -41,6 +67,21 @@ fn write_row_with_policy(
 
 fn scan_rows(addr: std::net::SocketAddr, ns: &str, schema_id: u16) -> HttpResponse {
     get(addr, &format!("/v1/db/tables/{ns}/rows?schema_id={schema_id}"))
+}
+
+fn scan_rows_with_headers(
+    addr: std::net::SocketAddr,
+    ns: &str,
+    schema_id: u16,
+    headers: &[(&str, &str)],
+) -> HttpResponse {
+    send_request(
+        addr,
+        "GET",
+        &format!("/v1/db/tables/{ns}/rows?schema_id={schema_id}"),
+        headers,
+        None,
+    )
 }
 
 fn scan_rows_with_limit(
@@ -96,6 +137,110 @@ fn scan_returns_503_without_bucket() {
     let resp = scan_rows(ctx.addr(), "test_ns", 10);
     assert_eq!(resp.status, 503, "body: {}", resp.body);
     assert_eq!(resp.json()["error"]["code"], "no_storage");
+}
+
+#[test]
+fn rows_endpoints_require_gateway_auth_when_enabled() {
+    let temp = TempDir::new().expect("temp dir");
+    let mut cfg = documents_config(temp.path());
+    cfg.gateway_secret = Some("secret".to_string());
+    cfg.tenants = vec![TenantSpec {
+        id: "tenant-a".to_string(),
+        storage_prefix: "tenant-a".to_string(),
+        allowed_models: vec![],
+    }];
+    let ctx = ServerTestContext::new(cfg);
+
+    let cols = standard_columns(1, "auth");
+    let write = write_row(ctx.addr(), "auth_ns", 10, &cols);
+    assert_eq!(write.status, 401, "body: {}", write.body);
+    assert_eq!(write.json()["error"]["code"], "unauthorized");
+
+    let scan = scan_rows(ctx.addr(), "auth_ns", 10);
+    assert_eq!(scan.status, 401, "body: {}", scan.body);
+    assert_eq!(scan.json()["error"]["code"], "unauthorized");
+
+    let secret_only = scan_rows_with_headers(
+        ctx.addr(),
+        "auth_ns",
+        10,
+        &[("X-Talu-Gateway-Secret", "secret")],
+    );
+    assert_eq!(secret_only.status, 403, "body: {}", secret_only.body);
+    assert_eq!(secret_only.json()["error"]["code"], "forbidden");
+}
+
+#[test]
+fn rows_storage_is_tenant_isolated_by_storage_prefix() {
+    let temp = TempDir::new().expect("temp dir");
+    let mut cfg = documents_config(temp.path());
+    cfg.gateway_secret = Some("secret".to_string());
+    cfg.tenants = vec![
+        TenantSpec {
+            id: "tenant-a".to_string(),
+            storage_prefix: "tenant-a".to_string(),
+            allowed_models: vec![],
+        },
+        TenantSpec {
+            id: "tenant-b".to_string(),
+            storage_prefix: "tenant-b".to_string(),
+            allowed_models: vec![],
+        },
+    ];
+    let ctx = ServerTestContext::new(cfg);
+
+    let tenant_a = [
+        ("X-Talu-Gateway-Secret", "secret"),
+        ("X-Talu-Tenant-Id", "tenant-a"),
+    ];
+    let tenant_b = [
+        ("X-Talu-Gateway-Secret", "secret"),
+        ("X-Talu-Tenant-Id", "tenant-b"),
+    ];
+
+    let write_a = write_row_with_headers(
+        ctx.addr(),
+        "shared_ns",
+        10,
+        &standard_columns(7, "from-a"),
+        &tenant_a,
+    );
+    assert_eq!(write_a.status, 200, "body: {}", write_a.body);
+
+    let scan_a = scan_rows_with_headers(ctx.addr(), "shared_ns", 10, &tenant_a);
+    assert_eq!(scan_a.status, 200, "body: {}", scan_a.body);
+    let rows_a = scan_a.json()["rows"].as_array().expect("rows").clone();
+    assert_eq!(rows_a.len(), 1, "tenant-a should see one row");
+    assert_eq!(rows_a[0]["payload"], "from-a");
+
+    let scan_b = scan_rows_with_headers(ctx.addr(), "shared_ns", 10, &tenant_b);
+    assert_eq!(scan_b.status, 200, "body: {}", scan_b.body);
+    assert_eq!(
+        scan_b.json()["rows"].as_array().expect("rows").len(),
+        0,
+        "tenant-b should not see tenant-a rows"
+    );
+
+    let write_b = write_row_with_headers(
+        ctx.addr(),
+        "shared_ns",
+        10,
+        &standard_columns(7, "from-b"),
+        &tenant_b,
+    );
+    assert_eq!(write_b.status, 200, "body: {}", write_b.body);
+
+    let scan_a_again = scan_rows_with_headers(ctx.addr(), "shared_ns", 10, &tenant_a);
+    assert_eq!(scan_a_again.status, 200, "body: {}", scan_a_again.body);
+    let rows_a_again = scan_a_again.json()["rows"].as_array().expect("rows").clone();
+    assert_eq!(rows_a_again.len(), 1);
+    assert_eq!(rows_a_again[0]["payload"], "from-a");
+
+    let scan_b_again = scan_rows_with_headers(ctx.addr(), "shared_ns", 10, &tenant_b);
+    assert_eq!(scan_b_again.status, 200, "body: {}", scan_b_again.body);
+    let rows_b_again = scan_b_again.json()["rows"].as_array().expect("rows").clone();
+    assert_eq!(rows_b_again.len(), 1);
+    assert_eq!(rows_b_again[0]["payload"], "from-b");
 }
 
 // =============================================================================
@@ -2040,4 +2185,111 @@ fn delete_row_hides_from_scan() {
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 1, "deleted row should be hidden from scan");
     assert_eq!(rows[0]["payload"], "keep");
+}
+
+/// Path params for namespace should be percent-decoded consistently for table rows routes.
+#[test]
+fn rows_namespace_path_params_are_percent_decoded() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let namespace = "team one+blue";
+    let encoded_namespace = "team%20one%2Bblue";
+
+    let write = post_json(
+        ctx.addr(),
+        &format!("/v1/db/tables/{encoded_namespace}/rows"),
+        &serde_json::json!({
+            "schema_id": 10,
+            "columns": standard_columns(7, "encoded-ns")
+        }),
+    );
+    assert_eq!(
+        write.status, 200,
+        "rows namespace path params should be percent-decoded for writes; body: {}",
+        write.body
+    );
+
+    let scan = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/{encoded_namespace}/rows?schema_id=10"),
+    );
+    assert_eq!(
+        scan.status, 200,
+        "rows namespace path params should be percent-decoded for scan; body: {}",
+        scan.body
+    );
+    let rows = scan.json()["rows"].as_array().expect("rows").clone();
+    assert_eq!(rows.len(), 1, "expected one row in decoded namespace");
+    assert_eq!(rows[0]["payload"], "encoded-ns");
+
+    let policy = get(
+        ctx.addr(),
+        &format!("/v1/db/tables/{encoded_namespace}/_meta/policy"),
+    );
+    assert_eq!(
+        policy.status, 200,
+        "rows namespace path params should be percent-decoded for policy route; body: {}",
+        policy.body
+    );
+
+    let list_ns = get(ctx.addr(), "/v1/db/tables/_meta/namespaces");
+    assert_eq!(list_ns.status, 200, "body: {}", list_ns.body);
+    let list_ns_json = list_ns.json();
+    let names = list_ns_json["namespaces"].as_array().expect("namespaces");
+    assert!(
+        names.iter().any(|n| n == namespace),
+        "decoded namespace should appear in namespace listing"
+    );
+}
+
+/// Namespace path params must reject decoded path separators.
+#[test]
+fn rows_namespace_rejects_percent_decoded_path_separators() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let write = post_json(
+        ctx.addr(),
+        "/v1/db/tables/bad%2Fns/rows",
+        &serde_json::json!({
+            "schema_id": 10,
+            "columns": standard_columns(1, "x")
+        }),
+    );
+    assert_eq!(
+        write.status, 400,
+        "decoded path separators in namespace should be rejected; body: {}",
+        write.body
+    );
+    assert_eq!(write.json()["error"]["code"], "invalid_argument");
+}
+
+/// Row-hash path params should be percent-decoded before numeric parsing.
+#[test]
+fn row_hash_path_params_are_percent_decoded_for_get_and_delete() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let cols = columns_with_ts(123, 10_000, "row-123");
+    let write = write_row(ctx.addr(), "hashdec", 10, &cols);
+    assert_eq!(write.status, 200, "body: {}", write.body);
+
+    let get = get(
+        ctx.addr(),
+        "/v1/db/tables/hashdec/rows/%31%32%33?schema_id=10",
+    );
+    assert_eq!(
+        get.status, 200,
+        "hash path params should be percent-decoded for GET; body: {}",
+        get.body
+    );
+    assert_eq!(get.json()["row"]["payload"], "row-123");
+
+    let del = delete(ctx.addr(), "/v1/db/tables/hashdec/rows/%31%32%33");
+    assert_eq!(
+        del.status, 200,
+        "hash path params should be percent-decoded for DELETE; body: {}",
+        del.body
+    );
 }

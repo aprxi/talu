@@ -76,10 +76,8 @@ fn search_finds_matching_title() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert!(!data.is_empty(), "should find Rust document");
-    assert!(data
-        .iter()
-        .any(|d| d["title"].as_str().unwrap_or("").contains("Rust")));
+    assert_eq!(data.len(), 1, "query should match only the Rust-titled document");
+    assert_eq!(data[0]["title"], "Rust Programming Guide");
 }
 
 #[test]
@@ -103,7 +101,8 @@ fn search_finds_matching_content() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert!(!data.is_empty(), "should find document by content");
+    assert_eq!(data.len(), 1, "content query should match exactly one document");
+    assert_eq!(data[0]["title"], "Generic Title");
 }
 
 #[test]
@@ -173,7 +172,14 @@ fn search_respects_limit() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert!(data.len() <= 3, "should respect limit");
+    assert_eq!(data.len(), 3, "limit=3 should return exactly three matches");
+    for item in data {
+        let title = item["title"].as_str().unwrap_or_default();
+        assert!(
+            title.contains("Common"),
+            "search results should match query; got title={title}"
+        );
+    }
 }
 
 #[test]
@@ -198,7 +204,8 @@ fn search_case_insensitive() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert!(!data.is_empty(), "search should be case-insensitive");
+    assert_eq!(data.len(), 1, "case-insensitive query should match one document");
+    assert_eq!(data[0]["title"], "UPPERCASE Title");
 }
 
 #[test]
@@ -239,9 +246,33 @@ fn search_requires_query() {
 
     let body = serde_json::json!({});
     let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
-    // Should either require query or return all documents
-    // Implementation may vary - just ensure it doesn't crash
-    assert!(resp.status == 200 || resp.status == 400);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "invalid_json");
+}
+
+#[test]
+fn search_rejects_non_string_query_field() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let body = serde_json::json!({"query": 123});
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "invalid_json");
+}
+
+#[test]
+fn search_rejects_non_numeric_limit_field() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let body = serde_json::json!({
+        "query": "anything",
+        "limit": "ten"
+    });
+    let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "invalid_json");
 }
 
 #[test]
@@ -251,12 +282,12 @@ fn search_empty_query_handled() {
 
     let body = serde_json::json!({"query": ""});
     let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
-    // Should handle empty query gracefully
-    assert!(resp.status == 200 || resp.status == 400);
+    assert_eq!(resp.status, 400, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "invalid_argument");
 }
 
 #[test]
-fn search_with_group_id_filter() {
+fn search_ignores_unsupported_group_id_field() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
@@ -290,15 +321,19 @@ fn search_with_group_id_filter() {
     let resp = post_json(ctx.addr(), "/v1/db/tables/documents/search", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
-    // Should only return team-a documents
+    // group_id is not part of DocumentSearchRequest, so this field is ignored.
     let json = resp.json();
-    let data = json["data"].as_array().expect("data array");
-    for doc in data {
-        // Either has group_id=team-a or check title
-        if doc.get("group_id").is_some() {
-            assert_eq!(doc["group_id"], "team-a");
-        }
-    }
+    let data = json["data"].as_array().expect("data array").clone();
+    assert_eq!(data.len(), 2, "unsupported field should not alter results");
+    let titles: Vec<&str> = data.iter().filter_map(|d| d["title"].as_str()).collect();
+    assert!(
+        titles.contains(&"Team A Document"),
+        "missing Team A doc: {titles:?}"
+    );
+    assert!(
+        titles.contains(&"Team B Document"),
+        "missing Team B doc: {titles:?}"
+    );
 }
 
 /// Expired documents still appear in search results (known inconsistency:
@@ -367,4 +402,74 @@ fn expired_document_still_appears_in_search() {
         ids.contains(&ephemeral_id.as_str()),
         "expired doc still appears in search (known inconsistency: search does not filter by TTL)"
     );
+}
+
+#[test]
+fn search_rejects_invalid_and_reserved_table_names() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let bad_name = post_json(
+        ctx.addr(),
+        "/v1/db/tables/bad.name/search",
+        &serde_json::json!({"query": "anything"}),
+    );
+    assert_eq!(bad_name.status, 400, "body: {}", bad_name.body);
+    assert_eq!(bad_name.json()["error"]["code"], "invalid_table_name");
+
+    let reserved = post_json(
+        ctx.addr(),
+        "/v1/db/tables/vector/search",
+        &serde_json::json!({"query": "anything"}),
+    );
+    assert_eq!(reserved.status, 400, "body: {}", reserved.body);
+    assert_eq!(reserved.json()["error"]["code"], "reserved_table_name");
+}
+
+#[test]
+fn search_is_isolated_per_table_name() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(documents_config(temp.path()));
+
+    let create_a = post_json(
+        ctx.addr(),
+        "/v1/db/tables/team_a",
+        &serde_json::json!({
+            "type": "note",
+            "title": "A title",
+            "content": {"text": "shared-term"}
+        }),
+    );
+    assert_eq!(create_a.status, 201, "body: {}", create_a.body);
+
+    let create_b = post_json(
+        ctx.addr(),
+        "/v1/db/tables/team_b",
+        &serde_json::json!({
+            "type": "note",
+            "title": "B title",
+            "content": {"text": "shared-term"}
+        }),
+    );
+    assert_eq!(create_b.status, 201, "body: {}", create_b.body);
+
+    let search_a = post_json(
+        ctx.addr(),
+        "/v1/db/tables/team_a/search",
+        &serde_json::json!({"query": "shared-term"}),
+    );
+    assert_eq!(search_a.status, 200, "body: {}", search_a.body);
+    let a_data = search_a.json()["data"].as_array().expect("data").clone();
+    assert_eq!(a_data.len(), 1, "team_a search should return one row");
+    assert_eq!(a_data[0]["title"], "A title");
+
+    let search_b = post_json(
+        ctx.addr(),
+        "/v1/db/tables/team_b/search",
+        &serde_json::json!({"query": "shared-term"}),
+    );
+    assert_eq!(search_b.status, 200, "body: {}", search_b.body);
+    let b_data = search_b.json()["data"].as_array().expect("data").clone();
+    assert_eq!(b_data.len(), 1, "team_b search should return one row");
+    assert_eq!(b_data[0]["title"], "B title");
 }

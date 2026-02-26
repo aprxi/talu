@@ -533,7 +533,11 @@ async fn test_search_documents() {
         .get("data")
         .and_then(|v| v.as_array())
         .expect("should have data");
-    assert!(!data.is_empty(), "should find at least one result");
+    assert!(
+        data.iter()
+            .any(|d| d.get("title").and_then(|v| v.as_str()) == Some("Rust Programming")),
+        "search results should include the Rust document; got {data:?}"
+    );
 }
 
 #[tokio::test]
@@ -610,10 +614,10 @@ async fn test_add_tags() {
     )
     .await;
     let (status, body) = body_bytes(add_resp).await;
-    assert!(
-        status.is_success(),
-        "add tags should succeed: status={} body={}",
+    assert_eq!(
         status,
+        StatusCode::OK,
+        "add tags should return 200: body={}",
         String::from_utf8_lossy(&body)
     );
 
@@ -662,7 +666,7 @@ async fn test_remove_tags() {
     )
     .await;
     let (add_status, _) = body_bytes(add_resp).await;
-    assert!(add_status.is_success(), "add tags should succeed");
+    assert_eq!(add_status, StatusCode::OK, "add tags should return 200");
 
     // Remove a tag
     let remove_body = serde_json::json!({
@@ -677,10 +681,10 @@ async fn test_remove_tags() {
     )
     .await;
     let (status, body) = body_bytes(remove_resp).await;
-    assert!(
-        status.is_success(),
-        "remove tags should succeed: status={} body={}",
+    assert_eq!(
         status,
+        StatusCode::OK,
+        "remove tags should return 200: body={}",
         String::from_utf8_lossy(&body)
     );
 
@@ -770,14 +774,17 @@ async fn test_error_json_structure() {
     let resp = send_request(&app, get("/v1/db/tables/documents/nonexistent")).await;
     let (status, json) = body_json(resp).await;
 
-    assert!(status.is_client_error());
+    assert_eq!(status, StatusCode::NOT_FOUND);
     let error = json.get("error").expect("should have error object");
-    assert!(
-        error.get("code").and_then(|v| v.as_str()).is_some(),
-        "should have code"
+    assert_eq!(
+        error.get("code").and_then(|v| v.as_str()),
+        Some("not_found")
     );
     assert!(
-        error.get("message").and_then(|v| v.as_str()).is_some(),
+        error
+            .get("message")
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| !m.is_empty()),
         "should have message"
     );
 }
@@ -795,7 +802,7 @@ async fn test_error_content_type() {
 
     assert!(
         ct.as_deref()
-            .map_or(false, |c| c.contains("application/json")),
+            .is_some_and(|c| c.starts_with("application/json")),
         "error Content-Type should be application/json: {:?}",
         ct
     );

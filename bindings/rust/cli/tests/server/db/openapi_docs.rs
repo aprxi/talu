@@ -103,3 +103,136 @@ fn openapi_db_specs_are_plane_scoped() {
         );
     }
 }
+
+#[test]
+fn openapi_sql_spec_includes_query_and_explain_paths() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let resp = get(ctx.addr(), "/openapi/db/sql.json");
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let json = resp.json();
+    let paths = json["paths"].as_object().expect("paths object");
+
+    let query = paths
+        .get("/v1/db/sql/query")
+        .expect("missing /v1/db/sql/query");
+    assert!(
+        query.get("post").is_some(),
+        "/v1/db/sql/query should expose POST"
+    );
+
+    let explain = paths
+        .get("/v1/db/sql/explain")
+        .expect("missing /v1/db/sql/explain");
+    assert!(
+        explain.get("post").is_some(),
+        "/v1/db/sql/explain should expose POST"
+    );
+}
+
+#[test]
+fn openapi_plane_specs_include_expected_paths_and_methods() {
+    let temp = TempDir::new().expect("temp dir");
+    let ctx = ServerTestContext::new(db_config(temp.path()));
+
+    let cases: [(&str, &[(&str, &[&str])]); 6] = [
+        (
+            "/openapi/db/tables.json",
+            &[
+                ("/v1/db/tables/{table}", &["get", "post"]),
+                ("/v1/db/tables/{table}/insert", &["post"]),
+                ("/v1/db/tables/{table}/{doc_id}", &["get", "patch", "delete"]),
+                ("/v1/db/tables/{table}/search", &["post"]),
+                ("/v1/db/tables/{table}/{doc_id}/tags", &["get", "post", "delete"]),
+            ],
+        ),
+        (
+            "/openapi/db/vectors.json",
+            &[
+                ("/v1/db/vectors/collections", &["get", "post"]),
+                ("/v1/db/vectors/collections/{name}", &["get", "delete"]),
+                (
+                    "/v1/db/vectors/collections/{name}/points/append",
+                    &["post"],
+                ),
+                (
+                    "/v1/db/vectors/collections/{name}/points/upsert",
+                    &["post"],
+                ),
+                (
+                    "/v1/db/vectors/collections/{name}/points/delete",
+                    &["post"],
+                ),
+                (
+                    "/v1/db/vectors/collections/{name}/points/fetch",
+                    &["post"],
+                ),
+                (
+                    "/v1/db/vectors/collections/{name}/points/query",
+                    &["post"],
+                ),
+                ("/v1/db/vectors/collections/{name}/stats", &["get"]),
+                ("/v1/db/vectors/collections/{name}/compact", &["post"]),
+                (
+                    "/v1/db/vectors/collections/{name}/indexes/build",
+                    &["post"],
+                ),
+                ("/v1/db/vectors/collections/{name}/changes", &["get"]),
+            ],
+        ),
+        (
+            "/openapi/db/kv.json",
+            &[
+                ("/v1/db/kv/namespaces/{namespace}/entries", &["get"]),
+                (
+                    "/v1/db/kv/namespaces/{namespace}/entries/{key}",
+                    &["put", "get", "delete"],
+                ),
+                ("/v1/db/kv/namespaces/{namespace}/flush", &["post"]),
+                ("/v1/db/kv/namespaces/{namespace}/compact", &["post"]),
+            ],
+        ),
+        (
+            "/openapi/db/blobs.json",
+            &[
+                ("/v1/db/blobs", &["get"]),
+                ("/v1/db/blobs/{blob_ref}", &["get"]),
+            ],
+        ),
+        (
+            "/openapi/db/sql.json",
+            &[
+                ("/v1/db/sql/query", &["post"]),
+                ("/v1/db/sql/explain", &["post"]),
+            ],
+        ),
+        (
+            "/openapi/db/ops.json",
+            &[
+                ("/v1/db/ops/compact", &["post"]),
+                ("/v1/db/ops/simulate_crash", &["post"]),
+            ],
+        ),
+    ];
+
+    for (spec_path, expected) in cases {
+        let resp = get(ctx.addr(), spec_path);
+        assert_eq!(resp.status, 200, "spec={spec_path} body={}", resp.body);
+        let json = resp.json();
+        let paths = json["paths"].as_object().expect("paths object");
+
+        for (path, methods) in expected {
+            let entry = paths
+                .get(*path)
+                .unwrap_or_else(|| panic!("spec={spec_path} missing path {path}"));
+            for method in *methods {
+                assert!(
+                    entry.get(*method).is_some(),
+                    "spec={spec_path} path={path} missing method {}",
+                    method
+                );
+            }
+        }
+    }
+}

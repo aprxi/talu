@@ -1,8 +1,17 @@
 //! Integration tests for low-level `/v1/db/*` endpoints.
 
+mod auth;
+mod blob;
+mod contracts;
+mod error_shapes;
 mod kv;
+mod method_matrix;
 mod openapi_docs;
+mod ops;
+mod routing;
+mod side_effects;
 mod sql;
+mod tenant_isolation;
 mod table;
 mod vector;
 
