@@ -6,6 +6,7 @@
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
+const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const log = @import("../../../../log.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const attention_kernel = @import("../kernels/attention.zig");
@@ -63,8 +64,44 @@ pub const TransformerBlock = struct {
         };
     }
 
+    const LayerProgramAdapterKind = enum(u8) {
+        norm,
+        mixer,
+        ffn,
+        mamba,
+        residual_add,
+    };
+
+    const layer_program_adapter_table: [256]?LayerProgramAdapterKind = blk: {
+        var table: [256]?LayerProgramAdapterKind = [_]?LayerProgramAdapterKind{null} ** 256;
+        table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = .norm;
+        table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = .mixer;
+        table[@intFromEnum(opcode_map.Opcode.shortconv)] = .mixer;
+        table[@intFromEnum(opcode_map.Opcode.swiglu)] = .ffn;
+        table[@intFromEnum(opcode_map.Opcode.moe)] = .ffn;
+        table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] = .mamba;
+        table[@intFromEnum(opcode_map.Opcode.residual_add)] = .residual_add;
+        break :blk table;
+    };
+
+    fn layerProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?LayerProgramAdapterKind {
+        return layer_program_adapter_table[@intFromEnum(opcode)];
+    }
+
     fn validateLayerProgram(program: []const layer_ops.LayerOp, layer_idx: usize, kind: usize) !void {
         for (program, 0..) |op, op_idx| {
+            const opcode = opcode_map.opcodeForLayerOp(op);
+            if (layerProgramAdapterForOpcode(opcode) == null) {
+                log.warn("inference", "Metal LayerOp program contains unsupported opcode", .{
+                    .layer = layer_idx,
+                    .op_index = op_idx,
+                    .kind = kind,
+                    .op = @tagName(op),
+                    .opcode = @intFromEnum(opcode),
+                });
+                return error.NotImplemented;
+            }
+
             switch (op) {
                 .kernel => |kernel_op| {
                     if (!isCoreProgramBuffer(kernel_op.in) or !isCoreProgramBuffer(kernel_op.out)) {
@@ -75,18 +112,6 @@ pub const TransformerBlock = struct {
                             .debug_type = @tagName(kernel_op.debug_type),
                         });
                         return error.NotImplemented;
-                    }
-                    switch (kernel_op.debug_type) {
-                        .norm, .multihead_attention, .shortconv, .mlp, .moe, .mamba_mixer => {},
-                        else => {
-                            log.warn("inference", "Metal LayerOp program uses unsupported kernel debug type", .{
-                                .layer = layer_idx,
-                                .op_index = op_idx,
-                                .kind = kind,
-                                .debug_type = @tagName(kernel_op.debug_type),
-                            });
-                            return error.NotImplemented;
-                        },
                     }
                 },
                 .add => |add_op| {
@@ -99,15 +124,7 @@ pub const TransformerBlock = struct {
                         return error.NotImplemented;
                     }
                 },
-                else => {
-                    log.warn("inference", "Metal LayerOp program contains unsupported op kind", .{
-                        .layer = layer_idx,
-                        .op_index = op_idx,
-                        .kind = kind,
-                        .op = @tagName(op),
-                    });
-                    return error.NotImplemented;
-                },
+                else => {},
             }
         }
 
@@ -419,6 +436,117 @@ pub const TransformerBlock = struct {
         };
     }
 
+    fn dispatchLayerProgramOp(
+        op: layer_ops.LayerOp,
+        lw: anytype,
+        layer_idx: usize,
+        config: anytype,
+        weight_handles: anytype,
+        cache: ?Cache,
+        shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
+        pos_offset: usize,
+        runtime_rope_cos_handle: mlx_graph.ArrayHandle,
+        runtime_rope_sin_handle: mlx_graph.ArrayHandle,
+        runtime_rope_dim: usize,
+        residual: *mlx_graph.ArrayHandle,
+        norm_out: *mlx_graph.ArrayHandle,
+        branch_out: *mlx_graph.ArrayHandle,
+        norm_index: *usize,
+    ) !void {
+        const opcode = opcode_map.opcodeForLayerOp(op);
+        const adapter_kind = layerProgramAdapterForOpcode(opcode) orelse return error.NotImplemented;
+
+        switch (adapter_kind) {
+            .norm => {
+                const kernel_op = switch (op) {
+                    .kernel => |kernel| kernel,
+                    else => return error.NotImplemented,
+                };
+                if (kernel_op.debug_type != .norm) return error.NotImplemented;
+                const input = try getBuffer(kernel_op.in, residual.*, norm_out.*, branch_out.*);
+                var output: mlx_graph.ArrayHandle = undefined;
+                const norm = norm_kernel.RMSNorm{
+                    .weight = try nextNormWeight(lw, norm_index),
+                    .eps = config.norm_eps,
+                };
+                norm.forward(input, &output);
+                try setBuffer(kernel_op.out, residual, norm_out, branch_out, output);
+            },
+            .mixer => {
+                const kernel_op = switch (op) {
+                    .kernel => |kernel| kernel,
+                    else => return error.NotImplemented,
+                };
+                if (kernel_op.debug_type != .multihead_attention and kernel_op.debug_type != .shortconv) {
+                    return error.NotImplemented;
+                }
+                const input = try getBuffer(kernel_op.in, residual.*, norm_out.*, branch_out.*);
+                const output = try runMixerKernel(
+                    input,
+                    lw,
+                    layer_idx,
+                    config,
+                    weight_handles,
+                    cache,
+                    shortconv_cache,
+                    mamba_cache,
+                    pos_offset,
+                    runtime_rope_cos_handle,
+                    runtime_rope_sin_handle,
+                    runtime_rope_dim,
+                );
+                try setBuffer(kernel_op.out, residual, norm_out, branch_out, output);
+            },
+            .ffn => {
+                const kernel_op = switch (op) {
+                    .kernel => |kernel| kernel,
+                    else => return error.NotImplemented,
+                };
+                if (kernel_op.debug_type != .mlp and kernel_op.debug_type != .moe) return error.NotImplemented;
+                const input = try getBuffer(kernel_op.in, residual.*, norm_out.*, branch_out.*);
+                const output = try runFfnKernel(input, lw, weight_handles);
+                try setBuffer(kernel_op.out, residual, norm_out, branch_out, output);
+            },
+            .mamba => {
+                const kernel_op = switch (op) {
+                    .kernel => |kernel| kernel,
+                    else => return error.NotImplemented,
+                };
+                if (kernel_op.debug_type != .mamba_mixer) return error.NotImplemented;
+                const input = try getBuffer(kernel_op.in, residual.*, norm_out.*, branch_out.*);
+                const output = try runMixerKernel(
+                    input,
+                    lw,
+                    layer_idx,
+                    config,
+                    weight_handles,
+                    cache,
+                    shortconv_cache,
+                    mamba_cache,
+                    pos_offset,
+                    runtime_rope_cos_handle,
+                    runtime_rope_sin_handle,
+                    runtime_rope_dim,
+                );
+                try setBuffer(kernel_op.out, residual, norm_out, branch_out, output);
+            },
+            .residual_add => {
+                const add_op = switch (op) {
+                    .add => |add| add,
+                    else => return error.NotImplemented,
+                };
+                const branch = try getBuffer(add_op.branch, residual.*, norm_out.*, branch_out.*);
+                const scale = residualScale(add_op.scale, weight_handles);
+                const scaled_branch = if (scale == 1.0)
+                    branch
+                else
+                    mlx_graph.mlx_lazy_multiply_scalar(branch, scale);
+                residual.* = mlx_graph.mlx_lazy_add(residual.*, scaled_branch);
+            },
+        }
+    }
+
     fn forwardWithProgram(
         hidden: mlx_graph.ArrayHandle,
         program: []const layer_ops.LayerOp,
@@ -440,68 +568,24 @@ pub const TransformerBlock = struct {
         var norm_index: usize = 0;
 
         for (program) |op| {
-            switch (op) {
-                .kernel => |kernel_op| {
-                    const input = try getBuffer(kernel_op.in, residual, norm_out, branch_out);
-                    var output: mlx_graph.ArrayHandle = undefined;
-                    switch (kernel_op.debug_type) {
-                        .norm => {
-                            const norm = norm_kernel.RMSNorm{
-                                .weight = try nextNormWeight(lw, &norm_index),
-                                .eps = config.norm_eps,
-                            };
-                            norm.forward(input, &output);
-                        },
-                        .multihead_attention, .shortconv => {
-                            output = try runMixerKernel(
-                                input,
-                                lw,
-                                layer_idx,
-                                config,
-                                weight_handles,
-                                cache,
-                                shortconv_cache,
-                                mamba_cache,
-                                pos_offset,
-                                runtime_rope_cos_handle,
-                                runtime_rope_sin_handle,
-                                runtime_rope_dim,
-                            );
-                        },
-                        .mlp, .moe => {
-                            output = try runFfnKernel(input, lw, weight_handles);
-                        },
-                        .mamba_mixer => {
-                            output = try runMixerKernel(
-                                input,
-                                lw,
-                                layer_idx,
-                                config,
-                                weight_handles,
-                                cache,
-                                shortconv_cache,
-                                mamba_cache,
-                                pos_offset,
-                                runtime_rope_cos_handle,
-                                runtime_rope_sin_handle,
-                                runtime_rope_dim,
-                            );
-                        },
-                        else => return error.NotImplemented,
-                    }
-                    try setBuffer(kernel_op.out, &residual, &norm_out, &branch_out, output);
-                },
-                .add => |add_op| {
-                    const branch = try getBuffer(add_op.branch, residual, norm_out, branch_out);
-                    const scale = residualScale(add_op.scale, weight_handles);
-                    const scaled_branch = if (scale == 1.0)
-                        branch
-                    else
-                        mlx_graph.mlx_lazy_multiply_scalar(branch, scale);
-                    residual = mlx_graph.mlx_lazy_add(residual, scaled_branch);
-                },
-                else => return error.NotImplemented,
-            }
+            try dispatchLayerProgramOp(
+                op,
+                lw,
+                layer_idx,
+                config,
+                weight_handles,
+                cache,
+                shortconv_cache,
+                mamba_cache,
+                pos_offset,
+                runtime_rope_cos_handle,
+                runtime_rope_sin_handle,
+                runtime_rope_dim,
+                &residual,
+                &norm_out,
+                &branch_out,
+                &norm_index,
+            );
         }
         return getBuffer(finalOutputBuffer(program), residual, norm_out, branch_out);
     }
@@ -641,6 +725,24 @@ test "validateLayerProgram accepts kernel-add programs" {
         } },
     };
     try TransformerBlock.validateLayerProgram(&program, 0, 0);
+}
+
+test "layerProgramAdapterForOpcode covers Metal LayerOp execution subset" {
+    const supported = [_]opcode_map.Opcode{
+        .rmsnorm,
+        .multihead_attention,
+        .swiglu,
+        .moe,
+        .mamba_mixer,
+        .shortconv,
+        .residual_add,
+    };
+    for (supported) |opcode| {
+        try std.testing.expect(TransformerBlock.layerProgramAdapterForOpcode(opcode) != null);
+    }
+
+    try std.testing.expect(TransformerBlock.layerProgramAdapterForOpcode(.mul_scalar) == null);
+    try std.testing.expect(TransformerBlock.layerProgramAdapterForOpcode(.vision_patch_embed) == null);
 }
 
 test "validateLayerProgram rejects unsupported primitive ops" {

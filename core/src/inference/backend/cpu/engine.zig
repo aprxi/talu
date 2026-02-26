@@ -44,6 +44,7 @@ const progress_mod = @import("../../../progress.zig");
 const cpu_executor = @import("executor/root.zig");
 const Transformer = cpu_executor.Model;
 const cpu_blocks = cpu_executor.weights;
+const runtime_contract = @import("../../runtime_contract/root.zig");
 const common_mrope = @import("vision/mrope.zig");
 const trace = @import("../../../xray/trace.zig");
 const PoolingStrategy = contract.PoolingStrategy;
@@ -251,6 +252,10 @@ pub const FusedCpuBackend = struct {
         }
     }
 
+    fn layerHasStateDescriptor(layer: *const cpu_executor.Block, state_id: u8) bool {
+        return runtime_contract.planHasStateDescriptor(&layer.compiled_plan.plan, state_id);
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
@@ -330,71 +335,54 @@ pub const FusedCpuBackend = struct {
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
-        // Initialize Mamba state for heterogeneous models
+        // Build executor model
+        var model = try Transformer.build(allocator, loaded, cpu_block_set);
+        errdefer model.deinit(allocator);
+
+        // Initialize recurrent/latent state from compiled plan descriptors.
         var mamba_layer_indices = std.ArrayListUnmanaged(usize){};
         defer mamba_layer_indices.deinit(allocator);
-        var mamba_config: ?cpu_blocks.MambaConfig = null;
-        for (loaded.blocks, 0..) |layer, layer_idx| {
-            if (layer.block_type == .mamba) {
+        var shortconv_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer shortconv_layer_indices.deinit(allocator);
+        var mla_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer mla_layer_indices.deinit(allocator);
+
+        const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
+        const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
+        for (model.layers, 0..) |*layer, layer_idx| {
+            if (layerHasStateDescriptor(layer, mamba_state_id)) {
                 try mamba_layer_indices.append(allocator, layer_idx);
-                if (mamba_config == null) {
-                    if (layer.map_context.mamba_config) |cfg| {
-                        mamba_config = .{
-                            .d_model = cfg.d_model,
-                            .d_state = cfg.d_state,
-                            .d_conv = cfg.d_conv,
-                            .n_heads = cfg.n_heads,
-                            .d_head = cfg.d_head,
-                            .n_groups = cfg.n_groups,
-                        };
-                    }
-                }
+            }
+            if (layerHasStateDescriptor(layer, shortconv_state_id)) {
+                try shortconv_layer_indices.append(allocator, layer_idx);
+            }
+            if (layer_idx < cpu_block_set.len and cpu_block_set[layer_idx].getMLAAttention() != null) {
+                try mla_layer_indices.append(allocator, layer_idx);
             }
         }
-        if (mamba_layer_indices.items.len > 0 and mamba_config != null) {
-            try scratch.initMamba(mamba_layer_indices.items, mamba_config.?);
+
+        if (mamba_layer_indices.items.len > 0) {
+            const first_layer_idx = mamba_layer_indices.items[0];
+            if (first_layer_idx >= cpu_block_set.len) return error.InvalidStateDescriptorBinding;
+            const mamba_kernel = cpu_block_set[first_layer_idx].getMambaKernel() orelse return error.InvalidStateDescriptorBinding;
+            try scratch.initMamba(mamba_layer_indices.items, mamba_kernel.config);
             log.info("inference", "Heterogeneous model detected", .{
                 .mamba_layers = mamba_layer_indices.items.len,
                 .attention_layers = @as(usize, layer_total) - mamba_layer_indices.items.len,
             });
         }
 
-        // Initialize ShortConv state for heterogeneous models with conv layers
-        var shortconv_layer_indices = std.ArrayListUnmanaged(usize){};
-        defer shortconv_layer_indices.deinit(allocator);
-        var shortconv_config: ?cpu_blocks.ShortConvConfig = null;
-        for (loaded.blocks, 0..) |layer, layer_idx| {
-            if (layer.block_type == .shortconv) {
-                try shortconv_layer_indices.append(allocator, layer_idx);
-                if (shortconv_config == null) {
-                    if (layer.map_context.shortconv_config) |cfg| {
-                        shortconv_config = .{
-                            .d_model = cfg.d_model,
-                            .d_conv = cfg.d_conv,
-                            .conv_dim = cfg.conv_dim,
-                            .conv_dim_out = cfg.conv_dim_out,
-                            .has_bias = cfg.has_bias,
-                        };
-                    }
-                }
-            }
-        }
-        if (shortconv_layer_indices.items.len > 0 and shortconv_config != null) {
-            try scratch.initShortConv(shortconv_layer_indices.items, shortconv_config.?);
+        if (shortconv_layer_indices.items.len > 0) {
+            const first_layer_idx = shortconv_layer_indices.items[0];
+            if (first_layer_idx >= cpu_block_set.len) return error.InvalidStateDescriptorBinding;
+            const shortconv_kernel = cpu_block_set[first_layer_idx].getShortConvKernel() orelse return error.InvalidStateDescriptorBinding;
+            try scratch.initShortConv(shortconv_layer_indices.items, shortconv_kernel.config);
             log.info("inference", "ShortConv heterogeneous model detected", .{
                 .shortconv_layers = shortconv_layer_indices.items.len,
                 .attention_layers = @as(usize, layer_total) - shortconv_layer_indices.items.len,
             });
         }
 
-        // Initialize MLA (Multi-Latent Attention) cache for MLA models
-        var mla_layer_indices = std.ArrayListUnmanaged(usize){};
-        defer mla_layer_indices.deinit(allocator);
-        for (loaded.blocks, 0..) |layer, layer_idx| {
-            if (layer.map_context.kernel_meta.mla_config != null) {
-                try mla_layer_indices.append(allocator, layer_idx);
-            }
-        }
         if (mla_layer_indices.items.len > 0) {
             try scratch.initMLA(mla_layer_indices.items);
             log.info("inference", "MLA model detected", .{
@@ -406,9 +394,6 @@ pub const FusedCpuBackend = struct {
         try scratch.ensure(1);
         progress.updateLine(1, @intCast(layer_total + 2), null);
 
-        // Build executor model
-        var model = try Transformer.build(allocator, loaded, cpu_block_set);
-        errdefer model.deinit(allocator);
         progress.updateLine(1, progress_total, null);
         // Note: completeLine(1) is called by the caller after warmup, so the
         // progress bar stays active during the warmup forward pass.

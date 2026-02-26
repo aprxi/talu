@@ -1264,6 +1264,35 @@ pub const Block = struct {
     /// This is intended for load-time checks to catch invalid graphs early.
     pub fn validate(self: *const Block) !void {
         for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
+            const expected_state_id = runtime_contract.stateBlockIdForOpcode(insn.opcode);
+            if (expected_state_id) |state_id| {
+                if (insn.state_block_id == null or insn.state_block_id.? != state_id) {
+                    error_context.setContext("block={d}, op={d}, opcode={d}, expected_state_id={d}", .{
+                        self.block_idx,
+                        op_index,
+                        @intFromEnum(insn.opcode),
+                        state_id,
+                    });
+                    return error.InvalidStateDescriptorBinding;
+                }
+                if (!runtime_contract.planHasStateDescriptor(&self.compiled_plan.plan, state_id)) {
+                    error_context.setContext("block={d}, op={d}, missing_state_desc_id={d}", .{
+                        self.block_idx,
+                        op_index,
+                        state_id,
+                    });
+                    return error.InvalidStateDescriptorBinding;
+                }
+            } else if (insn.state_block_id != null) {
+                error_context.setContext("block={d}, op={d}, opcode={d}, unexpected_state_id={d}", .{
+                    self.block_idx,
+                    op_index,
+                    @intFromEnum(insn.opcode),
+                    insn.state_block_id.?,
+                });
+                return error.InvalidStateDescriptorBinding;
+            }
+
             if (sequential_adapter_table[@intFromEnum(insn.opcode)] == null) {
                 error_context.setContext("block={d}, op={d}, opcode={d}", .{
                     self.block_idx,
@@ -1791,6 +1820,28 @@ test "Block.validate accepts valid program with all required weights" {
     defer block.deinit(allocator);
 
     try block.validate();
+}
+
+test "Block.validate rejects unexpected state descriptor binding on stateless opcode" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .add = .{ .branch = .branch_out, .scale = .one } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    const insn_mut = @constCast(block.compiled_plan.plan.instructions.ptr);
+    insn_mut[0].state_block_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
+
+    try testing.expectError(error.InvalidStateDescriptorBinding, block.validate());
 }
 
 test "Block.validate detects split with invalid num_outputs" {

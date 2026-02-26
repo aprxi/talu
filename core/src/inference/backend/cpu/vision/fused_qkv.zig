@@ -12,6 +12,7 @@
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
+const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const models = @import("../../../../models/root.zig");
 const compute = @import("../../../../compute/root.zig");
 const cpu_blocks = @import("../executor/weights.zig");
@@ -72,6 +73,34 @@ pub const VisionRuntime = struct {
     exec_blocks: []exec_block.Block,
     scratch: cpu_blocks.ScratchBuffer,
     vision_program: []const layer_ops.LayerOp,
+
+    const VisionProgramAdapterState = struct {
+        saw_patch_embed: bool = false,
+        saw_spatial_merge: bool = false,
+        merged_embeddings: ?[]f32 = null,
+    };
+
+    const VisionProgramAdapterFn = *const fn (
+        self: *VisionRuntime,
+        op: layer_ops.LayerOp,
+        grid: image_mod.VisionGrid,
+        merged_hidden_in: []const f32,
+        deepstack_layer_embeddings: []const []const f32,
+        state: *VisionProgramAdapterState,
+    ) anyerror!void;
+
+    const vision_program_adapter_table = blk: {
+        var table: [256]?VisionProgramAdapterFn = [_]?VisionProgramAdapterFn{null} ** 256;
+        table[@intFromEnum(opcode_map.Opcode.vision_patch_embed)] = visionProgramPatchEmbedAdapter;
+        table[@intFromEnum(opcode_map.Opcode.vision_deepstack_extract)] = visionProgramDeepstackExtractAdapter;
+        table[@intFromEnum(opcode_map.Opcode.vision_spatial_merge)] = visionProgramSpatialMergeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.vision_scatter)] = visionProgramScatterAdapter;
+        break :blk table;
+    };
+
+    fn visionProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?VisionProgramAdapterFn {
+        return vision_program_adapter_table[@intFromEnum(opcode)];
+    }
 
     const LayerWeights = struct {
         ln1_weight: Tensor,
@@ -594,46 +623,103 @@ pub const VisionRuntime = struct {
         merged_hidden_in: []const f32,
         deepstack_layer_embeddings: []const []const f32,
     ) !EncodedSingleImage {
-        var merged_embeddings: ?[]f32 = null;
-        errdefer if (merged_embeddings) |embeds| self.allocator.free(embeds);
-
-        var saw_patch_embed = false;
-        var saw_spatial_merge = false;
+        var state = VisionProgramAdapterState{};
+        errdefer if (state.merged_embeddings) |embeds| self.allocator.free(embeds);
 
         for (self.vision_program) |op| {
-            switch (op) {
-                .patch_embed => {
-                    if (saw_patch_embed or saw_spatial_merge) return error.InvalidVisionProgram;
-                    saw_patch_embed = true;
-                },
-                .deepstack_extract => |extract_op| {
-                    if (!saw_patch_embed) return error.InvalidVisionProgram;
-                    const layer_idx = std.math.cast(usize, extract_op.layer_index) orelse return error.InvalidVisionProgram;
-                    const merger_idx = self.deepstackLayerToMergerIndex(layer_idx) orelse return error.InvalidVisionProgram;
-                    if (merger_idx >= deepstack_layer_embeddings.len or deepstack_layer_embeddings[merger_idx].len == 0) {
-                        return error.InvalidState;
-                    }
-                },
-                .spatial_merge => {
-                    if (!saw_patch_embed or saw_spatial_merge) return error.InvalidVisionProgram;
-                    saw_spatial_merge = true;
-                    merged_embeddings = try self.runMerger(grid, merged_hidden_in);
-                },
-                .scatter => {
-                    if (!saw_spatial_merge) return error.InvalidVisionProgram;
-                },
-                else => {},
-            }
+            const opcode = opcode_map.opcodeForLayerOp(op);
+            const adapter = visionProgramAdapterForOpcode(opcode) orelse return error.InvalidVisionProgram;
+            try adapter(self, op, grid, merged_hidden_in, deepstack_layer_embeddings, &state);
         }
 
-        if (!saw_patch_embed or !saw_spatial_merge or merged_embeddings == null) {
+        if (!state.saw_patch_embed or !state.saw_spatial_merge or state.merged_embeddings == null) {
             return error.InvalidVisionProgram;
         }
 
         return .{
-            .merged_embeddings = merged_embeddings.?,
+            .merged_embeddings = state.merged_embeddings.?,
             .deepstack_layer_embeddings = deepstack_layer_embeddings,
         };
+    }
+
+    fn visionProgramPatchEmbedAdapter(
+        self: *VisionRuntime,
+        op: layer_ops.LayerOp,
+        grid: image_mod.VisionGrid,
+        merged_hidden_in: []const f32,
+        deepstack_layer_embeddings: []const []const f32,
+        state: *VisionProgramAdapterState,
+    ) !void {
+        _ = self;
+        _ = grid;
+        _ = merged_hidden_in;
+        _ = deepstack_layer_embeddings;
+        switch (op) {
+            .patch_embed => {},
+            else => return error.InvalidVisionProgram,
+        }
+        if (state.saw_patch_embed or state.saw_spatial_merge) return error.InvalidVisionProgram;
+        state.saw_patch_embed = true;
+    }
+
+    fn visionProgramDeepstackExtractAdapter(
+        self: *VisionRuntime,
+        op: layer_ops.LayerOp,
+        grid: image_mod.VisionGrid,
+        merged_hidden_in: []const f32,
+        deepstack_layer_embeddings: []const []const f32,
+        state: *VisionProgramAdapterState,
+    ) !void {
+        _ = grid;
+        _ = merged_hidden_in;
+        if (!state.saw_patch_embed) return error.InvalidVisionProgram;
+
+        const extract_op = switch (op) {
+            .deepstack_extract => |extract| extract,
+            else => return error.InvalidVisionProgram,
+        };
+        const layer_idx = std.math.cast(usize, extract_op.layer_index) orelse return error.InvalidVisionProgram;
+        const merger_idx = self.deepstackLayerToMergerIndex(layer_idx) orelse return error.InvalidVisionProgram;
+        if (merger_idx >= deepstack_layer_embeddings.len or deepstack_layer_embeddings[merger_idx].len == 0) {
+            return error.InvalidState;
+        }
+    }
+
+    fn visionProgramSpatialMergeAdapter(
+        self: *VisionRuntime,
+        op: layer_ops.LayerOp,
+        grid: image_mod.VisionGrid,
+        merged_hidden_in: []const f32,
+        deepstack_layer_embeddings: []const []const f32,
+        state: *VisionProgramAdapterState,
+    ) !void {
+        _ = deepstack_layer_embeddings;
+        switch (op) {
+            .spatial_merge => {},
+            else => return error.InvalidVisionProgram,
+        }
+        if (!state.saw_patch_embed or state.saw_spatial_merge) return error.InvalidVisionProgram;
+        state.saw_spatial_merge = true;
+        state.merged_embeddings = try self.runMerger(grid, merged_hidden_in);
+    }
+
+    fn visionProgramScatterAdapter(
+        self: *VisionRuntime,
+        op: layer_ops.LayerOp,
+        grid: image_mod.VisionGrid,
+        merged_hidden_in: []const f32,
+        deepstack_layer_embeddings: []const []const f32,
+        state: *VisionProgramAdapterState,
+    ) !void {
+        _ = self;
+        _ = grid;
+        _ = merged_hidden_in;
+        _ = deepstack_layer_embeddings;
+        switch (op) {
+            .scatter => {},
+            else => return error.InvalidVisionProgram,
+        }
+        if (!state.saw_spatial_merge) return error.InvalidVisionProgram;
     }
 
     fn deepstackLayerToMergerIndex(self: *const VisionRuntime, layer_idx: usize) ?usize {
@@ -978,4 +1064,20 @@ test "scatterVisionEmbeddings replaces image token rows" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ 7, 8 }, hidden[2..4]);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 9, 10 }, hidden[4..6]);
     try std.testing.expectEqualSlices(f32, &[_]f32{ 3, 3 }, hidden[6..8]);
+}
+
+test "visionProgramAdapterForOpcode covers CPU fused vision execution subset" {
+    const supported = [_]opcode_map.Opcode{
+        .vision_patch_embed,
+        .vision_deepstack_extract,
+        .vision_spatial_merge,
+        .vision_scatter,
+    };
+
+    for (supported) |opcode| {
+        try std.testing.expect(VisionRuntime.visionProgramAdapterForOpcode(opcode) != null);
+    }
+
+    try std.testing.expect(VisionRuntime.visionProgramAdapterForOpcode(.rmsnorm) == null);
+    try std.testing.expect(VisionRuntime.visionProgramAdapterForOpcode(.mul_scalar) == null);
 }

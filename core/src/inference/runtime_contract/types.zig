@@ -36,6 +36,12 @@ pub const StateDescriptor = struct {
     lifecycle: StateLifecycle,
 };
 
+pub const StateBlockId = enum(u8) {
+    kv_cache = 0,
+    shortconv = 1,
+    mamba = 2,
+};
+
 pub const Instruction = struct {
     opcode: Opcode,
     inputs: []const RegisterRef,
@@ -162,6 +168,48 @@ pub const AdapterCapability = struct {
 };
 
 pub const AdapterCapabilities = [256]AdapterCapability;
+
+pub fn stateBlockIdForOpcode(opcode: Opcode) ?u8 {
+    return switch (opcode) {
+        .multihead_attention, .mla_attention => @intFromEnum(StateBlockId.kv_cache),
+        .shortconv => @intFromEnum(StateBlockId.shortconv),
+        .mamba_mixer => @intFromEnum(StateBlockId.mamba),
+        else => null,
+    };
+}
+
+pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
+    return switch (state_id) {
+        .kv_cache => .{
+            .id = @intFromEnum(StateBlockId.kv_cache),
+            .size_bytes = 0,
+            .align_bytes = 64,
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+        },
+        .shortconv => .{
+            .id = @intFromEnum(StateBlockId.shortconv),
+            .size_bytes = 0,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+        },
+        .mamba => .{
+            .id = @intFromEnum(StateBlockId.mamba),
+            .size_bytes = 0,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+        },
+    };
+}
+
+pub fn planHasStateDescriptor(plan: *const ExecutionPlan, state_id: u8) bool {
+    for (plan.state_descs) |desc| {
+        if (desc.id == state_id) return true;
+    }
+    return false;
+}
 
 pub fn validateTensorViewDesc(view: *const TensorViewDesc) !void {
     if (view.rank > 4) return error.UnsupportedTensorRank;
@@ -303,4 +351,28 @@ test "validateCompiledPlan enforces liveness dimensions" {
 
 test "AdapterTable keeps 256 opcode slots" {
     try std.testing.expectEqual(@as(usize, 256), @typeInfo(AdapterTable).array.len);
+}
+
+test "stateBlockIdForOpcode maps stateful macro ops" {
+    try std.testing.expectEqual(
+        @as(?u8, @intFromEnum(StateBlockId.kv_cache)),
+        stateBlockIdForOpcode(.multihead_attention),
+    );
+    try std.testing.expectEqual(
+        @as(?u8, @intFromEnum(StateBlockId.shortconv)),
+        stateBlockIdForOpcode(.shortconv),
+    );
+    try std.testing.expectEqual(
+        @as(?u8, @intFromEnum(StateBlockId.mamba)),
+        stateBlockIdForOpcode(.mamba_mixer),
+    );
+    try std.testing.expectEqual(@as(?u8, null), stateBlockIdForOpcode(.residual_add));
+}
+
+test "defaultStateDescriptor uses stable v1 compatibility defaults" {
+    const kv_desc = defaultStateDescriptor(.kv_cache);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.kv_cache)), kv_desc.id);
+    try std.testing.expectEqual(@as(u16, 64), kv_desc.align_bytes);
+    try std.testing.expect(!kv_desc.zero_init);
+    try std.testing.expectEqual(StateLifecycle.slot_persistent, kv_desc.lifecycle);
 }

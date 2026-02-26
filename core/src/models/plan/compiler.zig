@@ -14,6 +14,10 @@ const qwen3_moe = @import("../qwen/qwen3_moe.zig");
 
 pub const CompileMode = runtime_contract.ExecutionMode;
 
+const kv_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
+const shortconv_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.shortconv);
+const mamba_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.mamba);
+
 fn registerFromBuffer(buffer: layer_ops.BufferId) runtime_contract.RegisterRef {
     return runtime_contract.registerFromIndex(@intFromEnum(buffer));
 }
@@ -63,6 +67,7 @@ fn compileOneInstruction(
     param_block_id: u16,
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
+    const state_block_id = runtime_contract.stateBlockIdForOpcode(opcode);
     return switch (op) {
         .kernel => |kernel_op| .{
             .opcode = opcode,
@@ -70,7 +75,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .add => |add_op| .{
             .opcode = opcode,
@@ -78,7 +83,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{.residual}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .linear => |linear_op| .{
             .opcode = opcode,
@@ -86,7 +91,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{linear_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .matmul => |matmul_op| .{
             .opcode = opcode,
@@ -94,7 +99,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{matmul_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .split => |split_op| .{
             .opcode = opcode,
@@ -102,7 +107,7 @@ fn compileOneInstruction(
             .outputs = try allocSequentialRegisters(allocator, split_op.out_start, split_op.num_outputs),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .softmax => |softmax_op| .{
             .opcode = opcode,
@@ -110,7 +115,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{softmax_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .silu => |silu_op| .{
             .opcode = opcode,
@@ -118,7 +123,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{silu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .gelu => |gelu_op| .{
             .opcode = opcode,
@@ -126,7 +131,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{gelu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .mul => |mul_op| .{
             .opcode = opcode,
@@ -134,7 +139,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{mul_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .add_tensor => |add_tensor_op| .{
             .opcode = opcode,
@@ -142,7 +147,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_tensor_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .add_scalar => |add_scalar_op| .{
             .opcode = opcode,
@@ -150,7 +155,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_scalar_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .mul_scalar => |mul_scalar_op| .{
             .opcode = opcode,
@@ -158,7 +163,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{mul_scalar_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .mean => |mean_op| .{
             .opcode = opcode,
@@ -166,7 +171,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{mean_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .pow => |pow_op| .{
             .opcode = opcode,
@@ -174,7 +179,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{pow_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .rsqrt => |rsqrt_op| .{
             .opcode = opcode,
@@ -182,7 +187,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{rsqrt_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .add_param => |add_param_op| .{
             .opcode = opcode,
@@ -190,7 +195,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .add_param_scalar => |add_param_scalar_op| .{
             .opcode = opcode,
@@ -198,7 +203,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_scalar_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .mul_param => |mul_param_op| .{
             .opcode = opcode,
@@ -206,7 +211,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{mul_param_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .reshape => |reshape_op| .{
             .opcode = opcode,
@@ -214,7 +219,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{reshape_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .transpose => |transpose_op| .{
             .opcode = opcode,
@@ -222,7 +227,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{transpose_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .rope => |rope_op| .{
             .opcode = opcode,
@@ -230,7 +235,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{rope_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .triu => |triu_op| .{
             .opcode = opcode,
@@ -238,7 +243,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{triu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .sdpa => |sdpa_op| .{
             .opcode = opcode,
@@ -246,7 +251,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{sdpa_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .patch_embed => |patch_op| .{
             .opcode = opcode,
@@ -254,7 +259,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{patch_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .spatial_merge => |spatial_op| .{
             .opcode = opcode,
@@ -262,7 +267,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{spatial_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .deepstack_extract => |deepstack_op| .{
             .opcode = opcode,
@@ -270,7 +275,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{deepstack_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
         .scatter => |scatter_op| .{
             .opcode = opcode,
@@ -278,7 +283,7 @@ fn compileOneInstruction(
             .outputs = try allocRegistersFromBuffers(allocator, &.{scatter_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
-            .state_block_id = null,
+            .state_block_id = state_block_id,
         },
     };
 }
@@ -403,6 +408,45 @@ fn buildLivenessMap(
     };
 }
 
+fn buildStateDescriptors(
+    allocator: std.mem.Allocator,
+    instructions: []const runtime_contract.Instruction,
+) ![]runtime_contract.StateDescriptor {
+    var has_kv = false;
+    var has_shortconv = false;
+    var has_mamba = false;
+
+    for (instructions) |insn| {
+        const state_id = insn.state_block_id orelse continue;
+        switch (state_id) {
+            kv_state_id => has_kv = true,
+            shortconv_state_id => has_shortconv = true,
+            mamba_state_id => has_mamba = true,
+            else => return error.UnknownStateDescriptorId,
+        }
+    }
+
+    const state_count: usize = @as(usize, @intFromBool(has_kv)) +
+        @as(usize, @intFromBool(has_shortconv)) +
+        @as(usize, @intFromBool(has_mamba));
+    if (state_count == 0) return &.{};
+
+    const descriptors = try allocator.alloc(runtime_contract.StateDescriptor, state_count);
+    var idx: usize = 0;
+    if (has_kv) {
+        descriptors[idx] = runtime_contract.defaultStateDescriptor(.kv_cache);
+        idx += 1;
+    }
+    if (has_shortconv) {
+        descriptors[idx] = runtime_contract.defaultStateDescriptor(.shortconv);
+        idx += 1;
+    }
+    if (has_mamba) {
+        descriptors[idx] = runtime_contract.defaultStateDescriptor(.mamba);
+    }
+    return descriptors;
+}
+
 fn computePeakRegisters(
     allocator: std.mem.Allocator,
     compiled: *const runtime_contract.CompiledPlan,
@@ -488,6 +532,9 @@ pub fn compileLayerProgram(
         allocator.free(param_block_slice);
     }
 
+    const state_descs = try buildStateDescriptors(allocator, instruction_slice);
+    errdefer if (state_descs.len > 0) allocator.free(state_descs);
+
     const diagnostics = try allocator.alloc(runtime_contract.PlanDiagnostic, 0);
     errdefer allocator.free(diagnostics);
 
@@ -495,7 +542,7 @@ pub fn compileLayerProgram(
         .plan = .{
             .instructions = instruction_slice,
             .register_count = register_count,
-            .state_descs = &.{},
+            .state_descs = state_descs,
         },
         .param_blocks = param_block_slice,
         .liveness = liveness,
@@ -528,6 +575,8 @@ pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contr
     allocator.free(compiled.plan.instructions);
     for (compiled.param_blocks) |param_block| deinitParamBlock(allocator, param_block);
     allocator.free(compiled.param_blocks);
+
+    if (compiled.plan.state_descs.len > 0) allocator.free(compiled.plan.state_descs);
 
     allocator.free(compiled.liveness.register_last_read);
     for (compiled.liveness.kill_after_instruction) |row| allocator.free(row);
@@ -752,6 +801,13 @@ fn expectProgramParity(source: []const layer_ops.LayerOp, compiled: *const runti
     }
 }
 
+fn hasStateDescriptor(compiled: *const runtime_contract.CompiledPlan, id: u8) bool {
+    for (compiled.plan.state_descs) |state_desc| {
+        if (state_desc.id == id) return true;
+    }
+    return false;
+}
+
 test "compileLayerProgram preserves structural parity for llama3" {
     var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
@@ -771,6 +827,54 @@ test "compileLayerProgram preserves structural parity for qwen3_moe" {
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try expectProgramParity(qwen3_moe.attention_mlp_program, &compiled);
+}
+
+test "compileLayerProgram emits KV state descriptor and attention state references" {
+    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expect(hasStateDescriptor(&compiled, kv_state_id));
+
+    var saw_attention = false;
+    for (compiled.plan.instructions) |insn| {
+        if (insn.opcode == .multihead_attention) {
+            saw_attention = true;
+            try std.testing.expectEqual(@as(?u8, kv_state_id), insn.state_block_id);
+        }
+    }
+    try std.testing.expect(saw_attention);
+}
+
+test "compileLayerProgram emits mamba state descriptor and mixer state references" {
+    var compiled = try compileLayerProgram(std.testing.allocator, granite_hybrid.mamba_program, .prefill);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expect(hasStateDescriptor(&compiled, mamba_state_id));
+
+    var saw_mamba = false;
+    for (compiled.plan.instructions) |insn| {
+        if (insn.opcode == .mamba_mixer) {
+            saw_mamba = true;
+            try std.testing.expectEqual(@as(?u8, mamba_state_id), insn.state_block_id);
+        }
+    }
+    try std.testing.expect(saw_mamba);
+}
+
+test "compileLayerProgram emits shortconv state descriptor when shortconv op is present" {
+    const shortconv_program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .shortconv,
+        } },
+    };
+    var compiled = try compileLayerProgram(std.testing.allocator, &shortconv_program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expect(hasStateDescriptor(&compiled, shortconv_state_id));
+    try std.testing.expectEqual(@as(?u8, shortconv_state_id), compiled.plan.instructions[0].state_block_id);
 }
 
 test "compileProgramForArchitecture resolves registry programs" {

@@ -8,6 +8,7 @@ const build_options = @import("build_options");
 const models = @import("../../../models/root.zig");
 const layer_ops = models.layer_ops;
 const op_types = models.op_types;
+const opcode_map = models.plan.opcode_map;
 const contract = @import("../contract.zig");
 const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
@@ -660,6 +661,18 @@ fn finalProgramOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.Buffer
 
 fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
     for (program, 0..) |op, op_idx| {
+        const opcode = opcode_map.opcodeForLayerOp(op);
+        if (CudaBackend.layerProgramAdapterForOpcode(opcode) == null) {
+            log.warn("inference", "CUDA LayerOp program contains unsupported opcode", .{
+                .layer = layer_idx,
+                .op_index = op_idx,
+                .kind = @intFromEnum(kind),
+                .op = @tagName(op),
+                .opcode = @intFromEnum(opcode),
+            });
+            return error.UnsupportedModel;
+        }
+
         switch (op) {
             .kernel => |kernel_op| {
                 if (!isCoreProgramBuffer(kernel_op.in) or !isCoreProgramBuffer(kernel_op.out)) {
@@ -670,18 +683,6 @@ fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: us
                         .debug_type = @tagName(kernel_op.debug_type),
                     });
                     return error.UnsupportedModel;
-                }
-                switch (kernel_op.debug_type) {
-                    .norm, .multihead_attention, .shortconv, .mlp, .moe, .mamba_mixer => {},
-                    else => {
-                        log.warn("inference", "CUDA LayerOp program uses unsupported kernel debug type", .{
-                            .layer = layer_idx,
-                            .op_index = op_idx,
-                            .kind = @intFromEnum(kind),
-                            .debug_type = @tagName(kernel_op.debug_type),
-                        });
-                        return error.UnsupportedModel;
-                    },
                 }
             },
             .add => |add_op| {
@@ -694,15 +695,7 @@ fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: us
                     return error.UnsupportedModel;
                 }
             },
-            else => {
-                log.warn("inference", "CUDA LayerOp program contains unsupported op kind", .{
-                    .layer = layer_idx,
-                    .op_index = op_idx,
-                    .kind = @intFromEnum(kind),
-                    .op = @tagName(op),
-                });
-                return error.UnsupportedModel;
-            },
+            else => {},
         }
     }
 
@@ -1589,6 +1582,8 @@ pub const CudaBackend = struct {
     slot_position: usize = 0,
     slot_rope_position_delta: isize = 0,
     slot_logits: []f32,
+    layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
+    prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     sequence_prefill_hidden_host: []f32,
     sequence_prefill_workspace: ?SequencePrefillWorkspace = null,
     argmax_index_dev: compute.cuda.Buffer,
@@ -1619,6 +1614,8 @@ pub const CudaBackend = struct {
             .attention_scale = 0.0,
             .norm_eps = prototype_eps,
             .slot_logits = undefined,
+            .layer_program_dispatch_total = [_]u64{0} ** 256,
+            .prefill_dispatch_window_start = [_]u64{0} ** 256,
             .sequence_prefill_hidden_host = &.{},
             .sequence_prefill_workspace = null,
             .argmax_index_dev = undefined,
@@ -2014,6 +2011,7 @@ pub const CudaBackend = struct {
         }
 
         self.slot_rope_position_delta = 0;
+        self.beginPrefillDispatchWindow();
         const prefill_start_ns: i128 = std.time.nanoTimestamp();
         try self.ensureKvCapacity(tokens.len);
 
@@ -2068,6 +2066,7 @@ pub const CudaBackend = struct {
         logits_out: []f32,
         mode: []const u8,
     ) !bool {
+        self.beginPrefillDispatchWindow();
         const gate = self.sequencePrefillGate(tokens.len);
         if (gate != .ok) {
             log.debug("inference", "CUDA sequence prefill path inactive", .{
@@ -2721,6 +2720,10 @@ pub const CudaBackend = struct {
     pub fn shouldDownloadPrefillLogitsImpl(self: *const CudaBackend, token_index: usize, token_count: usize) bool {
         _ = self;
         return shouldDownloadPrefillLogits(token_index, token_count);
+    }
+
+    pub fn beginPrefillDispatchWindow(self: *CudaBackend) void {
+        @memcpy(self.prefill_dispatch_window_start[0..], self.layer_program_dispatch_total[0..]);
     }
 
     pub fn logPrefillTimingImpl(self: *const CudaBackend, mode: []const u8, token_count: usize, elapsed_ns: u64) void {
@@ -3672,6 +3675,299 @@ pub const CudaBackend = struct {
         try self.linearForward(&self.prototype.ffn_mul_dev, down_weight, output);
     }
 
+    const LayerProgramExecutionContext = struct {
+        d_model_u32: u32,
+        head_dim_u32: u32,
+        rope_dim_u32: u32,
+        n_heads_u32: u32,
+        n_kv_heads_u32: u32,
+        seq_len_u32: u32,
+        position: usize,
+        position_u32: u32,
+        global_rope_theta: f32,
+        local_rope_theta: f32,
+        rope_function: compute.cuda.Function,
+        copy_function: compute.cuda.Function,
+        cast_f32_to_f16_function: ?compute.cuda.Function,
+        kv_write_f16_function: ?compute.cuda.Function,
+        rope_store_f16_function: ?compute.cuda.Function,
+        shortconv_step_function: compute.cuda.Function,
+        attention_kernels: AttentionKernelSet,
+        norm_buf: *compute.cuda.Buffer,
+        branch_buf: *compute.cuda.Buffer,
+        norm_index: usize,
+    };
+
+    const LayerProgramAdapterFn = *const fn (
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) anyerror!void;
+
+    const layer_program_adapter_table: [256]?LayerProgramAdapterFn = blk: {
+        var table: [256]?LayerProgramAdapterFn = [_]?LayerProgramAdapterFn{null} ** 256;
+        table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = layerProgramNormAdapter;
+        table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = layerProgramAttentionAdapter;
+        table[@intFromEnum(opcode_map.Opcode.shortconv)] = layerProgramShortConvAdapter;
+        table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramFfnAdapter;
+        table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramFfnAdapter;
+        table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] = layerProgramMambaAdapter;
+        table[@intFromEnum(opcode_map.Opcode.residual_add)] = layerProgramResidualAddAdapter;
+        break :blk table;
+    };
+
+    fn layerProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?LayerProgramAdapterFn {
+        return layer_program_adapter_table[@intFromEnum(opcode)];
+    }
+
+    fn recordLayerProgramDispatch(self: *CudaBackend, opcode: opcode_map.Opcode) void {
+        const opcode_idx = @intFromEnum(opcode);
+        self.layer_program_dispatch_total[opcode_idx] +%= 1;
+    }
+
+    fn prefillDispatchDelta(self: *const CudaBackend, opcode: opcode_map.Opcode) u64 {
+        const opcode_idx = @intFromEnum(opcode);
+        return self.layer_program_dispatch_total[opcode_idx] - self.prefill_dispatch_window_start[opcode_idx];
+    }
+
+    fn prefillDispatchTotal(self: *const CudaBackend) u64 {
+        var total: u64 = 0;
+        for (0..self.layer_program_dispatch_total.len) |idx| {
+            total += self.layer_program_dispatch_total[idx] - self.prefill_dispatch_window_start[idx];
+        }
+        return total;
+    }
+
+    fn selectCoreKernelOutput(self: *CudaBackend, out_id: layer_ops.BufferId) !*compute.cuda.Buffer {
+        return switch (out_id) {
+            .norm_out => &self.prototype.norm_out_dev,
+            .branch_out => &self.prototype.attn_out_dev,
+            else => error.UnsupportedModel,
+        };
+    }
+
+    fn selectFfnKernelOutput(self: *CudaBackend, out_id: layer_ops.BufferId) !*compute.cuda.Buffer {
+        return switch (out_id) {
+            .norm_out => &self.prototype.norm_out_dev,
+            .branch_out => &self.prototype.ffn_down_dev,
+            else => error.UnsupportedModel,
+        };
+    }
+
+    fn updateProgramOutputBinding(
+        ctx: *LayerProgramExecutionContext,
+        out_id: layer_ops.BufferId,
+        output: *compute.cuda.Buffer,
+    ) !void {
+        switch (out_id) {
+            .norm_out => ctx.norm_buf = output,
+            .branch_out => ctx.branch_buf = output,
+            else => return error.UnsupportedModel,
+        }
+    }
+
+    fn layerProgramNormAdapter(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const kernel_op = switch (op) {
+            .kernel => |kernel| kernel,
+            else => return error.InvalidArgument,
+        };
+        if (kernel_op.debug_type != .norm) return error.InvalidArgument;
+
+        const input = self.programBuffer(kernel_op.in, ctx.norm_buf, ctx.branch_buf) orelse return error.UnsupportedModel;
+        const output = try self.selectCoreKernelOutput(kernel_op.out);
+
+        if (layer.attention_mlp) |*block| {
+            const weight = nextAttentionNormWeight(block, &ctx.norm_index) orelse return error.UnsupportedModel;
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                input,
+                &weight.buffer,
+                output,
+                1,
+                ctx.d_model_u32,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
+            );
+        } else if (layer.shortconv) |*block| {
+            const weight = nextShortConvNormWeight(block, &ctx.norm_index) orelse return error.UnsupportedModel;
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                input,
+                &weight.buffer,
+                output,
+                1,
+                ctx.d_model_u32,
+                self.norm_eps,
+                self.loaded.runtime.weight_offset,
+            );
+        } else return error.UnsupportedModel;
+
+        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+    }
+
+    fn layerProgramAttentionAdapter(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const kernel_op = switch (op) {
+            .kernel => |kernel| kernel,
+            else => return error.InvalidArgument,
+        };
+        if (kernel_op.debug_type != .multihead_attention) return error.InvalidArgument;
+
+        const input = self.programBuffer(kernel_op.in, ctx.norm_buf, ctx.branch_buf) orelse return error.UnsupportedModel;
+        const output = try self.selectCoreKernelOutput(kernel_op.out);
+
+        if (layer.attention_mlp) |*block| {
+            try self.runAttentionMixerStep(
+                block,
+                input,
+                output,
+                ctx.d_model_u32,
+                ctx.head_dim_u32,
+                ctx.rope_dim_u32,
+                ctx.n_heads_u32,
+                ctx.n_kv_heads_u32,
+                ctx.seq_len_u32,
+                ctx.position,
+                ctx.position_u32,
+                ctx.global_rope_theta,
+                ctx.local_rope_theta,
+                ctx.rope_function,
+                ctx.copy_function,
+                ctx.cast_f32_to_f16_function,
+                ctx.kv_write_f16_function,
+                ctx.rope_store_f16_function,
+                ctx.attention_kernels,
+            );
+        } else return error.UnsupportedModel;
+
+        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+    }
+
+    fn layerProgramShortConvAdapter(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const kernel_op = switch (op) {
+            .kernel => |kernel| kernel,
+            else => return error.InvalidArgument,
+        };
+        if (kernel_op.debug_type != .shortconv) return error.InvalidArgument;
+
+        const input = self.programBuffer(kernel_op.in, ctx.norm_buf, ctx.branch_buf) orelse return error.UnsupportedModel;
+        const output = try self.selectCoreKernelOutput(kernel_op.out);
+
+        if (layer.shortconv) |*block| {
+            try self.runShortConvMixerStep(block, input, output, ctx.shortconv_step_function);
+        } else return error.UnsupportedModel;
+
+        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+    }
+
+    fn layerProgramFfnAdapter(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const kernel_op = switch (op) {
+            .kernel => |kernel| kernel,
+            else => return error.InvalidArgument,
+        };
+        if (kernel_op.debug_type != .mlp and kernel_op.debug_type != .moe) return error.InvalidArgument;
+
+        const input = self.programBuffer(kernel_op.in, ctx.norm_buf, ctx.branch_buf) orelse return error.UnsupportedModel;
+        const output = try self.selectFfnKernelOutput(kernel_op.out);
+
+        if (layer.attention_mlp) |*block| {
+            try self.runFfnStep(
+                input,
+                &block.w1,
+                &block.w3,
+                &block.w2,
+                @intCast(block.d_ff),
+                output,
+            );
+        } else if (layer.shortconv) |*block| {
+            const w1 = block.ffn_w1 orelse return error.UnsupportedModel;
+            const w2 = block.ffn_w2 orelse return error.UnsupportedModel;
+            const w3 = block.ffn_w3 orelse return error.UnsupportedModel;
+            try self.runFfnStep(
+                input,
+                &w1,
+                &w3,
+                &w2,
+                @intCast(block.d_ff),
+                output,
+            );
+        } else return error.UnsupportedModel;
+
+        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+    }
+
+    fn layerProgramMambaAdapter(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const kernel_op = switch (op) {
+            .kernel => |kernel| kernel,
+            else => return error.InvalidArgument,
+        };
+        if (kernel_op.debug_type != .mamba_mixer) return error.InvalidArgument;
+
+        const input = self.programBuffer(kernel_op.in, ctx.norm_buf, ctx.branch_buf) orelse return error.UnsupportedModel;
+        const output = try self.selectCoreKernelOutput(kernel_op.out);
+
+        if (layer.shortconv) |*block| {
+            try self.runShortConvMixerStep(block, input, output, ctx.shortconv_step_function);
+        } else return error.UnsupportedModel;
+
+        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+    }
+
+    fn layerProgramResidualAddAdapter(
+        self: *CudaBackend,
+        _: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const add_op = switch (op) {
+            .add => |add| add,
+            else => return error.InvalidArgument,
+        };
+        const branch = self.programBuffer(add_op.branch, ctx.norm_buf, ctx.branch_buf) orelse return error.UnsupportedModel;
+        try self.addResidualWithScale(&self.prototype.input_dev, branch, ctx.d_model_u32, add_op.scale);
+    }
+
+    fn dispatchLayerProgramOp(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        op: layer_ops.LayerOp,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const opcode = opcode_map.opcodeForLayerOp(op);
+        const adapter = layerProgramAdapterForOpcode(opcode) orelse return error.UnsupportedModel;
+        self.recordLayerProgramDispatch(opcode);
+        try adapter(self, layer, op, ctx);
+    }
+
     fn tryExecuteLayerProgram(
         self: *CudaBackend,
         layer: *BlockRuntimeLayer,
@@ -3694,187 +3990,38 @@ pub const CudaBackend = struct {
         shortconv_step_function: compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
     ) !void {
-        var norm_buf: *compute.cuda.Buffer = &self.prototype.norm_out_dev;
-        var branch_buf: *compute.cuda.Buffer = &self.prototype.attn_out_dev;
-        var norm_index: usize = 0;
+        var exec_ctx = LayerProgramExecutionContext{
+            .d_model_u32 = d_model_u32,
+            .head_dim_u32 = head_dim_u32,
+            .rope_dim_u32 = rope_dim_u32,
+            .n_heads_u32 = n_heads_u32,
+            .n_kv_heads_u32 = n_kv_heads_u32,
+            .seq_len_u32 = seq_len_u32,
+            .position = position,
+            .position_u32 = position_u32,
+            .global_rope_theta = global_rope_theta,
+            .local_rope_theta = local_rope_theta,
+            .rope_function = rope_function,
+            .copy_function = copy_function,
+            .cast_f32_to_f16_function = cast_f32_to_f16_function,
+            .kv_write_f16_function = kv_write_f16_function,
+            .rope_store_f16_function = rope_store_f16_function,
+            .shortconv_step_function = shortconv_step_function,
+            .attention_kernels = attention_kernels,
+            .norm_buf = &self.prototype.norm_out_dev,
+            .branch_buf = &self.prototype.attn_out_dev,
+            .norm_index = 0,
+        };
 
         for (program) |op| {
-            switch (op) {
-                .kernel => |kernel_op| {
-                    const input = self.programBuffer(kernel_op.in, norm_buf, branch_buf) orelse return error.UnsupportedModel;
-                    switch (kernel_op.debug_type) {
-                        .norm => {
-                            const output = switch (kernel_op.out) {
-                                .norm_out => &self.prototype.norm_out_dev,
-                                .branch_out => &self.prototype.attn_out_dev,
-                                .residual => return error.UnsupportedModel,
-                                else => return error.UnsupportedModel,
-                            };
-                            if (layer.attention_mlp) |*block| {
-                                const weight = nextAttentionNormWeight(block, &norm_index) orelse return error.UnsupportedModel;
-                                try compute.cuda.rmsnorm.runWithFunction(
-                                    &self.kernel_arg_pack,
-                                    &self.device,
-                                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                                    input,
-                                    &weight.buffer,
-                                    output,
-                                    1,
-                                    d_model_u32,
-                                    self.norm_eps,
-                                    self.loaded.runtime.weight_offset,
-                                );
-                            } else if (layer.shortconv) |*block| {
-                                const weight = nextShortConvNormWeight(block, &norm_index) orelse return error.UnsupportedModel;
-                                try compute.cuda.rmsnorm.runWithFunction(
-                                    &self.kernel_arg_pack,
-                                    &self.device,
-                                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                                    input,
-                                    &weight.buffer,
-                                    output,
-                                    1,
-                                    d_model_u32,
-                                    self.norm_eps,
-                                    self.loaded.runtime.weight_offset,
-                                );
-                            } else return error.UnsupportedModel;
-                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
-                        },
-                        .multihead_attention => {
-                            const output = switch (kernel_op.out) {
-                                .branch_out => &self.prototype.attn_out_dev,
-                                .norm_out => &self.prototype.norm_out_dev,
-                                .residual => return error.UnsupportedModel,
-                                else => return error.UnsupportedModel,
-                            };
-                            if (layer.attention_mlp) |*block| {
-                                try self.runAttentionMixerStep(
-                                    block,
-                                    input,
-                                    output,
-                                    d_model_u32,
-                                    head_dim_u32,
-                                    rope_dim_u32,
-                                    n_heads_u32,
-                                    n_kv_heads_u32,
-                                    seq_len_u32,
-                                    position,
-                                    position_u32,
-                                    global_rope_theta,
-                                    local_rope_theta,
-                                    rope_function,
-                                    copy_function,
-                                    cast_f32_to_f16_function,
-                                    kv_write_f16_function,
-                                    rope_store_f16_function,
-                                    attention_kernels,
-                                );
-                            } else return error.UnsupportedModel;
-                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
-                        },
-                        .shortconv => {
-                            const output = switch (kernel_op.out) {
-                                .branch_out => &self.prototype.attn_out_dev,
-                                .norm_out => &self.prototype.norm_out_dev,
-                                .residual => return error.UnsupportedModel,
-                                else => return error.UnsupportedModel,
-                            };
-                            if (layer.shortconv) |*block| {
-                                try self.runShortConvMixerStep(block, input, output, shortconv_step_function);
-                            } else return error.UnsupportedModel;
-                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
-                        },
-                        .mlp => {
-                            const output = switch (kernel_op.out) {
-                                .branch_out => &self.prototype.ffn_down_dev,
-                                .norm_out => &self.prototype.norm_out_dev,
-                                .residual => return error.UnsupportedModel,
-                                else => return error.UnsupportedModel,
-                            };
-                            if (layer.attention_mlp) |*block| {
-                                try self.runFfnStep(
-                                    input,
-                                    &block.w1,
-                                    &block.w3,
-                                    &block.w2,
-                                    @intCast(block.d_ff),
-                                    output,
-                                );
-                            } else if (layer.shortconv) |*block| {
-                                const w1 = block.ffn_w1 orelse return error.UnsupportedModel;
-                                const w2 = block.ffn_w2 orelse return error.UnsupportedModel;
-                                const w3 = block.ffn_w3 orelse return error.UnsupportedModel;
-                                try self.runFfnStep(
-                                    input,
-                                    &w1,
-                                    &w3,
-                                    &w2,
-                                    @intCast(block.d_ff),
-                                    output,
-                                );
-                            } else return error.UnsupportedModel;
-                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
-                        },
-                        .moe => {
-                            const output = switch (kernel_op.out) {
-                                .branch_out => &self.prototype.ffn_down_dev,
-                                .norm_out => &self.prototype.norm_out_dev,
-                                .residual => return error.UnsupportedModel,
-                                else => return error.UnsupportedModel,
-                            };
-                            if (layer.attention_mlp) |*block| {
-                                try self.runFfnStep(
-                                    input,
-                                    &block.w1,
-                                    &block.w3,
-                                    &block.w2,
-                                    @intCast(block.d_ff),
-                                    output,
-                                );
-                            } else if (layer.shortconv) |*block| {
-                                const w1 = block.ffn_w1 orelse return error.UnsupportedModel;
-                                const w2 = block.ffn_w2 orelse return error.UnsupportedModel;
-                                const w3 = block.ffn_w3 orelse return error.UnsupportedModel;
-                                try self.runFfnStep(
-                                    input,
-                                    &w1,
-                                    &w3,
-                                    &w2,
-                                    @intCast(block.d_ff),
-                                    output,
-                                );
-                            } else return error.UnsupportedModel;
-                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
-                        },
-                        .mamba_mixer => {
-                            const output = switch (kernel_op.out) {
-                                .branch_out => &self.prototype.attn_out_dev,
-                                .norm_out => &self.prototype.norm_out_dev,
-                                .residual => return error.UnsupportedModel,
-                                else => return error.UnsupportedModel,
-                            };
-                            if (layer.shortconv) |*block| {
-                                try self.runShortConvMixerStep(block, input, output, shortconv_step_function);
-                            } else return error.UnsupportedModel;
-                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
-                        },
-                        else => return error.UnsupportedModel,
-                    }
-                },
-                .add => |add_op| {
-                    const branch = self.programBuffer(add_op.branch, norm_buf, branch_buf) orelse return error.UnsupportedModel;
-                    try self.addResidualWithScale(&self.prototype.input_dev, branch, d_model_u32, add_op.scale);
-                },
-                else => return error.UnsupportedModel,
-            }
+            try self.dispatchLayerProgramOp(layer, op, &exec_ctx);
         }
 
         const final_buf_id = finalOutputBuffer(program);
         switch (final_buf_id) {
             .residual => {},
             .norm_out, .branch_out => {
-                const final_buf = self.programBuffer(final_buf_id, norm_buf, branch_buf) orelse return error.UnsupportedModel;
+                const final_buf = self.programBuffer(final_buf_id, exec_ctx.norm_buf, exec_ctx.branch_buf) orelse return error.UnsupportedModel;
                 try compute.cuda.copy.runWithFunction(
                     &self.kernel_arg_pack,
                     &self.device,
@@ -4596,11 +4743,24 @@ fn logPrefillTiming(self: *const CudaBackend, mode: []const u8, token_count: usi
         0.0
     else
         (@as(f64, @floatFromInt(token_count)) * 1_000_000_000.0) / @as(f64, @floatFromInt(elapsed_ns));
+    const dispatches = self.prefillDispatchTotal();
+    const dispatches_per_token: f64 = if (token_count == 0)
+        0.0
+    else
+        @as(f64, @floatFromInt(dispatches)) / @as(f64, @floatFromInt(token_count));
     log.info("inference", "CUDA prefill timing", .{
         .mode = mode,
         .tokens = token_count,
         .elapsed_ms = elapsed_ms,
         .tok_per_s = tok_per_s,
+        .layer_program_dispatches = dispatches,
+        .layer_program_dispatches_per_token = dispatches_per_token,
+        .layer_program_rmsnorm = self.prefillDispatchDelta(.rmsnorm),
+        .layer_program_attention = self.prefillDispatchDelta(.multihead_attention),
+        .layer_program_shortconv = self.prefillDispatchDelta(.shortconv),
+        .layer_program_ffn = self.prefillDispatchDelta(.swiglu) + self.prefillDispatchDelta(.moe),
+        .layer_program_mamba = self.prefillDispatchDelta(.mamba_mixer),
+        .layer_program_residual_add = self.prefillDispatchDelta(.residual_add),
         .layers = self.block_runtime.blocks.len,
         .attention_blocks = self.block_runtime.attention_block_count,
         .shortconv_blocks = self.block_runtime.shortconv_block_count,
@@ -5817,6 +5977,24 @@ test "validateLayerProgramForCuda accepts kernel-add programs" {
         } },
     };
     try validateLayerProgramForCuda(&program, 0, .attention_mlp);
+}
+
+test "layerProgramAdapterForOpcode covers CUDA LayerOp execution subset" {
+    const supported = [_]opcode_map.Opcode{
+        .rmsnorm,
+        .multihead_attention,
+        .swiglu,
+        .moe,
+        .mamba_mixer,
+        .shortconv,
+        .residual_add,
+    };
+    for (supported) |opcode| {
+        try std.testing.expect(CudaBackend.layerProgramAdapterForOpcode(opcode) != null);
+    }
+
+    try std.testing.expect(CudaBackend.layerProgramAdapterForOpcode(.mul_scalar) == null);
+    try std.testing.expect(CudaBackend.layerProgramAdapterForOpcode(.vision_patch_embed) == null);
 }
 
 test "validateLayerProgramForCuda rejects unsupported primitive ops" {
