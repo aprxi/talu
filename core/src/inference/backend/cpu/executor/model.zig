@@ -823,7 +823,11 @@ pub const Transformer = struct {
 
         // Build layers as Block (with ops-based execution)
         var block_layers = try allocator.alloc(Block, layer_count);
-        errdefer allocator.free(block_layers);
+        var built_layers: usize = 0;
+        errdefer {
+            for (block_layers[0..built_layers]) |*layer| layer.deinit(allocator);
+            allocator.free(block_layers);
+        }
 
         const static_entry = detectStaticTopologyEntry(loaded);
 
@@ -832,7 +836,8 @@ pub const Transformer = struct {
         for (blocks, 0..) |*block, layer_idx| {
             const block_kind = block.block_type;
             const layer_program = try resolveLayerProgram(static_entry, block_kind);
-            block_layers[layer_idx] = buildBlock(block, model_config, layer_idx, layer_program);
+            block_layers[layer_idx] = try buildBlock(allocator, block, model_config, layer_idx, layer_program);
+            built_layers = layer_idx + 1;
             try block_layers[layer_idx].validate();
         }
 
@@ -880,17 +885,19 @@ pub const Transformer = struct {
 
     /// Build a Block with ops-based execution from cpu_blocks.TransformerBlock
     fn buildBlock(
+        allocator: std.mem.Allocator,
         block: *const cpu_blocks.TransformerBlock,
         model_config: ModelConfig,
         layer_idx: usize,
         program: []const LayerOp,
-    ) Block {
-        return .{
-            .program = program,
-            .block = block,
-            .block_idx = layer_idx,
-            .hidden_size = @intCast(model_config.d_model),
-        };
+    ) !Block {
+        return Block.initWithProgram(
+            allocator,
+            block,
+            layer_idx,
+            @intCast(model_config.d_model),
+            program,
+        );
     }
 
     fn detectStaticTopologyEntry(loaded: *const LoadedModel) ?models.ModelDescriptor {
@@ -912,6 +919,7 @@ pub const Transformer = struct {
 
     /// Free model allocated by build
     pub fn deinit(self: *Transformer, allocator: std.mem.Allocator) void {
+        for (self.layers) |*layer| layer.deinit(allocator);
         allocator.free(self.layers);
         self.* = undefined;
     }

@@ -152,6 +152,7 @@ test "buildPhysicalMappingLinearScan reuses physical buffers with liveness" {
             .register_count = 3,
             .state_descs = &.{},
         },
+        .param_blocks = &.{},
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},

@@ -60,6 +60,7 @@ fn maxRegisterInInstruction(insn: runtime_contract.Instruction) u16 {
 fn compileOneInstruction(
     allocator: std.mem.Allocator,
     op: layer_ops.LayerOp,
+    param_block_id: u16,
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
     return switch (op) {
@@ -68,7 +69,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .add => |add_op| .{
@@ -76,7 +77,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{ .residual, add_op.branch }),
             .outputs = try allocRegistersFromBuffers(allocator, &.{.residual}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .linear => |linear_op| .{
@@ -84,7 +85,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{linear_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{linear_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .matmul => |matmul_op| .{
@@ -92,7 +93,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{ matmul_op.in_a, matmul_op.in_b }),
             .outputs = try allocRegistersFromBuffers(allocator, &.{matmul_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .split => |split_op| .{
@@ -100,7 +101,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{split_op.in}),
             .outputs = try allocSequentialRegisters(allocator, split_op.out_start, split_op.num_outputs),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .softmax => |softmax_op| .{
@@ -108,7 +109,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{softmax_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{softmax_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .silu => |silu_op| .{
@@ -116,7 +117,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{silu_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{silu_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .gelu => |gelu_op| .{
@@ -124,7 +125,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{gelu_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{gelu_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .mul => |mul_op| .{
@@ -132,7 +133,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{ mul_op.in, mul_op.other }),
             .outputs = try allocRegistersFromBuffers(allocator, &.{mul_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .add_tensor => |add_tensor_op| .{
@@ -140,7 +141,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{ add_tensor_op.in_a, add_tensor_op.in_b }),
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_tensor_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .add_scalar => |add_scalar_op| .{
@@ -148,7 +149,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{add_scalar_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_scalar_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .mul_scalar => |mul_scalar_op| .{
@@ -156,7 +157,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{mul_scalar_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{mul_scalar_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .mean => |mean_op| .{
@@ -164,7 +165,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{mean_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{mean_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .pow => |pow_op| .{
@@ -172,7 +173,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{pow_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{pow_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .rsqrt => |rsqrt_op| .{
@@ -180,7 +181,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{rsqrt_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{rsqrt_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .add_param => |add_param_op| .{
@@ -188,7 +189,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{add_param_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .add_param_scalar => |add_param_scalar_op| .{
@@ -196,7 +197,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_scalar_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .mul_param => |mul_param_op| .{
@@ -204,7 +205,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{mul_param_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{mul_param_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .reshape => |reshape_op| .{
@@ -212,7 +213,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{reshape_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{reshape_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .transpose => |transpose_op| .{
@@ -220,7 +221,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{transpose_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{transpose_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .rope => |rope_op| .{
@@ -228,7 +229,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{rope_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{rope_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .triu => |triu_op| .{
@@ -236,7 +237,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{triu_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{triu_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .sdpa => |sdpa_op| .{
@@ -244,7 +245,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{ sdpa_op.q, sdpa_op.k, sdpa_op.v }),
             .outputs = try allocRegistersFromBuffers(allocator, &.{sdpa_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .patch_embed => |patch_op| .{
@@ -252,7 +253,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{patch_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{patch_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .spatial_merge => |spatial_op| .{
@@ -260,7 +261,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{spatial_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{spatial_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .deepstack_extract => |deepstack_op| .{
@@ -268,7 +269,7 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{deepstack_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{deepstack_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
         .scatter => |scatter_op| .{
@@ -276,10 +277,71 @@ fn compileOneInstruction(
             .inputs = try allocRegistersFromBuffers(allocator, &.{ scatter_op.text_in, scatter_op.vision_in }),
             .outputs = try allocRegistersFromBuffers(allocator, &.{scatter_op.out}),
             .weights = &.{},
-            .param_block_id = null,
+            .param_block_id = param_block_id,
             .state_block_id = null,
         },
     };
+}
+
+fn serializeLayerOpParam(
+    allocator: std.mem.Allocator,
+    opcode: runtime_contract.Opcode,
+    op: layer_ops.LayerOp,
+) !runtime_contract.ParamBlock {
+    var owned = try cloneLayerOpOwned(allocator, op);
+    errdefer deinitOwnedLayerOp(allocator, &owned);
+
+    const payload = try allocator.alignedAlloc(
+        u8,
+        .fromByteUnits(@alignOf(layer_ops.LayerOp)),
+        @sizeOf(layer_ops.LayerOp),
+    );
+    @memcpy(payload[0..@sizeOf(layer_ops.LayerOp)], std.mem.asBytes(&owned));
+    return .{
+        .version = 1,
+        .opcode = opcode,
+        .data = payload,
+    };
+}
+
+fn cloneLayerOpOwned(allocator: std.mem.Allocator, op: layer_ops.LayerOp) !layer_ops.LayerOp {
+    var owned = op;
+    switch (owned) {
+        .linear => |*linear_op| linear_op.weight_name = try allocator.dupe(u8, linear_op.weight_name),
+        .split => |*split_op| split_op.split_sizes = if (split_op.split_sizes.len == 0)
+            &.{}
+        else
+            try allocator.dupe(usize, split_op.split_sizes),
+        .add_param => |*add_param_op| add_param_op.param_name = try allocator.dupe(u8, add_param_op.param_name),
+        .add_param_scalar => |*add_param_scalar_op| add_param_scalar_op.param_name = try allocator.dupe(u8, add_param_scalar_op.param_name),
+        .mul_param => |*mul_param_op| mul_param_op.param_name = try allocator.dupe(u8, mul_param_op.param_name),
+        .reshape => |*reshape_op| reshape_op.shape = if (reshape_op.shape.len == 0)
+            &.{}
+        else
+            try allocator.dupe(i32, reshape_op.shape),
+        else => {},
+    }
+    return owned;
+}
+
+fn deinitOwnedLayerOp(allocator: std.mem.Allocator, op: *layer_ops.LayerOp) void {
+    switch (op.*) {
+        .linear => |linear_op| allocator.free(linear_op.weight_name),
+        .split => |split_op| if (split_op.split_sizes.len > 0) allocator.free(split_op.split_sizes),
+        .add_param => |add_param_op| allocator.free(add_param_op.param_name),
+        .add_param_scalar => |add_param_scalar_op| allocator.free(add_param_scalar_op.param_name),
+        .mul_param => |mul_param_op| allocator.free(mul_param_op.param_name),
+        .reshape => |reshape_op| if (reshape_op.shape.len > 0) allocator.free(reshape_op.shape),
+        else => {},
+    }
+}
+
+fn deinitParamBlock(allocator: std.mem.Allocator, param_block: runtime_contract.ParamBlock) void {
+    if (param_block.data.len == @sizeOf(layer_ops.LayerOp)) {
+        const op_ptr: *layer_ops.LayerOp = @ptrCast(@alignCast(@constCast(param_block.data.ptr)));
+        deinitOwnedLayerOp(allocator, op_ptr);
+    }
+    allocator.free(param_block.data);
 }
 
 fn buildLivenessMap(
@@ -379,24 +441,30 @@ pub fn compileLayerProgram(
 ) !runtime_contract.CompiledPlan {
     _ = mode;
 
-    var instructions = std.ArrayList(runtime_contract.Instruction).init(allocator);
+    var instructions = std.ArrayListUnmanaged(runtime_contract.Instruction){};
+    var param_blocks = std.ArrayListUnmanaged(runtime_contract.ParamBlock){};
     errdefer {
         for (instructions.items) |insn| {
             allocator.free(insn.inputs);
             allocator.free(insn.outputs);
             if (insn.weights.len > 0) allocator.free(insn.weights);
         }
-        instructions.deinit();
+        instructions.deinit(allocator);
+        for (param_blocks.items) |param_block| deinitParamBlock(allocator, param_block);
+        param_blocks.deinit(allocator);
     }
 
     var max_register: u16 = 0;
     for (program) |op| {
-        const insn = try compileOneInstruction(allocator, op);
+        const opcode = opcode_map.opcodeForLayerOp(op);
+        const param_block_id: u16 = @intCast(param_blocks.items.len);
+        try param_blocks.append(allocator, try serializeLayerOpParam(allocator, opcode, op));
+        const insn = try compileOneInstruction(allocator, op, param_block_id);
         max_register = @max(max_register, maxRegisterInInstruction(insn));
-        try instructions.append(insn);
+        try instructions.append(allocator, insn);
     }
 
-    const instruction_slice = try instructions.toOwnedSlice();
+    const instruction_slice = try instructions.toOwnedSlice(allocator);
     errdefer {
         for (instruction_slice) |insn| {
             allocator.free(insn.inputs);
@@ -414,6 +482,12 @@ pub fn compileLayerProgram(
         allocator.free(liveness.kill_after_instruction);
     }
 
+    const param_block_slice = try param_blocks.toOwnedSlice(allocator);
+    errdefer {
+        for (param_block_slice) |param_block| deinitParamBlock(allocator, param_block);
+        allocator.free(param_block_slice);
+    }
+
     const diagnostics = try allocator.alloc(runtime_contract.PlanDiagnostic, 0);
     errdefer allocator.free(diagnostics);
 
@@ -423,6 +497,7 @@ pub fn compileLayerProgram(
             .register_count = register_count,
             .state_descs = &.{},
         },
+        .param_blocks = param_block_slice,
         .liveness = liveness,
         .peak_registers = register_count,
         .diagnostics = diagnostics,
@@ -451,6 +526,8 @@ pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contr
         if (insn.weights.len > 0) allocator.free(insn.weights);
     }
     allocator.free(compiled.plan.instructions);
+    for (compiled.param_blocks) |param_block| deinitParamBlock(allocator, param_block);
+    allocator.free(compiled.param_blocks);
 
     allocator.free(compiled.liveness.register_last_read);
     for (compiled.liveness.kill_after_instruction) |row| allocator.free(row);

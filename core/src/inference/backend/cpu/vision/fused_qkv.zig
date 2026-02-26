@@ -200,6 +200,7 @@ pub const VisionRuntime = struct {
         var built_layers: usize = 0;
         errdefer {
             for (0..built_layers) |idx| {
+                exec_blocks[idx].deinit(allocator);
                 blocks[idx].deinit(allocator);
                 layer_weights[idx].deinit(allocator);
             }
@@ -305,15 +306,15 @@ pub const VisionRuntime = struct {
                 layer_idx,
             );
 
-            exec_blocks[layer_idx] = .{
-                .program = &vision_block_program,
-                .block = &blocks[layer_idx],
-                .block_idx = layer_idx,
-                .hidden_size = vision_hidden_size,
-            };
+            exec_blocks[layer_idx] = try exec_block.Block.initWithProgram(
+                allocator,
+                &blocks[layer_idx],
+                layer_idx,
+                vision_hidden_size,
+                &vision_block_program,
+            );
+            built_layers = layer_idx + 1;
             try exec_blocks[layer_idx].validate();
-
-            built_layers += 1;
         }
 
         var scratch = try cpu_blocks.ScratchBuffer.init(
@@ -357,6 +358,7 @@ pub const VisionRuntime = struct {
     }
 
     pub fn deinit(self: *VisionRuntime) void {
+        for (self.exec_blocks) |*block| block.deinit(self.allocator);
         for (self.blocks) |*block| block.deinit(self.allocator);
         for (self.layer_weights) |*w| w.deinit(self.allocator);
         self.scratch.deinit();

@@ -74,6 +74,7 @@ pub const PlanDiagnostic = struct {
 
 pub const CompiledPlan = struct {
     plan: ExecutionPlan,
+    param_blocks: []const ParamBlock,
     liveness: LivenessMap,
     peak_registers: u16,
     diagnostics: []const PlanDiagnostic,
@@ -206,6 +207,14 @@ pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
         if (row.len != words) return error.InvalidLivenessBitsetWidth;
     }
     if (compiled.peak_registers > compiled.plan.register_count) return error.InvalidPeakRegisters;
+
+    for (compiled.plan.instructions) |insn| {
+        if (insn.param_block_id) |param_id| {
+            if (param_id >= compiled.param_blocks.len) return error.UnknownParamBlockId;
+            const param_block = compiled.param_blocks[param_id];
+            if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
+        }
+    }
 }
 
 test "register conversion keeps numeric identity" {
@@ -284,6 +293,7 @@ test "validateCompiledPlan enforces liveness dimensions" {
     };
     const compiled = CompiledPlan{
         .plan = plan,
+        .param_blocks = &.{},
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},

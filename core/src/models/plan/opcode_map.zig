@@ -112,10 +112,11 @@ pub fn opcodeForLayerOp(op: layer_ops.LayerOp) Opcode {
 
 test "every executable OpType maps to exactly one opcode and round-trips" {
     inline for (std.meta.tags(op_types.OpType)) |tag| {
-        if (!isExecutableOpType(tag)) continue;
-        const opcode = opcodeForOpType(tag);
-        const roundtrip = opTypeForOpcode(opcode) orelse return error.TestUnexpectedResult;
-        try std.testing.expectEqual(tag, roundtrip);
+        if (isExecutableOpType(tag)) {
+            const opcode = opcodeForOpType(tag);
+            const roundtrip = opTypeForOpcode(opcode) orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(tag, roundtrip);
+        }
     }
 }
 

@@ -6,9 +6,11 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const layer_ops = @import("../../../../models/layer_ops.zig");
+const plan_compiler = @import("../../../../models/plan/compiler.zig");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
 const error_context = @import("../../../../error_context.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const tv = compute.cpu.tensor_view;
 const activation_ops = compute.cpu.activation_view;
@@ -44,9 +46,15 @@ const copyTensor = cpu_forward.copyTensor;
 
 /// Return the buffer that holds the final output of the block program.
 /// Pre-norm programs end on `.residual`; post-norm programs may end on `.norm_out`.
-fn finalOutputBuffer(program: []const LayerOp) BufferId {
-    if (program.len == 0) return .residual;
-    const last = program[program.len - 1];
+fn finalOutputBuffer(compiled: *const runtime_contract.CompiledPlan) BufferId {
+    const instructions = compiled.plan.instructions;
+    if (instructions.len == 0) return .residual;
+    const last_insn = instructions[instructions.len - 1];
+    const param_id = last_insn.param_block_id orelse return .residual;
+    if (param_id >= compiled.param_blocks.len) return .residual;
+    const param_block = compiled.param_blocks[param_id];
+    if (param_block.data.len != @sizeOf(LayerOp)) return .residual;
+    const last: LayerOp = (@as(*const LayerOp, @ptrCast(@alignCast(param_block.data.ptr)))).*;
     return switch (last) {
         .kernel => |k| k.out,
         .add => .residual,
@@ -92,9 +100,8 @@ fn formatRmsNormLike(writer: anytype, dim: usize, eps: f32, weight_offset: f32) 
 ///
 /// Model files (src/models/*.zig) define block_program to create the op sequence.
 pub const Block = struct {
-    /// The "program" - sequence of operations defining block execution.
-    /// Typically points to a static table in `core/src/models/*`.
-    program: []const LayerOp,
+    /// Compiled execution program for this block.
+    compiled_plan: runtime_contract.CompiledPlan,
 
     /// CPU kernel container for this layer (single source of truth).
     block: *const cpu_forward.TransformerBlock,
@@ -104,6 +111,38 @@ pub const Block = struct {
 
     /// Hidden size (d_model)
     hidden_size: usize,
+
+    pub fn initWithProgram(
+        allocator: std.mem.Allocator,
+        block: *const cpu_forward.TransformerBlock,
+        block_idx: usize,
+        hidden_size: usize,
+        program: []const LayerOp,
+    ) !Block {
+        return .{
+            .compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode),
+            .block = block,
+            .block_idx = block_idx,
+            .hidden_size = hidden_size,
+        };
+    }
+
+    pub fn deinit(self: *Block, allocator: std.mem.Allocator) void {
+        plan_compiler.deinitCompiledPlan(allocator, &self.compiled_plan);
+        self.* = undefined;
+    }
+
+    fn decodeInstructionOp(self: *const Block, op_index: usize) !LayerOp {
+        if (op_index >= self.compiled_plan.plan.instructions.len) return error.InvalidInstructionIndex;
+        const insn = self.compiled_plan.plan.instructions[op_index];
+        const param_block_id = insn.param_block_id orelse return error.MissingParamBlock;
+        if (param_block_id >= self.compiled_plan.param_blocks.len) return error.MissingParamBlock;
+        const param_block = self.compiled_plan.param_blocks[param_block_id];
+        if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
+        if (param_block.data.len != @sizeOf(LayerOp)) return error.InvalidParamBlockSize;
+        const op_ptr: *const LayerOp = @ptrCast(@alignCast(param_block.data.ptr));
+        return op_ptr.*;
+    }
 
     fn residualScaleValue(self: *const Block, scale: ResidualScale) f32 {
         return switch (scale) {
@@ -238,7 +277,8 @@ pub const Block = struct {
         };
 
         // Execute the operation sequence
-        for (self.program, 0..) |op, op_index| {
+        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+            const op = try self.decodeInstructionOp(op_index);
             switch (op) {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
@@ -876,7 +916,7 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = finalOutputBuffer(self.program);
+        const final_buf = finalOutputBuffer(&self.compiled_plan);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
         }
@@ -885,7 +925,8 @@ pub const Block = struct {
     /// Validate the program against the block's weight registry and supported ops.
     /// This is intended for load-time checks to catch invalid graphs early.
     pub fn validate(self: *const Block) !void {
-        for (self.program, 0..) |op, op_index| {
+        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+            const op = try self.decodeInstructionOp(op_index);
             switch (op) {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
@@ -970,9 +1011,11 @@ pub const Block = struct {
     /// Describe block showing operation sequence (topology view)
     pub fn describeTopology(self: *const Block, writer: anytype, indent: usize) !void {
         try writer.writeByteNTimes(' ', indent);
-        try writer.print("(layers.{}): Block({} ops)\n", .{ self.block_idx, self.program.len });
+        const instruction_count = self.compiled_plan.plan.instructions.len;
+        try writer.print("(layers.{}): Block({} ops)\n", .{ self.block_idx, instruction_count });
 
-        for (self.program, 0..) |op, op_index| {
+        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+            const op = try self.decodeInstructionOp(op_index);
             try writer.writeByteNTimes(' ', indent + 2);
             try writer.print("[{}] ", .{op_index});
             try self.writeLayerOpDescription(op, writer, 0);
@@ -1004,7 +1047,8 @@ pub const Block = struct {
     /// Returns true when this block can execute decode in a single batched pass
     /// across multiple scheduler slots.
     pub fn supportsBatchedDecodeSlots(self: *const Block) bool {
-        for (self.program) |op| {
+        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+            const op = self.decodeInstructionOp(op_index) catch return false;
             switch (op) {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
@@ -1064,7 +1108,8 @@ pub const Block = struct {
         };
 
         // Execute the operation sequence
-        for (self.program) |op| {
+        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+            const op = try self.decodeInstructionOp(op_index);
             switch (op) {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
@@ -1141,7 +1186,7 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = finalOutputBuffer(self.program);
+        const final_buf = finalOutputBuffer(&self.compiled_plan);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
         }
@@ -1188,7 +1233,8 @@ pub const Block = struct {
             .use_cache = use_cache,
         };
 
-        for (self.program) |op| {
+        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+            const op = try self.decodeInstructionOp(op_index);
             switch (op) {
                 .kernel => |kernel_op| {
                     const kernel_id: usize = @intCast(kernel_op.id);
@@ -1261,7 +1307,7 @@ pub const Block = struct {
             }
         }
 
-        const final_buf = finalOutputBuffer(self.program);
+        const final_buf = finalOutputBuffer(&self.compiled_plan);
         if (final_buf != .residual) {
             copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
         }
@@ -1399,6 +1445,15 @@ fn createTestTransformerBlock(allocator: std.mem.Allocator, weights: *TestWeight
     );
 }
 
+fn createTestBlock(
+    allocator: std.mem.Allocator,
+    transformer_block: *const cpu_forward.TransformerBlock,
+    hidden_size: usize,
+    program: []const LayerOp,
+) !Block {
+    return Block.initWithProgram(allocator, transformer_block, 0, hidden_size, program);
+}
+
 test "Block.getHiddenSize returns correct hidden size" {
     const allocator = testing.allocator;
 
@@ -1414,12 +1469,8 @@ test "Block.getHiddenSize returns correct hidden size" {
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     try testing.expectEqual(@as(usize, 128), block.getHiddenSize());
 }
@@ -1437,12 +1488,9 @@ test "Block.getBlockIdx returns correct block index" {
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 5,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+    block.block_idx = 5;
 
     try testing.expectEqual(@as(usize, 5), block.getBlockIdx());
 }
@@ -1460,12 +1508,8 @@ test "Block.getAttention returns valid attention reference" {
         .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     const attention = block.getAttention() orelse return error.AttentionNotAvailable;
     try testing.expectEqual(@as(usize, 4), attention.n_heads);
@@ -1486,12 +1530,8 @@ test "Block.getFFN returns valid FFN reference" {
         .{ .kernel = .{ .id = 3, .in = .norm_out, .out = .branch_out, .debug_type = .mlp } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     const ffn = block.getFFN() orelse return error.FfnNotAvailable;
     switch (ffn.*) {
@@ -1520,12 +1560,8 @@ test "Block.validate accepts valid program with all required weights" {
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     try block.validate();
 }
@@ -1544,12 +1580,8 @@ test "Block.validate detects split with invalid num_outputs" {
         .{ .split = .{ .in = .norm_out, .out_start = .tmp3, .num_outputs = 0, .split_sizes = &.{}, .dim = -1 } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     try testing.expectError(error.TooManySplitOutputs, block.validate());
 }
@@ -1568,12 +1600,8 @@ test "Block.validate detects split with too many outputs" {
         .{ .split = .{ .in = .norm_out, .out_start = .tmp3, .num_outputs = 62, .split_sizes = &.{}, .dim = -1 } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     try testing.expectError(error.TooManySplitOutputs, block.validate());
 }
@@ -1593,12 +1621,8 @@ test "Block.forward executes simple norm-attn-add program" {
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     // Create input tensor
     const input_data = try allocator.alloc(f32, 1 * 4 * 128);
@@ -1651,12 +1675,8 @@ test "Block.forward executes full norm-attn-norm-ffn-add program" {
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     // Create input tensor with small seq_len for faster test
     const input_data = try allocator.alloc(f32, 1 * 2 * 128);
@@ -1706,12 +1726,8 @@ test "Block.forwardWithBatchedCache executes with batched cache" {
         .{ .add = .{ .branch = .branch_out, .scale = .one } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     // Create input tensor
     const input_data = try allocator.alloc(f32, 1 * 2 * 128);
@@ -1763,12 +1779,8 @@ test "Block.forwardWithBatchedCache handles mul_scalar" {
         .{ .mul_scalar = .{ .in = .residual, .out = .residual, .scalar = 0.5 } },
     };
 
-    const block = Block{
-        .program = &program,
-        .block = &transformer_block,
-        .block_idx = 0,
-        .hidden_size = 128,
-    };
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
 
     const input_data = try allocator.alloc(f32, 1 * 2 * 128);
     defer allocator.free(input_data);
@@ -1797,11 +1809,14 @@ test "Block.forwardWithBatchedCache handles mul_scalar" {
 }
 
 test "finalOutputBuffer resolves vision ops output buffer" {
+    const allocator = testing.allocator;
     const program = [_]LayerOp{
         .{ .patch_embed = .{ .in = .residual, .out = .tmp3 } },
         .{ .spatial_merge = .{ .in = .tmp3, .out = .tmp4, .merge_size = 2 } },
         .{ .deepstack_extract = .{ .in = .tmp4, .out = .tmp5, .layer_index = 3 } },
         .{ .scatter = .{ .text_in = .residual, .vision_in = .tmp5, .out = .branch_out, .image_token_id = 99 } },
     };
-    try testing.expectEqual(BufferId.branch_out, finalOutputBuffer(&program));
+    var compiled = try plan_compiler.compileLayerProgram(allocator, &program, .vision_encode);
+    defer plan_compiler.deinitCompiledPlan(allocator, &compiled);
+    try testing.expectEqual(BufferId.branch_out, finalOutputBuffer(&compiled));
 }

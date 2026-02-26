@@ -289,6 +289,11 @@ pub const FusedCpuBackend = struct {
             }
         }
         assignRuntimeRoPEToExecutorBlocks(cpu_block_set, runtime_rope);
+        errdefer {
+            clearRuntimeRoPEOnExecutorBlocks(cpu_block_set);
+            for (cpu_block_set) |*block| block.deinit(allocator);
+            allocator.free(cpu_block_set);
+        }
 
         // Build batched KV cache
         var kv_cache = try LayeredBatchedKVCache.init(
@@ -402,7 +407,8 @@ pub const FusedCpuBackend = struct {
         progress.updateLine(1, @intCast(layer_total + 2), null);
 
         // Build executor model
-        const model = try Transformer.build(allocator, loaded, cpu_block_set);
+        var model = try Transformer.build(allocator, loaded, cpu_block_set);
+        errdefer model.deinit(allocator);
         progress.updateLine(1, progress_total, null);
         // Note: completeLine(1) is called by the caller after warmup, so the
         // progress bar stays active during the warmup forward pass.
@@ -492,7 +498,7 @@ pub const FusedCpuBackend = struct {
         self.allocator.free(self.norm_buffers);
         self.allocator.free(self.hidden_buffers);
         self.allocator.free(self.slot_rope_position_deltas);
-        self.allocator.free(self.model.layers);
+        self.model.deinit(self.allocator);
         for (self.blocks) |*block| block.deinit(self.allocator);
         self.allocator.free(self.blocks);
         self.scratch.deinit();
