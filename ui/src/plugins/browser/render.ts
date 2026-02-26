@@ -9,8 +9,9 @@ import { renderProjectList } from "../../render/project-combo.ts";
 import { TAG_ICON as ICON_TAG } from "../../icons.ts";
 import { bState, search } from "./state.ts";
 import { getBrowserDom } from "./dom.ts";
-import { loadBrowserConversations } from "./data.ts";
+import { loadBrowserConversations, loadAvailableTags } from "./data.ts";
 import { handleRenameProject, handleDeleteProject } from "./actions.ts";
+import { chatService } from "./deps.ts";
 
 export function syncBrowserTabs(): void {
   const dom = getBrowserDom();
@@ -178,7 +179,13 @@ export function updateBrowserProjectSelector(): void {
       currentValues: search.projectFilter ? [search.projectFilter] : [],
       projects: search.availableProjects,
       onSelect: applyFilter,
-      onCreate: (name) => applyFilter([name]),
+      onCreate: (name) => {
+        applyFilter([name]);
+        // Re-fetch aggregations so the project list re-renders with the new entry.
+        void loadAvailableTags();
+        // Refresh chat sidebar so the new project appears there too.
+        void chatService.refreshSidebar();
+      },
       onRename: (oldName, newName) => void handleRenameProject(oldName, newName),
       onDelete: (name) => void handleDeleteProject(name),
     }),

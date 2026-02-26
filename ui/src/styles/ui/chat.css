@@ -31,6 +31,21 @@
   letter-spacing: -0.02em;
 }
 
+.welcome-project {
+  position: absolute;
+  top: 1.25rem;
+  left: 1.25rem;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+.welcome-project:empty {
+  display: none;
+}
+
 .welcome-brand {
   position: absolute;
   bottom: 1.25rem;
@@ -279,6 +294,13 @@
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.transcript-project {
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--text-muted);
+  white-space: nowrap;
 }
 
 .transcript-date {

@@ -40,12 +40,12 @@ export interface ChatState {
   sidebarSearchQuery: string;
   /** Project ID to assign to the next new session (set by "New Chat" in a project group). */
   pendingProjectId: string | null;
-  /** Draft sidebar item shown while composing a new chat (before first send). */
-  draftSession: { projectId: string | null; pinned: boolean } | null;
   /** Project groups collapsed in the sidebar (items hidden). */
   collapsedGroups: Set<string>;
   /** Project groups fully expanded (showing all items, not just 3). */
   expandedGroups: Set<string>;
+  /** Sidebar project sort: "recent" = latest chat activity, "created" = project creation time. */
+  sidebarSort: "recent" | "created";
   pagination: {
     offset: number;
     hasMore: boolean;
@@ -64,11 +64,10 @@ export async function loadCollapsedGroups(): Promise<void> {
   } catch { /* ignore */ }
 }
 
-/** Get the project ID of the currently active context (active chat or draft). */
+/** Get the project ID of the currently active context (active chat or pending). */
 export function getActiveProjectId(): string | null {
   if (chatState.activeChat) return chatState.activeChat.project_id ?? null;
-  if (chatState.draftSession) return chatState.draftSession.projectId;
-  return null;
+  return chatState.pendingProjectId;
 }
 
 export const chatState: ChatState = {
@@ -89,9 +88,9 @@ export const chatState: ChatState = {
   systemPromptEnabled: true,
   sidebarSearchQuery: "",
   pendingProjectId: null,
-  draftSession: null,
   collapsedGroups: new Set<string>(),
   expandedGroups: new Set(),
+  sidebarSort: "recent",
   pagination: {
     offset: 0,
     hasMore: true,

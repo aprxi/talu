@@ -109,9 +109,6 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
     } else {
       chatState.backgroundStreamSessions.add(sid);
     }
-    // Clear draft placeholder now that the real session exists.
-    const draftWasPinned = chatState.draftSession?.pinned ?? false;
-    chatState.draftSession = null;
     // Optimistically add to the sidebar so the session is navigable immediately,
     // without waiting for the full API refresh round-trip.
     if (!chatState.sessions.some(s => s.id === sid)) {
@@ -123,7 +120,7 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
         updated_at: now,
         model: getModelsService()?.getActiveModel() ?? "",
         title: opts.text.slice(0, 47) || null,
-        marker: draftWasPinned ? "pinned" : "active",
+        marker: "active",
         group_id: null,
         parent_session_id: null,
         source_doc_id: null,
@@ -131,10 +128,6 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
         metadata: {},
       });
       renderSidebar();
-    }
-    // Persist draft pin to server.
-    if (draftWasPinned) {
-      void api.patchConversation(sid, { marker: "pinned" });
     }
     if (!sidebarRefreshed) {
       sidebarRefreshed = true;

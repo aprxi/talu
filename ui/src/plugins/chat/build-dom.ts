@@ -1,4 +1,4 @@
-import { SEARCH_ICON as ICON_SEARCH, CLOSE_ICON as ICON_CLEAR } from "../../icons.ts";
+import { SEARCH_ICON as ICON_SEARCH, CLOSE_ICON as ICON_CLEAR, FOLDER_PLUS_ICON, COLLAPSE_ALL_ICON, SORT_RECENT_ICON, SORT_CREATED_ICON } from "../../icons.ts";
 
 /** Build the full chat DOM into the plugin's shadow root container. */
 export function buildChatDOM(container: HTMLElement): void {
@@ -17,7 +17,12 @@ export function buildChatDOM(container: HTMLElement): void {
           <button id="sidebar-search-clear" class="browser-clear-btn hidden">${ICON_CLEAR}</button>
         </div>
       </div>
-      <button id="sidebar-new-project-btn" class="sidebar-new-project-btn">+ New Project</button>
+      <div class="sidebar-toolbar">
+        <button id="sidebar-new-project-btn" class="sidebar-toolbar-btn" title="New project">${FOLDER_PLUS_ICON}</button>
+        <div class="flex-1"></div>
+        <button id="sidebar-collapse-all-btn" class="sidebar-toolbar-btn" title="Collapse all">${COLLAPSE_ALL_ICON}</button>
+        <button id="sidebar-sort-btn" class="sidebar-toolbar-btn" title="Sorted by recent activity">${SORT_RECENT_ICON}</button>
+      </div>
       <div class="sidebar-content scroll-thin">
         <div id="sidebar-list">
           <div id="loader-sentinel" class="empty-state hidden">
@@ -33,6 +38,7 @@ export function buildChatDOM(container: HTMLElement): void {
         <div id="transcript" class="transcript scroll-thin"></div>
 
         <div id="welcome-state" class="welcome-state">
+          <span id="welcome-project" class="welcome-project"></span>
           <h2 class="welcome-title">Ask anything</h2>
           <span class="welcome-brand">TALU</span>
           <div class="input-container">

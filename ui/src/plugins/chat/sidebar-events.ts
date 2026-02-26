@@ -3,14 +3,49 @@ import { chatState } from "./state.ts";
 import { handleTogglePin, showProjectContextMenu, showGroupContextMenu } from "./sidebar-actions.ts";
 import { selectChat } from "./selection.ts";
 import { startNewConversation } from "./welcome.ts";
-import { renderSidebar, setNewChatHandler, setGroupContextMenuHandler, showNewProjectInput } from "./sidebar-list.ts";
+import { renderSidebar, persistCollapsed, getRenderedGroupKeys, setProjectNavigateHandler, setGroupContextMenuHandler, showNewProjectInput } from "./sidebar-list.ts";
+import { SORT_RECENT_ICON, SORT_CREATED_ICON } from "../../icons.ts";
 
 export function setupSidebarEvents(): void {
-  setNewChatHandler((projectId) => startNewConversation(projectId));
+  setProjectNavigateHandler((projectId, firstChatId) => {
+    if (firstChatId) {
+      selectChat(firstChatId);
+    } else {
+      startNewConversation(projectId);
+    }
+  });
   setGroupContextMenuHandler((anchor, name, nameSpan) => showGroupContextMenu(anchor, name, nameSpan));
   const dom = getChatDom();
 
   dom.sidebarNewProject.addEventListener("click", () => showNewProjectInput());
+
+  // Collapse-all / expand-all toggle.
+  dom.sidebarCollapseAll.addEventListener("click", () => {
+    const keys = getRenderedGroupKeys();
+    const allCollapsed = keys.length > 0 && keys.every(k => chatState.collapsedGroups.has(k));
+    if (allCollapsed) {
+      chatState.collapsedGroups.clear();
+    } else {
+      for (const k of keys) chatState.collapsedGroups.add(k);
+      chatState.expandedGroups.clear();
+    }
+    persistCollapsed();
+    renderSidebar();
+  });
+
+  // Sort toggle: recent activity ↔ project creation time.
+  dom.sidebarSort.addEventListener("click", () => {
+    if (chatState.sidebarSort === "recent") {
+      chatState.sidebarSort = "created";
+      dom.sidebarSort.innerHTML = SORT_CREATED_ICON;
+      dom.sidebarSort.title = "Sorted by creation time";
+    } else {
+      chatState.sidebarSort = "recent";
+      dom.sidebarSort.innerHTML = SORT_RECENT_ICON;
+      dom.sidebarSort.title = "Sorted by recent activity";
+    }
+    renderSidebar();
+  });
 
   dom.sidebarList.addEventListener("click", (e) => {
     const target = e.target as HTMLElement;
@@ -22,14 +57,10 @@ export function setupSidebarEvents(): void {
       return;
     }
 
-    // Click on sidebar item → open chat (or restore draft)
+    // Click on sidebar item → open chat
     const item = target.closest<HTMLElement>(".sidebar-item");
     if (item?.dataset["id"]) {
-      if (item.dataset["id"] === "__draft__") {
-        startNewConversation(chatState.draftSession?.projectId);
-      } else {
-        selectChat(item.dataset["id"]);
-      }
+      selectChat(item.dataset["id"]);
     }
   });
 

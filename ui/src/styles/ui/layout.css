@@ -129,17 +129,14 @@
   gap: 0.25rem;
   font-size: 12px;
   font-weight: 600;
-  color: var(--text);
+  color: var(--text-muted);
   padding: 0.25rem 0.75rem;
   border-top: 1px solid var(--border);
-  margin-top: 0.75rem;
+  margin-top: 0.5rem;
   padding-top: 0.5rem;
-  background: color-mix(in srgb, var(--text) 4%, transparent);
-  border-radius: 4px;
 }
 .sidebar-group-label.active {
   color: var(--primary);
-  background: color-mix(in srgb, var(--primary) 8%, transparent);
 }
 .sidebar-group-label:first-child {
   border-top: none;
@@ -148,11 +145,20 @@
 }
 
 .sidebar-group-name {
-  flex: 1;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.sidebar-group-time {
+  margin-left: auto;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--text-muted);
+  opacity: 0.6;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .sidebar-group-collapse {
@@ -191,27 +197,6 @@
   color: var(--primary);
 }
 
-.sidebar-group-add {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  width: 18px;
-  height: 18px;
-  font-size: 16px;
-  font-weight: 400;
-  color: var(--text-muted);
-  background: none;
-  border: 1px solid color-mix(in srgb, var(--text-muted) 30%, transparent);
-  border-radius: 4px;
-  cursor: pointer;
-  padding: 0;
-  line-height: 1;
-}
-.sidebar-group-add:hover {
-  color: var(--primary);
-  border-color: var(--primary);
-}
-
 .sidebar-show-more {
   display: block;
   width: 100%;
@@ -230,32 +215,36 @@
   background: color-mix(in srgb, var(--primary) 6%, transparent);
 }
 
-.sidebar-group-count {
-  font-size: 11px;
-  color: var(--text-muted);
-  flex-shrink: 0;
-  min-width: 1rem;
-  text-align: right;
+.sidebar-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 0.125rem;
+  padding: 0 0.625rem 0.375rem;
 }
 
-.sidebar-new-project-btn {
-  display: block;
-  width: calc(100% - 1rem);
-  margin: 0 0.5rem;
-  padding: 0.375rem 0.5rem;
-  font-size: 12px;
-  font-weight: 500;
+.sidebar-toolbar-btn {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
   color: var(--text-muted);
   background: none;
-  border: none;
-  border-radius: 4px;
+  border: 1px solid transparent;
+  border-radius: 6px;
   cursor: pointer;
-  text-align: left;
-  font-family: inherit;
+  padding: 0;
 }
-.sidebar-new-project-btn:hover {
+
+.sidebar-toolbar-btn:hover {
+  color: var(--text);
+  background: var(--bg-code);
+}
+
+.sidebar-toolbar-btn.active {
   color: var(--primary);
-  background: color-mix(in srgb, var(--primary) 6%, transparent);
+  background: color-mix(in srgb, var(--primary) 10%, transparent);
+  border-color: color-mix(in srgb, var(--primary) 25%, transparent);
 }
 
 .sidebar-new-project-input {

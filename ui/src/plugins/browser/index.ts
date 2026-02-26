@@ -66,6 +66,7 @@ export const browserPlugin: PluginDefinition = {
       timers: ctx.timers,
       menus: ctx.menus,
       layout: ctx.layout,
+      mode: ctx.mode,
     });
 
     ctx.services.provide("talu.sessions", {

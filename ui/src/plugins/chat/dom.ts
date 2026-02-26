@@ -10,12 +10,15 @@ export interface ChatDom {
   sidebarSearch: HTMLInputElement;
   sidebarSearchClear: HTMLButtonElement;
   sidebarNewProject: HTMLButtonElement;
+  sidebarCollapseAll: HTMLButtonElement;
+  sidebarSort: HTMLButtonElement;
 
   // Transcript
   transcriptContainer: HTMLElement;
 
   // Welcome state
   welcomeState: HTMLElement;
+  welcomeProject: HTMLElement;
   welcomeInput: HTMLTextAreaElement;
   welcomeSend: HTMLButtonElement;
   welcomeAttach: HTMLButtonElement;
@@ -76,10 +79,13 @@ export function getChatDom(): ChatDom {
     sidebarSearch: q<HTMLInputElement>("#sidebar-search"),
     sidebarSearchClear: q<HTMLButtonElement>("#sidebar-search-clear"),
     sidebarNewProject: q<HTMLButtonElement>("#sidebar-new-project-btn"),
+    sidebarCollapseAll: q<HTMLButtonElement>("#sidebar-collapse-all-btn"),
+    sidebarSort: q<HTMLButtonElement>("#sidebar-sort-btn"),
 
     transcriptContainer: q("#transcript"),
 
     welcomeState: q("#welcome-state"),
+    welcomeProject: q("#welcome-project"),
     welcomeInput: q<HTMLTextAreaElement>("#welcome-input"),
     welcomeSend: q<HTMLButtonElement>("#welcome-send"),
     welcomeAttach: q<HTMLButtonElement>("#welcome-attach"),

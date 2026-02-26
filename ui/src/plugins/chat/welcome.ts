@@ -52,14 +52,14 @@ export function startNewConversation(projectId?: string | null): void {
   chatState.activeChat = null;
   chatState.lastResponseId = null;
   chatState.pendingProjectId = projectId ?? null;
-  chatState.draftSession = { projectId: projectId ?? null, pinned: false };
 
-  // Ensure the project group is open so the draft item is visible.
+  // Ensure the project group is open so the user can see chats.
   const groupKey = projectId ?? "__default__";
   chatState.collapsedGroups.delete(groupKey);
   renderSidebar();
 
   dom.transcriptContainer.innerHTML = "";
+  dom.welcomeProject.textContent = projectId && projectId !== "__default__" ? projectId : "";
   showWelcome();
   clearAttachments();
   dom.welcomeInput.value = "";

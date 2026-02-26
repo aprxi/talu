@@ -179,24 +179,13 @@ export const chatPlugin: PluginDefinition = {
       populatePromptSelect(getChatDom().welcomePrompt, promptsSvc.getAll());
     }
 
-    // Click Chat icon when already on chat mode → new conversation.
-    // - From an active chat in project X → new chat in project X
-    // - Already composing a draft in project X → switch to default
-    // - Already composing a draft in default → stay in default (reset)
+    // Click Chat icon when already on chat mode → new conversation in current project.
     const activityBar = document.getElementById("activity-bar");
     if (activityBar) {
       activityBar.addEventListener("click", (e) => {
         const btn = (e.target as Element).closest<HTMLElement>(".activity-btn");
         if (btn?.getAttribute("data-mode") === "chat" && ctx.mode.getActive() === "chat") {
-          const isDraft = chatState.draftSession !== null && chatState.activeSessionId === null;
-          const currentProject = getActiveProjectId();
-          if (isDraft && currentProject) {
-            // Already drafting in a project → cycle to default.
-            startNewConversation(null);
-          } else {
-            // Active chat or default draft → new chat in current project (or default).
-            startNewConversation(currentProject);
-          }
+          startNewConversation(getActiveProjectId());
         }
       });
     }

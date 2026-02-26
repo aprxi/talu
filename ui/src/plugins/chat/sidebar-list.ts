@@ -1,18 +1,18 @@
 import { getChatDom } from "./dom.ts";
 import { chatState, getActiveProjectId } from "./state.ts";
-import { api, notifications, observe, getModelsService } from "./deps.ts";
+import { api, notifications, observe } from "./deps.ts";
 import { setSetting, deleteSetting } from "../../kernel/system/kv-settings.ts";
 import { renderSidebarItem, renderSectionLabel } from "../../render/sidebar.ts";
 import { renderEmptyState } from "../../render/common.ts";
-import { el, isPinned, isArchived } from "../../render/helpers.ts";
+import { el, isPinned, isArchived, relativeTime } from "../../render/helpers.ts";
 import { getCachedProjects, createApiProject, loadApiProjects } from "../../render/project-combo.ts";
 import { CHEVRON_DOWN_ICON, CHEVRON_RIGHT_ICON } from "../../icons.ts";
 import type { Conversation } from "../../types.ts";
 
-/** Callback for "New Chat" in a project group. Set by sidebar-events to avoid circular imports. */
-let onNewChat: ((projectId: string | null) => void) | null = null;
-export function setNewChatHandler(handler: (projectId: string | null) => void): void {
-  onNewChat = handler;
+/** Callback for clicking a project group header. Set by sidebar-events to avoid circular imports. */
+let onProjectNavigate: ((projectId: string | null, firstChatId: string | null) => void) | null = null;
+export function setProjectNavigateHandler(handler: (projectId: string | null, firstChatId: string | null) => void): void {
+  onProjectNavigate = handler;
 }
 
 /** Callback for right-click on project group headers. Set by sidebar-events. */
@@ -22,6 +22,10 @@ export function setGroupContextMenuHandler(handler: (anchor: HTMLElement, projec
 }
 
 const COLLAPSED_LIMIT = 3;
+
+/** Group keys from the last render — used by collapse-all toggle. */
+let lastRenderedGroupKeys: string[] = [];
+export function getRenderedGroupKeys(): string[] { return lastRenderedGroupKeys; }
 
 export async function loadSessions(): Promise<void> {
   if (chatState.pagination.isLoading || !chatState.pagination.hasMore) return;
@@ -87,7 +91,7 @@ function projectKey(s: Conversation): string {
   return s.project_id ?? "__default__";
 }
 
-function persistCollapsed(): void {
+export function persistCollapsed(): void {
   const arr = [...chatState.collapsedGroups];
   const json = arr.length > 0 ? JSON.stringify(arr) : null;
   // KV primary (fire-and-forget).
@@ -127,17 +131,45 @@ function renderGroupedList(
   }
 
   if (groupMap.size === 0) {
+    lastRenderedGroupKeys = [];
     dom.sidebarList.insertBefore(renderEmptyState("No conversations"), dom.sidebarSentinel);
     return;
   }
 
-  // Stable sort: "__default__" first, then alphabetical.
+  // Build a created_at lookup from project cache.
+  const projectCreatedAt = new Map<string, number>();
+  for (const project of getCachedProjects()) {
+    projectCreatedAt.set(project.name, project.created_at);
+  }
+
+  // Compute max updated_at per group (for timestamps and sort-by-recent).
+  // Falls back to project created_at for empty groups so new projects sort to top.
+  const groupMaxUpdated = new Map<string, number>();
+  for (const [key, sessions] of groupMap) {
+    if (sessions.length > 0) {
+      groupMaxUpdated.set(key, Math.max(...sessions.map(s => s.updated_at)));
+    } else {
+      const created = projectCreatedAt.get(key);
+      if (created) groupMaxUpdated.set(key, created);
+    }
+  }
+
+  // Sort: "__default__" always first, then by recent activity or creation time.
   const sortedKeys = [...groupMap.keys()].sort((a, b) => {
     if (a === "__default__") return -1;
     if (b === "__default__") return 1;
-    return a.localeCompare(b);
+    if (chatState.sidebarSort === "created") {
+      const aTime = projectCreatedAt.get(a) ?? 0;
+      const bTime = projectCreatedAt.get(b) ?? 0;
+      return bTime - aTime;
+    }
+    // Default: sort by most recent chat activity.
+    const aTime = groupMaxUpdated.get(a) ?? 0;
+    const bTime = groupMaxUpdated.get(b) ?? 0;
+    return bTime - aTime;
   });
 
+  lastRenderedGroupKeys = sortedKeys;
   const multiGroup = sortedKeys.length > 1;
 
   for (const pValue of sortedKeys) {
@@ -149,43 +181,56 @@ function renderGroupedList(
     const isFullyExpanded = chatState.expandedGroups.has(pValue);
     const canShowMore = multiGroup && unpinned.length > COLLAPSED_LIMIT;
 
-    // Group header: [collapse toggle] name ... [+N / less toggle]
+    // Group header: [collapse chevron] name [timestamp] [+N / less toggle]
     const displayName = pValue === "__default__" ? "Default" : pValue;
     const activeProject = getActiveProjectId();
     const activeGroupKey = activeProject ?? "__default__";
     const label = el("div", "sidebar-group-label");
     if (pValue === activeGroupKey) label.classList.add("active");
 
-    const toggleCollapse = () => {
-      if (isOpen) {
-        chatState.collapsedGroups.add(pValue);
-        chatState.expandedGroups.delete(pValue);
-      } else {
-        chatState.collapsedGroups.delete(pValue);
-      }
-      persistCollapsed();
-      renderSidebar();
-    };
+    const projectForNav = pValue === "__default__" ? null : pValue;
+    const firstChatId = pinned.length > 0 ? pinned[0].id : (unpinned.length > 0 ? unpinned[0].id : null);
 
-    // Collapse/expand chevron on the left.
+    // Collapse/expand chevron on the left — only way to collapse.
     if (multiGroup) {
       const collapseBtn = el("button", "sidebar-group-collapse");
       collapseBtn.innerHTML = isOpen ? CHEVRON_DOWN_ICON : CHEVRON_RIGHT_ICON;
       collapseBtn.title = isOpen ? "Collapse" : "Expand";
+      collapseBtn.addEventListener("click", (e) => {
+        e.stopPropagation();
+        if (isOpen) {
+          chatState.collapsedGroups.add(pValue);
+          chatState.expandedGroups.delete(pValue);
+        } else {
+          chatState.collapsedGroups.delete(pValue);
+        }
+        persistCollapsed();
+        renderSidebar();
+      });
       label.appendChild(collapseBtn);
     }
 
     const nameSpan = el("span", "sidebar-group-name", displayName);
     label.appendChild(nameSpan);
 
-    // Conversation count badge.
-    label.appendChild(el("span", "sidebar-group-count", String(sessions.length)));
-
-    // Clicking anywhere on the header row toggles collapse.
-    if (multiGroup) {
-      label.style.cursor = "pointer";
-      label.addEventListener("click", toggleCollapse);
+    // Subtle timestamp showing most recent activity.
+    const maxUpdated = groupMaxUpdated.get(pValue);
+    if (maxUpdated) {
+      const timeSpan = el("span", "sidebar-group-time", relativeTime(maxUpdated));
+      label.appendChild(timeSpan);
     }
+
+    // Clicking the header row expands (if collapsed) and navigates to the
+    // first chat in the project (or starts a new chat if the project is empty).
+    label.style.cursor = "pointer";
+    label.addEventListener("click", () => {
+      if (!isOpen) {
+        chatState.collapsedGroups.delete(pValue);
+        persistCollapsed();
+        renderSidebar();
+      }
+      onProjectNavigate?.(projectForNav, firstChatId);
+    });
 
     // Right-click on group header → context menu (skip for Default).
     if (onGroupContextMenu && pValue !== "__default__") {
@@ -214,19 +259,6 @@ function renderGroupedList(
       controls.appendChild(moreBtn);
     }
 
-    // "+" new chat button.
-    if (onNewChat) {
-      const projectForNew = pValue === "__default__" ? null : pValue;
-      const addBtn = el("button", "sidebar-group-add");
-      addBtn.textContent = "+";
-      addBtn.title = "New chat in this project";
-      addBtn.addEventListener("click", (e) => {
-        e.stopPropagation();
-        onNewChat!(projectForNew);
-      });
-      controls.appendChild(addBtn);
-    }
-
     label.appendChild(controls);
 
     dom.sidebarList.insertBefore(label, dom.sidebarSentinel);
@@ -234,40 +266,13 @@ function renderGroupedList(
     // If collapsed, skip rendering items.
     if (!isOpen) continue;
 
-    // Draft item for this group (if any).
-    const draftGroupKey = chatState.draftSession?.projectId ?? "__default__";
-    const hasDraft = chatState.draftSession && draftGroupKey === pValue;
-    const insertDraft = () => {
-      const now = Math.floor(Date.now() / 1000);
-      const draftItem = renderSidebarItem({
-        id: "__draft__",
-        object: "session",
-        created_at: now,
-        updated_at: now,
-        model: getModelsService()?.getActiveModel() ?? "",
-        title: "New Chat",
-        marker: chatState.draftSession!.pinned ? "pinned" : "",
-        group_id: null,
-        parent_session_id: null,
-        source_doc_id: null,
-        project_id: chatState.draftSession!.projectId,
-        metadata: {},
-      }, true, false);
-      draftItem.classList.add("draft");
-      dom.sidebarList.insertBefore(draftItem, dom.sidebarSentinel);
-    };
-
-    // Pinned items + pinned draft first.
-    if (hasDraft && chatState.draftSession!.pinned) insertDraft();
+    // Pinned items first.
     for (const session of pinned) {
       dom.sidebarList.insertBefore(
         renderSidebarItem(session, session.id === chatState.activeSessionId, isGen(session.id)),
         dom.sidebarSentinel,
       );
     }
-
-    // Unpinned draft, then unpinned items.
-    if (hasDraft && !chatState.draftSession!.pinned) insertDraft();
 
     // Unpinned: limited when multi-group and not fully expanded.
     const showAll = !multiGroup || isFullyExpanded;

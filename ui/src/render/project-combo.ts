@@ -176,8 +176,7 @@ export function renderProjectList(options: ProjectListOptions): HTMLElement {
       const name = createInput.value.trim();
       if (name) {
         createSection.classList.add("hidden");
-        void createApiProject(name);
-        onCreate(name);
+        void createApiProject(name).then(() => onCreate(name));
       }
     } else if (e.key === "Escape") {
       e.preventDefault();

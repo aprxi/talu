@@ -216,8 +216,13 @@ export function renderTranscriptHeader(chat: Conversation, options?: HeaderOptio
 
   const row = el("div", "transcript-header-row");
 
-  // LEFT: Date + tags
+  // LEFT: Project + Date + tags
   const metaGroup = el("div", "transcript-meta");
+
+  if (chat.project_id && chat.project_id !== "__default__") {
+    const projectLabel = el("span", "transcript-project", chat.project_id);
+    metaGroup.appendChild(projectLabel);
+  }
 
   const date = el("span", "transcript-date", formatDate(chat.created_at));
   metaGroup.appendChild(date);
@@ -243,6 +248,14 @@ export function renderTranscriptHeader(chat: Conversation, options?: HeaderOptio
 
   // RIGHT: All actions together
   const actions = el("div", "transcript-actions");
+
+  const newChatBtn = el("button", "chat-action");
+  newChatBtn.innerHTML = PLUS_ICON;
+  newChatBtn.title = "New chat";
+  newChatBtn.dataset["action"] = "new-chat";
+  actions.appendChild(newChatBtn);
+
+  actions.appendChild(el("div", "actions-separator"));
 
   const thinkingBtn = el("button", isThinkingExpanded() ? "chat-action active" : "chat-action");
   thinkingBtn.id = "chat-thinking-toggle";

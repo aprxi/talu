@@ -1,5 +1,5 @@
 import { getChatDom } from "./dom.ts";
-import { chatState } from "./state.ts";
+import { chatState, getActiveProjectId } from "./state.ts";
 import { handleCopyUserMessage, handleCopyAssistantMessage, handleEditUserMessage } from "./message-actions.ts";
 import { handleRerunFromMessage } from "./rerun.ts";
 import { handleAddTagPrompt, removeTagFromChat } from "./tags.ts";
@@ -14,6 +14,7 @@ import {
 } from "./actions.ts";
 import { handleToggleTuning } from "./panel-readonly.ts";
 import { showReadOnlyParams } from "./panel-readonly.ts";
+import { startNewConversation } from "./welcome.ts";
 
 export function setupTranscriptEvents(): void {
   const tc = getChatDom().transcriptContainer;
@@ -112,6 +113,9 @@ export function setupTranscriptEvents(): void {
     if (actionBtn) {
       const action = actionBtn.dataset["action"];
       switch (action) {
+        case "new-chat":
+          startNewConversation(getActiveProjectId());
+          break;
         case "toggle-thinking":
           handleToggleThinking(actionBtn);
           break;
