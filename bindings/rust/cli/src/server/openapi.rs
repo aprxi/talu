@@ -125,6 +125,7 @@ use crate::server::{
         db::blob::handle_list,
         db::blob::handle_get,
         db::sql::handle_query,
+        db::sql::handle_explain,
         db::ops::handle_compact,
         db::ops::handle_simulate_crash,
         // Plugins

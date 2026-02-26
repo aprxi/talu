@@ -782,6 +782,9 @@ impl Service<Request<Incoming>> for Router {
                         (Method::POST, "/v1/db/sql/query") => {
                             db::sql::handle_query(state, req, auth).await
                         }
+                        (Method::POST, "/v1/db/sql/explain") => {
+                            db::sql::handle_explain(state, req, auth).await
+                        }
                         // DB ops plane endpoints
                         (Method::POST, p) if p.starts_with("/v1/db/ops/") => {
                             db::ops::handle(state, req, auth).await

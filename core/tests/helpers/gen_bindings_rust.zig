@@ -328,6 +328,9 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(elem_type, "CColumnValue")) {
                 return if (is_const) "*const CColumnValue" else "*mut CColumnValue";
             }
+            if (eql(elem_type, "CSqlParam")) {
+                return if (is_const) "*const CSqlParam" else "*mut CSqlParam";
+            }
             // Default fallback — log a warning if we hit this; likely a new struct
             // that needs an entry above.
             return elem_type;

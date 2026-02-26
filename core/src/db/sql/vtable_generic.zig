@@ -35,6 +35,12 @@ const ColumnMapping = struct {
     is_payload: bool,
 };
 
+/// Return type for schema discovery functions.
+const SchemaResult = struct {
+    columns: []ColumnMapping,
+    schema_sql: [:0]u8,
+};
+
 const GenericVTab = struct {
     base: sqlite.sqlite3_vtab = std.mem.zeroes(sqlite.sqlite3_vtab),
     db_root: []u8,
@@ -193,7 +199,7 @@ fn discoverSchema(
     db_root: []const u8,
     namespace: []const u8,
     schema_id: u16,
-) !struct { columns: []ColumnMapping, schema_sql: [:0]u8 } {
+) !SchemaResult {
     // Open a temporary reader to inspect blocks.
     var reader = db_reader.Reader.open(allocator, db_root, namespace) catch {
         return fallbackSchema();
@@ -221,7 +227,7 @@ fn discoverSchema(
     return fallbackSchema();
 }
 
-fn fallbackSchema() !struct { columns: []ColumnMapping, schema_sql: [:0]u8 } {
+fn fallbackSchema() !SchemaResult {
     const columns = try allocator.alloc(ColumnMapping, 3);
     columns[0] = .{ .column_id = 1, .is_payload = false };
     columns[1] = .{ .column_id = 2, .is_payload = false };
@@ -231,7 +237,7 @@ fn fallbackSchema() !struct { columns: []ColumnMapping, schema_sql: [:0]u8 } {
     return .{ .columns = columns, .schema_sql = sql };
 }
 
-fn buildSchemaFromDescs(descs: []const types.ColumnDesc) !struct { columns: []ColumnMapping, schema_sql: [:0]u8 } {
+fn buildSchemaFromDescs(descs: []const types.ColumnDesc) !SchemaResult {
     // Sort by column_id for deterministic order.
     const sorted = try allocator.alloc(types.ColumnDesc, descs.len);
     defer allocator.free(sorted);

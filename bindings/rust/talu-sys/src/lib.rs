@@ -837,6 +837,29 @@ impl Default for CColumnData {
     }
 }
 
+/// Source: core/src/capi/sql.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CSqlParam {
+    pub tag: u8,
+    pub int_val: i64,
+    pub float_val: f64,
+    pub ptr: *const u8,
+    pub len: usize,
+}
+
+impl Default for CSqlParam {
+    fn default() -> Self {
+        Self {
+            tag: 0,
+            int_val: 0,
+            float_val: 0.0,
+            ptr: std::ptr::null(),
+            len: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/plugins.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -3778,6 +3801,8 @@ extern "C" {
     pub fn talu_db_sql_query(db_path: *const c_char, query: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/db/sql.zig
     pub fn talu_db_sql_query_free(ptr: *const c_char);
+    // core/src/capi/db/sql.zig
+    pub fn talu_db_sql_query_params(db_path: *const c_char, query: *const c_char, params: *const CSqlParam, num_params: u32, out_json: *mut c_void) -> c_int;
     // core/src/capi/db/table.zig
     pub fn talu_db_table_append_row(handle: *mut c_void, schema_id: u16, columns: *const CColumnValue, num_cols: u32) -> c_int;
     // core/src/capi/db/table.zig
@@ -4208,6 +4233,8 @@ extern "C" {
     pub fn talu_sql_query(db_path: *const c_char, query: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/sql.zig
     pub fn talu_sql_query_free(ptr: *const c_char);
+    // core/src/capi/sql.zig
+    pub fn talu_sql_query_params(db_path: *const c_char, query: *const c_char, params: *const CSqlParam, num_params: u32, out_json: *mut c_void) -> c_int;
     // core/src/capi/error.zig
     pub fn talu_take_last_error(out_buf: *const u8, out_buf_size: usize, out_code: *mut c_void) -> usize;
     // core/src/capi/template.zig

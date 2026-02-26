@@ -2,6 +2,7 @@
 
 mod kv;
 mod openapi_docs;
+mod sql;
 mod table;
 mod vector;
 
