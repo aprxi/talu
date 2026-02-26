@@ -4,6 +4,7 @@
 
 mod api;
 mod crud;
+mod rows;
 mod search;
 mod tags;
 

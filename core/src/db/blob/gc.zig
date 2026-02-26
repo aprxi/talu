@@ -1,7 +1,16 @@
 //! Offline blob mark-and-sweep tooling for TaluDB.
 //!
-//! This module scans document/session payload metadata for external blob refs
-//! and removes unreferenced CAS files under `blobs/<shard>/<digest>`.
+//! This module scans payload metadata for external blob refs and removes
+//! unreferenced CAS files under `blobs/<shard>/<digest>`.
+//!
+//! Two scanning strategies:
+//! - **Policy-based** (builtin_policies): uses known schema IDs and KvBuf
+//!   field IDs for the standard `documents` and `chat` tables.
+//! - **Generic** (dynamic tables): iterates `tables/` to discover additional
+//!   table directories, scans all VARBYTES columns using a three-tier
+//!   approach: (1) KvBuf structured fields, (2) JSON string value scanning,
+//!   (3) raw blob reference string matching. This ensures user-created
+//!   dynamic tables are safe regardless of payload format.
 //!
 //! Safety notes:
 //! - This is an explicit/offline utility, not part of the hot write path.
@@ -15,14 +24,43 @@ const db_block_reader = @import("../block_reader.zig");
 const db_blob_store = @import("store.zig");
 const db_wal = @import("../wal.zig");
 const db_writer = @import("../writer.zig");
+const db_types = @import("../types.zig");
 
 const Allocator = std.mem.Allocator;
 
-const docs_namespace = "docs";
-const chat_namespace = "chat";
-const schema_documents: u16 = 11;
-const schema_items: u16 = 3;
 const col_payload: u32 = 20;
+
+/// Describes how to find blob references in a specific table/namespace.
+pub const TableBlobPolicy = struct {
+    /// Table directory name (under tables/{table_name}/).
+    table_name: []const u8,
+    /// Namespace subdirectory within the table.
+    namespace: []const u8,
+    /// Schema IDs whose payload may contain blob references.
+    schema_ids: []const u16,
+    /// KvBuf field ID for the external blob reference.
+    ref_field_id: u16,
+    /// KvBuf field ID for inline JSON that may contain a blob_ref key. Null if N/A.
+    inline_json_field_id: ?u16,
+};
+
+/// Built-in policies for the standard tables.
+pub const builtin_policies: []const TableBlobPolicy = &.{
+    .{
+        .table_name = "documents",
+        .namespace = "docs",
+        .schema_ids = &.{11},
+        .ref_field_id = kvbuf.DocumentFieldIds.doc_json_ref,
+        .inline_json_field_id = kvbuf.DocumentFieldIds.doc_json,
+    },
+    .{
+        .table_name = "chat",
+        .namespace = "chat",
+        .schema_ids = &.{3},
+        .ref_field_id = kvbuf.FieldIds.record_json_ref,
+        .inline_json_field_id = kvbuf.FieldIds.record_json,
+    },
+};
 
 const DigestKey = [db_blob_store.digest_hex_len]u8;
 const DigestSet = std.AutoHashMap(DigestKey, void);
@@ -56,12 +94,14 @@ pub const SweepOptions = struct {
 };
 
 /// Mark referenced blobs and delete unreferenced CAS files in `blobs/*/*`.
-/// Returns sweep statistics, including referenced/deleted counts.
+/// Uses the built-in policies for docs and chat tables.
 pub fn sweepUnreferencedBlobs(allocator: Allocator, db_root: []const u8) !SweepStats {
     return sweepUnreferencedBlobsWithOptions(allocator, db_root, .{});
 }
 
 /// Mark referenced blobs and delete unreferenced CAS files in `blobs/*/*`.
+/// Uses the built-in policies for docs and chat tables, plus dynamic
+/// discovery of any additional tables under `tables/`.
 /// Supports configurable grace-period behavior through SweepOptions.
 pub fn sweepUnreferencedBlobsWithOptions(
     allocator: Allocator,
@@ -71,18 +111,57 @@ pub fn sweepUnreferencedBlobsWithOptions(
     var stats = SweepStats{};
     const now_unix_seconds = options.now_unix_seconds orelse std.time.timestamp();
 
-    var digests = try markReferencedBlobDigests(allocator, db_root, &stats.invalid_reference_count);
+    // Mark phase 1: builtin policies (precise field-level scanning).
+    var digests = try markReferencedBlobDigests(allocator, db_root, builtin_policies, &stats.invalid_reference_count);
+    defer digests.deinit();
+
+    // Mark phase 2: dynamic tables (generic VARBYTES scanning).
+    try markDynamicTableBlobRefs(allocator, db_root, &digests, &stats.invalid_reference_count);
+
+    stats.referenced_blob_count = digests.count();
+
+    // Sweep phase.
+    try sweepUnreferencedDigests(allocator, db_root, &digests, now_unix_seconds, options, &stats);
+    return stats;
+}
+
+/// Mark referenced blobs and delete unreferenced CAS files in `blobs/*/*`.
+/// Accepts explicit table blob policies for extensibility.
+/// Does NOT include dynamic table discovery — use sweepUnreferencedBlobsWithOptions for that.
+pub fn sweepWithPolicies(
+    allocator: Allocator,
+    db_root: []const u8,
+    policies: []const TableBlobPolicy,
+    options: SweepOptions,
+) !SweepStats {
+    var stats = SweepStats{};
+    const now_unix_seconds = options.now_unix_seconds orelse std.time.timestamp();
+
+    var digests = try markReferencedBlobDigests(allocator, db_root, policies, &stats.invalid_reference_count);
     defer digests.deinit();
     stats.referenced_blob_count = digests.count();
 
+    try sweepUnreferencedDigests(allocator, db_root, &digests, now_unix_seconds, options, &stats);
+    return stats;
+}
+
+/// Delete blob files not present in the digest set.
+fn sweepUnreferencedDigests(
+    allocator: Allocator,
+    db_root: []const u8,
+    digests: *DigestSet,
+    now_unix_seconds: i64,
+    options: SweepOptions,
+    stats: *SweepStats,
+) !void {
     var root_dir = std.fs.cwd().openDir(db_root, .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return stats,
+        error.FileNotFound => return,
         else => return err,
     };
     defer root_dir.close();
 
     var blobs_dir = root_dir.openDir("blobs", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return stats,
+        error.FileNotFound => return,
         else => return err,
     };
     defer blobs_dir.close();
@@ -146,15 +225,13 @@ pub fn sweepUnreferencedBlobsWithOptions(
             stats.reclaimed_bytes += item.size;
         }
     }
-
-    return stats;
 }
 
-/// Collect all unique blob references discovered from docs/chat blocks and WALs.
+/// Collect all unique blob references discovered from table blocks and WALs.
 /// Caller owns the returned slice.
 pub fn collectReferencedBlobRefs(allocator: Allocator, db_root: []const u8) ![]RefKey {
     var invalid_ref_count: usize = 0;
-    var digests = try markReferencedBlobDigests(allocator, db_root, &invalid_ref_count);
+    var digests = try markReferencedBlobDigests(allocator, db_root, builtin_policies, &invalid_ref_count);
     defer digests.deinit();
 
     const out = try allocator.alloc(RefKey, digests.count());
@@ -184,68 +261,310 @@ fn isOldEnoughForSweep(stat: std.fs.File.Stat, now_unix_seconds: i64, min_blob_a
     return age_seconds >= min_blob_age_seconds;
 }
 
-fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, invalid_ref_count: *usize) !DigestSet {
+fn markReferencedBlobDigests(allocator: Allocator, db_root: []const u8, policies: []const TableBlobPolicy, invalid_ref_count: *usize) !DigestSet {
     var digests = DigestSet.init(allocator);
     errdefer digests.deinit();
 
     var store = try db_blob_store.BlobStore.init(allocator, db_root);
     defer store.deinit();
 
-    // After layout v1 migration, table data lives under tables/{table_name}/
-    // instead of at the bucket root. Construct the table-specific roots.
-    const docs_table_root = try std.fmt.allocPrint(allocator, "{s}/tables/documents", .{db_root});
-    defer allocator.free(docs_table_root);
-    const chat_table_root = try std.fmt.allocPrint(allocator, "{s}/tables/chat", .{db_root});
-    defer allocator.free(chat_table_root);
+    for (policies) |policy| {
+        const table_root = try std.fmt.allocPrint(allocator, "{s}/tables/{s}", .{ db_root, policy.table_name });
+        defer allocator.free(table_root);
 
-    try markNamespaceBlockRefs(
-        allocator,
-        docs_table_root,
-        docs_namespace,
-        schema_documents,
-        kvbuf.DocumentFieldIds.doc_json_ref,
-        kvbuf.DocumentFieldIds.doc_json,
-        &store,
-        &digests,
-        invalid_ref_count,
-    );
-    try markNamespaceBlockRefs(
-        allocator,
-        chat_table_root,
-        chat_namespace,
-        schema_items,
-        kvbuf.FieldIds.record_json_ref,
-        kvbuf.FieldIds.record_json,
-        &store,
-        &digests,
-        invalid_ref_count,
-    );
-
-    try markNamespaceWalRefs(
-        allocator,
-        docs_table_root,
-        docs_namespace,
-        schema_documents,
-        kvbuf.DocumentFieldIds.doc_json_ref,
-        kvbuf.DocumentFieldIds.doc_json,
-        &store,
-        &digests,
-        invalid_ref_count,
-    );
-    try markNamespaceWalRefs(
-        allocator,
-        chat_table_root,
-        chat_namespace,
-        schema_items,
-        kvbuf.FieldIds.record_json_ref,
-        kvbuf.FieldIds.record_json,
-        &store,
-        &digests,
-        invalid_ref_count,
-    );
+        for (policy.schema_ids) |schema_id| {
+            try markNamespaceBlockRefs(
+                allocator,
+                table_root,
+                policy.namespace,
+                schema_id,
+                policy.ref_field_id,
+                policy.inline_json_field_id,
+                &store,
+                &digests,
+                invalid_ref_count,
+            );
+            try markNamespaceWalRefs(
+                allocator,
+                table_root,
+                policy.namespace,
+                schema_id,
+                policy.ref_field_id,
+                policy.inline_json_field_id,
+                &store,
+                &digests,
+                invalid_ref_count,
+            );
+        }
+    }
 
     return digests;
 }
+
+// =============================================================================
+// Dynamic table discovery (generic scanning)
+// =============================================================================
+
+/// Discover tables under `tables/` and mark blob refs from any that are NOT
+/// already covered by `builtin_policies`. Scans all VARBYTES columns
+/// generically without needing per-table policy configuration.
+fn markDynamicTableBlobRefs(
+    allocator: Allocator,
+    db_root: []const u8,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    var store = try db_blob_store.BlobStore.init(allocator, db_root);
+    defer store.deinit();
+
+    const tables_path = try std.fmt.allocPrint(allocator, "{s}/tables", .{db_root});
+    defer allocator.free(tables_path);
+
+    var tables_dir = std.fs.cwd().openDir(tables_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer tables_dir.close();
+
+    var table_iter = tables_dir.iterate();
+    while (try table_iter.next()) |table_entry| {
+        if (table_entry.kind != .directory) continue;
+        if (isBuiltinTable(table_entry.name)) continue;
+
+        const table_root = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ tables_path, table_entry.name });
+        defer allocator.free(table_root);
+
+        // Each subdirectory under the table is a namespace.
+        var table_dir = tables_dir.openDir(table_entry.name, .{ .iterate = true }) catch continue;
+        defer table_dir.close();
+
+        var ns_iter = table_dir.iterate();
+        while (try ns_iter.next()) |ns_entry| {
+            if (ns_entry.kind != .directory) continue;
+            try markBlockRefsGeneric(allocator, table_root, ns_entry.name, &store, digests, invalid_ref_count);
+            try markWalRefsGeneric(allocator, table_root, ns_entry.name, &store, digests, invalid_ref_count);
+        }
+    }
+}
+
+fn isBuiltinTable(name: []const u8) bool {
+    for (builtin_policies) |policy| {
+        if (std.mem.eql(u8, name, policy.table_name)) return true;
+    }
+    return false;
+}
+
+/// Scan all VARBYTES columns in all blocks for blob references.
+fn markBlockRefsGeneric(
+    allocator: Allocator,
+    table_root: []const u8,
+    namespace: []const u8,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    var reader = db_reader.Reader.open(allocator, table_root, namespace) catch return;
+    defer reader.deinit();
+
+    const blocks = reader.getBlocks(allocator) catch return;
+    defer allocator.free(blocks);
+
+    for (blocks) |block| {
+        var file = reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+        defer file.close();
+
+        const block_rdr = db_block_reader.BlockReader.init(file, allocator);
+        const header = block_rdr.readHeader(block.offset) catch continue;
+        if (header.row_count == 0) continue;
+
+        const descs = block_rdr.readColumnDirectory(header, block.offset) catch continue;
+        defer allocator.free(descs);
+
+        // Scan every VARBYTES column for blob references (KvBuf, JSON, or raw string).
+        for (descs) |desc| {
+            if (desc.shape != @intFromEnum(db_types.ColumnShape.VARBYTES)) continue;
+            var payload_buffers = readVarBytesBuffers(file, block.offset, desc, header.row_count, allocator) catch continue;
+            defer payload_buffers.deinit(allocator);
+
+            for (0..header.row_count) |row_idx| {
+                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
+                try markBlobRefsInPayload(payload, store, digests, invalid_ref_count);
+            }
+        }
+    }
+}
+
+/// Scan all WAL entries, checking every column's data for blob references.
+fn markWalRefsGeneric(
+    allocator: Allocator,
+    table_root: []const u8,
+    namespace: []const u8,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    const ns_path = try std.fs.path.join(allocator, &.{ table_root, namespace });
+    defer allocator.free(ns_path);
+
+    var namespace_dir = std.fs.cwd().openDir(ns_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
+        else => return err,
+    };
+    defer namespace_dir.close();
+
+    var iter = namespace_dir.iterate();
+    while (try iter.next()) |entry| {
+        if (entry.kind != .file) continue;
+        if (!isWalName(entry.name)) continue;
+
+        var wal_file = namespace_dir.openFile(entry.name, .{ .mode = .read_only }) catch continue;
+        defer wal_file.close();
+
+        var wal_iter = db_wal.WalIterator.init(wal_file, allocator);
+        while (true) {
+            const payload_opt = wal_iter.next() catch |err| switch (err) {
+                error.InvalidMagic, error.InvalidCrc, error.InvalidWalEntry => break,
+                else => return err,
+            };
+            const payload = payload_opt orelse break;
+            defer allocator.free(payload);
+
+            try markWalPayloadGeneric(payload, store, digests, invalid_ref_count);
+        }
+    }
+}
+
+/// Parse a WAL entry and check every column's data for blob references.
+fn markWalPayloadGeneric(
+    payload: []const u8,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    var index: usize = 0;
+    _ = readU16(payload, &index) catch return; // schema
+    const column_count = readU16(payload, &index) catch return;
+    if (column_count == 0) return;
+
+    var i: usize = 0;
+    while (i < column_count) : (i += 1) {
+        _ = readU32(payload, &index) catch return; // column_id
+        _ = readU8(payload, &index) catch return; // shape
+        _ = readU8(payload, &index) catch return; // phys_type
+        _ = readU8(payload, &index) catch return; // encoding
+        _ = readU8(payload, &index) catch return;
+        _ = readU16(payload, &index) catch return;
+        const data_len = readU32(payload, &index) catch return;
+        const column_data = readBytes(payload, &index, data_len) catch return;
+
+        try markBlobRefsInPayload(column_data, store, digests, invalid_ref_count);
+    }
+}
+
+/// Scan a VARBYTES payload for blob references using a three-tier strategy:
+///
+/// 1. **KvBuf**: If the payload is a valid KvBuf, iterate all fields for direct
+///    refs (`sha256:…`, `multi:…`) and inline JSON containing `blob_ref` keys.
+/// 2. **JSON**: If not KvBuf but valid JSON, recursively scan all string values
+///    for blob reference patterns. This covers payloads written via the HTTP API
+///    as raw JSON objects.
+/// 3. **Raw string**: If the payload itself is a bare blob reference string
+///    (`sha256:…` or `multi:…`), mark it directly.
+fn markBlobRefsInPayload(
+    payload: []const u8,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    if (payload.len == 0) return;
+
+    // Tier 1: KvBuf — structured binary format with magic trailer byte.
+    if (kvbuf.isKvBuf(payload)) {
+        const reader = kvbuf.KvBufReader.init(payload) catch return;
+
+        var i: usize = 0;
+        while (i < reader.fieldCount()) : (i += 1) {
+            const entry = reader.entryAt(i) orelse continue;
+
+            // Direct blob ref: sha256:… or multi:…
+            if (isBlobRefCandidate(entry.value)) {
+                const parsed = db_blob_store.parseRef(entry.value) catch continue;
+                try markReferenceRecursive(store, parsed, digests, invalid_ref_count, store.allocator);
+                continue;
+            }
+
+            // Inline JSON with blob_ref key.
+            if (entry.value.len > 0 and entry.value[0] == '{') {
+                try markInlineBlobRefInJson(entry.value, store, digests, invalid_ref_count);
+            }
+        }
+        return;
+    }
+
+    // Tier 2: JSON — recursively scan all string values for blob ref patterns.
+    if (payload[0] == '{' or payload[0] == '[' or payload[0] == '"') {
+        try markBlobRefsInJsonValue(payload, store, digests, invalid_ref_count);
+        return;
+    }
+
+    // Tier 3: Raw string — check if the payload itself is a bare blob reference.
+    if (isBlobRefCandidate(payload)) {
+        const parsed = db_blob_store.parseRef(payload) catch return;
+        try markReferenceRecursive(store, parsed, digests, invalid_ref_count, store.allocator);
+    }
+}
+
+/// Recursively scan a JSON value for blob reference strings.
+/// Walks objects and arrays; checks every string value against isBlobRefCandidate.
+fn markBlobRefsInJsonValue(
+    json_payload: []const u8,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    var parsed_json = std.json.parseFromSlice(std.json.Value, store.allocator, json_payload, .{}) catch return;
+    defer parsed_json.deinit();
+    try walkJsonForBlobRefs(parsed_json.value, store, digests, invalid_ref_count);
+}
+
+fn walkJsonForBlobRefs(
+    value: std.json.Value,
+    store: *db_blob_store.BlobStore,
+    digests: *DigestSet,
+    invalid_ref_count: *usize,
+) !void {
+    switch (value) {
+        .string => |s| {
+            if (isBlobRefCandidate(s)) {
+                const parsed = db_blob_store.parseRef(s) catch return;
+                try markReferenceRecursive(store, parsed, digests, invalid_ref_count, store.allocator);
+            }
+        },
+        .object => |obj| {
+            var it = obj.iterator();
+            while (it.next()) |entry| {
+                try walkJsonForBlobRefs(entry.value_ptr.*, store, digests, invalid_ref_count);
+            }
+        },
+        .array => |arr| {
+            for (arr.items) |item| {
+                try walkJsonForBlobRefs(item, store, digests, invalid_ref_count);
+            }
+        },
+        else => {},
+    }
+}
+
+fn isBlobRefCandidate(value: []const u8) bool {
+    return (value.len == db_blob_store.sha256_ref_len and
+        std.mem.startsWith(u8, value, db_blob_store.sha256_ref_prefix)) or
+        (value.len == db_blob_store.multipart_ref_len and
+        std.mem.startsWith(u8, value, db_blob_store.multipart_ref_prefix));
+}
+
+// =============================================================================
+// Policy-based scanning (builtin tables)
+// =============================================================================
 
 fn markNamespaceBlockRefs(
     allocator: Allocator,
@@ -647,7 +966,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
         try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.refSlice());
         const doc_payload = try doc_payload_writer.finish(allocator);
         defer allocator.free(doc_payload);
-        var doc_writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, doc_payload, true);
+        var doc_writer = try appendPayloadRow(allocator, root_path, "documents", "docs", 11, doc_payload, true);
         doc_writer.deinit();
     }
 
@@ -657,7 +976,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
         try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.refSlice());
         const chat_payload = try chat_payload_writer.finish(allocator);
         defer allocator.free(chat_payload);
-        var chat_writer = try appendPayloadRow(allocator, root_path, "chat", chat_namespace, schema_items, chat_payload, true);
+        var chat_writer = try appendPayloadRow(allocator, root_path, "chat", "chat", 3, chat_payload, true);
         chat_writer.deinit();
     }
 
@@ -669,7 +988,7 @@ test "collectReferencedBlobRefs finds refs in blocks and WAL" {
         try wal_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, wal_blob.refSlice());
         const wal_payload = try wal_payload_writer.finish(allocator);
         defer allocator.free(wal_payload);
-        wal_writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, wal_payload, false);
+        wal_writer = try appendPayloadRow(allocator, root_path, "documents", "docs", 11, wal_payload, false);
     }
 
     const refs = try collectReferencedBlobRefs(allocator, root_path);
@@ -703,7 +1022,7 @@ test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced
         try doc_payload_writer.addString(allocator, kvbuf.DocumentFieldIds.doc_json_ref, doc_blob.refSlice());
         const doc_payload = try doc_payload_writer.finish(allocator);
         defer allocator.free(doc_payload);
-        var doc_writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, doc_payload, true);
+        var doc_writer = try appendPayloadRow(allocator, root_path, "documents", "docs", 11, doc_payload, true);
         doc_writer.deinit();
     }
 
@@ -713,7 +1032,7 @@ test "sweepUnreferencedBlobs deletes unreferenced blobs and preserves referenced
         try chat_payload_writer.addString(allocator, kvbuf.FieldIds.record_json_ref, chat_blob.refSlice());
         const chat_payload = try chat_payload_writer.finish(allocator);
         defer allocator.free(chat_payload);
-        var chat_writer = try appendPayloadRow(allocator, root_path, "chat", chat_namespace, schema_items, chat_payload, true);
+        var chat_writer = try appendPayloadRow(allocator, root_path, "chat", "chat", 3, chat_payload, true);
         chat_writer.deinit();
     }
 
@@ -754,7 +1073,7 @@ test "sweepUnreferencedBlobs keeps blobs referenced only from WAL" {
     const payload = try payload_writer.finish(allocator);
     defer allocator.free(payload);
 
-    var writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, payload, false);
+    var writer = try appendPayloadRow(allocator, root_path, "documents", "docs", 11, payload, false);
     defer writer.deinit();
 
     const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
@@ -799,7 +1118,7 @@ test "sweepUnreferencedBlobs preserves blobs referenced by inline doc_json blob_
     const payload = try payload_writer.finish(allocator);
     defer allocator.free(payload);
 
-    var writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, payload, true);
+    var writer = try appendPayloadRow(allocator, root_path, "documents", "docs", 11, payload, true);
     defer writer.deinit();
 
     const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
@@ -837,7 +1156,7 @@ test "sweepUnreferencedBlobs preserves multipart manifest and chunk blobs" {
     const payload = try payload_writer.finish(allocator);
     defer allocator.free(payload);
 
-    var writer = try appendPayloadRow(allocator, root_path, "documents", docs_namespace, schema_documents, payload, true);
+    var writer = try appendPayloadRow(allocator, root_path, "documents", "docs", 11, payload, true);
     defer writer.deinit();
 
     const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
@@ -909,4 +1228,341 @@ test "sweepUnreferencedBlobs default grace period protects recent unreferenced b
     const orphan_bytes = try store.readAll(orphan_blob.refSlice(), allocator);
     defer allocator.free(orphan_bytes);
     try std.testing.expectEqualStrings("recent-orphan", orphan_bytes);
+}
+
+test "sweepUnreferencedBlobs discovers blobs in dynamic tables" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const dynamic_blob = try store.put("dynamic-table-ref");
+    const orphan_blob = try store.put("dynamic-orphan");
+
+    // Write a blob ref in a non-standard KvBuf field (42) under a custom table
+    // name that is NOT in builtin_policies.
+    {
+        var pw = kvbuf.KvBufWriter.init();
+        defer pw.deinit(allocator);
+        try pw.addString(allocator, 42, dynamic_blob.refSlice());
+        const payload = try pw.finish(allocator);
+        defer allocator.free(payload);
+        var writer = try appendPayloadRow(allocator, root_path, "custom_data", "myns", 99, payload, true);
+        writer.deinit();
+    }
+
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+
+    // The dynamic blob should be discovered and preserved.
+    try std.testing.expectEqual(@as(usize, 1), stats.referenced_blob_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.total_blob_files);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
+
+    const keep = try store.readAll(dynamic_blob.refSlice(), allocator);
+    defer allocator.free(keep);
+    try std.testing.expectEqualStrings("dynamic-table-ref", keep);
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
+}
+
+test "sweepUnreferencedBlobs discovers WAL blobs in dynamic tables" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const wal_blob = try store.put("dynamic-wal-ref");
+    const orphan_blob = try store.put("dynamic-wal-orphan");
+
+    // Write to WAL (flush=false) under a dynamic table.
+    var wal_writer: ?db_writer.Writer = null;
+    defer if (wal_writer) |*w| w.deinit();
+    {
+        var pw = kvbuf.KvBufWriter.init();
+        defer pw.deinit(allocator);
+        try pw.addString(allocator, 7, wal_blob.refSlice());
+        const payload = try pw.finish(allocator);
+        defer allocator.free(payload);
+        wal_writer = try appendPayloadRow(allocator, root_path, "user_table", "default", 50, payload, false);
+    }
+
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), stats.referenced_blob_count);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
+
+    const keep = try store.readAll(wal_blob.refSlice(), allocator);
+    defer allocator.free(keep);
+    try std.testing.expectEqualStrings("dynamic-wal-ref", keep);
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
+}
+
+test "sweepUnreferencedBlobs handles missing tables directory" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    // No tables/ directory at all — should not crash.
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+    try std.testing.expectEqual(@as(usize, 0), stats.referenced_blob_count);
+}
+
+test "markBlobRefsInPayload finds refs in arbitrary fields" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const blob = try store.put("arbitrary-field-ref");
+
+    var pw = kvbuf.KvBufWriter.init();
+    defer pw.deinit(allocator);
+    try pw.addString(allocator, 1, "some-unrelated-data");
+    try pw.addString(allocator, 42, blob.refSlice());
+    try pw.addString(allocator, 99, "more-unrelated-data");
+    const payload = try pw.finish(allocator);
+    defer allocator.free(payload);
+
+    var digests = DigestSet.init(allocator);
+    defer digests.deinit();
+    var invalid: usize = 0;
+
+    try markBlobRefsInPayload(payload, &store, &digests, &invalid);
+
+    try std.testing.expectEqual(@as(usize, 1), digests.count());
+    try std.testing.expectEqual(@as(usize, 0), invalid);
+}
+
+test "markBlobRefsInPayload finds inline JSON blob_ref" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const blob = try store.put("inline-json-generic");
+    const inline_json = try std.fmt.allocPrint(
+        allocator,
+        "{{\"blob_ref\":\"{s}\",\"name\":\"test.bin\"}}",
+        .{blob.refSlice()},
+    );
+    defer allocator.free(inline_json);
+
+    var pw = kvbuf.KvBufWriter.init();
+    defer pw.deinit(allocator);
+    try pw.addString(allocator, 55, inline_json);
+    const payload = try pw.finish(allocator);
+    defer allocator.free(payload);
+
+    var digests = DigestSet.init(allocator);
+    defer digests.deinit();
+    var invalid: usize = 0;
+
+    try markBlobRefsInPayload(payload, &store, &digests, &invalid);
+
+    try std.testing.expectEqual(@as(usize, 1), digests.count());
+}
+
+test "markBlobRefsInPayload finds refs in raw JSON payload (tier 2)" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const blob = try store.put("json-tier2-ref");
+    // Raw JSON object (not wrapped in KvBuf).
+    const json_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"file_ref\":\"{s}\",\"name\":\"report.pdf\"}}",
+        .{blob.refSlice()},
+    );
+    defer allocator.free(json_payload);
+
+    var digests = DigestSet.init(allocator);
+    defer digests.deinit();
+    var invalid: usize = 0;
+
+    try markBlobRefsInPayload(json_payload, &store, &digests, &invalid);
+
+    try std.testing.expectEqual(@as(usize, 1), digests.count());
+    try std.testing.expectEqual(@as(usize, 0), invalid);
+}
+
+test "markBlobRefsInPayload finds refs in nested JSON array (tier 2)" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const blob1 = try store.put("nested-ref-1");
+    const blob2 = try store.put("nested-ref-2");
+    // Nested JSON with blob refs at different depths.
+    const json_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"attachments\":[\"{s}\"],\"meta\":{{\"backup\":\"{s}\"}}}}",
+        .{ blob1.refSlice(), blob2.refSlice() },
+    );
+    defer allocator.free(json_payload);
+
+    var digests = DigestSet.init(allocator);
+    defer digests.deinit();
+    var invalid: usize = 0;
+
+    try markBlobRefsInPayload(json_payload, &store, &digests, &invalid);
+
+    try std.testing.expectEqual(@as(usize, 2), digests.count());
+}
+
+test "markBlobRefsInPayload finds bare blob ref string (tier 3)" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const blob = try store.put("bare-string-ref");
+
+    var digests = DigestSet.init(allocator);
+    defer digests.deinit();
+    var invalid: usize = 0;
+
+    // Pass the bare blob reference string as payload (no KvBuf, no JSON wrapper).
+    try markBlobRefsInPayload(blob.refSlice(), &store, &digests, &invalid);
+
+    try std.testing.expectEqual(@as(usize, 1), digests.count());
+    try std.testing.expectEqual(@as(usize, 0), invalid);
+}
+
+test "markBlobRefsInPayload ignores non-matching raw data" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    var digests = DigestSet.init(allocator);
+    defer digests.deinit();
+    var invalid: usize = 0;
+
+    // Random binary data — should not match any tier.
+    try markBlobRefsInPayload("hello world this is not a blob ref", &store, &digests, &invalid);
+    try std.testing.expectEqual(@as(usize, 0), digests.count());
+
+    // Empty payload.
+    try markBlobRefsInPayload("", &store, &digests, &invalid);
+    try std.testing.expectEqual(@as(usize, 0), digests.count());
+}
+
+test "sweepUnreferencedBlobs protects JSON blob refs in dynamic tables" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root_path = try tmp.dir.realpathAlloc(allocator, ".");
+    defer allocator.free(root_path);
+
+    var store = try db_blob_store.BlobStore.init(allocator, root_path);
+    defer store.deinit();
+
+    const json_blob = try store.put("json-dynamic-ref");
+    const orphan_blob = try store.put("json-dynamic-orphan");
+
+    // Write a raw JSON payload (not KvBuf) under a custom dynamic table.
+    // This simulates what the HTTP API does when a user writes JSON directly.
+    const json_payload = try std.fmt.allocPrint(
+        allocator,
+        "{{\"data_ref\":\"{s}\",\"label\":\"test\"}}",
+        .{json_blob.refSlice()},
+    );
+    defer allocator.free(json_payload);
+
+    {
+        // Write the JSON payload as raw VARBYTES (encoding=RAW, not KVBUF).
+        const tbl_root = try std.fmt.allocPrint(allocator, "{s}/tables/json_store", .{root_path});
+        defer allocator.free(tbl_root);
+
+        var writer = try db_writer.Writer.open(allocator, tbl_root, "data");
+        defer writer.deinit();
+        writer.durability = .full;
+
+        const col = db_writer.ColumnValue{
+            .column_id = col_payload,
+            .shape = .VARBYTES,
+            .phys_type = .BINARY,
+            .encoding = .RAW,
+            .dims = 1,
+            .data = json_payload,
+        };
+        try writer.appendRow(50, &.{col});
+        try writer.flushBlock();
+    }
+
+    const stats = try sweepUnreferencedBlobsWithOptions(allocator, root_path, .{
+        .min_blob_age_seconds = 0,
+    });
+
+    // The JSON blob should be discovered and preserved.
+    try std.testing.expectEqual(@as(usize, 1), stats.referenced_blob_count);
+    try std.testing.expectEqual(@as(usize, 2), stats.total_blob_files);
+    try std.testing.expectEqual(@as(usize, 1), stats.deleted_blob_files);
+
+    const keep = try store.readAll(json_blob.refSlice(), allocator);
+    defer allocator.free(keep);
+    try std.testing.expectEqualStrings("json-dynamic-ref", keep);
+    try std.testing.expectError(error.FileNotFound, store.readAll(orphan_blob.refSlice(), allocator));
 }

@@ -119,8 +119,8 @@ fn open_storage(
     })?;
 
     let path = match auth {
-        Some(ctx) => base.join(&ctx.storage_prefix).join("tables").join("chat"),
-        None => base.join("tables").join("chat"),
+        Some(ctx) => base.join(&ctx.storage_prefix),
+        None => base.to_path_buf(),
     };
 
     StorageHandle::open(&path).map_err(|e| {

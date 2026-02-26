@@ -693,7 +693,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_db_table_create(
+        rc = self._lib.talu_db_docs_create(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(doc_type),
@@ -730,7 +730,7 @@ class DocumentStore:
 
         out_doc = CDocumentRecord()
 
-        rc = self._lib.talu_db_table_get(
+        rc = self._lib.talu_db_docs_get(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_doc),
@@ -795,7 +795,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_db_table_update(
+        rc = self._lib.talu_db_docs_update(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(title),
@@ -833,7 +833,7 @@ class DocumentStore:
         out_has_external = c_bool(False)
         out_ref = ctypes.create_string_buffer(128)
 
-        rc = self._lib.talu_db_table_get_blob_ref(
+        rc = self._lib.talu_db_docs_get_blob_ref(
             self._path_bytes,
             _to_bytes(doc_id),
             out_ref,
@@ -930,7 +930,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_db_table_delete(
+        rc = self._lib.talu_db_docs_delete(
             self._path_bytes,
             _to_bytes(doc_id),
         )
@@ -971,7 +971,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_db_table_list(
+        rc = self._lib.talu_db_docs_list(
             self._path_bytes,
             _to_bytes(doc_type),
             _to_bytes(group_id),
@@ -1003,7 +1003,7 @@ class DocumentStore:
                     )
 
             # Free the list - pass as pointer
-            self._lib.talu_db_table_free_list(c_void_p(out_list.value))
+            self._lib.talu_db_docs_free_list(c_void_p(out_list.value))
 
         return results
 
@@ -1042,7 +1042,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_db_table_search(
+        rc = self._lib.talu_db_docs_search(
             self._path_bytes,
             _to_bytes(query),
             _to_bytes(doc_type),
@@ -1068,7 +1068,7 @@ class DocumentStore:
                         )
                     )
 
-            self._lib.talu_db_table_free_search_results(c_void_p(out_list.value))
+            self._lib.talu_db_docs_free_search_results(c_void_p(out_list.value))
 
         return results
 
@@ -1119,7 +1119,7 @@ class DocumentStore:
         out_results_json = c_void_p()
         out_results_len = c_size_t()
 
-        rc = self._lib.talu_db_table_search_batch(
+        rc = self._lib.talu_db_docs_search_batch(
             self._path_bytes,
             queries_json,
             len(queries_json),
@@ -1136,7 +1136,7 @@ class DocumentStore:
             results = json.loads(result_bytes.decode("utf-8"))
 
             # Free the JSON buffer
-            self._lib.talu_db_table_free_json(out_results_json, out_results_len)
+            self._lib.talu_db_docs_free_json(out_results_json, out_results_len)
 
         return results
 
@@ -1168,7 +1168,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_db_table_add_tag(
+        rc = self._lib.talu_db_docs_add_tag(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(tag_id),
@@ -1200,7 +1200,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_db_table_remove_tag(
+        rc = self._lib.talu_db_docs_remove_tag(
             self._path_bytes,
             _to_bytes(doc_id),
             _to_bytes(tag_id),
@@ -1230,7 +1230,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_db_table_get_tags(
+        rc = self._lib.talu_db_docs_get_tags(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_list),
@@ -1261,7 +1261,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_db_table_get_by_tag(
+        rc = self._lib.talu_db_docs_get_by_tag(
             self._path_bytes,
             _to_bytes(tag_id),
             byref(out_list),
@@ -1287,7 +1287,7 @@ class DocumentStore:
                     if item:
                         results.append(item.decode("utf-8", errors="replace"))
 
-            self._lib.talu_db_table_free_string_list(c_void_p(out_list.value))
+            self._lib.talu_db_docs_free_string_list(c_void_p(out_list.value))
 
         return results
 
@@ -1312,7 +1312,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_db_table_set_ttl(
+        rc = self._lib.talu_db_docs_set_ttl(
             self._path_bytes,
             _to_bytes(doc_id),
             ttl_seconds,
@@ -1338,7 +1338,7 @@ class DocumentStore:
 
         out_count = c_size_t()
 
-        rc = self._lib.talu_db_table_count_expired(
+        rc = self._lib.talu_db_docs_count_expired(
             self._path_bytes,
             byref(out_count),
         )
@@ -1365,7 +1365,7 @@ class DocumentStore:
 
         out_count = c_size_t()
 
-        rc = self._lib.talu_db_table_purge_expired(
+        rc = self._lib.talu_db_docs_purge_expired(
             self._path_bytes,
             byref(out_count),
         )
@@ -1408,7 +1408,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_db_table_get_changes(
+        rc = self._lib.talu_db_docs_get_changes(
             self._path_bytes,
             since_seq,
             _to_bytes(group_id),
@@ -1436,7 +1436,7 @@ class DocumentStore:
                         )
                     )
 
-            self._lib.talu_db_table_free_changes(c_void_p(out_list.value))
+            self._lib.talu_db_docs_free_changes(c_void_p(out_list.value))
 
         return results
 
@@ -1477,7 +1477,7 @@ class DocumentStore:
 
         self._check_open()
 
-        rc = self._lib.talu_db_table_create_delta(
+        rc = self._lib.talu_db_docs_create_delta(
             self._path_bytes,
             _to_bytes(base_doc_id),
             _to_bytes(new_doc_id),
@@ -1510,7 +1510,7 @@ class DocumentStore:
 
         out_is_delta = c_bool()
 
-        rc = self._lib.talu_db_table_is_delta(
+        rc = self._lib.talu_db_docs_is_delta(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_is_delta),
@@ -1542,7 +1542,7 @@ class DocumentStore:
         buf_size = 256
         out_buf = ctypes.create_string_buffer(buf_size)
 
-        rc = self._lib.talu_db_table_get_base_id(
+        rc = self._lib.talu_db_docs_get_base_id(
             self._path_bytes,
             _to_bytes(doc_id),
             out_buf,
@@ -1590,7 +1590,7 @@ class DocumentStore:
 
         out_chain = c_void_p()
 
-        rc = self._lib.talu_db_table_get_delta_chain(
+        rc = self._lib.talu_db_docs_get_delta_chain(
             self._path_bytes,
             _to_bytes(doc_id),
             byref(out_chain),
@@ -1624,7 +1624,7 @@ class DocumentStore:
                         )
                     )
 
-            self._lib.talu_db_table_free_delta_chain(c_void_p(out_chain.value))
+            self._lib.talu_db_docs_free_delta_chain(c_void_p(out_chain.value))
 
         return results
 
@@ -1652,7 +1652,7 @@ class DocumentStore:
 
         out_stats = CCompactionStats()
 
-        rc = self._lib.talu_db_table_get_compaction_stats(
+        rc = self._lib.talu_db_docs_get_compaction_stats(
             self._path_bytes,
             byref(out_stats),
         )
@@ -1687,7 +1687,7 @@ class DocumentStore:
 
         out_list = c_void_p()
 
-        rc = self._lib.talu_db_table_get_garbage_candidates(
+        rc = self._lib.talu_db_docs_get_garbage_candidates(
             self._path_bytes,
             byref(out_list),
         )

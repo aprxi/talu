@@ -11,9 +11,9 @@
 const std = @import("std");
 const kvbuf = @import("../../io/kvbuf/root.zig");
 const db_writer = @import("../writer.zig");
-const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
 const types = @import("../types.zig");
+const generic = @import("generic.zig");
 
 const Allocator = std.mem.Allocator;
 const ColumnValue = db_writer.ColumnValue;
@@ -33,6 +33,13 @@ const col_payload: u32 = 20;
 
 // Column IDs for ConversationTag junction
 const col_session_hash: u32 = 5; // Different from col_tag_hash
+
+pub const tag_compaction_policy = generic.CompactionPolicy{
+    .active_schema_ids = &[_]u16{ schema_tags, schema_conversation_tags },
+    .tombstone_schema_id = schema_tag_deletes,
+    .dedup_column_id = col_tag_hash,
+    .ts_column_id = col_ts,
+};
 
 /// Tag entity record for storage/retrieval.
 pub const TagRecord = struct {
@@ -87,57 +94,34 @@ pub const BatchTagResult = struct {
 /// Thread safety: NOT thread-safe (single-writer semantics via lock).
 pub const TagAdapter = struct {
     allocator: Allocator,
-    fs_writer: *db_writer.Writer,
-    fs_reader: *db_reader.Reader,
-    read_only: bool,
+    table: generic.Table,
 
     /// Initialize a TaluDB-backed tag adapter with write capabilities.
     pub fn init(allocator: Allocator, db_root: []const u8) !TagAdapter {
-        var writer_ptr = try allocator.create(db_writer.Writer);
-        errdefer allocator.destroy(writer_ptr);
-        writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "chat");
-        errdefer writer_ptr.deinit();
-
-        var reader_ptr = try allocator.create(db_reader.Reader);
-        errdefer allocator.destroy(reader_ptr);
-        reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "chat");
-        errdefer reader_ptr.deinit();
-
+        const tables_root = try std.fs.path.join(allocator, &.{ db_root, "tables" });
+        defer allocator.free(tables_root);
         return .{
             .allocator = allocator,
-            .fs_writer = writer_ptr,
-            .fs_reader = reader_ptr,
-            .read_only = false,
+            .table = try generic.Table.open(allocator, tables_root, "chat", tag_compaction_policy),
         };
     }
 
     /// Initialize a read-only adapter for scanning tags.
     pub fn initReadOnly(allocator: Allocator, db_root: []const u8) !TagAdapter {
-        const reader_ptr = try allocator.create(db_reader.Reader);
-        errdefer allocator.destroy(reader_ptr);
-        reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "chat");
-
+        const tables_root = try std.fs.path.join(allocator, &.{ db_root, "tables" });
+        defer allocator.free(tables_root);
         return .{
             .allocator = allocator,
-            .fs_writer = undefined,
-            .fs_reader = reader_ptr,
-            .read_only = true,
+            .table = try generic.Table.openReadOnly(allocator, tables_root, "chat", tag_compaction_policy),
         };
     }
 
     pub fn deinit(self: *TagAdapter) void {
-        if (!self.read_only) {
-            self.fs_writer.flushBlock() catch {};
-            self.fs_writer.deinit();
-            self.allocator.destroy(self.fs_writer);
-        }
-        self.fs_reader.deinit();
-        self.allocator.destroy(self.fs_reader);
+        self.table.deinit();
     }
 
     pub fn deinitReadOnly(self: *TagAdapter) void {
-        self.fs_reader.deinit();
-        self.allocator.destroy(self.fs_reader);
+        self.table.deinit();
     }
 
     // =========================================================================
@@ -166,131 +150,44 @@ pub const TagAdapter = struct {
             .{ .column_id = col_payload, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = payload },
         };
 
-        try self.fs_writer.appendRow(schema_tags, &columns);
+        try self.table.appendRow(schema_tags, &columns);
     }
 
     /// Write a tag deletion marker.
     pub fn deleteTag(self: *TagAdapter, tag_id: []const u8, deleted_at_ms: i64) !void {
         const tag_hash = computeHash(tag_id);
-        var tag_hash_value = tag_hash;
-        var ts_value = deleted_at_ms;
-
-        const columns = [_]ColumnValue{
-            .{ .column_id = col_tag_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&tag_hash_value) },
-            .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ts_value) },
-        };
-
-        try self.fs_writer.appendRow(schema_tag_deletes, &columns);
+        try self.table.deleteTombstone(tag_hash, deleted_at_ms);
     }
 
     /// Scan all tags, optionally filtered by group.
     pub fn scanTags(self: *TagAdapter, allocator: Allocator, group_id: ?[]const u8) ![]TagRecord {
         const target_group_hash: ?u64 = if (group_id) |g| computeHash(g) else null;
+        const extra = [_]u32{col_group_hash};
 
-        // Collect deleted tag hashes
-        var deleted = std.AutoHashMap(u64, i64).init(allocator);
-        defer deleted.deinit();
-        try self.collectDeletedTags(allocator, &deleted);
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_tags,
+            .delete_schema_id = schema_tag_deletes,
+            .dedup_column_id = col_tag_hash,
+            .extra_columns = &extra,
+        });
+        defer generic.freeRows(allocator, result.rows);
 
-        // Track latest version of each tag by hash
-        var latest = std.AutoHashMap(u64, TagRecord).init(allocator);
-        defer {
-            var it = latest.valueIterator();
-            while (it.next()) |v| {
-                var tag = v.*;
-                tag.deinit(allocator);
-            }
-            latest.deinit();
-        }
-
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_tags) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const hash_desc = findColumn(descs, col_tag_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const group_desc = findColumn(descs, col_group_hash);
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
-            defer allocator.free(hash_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var group_bytes: ?[]const u8 = null;
-            defer if (group_bytes) |g| allocator.free(g);
-            if (group_desc) |gd| {
-                group_bytes = reader.readColumnData(block.offset, gd, allocator) catch null;
-            }
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const tag_hash = readU64At(hash_bytes, row_idx) catch continue;
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-
-                // Skip if deleted
-                if (deleted.get(tag_hash)) |del_ts| {
-                    if (del_ts >= ts) continue;
-                }
-
-                // Filter by group if specified
-                if (target_group_hash) |target| {
-                    if (group_bytes) |gb| {
-                        const row_group = readU64At(gb, row_idx) catch continue;
-                        if (row_group != target and row_group != 0) continue;
-                    }
-                }
-
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeTagRecord(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    // Check if we already have a newer version
-                    if (latest.get(tag_hash)) |existing| {
-                        if (existing.updated_at_ms >= record.updated_at_ms) {
-                            var r = record;
-                            r.deinit(allocator);
-                            continue;
-                        }
-                        var old = existing;
-                        old.deinit(allocator);
-                    }
-                    latest.put(tag_hash, record) catch {
-                        var r = record;
-                        r.deinit(allocator);
-                        continue;
-                    };
-                }
-            }
-        }
-
-        // Convert to slice
         var results = std.ArrayList(TagRecord).empty;
         errdefer {
             for (results.items) |*r| r.deinit(allocator);
             results.deinit(allocator);
         }
 
-        var it = latest.valueIterator();
-        while (it.next()) |v| {
-            try results.append(allocator, v.*);
+        for (result.rows) |row| {
+            // Post-filter: group 0-wildcard
+            if (target_group_hash) |target| {
+                const row_group = findScalarValue(row.scalars, col_group_hash) orelse continue;
+                if (row_group != target and row_group != 0) continue;
+            }
+
+            const record = decodeTagRecord(allocator, row.payload) catch continue orelse continue;
+            try results.append(allocator, record);
         }
-        latest.clearRetainingCapacity();
 
         return results.toOwnedSlice(allocator);
     }
@@ -298,161 +195,61 @@ pub const TagAdapter = struct {
     /// Get a single tag by ID.
     pub fn getTag(self: *TagAdapter, allocator: Allocator, tag_id: []const u8) !?TagRecord {
         const target_hash = computeHash(tag_id);
+        const filter = [_]generic.ColumnFilter{.{ .column_id = col_tag_hash, .op = .eq, .value = target_hash }};
 
-        // Check if deleted
-        var deleted = std.AutoHashMap(u64, i64).init(allocator);
-        defer deleted.deinit();
-        try self.collectDeletedTags(allocator, &deleted);
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_tags,
+            .delete_schema_id = schema_tag_deletes,
+            .dedup_column_id = col_tag_hash,
+            .filters = &filter,
+            .limit = 1,
+        });
+        defer generic.freeRows(allocator, result.rows);
 
-        var latest: ?TagRecord = null;
-        var latest_ts: i64 = 0;
-
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_tags) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const hash_desc = findColumn(descs, col_tag_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
-            defer allocator.free(hash_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const tag_hash = readU64At(hash_bytes, row_idx) catch continue;
-                if (tag_hash != target_hash) continue;
-
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-
-                // Skip if deleted
-                if (deleted.get(tag_hash)) |del_ts| {
-                    if (del_ts >= ts) continue;
-                }
-
-                if (ts <= latest_ts) continue;
-
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeTagRecord(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    if (latest) |*old| old.deinit(allocator);
-                    latest = record;
-                    latest_ts = ts;
-                }
-            }
-        }
-
-        return latest;
+        if (result.rows.len == 0) return null;
+        return decodeTagRecord(allocator, result.rows[0].payload) catch null;
     }
 
     /// Get a tag by name within a group.
     pub fn getTagByName(self: *TagAdapter, allocator: Allocator, name: []const u8, group_id: ?[]const u8) !?TagRecord {
         const target_name_hash = computeHash(name);
         const target_group_hash: ?u64 = if (group_id) |g| computeHash(g) else null;
+        const filter = [_]generic.ColumnFilter{.{ .column_id = col_name_hash, .op = .eq, .value = target_name_hash }};
+        const extra = [_]u32{col_group_hash};
 
-        // Check deleted tags
-        var deleted = std.AutoHashMap(u64, i64).init(allocator);
-        defer deleted.deinit();
-        try self.collectDeletedTags(allocator, &deleted);
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_tags,
+            .delete_schema_id = schema_tag_deletes,
+            .dedup_column_id = col_tag_hash,
+            .filters = &filter,
+            .extra_columns = &extra,
+        });
+        defer generic.freeRows(allocator, result.rows);
 
+        // Multiple tags may share the same name hash (collision).
+        // Find the latest that matches the name string and group.
         var latest: ?TagRecord = null;
-        var latest_ts: i64 = 0;
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_tags) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const hash_desc = findColumn(descs, col_tag_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const name_hash_desc = findColumn(descs, col_name_hash) orelse continue;
-            const group_desc = findColumn(descs, col_group_hash);
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
-            defer allocator.free(hash_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            const name_hash_bytes = reader.readColumnData(block.offset, name_hash_desc, allocator) catch continue;
-            defer allocator.free(name_hash_bytes);
-
-            var group_bytes: ?[]const u8 = null;
-            defer if (group_bytes) |g| allocator.free(g);
-            if (group_desc) |gd| {
-                group_bytes = reader.readColumnData(block.offset, gd, allocator) catch null;
+        for (result.rows) |row| {
+            // Post-filter: group 0-wildcard
+            if (target_group_hash) |target| {
+                const row_group = findScalarValue(row.scalars, col_group_hash) orelse continue;
+                if (row_group != target and row_group != 0) continue;
             }
 
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
+            const record = decodeTagRecord(allocator, row.payload) catch continue orelse continue;
 
-            for (0..row_count) |row_idx| {
-                const name_hash = readU64At(name_hash_bytes, row_idx) catch continue;
-                if (name_hash != target_name_hash) continue;
-
-                // Filter by group
-                if (target_group_hash) |target| {
-                    if (group_bytes) |gb| {
-                        const row_group = readU64At(gb, row_idx) catch continue;
-                        if (row_group != target and row_group != 0) continue;
-                    }
-                }
-
-                const tag_hash = readU64At(hash_bytes, row_idx) catch continue;
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-
-                // Skip if deleted
-                if (deleted.get(tag_hash)) |del_ts| {
-                    if (del_ts >= ts) continue;
-                }
-
-                if (ts <= latest_ts) continue;
-
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeTagRecord(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    // Verify name matches (hash collision check)
-                    if (!std.ascii.eqlIgnoreCase(record.name, name)) {
-                        var r = record;
-                        r.deinit(allocator);
-                        continue;
-                    }
-                    if (latest) |*old| old.deinit(allocator);
-                    latest = record;
-                    latest_ts = ts;
-                }
+            // Verify name matches (hash collision check)
+            if (!std.ascii.eqlIgnoreCase(record.name, name)) {
+                var r = record;
+                r.deinit(allocator);
+                continue;
             }
+
+            // Rows are returned newest-first; take the first match.
+            if (latest) |*old| old.deinit(allocator);
+            latest = record;
+            break;
         }
 
         return latest;
@@ -481,7 +278,7 @@ pub const TagAdapter = struct {
             .{ .column_id = col_payload, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = payload },
         };
 
-        try self.fs_writer.appendRow(schema_conversation_tags, &columns);
+        try self.table.appendRow(schema_conversation_tags, &columns);
     }
 
     /// Remove a tag from a conversation (writes a tombstone with negative timestamp).
@@ -504,14 +301,22 @@ pub const TagAdapter = struct {
             .{ .column_id = col_payload, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = payload },
         };
 
-        try self.fs_writer.appendRow(schema_conversation_tags, &columns);
+        try self.table.appendRow(schema_conversation_tags, &columns);
     }
 
     /// Get all tag IDs for a conversation.
     pub fn getConversationTags(self: *TagAdapter, allocator: Allocator, session_id: []const u8) ![][]const u8 {
         const target_session_hash = computeHash(session_id);
+        const filter = [_]generic.ColumnFilter{.{ .column_id = col_session_hash, .op = .eq, .value = target_session_hash }};
 
-        // Track active tags (positive added_at_ms = active, negative = removed)
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_conversation_tags,
+            .dedup_column_id = null,
+            .filters = &filter,
+        });
+        defer generic.freeRows(allocator, result.rows);
+
+        // Apply add/remove state tracking
         var tag_states = std.StringHashMap(i64).init(allocator);
         defer {
             var it = tag_states.keyIterator();
@@ -519,67 +324,26 @@ pub const TagAdapter = struct {
             tag_states.deinit();
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
+        for (result.rows) |row| {
+            const record = decodeConversationTagRecord(allocator, row.payload) catch continue orelse continue;
+            defer allocator.free(record.session_id);
 
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_conversation_tags) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const session_desc = findColumn(descs, col_session_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const session_bytes = reader.readColumnData(block.offset, session_desc, allocator) catch continue;
-            defer allocator.free(session_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const session_hash = readU64At(session_bytes, row_idx) catch continue;
-                if (session_hash != target_session_hash) continue;
-
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-
-                const record_opt = decodeConversationTagRecord(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    defer allocator.free(record.session_id);
-
-                    // Check if this is newer than existing state
-                    const abs_ts = if (ts >= 0) ts else -ts;
-                    if (tag_states.get(record.tag_id)) |existing_ts| {
-                        const existing_abs = if (existing_ts >= 0) existing_ts else -existing_ts;
-                        if (abs_ts <= existing_abs) {
-                            allocator.free(record.tag_id);
-                            continue;
-                        }
-                        // Remove old key
-                        if (tag_states.fetchRemove(record.tag_id)) |kv| {
-                            allocator.free(kv.key);
-                        }
-                    }
-
-                    tag_states.put(record.tag_id, record.added_at_ms) catch {
-                        allocator.free(record.tag_id);
-                        continue;
-                    };
+            const abs_ts: i64 = if (record.added_at_ms >= 0) record.added_at_ms else -record.added_at_ms;
+            if (tag_states.get(record.tag_id)) |existing_ts| {
+                const existing_abs: i64 = if (existing_ts >= 0) existing_ts else -existing_ts;
+                if (abs_ts <= existing_abs) {
+                    allocator.free(record.tag_id);
+                    continue;
+                }
+                if (tag_states.fetchRemove(record.tag_id)) |kv| {
+                    allocator.free(kv.key);
                 }
             }
+
+            tag_states.put(record.tag_id, record.added_at_ms) catch {
+                allocator.free(record.tag_id);
+                continue;
+            };
         }
 
         // Collect active tags (positive added_at_ms)
@@ -603,8 +367,16 @@ pub const TagAdapter = struct {
     /// Get all conversations that have a specific tag.
     pub fn getTagConversations(self: *TagAdapter, allocator: Allocator, tag_id: []const u8) ![][]const u8 {
         const target_tag_hash = computeHash(tag_id);
+        const filter = [_]generic.ColumnFilter{.{ .column_id = col_tag_hash, .op = .eq, .value = target_tag_hash }};
 
-        // Track active sessions for this tag
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_conversation_tags,
+            .dedup_column_id = null,
+            .filters = &filter,
+        });
+        defer generic.freeRows(allocator, result.rows);
+
+        // Apply add/remove state tracking
         var session_states = std.StringHashMap(i64).init(allocator);
         defer {
             var it = session_states.keyIterator();
@@ -612,65 +384,26 @@ pub const TagAdapter = struct {
             session_states.deinit();
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
+        for (result.rows) |row| {
+            const record = decodeConversationTagRecord(allocator, row.payload) catch continue orelse continue;
+            defer allocator.free(record.tag_id);
 
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_conversation_tags) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const tag_desc = findColumn(descs, col_tag_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const tag_bytes = reader.readColumnData(block.offset, tag_desc, allocator) catch continue;
-            defer allocator.free(tag_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const tag_hash = readU64At(tag_bytes, row_idx) catch continue;
-                if (tag_hash != target_tag_hash) continue;
-
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-
-                const record_opt = decodeConversationTagRecord(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    defer allocator.free(record.tag_id);
-
-                    const abs_ts = if (ts >= 0) ts else -ts;
-                    if (session_states.get(record.session_id)) |existing_ts| {
-                        const existing_abs = if (existing_ts >= 0) existing_ts else -existing_ts;
-                        if (abs_ts <= existing_abs) {
-                            allocator.free(record.session_id);
-                            continue;
-                        }
-                        if (session_states.fetchRemove(record.session_id)) |kv| {
-                            allocator.free(kv.key);
-                        }
-                    }
-
-                    session_states.put(record.session_id, record.added_at_ms) catch {
-                        allocator.free(record.session_id);
-                        continue;
-                    };
+            const abs_ts: i64 = if (record.added_at_ms >= 0) record.added_at_ms else -record.added_at_ms;
+            if (session_states.get(record.session_id)) |existing_ts| {
+                const existing_abs: i64 = if (existing_ts >= 0) existing_ts else -existing_ts;
+                if (abs_ts <= existing_abs) {
+                    allocator.free(record.session_id);
+                    continue;
+                }
+                if (session_states.fetchRemove(record.session_id)) |kv| {
+                    allocator.free(kv.key);
                 }
             }
+
+            session_states.put(record.session_id, record.added_at_ms) catch {
+                allocator.free(record.session_id);
+                continue;
+            };
         }
 
         // Collect active sessions
@@ -720,11 +453,11 @@ pub const TagAdapter = struct {
         }
         for (per_session) |*st| st.* = TagStates.init(alloc);
 
-        const blocks = try self.fs_reader.getBlocks(alloc);
+        const blocks = try self.table.fs_reader.getBlocks(alloc);
         defer alloc.free(blocks);
 
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, alloc);
@@ -814,57 +547,23 @@ pub const TagAdapter = struct {
 
     /// Flush pending writes to disk.
     pub fn flush(self: *TagAdapter) !void {
-        if (!self.read_only) {
-            try self.fs_writer.flushBlock();
+        if (self.table.fs_writer != null) {
+            try self.table.flush();
         }
     }
 
-    // =========================================================================
-    // Internal Helpers
-    // =========================================================================
-
-    fn collectDeletedTags(self: *TagAdapter, allocator: Allocator, deleted: *std.AutoHashMap(u64, i64)) !void {
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_tag_deletes) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const hash_desc = findColumn(descs, col_tag_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-
-            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
-            defer allocator.free(hash_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            for (0..row_count) |row_idx| {
-                const tag_hash = readU64At(hash_bytes, row_idx) catch continue;
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-
-                if (deleted.get(tag_hash)) |existing| {
-                    if (ts > existing) {
-                        try deleted.put(tag_hash, ts);
-                    }
-                } else {
-                    try deleted.put(tag_hash, ts);
-                }
-            }
-        }
-    }
 };
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+fn findScalarValue(scalars: []const generic.ColumnData, column_id: u32) ?u64 {
+    for (scalars) |s| {
+        if (s.column_id == column_id) return s.value_u64;
+    }
+    return null;
+}
 
 // =============================================================================
 // KvBuf Encoding/Decoding

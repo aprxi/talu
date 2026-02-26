@@ -137,7 +137,7 @@ class Database:
         out_sessions = ctypes.POINTER(CSessionList)()
         out_ptr = ctypes.pointer(out_sessions)
 
-        rc = lib.talu_db_table_session_list_by_source(
+        rc = lib.talu_db_session_list_by_source(
             db_path.encode("utf-8"),
             source_doc_id.encode("utf-8"),
             limit,
@@ -159,7 +159,7 @@ class Database:
             return results
         finally:
             if out_sessions:
-                lib.talu_db_table_session_free_list(out_sessions)
+                lib.talu_db_session_free_list(out_sessions)
 
     def list_sessions(
         self,
@@ -233,7 +233,7 @@ class Database:
         # Convert has_tags to C convention: 1=True, 0=False, -1=None
         has_tags_c = -1 if has_tags is None else (1 if has_tags else 0)
 
-        rc = lib.talu_db_table_session_list_ex(
+        rc = lib.talu_db_session_list_ex(
             db_path.encode("utf-8"),
             limit,
             before_updated_at_ms,
@@ -251,6 +251,8 @@ class Database:
             updated_before_ms,
             has_tags_c,
             source_doc_id.encode("utf-8") if source_doc_id else None,
+            None,  # project_id
+            -1,  # project_id_null (-1 = ignore)
             out_ptr,
         )
         check(rc)
@@ -267,4 +269,4 @@ class Database:
             return results
         finally:
             if out_sessions:
-                lib.talu_db_table_session_free_list(out_sessions)
+                lib.talu_db_session_free_list(out_sessions)

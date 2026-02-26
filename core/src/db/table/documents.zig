@@ -12,11 +12,11 @@
 const std = @import("std");
 const kvbuf = @import("../../io/kvbuf/root.zig");
 const db_writer = @import("../writer.zig");
-const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
 const db_blob_store = @import("../blob/store.zig");
 const types = @import("../types.zig");
 const parallel = @import("../../system/parallel.zig");
+const generic = @import("generic.zig");
 
 const Allocator = std.mem.Allocator;
 const ColumnValue = db_writer.ColumnValue;
@@ -51,6 +51,14 @@ const col_meta_f4: u32 = 18;
 const col_meta_f5: u32 = 19;
 const col_payload: u32 = 20;
 const col_seq_num: u32 = 21;
+
+pub const doc_compaction_policy = generic.CompactionPolicy{
+    .active_schema_ids = &[_]u16{schema_documents},
+    .tombstone_schema_id = schema_document_deletes,
+    .dedup_column_id = col_doc_hash,
+    .ts_column_id = col_ts,
+    .ttl_column_id = col_expires_at,
+};
 
 /// Document entity record for storage/retrieval.
 pub const DocumentRecord = struct {
@@ -197,70 +205,49 @@ pub const ChangeRecord = struct {
 /// Thread safety: NOT thread-safe (single-writer semantics via lock).
 pub const DocumentAdapter = struct {
     allocator: Allocator,
-    fs_writer: *db_writer.Writer,
-    fs_reader: *db_reader.Reader,
+    table: generic.Table,
     blob_store: db_blob_store.BlobStore,
-    read_only: bool,
     doc_json_externalize_threshold_bytes: usize,
 
     /// Initialize a TaluDB-backed document adapter with write capabilities.
     pub fn init(allocator: Allocator, db_root: []const u8) !DocumentAdapter {
-        var writer_ptr = try allocator.create(db_writer.Writer);
-        errdefer allocator.destroy(writer_ptr);
-        writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "docs");
-        errdefer writer_ptr.deinit();
-
-        var reader_ptr = try allocator.create(db_reader.Reader);
-        errdefer allocator.destroy(reader_ptr);
-        reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "docs");
-        errdefer reader_ptr.deinit();
+        var table = try generic.Table.open(allocator, db_root, "docs", doc_compaction_policy);
+        errdefer table.deinit();
 
         var blob_store = try db_blob_store.BlobStore.init(allocator, db_root);
         errdefer blob_store.deinit();
 
         return .{
             .allocator = allocator,
-            .fs_writer = writer_ptr,
-            .fs_reader = reader_ptr,
+            .table = table,
             .blob_store = blob_store,
-            .read_only = false,
             .doc_json_externalize_threshold_bytes = resolveDocJsonExternalizeThresholdBytes(),
         };
     }
 
     /// Initialize a read-only adapter for scanning documents.
     pub fn initReadOnly(allocator: Allocator, db_root: []const u8) !DocumentAdapter {
-        const reader_ptr = try allocator.create(db_reader.Reader);
-        errdefer allocator.destroy(reader_ptr);
-        reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "docs");
+        var table = try generic.Table.openReadOnly(allocator, db_root, "docs", doc_compaction_policy);
+        errdefer table.deinit();
 
         var blob_store = try db_blob_store.BlobStore.init(allocator, db_root);
         errdefer blob_store.deinit();
 
         return .{
             .allocator = allocator,
-            .fs_writer = undefined,
-            .fs_reader = reader_ptr,
+            .table = table,
             .blob_store = blob_store,
-            .read_only = true,
             .doc_json_externalize_threshold_bytes = resolveDocJsonExternalizeThresholdBytes(),
         };
     }
 
     pub fn deinit(self: *DocumentAdapter) void {
-        if (!self.read_only) {
-            self.fs_writer.flushBlock() catch {};
-            self.fs_writer.deinit();
-            self.allocator.destroy(self.fs_writer);
-        }
-        self.fs_reader.deinit();
-        self.allocator.destroy(self.fs_reader);
+        self.table.deinit();
         self.blob_store.deinit();
     }
 
     pub fn deinitReadOnly(self: *DocumentAdapter) void {
-        self.fs_reader.deinit();
-        self.allocator.destroy(self.fs_reader);
+        self.table.deinit();
         self.blob_store.deinit();
     }
 
@@ -356,21 +343,13 @@ pub const DocumentAdapter = struct {
             .{ .column_id = col_seq_num, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&seq_num_value) },
         };
 
-        try self.fs_writer.appendRow(schema_documents, &columns);
+        try self.table.appendRow(schema_documents, &columns);
     }
 
     /// Write a document deletion marker (tombstone).
     pub fn deleteDocument(self: *DocumentAdapter, doc_id: []const u8, deleted_at_ms: i64) !void {
         const doc_hash = computeHash(doc_id);
-        var doc_hash_value = doc_hash;
-        var ts_value = deleted_at_ms;
-
-        const columns = [_]ColumnValue{
-            .{ .column_id = col_doc_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&doc_hash_value) },
-            .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ts_value) },
-        };
-
-        try self.fs_writer.appendRow(schema_document_deletes, &columns);
+        try self.table.deleteTombstone(doc_hash, deleted_at_ms);
     }
 
     /// Scan all documents with optional filters.
@@ -387,375 +366,88 @@ pub const DocumentAdapter = struct {
         const target_group_hash: ?u64 = if (group_id) |g| computeHash(g) else null;
         const target_owner_hash: ?u64 = if (owner_id) |o| computeHash(o) else null;
         const target_marker_hash: ?u64 = if (marker) |m| computeHash(m) else null;
-        const now_ms = std.time.milliTimestamp();
 
-        // Collect deleted document hashes
-        var deleted = std.AutoHashMap(u64, i64).init(allocator);
-        defer deleted.deinit();
-        try self.collectDeletedDocuments(allocator, &deleted);
-
-        // Track latest version of each document by hash
-        var latest = std.AutoHashMap(u64, DocumentRecord).init(allocator);
-        defer {
-            var it = latest.valueIterator();
-            while (it.next()) |v| {
-                var doc = v.*;
-                doc.deinit(allocator);
-            }
-            latest.deinit();
+        // Build filters: type_hash is exact equality (no 0-wildcard)
+        var filters_buf: [1]generic.ColumnFilter = undefined;
+        var n_filters: usize = 0;
+        if (target_type_hash) |th| {
+            filters_buf[0] = .{ .column_id = col_type_hash, .op = .eq, .value = th };
+            n_filters = 1;
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
+        const extra = [_]u32{ col_group_hash, col_owner_hash };
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_documents,
+            .delete_schema_id = schema_document_deletes,
+            .dedup_column_id = col_doc_hash,
+            .ttl_column_id = col_expires_at,
+            .filters = filters_buf[0..n_filters],
+            .extra_columns = &extra,
+        });
+        defer generic.freeRows(allocator, result.rows);
 
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_documents) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const hash_desc = findColumn(descs, col_doc_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const type_desc = findColumn(descs, col_type_hash);
-            const group_desc = findColumn(descs, col_group_hash);
-            const owner_desc = findColumn(descs, col_owner_hash);
-            const marker_desc = findColumn(descs, col_marker_hash);
-            const expires_desc = findColumn(descs, col_expires_at);
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
-            defer allocator.free(hash_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var type_bytes: ?[]const u8 = null;
-            defer if (type_bytes) |tb| allocator.free(tb);
-            if (type_desc) |td| {
-                type_bytes = reader.readColumnData(block.offset, td, allocator) catch null;
-            }
-
-            var group_bytes: ?[]const u8 = null;
-            defer if (group_bytes) |gb| allocator.free(gb);
-            if (group_desc) |gd| {
-                group_bytes = reader.readColumnData(block.offset, gd, allocator) catch null;
-            }
-
-            var owner_bytes: ?[]const u8 = null;
-            defer if (owner_bytes) |ob| allocator.free(ob);
-            if (owner_desc) |od| {
-                owner_bytes = reader.readColumnData(block.offset, od, allocator) catch null;
-            }
-
-            var marker_bytes: ?[]const u8 = null;
-            defer if (marker_bytes) |mb| allocator.free(mb);
-            if (marker_desc) |md| {
-                marker_bytes = reader.readColumnData(block.offset, md, allocator) catch null;
-            }
-
-            var expires_bytes: ?[]const u8 = null;
-            defer if (expires_bytes) |eb| allocator.free(eb);
-            if (expires_desc) |ed| {
-                expires_bytes = reader.readColumnData(block.offset, ed, allocator) catch null;
-            }
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const doc_hash = readU64At(hash_bytes, row_idx) catch continue;
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-
-                // Skip if deleted
-                if (deleted.get(doc_hash)) |del_ts| {
-                    if (del_ts >= ts) continue;
-                }
-
-                // Skip if expired (expires_at > 0 means TTL is set)
-                if (expires_bytes) |eb| {
-                    const expires_at = readI64At(eb, row_idx) catch 0;
-                    if (expires_at > 0 and expires_at < now_ms) continue;
-                }
-
-                // Filter by type if specified
-                if (target_type_hash) |target| {
-                    if (type_bytes) |tb| {
-                        const row_type = readU64At(tb, row_idx) catch continue;
-                        if (row_type != target) continue;
-                    }
-                }
-
-                // Filter by group if specified
-                if (target_group_hash) |target| {
-                    if (group_bytes) |gb| {
-                        const row_group = readU64At(gb, row_idx) catch continue;
-                        if (row_group != target and row_group != 0) continue;
-                    }
-                }
-
-                // Filter by owner if specified
-                if (target_owner_hash) |target| {
-                    if (owner_bytes) |ob| {
-                        const row_owner = readU64At(ob, row_idx) catch continue;
-                        if (row_owner != target and row_owner != 0) continue;
-                    }
-                }
-
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
-                if (record_opt) |record| {
-                    // Check if we already have a newer version
-                    if (latest.get(doc_hash)) |existing| {
-                        if (existing.updated_at_ms >= record.updated_at_ms) {
-                            var r = record;
-                            r.deinit(allocator);
-                            continue;
-                        }
-                        var old = existing;
-                        old.deinit(allocator);
-                    }
-                    latest.put(doc_hash, record) catch {
-                        var r = record;
-                        r.deinit(allocator);
-                        continue;
-                    };
-                }
-            }
-        }
-
-        // Post-dedup marker filter: the latest map now has the true newest
-        // version of each document.  Filter by marker here so that stale
-        // marker states from older rows never leak through.
-        if (target_marker_hash) |target| {
-            var to_remove = std.ArrayList(u64).empty;
-            defer to_remove.deinit(allocator);
-            {
-                var it2 = latest.iterator();
-                while (it2.next()) |entry| {
-                    const rm: u64 = if (entry.value_ptr.marker) |m| computeHash(m) else 0;
-                    if (rm != target) {
-                        try to_remove.append(allocator, entry.key_ptr.*);
-                    }
-                }
-            }
-            for (to_remove.items) |key| {
-                if (latest.fetchRemove(key)) |kv| {
-                    var r = kv.value;
-                    r.deinit(allocator);
-                }
-            }
-        }
-
-        // Convert to slice
         var results = std.ArrayList(DocumentRecord).empty;
         errdefer {
             for (results.items) |*r| r.deinit(allocator);
             results.deinit(allocator);
         }
 
-        var it = latest.valueIterator();
-        while (it.next()) |v| {
-            try results.append(allocator, v.*);
+        for (result.rows) |row| {
+            // Post-filter: group 0-wildcard
+            if (target_group_hash) |target| {
+                const row_group = findScalarValue(row.scalars, col_group_hash) orelse continue;
+                if (row_group != target and row_group != 0) continue;
+            }
+
+            // Post-filter: owner 0-wildcard
+            if (target_owner_hash) |target| {
+                const row_owner = findScalarValue(row.scalars, col_owner_hash) orelse continue;
+                if (row_owner != target and row_owner != 0) continue;
+            }
+
+            const record = decodeDocumentRecordWithBlobStore(allocator, row.payload, &self.blob_store) catch continue orelse continue;
+
+            // Post-dedup marker filter
+            if (target_marker_hash) |target| {
+                const rm: u64 = if (record.marker) |m| computeHash(m) else 0;
+                if (rm != target) {
+                    var r = record;
+                    r.deinit(allocator);
+                    continue;
+                }
+            }
+
+            try results.append(allocator, record);
         }
-        latest.clearRetainingCapacity();
 
         return results.toOwnedSlice(allocator);
     }
 
     /// Get a single document by ID.
     /// Returns null if document is not found or has expired.
-    ///
-    /// Uses reverse scanning (newest block first, last row first) so that the
-    /// first matching row is the latest version.  This makes point lookups
-    /// O(1) in the common case (document was recently written/updated).
     pub fn getDocument(self: *DocumentAdapter, allocator: Allocator, doc_id: []const u8) !?DocumentRecord {
         const target_hash = computeHash(doc_id);
-        const now_ms = std.time.milliTimestamp();
-
-        // Check if deleted
-        var deleted = std.AutoHashMap(u64, i64).init(allocator);
-        defer deleted.deinit();
-        try self.collectDeletedDocuments(allocator, &deleted);
-
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        // Reverse-scan: newest blocks first (current.talu blocks are at the
-        // end of the slice, sealed segments at the front).
-        var block_idx = blocks.len;
-        while (block_idx > 0) {
-            block_idx -= 1;
-            const block = blocks[block_idx];
-
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_documents) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const hash_desc = findColumn(descs, col_doc_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const expires_desc = findColumn(descs, col_expires_at);
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
-            defer allocator.free(hash_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var expires_bytes: ?[]const u8 = null;
-            defer if (expires_bytes) |eb| allocator.free(eb);
-            if (expires_desc) |ed| {
-                expires_bytes = reader.readColumnData(block.offset, ed, allocator) catch null;
-            }
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            // Reverse-scan rows within block (last written = highest index).
-            var row_idx = row_count;
-            while (row_idx > 0) {
-                row_idx -= 1;
-
-                const doc_hash = readU64At(hash_bytes, row_idx) catch continue;
-                if (doc_hash != target_hash) continue;
-
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-
-                // Skip if deleted
-                if (deleted.get(doc_hash)) |del_ts| {
-                    if (del_ts >= ts) continue;
-                }
-
-                // First non-deleted match in reverse order is the latest version.
-                var expires_at: i64 = 0;
-                if (expires_bytes) |eb| {
-                    expires_at = readI64At(eb, row_idx) catch 0;
-                }
-
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
-                if (record_opt) |record| {
-                    // Check expiration before returning.
-                    if (expires_at > 0 and expires_at < now_ms) {
-                        var r = record;
-                        r.deinit(allocator);
-                        return null;
-                    }
-                    return record;
-                }
-            }
-        }
-
-        return null;
+        const row = try self.table.get(allocator, schema_documents, target_hash, null) orelse return null;
+        defer generic.freeRow(allocator, row);
+        return decodeDocumentRecordWithBlobStore(allocator, row.payload, &self.blob_store) catch null;
     }
 
     /// Get a single document header by ID without loading externalized doc_json.
     /// Returns null if document is not found or has expired.
-    ///
-    /// Uses reverse scanning (newest block first, last row first) for O(1)
-    /// best-case point lookups.
     pub fn getDocumentHeader(self: *DocumentAdapter, allocator: Allocator, doc_id: []const u8) !?DocumentHeader {
         const target_hash = computeHash(doc_id);
-        const now_ms = std.time.milliTimestamp();
+        const row = try self.table.get(allocator, schema_documents, target_hash, null) orelse return null;
+        defer generic.freeRow(allocator, row);
 
-        var deleted = std.AutoHashMap(u64, i64).init(allocator);
-        defer deleted.deinit();
-        try self.collectDeletedDocuments(allocator, &deleted);
-
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        // Reverse-scan: newest blocks first.
-        var block_idx = blocks.len;
-        while (block_idx > 0) {
-            block_idx -= 1;
-            const block = blocks[block_idx];
-
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_documents) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            if (header.row_count == 0) continue;
-
-            const hash_desc = findColumn(descs, col_doc_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const expires_desc = findColumn(descs, col_expires_at);
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const hash_bytes = reader.readColumnData(block.offset, hash_desc, allocator) catch continue;
-            defer allocator.free(hash_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var expires_bytes: ?[]const u8 = null;
-            defer if (expires_bytes) |eb| allocator.free(eb);
-            if (expires_desc) |ed| {
-                expires_bytes = reader.readColumnData(block.offset, ed, allocator) catch null;
-            }
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, header.row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            // Reverse-scan rows within block.
-            var row_idx = header.row_count;
-            while (row_idx > 0) {
-                row_idx -= 1;
-
-                const row_hash = readU64At(hash_bytes, row_idx) catch continue;
-                if (row_hash != target_hash) continue;
-
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-
-                if (deleted.get(row_hash)) |del_ts| {
-                    if (del_ts >= ts) continue;
-                }
-
-                // First non-deleted match in reverse order is the latest version.
-                var expires_at: i64 = 0;
-                if (expires_bytes) |eb| {
-                    expires_at = readI64At(eb, row_idx) catch 0;
-                }
-
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeDocumentHeader(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    if (expires_at > 0 and expires_at < now_ms) {
-                        var r = record;
-                        r.deinit(allocator);
-                        return null;
-                    }
-                    var result = record;
-                    result.expires_at_ms = expires_at;
-                    return result;
-                }
+        var result = (decodeDocumentHeader(allocator, row.payload) catch return null) orelse return null;
+        // Extract expires_at from scalars.
+        for (row.scalars) |s| {
+            if (s.column_id == col_expires_at) {
+                result.expires_at_ms = @bitCast(s.value_u64);
+                break;
             }
         }
-
-        return null;
+        return result;
     }
 
     /// Load an externalized blob by reference (`sha256:<hex>` or `multi:<hex>`).
@@ -771,6 +463,14 @@ pub const DocumentAdapter = struct {
     /// Get document version history (all versions linked by parent_id).
     pub fn getDocumentVersions(self: *DocumentAdapter, allocator: Allocator, doc_id: []const u8) ![]DocumentRecord {
         const target_parent_hash = computeHash(doc_id);
+        const filter = [_]generic.ColumnFilter{.{ .column_id = col_parent_hash, .op = .eq, .value = target_parent_hash }};
+
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_documents,
+            .dedup_column_id = null,
+            .filters = &filter,
+        });
+        defer generic.freeRows(allocator, result.rows);
 
         var results = std.ArrayList(DocumentRecord).empty;
         errdefer {
@@ -778,42 +478,9 @@ pub const DocumentAdapter = struct {
             results.deinit(allocator);
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
-
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_documents) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const parent_desc = findColumn(descs, col_parent_hash) orelse continue;
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const parent_bytes = reader.readColumnData(block.offset, parent_desc, allocator) catch continue;
-            defer allocator.free(parent_bytes);
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const parent_hash = readU64At(parent_bytes, row_idx) catch continue;
-                if (parent_hash != target_parent_hash) continue;
-
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-                const record_opt = decodeDocumentRecordWithBlobStore(allocator, payload, &self.blob_store) catch continue;
-                if (record_opt) |record| {
-                    try results.append(allocator, record);
-                }
-            }
+        for (result.rows) |row| {
+            const record = decodeDocumentRecordWithBlobStore(allocator, row.payload, &self.blob_store) catch continue orelse continue;
+            try results.append(allocator, record);
         }
 
         return results.toOwnedSlice(allocator);
@@ -821,8 +488,8 @@ pub const DocumentAdapter = struct {
 
     /// Flush pending writes to disk.
     pub fn flush(self: *DocumentAdapter) !void {
-        if (!self.read_only) {
-            try self.fs_writer.flushBlock();
+        if (self.table.fs_writer != null) {
+            try self.table.flush();
         }
     }
 
@@ -855,12 +522,12 @@ pub const DocumentAdapter = struct {
         var doc_first_seq = std.AutoHashMap(u64, u64).init(allocator);
         defer doc_first_seq.deinit();
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
+        const blocks = try self.table.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
         // Phase 1: Collect document creates/updates
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, allocator);
@@ -1075,11 +742,11 @@ pub const DocumentAdapter = struct {
         defer deleted.deinit();
         try self.collectDeletedDocuments(allocator, &deleted);
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
+        const blocks = try self.table.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, allocator);
@@ -1292,12 +959,12 @@ pub const DocumentAdapter = struct {
         var deleted = std.AutoHashMap(u64, i64).init(allocator);
         defer deleted.deinit();
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
+        const blocks = try self.table.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
         // Phase 1: Count tombstones and collect deleted hashes
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, allocator);
@@ -1340,7 +1007,7 @@ pub const DocumentAdapter = struct {
         defer latest_delta.deinit();
 
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, allocator);
@@ -1476,11 +1143,11 @@ pub const DocumentAdapter = struct {
             latest_id.deinit();
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
+        const blocks = try self.table.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, allocator);
@@ -1604,11 +1271,11 @@ pub const DocumentAdapter = struct {
             latest_id.deinit();
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
+        const blocks = try self.table.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, allocator);
@@ -1706,11 +1373,11 @@ pub const DocumentAdapter = struct {
     // =========================================================================
 
     fn collectDeletedDocuments(self: *DocumentAdapter, allocator: Allocator, deleted: *std.AutoHashMap(u64, i64)) !void {
-        const blocks = try self.fs_reader.getBlocks(allocator);
+        const blocks = try self.table.fs_reader.getBlocks(allocator);
         defer allocator.free(blocks);
 
         for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
+            var file = self.table.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
             defer file.close();
 
             const reader = block_reader.BlockReader.init(file, allocator);
@@ -1783,8 +1450,8 @@ pub const DocumentAdapter = struct {
         defer work_items.deinit(allocator);
 
         // current.talu
-        if (self.fs_reader.current_path) |current_path| {
-            const file = self.fs_reader.dir.openFile(current_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        if (self.table.fs_reader.current_path) |current_path| {
+            const file = self.table.fs_reader.dir.openFile(current_path, .{ .mode = .read_only }) catch |err| switch (err) {
                 error.FileNotFound => null,
                 else => return err,
             };
@@ -1808,9 +1475,9 @@ pub const DocumentAdapter = struct {
         }
 
         // Sealed segments
-        if (self.fs_reader.manifest_data) |manifest| {
+        if (self.table.fs_reader.manifest_data) |manifest| {
             for (manifest.segments) |segment| {
-                const file = self.fs_reader.dir.openFile(segment.path, .{ .mode = .read_only }) catch |err| switch (err) {
+                const file = self.table.fs_reader.dir.openFile(segment.path, .{ .mode = .read_only }) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
                 };
@@ -1930,8 +1597,8 @@ pub const DocumentAdapter = struct {
         defer work_items.deinit(allocator);
 
         // current.talu
-        if (self.fs_reader.current_path) |current_path| {
-            const file = self.fs_reader.dir.openFile(current_path, .{ .mode = .read_only }) catch |err| switch (err) {
+        if (self.table.fs_reader.current_path) |current_path| {
+            const file = self.table.fs_reader.dir.openFile(current_path, .{ .mode = .read_only }) catch |err| switch (err) {
                 error.FileNotFound => null,
                 else => return err,
             };
@@ -1955,9 +1622,9 @@ pub const DocumentAdapter = struct {
         }
 
         // Sealed segments
-        if (self.fs_reader.manifest_data) |manifest| {
+        if (self.table.fs_reader.manifest_data) |manifest| {
             for (manifest.segments) |segment| {
-                const file = self.fs_reader.dir.openFile(segment.path, .{ .mode = .read_only }) catch |err| switch (err) {
+                const file = self.table.fs_reader.dir.openFile(segment.path, .{ .mode = .read_only }) catch |err| switch (err) {
                     error.FileNotFound => continue,
                     else => return err,
                 };
@@ -2601,6 +2268,13 @@ fn computeHash(s: []const u8) u64 {
 fn computeOptionalHash(s: ?[]const u8) u64 {
     if (s) |str| return computeHash(str);
     return 0;
+}
+
+fn findScalarValue(scalars: []const generic.ColumnData, column_id: u32) ?u64 {
+    for (scalars) |s| {
+        if (s.column_id == column_id) return s.value_u64;
+    }
+    return null;
 }
 
 fn findColumn(descs: []const types.ColumnDesc, col_id: u32) ?types.ColumnDesc {

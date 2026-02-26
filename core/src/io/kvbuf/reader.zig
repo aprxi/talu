@@ -102,6 +102,26 @@ pub const KvBufReader = struct {
     pub fn fieldCount(self: KvBufReader) usize {
         return self.entry_count;
     }
+
+    /// A single directory entry: field ID and its value slice.
+    pub const Entry = struct {
+        field_id: u16,
+        value: []const u8,
+    };
+
+    /// Access a directory entry by index (0-based).
+    /// Returns null if the index is out of range or the entry is corrupt.
+    pub fn entryAt(self: KvBufReader, index: usize) ?Entry {
+        if (index >= self.entry_count) return null;
+        const base = @as(usize, self.dir_offset) + index * ENTRY_SIZE;
+        const fid = std.mem.readInt(u16, self.data[base..][0..2], .little);
+        const offset = std.mem.readInt(u32, self.data[base + 2 ..][0..4], .little);
+        const length = std.mem.readInt(u32, self.data[base + 6 ..][0..4], .little);
+        const start = @as(usize, offset);
+        const end = start + @as(usize, length);
+        if (end > @as(usize, self.dir_offset)) return null;
+        return .{ .field_id = fid, .value = self.data[start..end] };
+    }
 };
 
 // =============================================================================
@@ -235,4 +255,29 @@ test "KvBufReader large value roundtrip" {
     const val = reader.get(1) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(usize, 200_000), val.len);
     try std.testing.expectEqualStrings(large, val);
+}
+
+test "KvBufReader entryAt iterates all entries" {
+    const allocator = std.testing.allocator;
+    var w = writer_mod.KvBufWriter.init();
+    defer w.deinit(allocator);
+
+    try w.addString(allocator, 10, "alpha");
+    try w.addString(allocator, 20, "beta");
+
+    const blob = try w.finish(allocator);
+    defer allocator.free(blob);
+
+    const reader = try KvBufReader.init(blob);
+    try std.testing.expectEqual(@as(usize, 2), reader.fieldCount());
+
+    const e0 = reader.entryAt(0) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 10), e0.field_id);
+    try std.testing.expectEqualStrings("alpha", e0.value);
+
+    const e1 = reader.entryAt(1) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u16, 20), e1.field_id);
+    try std.testing.expectEqualStrings("beta", e1.value);
+
+    try std.testing.expect(reader.entryAt(2) == null);
 }

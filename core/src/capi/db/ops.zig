@@ -282,7 +282,7 @@ pub const CStorageEvent = extern struct {
 
 /// Wrapper backend that owns a TaluDB chat backend for the C API.
 pub const DbBackendWrapper = struct {
-    backend: *db.table.sessions.TableAdapter,
+    backend: *responses_root.TableAdapter,
     allocator: std.mem.Allocator,
 
     pub fn toStorageBackend(self: *DbBackendWrapper) StorageBackend {
@@ -329,12 +329,12 @@ fn clearStorageBackend(storage_backend: *?responses_root.StorageBackend) void {
 
 /// Create TaluDB backend and wrapper. Returns error code on failure (sets capi_error).
 fn createDbBackend(db_path_slice: []const u8, session_slice: []const u8) ?*DbBackendWrapper {
-    const backend_ptr = allocator.create(db.table.sessions.TableAdapter) catch {
+    const backend_ptr = allocator.create(responses_root.TableAdapter) catch {
         capi_error.setErrorWithCode(.out_of_memory, "failed to allocate TableAdapter", .{});
         return null;
     };
 
-    backend_ptr.* = db.table.sessions.TableAdapter.init(allocator, db_path_slice, session_slice) catch |err| {
+    backend_ptr.* = responses_root.TableAdapter.init(allocator, db_path_slice, session_slice) catch |err| {
         allocator.destroy(backend_ptr);
         capi_error.setError(err, "failed to initialize TaluDB backend", .{});
         return null;
@@ -439,8 +439,12 @@ pub export fn talu_db_ops_set_max_segment_size(
     }
 
     const wrapper: *DbBackendWrapper = @ptrCast(@alignCast(sb.ptr));
+    const writer = wrapper.backend.table.fs_writer orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "storage backend is read-only", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
     const size = if (max_bytes == 0) db.writer.default_max_segment_size else max_bytes;
-    wrapper.backend.fs_writer.max_segment_size = size;
+    writer.max_segment_size = size;
     return 0;
 }
 
@@ -485,7 +489,11 @@ pub export fn talu_db_ops_set_durability(
     }
 
     const wrapper: *DbBackendWrapper = @ptrCast(@alignCast(sb.ptr));
-    wrapper.backend.fs_writer.durability = durability;
+    const writer = wrapper.backend.table.fs_writer orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "storage backend is read-only", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    writer.durability = durability;
     return 0;
 }
 
@@ -678,3 +686,95 @@ test "CMessageRole values match MessageRole" {
     try std.testing.expectEqual(@intFromEnum(CMessageRole.user), @intFromEnum(items.MessageRole.user));
     try std.testing.expectEqual(@intFromEnum(CMessageRole.assistant), @intFromEnum(items.MessageRole.assistant));
 }
+
+// =============================================================================
+// Generic Table C-ABI Types
+// =============================================================================
+
+/// C-ABI column value for generic table writes.
+pub const CColumnValue = extern struct {
+    column_id: u32,
+    /// 1=SCALAR, 2=VECTOR, 3=VARBYTES (matches types.ColumnShape).
+    shape: u8,
+    /// 3=U64, 7=I64, 11=F64, 20=BINARY (matches types.PhysicalType).
+    phys_type: u8,
+    /// Vector dimensionality. 1 for scalars, 0 for varbytes.
+    dims: u16,
+    /// Pointer to raw data bytes.
+    data: ?[*]const u8,
+    /// Length of data in bytes.
+    data_len: usize,
+};
+
+/// C-ABI column filter for generic table scans.
+pub const CColumnFilter = extern struct {
+    column_id: u32,
+    /// 0=eq, 1=ne, 2=lt, 3=le, 4=gt, 5=ge.
+    op: u8,
+    _pad: [3]u8 = [_]u8{0} ** 3,
+    value: u64,
+};
+
+/// C-ABI compaction policy for generic table open.
+pub const CCompactionPolicy = extern struct {
+    active_schema_ids: ?[*]const u16,
+    active_schema_count: u32,
+    /// 0 = no tombstone schema.
+    tombstone_schema_id: u16,
+    dedup_column_id: u32,
+    ts_column_id: u32,
+    /// 0 = no TTL column.
+    ttl_column_id: u32,
+    _pad: [2]u8 = [_]u8{0} ** 2,
+};
+
+/// C-ABI scan parameters for generic table scans.
+pub const CScanParams = extern struct {
+    schema_id: u16,
+    additional_schema_ids: ?[*]const u16,
+    additional_schema_count: u32,
+    filters: ?[*]const CColumnFilter,
+    filter_count: u32,
+    dedup_column_id: u32,
+    /// 0 = no tombstone schema.
+    delete_schema_id: u16,
+    ts_column_id: u32,
+    /// 0 = no TTL column.
+    ttl_column_id: u32,
+    limit: u32,
+    /// 0 = no cursor.
+    cursor_ts: i64,
+    cursor_hash: u64,
+    payload_column_id: u32,
+    reverse: bool,
+    _pad: [3]u8 = [_]u8{0} ** 3,
+    /// Additional scalar columns to include in results.
+    extra_columns: ?[*]const u32 = null,
+    extra_column_count: u32 = 0,
+};
+
+/// C-ABI scalar column data from a scanned row.
+pub const CColumnData = extern struct {
+    column_id: u32,
+    _pad: [4]u8 = [_]u8{0} ** 4,
+    value: u64,
+};
+
+/// C-ABI generic row from scan/get results.
+pub const CRow = extern struct {
+    scalars: ?[*]CColumnData,
+    scalar_count: u32,
+    _pad: [4]u8 = [_]u8{0} ** 4,
+    payload: ?[*]const u8,
+    payload_len: usize,
+};
+
+/// C-ABI row iterator for scan/get results.
+/// All memory is arena-allocated; call talu_db_table_free_rows to release.
+pub const CRowIterator = extern struct {
+    rows: ?[*]CRow,
+    count: u32,
+    has_more: bool,
+    _pad: [3]u8 = [_]u8{0} ** 3,
+    _arena: ?*anyopaque,
+};
