@@ -1,7 +1,7 @@
-//! DB C-API: Table operations.
+//! DB C-API: Domain table operations + generic table engine.
 //!
-//! Canonical exports use `talu_db_table_*` and include document APIs plus
-//! session/tag table operations.
+//! Domain-specific exports: `talu_db_docs_*`, `talu_db_session_*`, `talu_db_tag_*`.
+//! Generic table engine: `talu_db_table_*`.
 
 const std = @import("std");
 const capi_error = @import("../error.zig");
@@ -19,7 +19,8 @@ const validateDbPath = helpers.validateDbPath;
 const validateRequiredArg = helpers.validateRequiredArg;
 const setArgError = helpers.setArgError;
 const ChatHandle = responses_mod.ChatHandle;
-const Chat = @import("../../responses/root.zig").Chat;
+const responses = @import("../../responses/root.zig");
+const Chat = responses.Chat;
 
 // =============================================================================
 // Type re-exports: Documents
@@ -91,7 +92,7 @@ pub const CSessionTagBatch = extern struct {
 // Documents
 // =============================================================================
 
-pub export fn talu_db_table_create(
+pub export fn talu_db_docs_create(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     doc_type: ?[*:0]const u8,
@@ -117,7 +118,7 @@ pub export fn talu_db_table_create(
     );
 }
 
-pub export fn talu_db_table_get(
+pub export fn talu_db_docs_get(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_doc: *docs.CDocumentRecord,
@@ -125,7 +126,7 @@ pub export fn talu_db_table_get(
     return docs.talu_documents_get(db_path, doc_id, out_doc);
 }
 
-pub export fn talu_db_table_get_blob_ref(
+pub export fn talu_db_docs_get_blob_ref(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_blob_ref: ?[*]u8,
@@ -141,7 +142,7 @@ pub export fn talu_db_table_get_blob_ref(
     );
 }
 
-pub export fn talu_db_table_update(
+pub export fn talu_db_docs_update(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     title: ?[*:0]const u8,
@@ -152,14 +153,14 @@ pub export fn talu_db_table_update(
     return docs.talu_documents_update(db_path, doc_id, title, doc_json, tags_text, marker);
 }
 
-pub export fn talu_db_table_delete(
+pub export fn talu_db_docs_delete(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
 ) callconv(.c) i32 {
     return docs.talu_documents_delete(db_path, doc_id);
 }
 
-pub export fn talu_db_table_delete_batch(
+pub export fn talu_db_docs_delete_batch(
     db_path: ?[*:0]const u8,
     doc_ids: ?[*]const ?[*:0]const u8,
     doc_ids_count: usize,
@@ -175,7 +176,7 @@ pub export fn talu_db_table_delete_batch(
     );
 }
 
-pub export fn talu_db_table_set_marker_batch(
+pub export fn talu_db_docs_set_marker_batch(
     db_path: ?[*:0]const u8,
     doc_ids: ?[*]const ?[*:0]const u8,
     doc_ids_count: usize,
@@ -193,7 +194,7 @@ pub export fn talu_db_table_set_marker_batch(
     );
 }
 
-pub export fn talu_db_table_list(
+pub export fn talu_db_docs_list(
     db_path: ?[*:0]const u8,
     doc_type: ?[*:0]const u8,
     group_id: ?[*:0]const u8,
@@ -205,11 +206,11 @@ pub export fn talu_db_table_list(
     return docs.talu_documents_list(db_path, doc_type, group_id, owner_id, marker, limit, out_list);
 }
 
-pub export fn talu_db_table_free_list(list: ?*docs.CDocumentList) callconv(.c) void {
+pub export fn talu_db_docs_free_list(list: ?*docs.CDocumentList) callconv(.c) void {
     docs.talu_documents_free_list(list);
 }
 
-pub export fn talu_db_table_search(
+pub export fn talu_db_docs_search(
     db_path: ?[*:0]const u8,
     query: ?[*:0]const u8,
     doc_type: ?[*:0]const u8,
@@ -219,11 +220,11 @@ pub export fn talu_db_table_search(
     return docs.talu_documents_search(db_path, query, doc_type, limit, out_list);
 }
 
-pub export fn talu_db_table_free_search_results(list: ?*docs.CSearchResultList) callconv(.c) void {
+pub export fn talu_db_docs_free_search_results(list: ?*docs.CSearchResultList) callconv(.c) void {
     docs.talu_documents_free_search_results(list);
 }
 
-pub export fn talu_db_table_search_batch(
+pub export fn talu_db_docs_search_batch(
     db_path: ?[*:0]const u8,
     queries_json: ?[*]const u8,
     queries_len: usize,
@@ -239,11 +240,11 @@ pub export fn talu_db_table_search_batch(
     );
 }
 
-pub export fn talu_db_table_free_json(ptr: ?[*]u8, len: usize) callconv(.c) void {
+pub export fn talu_db_docs_free_json(ptr: ?[*]u8, len: usize) callconv(.c) void {
     docs.talu_documents_free_json(ptr, len);
 }
 
-pub export fn talu_db_table_get_changes(
+pub export fn talu_db_docs_get_changes(
     db_path: ?[*:0]const u8,
     since_seq: u64,
     group_id: ?[*:0]const u8,
@@ -253,11 +254,11 @@ pub export fn talu_db_table_get_changes(
     return docs.talu_documents_get_changes(db_path, since_seq, group_id, limit, out_list);
 }
 
-pub export fn talu_db_table_free_changes(list: ?*docs.CChangeList) callconv(.c) void {
+pub export fn talu_db_docs_free_changes(list: ?*docs.CChangeList) callconv(.c) void {
     docs.talu_documents_free_changes(list);
 }
 
-pub export fn talu_db_table_set_ttl(
+pub export fn talu_db_docs_set_ttl(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     ttl_seconds: u64,
@@ -265,14 +266,14 @@ pub export fn talu_db_table_set_ttl(
     return docs.talu_documents_set_ttl(db_path, doc_id, ttl_seconds);
 }
 
-pub export fn talu_db_table_count_expired(
+pub export fn talu_db_docs_count_expired(
     db_path: ?[*:0]const u8,
     out_count: ?*usize,
 ) callconv(.c) i32 {
     return docs.talu_documents_count_expired(db_path, out_count);
 }
 
-pub export fn talu_db_table_create_delta(
+pub export fn talu_db_docs_create_delta(
     db_path: ?[*:0]const u8,
     base_doc_id: ?[*:0]const u8,
     new_doc_id: ?[*:0]const u8,
@@ -292,7 +293,7 @@ pub export fn talu_db_table_create_delta(
     );
 }
 
-pub export fn talu_db_table_get_delta_chain(
+pub export fn talu_db_docs_get_delta_chain(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_chain: ?*?*docs.CDeltaChain,
@@ -300,11 +301,11 @@ pub export fn talu_db_table_get_delta_chain(
     return docs.talu_documents_get_delta_chain(db_path, doc_id, out_chain);
 }
 
-pub export fn talu_db_table_free_delta_chain(chain: ?*docs.CDeltaChain) callconv(.c) void {
+pub export fn talu_db_docs_free_delta_chain(chain: ?*docs.CDeltaChain) callconv(.c) void {
     docs.talu_documents_free_delta_chain(chain);
 }
 
-pub export fn talu_db_table_is_delta(
+pub export fn talu_db_docs_is_delta(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_is_delta: ?*bool,
@@ -312,7 +313,7 @@ pub export fn talu_db_table_is_delta(
     return docs.talu_documents_is_delta(db_path, doc_id, out_is_delta);
 }
 
-pub export fn talu_db_table_get_base_id(
+pub export fn talu_db_docs_get_base_id(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_base_id: ?[*]u8,
@@ -321,28 +322,28 @@ pub export fn talu_db_table_get_base_id(
     return docs.talu_documents_get_base_id(db_path, doc_id, out_base_id, out_base_id_len);
 }
 
-pub export fn talu_db_table_get_compaction_stats(
+pub export fn talu_db_docs_get_compaction_stats(
     db_path: ?[*:0]const u8,
     out_stats: ?*docs.CCompactionStats,
 ) callconv(.c) i32 {
     return docs.talu_documents_get_compaction_stats(db_path, out_stats);
 }
 
-pub export fn talu_db_table_purge_expired(
+pub export fn talu_db_docs_purge_expired(
     db_path: ?[*:0]const u8,
     out_count: ?*usize,
 ) callconv(.c) i32 {
     return docs.talu_documents_purge_expired(db_path, out_count);
 }
 
-pub export fn talu_db_table_get_garbage_candidates(
+pub export fn talu_db_docs_get_garbage_candidates(
     db_path: ?[*:0]const u8,
     out_ids: ?*?*docs.CStringList,
 ) callconv(.c) i32 {
     return docs.talu_documents_get_garbage_candidates(db_path, out_ids);
 }
 
-pub export fn talu_db_table_add_tag(
+pub export fn talu_db_docs_add_tag(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
@@ -351,7 +352,7 @@ pub export fn talu_db_table_add_tag(
     return docs.talu_documents_add_tag(db_path, doc_id, tag_id, group_id);
 }
 
-pub export fn talu_db_table_remove_tag(
+pub export fn talu_db_docs_remove_tag(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
@@ -360,7 +361,7 @@ pub export fn talu_db_table_remove_tag(
     return docs.talu_documents_remove_tag(db_path, doc_id, tag_id, group_id);
 }
 
-pub export fn talu_db_table_get_tags(
+pub export fn talu_db_docs_get_tags(
     db_path: ?[*:0]const u8,
     doc_id: ?[*:0]const u8,
     out_tag_ids: ?*?*docs.CStringList,
@@ -368,7 +369,7 @@ pub export fn talu_db_table_get_tags(
     return docs.talu_documents_get_tags(db_path, doc_id, out_tag_ids);
 }
 
-pub export fn talu_db_table_get_by_tag(
+pub export fn talu_db_docs_get_by_tag(
     db_path: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
     out_doc_ids: ?*?*docs.CStringList,
@@ -376,7 +377,7 @@ pub export fn talu_db_table_get_by_tag(
     return docs.talu_documents_get_by_tag(db_path, tag_id, out_doc_ids);
 }
 
-pub export fn talu_db_table_free_string_list(list: ?*docs.CStringList) callconv(.c) void {
+pub export fn talu_db_docs_free_string_list(list: ?*docs.CStringList) callconv(.c) void {
     docs.talu_documents_free_string_list(list);
 }
 
@@ -399,7 +400,7 @@ fn copyToStaticBufOpt(buf: []u8, src: ?[]const u8) ?[*:0]const u8 {
 
 fn populateHashSet(session_ids: []const []const u8, out: *std.AutoHashMap(u64, void)) void {
     for (session_ids) |sid| {
-        out.put(db.table.sessions.computeSessionHash(sid), {}) catch continue;
+        out.put(responses.computeSessionHash(sid), {}) catch continue;
     }
 }
 
@@ -407,7 +408,7 @@ fn intersectHashSet(target: *std.AutoHashMap(u64, void), session_ids: []const []
     var new_set = std.AutoHashMap(u64, void).init(allocator);
     defer new_set.deinit();
     for (session_ids) |sid| {
-        new_set.put(db.table.sessions.computeSessionHash(sid), {}) catch continue;
+        new_set.put(responses.computeSessionHash(sid), {}) catch continue;
     }
     var removals = std.ArrayList(u64).empty;
     defer removals.deinit(allocator);
@@ -427,8 +428,8 @@ fn buildSessionScanParams(
     group_id: ?[*:0]const u8,
     project_id: ?[*:0]const u8,
     project_id_null: i32,
-) db.table.sessions.TableAdapter.ScanParams {
-    var params = db.table.sessions.TableAdapter.ScanParams.fromArgs(
+) responses.TableAdapter.ScanParams {
+    var params = responses.TableAdapter.ScanParams.fromArgs(
         limit,
         before_updated_at_ms,
         optSlice(before_session_id),
@@ -436,7 +437,7 @@ fn buildSessionScanParams(
     );
     if (project_id_null != 0) params.target_project_null = true;
     if (optSlice(project_id)) |pid| {
-        params.target_project_hash = db.table.sessions.computeGroupHash(pid);
+        params.target_project_hash = responses.computeGroupHash(pid);
         params.target_project_id = pid;
     }
     return params;
@@ -444,14 +445,14 @@ fn buildSessionScanParams(
 
 fn listSessionsImpl(
     db_path_slice: []const u8,
-    params: db.table.sessions.TableAdapter.ScanParams,
+    params: responses.TableAdapter.ScanParams,
     out_sessions: *?*CSessionList,
 ) i32 {
-    const records = db.table.sessions.listSessions(allocator, db_path_slice, params) catch |err| {
+    const records = responses.listSessions(allocator, db_path_slice, params) catch |err| {
         capi_error.setError(err, "failed to scan sessions", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-    defer db.table.sessions.freeScannedSessionRecords(allocator, records);
+    defer responses.freeScannedSessionRecords(allocator, records);
     const list = buildSessionList(records) catch |err| {
         capi_error.setError(err, "failed to build session list", .{});
         return @intFromEnum(error_codes.errorToCode(err));
@@ -460,7 +461,7 @@ fn listSessionsImpl(
     return 0;
 }
 
-fn buildSessionList(records: []db.table.sessions.ScannedSessionRecord) !*CSessionList {
+fn buildSessionList(records: []responses.ScannedSessionRecord) !*CSessionList {
     const list = allocator.create(CSessionList) catch return error.OutOfMemory;
     errdefer allocator.destroy(list);
     const arena_ptr = allocator.create(std.heap.ArenaAllocator) catch return error.OutOfMemory;
@@ -553,7 +554,7 @@ fn buildRelationStringList(strings: [][]const u8) !*CRelationStringList {
     return list;
 }
 
-fn populateSessionRecord(out: *CSessionRecord, record: db.table.sessions.ScannedSessionRecord) void {
+fn populateSessionRecord(out: *CSessionRecord, record: responses.ScannedSessionRecord) void {
     const S = struct {
         threadlocal var session_id_buf: [256]u8 = .{0} ** 256;
         threadlocal var model_buf: [256]u8 = .{0} ** 256;
@@ -842,7 +843,7 @@ fn getSessionsTagsBatchImpl(
 // Sessions: List / Get / Update / Fork / Delete
 // =============================================================================
 
-pub export fn talu_db_table_session_list(
+pub export fn talu_db_session_list(
     db_path: ?[*:0]const u8,
     limit: u32,
     before_updated_at_ms: i64,
@@ -888,7 +889,7 @@ pub export fn talu_db_table_session_list(
     return listSessionsImpl(db_path_slice, params, out);
 }
 
-pub export fn talu_db_table_session_list_ex(
+pub export fn talu_db_session_list_ex(
     db_path: ?[*:0]const u8,
     limit: u32,
     before_updated_at_ms: i64,
@@ -980,7 +981,7 @@ pub export fn talu_db_table_session_list_ex(
     return listSessionsImpl(db_path_slice, params, out);
 }
 
-pub export fn talu_db_table_session_list_by_source(
+pub export fn talu_db_session_list_by_source(
     db_path: ?[*:0]const u8,
     source_doc_id: ?[*:0]const u8,
     limit: u32,
@@ -1001,7 +1002,7 @@ pub export fn talu_db_table_session_list_by_source(
     return listSessionsImpl(db_path_slice, params, out);
 }
 
-pub export fn talu_db_table_session_list_batch(
+pub export fn talu_db_session_list_batch(
     db_path: ?[*:0]const u8,
     offset: u32,
     limit: u32,
@@ -1020,14 +1021,14 @@ pub export fn talu_db_table_session_list_batch(
     };
     out.* = null;
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var params = db.table.sessions.TableAdapter.ScanParams{};
+    var params = responses.TableAdapter.ScanParams{};
     if (project_id_null != 0) params.target_project_null = true;
     if (optSlice(group_id)) |gid| {
-        params.target_group_hash = db.table.sessions.computeGroupHash(gid);
+        params.target_group_hash = responses.computeGroupHash(gid);
         params.target_group_id = gid;
     }
     if (optSlice(project_id)) |pid| {
-        params.target_project_hash = db.table.sessions.computeGroupHash(pid);
+        params.target_project_hash = responses.computeGroupHash(pid);
         params.target_project_id = pid;
     }
     params.marker_filter = optSlice(marker_filter);
@@ -1045,11 +1046,11 @@ pub export fn talu_db_table_session_list_batch(
         populateHashSet(sids, &allowed_hashes);
         params.allowed_session_hashes = &allowed_hashes;
     }
-    const records = db.table.sessions.listSessions(allocator, db_path_slice, params) catch |err| {
+    const records = responses.listSessions(allocator, db_path_slice, params) catch |err| {
         capi_error.setError(err, "failed to scan sessions", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-    defer db.table.sessions.freeScannedSessionRecords(allocator, records);
+    defer responses.freeScannedSessionRecords(allocator, records);
     const total = records.len;
     const start = @min(@as(usize, offset), total);
     const end = if (limit > 0) @min(start + @as(usize, limit), total) else total;
@@ -1063,7 +1064,7 @@ pub export fn talu_db_table_session_list_batch(
     return 0;
 }
 
-pub export fn talu_db_table_session_get(
+pub export fn talu_db_session_get(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
     out_session: *CSessionRecord,
@@ -1072,7 +1073,7 @@ pub export fn talu_db_table_session_get(
     out_session.* = std.mem.zeroes(CSessionRecord);
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const session_id_slice = validateRequiredArg(session_id, "session_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var adapter = db.table.sessions.TableAdapter.initReadOnly(allocator, db_path_slice) catch |err| {
+    var adapter = responses.TableAdapter.initReadOnly(allocator, db_path_slice) catch |err| {
         capi_error.setError(err, "failed to open database for reading", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -1081,12 +1082,12 @@ pub export fn talu_db_table_session_get(
         capi_error.setError(err, "session not found", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
-    defer db.table.sessions.freeScannedSessionRecord(allocator, @constCast(&record));
+    defer responses.freeScannedSessionRecord(allocator, @constCast(&record));
     populateSessionRecord(out_session, record);
     return 0;
 }
 
-pub export fn talu_db_table_session_update(
+pub export fn talu_db_session_update(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
     title: ?[*:0]const u8,
@@ -1096,7 +1097,7 @@ pub export fn talu_db_table_session_update(
     capi_error.clearError();
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const session_id_slice = validateRequiredArg(session_id, "session_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var adapter = db.table.sessions.TableAdapter.init(allocator, db_path_slice, session_id_slice) catch |err| {
+    var adapter = responses.TableAdapter.init(allocator, db_path_slice, session_id_slice) catch |err| {
         if (err == error.LockUnavailable) {
             capi_error.setErrorWithCode(.resource_busy, "Database is locked by another process", .{});
             return @intFromEnum(error_codes.ErrorCode.resource_busy);
@@ -1112,7 +1113,7 @@ pub export fn talu_db_table_session_update(
     return 0;
 }
 
-pub export fn talu_db_table_session_update_ex(
+pub export fn talu_db_session_update_ex(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
     title: ?[*:0]const u8,
@@ -1125,7 +1126,7 @@ pub export fn talu_db_table_session_update_ex(
     capi_error.clearError();
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const session_id_slice = validateRequiredArg(session_id, "session_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var adapter = db.table.sessions.TableAdapter.init(allocator, db_path_slice, session_id_slice) catch |err| {
+    var adapter = responses.TableAdapter.init(allocator, db_path_slice, session_id_slice) catch |err| {
         if (err == error.LockUnavailable) {
             capi_error.setErrorWithCode(.resource_busy, "Database is locked by another process", .{});
             return @intFromEnum(error_codes.ErrorCode.resource_busy);
@@ -1141,7 +1142,7 @@ pub export fn talu_db_table_session_update_ex(
     return 0;
 }
 
-pub export fn talu_db_table_session_fork(
+pub export fn talu_db_session_fork(
     db_path: ?[*:0]const u8,
     source_session_id: ?[*:0]const u8,
     target_item_id: u64,
@@ -1151,21 +1152,21 @@ pub export fn talu_db_table_session_fork(
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const source_slice = validateRequiredArg(source_session_id, "source_session_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const new_slice = validateRequiredArg(new_session_id, "new_session_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    db.table.sessions.forkSession(allocator, db_path_slice, source_slice, target_item_id, new_slice) catch |err| {
+    responses.forkSession(allocator, db_path_slice, source_slice, target_item_id, new_slice) catch |err| {
         capi_error.setError(err, "failed to fork session", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
     return 0;
 }
 
-pub export fn talu_db_table_session_delete(
+pub export fn talu_db_session_delete(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
 ) callconv(.c) i32 {
     capi_error.clearError();
     const db_path_slice = validateDbPath(db_path) orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     const session_id_slice = validateRequiredArg(session_id, "session_id") orelse return @intFromEnum(error_codes.ErrorCode.invalid_argument);
-    var adapter = db.table.sessions.TableAdapter.init(allocator, db_path_slice, session_id_slice) catch |err| {
+    var adapter = responses.TableAdapter.init(allocator, db_path_slice, session_id_slice) catch |err| {
         if (err == error.LockUnavailable) {
             capi_error.setErrorWithCode(.resource_busy, "Database is locked by another process", .{});
             return @intFromEnum(error_codes.ErrorCode.resource_busy);
@@ -1181,24 +1182,24 @@ pub export fn talu_db_table_session_delete(
     return 0;
 }
 
-pub export fn talu_db_table_session_load_conversation(
+pub export fn talu_db_session_load_conversation(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
 ) callconv(.c) ?*anyopaque {
     capi_error.clearError();
     const db_path_slice = validateDbPath(db_path) orelse return null;
     const session_id_slice = validateRequiredArg(session_id, "session_id") orelse return null;
-    const conv = db.table.sessions.loadConversation(allocator, db_path_slice, session_id_slice) catch |err| {
+    const conv = responses.loadConversation(allocator, db_path_slice, session_id_slice) catch |err| {
         capi_error.setError(err, "failed to load conversation", .{});
         return null;
     };
     return @ptrCast(conv);
 }
 
-pub export fn talu_db_table_session_free_list(sessions: ?*CSessionList) callconv(.c) void {
+pub export fn talu_db_session_free_list(sessions: ?*CSessionList) callconv(.c) void {
     capi_error.clearError();
     const list = sessions orelse return;
-    log.debug("capi", "talu_db_table_session_free_list", .{
+    log.debug("capi", "talu_db_session_free_list", .{
         .list_ptr = @intFromPtr(list),
         .count = list.count,
         .arena_ptr = if (list._arena) |a| @intFromPtr(a) else 0,
@@ -1215,7 +1216,7 @@ pub export fn talu_db_table_session_free_list(sessions: ?*CSessionList) callconv
 // Tags: CRUD
 // =============================================================================
 
-pub export fn talu_db_table_tag_list(
+pub export fn talu_db_tag_list(
     db_path: ?[*:0]const u8,
     group_id: ?[*:0]const u8,
     out_tags: ?*?*CTagList,
@@ -1230,7 +1231,7 @@ pub export fn talu_db_table_tag_list(
     return listTagsImpl(db_path_slice, optSlice(group_id), out);
 }
 
-pub export fn talu_db_table_tag_get(
+pub export fn talu_db_tag_get(
     db_path: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
     out_tag: *CTagRecord,
@@ -1242,7 +1243,7 @@ pub export fn talu_db_table_tag_get(
     return getTagImpl(db_path_slice, tag_id_slice, out_tag);
 }
 
-pub export fn talu_db_table_tag_get_by_name(
+pub export fn talu_db_tag_get_by_name(
     db_path: ?[*:0]const u8,
     name: ?[*:0]const u8,
     group_id: ?[*:0]const u8,
@@ -1255,7 +1256,7 @@ pub export fn talu_db_table_tag_get_by_name(
     return getTagByNameImpl(db_path_slice, name_slice, optSlice(group_id), out_tag);
 }
 
-pub export fn talu_db_table_tag_create(
+pub export fn talu_db_tag_create(
     db_path: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
     name: ?[*:0]const u8,
@@ -1270,7 +1271,7 @@ pub export fn talu_db_table_tag_create(
     return createTagImpl(db_path_slice, tag_id_slice, name_slice, optSlice(color), optSlice(description), optSlice(group_id));
 }
 
-pub export fn talu_db_table_tag_update(
+pub export fn talu_db_tag_update(
     db_path: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
     name: ?[*:0]const u8,
@@ -1283,7 +1284,7 @@ pub export fn talu_db_table_tag_update(
     return updateTagImpl(db_path_slice, tag_id_slice, optSlice(name), optSlice(color), optSlice(description));
 }
 
-pub export fn talu_db_table_tag_delete(
+pub export fn talu_db_tag_delete(
     db_path: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
 ) callconv(.c) i32 {
@@ -1293,7 +1294,7 @@ pub export fn talu_db_table_tag_delete(
     return deleteTagImpl(db_path_slice, tag_id_slice);
 }
 
-pub export fn talu_db_table_tag_free_list(tags: ?*CTagList) callconv(.c) void {
+pub export fn talu_db_tag_free_list(tags: ?*CTagList) callconv(.c) void {
     capi_error.clearError();
     const list = tags orelse return;
     if (list._arena) |arena_ptr| {
@@ -1308,7 +1309,7 @@ pub export fn talu_db_table_tag_free_list(tags: ?*CTagList) callconv(.c) void {
 // Session-Tag junction
 // =============================================================================
 
-pub export fn talu_db_table_session_add_tag(
+pub export fn talu_db_session_add_tag(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
@@ -1320,7 +1321,7 @@ pub export fn talu_db_table_session_add_tag(
     return addConversationTagImpl(db_path_slice, session_id_slice, tag_id_slice);
 }
 
-pub export fn talu_db_table_session_remove_tag(
+pub export fn talu_db_session_remove_tag(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
@@ -1332,7 +1333,7 @@ pub export fn talu_db_table_session_remove_tag(
     return removeConversationTagImpl(db_path_slice, session_id_slice, tag_id_slice);
 }
 
-pub export fn talu_db_table_session_get_tags(
+pub export fn talu_db_session_get_tags(
     db_path: ?[*:0]const u8,
     session_id: ?[*:0]const u8,
     out_tag_ids: ?*?*CRelationStringList,
@@ -1348,7 +1349,7 @@ pub export fn talu_db_table_session_get_tags(
     return getConversationTagsImpl(db_path_slice, session_id_slice, out);
 }
 
-pub export fn talu_db_table_tag_get_conversations(
+pub export fn talu_db_tag_get_conversations(
     db_path: ?[*:0]const u8,
     tag_id: ?[*:0]const u8,
     out_session_ids: ?*?*CRelationStringList,
@@ -1364,7 +1365,7 @@ pub export fn talu_db_table_tag_get_conversations(
     return getTagConversationsImpl(db_path_slice, tag_id_slice, out);
 }
 
-pub export fn talu_db_table_free_relation_string_list(list: ?*CRelationStringList) callconv(.c) void {
+pub export fn talu_db_session_free_relation_list(list: ?*CRelationStringList) callconv(.c) void {
     capi_error.clearError();
     const l = list orelse return;
     if (l._arena) |arena_ptr| {
@@ -1378,8 +1379,8 @@ pub export fn talu_db_table_free_relation_string_list(list: ?*CRelationStringLis
 /// Get tag IDs for multiple sessions in a single scan.
 ///
 /// Returns flat parallel arrays: out_result.session_ids[i] paired with
-/// out_result.tag_ids[i]. Free with talu_db_table_free_session_tag_batch.
-pub export fn talu_db_table_sessions_get_tags_batch(
+/// out_result.tag_ids[i]. Free with talu_db_session_free_tag_batch.
+pub export fn talu_db_session_get_tags_batch(
     db_path: ?[*:0]const u8,
     session_ids: ?[*]const ?[*:0]const u8,
     session_count: u32,
@@ -1402,7 +1403,7 @@ pub export fn talu_db_table_sessions_get_tags_batch(
     return getSessionsTagsBatchImpl(db_path_slice, ids_ptr, session_count, out);
 }
 
-pub export fn talu_db_table_free_session_tag_batch(batch: ?*CSessionTagBatch) callconv(.c) void {
+pub export fn talu_db_session_free_tag_batch(batch: ?*CSessionTagBatch) callconv(.c) void {
     capi_error.clearError();
     const b = batch orelse return;
     if (b._arena) |arena_ptr| {
@@ -1442,4 +1443,375 @@ pub export fn talu_chat_inherit_tags(
         if (rc != 0) log.debug("capi", "inherit_tags_failed", .{ .rc = rc }, @src());
     }
     return 0;
+}
+
+// =============================================================================
+// Table C-API
+// =============================================================================
+
+const table_engine = db.table.generic;
+
+/// Heap-allocated Table that the C side holds as an opaque pointer.
+const TableBox = struct {
+    table: table_engine.Table,
+    /// Owned copy of active_schema_ids for policy lifetime.
+    policy_ids: []u16,
+};
+
+pub export fn talu_db_table_open(
+    db_root: ?[*]const u8,
+    db_root_len: usize,
+    ns: ?[*]const u8,
+    ns_len: usize,
+    policy: *const ops.CCompactionPolicy,
+    out_handle: *?*anyopaque,
+) callconv(.c) i32 {
+    out_handle.* = null;
+    const root_slice = (db_root orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "db_root is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    })[0..db_root_len];
+    const ns_slice = (ns orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "namespace is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    })[0..ns_len];
+
+    // Copy policy arrays so they outlive the C caller's stack.
+    const schema_ids = allocator.alloc(u16, policy.active_schema_count) catch {
+        capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    if (policy.active_schema_ids) |ids| {
+        @memcpy(schema_ids, ids[0..policy.active_schema_count]);
+    }
+    errdefer allocator.free(schema_ids);
+
+    const zig_policy = table_engine.CompactionPolicy{
+        .active_schema_ids = schema_ids,
+        .tombstone_schema_id = if (policy.tombstone_schema_id == 0) null else policy.tombstone_schema_id,
+        .dedup_column_id = policy.dedup_column_id,
+        .ts_column_id = policy.ts_column_id,
+        .ttl_column_id = if (policy.ttl_column_id == 0) null else policy.ttl_column_id,
+    };
+
+    var table = table_engine.Table.open(allocator, root_slice, ns_slice, zig_policy) catch |err| {
+        capi_error.setError(err, "failed to open generic table", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    errdefer table.deinit();
+
+    const box = allocator.create(TableBox) catch {
+        capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    box.* = .{
+        .table = table,
+        .policy_ids = schema_ids,
+    };
+    out_handle.* = @ptrCast(box);
+    return 0;
+}
+
+pub export fn talu_db_table_open_readonly(
+    db_root: ?[*]const u8,
+    db_root_len: usize,
+    ns: ?[*]const u8,
+    ns_len: usize,
+    out_handle: *?*anyopaque,
+) callconv(.c) i32 {
+    out_handle.* = null;
+    const root_slice = (db_root orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "db_root is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    })[0..db_root_len];
+    const ns_slice = (ns orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "namespace is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    })[0..ns_len];
+
+    var table = table_engine.Table.openReadOnly(allocator, root_slice, ns_slice, .{ .active_schema_ids = &.{} }) catch |err| {
+        capi_error.setError(err, "failed to open generic table readonly", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    errdefer table.deinit();
+
+    const box = allocator.create(TableBox) catch {
+        capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    box.* = .{
+        .table = table,
+        .policy_ids = &.{},
+    };
+    out_handle.* = @ptrCast(box);
+    return 0;
+}
+
+pub export fn talu_db_table_close(handle: ?*anyopaque) callconv(.c) void {
+    const box: *TableBox = @ptrCast(@alignCast(handle orelse return));
+    box.table.deinit();
+    if (box.policy_ids.len > 0) allocator.free(box.policy_ids);
+    allocator.destroy(box);
+}
+
+pub export fn talu_db_table_append_row(
+    handle: ?*anyopaque,
+    schema_id: u16,
+    columns: ?[*]const ops.CColumnValue,
+    num_cols: u32,
+) callconv(.c) i32 {
+    const box: *TableBox = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+    const col_slice = (columns orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "columns is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    })[0..num_cols];
+
+    // Convert CColumnValue to ColumnValue.
+    const zig_cols = allocator.alloc(table_engine.ColumnValue, num_cols) catch {
+        capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    defer allocator.free(zig_cols);
+
+    for (col_slice, 0..) |c, i| {
+        zig_cols[i] = .{
+            .column_id = c.column_id,
+            .shape = @enumFromInt(c.shape),
+            .phys_type = @enumFromInt(c.phys_type),
+            .encoding = .RAW,
+            .dims = c.dims,
+            .data = if (c.data) |d| d[0..c.data_len] else &.{},
+        };
+    }
+
+    box.table.appendRow(schema_id, zig_cols) catch |err| {
+        capi_error.setError(err, "failed to append row", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    return 0;
+}
+
+pub export fn talu_db_table_delete_row(
+    handle: ?*anyopaque,
+    pk_hash: u64,
+    ts: i64,
+) callconv(.c) i32 {
+    const box: *TableBox = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+    box.table.deleteTombstone(pk_hash, ts) catch |err| {
+        capi_error.setError(err, "failed to delete row", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    return 0;
+}
+
+pub export fn talu_db_table_flush(handle: ?*anyopaque) callconv(.c) i32 {
+    const box: *TableBox = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+    box.table.flush() catch |err| {
+        capi_error.setError(err, "failed to flush", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    return 0;
+}
+
+pub export fn talu_db_table_scan(
+    handle: ?*anyopaque,
+    params: *const ops.CScanParams,
+    out_iter: *ops.CRowIterator,
+) callconv(.c) i32 {
+    out_iter.* = .{ .rows = null, .count = 0, .has_more = false, ._pad = .{ 0, 0, 0 }, ._arena = null };
+
+    const box: *TableBox = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    // Convert CScanParams to ScanParams.
+    // Build filter slice.
+    const filter_slice: []const table_engine.ColumnFilter = blk: {
+        if (params.filter_count == 0 or params.filters == null) break :blk &.{};
+        const c_filters = params.filters.?[0..params.filter_count];
+        const zig_filters = allocator.alloc(table_engine.ColumnFilter, params.filter_count) catch {
+            capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+            return @intFromEnum(error_codes.ErrorCode.storage_error);
+        };
+        for (c_filters, 0..) |f, i| {
+            zig_filters[i] = .{
+                .column_id = f.column_id,
+                .op = @enumFromInt(f.op),
+                .value = f.value,
+            };
+        }
+        break :blk zig_filters;
+    };
+    defer if (filter_slice.len > 0) allocator.free(filter_slice);
+
+    const additional: ?[]const u16 = if (params.additional_schema_count > 0 and params.additional_schema_ids != null)
+        params.additional_schema_ids.?[0..params.additional_schema_count]
+    else
+        null;
+
+    const zig_params = table_engine.ScanParams{
+        .schema_id = params.schema_id,
+        .additional_schema_ids = additional,
+        .filters = filter_slice,
+        .dedup_column_id = if (params.dedup_column_id == 0) null else params.dedup_column_id,
+        .delete_schema_id = if (params.delete_schema_id == 0) null else params.delete_schema_id,
+        .ts_column_id = params.ts_column_id,
+        .ttl_column_id = if (params.ttl_column_id == 0) null else params.ttl_column_id,
+        .limit = params.limit,
+        .cursor_ts = if (params.cursor_ts == 0) null else params.cursor_ts,
+        .cursor_hash = if (params.cursor_hash == 0) null else params.cursor_hash,
+        .payload_column_id = params.payload_column_id,
+        .reverse = params.reverse,
+        .extra_columns = if (params.extra_column_count > 0 and params.extra_columns != null)
+            params.extra_columns.?[0..params.extra_column_count]
+        else
+            &.{},
+    };
+
+    // Create arena for results.
+    var arena_ptr = allocator.create(std.heap.ArenaAllocator) catch {
+        capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena_ptr.deinit();
+        allocator.destroy(arena_ptr);
+    }
+    const arena = arena_ptr.allocator();
+
+    const result = box.table.scan(arena, zig_params) catch |err| {
+        capi_error.setError(err, "scan failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+
+    // Convert Row[] to CRow[].
+    const c_rows = arena.alloc(ops.CRow, result.rows.len) catch {
+        capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+
+    for (result.rows, 0..) |row, i| {
+        const c_scalars = arena.alloc(ops.CColumnData, row.scalars.len) catch {
+            capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+            return @intFromEnum(error_codes.ErrorCode.storage_error);
+        };
+        for (row.scalars, 0..) |s, j| {
+            c_scalars[j] = .{
+                .column_id = s.column_id,
+                ._pad = .{ 0, 0, 0, 0 },
+                .value = s.value_u64,
+            };
+        }
+        c_rows[i] = .{
+            .scalars = if (c_scalars.len > 0) c_scalars.ptr else null,
+            .scalar_count = @intCast(c_scalars.len),
+            ._pad = .{ 0, 0, 0, 0 },
+            .payload = if (row.payload.len > 0) row.payload.ptr else null,
+            .payload_len = row.payload.len,
+        };
+    }
+
+    out_iter.* = .{
+        .rows = if (c_rows.len > 0) c_rows.ptr else null,
+        .count = @intCast(c_rows.len),
+        .has_more = result.has_more,
+        ._pad = .{ 0, 0, 0 },
+        ._arena = @ptrCast(arena_ptr),
+    };
+    return 0;
+}
+
+pub export fn talu_db_table_get(
+    handle: ?*anyopaque,
+    schema_id: u16,
+    pk_hash: u64,
+    legacy_hash: u64,
+    out_iter: *ops.CRowIterator,
+) callconv(.c) i32 {
+    out_iter.* = .{ .rows = null, .count = 0, .has_more = false, ._pad = .{ 0, 0, 0 }, ._arena = null };
+
+    const box: *TableBox = @ptrCast(@alignCast(handle orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "handle is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }));
+
+    var arena_ptr = allocator.create(std.heap.ArenaAllocator) catch {
+        capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+    arena_ptr.* = std.heap.ArenaAllocator.init(allocator);
+    errdefer {
+        arena_ptr.deinit();
+        allocator.destroy(arena_ptr);
+    }
+    const arena = arena_ptr.allocator();
+
+    const opt_legacy: ?u64 = if (legacy_hash == 0) null else legacy_hash;
+    const opt_row = box.table.get(arena, schema_id, pk_hash, opt_legacy) catch |err| {
+        capi_error.setError(err, "get failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.storage_error);
+    };
+
+    if (opt_row) |row| {
+        const c_rows = arena.alloc(ops.CRow, 1) catch {
+            capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+            return @intFromEnum(error_codes.ErrorCode.storage_error);
+        };
+        const c_scalars = arena.alloc(ops.CColumnData, row.scalars.len) catch {
+            capi_error.setErrorWithCode(.storage_error, "out of memory", .{});
+            return @intFromEnum(error_codes.ErrorCode.storage_error);
+        };
+        for (row.scalars, 0..) |s, j| {
+            c_scalars[j] = .{
+                .column_id = s.column_id,
+                ._pad = .{ 0, 0, 0, 0 },
+                .value = s.value_u64,
+            };
+        }
+        c_rows[0] = .{
+            .scalars = if (c_scalars.len > 0) c_scalars.ptr else null,
+            .scalar_count = @intCast(c_scalars.len),
+            ._pad = .{ 0, 0, 0, 0 },
+            .payload = if (row.payload.len > 0) row.payload.ptr else null,
+            .payload_len = row.payload.len,
+        };
+        out_iter.* = .{
+            .rows = c_rows.ptr,
+            .count = 1,
+            .has_more = false,
+            ._pad = .{ 0, 0, 0 },
+            ._arena = @ptrCast(arena_ptr),
+        };
+    } else {
+        // No row found — still set arena for consistent cleanup.
+        out_iter.* = .{
+            .rows = null,
+            .count = 0,
+            .has_more = false,
+            ._pad = .{ 0, 0, 0 },
+            ._arena = @ptrCast(arena_ptr),
+        };
+    }
+    return 0;
+}
+
+pub export fn talu_db_table_free_rows(iter: ?*ops.CRowIterator) callconv(.c) void {
+    const it = iter orelse return;
+    if (it._arena) |arena_opaque| {
+        const arena_ptr: *std.heap.ArenaAllocator = @ptrCast(@alignCast(arena_opaque));
+        arena_ptr.deinit();
+        allocator.destroy(arena_ptr);
+    }
+    it.* = .{ .rows = null, .count = 0, .has_more = false, ._pad = .{ 0, 0, 0 }, ._arena = null };
 }

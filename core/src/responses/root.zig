@@ -46,6 +46,14 @@ pub const record_serializer = @import("record_serializer.zig");
 pub const record_parser = @import("record_parser.zig");
 pub const reasoning_parser = @import("reasoning_parser.zig");
 pub const session_id = @import("session_id.zig");
+pub const schema = @import("schema.zig");
+
+// Session storage domain modules (moved from db/table/sessions/)
+pub const storage_adapter = @import("storage_adapter.zig");
+pub const session_codec = @import("codec.zig");
+pub const session_query = @import("query.zig");
+pub const session_search = @import("search.zig");
+pub const session_helpers = @import("helpers.zig");
 
 // Open Responses architecture modules
 pub const items = @import("items.zig");
@@ -122,6 +130,23 @@ pub const StorageType = enum(u8) {
     /// Reserved for custom/external backends.
     custom = 255,
 };
+
+// Session storage adapter re-exports (C API surface)
+pub const TableAdapter = storage_adapter.TableAdapter;
+pub const computeSessionHash = storage_adapter.computeSessionHash;
+pub const computeGroupHash = storage_adapter.computeGroupHash;
+pub const computeOptionalHash = storage_adapter.computeOptionalHash;
+pub const ScannedSessionRecord = storage_adapter.ScannedSessionRecord;
+pub const freeScannedSessionRecord = storage_adapter.freeScannedSessionRecord;
+pub const freeScannedSessionRecords = storage_adapter.freeScannedSessionRecords;
+pub const encodeSessionRecordMsgpack = storage_adapter.encodeSessionRecordMsgpack;
+pub const encodeSessionRecordKvBuf = storage_adapter.encodeSessionRecordKvBuf;
+pub const decodeSessionRecordMsgpack = storage_adapter.decodeSessionRecordMsgpack;
+pub const decodeSessionRecordKvBuf = storage_adapter.decodeSessionRecordKvBuf;
+pub const listSessions = storage_adapter.listSessions;
+pub const getSessionInfo = storage_adapter.getSessionInfo;
+pub const loadConversation = storage_adapter.loadConversation;
+pub const forkSession = storage_adapter.forkSession;
 
 // =============================================================================
 // Tests

@@ -10,9 +10,9 @@
 const std = @import("std");
 const kvbuf = @import("../../io/kvbuf/root.zig");
 const db_writer = @import("../writer.zig");
-const db_reader = @import("../reader.zig");
 const block_reader = @import("../block_reader.zig");
 const types = @import("../types.zig");
+const generic = @import("generic.zig");
 
 const Allocator = std.mem.Allocator;
 const ColumnValue = db_writer.ColumnValue;
@@ -28,6 +28,12 @@ const col_tag_hash: u32 = 2;
 const col_ts: u32 = 3;
 const col_group_hash: u32 = 4;
 const col_payload: u32 = 10;
+
+pub const doc_tag_compaction_policy = generic.CompactionPolicy{
+    .active_schema_ids = &[_]u16{ schema_document_tags, schema_tag_document_index },
+    .dedup_column_id = col_doc_hash,
+    .ts_column_id = col_ts,
+};
 
 /// Document-Tag junction record.
 pub const DocumentTagRecord = struct {
@@ -48,57 +54,30 @@ pub const DocumentTagRecord = struct {
 /// Thread safety: NOT thread-safe (single-writer semantics via lock).
 pub const DocumentTagAdapter = struct {
     allocator: Allocator,
-    fs_writer: *db_writer.Writer,
-    fs_reader: *db_reader.Reader,
-    read_only: bool,
+    table: generic.Table,
 
     /// Initialize a TaluDB-backed document-tag adapter with write capabilities.
     pub fn init(allocator: Allocator, db_root: []const u8) !DocumentTagAdapter {
-        var writer_ptr = try allocator.create(db_writer.Writer);
-        errdefer allocator.destroy(writer_ptr);
-        writer_ptr.* = try db_writer.Writer.open(allocator, db_root, "docs");
-        errdefer writer_ptr.deinit();
-
-        var reader_ptr = try allocator.create(db_reader.Reader);
-        errdefer allocator.destroy(reader_ptr);
-        reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "docs");
-        errdefer reader_ptr.deinit();
-
         return .{
             .allocator = allocator,
-            .fs_writer = writer_ptr,
-            .fs_reader = reader_ptr,
-            .read_only = false,
+            .table = try generic.Table.open(allocator, db_root, "docs", doc_tag_compaction_policy),
         };
     }
 
     /// Initialize a read-only adapter for scanning document-tag associations.
     pub fn initReadOnly(allocator: Allocator, db_root: []const u8) !DocumentTagAdapter {
-        const reader_ptr = try allocator.create(db_reader.Reader);
-        errdefer allocator.destroy(reader_ptr);
-        reader_ptr.* = try db_reader.Reader.open(allocator, db_root, "docs");
-
         return .{
             .allocator = allocator,
-            .fs_writer = undefined,
-            .fs_reader = reader_ptr,
-            .read_only = true,
+            .table = try generic.Table.openReadOnly(allocator, db_root, "docs", doc_tag_compaction_policy),
         };
     }
 
     pub fn deinit(self: *DocumentTagAdapter) void {
-        if (!self.read_only) {
-            self.fs_writer.flushBlock() catch {};
-            self.fs_writer.deinit();
-            self.allocator.destroy(self.fs_writer);
-        }
-        self.fs_reader.deinit();
-        self.allocator.destroy(self.fs_reader);
+        self.table.deinit();
     }
 
     pub fn deinitReadOnly(self: *DocumentTagAdapter) void {
-        self.fs_reader.deinit();
-        self.allocator.destroy(self.fs_reader);
+        self.table.deinit();
     }
 
     // =========================================================================
@@ -111,10 +90,8 @@ pub const DocumentTagAdapter = struct {
         // Write forward index (Schema 13: doc → tag)
         try self.writeForwardIndex(doc_id, tag_id, added_at_ms, group_id);
 
-        // Flush before switching schemas (13 → 14)
-        try self.fs_writer.flushBlock();
-
         // Write inverted index (Schema 14: tag → doc)
+        // Table handles the schema switch (13 → 14) automatically.
         try self.writeInvertedIndex(tag_id, doc_id, added_at_ms, group_id);
     }
 
@@ -124,18 +101,26 @@ pub const DocumentTagAdapter = struct {
         // Write forward tombstone (negative timestamp)
         try self.writeForwardIndex(doc_id, tag_id, -removed_at_ms, group_id);
 
-        // Flush before switching schemas (13 → 14)
-        try self.fs_writer.flushBlock();
-
         // Write inverted tombstone (negative timestamp)
+        // Table handles the schema switch (13 → 14) automatically.
         try self.writeInvertedIndex(tag_id, doc_id, -removed_at_ms, group_id);
     }
 
     /// Get all tag IDs for a document.
     pub fn getDocumentTags(self: *DocumentTagAdapter, allocator: Allocator, doc_id: []const u8) ![][]const u8 {
         const target_doc_hash = computeHash(doc_id);
+        const filter = [_]generic.ColumnFilter{.{ .column_id = col_doc_hash, .op = .eq, .value = target_doc_hash }};
 
-        // Track active tags (positive added_at_ms = active, negative = removed)
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_document_tags,
+            .dedup_column_id = null,
+            .ts_column_id = col_ts,
+            .payload_column_id = col_payload,
+            .filters = &filter,
+        });
+        defer generic.freeRows(allocator, result.rows);
+
+        // Apply add/remove state tracking
         var tag_states = std.StringHashMap(i64).init(allocator);
         defer {
             var it = tag_states.keyIterator();
@@ -143,67 +128,26 @@ pub const DocumentTagAdapter = struct {
             tag_states.deinit();
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
+        for (result.rows) |row| {
+            const record = decodeDocumentTagRecord(allocator, row.payload) catch continue orelse continue;
+            defer allocator.free(record.doc_id);
 
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
-
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            if (header.schema_id != schema_document_tags) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const doc_desc = findColumn(descs, col_doc_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const doc_bytes = reader.readColumnData(block.offset, doc_desc, allocator) catch continue;
-            defer allocator.free(doc_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const doc_hash = readU64At(doc_bytes, row_idx) catch continue;
-                if (doc_hash != target_doc_hash) continue;
-
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-
-                const record_opt = decodeDocumentTagRecord(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    defer allocator.free(record.doc_id);
-
-                    // Check if this is newer than existing state
-                    const abs_ts = if (ts >= 0) ts else -ts;
-                    if (tag_states.get(record.tag_id)) |existing_ts| {
-                        const existing_abs = if (existing_ts >= 0) existing_ts else -existing_ts;
-                        if (abs_ts <= existing_abs) {
-                            allocator.free(record.tag_id);
-                            continue;
-                        }
-                        // Remove old key
-                        if (tag_states.fetchRemove(record.tag_id)) |kv| {
-                            allocator.free(kv.key);
-                        }
-                    }
-
-                    tag_states.put(record.tag_id, record.added_at_ms) catch {
-                        allocator.free(record.tag_id);
-                        continue;
-                    };
+            const abs_ts: i64 = if (record.added_at_ms >= 0) record.added_at_ms else -record.added_at_ms;
+            if (tag_states.get(record.tag_id)) |existing_ts| {
+                const existing_abs: i64 = if (existing_ts >= 0) existing_ts else -existing_ts;
+                if (abs_ts <= existing_abs) {
+                    allocator.free(record.tag_id);
+                    continue;
+                }
+                if (tag_states.fetchRemove(record.tag_id)) |kv| {
+                    allocator.free(kv.key);
                 }
             }
+
+            tag_states.put(record.tag_id, record.added_at_ms) catch {
+                allocator.free(record.tag_id);
+                continue;
+            };
         }
 
         // Collect active tags (positive added_at_ms)
@@ -227,8 +171,18 @@ pub const DocumentTagAdapter = struct {
     /// Get all document IDs that have a specific tag (uses inverted index).
     pub fn getTagDocuments(self: *DocumentTagAdapter, allocator: Allocator, tag_id: []const u8) ![][]const u8 {
         const target_tag_hash = computeHash(tag_id);
+        const filter = [_]generic.ColumnFilter{.{ .column_id = col_tag_hash, .op = .eq, .value = target_tag_hash }};
 
-        // Track active documents for this tag
+        const result = try self.table.scan(allocator, .{
+            .schema_id = schema_tag_document_index,
+            .dedup_column_id = null,
+            .ts_column_id = col_ts,
+            .payload_column_id = col_payload,
+            .filters = &filter,
+        });
+        defer generic.freeRows(allocator, result.rows);
+
+        // Apply add/remove state tracking
         var doc_states = std.StringHashMap(i64).init(allocator);
         defer {
             var it = doc_states.keyIterator();
@@ -236,67 +190,34 @@ pub const DocumentTagAdapter = struct {
             doc_states.deinit();
         }
 
-        const blocks = try self.fs_reader.getBlocks(allocator);
-        defer allocator.free(blocks);
+        for (result.rows) |row| {
+            const record = decodeTagDocumentIndexRecord(allocator, row.payload) catch continue orelse continue;
+            defer allocator.free(record.tag_id);
 
-        for (blocks) |block| {
-            var file = self.fs_reader.dir.openFile(block.path, .{ .mode = .read_only }) catch continue;
-            defer file.close();
+            // Get timestamp from scalar columns
+            const ts: i64 = blk: {
+                for (row.scalars) |s| {
+                    if (s.column_id == col_ts) break :blk @bitCast(s.value_u64);
+                }
+                break :blk 0;
+            };
 
-            const reader = block_reader.BlockReader.init(file, allocator);
-            const header = reader.readHeader(block.offset) catch continue;
-            // Use inverted index (Schema 14) for tag → docs lookup
-            if (header.schema_id != schema_tag_document_index) continue;
-
-            const descs = reader.readColumnDirectory(header, block.offset) catch continue;
-            defer allocator.free(descs);
-
-            const row_count = header.row_count;
-            if (row_count == 0) continue;
-
-            const tag_desc = findColumn(descs, col_tag_hash) orelse continue;
-            const ts_desc = findColumn(descs, col_ts) orelse continue;
-            const payload_desc = findColumn(descs, col_payload) orelse continue;
-
-            const tag_bytes = reader.readColumnData(block.offset, tag_desc, allocator) catch continue;
-            defer allocator.free(tag_bytes);
-
-            const ts_bytes = reader.readColumnData(block.offset, ts_desc, allocator) catch continue;
-            defer allocator.free(ts_bytes);
-
-            var payload_buffers = readVarBytesBuffers(file, block.offset, payload_desc, row_count, allocator) catch continue;
-            defer payload_buffers.deinit(allocator);
-
-            for (0..row_count) |row_idx| {
-                const tag_hash = readU64At(tag_bytes, row_idx) catch continue;
-                if (tag_hash != target_tag_hash) continue;
-
-                const ts = readI64At(ts_bytes, row_idx) catch continue;
-                const payload = payload_buffers.sliceForRow(row_idx) catch continue;
-
-                const record_opt = decodeTagDocumentIndexRecord(allocator, payload) catch continue;
-                if (record_opt) |record| {
-                    defer allocator.free(record.tag_id);
-
-                    const abs_ts = if (ts >= 0) ts else -ts;
-                    if (doc_states.get(record.doc_id)) |existing_ts| {
-                        const existing_abs = if (existing_ts >= 0) existing_ts else -existing_ts;
-                        if (abs_ts <= existing_abs) {
-                            allocator.free(record.doc_id);
-                            continue;
-                        }
-                        if (doc_states.fetchRemove(record.doc_id)) |kv| {
-                            allocator.free(kv.key);
-                        }
-                    }
-
-                    // For inverted index, we store the timestamp in the record
-                    doc_states.put(record.doc_id, ts) catch {
-                        allocator.free(record.doc_id);
-                        continue;
-                    };
+            const abs_ts: i64 = if (ts >= 0) ts else -ts;
+            if (doc_states.get(record.doc_id)) |existing_ts| {
+                const existing_abs: i64 = if (existing_ts >= 0) existing_ts else -existing_ts;
+                if (abs_ts <= existing_abs) {
+                    allocator.free(record.doc_id);
+                    continue;
+                }
+                if (doc_states.fetchRemove(record.doc_id)) |kv| {
+                    allocator.free(kv.key);
                 }
             }
+
+            doc_states.put(record.doc_id, ts) catch {
+                allocator.free(record.doc_id);
+                continue;
+            };
         }
 
         // Collect active documents (positive timestamp)
@@ -319,8 +240,8 @@ pub const DocumentTagAdapter = struct {
 
     /// Flush pending writes to disk.
     pub fn flush(self: *DocumentTagAdapter) !void {
-        if (!self.read_only) {
-            try self.fs_writer.flushBlock();
+        if (self.table.fs_writer != null) {
+            try self.table.flush();
         }
     }
 
@@ -349,7 +270,7 @@ pub const DocumentTagAdapter = struct {
             .{ .column_id = col_payload, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = payload },
         };
 
-        try self.fs_writer.appendRow(schema_document_tags, &columns);
+        try self.table.appendRow(schema_document_tags, &columns);
     }
 
     fn writeInvertedIndex(self: *DocumentTagAdapter, tag_id: []const u8, doc_id: []const u8, added_at_ms: i64, group_id: ?[]const u8) !void {
@@ -374,7 +295,7 @@ pub const DocumentTagAdapter = struct {
             .{ .column_id = col_payload, .shape = .VARBYTES, .phys_type = .BINARY, .encoding = .RAW, .dims = 0, .data = payload },
         };
 
-        try self.fs_writer.appendRow(schema_tag_document_index, &columns);
+        try self.table.appendRow(schema_tag_document_index, &columns);
     }
 };
 

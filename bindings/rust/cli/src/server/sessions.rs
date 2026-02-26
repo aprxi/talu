@@ -101,22 +101,9 @@ fn open_storage(
     })?;
 
     let path = match auth {
-        Some(ctx) => base.join(&ctx.storage_prefix).join("tables").join("chat"),
-        None => base.join("tables").join("chat"),
+        Some(ctx) => base.join(&ctx.storage_prefix),
+        None => base.to_path_buf(),
     };
-
-    // Auto-create the storage directory on first access (same pattern as
-    // profile bucket initialization). A tenant that hasn't stored anything
-    // yet should get an empty storage, not a 500.
-    if !path.exists() {
-        std::fs::create_dir_all(&path).map_err(|e| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "storage_error",
-                &format!("Failed to create storage directory: {e}"),
-            )
-        })?;
-    }
 
     StorageHandle::open(&path).map_err(|e| {
         json_error(

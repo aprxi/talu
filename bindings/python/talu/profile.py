@@ -86,7 +86,7 @@ class Profile:
         Args:
             session_id: ID of the session to delete.
         """
-        rc = get_lib().talu_db_table_session_delete(
+        rc = get_lib().talu_db_session_delete(
             str(self._path).encode("utf-8"),
             session_id.encode("utf-8"),
         )

@@ -214,6 +214,7 @@ class ChatBase:
                 None,  # group_id
                 None,  # metadata_json
                 source_doc_id.encode("utf-8") if source_doc_id else None,
+                None,  # project_id
             )
             if rc != 0:
                 from .._bindings import get_last_error
@@ -328,6 +329,7 @@ class ChatBase:
             None,  # group_id
             None,  # metadata_json
             doc_id.encode("utf-8") if doc_id else None,  # source_doc_id
+            None,  # project_id
         )
         if rc != 0:
             from .._bindings import get_last_error

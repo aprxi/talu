@@ -99,7 +99,10 @@ pub use repo::{
 pub use repo_meta::{RepoMetaError, RepoMetaStore, RepoPinEntry};
 pub use sql::{SqlEngine, SqlError};
 pub use storage::{SessionRecord, StorageError, StorageHandle};
-pub use table::{TableError, TableHandle, TableRecord, TableSearchResult, TableSummary};
+pub use table::{
+    ColumnFilter, ColumnShape, ColumnValue, CompactionPolicy, FilterOp, PhysicalType, Row,
+    ScanParams, ScanResult, ScalarColumn, TableError, TableHandle,
+};
 pub use vector::{SearchBatchResult, VectorError, VectorStore};
 pub use xray::{TraceRecord, TraceStats, XrayCaptureHandle};
 

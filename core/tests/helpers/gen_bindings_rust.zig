@@ -143,6 +143,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(inner, "CRelationStringList")) return "*mut *mut CRelationStringList";
             if (eql(inner, "CDeltaChain")) return "*mut *mut CDeltaChain";
             if (eql(inner, "CPluginList")) return "*mut *mut CPluginList";
+            if (eql(inner, "CSessionTagBatch")) return "*mut *mut CSessionTagBatch";
         }
         // Opaque or unknown double-pointer types (e.g., ?*?*anyopaque) -> *mut c_void
         // This preserves the existing behavior for opaque output handles.
@@ -237,6 +238,16 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "CRelationStringList")) return if (is_const) "*const CRelationStringList" else "*mut CRelationStringList";
             // Blob types
             if (eql(pointee, "BlobGcStats")) return if (is_const) "*const BlobGcStats" else "*mut BlobGcStats";
+            // Session tag batch
+            if (eql(pointee, "CSessionTagBatch")) return if (is_const) "*const CSessionTagBatch" else "*mut CSessionTagBatch";
+            // Table engine types
+            if (eql(pointee, "CCompactionPolicy")) return if (is_const) "*const CCompactionPolicy" else "*mut CCompactionPolicy";
+            if (eql(pointee, "CScanParams")) return if (is_const) "*const CScanParams" else "*mut CScanParams";
+            if (eql(pointee, "CRowIterator")) return if (is_const) "*const CRowIterator" else "*mut CRowIterator";
+            if (eql(pointee, "CRow")) return if (is_const) "*const CRow" else "*mut CRow";
+            if (eql(pointee, "CColumnData")) return if (is_const) "*const CColumnData" else "*mut CColumnData";
+            if (eql(pointee, "CColumnValue")) return if (is_const) "*const CColumnValue" else "*mut CColumnValue";
+            if (eql(pointee, "CColumnFilter")) return if (is_const) "*const CColumnFilter" else "*mut CColumnFilter";
             // Fallback: return without wrapper (will cause compile error if used)
             return pointee;
         }
@@ -281,6 +292,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         // Check element type
         if (std.mem.indexOf(u8, zig_type, "f32") != null) return "*const f32";
         if (std.mem.indexOf(u8, zig_type, "u32") != null) return "*const u32";
+        if (std.mem.indexOf(u8, zig_type, "u16") != null) return "*const u16";
         if (std.mem.indexOf(u8, zig_type, "usize") != null) return "*const usize";
         if (std.mem.indexOf(u8, zig_type, "u8") != null) return "*const u8";
 
@@ -291,6 +303,10 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         const is_const = std.mem.startsWith(u8, elem_type, "const ");
         if (is_const) {
             elem_type = elem_type[6..];
+        }
+        // Strip module prefix (e.g. "ops.CColumnValue" -> "CColumnValue")
+        if (std.mem.lastIndexOfScalar(u8, elem_type, '.')) |dot| {
+            elem_type = elem_type[dot + 1 ..];
         }
         if (known_structs.contains(elem_type)) {
             // Return pointer to struct with correct constness
@@ -308,6 +324,9 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             }
             if (eql(elem_type, "CStorageRecord")) {
                 return if (is_const) "*const CStorageRecord" else "*mut CStorageRecord";
+            }
+            if (eql(elem_type, "CColumnValue")) {
+                return if (is_const) "*const CColumnValue" else "*mut CColumnValue";
             }
             // Default fallback — log a warning if we hit this; likely a new struct
             // that needs an entry above.
@@ -581,6 +600,7 @@ pub fn main() !void {
         while (i < sorted_structs.items.len) {
             const name = sorted_structs.items[i];
             if (structs.get(name)) |info| {
+                var swapped = false;
                 for (info.fields) |field| {
                     const ft = field.zig_type;
                     var dep_type: ?[]const u8 = null;
@@ -616,9 +636,13 @@ pub fn main() !void {
                                 sorted_structs.items[i] = dep;
                                 sorted_structs.items[j] = name;
                                 changed = true;
+                                swapped = true;
                                 break;
                             }
                         }
+                        // After a swap, `name` is stale — break out of
+                        // the field loop so we re-read items[i] next pass.
+                        if (swapped) break;
                     }
                 }
             }

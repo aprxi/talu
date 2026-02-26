@@ -166,7 +166,7 @@ pub fn seed_session_with_tags(
         let c_tag_name = CString::new(*tag_name).expect("tag_name cstr");
 
         let rc = unsafe {
-            talu_sys::talu_db_table_tag_create(
+            talu_sys::talu_db_tag_create(
                 c_db_path.as_ptr(),
                 c_tag_id.as_ptr(),
                 c_tag_name.as_ptr(),
@@ -175,10 +175,10 @@ pub fn seed_session_with_tags(
                 std::ptr::null(), // group_id
             )
         };
-        assert_eq!(rc, 0, "talu_db_table_tag_create failed for {}", tag_name);
+        assert_eq!(rc, 0, "talu_db_tag_create failed for {}", tag_name);
 
         let rc = unsafe {
-            talu_sys::talu_db_table_session_add_tag(
+            talu_sys::talu_db_session_add_tag(
                 c_db_path.as_ptr(),
                 c_session_id.as_ptr(),
                 c_tag_id.as_ptr(),
@@ -186,7 +186,7 @@ pub fn seed_session_with_tags(
         };
         assert_eq!(
             rc, 0,
-            "talu_db_table_session_add_tag failed for {}",
+            "talu_db_session_add_tag failed for {}",
             tag_name
         );
     }
@@ -241,7 +241,7 @@ pub fn seed_session_with_tags_and_group(
         let c_tag_name = CString::new(*tag_name).expect("tag_name cstr");
 
         let rc = unsafe {
-            talu_sys::talu_db_table_tag_create(
+            talu_sys::talu_db_tag_create(
                 c_db_path.as_ptr(),
                 c_tag_id.as_ptr(),
                 c_tag_name.as_ptr(),
@@ -250,10 +250,10 @@ pub fn seed_session_with_tags_and_group(
                 std::ptr::null(), // group_id
             )
         };
-        assert_eq!(rc, 0, "talu_db_table_tag_create failed for {}", tag_name);
+        assert_eq!(rc, 0, "talu_db_tag_create failed for {}", tag_name);
 
         let rc = unsafe {
-            talu_sys::talu_db_table_session_add_tag(
+            talu_sys::talu_db_session_add_tag(
                 c_db_path.as_ptr(),
                 c_session_id.as_ptr(),
                 c_tag_id.as_ptr(),
@@ -261,7 +261,7 @@ pub fn seed_session_with_tags_and_group(
         };
         assert_eq!(
             rc, 0,
-            "talu_db_table_session_add_tag failed for {}",
+            "talu_db_session_add_tag failed for {}",
             tag_name
         );
     }

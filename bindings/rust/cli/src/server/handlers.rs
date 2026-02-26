@@ -1747,7 +1747,7 @@ fn generate_title(
 
     // Update the session title in storage.
     if let Some(ref bp) = bucket_path {
-        if let Ok(storage) = talu::storage::StorageHandle::open(&bp.join("tables").join("chat")) {
+        if let Ok(storage) = talu::storage::StorageHandle::open(bp) {
             let update = talu::storage::SessionUpdate {
                 title: Some(title.clone()),
                 ..Default::default()

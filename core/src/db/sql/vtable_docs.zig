@@ -941,7 +941,6 @@ test "taludb_docs scan returns latest active documents" {
         .group_id = "g2",
     });
     try adapter.flush();
-    adapter.fs_writer.resetSchema();
     try adapter.deleteDocument("doc-b", 4000);
     try adapter.flush();
 

@@ -321,7 +321,7 @@ pub async fn handle_search(
 
     // Execute search
     let result = tokio::task::spawn_blocking(move || {
-        let storage = StorageHandle::open(&bucket.join("tables").join("chat"))?;
+        let storage = StorageHandle::open(&bucket)?;
 
         let search_params = SearchParams {
             query: text_query.as_deref(),
@@ -760,7 +760,7 @@ async fn handle_items_search(
     };
 
     let result = tokio::task::spawn_blocking(move || {
-        let storage = StorageHandle::open(&bucket.join("tables").join("chat"))?;
+        let storage = StorageHandle::open(&bucket)?;
 
         // Get all sessions (up to a reasonable limit for item search)
         let search_params = SearchParams {
@@ -1168,7 +1168,7 @@ async fn handle_federated_search(
 
     // Execute session search
     let conv_result = tokio::task::spawn_blocking(move || {
-        let storage = StorageHandle::open(&bucket.join("tables").join("chat"))?;
+        let storage = StorageHandle::open(&bucket)?;
 
         let search_params = SearchParams {
             query: Some(&query),

@@ -566,35 +566,58 @@ impl Service<Request<Incoming>> for Router {
                         {
                             sessions::handle_remove_tags(state, req, auth).await
                         }
+                        // Table meta endpoints
+                        (Method::GET, "/v1/db/tables/_meta/namespaces") => {
+                            db::table::handle_list_namespaces(state, req, auth).await
+                        }
+                        (Method::GET, p) if db::table::is_table_meta_policy_path(p) => {
+                            db::table::handle_get_policy(state, req, auth).await
+                        }
                         // Document/table plane endpoints
                         (Method::GET, p) if is_db_table_root_path(p) => {
-                            db::table::handle_list(state, req, auth, plugin_owner).await
+                            db::docs::handle_list(state, req, auth, plugin_owner).await
                         }
                         (Method::POST, p)
                             if is_db_table_root_path(p) || is_db_table_insert_path(p) =>
                         {
-                            db::table::handle_create(state, req, auth, plugin_owner).await
+                            db::docs::handle_create(state, req, auth, plugin_owner).await
                         }
                         (Method::POST, p) if is_db_table_search_path(p) => {
-                            db::table::handle_search(state, req, auth).await
+                            db::docs::handle_search(state, req, auth).await
                         }
                         (Method::GET, p) if is_db_table_tags_path(p) => {
-                            db::table::handle_get_tags(state, req, auth).await
+                            db::docs::handle_get_tags(state, req, auth).await
                         }
                         (Method::POST, p) if is_db_table_tags_path(p) => {
-                            db::table::handle_add_tags(state, req, auth).await
+                            db::docs::handle_add_tags(state, req, auth).await
                         }
                         (Method::DELETE, p) if is_db_table_tags_path(p) => {
-                            db::table::handle_remove_tags(state, req, auth).await
+                            db::docs::handle_remove_tags(state, req, auth).await
+                        }
+                        // Table rows endpoints (must come before item-path match)
+                        (Method::POST, p) if db::table::is_table_scan_path(p) => {
+                            db::table::handle_scan_post(state, req, auth).await
+                        }
+                        (Method::POST, p) if db::table::is_table_rows_path(p) => {
+                            db::table::handle_write_row(state, req, auth).await
+                        }
+                        (Method::GET, p) if db::table::is_table_row_path(p) => {
+                            db::table::handle_get_row(state, req, auth).await
+                        }
+                        (Method::GET, p) if db::table::is_table_rows_path(p) => {
+                            db::table::handle_scan(state, req, auth).await
+                        }
+                        (Method::DELETE, p) if db::table::is_table_row_path(p) => {
+                            db::table::handle_delete_row(state, req, auth).await
                         }
                         (Method::GET, p) if is_db_table_item_path(p) => {
-                            db::table::handle_get(state, req, auth).await
+                            db::docs::handle_get(state, req, auth).await
                         }
                         (Method::PATCH, p) if is_db_table_item_path(p) => {
-                            db::table::handle_update(state, req, auth).await
+                            db::docs::handle_update(state, req, auth).await
                         }
                         (Method::DELETE, p) if is_db_table_item_path(p) => {
-                            db::table::handle_delete(state, req, auth).await
+                            db::docs::handle_delete(state, req, auth).await
                         }
                         // Stateless file inspect/transform (no storage required)
                         (Method::POST, "/v1/file/inspect") | (Method::POST, "/file/inspect") => {
@@ -921,7 +944,7 @@ fn is_db_table_root_path(path: &str) -> bool {
     let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
         return false;
     };
-    !stripped.is_empty() && !stripped.contains('/')
+    !stripped.is_empty() && !stripped.contains('/') && stripped != "_meta"
 }
 
 fn is_db_table_insert_path(path: &str) -> bool {
@@ -951,7 +974,7 @@ fn is_db_table_item_path(path: &str) -> bool {
     let mut parts = stripped.split('/');
     let table = parts.next().unwrap_or("");
     let id = parts.next().unwrap_or("");
-    table != "" && id != "" && id != "search" && id != "insert" && parts.next().is_none()
+    table != "" && table != "_meta" && id != "" && id != "search" && id != "insert" && id != "rows" && id != "_meta" && parts.next().is_none()
 }
 
 fn is_db_table_tags_path(path: &str) -> bool {
