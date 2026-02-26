@@ -5,9 +5,12 @@
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
+const backend_contract = @import("../../contract.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
+const op_types = @import("../../../../models/op_types.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const log = @import("../../../../log.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const attention_kernel = @import("../kernels/attention.zig");
 const ffn_kernel = @import("../kernels/ffn.zig");
@@ -24,44 +27,7 @@ pub const MambaCache = runtime_graph.MambaCache;
 
 pub const TransformerBlock = struct {
     fn finalOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
-        if (program.len == 0) return .residual;
-        const last = program[program.len - 1];
-        return switch (last) {
-            .kernel => |k| k.out,
-            .add => .residual,
-            .linear => |op| op.out,
-            .matmul => |op| op.out,
-            .softmax => |op| op.out,
-            .silu => |op| op.out,
-            .gelu => |op| op.out,
-            .mul => |op| op.out,
-            .add_tensor => |op| op.out,
-            .add_scalar => |op| op.out,
-            .mul_scalar => |op| op.out,
-            .mean => |op| op.out,
-            .pow => |op| op.out,
-            .rsqrt => |op| op.out,
-            .add_param => |op| op.out,
-            .add_param_scalar => |op| op.out,
-            .mul_param => |op| op.out,
-            .reshape => |op| op.out,
-            .transpose => |op| op.out,
-            .rope => |op| op.out,
-            .triu => |op| op.out,
-            .sdpa => |op| op.out,
-            .patch_embed => |op| op.out,
-            .spatial_merge => |op| op.out,
-            .deepstack_extract => |op| op.out,
-            .scatter => |op| op.out,
-            else => .residual,
-        };
-    }
-
-    fn isCoreProgramBuffer(id: layer_ops.BufferId) bool {
-        return switch (id) {
-            .residual, .norm_out, .branch_out => true,
-            else => false,
-        };
+        return layer_ops.finalOutputBuffer(program);
     }
 
     const LayerProgramAdapterKind = enum(u8) {
@@ -70,6 +36,16 @@ pub const TransformerBlock = struct {
         ffn,
         mamba,
         residual_add,
+    };
+
+    const layer_program_required_opcodes = [_]opcode_map.Opcode{
+        .rmsnorm,
+        .multihead_attention,
+        .shortconv,
+        .swiglu,
+        .moe,
+        .mamba_mixer,
+        .residual_add,
     };
 
     const layer_program_adapter_table: [256]?LayerProgramAdapterKind = blk: {
@@ -84,27 +60,47 @@ pub const TransformerBlock = struct {
         break :blk table;
     };
 
+    comptime {
+        backend_contract.assertAdapterTableCoverage(
+            layer_program_adapter_table,
+            layer_program_required_opcodes,
+            "metal.executor.block.layer_program_adapter_table",
+        );
+    }
+
     fn layerProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?LayerProgramAdapterKind {
         return layer_program_adapter_table[@intFromEnum(opcode)];
     }
 
-    fn validateLayerProgram(program: []const layer_ops.LayerOp, layer_idx: usize, kind: usize) !void {
+    fn validateLayerProgram(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
         for (program, 0..) |op, op_idx| {
             const opcode = opcode_map.opcodeForLayerOp(op);
             if (layerProgramAdapterForOpcode(opcode) == null) {
                 log.warn("inference", "Metal LayerOp program contains unsupported opcode", .{
                     .layer = layer_idx,
                     .op_index = op_idx,
-                    .kind = kind,
+                    .kind = @intFromEnum(kind),
                     .op = @tagName(op),
                     .opcode = @intFromEnum(opcode),
+                });
+                return error.NotImplemented;
+            }
+            if (!runtime_contract.opcodeStateCompatibleWithBlockKind(opcode, kind)) {
+                const state_id = runtime_contract.stateBlockIdForOpcode(opcode).?;
+                log.warn("inference", "Metal LayerOp program state binding mismatches block kind", .{
+                    .layer = layer_idx,
+                    .op_index = op_idx,
+                    .kind = @intFromEnum(kind),
+                    .op = @tagName(op),
+                    .opcode = @intFromEnum(opcode),
+                    .state_id = state_id,
                 });
                 return error.NotImplemented;
             }
 
             switch (op) {
                 .kernel => |kernel_op| {
-                    if (!isCoreProgramBuffer(kernel_op.in) or !isCoreProgramBuffer(kernel_op.out)) {
+                    if (!layer_ops.isCoreProgramBuffer(kernel_op.in) or !layer_ops.isCoreProgramBuffer(kernel_op.out)) {
                         log.warn("inference", "Metal LayerOp program uses unsupported buffer id", .{
                             .layer = layer_idx,
                             .op_index = op_idx,
@@ -115,7 +111,7 @@ pub const TransformerBlock = struct {
                     }
                 },
                 .add => |add_op| {
-                    if (!isCoreProgramBuffer(add_op.branch)) {
+                    if (!layer_ops.isCoreProgramBuffer(add_op.branch)) {
                         log.warn("inference", "Metal LayerOp add uses unsupported buffer id", .{
                             .layer = layer_idx,
                             .op_index = op_idx,
@@ -128,10 +124,10 @@ pub const TransformerBlock = struct {
             }
         }
 
-        if (!isCoreProgramBuffer(finalOutputBuffer(program))) {
+        if (!layer_ops.isCoreProgramBuffer(finalOutputBuffer(program))) {
             log.warn("inference", "Metal LayerOp program final buffer is unsupported", .{
                 .layer = layer_idx,
-                .kind = kind,
+                .kind = @intFromEnum(kind),
             });
             return error.NotImplemented;
         }
@@ -607,7 +603,7 @@ pub const TransformerBlock = struct {
         const lw = layer_weights.*;
 
         if (lw.program) |program| {
-            try validateLayerProgram(program, layer_idx, @intFromEnum(lw.kind));
+            try validateLayerProgram(program, layer_idx, lw.kind);
             return forwardWithProgram(
                 hidden,
                 program,
@@ -724,7 +720,7 @@ test "validateLayerProgram accepts kernel-add programs" {
             .scale = .one,
         } },
     };
-    try TransformerBlock.validateLayerProgram(&program, 0, 0);
+    try TransformerBlock.validateLayerProgram(&program, 0, .attention_mlp);
 }
 
 test "layerProgramAdapterForOpcode covers Metal LayerOp execution subset" {
@@ -753,5 +749,24 @@ test "validateLayerProgram rejects unsupported primitive ops" {
             .scalar = 0.5,
         } },
     };
-    try std.testing.expectError(error.NotImplemented, TransformerBlock.validateLayerProgram(&program, 0, 0));
+    try std.testing.expectError(error.NotImplemented, TransformerBlock.validateLayerProgram(&program, 0, .attention_mlp));
+}
+
+test "validateLayerProgram rejects stateful opcode bound to wrong block kind" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .shortconv,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        } },
+    };
+    try std.testing.expectError(
+        error.NotImplemented,
+        TransformerBlock.validateLayerProgram(&program, 0, .attention_mlp),
+    );
 }

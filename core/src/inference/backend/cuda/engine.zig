@@ -9,6 +9,7 @@ const models = @import("../../../models/root.zig");
 const layer_ops = models.layer_ops;
 const op_types = models.op_types;
 const opcode_map = models.plan.opcode_map;
+const runtime_contract = @import("../../runtime_contract/root.zig");
 const contract = @import("../contract.zig");
 const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
@@ -618,45 +619,8 @@ const BlockRuntimeLayer = struct {
     }
 };
 
-fn isCoreProgramBuffer(id: layer_ops.BufferId) bool {
-    return switch (id) {
-        .residual, .norm_out, .branch_out => true,
-        else => false,
-    };
-}
-
 fn finalProgramOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
-    if (program.len == 0) return .residual;
-    const last = program[program.len - 1];
-    return switch (last) {
-        .kernel => |k| k.out,
-        .add => .residual,
-        .linear => |op| op.out,
-        .matmul => |op| op.out,
-        .softmax => |op| op.out,
-        .silu => |op| op.out,
-        .gelu => |op| op.out,
-        .mul => |op| op.out,
-        .add_tensor => |op| op.out,
-        .add_scalar => |op| op.out,
-        .mul_scalar => |op| op.out,
-        .mean => |op| op.out,
-        .pow => |op| op.out,
-        .rsqrt => |op| op.out,
-        .add_param => |op| op.out,
-        .add_param_scalar => |op| op.out,
-        .mul_param => |op| op.out,
-        .reshape => |op| op.out,
-        .transpose => |op| op.out,
-        .rope => |op| op.out,
-        .triu => |op| op.out,
-        .sdpa => |op| op.out,
-        .patch_embed => |op| op.out,
-        .spatial_merge => |op| op.out,
-        .deepstack_extract => |op| op.out,
-        .scatter => |op| op.out,
-        else => .residual,
-    };
+    return layer_ops.finalOutputBuffer(program);
 }
 
 fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
@@ -672,10 +636,22 @@ fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: us
             });
             return error.UnsupportedModel;
         }
+        if (!runtime_contract.opcodeStateCompatibleWithBlockKind(opcode, kind)) {
+            const state_id = runtime_contract.stateBlockIdForOpcode(opcode).?;
+            log.warn("inference", "CUDA LayerOp program state binding mismatches block kind", .{
+                .layer = layer_idx,
+                .op_index = op_idx,
+                .kind = @intFromEnum(kind),
+                .op = @tagName(op),
+                .opcode = @intFromEnum(opcode),
+                .state_id = state_id,
+            });
+            return error.UnsupportedModel;
+        }
 
         switch (op) {
             .kernel => |kernel_op| {
-                if (!isCoreProgramBuffer(kernel_op.in) or !isCoreProgramBuffer(kernel_op.out)) {
+                if (!layer_ops.isCoreProgramBuffer(kernel_op.in) or !layer_ops.isCoreProgramBuffer(kernel_op.out)) {
                     log.warn("inference", "CUDA LayerOp program uses unsupported buffer id", .{
                         .layer = layer_idx,
                         .op_index = op_idx,
@@ -686,7 +662,7 @@ fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: us
                 }
             },
             .add => |add_op| {
-                if (!isCoreProgramBuffer(add_op.branch)) {
+                if (!layer_ops.isCoreProgramBuffer(add_op.branch)) {
                     log.warn("inference", "CUDA LayerOp add uses unsupported buffer id", .{
                         .layer = layer_idx,
                         .op_index = op_idx,
@@ -699,7 +675,7 @@ fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: us
         }
     }
 
-    if (!isCoreProgramBuffer(finalProgramOutputBuffer(program))) {
+    if (!layer_ops.isCoreProgramBuffer(finalProgramOutputBuffer(program))) {
         log.warn("inference", "CUDA LayerOp program final buffer is unsupported", .{
             .layer = layer_idx,
             .kind = @intFromEnum(kind),
@@ -3705,6 +3681,16 @@ pub const CudaBackend = struct {
         ctx: *LayerProgramExecutionContext,
     ) anyerror!void;
 
+    const layer_program_required_opcodes = [_]opcode_map.Opcode{
+        .rmsnorm,
+        .multihead_attention,
+        .shortconv,
+        .swiglu,
+        .moe,
+        .mamba_mixer,
+        .residual_add,
+    };
+
     const layer_program_adapter_table: [256]?LayerProgramAdapterFn = blk: {
         var table: [256]?LayerProgramAdapterFn = [_]?LayerProgramAdapterFn{null} ** 256;
         table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = layerProgramNormAdapter;
@@ -3716,6 +3702,14 @@ pub const CudaBackend = struct {
         table[@intFromEnum(opcode_map.Opcode.residual_add)] = layerProgramResidualAddAdapter;
         break :blk table;
     };
+
+    comptime {
+        contract.assertAdapterTableCoverage(
+            layer_program_adapter_table,
+            layer_program_required_opcodes,
+            "cuda.engine.layer_program_adapter_table",
+        );
+    }
 
     fn layerProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?LayerProgramAdapterFn {
         return layer_program_adapter_table[@intFromEnum(opcode)];
@@ -6003,6 +5997,25 @@ test "validateLayerProgramForCuda rejects unsupported primitive ops" {
             .in = .residual,
             .out = .residual,
             .scalar = 0.5,
+        } },
+    };
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        validateLayerProgramForCuda(&program, 0, .attention_mlp),
+    );
+}
+
+test "validateLayerProgramForCuda rejects stateful opcode bound to wrong block kind" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .shortconv,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .one,
         } },
     };
     try std.testing.expectError(

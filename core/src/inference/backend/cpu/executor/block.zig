@@ -9,6 +9,7 @@ const layer_ops = @import("../../../../models/layer_ops.zig");
 const plan_compiler = @import("../../../../models/plan/compiler.zig");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
+const backend_contract = @import("../../contract.zig");
 const error_context = @import("../../../../error_context.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const cpu_linalg = compute.cpu.linalg;
@@ -47,43 +48,11 @@ const copyTensor = cpu_forward.copyTensor;
 /// Return the buffer that holds the final output of the block program.
 /// Pre-norm programs end on `.residual`; post-norm programs may end on `.norm_out`.
 fn finalOutputBuffer(compiled: *const runtime_contract.CompiledPlan) BufferId {
-    const instructions = compiled.plan.instructions;
-    if (instructions.len == 0) return .residual;
-    const last_insn = instructions[instructions.len - 1];
-    const param_id = last_insn.param_block_id orelse return .residual;
-    if (param_id >= compiled.param_blocks.len) return .residual;
-    const param_block = compiled.param_blocks[param_id];
-    if (param_block.data.len != @sizeOf(LayerOp)) return .residual;
-    const last: LayerOp = (@as(*const LayerOp, @ptrCast(@alignCast(param_block.data.ptr)))).*;
-    return switch (last) {
-        .kernel => |k| k.out,
-        .add => .residual,
-        .linear => |op| op.out,
-        .matmul => |op| op.out,
-        .softmax => |op| op.out,
-        .silu => |op| op.out,
-        .gelu => |op| op.out,
-        .mul => |op| op.out,
-        .add_tensor => |op| op.out,
-        .add_scalar => |op| op.out,
-        .mul_scalar => |op| op.out,
-        .mean => |op| op.out,
-        .pow => |op| op.out,
-        .rsqrt => |op| op.out,
-        .add_param => |op| op.out,
-        .add_param_scalar => |op| op.out,
-        .mul_param => |op| op.out,
-        .reshape => |op| op.out,
-        .transpose => |op| op.out,
-        .rope => |op| op.out,
-        .triu => |op| op.out,
-        .sdpa => |op| op.out,
-        .patch_embed => |op| op.out,
-        .spatial_merge => |op| op.out,
-        .deepstack_extract => |op| op.out,
-        .scatter => |op| op.out,
-        else => .residual,
-    };
+    const out_reg = runtime_contract.planFinalOutputRegister(&compiled.plan);
+    const out_idx = runtime_contract.registerToIndex(out_reg);
+    const max_buffer_idx: u16 = @intFromEnum(BufferId.tmp63);
+    if (out_idx > max_buffer_idx) return .residual;
+    return @enumFromInt(out_idx);
 }
 
 fn formatRmsNormLike(writer: anytype, dim: usize, eps: f32, weight_offset: f32) !void {
@@ -144,6 +113,20 @@ pub const Block = struct {
         return op_ptr.*;
     }
 
+    fn instructionSingleWeightBindingName(self: *const Block, op_index: usize) ![]const u8 {
+        return runtime_contract.instructionSingleWeightBindingName(&self.compiled_plan, op_index) catch |err| {
+            const weight_ref_count = if (op_index < self.compiled_plan.plan.instructions.len)
+                self.compiled_plan.plan.instructions[op_index].weights.len
+            else
+                @as(usize, 0);
+            error_context.setContext(
+                "block={d}, op={d}, expected_weight_refs=1, actual_weight_refs={d}, error={s}",
+                .{ self.block_idx, op_index, weight_ref_count, @errorName(err) },
+            );
+            return err;
+        };
+    }
+
     const BatchedDispatchMode = enum {
         single_slot,
         slot_batch,
@@ -160,6 +143,20 @@ pub const Block = struct {
         slot_index: usize,
         slot_indices: []const usize,
     ) anyerror!void;
+
+    const batched_required_opcodes = [_]runtime_contract.Opcode{
+        .rmsnorm,
+        .multihead_attention,
+        .swiglu,
+        .moe,
+        .mamba_mixer,
+        .shortconv,
+        .mla_attention,
+        .embedding,
+        .residual_add,
+        .mul_scalar,
+        .add_tensor,
+    };
 
     const batched_adapter_table: [256]?BatchedAdapterFn = blk: {
         var table: [256]?BatchedAdapterFn = [_]?BatchedAdapterFn{null} ** 256;
@@ -178,6 +175,14 @@ pub const Block = struct {
 
         break :blk table;
     };
+
+    comptime {
+        backend_contract.assertAdapterTableCoverage(
+            batched_adapter_table,
+            batched_required_opcodes,
+            "cpu.executor.block.batched_adapter_table",
+        );
+    }
 
     fn dispatchBatchedInstruction(
         self: *const Block,
@@ -363,6 +368,39 @@ pub const Block = struct {
         slot_ctx: SlotContext,
     ) anyerror!void;
 
+    const sequential_required_opcodes = [_]runtime_contract.Opcode{
+        .rmsnorm,
+        .multihead_attention,
+        .swiglu,
+        .moe,
+        .mamba_mixer,
+        .shortconv,
+        .mla_attention,
+        .embedding,
+        .residual_add,
+        .linear,
+        .matmul,
+        .split,
+        .softmax,
+        .silu,
+        .gelu,
+        .mul,
+        .add_tensor,
+        .add_scalar,
+        .mul_scalar,
+        .mean,
+        .pow,
+        .rsqrt,
+        .add_param,
+        .add_param_scalar,
+        .mul_param,
+        .reshape,
+        .transpose,
+        .rope,
+        .triu,
+        .scaled_dot_product_attention,
+    };
+
     const sequential_adapter_table: [256]?SequentialAdapterFn = blk: {
         var table: [256]?SequentialAdapterFn = [_]?SequentialAdapterFn{null} ** 256;
 
@@ -399,6 +437,14 @@ pub const Block = struct {
 
         break :blk table;
     };
+
+    comptime {
+        backend_contract.assertAdapterTableCoverage(
+            sequential_adapter_table,
+            sequential_required_opcodes,
+            "cpu.executor.block.sequential_adapter_table",
+        );
+    }
 
     fn dispatchSequentialInstruction(
         self: *const Block,
@@ -508,11 +554,12 @@ pub const Block = struct {
         const use_cache = slot_ctx.use_cache;
         switch (op) {
             .linear => |linear_op| {
-                const weight = self.block.weight_registry.get(linear_op.weight_name) orelse {
+                const weight_name = try self.instructionSingleWeightBindingName(op_index);
+                const weight = self.block.weight_registry.get(weight_name) orelse {
                     error_context.setContext("block={d}, op={d}, weight={s}", .{
                         self.block_idx,
                         op_index,
-                        linear_op.weight_name,
+                        weight_name,
                     });
                     return error.MissingWeight;
                 };
@@ -562,7 +609,7 @@ pub const Block = struct {
                     error_context.setContext("block={d}, op={d}, weight={s}, dtype={}", .{
                         self.block_idx,
                         op_index,
-                        linear_op.weight_name,
+                        weight_name,
                         weight.dtype,
                     });
                     return err;
@@ -847,7 +894,15 @@ pub const Block = struct {
             },
             .add_param => |add_param_op| {
                 const input_tensor = buffer_views[@intFromEnum(add_param_op.in)];
-                const param = self.block.weight_registry.get(add_param_op.param_name) orelse return error.MissingParam;
+                const param_name = try self.instructionSingleWeightBindingName(op_index);
+                const param = self.block.weight_registry.get(param_name) orelse {
+                    error_context.setContext("block={d}, op={d}, param={s}", .{
+                        self.block_idx,
+                        op_index,
+                        param_name,
+                    });
+                    return error.MissingParam;
+                };
 
                 const output_len = @max(input_tensor.numel, param.numel);
                 const output_slice = resolveOutputSlice(buffer_views, scratch, add_param_op.out, output_len);
@@ -860,7 +915,15 @@ pub const Block = struct {
                 );
             },
             .add_param_scalar => |add_param_scalar_op| {
-                const param = self.block.weight_registry.get(add_param_scalar_op.param_name) orelse return error.MissingParam;
+                const param_name = try self.instructionSingleWeightBindingName(op_index);
+                const param = self.block.weight_registry.get(param_name) orelse {
+                    error_context.setContext("block={d}, op={d}, param={s}", .{
+                        self.block_idx,
+                        op_index,
+                        param_name,
+                    });
+                    return error.MissingParam;
+                };
                 const p_len = param.numel;
                 const output_slice = resolveOutputSlice(buffer_views, scratch, add_param_scalar_op.out, p_len);
                 cpu_broadcast.addParamScalar(param, output_slice[0..p_len], add_param_scalar_op.scalar);
@@ -873,7 +936,15 @@ pub const Block = struct {
             },
             .mul_param => |mul_param_op| {
                 const input_tensor = buffer_views[@intFromEnum(mul_param_op.in)];
-                const param = self.block.weight_registry.get(mul_param_op.param_name) orelse return error.MissingParam;
+                const param_name = try self.instructionSingleWeightBindingName(op_index);
+                const param = self.block.weight_registry.get(param_name) orelse {
+                    error_context.setContext("block={d}, op={d}, param={s}", .{
+                        self.block_idx,
+                        op_index,
+                        param_name,
+                    });
+                    return error.MissingParam;
+                };
 
                 const output_len = @max(input_tensor.numel, param.numel);
                 const output_slice = resolveOutputSlice(buffer_views, scratch, mul_param_op.out, output_len);
@@ -1263,36 +1334,23 @@ pub const Block = struct {
     /// Validate the program against the block's weight registry and supported ops.
     /// This is intended for load-time checks to catch invalid graphs early.
     pub fn validate(self: *const Block) !void {
-        for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            const expected_state_id = runtime_contract.stateBlockIdForOpcode(insn.opcode);
-            if (expected_state_id) |state_id| {
-                if (insn.state_block_id == null or insn.state_block_id.? != state_id) {
-                    error_context.setContext("block={d}, op={d}, opcode={d}, expected_state_id={d}", .{
-                        self.block_idx,
-                        op_index,
-                        @intFromEnum(insn.opcode),
-                        state_id,
-                    });
-                    return error.InvalidStateDescriptorBinding;
-                }
-                if (!runtime_contract.planHasStateDescriptor(&self.compiled_plan.plan, state_id)) {
-                    error_context.setContext("block={d}, op={d}, missing_state_desc_id={d}", .{
-                        self.block_idx,
-                        op_index,
-                        state_id,
-                    });
-                    return error.InvalidStateDescriptorBinding;
-                }
-            } else if (insn.state_block_id != null) {
-                error_context.setContext("block={d}, op={d}, opcode={d}, unexpected_state_id={d}", .{
-                    self.block_idx,
-                    op_index,
-                    @intFromEnum(insn.opcode),
-                    insn.state_block_id.?,
-                });
-                return error.InvalidStateDescriptorBinding;
-            }
+        runtime_contract.validateCompiledPlan(&self.compiled_plan) catch |err| {
+            error_context.setContext("block={d}, compiled_plan_validation={s}", .{
+                self.block_idx,
+                @errorName(err),
+            });
+            return err;
+        };
+        runtime_contract.validateExecutionPlanForBlockKind(&self.compiled_plan.plan, self.block.block_type) catch |err| {
+            error_context.setContext("block={d}, block_kind_validation={s}, kind={d}", .{
+                self.block_idx,
+                @errorName(err),
+                @intFromEnum(self.block.block_type),
+            });
+            return err;
+        };
 
+        for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
             if (sequential_adapter_table[@intFromEnum(insn.opcode)] == null) {
                 error_context.setContext("block={d}, op={d}, opcode={d}", .{
                     self.block_idx,
@@ -1310,32 +1368,36 @@ pub const Block = struct {
                         return error.KernelIndexOutOfBounds;
                     }
                 },
-                .linear => |linear_op| {
-                    if (self.block.weight_registry.get(linear_op.weight_name) == null) {
-                        error_context.setContext("block={d}, op={d}, weight={s}", .{ self.block_idx, op_index, linear_op.weight_name });
+                .linear => {
+                    const weight_name = try self.instructionSingleWeightBindingName(op_index);
+                    if (self.block.weight_registry.get(weight_name) == null) {
+                        error_context.setContext("block={d}, op={d}, weight={s}", .{ self.block_idx, op_index, weight_name });
                         return error.MissingWeight;
                     }
-                    const weight = self.block.weight_registry.get(linear_op.weight_name).?;
+                    const weight = self.block.weight_registry.get(weight_name).?;
                     _ = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
-                        error_context.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
+                        error_context.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, weight_name, weight.dtype });
                         return err;
                     };
                 },
-                .add_param => |add_param_op| {
-                    if (self.block.weight_registry.get(add_param_op.param_name) == null) {
-                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, add_param_op.param_name });
+                .add_param => {
+                    const param_name = try self.instructionSingleWeightBindingName(op_index);
+                    if (self.block.weight_registry.get(param_name) == null) {
+                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, param_name });
                         return error.MissingParam;
                     }
                 },
-                .add_param_scalar => |add_param_scalar_op| {
-                    if (self.block.weight_registry.get(add_param_scalar_op.param_name) == null) {
-                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, add_param_scalar_op.param_name });
+                .add_param_scalar => {
+                    const param_name = try self.instructionSingleWeightBindingName(op_index);
+                    if (self.block.weight_registry.get(param_name) == null) {
+                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, param_name });
                         return error.MissingParam;
                     }
                 },
-                .mul_param => |mul_param_op| {
-                    if (self.block.weight_registry.get(mul_param_op.param_name) == null) {
-                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, mul_param_op.param_name });
+                .mul_param => {
+                    const param_name = try self.instructionSingleWeightBindingName(op_index);
+                    if (self.block.weight_registry.get(param_name) == null) {
+                        error_context.setContext("block={d}, op={d}, param={s}", .{ self.block_idx, op_index, param_name });
                         return error.MissingParam;
                     }
                 },
@@ -1820,6 +1882,71 @@ test "Block.validate accepts valid program with all required weights" {
     defer block.deinit(allocator);
 
     try block.validate();
+}
+
+test "Block.validate resolves primitive linear weights via compiled weight bindings" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .linear = .{ .in = .residual, .out = .norm_out, .weight_name = "q_proj" } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    try testing.expectEqual(@as(usize, 1), block.compiled_plan.weight_bindings.len);
+    const binding_name = @constCast(block.compiled_plan.weight_bindings[0].name);
+    try testing.expect(binding_name.len > 0);
+    binding_name[0] = 'x';
+
+    try testing.expectError(error.MissingWeight, block.validate());
+}
+
+test "Block.validate rejects invalid compiled weight ref count for primitive opcode" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .linear = .{ .in = .residual, .out = .norm_out, .weight_name = "q_proj" } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    const insn_mut = @constCast(block.compiled_plan.plan.instructions.ptr);
+    insn_mut[0].weights = &.{};
+
+    try testing.expectError(error.InvalidWeightRefCount, block.validate());
+}
+
+test "Block.validate rejects stateful opcode incompatible with block kind" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .shortconv } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    try testing.expectError(error.InvalidStateDescriptorBinding, block.validate());
 }
 
 test "Block.validate rejects unexpected state descriptor binding on stateless opcode" {

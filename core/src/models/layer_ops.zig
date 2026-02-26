@@ -298,3 +298,69 @@ pub const LayerOp = union(enum) {
 
     // Note: model-specific kernels (norm/attn/ffn/mamba) are now emitted as `.kernel`.
 };
+
+/// Returns the output buffer produced by the last operation in a LayerOp program.
+/// Empty programs default to `.residual`.
+pub fn finalOutputBuffer(program: []const LayerOp) BufferId {
+    if (program.len == 0) return .residual;
+    const last = program[program.len - 1];
+    return switch (last) {
+        .kernel => |k| k.out,
+        .add => .residual,
+        .linear => |op| op.out,
+        .matmul => |op| op.out,
+        .softmax => |op| op.out,
+        .silu => |op| op.out,
+        .gelu => |op| op.out,
+        .mul => |op| op.out,
+        .add_tensor => |op| op.out,
+        .add_scalar => |op| op.out,
+        .mul_scalar => |op| op.out,
+        .mean => |op| op.out,
+        .pow => |op| op.out,
+        .rsqrt => |op| op.out,
+        .add_param => |op| op.out,
+        .add_param_scalar => |op| op.out,
+        .mul_param => |op| op.out,
+        .reshape => |op| op.out,
+        .transpose => |op| op.out,
+        .rope => |op| op.out,
+        .triu => |op| op.out,
+        .sdpa => |op| op.out,
+        .patch_embed => |op| op.out,
+        .spatial_merge => |op| op.out,
+        .deepstack_extract => |op| op.out,
+        .scatter => |op| op.out,
+        else => .residual,
+    };
+}
+
+/// Returns true when the buffer id is one of the canonical runtime core buffers.
+pub fn isCoreProgramBuffer(id: BufferId) bool {
+    return switch (id) {
+        .residual, .norm_out, .branch_out => true,
+        else => false,
+    };
+}
+
+test "finalOutputBuffer defaults to residual for empty program" {
+    const testing = @import("std").testing;
+    try testing.expectEqual(BufferId.residual, finalOutputBuffer(&.{}));
+}
+
+test "finalOutputBuffer resolves last op output for vision scatter" {
+    const testing = @import("std").testing;
+    const program = [_]LayerOp{
+        .{ .patch_embed = .{ .in = .residual, .out = .tmp3 } },
+        .{ .scatter = .{ .text_in = .residual, .vision_in = .tmp3, .out = .branch_out, .image_token_id = 42 } },
+    };
+    try testing.expectEqual(BufferId.branch_out, finalOutputBuffer(&program));
+}
+
+test "isCoreProgramBuffer accepts residual/norm_out/branch_out only" {
+    const testing = @import("std").testing;
+    try testing.expect(isCoreProgramBuffer(.residual));
+    try testing.expect(isCoreProgramBuffer(.norm_out));
+    try testing.expect(isCoreProgramBuffer(.branch_out));
+    try testing.expect(!isCoreProgramBuffer(.tmp3));
+}

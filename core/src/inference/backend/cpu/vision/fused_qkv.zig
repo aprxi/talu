@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
+const backend_contract = @import("../../contract.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const models = @import("../../../../models/root.zig");
@@ -89,6 +90,13 @@ pub const VisionRuntime = struct {
         state: *VisionProgramAdapterState,
     ) anyerror!void;
 
+    const vision_program_required_opcodes = [_]opcode_map.Opcode{
+        .vision_patch_embed,
+        .vision_deepstack_extract,
+        .vision_spatial_merge,
+        .vision_scatter,
+    };
+
     const vision_program_adapter_table = blk: {
         var table: [256]?VisionProgramAdapterFn = [_]?VisionProgramAdapterFn{null} ** 256;
         table[@intFromEnum(opcode_map.Opcode.vision_patch_embed)] = visionProgramPatchEmbedAdapter;
@@ -97,6 +105,14 @@ pub const VisionRuntime = struct {
         table[@intFromEnum(opcode_map.Opcode.vision_scatter)] = visionProgramScatterAdapter;
         break :blk table;
     };
+
+    comptime {
+        backend_contract.assertAdapterTableCoverage(
+            vision_program_adapter_table,
+            vision_program_required_opcodes,
+            "cpu.vision.fused_qkv.vision_program_adapter_table",
+        );
+    }
 
     fn visionProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?VisionProgramAdapterFn {
         return vision_program_adapter_table[@intFromEnum(opcode)];

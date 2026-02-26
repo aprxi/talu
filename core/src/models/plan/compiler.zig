@@ -54,6 +54,25 @@ fn allocWeightRefs(
     return owned;
 }
 
+fn ensureWeightBindingIndex(
+    allocator: std.mem.Allocator,
+    bindings: *std.ArrayListUnmanaged(runtime_contract.WeightBinding),
+    name: []const u8,
+) !u32 {
+    for (bindings.items) |binding| {
+        if (std.mem.eql(u8, binding.name, name)) return binding.index;
+    }
+
+    const owned_name = try allocator.dupe(u8, name);
+    errdefer allocator.free(owned_name);
+    const binding_index: u32 = @intCast(bindings.items.len);
+    try bindings.append(allocator, .{
+        .index = binding_index,
+        .name = owned_name,
+    });
+    return binding_index;
+}
+
 fn maxRegisterInInstruction(insn: runtime_contract.Instruction) u16 {
     var max_register: u16 = 0;
     for (insn.inputs) |reg| max_register = @max(max_register, runtime_contract.registerToIndex(reg));
@@ -65,6 +84,7 @@ fn compileOneInstruction(
     allocator: std.mem.Allocator,
     op: layer_ops.LayerOp,
     param_block_id: u16,
+    weight_bindings: *std.ArrayListUnmanaged(runtime_contract.WeightBinding),
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
     const state_block_id = runtime_contract.stateBlockIdForOpcode(opcode);
@@ -89,7 +109,9 @@ fn compileOneInstruction(
             .opcode = opcode,
             .inputs = try allocRegistersFromBuffers(allocator, &.{linear_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{linear_op.out}),
-            .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
+            .weights = try allocWeightRefs(allocator, &.{.{
+                .index = try ensureWeightBindingIndex(allocator, weight_bindings, linear_op.weight_name),
+            }}),
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
@@ -193,7 +215,9 @@ fn compileOneInstruction(
             .opcode = opcode,
             .inputs = try allocRegistersFromBuffers(allocator, &.{add_param_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_op.out}),
-            .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
+            .weights = try allocWeightRefs(allocator, &.{.{
+                .index = try ensureWeightBindingIndex(allocator, weight_bindings, add_param_op.param_name),
+            }}),
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
@@ -201,7 +225,9 @@ fn compileOneInstruction(
             .opcode = opcode,
             .inputs = try allocRegistersFromBuffers(allocator, &.{}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_scalar_op.out}),
-            .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
+            .weights = try allocWeightRefs(allocator, &.{.{
+                .index = try ensureWeightBindingIndex(allocator, weight_bindings, add_param_scalar_op.param_name),
+            }}),
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
@@ -209,7 +235,9 @@ fn compileOneInstruction(
             .opcode = opcode,
             .inputs = try allocRegistersFromBuffers(allocator, &.{mul_param_op.in}),
             .outputs = try allocRegistersFromBuffers(allocator, &.{mul_param_op.out}),
-            .weights = try allocWeightRefs(allocator, &.{.{ .index = 0 }}),
+            .weights = try allocWeightRefs(allocator, &.{.{
+                .index = try ensureWeightBindingIndex(allocator, weight_bindings, mul_param_op.param_name),
+            }}),
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
@@ -478,15 +506,86 @@ fn computePeakRegisters(
     return @intCast(peak);
 }
 
+fn buildDiagnostics(
+    allocator: std.mem.Allocator,
+    mode: CompileMode,
+    compiled: *const runtime_contract.CompiledPlan,
+) ![]runtime_contract.PlanDiagnostic {
+    var diagnostics = std.ArrayListUnmanaged(runtime_contract.PlanDiagnostic){};
+    errdefer {
+        for (diagnostics.items) |diag| allocator.free(diag.message);
+        diagnostics.deinit(allocator);
+    }
+
+    const summary = try std.fmt.allocPrint(
+        allocator,
+        "plan_compiled mode={s} instructions={d} registers={d} peak_registers={d} states={d} weights={d}",
+        .{
+            @tagName(mode),
+            compiled.plan.instructions.len,
+            compiled.plan.register_count,
+            compiled.peak_registers,
+            compiled.plan.state_descs.len,
+            compiled.weight_bindings.len,
+        },
+    );
+    try diagnostics.append(allocator, .{
+        .level = .info,
+        .message = summary,
+    });
+
+    if (compiled.plan.instructions.len == 0) {
+        const empty_program = try std.fmt.allocPrint(
+            allocator,
+            "empty_plan mode={s}",
+            .{@tagName(mode)},
+        );
+        try diagnostics.append(allocator, .{
+            .level = .warn,
+            .message = empty_program,
+        });
+    }
+
+    if (compiled.plan.register_count > 0 and compiled.peak_registers == compiled.plan.register_count) {
+        const register_pressure = try std.fmt.allocPrint(
+            allocator,
+            "register_pressure peak_equals_register_count count={d}",
+            .{compiled.plan.register_count},
+        );
+        try diagnostics.append(allocator, .{
+            .level = .warn,
+            .message = register_pressure,
+        });
+    }
+
+    return diagnostics.toOwnedSlice(allocator);
+}
+
+fn deinitDiagnostics(allocator: std.mem.Allocator, diagnostics: []const runtime_contract.PlanDiagnostic) void {
+    for (diagnostics) |diag| allocator.free(diag.message);
+    if (diagnostics.len > 0) allocator.free(diagnostics);
+}
+
+fn validateProgramBlockKindStateCompatibility(
+    program: []const layer_ops.LayerOp,
+    block_kind: op_types.BlockKind,
+) !void {
+    for (program) |op| {
+        const opcode = opcode_map.opcodeForLayerOp(op);
+        if (!runtime_contract.opcodeStateCompatibleWithBlockKind(opcode, block_kind)) {
+            return error.InvalidStateDescriptorBinding;
+        }
+    }
+}
+
 pub fn compileLayerProgram(
     allocator: std.mem.Allocator,
     program: []const layer_ops.LayerOp,
     mode: CompileMode,
 ) !runtime_contract.CompiledPlan {
-    _ = mode;
-
     var instructions = std.ArrayListUnmanaged(runtime_contract.Instruction){};
     var param_blocks = std.ArrayListUnmanaged(runtime_contract.ParamBlock){};
+    var weight_bindings = std.ArrayListUnmanaged(runtime_contract.WeightBinding){};
     errdefer {
         for (instructions.items) |insn| {
             allocator.free(insn.inputs);
@@ -496,6 +595,8 @@ pub fn compileLayerProgram(
         instructions.deinit(allocator);
         for (param_blocks.items) |param_block| deinitParamBlock(allocator, param_block);
         param_blocks.deinit(allocator);
+        for (weight_bindings.items) |binding| allocator.free(binding.name);
+        weight_bindings.deinit(allocator);
     }
 
     var max_register: u16 = 0;
@@ -503,7 +604,10 @@ pub fn compileLayerProgram(
         const opcode = opcode_map.opcodeForLayerOp(op);
         const param_block_id: u16 = @intCast(param_blocks.items.len);
         try param_blocks.append(allocator, try serializeLayerOpParam(allocator, opcode, op));
-        const insn = try compileOneInstruction(allocator, op, param_block_id);
+        const insn = try compileOneInstruction(allocator, op, param_block_id, &weight_bindings);
+        if (insn.weights.len != runtime_contract.expectedWeightRefCount(insn.opcode)) {
+            return error.InvalidWeightRefCount;
+        }
         max_register = @max(max_register, maxRegisterInInstruction(insn));
         try instructions.append(allocator, insn);
     }
@@ -532,11 +636,14 @@ pub fn compileLayerProgram(
         allocator.free(param_block_slice);
     }
 
+    const weight_binding_slice = try weight_bindings.toOwnedSlice(allocator);
+    errdefer {
+        for (weight_binding_slice) |binding| allocator.free(binding.name);
+        allocator.free(weight_binding_slice);
+    }
+
     const state_descs = try buildStateDescriptors(allocator, instruction_slice);
     errdefer if (state_descs.len > 0) allocator.free(state_descs);
-
-    const diagnostics = try allocator.alloc(runtime_contract.PlanDiagnostic, 0);
-    errdefer allocator.free(diagnostics);
 
     var compiled = runtime_contract.CompiledPlan{
         .plan = .{
@@ -545,13 +652,15 @@ pub fn compileLayerProgram(
             .state_descs = state_descs,
         },
         .param_blocks = param_block_slice,
+        .weight_bindings = weight_binding_slice,
         .liveness = liveness,
         .peak_registers = register_count,
-        .diagnostics = diagnostics,
+        .diagnostics = &.{},
     };
     compiled.peak_registers = try computePeakRegisters(allocator, &compiled);
 
     try runtime_contract.validateCompiledPlan(&compiled);
+    compiled.diagnostics = try buildDiagnostics(allocator, mode, &compiled);
     return compiled;
 }
 
@@ -563,6 +672,7 @@ pub fn compileProgramForArchitecture(
 ) !runtime_contract.CompiledPlan {
     const entry = registry.detectByArchitectureId(architecture_id) orelse return error.UnknownArchitecture;
     const program = registry.blockProgramFor(entry, block_kind) orelse return error.MissingBlockProgram;
+    try validateProgramBlockKindStateCompatibility(program, block_kind);
     return compileLayerProgram(allocator, program, mode);
 }
 
@@ -576,12 +686,15 @@ pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contr
     for (compiled.param_blocks) |param_block| deinitParamBlock(allocator, param_block);
     allocator.free(compiled.param_blocks);
 
+    for (compiled.weight_bindings) |binding| allocator.free(binding.name);
+    if (compiled.weight_bindings.len > 0) allocator.free(compiled.weight_bindings);
+
     if (compiled.plan.state_descs.len > 0) allocator.free(compiled.plan.state_descs);
 
     allocator.free(compiled.liveness.register_last_read);
     for (compiled.liveness.kill_after_instruction) |row| allocator.free(row);
     allocator.free(compiled.liveness.kill_after_instruction);
-    allocator.free(compiled.diagnostics);
+    deinitDiagnostics(allocator, compiled.diagnostics);
 
     compiled.* = undefined;
 }
@@ -622,6 +735,13 @@ fn expectedOutputCount(op: layer_ops.LayerOp) usize {
     return switch (op) {
         .split => |split_op| split_op.num_outputs,
         else => 1,
+    };
+}
+
+fn expectedWeightCount(op: layer_ops.LayerOp) usize {
+    return switch (op) {
+        .linear, .add_param, .add_param_scalar, .mul_param => 1,
+        else => 0,
     };
 }
 
@@ -784,6 +904,7 @@ fn expectProgramParity(source: []const layer_ops.LayerOp, compiled: *const runti
         try std.testing.expectEqual(opcode_map.opcodeForLayerOp(source_op), compiled_insn.opcode);
         try std.testing.expectEqual(expectedInputCount(source_op), compiled_insn.inputs.len);
         try std.testing.expectEqual(expectedOutputCount(source_op), compiled_insn.outputs.len);
+        try std.testing.expectEqual(expectedWeightCount(source_op), compiled_insn.weights.len);
 
         var expected_inputs: [64]runtime_contract.RegisterRef = undefined;
         var expected_outputs: [64]runtime_contract.RegisterRef = undefined;
@@ -877,9 +998,74 @@ test "compileLayerProgram emits shortconv state descriptor when shortconv op is 
     try std.testing.expectEqual(@as(?u8, shortconv_state_id), compiled.plan.instructions[0].state_block_id);
 }
 
+test "compileLayerProgram emits deterministic weight bindings for parameterized primitive ops" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .linear = .{
+            .in = .residual,
+            .out = .tmp3,
+            .weight_name = "w_linear",
+        } },
+        .{ .add_param = .{
+            .in = .tmp3,
+            .out = .tmp4,
+            .param_name = "p_add",
+        } },
+        .{ .mul_param = .{
+            .in = .tmp4,
+            .out = .residual,
+            .param_name = "p_add",
+        } },
+    };
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expectEqual(@as(usize, 2), compiled.weight_bindings.len);
+    try std.testing.expectEqual(@as(u32, 0), compiled.weight_bindings[0].index);
+    try std.testing.expectEqualStrings("w_linear", compiled.weight_bindings[0].name);
+    try std.testing.expectEqual(@as(u32, 1), compiled.weight_bindings[1].index);
+    try std.testing.expectEqualStrings("p_add", compiled.weight_bindings[1].name);
+
+    try std.testing.expectEqual(@as(u32, 0), compiled.plan.instructions[0].weights[0].index);
+    try std.testing.expectEqual(@as(u32, 1), compiled.plan.instructions[1].weights[0].index);
+    try std.testing.expectEqual(@as(u32, 1), compiled.plan.instructions[2].weights[0].index);
+}
+
 test "compileProgramForArchitecture resolves registry programs" {
     var compiled = try compileProgramForArchitecture(std.testing.allocator, "granite_hybrid", .mamba, .decode);
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expect(compiled.plan.instructions.len > 0);
+}
+
+test "compileLayerProgram emits summary diagnostics" {
+    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expect(compiled.diagnostics.len >= 1);
+    try std.testing.expectEqual(runtime_contract.PlanDiagnosticLevel.info, compiled.diagnostics[0].level);
+    try std.testing.expect(std.mem.startsWith(u8, compiled.diagnostics[0].message, "plan_compiled mode=decode"));
+}
+
+test "compileLayerProgram emits empty plan warning diagnostics" {
+    var compiled = try compileLayerProgram(std.testing.allocator, &.{}, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expect(compiled.diagnostics.len >= 2);
+    try std.testing.expectEqual(runtime_contract.PlanDiagnosticLevel.warn, compiled.diagnostics[1].level);
+    try std.testing.expect(std.mem.startsWith(u8, compiled.diagnostics[1].message, "empty_plan mode=decode"));
+}
+
+test "validateProgramBlockKindStateCompatibility rejects mismatched stateful opcode" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .shortconv,
+        } },
+    };
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        validateProgramBlockKindStateCompatibility(&program, .attention_mlp),
+    );
 }

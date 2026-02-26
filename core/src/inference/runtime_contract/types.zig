@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const dtype = @import("../../dtype.zig");
+const op_types = @import("../../models/op_types.zig");
 const opcode_mod = @import("../../models/plan/opcode.zig");
 
 pub const Opcode = opcode_mod.Opcode;
@@ -20,6 +21,11 @@ pub fn registerToIndex(register: RegisterRef) u16 {
 
 pub const WeightRef = struct {
     index: u32,
+};
+
+pub const WeightBinding = struct {
+    index: u32,
+    name: []const u8,
 };
 
 pub const StateLifecycle = enum(u8) {
@@ -81,6 +87,7 @@ pub const PlanDiagnostic = struct {
 pub const CompiledPlan = struct {
     plan: ExecutionPlan,
     param_blocks: []const ParamBlock,
+    weight_bindings: []const WeightBinding = &.{},
     liveness: LivenessMap,
     peak_registers: u16,
     diagnostics: []const PlanDiagnostic,
@@ -178,6 +185,26 @@ pub fn stateBlockIdForOpcode(opcode: Opcode) ?u8 {
     };
 }
 
+pub fn expectedWeightRefCount(opcode: Opcode) usize {
+    return switch (opcode) {
+        .linear, .add_param, .add_param_scalar, .mul_param => 1,
+        else => 0,
+    };
+}
+
+pub fn blockKindSupportsState(kind: op_types.BlockKind, state_id: u8) bool {
+    return switch (kind) {
+        .attention_mlp => state_id == @intFromEnum(StateBlockId.kv_cache),
+        .shortconv => state_id == @intFromEnum(StateBlockId.shortconv),
+        .mamba => state_id == @intFromEnum(StateBlockId.mamba),
+    };
+}
+
+pub fn opcodeStateCompatibleWithBlockKind(opcode: Opcode, kind: op_types.BlockKind) bool {
+    const state_id = stateBlockIdForOpcode(opcode) orelse return true;
+    return blockKindSupportsState(kind, state_id);
+}
+
 pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
     return switch (state_id) {
         .kv_cache => .{
@@ -211,6 +238,28 @@ pub fn planHasStateDescriptor(plan: *const ExecutionPlan, state_id: u8) bool {
     return false;
 }
 
+pub fn instructionWeightBindingName(
+    compiled: *const CompiledPlan,
+    instruction_index: usize,
+    weight_slot: usize,
+) ![]const u8 {
+    if (instruction_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
+    const insn = compiled.plan.instructions[instruction_index];
+    if (weight_slot >= insn.weights.len) return error.InvalidWeightRefIndex;
+    const ref_index = insn.weights[weight_slot].index;
+    if (ref_index >= compiled.weight_bindings.len) return error.InvalidWeightRefIndex;
+    const binding_name = compiled.weight_bindings[ref_index].name;
+    if (binding_name.len == 0) return error.InvalidWeightBindingName;
+    return binding_name;
+}
+
+pub fn instructionSingleWeightBindingName(compiled: *const CompiledPlan, instruction_index: usize) ![]const u8 {
+    if (instruction_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
+    const insn = compiled.plan.instructions[instruction_index];
+    if (insn.weights.len != 1) return error.InvalidWeightRefCount;
+    return instructionWeightBindingName(compiled, instruction_index, 0);
+}
+
 pub fn validateTensorViewDesc(view: *const TensorViewDesc) !void {
     if (view.rank > 4) return error.UnsupportedTensorRank;
 }
@@ -229,6 +278,15 @@ pub fn validateExecutionPlan(plan: *const ExecutionPlan) !void {
     }
 
     for (plan.instructions) |insn| {
+        const expected_state_id = stateBlockIdForOpcode(insn.opcode);
+        if (expected_state_id) |state_id| {
+            if (insn.state_block_id == null or insn.state_block_id.? != state_id) {
+                return error.InvalidStateDescriptorBinding;
+            }
+        } else if (insn.state_block_id != null) {
+            return error.InvalidStateDescriptorBinding;
+        }
+
         for (insn.inputs) |register| {
             if (registerToIndex(register) >= plan.register_count) return error.InvalidInstructionRegisterRef;
         }
@@ -241,8 +299,28 @@ pub fn validateExecutionPlan(plan: *const ExecutionPlan) !void {
     }
 }
 
+pub fn validateExecutionPlanForBlockKind(plan: *const ExecutionPlan, kind: op_types.BlockKind) !void {
+    for (plan.instructions) |insn| {
+        if (!opcodeStateCompatibleWithBlockKind(insn.opcode, kind)) {
+            return error.InvalidStateDescriptorBinding;
+        }
+    }
+}
+
+pub fn planFinalOutputRegister(plan: *const ExecutionPlan) RegisterRef {
+    if (plan.instructions.len == 0) return registerFromIndex(0);
+    const last = plan.instructions[plan.instructions.len - 1];
+    if (last.outputs.len == 0) return registerFromIndex(0);
+    return last.outputs[last.outputs.len - 1];
+}
+
 pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
     try validateExecutionPlan(&compiled.plan);
+
+    for (compiled.weight_bindings, 0..) |binding, idx| {
+        if (binding.index != idx) return error.InvalidWeightBindingIndex;
+        if (binding.name.len == 0) return error.InvalidWeightBindingName;
+    }
 
     if (compiled.liveness.register_last_read.len != compiled.plan.register_count) {
         return error.InvalidLivenessRegisterCount;
@@ -257,6 +335,10 @@ pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
     if (compiled.peak_registers > compiled.plan.register_count) return error.InvalidPeakRegisters;
 
     for (compiled.plan.instructions) |insn| {
+        if (insn.weights.len != expectedWeightRefCount(insn.opcode)) return error.InvalidWeightRefCount;
+        for (insn.weights) |weight_ref| {
+            if (weight_ref.index >= compiled.weight_bindings.len) return error.InvalidWeightRefIndex;
+        }
         if (insn.param_block_id) |param_id| {
             if (param_id >= compiled.param_blocks.len) return error.UnknownParamBlockId;
             const param_block = compiled.param_blocks[param_id];
@@ -321,6 +403,106 @@ test "validateExecutionPlan detects invalid register references" {
     try std.testing.expectError(error.InvalidInstructionRegisterRef, validateExecutionPlan(&plan));
 }
 
+test "validateExecutionPlan rejects missing state binding for stateful opcode" {
+    const insn = Instruction{
+        .opcode = .multihead_attention,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 2,
+        .state_descs = &.{defaultStateDescriptor(.kv_cache)},
+    };
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, validateExecutionPlan(&plan));
+}
+
+test "validateExecutionPlan rejects mismatched state binding for opcode" {
+    const insn = Instruction{
+        .opcode = .multihead_attention,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = @intFromEnum(StateBlockId.shortconv),
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 2,
+        .state_descs = &.{
+            defaultStateDescriptor(.kv_cache),
+            defaultStateDescriptor(.shortconv),
+        },
+    };
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, validateExecutionPlan(&plan));
+}
+
+test "validateExecutionPlan rejects unexpected state binding for stateless opcode" {
+    const insn = Instruction{
+        .opcode = .residual_add,
+        .inputs = &.{ registerFromIndex(0), registerFromIndex(1) },
+        .outputs = &.{registerFromIndex(0)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = @intFromEnum(StateBlockId.kv_cache),
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 2,
+        .state_descs = &.{defaultStateDescriptor(.kv_cache)},
+    };
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, validateExecutionPlan(&plan));
+}
+
+test "validateExecutionPlanForBlockKind rejects incompatible stateful opcode for block kind" {
+    const insn = Instruction{
+        .opcode = .shortconv,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = @intFromEnum(StateBlockId.shortconv),
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 2,
+        .state_descs = &.{defaultStateDescriptor(.shortconv)},
+    };
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        validateExecutionPlanForBlockKind(&plan, .attention_mlp),
+    );
+}
+
+test "planFinalOutputRegister returns residual register for empty plan" {
+    const plan = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 0,
+        .state_descs = &.{},
+    };
+    try std.testing.expectEqual(@as(u16, 0), registerToIndex(planFinalOutputRegister(&plan)));
+}
+
+test "planFinalOutputRegister returns last instruction output register" {
+    const insn = Instruction{
+        .opcode = .split,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{ registerFromIndex(3), registerFromIndex(7) },
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 8,
+        .state_descs = &.{},
+    };
+    try std.testing.expectEqual(@as(u16, 7), registerToIndex(planFinalOutputRegister(&plan)));
+}
+
 test "validateCompiledPlan enforces liveness dimensions" {
     const insn = Instruction{
         .opcode = .rmsnorm,
@@ -342,11 +524,124 @@ test "validateCompiledPlan enforces liveness dimensions" {
     const compiled = CompiledPlan{
         .plan = plan,
         .param_blocks = &.{},
+        .weight_bindings = &.{},
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
     };
     try validateCompiledPlan(&compiled);
+}
+
+test "validateCompiledPlan rejects out-of-range instruction weight refs" {
+    const insn = Instruction{
+        .opcode = .linear,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{.{ .index = 1 }},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 2,
+        .state_descs = &.{},
+    };
+    const liveness = LivenessMap{
+        .register_last_read = &.{ 0, 0 },
+        .kill_after_instruction = &.{&.{0}},
+    };
+    const compiled = CompiledPlan{
+        .plan = plan,
+        .param_blocks = &.{},
+        .weight_bindings = &.{.{ .index = 0, .name = "w0" }},
+        .liveness = liveness,
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+    try std.testing.expectError(error.InvalidWeightRefIndex, validateCompiledPlan(&compiled));
+}
+
+test "validateCompiledPlan rejects invalid instruction weight ref count for opcode" {
+    const insn = Instruction{
+        .opcode = .add_param,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 2,
+        .state_descs = &.{},
+    };
+    const liveness = LivenessMap{
+        .register_last_read = &.{ 0, 0 },
+        .kill_after_instruction = &.{&.{0}},
+    };
+    const compiled = CompiledPlan{
+        .plan = plan,
+        .param_blocks = &.{},
+        .weight_bindings = &.{},
+        .liveness = liveness,
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+    try std.testing.expectError(error.InvalidWeightRefCount, validateCompiledPlan(&compiled));
+}
+
+test "instructionSingleWeightBindingName resolves configured binding name" {
+    const insn = Instruction{
+        .opcode = .linear,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{.{ .index = 0 }},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const compiled = CompiledPlan{
+        .plan = .{
+            .instructions = &.{insn},
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{.{ .index = 0, .name = "w0" }},
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{&.{0}},
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+    };
+    try std.testing.expectEqualStrings("w0", try instructionSingleWeightBindingName(&compiled, 0));
+}
+
+test "instructionSingleWeightBindingName rejects non-single weight arity" {
+    const insn = Instruction{
+        .opcode = .linear,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const compiled = CompiledPlan{
+        .plan = .{
+            .instructions = &.{insn},
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{},
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{&.{0}},
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+    };
+    try std.testing.expectError(error.InvalidWeightRefCount, instructionSingleWeightBindingName(&compiled, 0));
 }
 
 test "AdapterTable keeps 256 opcode slots" {
@@ -375,4 +670,21 @@ test "defaultStateDescriptor uses stable v1 compatibility defaults" {
     try std.testing.expectEqual(@as(u16, 64), kv_desc.align_bytes);
     try std.testing.expect(!kv_desc.zero_init);
     try std.testing.expectEqual(StateLifecycle.slot_persistent, kv_desc.lifecycle);
+}
+
+test "blockKindSupportsState maps canonical block-state compatibility" {
+    try std.testing.expect(blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.kv_cache)));
+    try std.testing.expect(blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.shortconv)));
+    try std.testing.expect(blockKindSupportsState(.mamba, @intFromEnum(StateBlockId.mamba)));
+    try std.testing.expect(!blockKindSupportsState(.attention_mlp, @intFromEnum(StateBlockId.shortconv)));
+    try std.testing.expect(!blockKindSupportsState(.shortconv, @intFromEnum(StateBlockId.kv_cache)));
+    try std.testing.expect(!blockKindSupportsState(.mamba, @intFromEnum(StateBlockId.kv_cache)));
+}
+
+test "opcodeStateCompatibleWithBlockKind enforces stateful opcode topology compatibility" {
+    try std.testing.expect(opcodeStateCompatibleWithBlockKind(.residual_add, .attention_mlp));
+    try std.testing.expect(opcodeStateCompatibleWithBlockKind(.multihead_attention, .attention_mlp));
+    try std.testing.expect(!opcodeStateCompatibleWithBlockKind(.multihead_attention, .shortconv));
+    try std.testing.expect(opcodeStateCompatibleWithBlockKind(.shortconv, .shortconv));
+    try std.testing.expect(!opcodeStateCompatibleWithBlockKind(.shortconv, .mamba));
 }
