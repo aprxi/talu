@@ -144,6 +144,968 @@ pub const Block = struct {
         return op_ptr.*;
     }
 
+    const BatchedDispatchMode = enum {
+        single_slot,
+        slot_batch,
+    };
+
+    const BatchedAdapterFn = *const fn (
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+        mode: BatchedDispatchMode,
+        slot_index: usize,
+        slot_indices: []const usize,
+    ) anyerror!void;
+
+    const batched_adapter_table: [256]?BatchedAdapterFn = blk: {
+        var table: [256]?BatchedAdapterFn = [_]?BatchedAdapterFn{null} ** 256;
+
+        table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.shortconv)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.embedding)] = batchedKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.residual_add)] = batchedResidualAddAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mul_scalar)] = batchedMulScalarAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.add_tensor)] = batchedAddTensorAdapter;
+
+        break :blk table;
+    };
+
+    fn dispatchBatchedInstruction(
+        self: *const Block,
+        opcode: runtime_contract.Opcode,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+        mode: BatchedDispatchMode,
+        slot_index: usize,
+        slot_indices: []const usize,
+    ) !void {
+        const adapter = batched_adapter_table[@intFromEnum(opcode)] orelse {
+            const op_name = @tagName(op);
+            error_context.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
+            return error.UnsupportedOpInBatchedMode;
+        };
+        try adapter(
+            self,
+            op_index,
+            op,
+            buffer_views,
+            scratch,
+            slot_ctx,
+            mode,
+            slot_index,
+            slot_indices,
+        );
+    }
+
+    fn batchedKernelAdapter(
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        _: *ScratchBuffer,
+        slot_ctx: SlotContext,
+        mode: BatchedDispatchMode,
+        slot_index: usize,
+        slot_indices: []const usize,
+    ) !void {
+        const kernel_op = switch (op) {
+            .kernel => |kernel| kernel,
+            else => return error.InvalidInstructionPayload,
+        };
+
+        const kernel_id: usize = @intCast(kernel_op.id);
+        if (kernel_id >= self.block.kernels.len) {
+            error_context.setContext("block={d}, kernel_id={d}, max={d}", .{
+                self.block_idx,
+                kernel_op.id,
+                self.block.kernels.len,
+            });
+            return error.KernelIndexOutOfBounds;
+        }
+
+        const kernel = self.block.kernels[kernel_id];
+        if (builtin.mode == .Debug) {
+            const actual_type = kernel.getOpType();
+            if (actual_type != kernel_op.debug_type) {
+                log.err("inference", "Graph/Kernel ordering mismatch", .{
+                    .block = self.block_idx,
+                    .kernel = kernel_op.id,
+                    .expected = @tagName(kernel_op.debug_type),
+                    .actual = @tagName(actual_type),
+                }, @src());
+                @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
+            }
+        }
+
+        const input = &buffer_views[@intFromEnum(kernel_op.in)];
+        const output = &buffer_views[@intFromEnum(kernel_op.out)];
+        switch (mode) {
+            .single_slot => try kernel.forwardBatched(input, output, slot_ctx, slot_index),
+            .slot_batch => try kernel.forwardBatchedSlots(input, output, slot_ctx, slot_indices),
+        }
+
+        _ = op_index;
+    }
+
+    fn batchedResidualAddAdapter(
+        self: *const Block,
+        _: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        _: *ScratchBuffer,
+        _: SlotContext,
+        _: BatchedDispatchMode,
+        _: usize,
+        _: []const usize,
+    ) !void {
+        const add_op = switch (op) {
+            .add => |add| add,
+            else => return error.InvalidInstructionPayload,
+        };
+        addIntoScaled(
+            &buffer_views[@intFromEnum(BufferId.residual)],
+            &buffer_views[@intFromEnum(add_op.branch)],
+            &buffer_views[@intFromEnum(BufferId.residual)],
+            self.residualScaleValue(add_op.scale),
+        );
+    }
+
+    fn batchedMulScalarAdapter(
+        _: *const Block,
+        _: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        _: SlotContext,
+        _: BatchedDispatchMode,
+        _: usize,
+        _: []const usize,
+    ) !void {
+        const mul_scalar_op = switch (op) {
+            .mul_scalar => |mul_op| mul_op,
+            else => return error.InvalidInstructionPayload,
+        };
+
+        const input_tensor = buffer_views[@intFromEnum(mul_scalar_op.in)];
+        const input_data = input_tensor.asSlice(f32);
+        const output_len = input_tensor.numel;
+
+        const output_slice = resolveOutputSlice(buffer_views, scratch, mul_scalar_op.out, output_len);
+        cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
+
+        buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(
+            output_slice[0..output_len],
+            input_tensor.shape,
+            input_tensor.n_dims,
+        );
+    }
+
+    fn batchedAddTensorAdapter(
+        _: *const Block,
+        _: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        _: SlotContext,
+        _: BatchedDispatchMode,
+        _: usize,
+        _: []const usize,
+    ) !void {
+        const add_tensor_op = switch (op) {
+            .add_tensor => |add_op| add_op,
+            else => return error.InvalidInstructionPayload,
+        };
+
+        const left_tensor = buffer_views[@intFromEnum(add_tensor_op.in_a)];
+        const right_tensor = buffer_views[@intFromEnum(add_tensor_op.in_b)];
+        const output_len = @max(left_tensor.numel, right_tensor.numel);
+
+        const output_slice = resolveOutputSlice(buffer_views, scratch, add_tensor_op.out, output_len);
+        try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
+            fn addScalar(lhs: f32, rhs: f32) f32 {
+                return lhs + rhs;
+            }
+        }.addScalar);
+
+        const output_shape = if (left_tensor.numel >= right_tensor.numel)
+            left_tensor.shape
+        else
+            right_tensor.shape;
+        const output_dims: i32 = if (left_tensor.numel >= right_tensor.numel)
+            left_tensor.n_dims
+        else
+            right_tensor.n_dims;
+        buffer_views[@intFromEnum(add_tensor_op.out)] = tensorFromSlice(
+            output_slice[0..output_len],
+            output_shape,
+            output_dims,
+        );
+    }
+
+    const SequentialAdapterFn = *const fn (
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+    ) anyerror!void;
+
+    const sequential_adapter_table: [256]?SequentialAdapterFn = blk: {
+        var table: [256]?SequentialAdapterFn = [_]?SequentialAdapterFn{null} ** 256;
+
+        table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.shortconv)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.embedding)] = sequentialKernelAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.residual_add)] = sequentialResidualAddAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.linear)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.matmul)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.split)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.softmax)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.silu)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.gelu)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mul)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.add_tensor)] = sequentialAddTensorAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.add_scalar)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mul_scalar)] = sequentialMulScalarAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mean)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.pow)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.rsqrt)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.add_param)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.add_param_scalar)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.mul_param)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.reshape)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.transpose)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.rope)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.triu)] = sequentialPrimitiveAdapter;
+        table[@intFromEnum(runtime_contract.Opcode.scaled_dot_product_attention)] = sequentialPrimitiveAdapter;
+
+        break :blk table;
+    };
+
+    fn dispatchSequentialInstruction(
+        self: *const Block,
+        opcode: runtime_contract.Opcode,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+    ) !void {
+        const adapter = sequential_adapter_table[@intFromEnum(opcode)] orelse {
+            const op_name = @tagName(op);
+            error_context.setContext("block={d}, op={d}, unsupported_op={s}", .{
+                self.block_idx,
+                op_index,
+                op_name,
+            });
+            return error.UnsupportedOpInSequentialMode;
+        };
+        try adapter(self, op_index, op, buffer_views, scratch, slot_ctx);
+    }
+
+    fn sequentialKernelAdapter(
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        _: *ScratchBuffer,
+        slot_ctx: SlotContext,
+    ) !void {
+        const kernel_op = switch (op) {
+            .kernel => |kernel| kernel,
+            else => return error.InvalidInstructionPayload,
+        };
+
+        const kernel_id: usize = @intCast(kernel_op.id);
+        if (kernel_id >= self.block.kernels.len) {
+            error_context.setContext("block={d}, kernel_id={d}, max={d}", .{
+                self.block_idx,
+                kernel_op.id,
+                self.block.kernels.len,
+            });
+            return error.KernelIndexOutOfBounds;
+        }
+        const kernel = self.block.kernels[kernel_id];
+        if (builtin.mode == .Debug) {
+            const actual_type = kernel.getOpType();
+            if (actual_type != kernel_op.debug_type) {
+                log.err("inference", "Graph/Kernel ordering mismatch", .{
+                    .block = self.block_idx,
+                    .kernel = kernel_op.id,
+                    .expected = @tagName(kernel_op.debug_type),
+                    .actual = @tagName(actual_type),
+                }, @src());
+                @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
+            }
+        }
+        const input = &buffer_views[@intFromEnum(kernel_op.in)];
+        const output = &buffer_views[@intFromEnum(kernel_op.out)];
+        try kernel.forward(input, output, slot_ctx);
+        _ = op_index;
+    }
+
+    fn sequentialResidualAddAdapter(
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+    ) !void {
+        try batchedResidualAddAdapter(self, op_index, op, buffer_views, scratch, slot_ctx, .single_slot, 0, &.{});
+    }
+
+    fn sequentialMulScalarAdapter(
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+    ) !void {
+        try batchedMulScalarAdapter(self, op_index, op, buffer_views, scratch, slot_ctx, .single_slot, 0, &.{});
+    }
+
+    fn sequentialAddTensorAdapter(
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+    ) !void {
+        try batchedAddTensorAdapter(self, op_index, op, buffer_views, scratch, slot_ctx, .single_slot, 0, &.{});
+    }
+
+    fn sequentialPrimitiveAdapter(
+        self: *const Block,
+        op_index: usize,
+        op: LayerOp,
+        buffer_views: *[64]Tensor,
+        scratch: *ScratchBuffer,
+        slot_ctx: SlotContext,
+    ) !void {
+        const seq_len: usize = @intCast(buffer_views[@intFromEnum(BufferId.residual)].shape[1]);
+        const slot_state = slot_ctx.slotState();
+        const use_cache = slot_ctx.use_cache;
+        switch (op) {
+            .linear => |linear_op| {
+                const weight = self.block.weight_registry.get(linear_op.weight_name) orelse {
+                    error_context.setContext("block={d}, op={d}, weight={s}", .{
+                        self.block_idx,
+                        op_index,
+                        linear_op.weight_name,
+                    });
+                    return error.MissingWeight;
+                };
+
+                const input_tensor = &buffer_views[@intFromEnum(linear_op.in)];
+                const output_features: usize = if (weight.dtype == .f32)
+                    @intCast(weight.shape[1])
+                else
+                    @intCast(weight.shape[0]);
+
+                const input_view = Tensor.view2D(
+                    input_tensor.data(),
+                    @intCast(input_tensor.shape[1]),
+                    @intCast(input_tensor.shape[2]),
+                );
+
+                const output_slice = blk: {
+                    const out_idx = @intFromEnum(linear_op.out);
+                    if (out_idx >= 3 and out_idx < cpu_forward.NUM_TMP_BUFFERS) {
+                        break :blk scratch.tmp[out_idx][0 .. seq_len * output_features];
+                    }
+                    if (linear_op.out == .norm_out) {
+                        break :blk scratch.tmp[1][0 .. seq_len * output_features];
+                    }
+
+                    const input_ptr = @intFromPtr(input_tensor.data().ptr);
+                    const branch_ptr = @intFromPtr(scratch.tmp[2].ptr);
+                    const input_aliases_branch = (input_ptr == branch_ptr);
+
+                    const residual_ptr = @intFromPtr(buffer_views[@intFromEnum(BufferId.residual)].data().ptr);
+                    const layer_tmp_buf_ptr = @intFromPtr(scratch.tmp[0].ptr);
+                    const residual_uses_layer_tmp = (residual_ptr == layer_tmp_buf_ptr);
+
+                    break :blk if (input_aliases_branch)
+                        if (residual_uses_layer_tmp)
+                            scratch.tmp[1][0 .. seq_len * output_features]
+                        else
+                            scratch.tmp[0][0 .. seq_len * output_features]
+                    else
+                        scratch.tmp[2][0 .. seq_len * output_features];
+                };
+
+                const out_byte_size = seq_len * output_features * @sizeOf(f32);
+                var output_view = Tensor.view2D(std.mem.sliceAsBytes(output_slice), seq_len, output_features);
+
+                const dk = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
+                    error_context.setContext("block={d}, op={d}, weight={s}, dtype={}", .{
+                        self.block_idx,
+                        op_index,
+                        linear_op.weight_name,
+                        weight.dtype,
+                    });
+                    return err;
+                };
+                dk.func(&input_view, weight, &output_view, &scratch.matmul_scratch);
+
+                const out_bytes = std.mem.sliceAsBytes(output_slice)[0..out_byte_size];
+                buffer_views[@intFromEnum(linear_op.out)] = Tensor.view(
+                    out_bytes.ptr,
+                    &.{ 1, seq_len, output_features },
+                    .f32,
+                    null,
+                );
+            },
+            .split => |split_op| {
+                const out_start_idx = @intFromEnum(split_op.out_start);
+                const max_outputs = cpu_forward.NUM_TMP_BUFFERS - out_start_idx;
+                if (out_start_idx < @intFromEnum(BufferId.tmp3) or split_op.num_outputs > max_outputs) {
+                    return error.TooManySplitOutputs;
+                }
+
+                const input_tensor = &buffer_views[@intFromEnum(split_op.in)];
+                const input_data = input_tensor.asSlice(f32);
+                const total_dim: usize = @intCast(input_tensor.shape[2]);
+
+                const attn_ptr = self.block.getAttention();
+                var actual_sizes: [3]usize = undefined;
+                if (split_op.num_outputs == 3 and attn_ptr != null) {
+                    const attn = attn_ptr.?;
+                    actual_sizes[0] = attn.n_heads * attn.head_dim;
+                    actual_sizes[1] = attn.n_kv_heads * attn.head_dim;
+                    actual_sizes[2] = attn.n_kv_heads * attn.head_dim;
+                } else if (split_op.num_outputs == 2) {
+                    actual_sizes[0] = total_dim / 2;
+                    actual_sizes[1] = total_dim / 2;
+                } else {
+                    for (0..split_op.num_outputs) |out_idx| {
+                        actual_sizes[out_idx] = total_dim / split_op.num_outputs;
+                    }
+                }
+
+                var out_slices: [3][]f32 = undefined;
+                var split_idx: u8 = 0;
+                while (split_idx < split_op.num_outputs) : (split_idx += 1) {
+                    const split_size: usize = actual_sizes[split_idx];
+                    const out_idx = @intFromEnum(split_op.out_start) + split_idx;
+                    const out_elems = seq_len * split_size;
+                    out_slices[split_idx] = scratch.tmp[out_idx][0..out_elems];
+                }
+                try cpu_layout.splitLastDimContiguous(
+                    input_data,
+                    seq_len,
+                    total_dim,
+                    actual_sizes[0..split_op.num_outputs],
+                    out_slices[0..split_op.num_outputs],
+                );
+
+                split_idx = 0;
+                while (split_idx < split_op.num_outputs) : (split_idx += 1) {
+                    const split_size: usize = actual_sizes[split_idx];
+                    const out_idx = @intFromEnum(split_op.out_start) + split_idx;
+                    const out_slice = out_slices[split_idx];
+                    const byte_size = out_slice.len * @sizeOf(f32);
+                    const out_bytes = std.mem.sliceAsBytes(out_slice)[0..byte_size];
+                    buffer_views[out_idx] = Tensor.view(
+                        out_bytes.ptr,
+                        &.{ 1, seq_len, split_size },
+                        .f32,
+                        null,
+                    );
+                }
+            },
+            .matmul => |matmul_op| {
+                const left_input = &buffer_views[@intFromEnum(matmul_op.in_a)];
+                const right_input = &buffer_views[@intFromEnum(matmul_op.in_b)];
+
+                const m_dim: usize = @intCast(left_input.shape[1]);
+                const n_dim: usize = @intCast(right_input.shape[1]);
+
+                const out_size = m_dim * n_dim;
+                const out_slice = scratch.tmp[0][0..out_size];
+                const out_byte_size = out_size * @sizeOf(f32);
+                var output_view = Tensor.view2D(std.mem.sliceAsBytes(out_slice), m_dim, n_dim);
+
+                const a_view = Tensor.view2D(
+                    left_input.data(),
+                    @intCast(left_input.shape[1]),
+                    @intCast(left_input.shape[2]),
+                );
+                const b_view = Tensor.view2D(
+                    right_input.data(),
+                    @intCast(right_input.shape[1]),
+                    @intCast(right_input.shape[2]),
+                );
+                try cpu_linalg.matmulAuto(&a_view, &b_view, &output_view, &scratch.matmul_scratch);
+
+                const out_bytes = std.mem.sliceAsBytes(out_slice)[0..out_byte_size];
+                buffer_views[@intFromEnum(matmul_op.out)] = Tensor.view(
+                    out_bytes.ptr,
+                    &.{ 1, m_dim, n_dim },
+                    .f32,
+                    null,
+                );
+            },
+            .softmax => |softmax_op| {
+                const input_tensor = &buffer_views[@intFromEnum(softmax_op.in)];
+                const output_tensor = &buffer_views[@intFromEnum(softmax_op.out)];
+                const input_view = tv.fromTensor(Tensor, input_tensor);
+                const output_view = tv.fromTensor(Tensor, output_tensor);
+                activation_ops.softmax(output_view, input_view);
+            },
+            .silu => |silu_op| {
+                const input_tensor = &buffer_views[@intFromEnum(silu_op.in)];
+                const output_tensor = &buffer_views[@intFromEnum(silu_op.out)];
+                const input_view = tv.fromTensor(Tensor, input_tensor);
+                const output_view = tv.fromTensor(Tensor, output_tensor);
+                activation_ops.silu(output_view, input_view);
+            },
+            .gelu => |gelu_op| {
+                const input_tensor = &buffer_views[@intFromEnum(gelu_op.in)];
+                const output_tensor = &buffer_views[@intFromEnum(gelu_op.out)];
+                const input_view = tv.fromTensor(Tensor, input_tensor);
+                const output_view = tv.fromTensor(Tensor, output_tensor);
+                activation_ops.gelu(output_view, input_view);
+            },
+            .mul => |mul_op| {
+                const left_tensor = buffer_views[@intFromEnum(mul_op.in)];
+                const right_tensor = buffer_views[@intFromEnum(mul_op.other)];
+                const output_len = @max(left_tensor.numel, right_tensor.numel);
+
+                const output_slice = resolveOutputSlice(buffer_views, scratch, mul_op.out, output_len);
+                try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
+                    fn multiply(a: f32, b: f32) f32 {
+                        return a * b;
+                    }
+                }.multiply);
+
+                const output_shape = if (left_tensor.numel >= right_tensor.numel)
+                    left_tensor.shape
+                else
+                    right_tensor.shape;
+                const output_dims: i32 = if (left_tensor.numel >= right_tensor.numel)
+                    left_tensor.n_dims
+                else
+                    right_tensor.n_dims;
+                buffer_views[@intFromEnum(mul_op.out)] = tensorFromSlice(
+                    output_slice[0..output_len],
+                    output_shape,
+                    output_dims,
+                );
+            },
+            .add_scalar => |add_scalar_op| {
+                const input_tensor = buffer_views[@intFromEnum(add_scalar_op.in)];
+                const input_data = input_tensor.asSlice(f32);
+                const output_len = input_tensor.numel;
+                const output_slice = resolveOutputSlice(buffer_views, scratch, add_scalar_op.out, output_len);
+                cpu_elementwise.addScalar(input_data, output_slice[0..output_len], add_scalar_op.scalar);
+
+                buffer_views[@intFromEnum(add_scalar_op.out)] = tensorFromSlice(
+                    output_slice[0..output_len],
+                    input_tensor.shape,
+                    input_tensor.n_dims,
+                );
+            },
+            .mean => |mean_op| {
+                const input_tensor = buffer_views[@intFromEnum(mean_op.in)];
+                const input_data = input_tensor.asSlice(f32);
+
+                if (input_tensor.n_dims == 4) {
+                    if (mean_op.dim != -1 and mean_op.dim != 3) return error.UnsupportedMeanDim;
+
+                    const mean_seq_len: usize = @intCast(input_tensor.shape[1]);
+                    const head_count: usize = @intCast(input_tensor.shape[2]);
+                    const hidden_size: usize = @intCast(input_tensor.shape[3]);
+                    const output_len = mean_seq_len * head_count;
+                    const output_slice = resolveOutputSlice(buffer_views, scratch, mean_op.out, output_len);
+                    try cpu_reduction.meanLastDim4D(
+                        input_data,
+                        mean_seq_len,
+                        head_count,
+                        hidden_size,
+                        output_slice[0..output_len],
+                    );
+
+                    const mean_shape: [8]i64 = if (mean_op.keepdim)
+                        .{
+                            1,
+                            @as(i64, @intCast(mean_seq_len)),
+                            @as(i64, @intCast(head_count)),
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                        }
+                    else
+                        .{
+                            1,
+                            @as(i64, @intCast(mean_seq_len)),
+                            @as(i64, @intCast(head_count)),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        };
+                    const mean_dims: i32 = if (mean_op.keepdim) 4 else 3;
+                    buffer_views[@intFromEnum(mean_op.out)] = tensorFromSlice(
+                        output_slice[0..output_len],
+                        mean_shape,
+                        mean_dims,
+                    );
+                } else {
+                    if (mean_op.dim != -1 and mean_op.dim != 2) return error.UnsupportedMeanDim;
+
+                    const mean_seq_len_3d: usize = @intCast(input_tensor.shape[1]);
+                    const hidden_size: usize = @intCast(input_tensor.shape[2]);
+                    const output_len = mean_seq_len_3d;
+                    const output_slice = resolveOutputSlice(buffer_views, scratch, mean_op.out, output_len);
+                    try cpu_reduction.meanLastDim3D(
+                        input_data,
+                        mean_seq_len_3d,
+                        hidden_size,
+                        output_slice[0..output_len],
+                    );
+
+                    const mean_shape_3d: [8]i64 = if (mean_op.keepdim)
+                        .{
+                            1,
+                            @as(i64, @intCast(mean_seq_len_3d)),
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        }
+                    else
+                        .{
+                            1,
+                            @as(i64, @intCast(mean_seq_len_3d)),
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                        };
+                    const mean_dims_3d: i32 = if (mean_op.keepdim) 3 else 2;
+                    buffer_views[@intFromEnum(mean_op.out)] = tensorFromSlice(
+                        output_slice[0..output_len],
+                        mean_shape_3d,
+                        mean_dims_3d,
+                    );
+                }
+            },
+            .pow => |pow_op| {
+                const input_tensor = buffer_views[@intFromEnum(pow_op.in)];
+                const input_data = input_tensor.asSlice(f32);
+                const output_len = input_tensor.numel;
+                const output_slice = resolveOutputSlice(buffer_views, scratch, pow_op.out, output_len);
+                cpu_elementwise.powScalar(input_data, output_slice[0..output_len], pow_op.exponent);
+
+                buffer_views[@intFromEnum(pow_op.out)] = tensorFromSlice(
+                    output_slice[0..output_len],
+                    input_tensor.shape,
+                    input_tensor.n_dims,
+                );
+            },
+            .rsqrt => |rsqrt_op| {
+                const input_tensor = buffer_views[@intFromEnum(rsqrt_op.in)];
+                const input_data = input_tensor.asSlice(f32);
+                const output_len = input_tensor.numel;
+                const output_slice = resolveOutputSlice(buffer_views, scratch, rsqrt_op.out, output_len);
+                cpu_elementwise.rsqrt(input_data, output_slice[0..output_len]);
+
+                buffer_views[@intFromEnum(rsqrt_op.out)] = tensorFromSlice(
+                    output_slice[0..output_len],
+                    input_tensor.shape,
+                    input_tensor.n_dims,
+                );
+            },
+            .add_param => |add_param_op| {
+                const input_tensor = buffer_views[@intFromEnum(add_param_op.in)];
+                const param = self.block.weight_registry.get(add_param_op.param_name) orelse return error.MissingParam;
+
+                const output_len = @max(input_tensor.numel, param.numel);
+                const output_slice = resolveOutputSlice(buffer_views, scratch, add_param_op.out, output_len);
+                try cpu_broadcast.addParam(input_tensor, param, output_slice[0..output_len]);
+
+                buffer_views[@intFromEnum(add_param_op.out)] = tensorFromSlice(
+                    output_slice[0..output_len],
+                    input_tensor.shape,
+                    input_tensor.n_dims,
+                );
+            },
+            .add_param_scalar => |add_param_scalar_op| {
+                const param = self.block.weight_registry.get(add_param_scalar_op.param_name) orelse return error.MissingParam;
+                const p_len = param.numel;
+                const output_slice = resolveOutputSlice(buffer_views, scratch, add_param_scalar_op.out, p_len);
+                cpu_broadcast.addParamScalar(param, output_slice[0..p_len], add_param_scalar_op.scalar);
+
+                buffer_views[@intFromEnum(add_param_scalar_op.out)] = tensorFromSlice(
+                    output_slice[0..p_len],
+                    param.shape,
+                    param.n_dims,
+                );
+            },
+            .mul_param => |mul_param_op| {
+                const input_tensor = buffer_views[@intFromEnum(mul_param_op.in)];
+                const param = self.block.weight_registry.get(mul_param_op.param_name) orelse return error.MissingParam;
+
+                const output_len = @max(input_tensor.numel, param.numel);
+                const output_slice = resolveOutputSlice(buffer_views, scratch, mul_param_op.out, output_len);
+                try cpu_broadcast.mulParam(input_tensor, param, output_slice[0..output_len]);
+
+                buffer_views[@intFromEnum(mul_param_op.out)] = tensorFromSlice(
+                    output_slice[0..output_len],
+                    input_tensor.shape,
+                    input_tensor.n_dims,
+                );
+            },
+            .reshape => |reshape_op| {
+                const input_tensor = &buffer_views[@intFromEnum(reshape_op.in)];
+                var output_tensor = input_tensor.*;
+
+                if (reshape_op.shape.len > 0) {
+                    var out_shape: [8]i64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
+                    var inferred_dim_idx: ?usize = null;
+                    var known_product: usize = 1;
+                    const total_elems = input_tensor.numel;
+
+                    const n_dims: usize = @min(reshape_op.shape.len, out_shape.len);
+                    for (reshape_op.shape[0..n_dims], 0..) |dim, dim_idx| {
+                        if (dim == -1) {
+                            inferred_dim_idx = dim_idx;
+                            continue;
+                        }
+                        const resolved: i64 = switch (dim) {
+                            -2 => input_tensor.shape[0],
+                            -3 => input_tensor.shape[1],
+                            else => dim,
+                        };
+                        out_shape[dim_idx] = resolved;
+                        known_product *= @intCast(resolved);
+                    }
+
+                    if (inferred_dim_idx) |dim_idx| {
+                        if (known_product == 0) return error.InvalidReshape;
+                        out_shape[dim_idx] = @intCast(total_elems / known_product);
+                    }
+
+                    output_tensor.shape = out_shape;
+                    output_tensor.n_dims = @intCast(n_dims);
+                } else if (input_tensor.n_dims == 3) {
+                    const reshape_seq_len = input_tensor.shape[1];
+                    const hidden = input_tensor.shape[2];
+                    const attn_info = self.block.getAttention() orelse return error.AttentionNotAvailable;
+                    const heads: i64 = @intCast(attn_info.n_heads);
+                    const kv_heads: i64 = @intCast(attn_info.n_kv_heads);
+                    const head_dim: i64 = @intCast(attn_info.head_dim);
+                    if (hidden == heads * head_dim) {
+                        output_tensor.shape = .{ 1, reshape_seq_len, heads, head_dim, 0, 0, 0, 0 };
+                        output_tensor.n_dims = 4;
+                    } else if (hidden == kv_heads * head_dim) {
+                        output_tensor.shape = .{ 1, reshape_seq_len, kv_heads, head_dim, 0, 0, 0, 0 };
+                        output_tensor.n_dims = 4;
+                    }
+                } else if (input_tensor.n_dims == 4) {
+                    const reshape_seq_len_4d = input_tensor.shape[1];
+                    const heads = input_tensor.shape[2];
+                    const head_dim = input_tensor.shape[3];
+                    output_tensor.shape = .{ 1, reshape_seq_len_4d, heads * head_dim, 0, 0, 0, 0, 0 };
+                    output_tensor.n_dims = 3;
+                }
+
+                buffer_views[@intFromEnum(reshape_op.out)] = output_tensor;
+            },
+            .transpose => |transpose_op| {
+                const in_tensor = &buffer_views[@intFromEnum(transpose_op.in)];
+                const out_len = in_tensor.numel;
+                const out_slice = resolveOutputSlice(buffer_views, scratch, transpose_op.out, out_len);
+
+                const ndim: usize = @intCast(in_tensor.n_dims);
+                const dim0: usize = if (transpose_op.dim0 < 0)
+                    @intCast(@as(i64, @intCast(ndim)) + transpose_op.dim0)
+                else
+                    @intCast(transpose_op.dim0);
+                const dim1: usize = if (transpose_op.dim1 < 0)
+                    @intCast(@as(i64, @intCast(ndim)) + transpose_op.dim1)
+                else
+                    @intCast(transpose_op.dim1);
+
+                var in_shape_dims: [8]usize = undefined;
+                for (0..ndim) |dim_idx| in_shape_dims[dim_idx] = @intCast(in_tensor.shape[dim_idx]);
+                for (ndim..8) |dim_idx| in_shape_dims[dim_idx] = 0;
+
+                var out_shape_dims: [8]usize = in_shape_dims;
+                const tmp_dim = out_shape_dims[dim0];
+                out_shape_dims[dim0] = out_shape_dims[dim1];
+                out_shape_dims[dim1] = tmp_dim;
+
+                const in_view = tv.TensorView.initContiguous(
+                    in_tensor.data_ptr.?,
+                    in_shape_dims[0..ndim],
+                    .f32,
+                );
+                const out_view = tv.TensorView.initContiguous(
+                    @ptrCast(out_slice.ptr),
+                    out_shape_dims[0..ndim],
+                    .f32,
+                );
+                transpose_ops.transposeDispatch(out_view, in_view, dim0, dim1);
+
+                var out_shape_i64: [8]i64 = in_tensor.shape;
+                const tmp_i64 = out_shape_i64[dim0];
+                out_shape_i64[dim0] = out_shape_i64[dim1];
+                out_shape_i64[dim1] = tmp_i64;
+                buffer_views[@intFromEnum(transpose_op.out)] = tensorFromSlice(
+                    out_slice[0..out_len],
+                    out_shape_i64,
+                    in_tensor.n_dims,
+                );
+            },
+            .rope => |rope_op| {
+                const in_tensor = &buffer_views[@intFromEnum(rope_op.in)];
+                const input_data = in_tensor.asSlice(f32);
+
+                const attn = self.block.getAttention() orelse {
+                    error_context.setContext("block={d}, op={d}, type=mamba", .{ self.block_idx, op_index });
+                    return error.RopeNotAvailableForMamba;
+                };
+                const rope = attn.rope orelse {
+                    error_context.setContext("block={d}, op={d}", .{ self.block_idx, op_index });
+                    return error.MissingRopeConfig;
+                };
+                const pos_offset = if (use_cache and slot_state.attn_cache != null)
+                    slot_state.attn_cache.?.cache_position
+                else
+                    0;
+                cpu_rotary.applyRopeTensorInPlace(
+                    input_data,
+                    @intCast(in_tensor.n_dims),
+                    in_tensor.shape,
+                    rope.dim,
+                    pos_offset,
+                    rope,
+                ) catch |err| {
+                    error_context.setContext("block={d}, op={d}, ndim={d}", .{
+                        self.block_idx,
+                        op_index,
+                        in_tensor.n_dims,
+                    });
+                    return err;
+                };
+
+                if (rope_op.in != rope_op.out) {
+                    const out_slice = resolveOutputSlice(buffer_views, scratch, rope_op.out, in_tensor.numel);
+                    @memcpy(out_slice, input_data);
+                    buffer_views[@intFromEnum(rope_op.out)] = tensorFromSlice(
+                        out_slice[0..in_tensor.numel],
+                        in_tensor.shape,
+                        in_tensor.n_dims,
+                    );
+                }
+            },
+            .triu => |triu_op| {
+                const in_tensor = &buffer_views[@intFromEnum(triu_op.in)];
+                const out_buf = &buffer_views[@intFromEnum(triu_op.out)];
+                const data = in_tensor.asSlice(f32);
+                const out_data = out_buf.asSlice(f32);
+
+                const n_dims: usize = @intCast(in_tensor.n_dims);
+                const rows: usize = @intCast(in_tensor.shape[n_dims - 2]);
+                const cols: usize = @intCast(in_tensor.shape[n_dims - 1]);
+                cpu_masking.triu(data, out_data, rows, cols, triu_op.diagonal);
+            },
+            .sdpa => |sdpa_op| {
+                const query_buf = &buffer_views[@intFromEnum(sdpa_op.q)];
+                const key_buf = &buffer_views[@intFromEnum(sdpa_op.k)];
+                const value_buf = &buffer_views[@intFromEnum(sdpa_op.v)];
+
+                if (query_buf.n_dims != 4) {
+                    error_context.setContext("block={d}, op={d}, got {d}D, need 4D", .{
+                        self.block_idx,
+                        op_index,
+                        query_buf.n_dims,
+                    });
+                    return error.InvalidShape;
+                }
+
+                const batch: usize = @intCast(query_buf.shape[0]);
+                const n_heads: usize = @intCast(query_buf.shape[1]);
+                const seq_q: usize = @intCast(query_buf.shape[2]);
+                const head_dim: usize = @intCast(query_buf.shape[3]);
+                const seq_k: usize = @intCast(key_buf.shape[2]);
+                const scale = sdpa_op.scale orelse 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+                const out_numel = batch * n_heads * seq_q * head_dim;
+                const out_slice = resolveOutputSlice(buffer_views, scratch, sdpa_op.out, out_numel);
+
+                const q_shape = [_]usize{ batch, n_heads, seq_q, head_dim };
+                const k_shape = [_]usize{ batch, n_heads, seq_k, head_dim };
+                const v_shape = [_]usize{ batch, n_heads, seq_k, head_dim };
+                const out_shape = [_]usize{ batch, n_heads, seq_q, head_dim };
+
+                const q_view = tv.TensorView.initContiguous(query_buf.data_ptr.?, &q_shape, .f32);
+                const k_view = tv.TensorView.initContiguous(key_buf.data_ptr.?, &k_shape, .f32);
+                const v_view = tv.TensorView.initContiguous(value_buf.data_ptr.?, &v_shape, .f32);
+                const out_view = tv.TensorView.initContiguous(@ptrCast(out_slice.ptr), &out_shape, .f32);
+
+                if (sdpa_op.is_causal) {
+                    attention_ops.sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, scratch.allocator) catch |err| {
+                        error_context.setContext("block={d}, op={d}, causal=true", .{ self.block_idx, op_index });
+                        return err;
+                    };
+                } else {
+                    attention_ops.sdpa(out_view, q_view, k_view, v_view, null, scale, scratch.allocator) catch |err| {
+                        error_context.setContext("block={d}, op={d}, causal=false", .{ self.block_idx, op_index });
+                        return err;
+                    };
+                }
+
+                const sdpa_shape: [8]i64 = .{
+                    @as(i64, @intCast(batch)),
+                    @as(i64, @intCast(n_heads)),
+                    @as(i64, @intCast(seq_q)),
+                    @as(i64, @intCast(head_dim)),
+                    0,
+                    0,
+                    0,
+                    0,
+                };
+                buffer_views[@intFromEnum(sdpa_op.out)] = tensorFromSlice(
+                    out_slice[0..out_numel],
+                    sdpa_shape,
+                    4,
+                );
+            },
+            else => return error.InvalidInstructionPayload,
+        }
+    }
+
     fn residualScaleValue(self: *const Block, scale: ResidualScale) f32 {
         return switch (scale) {
             .one => 1.0,
@@ -277,640 +1239,16 @@ pub const Block = struct {
         };
 
         // Execute the operation sequence
-        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+        for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
             const op = try self.decodeInstructionOp(op_index);
-            switch (op) {
-                .kernel => |kernel_op| {
-                    const kernel_id: usize = @intCast(kernel_op.id);
-                    if (kernel_id >= self.block.kernels.len) {
-                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
-                        return error.KernelIndexOutOfBounds;
-                    }
-                    const kernel = self.block.kernels[kernel_id];
-                    if (builtin.mode == .Debug) {
-                        const actual_type = kernel.getOpType();
-                        if (actual_type != kernel_op.debug_type) {
-                            log.err("inference", "Graph/Kernel ordering mismatch", .{
-                                .block = self.block_idx,
-                                .kernel = kernel_op.id,
-                                .expected = @tagName(kernel_op.debug_type),
-                                .actual = @tagName(actual_type),
-                            }, @src());
-                            @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
-                        }
-                    }
-                    const input = &buffer_views[@intFromEnum(kernel_op.in)];
-                    const output = &buffer_views[@intFromEnum(kernel_op.out)];
-                    try kernel.forward(input, output, ctx);
-                },
-                .add => |add_op| {
-                    addIntoScaled(
-                        &buffer_views[@intFromEnum(BufferId.residual)],
-                        &buffer_views[@intFromEnum(add_op.branch)],
-                        &buffer_views[@intFromEnum(BufferId.residual)],
-                        self.residualScaleValue(add_op.scale),
-                    );
-                },
-
-                // =========================================================================
-                // Low-level primitive ops for custom attention/MLP implementations
-                // =========================================================================
-
-                .linear => |linear_op| {
-                    // Linear projection: output = input @ weight
-                    // Look up weight from registry by name
-                    const weight = self.block.weight_registry.get(linear_op.weight_name) orelse {
-                        error_context.setContext("block={d}, op={d}, weight={s}", .{ self.block_idx, op_index, linear_op.weight_name });
-                        return error.MissingWeight;
-                    };
-
-                    const input_tensor = &buffer_views[@intFromEnum(linear_op.in)];
-                    const output_features: usize = if (weight.dtype == .f32)
-                        @intCast(weight.shape[1]) // f32 weights are [in, out]
-                    else
-                        @intCast(weight.shape[0]); // bf16/f16/quantized weights are [out, in]
-
-                    // Create 2D views for matmul
-                    // Input: use buffer's current shape
-                    const input_view = Tensor.view2D(input_tensor.data(), @intCast(input_tensor.shape[1]), @intCast(input_tensor.shape[2]));
-
-                    // Output buffer selection:
-                    // Default to scratch.tmp[2] (branch_out), but if input is also in tmp[2], we must use an alternate buffer
-                    // to avoid aliasing (matmul cannot handle overlapping input/output).
-                    // IMPORTANT: For odd-indexed layers, the residual buffer (`out`) points to layer_tmp (tmp[0]),
-                    // so we can't use layer_tmp as escape hatch - use tmp[1] (norm_out) instead.
-                    const output_slice = blk: {
-                        // Direct output to specific buffer_views if requested
-                        const out_idx = @intFromEnum(linear_op.out);
-                        if (out_idx >= 3 and out_idx < cpu_forward.NUM_TMP_BUFFERS) {
-                            break :blk scratch.tmp[out_idx][0 .. seq_len * output_features];
-                        }
-                        if (linear_op.out == .norm_out) {
-                            break :blk scratch.tmp[1][0 .. seq_len * output_features];
-                        }
-
-                        const input_ptr = @intFromPtr(input_tensor.data().ptr);
-                        const branch_ptr = @intFromPtr(scratch.tmp[2].ptr);
-                        const input_aliases_branch = (input_ptr == branch_ptr);
-
-                        // Check if residual uses layer_tmp (odd-indexed layers)
-                        const residual_ptr = @intFromPtr(buffer_views[@intFromEnum(BufferId.residual)].data().ptr);
-                        const layer_tmp_buf_ptr = @intFromPtr(scratch.tmp[0].ptr); // tmp[0] is layer_tmp
-                        const residual_uses_layer_tmp = (residual_ptr == layer_tmp_buf_ptr);
-
-                        break :blk if (input_aliases_branch)
-                            // Use tmp[1] (norm_out) if residual is in layer_tmp, otherwise use layer_tmp
-                            if (residual_uses_layer_tmp)
-                                scratch.tmp[1][0 .. seq_len * output_features]
-                            else
-                                scratch.tmp[0][0 .. seq_len * output_features]
-                        else
-                            scratch.tmp[2][0 .. seq_len * output_features];
-                    };
-
-                    const out_byte_size = seq_len * output_features * @sizeOf(f32);
-                    var output_view = Tensor.view2D(std.mem.sliceAsBytes(output_slice), seq_len, output_features);
-
-                    // Use the appropriate matmul kernel based on weight dtype
-                    const dk = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
-                        error_context.setContext("block={d}, op={d}, weight={s}, dtype={}", .{ self.block_idx, op_index, linear_op.weight_name, weight.dtype });
-                        return err;
-                    };
-                    dk.func(&input_view, weight, &output_view, &scratch.matmul_scratch);
-
-                    // Update output buffer to point to the result with correct shape
-                    const out_bytes = std.mem.sliceAsBytes(output_slice)[0..out_byte_size];
-                    buffer_views[@intFromEnum(linear_op.out)] = Tensor.view(out_bytes.ptr, &.{ 1, seq_len, output_features }, .f32, null);
-                },
-
-                .split => |split_op| {
-                    // Split tensor along last dimension into multiple outputs
-                    // Input is [1, seq, total_dim], outputs are [1, seq, split_size_i]
-
-                    // Guard: num_outputs must fit in scratch buffer array starting at out_start.
-                    const out_start_idx = @intFromEnum(split_op.out_start);
-                    const max_outputs = cpu_forward.NUM_TMP_BUFFERS - out_start_idx;
-                    if (out_start_idx < @intFromEnum(BufferId.tmp3) or split_op.num_outputs > max_outputs) {
-                        return error.TooManySplitOutputs;
-                    }
-
-                    const input_tensor = &buffer_views[@intFromEnum(split_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-
-                    // For 3D tensor [1, seq, dim], we split along dim (last axis)
-                    const total_dim: usize = @intCast(input_tensor.shape[2]); // Last dimension
-
-                    // Calculate actual split sizes
-                    // The traced split_sizes may be from dummy config, so compute from model params:
-                    // For QKV split: use n_heads, n_kv_heads, head_dim
-                    // For gate_up split: use intermediate_size
-                    const attn_ptr = self.block.getAttention();
-
-                    var actual_sizes: [3]usize = undefined; // filled based on split type below
-                    if (split_op.num_outputs == 3 and attn_ptr != null) {
-                        // QKV split: [Q, K, V] = [n_heads*head_dim, n_kv_heads*head_dim, n_kv_heads*head_dim]
-                        const attn = attn_ptr.?;
-                        actual_sizes[0] = attn.n_heads * attn.head_dim;
-                        actual_sizes[1] = attn.n_kv_heads * attn.head_dim;
-                        actual_sizes[2] = attn.n_kv_heads * attn.head_dim;
-                    } else if (split_op.num_outputs == 2) {
-                        // gate_up split: equal halves
-                        actual_sizes[0] = total_dim / 2;
-                        actual_sizes[1] = total_dim / 2;
-                    } else {
-                        // Default: equal split
-                        for (0..split_op.num_outputs) |out_idx| {
-                            actual_sizes[out_idx] = total_dim / split_op.num_outputs;
-                        }
-                    }
-
-                    var out_slices: [3][]f32 = undefined;
-                    var split_idx: u8 = 0;
-                    while (split_idx < split_op.num_outputs) : (split_idx += 1) {
-                        const split_size: usize = actual_sizes[split_idx];
-                        const out_idx = @intFromEnum(split_op.out_start) + split_idx;
-                        const out_elems = seq_len * split_size;
-                        out_slices[split_idx] = scratch.tmp[out_idx][0..out_elems];
-                    }
-                    try cpu_layout.splitLastDimContiguous(
-                        input_data,
-                        seq_len,
-                        total_dim,
-                        actual_sizes[0..split_op.num_outputs],
-                        out_slices[0..split_op.num_outputs],
-                    );
-
-                    split_idx = 0;
-                    while (split_idx < split_op.num_outputs) : (split_idx += 1) {
-                        const split_size: usize = actual_sizes[split_idx];
-                        const out_idx = @intFromEnum(split_op.out_start) + split_idx;
-                        const out_slice = out_slices[split_idx];
-                        const byte_size = out_slice.len * @sizeOf(f32);
-                        const out_bytes = std.mem.sliceAsBytes(out_slice)[0..byte_size];
-                        buffer_views[out_idx] = Tensor.view(out_bytes.ptr, &.{ 1, seq_len, split_size }, .f32, null);
-                    }
-                },
-
-                .matmul => |matmul_op| {
-                    // Matrix multiplication: out = a @ b
-                    const left_input = &buffer_views[@intFromEnum(matmul_op.in_a)];
-                    const right_input = &buffer_views[@intFromEnum(matmul_op.in_b)];
-
-                    // Compute output dimensions: [m, k] @ [k, n] = [m, n]
-                    // For attention Q@K: [seq, head_dim] @ [seq, head_dim].T = [seq, seq]
-                    // Note: matmul uses BF16 convention where B is [n, k] not [k, n]
-                    const m_dim: usize = @intCast(left_input.shape[1]); // seq
-                    const n_dim: usize = @intCast(right_input.shape[1]); // For Q@K, this would be seq (after reshape)
-
-                    // Allocate output using layer_tmp (tmp[0])
-                    const out_size = m_dim * n_dim;
-                    const out_slice = scratch.tmp[0][0..out_size];
-                    const out_byte_size = out_size * @sizeOf(f32);
-
-                    // Create output tensor view
-                    var output_view = Tensor.view2D(std.mem.sliceAsBytes(out_slice), m_dim, n_dim);
-
-                    // Create 2D views for inputs
-                    const a_view = Tensor.view2D(left_input.data(), @intCast(left_input.shape[1]), @intCast(left_input.shape[2]));
-                    const b_view = Tensor.view2D(right_input.data(), @intCast(right_input.shape[1]), @intCast(right_input.shape[2]));
-
-                    try cpu_linalg.matmulAuto(&a_view, &b_view, &output_view, &scratch.matmul_scratch);
-
-                    // Store result in buffer
-                    const out_bytes = std.mem.sliceAsBytes(out_slice)[0..out_byte_size];
-                    buffer_views[@intFromEnum(matmul_op.out)] = Tensor.view(out_bytes.ptr, &.{ 1, m_dim, n_dim }, .f32, null);
-                },
-
-                .softmax => |softmax_op| {
-                    // Softmax activation
-                    const input_tensor = &buffer_views[@intFromEnum(softmax_op.in)];
-                    const output_tensor = &buffer_views[@intFromEnum(softmax_op.out)];
-
-                    const input_view = tv.fromTensor(Tensor, input_tensor);
-                    const output_view = tv.fromTensor(Tensor, output_tensor);
-                    activation_ops.softmax(output_view, input_view);
-                },
-
-                .silu => |silu_op| {
-                    // SiLU/Swish activation
-                    const input_tensor = &buffer_views[@intFromEnum(silu_op.in)];
-                    const output_tensor = &buffer_views[@intFromEnum(silu_op.out)];
-
-                    const input_view = tv.fromTensor(Tensor, input_tensor);
-                    const output_view = tv.fromTensor(Tensor, output_tensor);
-                    activation_ops.silu(output_view, input_view);
-                },
-
-                .gelu => |gelu_op| {
-                    // GELU activation
-                    const input_tensor = &buffer_views[@intFromEnum(gelu_op.in)];
-                    const output_tensor = &buffer_views[@intFromEnum(gelu_op.out)];
-
-                    const input_view = tv.fromTensor(Tensor, input_tensor);
-                    const output_view = tv.fromTensor(Tensor, output_tensor);
-                    activation_ops.gelu(output_view, input_view);
-                },
-
-                .mul => |mul_op| {
-                    // Element-wise multiply (with broadcasting)
-                    const left_tensor = buffer_views[@intFromEnum(mul_op.in)];
-                    const right_tensor = buffer_views[@intFromEnum(mul_op.other)];
-                    const output_len = @max(left_tensor.numel, right_tensor.numel);
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_op.out, output_len);
-                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
-                        fn multiply(a: f32, b: f32) f32 {
-                            return a * b;
-                        }
-                    }.multiply);
-
-                    const output_shape = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.shape
-                    else
-                        right_tensor.shape;
-                    const output_dims: i32 = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.n_dims
-                    else
-                        right_tensor.n_dims;
-                    buffer_views[@intFromEnum(mul_op.out)] = tensorFromSlice(output_slice[0..output_len], output_shape, output_dims);
-                },
-
-                .add_tensor => |add_tensor_op| {
-                    // Element-wise add (with broadcasting)
-                    const left_tensor = buffer_views[@intFromEnum(add_tensor_op.in_a)];
-                    const right_tensor = buffer_views[@intFromEnum(add_tensor_op.in_b)];
-                    const output_len = @max(left_tensor.numel, right_tensor.numel);
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, add_tensor_op.out, output_len);
-                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
-                        fn addScalar(lhs: f32, rhs: f32) f32 {
-                            return lhs + rhs;
-                        }
-                    }.addScalar);
-
-                    const output_shape = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.shape
-                    else
-                        right_tensor.shape;
-                    const output_dims: i32 = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.n_dims
-                    else
-                        right_tensor.n_dims;
-                    buffer_views[@intFromEnum(add_tensor_op.out)] = tensorFromSlice(output_slice[0..output_len], output_shape, output_dims);
-                },
-
-                .add_scalar => |add_scalar_op| {
-                    const input_tensor = buffer_views[@intFromEnum(add_scalar_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-                    const output_len = input_tensor.numel;
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, add_scalar_op.out, output_len);
-                    cpu_elementwise.addScalar(input_data, output_slice[0..output_len], add_scalar_op.scalar);
-
-                    buffer_views[@intFromEnum(add_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-
-                .mul_scalar => |mul_scalar_op| {
-                    const input_tensor = buffer_views[@intFromEnum(mul_scalar_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-                    const output_len = input_tensor.numel;
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_scalar_op.out, output_len);
-                    cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
-
-                    buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-
-                .mean => |mean_op| {
-                    const input_tensor = buffer_views[@intFromEnum(mean_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-
-                    if (input_tensor.n_dims == 4) {
-                        if (mean_op.dim != -1 and mean_op.dim != 3) return error.UnsupportedMeanDim;
-
-                        const mean_seq_len: usize = @intCast(input_tensor.shape[1]);
-                        const head_count: usize = @intCast(input_tensor.shape[2]);
-                        const hidden_size: usize = @intCast(input_tensor.shape[3]);
-                        const output_len = mean_seq_len * head_count;
-                        const output_slice = resolveOutputSlice(&buffer_views, scratch, mean_op.out, output_len);
-                        try cpu_reduction.meanLastDim4D(input_data, mean_seq_len, head_count, hidden_size, output_slice[0..output_len]);
-
-                        const mean_shape: [8]i64 = if (mean_op.keepdim) .{ 1, @as(i64, @intCast(mean_seq_len)), @as(i64, @intCast(head_count)), 1, 0, 0, 0, 0 } else .{ 1, @as(i64, @intCast(mean_seq_len)), @as(i64, @intCast(head_count)), 0, 0, 0, 0, 0 };
-                        const mean_dims: i32 = if (mean_op.keepdim) 4 else 3;
-                        buffer_views[@intFromEnum(mean_op.out)] = tensorFromSlice(output_slice[0..output_len], mean_shape, mean_dims);
-                    } else {
-                        if (mean_op.dim != -1 and mean_op.dim != 2) return error.UnsupportedMeanDim;
-
-                        const mean_seq_len_3d: usize = @intCast(input_tensor.shape[1]);
-                        const hidden_size: usize = @intCast(input_tensor.shape[2]);
-                        const output_len = mean_seq_len_3d;
-                        const output_slice = resolveOutputSlice(&buffer_views, scratch, mean_op.out, output_len);
-                        try cpu_reduction.meanLastDim3D(input_data, mean_seq_len_3d, hidden_size, output_slice[0..output_len]);
-
-                        const mean_shape_3d: [8]i64 = if (mean_op.keepdim) .{ 1, @as(i64, @intCast(mean_seq_len_3d)), 1, 0, 0, 0, 0, 0 } else .{ 1, @as(i64, @intCast(mean_seq_len_3d)), 0, 0, 0, 0, 0, 0 };
-                        const mean_dims_3d: i32 = if (mean_op.keepdim) 3 else 2;
-                        buffer_views[@intFromEnum(mean_op.out)] = tensorFromSlice(output_slice[0..output_len], mean_shape_3d, mean_dims_3d);
-                    }
-                },
-
-                .pow => |pow_op| {
-                    const input_tensor = buffer_views[@intFromEnum(pow_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-                    const output_len = input_tensor.numel;
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, pow_op.out, output_len);
-                    cpu_elementwise.powScalar(input_data, output_slice[0..output_len], pow_op.exponent);
-
-                    buffer_views[@intFromEnum(pow_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-
-                .rsqrt => |rsqrt_op| {
-                    const input_tensor = buffer_views[@intFromEnum(rsqrt_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-                    const output_len = input_tensor.numel;
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, rsqrt_op.out, output_len);
-                    cpu_elementwise.rsqrt(input_data, output_slice[0..output_len]);
-
-                    buffer_views[@intFromEnum(rsqrt_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-
-                .add_param => |add_param_op| {
-                    const input_tensor = buffer_views[@intFromEnum(add_param_op.in)];
-                    const param = self.block.weight_registry.get(add_param_op.param_name) orelse return error.MissingParam;
-
-                    const output_len = @max(input_tensor.numel, param.numel);
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, add_param_op.out, output_len);
-                    try cpu_broadcast.addParam(input_tensor, param, output_slice[0..output_len]);
-
-                    buffer_views[@intFromEnum(add_param_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-
-                .add_param_scalar => |add_param_scalar_op| {
-                    const param = self.block.weight_registry.get(add_param_scalar_op.param_name) orelse return error.MissingParam;
-                    const p_len = param.numel;
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, add_param_scalar_op.out, p_len);
-                    cpu_broadcast.addParamScalar(param, output_slice[0..p_len], add_param_scalar_op.scalar);
-
-                    buffer_views[@intFromEnum(add_param_scalar_op.out)] = tensorFromSlice(output_slice[0..p_len], param.shape, param.n_dims);
-                },
-
-                .mul_param => |mul_param_op| {
-                    const input_tensor = buffer_views[@intFromEnum(mul_param_op.in)];
-                    const param = self.block.weight_registry.get(mul_param_op.param_name) orelse return error.MissingParam;
-
-                    const output_len = @max(input_tensor.numel, param.numel);
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_param_op.out, output_len);
-                    try cpu_broadcast.mulParam(input_tensor, param, output_slice[0..output_len]);
-
-                    buffer_views[@intFromEnum(mul_param_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-
-                .reshape => |reshape_op| {
-                    // Reshape is a view operation - update metadata only.
-                    // Note: shape inference is limited to common cases; full view tracking is pending.
-                    const input_tensor = &buffer_views[@intFromEnum(reshape_op.in)];
-                    var output_tensor = input_tensor.*;
-
-                    if (reshape_op.shape.len > 0) {
-                        var out_shape: [8]i64 = .{ 0, 0, 0, 0, 0, 0, 0, 0 };
-                        var inferred_dim_idx: ?usize = null;
-                        var known_product: usize = 1;
-                        const total_elems = input_tensor.numel;
-
-                        const n_dims: usize = @min(reshape_op.shape.len, out_shape.len);
-                        for (reshape_op.shape[0..n_dims], 0..) |dim, dim_idx| {
-                            if (dim == -1) {
-                                inferred_dim_idx = dim_idx;
-                                continue;
-                            }
-                            const resolved: i64 = switch (dim) {
-                                -2 => input_tensor.shape[0], // B
-                                -3 => input_tensor.shape[1], // T
-                                else => dim,
-                            };
-                            out_shape[dim_idx] = resolved;
-                            known_product *= @intCast(resolved);
-                        }
-
-                        if (inferred_dim_idx) |dim_idx| {
-                            if (known_product == 0) return error.InvalidReshape;
-                            out_shape[dim_idx] = @intCast(total_elems / known_product);
-                        }
-
-                        output_tensor.shape = out_shape;
-                        output_tensor.n_dims = @intCast(n_dims);
-                    } else if (input_tensor.n_dims == 3) {
-                        const reshape_seq_len = input_tensor.shape[1];
-                        const hidden = input_tensor.shape[2];
-                        const attn_info = self.block.getAttention() orelse return error.AttentionNotAvailable;
-                        const heads: i64 = @intCast(attn_info.n_heads);
-                        const kv_heads: i64 = @intCast(attn_info.n_kv_heads);
-                        const head_dim: i64 = @intCast(attn_info.head_dim);
-                        if (hidden == heads * head_dim) {
-                            output_tensor.shape = .{ 1, reshape_seq_len, heads, head_dim, 0, 0, 0, 0 };
-                            output_tensor.n_dims = 4;
-                        } else if (hidden == kv_heads * head_dim) {
-                            output_tensor.shape = .{ 1, reshape_seq_len, kv_heads, head_dim, 0, 0, 0, 0 };
-                            output_tensor.n_dims = 4;
-                        }
-                    } else if (input_tensor.n_dims == 4) {
-                        const reshape_seq_len_4d = input_tensor.shape[1];
-                        const heads = input_tensor.shape[2];
-                        const head_dim = input_tensor.shape[3];
-                        output_tensor.shape = .{ 1, reshape_seq_len_4d, heads * head_dim, 0, 0, 0, 0, 0 };
-                        output_tensor.n_dims = 3;
-                    }
-
-                    buffer_views[@intFromEnum(reshape_op.out)] = output_tensor;
-                },
-
-                .transpose => |transpose_op| {
-                    // Transpose two dimensions of a tensor
-                    const in_tensor = &buffer_views[@intFromEnum(transpose_op.in)];
-
-                    // Get output buffer
-                    const out_len = in_tensor.numel;
-                    const out_slice = resolveOutputSlice(&buffer_views, scratch, transpose_op.out, out_len);
-
-                    // Compute dim indices (handle negative dims)
-                    const ndim: usize = @intCast(in_tensor.n_dims);
-                    const dim0: usize = if (transpose_op.dim0 < 0)
-                        @intCast(@as(i64, @intCast(ndim)) + transpose_op.dim0)
-                    else
-                        @intCast(transpose_op.dim0);
-                    const dim1: usize = if (transpose_op.dim1 < 0)
-                        @intCast(@as(i64, @intCast(ndim)) + transpose_op.dim1)
-                    else
-                        @intCast(transpose_op.dim1);
-
-                    // Convert i64 shape to usize for TensorView
-                    var in_shape_dims: [8]usize = undefined;
-                    for (0..ndim) |dim_idx| {
-                        in_shape_dims[dim_idx] = @intCast(in_tensor.shape[dim_idx]);
-                    }
-                    for (ndim..8) |dim_idx| {
-                        in_shape_dims[dim_idx] = 0;
-                    }
-
-                    // Compute transposed shape (usize)
-                    var out_shape_dims: [8]usize = in_shape_dims;
-                    const tmp_dim = out_shape_dims[dim0];
-                    out_shape_dims[dim0] = out_shape_dims[dim1];
-                    out_shape_dims[dim1] = tmp_dim;
-
-                    // Create views using initContiguous
-                    const in_view = tv.TensorView.initContiguous(
-                        in_tensor.data_ptr.?,
-                        in_shape_dims[0..ndim],
-                        .f32,
-                    );
-                    const out_view = tv.TensorView.initContiguous(
-                        @ptrCast(out_slice.ptr),
-                        out_shape_dims[0..ndim],
-                        .f32,
-                    );
-
-                    transpose_ops.transposeDispatch(out_view, in_view, dim0, dim1);
-
-                    // Convert back to i64 shape for output tensor
-                    var out_shape_i64: [8]i64 = in_tensor.shape;
-                    const tmp_i64 = out_shape_i64[dim0];
-                    out_shape_i64[dim0] = out_shape_i64[dim1];
-                    out_shape_i64[dim1] = tmp_i64;
-
-                    buffer_views[@intFromEnum(transpose_op.out)] = tensorFromSlice(out_slice[0..out_len], out_shape_i64, in_tensor.n_dims);
-                },
-
-                .rope => |rope_op| {
-                    // Standalone RoPE for primitive mode
-                    // Apply rotary position embedding in-place
-                    const in_tensor = &buffer_views[@intFromEnum(rope_op.in)];
-                    const input_data = in_tensor.asSlice(f32);
-
-                    // Get RoPE from attention module
-                    const attn = self.block.getAttention() orelse {
-                        error_context.setContext("block={d}, op={d}, type=mamba", .{ self.block_idx, op_index });
-                        return error.RopeNotAvailableForMamba;
-                    };
-                    const rope = attn.rope orelse {
-                        error_context.setContext("block={d}, op={d}", .{ self.block_idx, op_index });
-                        return error.MissingRopeConfig;
-                    };
-
-                    // Get position offset from cache
-                    const pos_offset = if (use_cache and slot_state.attn_cache != null)
-                        slot_state.attn_cache.?.cache_position
-                    else
-                        0;
-                    cpu_rotary.applyRopeTensorInPlace(
-                        input_data,
-                        @intCast(in_tensor.n_dims),
-                        in_tensor.shape,
-                        rope.dim,
-                        pos_offset,
-                        rope,
-                    ) catch |err| {
-                        error_context.setContext("block={d}, op={d}, ndim={d}", .{ self.block_idx, op_index, in_tensor.n_dims });
-                        return err;
-                    };
-
-                    // Copy to output if different buffer
-                    if (rope_op.in != rope_op.out) {
-                        const out_slice = resolveOutputSlice(&buffer_views, scratch, rope_op.out, in_tensor.numel);
-                        @memcpy(out_slice, input_data);
-                        buffer_views[@intFromEnum(rope_op.out)] = tensorFromSlice(out_slice[0..in_tensor.numel], in_tensor.shape, in_tensor.n_dims);
-                    }
-                },
-
-                .triu => |triu_op| {
-                    // Upper triangular mask for causal attention
-                    // Set elements below diagonal to -inf
-                    const in_tensor = &buffer_views[@intFromEnum(triu_op.in)];
-                    const out_buf = &buffer_views[@intFromEnum(triu_op.out)];
-
-                    const data = in_tensor.asSlice(f32);
-                    const out_data = out_buf.asSlice(f32);
-
-                    // Assume 2D [seq, seq] or 3D [batch, seq, seq]
-                    const n_dims: usize = @intCast(in_tensor.n_dims);
-                    const rows: usize = @intCast(in_tensor.shape[n_dims - 2]);
-                    const cols: usize = @intCast(in_tensor.shape[n_dims - 1]);
-                    cpu_masking.triu(data, out_data, rows, cols, triu_op.diagonal);
-                },
-
-                .sdpa => |sdpa_op| {
-                    // Scaled dot-product attention (PyTorch-compatible 4D layout)
-                    // Q/K/V: [batch, heads, seq, head_dim]
-                    // Output: [batch, heads, seq, head_dim]
-                    // Pure attention op - RoPE and KV cache are separate ops in primitive mode
-
-                    const query_buf = &buffer_views[@intFromEnum(sdpa_op.q)];
-                    const key_buf = &buffer_views[@intFromEnum(sdpa_op.k)];
-                    const value_buf = &buffer_views[@intFromEnum(sdpa_op.v)];
-
-                    // Verify 4D shape
-                    if (query_buf.n_dims != 4) {
-                        error_context.setContext("block={d}, op={d}, got {d}D, need 4D", .{ self.block_idx, op_index, query_buf.n_dims });
-                        return error.InvalidShape;
-                    }
-
-                    const batch: usize = @intCast(query_buf.shape[0]);
-                    const n_heads: usize = @intCast(query_buf.shape[1]);
-                    const seq_q: usize = @intCast(query_buf.shape[2]);
-                    const head_dim: usize = @intCast(query_buf.shape[3]);
-                    const seq_k: usize = @intCast(key_buf.shape[2]);
-
-                    // Compute scale
-                    const scale = sdpa_op.scale orelse 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
-
-                    // Allocate output buffer
-                    const out_numel = batch * n_heads * seq_q * head_dim;
-                    const out_slice = resolveOutputSlice(&buffer_views, scratch, sdpa_op.out, out_numel);
-
-                    // Create TensorViews for the attention op
-                    const q_shape = [_]usize{ batch, n_heads, seq_q, head_dim };
-                    const k_shape = [_]usize{ batch, n_heads, seq_k, head_dim };
-                    const v_shape = [_]usize{ batch, n_heads, seq_k, head_dim };
-                    const out_shape = [_]usize{ batch, n_heads, seq_q, head_dim };
-
-                    const q_view = tv.TensorView.initContiguous(query_buf.data_ptr.?, &q_shape, .f32);
-                    const k_view = tv.TensorView.initContiguous(key_buf.data_ptr.?, &k_shape, .f32);
-                    const v_view = tv.TensorView.initContiguous(value_buf.data_ptr.?, &v_shape, .f32);
-                    const out_view = tv.TensorView.initContiguous(@ptrCast(out_slice.ptr), &out_shape, .f32);
-
-                    // Call the attention kernel
-                    if (sdpa_op.is_causal) {
-                        // Use causal version (no explicit mask needed)
-                        attention_ops.sdpaCausal(out_view, q_view, k_view, v_view, scale, 0, scratch.allocator) catch |err| {
-                            error_context.setContext("block={d}, op={d}, causal=true", .{ self.block_idx, op_index });
-                            return err;
-                        };
-                    } else {
-                        // Non-causal (no mask)
-                        attention_ops.sdpa(out_view, q_view, k_view, v_view, null, scale, scratch.allocator) catch |err| {
-                            error_context.setContext("block={d}, op={d}, causal=false", .{ self.block_idx, op_index });
-                            return err;
-                        };
-                    }
-
-                    // Set output tensor metadata
-                    const sdpa_shape: [8]i64 = .{
-                        @as(i64, @intCast(batch)),
-                        @as(i64, @intCast(n_heads)),
-                        @as(i64, @intCast(seq_q)),
-                        @as(i64, @intCast(head_dim)),
-                        0,
-                        0,
-                        0,
-                        0,
-                    };
-                    buffer_views[@intFromEnum(sdpa_op.out)] = tensorFromSlice(out_slice[0..out_numel], sdpa_shape, 4);
-                },
-                else => |other_op| {
-                    const op_name = @tagName(other_op);
-                    error_context.setContext("block={d}, op={d}, unsupported_op={s}", .{ self.block_idx, op_index, op_name });
-                    return error.UnsupportedOpInSequentialMode;
-                },
-            }
+            try self.dispatchSequentialInstruction(
+                insn.opcode,
+                op_index,
+                op,
+                &buffer_views,
+                scratch,
+                ctx,
+            );
         }
 
         // Post-norm finalization: if the program's final output is not in the residual
@@ -925,7 +1263,15 @@ pub const Block = struct {
     /// Validate the program against the block's weight registry and supported ops.
     /// This is intended for load-time checks to catch invalid graphs early.
     pub fn validate(self: *const Block) !void {
-        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+        for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
+            if (sequential_adapter_table[@intFromEnum(insn.opcode)] == null) {
+                error_context.setContext("block={d}, op={d}, opcode={d}", .{
+                    self.block_idx,
+                    op_index,
+                    @intFromEnum(insn.opcode),
+                });
+                return error.UnsupportedOpInSequentialMode;
+            }
             const op = try self.decodeInstructionOp(op_index);
             switch (op) {
                 .kernel => |kernel_op| {
@@ -1108,79 +1454,19 @@ pub const Block = struct {
         };
 
         // Execute the operation sequence
-        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+        for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
             const op = try self.decodeInstructionOp(op_index);
-            switch (op) {
-                .kernel => |kernel_op| {
-                    const kernel_id: usize = @intCast(kernel_op.id);
-                    if (kernel_id >= self.block.kernels.len) {
-                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
-                        return error.KernelIndexOutOfBounds;
-                    }
-                    const kernel = self.block.kernels[kernel_id];
-                    if (builtin.mode == .Debug) {
-                        const actual_type = kernel.getOpType();
-                        if (actual_type != kernel_op.debug_type) {
-                            log.err("inference", "Graph/Kernel ordering mismatch", .{
-                                .block = self.block_idx,
-                                .kernel = kernel_op.id,
-                                .expected = @tagName(kernel_op.debug_type),
-                                .actual = @tagName(actual_type),
-                            }, @src());
-                            @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
-                        }
-                    }
-                    const input = &buffer_views[@intFromEnum(kernel_op.in)];
-                    const output = &buffer_views[@intFromEnum(kernel_op.out)];
-                    try kernel.forwardBatched(input, output, ctx, slot_index);
-                },
-                .add => |add_op| {
-                    addIntoScaled(
-                        &buffer_views[@intFromEnum(BufferId.residual)],
-                        &buffer_views[@intFromEnum(add_op.branch)],
-                        &buffer_views[@intFromEnum(BufferId.residual)],
-                        self.residualScaleValue(add_op.scale),
-                    );
-                },
-                .mul_scalar => |mul_scalar_op| {
-                    const input_tensor = buffer_views[@intFromEnum(mul_scalar_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-                    const output_len = input_tensor.numel;
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_scalar_op.out, output_len);
-                    cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
-
-                    buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-                .add_tensor => |add_tensor_op| {
-                    const left_tensor = buffer_views[@intFromEnum(add_tensor_op.in_a)];
-                    const right_tensor = buffer_views[@intFromEnum(add_tensor_op.in_b)];
-                    const output_len = @max(left_tensor.numel, right_tensor.numel);
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, add_tensor_op.out, output_len);
-                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
-                        fn addScalar(lhs: f32, rhs: f32) f32 {
-                            return lhs + rhs;
-                        }
-                    }.addScalar);
-
-                    const output_shape = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.shape
-                    else
-                        right_tensor.shape;
-                    const output_dims: i32 = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.n_dims
-                    else
-                        right_tensor.n_dims;
-                    buffer_views[@intFromEnum(add_tensor_op.out)] = tensorFromSlice(output_slice[0..output_len], output_shape, output_dims);
-                },
-                else => |other_op| {
-                    // Other ops (linear, rope, etc.) not yet supported in batched mode
-                    const op_name = @tagName(other_op);
-                    error_context.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
-                    return error.UnsupportedOpInBatchedMode;
-                },
-            }
+            try self.dispatchBatchedInstruction(
+                insn.opcode,
+                op_index,
+                op,
+                &buffer_views,
+                scratch,
+                ctx,
+                .single_slot,
+                slot_index,
+                &.{},
+            );
         }
 
         // Post-norm finalization: if the program's final output is not in the residual
@@ -1233,78 +1519,19 @@ pub const Block = struct {
             .use_cache = use_cache,
         };
 
-        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
+        for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
             const op = try self.decodeInstructionOp(op_index);
-            switch (op) {
-                .kernel => |kernel_op| {
-                    const kernel_id: usize = @intCast(kernel_op.id);
-                    if (kernel_id >= self.block.kernels.len) {
-                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
-                        return error.KernelIndexOutOfBounds;
-                    }
-                    const kernel = self.block.kernels[kernel_id];
-                    if (builtin.mode == .Debug) {
-                        const actual_type = kernel.getOpType();
-                        if (actual_type != kernel_op.debug_type) {
-                            log.err("inference", "Graph/Kernel ordering mismatch", .{
-                                .block = self.block_idx,
-                                .kernel = kernel_op.id,
-                                .expected = @tagName(kernel_op.debug_type),
-                                .actual = @tagName(actual_type),
-                            }, @src());
-                            @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
-                        }
-                    }
-                    const input = &buffer_views[@intFromEnum(kernel_op.in)];
-                    const output = &buffer_views[@intFromEnum(kernel_op.out)];
-                    try kernel.forwardBatchedSlots(input, output, ctx, slot_indices);
-                },
-                .add => |add_op| {
-                    addIntoScaled(
-                        &buffer_views[@intFromEnum(BufferId.residual)],
-                        &buffer_views[@intFromEnum(add_op.branch)],
-                        &buffer_views[@intFromEnum(BufferId.residual)],
-                        self.residualScaleValue(add_op.scale),
-                    );
-                },
-                .mul_scalar => |mul_scalar_op| {
-                    const input_tensor = buffer_views[@intFromEnum(mul_scalar_op.in)];
-                    const input_data = input_tensor.asSlice(f32);
-                    const output_len = input_tensor.numel;
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, mul_scalar_op.out, output_len);
-                    cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
-
-                    buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(output_slice[0..output_len], input_tensor.shape, input_tensor.n_dims);
-                },
-                .add_tensor => |add_tensor_op| {
-                    const left_tensor = buffer_views[@intFromEnum(add_tensor_op.in_a)];
-                    const right_tensor = buffer_views[@intFromEnum(add_tensor_op.in_b)];
-                    const output_len = @max(left_tensor.numel, right_tensor.numel);
-
-                    const output_slice = resolveOutputSlice(&buffer_views, scratch, add_tensor_op.out, output_len);
-                    try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
-                        fn addScalar(lhs: f32, rhs: f32) f32 {
-                            return lhs + rhs;
-                        }
-                    }.addScalar);
-
-                    const output_shape = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.shape
-                    else
-                        right_tensor.shape;
-                    const output_dims: i32 = if (left_tensor.numel >= right_tensor.numel)
-                        left_tensor.n_dims
-                    else
-                        right_tensor.n_dims;
-                    buffer_views[@intFromEnum(add_tensor_op.out)] = tensorFromSlice(output_slice[0..output_len], output_shape, output_dims);
-                },
-                else => |other_op| {
-                    const op_name = @tagName(other_op);
-                    error_context.setContext("block={d}, unsupported_op={s}", .{ self.block_idx, op_name });
-                    return error.UnsupportedOpInBatchedMode;
-                },
-            }
+            try self.dispatchBatchedInstruction(
+                insn.opcode,
+                op_index,
+                op,
+                &buffer_views,
+                scratch,
+                ctx,
+                .slot_batch,
+                0,
+                slot_indices,
+            );
         }
 
         const final_buf = finalOutputBuffer(&self.compiled_plan);
@@ -1606,6 +1833,25 @@ test "Block.validate detects split with too many outputs" {
     try testing.expectError(error.TooManySplitOutputs, block.validate());
 }
 
+test "Block.validate rejects opcode without sequential adapter" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .patch_embed = .{ .in = .residual, .out = .tmp3 } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    try testing.expectError(error.UnsupportedOpInSequentialMode, block.validate());
+}
+
 test "Block.forward executes simple norm-attn-add program" {
     const allocator = testing.allocator;
 
@@ -1709,6 +1955,50 @@ test "Block.forward executes full norm-attn-norm-ffn-add program" {
     }
     try testing.expect(has_nonzero);
     try testing.expect(differs_from_input);
+}
+
+test "Block.forward executes mean primitive over last dim" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .mean = .{ .in = .residual, .out = .residual, .dim = -1, .keepdim = false } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    const seq_len = 2;
+    const hidden = 128;
+    const input_data = try allocator.alloc(f32, 1 * seq_len * hidden);
+    defer allocator.free(input_data);
+    for (0..hidden) |i| {
+        input_data[i] = @as(f32, @floatFromInt(i + 1));
+        input_data[hidden + i] = @as(f32, @floatFromInt(201 + i));
+    }
+    const input = Tensor.view(@ptrCast(input_data.ptr), &.{ 1, seq_len, hidden }, .f32, null);
+
+    const output_data = try allocator.alloc(f32, 1 * seq_len * hidden);
+    defer allocator.free(output_data);
+    @memset(output_data, 0.0);
+    var output = Tensor.view(@ptrCast(output_data.ptr), &.{ 1, seq_len, hidden }, .f32, null);
+
+    var scratch = try ScratchBuffer.init(allocator, hidden, 512, 1);
+    defer scratch.deinit();
+    try scratch.ensure(seq_len);
+
+    try block.forward(&input, &output, &scratch, false);
+
+    // Row means:
+    // 1..128 => 64.5
+    // 201..328 => 264.5
+    try testing.expectApproxEqAbs(@as(f32, 64.5), output_data[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 264.5), output_data[1], 1e-5);
 }
 
 test "Block.forwardWithBatchedCache executes with batched cache" {

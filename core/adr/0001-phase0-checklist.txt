@@ -1,0 +1,79 @@
+ADR 0001 Phase-0 Alignment Checklist (No CI Workflow Scope)
+
+Purpose
+- Lock architecture decisions before implementation of generic inference runtime migration.
+- Excludes CI pipeline mechanics by request.
+
+Status
+- Proposed
+- Date: 2026-02-26
+
+Checklist
+
+1. ExecutionPlan schema frozen for Phase 1
+- Fields, ownership, and serialization boundaries are fixed.
+
+2. v1 opcode set frozen (macro-op level)
+- Use macro-ops for v1 (attention, rmsnorm, swiglu, etc.).
+- Primitive-level opcode explosion deferred.
+
+3. ParamBlock ABI frozen
+- Stable serialized layout.
+- Explicit versioning and compatibility policy.
+
+4. StateDescriptor contract frozen
+- Required fields: id, size_bytes, align_bytes, zero_init, lifecycle.
+- Semantics for init/reset/evict/clone are defined.
+
+5. ExecutionContext batched contract frozen
+- Includes active slots, batch size, per-slot seq lengths, stream handle.
+- Adapters operate on batched data by default.
+
+6. Batching rule ratified
+- No per-slot host loops for ops with batched kernel support.
+- Per-slot fallback must be explicit and observable.
+
+7. Register liveness and reuse policy frozen
+- Plan compiler emits last-use/lifetime metadata.
+- Backend register allocator reuses physical buffers from liveness data.
+
+8. Backend adapter table design frozen
+- Static, typed adapter dispatch tables.
+- Compile-time completeness checks per backend.
+
+9. Performance guardrails and benchmark matrix ratified (process only)
+- Metrics and thresholds agreed (prefill/decode tok/s, latency, VRAM, launch count).
+- Sign-off process defined outside CI scope.
+
+10. Parity matrix and tolerance policy ratified (process only)
+- Model set, seeds, and numeric tolerances agreed.
+- Sign-off process defined outside CI scope.
+
+11. Transition window policy frozen
+- Dual-path duration is short and explicitly bounded.
+- Legacy path deletion milestone defined per phase.
+
+12. Onboarding policy frozen
+- Existing opcode/topology model additions: `models/` only.
+- New primitive additions: `compute/` + backend adapter + metadata mapping.
+
+13. Ownership boundaries frozen
+- `models/`: metadata/config hooks/plan compilation.
+- `inference/`: scheduling/state lifecycle/generic execution.
+- `compute/`: primitives + optional fusions.
+
+14. Reversibility rule frozen
+- Each phase must have rollback strategy and fallback behavior.
+- No irreversible migration without prior parity/perf sign-off.
+
+15. Phase exit criteria and sign-off owners frozen
+- Explicit owners for Models, Inference, Compute.
+- Exit criteria documented and approved before phase implementation starts.
+
+Sign-off Section
+- Models Owner:
+- Inference Owner:
+- Compute Owner:
+- Date:
+- Notes:
+

@@ -1,0 +1,761 @@
+ADR 0001: Generic Inference Runtime Contract
+
+Status: Proposed
+Date: 2026-02-26
+Owners: Core Inference + Models + Compute
+Decision Type: Architectural
+
+Context
+
+`inference-arch-v2` (`dc03fa8`) improved layering and correctness, but execution is still tied to:
+
+- Fixed scratch routing contracts (`BufferId`-style assumptions)
+- Backend-local large opcode switches
+- Backend awareness of some model-family details
+
+The roadmap includes many new architectures. If execution contracts remain semi-rigid, onboarding cost will keep growing and refactors get harder over time.
+
+Decision
+
+Adopt a typed, generic runtime contract so `core/src/inference/` is a stable execution engine:
+
+- `models/` defines architecture metadata and compiled execution plans
+- `inference/` handles scheduling, memory/state lifecycle, and generic dispatch
+- `compute/` provides primitives and optional fused kernels
+
+This is a phased migration with strict parity/perf gates at each phase.
+
+Goals
+
+1. Add most new transformer-family architectures without editing backend execution loops.
+2. Keep decode/prefill performance for existing models (no regressions).
+3. Keep strong typing and validation (no untyped dynamic runtime in hot path).
+4. Keep migration shippable and reversible phase-by-phase.
+
+Non-Goals
+
+1. No immediate dynamic runtime plugin ABI.
+2. No mandatory JIT at this stage.
+3. No broad rewrite of compute primitives.
+4. No removal of optimized fused paths; they remain optional backend specializations.
+5. No runtime dual execution paths for a backend (no old/new executor flags).
+
+Architectural Boundaries
+
+`models/` owns:
+- Architecture metadata and config parsing hooks
+- Plan compilation (metadata -> typed `ExecutionPlan`)
+- Instruction-local weight binding and validation metadata
+
+`inference/` owns:
+- Scheduler and slot lifecycle
+- State allocation/lifecycle based on typed descriptors
+- Generic instruction execution loop and adapter dispatch
+
+`compute/` owns:
+- Primitive kernels
+- Optional fused kernels
+- Kernel-specific state interpretation inside adapters/kernels
+
+Runtime Contracts (Typed)
+
+```zig
+pub const ExecutionPlan = struct {
+    instructions: []const Instruction,
+    register_count: u16,
+    state_descs: []const StateDescriptor,
+};
+
+pub const Instruction = struct {
+    opcode: Opcode,
+    inputs: []const RegisterRef,
+    outputs: []const RegisterRef,
+    weights: []const WeightRef,
+    param_block_id: ?u16,
+    state_block_id: ?u8,
+};
+
+pub const RegisterRef = enum(u16) { _ };
+
+pub const StateDescriptor = struct {
+    id: u8,
+    size_bytes: u64,
+    align_bytes: u16,
+    zero_init: bool,
+    lifecycle: StateLifecycle,
+};
+
+pub const KernelAdapterFn = *const fn (
+    ctx: *ExecutionContext,
+    insn: *const Instruction,
+    registers: []TensorHandle,
+    register_views: []const TensorViewDesc,
+    state_blocks: []StateBlockHandle,
+    params: []const ParamBlock,
+) anyerror!void;
+```
+
+Key rule:
+- `inference` must not contain model-family control flow in hot execution paths.
+- Adapters must execute batched work for all active slots in `ExecutionContext` (no per-slot host loops in hot paths).
+
+ExecutionContext requirements (v1):
+- Active slot list / compaction map
+- Batch size and per-slot sequence lengths
+- Backend stream/queue handle
+- Scratch/workspace handles for batched execution
+
+Why This Tradeoff
+
+Pros:
+1. Lower long-term churn in `inference/` as model count grows.
+2. Clear ownership and easier review boundaries.
+3. Better future support for novel topology without refactoring scheduler internals.
+4. Keeps fused performance paths possible.
+
+Cons:
+1. Migration is complex and multi-team.
+2. Temporary increase in code volume during transition.
+3. Risk of regressions without strict parity/perf gates.
+
+Migration Plan (Phased)
+
+Phase 0: Contract Freeze (Alignment)
+- Write/approve this ADR + exact acceptance gates.
+- Freeze opcode list for initial migration wave.
+- Define benchmark matrix and parity thresholds.
+
+Exit:
+- ADR approved by owners.
+- CI gates defined.
+
+Phase 1: ExecutionPlan Introduction (No behavior change)
+- Compile current metadata into typed plans.
+- Keep existing backend execution path as the only runtime path.
+- Add plan validator and tracing.
+
+Exit:
+- Output parity with current baseline.
+- No perf regression.
+
+Phase 2: Logical Registers -> Physical Mapping
+- Introduce logical registers in plans.
+- Backend allocator maps logical registers to existing scratch buffers.
+- No kernel changes required.
+- Plan compiler performs liveness analysis so logical register count does not map 1:1 to physical buffers.
+- Physical scratch reuse is driven by register last-use information.
+
+Exit:
+- Topology permutations stop requiring backend loop edits.
+- Peak scratch memory remains within agreed limits for baseline models.
+
+Phase 3: Static Adapter Dispatch Tables
+- Replace large backend opcode switches with static adapter tables.
+- Keep compile-time completeness checks per backend.
+- Backend cutover is atomic per backend (CPU, then CUDA, then Metal):
+  - switch to adapter-table execution path,
+  - remove prior executor path in the same change,
+  - no runtime flag selecting old vs new executor.
+
+Exit:
+- Backend executor loop becomes generic and stable.
+
+Phase 4: Typed StateDescriptor Integration
+- Scheduler allocates opaque state blocks by descriptor.
+- Backends/adapters interpret typed state views safely.
+- Preserve existing KV/shortconv/mamba via compatibility descriptors.
+
+Exit:
+- New stateful architecture metadata does not force scheduler struct rewrites.
+
+Phase 5: Flattened Weight Binding
+- Bind instruction-local weights at load time.
+- Remove backend dependence on family-specific weight structs in execute path.
+
+Exit:
+- New topology models onboard with `models/` only (when primitives already exist).
+
+Phase 6: Post-Cutover Cleanup
+- Remove dead transitional code that is no longer reachable after per-backend cutovers.
+- Enforce single-path rules in CI (no backend may expose dual execution loops).
+
+Exit:
+- Single runtime path in `inference/`.
+
+Performance and Correctness Gates
+
+Performance:
+1. Benchmark matrix: CPU/CUDA/Metal, representative text + multimodal + quantized.
+2. Track: prefill tok/s, decode tok/s, p50/p95 latency, VRAM usage.
+3. Regression budget (initial): decode <= 2%, prefill <= 3%, unless explicitly approved.
+4. Track kernel launch count per token/batch for GPU backends.
+5. Fail gate if batched kernels regress into per-slot/per-token host launch loops for supported batched ops.
+
+Correctness:
+1. Logit parity (seeded) across baseline models.
+2. Scheduler lifecycle tests (reuse/reset/evict).
+3. Plan validation failure tests for malformed models.
+4. Adapter contract tests for dtype/shape/state mismatch.
+
+Onboarding Rules After Migration
+
+1. Existing opcode/topology model: `models/` only.
+2. New state layout: `models/` + state descriptor (no scheduler refactor).
+3. New primitive: `compute/` + adapter registration + metadata mapping.
+4. Optional fused optimization: backend adapter/compute only; correctness path unchanged.
+
+Risks and Mitigations
+
+1. Risk: over-dynamic design reduces safety.
+   Mitigation: typed contracts + compile-time adapter tables + strict plan validation.
+2. Risk: hidden perf loss from extra indirection.
+   Mitigation: pre-resolve pointers, no allocations in hot loop, perf gate each phase.
+3. Risk: accidental dual-path drift during migration.
+   Mitigation: dual runtime paths are prohibited; enforce atomic per-backend cutover
+   and same-change removal of replaced executor loops.
+
+Resolved Questions
+
+1. Final opcode granularity: primitive-level vs small composite ops.
+   - v1 decision: macro-ops (e.g., attention, swiglu, rmsnorm), not fine-grained scalar primitives.
+   - Rationale: preserve throughput and avoid launch-overhead regressions.
+   - Opcode enum defined in Addendum A2.
+2. Param block ABI details across backends.
+   - v1 decision: versioned header + opcode-specific packed payload.
+   - Compiled once by plan compiler, validated once at load, never parsed in hot loop.
+   - Full spec in Addendum A2 (ParamBlock).
+3. Type definitions (Opcode, TensorHandle, StateBlockHandle, ParamBlock).
+   - All defined in Addendum A2.
+4. Plan compiler contract.
+   - Input/output/location defined in Addendum A1.
+5. Adapter registration mechanism.
+   - Static dispatch tables per backend, defined in Addendum A3.
+6. Backend-specific execution semantics (Metal graph-emit, CUDA batch-cap).
+   - Defined in Addendum A5.
+7. Vision pipeline scope.
+   - Staged plans (vision_encode, scatter, decoder), defined in Addendum A6.
+
+Open Questions (Deferred)
+
+1. State eviction/compaction policy for paged state cache (future phase).
+2. Whether CUDA Graph capture should be a later optional performance phase.
+3. Fine-grained primitive opcodes: if needed later, reserved range 64..127 in Opcode enum.
+
+Implementation Notes (v1)
+
+1. Register liveness metadata
+   - Plan compiler emits last-use metadata for each register use-site.
+   - Backends reclaim physical scratch immediately after last read.
+2. Batched adapter contract
+   - Adapters consume batched tensors/views and launch one batched kernel when supported.
+   - Unsupported batched execution is resolved at route/load time with typed errors;
+     no runtime old-path fallback executor.
+3. Weight flattening target
+   - Instructions carry `weights: []WeightRef`; adapters/kernels interpret ordering.
+   - Backend execution loop remains agnostic to semantic names (`q_proj`, `w1`, etc.).
+
+Implementation Addendum (Phase-0 Prerequisites)
+
+This section resolves open type definitions, specifies the plan compiler
+contract, and pins backend-specific semantics so Phase-0 can exit with an
+engineering-executable contract.
+
+A1. Plan Compiler Specification
+
+Location: `models/plan/` (new module, owned by `models/`).
+
+Input:
+- `*const Architecture` (from registry)
+- `BlockVariant` index and `KernelMeta` for the target layer
+- Compilation mode: `.decode`, `.prefill`, `.vision_encode`, `.scatter`
+- Model config scalars (d_model, n_heads, head_dim, d_ff, n_kv_heads, etc.)
+
+Output:
+```zig
+pub const CompiledPlan = struct {
+    plan: ExecutionPlan,
+    liveness: LivenessMap,
+    peak_registers: u16,
+    diagnostics: []const PlanDiagnostic,
+};
+
+pub const LivenessMap = struct {
+    /// register -> last instruction index that reads it.
+    register_last_read: []const u32,
+    /// instruction -> bitset of registers that die after this instruction.
+    /// Used by backend allocator for physical buffer reuse.
+    kill_after_instruction: []const []const u64,
+};
+
+pub const PlanDiagnostic = struct {
+    level: enum { info, warn },
+    message: []const u8,
+};
+```
+
+Note:
+- `LivenessMap` above is normative for implementation and is intentionally
+  identical to A9 §1 entry criteria.
+
+Compilation steps:
+1. Walk `LayerOp` program (existing static slices in model files).
+2. Assign logical `RegisterRef` for each operand (replace `BufferId`).
+3. Emit `Instruction` sequence with opcode + register refs + weight refs.
+4. Run liveness analysis: compute `register_last_read` from use-sites.
+5. Compute `peak_registers` (max simultaneously live registers).
+6. Validate: every weight ref resolves, every register has a producer.
+
+Migration: Phase 1 compiles plans and validates output parity against
+existing `LayerOp` execution. Plans are computed once at model load.
+
+A2. Type Contract Definitions
+
+Opcode:
+
+```zig
+/// Runtime opcode enum. 1:1 with adapter dispatch table entries.
+/// Derived from existing OpType but scoped to executable operations only.
+pub const Opcode = enum(u8) {
+    // Macro-ops (v1 primary path)
+    rmsnorm = 0,
+    multihead_attention = 1,
+    swiglu = 2,
+    moe = 3,
+    mamba_mixer = 4,
+    shortconv = 5,
+    mla_attention = 6,
+    embedding = 7,
+
+    // Structural
+    residual_add = 8,
+
+    // Vision pipeline
+    vision_patch_embed = 16,
+    vision_spatial_merge = 17,
+    vision_deepstack_extract = 18,
+    vision_scatter = 19,
+
+    // Reserved 32..63 for future macro-ops
+    // Reserved 64..127 for future fine-grained primitives (if needed)
+    _,
+};
+```
+
+Mapping from current code: `OpType.norm` -> `Opcode.rmsnorm`,
+`OpType.multihead_attention` -> `Opcode.multihead_attention`,
+`OpType.mlp` -> `Opcode.swiglu`, `LayerOp.add` -> `Opcode.residual_add`.
+
+TensorHandle:
+
+NOT a cross-backend union. Each backend defines its own physical handle
+resolved at backend init from logical `RegisterRef` ids.
+
+```zig
+/// Opaque register handle resolved by the backend allocator.
+/// CPU: []f32 slice. Metal: graph node ref. CUDA: device buffer + offset.
+/// The generic executor never inspects internals; it passes handles through.
+pub const TensorHandle = struct {
+    /// Logical register id (matches RegisterRef).
+    register: RegisterRef,
+    /// Backend-owned opaque pointer to physical storage.
+    /// Interpretation is adapter-specific and never crosses backend boundary.
+    ptr: *anyopaque,
+    /// No shape/len fields by design; adapters must use validated
+    /// TensorViewDesc for dtype/shape/stride queries.
+};
+```
+
+TensorViewDesc:
+
+```zig
+/// Backend-agnostic tensor metadata for adapter-side validation/routing.
+pub const TensorViewDesc = struct {
+    dtype: tensor.DType,
+    rank: u8,
+    /// v1 compatibility keeps rank <= 4 for runtime plans.
+    /// Plans exceeding rank 4 fail with `error.UnsupportedTensorRank`.
+    shape: [4]u32,
+    stride_elems: [4]u32,
+    layout: enum { contiguous, strided, backend_native },
+};
+```
+
+StateBlockHandle:
+
+```zig
+/// Typed wrapper for opaque state blocks allocated by scheduler.
+pub const StateBlockHandle = struct {
+    id: u8,
+    ptr: [*]align(64) u8,
+    size: u64,
+    align_bytes: u16,
+};
+```
+
+ParamBlock:
+
+```zig
+/// Immutable parameter payload for one instruction.
+/// Compiled once by plan compiler, validated once at load, never parsed
+/// in the per-token hot loop.
+pub const ParamBlock = struct {
+    /// Layout version tag. Adapter checks version == expected at init;
+    /// mismatch is a load-time error, never a runtime branch.
+    version: u8,
+    /// Opcode this param block is for (redundant with instruction, used
+    /// for validation only).
+    opcode: Opcode,
+    /// Raw payload bytes. Layout is opcode-specific and stable per version.
+    /// Example: RMSNorm v1 = { eps: f32, weight_offset: f32 }.
+    /// Example: Attention v1 = { n_heads: u32, n_kv_heads: u32,
+    ///          head_dim: u32, rope_theta: f32, is_causal: bool }.
+    data: []const u8,
+};
+```
+
+Hot-path contract: adapters cast `data` to a comptime-known packed struct
+via `@ptrCast`. No parsing, no allocation, no branching on version in the
+token loop. Version is checked once at plan load / adapter init.
+
+Forward-compat note:
+- Parameter payload layout is always little-endian.
+- Adapter-side typed views must be created from validated/aligned storage.
+
+A3. Adapter Registry Specification
+
+Each backend declares a static adapter dispatch table:
+
+```zig
+/// One entry per Opcode. Null = unsupported (load-time error if plan uses it).
+pub const AdapterTable = [256]?KernelAdapterFn;
+
+/// Backend declares its table as a comptime constant.
+pub const cpu_adapters: AdapterTable = blk: {
+    var table: AdapterTable = [_]?KernelAdapterFn{null} ** 256;
+    table[@intFromEnum(Opcode.rmsnorm)] = cpu_norm_adapter;
+    table[@intFromEnum(Opcode.multihead_attention)] = cpu_attention_adapter;
+    table[@intFromEnum(Opcode.swiglu)] = cpu_ffn_adapter;
+    table[@intFromEnum(Opcode.moe)] = cpu_moe_adapter;
+    table[@intFromEnum(Opcode.mamba_mixer)] = cpu_mamba_adapter;
+    table[@intFromEnum(Opcode.shortconv)] = cpu_shortconv_adapter;
+    table[@intFromEnum(Opcode.mla_attention)] = cpu_mla_adapter;
+    table[@intFromEnum(Opcode.embedding)] = cpu_embedding_adapter;
+    table[@intFromEnum(Opcode.residual_add)] = cpu_residual_add_adapter;
+    // Vision adapters...
+    break :blk table;
+};
+```
+
+Backend capability map:
+
+```zig
+pub const AdapterCapability = struct {
+    supports_batch: bool,
+    supports_graph_emit: bool,
+    max_batch_size: ?usize,
+};
+
+/// Per-opcode capability declaration. Checked at plan load.
+pub const AdapterCapabilities = [256]AdapterCapability;
+```
+
+Unsupported opcode policy:
+- Plan load validates every instruction opcode against the backend's table.
+- Null entry = typed `error.UnsupportedOpcode` at load time.
+- Never a silent runtime fallback. Never a per-token check.
+
+Registering a new adapter:
+1. Implement `KernelAdapterFn` in `compute/` or backend adapter module.
+2. Add entry to the backend's static `AdapterTable`.
+3. Declare capability in `AdapterCapabilities`.
+4. Compile-time: existing `contract.zig` assertions verify table completeness
+   for all opcodes the backend claims to support.
+
+A4. Register Allocation and Liveness
+
+Allocation is a two-stage process:
+
+Stage 1 — Compile-time (plan compiler in `models/plan/`):
+- Assign logical `RegisterRef` ids to all instruction operands.
+- Compute liveness intervals: for each register, [first_write, last_read].
+- Run interval-based register pressure analysis.
+- Emit `LivenessMap` with `register_last_read` metadata.
+- Output `peak_registers` = max simultaneously live logical registers.
+
+Stage 2 — Backend init (once at model load, not per-token):
+- Backend allocator receives `CompiledPlan`.
+- Allocates physical buffers based on `peak_registers`, not `register_count`.
+- Uses liveness intervals for buffer reuse (graph coloring or linear scan).
+- Separate sizing policies for prefill vs decode:
+  - Decode: buffers sized for batch_size * d_model (single token per slot).
+  - Prefill: buffers sized for max_seq_len * d_model (full sequence).
+  - Backend may maintain two physical allocation sets or resize on mode switch.
+
+Physical mapping output:
+
+```zig
+pub const PhysicalMapping = struct {
+    /// register_id -> physical buffer index (after graph coloring).
+    register_to_physical: []const u16,
+    /// Physical buffer count (<= peak_registers due to reuse).
+    physical_count: u16,
+    /// Physical buffer specs (size, alignment).
+    physical_specs: []const struct { size: usize, @"align": u16 },
+};
+```
+
+A5. Backend-Specific Execution Semantics
+
+The `KernelAdapterFn` signature is the same for all backends.
+Backend-specific behavior is encapsulated in how adapters use `ExecutionContext`:
+
+ForwardParams compatibility mapping (required during migration):
+- `cache` -> `state_blocks` entries selected by `insn.state_block_id` and
+  validated against `StateDescriptor.lifecycle`.
+- `scratch` -> backend-resolved `registers` views plus optional
+  `ExecutionContext.workspace` for non-register temporaries.
+- `use_cache` -> `ExecutionContext.mode` (`.decode`/`.prefill`) and/or
+  opcode-specific `ParamBlock` flag resolved at plan compile time.
+- `matmul_scratch` -> `ExecutionContext.workspace.matmul` (typed scratch slice
+  or device workspace handle), never passed via global/backend-singleton state.
+
+Phase boundary:
+- This mapping is a Phase-1b blocker when adapter wiring starts.
+- It is not a Phase-1a blocker because Phase-1a contains no adapter execution.
+
+CPU backend:
+- Adapters execute synchronously. `TensorHandle.ptr` points to `[]f32`.
+- Batched adapters iterate active slots via `ExecutionContext.active_slots`.
+
+Metal backend:
+- Adapters emit graph nodes rather than executing immediately.
+- `TensorHandle.ptr` points to an MLX graph node reference.
+- `ExecutionContext` carries the graph builder handle.
+- Execution boundary: the generic executor calls `graph.eval()` after the
+  full instruction sequence (or at explicit sync points for vision stages).
+- This is not a conflict with the adapter contract — "execute" means
+  "record work"; the graph runtime handles actual dispatch.
+
+CUDA backend:
+- Adapters launch kernels via `ExecutionContext.stream`.
+- `TensorHandle.ptr` points to a device buffer.
+- Batch capability initially capped at 1 via `AdapterCapabilities.max_batch_size`.
+- Contract is still batched-shaped (adapters accept `ExecutionContext` with
+  slot list); single-slot is a valid batch of size 1.
+- Expanding to real batched decode is a later CUDA milestone, not a
+  Phase-0 blocker.
+
+A6. Vision Plan Scope
+
+Vision-capable models produce multiple plan stages, not a single plan:
+
+```zig
+pub const ModelPlans = struct {
+    /// Vision encoder plan (image -> vision embeddings).
+    /// Null for text-only models.
+    vision_encode: ?CompiledPlan,
+    /// Scatter plan (merge vision embeddings into token stream).
+    /// Null for text-only models.
+    scatter: ?CompiledPlan,
+    /// Decoder plan (token-level transformer layers).
+    /// Separate plans for decode (single-token) and prefill (sequence).
+    decoder_prefill: CompiledPlan,
+    decoder_decode: CompiledPlan,
+};
+```
+
+Same `Instruction` contract across all stages. Different state lifecycles:
+- `vision_encode`: no KV cache state, temporary vision scratch only.
+- `scatter`: reads vision output registers + text token stream, writes merged
+  hidden state. No persistent state.
+- `decoder_prefill` / `decoder_decode`: KV cache state descriptors, attention
+  scratch, recurrent state (mamba/shortconv).
+
+Vision opcodes (`vision_patch_embed`, `vision_spatial_merge`,
+`vision_deepstack_extract`, `vision_scatter`) map to the existing
+`LayerOp.patch_embed`, `.spatial_merge`, `.deepstack_extract`, `.scatter`
+variants. Adapter implementations wrap the current vision kernel code.
+
+A7. StateDescriptor Size Fix
+
+Change `StateDescriptor.size_bytes` from `u32` to `u64`:
+
+```zig
+pub const StateDescriptor = struct {
+    id: u8,
+    size_bytes: u64,
+    align_bytes: u16,
+    zero_init: bool,
+    lifecycle: StateLifecycle,
+};
+```
+
+Rationale: KV caches for long-context models (128k+ tokens, large head_dim,
+many layers) can exceed 4GB per state block. u64 removes the ceiling without
+adding runtime cost (field is read once at allocation, never in hot path).
+
+A8. Performance Observability (Minimum Viable)
+
+Required before Phase 1 exit (not Phase 0):
+
+1. Per-op dispatch counter:
+   ```zig
+   /// Incremented by generic executor on each adapter call.
+   /// Protected by atomic increment, readable via debug/xray interface.
+   pub const DispatchCounters = struct {
+       per_opcode: [256]std.atomic.Value(u64),
+       total_instructions: std.atomic.Value(u64),
+   };
+   ```
+
+2. GPU kernel launch counter (CUDA/Metal only):
+   - Adapters increment a launch counter each time they enqueue a kernel.
+   - Counter is per-step (reset between decode calls) and per-cumulative.
+   - Exposed via existing `xray/trace.zig` interface.
+
+3. Anti-regression gate integration:
+   - Benchmark harness records launch count per token.
+   - CI asserts: `launches_per_token_new <= launches_per_token_baseline * 1.1`.
+   - Manual override with explicit approval for justified increases.
+
+Lightweight implementation: counters are `std.atomic.Value(u64)`, zero
+overhead when not read. No logging in hot path (per policy §5). Counters
+are read by benchmark harness and xray tooling outside the token loop.
+
+A9. Phase-1 Entry Criteria (Implementation-Blocking Invariants)
+
+Phase 1 MAY NOT start until all criteria below are written into code-level
+contracts/tests (not only prose):
+
+1. LivenessMap representation is unambiguous
+   - Replace the ambiguous draft shape with one concrete representation.
+   - Required v1 shape:
+   ```zig
+   pub const LivenessMap = struct {
+       /// register -> last instruction index that reads it.
+       register_last_read: []const u32,
+       /// instruction -> bitset of registers that die after this instruction.
+       kill_after_instruction: []const []const u64,
+   };
+   ```
+   - Invariant: `kill_after_instruction.len == plan.instructions.len`.
+   - Invariant: every produced register has exactly one last-read index or
+     is marked `never_read` by validator diagnostic.
+
+2. TensorHandle safety contract is explicit
+   - `TensorHandle` remains backend-opaque but MUST pair with validated
+     metadata so adapters do not guess dtype/layout.
+   - Required companion descriptor:
+   ```zig
+   pub const TensorViewDesc = struct {
+       dtype: tensor.DType,
+       rank: u8,
+       /// v1 compatibility keeps rank <= 4 for activations in runtime plans.
+       /// Current tensor core types support rank up to 8; plans exceeding rank 4
+       /// must fail validation in v1 with typed `error.UnsupportedTensorRank`.
+       /// If fine-grained primitive opcodes (reserved 64..127) are enabled in
+       /// a future phase, reevaluate this cap and move to rank 8.
+       shape: [4]u32,
+       stride_elems: [4]u32,
+       layout: enum { contiguous, strided, backend_native },
+   };
+   ```
+   - Validation point: load-time plan binding and debug assertions in adapter
+     entry (not per-element checks in hot loops).
+
+3. ParamBlock ABI is fixed and auditable
+   - Param payload encoding is little-endian, naturally aligned to 8 bytes.
+   - `ParamBlock.data.len` MUST be bounded (`<= 256` bytes in v1).
+   - Adapter-side cast contract:
+     - Validate `version`, `opcode`, and payload size once at plan load.
+     - Hot loop performs only direct typed access through prevalidated views.
+   - Any version mismatch is a typed load-time error (`error.InvalidParamBlockABI`).
+
+4. Batch semantics and routing are deterministic
+   - If `ExecutionContext.batch_size > AdapterCapabilities.max_batch_size`,
+     behavior is chosen at plan-route time only:
+     - Route to an alternate compatible plan/backend, OR
+     - fail with typed `error.BatchUnsupported`.
+   - No implicit per-token runtime fallback inside adapter hot path.
+   - Single-slot CUDA remains valid v1 behavior with explicit capability.
+
+5. Op mapping has a single source of truth
+   - `OpType/LayerOp -> Opcode` mapping must live in one module
+     (`models/plan/opcode_map.zig`).
+   - Compile-time test asserts every executable `OpType` has exactly one opcode.
+   - No duplicate mapping logic in backends.
+
+6. State lifecycle matrix is formalized
+   - Each `StateDescriptor.lifecycle` value must define exact behavior for:
+     `alloc`, `reset`, `reuse`, `evict`, `clone_for_fork`, `deinit`.
+   - Scheduler tests must cover slot recycle and aborted-request teardown for
+     each lifecycle class used by baseline models.
+
+7. Vision stage handoff contract is fixed
+   - `vision_encode -> scatter -> decoder_*` boundaries must specify:
+     - register ids used for handoff,
+     - required dtype/layout,
+     - ownership/lifetime until next stage consumes data,
+     - explicit sync boundary for graph backends.
+   - Failure to satisfy handoff contract is typed plan validation error.
+
+8. Observability overhead control is explicit
+   - Dispatch/launch counters must be compile-time gated or runtime disabled by default.
+   - Requirement: when disabled, no atomics on hot path.
+   - Benchmark harness/xray turns counters on for measurement runs only.
+
+9. Transition control to avoid dual-path drift
+   - Contract modules and plan compiler may land before backend cutover.
+   - For a backend cutover, old/new runtime execution duality is forbidden:
+     - no runtime executor feature flag,
+     - no shadow old executor loop,
+     - replaced executor path removed in the same change.
+   - Phase 1 exit requires backend cutover sequencing ownership (CPU -> CUDA -> Metal)
+     and per-cutover parity/perf signoff owners.
+
+10. `contract.zig` transition is explicit
+   - Stage A: keep existing compile-time assertions as source of truth.
+   - Stage B: add adapter-table completeness assertions in parallel, generated
+     from the same opcode map module (`models/plan/opcode_map.zig`).
+   - Stage C: require both assertion sets to pass during active backend cutovers.
+   - Stage D: delete legacy switch/completeness assertions immediately after
+     final backend cutover makes adapter-table path sole execution path.
+   - No stage may weaken compile-time unsupported-op detection.
+   - This is a Phase-3 entry criterion, not a Phase-1a blocker.
+
+Recommended Phase-1 test pack (minimum):
+1. Plan compile parity tests for representative text + multimodal + quantized models.
+2. Register allocator tests proving physical buffer reuse from liveness metadata.
+3. Adapter ABI tests for param block version/size mismatch.
+4. Batch-capability routing tests (`batch=1`, `batch>1`, unsupported path).
+5. Vision stage handoff tests (dtype/layout/lifetime contract).
+6. State lifecycle tests for reset/reuse/evict under slot recycling.
+
+A10. Phase-1a / Phase-1b Scope Lock
+
+The following split is normative to prevent scope drift:
+
+Phase-1a (contracts only; zero behavior change):
+- Deliver types/modules:
+  - `Opcode`, `RegisterRef`, `TensorHandle`, `TensorViewDesc`,
+    `StateBlockHandle`, `ParamBlock`, `StateDescriptor`, `LivenessMap`,
+    `ExecutionPlan`, `CompiledPlan`, `PhysicalMapping`,
+    `AdapterTable`, `AdapterCapability`.
+- Deliver `models/plan/opcode_map.zig` as single-source mapping:
+  `OpType/LayerOp -> Opcode`.
+- Deliver compile-time exhaustiveness tests:
+  - every executable `OpType` maps to exactly one `Opcode`.
+  - no backend executor imports.
+- Explicitly forbidden in 1a:
+  - adapter execution wiring,
+  - backend executor behavior changes,
+  - plan-driven runtime dispatch,
+  - runtime feature flags that introduce old/new executor selection.
+
+Phase-1b (plan compiler + parity):
+- Implement plan compiler that walks existing `LayerOp` programs and emits
+  `CompiledPlan`.
+- Add structural parity tests:
+  - compile plans for `llama3`, `granite_hybrid`, `qwen3_moe`,
+  - round-trip comparison against expected `LayerOp` equivalents.
+- Add seeded logit parity tests on representative models.
