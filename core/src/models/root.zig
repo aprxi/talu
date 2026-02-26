@@ -15,6 +15,7 @@ pub const op_types = @import("op_types.zig");
 pub const runtime_blocks = @import("runtime_blocks.zig");
 pub const rope_scaling = @import("rope_scaling.zig");
 pub const vision = @import("vision.zig");
+pub const plan = @import("plan/root.zig");
 pub const config = @import("config/root.zig");
 pub const common = struct {
     pub const types = @import("common/types.zig");

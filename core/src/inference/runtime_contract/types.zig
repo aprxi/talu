@@ -1,0 +1,296 @@
+//! Typed runtime contracts for generic inference execution plans.
+//!
+//! This module contains backend-agnostic plan/execution ABI types.
+
+const std = @import("std");
+const dtype = @import("../../dtype.zig");
+const opcode_mod = @import("../../models/plan/opcode.zig");
+
+pub const Opcode = opcode_mod.Opcode;
+
+pub const RegisterRef = enum(u16) { _ };
+
+pub fn registerFromIndex(index: u16) RegisterRef {
+    return @enumFromInt(index);
+}
+
+pub fn registerToIndex(register: RegisterRef) u16 {
+    return @intFromEnum(register);
+}
+
+pub const WeightRef = struct {
+    index: u32,
+};
+
+pub const StateLifecycle = enum(u8) {
+    slot_persistent = 0,
+    request_scoped = 1,
+    step_scoped = 2,
+};
+
+pub const StateDescriptor = struct {
+    id: u8,
+    size_bytes: u64,
+    align_bytes: u16,
+    zero_init: bool,
+    lifecycle: StateLifecycle,
+};
+
+pub const Instruction = struct {
+    opcode: Opcode,
+    inputs: []const RegisterRef,
+    outputs: []const RegisterRef,
+    weights: []const WeightRef,
+    param_block_id: ?u16,
+    state_block_id: ?u8,
+};
+
+pub const ExecutionPlan = struct {
+    instructions: []const Instruction,
+    register_count: u16,
+    state_descs: []const StateDescriptor,
+};
+
+pub const LivenessMap = struct {
+    /// register -> last instruction index that reads it.
+    register_last_read: []const u32,
+    /// instruction -> bitset words of registers that die after this instruction.
+    kill_after_instruction: []const []const u64,
+
+    pub fn bitsetWordCount(register_count: u16) usize {
+        return (@as(usize, register_count) + 63) / 64;
+    }
+};
+
+pub const PlanDiagnosticLevel = enum(u8) {
+    info = 0,
+    warn = 1,
+};
+
+pub const PlanDiagnostic = struct {
+    level: PlanDiagnosticLevel,
+    message: []const u8,
+};
+
+pub const CompiledPlan = struct {
+    plan: ExecutionPlan,
+    liveness: LivenessMap,
+    peak_registers: u16,
+    diagnostics: []const PlanDiagnostic,
+};
+
+pub const PhysicalBufferSpec = struct {
+    size: usize,
+    @"align": u16,
+};
+
+pub const PhysicalMapping = struct {
+    register_to_physical: []const u16,
+    physical_count: u16,
+    physical_specs: []const PhysicalBufferSpec,
+};
+
+pub const TensorHandle = struct {
+    register: RegisterRef,
+    ptr: *anyopaque,
+};
+
+pub const TensorLayout = enum(u8) {
+    contiguous = 0,
+    strided = 1,
+    backend_native = 2,
+};
+
+pub const TensorViewDesc = struct {
+    dtype: dtype.DType,
+    rank: u8,
+    shape: [4]u32,
+    stride_elems: [4]u32,
+    layout: TensorLayout,
+};
+
+pub const StateBlockHandle = struct {
+    id: u8,
+    ptr: [*]align(64) u8,
+    size: u64,
+    align_bytes: u16,
+};
+
+pub const ParamBlock = struct {
+    version: u8,
+    opcode: Opcode,
+    data: []const u8,
+};
+
+pub const ExecutionMode = enum(u8) {
+    decode = 0,
+    prefill = 1,
+    vision_encode = 2,
+    scatter = 3,
+};
+
+pub const Workspace = struct {
+    any: ?*anyopaque = null,
+    matmul: ?*anyopaque = null,
+};
+
+pub const ExecutionContext = struct {
+    mode: ExecutionMode,
+    active_slots: []const usize,
+    sequence_lengths: []const u32,
+    batch_size: usize,
+    stream_or_queue: ?*anyopaque = null,
+    workspace: Workspace = .{},
+};
+
+pub const KernelAdapterFn = *const fn (
+    ctx: *ExecutionContext,
+    insn: *const Instruction,
+    registers: []TensorHandle,
+    register_views: []const TensorViewDesc,
+    state_blocks: []StateBlockHandle,
+    params: []const ParamBlock,
+) anyerror!void;
+
+pub const AdapterTable = [256]?KernelAdapterFn;
+
+pub const AdapterCapability = struct {
+    supports_batch: bool,
+    supports_graph_emit: bool,
+    max_batch_size: ?usize,
+};
+
+pub const AdapterCapabilities = [256]AdapterCapability;
+
+pub fn validateTensorViewDesc(view: *const TensorViewDesc) !void {
+    if (view.rank > 4) return error.UnsupportedTensorRank;
+}
+
+pub fn validateExecutionContext(ctx: *const ExecutionContext) !void {
+    if (ctx.batch_size != ctx.active_slots.len) return error.InvalidBatchSize;
+    if (ctx.sequence_lengths.len != ctx.active_slots.len) return error.InvalidSequenceLengthCount;
+}
+
+pub fn validateExecutionPlan(plan: *const ExecutionPlan) !void {
+    var state_seen: [256]bool = [_]bool{false} ** 256;
+    for (plan.state_descs) |state_desc| {
+        if (state_seen[state_desc.id]) return error.DuplicateStateDescriptorId;
+        state_seen[state_desc.id] = true;
+        if (state_desc.align_bytes == 0) return error.InvalidStateAlignment;
+    }
+
+    for (plan.instructions) |insn| {
+        for (insn.inputs) |register| {
+            if (registerToIndex(register) >= plan.register_count) return error.InvalidInstructionRegisterRef;
+        }
+        for (insn.outputs) |register| {
+            if (registerToIndex(register) >= plan.register_count) return error.InvalidInstructionRegisterRef;
+        }
+        if (insn.state_block_id) |state_id| {
+            if (!state_seen[state_id]) return error.UnknownStateDescriptorId;
+        }
+    }
+}
+
+pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
+    try validateExecutionPlan(&compiled.plan);
+
+    if (compiled.liveness.register_last_read.len != compiled.plan.register_count) {
+        return error.InvalidLivenessRegisterCount;
+    }
+    if (compiled.liveness.kill_after_instruction.len != compiled.plan.instructions.len) {
+        return error.InvalidLivenessInstructionCount;
+    }
+    const words = LivenessMap.bitsetWordCount(compiled.plan.register_count);
+    for (compiled.liveness.kill_after_instruction) |row| {
+        if (row.len != words) return error.InvalidLivenessBitsetWidth;
+    }
+    if (compiled.peak_registers > compiled.plan.register_count) return error.InvalidPeakRegisters;
+}
+
+test "register conversion keeps numeric identity" {
+    const reg = registerFromIndex(42);
+    try std.testing.expectEqual(@as(u16, 42), registerToIndex(reg));
+}
+
+test "TensorHandle intentionally has no inline shape fields" {
+    try std.testing.expect(@hasField(TensorHandle, "register"));
+    try std.testing.expect(@hasField(TensorHandle, "ptr"));
+    try std.testing.expect(!@hasField(TensorHandle, "len"));
+    try std.testing.expect(!@hasField(TensorHandle, "shape"));
+}
+
+test "validateTensorViewDesc rejects rank above v1 cap" {
+    var view = TensorViewDesc{
+        .dtype = .f32,
+        .rank = 5,
+        .shape = .{ 1, 1, 1, 1 },
+        .stride_elems = .{ 1, 1, 1, 1 },
+        .layout = .contiguous,
+    };
+    try std.testing.expectError(error.UnsupportedTensorRank, validateTensorViewDesc(&view));
+    view.rank = 4;
+    try validateTensorViewDesc(&view);
+}
+
+test "validateExecutionContext checks batch invariants" {
+    var slot: [1]usize = .{0};
+    var seq_len: [2]u32 = .{ 3, 7 };
+    const invalid = ExecutionContext{
+        .mode = .decode,
+        .active_slots = slot[0..],
+        .sequence_lengths = seq_len[0..],
+        .batch_size = 1,
+    };
+    try std.testing.expectError(error.InvalidSequenceLengthCount, validateExecutionContext(&invalid));
+}
+
+test "validateExecutionPlan detects invalid register references" {
+    const inputs = [_]RegisterRef{registerFromIndex(0)};
+    const outputs = [_]RegisterRef{registerFromIndex(4)};
+    const insn = Instruction{
+        .opcode = .rmsnorm,
+        .inputs = inputs[0..],
+        .outputs = outputs[0..],
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 4,
+        .state_descs = &.{},
+    };
+    try std.testing.expectError(error.InvalidInstructionRegisterRef, validateExecutionPlan(&plan));
+}
+
+test "validateCompiledPlan enforces liveness dimensions" {
+    const insn = Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{insn},
+        .register_count = 2,
+        .state_descs = &.{},
+    };
+    const liveness = LivenessMap{
+        .register_last_read = &.{ 0, 0 },
+        .kill_after_instruction = &.{&.{0}},
+    };
+    const compiled = CompiledPlan{
+        .plan = plan,
+        .liveness = liveness,
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+    try validateCompiledPlan(&compiled);
+}
+
+test "AdapterTable keeps 256 opcode slots" {
+    try std.testing.expectEqual(@as(usize, 256), @typeInfo(AdapterTable).array.len);
+}
