@@ -186,7 +186,7 @@ pub const Model = struct {
         deepstack: ?DeepstackAdditions,
         runtime_rope: ?RuntimeRoPEOverride,
     ) !ArrayHandle {
-        const hidden = try forwardHiddenWithEmbeddingOverride(
+        const hidden = try forwardHiddenCoreWithEmbeddingOverride(
             allocator,
             weight_handles,
             input_ids,
@@ -244,6 +244,37 @@ pub const Model = struct {
         deepstack: ?DeepstackAdditions,
         runtime_rope: ?RuntimeRoPEOverride,
     ) !ArrayHandle {
+        const hidden = try forwardHiddenCoreWithEmbeddingOverride(
+            allocator,
+            weight_handles,
+            input_ids,
+            config,
+            cache,
+            shortconv_cache,
+            mamba_cache,
+            pos_offset,
+            use_compiled,
+            embedding_override,
+            deepstack,
+            runtime_rope,
+        );
+        return block_executor.TransformerBlock.projectHidden(hidden, weight_handles, config.norm_eps);
+    }
+
+    fn forwardHiddenCoreWithEmbeddingOverride(
+        allocator: std.mem.Allocator,
+        weight_handles: anytype,
+        input_ids: []const u32,
+        config: anytype,
+        cache: ?Cache,
+        shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
+        pos_offset: usize,
+        use_compiled: bool,
+        embedding_override: ?[]const f32,
+        deepstack: ?DeepstackAdditions,
+        runtime_rope: ?RuntimeRoPEOverride,
+    ) !ArrayHandle {
         if (builtin.os.tag != .macos) {
             return error.MLXNotAvailable;
         }
@@ -252,7 +283,6 @@ pub const Model = struct {
         if (trace and cache != null) trace = false;
         const phase: []const u8 = if (input_ids.len == 1) "decode" else "prefill";
 
-        const norm_eps = config.norm_eps;
         const layer_count: usize = @intCast(config.n_layers);
         const sequence_len = input_ids.len;
         _ = use_compiled;
@@ -316,7 +346,7 @@ pub const Model = struct {
             }
         }
 
-        return block_executor.TransformerBlock.projectHidden(hidden, weight_handles, norm_eps);
+        return hidden;
     }
 
     pub fn forwardFromGPUToken(
@@ -399,4 +429,115 @@ test "Model.forwardHidden exposes stable callable signature" {
 test "Model.forwardHiddenWithEmbeddingOverride exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(Model.forwardHiddenWithEmbeddingOverride)).@"fn";
     try std.testing.expectEqual(@as(usize, 12), fn_info.params.len);
+}
+
+test "Model.forward matches forwardFromGPUToken for single-token zero-layer model" {
+    if (builtin.os.tag != .macos) return;
+
+    const allocator = std.testing.allocator;
+    const d_model: usize = 4;
+    const vocab_size: usize = 8;
+
+    const embeddings_data = [_]f32{
+        0.11, -0.05, 0.23, 0.07,
+        -0.18, 0.09, 0.04, -0.12,
+        0.31, 0.08, -0.21, 0.16,
+        0.27, -0.14, 0.19, 0.05,
+        -0.07, 0.22, 0.13, -0.04,
+        0.15, -0.11, 0.06, 0.29,
+        -0.03, 0.17, -0.26, 0.10,
+        0.24, 0.02, -0.09, -0.19,
+    };
+    const embeddings_shape = [_]i64{ @intCast(vocab_size), @intCast(d_model) };
+    const embeddings = mlx_graph.createArrayF32(embeddings_data[0..], &embeddings_shape);
+    defer mlx_graph.freeArray(embeddings);
+
+    const ln_final_data = [_]f32{ 1.0, 0.5, 1.5, 2.0 };
+    const ln_final_shape = [_]i64{@intCast(d_model)};
+    const ln_final = mlx_graph.createArrayF32(ln_final_data[0..], &ln_final_shape);
+    defer mlx_graph.freeArray(ln_final);
+
+    const lm_head_data = [_]f32{
+        0.05, -0.02, 0.11, 0.07, -0.09, 0.03, 0.04, -0.01,
+        0.08, 0.12, -0.05, 0.06, 0.02, -0.04, 0.10, 0.09,
+        -0.03, 0.01, 0.07, -0.08, 0.13, 0.05, -0.06, 0.02,
+        0.14, -0.10, 0.03, 0.12, -0.07, 0.11, 0.00, -0.05,
+    };
+    const lm_head_shape = [_]i64{ @intCast(d_model), @intCast(vocab_size) };
+    const lm_head = mlx_graph.createArrayF32(lm_head_data[0..], &lm_head_shape);
+    defer mlx_graph.freeArray(lm_head);
+
+    const weights_mod = @import("weights.zig");
+    var weight_handles = weights_mod.WeightHandles{
+        .embed_tokens = embeddings,
+        .embed_tokens_quantized = null,
+        .layers = &.{},
+        .ln_final = ln_final,
+        .lm_head = lm_head,
+        .lm_head_quantized = null,
+        .lm_head_needs_transpose = false,
+        .d_model = d_model,
+        .is_quantized = false,
+    };
+
+    const cfg = struct {
+        n_layers: usize = 0,
+        norm_eps: f32 = 1e-5,
+    }{};
+
+    const input_ids = [_]u32{3};
+    const logits_from_ids = try Model.forward(
+        allocator,
+        &weight_handles,
+        input_ids[0..],
+        cfg,
+        null,
+        null,
+        null,
+        0,
+        false,
+    );
+    defer mlx_graph.freeArray(logits_from_ids);
+
+    const token_shape = [_]usize{input_ids.len};
+    const token_handle = mlx_graph.mlx_array_from_uint32(input_ids[0..].ptr, &token_shape, 1);
+    defer mlx_graph.freeArray(token_handle);
+
+    const logits_from_gpu_token = try Model.forwardFromGPUToken(
+        allocator,
+        &weight_handles,
+        token_handle,
+        cfg,
+        null,
+        null,
+        null,
+        0,
+    );
+    defer mlx_graph.freeArray(logits_from_gpu_token);
+
+    mlx_graph.eval(&.{ logits_from_ids, logits_from_gpu_token });
+
+    var shape_buf: [8]usize = undefined;
+    const rank_a = mlx_graph.getShape(logits_from_ids, &shape_buf);
+    var total_logits: usize = 1;
+    for (shape_buf[0..rank_a]) |dim| total_logits *= dim;
+    try std.testing.expectEqual(vocab_size, total_logits);
+
+    var shape_buf_b: [8]usize = undefined;
+    const rank_b = mlx_graph.getShape(logits_from_gpu_token, &shape_buf_b);
+    var total_logits_b: usize = 1;
+    for (shape_buf_b[0..rank_b]) |dim| total_logits_b *= dim;
+    try std.testing.expectEqual(vocab_size, total_logits_b);
+
+    const host_a = try allocator.alloc(f32, total_logits);
+    defer allocator.free(host_a);
+    const host_b = try allocator.alloc(f32, total_logits_b);
+    defer allocator.free(host_b);
+
+    mlx_graph.copyToHost(logits_from_ids, host_a);
+    mlx_graph.copyToHost(logits_from_gpu_token, host_b);
+
+    for (host_a, host_b) |a, b| {
+        try std.testing.expectApproxEqAbs(a, b, 1e-5);
+    }
 }

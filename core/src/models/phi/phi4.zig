@@ -1,7 +1,10 @@
 //! Phi4 model-version metadata.
 
+const std = @import("std");
+const tensor = @import("../../tensor.zig");
 const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
+const config_hooks = @import("../config/hook_utils.zig");
 
 /// Graph architecture id is "phi" for the phi family.
 pub const id: []const u8 = "phi";
@@ -52,39 +55,33 @@ pub const attention_mlp_program: []const layer_ops.LayerOp = &.{
 // Runtime architecture payload (migrated from runtime_architectures.zig)
 const phi_model_types = [_][]const u8{ "phi3", "phi4", "phi" };
 const phi_weight_prefixes = [_][]const u8{ "model.layers.{d}.", "layers.{d}.", "transformer.h.{d}.", "backbone.layers.{d}.", "language_model.model.layers.{d}." };
-const phi_pre_block_ops = [_]types.Op{
-    .{ .op_type = .embedding, .inputs = &.{.{ .tensor = "input_ids" }}, .outputs = &.{"_t0"} },
-};
-const phi_post_block_ops = [_]types.Op{
-    .{ .op_type = .norm, .inputs = &.{.{ .tensor = "_t_last" }}, .outputs = &.{"_t_out"} },
-};
-const phi_block_ops = [_]types.Op{
-    .{ .op_type = .norm, .name = "input_layernorm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "input_layernorm.weight" } }, .outputs = &.{"_t0"} },
-    .{ .op_type = .multihead_attention, .inputs = &.{.{ .tensor = "_t0" }}, .outputs = &.{"_t1"}, .fused_qkv = true },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "_t1" } }, .outputs = &.{"_t2"} },
-    .{ .op_type = .norm, .name = "post_attention_layernorm", .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "post_attention_layernorm.weight" } }, .outputs = &.{"_t3"} },
-    .{ .op_type = .mlp, .inputs = &.{.{ .tensor = "_t3" }}, .outputs = &.{"_t4"}, .fused_gate_up = true, .activation = "silu" },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "_t4" } }, .outputs = &.{"_t5"} },
-};
 const phi_block_weights = [_]types.WeightSpec{
-    .{ .id = "input_layernorm.weight", .candidates = &.{ "model.layers.{d}.input_layernorm.weight", "layers.{d}.input_layernorm.weight", "transformer.h.{d}.input_layernorm.weight", "backbone.layers.{d}.input_layernorm.weight", "language_model.model.layers.{d}.input_layernorm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
-    .{ .id = "self_attn.qkv_proj.weight", .candidates = &.{ "model.layers.{d}.self_attn.qkv_proj.weight", "layers.{d}.self_attn.qkv_proj.weight", "transformer.h.{d}.self_attn.qkv_proj.weight", "backbone.layers.{d}.self_attn.qkv_proj.weight", "language_model.model.layers.{d}.self_attn.qkv_proj.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
-    .{ .id = "self_attn.o_proj.weight", .candidates = &.{ "model.layers.{d}.self_attn.o_proj.weight", "layers.{d}.self_attn.o_proj.weight", "transformer.h.{d}.self_attn.o_proj.weight", "backbone.layers.{d}.self_attn.o_proj.weight", "language_model.model.layers.{d}.self_attn.o_proj.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
-    .{ .id = "post_attention_layernorm.weight", .candidates = &.{ "model.layers.{d}.post_attention_layernorm.weight", "layers.{d}.post_attention_layernorm.weight", "transformer.h.{d}.post_attention_layernorm.weight", "backbone.layers.{d}.post_attention_layernorm.weight", "language_model.model.layers.{d}.post_attention_layernorm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
-    .{ .id = "mlp.gate_up_proj.weight", .candidates = &.{ "model.layers.{d}.mlp.gate_up_proj.weight", "layers.{d}.mlp.gate_up_proj.weight", "transformer.h.{d}.mlp.gate_up_proj.weight", "backbone.layers.{d}.mlp.gate_up_proj.weight", "language_model.model.layers.{d}.mlp.gate_up_proj.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
-    .{ .id = "mlp.down_proj.weight", .candidates = &.{ "model.layers.{d}.mlp.down_proj.weight", "layers.{d}.mlp.down_proj.weight", "transformer.h.{d}.mlp.down_proj.weight", "backbone.layers.{d}.mlp.down_proj.weight", "language_model.model.layers.{d}.mlp.down_proj.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
+    .{ .id = "input_layernorm.weight", .suffix = "input_layernorm.weight", .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
+    .{ .id = "self_attn.qkv_proj.weight", .suffix = "self_attn.qkv_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
+    .{ .id = "self_attn.o_proj.weight", .suffix = "self_attn.o_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
+    .{ .id = "post_attention_layernorm.weight", .suffix = "post_attention_layernorm.weight", .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
+    .{ .id = "mlp.gate_up_proj.weight", .suffix = "mlp.gate_up_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
+    .{ .id = "mlp.down_proj.weight", .suffix = "mlp.down_proj.weight", .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = true },
 };
 const phi_global_weights = [_]types.WeightSpec{
-    .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
-    .{ .id = "ln_final", .candidates = &.{ "model.norm.weight", "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
-    .{ .id = "lm_head", .candidates = &.{ "lm_head.weight", "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
+    .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
+    .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
+    .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
+
+fn parseConfigHook(
+    config_obj: std.json.ObjectMap,
+    root_obj: std.json.ObjectMap,
+    config: *tensor.ModelConfig,
+) void {
+    config_hooks.applyCommonTextConfig(config_obj, root_obj, config);
+    config_hooks.applyPhiPartialRotary(config_obj, root_obj, config);
+}
+
 pub var arch: types.Architecture = .{
     .name = "phi",
     .model_types = &phi_model_types,
-    .block_ops = &phi_block_ops,
-    .pre_block_ops = &phi_pre_block_ops,
-    .post_block_ops = &phi_post_block_ops,
+    .parse_config_hook = parseConfigHook,
     .block_variants = null,
     .layer_map = null,
     .variant_aliases = null,

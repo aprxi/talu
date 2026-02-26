@@ -623,7 +623,6 @@ pub const LocalEngine = struct {
         const top_p = opts.top_p orelse chat.top_p;
         const min_p = opts.min_p orelse chat.min_p;
         const repetition_penalty = opts.repetition_penalty orelse chat.repetition_penalty;
-
         // Build sampling config
         var sampling_config = sampler.SamplingConfig{ .strategy = .greedy, .logit_bias = opts.logit_bias, .seed = opts.seed };
         if (temperature > 0 and (self.gen_config.do_sample or opts.temperature != null)) {

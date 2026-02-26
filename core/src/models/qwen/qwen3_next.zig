@@ -1,8 +1,10 @@
 //! Qwen3-Next model-version metadata.
 
 const std = @import("std");
+const tensor = @import("../../tensor.zig");
 const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
+const config_hooks = @import("../config/hook_utils.zig");
 
 pub const id: []const u8 = "qwen3_next";
 pub const family: []const u8 = "qwen";
@@ -95,20 +97,10 @@ const qwen3_next_weight_prefixes = [_][]const u8{
     "language_model.model.layers.{d}.",
 };
 
-fn layerCandidates(comptime suffix: []const u8) []const []const u8 {
-    return &.{
-        "model.layers.{d}." ++ suffix,
-        "layers.{d}." ++ suffix,
-        "transformer.h.{d}." ++ suffix,
-        "backbone.layers.{d}." ++ suffix,
-        "language_model.model.layers.{d}." ++ suffix,
-    };
-}
-
 fn requiredLayerWeight(comptime id_suffix: []const u8, comptime module_type: []const u8, comptime layout: types.WeightLayout) types.WeightSpec {
     return .{
         .id = id_suffix,
-        .candidates = layerCandidates(id_suffix),
+        .suffix = id_suffix,
         .module_type = module_type,
         .layout = layout,
         .dtype = "float32",
@@ -132,24 +124,17 @@ fn buildExpertWeights(comptime expert_count: usize) [expert_count * 3]types.Weig
     return specs;
 }
 
-const qwen3_next_pre_block_ops = [_]types.Op{
-    .{ .op_type = .embedding, .inputs = &.{.{ .tensor = "input_ids" }}, .outputs = &.{"_t0"} },
-};
-const qwen3_next_post_block_ops = [_]types.Op{
-    .{ .op_type = .norm, .inputs = &.{.{ .tensor = "_t_last" }}, .outputs = &.{"_t_out"} },
-};
-const qwen3_next_block_ops = [_]types.Op{};
+fn parseConfigHook(
+    config_obj: std.json.ObjectMap,
+    root_obj: std.json.ObjectMap,
+    config: *tensor.ModelConfig,
+) void {
+    config_hooks.applyCommonTextConfig(config_obj, root_obj, config);
+    config_hooks.applyMambaConfig(config_obj, root_obj, config);
+}
+
 const qwen3_next_block_weights = [_]types.WeightSpec{};
 const qwen3_next_layer_map = [_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 1 };
-
-const qwen3_next_linear_attention_ops = [_]types.Op{
-    .{ .op_type = .norm, .name = "input_layernorm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "input_layernorm.weight" } }, .outputs = &.{"_t0"}, .weight_offset = 1.0 },
-    .{ .op_type = .mamba_mixer, .name = "linear_attn", .inputs = &.{.{ .tensor = "_t0" }}, .outputs = &.{"_t1"}, .d_state = 128, .d_conv = 4, .n_heads = 32, .d_head = 128, .n_groups = 16, .d_inner = 4096 },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "_t1" } }, .outputs = &.{"_t2"} },
-    .{ .op_type = .norm, .name = "post_attention_layernorm", .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "post_attention_layernorm.weight" } }, .outputs = &.{"_t3"}, .weight_offset = 1.0 },
-    .{ .op_type = .moe, .inputs = &.{.{ .tensor = "_t3" }}, .outputs = &.{"_t4"}, .num_experts = 512, .experts_per_token = 10 },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "_t4" } }, .outputs = &.{"_t5"} },
-};
 
 const qwen3_next_expert_weights = buildExpertWeights(512);
 const qwen3_next_shared_expert_weights = [_]types.WeightSpec{
@@ -168,7 +153,7 @@ const qwen3_next_linear_attention_common_weights = [_]types.WeightSpec{
     requiredLayerWeight("linear_attn.conv1d.weight", "Conv1d", .conv1d_depthwise),
     .{
         .id = "linear_attn.norm.weight",
-        .candidates = layerCandidates("linear_attn.norm.weight"),
+        .suffix = "linear_attn.norm.weight",
         .module_type = "RMSNorm",
         .layout = .none,
         .dtype = "float32",
@@ -180,15 +165,6 @@ const qwen3_next_linear_attention_common_weights = [_]types.WeightSpec{
     requiredLayerWeight("mlp.gate.weight", "Linear", .linear),
 };
 const qwen3_next_linear_attention_weights = qwen3_next_linear_attention_common_weights ++ qwen3_next_expert_weights ++ qwen3_next_shared_expert_weights;
-
-const qwen3_next_full_attention_ops = [_]types.Op{
-    .{ .op_type = .norm, .name = "input_layernorm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "input_layernorm.weight" } }, .outputs = &.{"_t0"}, .weight_offset = 1.0 },
-    .{ .op_type = .multihead_attention, .inputs = &.{.{ .tensor = "_t0" }}, .outputs = &.{"_t1"}, .qk_norm = true },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "_t1" } }, .outputs = &.{"_t2"} },
-    .{ .op_type = .norm, .name = "post_attention_layernorm", .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "post_attention_layernorm.weight" } }, .outputs = &.{"_t3"}, .weight_offset = 1.0 },
-    .{ .op_type = .moe, .inputs = &.{.{ .tensor = "_t3" }}, .outputs = &.{"_t4"}, .num_experts = 512, .experts_per_token = 10 },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "_t4" } }, .outputs = &.{"_t5"} },
-};
 
 const qwen3_next_full_attention_common_weights = [_]types.WeightSpec{
     requiredLayerWeight("input_layernorm.weight", "RMSNorm", .none),
@@ -204,22 +180,33 @@ const qwen3_next_full_attention_common_weights = [_]types.WeightSpec{
 const qwen3_next_full_attention_weights = qwen3_next_full_attention_common_weights ++ qwen3_next_expert_weights ++ qwen3_next_shared_expert_weights;
 
 var qwen3_next_block_variants = [_]types.BlockVariant{
-    .{ .name = "linear_attention", .ops = &qwen3_next_linear_attention_ops, .weights = &qwen3_next_linear_attention_weights },
-    .{ .name = "full_attention", .ops = &qwen3_next_full_attention_ops, .weights = &qwen3_next_full_attention_weights },
+    .{
+        .name = "linear_attention",
+        .meta = .{
+            .mamba_config = .{
+                .d_state = 128,
+                .d_conv = 4,
+                .n_heads = 32,
+                .d_head = 128,
+                .n_groups = 16,
+                .d_inner = 4096,
+            },
+        },
+        .weights = &qwen3_next_linear_attention_weights,
+    },
+    .{ .name = "full_attention", .weights = &qwen3_next_full_attention_weights },
 };
 
 const qwen3_next_global_weights = [_]types.WeightSpec{
-    .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
-    .{ .id = "ln_final", .candidates = &.{ "model.norm.weight", "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
-    .{ .id = "lm_head", .candidates = &.{ "lm_head.weight", "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
+    .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
+    .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
+    .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
 
 pub var arch: types.Architecture = .{
     .name = "qwen3_next",
     .model_types = &qwen3_next_model_types,
-    .block_ops = &qwen3_next_block_ops,
-    .pre_block_ops = &qwen3_next_pre_block_ops,
-    .post_block_ops = &qwen3_next_post_block_ops,
+    .parse_config_hook = parseConfigHook,
     .block_variants = &qwen3_next_block_variants,
     .layer_map = &qwen3_next_layer_map,
     .variant_aliases = null,

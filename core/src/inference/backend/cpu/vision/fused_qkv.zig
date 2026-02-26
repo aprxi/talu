@@ -19,6 +19,7 @@ const exec_block = @import("../executor/block.zig");
 const image_mod = @import("../../../../image/root.zig");
 const common_vision = @import("types.zig");
 const vision_tensor_convert = @import("tensor_convert.zig");
+const vision_program_mod = @import("../../../vision_program.zig");
 
 const Tensor = tensor.Tensor;
 const ModelConfig = tensor.ModelConfig;
@@ -70,6 +71,7 @@ pub const VisionRuntime = struct {
     blocks: []cpu_blocks.TransformerBlock,
     exec_blocks: []exec_block.Block,
     scratch: cpu_blocks.ScratchBuffer,
+    vision_program: []const layer_ops.LayerOp,
 
     const LayerWeights = struct {
         ln1_weight: Tensor,
@@ -123,7 +125,7 @@ pub const VisionRuntime = struct {
         const vision_intermediate_size: usize = @intCast(if (cfg.vision_intermediate_size > 0) cfg.vision_intermediate_size else 4 * cfg.vision_hidden_size);
         const language_hidden_size: usize = @intCast(cfg.d_model);
         const patch_size: usize = @intCast(if (cfg.vision_patch_size > 0) cfg.vision_patch_size else 16);
-        const spatial_merge_size: usize = @intCast(if (cfg.vision_spatial_merge_size > 0) cfg.vision_spatial_merge_size else 2);
+        var spatial_merge_size: usize = @intCast(if (cfg.vision_spatial_merge_size > 0) cfg.vision_spatial_merge_size else 2);
         const temporal_patch_size: usize = @intCast(if (cfg.vision_temporal_patch_size > 0) cfg.vision_temporal_patch_size else 2);
         const num_pos_embeddings: usize = @intCast(if (cfg.vision_num_position_embeddings > 0) cfg.vision_num_position_embeddings else 2304);
         var deepstack_visual_layers: [8]usize = [_]usize{0} ** 8;
@@ -132,6 +134,16 @@ pub const VisionRuntime = struct {
         for (0..deepstack_layer_count) |idx| {
             deepstack_visual_layers[idx] = cfg.vision_probe_layers[idx];
         }
+        const vision_program = vision_load.resolveVisionProgram(loaded) orelse return null;
+        const parsed_program = try vision_program_mod.parseVisionProgram(
+            vision_program,
+            spatial_merge_size,
+            deepstack_visual_layers,
+            deepstack_layer_count,
+        );
+        spatial_merge_size = parsed_program.spatial_merge_size;
+        deepstack_visual_layers = parsed_program.deepstack_visual_layers;
+        deepstack_layer_count = parsed_program.deepstack_layer_count;
 
         const num_grid_side = std.math.sqrt(num_pos_embeddings);
         if (num_grid_side * num_grid_side != num_pos_embeddings) return error.InvalidShape;
@@ -266,7 +278,6 @@ pub const VisionRuntime = struct {
                 .moe_weights = null,
                 .sinks = null,
                 .is_causal = false,
-                .block_ops = &.{},
                 .mla_config = null,
                 .q_a_proj = null,
                 .q_a_norm = null,
@@ -276,7 +287,7 @@ pub const VisionRuntime = struct {
                 .kv_b_proj = null,
             } };
 
-            blocks[layer_idx] = try cpu_blocks.TransformerBlock.init(
+            blocks[layer_idx] = try cpu_blocks.TransformerBlock.initWithProgram(
                 allocator,
                 vision_hidden_size,
                 vision_intermediate_size,
@@ -285,6 +296,7 @@ pub const VisionRuntime = struct {
                 head_dim,
                 num_pos_embeddings,
                 weights,
+                &vision_block_program,
                 1e-6,
                 .{},
                 1.0,
@@ -298,8 +310,6 @@ pub const VisionRuntime = struct {
                 .block = &blocks[layer_idx],
                 .block_idx = layer_idx,
                 .hidden_size = vision_hidden_size,
-                .mamba_layer_idx = null,
-                .shortconv_layer_idx = null,
             };
             try exec_blocks[layer_idx].validate();
 
@@ -342,6 +352,7 @@ pub const VisionRuntime = struct {
             .blocks = blocks,
             .exec_blocks = exec_blocks,
             .scratch = scratch,
+            .vision_program = vision_program,
         };
     }
 
@@ -544,7 +555,6 @@ pub const VisionRuntime = struct {
                 &in_view,
                 &out_view,
                 &self.scratch,
-                &self.scratch.attn_caches[layer_idx],
                 false,
             );
 
@@ -573,8 +583,53 @@ pub const VisionRuntime = struct {
             .hidden_len = current.len,
         }, @src());
 
+        return try self.runVisionProgram(image.grid, current, deepstack_layer_embeddings);
+    }
+
+    fn runVisionProgram(
+        self: *VisionRuntime,
+        grid: image_mod.VisionGrid,
+        merged_hidden_in: []const f32,
+        deepstack_layer_embeddings: []const []const f32,
+    ) !EncodedSingleImage {
+        var merged_embeddings: ?[]f32 = null;
+        errdefer if (merged_embeddings) |embeds| self.allocator.free(embeds);
+
+        var saw_patch_embed = false;
+        var saw_spatial_merge = false;
+
+        for (self.vision_program) |op| {
+            switch (op) {
+                .patch_embed => {
+                    if (saw_patch_embed or saw_spatial_merge) return error.InvalidVisionProgram;
+                    saw_patch_embed = true;
+                },
+                .deepstack_extract => |extract_op| {
+                    if (!saw_patch_embed) return error.InvalidVisionProgram;
+                    const layer_idx = std.math.cast(usize, extract_op.layer_index) orelse return error.InvalidVisionProgram;
+                    const merger_idx = self.deepstackLayerToMergerIndex(layer_idx) orelse return error.InvalidVisionProgram;
+                    if (merger_idx >= deepstack_layer_embeddings.len or deepstack_layer_embeddings[merger_idx].len == 0) {
+                        return error.InvalidState;
+                    }
+                },
+                .spatial_merge => {
+                    if (!saw_patch_embed or saw_spatial_merge) return error.InvalidVisionProgram;
+                    saw_spatial_merge = true;
+                    merged_embeddings = try self.runMerger(grid, merged_hidden_in);
+                },
+                .scatter => {
+                    if (!saw_spatial_merge) return error.InvalidVisionProgram;
+                },
+                else => {},
+            }
+        }
+
+        if (!saw_patch_embed or !saw_spatial_merge or merged_embeddings == null) {
+            return error.InvalidVisionProgram;
+        }
+
         return .{
-            .merged_embeddings = try self.runMerger(image.grid, current),
+            .merged_embeddings = merged_embeddings.?,
             .deepstack_layer_embeddings = deepstack_layer_embeddings,
         };
     }

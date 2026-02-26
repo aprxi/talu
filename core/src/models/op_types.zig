@@ -4,12 +4,7 @@
 //! and inference runtime wiring.
 
 const std = @import("std");
-
-/// Input to an operation - either a tensor reference or a scalar value.
-pub const OpInput = union(enum) {
-    tensor: []const u8, // Tensor name (e.g., "weight", "x")
-    scalar: f32, // Scalar value (e.g., 1.0)
-};
+const tensor = @import("../tensor.zig");
 
 /// Operation types that can appear in model block metadata.
 /// High-level ops (norm, multihead_attention, mlp) are preferred.
@@ -43,59 +38,56 @@ pub const OpType = enum {
     rope,
     triu,
     scaled_dot_product_attention,
+
+    // Vision pipeline ops
+    patch_embed,
+    spatial_merge,
+    deepstack_extract,
+    scatter,
 };
 
-/// A single operation in static model metadata.
-pub const Op = struct {
-    op_type: OpType,
-    name: ?[]const u8 = null, // For norm: "input_layernorm", etc.
-    inputs: []const OpInput = &.{}, // Inputs to the operation
-    outputs: []const []const u8 = &.{}, // Output tensor names for dataflow tracking
-
-    // Op-specific parameters
-    weight_offset: f32 = 0.0, // For norm: add to weight before scaling (e.g., (1+w) formulation)
-    qk_norm: bool = false, // For attention: apply QK normalization
-    fused_qkv: bool = false, // For attention: weights are fused [Q,K,V]
-    fused_gate_up: bool = false, // For mlp: weights are fused [gate,up]
-    sliding_window: ?i32 = null, // For attention
-
-    // MLA (Multi-Latent Attention) specific fields
-    mla: bool = false, // For attention: use MLA (compressed Q/KV projections)
-    q_lora_rank: ?u32 = null, // MLA: Q compression rank
-    kv_lora_rank: ?u32 = null, // MLA: KV compression rank
-    qk_head_dim: ?u32 = null, // MLA: total Q/K head dimension (rope + nope)
-    qk_rope_head_dim: ?u32 = null, // MLA: dimension with RoPE applied
-    qk_nope_head_dim: ?u32 = null, // MLA: dimension without RoPE
-    v_head_dim: ?u32 = null, // MLA: value head dimension
-    rope_interleave: bool = true, // MLA: use interleaved RoPE layout
-    activation: ?[]const u8 = null, // For ffn: "silu", "gelu", "relu"
-    num_experts: i32 = 0, // For moe
-    experts_per_token: i32 = 0, // For moe
-    scale: f32 = 1.0, // For residual_add
-    num_outputs: i32 = 0, // For split: number of output tensors
-    dim: i32 = -1, // For split/softmax: dimension to operate on
-    dim0: i32 = -1, // For transpose: first dimension
-    dim1: i32 = -1, // For transpose: second dimension
-    keepdim: bool = false, // For mean
-    exponent: f32 = 1.0, // For pow
-    shape: []const i32 = &.{}, // For reshape
-    split_sizes: []const i32 = &.{}, // For split: sizes of each output
-    is_causal: bool = true, // For sdpa: apply causal mask
-    sdpa_scale: ?f32 = null, // For sdpa: explicit scale (null = use 1/sqrt(head_dim))
-
-    // Mamba-specific fields (for mamba_mixer op)
-    d_state: ?u32 = null, // SSM state dimension (e.g., 128)
-    d_conv: ?u32 = null, // Convolution kernel size (e.g., 4) - also used by shortconv
-    n_heads: ?u32 = null, // Number of SSM heads (e.g., 48)
-    d_head: ?u32 = null, // Head dimension (e.g., 32)
-    n_groups: ?u32 = null, // Groups for B/C projection (e.g., 1)
-    d_inner: ?u32 = null, // Inner dimension (n_heads * d_head)
-
-    // ShortConv-specific fields (for shortconv op)
-    conv_dim: ?u32 = null, // Intermediate dimension
-    conv_dim_out: ?u32 = null, // Output dimension
-    conv_bias: bool = false, // Whether conv uses bias
+pub const MLAConfig = struct {
+    q_lora_rank: u32 = 0,
+    kv_lora_rank: u32 = 0,
+    qk_head_dim: u32 = 0,
+    qk_rope_head_dim: u32 = 0,
+    qk_nope_head_dim: u32 = 0,
+    v_head_dim: u32 = 0,
+    rope_interleave: bool = true,
 };
+
+pub const MambaConfig = struct {
+    d_state: u32 = 0,
+    d_conv: u32 = 0,
+    n_heads: u32 = 0,
+    d_head: u32 = 0,
+    n_groups: u32 = 1,
+    d_inner: u32 = 0,
+};
+
+pub const ShortConvConfig = struct {
+    d_conv: u32 = 0,
+    conv_dim: u32 = 0,
+    conv_dim_out: u32 = 0,
+    has_bias: bool = false,
+};
+
+/// Loader-only metadata paired with a block program.
+/// LayerOp remains the execution bytecode; KernelMeta carries static loader hints.
+pub const KernelMeta = struct {
+    is_causal: bool = true,
+    mla_config: ?MLAConfig = null,
+    mamba_config: ?MambaConfig = null,
+    shortconv_config: ?ShortConvConfig = null,
+};
+
+/// Architecture-owned config parsing hook.
+/// Receives both parsed text-config object and root config object.
+pub const ConfigParseHook = *const fn (
+    config_obj: std.json.ObjectMap,
+    root_obj: std.json.ObjectMap,
+    config: *tensor.ModelConfig,
+) void;
 
 /// Weight layout hints for loading and transformation.
 pub const WeightLayout = enum {
@@ -119,8 +111,10 @@ pub const WeightTransform = enum {
 pub const WeightSpec = struct {
     /// Internal ID for lookup (relative path from block).
     id: []const u8,
-    /// Candidate name templates to try (expand {d} to layer index).
-    candidates: []const []const u8,
+    /// Primary tensor suffix for block weights, or full tensor name for globals.
+    suffix: []const u8,
+    /// Additional suffix/name aliases to probe if primary lookup misses.
+    aliases: []const []const u8 = &.{},
     /// PyTorch module type name (Linear, Conv1d, Embedding, etc.).
     module_type: []const u8,
     /// Weight layout for transform hints.
@@ -146,7 +140,7 @@ pub const VariantAlias = struct {
 
 pub const BlockVariant = struct {
     name: []const u8,
-    ops: []const Op,
+    meta: ?KernelMeta = null,
     weights: []const WeightSpec = &.{},
 };
 
@@ -154,197 +148,50 @@ pub const BlockVariant = struct {
 /// This keeps tensor-name conventions in the models contract instead of
 /// inference-owned hardcoded string templates.
 pub const VisionMetadata = struct {
-    /// Probe tensors used to classify fused/split attention layouts.
-    fused_qkv_probe_candidates: []const []const u8 = &.{
-        "model.visual.blocks.0.attn.qkv.weight",
-    },
-    split_qkv_probe_candidates: []const []const u8 = &.{
-        "model.visual.blocks.0.attn.q_proj.weight",
-        "model.visual.blocks.0.self_attn.q_proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.0.self_attn.q_proj.weight",
-        "model.vision_model.encoder.layers.0.self_attn.q_proj.weight",
-    },
+    fused_qkv_probe_candidates: []const []const u8 = &.{},
+    split_qkv_probe_candidates: []const []const u8 = &.{},
 
-    /// Candidate tensors used for config hydration.
-    patch_embed_candidates: []const []const u8 = &.{
-        "model.visual.patch_embed.proj.weight",
-        "model.vision_tower.vision_model.embeddings.patch_embedding.weight",
-        "model.vision_model.embeddings.patch_embedding.weight",
-    },
-    patch_embed_bias_candidates: []const []const u8 = &.{
-        "model.visual.patch_embed.proj.bias",
-        "model.vision_tower.vision_model.embeddings.patch_embedding.bias",
-        "model.vision_model.embeddings.patch_embedding.bias",
-    },
-    position_embed_candidates: []const []const u8 = &.{
-        "model.visual.pos_embed.weight",
-        "model.vision_tower.vision_model.embeddings.position_embedding.weight",
-        "model.vision_model.embeddings.position_embedding.weight",
-    },
-    post_norm_weight_candidates: []const []const u8 = &.{
-        "model.visual.norm.weight",
-        "model.vision_tower.vision_model.post_layernorm.weight",
-        "model.vision_model.post_layernorm.weight",
-    },
-    post_norm_bias_candidates: []const []const u8 = &.{
-        "model.visual.norm.bias",
-        "model.vision_tower.vision_model.post_layernorm.bias",
-        "model.vision_model.post_layernorm.bias",
-    },
-    merger_norm_weight_candidates: []const []const u8 = &.{
-        "model.visual.merger.norm.weight",
-        "model.multi_modal_projector.layer_norm.weight",
-    },
-    merger_norm_bias_candidates: []const []const u8 = &.{
-        "model.visual.merger.norm.bias",
-        "model.multi_modal_projector.layer_norm.bias",
-    },
-    merger_fc1_candidates: []const []const u8 = &.{
-        "model.visual.merger.linear_fc1.weight",
-        "model.multi_modal_projector.linear_1.weight",
-    },
-    merger_fc1_bias_candidates: []const []const u8 = &.{
-        "model.visual.merger.linear_fc1.bias",
-        "model.multi_modal_projector.linear_1.bias",
-    },
-    merger_fc2_candidates: []const []const u8 = &.{
-        "model.visual.merger.linear_fc2.weight",
-        "model.multi_modal_projector.linear_2.weight",
-    },
-    merger_fc2_bias_candidates: []const []const u8 = &.{
-        "model.visual.merger.linear_fc2.bias",
-        "model.multi_modal_projector.linear_2.bias",
-    },
+    patch_embed_candidates: []const []const u8 = &.{},
+    patch_embed_bias_candidates: []const []const u8 = &.{},
+    position_embed_candidates: []const []const u8 = &.{},
+    post_norm_weight_candidates: []const []const u8 = &.{},
+    post_norm_bias_candidates: []const []const u8 = &.{},
+    merger_norm_weight_candidates: []const []const u8 = &.{},
+    merger_norm_bias_candidates: []const []const u8 = &.{},
+    merger_fc1_candidates: []const []const u8 = &.{},
+    merger_fc1_bias_candidates: []const []const u8 = &.{},
+    merger_fc2_candidates: []const []const u8 = &.{},
+    merger_fc2_bias_candidates: []const []const u8 = &.{},
 
-    /// Layer templates for per-block vision weights.
-    ln1_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.norm1.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.weight",
-        "model.vision_model.encoder.layers.{d}.layer_norm1.weight",
-    },
-    ln1_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.norm1.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm1.bias",
-        "model.vision_model.encoder.layers.{d}.layer_norm1.bias",
-    },
-    ln2_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.norm2.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.weight",
-        "model.vision_model.encoder.layers.{d}.layer_norm2.weight",
-    },
-    ln2_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.norm2.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.layer_norm2.bias",
-        "model.vision_model.encoder.layers.{d}.layer_norm2.bias",
-    },
-    fused_qkv_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.qkv.weight",
-    },
-    fused_qkv_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.qkv.bias",
-    },
-    split_q_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.q_proj.weight",
-        "model.visual.blocks.{d}.self_attn.q_proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
-        "model.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
-    },
-    split_q_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.q_proj.bias",
-        "model.visual.blocks.{d}.self_attn.q_proj.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
-        "model.vision_model.encoder.layers.{d}.self_attn.q_proj.bias",
-    },
-    split_k_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.k_proj.weight",
-        "model.visual.blocks.{d}.self_attn.k_proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
-        "model.vision_model.encoder.layers.{d}.self_attn.k_proj.weight",
-    },
-    split_k_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.k_proj.bias",
-        "model.visual.blocks.{d}.self_attn.k_proj.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
-        "model.vision_model.encoder.layers.{d}.self_attn.k_proj.bias",
-    },
-    split_v_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.v_proj.weight",
-        "model.visual.blocks.{d}.self_attn.v_proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
-        "model.vision_model.encoder.layers.{d}.self_attn.v_proj.weight",
-    },
-    split_v_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.v_proj.bias",
-        "model.visual.blocks.{d}.self_attn.v_proj.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
-        "model.vision_model.encoder.layers.{d}.self_attn.v_proj.bias",
-    },
-    out_proj_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
-        "model.vision_model.encoder.layers.{d}.self_attn.out_proj.weight",
-    },
-    out_proj_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.proj.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
-        "model.vision_model.encoder.layers.{d}.self_attn.out_proj.bias",
-    },
-    fc1_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.mlp.linear_fc1.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.weight",
-        "model.vision_model.encoder.layers.{d}.mlp.fc1.weight",
-    },
-    fc1_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.mlp.linear_fc1.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc1.bias",
-        "model.vision_model.encoder.layers.{d}.mlp.fc1.bias",
-    },
-    fc2_weight_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.mlp.linear_fc2.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.weight",
-        "model.vision_model.encoder.layers.{d}.mlp.fc2.weight",
-    },
-    fc2_bias_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.mlp.linear_fc2.bias",
-        "model.vision_tower.vision_model.encoder.layers.{d}.mlp.fc2.bias",
-        "model.vision_model.encoder.layers.{d}.mlp.fc2.bias",
-    },
+    ln1_weight_templates: []const []const u8 = &.{},
+    ln1_bias_templates: []const []const u8 = &.{},
+    ln2_weight_templates: []const []const u8 = &.{},
+    ln2_bias_templates: []const []const u8 = &.{},
+    fused_qkv_weight_templates: []const []const u8 = &.{},
+    fused_qkv_bias_templates: []const []const u8 = &.{},
+    split_q_weight_templates: []const []const u8 = &.{},
+    split_q_bias_templates: []const []const u8 = &.{},
+    split_k_weight_templates: []const []const u8 = &.{},
+    split_k_bias_templates: []const []const u8 = &.{},
+    split_v_weight_templates: []const []const u8 = &.{},
+    split_v_bias_templates: []const []const u8 = &.{},
+    out_proj_weight_templates: []const []const u8 = &.{},
+    out_proj_bias_templates: []const []const u8 = &.{},
+    fc1_weight_templates: []const []const u8 = &.{},
+    fc1_bias_templates: []const []const u8 = &.{},
+    fc2_weight_templates: []const []const u8 = &.{},
+    fc2_bias_templates: []const []const u8 = &.{},
 
-    /// Deepstack merger templates (if present).
-    deepstack_norm_weight_templates: []const []const u8 = &.{
-        "model.visual.deepstack_merger_list.{d}.norm.weight",
-    },
-    deepstack_norm_bias_templates: []const []const u8 = &.{
-        "model.visual.deepstack_merger_list.{d}.norm.bias",
-    },
-    deepstack_fc1_weight_templates: []const []const u8 = &.{
-        "model.visual.deepstack_merger_list.{d}.linear_fc1.weight",
-    },
-    deepstack_fc1_bias_templates: []const []const u8 = &.{
-        "model.visual.deepstack_merger_list.{d}.linear_fc1.bias",
-    },
-    deepstack_fc2_weight_templates: []const []const u8 = &.{
-        "model.visual.deepstack_merger_list.{d}.linear_fc2.weight",
-    },
-    deepstack_fc2_bias_templates: []const []const u8 = &.{
-        "model.visual.deepstack_merger_list.{d}.linear_fc2.bias",
-    },
+    deepstack_norm_weight_templates: []const []const u8 = &.{},
+    deepstack_norm_bias_templates: []const []const u8 = &.{},
+    deepstack_fc1_weight_templates: []const []const u8 = &.{},
+    deepstack_fc1_bias_templates: []const []const u8 = &.{},
+    deepstack_fc2_weight_templates: []const []const u8 = &.{},
+    deepstack_fc2_bias_templates: []const []const u8 = &.{},
 
-    /// Layer templates used to infer depth/intermediate size.
-    depth_split_qproj_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.q_proj.weight",
-        "model.visual.blocks.{d}.self_attn.q_proj.weight",
-        "model.vision_tower.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
-        "model.vision_model.encoder.layers.{d}.self_attn.q_proj.weight",
-    },
-    depth_fused_qkv_templates: []const []const u8 = &.{
-        "model.visual.blocks.{d}.attn.qkv.weight",
-    },
-    intermediate_fc1_templates: []const []const u8 = &.{
-        "model.visual.blocks.0.mlp.linear_fc1.weight",
-        "model.vision_tower.vision_model.encoder.layers.0.mlp.fc1.weight",
-        "model.vision_model.encoder.layers.0.mlp.fc1.weight",
-    },
+    depth_split_qproj_templates: []const []const u8 = &.{},
+    depth_fused_qkv_templates: []const []const u8 = &.{},
+    intermediate_fc1_templates: []const []const u8 = &.{},
 };
 
 /// Canonical block kinds for heterogeneous model topologies.
@@ -400,11 +247,8 @@ pub fn fusedLayerKindId(kind: BlockKind) ?FusedLayerKindId {
 pub const Architecture = struct {
     name: []const u8,
     model_types: []const []const u8,
-
-    // Static op metadata (homogeneous models use block_ops, heterogeneous use block_variants)
-    block_ops: []const Op = &.{},
-    pre_block_ops: []const Op = &.{},
-    post_block_ops: []const Op = &.{},
+    kernel_meta: KernelMeta = .{},
+    parse_config_hook: ?ConfigParseHook = null,
 
     // Heterogeneous model support (e.g., Granite Hybrid with Mamba + Attention)
     // If block_variants is non-null, this is a heterogeneous model
@@ -440,7 +284,7 @@ pub const Architecture = struct {
     // strict checkpoint-native weight contracts.
     enable_loader_fusions: bool = true,
 
-    // Flags derived from analyzing block_ops
+    // Runtime flags declared on architecture metadata.
     has_qk_norm: bool = false,
     has_moe: bool = false,
     has_mamba: bool = false, // Has mamba_mixer ops (heterogeneous)

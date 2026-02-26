@@ -52,7 +52,7 @@ pub const LoadedModel = struct {
     /// Optional embedding layer norm (BERT-family).
     embedding_norm_weight: ?Tensor = null,
     embedding_norm_bias: ?Tensor = null,
-    blocks: []runtime_blocks.BlockWeights,
+    blocks: []runtime_blocks.LayerWeights,
     /// Original dtype of projection weights (before conversion to f32)
     /// Used to detect BF16 models for MLX GPU path
     original_weight_dtype: DType,
@@ -75,7 +75,15 @@ pub fn loadModel(
     load_options: LoadOptions,
     progress: progress_mod.Context,
 ) !LoadedModel {
-    return loadModelWithArchitecture(backing_allocator, config_path, safetensors_path, null, load_options, progress);
+    return loadModelWithArchitecture(
+        backing_allocator,
+        config_path,
+        safetensors_path,
+        null,
+        null,
+        load_options,
+        progress,
+    );
 }
 
 /// Environment flags collected once at load time to avoid repeated lookups.
@@ -133,14 +141,30 @@ fn detectOriginalWeightDType(
         arch.d_ff_source_weight_ids;
 
     if (probe_weight_ids.len == 0) return error.MissingWeightDTypeSourceWeightIds;
-    var name_buf: [256]u8 = undefined;
+    var name_buf: [512]u8 = undefined;
+    var prefix_buf: [256]u8 = undefined;
 
     for (probe_weight_ids) |id| {
         const spec = findWeightSpecById(specs, id) orelse continue;
-        for (spec.candidates) |candidate| {
-            const name = generic_weights.expandLayerTemplate(name_buf[0..], candidate, 0) catch continue;
-            const t = safetensors_file.getTensor(name, null) catch continue;
-            return t.dtype;
+        var alias_idx: usize = 0;
+        while (alias_idx < spec.aliases.len + 1) : (alias_idx += 1) {
+            const candidate = if (alias_idx == 0) spec.suffix else spec.aliases[alias_idx - 1];
+            if (arch.weight_prefixes.len == 0 or std.mem.indexOf(u8, candidate, "{d}") != null) {
+                const name = generic_weights.expandLayerTemplate(name_buf[0..], candidate, 0) catch continue;
+                const t = safetensors_file.getTensor(name, null) catch continue;
+                return t.dtype;
+            }
+
+            for (arch.weight_prefixes) |prefix_template| {
+                const expanded_prefix = generic_weights.expandLayerTemplate(prefix_buf[0..], prefix_template, 0) catch continue;
+                const total_len = expanded_prefix.len + candidate.len;
+                if (total_len > name_buf.len) continue;
+                @memcpy(name_buf[0..expanded_prefix.len], expanded_prefix);
+                @memcpy(name_buf[expanded_prefix.len..total_len], candidate);
+                const name = name_buf[0..total_len];
+                const t = safetensors_file.getTensor(name, null) catch continue;
+                return t.dtype;
+            }
         }
     }
 
@@ -287,44 +311,8 @@ fn inferDffFromWeight(w: Tensor, d_model: usize) ?usize {
 }
 
 fn inferMoEFromArchitecture(arch: *const model_types.Architecture, model_config: *ModelConfig) void {
-    var inferred_num_experts: i32 = 0;
-    var inferred_experts_per_token: i32 = 0;
-
-    const capture = struct {
-        fn fromOps(
-            ops: []const model_types.Op,
-            out_num_experts: *i32,
-            out_experts_per_token: *i32,
-        ) void {
-            for (ops) |op| {
-                if (op.op_type != .moe) continue;
-                if (out_num_experts.* <= 0 and op.num_experts > 0) out_num_experts.* = op.num_experts;
-                if (out_experts_per_token.* <= 0 and op.experts_per_token > 0) out_experts_per_token.* = op.experts_per_token;
-            }
-        }
-    };
-
-    capture.fromOps(arch.block_ops, &inferred_num_experts, &inferred_experts_per_token);
-    if (arch.block_variants) |variants| {
-        for (variants) |variant| {
-            capture.fromOps(variant.ops, &inferred_num_experts, &inferred_experts_per_token);
-        }
-    }
-
-    if (model_config.num_experts <= 0 and inferred_num_experts > 0) {
-        model_config.num_experts = inferred_num_experts;
-        log.debug("load", "Inferred MoE num_experts from architecture metadata", .{
-            .num_experts = inferred_num_experts,
-            .architecture = arch.name,
-        }, @src());
-    }
-    if (model_config.experts_per_token <= 0 and inferred_experts_per_token > 0) {
-        model_config.experts_per_token = inferred_experts_per_token;
-        log.debug("load", "Inferred MoE experts_per_token from architecture metadata", .{
-            .experts_per_token = inferred_experts_per_token,
-            .architecture = arch.name,
-        }, @src());
-    }
+    _ = arch;
+    _ = model_config;
 }
 
 pub fn loadModelWithArchitecture(
@@ -332,6 +320,7 @@ pub fn loadModelWithArchitecture(
     config_path: []const u8,
     safetensors_path: []const u8,
     runtime_arch: ?*const model_types.Architecture,
+    parse_config_hook: ?model_types.ConfigParseHook,
     model_load_options: LoadOptions,
     progress: progress_mod.Context,
 ) !LoadedModel {
@@ -352,7 +341,13 @@ pub fn loadModelWithArchitecture(
         start_time_ns = now;
     }
 
-    var model_config = try cfg_loader.loadConfig(arena_allocator, config_path);
+    const arch = runtime_arch orelse return error.MissingArchitecture;
+    var model_config = try cfg_loader.loadConfigForArchitectureWithHook(
+        arena_allocator,
+        config_path,
+        arch.name,
+        parse_config_hook orelse arch.parse_config_hook,
+    );
 
     log.debug("load", "Vision config from loadConfig", .{
         .vision_hidden_size = model_config.vision_hidden_size,
@@ -383,11 +378,10 @@ pub fn loadModelWithArchitecture(
 
     const layer_count: usize = @intCast(model_config.n_layers);
 
-    var block_weights = try arena_allocator.alloc(runtime_blocks.BlockWeights, layer_count);
+    var block_weights = try arena_allocator.alloc(runtime_blocks.LayerWeights, layer_count);
 
     // Graph metadata is now required for weight loading.
     // Legacy hardcoded loader has been removed - all models need architecture definitions.
-    const arch = runtime_arch orelse return error.MissingArchitecture;
     try requireArchitectureMetadata(arch);
     if (!archHasBlockWeights(arch)) return error.MissingArchitecture;
     inferMoEFromArchitecture(arch, &model_config);
@@ -426,6 +420,7 @@ pub fn loadModelWithArchitecture(
             runtime_blocks.BlockKind.attention_mlp;
 
         const specs = if (variant) |v| v.weights else arch.block_weights;
+        const layer_meta = if (variant) |v| v.meta orelse arch.kernel_meta else arch.kernel_meta;
 
         // Standard attention + MLP layer settings (used by attention blocks)
         const layer_has_global_attn = if (model_config.sliding_window <= 0)
@@ -445,6 +440,7 @@ pub fn loadModelWithArchitecture(
             arena_allocator,
             &safetensors_file,
             specs,
+            arch.weight_prefixes,
             layer_idx,
             &model_config,
             weight_load_options,
@@ -459,65 +455,40 @@ pub fn loadModelWithArchitecture(
             try maybeAddFusedWeights(arena_allocator, &weight_map);
         }
 
-        // Get block ops for this layer (handles heterogeneous models)
-        const layer_block_ops = if (variant) |v| v.ops else arch.block_ops;
-
-        // Extract is_causal from the multihead_attention op (default: true for decoders)
-        const layer_is_causal: bool = blk: {
-            for (layer_block_ops) |op| {
-                if (op.op_type == .multihead_attention) break :blk op.is_causal;
-            }
-            break :blk true;
-        };
-
         var map_context = runtime_blocks.BlockMapContext{
             .sliding_window = if (block_type == .attention_mlp) layer_window_size else 0,
-            .is_causal = layer_is_causal,
-            .block_ops = layer_block_ops,
+            .kernel_meta = layer_meta,
             .mamba_config = null,
             .shortconv_config = null,
-            .mla_config = null,
             // MoE configuration (architecture-driven loading)
             .num_experts = if (model_config.num_experts > 0) @intCast(model_config.num_experts) else 0,
             .experts_per_token = if (model_config.experts_per_token > 0) @intCast(model_config.experts_per_token) else 0,
             .allocator = arena_allocator,
         };
 
-        // Extract MLA config from attention op if present
         if (block_type == .attention_mlp) {
-            for (layer_block_ops) |op| {
-                if (op.op_type == .multihead_attention and op.mla) {
-                    map_context.mla_config = .{
-                        .q_lora_rank = op.q_lora_rank orelse 0,
-                        .kv_lora_rank = op.kv_lora_rank orelse 0,
-                        .qk_head_dim = op.qk_head_dim orelse 0,
-                        .qk_rope_head_dim = op.qk_rope_head_dim orelse 0,
-                        .qk_nope_head_dim = op.qk_nope_head_dim orelse 0,
-                        .v_head_dim = op.v_head_dim orelse 0,
-                        .rope_interleave = op.rope_interleave,
-                    };
-                    break;
-                }
-            }
+            // layer_meta carries causal + MLA metadata for attention blocks
         }
 
         if (block_type == .mamba) {
+            const meta_cfg = layer_meta.mamba_config;
             map_context.mamba_config = .{
                 .d_model = @intCast(model_config.d_model),
-                .d_state = @intCast(model_config.mamba_d_state),
-                .d_conv = @intCast(model_config.mamba_d_conv),
-                .n_heads = @intCast(model_config.mamba_n_heads),
-                .d_head = @intCast(model_config.mamba_d_head),
-                .n_groups = @intCast(model_config.mamba_n_groups),
+                .d_state = if (meta_cfg) |cfg| cfg.d_state else @intCast(model_config.mamba_d_state),
+                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.mamba_d_conv),
+                .n_heads = if (meta_cfg) |cfg| cfg.n_heads else @intCast(model_config.mamba_n_heads),
+                .d_head = if (meta_cfg) |cfg| cfg.d_head else @intCast(model_config.mamba_d_head),
+                .n_groups = if (meta_cfg) |cfg| cfg.n_groups else @intCast(model_config.mamba_n_groups),
             };
         }
         if (block_type == .shortconv) {
+            const meta_cfg = layer_meta.shortconv_config;
             map_context.shortconv_config = .{
                 .d_model = @intCast(model_config.d_model),
-                .d_conv = @intCast(model_config.shortconv_d_conv),
-                .conv_dim = @intCast(model_config.shortconv_conv_dim),
-                .conv_dim_out = @intCast(model_config.shortconv_conv_dim_out),
-                .has_bias = model_config.shortconv_has_bias,
+                .d_conv = if (meta_cfg) |cfg| cfg.d_conv else @intCast(model_config.shortconv_d_conv),
+                .conv_dim = if (meta_cfg) |cfg| cfg.conv_dim else @intCast(model_config.shortconv_conv_dim),
+                .conv_dim_out = if (meta_cfg) |cfg| cfg.conv_dim_out else @intCast(model_config.shortconv_conv_dim_out),
+                .has_bias = if (meta_cfg) |cfg| cfg.has_bias else model_config.shortconv_has_bias,
             };
             if (arch.resolve_shortconv_dims_from_weights) {
                 // Optional weight-driven shortconv dim correction, explicitly enabled by metadata.
@@ -530,7 +501,13 @@ pub fn loadModelWithArchitecture(
             }
         }
 
-        block_weights[layer_idx] = try runtime_blocks.blockWeightsFromMap(&weight_map, block_type, map_context);
+        var layer_context = map_context;
+        layer_context.allocator = null;
+        block_weights[layer_idx] = .{
+            .block_type = block_type,
+            .weight_map = weight_map,
+            .map_context = layer_context,
+        };
         block_time_ns += std.time.nanoTimestamp() - block_start_ns;
         progress.updateLine(0, @intCast(layer_idx + 1), null);
     }
@@ -543,15 +520,16 @@ pub fn loadModelWithArchitecture(
         .per_block_ms = @as(f64, @floatFromInt(block_time_ns)) / 1_000_000.0 / @as(f64, @floatFromInt(layer_count)),
     }, @src());
 
-    // Detect QKNorm by checking if any layer has q_norm/k_norm weights
+    // Detect QKNorm by checking if first layer map carries q/k norm weights.
     if (block_weights.len > 0) {
-        switch (block_weights[0]) {
-            .attention_mlp => |attn| {
-                if (attn.q_norm != null) model_config.use_qk_norm = true;
-            },
-            .mamba => {},
-            .shortconv => {},
-        }
+        const first_map = &block_weights[0].weight_map;
+        const has_q_norm = first_map.get("self_attn.q_norm.weight") != null or
+            first_map.get("self_attn.q_layernorm.weight") != null or
+            first_map.get("mixer.q_norm.weight") != null;
+        const has_k_norm = first_map.get("self_attn.k_norm.weight") != null or
+            first_map.get("self_attn.k_layernorm.weight") != null or
+            first_map.get("mixer.k_norm.weight") != null;
+        if (has_q_norm or has_k_norm) model_config.use_qk_norm = true;
     }
 
     {
@@ -568,6 +546,7 @@ pub fn loadModelWithArchitecture(
         arena_allocator,
         &safetensors_file,
         arch.global_weights,
+        &.{},
         0,
         &model_config,
         .{ .preserve_native_norm_dtype = model_load_options.preserve_native_norm_dtype },
@@ -689,13 +668,9 @@ fn freeAlignedTensorData(allocator: std.mem.Allocator, t: Tensor) void {
 }
 
 test "requireArchitectureMetadata rejects missing d_ff metadata for mlp architectures" {
-    const ops = [_]model_types.Op{
-        .{ .op_type = .mlp },
-    };
     const arch = model_types.Architecture{
         .name = "test_mlp",
         .model_types = &.{},
-        .block_ops = &ops,
         .global_weights = &.{},
         .resolve_d_ff_from_weights = true,
         .d_ff_source_weight_ids = &.{},
@@ -705,13 +680,9 @@ test "requireArchitectureMetadata rejects missing d_ff metadata for mlp architec
 }
 
 test "requireArchitectureMetadata rejects missing shortconv source id" {
-    const ops = [_]model_types.Op{
-        .{ .op_type = .shortconv },
-    };
     const arch = model_types.Architecture{
         .name = "test_shortconv",
         .model_types = &.{},
-        .block_ops = &ops,
         .global_weights = &.{},
         .resolve_shortconv_dims_from_weights = true,
         .d_ff_source_weight_ids = &.{"mlp.gate_proj.weight"},
@@ -1328,7 +1299,7 @@ test "LoadedModel.deinit: cleanup without backend runtime state" {
         .ln_final = undefined,
         .lm_head = undefined,
         .token_embeddings = undefined,
-        .blocks = &[_]runtime_blocks.BlockWeights{},
+        .blocks = &[_]runtime_blocks.LayerWeights{},
         .original_weight_dtype = .f32,
     };
 

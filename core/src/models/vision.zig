@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const tensor = @import("../tensor.zig");
+const layer_ops = @import("layer_ops.zig");
 const op_types = @import("op_types.zig");
 const registry = @import("registry.zig");
 const st_writer = @import("../io/safetensors/writer.zig");
@@ -27,6 +28,11 @@ pub fn resolveVisionMetadata(loaded: *const LoadedModel) VisionMetadata {
         }
     }
     return .{};
+}
+
+pub fn resolveVisionProgram(loaded: *const LoadedModel) ?[]const layer_ops.LayerOp {
+    const arch_id = loaded.runtime.architecture_id orelse return null;
+    return registry.visionProgramByArchitectureId(arch_id);
 }
 
 pub fn hasAnyTensor(st: *SafeTensors, candidates: []const []const u8) bool {
@@ -346,6 +352,33 @@ test "resolveVisionMetadata returns empty metadata when architecture is unset" {
     defer loaded.arena.deinit();
     const meta = resolveVisionMetadata(&loaded);
     try std.testing.expect(std.meta.eql(VisionMetadata{}, meta));
+}
+
+test "resolveVisionProgram returns null when architecture is unset" {
+    var loaded = makeLoadedModelForTests();
+    defer loaded.arena.deinit();
+    try std.testing.expect(resolveVisionProgram(&loaded) == null);
+}
+
+test "resolveVisionProgram returns multimodal program for youtu_vl" {
+    var loaded = makeLoadedModelForTests();
+    defer loaded.arena.deinit();
+    loaded.runtime.architecture_id = "youtu_vl";
+    const program = resolveVisionProgram(&loaded) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(program.len > 0);
+}
+
+test "resolveVisionProgram returns multimodal program for qwen3 and lfm2" {
+    var loaded = makeLoadedModelForTests();
+    defer loaded.arena.deinit();
+
+    loaded.runtime.architecture_id = "qwen3";
+    const qwen_program = resolveVisionProgram(&loaded) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(qwen_program.len > 0);
+
+    loaded.runtime.architecture_id = "lfm2";
+    const lfm_program = resolveVisionProgram(&loaded) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lfm_program.len > 0);
 }
 
 test "hasAnyTensor and getTensorByCandidates find existing tensor" {

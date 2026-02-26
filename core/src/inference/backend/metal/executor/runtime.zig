@@ -21,7 +21,6 @@ pub const MLXError = weights_executor.MLXError;
 pub const WeightHandles = weights_executor.WeightHandles;
 
 pub const loadWeightsToGPU = weights_executor.loadWeightsToGPU;
-pub const createFusedModel = weights_executor.createFusedModel;
 pub const freeWeights = weights_executor.freeWeights;
 
 pub const gatherTokenEmbeddingsLazy = model_executor.gatherTokenEmbeddingsLazy;

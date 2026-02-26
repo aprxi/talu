@@ -21,6 +21,7 @@ const phi4 = @import("phi/phi4.zig");
 const qwen3 = @import("qwen/qwen3.zig");
 const qwen3_moe = @import("qwen/qwen3_moe.zig");
 const qwen3_next = @import("qwen/qwen3_next.zig");
+const vision_shared = @import("vision_shared.zig");
 const youtu_vl = @import("youtu_vl/youtu_vl.zig");
 
 pub const Entry = common_types.ModelDescriptor;
@@ -183,6 +184,18 @@ pub fn blockProgramFor(entry: Entry, block_kind: op_types.BlockKind) ?[]const la
     return null;
 }
 
+pub fn visionProgramFor(entry: Entry) ?[]const layer_ops.LayerOp {
+    if (std.mem.eql(u8, entry.id, youtu_vl.id)) return vision_shared.vision_program;
+    if (std.mem.eql(u8, entry.id, qwen3.id)) return vision_shared.vision_program;
+    if (std.mem.eql(u8, entry.id, lfm2.id)) return vision_shared.vision_program;
+    return null;
+}
+
+pub fn visionProgramByArchitectureId(arch_id: []const u8) ?[]const layer_ops.LayerOp {
+    const entry = detectByArchitectureId(arch_id) orelse return null;
+    return visionProgramFor(entry);
+}
+
 pub fn loadArchitectureDefinitions(allocator: std.mem.Allocator) bool {
     _ = allocator;
     // Static models are compile-time metadata; no runtime architecture loading needed.
@@ -195,6 +208,21 @@ pub fn runtimeArchitectureById(arch_id: []const u8) ?*const op_types.Architectur
 
 pub fn runtimeArchitectureByModelType(model_type: []const u8) ?*const op_types.Architecture {
     return runtime_architectures.detectByModelType(model_type);
+}
+
+pub fn configParseHookFor(entry: Entry) ?op_types.ConfigParseHook {
+    const arch = runtimeArchitectureById(entry.id) orelse return null;
+    return arch.parse_config_hook;
+}
+
+pub fn configParseHookByArchitectureId(arch_id: []const u8) ?op_types.ConfigParseHook {
+    const arch = runtimeArchitectureById(arch_id) orelse return null;
+    return arch.parse_config_hook;
+}
+
+pub fn configParseHookByModelType(model_type: []const u8) ?op_types.ConfigParseHook {
+    const arch = runtimeArchitectureByModelType(model_type) orelse return null;
+    return arch.parse_config_hook;
 }
 
 test "registry supports llama and qwen model types" {
@@ -232,6 +260,29 @@ test "blockProgramFor returns program for known block kinds" {
     try std.testing.expect(blockProgramFor(entry, .shortconv) != null);
 }
 
+test "visionProgramFor returns program for supported multimodal architectures" {
+    const youtu_entry = detectByArchitectureId("youtu_vl") orelse return error.TestUnexpectedResult;
+    const youtu_program = visionProgramFor(youtu_entry) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(youtu_program.len > 0);
+
+    const qwen_entry = detectByArchitectureId("qwen3") orelse return error.TestUnexpectedResult;
+    const qwen_program = visionProgramFor(qwen_entry) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(qwen_program.len > 0);
+
+    const lfm_entry = detectByArchitectureId("lfm2") orelse return error.TestUnexpectedResult;
+    const lfm_program = visionProgramFor(lfm_entry) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(lfm_program.len > 0);
+}
+
+test "visionProgramByArchitectureId returns program for qwen3 and lfm2" {
+    try std.testing.expect(visionProgramByArchitectureId("qwen3") != null);
+    try std.testing.expect(visionProgramByArchitectureId("lfm2") != null);
+}
+
+test "visionProgramByArchitectureId returns null for text-only architectures" {
+    try std.testing.expect(visionProgramByArchitectureId("llama3") == null);
+}
+
 test "loadArchitectureDefinitions returns true for static registry" {
     try std.testing.expect(loadArchitectureDefinitions(std.testing.allocator));
 }
@@ -244,4 +295,14 @@ test "runtimeArchitectureById and runtimeArchitectureByModelType resolve payload
     const by_model_type = runtimeArchitectureByModelType("llama3");
     try std.testing.expect(by_model_type != null);
     try std.testing.expectEqualStrings("llama3", by_model_type.?.name);
+}
+
+test "configParseHook lookups resolve for every registered architecture" {
+    for (entries) |entry| {
+        try std.testing.expect(configParseHookFor(entry) != null);
+        try std.testing.expect(configParseHookByArchitectureId(entry.id) != null);
+        if (entry.model_types.len > 0) {
+            try std.testing.expect(configParseHookByModelType(entry.model_types[0]) != null);
+        }
+    }
 }

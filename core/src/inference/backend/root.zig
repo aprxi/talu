@@ -106,7 +106,7 @@ comptime {
 const DEFAULT_MAX_BATCH_SIZE: usize = 8;
 
 /// Compute model-load options before backend initialization.
-/// This keeps backend/platform policy out of io/ while preserving fast paths.
+/// This keeps backend/platform policy out of io/ while preserving optimized execution routes.
 pub fn defaultModelLoadOptions(init_options: InitOptions) LoadOptions {
     return .{
         .preserve_native_norm_dtype = shouldPreserveNativeNormDType(init_options.selection),
@@ -196,16 +196,16 @@ pub const Backend = union(enum) {
         return .scheduler;
     }
 
-    /// Whether scheduler should use backend decodeStreaming fast path.
-    ///
-    /// This is currently enabled only for Metal where fused decode streaming
-    /// remains the fastest scheduler-compatible path.
-    pub fn supportsSchedulerStreamingFastPath(self: *const Backend) bool {
-        return switch (self.*) {
-            .cpu => false,
-            .metal => true,
-            .cuda => false,
-        };
+    /// Whether scheduler should route decode-tail token generation through
+    /// backend `decodeStreaming`.
+    pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const Backend) bool {
+        switch (self.*) {
+            .cpu => return false,
+            .metal => |*b| if (has_metal and @hasDecl(metal.BackendType, "supportsSchedulerBackendDecodeStreamingRoute"))
+                return b.supportsSchedulerBackendDecodeStreamingRoute(),
+            .cuda => return false,
+        }
+        return false;
     }
 
     /// Initialize the appropriate backend based on platform and model format.
@@ -247,7 +247,16 @@ pub const Backend = union(enum) {
         const has_unsupported_runtime_features = runtimeHasMetalUnsupportedFeatures(&loaded.runtime);
         if (has_metal and isMetalSupported(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features)) {
             const metal_backend_state = metal.BackendType.init(allocator, loaded) catch |err| {
-                if (err == error.MoENotSupported or err == error.MLXNotAvailable or err == error.UnsupportedDType or err == error.ShortConvNotSupportedOnMetal or err == error.MLANotSupportedOnMetal or err == error.InvalidTensorType or err == error.UnsupportedModel) {
+                if (err == error.MoENotSupported or
+                    err == error.MLXNotAvailable or
+                    err == error.UnsupportedDType or
+                    err == error.ShortConvNotSupportedOnMetal or
+                    err == error.MLANotSupportedOnMetal or
+                    err == error.InvalidTensorType or
+                    err == error.UnsupportedModel or
+                    err == error.NotImplemented or
+                    err == error.DecodeModelUnavailable)
+                {
                     log.info("inference", "Metal backend unavailable, using CPU", .{
                         .reason = @errorName(err),
                         .detail = getMetalUnsupportedReason(&loaded.config, &loaded.runtime, loaded.original_weight_dtype, has_unsupported_runtime_features),
@@ -538,8 +547,8 @@ fn getMetalUnsupportedReason(
 }
 
 fn runtimeHasMetalUnsupportedFeatures(runtime: *const tensor.ModelRuntime) bool {
-    _ = runtime;
-    return false;
+    // Metal decode-model path currently does not support mamba layer topology.
+    return runtime.has_mamba;
 }
 
 fn initCpu(
@@ -632,16 +641,16 @@ test "getMetalUnsupportedReason mentions dtype" {
     try std.testing.expect(std.mem.indexOf(u8, reason, "dtype") != null);
 }
 
-test "isMetalSupported allows mamba models on supported dtypes" {
+test "isMetalSupported rejects models when runtime features are unsupported" {
     var config = std.mem.zeroes(ModelConfig);
     var runtime = std.mem.zeroes(tensor.ModelRuntime);
     config.num_experts = 0;
     runtime.has_mamba = true;
 
-    try std.testing.expect(isMetalSupported(&config, &runtime, .grouped_affine_u4, false));
+    try std.testing.expect(!isMetalSupported(&config, &runtime, .grouped_affine_u4, true));
 }
 
-test "runtimeHasMetalUnsupportedFeatures currently has no model-level blockers" {
+test "runtimeHasMetalUnsupportedFeatures flags unsupported metal topology" {
     var runtime = std.mem.zeroes(tensor.ModelRuntime);
     try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
 
@@ -650,7 +659,7 @@ test "runtimeHasMetalUnsupportedFeatures currently has no model-level blockers" 
 
     runtime.has_mla = false;
     runtime.has_mamba = true;
-    try std.testing.expect(!runtimeHasMetalUnsupportedFeatures(&runtime));
+    try std.testing.expect(runtimeHasMetalUnsupportedFeatures(&runtime));
 }
 
 test "defaultModelLoadOptions follows platform capability" {
@@ -743,21 +752,21 @@ test "generationPath: cuda always selects scheduler" {
     try std.testing.expectEqual(Backend.GenerationPath.scheduler, cuda_backend.generationPath(false));
 }
 
-test "supportsSchedulerStreamingFastPath: cpu disabled" {
+test "supportsSchedulerBackendDecodeStreamingRoute: cpu disabled" {
     const cpu_backend: Backend = .{ .cpu = undefined };
-    try std.testing.expectEqual(false, cpu_backend.supportsSchedulerStreamingFastPath());
+    try std.testing.expectEqual(false, cpu_backend.supportsSchedulerBackendDecodeStreamingRoute());
 }
 
-test "supportsSchedulerStreamingFastPath: metal enabled" {
+test "supportsSchedulerBackendDecodeStreamingRoute: metal delegated" {
     if (!has_metal) return;
     const metal_backend: Backend = .{ .metal = undefined };
-    try std.testing.expectEqual(true, metal_backend.supportsSchedulerStreamingFastPath());
+    try std.testing.expectEqual(true, metal_backend.supportsSchedulerBackendDecodeStreamingRoute());
 }
 
-test "supportsSchedulerStreamingFastPath: cuda disabled" {
+test "supportsSchedulerBackendDecodeStreamingRoute: cuda disabled" {
     if (!has_cuda) return;
     const cuda_backend: Backend = .{ .cuda = undefined };
-    try std.testing.expectEqual(false, cuda_backend.supportsSchedulerStreamingFastPath());
+    try std.testing.expectEqual(false, cuda_backend.supportsSchedulerBackendDecodeStreamingRoute());
 }
 
 test "kernel parity: rope cpu vs metal" {
@@ -882,7 +891,6 @@ test "kernel parity: embedding lookup cpu vs metal" {
         .embed_tokens = metal_embed,
         .embed_tokens_quantized = null,
         .layers = empty_layers[0..],
-        .decode_model = null,
         .ln_final = dummy_ln,
         .lm_head = null,
         .lm_head_quantized = null,
@@ -928,7 +936,6 @@ test "kernel parity: weight access error semantics cpu vs metal" {
         .embed_tokens = null,
         .embed_tokens_quantized = null,
         .layers = empty_layers[0..],
-        .decode_model = null,
         .ln_final = dummy_ln,
         .lm_head = null,
         .lm_head_quantized = null,

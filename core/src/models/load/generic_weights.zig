@@ -24,6 +24,7 @@ pub fn loadWeightMap(
     allocator: Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,
     specs: []const WeightSpec,
+    weight_prefixes: []const []const u8,
     layer_idx: usize,
     model_config: *const tensor.ModelConfig,
     options: LoadOptions,
@@ -32,7 +33,15 @@ pub fn loadWeightMap(
     errdefer map.deinit(allocator);
 
     for (specs) |spec| {
-        if (try loadWeightBySpec(allocator, safetensors, spec, layer_idx, model_config, options)) |weight| {
+        if (try loadWeightBySpec(
+            allocator,
+            safetensors,
+            spec,
+            weight_prefixes,
+            layer_idx,
+            model_config,
+            options,
+        )) |weight| {
             try map.put(allocator, spec.id, weight);
         }
     }
@@ -44,39 +53,38 @@ fn loadWeightBySpec(
     allocator: Allocator,
     safetensors: *st_loader.UnifiedSafeTensors,
     spec: WeightSpec,
+    weight_prefixes: []const []const u8,
     layer_idx: usize,
     model_config: *const tensor.ModelConfig,
     options: LoadOptions,
 ) !?*const Tensor {
-    var name_buf: [256]u8 = undefined;
-    for (spec.candidates) |candidate| {
-        const name = expandLayerTemplate(name_buf[0..], candidate, layer_idx) catch {
-            continue;
-        };
-        const raw_tensor = safetensors.getTensor(name, null) catch {
-            continue;
-        };
+    var name_buf: [512]u8 = undefined;
+    var prefix_buf: [256]u8 = undefined;
+    const alias_count = spec.aliases.len;
+    var candidate_index: usize = 0;
 
-        const transformed = applySpecTransforms(
-            allocator,
-            safetensors,
-            name,
-            raw_tensor,
-            spec,
-            model_config,
-            options,
-        ) catch |err| {
-            log.err("load", "Failed to apply weight transforms", .{
-                .id = spec.id,
-                .name = name,
-                .err = @errorName(err),
-            }, @src());
-            return err;
-        };
+    while (candidate_index < alias_count + 1) : (candidate_index += 1) {
+        const candidate = if (candidate_index == 0) spec.suffix else spec.aliases[candidate_index - 1];
 
-        const weight_ptr = try allocator.create(Tensor); // lint:ignore errdefer-alloc - arena freed atomically
-        weight_ptr.* = transformed;
-        return weight_ptr;
+        if (weight_prefixes.len == 0 or std.mem.indexOf(u8, candidate, "{d}") != null) {
+            const expanded_name = expandLayerTemplate(name_buf[0..], candidate, layer_idx) catch continue;
+            if (try tryLoadCandidate(allocator, safetensors, spec, expanded_name, model_config, options)) |weight| {
+                return weight;
+            }
+            continue;
+        }
+
+        for (weight_prefixes) |prefix_template| {
+            const expanded_prefix = expandLayerTemplate(prefix_buf[0..], prefix_template, layer_idx) catch continue;
+            const total_len = expanded_prefix.len + candidate.len;
+            if (total_len > name_buf.len) continue;
+            @memcpy(name_buf[0..expanded_prefix.len], expanded_prefix);
+            @memcpy(name_buf[expanded_prefix.len..total_len], candidate);
+            const expanded_name = name_buf[0..total_len];
+            if (try tryLoadCandidate(allocator, safetensors, spec, expanded_name, model_config, options)) |weight| {
+                return weight;
+            }
+        }
     }
 
     if (spec.required) {
@@ -88,6 +96,38 @@ fn loadWeightBySpec(
     }
 
     return null;
+}
+
+fn tryLoadCandidate(
+    allocator: Allocator,
+    safetensors: *st_loader.UnifiedSafeTensors,
+    spec: WeightSpec,
+    name: []const u8,
+    model_config: *const tensor.ModelConfig,
+    options: LoadOptions,
+) !?*const Tensor {
+    const raw_tensor = safetensors.getTensor(name, null) catch return null;
+
+    const transformed = applySpecTransforms(
+        allocator,
+        safetensors,
+        name,
+        raw_tensor,
+        spec,
+        model_config,
+        options,
+    ) catch |err| {
+        log.err("load", "Failed to apply weight transforms", .{
+            .id = spec.id,
+            .name = name,
+            .err = @errorName(err),
+        }, @src());
+        return err;
+    };
+
+    const weight_ptr = try allocator.create(Tensor); // lint:ignore errdefer-alloc - arena freed atomically
+    weight_ptr.* = transformed;
+    return weight_ptr;
 }
 
 fn applySpecTransforms(
@@ -287,7 +327,7 @@ test "WeightSpec.force_f32 overrides preserve_native_norm_dtype for norm weights
 
     const spec_force = WeightSpec{
         .id = "mixer.norm.weight",
-        .candidates = &.{"model.layers.{d}.mixer.norm.weight"},
+        .suffix = "mixer.norm.weight",
         .module_type = "RMSNorm",
         .layout = .none,
         .dtype = "float32",
@@ -296,7 +336,7 @@ test "WeightSpec.force_f32 overrides preserve_native_norm_dtype for norm weights
     };
     const spec_preserve = WeightSpec{
         .id = "mixer.norm.weight",
-        .candidates = &.{"model.layers.{d}.mixer.norm.weight"},
+        .suffix = "mixer.norm.weight",
         .module_type = "RMSNorm",
         .layout = .none,
         .dtype = "float32",

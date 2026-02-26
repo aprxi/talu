@@ -42,6 +42,7 @@ pub fn run(
     v_group_size: u32,
     v_scales_dtype_tag: u32,
     in_dim: u32,
+    batch_rows: u32,
 ) !registry_mod.KernelSource {
     try validateArgs(
         input,
@@ -67,6 +68,7 @@ pub fn run(
         v_group_size,
         v_scales_dtype_tag,
         in_dim,
+        batch_rows,
     );
 
     if (registry.embedded_module == null) try registry.loadEmbeddedModule(embedded_module);
@@ -100,6 +102,7 @@ pub fn run(
         v_group_size,
         v_scales_dtype_tag,
         in_dim,
+        batch_rows,
     );
     return resolved.source;
 }
@@ -131,6 +134,7 @@ pub fn runWithFunction(
     v_group_size: u32,
     v_scales_dtype_tag: u32,
     in_dim: u32,
+    batch_rows: u32,
 ) !void {
     try validateArgs(
         input,
@@ -156,6 +160,7 @@ pub fn runWithFunction(
         v_group_size,
         v_scales_dtype_tag,
         in_dim,
+        batch_rows,
     );
 
     arg_pack.reset();
@@ -182,12 +187,14 @@ pub fn runWithFunction(
     try arg_pack.appendScalar(u32, v_group_size);
     try arg_pack.appendScalar(u32, v_scales_dtype_tag);
     try arg_pack.appendScalar(u32, in_dim);
+    try arg_pack.appendScalar(u32, batch_rows);
 
     const total_out = std.math.add(u32, q_out_dim, std.math.add(u32, k_out_dim, v_out_dim) catch return error.InvalidArgument) catch return error.InvalidArgument;
     const rows_per_block = block_x / warp_size;
     const grid_x: u32 = ceilDiv(total_out, rows_per_block);
     try launch_mod.launch(device, function, .{
         .grid_x = grid_x,
+        .grid_y = batch_rows,
         .block_x = block_x,
     }, arg_pack);
 }
@@ -216,10 +223,12 @@ fn validateArgs(
     v_group_size: u32,
     v_scales_dtype_tag: u32,
     in_dim: u32,
+    batch_rows: u32,
 ) !void {
-    try validateOne(input, q_packed_weight, q_scales, q_biases, q_out, in_dim, q_out_dim, q_group_size, q_scales_dtype_tag);
-    try validateOne(input, k_packed_weight, k_scales, k_biases, k_out, in_dim, k_out_dim, k_group_size, k_scales_dtype_tag);
-    try validateOne(input, v_packed_weight, v_scales, v_biases, v_out, in_dim, v_out_dim, v_group_size, v_scales_dtype_tag);
+    if (batch_rows == 0) return error.InvalidArgument;
+    try validateOne(input, q_packed_weight, q_scales, q_biases, q_out, in_dim, q_out_dim, q_group_size, q_scales_dtype_tag, batch_rows);
+    try validateOne(input, k_packed_weight, k_scales, k_biases, k_out, in_dim, k_out_dim, k_group_size, k_scales_dtype_tag, batch_rows);
+    try validateOne(input, v_packed_weight, v_scales, v_biases, v_out, in_dim, v_out_dim, v_group_size, v_scales_dtype_tag, batch_rows);
 }
 
 fn validateOne(
@@ -232,6 +241,7 @@ fn validateOne(
     out_dim: u32,
     group_size: u32,
     scales_dtype_tag: u32,
+    batch_rows: u32,
 ) !void {
     if (in_dim == 0 or out_dim == 0 or group_size == 0) return error.InvalidArgument;
     if ((in_dim % 8) != 0 or (group_size % 8) != 0) return error.InvalidArgument;
@@ -246,8 +256,11 @@ fn validateOne(
     const groups_per_row = in_dim_usize / group_size_usize;
     const packed_row_words = in_dim_usize / 8;
 
-    const input_bytes = std.math.mul(usize, in_dim_usize, @sizeOf(f32)) catch return error.InvalidArgument;
-    const out_bytes = std.math.mul(usize, out_dim_usize, @sizeOf(f32)) catch return error.InvalidArgument;
+    const batch_rows_usize: usize = @intCast(batch_rows);
+    const input_elems = std.math.mul(usize, in_dim_usize, batch_rows_usize) catch return error.InvalidArgument;
+    const out_elems = std.math.mul(usize, out_dim_usize, batch_rows_usize) catch return error.InvalidArgument;
+    const input_bytes = std.math.mul(usize, input_elems, @sizeOf(f32)) catch return error.InvalidArgument;
+    const out_bytes = std.math.mul(usize, out_elems, @sizeOf(f32)) catch return error.InvalidArgument;
     const packed_words = std.math.mul(usize, out_dim_usize, packed_row_words) catch return error.InvalidArgument;
     const packed_bytes = std.math.mul(usize, packed_words, @sizeOf(u32)) catch return error.InvalidArgument;
     const sb_count = std.math.mul(usize, out_dim_usize, groups_per_row) catch return error.InvalidArgument;
@@ -296,6 +309,41 @@ test "validateArgs rejects invalid scales dtype tag" {
             8,
             gaffine.scales_dtype_bf16,
             16,
+            1,
+        ),
+    );
+}
+
+test "validateArgs rejects zero batch rows" {
+    const b = device_mod.Buffer{ .pointer = 0, .size = 8192 };
+    var out = b;
+    try std.testing.expectError(
+        error.InvalidArgument,
+        validateArgs(
+            &b,
+            &b,
+            &b,
+            &b,
+            &out,
+            16,
+            8,
+            gaffine.scales_dtype_bf16,
+            &b,
+            &b,
+            &b,
+            &out,
+            8,
+            8,
+            gaffine.scales_dtype_bf16,
+            &b,
+            &b,
+            &b,
+            &out,
+            8,
+            8,
+            gaffine.scales_dtype_bf16,
+            16,
+            0,
         ),
     );
 }

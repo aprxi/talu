@@ -7,6 +7,7 @@ const std = @import("std");
 const json = @import("../../io/json/root.zig");
 const tensor = @import("../../tensor.zig");
 const model_types = @import("../op_types.zig");
+const registry = @import("../registry.zig");
 
 const ModelConfig = tensor.ModelConfig;
 
@@ -77,21 +78,6 @@ fn getBoolField(obj: std.json.ObjectMap, key: []const u8) ?bool {
     };
 }
 
-fn getObjectIntField(obj: std.json.ObjectMap, key: []const u8) ?i32 {
-    const value = obj.get(key) orelse return null;
-    return switch (value) {
-        .integer => std.math.cast(i32, value.integer),
-        else => null,
-    };
-}
-
-fn getObjectFirstIntField(obj: std.json.ObjectMap, keys: []const []const u8) ?i32 {
-    for (keys) |key| {
-        if (getObjectIntField(obj, key)) |value| return value;
-    }
-    return null;
-}
-
 /// Quantization config - supports both MLX and MXFP4 formats
 const QuantConfig = struct {
     group_size: ?i64 = null,
@@ -100,13 +86,9 @@ const QuantConfig = struct {
     mode: ?[]const u8 = null, // Alternative to quant_method used by some models
 };
 
-/// JSON config struct with all possible field name variants.
-/// Different model formats use different names for the same fields.
+/// Core JSON config struct for shared text-model fields.
+/// Model-family-specific fields are parsed via architecture hooks.
 const JsonConfig = struct {
-    // Architecture identification
-    model_type: ?[]const u8 = null,
-    architectures: ?[]const []const u8 = null,
-
     vocab_size: ?i64 = null,
     // Model dimension
     d_model: ?i64 = null,
@@ -177,38 +159,8 @@ const JsonConfig = struct {
     num_experts_per_tok: ?i64 = null,
     experts_per_token: ?i64 = null, // Alias used by some models
     moe_intermediate_size: ?i64 = null,
-    // Attention bias
-    attention_bias: ?bool = null,
-    // Activation and attention parameters
+    // Activation
     hidden_activation: ?[]const u8 = null, // "silu" or "gelu_pytorch_tanh"
-    query_pre_attn_scalar: ?f64 = null, // Alternative attention scale: 1/sqrt(val)
-    use_qk_norm: ?bool = null, // Enable Query/Key normalization
-    sliding_window: ?i64 = null, // Sliding window attention size
-    sliding_window_pattern: ?i64 = null, // Every Nth layer uses global attention
-    rope_local_base_freq: ?f64 = null, // Local RoPE theta for sliding window layers
-    // Special tokens
-    bos_token_id: ?i64 = null, // Beginning of sequence token
-    // Custom scaling multipliers (data-driven from config.json)
-    embedding_multiplier: ?f64 = null, // Scales embedding output
-    attention_multiplier: ?f64 = null, // Custom attention scale (replaces 1/sqrt(head_dim))
-    residual_multiplier: ?f64 = null, // Scales residual connections
-    logits_scaling: ?f64 = null, // Scales output logits
-    // Phi-specific fields
-    partial_rotary_factor: ?f64 = null, // Fraction of head_dim to apply RoPE (Phi: 0.75)
-    // Mamba/SSM fields (for heterogeneous models like Granite Hybrid)
-    mamba_d_state: ?i64 = null, // SSM state dimension
-    mamba_d_conv: ?i64 = null, // Convolution kernel size
-    mamba_n_heads: ?i64 = null, // Number of SSM heads
-    mamba_d_head: ?i64 = null, // Head dimension for Mamba
-    mamba_n_groups: ?i64 = null, // Groups for B/C projection
-    mamba_expand: ?i64 = null, // Expansion factor
-    // ShortConv fields (for heterogeneous models)
-    conv_dim: ?i64 = null, // ShortConv intermediate dimension
-    conv_dim_out: ?i64 = null, // ShortConv output dimension
-    conv_L_cache: ?i64 = null, // ShortConv kernel size (d_conv)
-    conv_bias: ?bool = null, // Whether conv has bias
-    // Layer types for heterogeneous models (maps layer index to variant name)
-    layer_types: ?[]const []const u8 = null, // e.g., ["mamba", "mamba", "attention", ...]
 
     /// Get first non-null integer from a list of field names
     fn firstInt(self: @This(), comptime fields: anytype) ?i32 {
@@ -247,35 +199,37 @@ const JsonConfig = struct {
     }
 };
 
-/// Read just the model_type string from config.json.
-/// Returns null if model_type is not present.
-/// Caller owns the returned string.
-pub fn readModelType(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
-    const config_bytes = try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024);
-    defer allocator.free(config_bytes);
+/// Minimal config payload used for architecture detection before full parsing.
+pub const BaseConfig = struct {
+    model_type: ?[]const u8 = null,
+    architecture: ?[]const u8 = null,
 
-    const raw_parsed = json.parseValue(allocator, config_bytes, .{ .max_size_bytes = 256 * 1024 }) catch |err| {
-        return switch (err) {
-            error.InputTooLarge => error.InvalidJson,
-            error.InputTooDeep => error.InvalidJson,
-            error.StringTooLong => error.InvalidJson,
-            error.InvalidJson => error.InvalidJson,
-            error.OutOfMemory => error.OutOfMemory,
-        };
+    pub fn deinit(self: *BaseConfig, allocator: std.mem.Allocator) void {
+        if (self.model_type) |model_type| allocator.free(model_type);
+        if (self.architecture) |architecture| allocator.free(architecture);
+        self.* = .{};
+    }
+};
+
+fn mapJsonParseError(err: anyerror) anyerror {
+    return switch (err) {
+        error.InputTooLarge => error.InvalidJson,
+        error.InputTooDeep => error.InvalidJson,
+        error.StringTooLong => error.InvalidJson,
+        error.InvalidJson => error.InvalidJson,
+        error.OutOfMemory => error.OutOfMemory,
+        else => err,
     };
-    defer raw_parsed.deinit();
+}
 
-    if (raw_parsed.value != .object) return null;
-
-    const root_obj = raw_parsed.value.object;
-
+fn modelTypeFromRootObject(root_obj: std.json.ObjectMap) ?[]const u8 {
     // Prefer root-level model_type. This is the primary architecture identifier
     // for model bundles and conversion.
     if (root_obj.get("model_type")) |v| {
-        return switch (v) {
-            .string => |s| try allocator.dupe(u8, s),
-            else => null,
-        };
+        switch (v) {
+            .string => |s| return s,
+            else => {},
+        }
     }
 
     // Fall back to text_config.model_type for multimodal wrappers that only
@@ -283,46 +237,97 @@ pub fn readModelType(allocator: std.mem.Allocator, path: []const u8) !?[]const u
     if (root_obj.get("text_config")) |tc| {
         if (tc == .object) {
             if (tc.object.get("model_type")) |v| {
-                return switch (v) {
-                    .string => |s| try allocator.dupe(u8, s),
-                    else => null,
-                };
+                switch (v) {
+                    .string => |s| return s,
+                    else => {},
+                }
             }
         }
     }
     return null;
 }
 
-/// Read the first architecture entry from config.json architectures[].
-/// Returns null if architectures is absent or empty.
-/// Caller owns the returned string.
-pub fn readArchitectureName(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+fn architectureNameFromRootObject(root_obj: std.json.ObjectMap) ?[]const u8 {
+    if (root_obj.get("architectures")) |v| {
+        if (v == .array and v.array.items.len > 0) {
+            const first = v.array.items[0];
+            if (first == .string) return first.string;
+        }
+    }
+    return null;
+}
+
+fn resolveConfigParseHook(
+    architecture_id: ?[]const u8,
+    root_obj: std.json.ObjectMap,
+) ?model_types.ConfigParseHook {
+    if (architecture_id) |arch_id| {
+        if (registry.runtimeArchitectureById(arch_id)) |arch| {
+            return arch.parse_config_hook;
+        }
+    }
+
+    if (modelTypeFromRootObject(root_obj)) |model_type| {
+        if (registry.detectByModelType(model_type)) |entry| {
+            if (registry.runtimeArchitectureById(entry.id)) |arch| {
+                return arch.parse_config_hook;
+            }
+        }
+    }
+
+    return null;
+}
+
+/// Read minimal architecture-identification config fields from config.json.
+/// Caller owns any returned strings and must call `BaseConfig.deinit`.
+pub fn readBaseConfig(allocator: std.mem.Allocator, path: []const u8) !BaseConfig {
     const config_bytes = try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024);
     defer allocator.free(config_bytes);
 
     const raw_parsed = json.parseValue(allocator, config_bytes, .{ .max_size_bytes = 256 * 1024 }) catch |err| {
-        return switch (err) {
-            error.InputTooLarge => error.InvalidJson,
-            error.InputTooDeep => error.InvalidJson,
-            error.StringTooLong => error.InvalidJson,
-            error.InvalidJson => error.InvalidJson,
-            error.OutOfMemory => error.OutOfMemory,
-        };
+        return mapJsonParseError(err);
     };
     defer raw_parsed.deinit();
 
-    if (raw_parsed.value != .object) return null;
+    if (raw_parsed.value != .object) return .{};
     const root_obj = raw_parsed.value.object;
 
-    if (root_obj.get("architectures")) |v| {
-        if (v == .array and v.array.items.len > 0) {
-            const first = v.array.items[0];
-            if (first == .string) {
-                return try allocator.dupe(u8, first.string);
-            }
-        }
-    }
-    return null;
+    return .{
+        .model_type = if (modelTypeFromRootObject(root_obj)) |model_type|
+            try allocator.dupe(u8, model_type)
+        else
+            null,
+        .architecture = if (architectureNameFromRootObject(root_obj)) |architecture|
+            try allocator.dupe(u8, architecture)
+        else
+            null,
+    };
+}
+
+/// Read just the model_type string from config.json.
+/// Returns null if model_type is not present.
+/// Caller owns the returned string.
+pub fn readModelType(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    var base_config = try readBaseConfig(allocator, path);
+    errdefer base_config.deinit(allocator);
+
+    const model_type = base_config.model_type;
+    base_config.model_type = null;
+    base_config.deinit(allocator);
+    return model_type;
+}
+
+/// Read the first architecture entry from config.json architectures[].
+/// Returns null if architectures is absent or empty.
+/// Caller owns the returned string.
+pub fn readArchitectureName(allocator: std.mem.Allocator, path: []const u8) !?[]const u8 {
+    var base_config = try readBaseConfig(allocator, path);
+    errdefer base_config.deinit(allocator);
+
+    const architecture = base_config.architecture;
+    base_config.architecture = null;
+    base_config.deinit(allocator);
+    return architecture;
 }
 
 /// Parse layer_types from a model's config.json and convert to variant indices.
@@ -399,6 +404,23 @@ pub fn parseLayerTypes(
 }
 
 pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
+    return loadConfigForArchitectureWithHook(allocator, path, null, null);
+}
+
+pub fn loadConfigForArchitecture(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    architecture_id: ?[]const u8,
+) !ModelConfig {
+    return loadConfigForArchitectureWithHook(allocator, path, architecture_id, null);
+}
+
+pub fn loadConfigForArchitectureWithHook(
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    architecture_id: ?[]const u8,
+    parse_config_hook: ?model_types.ConfigParseHook,
+) !ModelConfig {
     const config_bytes = try std.fs.cwd().readFileAlloc(allocator, path, 256 * 1024);
     defer allocator.free(config_bytes);
 
@@ -418,16 +440,18 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         raw_parsed.value.object
     else
         return error.InvalidJson;
+    const config_parse_hook = parse_config_hook orelse resolveConfigParseHook(architecture_id, root_obj);
 
     // Determine which value to parse as JsonConfig:
     // - If multimodal model with text_config, use that subobject
     // - Otherwise use the root object
     const config_value: std.json.Value = if (raw_parsed.value == .object) blk: {
         if (root_obj.get("text_config")) |text_config| {
-            break :blk text_config;
+            if (text_config == .object) break :blk text_config;
         }
         break :blk raw_parsed.value;
     } else raw_parsed.value;
+    const config_obj: std.json.ObjectMap = if (config_value == .object) config_value.object else root_obj;
 
     // Parse the selected value into JsonConfig (no re-parsing of the file)
     const parsed_config = json.parseStructFromValue(allocator, JsonConfig, config_value, config_bytes.len, .{
@@ -536,61 +560,8 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
     else
         false;
 
-    // Model architecture is now driven by the static models registry.
-    // loadConfig doesn't detect architecture - that's done by detectModelKind in loader.
-    // We always use .custom here; the actual architecture comes from models metadata.
-    _ = config_json.model_type; // Acknowledged but not used for arch detection
-
-    // Calculate rope_dim from head_dim and partial_rotary_factor
-    // For most models, rope_dim == head_dim. For Phi, it's head_dim * 0.75
+    // Model architecture is driven by static metadata from the registry.
     const head_dim_value = config_json.firstInt(.{"head_dim"}) orelse @divTrunc(d_model, n_heads);
-    const rope_dim_value: i32 = if (config_json.partial_rotary_factor) |partial_rotary_factor|
-        @intFromFloat(@as(f32, @floatFromInt(head_dim_value)) * @as(f32, @floatCast(partial_rotary_factor)))
-    else
-        0; // 0 means use head_dim
-
-    const vision_obj: ?std.json.ObjectMap = if (root_obj.get("vision_config")) |vision_cfg|
-        switch (vision_cfg) {
-            .object => vision_cfg.object,
-            else => null,
-        }
-    else
-        null;
-
-    const vision_hidden_size = if (vision_obj) |obj| getObjectIntField(obj, "hidden_size") orelse 0 else 0;
-    const vision_depth = if (vision_obj) |obj| getObjectFirstIntField(obj, &.{ "depth", "num_hidden_layers" }) orelse 0 else 0;
-    const vision_num_heads = if (vision_obj) |obj| getObjectFirstIntField(obj, &.{ "num_heads", "num_attention_heads" }) orelse 0 else 0;
-    const vision_intermediate_size = if (vision_obj) |obj| getObjectIntField(obj, "intermediate_size") orelse 0 else 0;
-    const projector_hidden_size = getObjectIntField(root_obj, "projector_hidden_size") orelse 0;
-    const vision_out_hidden_size = if (vision_obj) |obj| getObjectIntField(obj, "out_hidden_size") orelse 0 else 0;
-    const vision_patch_size = if (vision_obj) |obj| getObjectIntField(obj, "patch_size") orelse 0 else 0;
-    const vision_spatial_merge_size = if (vision_obj) |obj|
-        getObjectIntField(obj, "spatial_merge_size") orelse
-            getObjectIntField(root_obj, "downsample_factor") orelse 1
-    else
-        0;
-    const vision_temporal_patch_size = if (vision_obj) |obj| getObjectIntField(obj, "temporal_patch_size") orelse 1 else 0;
-    const vision_num_position_embeddings = if (vision_obj) |obj| getObjectFirstIntField(obj, &.{ "num_position_embeddings", "num_patches" }) orelse 0 else 0;
-    const vision_max_num_patches = if (vision_obj != null)
-        getObjectIntField(root_obj, "max_num_patches") orelse vision_num_position_embeddings
-    else
-        0;
-    var vision_probe_layers: [8]u16 = [_]u16{0} ** 8;
-    var vision_probe_layer_count: u8 = 0;
-    if (vision_obj) |obj| {
-        if (obj.get("deepstack_visual_indexes")) |raw_layers| {
-            if (raw_layers == .array) {
-                for (raw_layers.array.items) |item| {
-                    if (vision_probe_layer_count >= vision_probe_layers.len) break;
-                    if (item != .integer) continue;
-                    if (item.integer < 0) continue;
-                    const casted = std.math.cast(u16, item.integer) orelse continue;
-                    vision_probe_layers[vision_probe_layer_count] = casted;
-                    vision_probe_layer_count += 1;
-                }
-            }
-        }
-    }
     var config = ModelConfig{
         .vocab_size = vocab_size,
         .d_model = d_model,
@@ -600,7 +571,7 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         .d_ff = d_ff,
         .max_seq_len = max_seq_len,
         .head_dim = head_dim_value,
-        .rope_dim = rope_dim_value,
+        .rope_dim = 0,
         .rope_theta = config_json.firstFloat(.{ "rope_base", "rope_theta" }) orelse
             (if (config_json.rope_parameters) |rope_params| if (rope_params.rope_theta) |t| @as(f32, @floatCast(t)) else null else null) orelse 10000.0,
         .norm_eps = config_json.firstFloat(.{ "norm_eps", "rms_norm_eps" }) orelse 1e-5,
@@ -609,52 +580,27 @@ pub fn loadConfig(allocator: std.mem.Allocator, path: []const u8) !ModelConfig {
         .tie_word_embeddings = config_json.tie_word_embeddings orelse true, // Default true for most models
         .num_experts = config_json.firstInt(.{ "num_local_experts", "num_experts" }) orelse 0,
         .experts_per_token = config_json.firstInt(.{ "num_experts_per_tok", "experts_per_token" }) orelse 0,
-        .attention_bias = config_json.attention_bias orelse false,
         .quant_method = quant_method_kind,
         .rope_scaling = rope_scaling_params,
         // Model arch is always .custom - actual architecture comes from models metadata.
         .model_arch = .custom,
         .use_gelu = use_gelu_activation,
-        .use_qk_norm = config_json.use_qk_norm orelse false,
-        .query_pre_attn_scalar = config_json.floatOrDefault("query_pre_attn_scalar", 0),
-        .rope_local_theta = config_json.floatOrDefault("rope_local_base_freq", 0),
-        .sliding_window = config_json.intOrDefault("sliding_window", 0),
-        .sliding_window_pattern = config_json.intOrDefault("sliding_window_pattern", 0),
-        // Custom scaling multipliers
-        .embedding_multiplier = config_json.floatOrDefault("embedding_multiplier", 1.0),
-        .attention_multiplier = config_json.floatOrDefault("attention_multiplier", 0),
-        .residual_multiplier = config_json.floatOrDefault("residual_multiplier", 1.0),
-        .logits_scaling = config_json.floatOrDefault("logits_scaling", 1.0),
-        .bos_token_id = if (config_json.bos_token_id) |id| @intCast(id) else null,
-        // Mamba/SSM fields
-        .mamba_d_state = config_json.intOrDefault("mamba_d_state", 0),
-        .mamba_d_conv = config_json.intOrDefault("mamba_d_conv", 0),
-        .mamba_n_heads = config_json.intOrDefault("mamba_n_heads", 0),
-        .mamba_d_head = config_json.intOrDefault("mamba_d_head", 0),
-        .mamba_n_groups = config_json.intOrDefault("mamba_n_groups", 1),
-        .mamba_expand = config_json.intOrDefault("mamba_expand", 2),
-        // ShortConv fields (heterogeneous models)
-        .shortconv_d_conv = config_json.intOrDefault("conv_L_cache", 0),
-        .shortconv_conv_dim = config_json.intOrDefault("conv_dim", 0),
-        .shortconv_conv_dim_out = config_json.intOrDefault("conv_dim_out", 0),
-        .shortconv_has_bias = config_json.conv_bias orelse false,
-        .vision_hidden_size = vision_hidden_size,
-        .vision_depth = vision_depth,
-        .vision_num_heads = vision_num_heads,
-        .vision_intermediate_size = vision_intermediate_size,
-        .projector_hidden_size = projector_hidden_size,
-        .vision_out_hidden_size = vision_out_hidden_size,
-        .vision_patch_size = vision_patch_size,
-        .vision_spatial_merge_size = vision_spatial_merge_size,
-        .vision_temporal_patch_size = vision_temporal_patch_size,
-        .vision_num_position_embeddings = vision_num_position_embeddings,
-        .vision_max_num_patches = vision_max_num_patches,
-        .image_token_id = getObjectFirstIntField(root_obj, &.{ "image_token_id", "image_token_index" }) orelse 0,
-        .vision_start_token_id = getObjectFirstIntField(root_obj, &.{ "vision_start_token_id", "image_start_token_id" }) orelse 0,
-        .vision_end_token_id = getObjectFirstIntField(root_obj, &.{ "vision_end_token_id", "image_end_token_id" }) orelse 0,
-        .vision_probe_layer_count = vision_probe_layer_count,
-        .vision_probe_layers = vision_probe_layers,
+        .mamba_d_state = 0,
+        .mamba_d_conv = 0,
+        .mamba_n_heads = 0,
+        .mamba_d_head = 0,
+        .mamba_n_groups = 1,
+        .mamba_expand = 2,
+        .shortconv_d_conv = 0,
+        .shortconv_conv_dim = 0,
+        .shortconv_conv_dim_out = 0,
+        .shortconv_has_bias = false,
     };
+
+    if (config_parse_hook) |hook| {
+        hook(config_obj, root_obj, &config);
+    }
+
     config.initFlashAttnCompat();
     return config;
 }
@@ -680,7 +626,7 @@ fn initialDff(config_json: JsonConfig) !i32 {
 pub fn loadConfigFromDir(allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
     const config_path = try std.fs.path.join(allocator, &.{ model_dir, "config.json" });
     defer allocator.free(config_path);
-    return loadConfig(allocator, config_path);
+    return loadConfigForArchitecture(allocator, config_path, null);
 }
 
 // =============================================================================
@@ -1143,13 +1089,286 @@ test "readModelType falls back to text_config model_type when root is missing" {
     try std.testing.expectEqualStrings("llama", model_type.?);
 }
 
-test "loadConfig parses vision deepstack probe layers from vision_config" {
+test "readBaseConfig parses model_type and first architecture entry" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const config_json =
         \\{
-        \\  "model_type": "multimodal_vit",
+        \\  "model_type": "llama3",
+        \\  "architectures": ["LlamaForCausalLM"]
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    var base_config = try readBaseConfig(std.testing.allocator, path);
+    defer base_config.deinit(std.testing.allocator);
+
+    try std.testing.expect(base_config.model_type != null);
+    try std.testing.expectEqualStrings("llama3", base_config.model_type.?);
+    try std.testing.expect(base_config.architecture != null);
+    try std.testing.expectEqualStrings("LlamaForCausalLM", base_config.architecture.?);
+}
+
+test "readArchitectureName returns first architectures entry" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "architectures": ["llama3", "ignored"]
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const architecture_name = try readArchitectureName(std.testing.allocator, path);
+    defer if (architecture_name) |name| std.testing.allocator.free(name);
+    try std.testing.expect(architecture_name != null);
+    try std.testing.expectEqualStrings("llama3", architecture_name.?);
+}
+
+test "loadConfigForArchitecture parses Mamba family fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_next",
+        \\  "vocab_size": 32000,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 16,
+        \\  "intermediate_size": 4096,
+        \\  "max_position_embeddings": 8192,
+        \\  "mamba_d_state": 64,
+        \\  "mamba_d_conv": 4,
+        \\  "mamba_n_heads": 16,
+        \\  "mamba_d_head": 64,
+        \\  "mamba_n_groups": 2,
+        \\  "mamba_expand": 3
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfigForArchitecture(std.testing.allocator, path, "qwen3_next");
+    try std.testing.expectEqual(@as(i32, 64), config.mamba_d_state);
+    try std.testing.expectEqual(@as(i32, 4), config.mamba_d_conv);
+    try std.testing.expectEqual(@as(i32, 16), config.mamba_n_heads);
+    try std.testing.expectEqual(@as(i32, 64), config.mamba_d_head);
+    try std.testing.expectEqual(@as(i32, 2), config.mamba_n_groups);
+    try std.testing.expectEqual(@as(i32, 3), config.mamba_expand);
+}
+
+test "loadConfigForArchitecture parses ShortConv family fields" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "lfm2_5",
+        \\  "vocab_size": 32000,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 16,
+        \\  "intermediate_size": 4096,
+        \\  "max_position_embeddings": 8192,
+        \\  "conv_L_cache": 5,
+        \\  "conv_dim": 4096,
+        \\  "conv_dim_out": 1024,
+        \\  "conv_bias": true
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfigForArchitecture(std.testing.allocator, path, "lfm2_5");
+    try std.testing.expectEqual(@as(i32, 5), config.shortconv_d_conv);
+    try std.testing.expectEqual(@as(i32, 4096), config.shortconv_conv_dim);
+    try std.testing.expectEqual(@as(i32, 1024), config.shortconv_conv_dim_out);
+    try std.testing.expectEqual(true, config.shortconv_has_bias);
+}
+
+test "loadConfigForArchitectureWithHook applies explicit hook override" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "llama3",
+        \\  "vocab_size": 32000,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 16,
+        \\  "intermediate_size": 4096,
+        \\  "max_position_embeddings": 8192
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const LocalHook = struct {
+        fn apply(
+            config_obj: std.json.ObjectMap,
+            root_obj: std.json.ObjectMap,
+            config: *ModelConfig,
+        ) void {
+            _ = config_obj;
+            _ = root_obj;
+            config.mamba_d_state = 123;
+        }
+    };
+
+    const config = try loadConfigForArchitectureWithHook(
+        std.testing.allocator,
+        path,
+        null,
+        LocalHook.apply,
+    );
+    try std.testing.expectEqual(@as(i32, 123), config.mamba_d_state);
+}
+
+test "loadConfig fallback parser keeps family fields without architecture id" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "granite_hybrid",
+        \\  "vocab_size": 32000,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 16,
+        \\  "intermediate_size": 4096,
+        \\  "max_position_embeddings": 8192,
+        \\  "mamba_d_state": 72
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(@as(i32, 72), config.mamba_d_state);
+}
+
+test "loadConfigForArchitecture parses common hook fields across all architectures" {
+    const HookCase = struct {
+        model_type: []const u8,
+        architecture_id: []const u8,
+    };
+    const cases = [_]HookCase{
+        .{ .model_type = "llama2", .architecture_id = "llama2" },
+        .{ .model_type = "llama3", .architecture_id = "llama3" },
+        .{ .model_type = "gemma3", .architecture_id = "gemma3" },
+        .{ .model_type = "granite", .architecture_id = "granite3" },
+        .{ .model_type = "granite_hybrid", .architecture_id = "granite_hybrid" },
+        .{ .model_type = "lfm2", .architecture_id = "lfm2" },
+        .{ .model_type = "lfm2_5", .architecture_id = "lfm2_5" },
+        .{ .model_type = "phi4", .architecture_id = "phi" },
+        .{ .model_type = "qwen3", .architecture_id = "qwen3" },
+        .{ .model_type = "qwen3_moe", .architecture_id = "qwen3_moe" },
+        .{ .model_type = "qwen3_next", .architecture_id = "qwen3_next" },
+        .{ .model_type = "gpt_oss", .architecture_id = "gpt_oss" },
+        .{ .model_type = "bert", .architecture_id = "minilm" },
+        .{ .model_type = "ministral3", .architecture_id = "ministral3" },
+        .{ .model_type = "youtu_vl", .architecture_id = "youtu_vl" },
+    };
+
+    for (cases) |case| {
+        var tmp = std.testing.tmpDir(.{});
+        defer tmp.cleanup();
+
+        const config_json = try std.fmt.allocPrint(std.testing.allocator,
+            \\{{
+            \\  "model_type": "{s}",
+            \\  "vocab_size": 32000,
+            \\  "hidden_size": 1024,
+            \\  "num_hidden_layers": 8,
+            \\  "num_attention_heads": 16,
+            \\  "intermediate_size": 4096,
+            \\  "max_position_embeddings": 8192,
+            \\  "use_qk_norm": true,
+            \\  "attention_bias": true,
+            \\  "query_pre_attn_scalar": 128,
+            \\  "sliding_window": 512,
+            \\  "sliding_window_pattern": 2,
+            \\  "rope_local_base_freq": 25000,
+            \\  "embedding_multiplier": 1.5,
+            \\  "attention_multiplier": 0.5,
+            \\  "residual_multiplier": 0.75,
+            \\  "logits_scaling": 1.25,
+            \\  "bos_token_id": 42
+            \\}}
+        , .{case.model_type});
+        defer std.testing.allocator.free(config_json);
+
+        try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+        const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+        defer std.testing.allocator.free(path);
+
+        const config = try loadConfigForArchitecture(std.testing.allocator, path, case.architecture_id);
+        try std.testing.expect(config.use_qk_norm);
+        try std.testing.expect(config.attention_bias);
+        try std.testing.expectApproxEqAbs(@as(f32, 128.0), config.query_pre_attn_scalar, 0.0001);
+        try std.testing.expectEqual(@as(i32, 512), config.sliding_window);
+        try std.testing.expectEqual(@as(i32, 2), config.sliding_window_pattern);
+        try std.testing.expectApproxEqAbs(@as(f32, 25000.0), config.rope_local_theta, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.5), config.embedding_multiplier, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.5), config.attention_multiplier, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 0.75), config.residual_multiplier, 0.0001);
+        try std.testing.expectApproxEqAbs(@as(f32, 1.25), config.logits_scaling, 0.0001);
+        try std.testing.expect(config.bos_token_id != null);
+        try std.testing.expectEqual(@as(i32, 42), config.bos_token_id.?);
+    }
+}
+
+test "loadConfigForArchitecture parses Phi partial rotary factor via hook" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "phi4",
+        \\  "vocab_size": 32000,
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 8,
+        \\  "num_attention_heads": 16,
+        \\  "head_dim": 128,
+        \\  "intermediate_size": 4096,
+        \\  "max_position_embeddings": 8192,
+        \\  "partial_rotary_factor": 0.75
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfigForArchitecture(std.testing.allocator, path, "phi");
+    try std.testing.expectEqual(@as(i32, 96), config.rope_dim);
+}
+
+test "loadConfig parses vision deepstack probe layers from vision_config via youtu hook" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "youtu_vl",
         \\  "text_config": {
         \\    "vocab_size": 151936,
         \\    "hidden_size": 2048,
@@ -1187,13 +1406,13 @@ test "loadConfig parses vision deepstack probe layers from vision_config" {
     try std.testing.expectEqual(@as(u16, 17), config.vision_probe_layers[2]);
 }
 
-test "loadConfig parses generic vision fallback fields and image token aliases" {
+test "loadConfig parses generic vision fallback fields and image token aliases via youtu hook" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
     const config_json =
         \\{
-        \\  "model_type": "multimodal_vit",
+        \\  "model_type": "youtu_vl",
         \\  "image_token_index": 396,
         \\  "downsample_factor": 2,
         \\  "max_num_patches": 1024,
@@ -1236,4 +1455,107 @@ test "loadConfig parses generic vision fallback fields and image token aliases" 
     try std.testing.expectEqual(@as(i32, 256), config.vision_num_position_embeddings);
     try std.testing.expectEqual(@as(i32, 1024), config.vision_max_num_patches);
     try std.testing.expectEqual(@as(i32, 396), config.image_token_id);
+}
+
+test "loadConfig parses qwen3_vl vision fields through qwen3 architecture hook" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_vl",
+        \\  "image_token_id": 151655,
+        \\  "vision_start_token_id": 151652,
+        \\  "vision_end_token_id": 151653,
+        \\  "text_config": {
+        \\    "vocab_size": 151936,
+        \\    "hidden_size": 2048,
+        \\    "num_hidden_layers": 28,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "intermediate_size": 6144,
+        \\    "max_position_embeddings": 262144,
+        \\    "rms_norm_eps": 1e-6,
+        \\    "rope_theta": 5000000.0
+        \\  },
+        \\  "vision_config": {
+        \\    "hidden_size": 1024,
+        \\    "depth": 24,
+        \\    "num_heads": 16,
+        \\    "intermediate_size": 4096,
+        \\    "out_hidden_size": 2048,
+        \\    "patch_size": 16,
+        \\    "spatial_merge_size": 2,
+        \\    "temporal_patch_size": 2,
+        \\    "num_position_embeddings": 2304
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(@as(i32, 151655), config.image_token_id);
+    try std.testing.expectEqual(@as(i32, 151652), config.vision_start_token_id);
+    try std.testing.expectEqual(@as(i32, 151653), config.vision_end_token_id);
+    try std.testing.expectEqual(@as(i32, 1024), config.vision_hidden_size);
+    try std.testing.expectEqual(@as(i32, 24), config.vision_depth);
+    try std.testing.expectEqual(@as(i32, 16), config.vision_num_heads);
+    try std.testing.expectEqual(@as(i32, 4096), config.vision_intermediate_size);
+    try std.testing.expectEqual(@as(i32, 2048), config.vision_out_hidden_size);
+    try std.testing.expectEqual(@as(i32, 16), config.vision_patch_size);
+    try std.testing.expectEqual(@as(i32, 2), config.vision_spatial_merge_size);
+    try std.testing.expectEqual(@as(i32, 2), config.vision_temporal_patch_size);
+    try std.testing.expectEqual(@as(i32, 2304), config.vision_num_position_embeddings);
+}
+
+test "loadConfig parses lfm2_vl vision fields through lfm2 architecture hook" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "lfm2_vl",
+        \\  "image_token_index": 396,
+        \\  "downsample_factor": 2,
+        \\  "projector_hidden_size": 2560,
+        \\  "text_config": {
+        \\    "vocab_size": 65536,
+        \\    "hidden_size": 1024,
+        \\    "num_hidden_layers": 16,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "intermediate_size": 6656,
+        \\    "max_position_embeddings": 128000,
+        \\    "norm_eps": 1e-5,
+        \\    "rope_theta": 1000000.0
+        \\  },
+        \\  "vision_config": {
+        \\    "hidden_size": 768,
+        \\    "num_hidden_layers": 12,
+        \\    "num_attention_heads": 12,
+        \\    "intermediate_size": 3072,
+        \\    "patch_size": 16,
+        \\    "num_patches": 256
+        \\  }
+        \\}
+    ;
+
+    try tmp.dir.writeFile(.{ .sub_path = "config.json", .data = config_json });
+    const path = try tmp.dir.realpathAlloc(std.testing.allocator, "config.json");
+    defer std.testing.allocator.free(path);
+
+    const config = try loadConfig(std.testing.allocator, path);
+    try std.testing.expectEqual(@as(i32, 396), config.image_token_id);
+    try std.testing.expectEqual(@as(i32, 768), config.vision_hidden_size);
+    try std.testing.expectEqual(@as(i32, 12), config.vision_depth);
+    try std.testing.expectEqual(@as(i32, 12), config.vision_num_heads);
+    try std.testing.expectEqual(@as(i32, 3072), config.vision_intermediate_size);
+    try std.testing.expectEqual(@as(i32, 2560), config.projector_hidden_size);
+    try std.testing.expectEqual(@as(i32, 16), config.vision_patch_size);
+    try std.testing.expectEqual(@as(i32, 2), config.vision_spatial_merge_size);
+    try std.testing.expectEqual(@as(i32, 1), config.vision_temporal_patch_size);
+    try std.testing.expectEqual(@as(i32, 256), config.vision_num_position_embeddings);
 }

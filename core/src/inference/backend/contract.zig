@@ -101,6 +101,57 @@ fn requireEnumTag(comptime E: type, comptime owner_name: []const u8, comptime ta
     @compileError("Contract for '" ++ owner_name ++ "' missing enum tag '" ++ tag_name ++ "'");
 }
 
+const required_kernel_names = [_][]const u8{
+    "attention",
+    "describe_fmt",
+    "embedding",
+    "ffn",
+    "fused_attention",
+    "kv_cache",
+    "mamba",
+    "mla_attention",
+    "moe",
+    "norm",
+    "rope",
+    "shortconv",
+    "weights",
+};
+
+fn assertKernelSupportShape(comptime K: type, comptime backend_name: []const u8) type {
+    @setEvalBranchQuota(10_000);
+
+    requireLayoutDecl(K, backend_name, "support");
+    const S = @TypeOf(K.support);
+    const owner = "Kernel support map for '" ++ backend_name ++ "'";
+
+    inline for (required_kernel_names) |kernel_name| {
+        requireBoolField(S, owner, kernel_name);
+        requireLayoutDecl(K, backend_name, kernel_name);
+    }
+
+    const support_fields = std.meta.fields(S);
+    if (support_fields.len != required_kernel_names.len) {
+        @compileError(
+            "Kernel support map for '" ++ backend_name ++ "' must declare exactly " ++
+                std.fmt.comptimePrint("{}", .{required_kernel_names.len}) ++
+                " capabilities",
+        );
+    }
+
+    inline for (support_fields) |field| {
+        if (field.type != bool) {
+            @compileError(
+                "Kernel support map for '" ++ backend_name ++ "' field '" ++ field.name ++ "' must be bool",
+            );
+        }
+        if (!@hasDecl(K, field.name)) {
+            @compileError("Kernel module layout for '" ++ backend_name ++ "' missing module '" ++ field.name ++ "'");
+        }
+    }
+
+    return S;
+}
+
 /// Assert module layout symmetry for backends.
 ///
 /// This enforces the structural design (executor/kernels/engine split) so
@@ -208,19 +259,7 @@ pub fn assertExecutorSymbolLayout(comptime E: type, comptime backend_name: []con
 /// discoverable with stable names across architectures.
 pub fn assertKernelModuleLayout(comptime K: type, comptime backend_name: []const u8) void {
     comptime {
-        requireLayoutDecl(K, backend_name, "attention");
-        requireLayoutDecl(K, backend_name, "describe_fmt");
-        requireLayoutDecl(K, backend_name, "embedding");
-        requireLayoutDecl(K, backend_name, "ffn");
-        requireLayoutDecl(K, backend_name, "fused_attention");
-        requireLayoutDecl(K, backend_name, "kv_cache");
-        requireLayoutDecl(K, backend_name, "mamba");
-        requireLayoutDecl(K, backend_name, "mla_attention");
-        requireLayoutDecl(K, backend_name, "moe");
-        requireLayoutDecl(K, backend_name, "norm");
-        requireLayoutDecl(K, backend_name, "rope");
-        requireLayoutDecl(K, backend_name, "shortconv");
-        requireLayoutDecl(K, backend_name, "weights");
+        _ = assertKernelSupportShape(K, backend_name);
     }
 }
 
@@ -229,35 +268,12 @@ pub fn assertKernelModuleLayout(comptime K: type, comptime backend_name: []const
 /// This makes unsupported capability gaps explicit and grep-friendly.
 pub fn assertKernelSupportMap(comptime K: type, comptime backend_name: []const u8) void {
     comptime {
-        requireLayoutDecl(K, backend_name, "support");
-        const S = @TypeOf(K.support);
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "attention");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "describe_fmt");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "embedding");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "ffn");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "fused_attention");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "kv_cache");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "mamba");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "mla_attention");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "moe");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "norm");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "rope");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "shortconv");
-        requireBoolField(S, "Kernel support map for '" ++ backend_name ++ "'", "weights");
-
-        assertKernelSupportDeclMatches(K.attention, backend_name, "attention", K.support.attention);
-        assertKernelSupportDeclMatches(K.describe_fmt, backend_name, "describe_fmt", K.support.describe_fmt);
-        assertKernelSupportDeclMatches(K.embedding, backend_name, "embedding", K.support.embedding);
-        assertKernelSupportDeclMatches(K.ffn, backend_name, "ffn", K.support.ffn);
-        assertKernelSupportDeclMatches(K.fused_attention, backend_name, "fused_attention", K.support.fused_attention);
-        assertKernelSupportDeclMatches(K.kv_cache, backend_name, "kv_cache", K.support.kv_cache);
-        assertKernelSupportDeclMatches(K.mamba, backend_name, "mamba", K.support.mamba);
-        assertKernelSupportDeclMatches(K.mla_attention, backend_name, "mla_attention", K.support.mla_attention);
-        assertKernelSupportDeclMatches(K.moe, backend_name, "moe", K.support.moe);
-        assertKernelSupportDeclMatches(K.norm, backend_name, "norm", K.support.norm);
-        assertKernelSupportDeclMatches(K.rope, backend_name, "rope", K.support.rope);
-        assertKernelSupportDeclMatches(K.shortconv, backend_name, "shortconv", K.support.shortconv);
-        assertKernelSupportDeclMatches(K.weights, backend_name, "weights", K.support.weights);
+        const S = assertKernelSupportShape(K, backend_name);
+        for (std.meta.fields(S)) |field| {
+            const kernel_name = field.name;
+            const expected = @field(K.support, kernel_name);
+            assertKernelSupportDeclMatches(@field(K, kernel_name), backend_name, kernel_name, expected);
+        }
     }
 }
 
@@ -281,73 +297,100 @@ fn assertKernelSupportDeclMatches(
 /// Assert kernel symbol symmetry (type + method names) across backends.
 pub fn assertKernelSymbolLayout(comptime K: type, comptime backend_name: []const u8) void {
     comptime {
+        const S = assertKernelSupportShape(K, backend_name);
         requireLayoutDecl(K, backend_name ++ ".kernels", "TransformerBlock");
-        requireLayoutDecl(K.norm, backend_name ++ ".kernels.norm", "RMSNorm");
-        requireLayoutDecl(K.attention, backend_name ++ ".kernels.attention", "MultiHeadAttention");
-        requireLayoutDecl(K.ffn, backend_name ++ ".kernels.ffn", "SwiGLU");
-        requireLayoutDecl(K.shortconv, backend_name ++ ".kernels.shortconv", "ShortConvKernel");
-        requireLayoutDecl(K.moe, backend_name ++ ".kernels.moe", "MoEFFN");
-        requireLayoutDecl(K.embedding, backend_name ++ ".kernels.embedding", "EmbeddingLookup");
-        requireLayoutDecl(K.kv_cache, backend_name ++ ".kernels.kv_cache", "KVCache");
-        requireLayoutDecl(K.fused_attention, backend_name ++ ".kernels.fused_attention", "FusedAttention");
-        requireLayoutDecl(K.rope, backend_name ++ ".kernels.rope", "RotaryEmbedding");
-        requireLayoutDecl(K.weights, backend_name ++ ".kernels.weights", "WeightAccess");
+        for (std.meta.fields(S)) |field| {
+            if (@field(K.support, field.name)) {
+                assertKernelContract(K, backend_name, field.name);
+            }
+        }
+    }
+}
 
-        requireLayoutDecl(K.norm.RMSNorm, backend_name ++ ".kernels.norm.RMSNorm", "ForwardParams");
-        requireLayoutDecl(K.attention.MultiHeadAttention, backend_name ++ ".kernels.attention.MultiHeadAttention", "ForwardParams");
-        requireLayoutDecl(K.ffn.SwiGLU, backend_name ++ ".kernels.ffn.SwiGLU", "ForwardParams");
-        requireLayoutDecl(K.shortconv.ShortConvKernel, backend_name ++ ".kernels.shortconv.ShortConvKernel", "ForwardParams");
-        requireLayoutDecl(K.moe.MoEFFN, backend_name ++ ".kernels.moe.MoEFFN", "ForwardParams");
-        requireLayoutDecl(K.embedding.EmbeddingLookup, backend_name ++ ".kernels.embedding.EmbeddingLookup", "ForwardParams");
-        requireLayoutDecl(K.kv_cache.KVCache, backend_name ++ ".kernels.kv_cache.KVCache", "ForwardParams");
-        requireLayoutDecl(K.fused_attention.FusedAttention, backend_name ++ ".kernels.fused_attention.FusedAttention", "ForwardParams");
-        requireLayoutDecl(K.rope.RotaryEmbedding, backend_name ++ ".kernels.rope.RotaryEmbedding", "ForwardParams");
-        requireLayoutDecl(K.weights.WeightAccess, backend_name ++ ".kernels.weights.WeightAccess", "ForwardParams");
+fn assertKernelContract(comptime K: type, comptime backend_name: []const u8, comptime kernel_name: []const u8) void {
+    const Module = @field(K, kernel_name);
+    const owner = backend_name ++ ".kernels." ++ kernel_name;
 
-        requireStructField(K.norm.RMSNorm.ForwardParams, backend_name ++ ".kernels.norm.RMSNorm.ForwardParams", "input");
-        requireStructField(K.norm.RMSNorm.ForwardParams, backend_name ++ ".kernels.norm.RMSNorm.ForwardParams", "output");
-        requireStructField(K.ffn.SwiGLU.ForwardParams, backend_name ++ ".kernels.ffn.SwiGLU.ForwardParams", "input_tensor");
-        requireStructField(K.ffn.SwiGLU.ForwardParams, backend_name ++ ".kernels.ffn.SwiGLU.ForwardParams", "output_tensor");
-        requireStructField(K.ffn.SwiGLU.ForwardParams, backend_name ++ ".kernels.ffn.SwiGLU.ForwardParams", "scratch");
-        requireStructField(K.ffn.SwiGLU.ForwardParams, backend_name ++ ".kernels.ffn.SwiGLU.ForwardParams", "matmul_scratch");
-        requireStructField(K.attention.MultiHeadAttention.ForwardParams, backend_name ++ ".kernels.attention.MultiHeadAttention.ForwardParams", "input_tensor");
-        requireStructField(K.attention.MultiHeadAttention.ForwardParams, backend_name ++ ".kernels.attention.MultiHeadAttention.ForwardParams", "output_tensor");
-        requireStructField(K.attention.MultiHeadAttention.ForwardParams, backend_name ++ ".kernels.attention.MultiHeadAttention.ForwardParams", "cache");
-        requireStructField(K.attention.MultiHeadAttention.ForwardParams, backend_name ++ ".kernels.attention.MultiHeadAttention.ForwardParams", "scratch");
-        requireStructField(K.attention.MultiHeadAttention.ForwardParams, backend_name ++ ".kernels.attention.MultiHeadAttention.ForwardParams", "matmul_scratch");
-        requireStructField(K.attention.MultiHeadAttention.ForwardParams, backend_name ++ ".kernels.attention.MultiHeadAttention.ForwardParams", "use_cache");
-        requireStructField(K.shortconv.ShortConvKernel.ForwardParams, backend_name ++ ".kernels.shortconv.ShortConvKernel.ForwardParams", "input_tensor");
-        requireStructField(K.shortconv.ShortConvKernel.ForwardParams, backend_name ++ ".kernels.shortconv.ShortConvKernel.ForwardParams", "output_tensor");
-        requireStructField(K.shortconv.ShortConvKernel.ForwardParams, backend_name ++ ".kernels.shortconv.ShortConvKernel.ForwardParams", "state");
-        requireStructField(K.shortconv.ShortConvKernel.ForwardParams, backend_name ++ ".kernels.shortconv.ShortConvKernel.ForwardParams", "scratch");
-        requireStructField(K.shortconv.ShortConvKernel.ForwardParams, backend_name ++ ".kernels.shortconv.ShortConvKernel.ForwardParams", "matmul_scratch");
-        requireStructField(K.moe.MoEFFN.ForwardParams, backend_name ++ ".kernels.moe.MoEFFN.ForwardParams", "input_tensor");
-        requireStructField(K.moe.MoEFFN.ForwardParams, backend_name ++ ".kernels.moe.MoEFFN.ForwardParams", "output_tensor");
-        requireStructField(K.moe.MoEFFN.ForwardParams, backend_name ++ ".kernels.moe.MoEFFN.ForwardParams", "scratch");
-        requireStructField(K.moe.MoEFFN.ForwardParams, backend_name ++ ".kernels.moe.MoEFFN.ForwardParams", "matmul_scratch");
-        requireStructField(K.embedding.EmbeddingLookup.ForwardParams, backend_name ++ ".kernels.embedding.EmbeddingLookup.ForwardParams", "token_ids");
-        requireStructField(K.embedding.EmbeddingLookup.ForwardParams, backend_name ++ ".kernels.embedding.EmbeddingLookup.ForwardParams", "output_tensor");
-        requireStructField(K.kv_cache.KVCache.ForwardParams, backend_name ++ ".kernels.kv_cache.KVCache.ForwardParams", "cache_index");
-        requireStructField(K.kv_cache.KVCache.ForwardParams, backend_name ++ ".kernels.kv_cache.KVCache.ForwardParams", "key_input");
-        requireStructField(K.kv_cache.KVCache.ForwardParams, backend_name ++ ".kernels.kv_cache.KVCache.ForwardParams", "value_input");
-        requireStructField(K.fused_attention.FusedAttention.ForwardParams, backend_name ++ ".kernels.fused_attention.FusedAttention.ForwardParams", "input_tensor");
-        requireStructField(K.fused_attention.FusedAttention.ForwardParams, backend_name ++ ".kernels.fused_attention.FusedAttention.ForwardParams", "output_tensor");
-        requireStructField(K.rope.RotaryEmbedding.ForwardParams, backend_name ++ ".kernels.rope.RotaryEmbedding.ForwardParams", "input_vector");
-        requireStructField(K.rope.RotaryEmbedding.ForwardParams, backend_name ++ ".kernels.rope.RotaryEmbedding.ForwardParams", "output_vector");
-        requireStructField(K.rope.RotaryEmbedding.ForwardParams, backend_name ++ ".kernels.rope.RotaryEmbedding.ForwardParams", "position");
-        requireStructField(K.weights.WeightAccess.ForwardParams, backend_name ++ ".kernels.weights.WeightAccess.ForwardParams", "weight_index");
-        requireStructField(K.weights.WeightAccess.ForwardParams, backend_name ++ ".kernels.weights.WeightAccess.ForwardParams", "output_weight");
-
-        requireMethodArity(K.norm.RMSNorm, backend_name ++ ".kernels.norm.RMSNorm", "forward", 3);
-        requireMethodArity(K.ffn.SwiGLU, backend_name ++ ".kernels.ffn.SwiGLU", "forward", 5);
-        requireMethodArity(K.attention.MultiHeadAttention, backend_name ++ ".kernels.attention.MultiHeadAttention", "forward", 7);
-        requireMethodArity(K.shortconv.ShortConvKernel, backend_name ++ ".kernels.shortconv.ShortConvKernel", "forward", 6);
-        requireMethodArity(K.moe.MoEFFN, backend_name ++ ".kernels.moe.MoEFFN", "forward", 5);
-        requireMethodArity(K.embedding.EmbeddingLookup, backend_name ++ ".kernels.embedding.EmbeddingLookup", "forward", 3);
-        requireMethodArity(K.kv_cache.KVCache, backend_name ++ ".kernels.kv_cache.KVCache", "forward", 4);
-        requireMethodArity(K.fused_attention.FusedAttention, backend_name ++ ".kernels.fused_attention.FusedAttention", "forward", 7);
-        requireMethodArity(K.rope.RotaryEmbedding, backend_name ++ ".kernels.rope.RotaryEmbedding", "forward", 4);
-        requireMethodArity(K.weights.WeightAccess, backend_name ++ ".kernels.weights.WeightAccess", "forward", 3);
+    if (std.mem.eql(u8, kernel_name, "norm")) {
+        requireLayoutDecl(Module, owner, "RMSNorm");
+        requireLayoutDecl(Module.RMSNorm, owner ++ ".RMSNorm", "ForwardParams");
+        requireStructField(Module.RMSNorm.ForwardParams, owner ++ ".RMSNorm.ForwardParams", "input");
+        requireStructField(Module.RMSNorm.ForwardParams, owner ++ ".RMSNorm.ForwardParams", "output");
+        requireMethodArity(Module.RMSNorm, owner ++ ".RMSNorm", "forward", 3);
+    } else if (std.mem.eql(u8, kernel_name, "attention")) {
+        requireLayoutDecl(Module, owner, "MultiHeadAttention");
+        requireLayoutDecl(Module.MultiHeadAttention, owner ++ ".MultiHeadAttention", "ForwardParams");
+        requireStructField(Module.MultiHeadAttention.ForwardParams, owner ++ ".MultiHeadAttention.ForwardParams", "input_tensor");
+        requireStructField(Module.MultiHeadAttention.ForwardParams, owner ++ ".MultiHeadAttention.ForwardParams", "output_tensor");
+        requireStructField(Module.MultiHeadAttention.ForwardParams, owner ++ ".MultiHeadAttention.ForwardParams", "cache");
+        requireStructField(Module.MultiHeadAttention.ForwardParams, owner ++ ".MultiHeadAttention.ForwardParams", "scratch");
+        requireStructField(Module.MultiHeadAttention.ForwardParams, owner ++ ".MultiHeadAttention.ForwardParams", "matmul_scratch");
+        requireStructField(Module.MultiHeadAttention.ForwardParams, owner ++ ".MultiHeadAttention.ForwardParams", "use_cache");
+        requireMethodArity(Module.MultiHeadAttention, owner ++ ".MultiHeadAttention", "forward", 7);
+    } else if (std.mem.eql(u8, kernel_name, "ffn")) {
+        requireLayoutDecl(Module, owner, "SwiGLU");
+        requireLayoutDecl(Module.SwiGLU, owner ++ ".SwiGLU", "ForwardParams");
+        requireStructField(Module.SwiGLU.ForwardParams, owner ++ ".SwiGLU.ForwardParams", "input_tensor");
+        requireStructField(Module.SwiGLU.ForwardParams, owner ++ ".SwiGLU.ForwardParams", "output_tensor");
+        requireStructField(Module.SwiGLU.ForwardParams, owner ++ ".SwiGLU.ForwardParams", "scratch");
+        requireStructField(Module.SwiGLU.ForwardParams, owner ++ ".SwiGLU.ForwardParams", "matmul_scratch");
+        requireMethodArity(Module.SwiGLU, owner ++ ".SwiGLU", "forward", 5);
+    } else if (std.mem.eql(u8, kernel_name, "shortconv")) {
+        requireLayoutDecl(Module, owner, "ShortConvKernel");
+        requireLayoutDecl(Module.ShortConvKernel, owner ++ ".ShortConvKernel", "ForwardParams");
+        requireStructField(Module.ShortConvKernel.ForwardParams, owner ++ ".ShortConvKernel.ForwardParams", "input_tensor");
+        requireStructField(Module.ShortConvKernel.ForwardParams, owner ++ ".ShortConvKernel.ForwardParams", "output_tensor");
+        requireStructField(Module.ShortConvKernel.ForwardParams, owner ++ ".ShortConvKernel.ForwardParams", "state");
+        requireStructField(Module.ShortConvKernel.ForwardParams, owner ++ ".ShortConvKernel.ForwardParams", "scratch");
+        requireStructField(Module.ShortConvKernel.ForwardParams, owner ++ ".ShortConvKernel.ForwardParams", "matmul_scratch");
+        requireMethodArity(Module.ShortConvKernel, owner ++ ".ShortConvKernel", "forward", 6);
+    } else if (std.mem.eql(u8, kernel_name, "moe")) {
+        requireLayoutDecl(Module, owner, "MoEFFN");
+        requireLayoutDecl(Module.MoEFFN, owner ++ ".MoEFFN", "ForwardParams");
+        requireStructField(Module.MoEFFN.ForwardParams, owner ++ ".MoEFFN.ForwardParams", "input_tensor");
+        requireStructField(Module.MoEFFN.ForwardParams, owner ++ ".MoEFFN.ForwardParams", "output_tensor");
+        requireStructField(Module.MoEFFN.ForwardParams, owner ++ ".MoEFFN.ForwardParams", "scratch");
+        requireStructField(Module.MoEFFN.ForwardParams, owner ++ ".MoEFFN.ForwardParams", "matmul_scratch");
+        requireMethodArity(Module.MoEFFN, owner ++ ".MoEFFN", "forward", 5);
+    } else if (std.mem.eql(u8, kernel_name, "embedding")) {
+        requireLayoutDecl(Module, owner, "EmbeddingLookup");
+        requireLayoutDecl(Module.EmbeddingLookup, owner ++ ".EmbeddingLookup", "ForwardParams");
+        requireStructField(Module.EmbeddingLookup.ForwardParams, owner ++ ".EmbeddingLookup.ForwardParams", "token_ids");
+        requireStructField(Module.EmbeddingLookup.ForwardParams, owner ++ ".EmbeddingLookup.ForwardParams", "output_tensor");
+        requireMethodArity(Module.EmbeddingLookup, owner ++ ".EmbeddingLookup", "forward", 3);
+    } else if (std.mem.eql(u8, kernel_name, "kv_cache")) {
+        requireLayoutDecl(Module, owner, "KVCache");
+        requireLayoutDecl(Module.KVCache, owner ++ ".KVCache", "ForwardParams");
+        requireStructField(Module.KVCache.ForwardParams, owner ++ ".KVCache.ForwardParams", "cache_index");
+        requireStructField(Module.KVCache.ForwardParams, owner ++ ".KVCache.ForwardParams", "key_input");
+        requireStructField(Module.KVCache.ForwardParams, owner ++ ".KVCache.ForwardParams", "value_input");
+        requireMethodArity(Module.KVCache, owner ++ ".KVCache", "forward", 4);
+    } else if (std.mem.eql(u8, kernel_name, "fused_attention")) {
+        requireLayoutDecl(Module, owner, "FusedAttention");
+        requireLayoutDecl(Module.FusedAttention, owner ++ ".FusedAttention", "ForwardParams");
+        requireStructField(Module.FusedAttention.ForwardParams, owner ++ ".FusedAttention.ForwardParams", "input_tensor");
+        requireStructField(Module.FusedAttention.ForwardParams, owner ++ ".FusedAttention.ForwardParams", "output_tensor");
+        requireMethodArity(Module.FusedAttention, owner ++ ".FusedAttention", "forward", 7);
+    } else if (std.mem.eql(u8, kernel_name, "rope")) {
+        requireLayoutDecl(Module, owner, "RotaryEmbedding");
+        requireLayoutDecl(Module.RotaryEmbedding, owner ++ ".RotaryEmbedding", "ForwardParams");
+        requireStructField(Module.RotaryEmbedding.ForwardParams, owner ++ ".RotaryEmbedding.ForwardParams", "input_vector");
+        requireStructField(Module.RotaryEmbedding.ForwardParams, owner ++ ".RotaryEmbedding.ForwardParams", "output_vector");
+        requireStructField(Module.RotaryEmbedding.ForwardParams, owner ++ ".RotaryEmbedding.ForwardParams", "position");
+        requireMethodArity(Module.RotaryEmbedding, owner ++ ".RotaryEmbedding", "forward", 4);
+    } else if (std.mem.eql(u8, kernel_name, "weights")) {
+        requireLayoutDecl(Module, owner, "WeightAccess");
+        requireLayoutDecl(Module.WeightAccess, owner ++ ".WeightAccess", "ForwardParams");
+        requireStructField(Module.WeightAccess.ForwardParams, owner ++ ".WeightAccess.ForwardParams", "weight_index");
+        requireStructField(Module.WeightAccess.ForwardParams, owner ++ ".WeightAccess.ForwardParams", "output_weight");
+        requireMethodArity(Module.WeightAccess, owner ++ ".WeightAccess", "forward", 3);
+    } else if (std.mem.eql(u8, kernel_name, "describe_fmt") or
+        std.mem.eql(u8, kernel_name, "mamba") or
+        std.mem.eql(u8, kernel_name, "mla_attention"))
+    {
+        // Supported surface shape is enforced elsewhere for these modules.
+    } else {
+        @compileError("No symbol contract defined for kernel '" ++ kernel_name ++ "'");
     }
 }
 
@@ -369,44 +412,11 @@ fn assertUnsupportedKernelModule(comptime M: type, comptime backend_name: []cons
 /// Assert unsupported-kernel modules expose explicit typed failures.
 pub fn assertUnsupportedKernelPolicy(comptime K: type, comptime backend_name: []const u8) void {
     comptime {
-        if (!K.support.attention) {
-            assertUnsupportedKernelModule(K.attention, backend_name, "attention");
-        }
-        if (!K.support.describe_fmt) {
-            assertUnsupportedKernelModule(K.describe_fmt, backend_name, "describe_fmt");
-        }
-        if (!K.support.embedding) {
-            assertUnsupportedKernelModule(K.embedding, backend_name, "embedding");
-        }
-        if (!K.support.ffn) {
-            assertUnsupportedKernelModule(K.ffn, backend_name, "ffn");
-        }
-        if (!K.support.fused_attention) {
-            assertUnsupportedKernelModule(K.fused_attention, backend_name, "fused_attention");
-        }
-        if (!K.support.kv_cache) {
-            assertUnsupportedKernelModule(K.kv_cache, backend_name, "kv_cache");
-        }
-        if (!K.support.mamba) {
-            assertUnsupportedKernelModule(K.mamba, backend_name, "mamba");
-        }
-        if (!K.support.mla_attention) {
-            assertUnsupportedKernelModule(K.mla_attention, backend_name, "mla_attention");
-        }
-        if (!K.support.moe) {
-            assertUnsupportedKernelModule(K.moe, backend_name, "moe");
-        }
-        if (!K.support.norm) {
-            assertUnsupportedKernelModule(K.norm, backend_name, "norm");
-        }
-        if (!K.support.rope) {
-            assertUnsupportedKernelModule(K.rope, backend_name, "rope");
-        }
-        if (!K.support.shortconv) {
-            assertUnsupportedKernelModule(K.shortconv, backend_name, "shortconv");
-        }
-        if (!K.support.weights) {
-            assertUnsupportedKernelModule(K.weights, backend_name, "weights");
+        const S = assertKernelSupportShape(K, backend_name);
+        for (std.meta.fields(S)) |field| {
+            if (!@field(K.support, field.name)) {
+                assertUnsupportedKernelModule(@field(K, field.name), backend_name, field.name);
+            }
         }
     }
 }

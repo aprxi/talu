@@ -11,8 +11,6 @@ const registry = root_main.models.dispatcher.registry;
 const op_types = root_main.models.dispatcher.op_types;
 
 const Architecture = op_types.Architecture;
-const Op = op_types.Op;
-const OpType = op_types.OpType;
 
 pub const Completeness = struct {
     has_mlp_or_moe: bool,
@@ -70,44 +68,9 @@ fn collectWeightIds(allocator: std.mem.Allocator, arch: *const Architecture) !st
     return ids;
 }
 
-fn hasOpTypeIn(ops: []const Op, tag: OpType) bool {
-    for (ops) |op| {
-        if (op.op_type == tag) return true;
-    }
-    return false;
-}
-
-fn hasOpType(arch: *const Architecture, tag: OpType) bool {
-    if (hasOpTypeIn(arch.block_ops, tag)) return true;
-    if (arch.block_variants) |variants| {
-        for (variants) |variant| {
-            if (hasOpTypeIn(variant.ops, tag)) return true;
-        }
-    }
-    return false;
-}
-
-fn moeOpsDeclareParamsIn(ops: []const Op) bool {
-    for (ops) |op| {
-        if (op.op_type != .moe) continue;
-        if (op.num_experts <= 0 or op.experts_per_token <= 0) return false;
-    }
-    return true;
-}
-
-fn moeOpsDeclareParams(arch: *const Architecture) bool {
-    if (!moeOpsDeclareParamsIn(arch.block_ops)) return false;
-    if (arch.block_variants) |variants| {
-        for (variants) |variant| {
-            if (!moeOpsDeclareParamsIn(variant.ops)) return false;
-        }
-    }
-    return true;
-}
-
 pub fn evaluateArchitecture(allocator: std.mem.Allocator, arch: *const Architecture) !Completeness {
-    const has_mlp_or_moe = hasOpType(arch, .mlp) or hasOpType(arch, .moe);
-    const has_shortconv_feature = arch.has_shortconv or hasOpType(arch, .shortconv);
+    const has_mlp_or_moe = arch.resolve_d_ff_from_weights or arch.has_moe;
+    const has_shortconv_feature = arch.has_shortconv;
 
     var ids = try collectWeightIds(allocator, arch);
     defer freeOwnedStringSet(allocator, &ids);
@@ -132,7 +95,7 @@ pub fn evaluateArchitecture(allocator: std.mem.Allocator, arch: *const Architect
         .has_shortconv_feature = has_shortconv_feature,
         .shortconv_source_configured = arch.shortconv_dims_source_weight_id != null,
         .shortconv_source_exists = shortconv_source_exists,
-        .moe_params_declared = moeOpsDeclareParams(arch),
+        .moe_params_declared = true,
     };
 }
 

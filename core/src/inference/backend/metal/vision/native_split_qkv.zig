@@ -12,10 +12,12 @@
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
 const models = @import("../../../../models/root.zig");
+const layer_ops = @import("../../../../models/layer_ops.zig");
 const compute = @import("../../../../compute/root.zig");
 const image_mod = @import("../../../../image/root.zig");
 const common_vision = @import("../../../vision_types.zig");
 const vision_tensor_convert = @import("../../../vision_tensor_convert.zig");
+const vision_program_mod = @import("../../../vision_program.zig");
 const mlx_fused = @import("../mlx/ffi.zig");
 const graph = compute.metal.graph;
 
@@ -78,13 +80,16 @@ pub const VisionRuntime = struct {
 
     layer_weights: []LayerWeights,
     matmul_scratch: MatmulScratch,
+    vision_program: []const layer_ops.LayerOp,
 
     const LayerWeights = struct {
         ln1_weight: Tensor,
         ln1_weight_handle: ArrayHandle,
+        ln1_bias: []f32,
         ln1_bias_handle: ArrayHandle,
         ln2_weight: Tensor,
         ln2_weight_handle: ArrayHandle,
+        ln2_bias: []f32,
         ln2_bias_handle: ArrayHandle,
         qkv_weight: Tensor,
         qkv_weight_handle: ArrayHandle,
@@ -120,6 +125,8 @@ pub const VisionRuntime = struct {
             graph.freeArray(self.ln1_bias_handle);
             graph.freeArray(self.ln2_weight_handle);
             graph.freeArray(self.ln2_bias_handle);
+            if (self.ln1_bias.len > 0) allocator.free(self.ln1_bias);
+            if (self.ln2_bias.len > 0) allocator.free(self.ln2_bias);
             if (self.has_fused_qkv) {
                 graph.freeArray(self.qkv_weight_handle);
                 graph.freeArray(self.qkv_bias_handle);
@@ -174,7 +181,7 @@ pub const VisionRuntime = struct {
         const merger_intermediate_size: usize = @intCast(if (cfg.projector_hidden_size > 0) cfg.projector_hidden_size else if (cfg.vision_intermediate_size > 0) cfg.vision_intermediate_size else 4 * cfg.vision_hidden_size);
         const language_hidden_size: usize = @intCast(cfg.d_model);
         const patch_size: usize = @intCast(if (cfg.vision_patch_size > 0) cfg.vision_patch_size else 16);
-        const spatial_merge_size: usize = @intCast(if (cfg.vision_spatial_merge_size > 0) cfg.vision_spatial_merge_size else 1);
+        var spatial_merge_size: usize = @intCast(if (cfg.vision_spatial_merge_size > 0) cfg.vision_spatial_merge_size else 1);
         const temporal_patch_size: usize = @intCast(if (cfg.vision_temporal_patch_size > 0) cfg.vision_temporal_patch_size else 1);
         const num_pos_embeddings: usize = @intCast(if (cfg.vision_num_position_embeddings > 0) cfg.vision_num_position_embeddings else 2304);
         var deepstack_visual_layers: [8]usize = [_]usize{0} ** 8;
@@ -183,6 +190,16 @@ pub const VisionRuntime = struct {
         for (0..deepstack_layer_count) |idx| {
             deepstack_visual_layers[idx] = cfg.vision_probe_layers[idx];
         }
+        const vision_program = vision_load.resolveVisionProgram(loaded) orelse return null;
+        const parsed_program = try vision_program_mod.parseVisionProgram(
+            vision_program,
+            spatial_merge_size,
+            deepstack_visual_layers,
+            deepstack_layer_count,
+        );
+        spatial_merge_size = parsed_program.spatial_merge_size;
+        deepstack_visual_layers = parsed_program.deepstack_visual_layers;
+        deepstack_layer_count = parsed_program.deepstack_layer_count;
 
         const num_grid_side = std.math.sqrt(num_pos_embeddings);
         if (num_grid_side * num_grid_side != num_pos_embeddings) return error.InvalidShape;
@@ -330,11 +347,15 @@ pub const VisionRuntime = struct {
 
             const ln1_weight_handle = try tensorToMetalArray(&ln1_weight);
             errdefer graph.freeArray(ln1_weight_handle);
-            const ln1_bias_handle = f32SliceToMetalArray(ln1_bias.asSlice(f32));
+            const ln1_bias_f32 = try vision_tensor_convert.tensorToOwnedF32(allocator, ln1_bias);
+            errdefer allocator.free(ln1_bias_f32);
+            const ln1_bias_handle = f32SliceToMetalArray(ln1_bias_f32);
             errdefer graph.freeArray(ln1_bias_handle);
             const ln2_weight_handle = try tensorToMetalArray(&ln2_weight);
             errdefer graph.freeArray(ln2_weight_handle);
-            const ln2_bias_handle = f32SliceToMetalArray(ln2_bias.asSlice(f32));
+            const ln2_bias_f32 = try vision_tensor_convert.tensorToOwnedF32(allocator, ln2_bias);
+            errdefer allocator.free(ln2_bias_f32);
+            const ln2_bias_handle = f32SliceToMetalArray(ln2_bias_f32);
             errdefer graph.freeArray(ln2_bias_handle);
             const qkv_weight_handle = if (fused_qkv_weight != null) try tensorToMetalArray(&(fused_qkv_weight.?)) else null;
             errdefer if (qkv_weight_handle != null) graph.freeArray(qkv_weight_handle);
@@ -368,9 +389,11 @@ pub const VisionRuntime = struct {
             layer_weights[layer_idx] = .{
                 .ln1_weight = ln1_weight,
                 .ln1_weight_handle = ln1_weight_handle,
+                .ln1_bias = ln1_bias_f32,
                 .ln1_bias_handle = ln1_bias_handle,
                 .ln2_weight = ln2_weight,
                 .ln2_weight_handle = ln2_weight_handle,
+                .ln2_bias = ln2_bias_f32,
                 .ln2_bias_handle = ln2_bias_handle,
                 .qkv_weight = fused_qkv_weight orelse undefined,
                 .qkv_weight_handle = qkv_weight_handle,
@@ -442,6 +465,7 @@ pub const VisionRuntime = struct {
             .deepstack_layer_count = deepstack_layer_count,
             .layer_weights = layer_weights,
             .matmul_scratch = matmul_scratch,
+            .vision_program = vision_program,
         };
     }
 
@@ -731,8 +755,53 @@ pub const VisionRuntime = struct {
         } else final_hidden;
         defer if (merger_input.ptr != final_hidden.ptr) self.allocator.free(merger_input);
 
+        return try self.runVisionProgram(image.grid, merger_input, deepstack_layer_embeddings);
+    }
+
+    fn runVisionProgram(
+        self: *VisionRuntime,
+        grid: image_mod.VisionGrid,
+        merged_hidden_in: []const f32,
+        deepstack_layer_embeddings: []const []const f32,
+    ) !EncodedSingleImage {
+        var merged_embeddings: ?[]f32 = null;
+        errdefer if (merged_embeddings) |embeds| self.allocator.free(embeds);
+
+        var saw_patch_embed = false;
+        var saw_spatial_merge = false;
+
+        for (self.vision_program) |op| {
+            switch (op) {
+                .patch_embed => {
+                    if (saw_patch_embed or saw_spatial_merge) return error.InvalidVisionProgram;
+                    saw_patch_embed = true;
+                },
+                .deepstack_extract => |extract_op| {
+                    if (!saw_patch_embed) return error.InvalidVisionProgram;
+                    const layer_idx = std.math.cast(usize, extract_op.layer_index) orelse return error.InvalidVisionProgram;
+                    const merger_idx = self.deepstackLayerToMergerIndex(layer_idx) orelse return error.InvalidVisionProgram;
+                    if (merger_idx >= deepstack_layer_embeddings.len or deepstack_layer_embeddings[merger_idx].len == 0) {
+                        return error.InvalidState;
+                    }
+                },
+                .spatial_merge => {
+                    if (!saw_patch_embed or saw_spatial_merge) return error.InvalidVisionProgram;
+                    saw_spatial_merge = true;
+                    merged_embeddings = try self.runMerger(grid, merged_hidden_in);
+                },
+                .scatter => {
+                    if (!saw_spatial_merge) return error.InvalidVisionProgram;
+                },
+                else => {},
+            }
+        }
+
+        if (!saw_patch_embed or !saw_spatial_merge or merged_embeddings == null) {
+            return error.InvalidVisionProgram;
+        }
+
         return .{
-            .merged_embeddings = try self.runMerger(image.grid, merger_input),
+            .merged_embeddings = merged_embeddings.?,
             .deepstack_layer_embeddings = deepstack_layer_embeddings,
         };
     }

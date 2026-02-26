@@ -6,6 +6,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const models = @import("../../../models/root.zig");
+const layer_ops = models.layer_ops;
+const op_types = models.op_types;
 const contract = @import("../contract.zig");
 const compute = @import("../../../compute/root.zig");
 const tensor = @import("../../../tensor.zig");
@@ -604,6 +606,7 @@ const ShortConvBlockRuntime = struct {
 };
 
 const BlockRuntimeLayer = struct {
+    program: ?[]const layer_ops.LayerOp = null,
     attention_mlp: ?AttentionMlpBlockRuntime = null,
     shortconv: ?ShortConvBlockRuntime = null,
 
@@ -613,6 +616,104 @@ const BlockRuntimeLayer = struct {
         self.* = .{};
     }
 };
+
+fn isCoreProgramBuffer(id: layer_ops.BufferId) bool {
+    return switch (id) {
+        .residual, .norm_out, .branch_out => true,
+        else => false,
+    };
+}
+
+fn finalProgramOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
+    if (program.len == 0) return .residual;
+    const last = program[program.len - 1];
+    return switch (last) {
+        .kernel => |k| k.out,
+        .add => .residual,
+        .linear => |op| op.out,
+        .matmul => |op| op.out,
+        .softmax => |op| op.out,
+        .silu => |op| op.out,
+        .gelu => |op| op.out,
+        .mul => |op| op.out,
+        .add_tensor => |op| op.out,
+        .add_scalar => |op| op.out,
+        .mul_scalar => |op| op.out,
+        .mean => |op| op.out,
+        .pow => |op| op.out,
+        .rsqrt => |op| op.out,
+        .add_param => |op| op.out,
+        .add_param_scalar => |op| op.out,
+        .mul_param => |op| op.out,
+        .reshape => |op| op.out,
+        .transpose => |op| op.out,
+        .rope => |op| op.out,
+        .triu => |op| op.out,
+        .sdpa => |op| op.out,
+        .patch_embed => |op| op.out,
+        .spatial_merge => |op| op.out,
+        .deepstack_extract => |op| op.out,
+        .scatter => |op| op.out,
+        else => .residual,
+    };
+}
+
+fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
+    for (program, 0..) |op, op_idx| {
+        switch (op) {
+            .kernel => |kernel_op| {
+                if (!isCoreProgramBuffer(kernel_op.in) or !isCoreProgramBuffer(kernel_op.out)) {
+                    log.warn("inference", "CUDA LayerOp program uses unsupported buffer id", .{
+                        .layer = layer_idx,
+                        .op_index = op_idx,
+                        .kind = @intFromEnum(kind),
+                        .debug_type = @tagName(kernel_op.debug_type),
+                    });
+                    return error.UnsupportedModel;
+                }
+                switch (kernel_op.debug_type) {
+                    .norm, .multihead_attention, .shortconv, .mlp, .moe, .mamba_mixer => {},
+                    else => {
+                        log.warn("inference", "CUDA LayerOp program uses unsupported kernel debug type", .{
+                            .layer = layer_idx,
+                            .op_index = op_idx,
+                            .kind = @intFromEnum(kind),
+                            .debug_type = @tagName(kernel_op.debug_type),
+                        });
+                        return error.UnsupportedModel;
+                    },
+                }
+            },
+            .add => |add_op| {
+                if (!isCoreProgramBuffer(add_op.branch)) {
+                    log.warn("inference", "CUDA LayerOp add uses unsupported buffer id", .{
+                        .layer = layer_idx,
+                        .op_index = op_idx,
+                        .kind = @intFromEnum(kind),
+                    });
+                    return error.UnsupportedModel;
+                }
+            },
+            else => {
+                log.warn("inference", "CUDA LayerOp program contains unsupported op kind", .{
+                    .layer = layer_idx,
+                    .op_index = op_idx,
+                    .kind = @intFromEnum(kind),
+                    .op = @tagName(op),
+                });
+                return error.UnsupportedModel;
+            },
+        }
+    }
+
+    if (!isCoreProgramBuffer(finalProgramOutputBuffer(program))) {
+        log.warn("inference", "CUDA LayerOp program final buffer is unsupported", .{
+            .layer = layer_idx,
+            .kind = @intFromEnum(kind),
+        });
+        return error.UnsupportedModel;
+    }
+}
 
 const BlockRuntime = struct {
     blocks: []BlockRuntimeLayer,
@@ -642,6 +743,11 @@ const BlockRuntime = struct {
         const max_seq_len: usize = @intCast(loaded.config.max_seq_len);
         if (n_heads == 0 or n_kv_heads == 0 or head_dim == 0 or max_seq_len == 0) return error.InvalidArgument;
         if (n_heads % n_kv_heads != 0) return error.UnsupportedModel;
+        const arena_allocator = @constCast(&loaded.arena).allocator();
+        const static_entry = if (loaded.runtime.architecture_id) |arch_id|
+            models.registry.detectByArchitectureId(arch_id)
+        else
+            null;
         const layer_count = loaded.blocks.len;
         var attention_block_count: usize = 0;
         var shortconv_block_count: usize = 0;
@@ -665,9 +771,27 @@ const BlockRuntime = struct {
             }
         }
 
-        for (loaded.blocks, 0..) |block_weights, layer_idx| {
+        for (loaded.blocks, 0..) |*layer_weights, layer_idx| {
+            const block_weights = try models.runtime_blocks.layerToBlockWeights(arena_allocator, layer_weights);
             switch (block_weights) {
                 .attention_mlp => |attn| {
+                    const entry = static_entry orelse {
+                        log.warn("inference", "CUDA block runtime missing architecture metadata", .{ .layer = layer_idx });
+                        return error.UnsupportedModel;
+                    };
+                    blocks[layer_idx].program = models.registry.blockProgramFor(entry, .attention_mlp) orelse {
+                        log.warn("inference", "CUDA block runtime missing LayerOp program", .{
+                            .layer = layer_idx,
+                            .kind = @intFromEnum(op_types.BlockKind.attention_mlp),
+                            .architecture = entry.id,
+                        });
+                        return error.UnsupportedModel;
+                    };
+                    try validateLayerProgramForCuda(
+                        blocks[layer_idx].program.?,
+                        layer_idx,
+                        .attention_mlp,
+                    );
                     if (attn.mla_config != null) {
                         log.warn("inference", "CUDA block runtime MLA not supported yet", .{ .layer = layer_idx });
                         return error.UnsupportedModel;
@@ -977,6 +1101,23 @@ const BlockRuntime = struct {
                     attention_block_count += 1;
                 },
                 .shortconv => |shortconv| {
+                    const entry = static_entry orelse {
+                        log.warn("inference", "CUDA shortconv runtime missing architecture metadata", .{ .layer = layer_idx });
+                        return error.UnsupportedModel;
+                    };
+                    blocks[layer_idx].program = models.registry.blockProgramFor(entry, .shortconv) orelse {
+                        log.warn("inference", "CUDA shortconv runtime missing LayerOp program", .{
+                            .layer = layer_idx,
+                            .kind = @intFromEnum(op_types.BlockKind.shortconv),
+                            .architecture = entry.id,
+                        });
+                        return error.UnsupportedModel;
+                    };
+                    try validateLayerProgramForCuda(
+                        blocks[layer_idx].program.?,
+                        layer_idx,
+                        .shortconv,
+                    );
                     if (shortconv.fused_gate_up != null) {
                         log.warn("inference", "CUDA block runtime fused shortconv gate_up not supported yet", .{
                             .layer = layer_idx,
@@ -1427,6 +1568,9 @@ pub const CudaBackend = struct {
     gaffine_u4_matvec_gate_up_source: ?compute.cuda.registry.KernelSource = null,
     gaffine_u4_matvec_qkv_function: ?compute.cuda.Function = null,
     gaffine_u4_matvec_qkv_source: ?compute.cuda.registry.KernelSource = null,
+    gaffine_sequence_rows_supported: bool = false,
+    gaffine_sequence_fused_qkv_supported: bool = false,
+    gaffine_sequence_fused_gate_up_supported: bool = false,
     kernel_arg_pack: compute.cuda.ArgPack,
     blas: compute.cuda.Blas,
     prototype: PrototypeRuntime,
@@ -1445,6 +1589,8 @@ pub const CudaBackend = struct {
     slot_position: usize = 0,
     slot_rope_position_delta: isize = 0,
     slot_logits: []f32,
+    sequence_prefill_hidden_host: []f32,
+    sequence_prefill_workspace: ?SequencePrefillWorkspace = null,
     argmax_index_dev: compute.cuda.Buffer,
 
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel) !CudaBackend {
@@ -1473,6 +1619,8 @@ pub const CudaBackend = struct {
             .attention_scale = 0.0,
             .norm_eps = prototype_eps,
             .slot_logits = undefined,
+            .sequence_prefill_hidden_host = &.{},
+            .sequence_prefill_workspace = null,
             .argmax_index_dev = undefined,
         };
         if (backend.n_heads == 0 or backend.n_kv_heads == 0 or backend.head_dim == 0 or backend.max_seq_len == 0) {
@@ -1545,6 +1693,29 @@ pub const CudaBackend = struct {
         errdefer backend.prototype.deinit(allocator, &backend.device);
         try backend.initKernelFunctions();
 
+        if (loaded.original_weight_dtype == .grouped_affine_u4) {
+            backend.gaffine_sequence_rows_supported = smoke_checks.probeGaffineU4SequenceRowsSupport(&backend) catch false;
+            if (!backend.gaffine_sequence_rows_supported) {
+                log.warn("inference", "CUDA gaffine sequence prefill using per-row linear fallback (multi-row parity probe failed)", .{
+                    .reason = "gaffine_batch_rows_probe_failed",
+                });
+            } else {
+                backend.gaffine_sequence_fused_qkv_supported = smoke_checks.probeGaffineU4SequenceFusedQkvSupport(&backend) catch false;
+                if (!backend.gaffine_sequence_fused_qkv_supported) {
+                    log.warn("inference", "CUDA gaffine sequence prefill using unfused QKV fallback (multi-row fused parity probe failed)", .{
+                        .reason = "gaffine_batch_rows_fused_qkv_probe_failed",
+                    });
+                }
+
+                backend.gaffine_sequence_fused_gate_up_supported = smoke_checks.probeGaffineU4SequenceFusedGateUpSupport(&backend) catch false;
+                if (!backend.gaffine_sequence_fused_gate_up_supported) {
+                    log.warn("inference", "CUDA gaffine sequence prefill using unfused gate/up fallback (multi-row fused parity probe failed)", .{
+                        .reason = "gaffine_batch_rows_fused_gate_up_probe_failed",
+                    });
+                }
+            }
+        }
+
         if (run_startup_selftests) {
             try smoke_checks.runMatmulSmoke(&backend);
             try smoke_checks.runKernelSmoke(&backend);
@@ -1604,6 +1775,9 @@ pub const CudaBackend = struct {
             .gaffine_u4_matvec_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_function != null)),
             .gaffine_u4_matvec_gate_up_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_gate_up_function != null)),
             .gaffine_u4_matvec_qkv_kernel = @as(u8, @intFromBool(backend.gaffine_u4_matvec_qkv_function != null)),
+            .gaffine_sequence_rows_supported = @as(u8, @intFromBool(backend.gaffine_sequence_rows_supported)),
+            .gaffine_sequence_fused_qkv_supported = @as(u8, @intFromBool(backend.gaffine_sequence_fused_qkv_supported)),
+            .gaffine_sequence_fused_gate_up_supported = @as(u8, @intFromBool(backend.gaffine_sequence_fused_gate_up_supported)),
             .kv_dtype = if (kv_cache_dtype_fp16) "f16" else "f32",
             .linear_weight_mib = bytesToMiB(backend.block_runtime.linear_weight_bytes),
             .norm_weight_mib = bytesToMiB(backend.block_runtime.norm_weight_bytes),
@@ -1637,6 +1811,14 @@ pub const CudaBackend = struct {
             self.device.destroyStream(stream);
             self.compute_stream = null;
         }
+        if (self.sequence_prefill_workspace) |*ws| {
+            ws.deinit(&self.device);
+            self.sequence_prefill_workspace = null;
+        }
+        if (self.sequence_prefill_hidden_host.len > 0) {
+            self.allocator.free(self.sequence_prefill_hidden_host);
+            self.sequence_prefill_hidden_host = &.{};
+        }
         self.argmax_index_dev.deinit(&self.device);
         self.allocator.free(self.slot_logits);
         self.block_runtime.deinit(self.allocator, &self.device);
@@ -1661,6 +1843,48 @@ pub const CudaBackend = struct {
             if (layer.attention_mlp) |block| return block.kv_capacity;
         }
         return 0;
+    }
+
+    fn ensureSequencePrefillHiddenHost(self: *CudaBackend, token_count: usize) ![]f32 {
+        if (token_count == 0) return error.InvalidArgument;
+        const required = std.math.mul(usize, token_count, self.d_model) catch return error.InvalidArgument;
+        if (self.sequence_prefill_hidden_host.len < required) {
+            const current = self.sequence_prefill_hidden_host.len;
+            const grown = if (current == 0)
+                required
+            else
+                std.math.mul(usize, current, 2) catch required;
+            const target = @max(required, grown);
+            const new_buffer = try self.allocator.alloc(f32, target);
+            if (current > 0) self.allocator.free(self.sequence_prefill_hidden_host);
+            self.sequence_prefill_hidden_host = new_buffer;
+        }
+        return self.sequence_prefill_hidden_host[0..required];
+    }
+
+    fn ensureSequencePrefillWorkspace(self: *CudaBackend, token_count: usize) !*SequencePrefillWorkspace {
+        if (token_count == 0) return error.InvalidArgument;
+        if (self.sequence_prefill_workspace) |*ws| {
+            if (ws.token_count >= token_count) return ws;
+            ws.deinit(&self.device);
+            self.sequence_prefill_workspace = null;
+        }
+
+        const grown_tokens = if (token_count < 256)
+            token_count
+        else
+            std.math.mul(usize, token_count, 2) catch token_count;
+        const capacity_tokens = @min(grown_tokens, self.max_seq_len);
+        self.sequence_prefill_workspace = try SequencePrefillWorkspace.init(
+            &self.device,
+            capacity_tokens,
+            self.d_model,
+            self.prototype.max_attn,
+            self.prototype.max_kv,
+            self.prototype.max_dff,
+            self.n_heads,
+        );
+        return &self.sequence_prefill_workspace.?;
     }
 
     pub fn prefill(self: *CudaBackend, tokens: []const u32, logits_out: []f32) !void {
@@ -1833,6 +2057,11 @@ pub const CudaBackend = struct {
         self.slot_position = tokens.len;
     }
 
+    /// Optional multi-token prefill accelerator.
+    ///
+    /// This path is intentionally conservative: it only activates for attention-only
+    /// layer programs that preserve residual output semantics. Unsupported
+    /// topologies always fall back to the canonical LayerOp prefill route.
     pub fn trySequencePrefill(
         self: *CudaBackend,
         tokens: []const u32,
@@ -1841,17 +2070,17 @@ pub const CudaBackend = struct {
     ) !bool {
         const gate = self.sequencePrefillGate(tokens.len);
         if (gate != .ok) {
-            log.info("inference", "CUDA sequence prefill path inactive", .{
-                .tokens = tokens.len,
+            log.debug("inference", "CUDA sequence prefill path inactive", .{
                 .mode = mode,
+                .tokens = tokens.len,
                 .reason = @tagName(gate),
-            });
+            }, @src());
             return false;
         }
-        log.info("inference", "CUDA sequence prefill path active", .{
-            .tokens = tokens.len,
+        log.debug("inference", "CUDA sequence prefill path active", .{
             .mode = mode,
-        });
+            .tokens = tokens.len,
+        }, @src());
 
         const rmsnorm_function = self.rmsnorm_function orelse return error.CudaKernelUnavailable;
         const rope_function = self.rope_function orelse return error.CudaKernelUnavailable;
@@ -1869,20 +2098,10 @@ pub const CudaBackend = struct {
         try self.ensureKvCapacity(tokens.len);
 
         const hidden_count = std.math.mul(usize, tokens.len, self.d_model) catch return error.InvalidArgument;
-        const hidden_host = try self.allocator.alloc(f32, hidden_count);
-        defer self.allocator.free(hidden_host);
+        const hidden_host = try self.ensureSequencePrefillHiddenHost(tokens.len);
         try populatePrefillHiddenFromTokens(self.loaded, tokens, self.d_model, hidden_host);
 
-        var ws = try SequencePrefillWorkspace.init(
-            &self.device,
-            tokens.len,
-            self.d_model,
-            self.prototype.max_attn,
-            self.prototype.max_kv,
-            self.prototype.max_dff,
-            self.n_heads,
-        );
-        defer ws.deinit(&self.device);
+        const ws = try self.ensureSequencePrefillWorkspace(tokens.len);
 
         try ws.hidden_dev.upload(&self.device, std.mem.sliceAsBytes(hidden_host));
 
@@ -1900,7 +2119,7 @@ pub const CudaBackend = struct {
             global_rope_theta;
 
         for (self.block_runtime.blocks) |*layer| {
-            const block = layer.attention_mlp orelse return false;
+            const block = if (layer.attention_mlp) |*b| b else return false;
 
             try compute.cuda.rmsnorm.runWithFunction(
                 &self.kernel_arg_pack,
@@ -1915,9 +2134,11 @@ pub const CudaBackend = struct {
                 self.loaded.runtime.weight_offset,
             );
 
-            try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.q_proj, &ws.q_dev);
-            try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.k_proj, &ws.k_dev);
-            try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.v_proj, &ws.v_dev);
+            if (!try self.trySequenceFusedQkvRows(&ws.norm_dev, tokens.len, block, &ws.q_dev, &ws.k_dev, &ws.v_dev)) {
+                try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.q_proj, &ws.q_dev);
+                try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.k_proj, &ws.k_dev);
+                try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.v_proj, &ws.v_dev);
+            }
 
             const q_rows = std.math.mul(usize, tokens.len, self.n_heads) catch return error.InvalidArgument;
             const kv_rows = std.math.mul(usize, tokens.len, self.n_kv_heads) catch return error.InvalidArgument;
@@ -2179,8 +2400,10 @@ pub const CudaBackend = struct {
                 );
             }
 
-            try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.w1, &ws.ffn_gate_dev);
-            try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.w3, &ws.ffn_up_dev);
+            if (!try self.trySequenceFusedGateUpRows(&ws.norm_dev, tokens.len, &block.w1, &block.w3, &ws.ffn_gate_dev, &ws.ffn_up_dev)) {
+                try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.w1, &ws.ffn_gate_dev);
+                try self.linearForwardRows(&ws.norm_dev, tokens.len, &block.w3, &ws.ffn_up_dev);
+            }
             const ffn_count = std.math.mul(usize, tokens.len, block.d_ff) catch return error.InvalidArgument;
             if (ffn_count > std.math.maxInt(u32)) return error.InvalidArgument;
             if (self.loaded.config.use_gelu) {
@@ -2269,7 +2492,20 @@ pub const CudaBackend = struct {
         missing_fp16_kv_kernels,
         missing_f32_kv_kernels,
         unsupported_linear_projection,
+        unsupported_layer_program,
     };
+
+    fn sequencePrefillProgramCompatible(program: []const layer_ops.LayerOp) bool {
+        for (program) |op| switch (op) {
+            .kernel => |kernel_op| switch (kernel_op.debug_type) {
+                .norm, .multihead_attention, .mlp, .moe => {},
+                else => return false,
+            },
+            .add => {},
+            else => return false,
+        };
+        return finalProgramOutputBuffer(program) == .residual;
+    }
 
     fn sequencePrefillGate(self: *const CudaBackend, token_count: usize) SequencePrefillGate {
         if (token_count <= 1) return .token_count_le_one;
@@ -2310,6 +2546,8 @@ pub const CudaBackend = struct {
 
         for (self.block_runtime.blocks) |layer| {
             const block = layer.attention_mlp orelse return .non_attention_blocks_present;
+            const program = layer.program orelse return .unsupported_layer_program;
+            if (!sequencePrefillProgramCompatible(program)) return .unsupported_layer_program;
             if (!self.linearWeightSupportsSequenceRows(&block.q_proj)) return .unsupported_linear_projection;
             if (!self.linearWeightSupportsSequenceRows(&block.k_proj)) return .unsupported_linear_projection;
             if (!self.linearWeightSupportsSequenceRows(&block.v_proj)) return .unsupported_linear_projection;
@@ -2321,19 +2559,151 @@ pub const CudaBackend = struct {
         return .ok;
     }
 
-    fn canUseSequencePrefill(self: *const CudaBackend, token_count: usize) bool {
-        return self.sequencePrefillGate(token_count) == .ok;
+    fn linearWeightSupportsSequenceRows(self: *const CudaBackend, weight: *const LinearWeight) bool {
+        return linearWeightSupportsSequenceRowsForKernels(
+            weight,
+            self.matmul_f16_function != null,
+            self.matmul_bf16_function != null,
+            self.gaffine_u4_matvec_function != null,
+        );
     }
 
-    fn linearWeightSupportsSequenceRows(self: *const CudaBackend, weight: *const LinearWeight) bool {
+    fn linearWeightSupportsSequenceRowsForKernels(
+        weight: *const LinearWeight,
+        matmul_f16_available: bool,
+        matmul_bf16_available: bool,
+        gaffine_matvec_available: bool,
+    ) bool {
         return switch (weight.*) {
             .dense_f32 => true,
             .dense_u16 => |w| switch (w.dtype) {
-                .f16 => self.matmul_f16_function != null,
-                .bf16 => self.matmul_bf16_function != null,
+                .f16 => matmul_f16_available,
+                .bf16 => matmul_bf16_available,
             },
-            .gaffine_u4 => false,
+            .gaffine_u4 => gaffine_matvec_available,
         };
+    }
+
+    fn trySequenceFusedQkvRows(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        rows: usize,
+        block: *const AttentionMlpBlockRuntime,
+        q_out: *compute.cuda.Buffer,
+        k_out: *compute.cuda.Buffer,
+        v_out: *compute.cuda.Buffer,
+    ) !bool {
+        if (rows == 0) return error.InvalidArgument;
+        if (rows != 1 and !self.gaffine_sequence_fused_qkv_supported) return false;
+
+        const fused_kernel = self.gaffine_u4_matvec_qkv_function orelse return false;
+        const q = switch (block.q_proj) {
+            .gaffine_u4 => |w| w,
+            else => return false,
+        };
+        const k = switch (block.k_proj) {
+            .gaffine_u4 => |w| w,
+            else => return false,
+        };
+        const v = switch (block.v_proj) {
+            .gaffine_u4 => |w| w,
+            else => return false,
+        };
+        if (q.rows != self.d_model or k.rows != self.d_model or v.rows != self.d_model) return false;
+        if (q.scales_dtype_tag != k.scales_dtype_tag or q.scales_dtype_tag != v.scales_dtype_tag) return false;
+        if (q.cols > std.math.maxInt(u32) or
+            k.cols > std.math.maxInt(u32) or
+            v.cols > std.math.maxInt(u32) or
+            q.rows > std.math.maxInt(u32))
+        {
+            return false;
+        }
+
+        try compute.cuda.gaffine_u4_matvec_qkv.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &q.packed_data,
+            &q.scales,
+            &q.biases,
+            q_out,
+            @intCast(q.cols),
+            q.group_size,
+            q.scales_dtype_tag,
+            &k.packed_data,
+            &k.scales,
+            &k.biases,
+            k_out,
+            @intCast(k.cols),
+            k.group_size,
+            k.scales_dtype_tag,
+            &v.packed_data,
+            &v.scales,
+            &v.biases,
+            v_out,
+            @intCast(v.cols),
+            v.group_size,
+            v.scales_dtype_tag,
+            @intCast(q.rows),
+            @intCast(rows),
+        );
+        return true;
+    }
+
+    fn trySequenceFusedGateUpRows(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        rows: usize,
+        gate_weight: *const LinearWeight,
+        up_weight: *const LinearWeight,
+        gate_out: *compute.cuda.Buffer,
+        up_out: *compute.cuda.Buffer,
+    ) !bool {
+        if (rows == 0) return error.InvalidArgument;
+        if (rows != 1 and !self.gaffine_sequence_fused_gate_up_supported) return false;
+
+        const fused_kernel = self.gaffine_u4_matvec_gate_up_function orelse return false;
+        const gate = switch (gate_weight.*) {
+            .gaffine_u4 => |w| w,
+            else => return false,
+        };
+        const up = switch (up_weight.*) {
+            .gaffine_u4 => |w| w,
+            else => return false,
+        };
+        if (gate.rows != self.d_model or up.rows != self.d_model) return false;
+        if (gate.scales_dtype_tag != up.scales_dtype_tag) return false;
+        if (gate.cols > std.math.maxInt(u32) or
+            up.cols > std.math.maxInt(u32) or
+            gate.rows > std.math.maxInt(u32))
+        {
+            return false;
+        }
+
+        try compute.cuda.gaffine_u4_matvec_gate_up.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            fused_kernel,
+            input,
+            &gate.packed_data,
+            &gate.scales,
+            &gate.biases,
+            gate_out,
+            @intCast(gate.cols),
+            gate.group_size,
+            gate.scales_dtype_tag,
+            &up.packed_data,
+            &up.scales,
+            &up.biases,
+            up_out,
+            @intCast(up.cols),
+            up.group_size,
+            up.scales_dtype_tag,
+            @intCast(gate.rows),
+            @intCast(rows),
+        );
+        return true;
     }
 
     pub fn decodeBatch(
@@ -2583,320 +2953,40 @@ pub const CudaBackend = struct {
         var layer_idx: usize = 0;
         while (layer_idx < layer_limit) : (layer_idx += 1) {
             const layer = &self.block_runtime.blocks[layer_idx];
-            if (layer.attention_mlp) |*block| {
-                const layer_rope_theta = if (block.sliding_window > 0) local_rope_theta else global_rope_theta;
-                try compute.cuda.rmsnorm.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    rmsnorm_function,
-                    &self.prototype.input_dev,
-                    &block.ln1_weight.buffer,
-                    &self.prototype.norm_out_dev,
-                    1,
+            const attention_kernels = AttentionKernelSet{
+                .attn_scores_heads_f32_function = attn_scores_heads_f32_function,
+                .attn_weighted_sum_heads_f32_function = attn_weighted_sum_heads_f32_function,
+                .attn_scores_heads_f16_kv_function = attn_scores_heads_f16_kv_function,
+                .softmax_rows_function = softmax_rows_function,
+                .attn_weighted_sum_heads_f16_kv_function = attn_weighted_sum_heads_f16_kv_function,
+                .attn_fused_heads_f16_kv_function = attn_fused_heads_f16_kv_function,
+            };
+            if (layer.program) |program| {
+                try self.tryExecuteLayerProgram(
+                    layer,
+                    program,
                     d_model_u32,
-                    self.norm_eps,
-                    self.loaded.runtime.weight_offset,
-                );
-
-                _ = try self.runQkvProjection(&self.prototype.norm_out_dev, block);
-
-                if (block.q_norm_weight) |*q_norm| {
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rmsnorm_function,
-                        &self.prototype.attn_q_dev,
-                        &q_norm.buffer,
-                        &self.prototype.attn_q_dev,
-                        n_heads_u32,
-                        head_dim_u32,
-                        self.norm_eps,
-                        self.loaded.runtime.qk_norm_weight_offset,
-                    );
-                }
-                if (block.k_norm_weight) |*k_norm| {
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rmsnorm_function,
-                        &self.prototype.attn_k_dev,
-                        &k_norm.buffer,
-                        &self.prototype.attn_k_dev,
-                        n_kv_heads_u32,
-                        head_dim_u32,
-                        self.norm_eps,
-                        self.loaded.runtime.qk_norm_weight_offset,
-                    );
-                }
-
-                const use_fused_attention_heads_f16_kv = attention_mod.useFusedHeadsF16Kv(
-                    attention_policy_config,
-                    seq_len_u32,
-                    block.sliding_window,
-                    block.is_causal,
                     head_dim_u32,
-                    attn_fused_heads_f16_kv_function != null,
-                );
-                if (!use_fused_attention_heads_f16_kv) {
-                    try compute.cuda.rope.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rope_function,
-                        &self.prototype.attn_q_dev,
-                        n_heads_u32,
-                        head_dim_u32,
-                        rope_dim_u32,
-                        position_u32,
-                        layer_rope_theta,
-                    );
-                }
-                const use_k_write_fused = kv_cache_dtype_fp16 and (kv_write_f16_function != null or rope_store_f16_function != null);
-                if (!use_k_write_fused) {
-                    try compute.cuda.rope.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rope_function,
-                        &self.prototype.attn_k_dev,
-                        n_kv_heads_u32,
-                        head_dim_u32,
-                        rope_dim_u32,
-                        position_u32,
-                        layer_rope_theta,
-                    );
-                }
-
-                const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
-                const kv_row_bytes = std.math.mul(usize, block.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
-                const kv_row_offset = std.math.mul(usize, position, kv_row_bytes) catch return error.InvalidArgument;
-                var k_row = try bufferSlice(&block.k_cache, kv_row_offset, kv_row_bytes);
-                var v_row = try bufferSlice(&block.v_cache, kv_row_offset, kv_row_bytes);
-                if (kv_cache_dtype_fp16) {
-                    if (kv_write_f16_function) |kv_write_f16| {
-                        try compute.cuda.kv_write_f16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            kv_write_f16,
-                            &self.prototype.attn_k_dev,
-                            &self.prototype.attn_v_dev,
-                            &k_row,
-                            &v_row,
-                            n_kv_heads_u32,
-                            head_dim_u32,
-                            rope_dim_u32,
-                            position_u32,
-                            layer_rope_theta,
-                        );
-                    } else if (rope_store_f16_function) |rope_store_f16| {
-                        try compute.cuda.rope_store_f16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            rope_store_f16,
-                            &self.prototype.attn_k_dev,
-                            &k_row,
-                            n_kv_heads_u32,
-                            head_dim_u32,
-                            rope_dim_u32,
-                            position_u32,
-                            layer_rope_theta,
-                        );
-                        try compute.cuda.cast_f32_to_f16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            cast_f32_to_f16_function.?,
-                            &self.prototype.attn_v_dev,
-                            &v_row,
-                            @intCast(block.kv_dim),
-                        );
-                    } else {
-                        try compute.cuda.cast_f32_to_f16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            cast_f32_to_f16_function.?,
-                            &self.prototype.attn_k_dev,
-                            &k_row,
-                            @intCast(block.kv_dim),
-                        );
-                        try compute.cuda.cast_f32_to_f16.runWithFunction(
-                            &self.kernel_arg_pack,
-                            &self.device,
-                            cast_f32_to_f16_function.?,
-                            &self.prototype.attn_v_dev,
-                            &v_row,
-                            @intCast(block.kv_dim),
-                        );
-                    }
-                } else {
-                    try compute.cuda.copy.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        copy_function,
-                        &self.prototype.attn_k_dev,
-                        &k_row,
-                        @intCast(block.kv_dim),
-                    );
-                    try compute.cuda.copy.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        copy_function,
-                        &self.prototype.attn_v_dev,
-                        &v_row,
-                        @intCast(block.kv_dim),
-                    );
-                }
-
-                const kv_groups = self.n_heads / self.n_kv_heads;
-                const kv_groups_u32: u32 = @intCast(kv_groups);
-                const kv_dim_u32: u32 = @intCast(block.kv_dim);
-                const attention_kernels = AttentionKernelSet{
-                    .attn_scores_heads_f32_function = attn_scores_heads_f32_function,
-                    .attn_weighted_sum_heads_f32_function = attn_weighted_sum_heads_f32_function,
-                    .attn_scores_heads_f16_kv_function = attn_scores_heads_f16_kv_function,
-                    .softmax_rows_function = softmax_rows_function,
-                    .attn_weighted_sum_heads_f16_kv_function = attn_weighted_sum_heads_f16_kv_function,
-                    .attn_fused_heads_f16_kv_function = attn_fused_heads_f16_kv_function,
-                };
-                _ = try self.runAttentionContext(
-                    block,
-                    attention_kernels,
-                    seq_len_u32,
-                    head_dim_u32,
-                    kv_dim_u32,
-                    kv_groups_u32,
                     rope_dim_u32,
+                    n_heads_u32,
+                    n_kv_heads_u32,
+                    seq_len_u32,
+                    position,
                     position_u32,
-                    layer_rope_theta,
-                );
-
-                try self.linearForward(&self.prototype.attn_context_dev, &block.o_proj, &self.prototype.attn_out_dev);
-                if (block.pre_ffn_norm_weight != null or block.post_ffn_norm_weight != null) {
-                    // Extended norm topology (e.g. Gemma-family):
-                    // attn_out -> post_attn_norm(ln2) -> add residual -> pre_ffn_norm -> mlp -> post_ffn_norm -> add residual
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rmsnorm_function,
-                        &self.prototype.attn_out_dev,
-                        &block.ln2_weight.buffer,
-                        &self.prototype.attn_out_dev,
-                        1,
-                        d_model_u32,
-                        self.norm_eps,
-                        self.loaded.runtime.weight_offset,
-                    );
-                    try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.attn_out_dev, d_model_u32);
-
-                    const pre_ffn_norm = if (block.pre_ffn_norm_weight) |*w| &w.buffer else &block.ln2_weight.buffer;
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rmsnorm_function,
-                        &self.prototype.input_dev,
-                        pre_ffn_norm,
-                        &self.prototype.norm_out_dev,
-                        1,
-                        d_model_u32,
-                        self.norm_eps,
-                        self.loaded.runtime.weight_offset,
-                    );
-                } else {
-                    // Standard topology:
-                    // attn_out -> add residual -> ln2 -> mlp -> add residual
-                    try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.attn_out_dev, d_model_u32);
-
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rmsnorm_function,
-                        &self.prototype.input_dev,
-                        &block.ln2_weight.buffer,
-                        &self.prototype.norm_out_dev,
-                        1,
-                        d_model_u32,
-                        self.norm_eps,
-                        self.loaded.runtime.weight_offset,
-                    );
-                }
-
-                _ = try self.runGateUpProjectionWithWeights(&self.prototype.norm_out_dev, &block.w1, &block.w3);
-                const d_ff_u32: u32 = @intCast(block.d_ff);
-                try self.runFfnActivationMul(d_ff_u32);
-                try self.linearForward(&self.prototype.ffn_mul_dev, &block.w2, &self.prototype.ffn_down_dev);
-                if (block.post_ffn_norm_weight) |*post_ffn_norm| {
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rmsnorm_function,
-                        &self.prototype.ffn_down_dev,
-                        &post_ffn_norm.buffer,
-                        &self.prototype.ffn_down_dev,
-                        1,
-                        d_model_u32,
-                        self.norm_eps,
-                        self.loaded.runtime.weight_offset,
-                    );
-                }
-                try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.ffn_down_dev, d_model_u32);
-            } else if (layer.shortconv) |*block| {
-                try compute.cuda.rmsnorm.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    rmsnorm_function,
-                    &self.prototype.input_dev,
-                    &block.ln1_weight.buffer,
-                    &self.prototype.norm_out_dev,
-                    1,
-                    d_model_u32,
-                    self.norm_eps,
-                    self.loaded.runtime.weight_offset,
-                );
-
-                try self.linearForward(&self.prototype.norm_out_dev, &block.in_proj, &self.prototype.shortconv_proj_dev);
-                const conv_bytes = std.math.mul(usize, block.conv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
-                var b_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, 0, conv_bytes);
-                var c_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes, conv_bytes);
-                var x_proj = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes * 2, conv_bytes);
-
-                try compute.cuda.shortconv_step.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
+                    global_rope_theta,
+                    local_rope_theta,
+                    rope_function,
+                    copy_function,
+                    cast_f32_to_f16_function,
+                    kv_write_f16_function,
+                    rope_store_f16_function,
                     shortconv_step_function,
-                    &b_gate,
-                    &c_gate,
-                    &x_proj,
-                    &block.conv_state,
-                    &block.conv_weight_time_major.buffer,
-                    if (block.conv_bias) |*w| &w.buffer else null,
-                    &self.prototype.shortconv_conv_dev,
-                    @intCast(block.conv_dim),
-                    @intCast(block.d_conv),
+                    attention_kernels,
                 );
-
-                try self.linearForward(&self.prototype.shortconv_conv_dev, &block.out_proj, &self.prototype.attn_out_dev);
-                try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.attn_out_dev, d_model_u32);
-
-                if (block.ln2_weight != null and block.ffn_w1 != null and block.ffn_w2 != null and block.ffn_w3 != null) {
-                    try compute.cuda.rmsnorm.runWithFunction(
-                        &self.kernel_arg_pack,
-                        &self.device,
-                        rmsnorm_function,
-                        &self.prototype.input_dev,
-                        &block.ln2_weight.?.buffer,
-                        &self.prototype.norm_out_dev,
-                        1,
-                        d_model_u32,
-                        self.norm_eps,
-                        self.loaded.runtime.weight_offset,
-                    );
-                    _ = try self.runGateUpProjectionWithWeights(&self.prototype.norm_out_dev, &block.ffn_w1.?, &block.ffn_w3.?);
-                    const d_ff_u32: u32 = @intCast(block.d_ff);
-                    try self.runFfnActivationMul(d_ff_u32);
-                    try self.linearForward(&self.prototype.ffn_mul_dev, &block.ffn_w2.?, &self.prototype.ffn_down_dev);
-                    try self.addResidualWithModelScale(&self.prototype.input_dev, &self.prototype.ffn_down_dev, d_model_u32);
-                }
             } else {
-                return error.InvalidArgument;
+                log.warn("inference", "CUDA layer missing LayerOp program", .{ .layer = layer_idx });
+                return error.UnsupportedModel;
             }
-
             if (deepstack_layer_features_opt) |deepstack_layer_features| {
                 if (deepstack_feature_index_opt) |deepstack_feature_index| {
                     if (layer_idx < deepstack_layer_features.len) {
@@ -3111,22 +3201,50 @@ pub const CudaBackend = struct {
                 }
             },
             .gaffine_u4 => |w| {
-                if (rows != 1) return error.CudaKernelUnavailable;
                 const kernel = self.gaffine_u4_matvec_function orelse return error.CudaKernelUnavailable;
-                try compute.cuda.gaffine_u4_matvec.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    kernel,
-                    input,
-                    &w.packed_data,
-                    &w.scales,
-                    &w.biases,
-                    out,
-                    @intCast(w.rows),
-                    @intCast(w.cols),
-                    w.group_size,
-                    w.scales_dtype_tag,
-                );
+                if (rows == 1 or self.gaffine_sequence_rows_supported) {
+                    try compute.cuda.gaffine_u4_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        input,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        out,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        @intCast(rows),
+                    );
+                    return;
+                }
+
+                const in_row_bytes = std.math.mul(usize, w.rows, @sizeOf(f32)) catch return error.InvalidArgument;
+                const out_row_bytes = std.math.mul(usize, w.cols, @sizeOf(f32)) catch return error.InvalidArgument;
+                var row_index: usize = 0;
+                while (row_index < rows) : (row_index += 1) {
+                    const input_offset = std.math.mul(usize, row_index, in_row_bytes) catch return error.InvalidArgument;
+                    const out_offset = std.math.mul(usize, row_index, out_row_bytes) catch return error.InvalidArgument;
+                    var input_row = try bufferSlice(input, input_offset, in_row_bytes);
+                    var out_row = try bufferSlice(out, out_offset, out_row_bytes);
+                    try compute.cuda.gaffine_u4_matvec.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        kernel,
+                        &input_row,
+                        &w.packed_data,
+                        &w.scales,
+                        &w.biases,
+                        &out_row,
+                        @intCast(w.rows),
+                        @intCast(w.cols),
+                        w.group_size,
+                        w.scales_dtype_tag,
+                        1,
+                    );
+                }
             },
         }
     }
@@ -3223,6 +3341,551 @@ pub const CudaBackend = struct {
             self.loaded.config.residual_multiplier,
             count,
         );
+    }
+
+    fn addResidualWithScale(
+        self: *CudaBackend,
+        residual: *compute.cuda.Buffer,
+        branch: *compute.cuda.Buffer,
+        count: u32,
+        scale: layer_ops.ResidualScale,
+    ) !void {
+        switch (scale) {
+            .residual_multiplier => return self.addResidualWithModelScale(residual, branch, count),
+            .one => {
+                const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
+                return compute.cuda.vector_add.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    vector_add_function,
+                    residual,
+                    branch,
+                    residual,
+                    count,
+                );
+            },
+            .literal => |literal| {
+                if (literal == 1.0) {
+                    const vector_add_function = self.vector_add_function orelse return error.CudaKernelUnavailable;
+                    return compute.cuda.vector_add.runWithFunction(
+                        &self.kernel_arg_pack,
+                        &self.device,
+                        vector_add_function,
+                        residual,
+                        branch,
+                        residual,
+                        count,
+                    );
+                }
+                const vector_add_scaled_function = self.vector_add_scaled_function orelse return error.CudaKernelUnavailable;
+                return compute.cuda.vector_add_scaled.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    vector_add_scaled_function,
+                    residual,
+                    branch,
+                    residual,
+                    literal,
+                    count,
+                );
+            },
+        }
+    }
+
+    fn programBuffer(
+        self: *CudaBackend,
+        id: layer_ops.BufferId,
+        norm_buf: *compute.cuda.Buffer,
+        branch_buf: *compute.cuda.Buffer,
+    ) ?*compute.cuda.Buffer {
+        return switch (id) {
+            .residual => &self.prototype.input_dev,
+            .norm_out => norm_buf,
+            .branch_out => branch_buf,
+            else => null,
+        };
+    }
+
+    fn finalOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
+        return finalProgramOutputBuffer(program);
+    }
+
+    fn nextAttentionNormWeight(
+        block: *const AttentionMlpBlockRuntime,
+        norm_index: *usize,
+    ) ?*const DeviceTensor {
+        defer norm_index.* += 1;
+        return switch (norm_index.*) {
+            0 => &block.ln1_weight,
+            1 => &block.ln2_weight,
+            2 => if (block.pre_ffn_norm_weight != null)
+                &block.pre_ffn_norm_weight.?
+            else if (block.post_ffn_norm_weight != null)
+                &block.post_ffn_norm_weight.?
+            else
+                null,
+            3 => if (block.post_ffn_norm_weight != null) &block.post_ffn_norm_weight.? else null,
+            else => null,
+        };
+    }
+
+    fn nextShortConvNormWeight(
+        block: *const ShortConvBlockRuntime,
+        norm_index: *usize,
+    ) ?*const DeviceTensor {
+        defer norm_index.* += 1;
+        return switch (norm_index.*) {
+            0 => &block.ln1_weight,
+            1 => if (block.ln2_weight != null) &block.ln2_weight.? else null,
+            else => null,
+        };
+    }
+
+    fn runAttentionMixerStep(
+        self: *CudaBackend,
+        block: *const AttentionMlpBlockRuntime,
+        input: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        d_model_u32: u32,
+        head_dim_u32: u32,
+        rope_dim_u32: u32,
+        n_heads_u32: u32,
+        n_kv_heads_u32: u32,
+        seq_len_u32: u32,
+        position: usize,
+        position_u32: u32,
+        global_rope_theta: f32,
+        local_rope_theta: f32,
+        rope_function: compute.cuda.Function,
+        copy_function: compute.cuda.Function,
+        cast_f32_to_f16_function: ?compute.cuda.Function,
+        kv_write_f16_function: ?compute.cuda.Function,
+        rope_store_f16_function: ?compute.cuda.Function,
+        attention_kernels: AttentionKernelSet,
+    ) !void {
+        const layer_rope_theta = if (block.sliding_window > 0) local_rope_theta else global_rope_theta;
+        _ = try self.runQkvProjection(input, block);
+
+        if (block.q_norm_weight) |*q_norm| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &self.prototype.attn_q_dev,
+                &q_norm.buffer,
+                &self.prototype.attn_q_dev,
+                n_heads_u32,
+                head_dim_u32,
+                self.norm_eps,
+                self.loaded.runtime.qk_norm_weight_offset,
+            );
+        }
+        if (block.k_norm_weight) |*k_norm| {
+            try compute.cuda.rmsnorm.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                &self.prototype.attn_k_dev,
+                &k_norm.buffer,
+                &self.prototype.attn_k_dev,
+                n_kv_heads_u32,
+                head_dim_u32,
+                self.norm_eps,
+                self.loaded.runtime.qk_norm_weight_offset,
+            );
+        }
+
+        const use_fused_attention_heads_f16_kv = attention_mod.useFusedHeadsF16Kv(
+            attention_policy_config,
+            seq_len_u32,
+            block.sliding_window,
+            block.is_causal,
+            head_dim_u32,
+            attention_kernels.attn_fused_heads_f16_kv_function != null,
+        );
+        if (!use_fused_attention_heads_f16_kv) {
+            try compute.cuda.rope.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rope_function,
+                &self.prototype.attn_q_dev,
+                n_heads_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                position_u32,
+                layer_rope_theta,
+            );
+        }
+        const use_k_write_fused = kv_cache_dtype_fp16 and (kv_write_f16_function != null or rope_store_f16_function != null);
+        if (!use_k_write_fused) {
+            try compute.cuda.rope.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                rope_function,
+                &self.prototype.attn_k_dev,
+                n_kv_heads_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                position_u32,
+                layer_rope_theta,
+            );
+        }
+
+        const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
+        const kv_row_bytes = std.math.mul(usize, block.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
+        const kv_row_offset = std.math.mul(usize, position, kv_row_bytes) catch return error.InvalidArgument;
+        var k_row = try bufferSlice(&block.k_cache, kv_row_offset, kv_row_bytes);
+        var v_row = try bufferSlice(&block.v_cache, kv_row_offset, kv_row_bytes);
+        if (kv_cache_dtype_fp16) {
+            if (kv_write_f16_function) |kv_write_f16| {
+                try compute.cuda.kv_write_f16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    kv_write_f16,
+                    &self.prototype.attn_k_dev,
+                    &self.prototype.attn_v_dev,
+                    &k_row,
+                    &v_row,
+                    n_kv_heads_u32,
+                    head_dim_u32,
+                    rope_dim_u32,
+                    position_u32,
+                    layer_rope_theta,
+                );
+            } else if (rope_store_f16_function) |rope_store_f16| {
+                try compute.cuda.rope_store_f16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    rope_store_f16,
+                    &self.prototype.attn_k_dev,
+                    &k_row,
+                    n_kv_heads_u32,
+                    head_dim_u32,
+                    rope_dim_u32,
+                    position_u32,
+                    layer_rope_theta,
+                );
+                try compute.cuda.cast_f32_to_f16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                    &self.prototype.attn_v_dev,
+                    &v_row,
+                    @intCast(block.kv_dim),
+                );
+            } else {
+                try compute.cuda.cast_f32_to_f16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                    &self.prototype.attn_k_dev,
+                    &k_row,
+                    @intCast(block.kv_dim),
+                );
+                try compute.cuda.cast_f32_to_f16.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
+                    &self.prototype.attn_v_dev,
+                    &v_row,
+                    @intCast(block.kv_dim),
+                );
+            }
+        } else {
+            try compute.cuda.copy.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                copy_function,
+                &self.prototype.attn_k_dev,
+                &k_row,
+                @intCast(block.kv_dim),
+            );
+            try compute.cuda.copy.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                copy_function,
+                &self.prototype.attn_v_dev,
+                &v_row,
+                @intCast(block.kv_dim),
+            );
+        }
+
+        const kv_groups = self.n_heads / self.n_kv_heads;
+        const kv_groups_u32: u32 = @intCast(kv_groups);
+        const kv_dim_u32: u32 = @intCast(block.kv_dim);
+        _ = try self.runAttentionContext(
+            block,
+            attention_kernels,
+            seq_len_u32,
+            head_dim_u32,
+            kv_dim_u32,
+            kv_groups_u32,
+            rope_dim_u32,
+            position_u32,
+            layer_rope_theta,
+        );
+        try self.linearForward(&self.prototype.attn_context_dev, &block.o_proj, output);
+        _ = d_model_u32;
+    }
+
+    fn runShortConvMixerStep(
+        self: *CudaBackend,
+        block: *ShortConvBlockRuntime,
+        input: *const compute.cuda.Buffer,
+        output: *compute.cuda.Buffer,
+        shortconv_step_function: compute.cuda.Function,
+    ) !void {
+        try self.linearForward(input, &block.in_proj, &self.prototype.shortconv_proj_dev);
+        const conv_bytes = std.math.mul(usize, block.conv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+        var b_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, 0, conv_bytes);
+        var c_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes, conv_bytes);
+        var x_proj = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes * 2, conv_bytes);
+
+        try compute.cuda.shortconv_step.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            shortconv_step_function,
+            &b_gate,
+            &c_gate,
+            &x_proj,
+            &block.conv_state,
+            &block.conv_weight_time_major.buffer,
+            if (block.conv_bias) |*w| &w.buffer else null,
+            &self.prototype.shortconv_conv_dev,
+            @intCast(block.conv_dim),
+            @intCast(block.d_conv),
+        );
+        try self.linearForward(&self.prototype.shortconv_conv_dev, &block.out_proj, output);
+    }
+
+    fn runFfnStep(
+        self: *CudaBackend,
+        input: *const compute.cuda.Buffer,
+        gate_weight: *const LinearWeight,
+        up_weight: *const LinearWeight,
+        down_weight: *const LinearWeight,
+        d_ff: u32,
+        output: *compute.cuda.Buffer,
+    ) !void {
+        _ = try self.runGateUpProjectionWithWeights(input, gate_weight, up_weight);
+        try self.runFfnActivationMul(d_ff);
+        try self.linearForward(&self.prototype.ffn_mul_dev, down_weight, output);
+    }
+
+    fn tryExecuteLayerProgram(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        program: []const layer_ops.LayerOp,
+        d_model_u32: u32,
+        head_dim_u32: u32,
+        rope_dim_u32: u32,
+        n_heads_u32: u32,
+        n_kv_heads_u32: u32,
+        seq_len_u32: u32,
+        position: usize,
+        position_u32: u32,
+        global_rope_theta: f32,
+        local_rope_theta: f32,
+        rope_function: compute.cuda.Function,
+        copy_function: compute.cuda.Function,
+        cast_f32_to_f16_function: ?compute.cuda.Function,
+        kv_write_f16_function: ?compute.cuda.Function,
+        rope_store_f16_function: ?compute.cuda.Function,
+        shortconv_step_function: compute.cuda.Function,
+        attention_kernels: AttentionKernelSet,
+    ) !void {
+        var norm_buf: *compute.cuda.Buffer = &self.prototype.norm_out_dev;
+        var branch_buf: *compute.cuda.Buffer = &self.prototype.attn_out_dev;
+        var norm_index: usize = 0;
+
+        for (program) |op| {
+            switch (op) {
+                .kernel => |kernel_op| {
+                    const input = self.programBuffer(kernel_op.in, norm_buf, branch_buf) orelse return error.UnsupportedModel;
+                    switch (kernel_op.debug_type) {
+                        .norm => {
+                            const output = switch (kernel_op.out) {
+                                .norm_out => &self.prototype.norm_out_dev,
+                                .branch_out => &self.prototype.attn_out_dev,
+                                .residual => return error.UnsupportedModel,
+                                else => return error.UnsupportedModel,
+                            };
+                            if (layer.attention_mlp) |*block| {
+                                const weight = nextAttentionNormWeight(block, &norm_index) orelse return error.UnsupportedModel;
+                                try compute.cuda.rmsnorm.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                                    input,
+                                    &weight.buffer,
+                                    output,
+                                    1,
+                                    d_model_u32,
+                                    self.norm_eps,
+                                    self.loaded.runtime.weight_offset,
+                                );
+                            } else if (layer.shortconv) |*block| {
+                                const weight = nextShortConvNormWeight(block, &norm_index) orelse return error.UnsupportedModel;
+                                try compute.cuda.rmsnorm.runWithFunction(
+                                    &self.kernel_arg_pack,
+                                    &self.device,
+                                    self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+                                    input,
+                                    &weight.buffer,
+                                    output,
+                                    1,
+                                    d_model_u32,
+                                    self.norm_eps,
+                                    self.loaded.runtime.weight_offset,
+                                );
+                            } else return error.UnsupportedModel;
+                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
+                        },
+                        .multihead_attention => {
+                            const output = switch (kernel_op.out) {
+                                .branch_out => &self.prototype.attn_out_dev,
+                                .norm_out => &self.prototype.norm_out_dev,
+                                .residual => return error.UnsupportedModel,
+                                else => return error.UnsupportedModel,
+                            };
+                            if (layer.attention_mlp) |*block| {
+                                try self.runAttentionMixerStep(
+                                    block,
+                                    input,
+                                    output,
+                                    d_model_u32,
+                                    head_dim_u32,
+                                    rope_dim_u32,
+                                    n_heads_u32,
+                                    n_kv_heads_u32,
+                                    seq_len_u32,
+                                    position,
+                                    position_u32,
+                                    global_rope_theta,
+                                    local_rope_theta,
+                                    rope_function,
+                                    copy_function,
+                                    cast_f32_to_f16_function,
+                                    kv_write_f16_function,
+                                    rope_store_f16_function,
+                                    attention_kernels,
+                                );
+                            } else return error.UnsupportedModel;
+                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
+                        },
+                        .shortconv => {
+                            const output = switch (kernel_op.out) {
+                                .branch_out => &self.prototype.attn_out_dev,
+                                .norm_out => &self.prototype.norm_out_dev,
+                                .residual => return error.UnsupportedModel,
+                                else => return error.UnsupportedModel,
+                            };
+                            if (layer.shortconv) |*block| {
+                                try self.runShortConvMixerStep(block, input, output, shortconv_step_function);
+                            } else return error.UnsupportedModel;
+                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
+                        },
+                        .mlp => {
+                            const output = switch (kernel_op.out) {
+                                .branch_out => &self.prototype.ffn_down_dev,
+                                .norm_out => &self.prototype.norm_out_dev,
+                                .residual => return error.UnsupportedModel,
+                                else => return error.UnsupportedModel,
+                            };
+                            if (layer.attention_mlp) |*block| {
+                                try self.runFfnStep(
+                                    input,
+                                    &block.w1,
+                                    &block.w3,
+                                    &block.w2,
+                                    @intCast(block.d_ff),
+                                    output,
+                                );
+                            } else if (layer.shortconv) |*block| {
+                                const w1 = block.ffn_w1 orelse return error.UnsupportedModel;
+                                const w2 = block.ffn_w2 orelse return error.UnsupportedModel;
+                                const w3 = block.ffn_w3 orelse return error.UnsupportedModel;
+                                try self.runFfnStep(
+                                    input,
+                                    &w1,
+                                    &w3,
+                                    &w2,
+                                    @intCast(block.d_ff),
+                                    output,
+                                );
+                            } else return error.UnsupportedModel;
+                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
+                        },
+                        .moe => {
+                            const output = switch (kernel_op.out) {
+                                .branch_out => &self.prototype.ffn_down_dev,
+                                .norm_out => &self.prototype.norm_out_dev,
+                                .residual => return error.UnsupportedModel,
+                                else => return error.UnsupportedModel,
+                            };
+                            if (layer.attention_mlp) |*block| {
+                                try self.runFfnStep(
+                                    input,
+                                    &block.w1,
+                                    &block.w3,
+                                    &block.w2,
+                                    @intCast(block.d_ff),
+                                    output,
+                                );
+                            } else if (layer.shortconv) |*block| {
+                                const w1 = block.ffn_w1 orelse return error.UnsupportedModel;
+                                const w2 = block.ffn_w2 orelse return error.UnsupportedModel;
+                                const w3 = block.ffn_w3 orelse return error.UnsupportedModel;
+                                try self.runFfnStep(
+                                    input,
+                                    &w1,
+                                    &w3,
+                                    &w2,
+                                    @intCast(block.d_ff),
+                                    output,
+                                );
+                            } else return error.UnsupportedModel;
+                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
+                        },
+                        .mamba_mixer => {
+                            const output = switch (kernel_op.out) {
+                                .branch_out => &self.prototype.attn_out_dev,
+                                .norm_out => &self.prototype.norm_out_dev,
+                                .residual => return error.UnsupportedModel,
+                                else => return error.UnsupportedModel,
+                            };
+                            if (layer.shortconv) |*block| {
+                                try self.runShortConvMixerStep(block, input, output, shortconv_step_function);
+                            } else return error.UnsupportedModel;
+                            if (kernel_op.out == .norm_out) norm_buf = output else branch_buf = output;
+                        },
+                        else => return error.UnsupportedModel,
+                    }
+                },
+                .add => |add_op| {
+                    const branch = self.programBuffer(add_op.branch, norm_buf, branch_buf) orelse return error.UnsupportedModel;
+                    try self.addResidualWithScale(&self.prototype.input_dev, branch, d_model_u32, add_op.scale);
+                },
+                else => return error.UnsupportedModel,
+            }
+        }
+
+        const final_buf_id = finalOutputBuffer(program);
+        switch (final_buf_id) {
+            .residual => {},
+            .norm_out, .branch_out => {
+                const final_buf = self.programBuffer(final_buf_id, norm_buf, branch_buf) orelse return error.UnsupportedModel;
+                try compute.cuda.copy.runWithFunction(
+                    &self.kernel_arg_pack,
+                    &self.device,
+                    copy_function,
+                    final_buf,
+                    &self.prototype.input_dev,
+                    d_model_u32,
+                );
+            },
+            else => return error.UnsupportedModel,
+        }
     }
 
     fn runAttentionContext(
@@ -3427,6 +4090,7 @@ pub const CudaBackend = struct {
             v.group_size,
             v.scales_dtype_tag,
             @intCast(q.rows),
+            1,
         );
         return true;
     }
@@ -3533,6 +4197,7 @@ pub const CudaBackend = struct {
             up.group_size,
             up.scales_dtype_tag,
             @intCast(gate.rows),
+            1,
         );
         return true;
     }
@@ -5104,6 +5769,70 @@ test "resolveDenseInOutLayout keeps [in,out] orientation" {
     try std.testing.expect(!layout.needs_transpose);
 }
 
+test "finalOutputBuffer returns residual when program ends with add" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .multihead_attention,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        } },
+    };
+    try std.testing.expectEqual(layer_ops.BufferId.residual, CudaBackend.finalOutputBuffer(&program));
+}
+
+test "finalOutputBuffer returns kernel output buffer for post-norm endings" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+    };
+    try std.testing.expectEqual(layer_ops.BufferId.norm_out, CudaBackend.finalOutputBuffer(&program));
+}
+
+test "validateLayerProgramForCuda accepts kernel-add programs" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+        .{ .kernel = .{
+            .id = 1,
+            .in = .norm_out,
+            .out = .branch_out,
+            .debug_type = .mlp,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        } },
+    };
+    try validateLayerProgramForCuda(&program, 0, .attention_mlp);
+}
+
+test "validateLayerProgramForCuda rejects unsupported primitive ops" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .mul_scalar = .{
+            .in = .residual,
+            .out = .residual,
+            .scalar = 0.5,
+        } },
+    };
+    try std.testing.expectError(
+        error.UnsupportedModel,
+        validateLayerProgramForCuda(&program, 0, .attention_mlp),
+    );
+}
+
 test "resolveDenseInOutLayout transposes [out,in] orientation" {
     const layout = try resolveDenseInOutLayout(256, 128, 128);
     try std.testing.expectEqual(@as(usize, 128), layout.in_dim);
@@ -5427,6 +6156,24 @@ test "shouldDownloadPrefillLogits only on final token" {
 
 test "shouldDownloadPrefillLogits true for single-token prefill" {
     try std.testing.expect(shouldDownloadPrefillLogits(0, 1));
+}
+
+test "linearWeightSupportsSequenceRows allows gaffine when matvec kernel is loaded" {
+    const dummy_buffer: compute.cuda.Buffer = .{ .pointer = 0, .size = 0 };
+    var weight = LinearWeight{
+        .gaffine_u4 = .{
+            .rows = 16,
+            .cols = 16,
+            .packed_data = dummy_buffer,
+            .scales = dummy_buffer,
+            .biases = dummy_buffer,
+            .group_size = 8,
+            .scales_dtype_tag = gaffine_scales_dtype_bf16,
+        },
+    };
+
+    try std.testing.expect(!CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, false));
+    try std.testing.expect(CudaBackend.linearWeightSupportsSequenceRowsForKernels(&weight, false, false, true));
 }
 
 test "canFuseDenseU16QkvWeights supports GQA-style unequal output dims" {

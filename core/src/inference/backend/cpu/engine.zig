@@ -272,8 +272,9 @@ pub const FusedCpuBackend = struct {
         var runtime_rope = try initRuntimeRopeHandles(allocator, loaded);
         errdefer deinitRuntimeRopeHandles(allocator, &runtime_rope);
 
-        const cpu_block_set = try cpu_blocks.buildBlocks(
+        const cpu_block_set = try cpu_blocks.buildBlocksFromLayers(
             allocator,
+            loaded.arena.allocator(),
             loaded.config,
             loaded.runtime,
             loaded.blocks,
@@ -325,58 +326,74 @@ pub const FusedCpuBackend = struct {
         errdefer if (vision_runtime) |*rt| rt.deinit();
 
         // Initialize Mamba state for heterogeneous models
-        var mamba_layer_count: usize = 0;
+        var mamba_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer mamba_layer_indices.deinit(allocator);
         var mamba_config: ?cpu_blocks.MambaConfig = null;
-        for (cpu_block_set) |*block| {
-            if (block.isMamba()) {
-                mamba_layer_count += 1;
+        for (loaded.blocks, 0..) |layer, layer_idx| {
+            if (layer.block_type == .mamba) {
+                try mamba_layer_indices.append(allocator, layer_idx);
                 if (mamba_config == null) {
-                    if (block.getMambaKernel()) |kernel| {
-                        mamba_config = kernel.config;
+                    if (layer.map_context.mamba_config) |cfg| {
+                        mamba_config = .{
+                            .d_model = cfg.d_model,
+                            .d_state = cfg.d_state,
+                            .d_conv = cfg.d_conv,
+                            .n_heads = cfg.n_heads,
+                            .d_head = cfg.d_head,
+                            .n_groups = cfg.n_groups,
+                        };
                     }
                 }
             }
         }
-        if (mamba_layer_count > 0 and mamba_config != null) {
-            try scratch.initMamba(mamba_layer_count, mamba_config.?);
+        if (mamba_layer_indices.items.len > 0 and mamba_config != null) {
+            try scratch.initMamba(mamba_layer_indices.items, mamba_config.?);
             log.info("inference", "Heterogeneous model detected", .{
-                .mamba_layers = mamba_layer_count,
-                .attention_layers = @as(usize, layer_total) - mamba_layer_count,
+                .mamba_layers = mamba_layer_indices.items.len,
+                .attention_layers = @as(usize, layer_total) - mamba_layer_indices.items.len,
             });
         }
 
         // Initialize ShortConv state for heterogeneous models with conv layers
-        var shortconv_layer_count: usize = 0;
+        var shortconv_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer shortconv_layer_indices.deinit(allocator);
         var shortconv_config: ?cpu_blocks.ShortConvConfig = null;
-        for (cpu_block_set) |*block| {
-            if (block.isShortConv()) {
-                shortconv_layer_count += 1;
+        for (loaded.blocks, 0..) |layer, layer_idx| {
+            if (layer.block_type == .shortconv) {
+                try shortconv_layer_indices.append(allocator, layer_idx);
                 if (shortconv_config == null) {
-                    if (block.getShortConvKernel()) |kernel| {
-                        shortconv_config = kernel.config;
+                    if (layer.map_context.shortconv_config) |cfg| {
+                        shortconv_config = .{
+                            .d_model = cfg.d_model,
+                            .d_conv = cfg.d_conv,
+                            .conv_dim = cfg.conv_dim,
+                            .conv_dim_out = cfg.conv_dim_out,
+                            .has_bias = cfg.has_bias,
+                        };
                     }
                 }
             }
         }
-        if (shortconv_layer_count > 0 and shortconv_config != null) {
-            try scratch.initShortConv(shortconv_layer_count, shortconv_config.?);
+        if (shortconv_layer_indices.items.len > 0 and shortconv_config != null) {
+            try scratch.initShortConv(shortconv_layer_indices.items, shortconv_config.?);
             log.info("inference", "ShortConv heterogeneous model detected", .{
-                .shortconv_layers = shortconv_layer_count,
-                .attention_layers = @as(usize, layer_total) - shortconv_layer_count,
+                .shortconv_layers = shortconv_layer_indices.items.len,
+                .attention_layers = @as(usize, layer_total) - shortconv_layer_indices.items.len,
             });
         }
 
         // Initialize MLA (Multi-Latent Attention) cache for MLA models
-        var mla_layer_count: usize = 0;
-        for (cpu_block_set) |*block| {
-            if (block.isMLA()) {
-                mla_layer_count += 1;
+        var mla_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer mla_layer_indices.deinit(allocator);
+        for (loaded.blocks, 0..) |layer, layer_idx| {
+            if (layer.map_context.kernel_meta.mla_config != null) {
+                try mla_layer_indices.append(allocator, layer_idx);
             }
         }
-        if (mla_layer_count > 0) {
-            try scratch.initMLA(layer_total);
+        if (mla_layer_indices.items.len > 0) {
+            try scratch.initMLA(mla_layer_indices.items);
             log.info("inference", "MLA model detected", .{
-                .mla_layers = mla_layer_count,
+                .mla_layers = mla_layer_indices.items.len,
             });
         }
 
@@ -638,7 +655,7 @@ pub const FusedCpuBackend = struct {
     }
 
     /// Single-step decode for one slot, returning logits for sampling.
-    /// This is the minimal per-token operation used by the scheduler's fast path.
+    /// This is the minimal per-token operation used by the scheduler's single-request route.
     pub fn decodeStep(self: *FusedCpuBackend, slot_index: usize, token: u32) []f32 {
         const model_dim = self.d_model;
         const hidden_buffer = self.getHiddenBuffer(slot_index);

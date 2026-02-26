@@ -4,7 +4,6 @@ const std = @import("std");
 const main = @import("main");
 const model_types = main.models.dispatcher.op_types;
 const Architecture = model_types.Architecture;
-const Op = model_types.Op;
 
 test "Architecture type is accessible" {
     _ = Architecture;
@@ -14,7 +13,6 @@ test "Architecture.isHeterogeneous returns false for homogeneous model" {
     const arch = Architecture{
         .name = "test_arch",
         .model_types = &.{},
-        .block_ops = &.{},
         .block_variants = null,
     };
 
@@ -24,13 +22,11 @@ test "Architecture.isHeterogeneous returns false for homogeneous model" {
 test "Architecture.isHeterogeneous returns true when block_variants set" {
     var variants: [1]model_types.BlockVariant = .{.{
         .name = "attention",
-        .ops = &.{},
     }};
 
     const arch = Architecture{
         .name = "test_arch",
         .model_types = &.{},
-        .block_ops = &.{},
         .block_variants = &variants,
     };
 
@@ -41,7 +37,6 @@ test "Architecture.getVariantIndex returns 0 for homogeneous model" {
     const arch = Architecture{
         .name = "test_arch",
         .model_types = &.{},
-        .block_ops = &.{},
         .layer_map = null,
     };
 
@@ -56,7 +51,6 @@ test "Architecture.getVariantIndex uses layer_map when present" {
     const arch = Architecture{
         .name = "test_arch",
         .model_types = &.{},
-        .block_ops = &.{},
         .layer_map = &layer_map,
     };
 
@@ -74,7 +68,6 @@ test "Architecture.getVariant returns null for homogeneous model" {
     const arch = Architecture{
         .name = "test_arch",
         .model_types = &.{},
-        .block_ops = &.{},
         .block_variants = null,
     };
 

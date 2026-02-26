@@ -4,9 +4,9 @@
 //! metadata from `core/src/models/*`.
 
 const std = @import("std");
-const json = @import("../io/json/root.zig");
 const tensor = @import("../tensor.zig");
 const op_types = @import("op_types.zig");
+const cfg_loader = @import("config/root.zig");
 const weights_impl = @import("load/weights.zig");
 const models_registry = @import("registry.zig");
 const log = @import("../log.zig");
@@ -24,6 +24,7 @@ pub const Reporter = validation.Reporter;
 pub const ResolvedModelKind = struct {
     descriptor: models_registry.Entry,
     runtime_arch: *const op_types.Architecture,
+    parse_config_hook: ?op_types.ConfigParseHook,
 };
 
 // =============================================================================
@@ -65,6 +66,7 @@ fn loadSafeTensorsModel(
         config_path,
         weights_path,
         model_kind.runtime_arch,
+        model_kind.parse_config_hook,
         load_options,
         progress,
     );
@@ -106,25 +108,6 @@ pub fn applyRuntimeArchitectureMetadata(
         loaded_model.config.embedding_multiplier = runtime_architecture.embedding_multiplier;
     }
 
-    // Check for explicit weight offset in add ops.
-    for (runtime_architecture.block_ops) |op| {
-        if (op.op_type == .add) {
-            var op_scalar_value: f32 = 0.0;
-            var op_has_tensor = false;
-            for (op.inputs) |inp| {
-                switch (inp) {
-                    .scalar => |s| op_scalar_value = s,
-                    .tensor => op_has_tensor = true,
-                }
-            }
-            if (op_has_tensor and op_scalar_value != 0.0) {
-                loaded_model.runtime.weight_offset = op_scalar_value;
-                loaded_model.runtime.qk_norm_weight_offset = op_scalar_value;
-                break;
-            }
-        }
-    }
-
     // Store runtime architecture metadata needed by inference runtime.
     loaded_model.runtime.architecture_id = runtime_architecture.name;
     loaded_model.runtime.has_moe = runtime_architecture.has_moe;
@@ -156,26 +139,9 @@ pub fn resolveModelKindForConfig(
     allocator: std.mem.Allocator,
     config_path: []const u8,
 ) !ResolvedModelKind {
-    const config_bytes = try std.fs.cwd().readFileAlloc(allocator, config_path, 256 * 1024);
-    defer allocator.free(config_bytes);
-
-    const parsed_json = json.parseValue(allocator, config_bytes, .{ .max_size_bytes = 256 * 1024 }) catch |err| {
-        return switch (err) {
-            error.InputTooLarge => error.InvalidJson,
-            error.InputTooDeep => error.InvalidJson,
-            error.StringTooLong => error.InvalidJson,
-            error.InvalidJson => error.InvalidJson,
-            error.OutOfMemory => error.OutOfMemory,
-        };
-    };
-    defer parsed_json.deinit();
-    if (parsed_json.value != .object) return error.InvalidJson;
-    const config_obj = parsed_json.value.object;
-
-    const model_type = if (config_obj.get("model_type")) |v| switch (v) {
-        .string => |s| s,
-        else => null,
-    } else null;
+    var base_config = try cfg_loader.readBaseConfig(allocator, config_path);
+    defer base_config.deinit(allocator);
+    const model_type = base_config.model_type;
 
     log.trace("load", "Detecting model kind", .{ .model_type = model_type orelse "unknown" }, @src());
 
@@ -196,6 +162,7 @@ pub fn resolveModelKindForConfig(
             return .{
                 .descriptor = entry,
                 .runtime_arch = detected_arch,
+                .parse_config_hook = models_registry.configParseHookFor(entry),
             };
         }
 
@@ -206,7 +173,28 @@ pub fn resolveModelKindForConfig(
         return error.UnsupportedModel;
     }
 
-    // No model_type field in config.json - cannot determine architecture
+    if (base_config.architecture) |architecture_name| {
+        if (models_registry.detectByArchitectureId(architecture_name)) |entry| {
+            const detected_arch = models_registry.runtimeArchitectureById(entry.id) orelse {
+                log.err("load", "Missing architecture payload for supported architecture id", .{
+                    .architecture = architecture_name,
+                    .entry = entry.id,
+                }, @src());
+                return error.UnsupportedModel;
+            };
+            log.trace("load", "Architecture resolved from config architectures[] fallback", .{
+                .architecture = architecture_name,
+                .entry = entry.id,
+            }, @src());
+            return .{
+                .descriptor = entry,
+                .runtime_arch = detected_arch,
+                .parse_config_hook = models_registry.configParseHookFor(entry),
+            };
+        }
+    }
+
+    // No model_type or supported architecture id in config.json.
     log.err("load", "Missing model_type in config.json", .{}, @src());
     return error.UnsupportedModel;
 }
@@ -229,6 +217,38 @@ test "resolveModelKindForConfig and runtimeArchitectureForConfig detect known mo
 
     const runtime_arch = try runtimeArchitectureForConfig(allocator, config_path);
     try std.testing.expectEqualStrings("llama3", runtime_arch.name);
+}
+
+test "resolveModelKindForConfig falls back to text_config model_type" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.json",
+        .data = "{\"text_config\":{\"model_type\":\"llama3\"}}",
+    });
+    const config_path = try tmp.dir.realpathAlloc(allocator, "config.json");
+    defer allocator.free(config_path);
+
+    const resolved = try resolveModelKindForConfig(allocator, config_path);
+    try std.testing.expectEqualStrings("llama3", resolved.descriptor.id);
+    try std.testing.expectEqualStrings("llama3", resolved.runtime_arch.name);
+}
+
+test "resolveModelKindForConfig falls back to architectures id when model_type missing" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(.{
+        .sub_path = "config.json",
+        .data = "{\"architectures\":[\"llama3\"]}",
+    });
+    const config_path = try tmp.dir.realpathAlloc(allocator, "config.json");
+    defer allocator.free(config_path);
+
+    const resolved = try resolveModelKindForConfig(allocator, config_path);
+    try std.testing.expectEqualStrings("llama3", resolved.descriptor.id);
+    try std.testing.expectEqualStrings("llama3", resolved.runtime_arch.name);
 }
 
 test "applyRuntimeArchitectureMetadata copies runtime flags from architecture" {

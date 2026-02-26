@@ -154,8 +154,9 @@ pub const SchedulerConfig = struct {
 /// - `freeSlot(*T, usize) void` - release a slot
 /// - `prefillSlot(*T, usize, []const u32, []f32) !void` - prefill
 /// - optional: `prefillSlotWithVision(*T, usize, []const u32, ?*const PrefillVisionInput, []f32) !void`
+/// - optional: `supportsSchedulerBackendDecodeStreamingRoute(*const T) bool`
+/// - optional: `decodeStreaming(*T, u32, usize, usize, []const u32, []u32, ?*const fn (u32, ?*anyopaque) void, ?*anyopaque) !usize`
 /// - `decodeBatch(*T, []const DecodeRequest, []DecodeResult) !void` - batch decode
-/// - optional: `decodeStreaming(*T, u32, usize, usize, []const u32, []u32, ?*const fn(u32, ?*anyopaque) void, ?*anyopaque) !usize`
 pub fn GenericScheduler(comptime BackendType: type) type {
     return struct {
         const Self = @This();
@@ -575,7 +576,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         /// Submits one request and runs to completion, returning generated tokens.
         /// This is a convenience wrapper for single-request use cases.
         ///
-        /// Uses a fast path that bypasses the step() overhead when the scheduler
+        /// Uses a single-request route that bypasses `step()` overhead when the scheduler
         /// has no other active requests. This avoids per-token ArrayList iterations
         /// and allocation overhead that hurt single-request performance.
         ///
@@ -596,10 +597,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             const stop_flag = submit_config.stop_flag;
             const vision_input = submit_config.vision_input;
 
-            // Fast path: if no other requests are active, bypass the full step() machinery
+            // Single-request route: if no other requests are active, bypass full `step()` machinery.
             // This avoids per-token overhead from ArrayList iterations and allocations
             if (self.active_requests.items.len == 0 and self.pending_queue.items.len == 0) {
-                return self.generateSyncFastPath(
+                return self.generateSyncSingleRequestRoute(
                     prompt_tokens,
                     max_tokens,
                     eos_token_ids,
@@ -613,7 +614,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 );
             }
 
-            // Slow path: use step() for concurrent requests
+            // Request-tracking route: use `step()` for concurrent requests.
             const request_id = try self.submit(prompt_tokens, max_tokens, options);
 
             // Run until this request completes
@@ -644,7 +645,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Cleanup
             self.remove(request_id);
 
-            // Note: slow path doesn't have accurate timing (would need to track in Request)
+            // Note: request-tracking route doesn't have accurate timing (would need to track in Request).
             return GenerateSyncResult{
                 .tokens = generated_tokens,
                 .finish_reason = finish_reason,
@@ -653,9 +654,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             };
         }
 
-        /// Fast path for single-request generation.
-        /// Bypasses all request tracking and step() overhead.
-        fn generateSyncFastPath(
+        /// Single-request route for synchronous generation.
+        /// Bypasses all request tracking and `step()` overhead.
+        fn generateSyncSingleRequestRoute(
             self: *Self,
             prompt_tokens: []const u32,
             max_tokens: usize,
@@ -688,7 +689,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             var prefill_timer = std.time.Timer.start() catch unreachable;
             // Prefill
-            log.debug("inference", "Scheduler fast-path prefill start", .{
+            log.debug("inference", "Scheduler single-request route prefill start", .{
                 .slot_index = slot_index,
                 .prompt_len = prompt_tokens.len,
                 .has_vision_input = @as(u8, @intFromBool(vision_input != null)),
@@ -707,8 +708,23 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 self.sampler.reseed(sampling_config.seed);
             }
 
+            var effective_sampling_config = sampling_config.*;
+            const decode_tail_route = self.selectDecodeTailRoute(
+                &effective_sampling_config,
+                stop_sequences,
+                grammar_sampler,
+                vision_input != null,
+            );
+            log.debug("scheduler", "Scheduler decode tail route selected", .{
+                .route = @tagName(decode_tail_route),
+                .sampling_strategy = @as(u8, @intCast(@intFromEnum(effective_sampling_config.strategy))),
+                .has_stop_sequences = @as(u8, @intFromBool(stop_sequences.len != 0)),
+                .has_grammar = @as(u8, @intFromBool(grammar_sampler != null)),
+                .has_vision_input = @as(u8, @intFromBool(vision_input != null)),
+            }, @src());
+
             // Sample first token from prefill logits
-            var current_token = self.sampleToken(self.logits_buffer, sampling_config.*, grammar_sampler) catch 0;
+            var current_token = self.sampleToken(self.logits_buffer, effective_sampling_config, grammar_sampler) catch 0;
 
             // Allocate output buffer (pre-allocate max size to avoid per-token reallocs)
             var generated = try std.ArrayList(u32).initCapacity(self.allocator, max_tokens);
@@ -764,9 +780,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 };
             }
 
-            // Use backend-provided streaming decode when safe and available
-            // (currently metal fast path inside scheduler generation).
-            if (vision_input == null and self.shouldUseBackendStreamingDecode(sampling_config, stop_sequences, grammar_sampler)) {
+            if (decode_tail_route == .backend_decode_streaming) {
                 const remaining_token_budget = max_tokens - generated.items.len;
                 const generated_tail = try self.allocator.alloc(u32, remaining_token_budget);
                 defer self.allocator.free(generated_tail);
@@ -809,6 +823,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 const decode_ns = decode_timer.read();
                 const finish_reason: FinishReason = if (tail_count < remaining_token_budget) .eos_token else .length;
+                log.debug("scheduler", "Decode complete (streaming)", .{
+                    .tokens_generated = generated.items.len,
+                    .decode_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
+                    .decode_tok_per_sec = @as(f64, @floatFromInt(generated.items.len)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns)),
+                }, @src());
                 return GenerateSyncResult{
                     .tokens = try generated.toOwnedSlice(self.allocator),
                     .finish_reason = finish_reason,
@@ -847,7 +866,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 try self.backend.decodeBatch(self.decode_requests[0..1], self.decode_results[0..1]);
 
                 // Sample next token
-                const next_token = self.sampleToken(self.decode_results[0].logits, sampling_config.*, grammar_sampler) catch 0;
+                const next_token = self.sampleToken(self.decode_results[0].logits, effective_sampling_config, grammar_sampler) catch 0;
 
                 try generated.append(self.allocator, next_token);
                 current_token = next_token;
@@ -1106,20 +1125,26 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             return 0;
         }
 
-        fn shouldUseBackendStreamingDecode(
+        const DecodeTailRoute = enum {
+            backend_decode_streaming,
+            decode_batch,
+        };
+
+        fn selectDecodeTailRoute(
             self: *const Self,
             sampling_config: *const sampling.SamplingConfig,
             stop_sequences: []const []const u32,
             grammar_sampler: ?*validate.sampler.ConstrainedSampler,
-        ) bool {
-            if (sampling_config.strategy != .greedy) return false;
-            if (stop_sequences.len != 0) return false;
-            if (grammar_sampler != null) return false;
-            if (comptime !@hasDecl(BackendType, "decodeStreaming")) return false;
-            if (comptime @hasDecl(BackendType, "supportsSchedulerStreamingFastPath")) {
-                return self.backend.supportsSchedulerStreamingFastPath();
-            }
-            return false;
+            has_vision_input: bool,
+        ) DecodeTailRoute {
+            if (has_vision_input) return .decode_batch;
+            if (stop_sequences.len != 0) return .decode_batch;
+            if (grammar_sampler != null) return .decode_batch;
+            if (sampling_config.strategy != .greedy) return .decode_batch;
+            if (comptime !@hasDecl(BackendType, "decodeStreaming")) return .decode_batch;
+            if (comptime !@hasDecl(BackendType, "supportsSchedulerBackendDecodeStreamingRoute")) return .decode_batch;
+            if (!self.backend.supportsSchedulerBackendDecodeStreamingRoute()) return .decode_batch;
+            return .backend_decode_streaming;
         }
 
         fn prefillWithOptionalVision(
@@ -2082,13 +2107,18 @@ const MockBackend = struct {
 /// MockScheduler for tests - Scheduler backed by MockBackend.
 const MockScheduler = GenericScheduler(MockBackend);
 
-/// Mock backend with decodeStreaming support for fast-path tests.
+/// Mock backend used by generateSync route selection tests.
 const MockStreamingBackend = struct {
+    const PrefillVisionInput = struct {
+        tag: u8 = 0,
+    };
+
     allocator: std.mem.Allocator,
     vocab_size: usize,
     slot_in_use: bool = false,
     decode_batch_calls: usize = 0,
     decode_streaming_calls: usize = 0,
+    prefill_with_vision_calls: usize = 0,
     allocated_logits: std.ArrayList([]f32),
     greedy_token: usize = 42,
 
@@ -2116,7 +2146,7 @@ const MockStreamingBackend = struct {
         return self.vocab_size;
     }
 
-    fn supportsSchedulerStreamingFastPath(self: *const MockStreamingBackend) bool {
+    fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MockStreamingBackend) bool {
         _ = self;
         return true;
     }
@@ -2138,6 +2168,22 @@ const MockStreamingBackend = struct {
         _ = tokens;
         for (logits_out, 0..) |*logit, idx| {
             logit.* = if (idx == 42) 10.0 else 1.0;
+        }
+    }
+
+    fn prefillSlotWithVision(
+        self: *MockStreamingBackend,
+        slot_index: usize,
+        tokens: []const u32,
+        vision_input: ?*const PrefillVisionInput,
+        logits_out: []f32,
+    ) !void {
+        _ = slot_index;
+        _ = tokens;
+        if (vision_input == null) return error.InvalidArgument;
+        self.prefill_with_vision_calls += 1;
+        for (logits_out, 0..) |*logit, idx| {
+            logit.* = if (idx == self.greedy_token) 10.0 else 1.0;
         }
     }
 
@@ -2181,7 +2227,7 @@ const MockStreamingScheduler = GenericScheduler(MockStreamingBackend);
 // Scheduler Integration Tests - init/deinit
 // =============================================================================
 
-test "generateSync uses decodeStreaming fast path when backend supports it" {
+test "generateSync uses backend decode-streaming route for greedy sampling" {
     const alloc = std.testing.allocator;
     var backend = MockStreamingBackend.init(alloc, 256);
     defer backend.deinit();
@@ -2207,7 +2253,35 @@ test "generateSync uses decodeStreaming fast path when backend supports it" {
     try std.testing.expectEqualSlices(u32, &.{ 42, 44, 45, 46 }, result.tokens);
 }
 
-test "generateSync falls back to decodeBatch when stop sequences are configured" {
+test "generateSync uses decodeBatch route with vision input" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .greedy,
+        },
+    });
+    defer scheduler.deinit();
+
+    const vision_input = MockStreamingBackend.PrefillVisionInput{ .tag = 1 };
+    var result = try scheduler.generateSync(&[_]u32{ 11, 12 }, 4, .{
+        .sampling = .{
+            .strategy = .greedy,
+        },
+        .eos_token_ids = &[_]u32{9999},
+        .vision_input = @ptrCast(&vision_input),
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), backend.prefill_with_vision_calls);
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
+    try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
+}
+
+test "generateSync uses decodeBatch when stop sequences are configured" {
     const alloc = std.testing.allocator;
     var backend = MockStreamingBackend.init(alloc, 256);
     defer backend.deinit();
@@ -2234,6 +2308,37 @@ test "generateSync falls back to decodeBatch when stop sequences are configured"
     try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
     try std.testing.expect(backend.decode_batch_calls > 0);
     try std.testing.expectEqual(@as(usize, 3), result.tokens.len);
+}
+
+test "generateSync uses decodeBatch route when sampling strategy is top_k" {
+    const alloc = std.testing.allocator;
+    var backend = MockStreamingBackend.init(alloc, 256);
+    defer backend.deinit();
+
+    var scheduler = try MockStreamingScheduler.init(alloc, &backend, .{
+        .default_sampling = .{
+            .strategy = .top_k,
+            .top_k = 20,
+            .temperature = 0.7,
+            .seed = 7,
+        },
+    });
+    defer scheduler.deinit();
+
+    var result = try scheduler.generateSync(&[_]u32{ 7, 8, 9 }, 4, .{
+        .sampling = .{
+            .strategy = .top_k,
+            .top_k = 20,
+            .temperature = 0.7,
+            .seed = 7,
+        },
+        .eos_token_ids = &[_]u32{9999},
+    });
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), backend.decode_streaming_calls);
+    try std.testing.expect(backend.decode_batch_calls > 0);
+    try std.testing.expectEqual(@as(usize, 4), result.tokens.len);
 }
 
 test "Scheduler.init - creates with default config" {
@@ -3255,7 +3360,7 @@ test "step callback invocation" {
     try std.testing.expect(callback_data.is_final);
 }
 
-test "generateSync fast path - basic generation" {
+test "generateSync single-request route - basic generation" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3265,7 +3370,7 @@ test "generateSync fast path - basic generation" {
 
     const prompt = [_]u32{ 1, 2, 3 };
 
-    // generateSync should use fast path when no other requests active
+    // generateSync should use single-request route when no other requests are active.
     var result = try scheduler.generateSync(&prompt, 5, null);
     defer result.deinit(alloc);
 
@@ -3274,7 +3379,7 @@ test "generateSync fast path - basic generation" {
     try std.testing.expectEqual(FinishReason.length, result.finish_reason);
 }
 
-test "generateSync fast path - EOS detection" {
+test "generateSync single-request route - EOS detection" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3297,7 +3402,7 @@ test "generateSync fast path - EOS detection" {
     try std.testing.expectEqual(FinishReason.eos_token, result.finish_reason);
 }
 
-test "generateSync fast path - stop sequences" {
+test "generateSync single-request route - stop sequences" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3320,7 +3425,7 @@ test "generateSync fast path - stop sequences" {
     try std.testing.expectEqual(FinishReason.stop_sequence, result.finish_reason);
 }
 
-test "generateSync fast path - callback invocation" {
+test "generateSync single-request route - callback invocation" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3354,7 +3459,7 @@ test "generateSync fast path - callback invocation" {
     try std.testing.expectEqual(@as(usize, 5), callback_data.token_count);
 }
 
-test "generateSync slow path - used when other requests active" {
+test "generateSync request-tracking route - used when other requests are active" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();
@@ -3370,10 +3475,10 @@ test "generateSync slow path - used when other requests active" {
     const prompt1 = [_]u32{ 1, 2, 3 };
     const prompt2 = [_]u32{ 4, 5, 6 };
 
-    // Submit first request (this should use fast path internally but let's verify slow path too)
+    // Submit first request (this would use the single-request route in isolation).
     _ = try scheduler.submit(&prompt1, 5, null);
 
-    // Now scheduler has active requests, generateSync should use slow path
+    // Now scheduler has active requests, generateSync should use request-tracking route.
     var result = try scheduler.generateSync(&prompt2, 5, null);
     defer result.deinit(alloc);
 
@@ -3381,7 +3486,7 @@ test "generateSync slow path - used when other requests active" {
     try std.testing.expect(result.tokens.len > 0);
 }
 
-test "generateSync fast path - seed produces deterministic output" {
+test "generateSync single-request route - seed produces deterministic output" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 4);
     defer backend.deinit();

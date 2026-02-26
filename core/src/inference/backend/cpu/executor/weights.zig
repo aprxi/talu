@@ -23,6 +23,7 @@ const log = @import("../../../../log.zig");
 const progress_mod = @import("../../../../progress.zig");
 const runtime_blocks = @import("../../../../models/runtime_blocks.zig");
 const topology = @import("../../../../models/op_types.zig");
+const models_registry = @import("../../../../models/registry.zig");
 
 pub const BufferId = layer_ops.BufferId;
 
@@ -84,6 +85,7 @@ pub const ShortConvBlockWeights = runtime_blocks.ShortConvBlockWeights;
 pub const BlockWeights = runtime_blocks.BlockWeights;
 pub const WeightMap = runtime_blocks.WeightMap;
 pub const BlockMapContext = runtime_blocks.BlockMapContext;
+pub const LayerWeights = runtime_blocks.LayerWeights;
 
 comptime {
     if (cpu_linalg.matmul.MAX_GROUPS != topology.MAX_SUPPORTED_GAFFINE_GROUPS) {
@@ -410,6 +412,9 @@ pub const TransformerBlock = struct {
     /// Ordered kernel list (ids align with graph compiler emission order).
     kernels: []CpuKernel,
 
+    /// Canonical block kind from model topology.
+    block_type: BlockType,
+
     /// Common fields for all block types.
     residual_multiplier: f32 = 1.0,
     block_idx: usize = 0,
@@ -426,113 +431,119 @@ pub const TransformerBlock = struct {
     /// True if fused_gate_up_storage data was allocated by us (needs freeing)
     fused_gate_up_owned: bool = false,
 
-    // =========================================================================
-    // Kernel ownership (heap-allocated for pointer stability)
-    // =========================================================================
-
-    _ln1: *norm.NormKernel,
-    _ln2: ?*norm.NormKernel = null,
-    _pre_ffn_norm: ?*norm.NormKernel = null,
-    _post_ffn_norm: ?*norm.NormKernel = null,
-    _attn: ?*attn.MultiHeadAttention = null,
-    _mla_attn: ?*mla.MLAttention = null,
-    _mamba: ?*mamba.MambaKernel = null,
-    _shortconv: ?*shortconv.ShortConvKernel = null,
-    _ffn_layer: ?*FfnLayer = null,
-
-    // =========================================================================
-    // Type accessors
-    // =========================================================================
-
-    /// Check if this block is a Mamba block.
-    pub fn isMamba(self: *const TransformerBlock) bool {
-        return self._mamba != null;
-    }
-
-    /// Check if this block is a ShortConv block.
-    pub fn isShortConv(self: *const TransformerBlock) bool {
-        return self._shortconv != null;
-    }
-
-    /// Check if this block is an attention + MLP block (standard or MLA).
-    pub fn isAttentionMlp(self: *const TransformerBlock) bool {
-        return self._attn != null or self._mla_attn != null;
-    }
-
-    /// Check if this block uses MLA (Multi-Latent Attention).
-    pub fn isMLA(self: *const TransformerBlock) bool {
-        return self._mla_attn != null;
-    }
-
-    /// Get the Mamba kernel, or null if this is not a Mamba block.
-    pub fn getMambaKernel(self: *const TransformerBlock) ?*const mamba.MambaKernel {
-        return self._mamba;
-    }
-
-    /// Get the ShortConv kernel, or null if this is not a ShortConv block.
-    pub fn getShortConvKernel(self: *const TransformerBlock) ?*const shortconv.ShortConvKernel {
-        return self._shortconv;
+    fn normAt(self: *const TransformerBlock, norm_index: usize) ?*const norm.NormKernel {
+        var seen: usize = 0;
+        for (self.kernels) |kernel| {
+            if (kernel == .norm) {
+                if (seen == norm_index) return kernel.norm;
+                seen += 1;
+            }
+        }
+        return null;
     }
 
     /// Get the attention struct (only valid for standard attention_mlp blocks).
     pub fn getAttention(self: *const TransformerBlock) ?*const attn.MultiHeadAttention {
-        return self._attn;
+        for (self.kernels) |kernel| {
+            if (kernel == .attention) return kernel.attention;
+        }
+        return null;
     }
 
     /// Get a mutable reference to the attention struct (only valid for standard attention_mlp blocks).
     pub fn getAttentionMut(self: *TransformerBlock) ?*attn.MultiHeadAttention {
-        return self._attn;
+        return if (self.getAttention()) |attn_ptr| @constCast(attn_ptr) else null;
     }
 
     /// Get the MLA attention struct (only valid for MLA attention_mlp blocks).
     pub fn getMLAAttention(self: *const TransformerBlock) ?*const mla.MLAttention {
-        return self._mla_attn;
+        for (self.kernels) |kernel| {
+            if (kernel == .mla_attention) return kernel.mla_attention;
+        }
+        return null;
     }
 
     /// Get a mutable reference to the MLA attention struct (only valid for MLA attention_mlp blocks).
     pub fn getMLAAttentionMut(self: *TransformerBlock) ?*mla.MLAttention {
-        return self._mla_attn;
+        return if (self.getMLAAttention()) |mla_ptr| @constCast(mla_ptr) else null;
+    }
+
+    pub fn getMambaKernel(self: *const TransformerBlock) ?*const mamba.MambaKernel {
+        for (self.kernels) |kernel| {
+            if (kernel == .mamba) return kernel.mamba;
+        }
+        return null;
+    }
+
+    pub fn getMambaKernelMut(self: *TransformerBlock) ?*mamba.MambaKernel {
+        return if (self.getMambaKernel()) |mamba_ptr| @constCast(mamba_ptr) else null;
+    }
+
+    pub fn getShortConvKernel(self: *const TransformerBlock) ?*const shortconv.ShortConvKernel {
+        for (self.kernels) |kernel| {
+            if (kernel == .shortconv) return kernel.shortconv;
+        }
+        return null;
+    }
+
+    pub fn getShortConvKernelMut(self: *TransformerBlock) ?*shortconv.ShortConvKernel {
+        return if (self.getShortConvKernel()) |shortconv_ptr| @constCast(shortconv_ptr) else null;
     }
 
     /// Get the FFN layer (valid for both attention_mlp and mamba blocks with MLP).
     /// Returns a pointer to heap-allocated FfnLayer for kernel list stability.
     pub fn getFfnLayer(self: *const TransformerBlock) ?*const FfnLayer {
-        return self._ffn_layer;
+        for (self.kernels) |kernel| {
+            switch (kernel) {
+                .swiglu => |ffn_ptr| return @fieldParentPtr("swiglu", ffn_ptr),
+                .moe => |moe_ptr| return @fieldParentPtr("moe_ffn", moe_ptr),
+                else => {},
+            }
+        }
+        return null;
+    }
+
+    pub fn getFfnLayerMut(self: *TransformerBlock) ?*FfnLayer {
+        return if (self.getFfnLayer()) |ffn_ptr| @constCast(ffn_ptr) else null;
     }
 
     /// Get ln1 (input layernorm) - available for both block types.
     pub fn getLn1(self: *const TransformerBlock) *const norm.NormKernel {
-        return self._ln1;
+        return self.normAt(0) orelse unreachable;
     }
 
     /// Get ln2 (post-attention layernorm for attention_mlp, optional post-mixer for mamba).
     pub fn getLn2(self: *const TransformerBlock) ?*const norm.NormKernel {
-        return self._ln2;
+        return self.normAt(1);
     }
 
     /// Get pre_ffn_norm (only for attention_mlp blocks with this norm).
     pub fn getPreFfnNorm(self: *const TransformerBlock) ?*const norm.NormKernel {
-        return self._pre_ffn_norm;
+        return self.normAt(2);
     }
 
     /// Get post_ffn_norm (only for attention_mlp blocks with this norm).
     pub fn getPostFfnNorm(self: *const TransformerBlock) ?*const norm.NormKernel {
-        return self._post_ffn_norm;
+        return self.normAt(3);
     }
 
     pub fn deinit(self: *TransformerBlock, allocator: std.mem.Allocator) void {
-        allocator.destroy(self._ln1);
-        if (self._ln2) |p| allocator.destroy(p);
-        if (self._pre_ffn_norm) |p| allocator.destroy(p);
-        if (self._post_ffn_norm) |p| allocator.destroy(p);
-        if (self._attn) |p| allocator.destroy(p);
-        if (self._mamba) |p| allocator.destroy(p);
-        if (self._shortconv) |p| {
-            // Free transposed weight buffer before destroying kernel
-            p.deinit();
-            allocator.destroy(p);
+        if (self.getFfnLayerMut()) |p| allocator.destroy(p);
+        for (self.kernels) |kernel| {
+            switch (kernel) {
+                .norm => |p| allocator.destroy(@constCast(p)),
+                .attention => |p| allocator.destroy(@constCast(p)),
+                .mla_attention => |p| allocator.destroy(@constCast(p)),
+                .mamba => |p| allocator.destroy(@constCast(p)),
+                .shortconv => |p| {
+                    // Free transposed weight buffer before destroying kernel.
+                    const shortconv_kernel = @constCast(p);
+                    shortconv_kernel.deinit();
+                    allocator.destroy(shortconv_kernel);
+                },
+                .swiglu, .moe => {},
+            }
         }
-        if (self._ffn_layer) |p| allocator.destroy(p);
 
         // Free fused gate_up storage if we allocated it
         if (self.fused_gate_up_owned) {
@@ -591,6 +602,42 @@ pub const TransformerBlock = struct {
         use_gelu: bool,
         block_idx: usize,
     ) !TransformerBlock {
+        return TransformerBlock.initWithProgram(
+            allocator,
+            d_model,
+            d_ff,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            weights,
+            null,
+            norm_eps,
+            runtime,
+            residual_multiplier,
+            attention_scale,
+            use_gelu,
+            block_idx,
+        );
+    }
+
+    pub fn initWithProgram(
+        allocator: std.mem.Allocator,
+        d_model: usize,
+        d_ff: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        weights: BlockWeights,
+        program: ?[]const layer_ops.LayerOp,
+        norm_eps: f32,
+        runtime: tensor.ModelRuntime,
+        residual_multiplier: f32,
+        attention_scale: f32,
+        use_gelu: bool,
+        block_idx: usize,
+    ) !TransformerBlock {
         return switch (weights) {
             .attention_mlp => |attn_weights| try initAttentionMlp(
                 allocator,
@@ -601,6 +648,7 @@ pub const TransformerBlock = struct {
                 head_dim,
                 max_seq_len,
                 attn_weights,
+                program,
                 norm_eps,
                 runtime,
                 residual_multiplier,
@@ -643,6 +691,7 @@ pub const TransformerBlock = struct {
         head_dim: usize,
         max_seq_len: usize,
         weights: AttentionMlpWeights,
+        program: ?[]const layer_ops.LayerOp,
         norm_eps: f32,
         runtime: tensor.ModelRuntime,
         residual_multiplier: f32,
@@ -883,18 +932,17 @@ pub const TransformerBlock = struct {
         var kernel_list = std.ArrayListUnmanaged(CpuKernel){};
         errdefer kernel_list.deinit(allocator);
 
-        // Build kernel list in graph op order (supports pre-norm and post-norm architectures).
-        // Kernel-producing ops are: norm, multihead_attention, mlp/moe.
-        // Non-kernel ops (add) are skipped here — they're handled by the compiled program.
-        if (weights.block_ops.len > 0) {
-            // All available norms in order: ln1, ln2, pre_ffn_norm, post_ffn_norm
+        // Build kernel list in LayerOp order when available.
+        // The program drives kernel sequencing for both pre-norm and post-norm blocks.
+        var used_program_order = false;
+        if (program) |ops| {
             const norm_pool = [_]?*norm.NormKernel{ ln1_ptr, ln2_ptr, pre_ffn_norm_ptr, post_ffn_norm_ptr };
             var norm_idx: usize = 0;
-
-            for (weights.block_ops) |op| {
-                switch (op.op_type) {
+            for (ops) |op| {
+                if (op != .kernel) continue;
+                used_program_order = true;
+                switch (op.kernel.debug_type) {
                     .norm => {
-                        // Skip norms that don't produce kernels (e.g., QK norm handled inside attention)
                         while (norm_idx < norm_pool.len) : (norm_idx += 1) {
                             if (norm_pool[norm_idx] != null) break;
                         }
@@ -917,11 +965,13 @@ pub const TransformerBlock = struct {
                             try kernel_list.append(allocator, .{ .swiglu = &ffn_ptr.swiglu });
                         }
                     },
-                    else => {}, // add, etc. — not kernels
+                    else => {},
                 }
             }
-        } else {
-            // Default pre-norm order (backward compat when no block_ops provided)
+        }
+
+        if (!used_program_order) {
+            // Default pre-norm order when no LayerOp program is supplied.
             try kernel_list.append(allocator, .{ .norm = ln1_ptr });
             if (mla_kernel) |mla_k| {
                 try kernel_list.append(allocator, .{ .mla_attention = mla_k });
@@ -950,19 +1000,12 @@ pub const TransformerBlock = struct {
 
         return TransformerBlock{
             .kernels = kernels,
+            .block_type = .attention_mlp,
             .residual_multiplier = residual_multiplier,
             .block_idx = block_idx,
             .fused_qkv_storage = weights.fused.qkv_proj,
             .fused_gate_up_storage = if (owned_fused_gate_up) |fg| fg else weights.fused.gate_up,
             .fused_gate_up_owned = owned_fused_gate_up != null,
-            ._ln1 = ln1_ptr,
-            ._ln2 = ln2_ptr,
-            ._pre_ffn_norm = pre_ffn_norm_ptr,
-            ._post_ffn_norm = post_ffn_norm_ptr,
-            ._attn = attn_kernel,
-            ._mla_attn = mla_kernel,
-            ._mamba = null,
-            ._ffn_layer = ffn_ptr,
         };
     }
 
@@ -1059,17 +1102,10 @@ pub const TransformerBlock = struct {
 
         return TransformerBlock{
             .kernels = kernels,
+            .block_type = .mamba,
             .residual_multiplier = residual_multiplier,
             .block_idx = block_idx,
             .fused_gate_up_storage = fused_gate_up_storage,
-            ._ln1 = ln1_ptr,
-            ._ln2 = ln2_ptr,
-            ._pre_ffn_norm = null,
-            ._post_ffn_norm = null,
-            ._attn = null,
-            ._mamba = mamba_ptr,
-            ._shortconv = null,
-            ._ffn_layer = ffn_ptr,
         };
     }
 
@@ -1229,18 +1265,11 @@ pub const TransformerBlock = struct {
 
         return TransformerBlock{
             .kernels = kernels,
+            .block_type = .shortconv,
             .residual_multiplier = residual_multiplier,
             .block_idx = block_idx,
             .fused_gate_up_storage = fused_gate_up_storage,
             .fused_gate_up_owned = fused_gate_up_owned,
-            ._ln1 = ln1_ptr,
-            ._ln2 = ln2_ptr,
-            ._pre_ffn_norm = null,
-            ._post_ffn_norm = null,
-            ._attn = null,
-            ._mamba = null,
-            ._shortconv = shortconv_ptr,
-            ._ffn_layer = ffn_ptr,
         };
     }
 
@@ -1382,8 +1411,21 @@ pub fn buildBlocks(
         default_attention_scale;
 
     const use_gelu_activation = config.use_gelu;
+    const static_entry = if (runtime.architecture_id) |arch_id|
+        models_registry.detectByArchitectureId(arch_id)
+    else
+        null;
     for (block_array, block_weights, 0..) |*block_slot, block_weight, layer_idx| {
-        block_slot.* = try TransformerBlock.init(
+        const block_kind: BlockType = switch (block_weight) {
+            .attention_mlp => .attention_mlp,
+            .mamba => .mamba,
+            .shortconv => .shortconv,
+        };
+        const layer_program = if (static_entry) |entry|
+            models_registry.blockProgramFor(entry, block_kind)
+        else
+            null;
+        block_slot.* = try TransformerBlock.initWithProgram(
             allocator,
             @intCast(config.d_model),
             @intCast(config.d_ff),
@@ -1392,6 +1434,7 @@ pub fn buildBlocks(
             @intCast(config.head_dim),
             @intCast(config.max_seq_len),
             block_weight,
+            layer_program,
             config.norm_eps,
             runtime,
             config.residual_multiplier,
@@ -1400,6 +1443,66 @@ pub fn buildBlocks(
             layer_idx,
         );
         // Initialize weight registry now that block is in its final heap location
+        try block_slot.initWeightRegistry(allocator, block_weight);
+        progress.updateLine(1, @intCast(layer_idx + 1), null);
+    }
+
+    return block_array;
+}
+
+/// Build CPU kernel blocks directly from loader-stage layer registries.
+pub fn buildBlocksFromLayers(
+    allocator: std.mem.Allocator,
+    _arena_allocator: std.mem.Allocator,
+    config: ModelConfig,
+    runtime: tensor.ModelRuntime,
+    layer_weights: []const LayerWeights,
+    progress: progress_mod.Context,
+) ![]TransformerBlock {
+    _ = _arena_allocator;
+    if (layer_weights.len != config.n_layers) return error.InvalidLayerCount;
+
+    const block_array = try allocator.alloc(TransformerBlock, @intCast(config.n_layers));
+    errdefer allocator.free(block_array);
+
+    const default_attention_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(config.head_dim)));
+    const attention_scale: f32 = if (config.attention_multiplier > 0)
+        config.attention_multiplier
+    else if (config.query_pre_attn_scalar > 0)
+        1.0 / @sqrt(config.query_pre_attn_scalar)
+    else
+        default_attention_scale;
+    const use_gelu_activation = config.use_gelu;
+    const static_entry = if (runtime.architecture_id) |arch_id|
+        models_registry.detectByArchitectureId(arch_id)
+    else
+        null;
+
+    for (block_array, layer_weights, 0..) |*block_slot, *layer, layer_idx| {
+        const block_kind: BlockType = layer.block_type;
+        const layer_program = if (static_entry) |entry|
+            models_registry.blockProgramFor(entry, block_kind)
+        else
+            null;
+        const block_weight = try runtime_blocks.layerToBlockWeights(allocator, layer);
+
+        block_slot.* = try TransformerBlock.initWithProgram(
+            allocator,
+            @intCast(config.d_model),
+            @intCast(config.d_ff),
+            @intCast(config.n_heads),
+            @intCast(config.n_kv_groups),
+            @intCast(config.head_dim),
+            @intCast(config.max_seq_len),
+            block_weight,
+            layer_program,
+            config.norm_eps,
+            runtime,
+            config.residual_multiplier,
+            attention_scale,
+            use_gelu_activation,
+            layer_idx,
+        );
         try block_slot.initWeightRegistry(allocator, block_weight);
         progress.updateLine(1, @intCast(layer_idx + 1), null);
     }
@@ -1441,7 +1544,10 @@ test "ScratchBuffer: init and deinit basic lifecycle" {
 
     try std.testing.expectEqual(d_model, scratch.d_model);
     try std.testing.expectEqual(d_ff, scratch.d_ff);
-    try std.testing.expectEqual(n_layers, scratch.attn_caches.len);
+    try std.testing.expectEqual(n_layers, scratch.slot_states.len);
+    for (scratch.slot_states) |slot_state| {
+        try std.testing.expect(slot_state.attn_cache != null);
+    }
 
     // All tmp buffers should be initially empty
     for (scratch.tmp) |temp_slice| {
@@ -1582,17 +1688,20 @@ test "ScratchBuffer: resetCaches clears all attention caches" {
     var scratch = try ScratchBuffer.init(allocator, 64, 256, n_layers);
     defer scratch.deinit();
 
-    // Simulate setting up caches (in real usage, these would be populated during forward pass)
-    for (scratch.attn_caches) |*cache| {
-        cache.* = .{}; // Initialize with default values
+    // Simulate cache progression before reset.
+    for (scratch.slot_states) |*slot_state| {
+        if (slot_state.attn_cache) |*cache| {
+            cache.cache_position = 7;
+        }
     }
 
     // Reset should work without error
     scratch.resetCaches();
 
     // After reset, caches should be in clean state
-    for (scratch.attn_caches) |cache| {
-        try std.testing.expectEqual(@as(usize, 0), cache.cache_position);
+    for (scratch.slot_states) |slot_state| {
+        try std.testing.expect(slot_state.attn_cache != null);
+        try std.testing.expectEqual(@as(usize, 0), slot_state.attn_cache.?.cache_position);
     }
 }
 
@@ -1859,19 +1968,6 @@ test "TransformerBlock: getDModel from SwiGLU FFN" {
     var w2_tensor = w2_owned.view();
     const dk = try cpu_linalg.matmulKernel(.f32);
 
-    var ln1_data = [_]f32{0};
-    var ln2_data = [_]f32{0};
-    var ln1_tensor = Tensor.view2DSlice(ln1_data[0..], 1, 1);
-    var ln2_tensor = Tensor.view2DSlice(ln2_data[0..], 1, 1);
-
-    const ln1 = try allocator.create(norm.NormKernel);
-    defer allocator.destroy(ln1);
-    ln1.* = .{ .rms = .{ .weight = &ln1_tensor, .dim = d_model, .eps = 1e-5, .weight_offset = 0.0 } };
-
-    const ln2 = try allocator.create(norm.NormKernel);
-    defer allocator.destroy(ln2);
-    ln2.* = .{ .rms = .{ .weight = &ln2_tensor, .dim = d_model, .eps = 1e-5, .weight_offset = 0.0 } };
-
     const ffn_ptr = try allocator.create(FfnLayer);
     defer allocator.destroy(ffn_ptr);
     ffn_ptr.* = .{ .swiglu = .{
@@ -1890,17 +1986,14 @@ test "TransformerBlock: getDModel from SwiGLU FFN" {
         .matmul_down = dk.func,
     } };
 
+    var kernels = [_]CpuKernel{
+        .{ .swiglu = &ffn_ptr.swiglu },
+    };
     const block = TransformerBlock{
-        .kernels = &.{},
+        .kernels = kernels[0..],
+        .block_type = .attention_mlp,
         .residual_multiplier = 1.0,
         .block_idx = 0,
-        ._ln1 = ln1,
-        ._ln2 = ln2,
-        ._pre_ffn_norm = null,
-        ._post_ffn_norm = null,
-        ._attn = null,
-        ._mamba = null,
-        ._ffn_layer = ffn_ptr,
     };
 
     const ffn_layer_ptr = block.getFfnLayer() orelse unreachable;
@@ -2160,8 +2253,8 @@ test "buildBlocks handles heterogeneous blocks" {
     }
 
     try std.testing.expectEqual(@as(usize, 2), blocks.len);
-    try std.testing.expect(blocks[0].isAttentionMlp());
-    try std.testing.expect(blocks[1].isMamba());
+    try std.testing.expectEqual(BlockType.attention_mlp, blocks[0].block_type);
+    try std.testing.expectEqual(BlockType.mamba, blocks[1].block_type);
     try std.testing.expect(blocks[0].getAttention() != null);
     try std.testing.expect(blocks[1].getMambaKernel() != null);
     try std.testing.expectEqual(@as(usize, 4), blocks[0].kernels.len);
@@ -2270,12 +2363,11 @@ test "init ScratchBuffer attn_caches" {
     var scratch = try ScratchBuffer.init(allocator, 128, 512, n_layers);
     defer scratch.deinit();
 
-    // All caches should be initialized
-    try std.testing.expectEqual(n_layers, scratch.attn_caches.len);
-
-    // Each cache should have default initialization
-    for (scratch.attn_caches) |cache| {
-        try std.testing.expectEqual(@as(usize, 0), cache.cache_position);
+    // All slot states should have initialized attention caches.
+    try std.testing.expectEqual(n_layers, scratch.slot_states.len);
+    for (scratch.slot_states) |slot_state| {
+        try std.testing.expect(slot_state.attn_cache != null);
+        try std.testing.expectEqual(@as(usize, 0), slot_state.attn_cache.?.cache_position);
     }
 }
 
@@ -2396,20 +2488,19 @@ test "TransformerBlock: attention_mlp block type accessors" {
         .matmul_down = dk.func,
     } };
 
+    var kernels = [_]CpuKernel{
+        .{ .norm = ln1 },
+        .{ .attention = attn_ptr },
+        .{ .norm = ln2 },
+        .{ .swiglu = &ffn_ptr.swiglu },
+    };
     const block = TransformerBlock{
-        .kernels = &.{},
-        ._ln1 = ln1,
-        ._ln2 = ln2,
-        ._pre_ffn_norm = null,
-        ._post_ffn_norm = null,
-        ._attn = attn_ptr,
-        ._mamba = null,
-        ._ffn_layer = ffn_ptr,
+        .kernels = kernels[0..],
+        .block_type = .attention_mlp,
     };
 
-    // Test type accessors
-    try std.testing.expect(block.isAttentionMlp());
-    try std.testing.expect(!block.isMamba());
+    // Test block metadata
+    try std.testing.expectEqual(BlockType.attention_mlp, block.block_type);
 
     // Test component accessors
     try std.testing.expect(block.getAttention() != null);
@@ -2468,20 +2559,17 @@ test "TransformerBlock: mamba block type accessors" {
     defer allocator.destroy(mamba_ptr);
     mamba_ptr.* = mamba_kernel;
 
+    var kernels = [_]CpuKernel{
+        .{ .norm = ln1 },
+        .{ .mamba = mamba_ptr },
+    };
     const block = TransformerBlock{
-        .kernels = &.{},
-        ._ln1 = ln1,
-        ._ln2 = null,
-        ._pre_ffn_norm = null,
-        ._post_ffn_norm = null,
-        ._attn = null,
-        ._mamba = mamba_ptr,
-        ._ffn_layer = null,
+        .kernels = kernels[0..],
+        .block_type = .mamba,
     };
 
-    // Test type accessors
-    try std.testing.expect(block.isMamba());
-    try std.testing.expect(!block.isAttentionMlp());
+    // Test block metadata
+    try std.testing.expectEqual(BlockType.mamba, block.block_type);
 
     // Test component accessors
     try std.testing.expect(block.getAttention() == null);
@@ -2496,10 +2584,11 @@ test "ScratchBuffer: initMamba allocates state for mamba layers" {
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 4);
     defer scratch.deinit();
 
-    // Before initMamba, no mamba state
-    try std.testing.expect(scratch.mamba_states == null);
+    // Before initMamba, no per-slot mamba state.
     try std.testing.expect(scratch.mamba_scratch == null);
-    try std.testing.expect(scratch.getMambaState(0) == null);
+    for (scratch.slot_states) |slot_state| {
+        try std.testing.expect(slot_state.mamba_state == null);
+    }
 
     // Initialize Mamba state for 2 Mamba layers
     const mamba_config = mamba.MambaConfig{
@@ -2510,20 +2599,50 @@ test "ScratchBuffer: initMamba allocates state for mamba layers" {
         .d_head = 32,
         .n_groups = 1,
     };
-    try scratch.initMamba(2, mamba_config);
+    try scratch.initMamba(&.{ 0, 1 }, mamba_config);
 
     // After initMamba, mamba state should be available
-    try std.testing.expect(scratch.mamba_states != null);
     try std.testing.expect(scratch.mamba_scratch != null);
-    try std.testing.expect(scratch.mamba_states.?.len == 2);
-
-    // Can get state for valid indices
-    try std.testing.expect(scratch.getMambaState(0) != null);
-    try std.testing.expect(scratch.getMambaState(1) != null);
-    try std.testing.expect(scratch.getMambaState(2) == null); // Out of bounds
+    try std.testing.expect(scratch.slot_states[0].mamba_state != null);
+    try std.testing.expect(scratch.slot_states[1].mamba_state != null);
+    try std.testing.expect(scratch.slot_states[2].mamba_state == null);
 
     // Scratch buffer available
     try std.testing.expect(scratch.getMambaScratch() != null);
+}
+
+test "ScratchBuffer: per-layer attention cache is available via slot state" {
+    const allocator = std.testing.allocator;
+    var scratch = try ScratchBuffer.init(allocator, 64, 256, 2);
+    defer scratch.deinit();
+
+    const slot0 = scratch.getSlotState(0);
+    const slot1 = scratch.getSlotState(1);
+    const slot2 = scratch.getSlotState(2);
+
+    try std.testing.expect(slot0 != null);
+    try std.testing.expect(slot1 != null);
+    try std.testing.expect(slot2 == null);
+    try std.testing.expect(slot0.?.attn_cache != null);
+    try std.testing.expect(slot1.?.attn_cache != null);
+}
+
+test "ScratchBuffer: getSlotState returns persistent slot state" {
+    const allocator = std.testing.allocator;
+    var scratch = try ScratchBuffer.init(allocator, 64, 256, 2);
+    defer scratch.deinit();
+
+    const slot0 = scratch.getSlotState(0);
+    const slot1 = scratch.getSlotState(1);
+    const slot2 = scratch.getSlotState(2);
+
+    try std.testing.expect(slot0 != null);
+    try std.testing.expect(slot1 != null);
+    try std.testing.expect(slot2 == null);
+    try std.testing.expect(slot0.?.attn_cache != null);
+    try std.testing.expect(slot1.?.attn_cache != null);
+    try std.testing.expectEqual(@as(usize, 0), slot0.?.attn_cache.?.cache_position);
+    try std.testing.expectEqual(@as(usize, 0), slot1.?.attn_cache.?.cache_position);
 }
 
 test "ScratchBuffer: resetCaches resets both attention and mamba state" {
@@ -2540,24 +2659,30 @@ test "ScratchBuffer: resetCaches resets both attention and mamba state" {
         .d_head = 32,
         .n_groups = 1,
     };
-    try scratch.initMamba(1, mamba_config);
+    try scratch.initMamba(&.{0}, mamba_config);
 
-    // Modify state to non-zero values
-    if (scratch.getMambaState(0)) |state| {
-        for (state.conv_state) |*v| v.* = 1.0;
-        for (state.ssm_state) |*v| v.* = 1.0;
+    // Modify state to non-zero values.
+    if (scratch.getSlotState(0)) |slot_state| {
+        try std.testing.expect(slot_state.mamba_state != null);
+        if (slot_state.mamba_state) |*state| {
+            for (state.conv_state) |*v| v.* = 1.0;
+            for (state.ssm_state) |*v| v.* = 1.0;
+        }
     }
 
     // Reset caches
     scratch.resetCaches();
 
     // Mamba state should be zeroed
-    if (scratch.getMambaState(0)) |state| {
-        for (state.conv_state) |v| {
-            try std.testing.expectEqual(@as(f32, 0.0), v);
-        }
-        for (state.ssm_state) |v| {
-            try std.testing.expectEqual(@as(f32, 0.0), v);
+    if (scratch.getSlotState(0)) |slot_state| {
+        try std.testing.expect(slot_state.mamba_state != null);
+        if (slot_state.mamba_state) |*state| {
+            for (state.conv_state) |v| {
+                try std.testing.expectEqual(@as(f32, 0.0), v);
+            }
+            for (state.ssm_state) |v| {
+                try std.testing.expectEqual(@as(f32, 0.0), v);
+            }
         }
     }
 }
@@ -2736,5 +2861,5 @@ test "TransformerBlock.fromMap builds attention block" {
 
     var block = try TransformerBlock.fromMap(context, .attention_mlp, &map);
     defer block.deinit(allocator);
-    try std.testing.expect(block.isAttentionMlp());
+    try std.testing.expectEqual(BlockType.attention_mlp, block.block_type);
 }

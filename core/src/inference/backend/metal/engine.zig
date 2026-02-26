@@ -15,7 +15,7 @@ const log = @import("../../../log.zig");
 const compute = @import("../../../compute/root.zig");
 const metal_compute = compute.metal;
 const graph = metal_compute.graph;
-const model_runtime = @import("model_runtime.zig");
+const model_runtime = metal_compute.model_runtime;
 const runtime_graph_mod = @import("runtime_graph.zig");
 const LoadedModel = models.LoadedModel;
 
@@ -63,19 +63,12 @@ pub const MetalBackend = struct {
     /// Slots 1..N-1 for scheduler-managed multi-slot decode.
     extra_slots: []SlotState,
     slot_logits_buffer: []f32,
-    decode_batch_cache_handles: []runtime_graph_mod.CacheHandle,
-    decode_batch_shortconv_handles: []runtime_graph_mod.ShortConvCacheHandle,
-    decode_batch_mamba_handles: []runtime_graph_mod.MambaCacheHandle,
-    decode_batch_tokens: []u32,
-    decode_batch_positions: []usize,
-    decode_batch_logits_handles: []graph.ArrayHandle,
     vision_runtime: ?vision_runtime_mod.VisionRuntime = null,
     slot_rope_position_delta: isize,
 
     // Track position for decode
     current_position: usize,
-
-    // Unified decode model handle (quantized or dense implementation).
+    // Prepared decode model for fused dense/quantized decode.
     decode_model: ?model_runtime.DecodeModel,
 
     const SlotState = struct {
@@ -87,40 +80,33 @@ pub const MetalBackend = struct {
         rope_position_delta: isize = 0,
     };
 
-    const DecodePath = enum {
-        pipeline_fused,
-        batch_fused,
-    };
-
-    const DecodePlan = struct {
-        path: DecodePath,
-    };
-
-    fn shouldUseBatchDecode(
-        env_batch_decode: bool,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-    ) bool {
-        if (env_batch_decode) return true;
-        return callback == null;
+    fn argmaxHost(values: []const f32) u32 {
+        var best_idx: usize = 0;
+        var best_val: f32 = -std.math.inf(f32);
+        for (values, 0..) |v, idx| {
+            if (v > best_val) {
+                best_val = v;
+                best_idx = idx;
+            }
+        }
+        return @intCast(best_idx);
     }
 
-    fn selectDecodePlan(
-        env_batch_decode: bool,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-    ) DecodePlan {
-        const batch_decode_enabled = shouldUseBatchDecode(env_batch_decode, callback);
-        return .{ .path = if (batch_decode_enabled) .batch_fused else .pipeline_fused };
+    fn argminHost(values: []const f32) u32 {
+        var best_idx: usize = 0;
+        var best_val: f32 = std.math.inf(f32);
+        for (values, 0..) |v, idx| {
+            if (v < best_val) {
+                best_val = v;
+                best_idx = idx;
+            }
+        }
+        return @intCast(best_idx);
     }
 
-    fn decodePathLabel(path: DecodePath) []const u8 {
-        return switch (path) {
-            .pipeline_fused => "pipeline_fused",
-            .batch_fused => "batch_fused",
-        };
-    }
-
-    fn isBatchDecodePath(path: DecodePath) bool {
-        return path == .batch_fused;
+    fn selectNextTokenFromLogits(self: *const MetalBackend, logits: []const f32) !u32 {
+        if (logits.len != self.vocab_size) return error.InvalidArgument;
+        return if (self.config.logits_scaling < 0.0) argminHost(logits) else argmaxHost(logits);
     }
 
     fn resolveMaxBatchSize() usize {
@@ -129,6 +115,18 @@ pub const MetalBackend = struct {
             return @max(@as(usize, 1), parsed);
         }
         return 8;
+    }
+
+    fn resolveCacheMaxSeqLen(config_max_seq_len: usize) usize {
+        // Fixed-capacity KV allocation at very large context lengths can stall
+        // decode startup. Switch those models to dynamic cache growth.
+        const fixed_capacity_limit: usize = 65_536;
+        if (config_max_seq_len > fixed_capacity_limit) return 0;
+        return config_max_seq_len;
+    }
+
+    fn cacheMaxSeqLen(self: *const MetalBackend) usize {
+        return resolveCacheMaxSeqLen(@intCast(self.config.max_seq_len));
     }
 
     fn extraSlotIndexFor(slot_index: usize, max_batch_size: usize) !usize {
@@ -182,7 +180,7 @@ pub const MetalBackend = struct {
         slot_cache.* = runtime_graph_mod.Cache.init(
             @intCast(self.config.n_layers),
             true,
-            @intCast(self.config.max_seq_len),
+            self.cacheMaxSeqLen(),
         );
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
@@ -206,7 +204,7 @@ pub const MetalBackend = struct {
         slot_cache.* = runtime_graph_mod.Cache.init(
             @intCast(self.config.n_layers),
             true,
-            @intCast(self.config.max_seq_len),
+            self.cacheMaxSeqLen(),
         );
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
@@ -250,14 +248,12 @@ pub const MetalBackend = struct {
         position: usize,
         logits_out: []f32,
     ) !void {
+        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
         const slot_mamba_cache = try self.slotMambaCache(slot_index);
-        const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
-
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
-        const decode_model = self.decode_model orelse return error.InvalidState;
         const logits_handle = model_runtime.decodeStepLogits(
             decode_model,
             slot_cache.handle,
@@ -266,7 +262,11 @@ pub const MetalBackend = struct {
             token,
             effective_position,
         );
+        if (logits_handle == null) return error.InvalidState;
+        defer graph.freeArray(logits_handle);
+        graph.eval(&[_]graph.ArrayHandle{logits_handle});
         graph.copyToHost(logits_handle, logits_out);
+        const slot_position = try self.slotPositionPtr(slot_index);
         slot_position.* = position + 1;
     }
 
@@ -284,28 +284,27 @@ pub const MetalBackend = struct {
         return self.vocab_size;
     }
 
+    pub fn supportsSchedulerBackendDecodeStreamingRoute(self: *const MetalBackend) bool {
+        _ = self;
+        return true;
+    }
+
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel) !MetalBackend {
         // Load weights to GPU
         const weight_handles = try weights_trait.loadWeightsToGPU(allocator, loaded);
         errdefer weights_trait.freeWeights(allocator, weight_handles);
-
-        // Create decode model for low-FFI decode optimization.
-        try weights_trait.createDecodeModel(allocator, weight_handles, loaded.config);
-        if (weight_handles.decode_model == null) return error.InvalidState;
-
-        log.debug("inference", "Metal decode model selection", .{
-            .decode_model = @as(u8, @intFromBool(weight_handles.decode_model != null)),
-            .decode_model_quantized = 0,
-            .decode_model_dense = 0,
-            .has_shortconv = @as(u8, @intFromBool(weight_handles.has_shortconv)),
-            .is_quantized = @as(u8, @intFromBool(weight_handles.is_quantized)),
-            .is_moe = @as(u8, @intFromBool(weight_handles.is_moe)),
-        }, @src());
+        if (weight_handles.decode_model == null) return error.DecodeModelUnavailable;
 
         // Initialize slot 0 cache (single-sequence compatibility path).
         const layer_count: usize = @intCast(loaded.config.n_layers);
         const max_seq_len: usize = @intCast(loaded.config.max_seq_len);
-        const kv_cache = runtime_graph_mod.Cache.init(layer_count, true, max_seq_len);
+        const cache_max_seq_len = resolveCacheMaxSeqLen(max_seq_len);
+        log.debug("inference", "Metal cache capacity policy", .{
+            .config_max_seq_len = max_seq_len,
+            .cache_max_seq_len = cache_max_seq_len,
+            .dynamic_growth = @as(u8, @intFromBool(cache_max_seq_len == 0)),
+        }, @src());
+        const kv_cache = runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len);
         const shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count);
         const mamba_cache = runtime_graph_mod.MambaCache.init(layer_count);
         errdefer mamba_cache.deinit();
@@ -319,7 +318,7 @@ pub const MetalBackend = struct {
         errdefer allocator.free(extra_slots);
         for (extra_slots) |*slot| {
             slot.* = .{
-                .cache = runtime_graph_mod.Cache.init(layer_count, true, max_seq_len),
+                .cache = runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len),
                 .shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count),
                 .mamba_cache = runtime_graph_mod.MambaCache.init(layer_count),
                 .in_use = false,
@@ -335,18 +334,6 @@ pub const MetalBackend = struct {
 
         const slot_logits_buffer = try allocator.alloc(f32, max_batch_size * @as(usize, @intCast(loaded.config.vocab_size)));
         errdefer allocator.free(slot_logits_buffer);
-        const decode_batch_cache_handles = try allocator.alloc(runtime_graph_mod.CacheHandle, max_batch_size);
-        errdefer allocator.free(decode_batch_cache_handles);
-        const decode_batch_shortconv_handles = try allocator.alloc(runtime_graph_mod.ShortConvCacheHandle, max_batch_size);
-        errdefer allocator.free(decode_batch_shortconv_handles);
-        const decode_batch_mamba_handles = try allocator.alloc(runtime_graph_mod.MambaCacheHandle, max_batch_size);
-        errdefer allocator.free(decode_batch_mamba_handles);
-        const decode_batch_tokens = try allocator.alloc(u32, max_batch_size);
-        errdefer allocator.free(decode_batch_tokens);
-        const decode_batch_positions = try allocator.alloc(usize, max_batch_size);
-        errdefer allocator.free(decode_batch_positions);
-        const decode_batch_logits_handles = try allocator.alloc(graph.ArrayHandle, max_batch_size);
-        errdefer allocator.free(decode_batch_logits_handles);
 
         return MetalBackend{
             .allocator = allocator,
@@ -362,12 +349,6 @@ pub const MetalBackend = struct {
             .slot_in_use = false,
             .extra_slots = extra_slots,
             .slot_logits_buffer = slot_logits_buffer,
-            .decode_batch_cache_handles = decode_batch_cache_handles,
-            .decode_batch_shortconv_handles = decode_batch_shortconv_handles,
-            .decode_batch_mamba_handles = decode_batch_mamba_handles,
-            .decode_batch_tokens = decode_batch_tokens,
-            .decode_batch_positions = decode_batch_positions,
-            .decode_batch_logits_handles = decode_batch_logits_handles,
             .vision_runtime = vision_runtime,
             .slot_rope_position_delta = 0,
             .current_position = 0,
@@ -377,12 +358,6 @@ pub const MetalBackend = struct {
 
     pub fn deinit(self: *MetalBackend) void {
         if (self.vision_runtime) |*rt| rt.deinit();
-        self.allocator.free(self.decode_batch_logits_handles);
-        self.allocator.free(self.decode_batch_positions);
-        self.allocator.free(self.decode_batch_tokens);
-        self.allocator.free(self.decode_batch_mamba_handles);
-        self.allocator.free(self.decode_batch_shortconv_handles);
-        self.allocator.free(self.decode_batch_cache_handles);
         self.allocator.free(self.slot_logits_buffer);
         for (self.extra_slots) |slot| {
             slot.cache.deinit();
@@ -636,7 +611,7 @@ pub const MetalBackend = struct {
         slot_cache.* = runtime_graph_mod.Cache.init(
             @intCast(self.config.n_layers),
             true,
-            @intCast(self.config.max_seq_len),
+            self.cacheMaxSeqLen(),
         );
         slot_shortconv_cache.reset();
         slot_mamba_cache.reset();
@@ -678,11 +653,43 @@ pub const MetalBackend = struct {
 
     /// Scheduler decode entrypoint.
     pub fn decodeBatch(self: *MetalBackend, requests: []const contract.DecodeRequest, results: []contract.DecodeResult) !void {
+        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
         if (requests.len == 0) return;
         if (results.len < requests.len) return error.InvalidArgument;
         if (requests.len > self.max_batch_size) return error.InvalidArgument;
+        const seen_slots = try self.allocator.alloc(bool, self.max_batch_size);
+        defer self.allocator.free(seen_slots);
+        @memset(seen_slots, false);
 
-        const decode_model = self.decode_model orelse return error.InvalidState;
+        var has_duplicate_slot = false;
+        for (requests) |request| {
+            if (request.slot_index >= self.max_batch_size) return error.InvalidArgument;
+            if (seen_slots[request.slot_index]) {
+                has_duplicate_slot = true;
+                break;
+            }
+            seen_slots[request.slot_index] = true;
+        }
+
+        if (has_duplicate_slot) return error.InvalidArgument;
+
+        const cache_handles = try self.allocator.alloc(runtime_graph_mod.CacheHandle, requests.len);
+        defer self.allocator.free(cache_handles);
+        const shortconv_handles = try self.allocator.alloc(runtime_graph_mod.ShortConvCacheHandle, requests.len);
+        defer self.allocator.free(shortconv_handles);
+        const mamba_handles = try self.allocator.alloc(runtime_graph_mod.MambaCacheHandle, requests.len);
+        defer self.allocator.free(mamba_handles);
+        const token_ids = try self.allocator.alloc(u32, requests.len);
+        defer self.allocator.free(token_ids);
+        const pos_offsets = try self.allocator.alloc(usize, requests.len);
+        defer self.allocator.free(pos_offsets);
+        const logits_handles = try self.allocator.alloc(graph.ArrayHandle, requests.len);
+        defer self.allocator.free(logits_handles);
+        for (logits_handles) |*handle| handle.* = null;
+        errdefer for (logits_handles) |handle| {
+            if (handle != null) graph.freeArray(handle);
+        };
+
         for (requests, 0..) |request, idx| {
             const logits = try self.slotLogits(request.slot_index);
             const slot_cache = try self.slotCache(request.slot_index);
@@ -690,15 +697,11 @@ pub const MetalBackend = struct {
             const slot_mamba_cache = try self.slotMambaCache(request.slot_index);
             const slot_position = try self.slotPositionPtr(request.slot_index);
             const slot_rope_delta = try self.slotRopeDeltaPtr(request.slot_index);
-            const effective_position = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
-
-            self.decode_batch_cache_handles[idx] = slot_cache.handle;
-            self.decode_batch_shortconv_handles[idx] = slot_shortconv_cache.handle;
-            self.decode_batch_mamba_handles[idx] = slot_mamba_cache.handle;
-            self.decode_batch_tokens[idx] = request.token;
-            self.decode_batch_positions[idx] = effective_position;
-            self.decode_batch_logits_handles[idx] = null;
-
+            cache_handles[idx] = slot_cache.handle;
+            shortconv_handles[idx] = slot_shortconv_cache.handle;
+            mamba_handles[idx] = slot_mamba_cache.handle;
+            token_ids[idx] = request.token;
+            pos_offsets[idx] = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
             results[idx] = .{
                 .slot_index = request.slot_index,
                 .logits = logits,
@@ -707,16 +710,17 @@ pub const MetalBackend = struct {
 
         model_runtime.decodeStepLogitsBatch(
             decode_model,
-            self.decode_batch_cache_handles[0..requests.len],
-            self.decode_batch_shortconv_handles[0..requests.len],
-            self.decode_batch_mamba_handles[0..requests.len],
-            self.decode_batch_tokens[0..requests.len],
-            self.decode_batch_positions[0..requests.len],
-            self.decode_batch_logits_handles[0..requests.len],
+            cache_handles,
+            shortconv_handles,
+            mamba_handles,
+            token_ids,
+            pos_offsets,
+            logits_handles,
         );
-
         for (requests, 0..) |request, idx| {
-            graph.copyToHost(self.decode_batch_logits_handles[idx], results[idx].logits);
+            if (logits_handles[idx] == null) return error.InvalidState;
+            graph.copyToHost(logits_handles[idx], results[idx].logits);
+            graph.freeArray(logits_handles[idx]);
             const slot_position = try self.slotPositionPtr(request.slot_index);
             slot_position.* += 1;
         }
@@ -740,143 +744,45 @@ pub const MetalBackend = struct {
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
     ) !usize {
-        const env_batch_decode = std.process.hasEnvVar(self.allocator, "TALU_BATCH_DECODE") catch false;
-        const decode_model = self.decode_model orelse return error.InvalidState;
-        const decode_plan = selectDecodePlan(env_batch_decode, callback);
-        const decode_path = decodePathLabel(decode_plan.path);
-        const batch_decode_enabled = isBatchDecodePath(decode_plan.path);
-        log.debug("inference", "Metal decode path", .{
-            .decode_model = @as(u8, @intFromBool(true)),
-            .decode_model_quantized = 0,
-            .decode_model_dense = 0,
-            .batch_decode_enabled = @as(u8, @intFromBool(batch_decode_enabled)),
-            .path = decode_path,
-        }, @src());
+        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
+        if (max_tokens == 0 or output_tokens.len == 0) return 0;
+        self.slot_in_use = true;
 
-        // Batch decode: run entire loop in C++ to eliminate FFI overhead
-        // Note: callbacks are called AFTER batch completes (not during)
-        if (batch_decode_enabled) {
-            const effective_start_position = try common_mrope.applyPositionDelta(start_position, self.slot_rope_position_delta);
-            const generated_count = switch (decode_plan.path) {
-                .batch_fused => model_runtime.decodeBatch(
-                    decode_model,
-                    self.cache.handle,
-                    self.shortconv_cache.handle,
-                    self.mamba_cache.handle,
-                    first_token,
-                    effective_start_position,
-                    output_tokens.ptr,
-                    max_tokens,
-                    eos_token_ids.ptr,
-                    eos_token_ids.len,
-                ),
-                .pipeline_fused => return error.InvalidState,
-            };
-
-            if (generated_count > 0) {
-                // Call callbacks after batch (for streaming output)
-                if (callback) |cb| {
-                    for (0..generated_count) |token_index| {
-                        cb(output_tokens[token_index], callback_data);
-                    }
-                }
-                self.current_position = start_position + generated_count;
-                return generated_count;
-            }
-        }
-
-        switch (decode_plan.path) {
-            .pipeline_fused => {
-                return self.decodeStreamingFused(
-                    first_token,
-                    start_position,
-                    max_tokens,
-                    eos_token_ids,
-                    output_tokens,
-                    callback,
-                    callback_data,
-                );
-            },
-            .batch_fused => return error.InvalidState,
-        }
-    }
-
-    /// Decode-model path - uses pipelined C++ execution
-    fn decodeStreamingFused(
-        self: *MetalBackend,
-        first_token: u32,
-        start_position: usize,
-        max_tokens: usize,
-        eos_token_ids: []const u32,
-        output_tokens: []u32,
-        callback: ?*const fn (u32, ?*anyopaque) void,
-        callback_data: ?*anyopaque,
-    ) !usize {
-        var generated_count: usize = 0;
-        var position_index = start_position;
-
-        // Prime the pipeline
-        const effective_start_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
-        const decode_model = self.decode_model orelse return error.InvalidState;
-        model_runtime.pipelinePrime(
+        var decode_timer = std.time.Timer.start() catch unreachable;
+        const budget = @min(max_tokens, output_tokens.len);
+        const effective_start_position = try common_mrope.applyPositionDelta(start_position, self.slot_rope_position_delta);
+        const generated_u32 = model_runtime.decodeBatch(
             decode_model,
             self.cache.handle,
             self.shortconv_cache.handle,
             self.mamba_cache.handle,
             first_token,
             effective_start_position,
+            output_tokens.ptr,
+            budget,
+            eos_token_ids.ptr,
+            eos_token_ids.len,
         );
-        position_index += 1;
-
-        while (generated_count < max_tokens) : (generated_count += 1) {
-            var sampled_token_id: u32 = undefined; // Safe: both branches assign before use
-
-            if (generated_count + 1 < max_tokens) {
-                // Normal step: returns current, queues next
-                const effective_position = try common_mrope.applyPositionDelta(position_index, self.slot_rope_position_delta);
-                sampled_token_id = model_runtime.pipelineStep(
-                    decode_model,
-                    self.cache.handle,
-                    self.shortconv_cache.handle,
-                    self.mamba_cache.handle,
-                    effective_position,
-                );
-            } else {
-                // Last iteration: flush
-                sampled_token_id = model_runtime.pipelineFlushWithCache(
-                    decode_model,
-                    self.cache.handle,
-                    self.shortconv_cache.handle,
-                    self.mamba_cache.handle,
-                );
-            }
-            position_index += 1;
-
-            // Store token
-            output_tokens[generated_count] = sampled_token_id;
-            log.trace("inference", "Generated token", .{ .idx = generated_count, .token_id = sampled_token_id, .position = position_index - 1 }, @src());
-
-            // Check for EOS
-            var is_eos_token = false;
-            for (eos_token_ids) |eos_id| {
-                if (sampled_token_id == eos_id) {
-                    is_eos_token = true;
-                    break;
-                }
-            }
-
-            // Invoke callback
-            if (callback) |cb| {
-                cb(sampled_token_id, callback_data);
-            }
-
-            if (is_eos_token) {
-                generated_count += 1;
-                break;
-            }
+        const generated_count: usize = @intCast(@min(generated_u32, budget));
+        const decode_ns = decode_timer.read();
+        log.debug("inference", "Metal decode route complete", .{
+            .route = "decode_model_batch",
+            .requested_tokens = budget,
+            .generated_tokens = generated_count,
+            .duration_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
+            .tok_per_sec = if (decode_ns == 0)
+                @as(f64, 0.0)
+            else
+                @as(f64, @floatFromInt(generated_count)) * 1_000_000_000.0 / @as(f64, @floatFromInt(decode_ns)),
+            .has_callback = @as(u8, @intFromBool(callback != null)),
+            .eos_count = eos_token_ids.len,
+        }, @src());
+        if (callback) |cb| {
+            for (output_tokens[0..generated_count]) |token_id| cb(token_id, callback_data);
         }
-
-        self.current_position = position_index;
+        const slot_position = try self.slotPositionPtr(0);
+        slot_position.* = start_position + generated_count;
+        self.current_position = slot_position.*;
         return generated_count;
     }
 
@@ -985,30 +891,6 @@ pub const MetalBackend = struct {
     }
 };
 
-test "shouldUseBatchDecode enables auto batch without callback" {
-    try std.testing.expect(MetalBackend.shouldUseBatchDecode(
-        false,
-        null,
-    ));
-}
-
-test "shouldUseBatchDecode keeps streaming path when callback is set" {
-    const TestCallback = struct {
-        fn cb(_: u32, _: ?*anyopaque) void {}
-    };
-    try std.testing.expect(!MetalBackend.shouldUseBatchDecode(
-        false,
-        TestCallback.cb,
-    ));
-}
-
-test "shouldUseBatchDecode honors env override" {
-    try std.testing.expect(MetalBackend.shouldUseBatchDecode(
-        true,
-        null,
-    ));
-}
-
 test "extraSlotIndexFor maps scheduler slots to extra-slot storage" {
     try std.testing.expectEqual(@as(usize, 0), try MetalBackend.extraSlotIndexFor(1, 4));
     try std.testing.expectEqual(@as(usize, 2), try MetalBackend.extraSlotIndexFor(3, 4));
@@ -1019,31 +901,15 @@ test "extraSlotIndexFor rejects slot 0 and out-of-range slots" {
     try std.testing.expectError(error.InvalidArgument, MetalBackend.extraSlotIndexFor(4, 4));
 }
 
-test "selectDecodePlan returns pipeline path when callback is set" {
-    const TestCallback = struct {
-        fn cb(_: u32, _: ?*anyopaque) void {}
-    };
-    const plan = MetalBackend.selectDecodePlan(
-        false,
-        TestCallback.cb,
-    );
-    try std.testing.expectEqual(MetalBackend.DecodePath.pipeline_fused, plan.path);
+test "argmaxHost and argminHost select expected indices" {
+    const values = [_]f32{ 0.5, -4.0, 1.25, 0.8 };
+    try std.testing.expectEqual(@as(u32, 2), MetalBackend.argmaxHost(values[0..]));
+    try std.testing.expectEqual(@as(u32, 1), MetalBackend.argminHost(values[0..]));
 }
 
-test "selectDecodePlan returns batch path without callback" {
-    const plan = MetalBackend.selectDecodePlan(
-        false,
-        null,
-    );
-    try std.testing.expectEqual(MetalBackend.DecodePath.batch_fused, plan.path);
-}
-
-test "selectDecodePlan returns batch path when env override is set" {
-    const plan = MetalBackend.selectDecodePlan(
-        true,
-        null,
-    );
-    try std.testing.expectEqual(MetalBackend.DecodePath.batch_fused, plan.path);
+test "resolveCacheMaxSeqLen uses dynamic growth for very large contexts" {
+    try std.testing.expectEqual(@as(usize, 0), MetalBackend.resolveCacheMaxSeqLen(262_144));
+    try std.testing.expectEqual(@as(usize, 40_960), MetalBackend.resolveCacheMaxSeqLen(40_960));
 }
 
 test "applyPositionDelta rejects negative resulting positions" {
@@ -1093,6 +959,60 @@ test "buildMultimodalMropeTables computes multimodal decode position_delta" {
     try std.testing.expectEqual(seq_len * 128, tables.cos.len);
     try std.testing.expectEqual(seq_len * 128, tables.sin.len);
     try std.testing.expectEqual(@as(isize, -156), tables.position_delta);
+}
+
+test "decodeBatch advances positions across multiple slots" {
+    if (!isAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const loaded = try weights_trait.createTestLoadedModel(allocator);
+    defer weights_trait.destroyTestLoadedModel(allocator, loaded);
+
+    var backend = try MetalBackend.init(allocator, loaded);
+    defer backend.deinit();
+
+    const slot0 = backend.allocSlot() orelse return error.TestUnexpectedResult;
+    const slot1 = backend.allocSlot() orelse return error.TestUnexpectedResult;
+    defer backend.freeSlot(slot1);
+    defer backend.freeSlot(slot0);
+
+    try std.testing.expectEqual(@as(usize, 0), slot0);
+    try std.testing.expectEqual(@as(usize, 1), slot1);
+
+    const vocab_size = backend.vocabSize();
+    const prefill_logits0 = try allocator.alloc(f32, vocab_size);
+    defer allocator.free(prefill_logits0);
+    const prefill_logits1 = try allocator.alloc(f32, vocab_size);
+    defer allocator.free(prefill_logits1);
+
+    try backend.prefillSlot(slot0, &[_]u32{ 1, 2 }, prefill_logits0);
+    try backend.prefillSlot(slot1, &[_]u32{ 3, 4 }, prefill_logits1);
+    try std.testing.expectEqual(@as(usize, 2), backend.getPosition(slot0));
+    try std.testing.expectEqual(@as(usize, 2), backend.getPosition(slot1));
+
+    const requests = [_]contract.DecodeRequest{
+        .{ .slot_index = slot0, .token = 5 },
+        .{ .slot_index = slot1, .token = 6 },
+    };
+    var results: [2]contract.DecodeResult = undefined;
+    try backend.decodeBatch(requests[0..], results[0..]);
+
+    try std.testing.expectEqual(slot0, results[0].slot_index);
+    try std.testing.expectEqual(slot1, results[1].slot_index);
+    try std.testing.expectEqual(vocab_size, results[0].logits.len);
+    try std.testing.expectEqual(vocab_size, results[1].logits.len);
+    try std.testing.expect(results[0].logits.ptr != results[1].logits.ptr);
+    try std.testing.expectEqual(@as(usize, 3), backend.getPosition(slot0));
+    try std.testing.expectEqual(@as(usize, 3), backend.getPosition(slot1));
+
+    const duplicate_requests = [_]contract.DecodeRequest{
+        .{ .slot_index = slot0, .token = 7 },
+        .{ .slot_index = slot0, .token = 8 },
+    };
+    var duplicate_results: [2]contract.DecodeResult = undefined;
+    try std.testing.expectError(error.InvalidArgument, backend.decodeBatch(duplicate_requests[0..], duplicate_results[0..]));
+    try std.testing.expectEqual(@as(usize, 3), backend.getPosition(slot0));
+    try std.testing.expectEqual(@as(usize, 3), backend.getPosition(slot1));
 }
 
 test "metal availability" {

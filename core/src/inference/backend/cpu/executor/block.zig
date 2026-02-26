@@ -27,7 +27,6 @@ const log = @import("../../../../log.zig");
 
 const Tensor = tensor.Tensor;
 const Attention = attn_kernel.MultiHeadAttention;
-const AttnCache = runtime.AttnCache;
 const ScratchBuffer = runtime.ScratchBuffer;
 const FFNLayer = cpu_forward.FfnLayer;
 
@@ -37,7 +36,8 @@ const BatchedKVCache = kv_cache.BatchedKVCache;
 const BufferId = layer_ops.BufferId;
 const ResidualScale = layer_ops.ResidualScale;
 const LayerOp = layer_ops.LayerOp;
-const KernelContext = runtime.KernelContext;
+const SlotContext = runtime.SlotContext;
+const SharedPersistentState = runtime.SharedPersistentState;
 
 const addIntoScaled = cpu_forward.addIntoScaled;
 const copyTensor = cpu_forward.copyTensor;
@@ -50,7 +50,30 @@ fn finalOutputBuffer(program: []const LayerOp) BufferId {
     return switch (last) {
         .kernel => |k| k.out,
         .add => .residual,
-        .add_tensor => |at| at.out,
+        .linear => |op| op.out,
+        .matmul => |op| op.out,
+        .softmax => |op| op.out,
+        .silu => |op| op.out,
+        .gelu => |op| op.out,
+        .mul => |op| op.out,
+        .add_tensor => |op| op.out,
+        .add_scalar => |op| op.out,
+        .mul_scalar => |op| op.out,
+        .mean => |op| op.out,
+        .pow => |op| op.out,
+        .rsqrt => |op| op.out,
+        .add_param => |op| op.out,
+        .add_param_scalar => |op| op.out,
+        .mul_param => |op| op.out,
+        .reshape => |op| op.out,
+        .transpose => |op| op.out,
+        .rope => |op| op.out,
+        .triu => |op| op.out,
+        .sdpa => |op| op.out,
+        .patch_embed => |op| op.out,
+        .spatial_merge => |op| op.out,
+        .deepstack_extract => |op| op.out,
+        .scatter => |op| op.out,
         else => .residual,
     };
 }
@@ -81,18 +104,6 @@ pub const Block = struct {
 
     /// Hidden size (d_model)
     hidden_size: usize,
-
-    /// Mamba layer index (for heterogeneous models with Mamba layers).
-    /// This is the index into mamba_states[], NOT the global layer index.
-    /// For homogeneous attention-only models, this is null.
-    /// For Mamba layers: mamba_layer_idx = count of Mamba layers before this one.
-    mamba_layer_idx: ?usize = null,
-
-    /// ShortConv layer index (for heterogeneous models with ShortConv layers).
-    /// This is the index into shortconv_states[], NOT the global layer index.
-    /// For homogeneous attention-only models, this is null.
-    /// For ShortConv layers: shortconv_layer_idx = count of ShortConv layers before this one.
-    shortconv_layer_idx: ?usize = null,
 
     fn residualScaleValue(self: *const Block, scale: ResidualScale) f32 {
         return switch (scale) {
@@ -177,6 +188,9 @@ pub const Block = struct {
                     try writer.print("residual += {s} * {d:.2}\n", .{ @tagName(add_op.branch), scale });
                 }
             },
+            else => |other_op| {
+                try writer.print("{s}\n", .{@tagName(other_op)});
+            },
         }
     }
 
@@ -186,7 +200,6 @@ pub const Block = struct {
         x: *const Tensor,
         out: *Tensor,
         scratch: *ScratchBuffer,
-        attn_cache: *AttnCache,
         use_cache: bool,
     ) !void {
         std.debug.assert(x.shape[0] == 1 and out.shape[0] == 1); // Only batch=1 supported
@@ -209,21 +222,18 @@ pub const Block = struct {
         // Initialize residual stream with input
         copyTensor(x, out);
 
-        // Get MLA cache/scratch if this is an MLA block
-        const is_mla = self.block.isMLA();
-        const mla_cache = if (is_mla) scratch.getMLACache(self.block_idx) else null;
-        const mla_scratch = if (is_mla) scratch.getMLAScratch() else null;
-
-        const ctx = KernelContext{
-            .scratch = scratch,
-            .attn_cache = if (is_mla) null else attn_cache,
-            .mla_cache = mla_cache,
-            .mla_scratch = mla_scratch,
-            .mamba_state = if (self.mamba_layer_idx) |idx| scratch.getMambaState(idx) else null,
+        // Populate shared scratch only for kernels present in this block.
+        const is_mla = self.block.getMLAAttention() != null;
+        const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
+        var shared_state = SharedPersistentState{
+            .mla_scratch = if (is_mla) scratch.getMLAScratch() else null,
             .mamba_scratch = scratch.getMambaScratch(),
-            .shortconv_state = if (self.shortconv_layer_idx) |idx| scratch.getShortConvState(idx) else null,
             .shortconv_scratch = scratch.getShortConvScratch(),
-            .matmul_scratch = &scratch.matmul_scratch,
+        };
+        const ctx = SlotContext{
+            .slot_state_ptr = slot_state,
+            .shared_state = &shared_state,
+            .scratch = scratch,
             .use_cache = use_cache,
         };
 
@@ -747,7 +757,10 @@ pub const Block = struct {
                     };
 
                     // Get position offset from cache
-                    const pos_offset = if (use_cache) attn_cache.cache_position else 0;
+                    const pos_offset = if (use_cache and slot_state.attn_cache != null)
+                        slot_state.attn_cache.?.cache_position
+                    else
+                        0;
                     cpu_rotary.applyRopeTensorInPlace(
                         input_data,
                         @intCast(in_tensor.n_dims),
@@ -852,6 +865,11 @@ pub const Block = struct {
                     };
                     buffer_views[@intFromEnum(sdpa_op.out)] = tensorFromSlice(out_slice[0..out_numel], sdpa_shape, 4);
                 },
+                else => |other_op| {
+                    const op_name = @tagName(other_op);
+                    error_context.setContext("block={d}, op={d}, unsupported_op={s}", .{ self.block_idx, op_index, op_name });
+                    return error.UnsupportedOpInSequentialMode;
+                },
             }
         }
 
@@ -936,7 +954,7 @@ pub const Block = struct {
             try writer.writeAll("(ffn): ");
             try ffn.describe(writer, indent + 2, show_kernels);
         }
-        if (self.block.getMambaKernel()) |mamba_k| {
+        if (self.block._mamba) |mamba_k| {
             try writer.writeByteNTimes(' ', indent + 2);
             try writer.print("(mixer): Mamba(d_model={}, d_state={}, d_conv={})\n", .{
                 mamba_k.config.d_model,
@@ -1030,21 +1048,18 @@ pub const Block = struct {
 
         copyTensor(x, out);
 
-        // Get MLA cache/scratch if this is an MLA block
-        const is_mla = self.block.isMLA();
-        const mla_cache = if (is_mla) scratch.getMLACache(self.block_idx) else null;
-        const mla_scratch = if (is_mla) scratch.getMLAScratch() else null;
-
-        const ctx = KernelContext{
-            .scratch = scratch,
-            .attn_cache = null,
-            .mla_cache = mla_cache,
-            .mla_scratch = mla_scratch,
-            .mamba_state = if (self.mamba_layer_idx) |idx| scratch.getMambaState(idx) else null,
+        const is_mla = self.block.getMLAAttention() != null;
+        const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
+        var shared_state = SharedPersistentState{
+            .batched_cache = batched_cache,
+            .mla_scratch = if (is_mla) scratch.getMLAScratch() else null,
             .mamba_scratch = scratch.getMambaScratch(),
-            .shortconv_state = if (self.shortconv_layer_idx) |idx| scratch.getShortConvState(idx) else null,
             .shortconv_scratch = scratch.getShortConvScratch(),
-            .matmul_scratch = &scratch.matmul_scratch,
+        };
+        const ctx = SlotContext{
+            .slot_state_ptr = slot_state,
+            .shared_state = &shared_state,
+            .scratch = scratch,
             .use_cache = use_cache,
         };
 
@@ -1072,7 +1087,7 @@ pub const Block = struct {
                     }
                     const input = &buffer_views[@intFromEnum(kernel_op.in)];
                     const output = &buffer_views[@intFromEnum(kernel_op.out)];
-                    try kernel.forwardBatched(input, output, ctx, batched_cache, slot_index);
+                    try kernel.forwardBatched(input, output, ctx, slot_index);
                 },
                 .add => |add_op| {
                     addIntoScaled(
@@ -1158,20 +1173,18 @@ pub const Block = struct {
 
         copyTensor(x, out);
 
-        const is_mla = self.block.isMLA();
-        const mla_cache = if (is_mla) scratch.getMLACache(self.block_idx) else null;
-        const mla_scratch = if (is_mla) scratch.getMLAScratch() else null;
-
-        const ctx = KernelContext{
-            .scratch = scratch,
-            .attn_cache = null,
-            .mla_cache = mla_cache,
-            .mla_scratch = mla_scratch,
-            .mamba_state = if (self.mamba_layer_idx) |idx| scratch.getMambaState(idx) else null,
+        const is_mla = self.block.getMLAAttention() != null;
+        const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
+        var shared_state = SharedPersistentState{
+            .batched_cache = batched_cache,
+            .mla_scratch = if (is_mla) scratch.getMLAScratch() else null,
             .mamba_scratch = scratch.getMambaScratch(),
-            .shortconv_state = if (self.shortconv_layer_idx) |idx| scratch.getShortConvState(idx) else null,
             .shortconv_scratch = scratch.getShortConvScratch(),
-            .matmul_scratch = &scratch.matmul_scratch,
+        };
+        const ctx = SlotContext{
+            .slot_state_ptr = slot_state,
+            .shared_state = &shared_state,
+            .scratch = scratch,
             .use_cache = use_cache,
         };
 
@@ -1198,7 +1211,7 @@ pub const Block = struct {
                     }
                     const input = &buffer_views[@intFromEnum(kernel_op.in)];
                     const output = &buffer_views[@intFromEnum(kernel_op.out)];
-                    try kernel.forwardBatchedSlots(input, output, ctx, batched_cache, slot_indices);
+                    try kernel.forwardBatchedSlots(input, output, ctx, slot_indices);
                 },
                 .add => |add_op| {
                     addIntoScaled(
@@ -1606,12 +1619,8 @@ test "Block.forward executes simple norm-attn-add program" {
     defer scratch.deinit();
     try scratch.ensure(4);
 
-    // Create attention cache
-    var attn_cache = AttnCache{};
-    defer attn_cache.deinit(allocator);
-
     // Execute forward pass
-    try block.forward(&input, &output, &scratch, &attn_cache, false);
+    try block.forward(&input, &output, &scratch, false);
 
     // Verify output is non-zero (computation occurred)
     var has_nonzero = false;
@@ -1668,12 +1677,8 @@ test "Block.forward executes full norm-attn-norm-ffn-add program" {
     defer scratch.deinit();
     try scratch.ensure(2);
 
-    // Create attention cache
-    var attn_cache = AttnCache{};
-    defer attn_cache.deinit(allocator);
-
     // Execute forward pass
-    try block.forward(&input, &output, &scratch, &attn_cache, false);
+    try block.forward(&input, &output, &scratch, false);
 
     // Verify output is non-zero and different from input
     var has_nonzero = false;
@@ -1789,4 +1794,14 @@ test "Block.forwardWithBatchedCache handles mul_scalar" {
     for (output_data, 0..) |val, i| {
         try testing.expectApproxEqAbs(input_data[i] * 0.5, val, 1e-6);
     }
+}
+
+test "finalOutputBuffer resolves vision ops output buffer" {
+    const program = [_]LayerOp{
+        .{ .patch_embed = .{ .in = .residual, .out = .tmp3 } },
+        .{ .spatial_merge = .{ .in = .tmp3, .out = .tmp4, .merge_size = 2 } },
+        .{ .deepstack_extract = .{ .in = .tmp4, .out = .tmp5, .layer_index = 3 } },
+        .{ .scatter = .{ .text_in = .residual, .vision_in = .tmp5, .out = .branch_out, .image_token_id = 99 } },
+    };
+    try testing.expectEqual(BufferId.branch_out, finalOutputBuffer(&program));
 }

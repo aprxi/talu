@@ -3,6 +3,7 @@
 const std = @import("std");
 const layer_ops = @import("../layer_ops.zig");
 const types = @import("../op_types.zig");
+const config_hooks = @import("../config/hook_utils.zig");
 
 pub const id: []const u8 = "qwen3_moe";
 pub const family: []const u8 = "qwen";
@@ -58,20 +59,10 @@ const qwen3_moe_weight_prefixes = [_][]const u8{
     "language_model.model.layers.{d}.",
 };
 
-fn layerCandidates(comptime suffix: []const u8) []const []const u8 {
-    return &.{
-        "model.layers.{d}." ++ suffix,
-        "layers.{d}." ++ suffix,
-        "transformer.h.{d}." ++ suffix,
-        "backbone.layers.{d}." ++ suffix,
-        "language_model.model.layers.{d}." ++ suffix,
-    };
-}
-
 fn requiredLayerWeight(comptime id_suffix: []const u8, comptime module_type: []const u8, comptime layout: types.WeightLayout) types.WeightSpec {
     return .{
         .id = id_suffix,
-        .candidates = layerCandidates(id_suffix),
+        .suffix = id_suffix,
         .module_type = module_type,
         .layout = layout,
         .dtype = "float32",
@@ -95,21 +86,6 @@ fn buildExpertWeights(comptime expert_count: usize) [expert_count * 3]types.Weig
     return specs;
 }
 
-const qwen3_moe_pre_block_ops = [_]types.Op{
-    .{ .op_type = .embedding, .inputs = &.{.{ .tensor = "input_ids" }}, .outputs = &.{"_t0"} },
-};
-const qwen3_moe_post_block_ops = [_]types.Op{
-    .{ .op_type = .norm, .inputs = &.{.{ .tensor = "_t_last" }}, .outputs = &.{"_t_out"} },
-};
-const qwen3_moe_block_ops = [_]types.Op{
-    .{ .op_type = .norm, .name = "input_layernorm", .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "input_layernorm.weight" } }, .outputs = &.{"_t0"} },
-    .{ .op_type = .multihead_attention, .inputs = &.{.{ .tensor = "_t0" }}, .outputs = &.{"_t1"}, .qk_norm = true },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "x" }, .{ .tensor = "_t1" } }, .outputs = &.{"_t2"} },
-    .{ .op_type = .norm, .name = "post_attention_layernorm", .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "post_attention_layernorm.weight" } }, .outputs = &.{"_t3"} },
-    .{ .op_type = .moe, .inputs = &.{.{ .tensor = "_t3" }}, .outputs = &.{"_t4"}, .num_experts = 128, .experts_per_token = 8 },
-    .{ .op_type = .add, .inputs = &.{ .{ .tensor = "_t2" }, .{ .tensor = "_t4" } }, .outputs = &.{"_t5"} },
-};
-
 const qwen3_moe_common_weights = [_]types.WeightSpec{
     requiredLayerWeight("input_layernorm.weight", "RMSNorm", .none),
     requiredLayerWeight("self_attn.q_proj.weight", "Linear", .linear),
@@ -125,17 +101,15 @@ const qwen3_moe_expert_weights = buildExpertWeights(128);
 const qwen3_moe_block_weights = qwen3_moe_common_weights ++ qwen3_moe_expert_weights;
 
 const qwen3_moe_global_weights = [_]types.WeightSpec{
-    .{ .id = "token_embeddings", .candidates = &.{ "model.embed_tokens.weight", "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
-    .{ .id = "ln_final", .candidates = &.{ "model.norm.weight", "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
-    .{ .id = "lm_head", .candidates = &.{ "lm_head.weight", "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
+    .{ .id = "token_embeddings", .suffix = "model.embed_tokens.weight", .aliases = &.{ "embed_tokens.weight", "transformer.wte.weight", "backbone.embedding.weight", "language_model.model.embed_tokens.weight" }, .module_type = "Embedding", .layout = .embedding, .dtype = "float32", .required = true },
+    .{ .id = "ln_final", .suffix = "model.norm.weight", .aliases = &.{ "norm.weight", "transformer.ln_f.weight", "backbone.norm.weight", "language_model.model.norm.weight", "model.embedding_norm.weight" }, .module_type = "RMSNorm", .layout = .none, .dtype = "float32", .required = true },
+    .{ .id = "lm_head", .suffix = "lm_head.weight", .aliases = &.{ "output.weight", "transformer.lm_head.weight", "language_model.lm_head.weight" }, .module_type = "Linear", .layout = .linear, .dtype = "float32", .required = false },
 };
 
 pub var arch: types.Architecture = .{
     .name = "qwen3_moe",
     .model_types = &qwen3_moe_model_types,
-    .block_ops = &qwen3_moe_block_ops,
-    .pre_block_ops = &qwen3_moe_pre_block_ops,
-    .post_block_ops = &qwen3_moe_post_block_ops,
+    .parse_config_hook = config_hooks.applyCommonTextConfigHook,
     .block_variants = null,
     .layer_map = null,
     .variant_aliases = null,

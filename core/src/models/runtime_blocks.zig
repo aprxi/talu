@@ -116,7 +116,6 @@ pub const AttentionMlpWeights = struct {
     moe_weights: ?*MoEWeights = null,
     sinks: ?[]const f32 = null,
     is_causal: bool = true,
-    block_ops: []const graph_types.Op = &.{},
     mla_config: ?MLAConfig = null,
     q_a_proj: ?*const Tensor = null,
     q_a_norm: ?*const Tensor = null,
@@ -159,17 +158,30 @@ pub const BlockWeights = union(BlockKind) {
 
 pub const WeightMap = std.StringHashMapUnmanaged(*const Tensor);
 
+pub const LayerWeights = struct {
+    block_type: BlockKind,
+    weight_map: WeightMap,
+    map_context: BlockMapContext,
+};
+
 pub const BlockMapContext = struct {
     sliding_window: usize = 0,
-    is_causal: bool = true,
-    block_ops: []const graph_types.Op = &.{},
+    kernel_meta: graph_types.KernelMeta = .{},
     mamba_config: ?MambaConfig = null,
     shortconv_config: ?ShortConvConfig = null,
-    mla_config: ?MLAConfig = null,
     num_experts: usize = 0,
     experts_per_token: usize = 0,
     allocator: ?std.mem.Allocator = null,
 };
+
+pub fn layerToBlockWeights(
+    allocator: std.mem.Allocator,
+    layer: *const LayerWeights,
+) !BlockWeights {
+    var context = layer.map_context;
+    context.allocator = allocator;
+    return blockWeightsFromMap(&layer.weight_map, layer.block_type, context);
+}
 
 fn getRequiredWeight(map: *const WeightMap, name: []const u8) !*const Tensor {
     if (map.get(name)) |weight| return weight;
@@ -396,7 +408,18 @@ pub fn blockWeightsFromMap(
             var fused = FusedBlockWeights{};
             if (fused_qkv) |fq| fused.qkv_proj = fq.*;
 
-            const mla_config = if (is_mla) context.mla_config else null;
+            const mla_config = if (is_mla) blk: {
+                const meta_cfg = context.kernel_meta.mla_config orelse return error.MissingMlaConfig;
+                break :blk MLAConfig{
+                    .q_lora_rank = meta_cfg.q_lora_rank,
+                    .kv_lora_rank = meta_cfg.kv_lora_rank,
+                    .qk_head_dim = meta_cfg.qk_head_dim,
+                    .qk_rope_head_dim = meta_cfg.qk_rope_head_dim,
+                    .qk_nope_head_dim = meta_cfg.qk_nope_head_dim,
+                    .v_head_dim = meta_cfg.v_head_dim,
+                    .rope_interleave = meta_cfg.rope_interleave,
+                };
+            } else null;
             const moe_weights: ?*MoEWeights = if (context.allocator) |alloc|
                 try buildMoEWeightsFromMap(alloc, map, context.num_experts, context.experts_per_token)
             else
@@ -458,8 +481,7 @@ pub fn blockWeightsFromMap(
                     .o_bias = o_bias,
                     .moe_weights = moe_weights,
                     .sinks = sinks,
-                    .is_causal = context.is_causal,
-                    .block_ops = context.block_ops,
+                    .is_causal = context.kernel_meta.is_causal,
                     .mla_config = mla_config,
                     .q_a_proj = q_a_proj,
                     .q_a_norm = q_a_norm,

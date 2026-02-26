@@ -3,7 +3,10 @@
 //! Centralizes single-layer lazy graph assembly so model-level orchestration
 //! can delegate layer work through a stable `TransformerBlock.forward` surface.
 
+const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
+const layer_ops = @import("../../../../models/layer_ops.zig");
+const log = @import("../../../../log.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const attention_kernel = @import("../kernels/attention.zig");
 const ffn_kernel = @import("../kernels/ffn.zig");
@@ -19,9 +22,160 @@ pub const ShortConvCache = runtime_graph.ShortConvCache;
 pub const MambaCache = runtime_graph.MambaCache;
 
 pub const TransformerBlock = struct {
-    pub fn forward(
-        hidden: mlx_graph.ArrayHandle,
-        layer_weights: anytype,
+    fn finalOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
+        if (program.len == 0) return .residual;
+        const last = program[program.len - 1];
+        return switch (last) {
+            .kernel => |k| k.out,
+            .add => .residual,
+            .linear => |op| op.out,
+            .matmul => |op| op.out,
+            .softmax => |op| op.out,
+            .silu => |op| op.out,
+            .gelu => |op| op.out,
+            .mul => |op| op.out,
+            .add_tensor => |op| op.out,
+            .add_scalar => |op| op.out,
+            .mul_scalar => |op| op.out,
+            .mean => |op| op.out,
+            .pow => |op| op.out,
+            .rsqrt => |op| op.out,
+            .add_param => |op| op.out,
+            .add_param_scalar => |op| op.out,
+            .mul_param => |op| op.out,
+            .reshape => |op| op.out,
+            .transpose => |op| op.out,
+            .rope => |op| op.out,
+            .triu => |op| op.out,
+            .sdpa => |op| op.out,
+            .patch_embed => |op| op.out,
+            .spatial_merge => |op| op.out,
+            .deepstack_extract => |op| op.out,
+            .scatter => |op| op.out,
+            else => .residual,
+        };
+    }
+
+    fn isCoreProgramBuffer(id: layer_ops.BufferId) bool {
+        return switch (id) {
+            .residual, .norm_out, .branch_out => true,
+            else => false,
+        };
+    }
+
+    fn validateLayerProgram(program: []const layer_ops.LayerOp, layer_idx: usize, kind: usize) !void {
+        for (program, 0..) |op, op_idx| {
+            switch (op) {
+                .kernel => |kernel_op| {
+                    if (!isCoreProgramBuffer(kernel_op.in) or !isCoreProgramBuffer(kernel_op.out)) {
+                        log.warn("inference", "Metal LayerOp program uses unsupported buffer id", .{
+                            .layer = layer_idx,
+                            .op_index = op_idx,
+                            .kind = kind,
+                            .debug_type = @tagName(kernel_op.debug_type),
+                        });
+                        return error.NotImplemented;
+                    }
+                    switch (kernel_op.debug_type) {
+                        .norm, .multihead_attention, .shortconv, .mlp, .moe, .mamba_mixer => {},
+                        else => {
+                            log.warn("inference", "Metal LayerOp program uses unsupported kernel debug type", .{
+                                .layer = layer_idx,
+                                .op_index = op_idx,
+                                .kind = kind,
+                                .debug_type = @tagName(kernel_op.debug_type),
+                            });
+                            return error.NotImplemented;
+                        },
+                    }
+                },
+                .add => |add_op| {
+                    if (!isCoreProgramBuffer(add_op.branch)) {
+                        log.warn("inference", "Metal LayerOp add uses unsupported buffer id", .{
+                            .layer = layer_idx,
+                            .op_index = op_idx,
+                            .kind = kind,
+                        });
+                        return error.NotImplemented;
+                    }
+                },
+                else => {
+                    log.warn("inference", "Metal LayerOp program contains unsupported op kind", .{
+                        .layer = layer_idx,
+                        .op_index = op_idx,
+                        .kind = kind,
+                        .op = @tagName(op),
+                    });
+                    return error.NotImplemented;
+                },
+            }
+        }
+
+        if (!isCoreProgramBuffer(finalOutputBuffer(program))) {
+            log.warn("inference", "Metal LayerOp program final buffer is unsupported", .{
+                .layer = layer_idx,
+                .kind = kind,
+            });
+            return error.NotImplemented;
+        }
+    }
+
+    fn getBuffer(
+        buffer_id: layer_ops.BufferId,
+        residual: mlx_graph.ArrayHandle,
+        norm_out: mlx_graph.ArrayHandle,
+        branch_out: mlx_graph.ArrayHandle,
+    ) !mlx_graph.ArrayHandle {
+        return switch (buffer_id) {
+            .residual => residual,
+            .norm_out => norm_out,
+            .branch_out => branch_out,
+            else => error.NotImplemented,
+        };
+    }
+
+    fn setBuffer(
+        buffer_id: layer_ops.BufferId,
+        residual: *mlx_graph.ArrayHandle,
+        norm_out: *mlx_graph.ArrayHandle,
+        branch_out: *mlx_graph.ArrayHandle,
+        value: mlx_graph.ArrayHandle,
+    ) !void {
+        switch (buffer_id) {
+            .residual => residual.* = value,
+            .norm_out => norm_out.* = value,
+            .branch_out => branch_out.* = value,
+            else => return error.NotImplemented,
+        }
+    }
+
+    fn nextNormWeight(lw: anytype, norm_index: *usize) !mlx_graph.ArrayHandle {
+        const idx = norm_index.*;
+        norm_index.* = idx + 1;
+        return switch (idx) {
+            0 => lw.getLn1(),
+            1 => lw.getLn2(),
+            // Gemma-style 4-norm blocks use pre/post-FFN norms.
+            2 => lw.getPreFfnNorm() orelse lw.getPostFfnNorm() orelse error.InvalidState,
+            3 => lw.getPostFfnNorm() orelse error.InvalidState,
+            else => error.InvalidState,
+        };
+    }
+
+    fn residualScale(
+        scale: layer_ops.ResidualScale,
+        weight_handles: anytype,
+    ) f32 {
+        return switch (scale) {
+            .one => 1.0,
+            .residual_multiplier => weight_handles.residual_multiplier,
+            .literal => |value| value,
+        };
+    }
+
+    fn runMixerKernel(
+        input: mlx_graph.ArrayHandle,
+        lw: anytype,
         layer_idx: usize,
         config: anytype,
         weight_handles: anytype,
@@ -37,67 +191,10 @@ pub const TransformerBlock = struct {
         const head_count: usize = @intCast(config.n_heads);
         const kv_head_count: usize = @intCast(config.n_kv_groups);
         const head_dim: usize = @intCast(config.head_dim);
-        const lw = layer_weights.*;
         const attention_storage = lw.attentionStorageKind();
         const shortconv_storage = lw.shortconvStorageKind();
-        const ffn_storage = lw.ffnStorageKind();
 
-        if (lw.kind == .mamba) {
-            const conv_weight = lw.mamba_conv_weight orelse return error.MissingField;
-            const a_log = lw.mamba_a_log orelse return error.MissingField;
-            const d_skip = lw.mamba_d_skip orelse return error.MissingField;
-            const mamba = mamba_kernel.MambaKernel{
-                .d_state = lw.mamba_d_state,
-                .d_conv = lw.mamba_d_conv,
-                .n_heads = lw.mamba_n_heads,
-                .d_head = lw.mamba_d_head,
-                .n_groups = lw.mamba_n_groups,
-                .use_gelu = weight_handles.use_gelu,
-                .residual_multiplier = weight_handles.residual_multiplier,
-                .norm_eps = norm_eps,
-                .gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
-                .ln1_weight = lw.getLn1(),
-                .in_proj = lw.mamba_in_proj,
-                .in_proj_bf16 = lw.mamba_in_proj_bf16,
-                .conv_weight = conv_weight,
-                .conv_bias = lw.mamba_conv_bias,
-                .a_log = a_log,
-                .d_skip = d_skip,
-                .dt_bias = lw.mamba_dt_bias,
-                .norm_weight = lw.mamba_norm_weight,
-                .out_proj = lw.mamba_out_proj,
-                .out_proj_bf16 = lw.mamba_out_proj_bf16,
-                .ln2_weight = lw.getLn2(),
-                .gate_up = lw.mamba_gate_up,
-                .gate_up_bf16 = lw.mamba_gate_up_bf16,
-                .down_proj = lw.mamba_down_proj,
-                .down_proj_bf16 = lw.mamba_down_proj_bf16,
-            };
-            var m_state = mamba_kernel.MambaState{
-                .cache = mamba_cache,
-                .layer_idx = layer_idx,
-            };
-            var m_scratch = mamba_kernel.MambaScratch{};
-            var m_matmul = mamba_kernel.MatmulScratch{};
-            var m_out: mlx_graph.ArrayHandle = undefined;
-            try mamba.forward(
-                hidden,
-                &m_out,
-                &m_state,
-                &m_scratch,
-                &m_matmul,
-            );
-            return m_out;
-        }
-
-        const attn_norm = norm_kernel.RMSNorm{
-            .weight = lw.getLn1(),
-            .eps = norm_eps,
-        };
-        var normed: mlx_graph.ArrayHandle = undefined;
-        attn_norm.forward(hidden, &normed);
-
-        const mixer_out = switch (lw.kind) {
+        return switch (lw.kind) {
             .attention_mlp => blk: {
                 if (lw.isMLA()) {
                     const mla_cfg = lw.mla_config orelse return error.MissingField;
@@ -137,7 +234,7 @@ pub const TransformerBlock = struct {
                     var mla_matmul_scratch = mla_kernel.MatmulScratch{};
                     var mla_out: mlx_graph.ArrayHandle = undefined;
                     try mla_attention.forward(
-                        normed,
+                        input,
                         &mla_out,
                         &mla_cache,
                         &mla_scratch,
@@ -186,7 +283,7 @@ pub const TransformerBlock = struct {
                 var attn_matmul_scratch = attention_kernel.MatmulScratch{};
                 var attn_out: mlx_graph.ArrayHandle = undefined;
                 try attention.forward(
-                    normed,
+                    input,
                     &attn_out,
                     &attn_cache,
                     &attn_scratch,
@@ -217,7 +314,7 @@ pub const TransformerBlock = struct {
                 var shortconv_matmul_scratch = shortconv_kernel.MatmulScratch{};
                 var shortconv_out: mlx_graph.ArrayHandle = undefined;
                 try shortconv.forward(
-                    normed,
+                    input,
                     &shortconv_out,
                     &shortconv_state,
                     &shortconv_scratch,
@@ -225,36 +322,63 @@ pub const TransformerBlock = struct {
                 );
                 break :blk shortconv_out;
             },
-            .mamba => return error.InvalidState,
+            .mamba => blk: {
+                const conv_weight = lw.mamba_conv_weight orelse return error.MissingField;
+                const a_log = lw.mamba_a_log orelse return error.MissingField;
+                const d_skip = lw.mamba_d_skip orelse return error.MissingField;
+                const mamba = mamba_kernel.MambaKernel{
+                    .d_state = lw.mamba_d_state,
+                    .d_conv = lw.mamba_d_conv,
+                    .n_heads = lw.mamba_n_heads,
+                    .d_head = lw.mamba_d_head,
+                    .n_groups = lw.mamba_n_groups,
+                    .use_gelu = weight_handles.use_gelu,
+                    .residual_multiplier = weight_handles.residual_multiplier,
+                    .norm_eps = norm_eps,
+                    .gate_up_layout = @intFromEnum(lw.mamba_gate_up_layout),
+                    .ln1_weight = lw.getLn1(),
+                    .in_proj = lw.mamba_in_proj,
+                    .in_proj_bf16 = lw.mamba_in_proj_bf16,
+                    .conv_weight = conv_weight,
+                    .conv_bias = lw.mamba_conv_bias,
+                    .a_log = a_log,
+                    .d_skip = d_skip,
+                    .dt_bias = lw.mamba_dt_bias,
+                    .norm_weight = lw.mamba_norm_weight,
+                    .out_proj = lw.mamba_out_proj,
+                    .out_proj_bf16 = lw.mamba_out_proj_bf16,
+                    .ln2_weight = lw.getLn2(),
+                    .gate_up = lw.mamba_gate_up,
+                    .gate_up_bf16 = lw.mamba_gate_up_bf16,
+                    .down_proj = lw.mamba_down_proj,
+                    .down_proj_bf16 = lw.mamba_down_proj_bf16,
+                };
+                var m_state = mamba_kernel.MambaState{
+                    .cache = mamba_cache,
+                    .layer_idx = layer_idx,
+                };
+                var m_scratch = mamba_kernel.MambaScratch{};
+                var m_matmul = mamba_kernel.MatmulScratch{};
+                var m_out: mlx_graph.ArrayHandle = undefined;
+                try mamba.forward(
+                    input,
+                    &m_out,
+                    &m_state,
+                    &m_scratch,
+                    &m_matmul,
+                );
+                break :blk m_out;
+            },
         };
+    }
 
-        const attn_for_residual = if (weight_handles.use_post_attn_norm) blk: {
-            const post_attn_norm = norm_kernel.RMSNorm{
-                .weight = lw.getLn2(),
-                .eps = norm_eps,
-            };
-            var normed_attn: mlx_graph.ArrayHandle = undefined;
-            post_attn_norm.forward(mixer_out, &normed_attn);
-            break :blk normed_attn;
-        } else mixer_out;
-        const scaled_attn = if (weight_handles.residual_multiplier != 1.0)
-            mlx_graph.mlx_lazy_multiply_scalar(attn_for_residual, weight_handles.residual_multiplier)
-        else
-            attn_for_residual;
-        const hidden_1 = mlx_graph.mlx_lazy_add(hidden, scaled_attn);
-
-        const ffn_norm_weight = if (weight_handles.use_post_attn_norm and lw.getPreFfnNorm() != null)
-            lw.getPreFfnNorm().?
-        else
-            lw.getLn2();
-        const ffn_norm = norm_kernel.RMSNorm{
-            .weight = ffn_norm_weight,
-            .eps = norm_eps,
-        };
-        var normed_2: mlx_graph.ArrayHandle = undefined;
-        ffn_norm.forward(hidden_1, &normed_2);
-
-        const ffn_out = switch (ffn_storage) {
+    fn runFfnKernel(
+        input: mlx_graph.ArrayHandle,
+        lw: anytype,
+        weight_handles: anytype,
+    ) !mlx_graph.ArrayHandle {
+        const ffn_storage = lw.ffnStorageKind();
+        return switch (ffn_storage) {
             .moe => blk: {
                 const moe = lw.moe orelse return error.MissingField;
                 const ffn_moe = moe_kernel.MoEFFN{ .weights = moe };
@@ -262,7 +386,7 @@ pub const TransformerBlock = struct {
                 var moe_matmul_scratch = moe_kernel.MatmulScratch{};
                 var moe_out: mlx_graph.ArrayHandle = undefined;
                 try ffn_moe.forward(
-                    normed_2,
+                    input,
                     &moe_out,
                     &moe_scratch,
                     &moe_matmul_scratch,
@@ -283,31 +407,144 @@ pub const TransformerBlock = struct {
                 var ffn_matmul_scratch = ffn_kernel.MatmulScratch{};
                 var ffn_result: mlx_graph.ArrayHandle = undefined;
                 try swiglu.forward(
-                    normed_2,
+                    input,
                     &ffn_result,
                     &ffn_scratch,
                     &ffn_matmul_scratch,
                 );
                 break :blk ffn_result;
             },
-            .missing => return error.MissingField,
-            .invalid => return error.InvalidTensorType,
+            .missing => error.MissingField,
+            .invalid => error.InvalidTensorType,
         };
+    }
 
-        const ffn_for_residual = if (lw.getPostFfnNorm()) |post_ffn| blk: {
-            const post_norm = norm_kernel.RMSNorm{
-                .weight = post_ffn,
-                .eps = norm_eps,
-            };
-            var normed_ffn: mlx_graph.ArrayHandle = undefined;
-            post_norm.forward(ffn_out, &normed_ffn);
-            break :blk normed_ffn;
-        } else ffn_out;
-        const scaled_ffn = if (weight_handles.residual_multiplier != 1.0)
-            mlx_graph.mlx_lazy_multiply_scalar(ffn_for_residual, weight_handles.residual_multiplier)
-        else
-            ffn_for_residual;
-        return mlx_graph.mlx_lazy_add(hidden_1, scaled_ffn);
+    fn forwardWithProgram(
+        hidden: mlx_graph.ArrayHandle,
+        program: []const layer_ops.LayerOp,
+        lw: anytype,
+        layer_idx: usize,
+        config: anytype,
+        weight_handles: anytype,
+        cache: ?Cache,
+        shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
+        pos_offset: usize,
+        runtime_rope_cos_handle: mlx_graph.ArrayHandle,
+        runtime_rope_sin_handle: mlx_graph.ArrayHandle,
+        runtime_rope_dim: usize,
+    ) !mlx_graph.ArrayHandle {
+        var residual = hidden;
+        var norm_out: mlx_graph.ArrayHandle = hidden;
+        var branch_out: mlx_graph.ArrayHandle = hidden;
+        var norm_index: usize = 0;
+
+        for (program) |op| {
+            switch (op) {
+                .kernel => |kernel_op| {
+                    const input = try getBuffer(kernel_op.in, residual, norm_out, branch_out);
+                    var output: mlx_graph.ArrayHandle = undefined;
+                    switch (kernel_op.debug_type) {
+                        .norm => {
+                            const norm = norm_kernel.RMSNorm{
+                                .weight = try nextNormWeight(lw, &norm_index),
+                                .eps = config.norm_eps,
+                            };
+                            norm.forward(input, &output);
+                        },
+                        .multihead_attention, .shortconv => {
+                            output = try runMixerKernel(
+                                input,
+                                lw,
+                                layer_idx,
+                                config,
+                                weight_handles,
+                                cache,
+                                shortconv_cache,
+                                mamba_cache,
+                                pos_offset,
+                                runtime_rope_cos_handle,
+                                runtime_rope_sin_handle,
+                                runtime_rope_dim,
+                            );
+                        },
+                        .mlp, .moe => {
+                            output = try runFfnKernel(input, lw, weight_handles);
+                        },
+                        .mamba_mixer => {
+                            output = try runMixerKernel(
+                                input,
+                                lw,
+                                layer_idx,
+                                config,
+                                weight_handles,
+                                cache,
+                                shortconv_cache,
+                                mamba_cache,
+                                pos_offset,
+                                runtime_rope_cos_handle,
+                                runtime_rope_sin_handle,
+                                runtime_rope_dim,
+                            );
+                        },
+                        else => return error.NotImplemented,
+                    }
+                    try setBuffer(kernel_op.out, &residual, &norm_out, &branch_out, output);
+                },
+                .add => |add_op| {
+                    const branch = try getBuffer(add_op.branch, residual, norm_out, branch_out);
+                    const scale = residualScale(add_op.scale, weight_handles);
+                    const scaled_branch = if (scale == 1.0)
+                        branch
+                    else
+                        mlx_graph.mlx_lazy_multiply_scalar(branch, scale);
+                    residual = mlx_graph.mlx_lazy_add(residual, scaled_branch);
+                },
+                else => return error.NotImplemented,
+            }
+        }
+        return getBuffer(finalOutputBuffer(program), residual, norm_out, branch_out);
+    }
+
+    pub fn forward(
+        hidden: mlx_graph.ArrayHandle,
+        layer_weights: anytype,
+        layer_idx: usize,
+        config: anytype,
+        weight_handles: anytype,
+        cache: ?Cache,
+        shortconv_cache: ?ShortConvCache,
+        mamba_cache: ?MambaCache,
+        pos_offset: usize,
+        runtime_rope_cos_handle: mlx_graph.ArrayHandle,
+        runtime_rope_sin_handle: mlx_graph.ArrayHandle,
+        runtime_rope_dim: usize,
+    ) !mlx_graph.ArrayHandle {
+        const lw = layer_weights.*;
+
+        if (lw.program) |program| {
+            try validateLayerProgram(program, layer_idx, @intFromEnum(lw.kind));
+            return forwardWithProgram(
+                hidden,
+                program,
+                lw,
+                layer_idx,
+                config,
+                weight_handles,
+                cache,
+                shortconv_cache,
+                mamba_cache,
+                pos_offset,
+                runtime_rope_cos_handle,
+                runtime_rope_sin_handle,
+                runtime_rope_dim,
+            );
+        }
+        log.warn("inference", "Metal block missing LayerOp program", .{
+            .layer = layer_idx,
+            .kind = @intFromEnum(lw.kind),
+        });
+        return error.UnsupportedModel;
     }
 
     pub fn projectLogits(
@@ -355,3 +592,64 @@ pub const TransformerBlock = struct {
         return final_normed;
     }
 };
+
+test "finalOutputBuffer returns residual when program ends with add" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .multihead_attention,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        } },
+    };
+    try std.testing.expectEqual(layer_ops.BufferId.residual, TransformerBlock.finalOutputBuffer(&program));
+}
+
+test "finalOutputBuffer returns kernel output buffer for post-norm endings" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+    };
+    try std.testing.expectEqual(layer_ops.BufferId.norm_out, TransformerBlock.finalOutputBuffer(&program));
+}
+
+test "validateLayerProgram accepts kernel-add programs" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+        .{ .kernel = .{
+            .id = 1,
+            .in = .norm_out,
+            .out = .branch_out,
+            .debug_type = .mlp,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        } },
+    };
+    try TransformerBlock.validateLayerProgram(&program, 0, 0);
+}
+
+test "validateLayerProgram rejects unsupported primitive ops" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .mul_scalar = .{
+            .in = .residual,
+            .out = .residual,
+            .scalar = 0.5,
+        } },
+    };
+    try std.testing.expectError(error.NotImplemented, TransformerBlock.validateLayerProgram(&program, 0, 0));
+}

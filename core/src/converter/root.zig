@@ -160,8 +160,9 @@ pub fn buildWeightLayoutMap(
 
     // Add global weights (embeddings, final norm, lm_head)
     for (arch.global_weights) |weight_spec| {
-        // Global weights use candidate names directly
-        for (weight_spec.candidates) |candidate| {
+        var alias_idx: usize = 0;
+        while (alias_idx < weight_spec.aliases.len + 1) : (alias_idx += 1) {
+            const candidate = if (alias_idx == 0) weight_spec.suffix else weight_spec.aliases[alias_idx - 1];
             const key = try allocator.dupe(u8, candidate);
             errdefer allocator.free(key);
             try layout_map.layouts.put(key, weight_spec.layout);
@@ -181,13 +182,30 @@ pub fn buildWeightLayoutMap(
         const weights = getWeightsForLayer(arch, layer_idx);
 
         for (weights) |weight_spec| {
-            // Use architecture-provided candidates as the source of truth.
-            // Candidates may be generated from weight_prefixes+id or explicitly overridden
-            // for architecture-specific naming (e.g., Granite mamba/self_attn aliases).
-            for (weight_spec.candidates) |candidate_template| {
-                const full_name = try expandLayerPlaceholder(allocator, candidate_template, layer_idx);
-                errdefer allocator.free(full_name);
-                try layout_map.layouts.put(full_name, weight_spec.layout);
+            var alias_idx: usize = 0;
+            while (alias_idx < weight_spec.aliases.len + 1) : (alias_idx += 1) {
+                const candidate = if (alias_idx == 0) weight_spec.suffix else weight_spec.aliases[alias_idx - 1];
+                if (std.mem.indexOf(u8, candidate, "{d}") != null) {
+                    const full_name = try expandLayerPlaceholder(allocator, candidate, layer_idx);
+                    errdefer allocator.free(full_name);
+                    try layout_map.layouts.put(full_name, weight_spec.layout);
+                    continue;
+                }
+
+                if (arch.weight_prefixes.len == 0) {
+                    const full_name = try allocator.dupe(u8, candidate);
+                    errdefer allocator.free(full_name);
+                    try layout_map.layouts.put(full_name, weight_spec.layout);
+                    continue;
+                }
+
+                for (arch.weight_prefixes) |prefix_template| {
+                    const expanded_prefix = try expandLayerPlaceholder(allocator, prefix_template, layer_idx);
+                    defer allocator.free(expanded_prefix);
+                    const full_name = try std.mem.concat(allocator, u8, &.{ expanded_prefix, candidate });
+                    errdefer allocator.free(full_name);
+                    try layout_map.layouts.put(full_name, weight_spec.layout);
+                }
             }
         }
     }
@@ -1199,16 +1217,16 @@ test "copyModelAssets preserves chat_template in tokenizer_config.json" {
     try std.testing.expect(std.mem.indexOf(u8, content, "{% for message in messages %}") != null);
 }
 
-test "buildWeightLayoutMap uses weight candidates for block weights" {
+test "buildWeightLayoutMap expands block prefixes and suffixes" {
     const allocator = std.testing.allocator;
 
-    const qproj_candidates = [_][]const u8{
-        "model.layers.{d}.self_attn.q_proj.weight",
+    const layer_prefixes = [_][]const u8{
+        "model.layers.{d}.",
     };
     const block_weights = [_]op_types.WeightSpec{
         .{
             .id = "mixer.q_proj.weight",
-            .candidates = &qproj_candidates,
+            .suffix = "self_attn.q_proj.weight",
             .module_type = "Linear",
             .layout = .linear,
             .dtype = "float32",
@@ -1221,6 +1239,7 @@ test "buildWeightLayoutMap uses weight candidates for block weights" {
         .name = "test_arch",
         .model_types = &model_types,
         .block_weights = &block_weights,
+        .weight_prefixes = &layer_prefixes,
     };
 
     var layout_map = try buildWeightLayoutMap(allocator, &arch, 2);

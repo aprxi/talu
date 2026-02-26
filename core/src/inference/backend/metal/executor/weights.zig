@@ -11,9 +11,10 @@ const models = @import("../../../../models/root.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
+const model_runtime = compute.metal.model_runtime;
 const runtime_graph = @import("../runtime_graph.zig");
-const model_runtime = @import("../model_runtime.zig");
 const topology = @import("../../../../models/op_types.zig");
+const models_registry = models.registry;
 
 const builtin = @import("builtin");
 const LoadedModel = models.LoadedModel;
@@ -176,7 +177,11 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         return error.MLXNotAvailable;
     }
 
-    const model_blocks = loaded.blocks;
+    const arena_allocator = loaded.arena.allocator();
+    const static_entry = if (loaded.runtime.architecture_id) |arch_id|
+        models_registry.detectByArchitectureId(arch_id)
+    else
+        null;
 
     // MoE models are now supported
     const is_moe_model = loaded.config.num_experts > 0;
@@ -185,8 +190,18 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     }
 
     var weight_handles = try allocator.create(WeightHandles);
-    // Initialize all optional fields to null to avoid undefined memory
-    weight_handles.decode_model = null;
+    // Initialize required fields plus defaults so optional handles start null.
+    weight_handles.* = .{
+        .embed_tokens = null,
+        .embed_tokens_quantized = null,
+        .layers = &.{},
+        .decode_model = null,
+        .ln_final = null,
+        .lm_head = null,
+        .lm_head_quantized = null,
+    };
+
+    // Fill model-dependent metadata.
     weight_handles.is_moe = is_moe_model;
     weight_handles.has_mamba = false;
     weight_handles.num_experts = if (is_moe_model) @intCast(loaded.config.num_experts) else 0;
@@ -226,8 +241,8 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     weight_handles.is_quantized = is_quantized_model;
 
     var has_shortconv_layers = false;
-    for (model_blocks) |block| {
-        switch (block) {
+    for (loaded.blocks) |layer| {
+        switch (layer.block_type) {
             .shortconv => has_shortconv_layers = true,
             else => {},
         }
@@ -267,7 +282,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     }
 
     // Load per-layer weights
-    weight_handles.layers = try allocator.alloc(WeightHandles.LayerWeights, model_blocks.len);
+    weight_handles.layers = try allocator.alloc(WeightHandles.LayerWeights, loaded.blocks.len);
     errdefer allocator.free(weight_handles.layers);
 
     // Initialize all layer weights to default values (null for optional fields)
@@ -275,10 +290,15 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         layer.* = std.mem.zeroes(WeightHandles.LayerWeights);
     }
 
-    for (model_blocks, 0..) |*block, layer_idx| {
-        switch (block.*) {
-            .attention_mlp => |*attn_block| {
+    for (loaded.blocks, 0..) |*layer, layer_idx| {
+        const block = try models.runtime_blocks.layerToBlockWeights(arena_allocator, layer);
+        switch (block) {
+            .attention_mlp => |attn_block| {
                 weight_handles.layers[layer_idx].kind = .attention_mlp;
+                if (static_entry) |entry| {
+                    weight_handles.layers[layer_idx].program =
+                        models_registry.blockProgramFor(entry, .attention_mlp);
+                }
                 const is_mla = attn_block.isMLA();
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
@@ -478,8 +498,12 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 // Initialize MoE weights to null (will be loaded separately for MoE models)
                 weight_handles.layers[layer_idx].moe = null;
             },
-            .mamba => |*mamba_block| {
+            .mamba => |mamba_block| {
                 weight_handles.layers[layer_idx].kind = .mamba;
+                if (static_entry) |entry| {
+                    weight_handles.layers[layer_idx].program =
+                        models_registry.blockProgramFor(entry, .mamba);
+                }
                 weight_handles.has_mamba = true;
 
                 var ln1_arr = try loadNormWeight(mamba_block.ln1_weight);
@@ -550,8 +574,12 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     } else return error.InvalidTensorType;
                 }
             },
-            .shortconv => |*shortconv_block| {
+            .shortconv => |shortconv_block| {
                 weight_handles.layers[layer_idx].kind = .shortconv;
+                if (static_entry) |entry| {
+                    weight_handles.layers[layer_idx].program =
+                        models_registry.blockProgramFor(entry, .shortconv);
+                }
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
                 var ln1_arr = try loadNormWeight(shortconv_block.ln1_weight);
@@ -621,8 +649,9 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
     // Load MoE weights for each layer (already sanitized by model hooks).
     if (is_moe_model) {
-        for (0..model_blocks.len) |layer_idx| {
-            const moe_block_weights = switch (model_blocks[layer_idx]) {
+        for (loaded.blocks, 0..) |*layer, layer_idx| {
+            const block = try models.runtime_blocks.layerToBlockWeights(arena_allocator, layer);
+            const moe_block_weights = switch (block) {
                 .attention_mlp => |attn| attn.moe_weights orelse continue,
                 .mamba, .shortconv => continue, // Mamba/ShortConv layers don't have MoE
             };
@@ -877,44 +906,16 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         }
     }
 
-    // Initialize decode model to null (created by createDecodeModel when possible)
-    weight_handles.decode_model = null;
+    try createDecodeModel(allocator, weight_handles, loaded.config);
 
     return weight_handles;
 }
 
-/// Create a decode model (quantized or dense fused backend implementation) to
-/// reduce per-token FFI overhead.
-/// Supports both quantized (4-bit/8-bit) and dense (BF16) models.
 const DecodeModelCandidate = enum {
     none,
     quantized,
     dense,
 };
-
-fn decodeModelUnsupportedReason(weight_handles: *const WeightHandles) []const u8 {
-    for (weight_handles.layers) |layer| {
-        if (layer.kind == .mamba) {
-            switch (layer.mambaStorageKind()) {
-                .invalid => return "Metal decode-model path received invalid Mamba tensor layout",
-                .missing => return "Metal decode-model path is missing required Mamba tensors",
-                .quantized, .dense => {},
-            }
-        }
-        if (layer.isMLA()) {
-            return switch (layer.mlaStorageKind()) {
-                .invalid => "Metal decode-model path received invalid MLA tensor layout",
-                .missing => "Metal decode-model path is missing required MLA tensors",
-                .quantized => "Metal decode-model path rejected this MLA configuration",
-                .dense => "Metal decode-model path rejected this MLA configuration",
-            };
-        }
-        if (layer.kind == .attention_mlp and layer.attentionStorageKind() == .mixed_qkv_quantized_o_dense) {
-            return "Metal decode-model path does not support mixed QKV quantized + dense O attention";
-        }
-    }
-    return "Metal decode-model path does not support this model topology/dtype combination";
-}
 
 fn classifyDecodeModelCandidate(weight_handles: *const WeightHandles) DecodeModelCandidate {
     // IMPORTANT: keep this selection fully data-driven from traced layer kinds and tensor dtypes.
@@ -925,26 +926,17 @@ fn classifyDecodeModelCandidate(weight_handles: *const WeightHandles) DecodeMode
     for (weight_handles.layers) |layer| {
         switch (layer.kind) {
             .attention_mlp => {
+                const attention_storage = layer.attentionStorageKind();
                 const ffn_storage = layer.ffnStorageKind();
-                if (ffn_storage == .invalid or ffn_storage == .missing) return .none;
+                if (attention_storage == .invalid or
+                    attention_storage == .missing or
+                    attention_storage == .mixed_qkv_quantized_o_dense or
+                    ffn_storage == .invalid or
+                    ffn_storage == .missing) return .none;
 
-                var layer_quantized: bool = false;
-                var layer_dense: bool = false;
-                if (layer.isMLA()) {
-                    const mla_storage = layer.mlaStorageKind();
-                    if (mla_storage == .invalid or mla_storage == .missing) return .none;
-                    layer_quantized = mla_storage == .quantized and
-                        (ffn_storage == .quantized or ffn_storage == .moe);
-                    layer_dense = mla_storage == .dense and ffn_storage == .dense;
-                } else {
-                    const attention_storage = layer.attentionStorageKind();
-                    if (attention_storage == .invalid or
-                        attention_storage == .missing or
-                        attention_storage == .mixed_qkv_quantized_o_dense) return .none;
-                    layer_quantized = attention_storage == .quantized and
-                        (ffn_storage == .quantized or ffn_storage == .moe);
-                    layer_dense = attention_storage == .dense and ffn_storage == .dense;
-                }
+                const layer_quantized = attention_storage == .quantized and
+                    (ffn_storage == .quantized or ffn_storage == .moe);
+                const layer_dense = attention_storage == .dense and ffn_storage == .dense;
 
                 // Fused kernels only support one consistent representation across all layers.
                 if (layer_quantized == layer_dense) return .none;
@@ -970,17 +962,7 @@ fn classifyDecodeModelCandidate(weight_handles: *const WeightHandles) DecodeMode
                 if (!layer_quantized) all_layers_quantized = false;
                 if (!layer_dense) all_layers_dense = false;
             },
-            .mamba => {
-                const mamba_storage = layer.mambaStorageKind();
-                if (mamba_storage == .invalid or mamba_storage == .missing) return .none;
-
-                const layer_quantized = mamba_storage == .quantized;
-                const layer_dense = mamba_storage == .dense;
-                if (layer_quantized == layer_dense) return .none;
-
-                if (!layer_quantized) all_layers_quantized = false;
-                if (!layer_dense) all_layers_dense = false;
-            },
+            .mamba => return .none,
         }
     }
 
@@ -1001,10 +983,6 @@ fn quantizedDecodeModelLayout(weight_handles: *const WeightHandles) ?QuantizedLa
     for (weight_handles.layers) |layer| {
         const candidate = switch (layer.kind) {
             .attention_mlp => blk: {
-                if (layer.isMLA()) {
-                    if (layer.mlaStorageKind() != .quantized) return null;
-                    break :blk layer.mla_q_a_proj orelse return null;
-                }
                 if (layer.attentionStorageKind() != .quantized) return null;
                 break :blk layer.q_proj orelse return null;
             },
@@ -1012,10 +990,7 @@ fn quantizedDecodeModelLayout(weight_handles: *const WeightHandles) ?QuantizedLa
                 if (layer.shortconvStorageKind() != .quantized) return null;
                 break :blk layer.shortconv_in_proj orelse return null;
             },
-            .mamba => blk: {
-                if (layer.mambaStorageKind() != .quantized) return null;
-                break :blk layer.mamba_in_proj orelse return null;
-            },
+            .mamba => return null,
         };
         if (group_size_opt == null) {
             group_size_opt = candidate.group_size;
@@ -1047,15 +1022,17 @@ fn buildDecodeLayerKindPlan(
 }
 
 pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHandles, config: anytype) !void {
-    if (weight_handles.decode_model != null) return; // Already created
-
+    if (weight_handles.decode_model != null) return;
     const model_kind = classifyDecodeModelCandidate(weight_handles);
-    if (model_kind == .none) {
-        log.info("inference", "Metal decode-model admission rejected", .{
-            .reason = decodeModelUnsupportedReason(weight_handles),
-        });
-        return error.UnsupportedModel;
-    }
+    if (model_kind == .none) return error.NotImplemented;
+    log.debug("inference", "Metal decode-model candidate selected", .{
+        .kind = switch (model_kind) {
+            .quantized => "quantized",
+            .dense => "dense",
+            .none => "none",
+        },
+        .layer_count = weight_handles.layers.len,
+    }, @src());
 
     const layer_count: usize = @intCast(config.n_layers);
     const head_count: usize = @intCast(config.n_heads);
@@ -1064,13 +1041,11 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
     const model_width: usize = @intCast(config.d_model);
 
     if (model_kind == .quantized) {
-        // QUANTIZED PATH: Use FusedModelWeights with quantized_matmul
-        const quant_layout = quantizedDecodeModelLayout(weight_handles) orelse {
-            log.info("inference", "Metal decode-model admission rejected", .{
-                .reason = "quantized decode-model requires a single grouped-affine layout across all layers",
-            });
-            return error.UnsupportedModel;
-        };
+        const quant_layout = quantizedDecodeModelLayout(weight_handles) orelse return error.NotImplemented;
+        log.debug("inference", "Metal quantized decode-model layout", .{
+            .group_size = quant_layout.group_size,
+            .bits = quant_layout.bits,
+        }, @src());
 
         const fused = model_runtime.mlx_fused_model_create(
             layer_count,
@@ -1084,14 +1059,12 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
             config.norm_eps,
         );
 
-        // Set embeddings (must be quantized for quantized decode-model path)
         if (weight_handles.embed_tokens_quantized) |quantized_weight| {
             model_runtime.mlx_fused_model_set_embeddings(fused, quantized_weight.weights, quantized_weight.scales, quantized_weight.biases);
         } else {
             return error.FusedModelRequiresQuantizedEmbeddings;
         }
 
-        // Set final weights
         if (weight_handles.lm_head_quantized) |quantized_weight| {
             model_runtime.mlx_fused_model_set_final(fused, weight_handles.ln_final, quantized_weight.weights, quantized_weight.scales, quantized_weight.biases);
         } else {
@@ -1102,179 +1075,70 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
         defer allocator.free(layer_kind_plan);
         model_runtime.mlx_fused_model_set_topology(fused, layer_kind_plan.ptr, layer_kind_plan.len);
 
-        // Set per-layer weights
         for (weight_handles.layers, 0..) |*layer, layer_idx| {
             switch (layer.kind) {
                 .attention_mlp => {
                     const ffn_storage = layer.ffnStorageKind();
                     if (ffn_storage == .invalid or ffn_storage == .missing) return error.InvalidTensorType;
-                    if (layer.isMLA()) {
-                        if (layer.mlaStorageKind() != .quantized) return error.UnsupportedModel;
-                        const mla = layer.mla_config orelse return error.InvalidTensorType;
-                        const q_a = layer.mla_q_a_proj orelse return error.InvalidTensorType;
-                        const q_b = layer.mla_q_b_proj orelse return error.InvalidTensorType;
-                        const kv_a = layer.mla_kv_a_proj orelse return error.InvalidTensorType;
-                        const kv_b = layer.mla_kv_b_proj orelse return error.InvalidTensorType;
-                        const q_a_norm = layer.mla_q_a_norm orelse return error.InvalidTensorType;
-                        const kv_a_norm = layer.mla_kv_a_norm orelse return error.InvalidTensorType;
-                        const out = layer.o_proj orelse return error.InvalidTensorType;
 
-                        if (q_a.group_size != quant_layout.group_size or q_a.bits != quant_layout.bits or
-                            q_b.group_size != quant_layout.group_size or q_b.bits != quant_layout.bits or
-                            kv_a.group_size != quant_layout.group_size or kv_a.bits != quant_layout.bits or
-                            kv_b.group_size != quant_layout.group_size or kv_b.bits != quant_layout.bits or
-                            out.group_size != quant_layout.group_size or out.bits != quant_layout.bits)
-                        {
-                            return error.InvalidTensorType;
-                        }
-
-                        model_runtime.mlx_fused_model_set_layer(
-                            fused,
-                            layer_idx,
-                            layer.ln1_weight,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            layer.ln2_weight,
-                            if (ffn_storage == .quantized) layer.w1.?.weights else null, // gate
-                            if (ffn_storage == .quantized) layer.w1.?.scales else null,
-                            if (ffn_storage == .quantized) layer.w1.?.biases else null,
-                            if (ffn_storage == .quantized) layer.w3.?.weights else null, // up
-                            if (ffn_storage == .quantized) layer.w3.?.scales else null,
-                            if (ffn_storage == .quantized) layer.w3.?.biases else null,
-                            if (ffn_storage == .quantized) layer.w2.?.weights else null, // down
-                            if (ffn_storage == .quantized) layer.w2.?.scales else null,
-                            if (ffn_storage == .quantized) layer.w2.?.biases else null,
-                            null,
-                            null,
-                            if (layer.pre_ffn_norm) |n| n else null,
-                            if (layer.post_ffn_norm) |n| n else null,
-                            0,
-                            0,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            if (ffn_storage == .moe) layer.moe.?.router_w else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.router_s) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.router_b) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.router_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) layer.moe.?.gate_w else null,
-                            if (ffn_storage == .moe) layer.moe.?.gate_s else null,
-                            if (ffn_storage == .moe) layer.moe.?.up_w else null,
-                            if (ffn_storage == .moe) layer.moe.?.up_s else null,
-                            if (ffn_storage == .moe) layer.moe.?.down_w else null,
-                            if (ffn_storage == .moe) layer.moe.?.down_s else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.gate_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.up_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.down_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) layer.moe.?.num_experts else 0,
-                            if (ffn_storage == .moe) layer.moe.?.experts_per_token else 0,
-                            if (ffn_storage == .moe) layer.moe.?.router_group_size else 0,
-                            if (ffn_storage == .moe) layer.moe.?.expert_group_size else 0,
-                        );
-
-                        model_runtime.mlx_fused_model_set_layer_mla_quantized(
-                            fused,
-                            layer_idx,
-                            head_count,
-                            mla.q_lora_rank,
-                            mla.kv_lora_rank,
-                            mla.qk_head_dim,
-                            mla.qk_rope_head_dim,
-                            mla.qk_nope_head_dim,
-                            mla.v_head_dim,
-                            q_a.weights,
-                            q_a.scales,
-                            q_a.biases,
-                            q_b.weights,
-                            q_b.scales,
-                            q_b.biases,
-                            kv_a.weights,
-                            kv_a.scales,
-                            kv_a.biases,
-                            kv_b.weights,
-                            kv_b.scales,
-                            kv_b.biases,
-                            q_a_norm,
-                            kv_a_norm,
-                            out.weights,
-                            out.scales,
-                            out.biases,
-                        );
-                    } else {
-                        model_runtime.mlx_fused_model_set_layer(
-                            fused,
-                            layer_idx,
-                            layer.ln1_weight,
-                            layer.q_proj.?.weights,
-                            layer.q_proj.?.scales,
-                            layer.q_proj.?.biases,
-                            layer.k_proj.?.weights,
-                            layer.k_proj.?.scales,
-                            layer.k_proj.?.biases,
-                            layer.v_proj.?.weights,
-                            layer.v_proj.?.scales,
-                            layer.v_proj.?.biases,
-                            layer.o_proj.?.weights,
-                            layer.o_proj.?.scales,
-                            layer.o_proj.?.biases,
-                            layer.ln2_weight,
-                            if (ffn_storage == .quantized) layer.w1.?.weights else null, // gate
-                            if (ffn_storage == .quantized) layer.w1.?.scales else null,
-                            if (ffn_storage == .quantized) layer.w1.?.biases else null,
-                            if (ffn_storage == .quantized) layer.w3.?.weights else null, // up
-                            if (ffn_storage == .quantized) layer.w3.?.scales else null,
-                            if (ffn_storage == .quantized) layer.w3.?.biases else null,
-                            if (ffn_storage == .quantized) layer.w2.?.weights else null, // down
-                            if (ffn_storage == .quantized) layer.w2.?.scales else null,
-                            if (ffn_storage == .quantized) layer.w2.?.biases else null,
-                            if (layer.q_norm) |qn| qn else null,
-                            if (layer.k_norm) |kn| kn else null,
-                            if (layer.pre_ffn_norm) |n| n else null,
-                            if (layer.post_ffn_norm) |n| n else null,
-                            0,
-                            0,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            null,
-                            if (ffn_storage == .moe) layer.moe.?.router_w else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.router_s) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.router_b) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.router_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) layer.moe.?.gate_w else null,
-                            if (ffn_storage == .moe) layer.moe.?.gate_s else null,
-                            if (ffn_storage == .moe) layer.moe.?.up_w else null,
-                            if (ffn_storage == .moe) layer.moe.?.up_s else null,
-                            if (ffn_storage == .moe) layer.moe.?.down_w else null,
-                            if (ffn_storage == .moe) layer.moe.?.down_s else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.gate_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.up_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) if (layer.moe.?.down_bias) |v| v else null else null,
-                            if (ffn_storage == .moe) layer.moe.?.num_experts else 0,
-                            if (ffn_storage == .moe) layer.moe.?.experts_per_token else 0,
-                            if (ffn_storage == .moe) layer.moe.?.router_group_size else 0,
-                            if (ffn_storage == .moe) layer.moe.?.expert_group_size else 0,
-                        );
-                    }
+                    model_runtime.mlx_fused_model_set_layer(
+                        fused,
+                        layer_idx,
+                        layer.ln1_weight,
+                        layer.q_proj.?.weights,
+                        layer.q_proj.?.scales,
+                        layer.q_proj.?.biases,
+                        layer.k_proj.?.weights,
+                        layer.k_proj.?.scales,
+                        layer.k_proj.?.biases,
+                        layer.v_proj.?.weights,
+                        layer.v_proj.?.scales,
+                        layer.v_proj.?.biases,
+                        layer.o_proj.?.weights,
+                        layer.o_proj.?.scales,
+                        layer.o_proj.?.biases,
+                        layer.ln2_weight,
+                        if (ffn_storage == .quantized) layer.w1.?.weights else null,
+                        if (ffn_storage == .quantized) layer.w1.?.scales else null,
+                        if (ffn_storage == .quantized) layer.w1.?.biases else null,
+                        if (ffn_storage == .quantized) layer.w3.?.weights else null,
+                        if (ffn_storage == .quantized) layer.w3.?.scales else null,
+                        if (ffn_storage == .quantized) layer.w3.?.biases else null,
+                        if (ffn_storage == .quantized) layer.w2.?.weights else null,
+                        if (ffn_storage == .quantized) layer.w2.?.scales else null,
+                        if (ffn_storage == .quantized) layer.w2.?.biases else null,
+                        if (layer.q_norm) |qn| qn else null,
+                        if (layer.k_norm) |kn| kn else null,
+                        if (layer.pre_ffn_norm) |n| n else null,
+                        if (layer.post_ffn_norm) |n| n else null,
+                        0,
+                        0,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        null,
+                        if (ffn_storage == .moe) layer.moe.?.router_w else null,
+                        if (ffn_storage == .moe) if (layer.moe.?.router_s) |v| v else null else null,
+                        if (ffn_storage == .moe) if (layer.moe.?.router_b) |v| v else null else null,
+                        if (ffn_storage == .moe) if (layer.moe.?.router_bias) |v| v else null else null,
+                        if (ffn_storage == .moe) layer.moe.?.gate_w else null,
+                        if (ffn_storage == .moe) layer.moe.?.gate_s else null,
+                        if (ffn_storage == .moe) layer.moe.?.up_w else null,
+                        if (ffn_storage == .moe) layer.moe.?.up_s else null,
+                        if (ffn_storage == .moe) layer.moe.?.down_w else null,
+                        if (ffn_storage == .moe) layer.moe.?.down_s else null,
+                        if (ffn_storage == .moe) if (layer.moe.?.gate_bias) |v| v else null else null,
+                        if (ffn_storage == .moe) if (layer.moe.?.up_bias) |v| v else null else null,
+                        if (ffn_storage == .moe) if (layer.moe.?.down_bias) |v| v else null else null,
+                        if (ffn_storage == .moe) layer.moe.?.num_experts else 0,
+                        if (ffn_storage == .moe) layer.moe.?.experts_per_token else 0,
+                        if (ffn_storage == .moe) layer.moe.?.router_group_size else 0,
+                        if (ffn_storage == .moe) layer.moe.?.expert_group_size else 0,
+                    );
                 },
                 .shortconv => {
                     const sc_in = layer.shortconv_in_proj orelse return error.InvalidTensorType;
@@ -1296,13 +1160,13 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
                         null,
                         null,
                         layer.ln2_weight,
-                        layer.w1.?.weights, // gate
+                        layer.w1.?.weights,
                         layer.w1.?.scales,
                         layer.w1.?.biases,
-                        layer.w3.?.weights, // up
+                        layer.w3.?.weights,
                         layer.w3.?.scales,
                         layer.w3.?.biases,
-                        layer.w2.?.weights, // down
+                        layer.w2.?.weights,
                         layer.w2.?.scales,
                         layer.w2.?.biases,
                         null,
@@ -1338,66 +1202,10 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
                         0,
                     );
                 },
-                .mamba => {
-                    if (layer.mambaStorageKind() != .quantized) return error.InvalidTensorType;
-                    const in_proj = layer.mamba_in_proj orelse return error.InvalidTensorType;
-                    const out_proj = layer.mamba_out_proj orelse return error.InvalidTensorType;
-                    const conv_weight = layer.mamba_conv_weight orelse return error.InvalidTensorType;
-                    const a_log = layer.mamba_a_log orelse return error.InvalidTensorType;
-                    const d_skip = layer.mamba_d_skip orelse return error.InvalidTensorType;
-
-                    if (in_proj.group_size != quant_layout.group_size or in_proj.bits != quant_layout.bits or
-                        out_proj.group_size != quant_layout.group_size or out_proj.bits != quant_layout.bits)
-                    {
-                        return error.InvalidTensorType;
-                    }
-
-                    if (layer.mamba_gate_up) |gate_up| {
-                        const down_proj = layer.mamba_down_proj orelse return error.InvalidTensorType;
-                        if (gate_up.group_size != quant_layout.group_size or gate_up.bits != quant_layout.bits or
-                            down_proj.group_size != quant_layout.group_size or down_proj.bits != quant_layout.bits)
-                        {
-                            return error.InvalidTensorType;
-                        }
-                    } else if (layer.mamba_down_proj != null) {
-                        return error.InvalidTensorType;
-                    }
-
-                    model_runtime.mlx_fused_model_set_layer_mamba_quantized(
-                        fused,
-                        layer_idx,
-                        layer.mamba_d_state,
-                        layer.mamba_d_conv,
-                        layer.mamba_n_heads,
-                        layer.mamba_d_head,
-                        layer.mamba_n_groups,
-                        @intFromEnum(layer.mamba_gate_up_layout),
-                        layer.ln1_weight,
-                        conv_weight,
-                        if (layer.mamba_conv_bias) |v| v else null,
-                        a_log,
-                        d_skip,
-                        if (layer.mamba_dt_bias) |v| v else null,
-                        if (layer.mamba_norm_weight) |v| v else null,
-                        in_proj.weights,
-                        in_proj.scales,
-                        in_proj.biases,
-                        out_proj.weights,
-                        out_proj.scales,
-                        out_proj.biases,
-                        layer.ln2_weight,
-                        if (layer.mamba_gate_up) |v| v.weights else null,
-                        if (layer.mamba_gate_up) |v| v.scales else null,
-                        if (layer.mamba_gate_up) |v| v.biases else null,
-                        if (layer.mamba_down_proj) |v| v.weights else null,
-                        if (layer.mamba_down_proj) |v| v.scales else null,
-                        if (layer.mamba_down_proj) |v| v.biases else null,
-                    );
-                },
+                .mamba => unreachable,
             }
         }
 
-        // Set architecture-specific config for quantized decode-model path
         if (weight_handles.has_norm_weight_offset or config.use_gelu or config.query_pre_attn_scalar != 0) {
             model_runtime.mlx_fused_model_set_arch_config(
                 fused,
@@ -1407,7 +1215,6 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
             );
         }
 
-        // Set custom scaling multipliers if any are non-default
         const has_custom_scaling = config.embedding_multiplier != 1.0 or
             config.attention_multiplier != 0.0 or
             config.residual_multiplier != 1.0 or
@@ -1422,14 +1229,8 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
             );
         }
 
-        // Set Llama3 RoPE frequencies if configured
         if (config.rope_scaling.rope_type == .llama3) {
-            log.info("inference", "Setting Llama3 RoPE frequencies", .{
-                .factor = config.rope_scaling.factor,
-                .low_freq_factor = config.rope_scaling.low_freq_factor,
-                .high_freq_factor = config.rope_scaling.high_freq_factor,
-            });
-            const freqs: ?[]f32 = computeLlama3RopeFreqs(
+            const freqs = computeLlama3RopeFreqs(
                 allocator,
                 @intCast(config.head_dim),
                 config.rope_theta,
@@ -1437,237 +1238,119 @@ pub fn createDecodeModel(allocator: std.mem.Allocator, weight_handles: *WeightHa
                 config.rope_scaling.low_freq_factor,
                 config.rope_scaling.high_freq_factor,
                 @intCast(config.rope_scaling.original_max_position_embeddings),
-            ) catch |err| blk: {
-                log.warn("inference", "Failed to compute Llama3 RoPE frequencies, using standard RoPE", .{
-                    .reason = @errorName(err),
-                });
-                break :blk null;
-            };
-            if (freqs) |freq_values| {
-                defer allocator.free(freq_values);
-                if (freq_values.len > 0) {
-                    log.info("inference", "Computed rope frequencies", .{
-                        .count = freq_values.len,
-                        .first = freq_values[0],
-                        .last = freq_values[freq_values.len - 1],
-                    });
-                    const freqs_array = mlx_graph.createArrayF32(freq_values, &[_]i64{@intCast(freq_values.len)});
-                    model_runtime.mlx_fused_model_set_rope_freqs(fused, freqs_array);
-                }
-            }
+            ) catch return error.NotImplemented;
+            defer allocator.free(freqs);
+            const freqs_array = mlx_graph.createArrayF32(freqs, &[_]i64{@intCast(freqs.len)});
+            model_runtime.mlx_fused_model_set_rope_freqs(fused, freqs_array);
         }
 
-        // Pre-evaluate all weights to ensure GPU transfer happens upfront
         model_runtime.mlx_fused_model_optimize(fused);
-        // Compile hook retained for ABI compatibility; decode uses fused forward path.
         model_runtime.mlx_fused_model_compile(fused);
-        weight_handles.decode_model = model_runtime.decodeModelFromFused(fused) orelse return error.InvalidState;
-    } else {
-        // DENSE PATH: Use FusedDenseModel with dense matmul (BF16)
-        const dense = model_runtime.mlx_dense_model_create(
-            layer_count,
-            head_count,
-            kv_head_count,
-            head_dim,
-            model_width,
-            config.rope_theta,
-            config.norm_eps,
-        );
-
-        // Set embeddings (BF16)
-        if (weight_handles.embed_tokens) |embedding_handle| {
-            model_runtime.mlx_dense_model_set_embeddings(dense, embedding_handle);
-        } else {
-            return error.DenseModelRequiresEmbeddings;
-        }
-
-        // Set final weights (BF16)
-        if (weight_handles.lm_head) |lm_head_handle| {
-            model_runtime.mlx_dense_model_set_final(dense, weight_handles.ln_final, lm_head_handle);
-        } else {
-            return error.DenseModelRequiresLMHead;
-        }
-
-        const layer_kind_plan = try buildDecodeLayerKindPlan(allocator, weight_handles.layers);
-        defer allocator.free(layer_kind_plan);
-        model_runtime.mlx_dense_model_set_topology(dense, layer_kind_plan.ptr, layer_kind_plan.len);
-
-        // Set architecture-specific config for dense decode-model path.
-        if (weight_handles.has_norm_weight_offset or config.use_gelu or config.query_pre_attn_scalar != 0) {
-            model_runtime.mlx_dense_model_set_arch_config(
-                dense,
-                weight_handles.has_norm_weight_offset,
-                config.use_gelu,
-                config.query_pre_attn_scalar,
-            );
-        }
-
-        // Set custom scaling multipliers if any are non-default.
-        const dense_has_custom_scaling = config.embedding_multiplier != 1.0 or
-            config.attention_multiplier != 0.0 or
-            config.residual_multiplier != 1.0 or
-            config.logits_scaling != 1.0;
-        if (dense_has_custom_scaling) {
-            model_runtime.mlx_dense_model_set_scaling_config(
-                dense,
-                config.embedding_multiplier,
-                config.attention_multiplier,
-                config.residual_multiplier,
-                config.logits_scaling,
-            );
-        }
-
-        // Set per-layer weights (BF16)
-        for (weight_handles.layers, 0..) |*layer, layer_idx| {
-            switch (layer.kind) {
-                .attention_mlp => {
-                    if (layer.isMLA()) {
-                        if (layer.mlaStorageKind() != .dense) return error.InvalidTensorType;
-                        const mla = layer.mla_config orelse return error.InvalidTensorType;
-                        model_runtime.mlx_dense_model_set_layer(
-                            dense,
-                            layer_idx,
-                            layer.ln1_weight,
-                            null,
-                            null,
-                            null,
-                            null,
-                            layer.ln2_weight,
-                            layer.w1_bf16.?, // gate
-                            layer.w3_bf16.?, // up
-                            layer.w2_bf16.?, // down
-                            null,
-                            null,
-                            0,
-                            0,
-                            null,
-                            null,
-                            null,
-                            null,
-                        );
-                        model_runtime.mlx_dense_model_set_layer_mla_bf16(
-                            dense,
-                            layer_idx,
-                            head_count,
-                            mla.q_lora_rank,
-                            mla.kv_lora_rank,
-                            mla.qk_head_dim,
-                            mla.qk_rope_head_dim,
-                            mla.qk_nope_head_dim,
-                            mla.v_head_dim,
-                            layer.mla_q_a_proj_bf16.?,
-                            layer.mla_q_b_proj_bf16.?,
-                            layer.mla_kv_a_proj_bf16.?,
-                            layer.mla_kv_b_proj_bf16.?,
-                            layer.mla_q_a_norm.?,
-                            layer.mla_kv_a_norm.?,
-                            layer.o_proj_bf16.?,
-                        );
-                    } else {
-                        model_runtime.mlx_dense_model_set_layer(
-                            dense,
-                            layer_idx,
-                            layer.ln1_weight,
-                            layer.q_proj_bf16.?,
-                            layer.k_proj_bf16.?,
-                            layer.v_proj_bf16.?,
-                            layer.o_proj_bf16.?,
-                            layer.ln2_weight,
-                            layer.w1_bf16.?, // gate
-                            layer.w3_bf16.?, // up
-                            layer.w2_bf16.?, // down
-                            if (layer.q_norm) |qn| qn else null,
-                            if (layer.k_norm) |kn| kn else null,
-                            0,
-                            0,
-                            null,
-                            null,
-                            null,
-                            null,
-                        );
-                    }
-                },
-                .shortconv => {
-                    var in_shape: [8]usize = undefined;
-                    var out_shape: [8]usize = undefined;
-                    const in_rank = mlx_graph.getShape(layer.shortconv_in_proj_bf16.?, &in_shape);
-                    const out_rank = mlx_graph.getShape(layer.shortconv_out_proj_bf16.?, &out_shape);
-                    log.debug("inference", "Dense shortconv fused layer", .{
-                        .layer_idx = layer_idx,
-                        .in_rank = in_rank,
-                        .in0 = in_shape[0],
-                        .in1 = if (in_rank > 1) in_shape[1] else 0,
-                        .out_rank = out_rank,
-                        .out0 = out_shape[0],
-                        .out1 = if (out_rank > 1) out_shape[1] else 0,
-                        .d_conv = layer.shortconv_d_conv,
-                        .conv_dim = layer.shortconv_conv_dim,
-                    }, @src());
-                    model_runtime.mlx_dense_model_set_layer(
-                        dense,
-                        layer_idx,
-                        layer.ln1_weight,
-                        null,
-                        null,
-                        null,
-                        null,
-                        layer.ln2_weight,
-                        layer.w1_bf16.?, // gate
-                        layer.w3_bf16.?, // up
-                        layer.w2_bf16.?, // down
-                        null,
-                        null,
-                        layer.shortconv_d_conv,
-                        layer.shortconv_conv_dim,
-                        layer.shortconv_in_proj_bf16.?,
-                        layer.shortconv_conv_weight.?,
-                        if (layer.shortconv_conv_bias) |b| b else null,
-                        layer.shortconv_out_proj_bf16.?,
-                    );
-                },
-                .mamba => {
-                    if (layer.mambaStorageKind() != .dense) return error.InvalidTensorType;
-                    const in_proj = layer.mamba_in_proj_bf16 orelse return error.InvalidTensorType;
-                    const out_proj = layer.mamba_out_proj_bf16 orelse return error.InvalidTensorType;
-                    const conv_weight = layer.mamba_conv_weight orelse return error.InvalidTensorType;
-                    const a_log = layer.mamba_a_log orelse return error.InvalidTensorType;
-                    const d_skip = layer.mamba_d_skip orelse return error.InvalidTensorType;
-
-                    if (layer.mamba_gate_up_bf16 == null and layer.mamba_down_proj_bf16 != null) return error.InvalidTensorType;
-                    if (layer.mamba_gate_up_bf16 != null and layer.mamba_down_proj_bf16 == null) return error.InvalidTensorType;
-
-                    model_runtime.mlx_dense_model_set_layer_mamba_bf16(
-                        dense,
-                        layer_idx,
-                        layer.mamba_d_state,
-                        layer.mamba_d_conv,
-                        layer.mamba_n_heads,
-                        layer.mamba_d_head,
-                        layer.mamba_n_groups,
-                        @intFromEnum(layer.mamba_gate_up_layout),
-                        layer.ln1_weight,
-                        conv_weight,
-                        if (layer.mamba_conv_bias) |v| v else null,
-                        a_log,
-                        d_skip,
-                        if (layer.mamba_dt_bias) |v| v else null,
-                        if (layer.mamba_norm_weight) |v| v else null,
-                        in_proj,
-                        out_proj,
-                        layer.ln2_weight,
-                        if (layer.mamba_gate_up_bf16) |v| v else null,
-                        if (layer.mamba_down_proj_bf16) |v| v else null,
-                    );
-                },
-            }
-        }
-
-        weight_handles.decode_model = model_runtime.decodeModelFromDense(dense) orelse return error.InvalidState;
+        weight_handles.decode_model = model_runtime.decodeModelFromFused(fused) orelse return error.NotImplemented;
+        log.debug("inference", "Metal decode-model ready", .{ .kind = "quantized" }, @src());
+        return;
     }
+
+    const embedding_handle = weight_handles.embed_tokens orelse return error.DenseModelRequiresEmbeddings;
+    const lm_head_handle = weight_handles.lm_head orelse return error.DenseModelRequiresLMHead;
+    const dense = model_runtime.mlx_dense_model_create(
+        layer_count,
+        head_count,
+        kv_head_count,
+        head_dim,
+        model_width,
+        config.rope_theta,
+        config.norm_eps,
+    );
+    errdefer model_runtime.mlx_dense_model_free(dense);
+
+    model_runtime.mlx_dense_model_set_embeddings(dense, embedding_handle);
+    model_runtime.mlx_dense_model_set_final(dense, weight_handles.ln_final, lm_head_handle);
+
+    if (weight_handles.has_norm_weight_offset or config.use_gelu or config.query_pre_attn_scalar != 0) {
+        model_runtime.mlx_dense_model_set_arch_config(
+            dense,
+            weight_handles.has_norm_weight_offset,
+            config.use_gelu,
+            config.query_pre_attn_scalar,
+        );
+    }
+
+    const has_custom_scaling = config.embedding_multiplier != 1.0 or
+        config.attention_multiplier != 0.0 or
+        config.residual_multiplier != 1.0 or
+        config.logits_scaling != 1.0;
+    if (has_custom_scaling) {
+        model_runtime.mlx_dense_model_set_scaling_config(
+            dense,
+            config.embedding_multiplier,
+            config.attention_multiplier,
+            config.residual_multiplier,
+            config.logits_scaling,
+        );
+    }
+
+    const layer_kind_plan = try buildDecodeLayerKindPlan(allocator, weight_handles.layers);
+    defer allocator.free(layer_kind_plan);
+    model_runtime.mlx_dense_model_set_topology(dense, layer_kind_plan.ptr, layer_kind_plan.len);
+
+    for (weight_handles.layers, 0..) |*layer, layer_idx| {
+        switch (layer.kind) {
+            .attention_mlp => model_runtime.mlx_dense_model_set_layer(
+                dense,
+                layer_idx,
+                layer.ln1_weight,
+                layer.q_proj_bf16.?,
+                layer.k_proj_bf16.?,
+                layer.v_proj_bf16.?,
+                layer.o_proj_bf16.?,
+                layer.ln2_weight,
+                layer.w1_bf16.?,
+                layer.w3_bf16.?,
+                layer.w2_bf16.?,
+                if (layer.q_norm) |qn| qn else null,
+                if (layer.k_norm) |kn| kn else null,
+                0,
+                0,
+                null,
+                null,
+                null,
+                null,
+            ),
+            .shortconv => model_runtime.mlx_dense_model_set_layer(
+                dense,
+                layer_idx,
+                layer.ln1_weight,
+                null,
+                null,
+                null,
+                null,
+                layer.ln2_weight,
+                layer.w1_bf16.?,
+                layer.w3_bf16.?,
+                layer.w2_bf16.?,
+                null,
+                null,
+                layer.shortconv_d_conv,
+                layer.shortconv_conv_dim,
+                layer.shortconv_in_proj_bf16.?,
+                layer.shortconv_conv_weight.?,
+                if (layer.shortconv_conv_bias) |bias| bias else null,
+                layer.shortconv_out_proj_bf16.?,
+            ),
+            .mamba => unreachable,
+        }
+    }
+
+    weight_handles.decode_model = model_runtime.decodeModelFromDense(dense) orelse return error.NotImplemented;
+    log.debug("inference", "Metal decode-model ready", .{ .kind = "dense" }, @src());
 }
 
 /// Free all GPU weight handles.
 pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles) void {
+    if (weight_handles.decode_model) |decode_model| {
+        model_runtime.decodeModelFree(decode_model);
+    }
     if (weight_handles.embed_tokens) |embedding_handle| {
         mlx_graph.freeArray(embedding_handle);
     }
@@ -1753,10 +1436,6 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
         allocator.destroy(quantized_weight);
     }
 
-    if (weight_handles.decode_model) |decode_model| {
-        model_runtime.decodeModelFree(decode_model);
-    }
-
     allocator.destroy(weight_handles);
 }
 
@@ -1828,7 +1507,7 @@ pub const WeightHandles = struct {
     // Per-layer weights
     layers: []LayerWeights,
 
-    // Fully prepared decode model (quantized or dense backend implementation).
+    // Fully prepared decode model (dense backend implementation).
     decode_model: ?model_runtime.DecodeModel = null,
 
     // Final
@@ -1940,6 +1619,7 @@ pub const WeightHandles = struct {
         };
 
         kind: LayerKind = .attention_mlp,
+        program: ?[]const models.layer_ops.LayerOp = null,
         ln1_weight: ArrayHandle,
         ln2_weight: ArrayHandle,
 
@@ -2238,7 +1918,6 @@ pub const BlockType = WeightHandles.LayerWeights.LayerKind;
 
 const testing = std.testing;
 const metal_device = compute.metal.device;
-const block_kernels = @import("../../cpu/executor/weights.zig");
 const model_executor = @import("model.zig");
 
 test "resolveAttentionMixerLayout returns quantized for fully quantized attention projections" {
@@ -2388,48 +2067,7 @@ test "LayerWeights storage helpers classify MLA dense path" {
     try testing.expectEqual(WeightHandles.LayerWeights.MLAStorageKind.dense, layer.mlaStorageKind());
 }
 
-test "classifyDecodeModelCandidate returns quantized for mixed attention/shortconv quantized layers" {
-    var layers = [_]WeightHandles.LayerWeights{
-        .{
-            .kind = .attention_mlp,
-            .ln1_weight = testHandle(1),
-            .ln2_weight = testHandle(2),
-            .q_proj = testQuantizedWeight(10, 64, 4),
-            .k_proj = testQuantizedWeight(20, 64, 4),
-            .v_proj = testQuantizedWeight(30, 64, 4),
-            .o_proj = testQuantizedWeight(40, 64, 4),
-            .w1 = testQuantizedWeight(50, 64, 4),
-            .w2 = testQuantizedWeight(60, 64, 4),
-            .w3 = testQuantizedWeight(70, 64, 4),
-        },
-        .{
-            .kind = .shortconv,
-            .ln1_weight = testHandle(3),
-            .ln2_weight = testHandle(4),
-            .shortconv_d_conv = 3,
-            .shortconv_conv_dim = 1024,
-            .shortconv_in_proj = testQuantizedWeight(80, 64, 4),
-            .shortconv_out_proj = testQuantizedWeight(90, 64, 4),
-            .shortconv_conv_weight = testHandle(100),
-            .w1 = testQuantizedWeight(110, 64, 4),
-            .w2 = testQuantizedWeight(120, 64, 4),
-            .w3 = testQuantizedWeight(130, 64, 4),
-        },
-    };
-    var weight_handles = WeightHandles{
-        .embed_tokens = null,
-        .embed_tokens_quantized = null,
-        .layers = &layers,
-        .decode_model = null,
-        .ln_final = testHandle(5),
-        .lm_head = null,
-        .lm_head_quantized = null,
-    };
-
-    try testing.expectEqual(DecodeModelCandidate.quantized, classifyDecodeModelCandidate(&weight_handles));
-}
-
-test "classifyDecodeModelCandidate returns dense for mixed attention/shortconv dense layers" {
+test "classifyDecodeModelCandidate returns dense when all layers are dense" {
     var layers = [_]WeightHandles.LayerWeights{
         .{
             .kind = .attention_mlp,
@@ -2443,212 +2081,20 @@ test "classifyDecodeModelCandidate returns dense for mixed attention/shortconv d
             .w2_bf16 = testHandle(15),
             .w3_bf16 = testHandle(16),
         },
-        .{
-            .kind = .shortconv,
-            .ln1_weight = testHandle(20),
-            .ln2_weight = testHandle(21),
-            .shortconv_d_conv = 3,
-            .shortconv_conv_dim = 1024,
-            .shortconv_in_proj_bf16 = testHandle(22),
-            .shortconv_out_proj_bf16 = testHandle(23),
-            .shortconv_conv_weight = testHandle(24),
-            .w1_bf16 = testHandle(25),
-            .w2_bf16 = testHandle(26),
-            .w3_bf16 = testHandle(27),
-        },
     };
-    var weight_handles = WeightHandles{
+    var handles = WeightHandles{
         .embed_tokens = null,
         .embed_tokens_quantized = null,
         .layers = &layers,
         .decode_model = null,
-        .ln_final = testHandle(30),
+        .ln_final = testHandle(100),
         .lm_head = null,
         .lm_head_quantized = null,
     };
-
-    try testing.expectEqual(DecodeModelCandidate.dense, classifyDecodeModelCandidate(&weight_handles));
+    try testing.expectEqual(DecodeModelCandidate.dense, classifyDecodeModelCandidate(&handles));
 }
 
-test "classifyDecodeModelCandidate returns quantized for quantized attention with moe ffn" {
-    var moe = WeightHandles.MoEWeights{
-        .router_w = testHandle(1),
-        .gate_w = testHandle(2),
-        .gate_s = testHandle(3),
-        .up_w = testHandle(4),
-        .up_s = testHandle(5),
-        .down_w = testHandle(6),
-        .down_s = testHandle(7),
-        .num_experts = 8,
-        .experts_per_token = 2,
-    };
-    var layers = [_]WeightHandles.LayerWeights{
-        .{
-            .kind = .attention_mlp,
-            .ln1_weight = testHandle(10),
-            .ln2_weight = testHandle(11),
-            .q_proj = testQuantizedWeight(20, 64, 4),
-            .k_proj = testQuantizedWeight(30, 64, 4),
-            .v_proj = testQuantizedWeight(40, 64, 4),
-            .o_proj = testQuantizedWeight(50, 64, 4),
-            .moe = &moe,
-        },
-    };
-    var weight_handles = WeightHandles{
-        .embed_tokens = null,
-        .embed_tokens_quantized = null,
-        .layers = &layers,
-        .decode_model = null,
-        .ln_final = testHandle(12),
-        .lm_head = null,
-        .lm_head_quantized = null,
-    };
-
-    try testing.expectEqual(DecodeModelCandidate.quantized, classifyDecodeModelCandidate(&weight_handles));
-}
-
-test "classifyDecodeModelCandidate accepts quantized mamba layers for decode-model path" {
-    var layers = [_]WeightHandles.LayerWeights{
-        .{
-            .kind = .mamba,
-            .ln1_weight = testHandle(1),
-            .ln2_weight = testHandle(2),
-            .mamba_d_state = 16,
-            .mamba_d_conv = 4,
-            .mamba_n_heads = 8,
-            .mamba_d_head = 16,
-            .mamba_n_groups = 1,
-            .mamba_in_proj = testQuantizedWeight(10, 64, 4),
-            .mamba_out_proj = testQuantizedWeight(20, 64, 4),
-            .mamba_conv_weight = testHandle(30),
-            .mamba_a_log = testHandle(31),
-            .mamba_d_skip = testHandle(32),
-        },
-    };
-    var weight_handles = WeightHandles{
-        .embed_tokens = null,
-        .embed_tokens_quantized = null,
-        .layers = &layers,
-        .decode_model = null,
-        .ln_final = testHandle(3),
-        .lm_head = null,
-        .lm_head_quantized = null,
-        .has_mamba = true,
-    };
-
-    try testing.expectEqual(DecodeModelCandidate.quantized, classifyDecodeModelCandidate(&weight_handles));
-}
-
-test "classifyDecodeModelCandidate accepts dense mamba layers for decode-model path" {
-    var layers = [_]WeightHandles.LayerWeights{
-        .{
-            .kind = .mamba,
-            .ln1_weight = testHandle(1),
-            .ln2_weight = testHandle(2),
-            .mamba_d_state = 16,
-            .mamba_d_conv = 4,
-            .mamba_n_heads = 8,
-            .mamba_d_head = 16,
-            .mamba_n_groups = 1,
-            .mamba_in_proj_bf16 = testHandle(10),
-            .mamba_out_proj_bf16 = testHandle(11),
-            .mamba_conv_weight = testHandle(30),
-            .mamba_a_log = testHandle(31),
-            .mamba_d_skip = testHandle(32),
-        },
-    };
-    var weight_handles = WeightHandles{
-        .embed_tokens = null,
-        .embed_tokens_quantized = null,
-        .layers = &layers,
-        .decode_model = null,
-        .ln_final = testHandle(3),
-        .lm_head = null,
-        .lm_head_quantized = null,
-        .has_mamba = true,
-    };
-
-    try testing.expectEqual(DecodeModelCandidate.dense, classifyDecodeModelCandidate(&weight_handles));
-}
-
-test "classifyDecodeModelCandidate accepts quantized MLA layers for decode-model path" {
-    var layers = [_]WeightHandles.LayerWeights{
-        .{
-            .kind = .attention_mlp,
-            .ln1_weight = testHandle(1),
-            .ln2_weight = testHandle(2),
-            .mla_config = .{
-                .q_lora_rank = 8,
-                .kv_lora_rank = 8,
-                .qk_head_dim = 16,
-                .qk_rope_head_dim = 4,
-                .qk_nope_head_dim = 12,
-                .v_head_dim = 12,
-                .rope_interleave = true,
-            },
-            .mla_q_a_proj = testQuantizedWeight(10, 64, 4),
-            .mla_q_b_proj = testQuantizedWeight(20, 64, 4),
-            .mla_kv_a_proj = testQuantizedWeight(30, 64, 4),
-            .mla_kv_b_proj = testQuantizedWeight(40, 64, 4),
-            .mla_q_a_norm = testHandle(50),
-            .mla_kv_a_norm = testHandle(51),
-            .o_proj = testQuantizedWeight(60, 64, 4),
-        },
-    };
-    var weight_handles = WeightHandles{
-        .embed_tokens = null,
-        .embed_tokens_quantized = null,
-        .layers = &layers,
-        .decode_model = null,
-        .ln_final = testHandle(61),
-        .lm_head = null,
-        .lm_head_quantized = null,
-    };
-
-    try testing.expectEqual(DecodeModelCandidate.quantized, classifyDecodeModelCandidate(&weight_handles));
-}
-
-test "classifyDecodeModelCandidate accepts dense MLA layers for decode-model path" {
-    var layers = [_]WeightHandles.LayerWeights{
-        .{
-            .kind = .attention_mlp,
-            .ln1_weight = testHandle(1),
-            .ln2_weight = testHandle(2),
-            .mla_config = .{
-                .q_lora_rank = 8,
-                .kv_lora_rank = 8,
-                .qk_head_dim = 16,
-                .qk_rope_head_dim = 4,
-                .qk_nope_head_dim = 12,
-                .v_head_dim = 12,
-                .rope_interleave = true,
-            },
-            .mla_q_a_proj_bf16 = testHandle(10),
-            .mla_q_b_proj_bf16 = testHandle(11),
-            .mla_kv_a_proj_bf16 = testHandle(12),
-            .mla_kv_b_proj_bf16 = testHandle(13),
-            .mla_q_a_norm = testHandle(14),
-            .mla_kv_a_norm = testHandle(15),
-            .o_proj_bf16 = testHandle(16),
-            .w1_bf16 = testHandle(17),
-            .w2_bf16 = testHandle(18),
-            .w3_bf16 = testHandle(19),
-        },
-    };
-    var weight_handles = WeightHandles{
-        .embed_tokens = null,
-        .embed_tokens_quantized = null,
-        .layers = &layers,
-        .decode_model = null,
-        .ln_final = testHandle(20),
-        .lm_head = null,
-        .lm_head_quantized = null,
-    };
-
-    try testing.expectEqual(DecodeModelCandidate.dense, classifyDecodeModelCandidate(&weight_handles));
-}
-
-test "quantizedDecodeModelLayout rejects mixed quantization layout" {
+test "classifyDecodeModelCandidate returns none for mixed dense and quantized layers" {
     var layers = [_]WeightHandles.LayerWeights{
         .{
             .kind = .attention_mlp,
@@ -2663,35 +2109,33 @@ test "quantizedDecodeModelLayout rejects mixed quantization layout" {
             .w3 = testQuantizedWeight(70, 64, 4),
         },
         .{
-            .kind = .shortconv,
+            .kind = .attention_mlp,
             .ln1_weight = testHandle(3),
             .ln2_weight = testHandle(4),
-            .shortconv_d_conv = 3,
-            .shortconv_conv_dim = 1024,
-            .shortconv_in_proj = testQuantizedWeight(80, 128, 4),
-            .shortconv_out_proj = testQuantizedWeight(90, 128, 4),
-            .shortconv_conv_weight = testHandle(100),
-            .w1 = testQuantizedWeight(110, 64, 4),
-            .w2 = testQuantizedWeight(120, 64, 4),
-            .w3 = testQuantizedWeight(130, 64, 4),
+            .q_proj_bf16 = testHandle(80),
+            .k_proj_bf16 = testHandle(81),
+            .v_proj_bf16 = testHandle(82),
+            .o_proj_bf16 = testHandle(83),
+            .w1_bf16 = testHandle(84),
+            .w2_bf16 = testHandle(85),
+            .w3_bf16 = testHandle(86),
         },
     };
-    var weight_handles = WeightHandles{
+    var handles = WeightHandles{
         .embed_tokens = null,
         .embed_tokens_quantized = null,
         .layers = &layers,
         .decode_model = null,
-        .ln_final = testHandle(5),
+        .ln_final = testHandle(101),
         .lm_head = null,
         .lm_head_quantized = null,
     };
-
-    try testing.expect(quantizedDecodeModelLayout(&weight_handles) == null);
+    try testing.expectEqual(DecodeModelCandidate.none, classifyDecodeModelCandidate(&handles));
 }
 
-/// Helper to create a minimal test LoadedModel with BF16 weights (non-quantized path)
-/// This creates a tiny 1-layer model for testing GPU weight loading
-fn createTestLoadedModel(allocator: std.mem.Allocator) !*LoadedModel {
+/// Helper to create a minimal test LoadedModel with BF16 weights (non-quantized path).
+/// This is test-only scaffolding used by Metal backend regression tests.
+pub fn createTestLoadedModel(allocator: std.mem.Allocator) !*LoadedModel {
     var arena = std.heap.ArenaAllocator.init(allocator);
     const arena_alloc = arena.allocator();
 
@@ -2781,19 +2225,31 @@ fn createTestLoadedModel(allocator: std.mem.Allocator) !*LoadedModel {
     const w3_view = try arena_alloc.create(tensor_mod.Tensor);
     w3_view.* = w3.toTensor();
 
-    // Create block weights array
-    const blocks = try arena_alloc.alloc(block_kernels.BlockWeights, 1);
-    blocks[0] = .{ .attention_mlp = .{
-        .ln1_weight = ln1_view,
-        .ln2_weight = ln2_view,
-        .q_proj = q_view,
-        .k_proj = k_view,
-        .v_proj = v_view,
-        .o_proj = o_view,
-        .w1 = w1_view,
-        .w2 = w2_view,
-        .w3 = w3_view,
-    } };
+    // Create layer registry map
+    const blocks = try arena_alloc.alloc(models.runtime_blocks.LayerWeights, 1);
+    var map: models.runtime_blocks.WeightMap = .{};
+    try map.put(arena_alloc, "input_layernorm.weight", ln1_view);
+    try map.put(arena_alloc, "post_attention_layernorm.weight", ln2_view);
+    try map.put(arena_alloc, "self_attn.q_proj.weight", q_view);
+    try map.put(arena_alloc, "self_attn.k_proj.weight", k_view);
+    try map.put(arena_alloc, "self_attn.v_proj.weight", v_view);
+    try map.put(arena_alloc, "self_attn.o_proj.weight", o_view);
+    try map.put(arena_alloc, "mlp.gate_proj.weight", w1_view);
+    try map.put(arena_alloc, "mlp.down_proj.weight", w2_view);
+    try map.put(arena_alloc, "mlp.up_proj.weight", w3_view);
+    blocks[0] = .{
+        .block_type = .attention_mlp,
+        .weight_map = map,
+        .map_context = .{
+            .sliding_window = 0,
+            .kernel_meta = .{},
+            .mamba_config = null,
+            .shortconv_config = null,
+            .num_experts = 0,
+            .experts_per_token = 0,
+            .allocator = null,
+        },
+    };
 
     // Create LoadedModel
     const loaded = try allocator.create(LoadedModel);
@@ -2822,7 +2278,8 @@ fn createTestLoadedModel(allocator: std.mem.Allocator) !*LoadedModel {
     return loaded;
 }
 
-fn destroyTestLoadedModel(allocator: std.mem.Allocator, loaded: *LoadedModel) void {
+/// Paired teardown for `createTestLoadedModel`.
+pub fn destroyTestLoadedModel(allocator: std.mem.Allocator, loaded: *LoadedModel) void {
     loaded.arena.deinit();
     allocator.destroy(loaded);
 }
@@ -2880,60 +2337,6 @@ test "freeWeights releases all GPU resources" {
     freeWeights(testing.allocator, weight_handles);
 
     // If we get here without crash, test passes
-}
-
-test "createDecodeModel skips when decode_model already exists (quantized)" {
-    if (comptime builtin.os.tag != .macos) return;
-    if (!metal_device.isAvailable()) return;
-
-    const loaded = try createTestLoadedModel(testing.allocator);
-    defer destroyTestLoadedModel(testing.allocator, loaded);
-
-    const weight_handles = try loadWeightsToGPU(testing.allocator, loaded);
-    defer freeWeights(testing.allocator, weight_handles);
-
-    // Set a sentinel decode model
-    const original_decode_model = weight_handles.decode_model;
-    weight_handles.decode_model = .{
-        .handle = @ptrFromInt(0xDEADBEEF),
-    };
-
-    // createDecodeModel should return early without changing it
-    try createDecodeModel(testing.allocator, weight_handles, loaded.config);
-
-    // Verify it wasn't changed
-    try testing.expect(weight_handles.decode_model != null);
-    try testing.expect(weight_handles.decode_model.?.handle == @as(*anyopaque, @ptrFromInt(0xDEADBEEF)));
-
-    // Restore for proper cleanup
-    weight_handles.decode_model = original_decode_model;
-}
-
-test "createDecodeModel skips when decode_model already exists (dense)" {
-    if (comptime builtin.os.tag != .macos) return;
-    if (!metal_device.isAvailable()) return;
-
-    const loaded = try createTestLoadedModel(testing.allocator);
-    defer destroyTestLoadedModel(testing.allocator, loaded);
-
-    const weight_handles = try loadWeightsToGPU(testing.allocator, loaded);
-    defer freeWeights(testing.allocator, weight_handles);
-
-    // Set a sentinel decode model
-    const original_decode_model = weight_handles.decode_model;
-    weight_handles.decode_model = .{
-        .handle = @ptrFromInt(0xDEADBEEF),
-    };
-
-    // createDecodeModel should return early without error
-    try createDecodeModel(testing.allocator, weight_handles, loaded.config);
-
-    // Verify decode_model wasn't changed
-    try testing.expect(weight_handles.decode_model != null);
-    try testing.expect(weight_handles.decode_model.?.handle == @as(*anyopaque, @ptrFromInt(0xDEADBEEF)));
-
-    // Restore for proper cleanup
-    weight_handles.decode_model = original_decode_model;
 }
 
 test "Model.forward produces logits from input tokens" {

@@ -35,6 +35,36 @@ pub const MambaState = mamba.MambaState;
 pub const MambaScratch = mamba.MambaScratch;
 pub const ShortConvState = shortconv.ShortConvState;
 pub const ShortConvScratch = shortconv.ShortConvScratch;
+const BatchedKVCache = kv_cache.BatchedKVCache;
+
+pub const BatchedKernelError = error{
+    UnsupportedBatchedDecodeKernel,
+};
+
+pub const SlotContextError = error{
+    MissingAttentionCache,
+    MissingMlaCache,
+    MissingMlaScratch,
+    MissingMambaState,
+    MissingMambaScratch,
+    MissingShortConvState,
+    MissingShortConvScratch,
+    MissingBatchedCache,
+};
+
+pub const SlotPersistentState = struct {
+    attn_cache: ?AttnCache = null,
+    mla_cache: ?MLACache = null,
+    mamba_state: ?MambaState = null,
+    shortconv_state: ?ShortConvState = null,
+};
+
+pub const SharedPersistentState = struct {
+    batched_cache: ?*BatchedKVCache = null,
+    mla_scratch: ?*MLATemp = null,
+    mamba_scratch: ?*MambaScratch = null,
+    shortconv_scratch: ?*ShortConvScratch = null,
+};
 
 /// Number of temporary buffers available.
 /// Array index maps to BufferId enum values (except index 0):
@@ -55,23 +85,18 @@ pub const ScratchBuffer = struct {
     /// Unified temporary buffer array. See NUM_TMP_BUFFERS doc for index mapping.
     /// Access via getTmp(BufferId, len) or getLayerTmp(len) for index 0.
     tmp: [NUM_TMP_BUFFERS][]f32 = [_][]f32{&.{}} ** NUM_TMP_BUFFERS,
+    slot_states: []SlotPersistentState = &.{},
 
-    attn_caches: []attn.AttnCache = &.{},
     attn_scratch: attn.AttnTemp = .{},
     ffn_scratch: ffn.FfnScratch = .{},
     moe_scratch: moe.MoEScratch = .{}, // For MoE layers
     matmul_scratch: cpu_linalg.MatmulScratch,
 
-    // Mamba state/scratch for heterogeneous models (null for homogeneous attention-only)
-    mamba_states: ?[]mamba.MambaState = null,
+    // Shared recurrent scratch for heterogeneous models.
     mamba_scratch: ?mamba.MambaScratch = null,
 
-    // ShortConv state/scratch for heterogeneous models (null for homogeneous attention-only)
-    shortconv_states: ?[]shortconv.ShortConvState = null,
     shortconv_scratch: ?shortconv.ShortConvScratch = null,
 
-    // MLA (Multi-Latent Attention) cache/scratch for MLA models (null for standard attention)
-    mla_caches: ?[]mla.MLACache = null,
     mla_scratch: ?mla.MLATemp = null,
 
     /// Get a temporary buffer by BufferId and length.
@@ -98,16 +123,20 @@ pub const ScratchBuffer = struct {
     }
 
     pub fn init(allocator: std.mem.Allocator, d_model: usize, d_ff: usize, n_layers: usize) !ScratchBuffer {
-        const attn_cache_buffer = try allocator.alloc(attn.AttnCache, n_layers);
-        errdefer allocator.free(attn_cache_buffer);
-        for (attn_cache_buffer) |*cache| cache.* = .{};
+        const slot_state_buffer = try allocator.alloc(SlotPersistentState, n_layers);
+        errdefer allocator.free(slot_state_buffer);
+        for (slot_state_buffer) |*slot_state| {
+            slot_state.* = .{
+                .attn_cache = .{},
+            };
+        }
         var matmul_workspace = try cpu_linalg.MatmulScratch.init(allocator);
         errdefer matmul_workspace.deinit();
         return .{
             .allocator = allocator,
             .d_model = d_model,
             .d_ff = d_ff,
-            .attn_caches = attn_cache_buffer,
+            .slot_states = slot_state_buffer,
             .matmul_scratch = matmul_workspace,
         };
     }
@@ -136,29 +165,25 @@ pub const ScratchBuffer = struct {
         }
 
         self.attn_scratch.deinit(self.allocator);
-        for (self.attn_caches) |*cache| cache.deinit(self.allocator);
-        if (self.attn_caches.len > 0) self.allocator.free(self.attn_caches);
+        for (self.slot_states) |*slot_state| {
+            if (slot_state.attn_cache) |*cache| cache.deinit(self.allocator);
+            if (slot_state.mla_cache) |*cache| cache.deinit(self.allocator);
+            if (slot_state.mamba_state) |*state| state.deinit();
+            if (slot_state.shortconv_state) |*state| state.deinit();
+        }
+        if (self.slot_states.len > 0) {
+            self.allocator.free(self.slot_states);
+            self.slot_states = &.{};
+        }
         self.ffn_scratch.deinit(self.allocator);
         self.moe_scratch.deinit(self.allocator);
         self.matmul_scratch.deinit();
 
-        // Clean up Mamba resources if present
-        if (self.mamba_states) |states| {
-            for (states) |*state| state.deinit();
-            self.allocator.free(states);
-            self.mamba_states = null;
-        }
         if (self.mamba_scratch) |*scratch| {
             scratch.deinit();
             self.mamba_scratch = null;
         }
 
-        // Clean up MLA resources if present
-        if (self.mla_caches) |caches| {
-            for (caches) |*cache| cache.deinit(self.allocator);
-            self.allocator.free(caches);
-            self.mla_caches = null;
-        }
         if (self.mla_scratch) |*scratch| {
             scratch.deinit(self.allocator);
             self.mla_scratch = null;
@@ -166,48 +191,40 @@ pub const ScratchBuffer = struct {
     }
 
     pub fn resetCaches(self: *ScratchBuffer) void {
-        for (self.attn_caches) |*cache| cache.resetCache();
-        // Reset MLA caches if present
-        if (self.mla_caches) |caches| {
-            for (caches) |*cache| cache.resetCache();
-        }
-        // Reset Mamba state if present
-        if (self.mamba_states) |states| {
-            for (states) |*state| state.reset();
+        for (self.slot_states) |*slot_state| {
+            if (slot_state.attn_cache) |*cache| cache.resetCache();
+            if (slot_state.mla_cache) |*cache| cache.resetCache();
+            if (slot_state.mamba_state) |*state| state.reset();
+            if (slot_state.shortconv_state) |*state| state.reset();
         }
     }
 
-    /// Initialize Mamba state and scratch for heterogeneous models.
-    /// Call this after init() if the model contains Mamba layers.
-    pub fn initMamba(self: *ScratchBuffer, n_mamba_layers: usize, config: mamba.MambaConfig) !void {
-        if (n_mamba_layers == 0) return;
+    /// Initialize Mamba state and scratch for selected global layer indices.
+    /// Call this after init() when the model contains Mamba layers.
+    pub fn initMamba(self: *ScratchBuffer, layer_indices: []const usize, config: mamba.MambaConfig) !void {
+        if (layer_indices.len == 0) return;
 
-        // Allocate state for each Mamba layer
-        const states = try self.allocator.alloc(mamba.MambaState, n_mamba_layers);
-        errdefer self.allocator.free(states);
-
-        for (states, 0..) |*state, i| {
-            state.* = mamba.MambaState.init(self.allocator, 1, config) catch |err| {
-                // Clean up already-initialized states on error
-                for (0..i) |j| states[j].deinit();
-                return err;
-            };
+        for (layer_indices) |layer_idx| {
+            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
+            if (self.slot_states[layer_idx].mamba_state != null) return error.AlreadyInitialized;
         }
-
-        self.mamba_states = states;
+        var initialized: usize = 0;
+        errdefer {
+            for (0..initialized) |idx| {
+                const layer_idx = layer_indices[idx];
+                if (self.slot_states[layer_idx].mamba_state) |*state| {
+                    state.deinit();
+                    self.slot_states[layer_idx].mamba_state = null;
+                }
+            }
+        }
+        for (layer_indices) |layer_idx| {
+            self.slot_states[layer_idx].mamba_state = try mamba.MambaState.init(self.allocator, 1, config);
+            initialized += 1;
+        }
 
         // Allocate shared scratch buffer (same config for all layers)
         self.mamba_scratch = try mamba.MambaScratch.init(self.allocator, config);
-    }
-
-    /// Get Mamba state for a specific layer (by Mamba layer index, not global layer index).
-    pub fn getMambaState(self: *ScratchBuffer, mamba_layer_idx: usize) ?*mamba.MambaState {
-        if (self.mamba_states) |states| {
-            if (mamba_layer_idx < states.len) {
-                return &states[mamba_layer_idx];
-            }
-        }
-        return null;
     }
 
     /// Get shared Mamba scratch buffer.
@@ -216,37 +233,32 @@ pub const ScratchBuffer = struct {
         return null;
     }
 
-    /// Initialize ShortConv state and scratch for heterogeneous models.
-    /// Call this after init() if the model contains ShortConv layers.
-    pub fn initShortConv(self: *ScratchBuffer, n_shortconv_layers: usize, config: shortconv.ShortConvConfig) !void {
-        if (n_shortconv_layers == 0) return;
+    /// Initialize ShortConv state and scratch for selected global layer indices.
+    /// Call this after init() when the model contains ShortConv layers.
+    pub fn initShortConv(self: *ScratchBuffer, layer_indices: []const usize, config: shortconv.ShortConvConfig) !void {
+        if (layer_indices.len == 0) return;
 
-        // Allocate state for each ShortConv layer
-        const states = try self.allocator.alloc(shortconv.ShortConvState, n_shortconv_layers);
-        errdefer self.allocator.free(states);
-
-        for (states, 0..) |*state, i| {
-            state.* = shortconv.ShortConvState.init(self.allocator, 1, config) catch |err| {
-                // Clean up already-initialized states on error
-                for (0..i) |j| states[j].deinit();
-                return err;
-            };
+        for (layer_indices) |layer_idx| {
+            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
+            if (self.slot_states[layer_idx].shortconv_state != null) return error.AlreadyInitialized;
         }
-
-        self.shortconv_states = states;
+        var initialized: usize = 0;
+        errdefer {
+            for (0..initialized) |idx| {
+                const layer_idx = layer_indices[idx];
+                if (self.slot_states[layer_idx].shortconv_state) |*state| {
+                    state.deinit();
+                    self.slot_states[layer_idx].shortconv_state = null;
+                }
+            }
+        }
+        for (layer_indices) |layer_idx| {
+            self.slot_states[layer_idx].shortconv_state = try shortconv.ShortConvState.init(self.allocator, 1, config);
+            initialized += 1;
+        }
 
         // Allocate shared scratch buffer (same config for all layers)
         self.shortconv_scratch = try shortconv.ShortConvScratch.init(self.allocator, config);
-    }
-
-    /// Get ShortConv state for a specific layer (by ShortConv layer index, not global layer index).
-    pub fn getShortConvState(self: *ScratchBuffer, shortconv_layer_idx: usize) ?*shortconv.ShortConvState {
-        if (self.shortconv_states) |states| {
-            if (shortconv_layer_idx < states.len) {
-                return &states[shortconv_layer_idx];
-            }
-        }
-        return null;
     }
 
     /// Get shared ShortConv scratch buffer.
@@ -277,32 +289,24 @@ pub const ScratchBuffer = struct {
         return &self.moe_scratch;
     }
 
-    /// Initialize MLA cache and scratch for models using Multi-Latent Attention.
-    /// Call this after init() if the model uses MLA (e.g., DeepSeek-V2, Youtu-VL).
-    pub fn initMLA(self: *ScratchBuffer, n_layers: usize) !void {
-        if (n_layers == 0) return;
+    /// Initialize MLA cache and scratch for selected global layer indices.
+    /// Call this after init() for models using MLA (e.g., DeepSeek-V2, Youtu-VL).
+    pub fn initMLA(self: *ScratchBuffer, layer_indices: []const usize) !void {
+        if (layer_indices.len == 0) return;
 
-        // Allocate per-layer MLA caches
-        const caches = try self.allocator.alloc(mla.MLACache, n_layers);
-        errdefer self.allocator.free(caches);
-
-        for (caches) |*cache| {
-            cache.* = .{};
+        for (layer_indices) |layer_idx| {
+            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
+            if (self.slot_states[layer_idx].mla_cache != null) return error.AlreadyInitialized;
+            self.slot_states[layer_idx].mla_cache = .{};
         }
-
-        self.mla_caches = caches;
 
         // Allocate shared scratch buffer (initialized lazily in ensureTemp)
         self.mla_scratch = .{};
     }
 
-    /// Get MLA cache for a specific layer.
-    pub fn getMLACache(self: *ScratchBuffer, layer_idx: usize) ?*mla.MLACache {
-        if (self.mla_caches) |caches| {
-            if (layer_idx < caches.len) {
-                return &caches[layer_idx];
-            }
-        }
+    /// Get mutable persistent slot state for a specific global layer index.
+    pub fn getSlotState(self: *ScratchBuffer, layer_idx: usize) ?*SlotPersistentState {
+        if (layer_idx < self.slot_states.len) return &self.slot_states[layer_idx];
         return null;
     }
 
@@ -313,24 +317,20 @@ pub const ScratchBuffer = struct {
     }
 };
 
-const BatchedKVCache = kv_cache.BatchedKVCache;
-
-pub const BatchedKernelError = error{
-    UnsupportedBatchedDecodeKernel,
-};
-
 /// Runtime resources needed by kernels during execution.
-pub const KernelContext = struct {
+pub const SlotContext = struct {
+    slot_state_ptr: *anyopaque,
+    shared_state: *anyopaque,
     scratch: *ScratchBuffer,
-    matmul_scratch: *cpu_linalg.MatmulScratch,
-    attn_cache: ?*AttnCache = null,
-    mla_cache: ?*MLACache = null,
-    mla_scratch: ?*MLATemp = null,
-    mamba_state: ?*MambaState = null,
-    mamba_scratch: ?*MambaScratch = null,
-    shortconv_state: ?*ShortConvState = null,
-    shortconv_scratch: ?*ShortConvScratch = null,
     use_cache: bool,
+
+    pub fn slotState(self: SlotContext) *SlotPersistentState {
+        return @ptrCast(@alignCast(self.slot_state_ptr));
+    }
+
+    pub fn sharedState(self: SlotContext) *SharedPersistentState {
+        return @ptrCast(@alignCast(self.shared_state));
+    }
 };
 
 /// CPU kernel dispatch union.
@@ -355,14 +355,27 @@ pub const CpuKernel = union(enum) {
         };
     }
 
-    pub fn forward(self: CpuKernel, input: *const Tensor, output: *Tensor, ctx: KernelContext) !void {
+    pub fn forward(self: CpuKernel, input: *const Tensor, output: *Tensor, ctx: SlotContext) !void {
+        const slot_state = ctx.slotState();
+        const shared_state = ctx.sharedState();
         switch (self) {
-            .attention => |k| try k.forward(input, output, ctx.attn_cache.?, &ctx.scratch.attn_scratch, ctx.matmul_scratch, ctx.use_cache),
-            .mla_attention => |k| try k.forward(input, output, ctx.mla_cache.?, ctx.mla_scratch.?, ctx.matmul_scratch, ctx.use_cache),
-            .mamba => |k| try k.forward(input, output, ctx.mamba_state.?, ctx.mamba_scratch.?, ctx.matmul_scratch),
-            .shortconv => |k| try k.forward(input, output, ctx.shortconv_state.?, ctx.shortconv_scratch.?, ctx.matmul_scratch),
-            .swiglu => |k| try k.forward(input, output, &ctx.scratch.ffn_scratch, ctx.matmul_scratch),
-            .moe => |k| try k.forward(input, output, &ctx.scratch.moe_scratch, ctx.matmul_scratch),
+            .attention => |k| if (slot_state.attn_cache) |*attn_cache| {
+                try k.forward(input, output, attn_cache, &ctx.scratch.attn_scratch, &ctx.scratch.matmul_scratch, ctx.use_cache);
+            } else return SlotContextError.MissingAttentionCache,
+            .mla_attention => |k| if (slot_state.mla_cache) |*mla_cache| {
+                const mla_scratch = shared_state.mla_scratch orelse return SlotContextError.MissingMlaScratch;
+                try k.forward(input, output, mla_cache, mla_scratch, &ctx.scratch.matmul_scratch, ctx.use_cache);
+            } else return SlotContextError.MissingMlaCache,
+            .mamba => |k| if (slot_state.mamba_state) |*mamba_state| {
+                const mamba_scratch = shared_state.mamba_scratch orelse return SlotContextError.MissingMambaScratch;
+                try k.forward(input, output, mamba_state, mamba_scratch, &ctx.scratch.matmul_scratch);
+            } else return SlotContextError.MissingMambaState,
+            .shortconv => |k| if (slot_state.shortconv_state) |*shortconv_state| {
+                const shortconv_scratch = shared_state.shortconv_scratch orelse return SlotContextError.MissingShortConvScratch;
+                try k.forward(input, output, shortconv_state, shortconv_scratch, &ctx.scratch.matmul_scratch);
+            } else return SlotContextError.MissingShortConvState,
+            .swiglu => |k| try k.forward(input, output, &ctx.scratch.ffn_scratch, &ctx.scratch.matmul_scratch),
+            .moe => |k| try k.forward(input, output, &ctx.scratch.moe_scratch, &ctx.scratch.matmul_scratch),
             .norm => |k| k.forward(input, output),
         }
     }
@@ -371,17 +384,30 @@ pub const CpuKernel = union(enum) {
         self: CpuKernel,
         input: *const Tensor,
         output: *Tensor,
-        ctx: KernelContext,
-        batched_cache: *BatchedKVCache,
+        ctx: SlotContext,
         slot_index: usize,
     ) !void {
+        const slot_state = ctx.slotState();
+        const shared_state = ctx.sharedState();
         switch (self) {
-            .attention => |k| try k.forwardWithBatchedCache(input, output, batched_cache, slot_index, &ctx.scratch.attn_scratch, ctx.matmul_scratch, ctx.use_cache),
-            .mla_attention => |k| try k.forward(input, output, ctx.mla_cache.?, ctx.mla_scratch.?, ctx.matmul_scratch, ctx.use_cache),
-            .mamba => |k| try k.forward(input, output, ctx.mamba_state.?, ctx.mamba_scratch.?, ctx.matmul_scratch),
-            .shortconv => |k| try k.forward(input, output, ctx.shortconv_state.?, ctx.shortconv_scratch.?, ctx.matmul_scratch),
-            .swiglu => |k| try k.forward(input, output, ctx.scratch.getFfnScratch(slot_index), ctx.matmul_scratch),
-            .moe => |k| try k.forward(input, output, ctx.scratch.getMoeScratch(slot_index), ctx.matmul_scratch),
+            .attention => |k| {
+                const batched_cache = shared_state.batched_cache orelse return SlotContextError.MissingBatchedCache;
+                try k.forwardWithBatchedCache(input, output, batched_cache, slot_index, &ctx.scratch.attn_scratch, &ctx.scratch.matmul_scratch, ctx.use_cache);
+            },
+            .mla_attention => |k| if (slot_state.mla_cache) |*mla_cache| {
+                const mla_scratch = shared_state.mla_scratch orelse return SlotContextError.MissingMlaScratch;
+                try k.forward(input, output, mla_cache, mla_scratch, &ctx.scratch.matmul_scratch, ctx.use_cache);
+            } else return SlotContextError.MissingMlaCache,
+            .mamba => |k| if (slot_state.mamba_state) |*mamba_state| {
+                const mamba_scratch = shared_state.mamba_scratch orelse return SlotContextError.MissingMambaScratch;
+                try k.forward(input, output, mamba_state, mamba_scratch, &ctx.scratch.matmul_scratch);
+            } else return SlotContextError.MissingMambaState,
+            .shortconv => |k| if (slot_state.shortconv_state) |*shortconv_state| {
+                const shortconv_scratch = shared_state.shortconv_scratch orelse return SlotContextError.MissingShortConvScratch;
+                try k.forward(input, output, shortconv_state, shortconv_scratch, &ctx.scratch.matmul_scratch);
+            } else return SlotContextError.MissingShortConvState,
+            .swiglu => |k| try k.forward(input, output, ctx.scratch.getFfnScratch(slot_index), &ctx.scratch.matmul_scratch),
+            .moe => |k| try k.forward(input, output, ctx.scratch.getMoeScratch(slot_index), &ctx.scratch.matmul_scratch),
             .norm => |k| k.forward(input, output),
         }
     }
@@ -392,22 +418,22 @@ pub const CpuKernel = union(enum) {
         self: CpuKernel,
         input: *const Tensor,
         output: *Tensor,
-        ctx: KernelContext,
-        batched_cache: *BatchedKVCache,
+        ctx: SlotContext,
         slot_indices: []const usize,
     ) !void {
+        const shared_state = ctx.sharedState();
         switch (self) {
             .attention => |k| try k.forwardWithBatchedCacheSlots(
                 input,
                 output,
-                batched_cache,
+                shared_state.batched_cache orelse return SlotContextError.MissingBatchedCache,
                 slot_indices,
                 &ctx.scratch.attn_scratch,
-                ctx.matmul_scratch,
+                &ctx.scratch.matmul_scratch,
                 ctx.use_cache,
             ),
-            .swiglu => |k| try k.forward(input, output, &ctx.scratch.ffn_scratch, ctx.matmul_scratch),
-            .moe => |k| try k.forward(input, output, &ctx.scratch.moe_scratch, ctx.matmul_scratch),
+            .swiglu => |k| try k.forward(input, output, &ctx.scratch.ffn_scratch, &ctx.scratch.matmul_scratch),
+            .moe => |k| try k.forward(input, output, &ctx.scratch.moe_scratch, &ctx.scratch.matmul_scratch),
             .norm => |k| k.forward(input, output),
             .mla_attention, .mamba, .shortconv => return BatchedKernelError.UnsupportedBatchedDecodeKernel,
         }
@@ -415,3 +441,28 @@ pub const CpuKernel = union(enum) {
 };
 
 pub const kernels = @import("../kernels/root.zig");
+
+test "CpuKernel.forward returns typed error when attention cache is missing" {
+    const allocator = std.testing.allocator;
+    var scratch = try ScratchBuffer.init(allocator, 8, 16, 1);
+    defer scratch.deinit();
+
+    var input_data = [_]f32{0} ** 8;
+    var output_data = [_]f32{0} ** 8;
+    const input = Tensor.view3DSlice(input_data[0..], 1, 8);
+    var output = Tensor.view3DSlice(output_data[0..], 1, 8);
+
+    var slot_state = SlotPersistentState{};
+    var shared_state = SharedPersistentState{};
+    const ctx = SlotContext{
+        .slot_state_ptr = &slot_state,
+        .shared_state = &shared_state,
+        .scratch = &scratch,
+        .use_cache = true,
+    };
+
+    // Forward validates state before dereferencing the kernel pointer.
+    const fake_attention = @as(*const attn.MultiHeadAttention, @ptrFromInt(@as(usize, @alignOf(attn.MultiHeadAttention))));
+    const kernel = CpuKernel{ .attention = fake_attention };
+    try std.testing.expectError(SlotContextError.MissingAttentionCache, kernel.forward(&input, &output, ctx));
+}

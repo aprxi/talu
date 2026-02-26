@@ -243,6 +243,329 @@ pub fn runKernelSmoke(backend: anytype) !void {
     );
 }
 
+pub fn probeGaffineU4SequenceRowsSupport(backend: anytype) !bool {
+    if (!backend.device.supportsModuleLaunch()) return false;
+    const function = backend.gaffine_u4_matvec_function orelse return false;
+
+    const in_dim: u32 = 8;
+    const out_dim: u32 = 2;
+    const group_size: u32 = 8;
+    const batch_rows: u32 = 2;
+
+    const input = [_]f32{
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+    };
+    const packed_words = [_]u32{
+        0x7654_3210, // row 0 => 0..7
+        0x0123_4567, // row 1 => 7..0
+    };
+    const scales = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.0),
+    };
+    const biases = [_]u16{
+        dtype.f32ToBf16(0.0),
+        dtype.f32ToBf16(0.0),
+    };
+    const expected = [_]f32{
+        28.0,  28.0,
+        168.0, 84.0,
+    };
+    var actual = [_]f32{0.0} ** (out_dim * batch_rows);
+
+    var input_dev = try backend.device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(&backend.device);
+    var packed_dev = try backend.device.allocBuffer(packed_words.len * @sizeOf(u32));
+    defer packed_dev.deinit(&backend.device);
+    var scales_dev = try backend.device.allocBuffer(scales.len * @sizeOf(u16));
+    defer scales_dev.deinit(&backend.device);
+    var biases_dev = try backend.device.allocBuffer(biases.len * @sizeOf(u16));
+    defer biases_dev.deinit(&backend.device);
+    var out_dev = try backend.device.allocBuffer(actual.len * @sizeOf(f32));
+    defer out_dev.deinit(&backend.device);
+
+    try input_dev.upload(&backend.device, std.mem.sliceAsBytes(input[0..]));
+    try packed_dev.upload(&backend.device, std.mem.sliceAsBytes(packed_words[0..]));
+    try scales_dev.upload(&backend.device, std.mem.sliceAsBytes(scales[0..]));
+    try biases_dev.upload(&backend.device, std.mem.sliceAsBytes(biases[0..]));
+
+    try compute.cuda.gaffine_u4_matvec.runWithFunction(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        function,
+        &input_dev,
+        &packed_dev,
+        &scales_dev,
+        &biases_dev,
+        &out_dev,
+        in_dim,
+        out_dim,
+        group_size,
+        gaffine_scales_dtype_bf16,
+        batch_rows,
+    );
+    try out_dev.download(&backend.device, std.mem.sliceAsBytes(actual[0..]));
+
+    for (expected, actual) |want, got| {
+        if (@abs(want - got) > 0.02) return false;
+    }
+
+    return true;
+}
+
+pub fn probeGaffineU4SequenceFusedQkvSupport(backend: anytype) !bool {
+    if (!backend.device.supportsModuleLaunch()) return false;
+    const function = backend.gaffine_u4_matvec_qkv_function orelse return false;
+
+    const in_dim: u32 = 8;
+    const out_dim: u32 = 2;
+    const group_size: u32 = 8;
+    const batch_rows: u32 = 2;
+
+    const input = [_]f32{
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+    };
+    const packed_words = [_]u32{
+        0x7654_3210, // row 0 => 0..7
+        0x0123_4567, // row 1 => 7..0
+    };
+    const q_scales = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.0),
+    };
+    const q_biases = [_]u16{
+        dtype.f32ToBf16(0.0),
+        dtype.f32ToBf16(0.0),
+    };
+    const k_scales = [_]u16{
+        dtype.f32ToBf16(2.0),
+        dtype.f32ToBf16(2.0),
+    };
+    const k_biases = [_]u16{
+        dtype.f32ToBf16(0.0),
+        dtype.f32ToBf16(0.0),
+    };
+    const v_scales = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.0),
+    };
+    const v_biases = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.0),
+    };
+    const expected_q = [_]f32{
+        28.0,  28.0,
+        168.0, 84.0,
+    };
+    const expected_k = [_]f32{
+        56.0,  56.0,
+        336.0, 168.0,
+    };
+    const expected_v = [_]f32{
+        36.0,  36.0,
+        204.0, 120.0,
+    };
+    var actual_q = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
+    var actual_k = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
+    var actual_v = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
+
+    var input_dev = try backend.device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(&backend.device);
+    var q_packed_dev = try backend.device.allocBuffer(packed_words.len * @sizeOf(u32));
+    defer q_packed_dev.deinit(&backend.device);
+    var q_scales_dev = try backend.device.allocBuffer(q_scales.len * @sizeOf(u16));
+    defer q_scales_dev.deinit(&backend.device);
+    var q_biases_dev = try backend.device.allocBuffer(q_biases.len * @sizeOf(u16));
+    defer q_biases_dev.deinit(&backend.device);
+    var q_out_dev = try backend.device.allocBuffer(actual_q.len * @sizeOf(f32));
+    defer q_out_dev.deinit(&backend.device);
+
+    var k_packed_dev = try backend.device.allocBuffer(packed_words.len * @sizeOf(u32));
+    defer k_packed_dev.deinit(&backend.device);
+    var k_scales_dev = try backend.device.allocBuffer(k_scales.len * @sizeOf(u16));
+    defer k_scales_dev.deinit(&backend.device);
+    var k_biases_dev = try backend.device.allocBuffer(k_biases.len * @sizeOf(u16));
+    defer k_biases_dev.deinit(&backend.device);
+    var k_out_dev = try backend.device.allocBuffer(actual_k.len * @sizeOf(f32));
+    defer k_out_dev.deinit(&backend.device);
+
+    var v_packed_dev = try backend.device.allocBuffer(packed_words.len * @sizeOf(u32));
+    defer v_packed_dev.deinit(&backend.device);
+    var v_scales_dev = try backend.device.allocBuffer(v_scales.len * @sizeOf(u16));
+    defer v_scales_dev.deinit(&backend.device);
+    var v_biases_dev = try backend.device.allocBuffer(v_biases.len * @sizeOf(u16));
+    defer v_biases_dev.deinit(&backend.device);
+    var v_out_dev = try backend.device.allocBuffer(actual_v.len * @sizeOf(f32));
+    defer v_out_dev.deinit(&backend.device);
+
+    try input_dev.upload(&backend.device, std.mem.sliceAsBytes(input[0..]));
+    try q_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(packed_words[0..]));
+    try q_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(q_scales[0..]));
+    try q_biases_dev.upload(&backend.device, std.mem.sliceAsBytes(q_biases[0..]));
+    try k_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(packed_words[0..]));
+    try k_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(k_scales[0..]));
+    try k_biases_dev.upload(&backend.device, std.mem.sliceAsBytes(k_biases[0..]));
+    try v_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(packed_words[0..]));
+    try v_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(v_scales[0..]));
+    try v_biases_dev.upload(&backend.device, std.mem.sliceAsBytes(v_biases[0..]));
+
+    try compute.cuda.gaffine_u4_matvec_qkv.runWithFunction(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        function,
+        &input_dev,
+        &q_packed_dev,
+        &q_scales_dev,
+        &q_biases_dev,
+        &q_out_dev,
+        out_dim,
+        group_size,
+        gaffine_scales_dtype_bf16,
+        &k_packed_dev,
+        &k_scales_dev,
+        &k_biases_dev,
+        &k_out_dev,
+        out_dim,
+        group_size,
+        gaffine_scales_dtype_bf16,
+        &v_packed_dev,
+        &v_scales_dev,
+        &v_biases_dev,
+        &v_out_dev,
+        out_dim,
+        group_size,
+        gaffine_scales_dtype_bf16,
+        in_dim,
+        batch_rows,
+    );
+
+    try q_out_dev.download(&backend.device, std.mem.sliceAsBytes(actual_q[0..]));
+    try k_out_dev.download(&backend.device, std.mem.sliceAsBytes(actual_k[0..]));
+    try v_out_dev.download(&backend.device, std.mem.sliceAsBytes(actual_v[0..]));
+
+    for (expected_q, actual_q) |want, got| {
+        if (@abs(want - got) > 0.02) return false;
+    }
+    for (expected_k, actual_k) |want, got| {
+        if (@abs(want - got) > 0.02) return false;
+    }
+    for (expected_v, actual_v) |want, got| {
+        if (@abs(want - got) > 0.02) return false;
+    }
+
+    return true;
+}
+
+pub fn probeGaffineU4SequenceFusedGateUpSupport(backend: anytype) !bool {
+    if (!backend.device.supportsModuleLaunch()) return false;
+    const function = backend.gaffine_u4_matvec_gate_up_function orelse return false;
+
+    const in_dim: u32 = 8;
+    const out_dim: u32 = 2;
+    const group_size: u32 = 8;
+    const batch_rows: u32 = 2;
+
+    const input = [_]f32{
+        1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0,
+        1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0,
+    };
+    const packed_words = [_]u32{
+        0x7654_3210, // row 0 => 0..7
+        0x0123_4567, // row 1 => 7..0
+    };
+    const gate_scales = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.0),
+    };
+    const gate_biases = [_]u16{
+        dtype.f32ToBf16(0.0),
+        dtype.f32ToBf16(0.0),
+    };
+    const up_scales = [_]u16{
+        dtype.f32ToBf16(2.0),
+        dtype.f32ToBf16(2.0),
+    };
+    const up_biases = [_]u16{
+        dtype.f32ToBf16(1.0),
+        dtype.f32ToBf16(1.0),
+    };
+    const expected_gate = [_]f32{
+        28.0,  28.0,
+        168.0, 84.0,
+    };
+    const expected_up = [_]f32{
+        64.0,  64.0,
+        372.0, 204.0,
+    };
+    var actual_gate = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
+    var actual_up = [_]f32{0.0} ** @as(usize, out_dim * batch_rows);
+
+    var input_dev = try backend.device.allocBuffer(input.len * @sizeOf(f32));
+    defer input_dev.deinit(&backend.device);
+    var gate_packed_dev = try backend.device.allocBuffer(packed_words.len * @sizeOf(u32));
+    defer gate_packed_dev.deinit(&backend.device);
+    var gate_scales_dev = try backend.device.allocBuffer(gate_scales.len * @sizeOf(u16));
+    defer gate_scales_dev.deinit(&backend.device);
+    var gate_biases_dev = try backend.device.allocBuffer(gate_biases.len * @sizeOf(u16));
+    defer gate_biases_dev.deinit(&backend.device);
+    var gate_out_dev = try backend.device.allocBuffer(actual_gate.len * @sizeOf(f32));
+    defer gate_out_dev.deinit(&backend.device);
+
+    var up_packed_dev = try backend.device.allocBuffer(packed_words.len * @sizeOf(u32));
+    defer up_packed_dev.deinit(&backend.device);
+    var up_scales_dev = try backend.device.allocBuffer(up_scales.len * @sizeOf(u16));
+    defer up_scales_dev.deinit(&backend.device);
+    var up_biases_dev = try backend.device.allocBuffer(up_biases.len * @sizeOf(u16));
+    defer up_biases_dev.deinit(&backend.device);
+    var up_out_dev = try backend.device.allocBuffer(actual_up.len * @sizeOf(f32));
+    defer up_out_dev.deinit(&backend.device);
+
+    try input_dev.upload(&backend.device, std.mem.sliceAsBytes(input[0..]));
+    try gate_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(packed_words[0..]));
+    try gate_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(gate_scales[0..]));
+    try gate_biases_dev.upload(&backend.device, std.mem.sliceAsBytes(gate_biases[0..]));
+    try up_packed_dev.upload(&backend.device, std.mem.sliceAsBytes(packed_words[0..]));
+    try up_scales_dev.upload(&backend.device, std.mem.sliceAsBytes(up_scales[0..]));
+    try up_biases_dev.upload(&backend.device, std.mem.sliceAsBytes(up_biases[0..]));
+
+    try compute.cuda.gaffine_u4_matvec_gate_up.runWithFunction(
+        &backend.kernel_arg_pack,
+        &backend.device,
+        function,
+        &input_dev,
+        &gate_packed_dev,
+        &gate_scales_dev,
+        &gate_biases_dev,
+        &gate_out_dev,
+        out_dim,
+        group_size,
+        gaffine_scales_dtype_bf16,
+        &up_packed_dev,
+        &up_scales_dev,
+        &up_biases_dev,
+        &up_out_dev,
+        out_dim,
+        group_size,
+        gaffine_scales_dtype_bf16,
+        in_dim,
+        batch_rows,
+    );
+
+    try gate_out_dev.download(&backend.device, std.mem.sliceAsBytes(actual_gate[0..]));
+    try up_out_dev.download(&backend.device, std.mem.sliceAsBytes(actual_up[0..]));
+
+    for (expected_gate, actual_gate) |want, got| {
+        if (@abs(want - got) > 0.02) return false;
+    }
+    for (expected_up, actual_up) |want, got| {
+        if (@abs(want - got) > 0.02) return false;
+    }
+
+    return true;
+}
+
 fn runVectorAddSmoke(
     arg_pack: *compute.cuda.ArgPack,
     device: *compute.cuda.Device,
@@ -1954,6 +2277,7 @@ fn runGaffineU4MatvecSmoke(
         out_dim,
         group_size,
         gaffine_scales_dtype_bf16,
+        1,
     );
     try out_dev.download(device, std.mem.sliceAsBytes(actual[0..]));
 
@@ -2052,6 +2376,7 @@ fn runGaffineU4MatvecGateUpSmoke(
         group_size,
         gaffine_scales_dtype_bf16,
         in_dim,
+        1,
     );
     try out_gate_dev.download(device, std.mem.sliceAsBytes(out_gate[0..]));
     try out_up_dev.download(device, std.mem.sliceAsBytes(out_up[0..]));
@@ -2184,6 +2509,7 @@ fn runGaffineU4MatvecQkvSmoke(
         group_size,
         gaffine_scales_dtype_bf16,
         in_dim,
+        1,
     );
     try q_out_dev.download(device, std.mem.sliceAsBytes(out_q[0..]));
     try k_out_dev.download(device, std.mem.sliceAsBytes(out_k[0..]));

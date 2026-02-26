@@ -291,12 +291,11 @@ pub const Transformer = struct {
                 null, // no kernel - this is the input activation
             );
 
-            const attention_cache = &scratch.attn_caches[layer_idx];
             if (write_to_scratch_view) {
-                try layer.forward(current_input_tensor, &scratch_tensor_view, scratch, attention_cache, use_cache);
+                try layer.forward(current_input_tensor, &scratch_tensor_view, scratch, use_cache);
                 current_input_tensor = &scratch_tensor_view;
             } else {
-                try layer.forward(current_input_tensor, output_tensor, scratch, attention_cache, use_cache);
+                try layer.forward(current_input_tensor, output_tensor, scratch, use_cache);
                 current_input_tensor = output_tensor;
             }
             write_to_scratch_view = !write_to_scratch_view;
@@ -829,29 +828,11 @@ pub const Transformer = struct {
         const static_entry = detectStaticTopologyEntry(loaded);
 
         // Get block program for each layer (handles heterogeneous models)
-        // For heterogeneous models, each layer may have a different program (e.g., Mamba vs Attention)
-        // Track Mamba/ShortConv layer indices separately from global layer index
-        var mamba_layer_count: usize = 0;
-        var shortconv_layer_count: usize = 0;
+        // For heterogeneous models, each layer may have a different program (e.g., Mamba vs Attention).
         for (blocks, 0..) |*block, layer_idx| {
-            const block_kind = if (block.isMamba())
-                BlockKind.mamba
-            else if (block.isShortConv())
-                BlockKind.shortconv
-            else
-                BlockKind.attention_mlp;
+            const block_kind = block.block_type;
             const layer_program = try resolveLayerProgram(static_entry, block_kind);
-            const mamba_idx: ?usize = if (block.isMamba()) blk: {
-                const idx = mamba_layer_count;
-                mamba_layer_count += 1;
-                break :blk idx;
-            } else null;
-            const shortconv_idx: ?usize = if (block.isShortConv()) blk: {
-                const idx = shortconv_layer_count;
-                shortconv_layer_count += 1;
-                break :blk idx;
-            } else null;
-            block_layers[layer_idx] = buildBlock(block, model_config, layer_idx, layer_program, mamba_idx, shortconv_idx);
+            block_layers[layer_idx] = buildBlock(block, model_config, layer_idx, layer_program);
             try block_layers[layer_idx].validate();
         }
 
@@ -903,16 +884,12 @@ pub const Transformer = struct {
         model_config: ModelConfig,
         layer_idx: usize,
         program: []const LayerOp,
-        mamba_layer_idx: ?usize,
-        shortconv_layer_idx: ?usize,
     ) Block {
         return .{
             .program = program,
             .block = block,
             .block_idx = layer_idx,
             .hidden_size = @intCast(model_config.d_model),
-            .mamba_layer_idx = mamba_layer_idx,
-            .shortconv_layer_idx = shortconv_layer_idx,
         };
     }
 

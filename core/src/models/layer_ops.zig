@@ -264,5 +264,37 @@ pub const LayerOp = union(enum) {
         scale: ?f32 = null, // If null, uses 1/sqrt(head_dim)
     },
 
+    // =========================================================================
+    // Vision pipeline ops (Phase F groundwork)
+    // =========================================================================
+
+    /// Vision patch embedding projection from image/patch input.
+    patch_embed: struct {
+        in: BufferId,
+        out: BufferId,
+    },
+
+    /// Spatial merge/reduction over vision token grid.
+    spatial_merge: struct {
+        in: BufferId,
+        out: BufferId,
+        merge_size: u32,
+    },
+
+    /// Extract per-layer deepstack features from vision hidden state.
+    deepstack_extract: struct {
+        in: BufferId,
+        out: BufferId,
+        layer_index: u32,
+    },
+
+    /// Scatter vision features into text token stream.
+    scatter: struct {
+        text_in: BufferId,
+        vision_in: BufferId,
+        out: BufferId,
+        image_token_id: u32,
+    },
+
     // Note: model-specific kernels (norm/attn/ffn/mamba) are now emitted as `.kernel`.
 };

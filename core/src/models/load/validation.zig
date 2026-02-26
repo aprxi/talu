@@ -6,6 +6,7 @@ const std = @import("std");
 const weights = @import("weights.zig");
 const tensor = @import("../../tensor.zig");
 const log = @import("../../log.zig");
+const op_types = @import("../op_types.zig");
 
 pub const Error = error{ValidationFailed};
 
@@ -69,8 +70,12 @@ fn validateCommon(reporter: *Reporter, loaded_model: *weights.LoadedModel) !void
     if (loaded_model.blocks.len != @as(usize, @intCast(loaded_model.config.n_layers)))
         return reporter.reportError("blocks len mismatch (blocks={} config={})", .{ loaded_model.blocks.len, loaded_model.config.n_layers });
 
-    for (loaded_model.blocks, 0..) |block_weights, layer_idx| {
-        switch (block_weights) {
+    const arena_allocator = loaded_model.arena.allocator();
+    for (loaded_model.blocks, 0..) |*layer, layer_idx| {
+        const block_weights_at_layer = weights.blocks.layerToBlockWeights(arena_allocator, layer) catch {
+            return reporter.reportError("failed to materialize layer {} block weights for validation", .{layer_idx});
+        };
+        switch (block_weights_at_layer) {
             .attention_mlp => |block| {
                 if (!isVectorShape(block.ln1_weight, d_model))
                     return reporter.reportError("layer {} ln1 shape mismatch (n_dims={}, shape0={}, expected={})", .{
@@ -242,6 +247,149 @@ fn isVectorShape(tensor_view: *const tensor.Tensor, len: usize) bool {
     if (tensor_view.n_dims == 1) return tensor_view.shape[0] == len;
     if (tensor_view.n_dims == 2) return (tensor_view.shape[0] == len and tensor_view.shape[1] == 1) or (tensor_view.shape[0] == 1 and tensor_view.shape[1] == len);
     return false;
+}
+
+fn allocTensorCopy(allocator: std.mem.Allocator, t: tensor.Tensor) !*const tensor.Tensor {
+    const copy = try allocator.create(tensor.Tensor);
+    copy.* = t;
+    return copy;
+}
+
+fn legacyBlockToLayer(
+    allocator: std.mem.Allocator,
+    legacy_block: weights.blocks.BlockWeights,
+) !weights.blocks.LayerWeights {
+    var map: weights.blocks.WeightMap = .{};
+
+    switch (legacy_block) {
+        .attention_mlp => |block| {
+            try map.put(allocator, "input_layernorm.weight", block.ln1_weight);
+            try map.put(allocator, "post_attention_layernorm.weight", block.ln2_weight);
+            if (block.q_proj) |q| try map.put(allocator, "self_attn.q_proj.weight", q);
+            if (block.k_proj) |k| try map.put(allocator, "self_attn.k_proj.weight", k);
+            if (block.v_proj) |v| try map.put(allocator, "self_attn.v_proj.weight", v);
+            try map.put(allocator, "self_attn.o_proj.weight", block.o_proj);
+            if (block.fused.qkv_proj) |qkv| {
+                try map.put(allocator, "self_attn.qkv_proj.weight", try allocTensorCopy(allocator, qkv));
+            }
+            if (block.w1) |w1| try map.put(allocator, "mlp.gate_proj.weight", w1);
+            if (block.w2) |w2| try map.put(allocator, "mlp.down_proj.weight", w2);
+            if (block.w3) |w3| try map.put(allocator, "mlp.up_proj.weight", w3);
+            if (block.fused.gate_up) |gate_up| {
+                try map.put(allocator, "mlp.gate_up_proj.weight", try allocTensorCopy(allocator, gate_up));
+            }
+            if (block.q_norm) |q_norm| try map.put(allocator, "self_attn.q_norm.weight", q_norm);
+            if (block.k_norm) |k_norm| try map.put(allocator, "self_attn.k_norm.weight", k_norm);
+            if (block.pre_ffn_norm) |pre_ffn_norm| try map.put(allocator, "pre_feedforward_layernorm.weight", pre_ffn_norm);
+            if (block.post_ffn_norm) |post_ffn_norm| try map.put(allocator, "post_feedforward_layernorm.weight", post_ffn_norm);
+            if (block.q_a_proj) |t| try map.put(allocator, "self_attn.q_a_proj.weight", t);
+            if (block.q_a_norm) |t| try map.put(allocator, "self_attn.q_a_layernorm.weight", t);
+            if (block.q_b_proj) |t| try map.put(allocator, "self_attn.q_b_proj.weight", t);
+            if (block.kv_a_proj) |t| try map.put(allocator, "self_attn.kv_a_proj_with_mqa.weight", t);
+            if (block.kv_a_norm) |t| try map.put(allocator, "self_attn.kv_a_layernorm.weight", t);
+            if (block.kv_b_proj) |t| try map.put(allocator, "self_attn.kv_b_proj.weight", t);
+
+            var kernel_meta = op_types.KernelMeta{
+                .is_causal = block.is_causal,
+            };
+            if (block.mla_config) |mla_cfg| {
+                kernel_meta.mla_config = .{
+                    .q_lora_rank = @intCast(mla_cfg.q_lora_rank),
+                    .kv_lora_rank = @intCast(mla_cfg.kv_lora_rank),
+                    .qk_head_dim = @intCast(mla_cfg.qk_head_dim),
+                    .qk_rope_head_dim = @intCast(mla_cfg.qk_rope_head_dim),
+                    .qk_nope_head_dim = @intCast(mla_cfg.qk_nope_head_dim),
+                    .v_head_dim = @intCast(mla_cfg.v_head_dim),
+                    .rope_interleave = mla_cfg.rope_interleave,
+                };
+            }
+
+            return .{
+                .block_type = .attention_mlp,
+                .weight_map = map,
+                .map_context = .{
+                    .sliding_window = block.sliding_window,
+                    .kernel_meta = kernel_meta,
+                    .mamba_config = null,
+                    .shortconv_config = null,
+                    .num_experts = if (block.moe_weights) |moe_w| moe_w.num_experts else 0,
+                    .experts_per_token = if (block.moe_weights) |moe_w| moe_w.experts_per_token else 0,
+                    .allocator = null,
+                },
+            };
+        },
+        .mamba => |block| {
+            try map.put(allocator, "input_layernorm.weight", block.ln1_weight);
+            try map.put(allocator, "mixer.in_proj.weight", block.weights.in_proj);
+            try map.put(allocator, "mixer.conv1d.weight", block.weights.conv1d_weight);
+            try map.put(allocator, "mixer.A_log", block.weights.A_log);
+            try map.put(allocator, "mixer.D", block.weights.D);
+            try map.put(allocator, "mixer.out_proj.weight", block.weights.out_proj);
+            if (block.ln2_weight) |ln2| try map.put(allocator, "post_attention_layernorm.weight", ln2);
+            if (block.weights.conv1d_bias) |b| try map.put(allocator, "mixer.conv1d.bias", b);
+            if (block.weights.dt_bias) |b| try map.put(allocator, "mixer.dt_bias", b);
+            if (block.weights.norm_weight) |w| try map.put(allocator, "mixer.norm.weight", w);
+
+            return .{
+                .block_type = .mamba,
+                .weight_map = map,
+                .map_context = .{
+                    .kernel_meta = .{},
+                    .mamba_config = block.config,
+                    .shortconv_config = null,
+                    .allocator = null,
+                },
+            };
+        },
+        .shortconv => |block| {
+            try map.put(allocator, "operator_norm.weight", block.ln1_weight);
+            try map.put(allocator, "conv.in_proj.weight", block.weights.in_proj);
+            try map.put(allocator, "conv.conv.weight", block.weights.conv1d_weight);
+            try map.put(allocator, "conv.out_proj.weight", block.weights.out_proj);
+            if (block.ln2_weight) |ln2| try map.put(allocator, "ffn_norm.weight", ln2);
+            if (block.fused_gate_up) |fused| {
+                if (fused.gate_up) |gate_up| {
+                    try map.put(allocator, "feed_forward.gate_up_proj.weight", try allocTensorCopy(allocator, gate_up));
+                }
+            } else {
+                if (block.w1) |w1| try map.put(allocator, "feed_forward.w1.weight", w1);
+                if (block.w2) |w2| try map.put(allocator, "feed_forward.w2.weight", w2);
+                if (block.w3) |w3| try map.put(allocator, "feed_forward.w3.weight", w3);
+            }
+            return .{
+                .block_type = .shortconv,
+                .weight_map = map,
+                .map_context = .{
+                    .kernel_meta = .{},
+                    .mamba_config = null,
+                    .shortconv_config = block.config,
+                    .allocator = null,
+                },
+            };
+        },
+    }
+}
+
+fn legacyBlocksToLayers(
+    allocator: std.mem.Allocator,
+    legacy_blocks: []const weights.blocks.BlockWeights,
+) ![]weights.blocks.LayerWeights {
+    const layer_blocks = try allocator.alloc(weights.blocks.LayerWeights, legacy_blocks.len);
+    errdefer allocator.free(layer_blocks);
+    for (legacy_blocks, 0..) |legacy_block, idx| {
+        layer_blocks[idx] = try legacyBlockToLayer(allocator, legacy_block);
+    }
+    return layer_blocks;
+}
+
+fn freeLayerBlocks(
+    allocator: std.mem.Allocator,
+    layer_blocks: []weights.blocks.LayerWeights,
+) void {
+    for (layer_blocks) |*layer| {
+        layer.weight_map.deinit(allocator);
+    }
+    allocator.free(layer_blocks);
 }
 
 // =============================================================================
@@ -771,6 +919,9 @@ test "validateCommon: valid minimal model" {
         } },
     };
 
+    const layer_blocks = try legacyBlocksToLayers(std.testing.allocator, &blocks);
+    defer freeLayerBlocks(std.testing.allocator, layer_blocks);
+
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         .config = config,
@@ -795,7 +946,7 @@ test "validateCommon: valid minimal model" {
             .data_ptr = null,
             .data_size = 0,
         },
-        .blocks = &blocks,
+        .blocks = layer_blocks,
         .original_weight_dtype = .f32,
     };
     defer loaded_model.arena.deinit();
@@ -903,6 +1054,9 @@ test "validateCommon: token_embeddings wrong dimensions" {
         },
     } }};
 
+    const layer_blocks = try legacyBlocksToLayers(std.testing.allocator, &blocks);
+    defer freeLayerBlocks(std.testing.allocator, layer_blocks);
+
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         .config = config,
@@ -927,7 +1081,7 @@ test "validateCommon: token_embeddings wrong dimensions" {
             .data_ptr = null,
             .data_size = 0,
         },
-        .blocks = &blocks,
+        .blocks = layer_blocks,
         .original_weight_dtype = .f32,
     };
     defer loaded_model.arena.deinit();
@@ -1036,6 +1190,9 @@ test "validateCommon: token_embeddings shape mismatch" {
         },
     } }};
 
+    const layer_blocks = try legacyBlocksToLayers(std.testing.allocator, &blocks);
+    defer freeLayerBlocks(std.testing.allocator, layer_blocks);
+
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         .config = config,
@@ -1060,7 +1217,7 @@ test "validateCommon: token_embeddings shape mismatch" {
             .data_ptr = null,
             .data_size = 0,
         },
-        .blocks = &blocks,
+        .blocks = layer_blocks,
         .original_weight_dtype = .f32,
     };
     defer loaded_model.arena.deinit();
@@ -1171,6 +1328,9 @@ test "validateCommon: blocks count mismatch" {
         },
     } }};
 
+    const layer_blocks = try legacyBlocksToLayers(std.testing.allocator, &blocks);
+    defer freeLayerBlocks(std.testing.allocator, layer_blocks);
+
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         .config = config,
@@ -1195,7 +1355,7 @@ test "validateCommon: blocks count mismatch" {
             .data_ptr = null,
             .data_size = 0,
         },
-        .blocks = &blocks, // Only 1 block, but config expects 3
+        .blocks = layer_blocks, // Only 1 block, but config expects 3
         .original_weight_dtype = .f32,
     };
     defer loaded_model.arena.deinit();
@@ -1306,6 +1466,9 @@ test "validateCommon: layer ln1 shape mismatch" {
         },
     }};
 
+    const layer_blocks = try legacyBlocksToLayers(std.testing.allocator, &blocks);
+    defer freeLayerBlocks(std.testing.allocator, layer_blocks);
+
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         .config = config,
@@ -1330,7 +1493,7 @@ test "validateCommon: layer ln1 shape mismatch" {
             .data_ptr = null,
             .data_size = 0,
         },
-        .blocks = &blocks,
+        .blocks = layer_blocks,
         .original_weight_dtype = .f32,
     };
     defer loaded_model.arena.deinit();
@@ -1424,6 +1587,9 @@ test "validateCommon: missing q/k/v without fused qkv" {
         },
     }};
 
+    const layer_blocks = try legacyBlocksToLayers(std.testing.allocator, &blocks);
+    defer freeLayerBlocks(std.testing.allocator, layer_blocks);
+
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         .config = config,
@@ -1448,7 +1614,7 @@ test "validateCommon: missing q/k/v without fused qkv" {
             .data_ptr = null,
             .data_size = 0,
         },
-        .blocks = &blocks,
+        .blocks = layer_blocks,
         .original_weight_dtype = .f32,
     };
     defer loaded_model.arena.deinit();
@@ -1468,7 +1634,7 @@ test "validateCommon: missing q/k/v without fused qkv" {
 
     // Should fail
     try std.testing.expectError(Error.ValidationFailed, validateCommon(&reporter, &loaded_model));
-    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "missing q/k/v weights") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.items, "failed to materialize layer 0 block weights for validation") != null);
 }
 
 test "validateCommon: lm_head not 2D" {
@@ -1557,6 +1723,9 @@ test "validateCommon: lm_head not 2D" {
         },
     } }};
 
+    const layer_blocks = try legacyBlocksToLayers(std.testing.allocator, &blocks);
+    defer freeLayerBlocks(std.testing.allocator, layer_blocks);
+
     var loaded_model = weights.LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
         .config = config,
@@ -1581,7 +1750,7 @@ test "validateCommon: lm_head not 2D" {
             .data_ptr = null,
             .data_size = 0,
         },
-        .blocks = &blocks,
+        .blocks = layer_blocks,
         .original_weight_dtype = .f32,
     };
     defer loaded_model.arena.deinit();

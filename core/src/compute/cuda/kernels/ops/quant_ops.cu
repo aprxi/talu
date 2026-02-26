@@ -52,16 +52,21 @@ extern "C" __global__ void talu_gaffine_u4_matvec_f32(
     unsigned int in_dim,
     unsigned int out_dim,
     unsigned int group_size,
-    unsigned int scales_dtype_tag
+    unsigned int scales_dtype_tag,
+    unsigned int batch_rows
 ) {
+    const unsigned int batch = blockIdx.y;
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
     const unsigned int warps_per_block = blockDim.x / TALU_QUANT_WARP_SIZE;
     const unsigned int out_idx = blockIdx.x * warps_per_block + warp_id;
+    if (batch >= batch_rows) return;
     if (out_idx >= out_dim) return;
     if (group_size == 0 || (in_dim % group_size) != 0 || (group_size % 8) != 0) {
         return;
     }
+    const float* input_row = input + (unsigned long long)batch * in_dim;
+    float* out_row = out + (unsigned long long)batch * out_dim;
 
     const unsigned int groups_per_row = in_dim / group_size;
     const unsigned int words_per_group = group_size / 8;
@@ -80,11 +85,11 @@ extern "C" __global__ void talu_gaffine_u4_matvec_f32(
         const float scale = talu_decode_scale_bias_u16(scales[row_sb_base + group_idx], scales_dtype_tag);
         const float bias = talu_decode_scale_bias_u16(biases[row_sb_base + group_idx], scales_dtype_tag);
         const float dequant = static_cast<float>(quant) * scale + bias;
-        acc = fmaf(input[i], dequant, acc);
+        acc = fmaf(input_row[i], dequant, acc);
     }
     acc = talu_quant_warp_sum_f32(acc);
 
-    if (lane == 0) out[out_idx] = acc;
+    if (lane == 0) out_row[out_idx] = acc;
 }
 
 static __device__ __forceinline__ float talu_gaffine_u4_dot_row_warp(
@@ -142,9 +147,16 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
     unsigned int v_out_dim,
     unsigned int v_group_size,
     unsigned int v_scales_dtype_tag,
-    unsigned int in_dim
+    unsigned int in_dim,
+    unsigned int batch_rows
 ) {
+    const unsigned int batch = blockIdx.y;
+    if (batch >= batch_rows) return;
     if (in_dim == 0 || (in_dim % 8) != 0) return;
+    const float* input_row = input + (unsigned long long)batch * in_dim;
+    float* q_out_row = q_out + (unsigned long long)batch * q_out_dim;
+    float* k_out_row = k_out + (unsigned long long)batch * k_out_dim;
+    float* v_out_row = v_out + (unsigned long long)batch * v_out_dim;
 
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
@@ -158,7 +170,7 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
     if (out_index < q_out_dim) {
         if (q_group_size == 0 || (in_dim % q_group_size) != 0 || (q_group_size % 8) != 0) return;
         acc = talu_gaffine_u4_dot_row_warp(
-            input,
+            input_row,
             q_packed_weight,
             q_scales,
             q_biases,
@@ -168,7 +180,7 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
             q_scales_dtype_tag,
             lane
         );
-        if (lane == 0) q_out[out_index] = acc;
+        if (lane == 0) q_out_row[out_index] = acc;
         return;
     }
 
@@ -176,7 +188,7 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
         if (k_group_size == 0 || (in_dim % k_group_size) != 0 || (k_group_size % 8) != 0) return;
         const unsigned int k_row = out_index - q_out_dim;
         acc = talu_gaffine_u4_dot_row_warp(
-            input,
+            input_row,
             k_packed_weight,
             k_scales,
             k_biases,
@@ -186,14 +198,14 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
             k_scales_dtype_tag,
             lane
         );
-        if (lane == 0) k_out[k_row] = acc;
+        if (lane == 0) k_out_row[k_row] = acc;
         return;
     }
 
     if (v_group_size == 0 || (in_dim % v_group_size) != 0 || (v_group_size % 8) != 0) return;
     const unsigned int v_row = out_index - qk_dim;
     acc = talu_gaffine_u4_dot_row_warp(
-        input,
+        input_row,
         v_packed_weight,
         v_scales,
         v_biases,
@@ -203,7 +215,7 @@ extern "C" __global__ void talu_gaffine_u4_matvec_qkv_f32(
         v_scales_dtype_tag,
         lane
     );
-    if (lane == 0) v_out[v_row] = acc;
+    if (lane == 0) v_out_row[v_row] = acc;
 }
 
 extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
@@ -222,9 +234,15 @@ extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
     unsigned int up_out_dim,
     unsigned int up_group_size,
     unsigned int up_scales_dtype_tag,
-    unsigned int in_dim
+    unsigned int in_dim,
+    unsigned int batch_rows
 ) {
+    const unsigned int batch = blockIdx.y;
+    if (batch >= batch_rows) return;
     if (in_dim == 0 || (in_dim % 8) != 0) return;
+    const float* input_row = input + (unsigned long long)batch * in_dim;
+    float* gate_out_row = gate_out + (unsigned long long)batch * gate_out_dim;
+    float* up_out_row = up_out + (unsigned long long)batch * up_out_dim;
 
     const unsigned int lane = threadIdx.x & (TALU_QUANT_WARP_SIZE - 1u);
     const unsigned int warp_id = threadIdx.x / TALU_QUANT_WARP_SIZE;
@@ -237,7 +255,7 @@ extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
     if (out_index < gate_out_dim) {
         if (gate_group_size == 0 || (in_dim % gate_group_size) != 0 || (gate_group_size % 8) != 0) return;
         acc = talu_gaffine_u4_dot_row_warp(
-            input,
+            input_row,
             gate_packed_weight,
             gate_scales,
             gate_biases,
@@ -247,14 +265,14 @@ extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
             gate_scales_dtype_tag,
             lane
         );
-        if (lane == 0) gate_out[out_index] = acc;
+        if (lane == 0) gate_out_row[out_index] = acc;
         return;
     }
 
     if (up_group_size == 0 || (in_dim % up_group_size) != 0 || (up_group_size % 8) != 0) return;
     const unsigned int up_row = out_index - gate_out_dim;
     acc = talu_gaffine_u4_dot_row_warp(
-        input,
+        input_row,
         up_packed_weight,
         up_scales,
         up_biases,
@@ -264,5 +282,5 @@ extern "C" __global__ void talu_gaffine_u4_matvec_gate_up_f32(
         up_scales_dtype_tag,
         lane
     );
-    if (lane == 0) up_out[up_row] = acc;
+    if (lane == 0) up_out_row[up_row] = acc;
 }

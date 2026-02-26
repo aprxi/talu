@@ -8,7 +8,6 @@ pub const MLXError = weights.MLXError;
 pub const WeightHandles = weights.WeightHandles;
 
 pub const loadWeightsToGPU = weights.loadWeightsToGPU;
-pub const createFusedModel = weights.createFusedModel;
 pub const freeWeights = weights.freeWeights;
 
 pub const WeightAccess = struct {
