@@ -82,6 +82,20 @@ pub async fn handle_list(
         .and_then(|v| v.parse::<usize>().ok())
         .unwrap_or(100);
 
+    if limit == 0 {
+        let body = BlobListResponse { data: vec![], count: 0 };
+        return Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "application/json")
+            .body(
+                Full::new(Bytes::from(
+                    serde_json::to_vec(&body).unwrap_or_else(|_| b"{}".to_vec()),
+                ))
+                .boxed(),
+            )
+            .unwrap();
+    }
+
     let handle = match BlobsHandle::open(&storage_path) {
         Ok(h) => h,
         Err(err) => return blob_error_response(err),

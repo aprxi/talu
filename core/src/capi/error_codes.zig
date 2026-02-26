@@ -81,6 +81,7 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.InvalidHandle => .invalid_handle,
         error.ResourceExhausted => .resource_exhausted,
         error.ZeroVectorNotAllowed => .invalid_argument,
+        error.InvalidColumnData => .invalid_argument,
         error.InvalidJson => .invalid_argument,
         error.InvalidSchema => .invalid_argument,
         error.InputTooLarge => .invalid_argument,

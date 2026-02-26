@@ -175,6 +175,14 @@ pub struct WriteResponse {
 // Handlers
 // =========================================================================
 
+#[utoipa::path(
+    post,
+    path = "/v1/db/tables/{ns}/rows",
+    tag = "DB::Tables",
+    params(("ns" = String, Path, description = "Table namespace")),
+    request_body = WriteRowRequest,
+    responses((status = 200, body = WriteResponse))
+)]
 /// POST /v1/db/tables/{ns}/rows — write a row.
 pub async fn handle_write_row(
     state: Arc<AppState>,
@@ -183,8 +191,9 @@ pub async fn handle_write_row(
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
     let ns = match parse_namespace(&path) {
-        Some(ns) => ns,
-        None => return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace"),
+        Ok(ns) => ns,
+        Err(Some(resp)) => return resp,
+        Err(None) => return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace"),
     };
 
     let body = match read_json_body::<WriteRowRequest>(req).await {
@@ -248,6 +257,13 @@ pub async fn handle_write_row(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/db/tables/{ns}/rows",
+    tag = "DB::Tables",
+    params(("ns" = String, Path, description = "Table namespace")),
+    responses((status = 200, body = ScanResponse))
+)]
 /// GET /v1/db/tables/{ns}/rows — scan rows.
 pub async fn handle_scan(
     state: Arc<AppState>,
@@ -256,8 +272,9 @@ pub async fn handle_scan(
 ) -> Response<BoxBody> {
     let path = req.uri().path().to_string();
     let ns = match parse_namespace(&path) {
-        Some(ns) => ns,
-        None => return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace"),
+        Ok(ns) => ns,
+        Err(Some(resp)) => return resp,
+        Err(None) => return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace"),
     };
 
     let query = req
@@ -348,6 +365,16 @@ pub async fn handle_scan(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/db/tables/{ns}/rows/{hash}",
+    tag = "DB::Tables",
+    params(
+        ("ns" = String, Path, description = "Table namespace"),
+        ("hash" = u64, Path, description = "Row primary hash"),
+    ),
+    responses((status = 200, body = GetResponse))
+)]
 /// GET /v1/db/tables/{ns}/rows/{hash} — get row by primary hash.
 pub async fn handle_get_row(
     state: Arc<AppState>,
@@ -422,6 +449,16 @@ pub async fn handle_get_row(
     json_response(StatusCode::OK, &GetResponse { row: json_row })
 }
 
+#[utoipa::path(
+    delete,
+    path = "/v1/db/tables/{ns}/rows/{hash}",
+    tag = "DB::Tables",
+    params(
+        ("ns" = String, Path, description = "Table namespace"),
+        ("hash" = u64, Path, description = "Row primary hash"),
+    ),
+    responses((status = 200, body = WriteResponse))
+)]
 /// DELETE /v1/db/tables/{ns}/rows/{hash} — tombstone a row.
 pub async fn handle_delete_row(
     state: Arc<AppState>,
@@ -493,6 +530,14 @@ pub async fn handle_delete_row(
     )
 }
 
+#[utoipa::path(
+    post,
+    path = "/v1/db/tables/{ns}/rows/scan",
+    tag = "DB::Tables",
+    params(("ns" = String, Path, description = "Table namespace")),
+    request_body = ScanRequest,
+    responses((status = 200, body = ScanResponse))
+)]
 /// POST /v1/db/tables/{ns}/rows/scan — advanced scan with full engine params.
 pub async fn handle_scan_post(
     state: Arc<AppState>,
@@ -596,6 +641,12 @@ pub async fn handle_scan_post(
     )
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/db/tables/_meta/namespaces",
+    tag = "DB::Tables",
+    responses((status = 200, body = NamespacesResponse))
+)]
 /// GET /v1/db/tables/_meta/namespaces — list table namespaces.
 pub async fn handle_list_namespaces(
     state: Arc<AppState>,
@@ -625,6 +676,13 @@ pub async fn handle_list_namespaces(
     json_response(StatusCode::OK, &NamespacesResponse { namespaces })
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/db/tables/{ns}/_meta/policy",
+    tag = "DB::Tables",
+    params(("ns" = String, Path, description = "Table namespace")),
+    responses((status = 200))
+)]
 /// GET /v1/db/tables/{ns}/_meta/policy — read persisted policy.
 pub async fn handle_get_policy(
     state: Arc<AppState>,
@@ -680,19 +738,33 @@ pub async fn handle_get_policy(
 // =========================================================================
 
 /// Extract namespace from /v1/db/tables/{ns}/rows
-fn parse_namespace(path: &str) -> Option<String> {
-    let stripped = path.strip_prefix(PATH_PREFIX)?;
+fn parse_namespace(path: &str) -> Result<String, Option<Response<BoxBody>>> {
+    let stripped = path.strip_prefix(PATH_PREFIX).ok_or(None)?;
     let mut parts = stripped.split('/');
-    let ns = parts.next().filter(|s| !s.is_empty())?;
-    let action = parts.next()?;
+    let ns_raw = parts.next().unwrap_or("");
+    let action = parts.next().ok_or(None)?;
     if action != "rows" || parts.next().is_some() {
-        return None;
+        return Err(None);
     }
-    Some(
-        percent_encoding::percent_decode_str(ns)
-            .decode_utf8_lossy()
-            .into_owned(),
-    )
+    // Pattern matches /v1/db/tables/{ns}/rows — validate namespace.
+    if ns_raw.is_empty() {
+        return Err(Some(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_path",
+            "missing namespace",
+        )));
+    }
+    let decoded = percent_encoding::percent_decode_str(ns_raw)
+        .decode_utf8_lossy()
+        .into_owned();
+    if decoded.contains('/') {
+        return Err(Some(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "namespace must not contain path separators",
+        )));
+    }
+    Ok(decoded)
 }
 
 /// Extract namespace and hash from /v1/db/tables/{ns}/rows/{hash}
@@ -708,13 +780,16 @@ fn parse_namespace_and_hash(path: &str) -> Option<(String, u64)> {
     if parts.next().is_some() {
         return None;
     }
-    let hash: u64 = hash_str.parse().ok()?;
-    Some((
-        percent_encoding::percent_decode_str(ns)
-            .decode_utf8_lossy()
-            .into_owned(),
-        hash,
-    ))
+    let decoded_hash = percent_encoding::percent_decode_str(hash_str)
+        .decode_utf8_lossy();
+    let hash: u64 = decoded_hash.parse().ok()?;
+    let decoded_ns = percent_encoding::percent_decode_str(ns)
+        .decode_utf8_lossy()
+        .into_owned();
+    if decoded_ns.contains('/') {
+        return None;
+    }
+    Some((decoded_ns, hash))
 }
 
 /// Extract namespace from /v1/db/tables/{ns}/rows/scan
@@ -731,11 +806,13 @@ fn parse_scan_namespace(path: &str) -> Option<String> {
     if parts.next().is_some() {
         return None;
     }
-    Some(
-        percent_encoding::percent_decode_str(ns)
-            .decode_utf8_lossy()
-            .into_owned(),
-    )
+    let decoded = percent_encoding::percent_decode_str(ns)
+        .decode_utf8_lossy()
+        .into_owned();
+    if decoded.contains('/') {
+        return None;
+    }
+    Some(decoded)
 }
 
 /// Extract namespace from /v1/db/tables/{ns}/_meta/policy
@@ -752,16 +829,18 @@ fn parse_meta_policy_namespace(path: &str) -> Option<String> {
     if parts.next().is_some() {
         return None;
     }
-    Some(
-        percent_encoding::percent_decode_str(ns)
-            .decode_utf8_lossy()
-            .into_owned(),
-    )
+    let decoded = percent_encoding::percent_decode_str(ns)
+        .decode_utf8_lossy()
+        .into_owned();
+    if decoded.contains('/') {
+        return None;
+    }
+    Some(decoded)
 }
 
 /// Check if path matches a table rows endpoint.
 pub fn is_table_rows_path(path: &str) -> bool {
-    parse_namespace(path).is_some()
+    !matches!(parse_namespace(path), Err(None))
 }
 
 /// Check if path matches a table rows/{hash} endpoint.

@@ -291,7 +291,7 @@ pub async fn handle_get(
         Err(e) => return document_error_response(e),
     };
 
-    let doc = match handle.get(doc_id) {
+    let doc = match handle.get(&doc_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
             return json_error(
@@ -353,9 +353,33 @@ pub async fn handle_create(
         None
     };
 
+    let explicit_id = create_req.id.is_some();
     let doc_id = create_req
         .id
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+
+    // Validate explicit IDs: reject path separators and reserved route segments.
+    if explicit_id {
+        if doc_id.contains('/') {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "document ID must not contain path separators",
+            );
+        }
+        const RESERVED_DOC_IDS: &[&str] = &["search", "insert", "rows", "_meta"];
+        if RESERVED_DOC_IDS.contains(&doc_id.as_str()) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &format!(
+                    "document ID '{}' conflicts with a reserved route segment",
+                    doc_id
+                ),
+            );
+        }
+    }
+
     let title = create_req.title.unwrap_or_default();
     let content_json = create_req
         .content
@@ -369,6 +393,17 @@ pub async fn handle_create(
         Ok(h) => h,
         Err(e) => return document_error_response(e),
     };
+
+    // Reject duplicate explicit IDs.
+    if explicit_id {
+        if let Ok(Some(_)) = handle.get(&doc_id) {
+            return json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                &format!("Document already exists: {}", doc_id),
+            );
+        }
+    }
 
     // Plugin storage: force owner_id to the authenticated plugin_id.
     let owner_id = plugin_owner_id.or(create_req.owner_id);
@@ -466,7 +501,7 @@ pub async fn handle_update(
     let content_json = update_req.content.map(|v| v.to_string());
 
     if let Err(e) = handle.update(
-        doc_id,
+        &doc_id,
         update_req.title.as_deref(),
         content_json.as_deref(),
         update_req.tags_text.as_deref(),
@@ -476,7 +511,7 @@ pub async fn handle_update(
     }
 
     // Fetch the updated document
-    let doc = match handle.get(doc_id) {
+    let doc = match handle.get(&doc_id) {
         Ok(Some(d)) => d,
         Ok(None) => {
             return json_error(
@@ -516,7 +551,7 @@ pub async fn handle_delete(
         Err(e) => return document_error_response(e),
     };
 
-    if let Err(e) = handle.delete(doc_id) {
+    if let Err(e) = handle.delete(&doc_id) {
         return document_error_response(e);
     }
 
@@ -598,7 +633,19 @@ pub async fn handle_get_tags(
         Err(e) => return document_error_response(e),
     };
 
-    let tags = match handle.get_tags(doc_id) {
+    match handle.get(&doc_id) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(DocumentError::DocumentNotFound(_)) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("Document not found: {}", doc_id),
+            );
+        }
+        Err(e) => return document_error_response(e),
+    }
+
+    let tags = match handle.get_tags(&doc_id) {
         Ok(t) => t,
         Err(e) => return document_error_response(e),
     };
@@ -644,14 +691,26 @@ pub async fn handle_add_tags(
         Err(e) => return document_error_response(e),
     };
 
+    match handle.get(&doc_id) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(DocumentError::DocumentNotFound(_)) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("Document not found: {}", doc_id),
+            );
+        }
+        Err(e) => return document_error_response(e),
+    }
+
     for tag in &tags_req.tags {
-        if let Err(e) = handle.add_tag(doc_id, tag, group_id.as_deref()) {
+        if let Err(e) = handle.add_tag(&doc_id, tag, group_id.as_deref()) {
             return document_error_response(e);
         }
     }
 
     // Return updated tags
-    let tags = match handle.get_tags(doc_id) {
+    let tags = match handle.get_tags(&doc_id) {
         Ok(t) => t,
         Err(e) => return document_error_response(e),
     };
@@ -697,14 +756,26 @@ pub async fn handle_remove_tags(
         Err(e) => return document_error_response(e),
     };
 
+    match handle.get(&doc_id) {
+        Ok(Some(_)) => {}
+        Ok(None) | Err(DocumentError::DocumentNotFound(_)) => {
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                &format!("Document not found: {}", doc_id),
+            );
+        }
+        Err(e) => return document_error_response(e),
+    }
+
     for tag in &tags_req.tags {
-        if let Err(e) = handle.remove_tag(doc_id, tag, group_id.as_deref()) {
+        if let Err(e) = handle.remove_tag(&doc_id, tag, group_id.as_deref()) {
             return document_error_response(e);
         }
     }
 
     // Return updated tags
-    let tags = match handle.get_tags(doc_id) {
+    let tags = match handle.get_tags(&doc_id) {
         Ok(t) => t,
         Err(e) => return document_error_response(e),
     };
@@ -716,23 +787,29 @@ pub async fn handle_remove_tags(
 // Helper functions
 // =============================================================================
 
-fn extract_doc_id(path: &str) -> &str {
+fn extract_doc_id(path: &str) -> String {
     let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
-        return "";
+        return String::new();
     };
     let mut parts = stripped.split('/');
     let _table_name = parts.next();
-    parts.next().unwrap_or("")
+    let raw = parts.next().unwrap_or("");
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
-fn extract_doc_id_before_tags(path: &str) -> &str {
+fn extract_doc_id_before_tags(path: &str) -> String {
     let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
-        return "";
+        return String::new();
     };
     let without_tags = stripped.strip_suffix("/tags").unwrap_or(stripped);
     let mut parts = without_tags.split('/');
     let _table_name = parts.next();
-    parts.next().unwrap_or("")
+    let raw = parts.next().unwrap_or("");
+    percent_encoding::percent_decode_str(raw)
+        .decode_utf8_lossy()
+        .into_owned()
 }
 
 fn extract_table_name(path: &str) -> Option<&str> {
@@ -747,7 +824,7 @@ fn extract_table_name(path: &str) -> Option<&str> {
 
 /// Reserved names that collide with internal storage directories.
 const RESERVED_TABLE_NAMES: &[&str] = &[
-    "docs", "blobs", "chat", "tables", "vector", "sql", "kv_state",
+    "docs", "blobs", "chat", "tables", "vector", "sql", "kv_state", "_meta",
 ];
 
 /// Validate that a table name is safe and well-formed.
@@ -826,8 +903,13 @@ fn parse_query_param(query: &str, key: &str) -> Option<String> {
     for pair in query.split('&') {
         if let Some((k, v)) = pair.split_once('=') {
             if k == key {
-                // URL decode the value (simple version)
-                return Some(v.replace("%20", " ").replace("+", " "));
+                // In query strings, '+' represents a space (x-www-form-urlencoded).
+                let with_spaces = v.replace('+', " ");
+                return Some(
+                    percent_encoding::percent_decode_str(&with_spaces)
+                        .decode_utf8_lossy()
+                        .into_owned(),
+                );
             }
         }
     }

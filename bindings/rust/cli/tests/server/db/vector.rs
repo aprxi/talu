@@ -252,7 +252,7 @@ fn list_get_and_delete_collection() {
     assert_eq!(one_json["dims"], 256);
 
     let del = delete(ctx.addr(), "/v1/db/vectors/collections/c1");
-    assert_eq!(del.status, 204, "body: {}", del.body);
+    assert_eq!(del.status, 200, "body: {}", del.body);
 
     let missing = get(ctx.addr(), "/v1/db/vectors/collections/c1");
     assert_eq!(missing.status, 404, "body: {}", missing.body);

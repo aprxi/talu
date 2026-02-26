@@ -1110,7 +1110,7 @@ fn delete_with_tombstone_schema_id_query_param() {
 // Path parsing errors
 // =============================================================================
 
-/// POST to invalid path (no namespace) returns 400.
+/// POST to invalid path (no namespace) returns 400 structured error.
 #[test]
 fn write_rejects_invalid_path() {
     let temp = TempDir::new().expect("temp dir");
@@ -1119,7 +1119,8 @@ fn write_rejects_invalid_path() {
     let body = serde_json::json!({"schema_id": 10, "columns": []});
     // Path missing namespace segment: /v1/db/tables//rows
     let resp = post_json(ctx.addr(), "/v1/db/tables//rows", &body);
-    assert_eq!(resp.status, 404, "empty namespace: {}", resp.body);
+    assert_eq!(resp.status, 400, "empty namespace: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "invalid_path");
 }
 
 /// GET row with non-numeric hash returns 404 (path doesn't match route).
@@ -2005,14 +2006,14 @@ fn write_and_scan_empty_payload() {
     assert_eq!(rows[0]["payload_encoding"], "utf8");
 }
 
-/// DELETE with invalid path (missing hash) returns 404.
+/// DELETE with invalid path (missing hash) returns 501 (known path, unsupported method).
 #[test]
 fn delete_rejects_invalid_path() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
     let resp = delete(ctx.addr(), "/v1/db/tables/ns/rows");
-    assert_eq!(resp.status, 404, "missing hash: {}", resp.body);
+    assert_eq!(resp.status, 501, "missing hash: {}", resp.body);
 }
 
 /// DELETE with non-numeric hash returns 404.
@@ -2271,10 +2272,34 @@ fn row_hash_path_params_are_percent_decoded_for_get_and_delete() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
+    // Write with explicit policy including tombstone_schema_id so DELETE works.
+    // Use tombstone_schema_id different from write schema_id (matches existing
+    // patterns, e.g. delete_row_hides_from_get).
     let cols = columns_with_ts(123, 10_000, "row-123");
-    let write = write_row(ctx.addr(), "hashdec", 10, &cols);
+    let policy = serde_json::json!({
+        "active_schema_ids": [10],
+        "tombstone_schema_id": 2,
+        "dedup_column_id": 1,
+        "ts_column_id": 2,
+    });
+    let write = write_row_with_policy(ctx.addr(), "hashdec", 10, &cols, policy);
     assert_eq!(write.status, 200, "body: {}", write.body);
 
+    // Confirm the row is stored under hash 123 (dedup key = column 1 value).
+    let scan = scan_rows(ctx.addr(), "hashdec", 10);
+    assert_eq!(scan.status, 200, "scan: {}", scan.body);
+    let rows = scan.json()["rows"].as_array().expect("rows").clone();
+    assert_eq!(rows.len(), 1, "expected exactly one row");
+    let scalars = rows[0]["scalars"].as_array().expect("scalars");
+    let hash = scalars
+        .iter()
+        .find(|s| s["column_id"] == 1)
+        .expect("col 1")["value"]
+        .as_u64()
+        .expect("hash");
+    assert_eq!(hash, 123, "dedup key should match written value");
+
+    // GET with percent-encoded hash (%31%32%33 == "123").
     let get = get(
         ctx.addr(),
         "/v1/db/tables/hashdec/rows/%31%32%33?schema_id=10",
@@ -2286,6 +2311,7 @@ fn row_hash_path_params_are_percent_decoded_for_get_and_delete() {
     );
     assert_eq!(get.json()["row"]["payload"], "row-123");
 
+    // DELETE with percent-encoded hash.
     let del = delete(ctx.addr(), "/v1/db/tables/hashdec/rows/%31%32%33");
     assert_eq!(
         del.status, 200,

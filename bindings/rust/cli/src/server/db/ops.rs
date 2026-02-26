@@ -102,6 +102,13 @@ pub async fn handle_compact(
             "collection is required",
         );
     }
+    if compact_req.collection.contains('/') || compact_req.collection.contains('\\') {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "collection name must not contain path separators",
+        );
+    }
     if compact_req.dims == 0 {
         return json_error(
             StatusCode::BAD_REQUEST,
@@ -169,6 +176,13 @@ pub async fn handle_simulate_crash(
             StatusCode::BAD_REQUEST,
             "invalid_argument",
             "collection is required",
+        );
+    }
+    if crash_req.collection.contains('/') || crash_req.collection.contains('\\') {
+        return json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "collection name must not contain path separators",
         );
     }
 
@@ -262,7 +276,12 @@ fn vector_error_response(err: VectorError) -> Response<BoxBody> {
             }
         }
         VectorError::StoreError(msg) => {
-            json_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", &msg)
+            let lower = msg.to_ascii_lowercase();
+            if lower.contains("dim") {
+                json_error(StatusCode::BAD_REQUEST, "dimension_mismatch", &msg)
+            } else {
+                json_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", &msg)
+            }
         }
     }
 }

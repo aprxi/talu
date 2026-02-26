@@ -86,7 +86,7 @@ static OPENAPI_DB_VECTORS_SPEC: Lazy<Vec<u8>> =
 static OPENAPI_DB_KV_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/kv/"]));
 static OPENAPI_DB_BLOBS_SPEC: Lazy<Vec<u8>> =
-    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/blobs/"]));
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/blobs"]));
 static OPENAPI_DB_SQL_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/sql/"]));
 static OPENAPI_DB_OPS_SPEC: Lazy<Vec<u8>> =
@@ -517,10 +517,16 @@ impl Service<Request<Incoming>> for Router {
                         {
                             db::vector::handle_collection_changes(state, req, auth).await
                         }
-                        (Method::GET, p) if p.starts_with("/v1/db/vectors/collections/") => {
+                        (Method::GET, p)
+                            if p.starts_with("/v1/db/vectors/collections/")
+                                && !is_dynamic_vector_subpath(p) =>
+                        {
                             db::vector::handle_get_collection(state, req, auth).await
                         }
-                        (Method::DELETE, p) if p.starts_with("/v1/db/vectors/collections/") => {
+                        (Method::DELETE, p)
+                            if p.starts_with("/v1/db/vectors/collections/")
+                                && !is_dynamic_vector_subpath(p) =>
+                        {
                             db::vector::handle_delete_collection(state, req, auth).await
                         }
                         // Tag management endpoints
@@ -947,7 +953,7 @@ fn is_db_table_root_path(path: &str) -> bool {
     let Some(stripped) = path.strip_prefix("/v1/db/tables/") else {
         return false;
     };
-    !stripped.is_empty() && !stripped.contains('/') && stripped != "_meta"
+    !stripped.is_empty() && !stripped.contains('/')
 }
 
 fn is_db_table_insert_path(path: &str) -> bool {
@@ -977,7 +983,14 @@ fn is_db_table_item_path(path: &str) -> bool {
     let mut parts = stripped.split('/');
     let table = parts.next().unwrap_or("");
     let id = parts.next().unwrap_or("");
-    table != "" && table != "_meta" && id != "" && id != "search" && id != "insert" && id != "rows" && id != "_meta" && parts.next().is_none()
+    table != ""
+        && id != ""
+        && id != "search"
+        && id != "insert"
+        && id != "rows"
+        && id != "_meta"
+        && !(table == "_meta" && (id == "namespaces" || id == "policy"))
+        && parts.next().is_none()
 }
 
 fn is_db_table_tags_path(path: &str) -> bool {
@@ -996,9 +1009,85 @@ fn is_known_path(path: &str) -> bool {
         return true;
     }
     if let Some(stripped) = path.strip_prefix("/v1") {
-        return KNOWN_PATHS.contains(stripped);
+        if KNOWN_PATHS.contains(stripped) {
+            return true;
+        }
     }
-    false
+    // Parameterized paths not in KNOWN_PATHS as literals.
+    is_kv_entry_path(path)
+        || is_kv_state_op_path(path)
+        || is_db_table_root_path(path)
+        || is_db_table_item_path(path)
+        || is_db_table_insert_path(path)
+        || is_db_table_search_path(path)
+        || is_db_table_tags_path(path)
+        || db::table::is_table_rows_path(path)
+        || db::table::is_table_row_path(path)
+        || db::table::is_table_scan_path(path)
+        || db::table::is_table_meta_policy_path(path)
+        || is_dynamic_vector_path(path)
+        || is_blob_item_path(path)
+}
+
+fn is_kv_entry_path(path: &str) -> bool {
+    let p = path.strip_prefix("/v1").unwrap_or(path);
+    p.starts_with("/db/kv/namespaces/") && p.contains("/entries")
+}
+
+fn is_kv_state_op_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/kv/namespaces/") else {
+        return false;
+    };
+    stripped.ends_with("/flush") || stripped.ends_with("/compact")
+}
+
+/// True when path is a known vector sub-path (points/*, stats, compact, etc.)
+/// as opposed to a simple collection-name path.  Used to prevent GET/DELETE
+/// catch-alls from absorbing wrong-method requests on known sub-paths.
+fn is_dynamic_vector_subpath(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/vectors/collections/") else {
+        return false;
+    };
+    let parts: Vec<&str> = stripped.split('/').collect();
+    match parts.len() {
+        2 => matches!(parts[1], "stats" | "compact" | "changes"),
+        3 => {
+            (parts[1] == "points"
+                && matches!(parts[2], "append" | "upsert" | "delete" | "fetch" | "query"))
+                || (parts[1] == "indexes" && parts[2] == "build")
+        }
+        _ => false,
+    }
+}
+
+fn is_dynamic_vector_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/vectors/collections/") else {
+        return false;
+    };
+    if stripped.is_empty() {
+        return false;
+    }
+    let parts: Vec<&str> = stripped.split('/').collect();
+    match parts.len() {
+        // /v1/db/vectors/collections/{name}
+        1 => true,
+        // /v1/db/vectors/collections/{name}/{suffix}
+        2 => matches!(parts[1], "stats" | "compact" | "changes"),
+        // /v1/db/vectors/collections/{name}/points/{action} or indexes/build
+        3 => {
+            (parts[1] == "points"
+                && matches!(parts[2], "append" | "upsert" | "delete" | "fetch" | "query"))
+                || (parts[1] == "indexes" && parts[2] == "build")
+        }
+        _ => false,
+    }
+}
+
+fn is_blob_item_path(path: &str) -> bool {
+    let Some(stripped) = path.strip_prefix("/v1/db/blobs/") else {
+        return false;
+    };
+    !stripped.is_empty() && !stripped.contains('/')
 }
 
 /// Serve a console UI asset.

@@ -192,7 +192,7 @@ pub(crate) struct QueryPointsResponse {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct CollectionStatsResponse {
-    pub collection: String,
+    pub name: String,
     pub dims: u32,
     pub metric: CollectionMetric,
     pub normalization: NormalizationPolicy,
@@ -418,8 +418,9 @@ pub async fn handle_get_collection(
         Err(resp) => return resp,
     };
 
-    let Some(name) = extract_collection_name(req.uri().path()) else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let name = match extract_collection_name(req.uri().path()) {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let disk = match load_collections_cached(&storage_root) {
@@ -443,7 +444,7 @@ pub async fn handle_get_collection(
     path = "/v1/db/vectors/collections/{name}",
     tag = "DB::Vectors",
     params(("name" = String, Path, description = "Collection name")),
-    responses((status = 204))
+    responses((status = 200))
 )]
 /// DELETE /v1/db/vectors/collections/{name} - Delete a collection.
 pub async fn handle_delete_collection(
@@ -456,8 +457,9 @@ pub async fn handle_delete_collection(
         Err(resp) => return resp,
     };
 
-    let Some(name) = extract_collection_name(req.uri().path()) else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let name = match extract_collection_name(req.uri().path()) {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let _collections_lock = match acquire_file_lock(&collections_lock_path(&storage_root)) {
@@ -486,17 +488,17 @@ pub async fn handle_delete_collection(
     if let Err(e) = store_collections_cache(&storage_root, &disk) {
         return json_error(StatusCode::INTERNAL_SERVER_ERROR, "storage_error", &e);
     }
-    clear_collection_store_cache(&storage_root, name);
+    clear_collection_store_cache(&storage_root, &name);
 
-    let root = collection_store_root(&storage_root, name);
+    let root = collection_store_root(&storage_root, &name);
     if root.exists() {
         let _ = fs::remove_dir_all(root);
     }
 
-    Response::builder()
-        .status(StatusCode::NO_CONTENT)
-        .body(Full::new(Bytes::new()).boxed())
-        .unwrap()
+    json_response(
+        StatusCode::OK,
+        &serde_json::json!({ "name": name, "status": "deleted" }),
+    )
 }
 
 #[utoipa::path(
@@ -519,11 +521,9 @@ pub async fn handle_append_points(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/points/append")
-            .map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/append") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let collection = match require_collection(&storage_root, &collection_name) {
@@ -630,11 +630,9 @@ pub async fn handle_upsert_points(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/points/upsert")
-            .map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/upsert") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let collection = match require_collection(&storage_root, &collection_name) {
@@ -732,11 +730,9 @@ pub async fn handle_delete_points(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/points/delete")
-            .map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/delete") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let collection = match require_collection(&storage_root, &collection_name) {
@@ -805,11 +801,9 @@ pub async fn handle_fetch_points(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/points/fetch")
-            .map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/fetch") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let collection = match require_collection(&storage_root, &collection_name) {
@@ -890,11 +884,9 @@ pub async fn handle_query_points(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/points/query")
-            .map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/query") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let collection = match require_collection(&storage_root, &collection_name) {
@@ -1026,10 +1018,9 @@ pub async fn handle_collection_stats(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/stats").map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/stats") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let collection = match require_collection(&storage_root, &collection_name) {
@@ -1047,7 +1038,7 @@ pub async fn handle_collection_stats(
     json_response(
         StatusCode::OK,
         &CollectionStatsResponse {
-            collection: collection_name.to_string(),
+            name: collection_name.to_string(),
             dims: collection.dims,
             metric: collection.metric,
             normalization: collection.normalization,
@@ -1083,10 +1074,9 @@ pub async fn handle_compact_collection(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/compact").map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/compact") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     let collection = match require_collection(&storage_root, &collection_name) {
@@ -1181,11 +1171,9 @@ pub async fn handle_build_collection_indexes(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/indexes/build")
-            .map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/indexes/build") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     if let Err(resp) = require_collection(&storage_root, &collection_name).map(|_| ()) {
@@ -1266,10 +1254,9 @@ pub async fn handle_collection_changes(
         Err(resp) => return resp,
     };
 
-    let Some(collection_name) =
-        extract_collection_name_with_suffix(req.uri().path(), "/changes").map(ToOwned::to_owned)
-    else {
-        return json_error(StatusCode::NOT_FOUND, "not_found", "Not found");
+    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/changes") {
+        Ok(n) => n,
+        Err(resp) => return resp,
     };
 
     if let Err(resp) = require_collection(&storage_root, &collection_name).map(|_| ()) {
@@ -1536,21 +1523,50 @@ fn validate_collection_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn extract_collection_name(path: &str) -> Option<&str> {
-    let stripped = path.strip_prefix("/v1/db/vectors/collections/")?;
+fn extract_collection_name(path: &str) -> Result<String, Response<BoxBody>> {
+    let stripped = path
+        .strip_prefix("/v1/db/vectors/collections/")
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "not_found", "Not found"))?;
     if stripped.is_empty() || stripped.contains('/') {
-        return None;
+        return Err(json_error(StatusCode::NOT_FOUND, "not_found", "Not found"));
     }
-    Some(stripped)
+    let decoded = percent_encoding::percent_decode_str(stripped)
+        .decode_utf8_lossy()
+        .into_owned();
+    if decoded.contains('/') {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "collection name must not contain path separators",
+        ));
+    }
+    Ok(decoded)
 }
 
-fn extract_collection_name_with_suffix<'a>(path: &'a str, suffix: &str) -> Option<&'a str> {
-    let stripped = path.strip_prefix("/v1/db/vectors/collections/")?;
-    let name = stripped.strip_suffix(suffix)?;
+fn extract_collection_name_with_suffix(
+    path: &str,
+    suffix: &str,
+) -> Result<String, Response<BoxBody>> {
+    let stripped = path
+        .strip_prefix("/v1/db/vectors/collections/")
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "not_found", "Not found"))?;
+    let name = stripped
+        .strip_suffix(suffix)
+        .ok_or_else(|| json_error(StatusCode::NOT_FOUND, "not_found", "Not found"))?;
     if name.is_empty() || name.contains('/') {
-        return None;
+        return Err(json_error(StatusCode::NOT_FOUND, "not_found", "Not found"));
     }
-    Some(name)
+    let decoded = percent_encoding::percent_decode_str(name)
+        .decode_utf8_lossy()
+        .into_owned();
+    if decoded.contains('/') {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "invalid_argument",
+            "collection name must not contain path separators",
+        ));
+    }
+    Ok(decoded)
 }
 
 fn hash_bytes(data: &[u8]) -> u64 {

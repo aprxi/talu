@@ -686,12 +686,15 @@ pub async fn handle_get_blob(
     }
 
     let storage_path = match state.bucket_path.as_ref() {
-        Some(p) => p.clone(),
+        Some(p) => match _auth.as_ref() {
+            Some(ctx) => p.join(&ctx.storage_prefix),
+            None => p.clone(),
+        },
         None => {
             return json_error(
-                StatusCode::NOT_FOUND,
-                "not_found",
-                "No file storage configured",
+                StatusCode::SERVICE_UNAVAILABLE,
+                "no_storage",
+                "Storage not configured",
             );
         }
     };

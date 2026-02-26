@@ -33,9 +33,11 @@ fn materialize_db_path(template: &str, suffix: &str) -> String {
         ("table", "documents".to_string()),
         ("doc_id", format!("missing-{suffix}")),
         ("namespace", format!("ns-{suffix}")),
+        ("ns", format!("ns-{suffix}")),
         ("key", format!("k-{suffix}")),
         ("name", format!("coll-{suffix}")),
         ("blob_ref", "a".repeat(64)),
+        ("hash", format!("123")),
     ]);
 
     let mut out = template.to_string();

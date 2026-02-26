@@ -573,6 +573,7 @@ pub export fn talu_db_ops_vector_compact(
     const result = backend.compactIdempotent(dims, 0, 0) catch |err| {
         switch (err) {
             error.IdempotencyConflict => capi_error.setError(err, "idempotency conflict", .{}),
+            error.InvalidColumnData => capi_error.setError(err, "dimension mismatch: requested dimensions do not match stored vectors", .{}),
             else => capi_error.setError(err, "failed to compact vectors", .{}),
         }
         return @intFromEnum(error_codes.errorToCode(err));

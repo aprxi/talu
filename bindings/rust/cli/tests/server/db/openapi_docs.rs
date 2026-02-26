@@ -89,7 +89,7 @@ fn openapi_db_specs_are_plane_scoped() {
         ("/openapi/db/tables.json", "/v1/db/tables/"),
         ("/openapi/db/vectors.json", "/v1/db/vectors/"),
         ("/openapi/db/kv.json", "/v1/db/kv/"),
-        ("/openapi/db/blobs.json", "/v1/db/blobs/"),
+        ("/openapi/db/blobs.json", "/v1/db/blobs"),
         ("/openapi/db/sql.json", "/v1/db/sql/"),
         ("/openapi/db/ops.json", "/v1/db/ops/"),
     ] {

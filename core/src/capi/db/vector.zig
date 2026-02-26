@@ -447,6 +447,7 @@ pub export fn talu_db_vector_compact_idempotent(
     const result = backend.compactIdempotent(dims, key_hash, request_hash) catch |err| {
         switch (err) {
             error.IdempotencyConflict => capi_error.setError(err, "idempotency conflict", .{}),
+            error.InvalidColumnData => capi_error.setError(err, "dimension mismatch: requested dimensions do not match stored vectors", .{}),
             else => capi_error.setError(err, "failed to compact vectors", .{}),
         }
         return @intFromEnum(error_codes.errorToCode(err));
@@ -481,6 +482,7 @@ pub export fn talu_db_vector_compact_with_generation(
                 "manifest generation conflict",
                 .{},
             ),
+            error.InvalidColumnData => capi_error.setError(err, "dimension mismatch: requested dimensions do not match stored vectors", .{}),
             else => capi_error.setError(err, "failed to compact vectors with generation guard", .{}),
         }
         return @intFromEnum(error_codes.errorToCode(err));

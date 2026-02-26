@@ -560,10 +560,14 @@ pub const Table = struct {
                     }
                 }
 
-                // Skip if TTL expired.
+                // Skip if TTL expired. An expired newer version tombstones
+                // all older versions of this key.
                 if (ttl_bytes) |tb| {
                     const ttl_val = readI64At(tb, row_idx) catch continue;
-                    if (ttl_val > 0 and ttl_val < now_ms) continue;
+                    if (ttl_val > 0 and ttl_val < now_ms) {
+                        try tombstones.put(row_pk, std.math.maxInt(i64));
+                        continue;
+                    }
                 }
 
                 if (row_ts <= best_ts) continue;
