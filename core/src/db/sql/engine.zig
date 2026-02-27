@@ -5,7 +5,8 @@
 //! queries with typed binary parameters (no JSON at this layer).
 
 const std = @import("std");
-const sqlite = @import("c.zig").sqlite3;
+const c = @import("c.zig");
+const sqlite = c.sqlite3;
 const vtable_docs = @import("vtable_docs.zig");
 const vtable_generic = @import("vtable_generic.zig");
 const vtable_vector = @import("vtable_vector.zig");
@@ -86,14 +87,14 @@ fn bindParams(stmt: *sqlite.sqlite3_stmt, params: []const SqlParam) !void {
                 idx,
                 p.ptr,
                 @intCast(p.len),
-                sqlite.SQLITE_TRANSIENT,
+                c.SQLITE_TRANSIENT(),
             ),
             .blob => sqlite.sqlite3_bind_blob(
                 stmt,
                 idx,
                 p.ptr,
                 @intCast(p.len),
-                sqlite.SQLITE_TRANSIENT,
+                c.SQLITE_TRANSIENT(),
             ),
         };
         if (rc != sqlite.SQLITE_OK) return error.SqliteBindFailed;
