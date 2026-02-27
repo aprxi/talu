@@ -16,6 +16,7 @@ const layer_ops = @import("../../../../models/layer_ops.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const compute = @import("../../../../compute/root.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
+const plan_compiler = @import("../../../../models/plan/compiler.zig");
 const cpu_blocks = @import("../executor/weights.zig");
 const exec_block = @import("../executor/block.zig");
 const image_mod = @import("../../../../image/root.zig");
@@ -83,6 +84,9 @@ pub const VisionRuntime = struct {
     exec_blocks: []exec_block.Block,
     scratch: cpu_blocks.ScratchBuffer,
     vision_program: []const layer_ops.LayerOp,
+    compiled_vision_plan: runtime_contract.CompiledPlan,
+    instruction_ops: []const layer_ops.LayerOp,
+    dispatch_counters: runtime_contract.DispatchCounters = .{},
 
     const VisionProgramAdapterState = struct {
         saw_patch_embed: bool = false,
@@ -90,14 +94,16 @@ pub const VisionRuntime = struct {
         merged_embeddings: ?[]f32 = null,
     };
 
-    const VisionProgramAdapterFn = *const fn (
-        self: *VisionRuntime,
-        op: layer_ops.LayerOp,
+    const VisionProgramExecutionContext = struct {
+        runtime: *VisionRuntime,
+        compiled_plan: *const runtime_contract.CompiledPlan,
+        instruction_ops: []const layer_ops.LayerOp,
+        op_index: usize,
         grid: image_mod.VisionGrid,
         merged_hidden_in: []const f32,
         deepstack_layer_embeddings: []const []const f32,
         state: *VisionProgramAdapterState,
-    ) anyerror!void;
+    };
 
     const vision_program_required_opcodes = [_]opcode_map.Opcode{
         .vision_patch_embed,
@@ -106,12 +112,12 @@ pub const VisionRuntime = struct {
         .vision_scatter,
     };
 
-    const vision_program_adapter_table = blk: {
-        var table: [256]?VisionProgramAdapterFn = [_]?VisionProgramAdapterFn{null} ** 256;
-        table[@intFromEnum(opcode_map.Opcode.vision_patch_embed)] = visionProgramPatchEmbedAdapter;
-        table[@intFromEnum(opcode_map.Opcode.vision_deepstack_extract)] = visionProgramDeepstackExtractAdapter;
-        table[@intFromEnum(opcode_map.Opcode.vision_spatial_merge)] = visionProgramSpatialMergeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.vision_scatter)] = visionProgramScatterAdapter;
+    const vision_program_adapter_table: runtime_contract.AdapterTable = blk: {
+        var table: runtime_contract.AdapterTable = [_]?runtime_contract.KernelAdapterFn{null} ** 256;
+        table[@intFromEnum(opcode_map.Opcode.vision_patch_embed)] = visionProgramPatchEmbedRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.vision_deepstack_extract)] = visionProgramDeepstackExtractRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.vision_spatial_merge)] = visionProgramSpatialMergeRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.vision_scatter)] = visionProgramScatterRuntimeAdapter;
         break :blk table;
     };
 
@@ -123,8 +129,21 @@ pub const VisionRuntime = struct {
         );
     }
 
-    fn visionProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?VisionProgramAdapterFn {
+    fn visionProgramAdapterForOpcode(opcode: opcode_map.Opcode) ?runtime_contract.KernelAdapterFn {
         return vision_program_adapter_table[@intFromEnum(opcode)];
+    }
+
+    fn visionProgramExecutionState(ctx: *runtime_contract.ExecutionContext) !*VisionProgramExecutionContext {
+        const raw_state = ctx.workspace.any orelse return error.InvalidDispatchState;
+        return @ptrCast(@alignCast(raw_state));
+    }
+
+    fn visionProgramOpForInstruction(
+        exec_ctx: *const VisionProgramExecutionContext,
+        _: *const runtime_contract.Instruction,
+    ) !layer_ops.LayerOp {
+        if (exec_ctx.op_index >= exec_ctx.instruction_ops.len) return error.InvalidInstructionIndex;
+        return exec_ctx.instruction_ops[exec_ctx.op_index];
     }
 
     fn initVisionScratch(
@@ -227,6 +246,17 @@ pub const VisionRuntime = struct {
             deepstack_visual_layers,
             deepstack_layer_count,
         );
+        var compiled_vision_plan = try plan_compiler.compileLayerProgram(
+            allocator,
+            vision_program,
+            .vision_encode,
+        );
+        errdefer plan_compiler.deinitCompiledPlan(allocator, &compiled_vision_plan);
+        const instruction_ops = try allocator.alloc(layer_ops.LayerOp, compiled_vision_plan.plan.instructions.len);
+        errdefer allocator.free(instruction_ops);
+        for (compiled_vision_plan.plan.instructions, 0..) |insn, op_index| {
+            instruction_ops[op_index] = try runtime_contract.decodeInstructionLayerOp(&compiled_vision_plan, &insn, op_index);
+        }
         spatial_merge_size = parsed_program.spatial_merge_size;
         deepstack_visual_layers = parsed_program.deepstack_visual_layers;
         deepstack_layer_count = parsed_program.deepstack_layer_count;
@@ -520,6 +550,9 @@ pub const VisionRuntime = struct {
             .exec_blocks = exec_blocks,
             .scratch = scratch,
             .vision_program = vision_program,
+            .compiled_vision_plan = compiled_vision_plan,
+            .instruction_ops = instruction_ops,
+            .dispatch_counters = .{},
         };
     }
 
@@ -545,6 +578,8 @@ pub const VisionRuntime = struct {
         if (self.exec_blocks.len > 0) self.allocator.free(self.exec_blocks);
         if (self.blocks.len > 0) self.allocator.free(self.blocks);
         if (self.layer_weights.len > 0) self.allocator.free(self.layer_weights);
+        if (self.instruction_ops.len > 0) self.allocator.free(self.instruction_ops);
+        plan_compiler.deinitCompiledPlan(self.allocator, &self.compiled_vision_plan);
 
         self.* = undefined;
     }
@@ -771,11 +806,41 @@ pub const VisionRuntime = struct {
     ) !EncodedSingleImage {
         var state = VisionProgramAdapterState{};
         errdefer if (state.merged_embeddings) |embeds| self.allocator.free(embeds);
-
-        for (self.vision_program) |op| {
-            const opcode = opcode_map.opcodeForLayerOp(op);
-            const adapter = visionProgramAdapterForOpcode(opcode) orelse return error.InvalidVisionProgram;
-            try adapter(self, op, grid, merged_hidden_in, deepstack_layer_embeddings, &state);
+        var exec_state = VisionProgramExecutionContext{
+            .runtime = self,
+            .compiled_plan = &self.compiled_vision_plan,
+            .instruction_ops = self.instruction_ops,
+            .op_index = 0,
+            .grid = grid,
+            .merged_hidden_in = merged_hidden_in,
+            .deepstack_layer_embeddings = deepstack_layer_embeddings,
+            .state = &state,
+        };
+        var active_slots: [1]usize = .{0};
+        const no_seq_lengths: [0]u32 = .{};
+        const no_registers: [0]runtime_contract.TensorHandle = .{};
+        const no_views: [0]runtime_contract.TensorViewDesc = .{};
+        const no_state_blocks: [0]runtime_contract.StateBlockHandle = .{};
+        for (self.compiled_vision_plan.plan.instructions, 0..) |insn, op_index| {
+            exec_state.op_index = op_index;
+            const adapter = visionProgramAdapterForOpcode(insn.opcode) orelse return error.InvalidVisionProgram;
+            var rt_ctx = runtime_contract.ExecutionContext{
+                .mode = .vision_encode,
+                .active_slots = active_slots[0..],
+                .sequence_lengths = no_seq_lengths[0..],
+                .batch_size = 1,
+                .dispatch_counters = &self.dispatch_counters,
+                .workspace = .{ .any = @ptrCast(&exec_state) },
+            };
+            runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
+            try adapter(
+                &rt_ctx,
+                &insn,
+                no_registers[0..],
+                no_views[0..],
+                no_state_blocks[0..],
+                self.compiled_vision_plan.param_blocks,
+            );
         }
 
         if (!state.saw_patch_embed or !state.saw_spatial_merge or state.merged_embeddings == null) {
@@ -786,6 +851,90 @@ pub const VisionRuntime = struct {
             .merged_embeddings = state.merged_embeddings.?,
             .deepstack_layer_embeddings = deepstack_layer_embeddings,
         };
+    }
+
+    fn visionProgramPatchEmbedRuntimeAdapter(
+        ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        _: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []const runtime_contract.ParamBlock,
+    ) !void {
+        const exec_ctx = try visionProgramExecutionState(ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &exec_ctx.compiled_plan.plan, state_blocks);
+        const op = try visionProgramOpForInstruction(exec_ctx, insn);
+        try visionProgramPatchEmbedAdapter(
+            exec_ctx.runtime,
+            op,
+            exec_ctx.grid,
+            exec_ctx.merged_hidden_in,
+            exec_ctx.deepstack_layer_embeddings,
+            exec_ctx.state,
+        );
+    }
+
+    fn visionProgramDeepstackExtractRuntimeAdapter(
+        ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        _: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []const runtime_contract.ParamBlock,
+    ) !void {
+        const exec_ctx = try visionProgramExecutionState(ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &exec_ctx.compiled_plan.plan, state_blocks);
+        const op = try visionProgramOpForInstruction(exec_ctx, insn);
+        try visionProgramDeepstackExtractAdapter(
+            exec_ctx.runtime,
+            op,
+            exec_ctx.grid,
+            exec_ctx.merged_hidden_in,
+            exec_ctx.deepstack_layer_embeddings,
+            exec_ctx.state,
+        );
+    }
+
+    fn visionProgramSpatialMergeRuntimeAdapter(
+        ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        _: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []const runtime_contract.ParamBlock,
+    ) !void {
+        const exec_ctx = try visionProgramExecutionState(ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &exec_ctx.compiled_plan.plan, state_blocks);
+        const op = try visionProgramOpForInstruction(exec_ctx, insn);
+        try visionProgramSpatialMergeAdapter(
+            exec_ctx.runtime,
+            op,
+            exec_ctx.grid,
+            exec_ctx.merged_hidden_in,
+            exec_ctx.deepstack_layer_embeddings,
+            exec_ctx.state,
+        );
+    }
+
+    fn visionProgramScatterRuntimeAdapter(
+        ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        _: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []const runtime_contract.ParamBlock,
+    ) !void {
+        const exec_ctx = try visionProgramExecutionState(ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &exec_ctx.compiled_plan.plan, state_blocks);
+        const op = try visionProgramOpForInstruction(exec_ctx, insn);
+        try visionProgramScatterAdapter(
+            exec_ctx.runtime,
+            op,
+            exec_ctx.grid,
+            exec_ctx.merged_hidden_in,
+            exec_ctx.deepstack_layer_embeddings,
+            exec_ctx.state,
+        );
     }
 
     fn visionProgramPatchEmbedAdapter(

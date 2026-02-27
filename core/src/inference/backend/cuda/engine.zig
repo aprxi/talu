@@ -610,22 +610,182 @@ const ShortConvBlockRuntime = struct {
 
 const BlockRuntimeLayer = struct {
     const invalid_slot = std.math.maxInt(u8);
+    const MaxNormWeights = 4;
+    const MaxStateBindings = 256;
 
-    program: ?[]const layer_ops.LayerOp = null,
+    const FfnBinding = struct {
+        gate: *const LinearWeight,
+        up: *const LinearWeight,
+        down: *const LinearWeight,
+        d_ff: u32,
+    };
+
+    const StateBinding = struct {
+        id: u8,
+        ptr: *anyopaque,
+    };
+
     compiled_plan: ?runtime_contract.CompiledPlan = null,
+    instruction_ops: []layer_ops.LayerOp = &.{},
+    instruction_norm_weight_refs: []?*const DeviceTensor = &.{},
+    instruction_attention_refs: []?*AttentionMlpBlockRuntime = &.{},
+    instruction_shortconv_refs: []?*ShortConvBlockRuntime = &.{},
+    instruction_ffn_refs: []?FfnBinding = &.{},
     register_to_slot_map: [64]u8 = [_]u8{invalid_slot} ** 64,
-    has_kv_state: bool = false,
-    has_shortconv_state: bool = false,
-    attention_mlp: ?AttentionMlpBlockRuntime = null,
-    shortconv: ?ShortConvBlockRuntime = null,
+    attention_runtime: ?AttentionMlpBlockRuntime = null,
+    shortconv_runtime: ?ShortConvBlockRuntime = null,
+    attention_binding: ?*AttentionMlpBlockRuntime = null,
+    shortconv_binding: ?*ShortConvBlockRuntime = null,
+    norm_weights: [MaxNormWeights]?*const DeviceTensor = [_]?*const DeviceTensor{null} ** MaxNormWeights,
+    norm_weight_count: u8 = 0,
+    ffn_binding: ?FfnBinding = null,
+    state_bindings: [MaxStateBindings]?StateBinding = [_]?StateBinding{null} ** MaxStateBindings,
+    state_binding_count: u8 = 0,
+
+    fn bindState(self: *BlockRuntimeLayer, state_id: u8, ptr: *anyopaque) !void {
+        var idx: usize = 0;
+        while (idx < self.state_binding_count) : (idx += 1) {
+            const existing = self.state_bindings[idx] orelse continue;
+            if (existing.id == state_id) {
+                self.state_bindings[idx] = .{ .id = state_id, .ptr = ptr };
+                return;
+            }
+        }
+        if (self.state_binding_count >= self.state_bindings.len) return error.InvalidStateDescriptorBinding;
+        self.state_bindings[self.state_binding_count] = .{ .id = state_id, .ptr = ptr };
+        self.state_binding_count += 1;
+    }
+
+    fn stateBinding(self: *const BlockRuntimeLayer, state_id: u8) ?StateBinding {
+        var idx: usize = 0;
+        while (idx < self.state_binding_count) : (idx += 1) {
+            const binding = self.state_bindings[idx] orelse continue;
+            if (binding.id == state_id) return binding;
+        }
+        return null;
+    }
+
+    fn rebuildStateBindingsFromDescriptors(self: *BlockRuntimeLayer) !void {
+        self.state_bindings = [_]?StateBinding{null} ** MaxStateBindings;
+        self.state_binding_count = 0;
+        const compiled = self.compiled_plan orelse return;
+        for (compiled.plan.state_descs) |state_desc| {
+            switch (state_desc.id) {
+                @intFromEnum(runtime_contract.StateBlockId.kv_cache) => {
+                    if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+                    const attention = self.attention_binding orelse return error.InvalidStateDescriptorBinding;
+                    try self.bindState(state_desc.id, attention);
+                },
+                @intFromEnum(runtime_contract.StateBlockId.shortconv) => {
+                    if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+                    const shortconv = self.shortconv_binding orelse return error.InvalidStateDescriptorBinding;
+                    try self.bindState(state_desc.id, shortconv);
+                },
+                @intFromEnum(runtime_contract.StateBlockId.mamba) => return error.InvalidStateDescriptorBinding,
+                else => return error.InvalidStateDescriptorBinding,
+            }
+        }
+    }
+
+    fn rebuildInstructionRefs(self: *BlockRuntimeLayer, allocator: std.mem.Allocator) !void {
+        if (self.instruction_ops.len != 0) {
+            allocator.free(self.instruction_ops);
+            self.instruction_ops = &.{};
+        }
+        if (self.instruction_norm_weight_refs.len != 0) {
+            allocator.free(self.instruction_norm_weight_refs);
+            self.instruction_norm_weight_refs = &.{};
+        }
+        if (self.instruction_attention_refs.len != 0) {
+            allocator.free(self.instruction_attention_refs);
+            self.instruction_attention_refs = &.{};
+        }
+        if (self.instruction_shortconv_refs.len != 0) {
+            allocator.free(self.instruction_shortconv_refs);
+            self.instruction_shortconv_refs = &.{};
+        }
+        if (self.instruction_ffn_refs.len != 0) {
+            allocator.free(self.instruction_ffn_refs);
+            self.instruction_ffn_refs = &.{};
+        }
+
+        const compiled = self.compiled_plan orelse return;
+        const len = compiled.plan.instructions.len;
+        self.instruction_ops = try allocator.alloc(layer_ops.LayerOp, len);
+        self.instruction_norm_weight_refs = try allocator.alloc(?*const DeviceTensor, len);
+        self.instruction_attention_refs = try allocator.alloc(?*AttentionMlpBlockRuntime, len);
+        self.instruction_shortconv_refs = try allocator.alloc(?*ShortConvBlockRuntime, len);
+        self.instruction_ffn_refs = try allocator.alloc(?FfnBinding, len);
+        @memset(self.instruction_norm_weight_refs, null);
+        @memset(self.instruction_attention_refs, null);
+        @memset(self.instruction_shortconv_refs, null);
+        @memset(self.instruction_ffn_refs, null);
+
+        var norm_index: usize = 0;
+        for (compiled.plan.instructions, 0..) |insn, op_index| {
+            const op = try runtime_contract.decodeInstructionLayerOp(&compiled, &insn, op_index);
+            self.instruction_ops[op_index] = op;
+            switch (op) {
+                .kernel => |kernel_op| switch (kernel_op.debug_type) {
+                    .norm => {
+                        if (norm_index >= self.norm_weight_count) return error.UnsupportedModel;
+                        const weight = self.norm_weights[norm_index] orelse return error.UnsupportedModel;
+                        self.instruction_norm_weight_refs[op_index] = weight;
+                        norm_index += 1;
+                    },
+                    .multihead_attention => {
+                        self.instruction_attention_refs[op_index] = self.attention_binding orelse return error.UnsupportedModel;
+                    },
+                    .shortconv => {
+                        self.instruction_shortconv_refs[op_index] = self.shortconv_binding orelse return error.UnsupportedModel;
+                    },
+                    .mlp, .moe => {
+                        self.instruction_ffn_refs[op_index] = self.ffn_binding orelse return error.UnsupportedModel;
+                    },
+                    else => {},
+                },
+                else => {},
+            }
+        }
+    }
+
+    fn instructionNormWeightRef(self: *const BlockRuntimeLayer, op_index: usize) !*const DeviceTensor {
+        if (op_index >= self.instruction_norm_weight_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_norm_weight_refs[op_index] orelse return error.UnsupportedModel;
+    }
+
+    fn instructionOp(self: *const BlockRuntimeLayer, op_index: usize) !layer_ops.LayerOp {
+        if (op_index >= self.instruction_ops.len) return error.InvalidInstructionIndex;
+        return self.instruction_ops[op_index];
+    }
+
+    fn instructionAttentionRef(self: *const BlockRuntimeLayer, op_index: usize) !*const AttentionMlpBlockRuntime {
+        if (op_index >= self.instruction_attention_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_attention_refs[op_index] orelse return error.UnsupportedModel;
+    }
+
+    fn instructionShortConvRef(self: *const BlockRuntimeLayer, op_index: usize) !*ShortConvBlockRuntime {
+        if (op_index >= self.instruction_shortconv_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_shortconv_refs[op_index] orelse return error.UnsupportedModel;
+    }
+
+    fn instructionFfnRef(self: *const BlockRuntimeLayer, op_index: usize) !FfnBinding {
+        if (op_index >= self.instruction_ffn_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_ffn_refs[op_index] orelse return error.UnsupportedModel;
+    }
 
     fn deinit(self: *BlockRuntimeLayer, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+        if (self.instruction_ops.len != 0) allocator.free(self.instruction_ops);
+        if (self.instruction_norm_weight_refs.len != 0) allocator.free(self.instruction_norm_weight_refs);
+        if (self.instruction_attention_refs.len != 0) allocator.free(self.instruction_attention_refs);
+        if (self.instruction_shortconv_refs.len != 0) allocator.free(self.instruction_shortconv_refs);
+        if (self.instruction_ffn_refs.len != 0) allocator.free(self.instruction_ffn_refs);
         if (self.compiled_plan) |*compiled_plan| {
             plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
             self.compiled_plan = null;
         }
-        if (self.attention_mlp) |*block| block.deinit(device);
-        if (self.shortconv) |*block| block.deinit(device);
+        if (self.attention_runtime) |*block| block.deinit(device);
+        if (self.shortconv_runtime) |*block| block.deinit(device);
         self.* = .{};
     }
 };
@@ -703,26 +863,28 @@ fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: us
     }
 }
 
-const LayerStateDescriptorFlags = struct {
-    has_kv: bool = false,
-    has_shortconv: bool = false,
-    has_mamba: bool = false,
-};
-
-fn collectLayerStateDescriptorFlags(plan: *const runtime_contract.ExecutionPlan) !LayerStateDescriptorFlags {
-    var flags = LayerStateDescriptorFlags{};
-    const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
-    const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
-    const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
-    for (plan.state_descs) |state_desc| {
-        switch (state_desc.id) {
-            kv_state_id => flags.has_kv = true,
-            shortconv_state_id => flags.has_shortconv = true,
-            mamba_state_id => flags.has_mamba = true,
-            else => return error.InvalidStateDescriptorBinding,
-        }
+fn validateCompiledLayerPlanForCuda(
+    compiled: *const runtime_contract.CompiledPlan,
+    layer_idx: usize,
+    kind: op_types.BlockKind,
+) !void {
+    runtime_contract.validateExecutionPlanForBlockKind(&compiled.plan, kind) catch |err| {
+        log.warn("inference", "CUDA compiled layer plan fails block-kind validation", .{
+            .layer = layer_idx,
+            .kind = @intFromEnum(kind),
+            .reason = @errorName(err),
+        });
+        return error.UnsupportedModel;
+    };
+    if (runtime_contract.firstUnsupportedInstructionOpcode(&compiled.plan, CudaBackend.layer_program_adapter_table)) |unsupported| {
+        log.warn("inference", "CUDA compiled layer plan contains unsupported opcode", .{
+            .layer = layer_idx,
+            .kind = @intFromEnum(kind),
+            .op_index = unsupported.instruction_index,
+            .opcode = @intFromEnum(unsupported.opcode),
+        });
+        return error.UnsupportedModel;
     }
-    return flags;
 }
 
 const BlockRuntime = struct {
@@ -768,7 +930,6 @@ const BlockRuntime = struct {
         var kv_cache_bytes: usize = 0;
         var shortconv_state_bytes: usize = 0;
         var max_shortconv_dim: usize = 0;
-
         var blocks = try allocator.alloc(BlockRuntimeLayer, layer_count);
         errdefer allocator.free(blocks);
         for (blocks) |*layer| layer.* = .{};
@@ -788,7 +949,7 @@ const BlockRuntime = struct {
                         log.warn("inference", "CUDA block runtime missing architecture metadata", .{ .layer = layer_idx });
                         return error.UnsupportedModel;
                     };
-                    blocks[layer_idx].program = models.registry.blockProgramFor(entry, .attention_mlp) orelse {
+                    const program = models.registry.blockProgramFor(entry, .attention_mlp) orelse {
                         log.warn("inference", "CUDA block runtime missing LayerOp program", .{
                             .layer = layer_idx,
                             .kind = @intFromEnum(op_types.BlockKind.attention_mlp),
@@ -796,34 +957,23 @@ const BlockRuntime = struct {
                         });
                         return error.UnsupportedModel;
                     };
-                    try validateLayerProgramForCuda(
-                        blocks[layer_idx].program.?,
-                        layer_idx,
-                        .attention_mlp,
-                    );
                     blocks[layer_idx].compiled_plan = try plan_compiler.compileLayerProgram(
                         allocator,
-                        blocks[layer_idx].program.?,
+                        program,
                         .decode,
                     );
+                    try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .attention_mlp);
                     errdefer if (blocks[layer_idx].compiled_plan) |*compiled_plan| {
                         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
                         blocks[layer_idx].compiled_plan = null;
-                    };
-                    runtime_contract.validatePlanWithoutInstructionWeights(&blocks[layer_idx].compiled_plan.?) catch {
-                        log.warn("inference", "CUDA layer program has unsupported instruction weight bindings", .{
-                            .layer = layer_idx,
-                            .weight_bindings = blocks[layer_idx].compiled_plan.?.weight_bindings.len,
-                        });
-                        return error.UnsupportedModel;
                     };
                     blocks[layer_idx].register_to_slot_map = try buildCudaLayerProgramRegisterSlotMap(
                         allocator,
                         &blocks[layer_idx].compiled_plan.?,
                     );
-                    const state_flags = try collectLayerStateDescriptorFlags(&blocks[layer_idx].compiled_plan.?.plan);
-                    blocks[layer_idx].has_kv_state = state_flags.has_kv;
-                    if (!blocks[layer_idx].has_kv_state) {
+                    const state_flags = try runtime_contract.collectBuiltinStateFlags(&blocks[layer_idx].compiled_plan.?.plan);
+                    if (state_flags.has_mamba or state_flags.has_shortconv) return error.InvalidStateDescriptorBinding;
+                    if (!state_flags.has_kv) {
                         log.warn("inference", "CUDA block runtime missing KV state descriptor", .{
                             .layer = layer_idx,
                         });
@@ -1112,7 +1262,7 @@ const BlockRuntime = struct {
                     const layer_kv_bytes = std.math.mul(usize, kv_cache_bytes_per_buffer, 2) catch return error.InvalidArgument;
                     kv_cache_bytes = std.math.add(usize, kv_cache_bytes, layer_kv_bytes) catch return error.InvalidArgument;
 
-                    blocks[layer_idx].attention_mlp = .{
+                    blocks[layer_idx].attention_runtime = .{
                         .q_dim = q_proj_dev.cols(),
                         .kv_dim = k_proj_dev.cols(),
                         .d_ff = d_ff,
@@ -1135,6 +1285,14 @@ const BlockRuntime = struct {
                         .v_cache = v_cache,
                         .kv_capacity = kv_capacity,
                     };
+                    blocks[layer_idx].attention_binding = &blocks[layer_idx].attention_runtime.?;
+                    blocks[layer_idx].ffn_binding = .{
+                        .gate = &blocks[layer_idx].attention_runtime.?.w1,
+                        .up = &blocks[layer_idx].attention_runtime.?.w3,
+                        .down = &blocks[layer_idx].attention_runtime.?.w2,
+                        .d_ff = @intCast(blocks[layer_idx].attention_runtime.?.d_ff),
+                    };
+                    CudaBackend.bindAttentionNormWeights(&blocks[layer_idx], &blocks[layer_idx].attention_runtime.?);
                     attention_block_count += 1;
                 },
                 .shortconv => |shortconv| {
@@ -1142,7 +1300,7 @@ const BlockRuntime = struct {
                         log.warn("inference", "CUDA shortconv runtime missing architecture metadata", .{ .layer = layer_idx });
                         return error.UnsupportedModel;
                     };
-                    blocks[layer_idx].program = models.registry.blockProgramFor(entry, .shortconv) orelse {
+                    const program = models.registry.blockProgramFor(entry, .shortconv) orelse {
                         log.warn("inference", "CUDA shortconv runtime missing LayerOp program", .{
                             .layer = layer_idx,
                             .kind = @intFromEnum(op_types.BlockKind.shortconv),
@@ -1150,34 +1308,23 @@ const BlockRuntime = struct {
                         });
                         return error.UnsupportedModel;
                     };
-                    try validateLayerProgramForCuda(
-                        blocks[layer_idx].program.?,
-                        layer_idx,
-                        .shortconv,
-                    );
                     blocks[layer_idx].compiled_plan = try plan_compiler.compileLayerProgram(
                         allocator,
-                        blocks[layer_idx].program.?,
+                        program,
                         .decode,
                     );
+                    try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .shortconv);
                     errdefer if (blocks[layer_idx].compiled_plan) |*compiled_plan| {
                         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
                         blocks[layer_idx].compiled_plan = null;
-                    };
-                    runtime_contract.validatePlanWithoutInstructionWeights(&blocks[layer_idx].compiled_plan.?) catch {
-                        log.warn("inference", "CUDA layer program has unsupported instruction weight bindings", .{
-                            .layer = layer_idx,
-                            .weight_bindings = blocks[layer_idx].compiled_plan.?.weight_bindings.len,
-                        });
-                        return error.UnsupportedModel;
                     };
                     blocks[layer_idx].register_to_slot_map = try buildCudaLayerProgramRegisterSlotMap(
                         allocator,
                         &blocks[layer_idx].compiled_plan.?,
                     );
-                    const state_flags = try collectLayerStateDescriptorFlags(&blocks[layer_idx].compiled_plan.?.plan);
-                    blocks[layer_idx].has_shortconv_state = state_flags.has_shortconv;
-                    if (!blocks[layer_idx].has_shortconv_state) {
+                    const state_flags = try runtime_contract.collectBuiltinStateFlags(&blocks[layer_idx].compiled_plan.?.plan);
+                    if (state_flags.has_kv or state_flags.has_mamba) return error.InvalidStateDescriptorBinding;
+                    if (!state_flags.has_shortconv) {
                         log.warn("inference", "CUDA shortconv runtime missing state descriptor", .{
                             .layer = layer_idx,
                         });
@@ -1354,7 +1501,7 @@ const BlockRuntime = struct {
                     shortconv_state_bytes = std.math.add(usize, shortconv_state_bytes, conv_state.size) catch return error.InvalidArgument;
                     max_shortconv_dim = @max(max_shortconv_dim, conv_dim);
 
-                    blocks[layer_idx].shortconv = .{
+                    blocks[layer_idx].shortconv_runtime = .{
                         .conv_dim = conv_dim,
                         .d_conv = d_conv,
                         .d_ff = d_ff,
@@ -1369,6 +1516,19 @@ const BlockRuntime = struct {
                         .ffn_w2 = ffn_w2,
                         .ffn_w3 = ffn_w3,
                     };
+                    blocks[layer_idx].shortconv_binding = &blocks[layer_idx].shortconv_runtime.?;
+                    if (blocks[layer_idx].shortconv_runtime.?.ffn_w1 != null and
+                        blocks[layer_idx].shortconv_runtime.?.ffn_w2 != null and
+                        blocks[layer_idx].shortconv_runtime.?.ffn_w3 != null)
+                    {
+                        blocks[layer_idx].ffn_binding = .{
+                            .gate = &blocks[layer_idx].shortconv_runtime.?.ffn_w1.?,
+                            .up = &blocks[layer_idx].shortconv_runtime.?.ffn_w3.?,
+                            .down = &blocks[layer_idx].shortconv_runtime.?.ffn_w2.?,
+                            .d_ff = @intCast(blocks[layer_idx].shortconv_runtime.?.d_ff),
+                        };
+                    }
+                    CudaBackend.bindShortConvNormWeights(&blocks[layer_idx], &blocks[layer_idx].shortconv_runtime.?);
                     shortconv_block_count += 1;
                 },
                 else => {
@@ -1378,6 +1538,8 @@ const BlockRuntime = struct {
                     return error.UnsupportedModel;
                 },
             }
+            try blocks[layer_idx].rebuildStateBindingsFromDescriptors();
+            try blocks[layer_idx].rebuildInstructionRefs(allocator);
             initialized += 1;
         }
 
@@ -1407,10 +1569,10 @@ const BlockRuntime = struct {
     fn maxDff(self: *const BlockRuntime) usize {
         var max_dff: usize = 0;
         for (self.blocks) |layer| {
-            if (layer.attention_mlp) |block| {
+            if (layer.attention_binding) |block| {
                 if (block.d_ff > max_dff) max_dff = block.d_ff;
             }
-            if (layer.shortconv) |block| {
+            if (layer.shortconv_binding) |block| {
                 if (block.d_ff > max_dff) max_dff = block.d_ff;
             }
         }
@@ -1420,7 +1582,7 @@ const BlockRuntime = struct {
     fn maxAttn(self: *const BlockRuntime) usize {
         var max_attn: usize = 0;
         for (self.blocks) |layer| {
-            if (layer.attention_mlp) |block| {
+            if (layer.attention_binding) |block| {
                 if (block.q_dim > max_attn) max_attn = block.q_dim;
             }
         }
@@ -1430,7 +1592,7 @@ const BlockRuntime = struct {
     fn maxKv(self: *const BlockRuntime) usize {
         var max_kv: usize = 0;
         for (self.blocks) |layer| {
-            if (layer.attention_mlp) |block| {
+            if (layer.attention_binding) |block| {
                 if (block.kv_dim > max_kv) max_kv = block.kv_dim;
             }
         }
@@ -1654,6 +1816,17 @@ pub const CudaBackend = struct {
     slot_position: usize = 0,
     slot_rope_position_delta: isize = 0,
     slot_logits: []f32,
+    state_descriptors_storage: [3]runtime_contract.StateDescriptor = .{
+        runtime_contract.defaultStateDescriptor(.kv_cache),
+        runtime_contract.defaultStateDescriptor(.shortconv),
+        runtime_contract.defaultStateDescriptor(.mamba),
+    },
+    state_descriptor_count: u8 = 0,
+    slot_state_blocks: [3]runtime_contract.StateBlockHandle = undefined,
+    slot_state_block_count: u8 = 0,
+    slot_state_bound: bool = false,
+    implicit_slot_state_storage: [3][64]u8 align(64) = [_][64]u8{[_]u8{0} ** 64} ** 3,
+    runtime_dispatch_counters: runtime_contract.DispatchCounters = .{},
     layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     sequence_prefill_hidden_host: []f32,
@@ -1686,6 +1859,17 @@ pub const CudaBackend = struct {
             .attention_scale = 0.0,
             .norm_eps = prototype_eps,
             .slot_logits = undefined,
+            .state_descriptors_storage = .{
+                runtime_contract.defaultStateDescriptor(.kv_cache),
+                runtime_contract.defaultStateDescriptor(.shortconv),
+                runtime_contract.defaultStateDescriptor(.mamba),
+            },
+            .state_descriptor_count = 0,
+            .slot_state_blocks = undefined,
+            .slot_state_block_count = 0,
+            .slot_state_bound = false,
+            .implicit_slot_state_storage = [_][64]u8{[_]u8{0} ** 64} ** 3,
+            .runtime_dispatch_counters = .{},
             .layer_program_dispatch_total = [_]u64{0} ** 256,
             .prefill_dispatch_window_start = [_]u64{0} ** 256,
             .sequence_prefill_hidden_host = &.{},
@@ -1728,6 +1912,34 @@ pub const CudaBackend = struct {
         errdefer backend.argmax_index_dev.deinit(&backend.device);
         backend.block_runtime = try BlockRuntime.init(allocator, &backend.device, loaded);
         errdefer backend.block_runtime.deinit(allocator, &backend.device);
+        for (backend.block_runtime.blocks) |*layer| {
+            if (layer.compiled_plan) |*compiled_plan| {
+                try runtime_contract.appendUniquePlanStateDescriptors(
+                    backend.state_descriptors_storage[0..],
+                    &backend.state_descriptor_count,
+                    &compiled_plan.plan,
+                );
+            }
+        }
+        const descriptor_slice = backend.state_descriptors_storage[0..backend.state_descriptor_count];
+        const has_kv_descriptor = runtime_contract.stateDescriptorIndex(
+            descriptor_slice,
+            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+        ) != null;
+        const has_shortconv_descriptor = runtime_contract.stateDescriptorIndex(
+            descriptor_slice,
+            @intFromEnum(runtime_contract.StateBlockId.shortconv),
+        ) != null;
+        const has_mamba_descriptor = runtime_contract.stateDescriptorIndex(
+            descriptor_slice,
+            @intFromEnum(runtime_contract.StateBlockId.mamba),
+        ) != null;
+        if (has_kv_descriptor != (backend.block_runtime.attention_block_count > 0) or
+            has_shortconv_descriptor != (backend.block_runtime.shortconv_block_count > 0) or
+            has_mamba_descriptor)
+        {
+            return error.InvalidStateDescriptorBinding;
+        }
         backend.vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (backend.vision_runtime) |*rt| rt.deinit();
         if (loaded.config.use_qk_norm and
@@ -1909,7 +2121,7 @@ pub const CudaBackend = struct {
 
     fn initialKvCapacity(self: *const CudaBackend) usize {
         for (self.block_runtime.blocks) |layer| {
-            if (layer.attention_mlp) |block| return block.kv_capacity;
+            if (layer.attention_binding) |block| return block.kv_capacity;
         }
         return 0;
     }
@@ -1957,6 +2169,7 @@ pub const CudaBackend = struct {
     }
 
     pub fn prefill(self: *CudaBackend, tokens: []const u32, logits_out: []f32) !void {
+        try self.bindImplicitSlot0StateBlocks();
         return prefill_mod.prefill(self, tokens, logits_out);
     }
 
@@ -2002,6 +2215,64 @@ pub const CudaBackend = struct {
         return decode_mod.getPosition(self, slot_index);
     }
 
+    pub fn stateDescriptors(self: *const CudaBackend) []const runtime_contract.StateDescriptor {
+        return self.state_descriptors_storage[0..self.state_descriptor_count];
+    }
+
+    pub fn bindSlotStateBlocks(
+        self: *CudaBackend,
+        slot_index: usize,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        if (slot_index != 0) return error.InvalidArgument;
+        try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
+        if (state_blocks.len > self.slot_state_blocks.len) return error.InvalidStateDescriptorBinding;
+        for (state_blocks, 0..) |state_block, idx| {
+            self.slot_state_blocks[idx] = state_block;
+        }
+        self.slot_state_block_count = @intCast(state_blocks.len);
+        self.slot_state_bound = true;
+    }
+
+    pub fn unbindSlotStateBlocks(self: *CudaBackend, slot_index: usize) void {
+        if (slot_index != 0) return;
+        self.slot_state_block_count = 0;
+        self.slot_state_bound = false;
+    }
+
+    fn slotStateBlocks(self: *const CudaBackend) []const runtime_contract.StateBlockHandle {
+        return self.slot_state_blocks[0..self.slot_state_block_count];
+    }
+
+    pub fn ensureSlotStateBlocksBoundForScheduler(self: *const CudaBackend, slot_index: usize) !void {
+        if (slot_index != 0) return error.InvalidArgument;
+        if (self.state_descriptor_count == 0) return;
+        if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
+        try runtime_contract.validateStateBlocksForDescriptors(
+            self.stateDescriptors(),
+            self.slotStateBlocks(),
+        );
+    }
+
+    fn bindImplicitSlot0StateBlocks(self: *CudaBackend) !void {
+        if (self.state_descriptor_count == 0 or self.slot_state_bound) return;
+        const descriptors = self.stateDescriptors();
+        var handles: [3]runtime_contract.StateBlockHandle = undefined;
+        for (descriptors, 0..) |descriptor, idx| {
+            const size_bytes = if (descriptor.size_bytes == 0) @as(u64, 1) else descriptor.size_bytes;
+            const implicit_capacity = @as(u64, @intCast(self.implicit_slot_state_storage[idx].len));
+            if (size_bytes > implicit_capacity) return error.InvalidStateDescriptorBinding;
+            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
+            handles[idx] = .{
+                .id = descriptor.id,
+                .ptr = @ptrCast(&self.implicit_slot_state_storage[idx][0]),
+                .size = size_bytes,
+                .align_bytes = 64,
+            };
+        }
+        try self.bindSlotStateBlocks(0, handles[0..descriptors.len]);
+    }
+
     pub fn prefillSlot(
         self: *CudaBackend,
         slot_index: usize,
@@ -2019,6 +2290,7 @@ pub const CudaBackend = struct {
         logits_out: []f32,
     ) !void {
         if (vision_input == null) return self.prefillSlot(slot_index, tokens, logits_out);
+        try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
 
         if (tokens.len == 0) {
             log.warn("inference", "CUDA prefillSlotWithVision invalid args", .{
@@ -2190,7 +2462,7 @@ pub const CudaBackend = struct {
             global_rope_theta;
 
         for (self.block_runtime.blocks) |*layer| {
-            const block = if (layer.attention_mlp) |*b| b else return false;
+            const block = layer.attention_binding orelse return false;
 
             try compute.cuda.rmsnorm.runWithFunction(
                 &self.kernel_arg_pack,
@@ -2566,16 +2838,21 @@ pub const CudaBackend = struct {
         unsupported_layer_program,
     };
 
-    fn sequencePrefillProgramCompatible(program: []const layer_ops.LayerOp) bool {
-        for (program) |op| switch (op) {
-            .kernel => |kernel_op| switch (kernel_op.debug_type) {
-                .norm, .multihead_attention, .mlp, .moe => {},
+    fn sequencePrefillProgramCompatible(layer: *const BlockRuntimeLayer) bool {
+        const compiled = layer.compiled_plan orelse return false;
+        for (compiled.plan.instructions, 0..) |insn, op_index| {
+            const op = layerProgramOpForInstruction(layer, &insn, op_index) catch return false;
+            switch (op) {
+                .kernel => |kernel_op| switch (kernel_op.debug_type) {
+                    .norm, .multihead_attention, .mlp, .moe => {},
+                    else => return false,
+                },
+                .add => {},
                 else => return false,
-            },
-            .add => {},
-            else => return false,
-        };
-        return finalProgramOutputBuffer(program) == .residual;
+            }
+        }
+        const final_register = runtime_contract.planFinalOutputRegister(&compiled.plan);
+        return runtime_contract.registerToIndex(final_register) == @intFromEnum(layer_ops.BufferId.residual);
     }
 
     fn sequencePrefillGate(self: *const CudaBackend, token_count: usize) SequencePrefillGate {
@@ -2616,9 +2893,8 @@ pub const CudaBackend = struct {
         }
 
         for (self.block_runtime.blocks) |layer| {
-            const block = layer.attention_mlp orelse return .non_attention_blocks_present;
-            const program = layer.program orelse return .unsupported_layer_program;
-            if (!sequencePrefillProgramCompatible(program)) return .unsupported_layer_program;
+            const block = layer.attention_binding orelse return .non_attention_blocks_present;
+            if (!sequencePrefillProgramCompatible(&layer)) return .unsupported_layer_program;
             if (!self.linearWeightSupportsSequenceRows(&block.q_proj)) return .unsupported_linear_projection;
             if (!self.linearWeightSupportsSequenceRows(&block.k_proj)) return .unsupported_linear_projection;
             if (!self.linearWeightSupportsSequenceRows(&block.v_proj)) return .unsupported_linear_projection;
@@ -3036,32 +3312,26 @@ pub const CudaBackend = struct {
                 .attn_weighted_sum_heads_f16_kv_function = attn_weighted_sum_heads_f16_kv_function,
                 .attn_fused_heads_f16_kv_function = attn_fused_heads_f16_kv_function,
             };
-            if (layer.program) |program| {
-                _ = program;
-                try self.tryExecuteLayerProgram(
-                    layer,
-                    d_model_u32,
-                    head_dim_u32,
-                    rope_dim_u32,
-                    n_heads_u32,
-                    n_kv_heads_u32,
-                    seq_len_u32,
-                    position,
-                    position_u32,
-                    global_rope_theta,
-                    local_rope_theta,
-                    rope_function,
-                    copy_function,
-                    cast_f32_to_f16_function,
-                    kv_write_f16_function,
-                    rope_store_f16_function,
-                    shortconv_step_function,
-                    attention_kernels,
-                );
-            } else {
-                log.warn("inference", "CUDA layer missing LayerOp program", .{ .layer = layer_idx });
-                return error.UnsupportedModel;
-            }
+            try self.tryExecuteLayerProgram(
+                layer,
+                d_model_u32,
+                head_dim_u32,
+                rope_dim_u32,
+                n_heads_u32,
+                n_kv_heads_u32,
+                seq_len_u32,
+                position,
+                position_u32,
+                global_rope_theta,
+                local_rope_theta,
+                rope_function,
+                copy_function,
+                cast_f32_to_f16_function,
+                kv_write_f16_function,
+                rope_store_f16_function,
+                shortconv_step_function,
+                attention_kernels,
+            );
             if (deepstack_layer_features_opt) |deepstack_layer_features| {
                 if (deepstack_feature_index_opt) |deepstack_feature_index| {
                     if (layer_idx < deepstack_layer_features.len) {
@@ -3132,7 +3402,7 @@ pub const CudaBackend = struct {
             null;
 
         for (self.block_runtime.blocks) |*layer| {
-            const block = if (layer.attention_mlp) |*b| b else continue;
+            const block = layer.attention_binding orelse continue;
             if (required_tokens <= block.kv_capacity) continue;
 
             var new_capacity = block.kv_capacity;
@@ -3203,7 +3473,7 @@ pub const CudaBackend = struct {
 
     fn resetShortConvStates(self: *CudaBackend) !void {
         for (self.block_runtime.blocks) |*layer| {
-            const block = if (layer.shortconv) |*b| b else continue;
+            const block = layer.shortconv_binding orelse continue;
             const elems = std.math.divExact(usize, block.conv_state.size, @sizeOf(f32)) catch return error.InvalidArgument;
             const zeros = try self.allocator.alloc(f32, elems);
             defer self.allocator.free(zeros);
@@ -3480,35 +3750,31 @@ pub const CudaBackend = struct {
         return finalProgramOutputBuffer(program);
     }
 
-    fn nextAttentionNormWeight(
-        block: *const AttentionMlpBlockRuntime,
-        norm_index: *usize,
-    ) ?*const DeviceTensor {
-        defer norm_index.* += 1;
-        return switch (norm_index.*) {
-            0 => &block.ln1_weight,
-            1 => &block.ln2_weight,
-            2 => if (block.pre_ffn_norm_weight != null)
-                &block.pre_ffn_norm_weight.?
-            else if (block.post_ffn_norm_weight != null)
-                &block.post_ffn_norm_weight.?
-            else
-                null,
-            3 => if (block.post_ffn_norm_weight != null) &block.post_ffn_norm_weight.? else null,
-            else => null,
-        };
+    fn appendLayerNormWeight(layer: *BlockRuntimeLayer, weight: ?*const DeviceTensor) void {
+        const value = weight orelse return;
+        if (layer.norm_weight_count >= layer.norm_weights.len) return;
+        layer.norm_weights[layer.norm_weight_count] = value;
+        layer.norm_weight_count += 1;
     }
 
-    fn nextShortConvNormWeight(
-        block: *const ShortConvBlockRuntime,
-        norm_index: *usize,
-    ) ?*const DeviceTensor {
-        defer norm_index.* += 1;
-        return switch (norm_index.*) {
-            0 => &block.ln1_weight,
-            1 => if (block.ln2_weight != null) &block.ln2_weight.? else null,
-            else => null,
-        };
+    fn bindAttentionNormWeights(layer: *BlockRuntimeLayer, block: *const AttentionMlpBlockRuntime) void {
+        appendLayerNormWeight(layer, &block.ln1_weight);
+        appendLayerNormWeight(layer, &block.ln2_weight);
+        if (block.pre_ffn_norm_weight) |*weight| {
+            appendLayerNormWeight(layer, weight);
+        } else if (block.post_ffn_norm_weight) |*weight| {
+            appendLayerNormWeight(layer, weight);
+        }
+        if (block.post_ffn_norm_weight) |*weight| {
+            appendLayerNormWeight(layer, weight);
+        }
+    }
+
+    fn bindShortConvNormWeights(layer: *BlockRuntimeLayer, block: *const ShortConvBlockRuntime) void {
+        appendLayerNormWeight(layer, &block.ln1_weight);
+        if (block.ln2_weight) |*weight| {
+            appendLayerNormWeight(layer, weight);
+        }
     }
 
     fn runAttentionMixerStep(
@@ -3745,7 +4011,6 @@ pub const CudaBackend = struct {
     const LayerProgramExecutionContext = struct {
         backend: *CudaBackend,
         layer: *BlockRuntimeLayer,
-        param_blocks: []const runtime_contract.ParamBlock,
         op_index: usize,
         d_model_u32: u32,
         head_dim_u32: u32,
@@ -3766,7 +4031,13 @@ pub const CudaBackend = struct {
         attention_kernels: AttentionKernelSet,
         register_to_slot_map: *const [64]u8,
         slot_buffers: [2]*compute.cuda.Buffer,
-        norm_index: usize,
+    };
+    const MAX_LAYER_PROGRAM_HANDLES: usize = 8;
+    const IMPLICIT_BINDING_REGISTER_BASE: u16 = 0xF000;
+
+    const BuiltLayerProgramHandles = struct {
+        registers: []runtime_contract.TensorHandle,
+        views: []const runtime_contract.TensorViewDesc,
     };
 
     const LayerProgramStateRef = struct {
@@ -3826,47 +4097,156 @@ pub const CudaBackend = struct {
     ) !LayerProgramInstructionStateBlocks {
         var blocks = LayerProgramInstructionStateBlocks{};
         const state_id = insn.state_block_id orelse return blocks;
-        const state_ptr: *anyopaque = switch (state_id) {
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache) => blk: {
-                if (ctx.layer.attention_mlp) |*attn| break :blk attn;
-                return error.InvalidStateDescriptorBinding;
-            },
-            @intFromEnum(runtime_contract.StateBlockId.shortconv) => blk: {
-                if (ctx.layer.shortconv) |*shortconv| break :blk shortconv;
-                return error.InvalidStateDescriptorBinding;
-            },
-            @intFromEnum(runtime_contract.StateBlockId.mamba) => return error.UnsupportedModel,
-            else => return error.InvalidStateDescriptorBinding,
+        const binding = ctx.layer.stateBinding(state_id) orelse return error.InvalidStateDescriptorBinding;
+        const descriptor = runtime_contract.findStateDescriptor(&ctx.layer.compiled_plan.?.plan, state_id) orelse {
+            return error.UnknownStateDescriptorId;
         };
 
-        blocks.refs[0] = .{ .ptr = state_ptr };
+        blocks.refs[0] = .{ .ptr = binding.ptr };
         blocks.handles[0] = .{
             .id = state_id,
             .ptr = @ptrCast(&blocks.refs[0]),
-            .size = @sizeOf(LayerProgramStateRef),
-            .align_bytes = 64,
+            .size = if (descriptor.size_bytes > 0) descriptor.size_bytes else @sizeOf(LayerProgramStateRef),
+            .align_bytes = descriptor.align_bytes,
         };
         blocks.len = 1;
         return blocks;
     }
 
-    fn decodeInstructionLayerOp(
-        insn: *const runtime_contract.Instruction,
-        params: []const runtime_contract.ParamBlock,
+    fn layerProgramOpForInstruction(
+        layer: *const BlockRuntimeLayer,
+        _: *const runtime_contract.Instruction,
+        instruction_index: usize,
     ) !layer_ops.LayerOp {
-        const param_block_id = insn.param_block_id orelse return error.MissingParamBlock;
-        if (param_block_id >= params.len) return error.MissingParamBlock;
-        const param_block = params[param_block_id];
-        try runtime_contract.validateParamBlockAbi(&param_block);
-        if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
-        if (param_block.data.len != @sizeOf(layer_ops.LayerOp)) return error.InvalidParamBlockSize;
-        const op_ptr: *const layer_ops.LayerOp = @ptrCast(@alignCast(param_block.data.ptr));
-        return op_ptr.*;
+        return layer.instructionOp(instruction_index);
+    }
+
+    fn implicitBindingRegister(slot: usize) !runtime_contract.RegisterRef {
+        const slot_u16: u16 = std.math.cast(u16, slot) orelse return error.InvalidInstructionBinding;
+        return runtime_contract.registerFromIndex(IMPLICIT_BINDING_REGISTER_BASE + slot_u16);
+    }
+
+    fn bufferFromTensorHandle(handle: runtime_contract.TensorHandle) *compute.cuda.Buffer {
+        return @ptrCast(@alignCast(handle.ptr));
+    }
+
+    fn instructionIoSlices(
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+    ) !struct { inputs: []const runtime_contract.TensorHandle, outputs: []const runtime_contract.TensorHandle } {
+        const io_count = insn.inputs.len + insn.outputs.len;
+        if (registers.len < io_count) return error.InvalidInstructionBinding;
+        return .{
+            .inputs = registers[0..insn.inputs.len],
+            .outputs = registers[insn.inputs.len..io_count],
+        };
+    }
+
+    fn instructionImplicitBindingHandle(
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        slot: usize,
+    ) !runtime_contract.TensorHandle {
+        const idx = insn.inputs.len + insn.outputs.len + insn.weights.len + slot;
+        if (idx >= registers.len) return error.InvalidInstructionBinding;
+        return registers[idx];
+    }
+
+    fn tensorViewDescForCudaBuffer() runtime_contract.TensorViewDesc {
+        return .{
+            .dtype = .f32,
+            .rank = 0,
+            .shape = .{ 0, 0, 0, 0 },
+            .stride_elems = .{ 0, 0, 0, 0 },
+            .layout = .backend_native,
+        };
+    }
+
+    fn buildLayerProgramInstructionHandles(
+        self: *CudaBackend,
+        insn: *const runtime_contract.Instruction,
+        ctx: *LayerProgramExecutionContext,
+        handle_storage: *[MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorHandle,
+        view_storage: *[MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorViewDesc,
+    ) !BuiltLayerProgramHandles {
+        var handle_count: usize = 0;
+        var view_count: usize = 0;
+
+        for (insn.inputs) |reg| {
+            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            const buffer_id: layer_ops.BufferId = @enumFromInt(runtime_contract.registerToIndex(reg));
+            const input = self.programBuffer(buffer_id, ctx) orelse return error.UnsupportedModel;
+            handle_storage[handle_count] = .{
+                .register = reg,
+                .ptr = @ptrCast(input),
+            };
+            view_storage[view_count] = tensorViewDescForCudaBuffer();
+            handle_count += 1;
+            view_count += 1;
+        }
+        for (insn.outputs) |reg| {
+            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            const buffer_id: layer_ops.BufferId = @enumFromInt(runtime_contract.registerToIndex(reg));
+            const output = self.programBuffer(buffer_id, ctx) orelse return error.UnsupportedModel;
+            handle_storage[handle_count] = .{
+                .register = reg,
+                .ptr = @ptrCast(output),
+            };
+            view_storage[view_count] = tensorViewDescForCudaBuffer();
+            handle_count += 1;
+            view_count += 1;
+        }
+
+        switch (insn.opcode) {
+            .rmsnorm => {
+                if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+                const weight = try ctx.layer.instructionNormWeightRef(ctx.op_index);
+                handle_storage[handle_count] = .{
+                    .register = try implicitBindingRegister(0),
+                    .ptr = @ptrCast(@constCast(weight)),
+                };
+                handle_count += 1;
+            },
+            .multihead_attention => {
+                if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+                const binding = try ctx.layer.instructionAttentionRef(ctx.op_index);
+                handle_storage[handle_count] = .{
+                    .register = try implicitBindingRegister(0),
+                    .ptr = @ptrCast(@constCast(binding)),
+                };
+                handle_count += 1;
+            },
+            .shortconv => {
+                if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+                const binding = try ctx.layer.instructionShortConvRef(ctx.op_index);
+                handle_storage[handle_count] = .{
+                    .register = try implicitBindingRegister(0),
+                    .ptr = @ptrCast(binding),
+                };
+                handle_count += 1;
+            },
+            .swiglu, .moe => {
+                if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+                const binding = &ctx.layer.instruction_ffn_refs[ctx.op_index].?;
+                handle_storage[handle_count] = .{
+                    .register = try implicitBindingRegister(0),
+                    .ptr = @ptrCast(@constCast(binding)),
+                };
+                handle_count += 1;
+            },
+            else => {},
+        }
+
+        return .{
+            .registers = handle_storage[0..handle_count],
+            .views = view_storage[0..view_count],
+        };
     }
 
     fn recordLayerProgramDispatch(self: *CudaBackend, opcode: opcode_map.Opcode) void {
         const opcode_idx = @intFromEnum(opcode);
         self.layer_program_dispatch_total[opcode_idx] +%= 1;
+        self.runtime_dispatch_counters.record(opcode);
     }
 
     fn prefillDispatchDelta(self: *const CudaBackend, opcode: opcode_map.Opcode) u64 {
@@ -3919,239 +4299,205 @@ pub const CudaBackend = struct {
 
     fn layerProgramNormAdapter(
         self: *CudaBackend,
-        layer: *BlockRuntimeLayer,
-        op: layer_ops.LayerOp,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
         ctx: *LayerProgramExecutionContext,
     ) !void {
-        const kernel_op = switch (op) {
-            .kernel => |kernel| kernel,
-            else => return error.InvalidArgument,
-        };
-        if (kernel_op.debug_type != .norm) return error.InvalidArgument;
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        const input = bufferFromTensorHandle(io.inputs[0]);
+        const output = bufferFromTensorHandle(io.outputs[0]);
+        const weight_handle = try instructionImplicitBindingHandle(insn, registers, 0);
+        const weight: *const DeviceTensor = @ptrCast(@alignCast(weight_handle.ptr));
+        try compute.cuda.rmsnorm.runWithFunction(
+            &self.kernel_arg_pack,
+            &self.device,
+            self.rmsnorm_function orelse return error.CudaKernelUnavailable,
+            input,
+            &weight.buffer,
+            output,
+            1,
+            ctx.d_model_u32,
+            self.norm_eps,
+            self.loaded.runtime.weight_offset,
+        );
 
-        const input = self.programBuffer(kernel_op.in, ctx) orelse return error.UnsupportedModel;
-        const output = try self.selectKernelOutputBuffer(ctx, kernel_op.out, &self.prototype.attn_out_dev);
-
-        if (layer.attention_mlp) |*block| {
-            const weight = nextAttentionNormWeight(block, &ctx.norm_index) orelse return error.UnsupportedModel;
-            try compute.cuda.rmsnorm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                input,
-                &weight.buffer,
-                output,
-                1,
-                ctx.d_model_u32,
-                self.norm_eps,
-                self.loaded.runtime.weight_offset,
-            );
-        } else if (layer.shortconv) |*block| {
-            const weight = nextShortConvNormWeight(block, &ctx.norm_index) orelse return error.UnsupportedModel;
-            try compute.cuda.rmsnorm.runWithFunction(
-                &self.kernel_arg_pack,
-                &self.device,
-                self.rmsnorm_function orelse return error.CudaKernelUnavailable,
-                input,
-                &weight.buffer,
-                output,
-                1,
-                ctx.d_model_u32,
-                self.norm_eps,
-                self.loaded.runtime.weight_offset,
-            );
-        } else return error.UnsupportedModel;
-
-        try updateProgramOutputBinding(ctx, kernel_op.out, output);
     }
 
     fn layerProgramAttentionAdapter(
         self: *CudaBackend,
-        layer: *BlockRuntimeLayer,
-        op: layer_ops.LayerOp,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
         ctx: *LayerProgramExecutionContext,
     ) !void {
-        const kernel_op = switch (op) {
-            .kernel => |kernel| kernel,
-            else => return error.InvalidArgument,
-        };
-        if (kernel_op.debug_type != .multihead_attention) return error.InvalidArgument;
-
-        const input = self.programBuffer(kernel_op.in, ctx) orelse return error.UnsupportedModel;
-        const output = try self.selectKernelOutputBuffer(ctx, kernel_op.out, &self.prototype.attn_out_dev);
-
-        if (layer.attention_mlp) |*block| {
-            try self.runAttentionMixerStep(
-                block,
-                input,
-                output,
-                ctx.d_model_u32,
-                ctx.head_dim_u32,
-                ctx.rope_dim_u32,
-                ctx.n_heads_u32,
-                ctx.n_kv_heads_u32,
-                ctx.seq_len_u32,
-                ctx.position,
-                ctx.position_u32,
-                ctx.global_rope_theta,
-                ctx.local_rope_theta,
-                ctx.rope_function,
-                ctx.copy_function,
-                ctx.cast_f32_to_f16_function,
-                ctx.kv_write_f16_function,
-                ctx.rope_store_f16_function,
-                ctx.attention_kernels,
-            );
-        } else return error.UnsupportedModel;
-
-        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        const input = bufferFromTensorHandle(io.inputs[0]);
+        const output = bufferFromTensorHandle(io.outputs[0]);
+        const binding_handle = try instructionImplicitBindingHandle(insn, registers, 0);
+        const binding: *const AttentionMlpBlockRuntime = @ptrCast(@alignCast(binding_handle.ptr));
+        try self.runAttentionMixerStep(
+            binding,
+            input,
+            output,
+            ctx.d_model_u32,
+            ctx.head_dim_u32,
+            ctx.rope_dim_u32,
+            ctx.n_heads_u32,
+            ctx.n_kv_heads_u32,
+            ctx.seq_len_u32,
+            ctx.position,
+            ctx.position_u32,
+            ctx.global_rope_theta,
+            ctx.local_rope_theta,
+            ctx.rope_function,
+            ctx.copy_function,
+            ctx.cast_f32_to_f16_function,
+            ctx.kv_write_f16_function,
+            ctx.rope_store_f16_function,
+            ctx.attention_kernels,
+        );
     }
 
     fn layerProgramShortConvAdapter(
         self: *CudaBackend,
-        layer: *BlockRuntimeLayer,
-        op: layer_ops.LayerOp,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
         ctx: *LayerProgramExecutionContext,
     ) !void {
-        const kernel_op = switch (op) {
-            .kernel => |kernel| kernel,
-            else => return error.InvalidArgument,
-        };
-        if (kernel_op.debug_type != .shortconv) return error.InvalidArgument;
-
-        const input = self.programBuffer(kernel_op.in, ctx) orelse return error.UnsupportedModel;
-        const output = try self.selectKernelOutputBuffer(ctx, kernel_op.out, &self.prototype.attn_out_dev);
-
-        if (layer.shortconv) |*block| {
-            try self.runShortConvMixerStep(block, input, output, ctx.shortconv_step_function);
-        } else return error.UnsupportedModel;
-
-        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        const input = bufferFromTensorHandle(io.inputs[0]);
+        const output = bufferFromTensorHandle(io.outputs[0]);
+        const binding_handle = try instructionImplicitBindingHandle(insn, registers, 0);
+        const binding: *ShortConvBlockRuntime = @ptrCast(@alignCast(binding_handle.ptr));
+        try self.runShortConvMixerStep(binding, input, output, ctx.shortconv_step_function);
     }
 
     fn layerProgramFfnAdapter(
         self: *CudaBackend,
-        layer: *BlockRuntimeLayer,
-        op: layer_ops.LayerOp,
-        ctx: *LayerProgramExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        _: *LayerProgramExecutionContext,
     ) !void {
-        const kernel_op = switch (op) {
-            .kernel => |kernel| kernel,
-            else => return error.InvalidArgument,
-        };
-        if (kernel_op.debug_type != .mlp and kernel_op.debug_type != .moe) return error.InvalidArgument;
-
-        const input = self.programBuffer(kernel_op.in, ctx) orelse return error.UnsupportedModel;
-        const output = try self.selectKernelOutputBuffer(ctx, kernel_op.out, &self.prototype.ffn_down_dev);
-
-        if (layer.attention_mlp) |*block| {
-            try self.runFfnStep(
-                input,
-                &block.w1,
-                &block.w3,
-                &block.w2,
-                @intCast(block.d_ff),
-                output,
-            );
-        } else if (layer.shortconv) |*block| {
-            const w1 = block.ffn_w1 orelse return error.UnsupportedModel;
-            const w2 = block.ffn_w2 orelse return error.UnsupportedModel;
-            const w3 = block.ffn_w3 orelse return error.UnsupportedModel;
-            try self.runFfnStep(
-                input,
-                &w1,
-                &w3,
-                &w2,
-                @intCast(block.d_ff),
-                output,
-            );
-        } else return error.UnsupportedModel;
-
-        try updateProgramOutputBinding(ctx, kernel_op.out, output);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        const input = bufferFromTensorHandle(io.inputs[0]);
+        const output = bufferFromTensorHandle(io.outputs[0]);
+        const binding_handle = try instructionImplicitBindingHandle(insn, registers, 0);
+        const binding: *const BlockRuntimeLayer.FfnBinding = @ptrCast(@alignCast(binding_handle.ptr));
+        try self.runFfnStep(
+            input,
+            binding.gate,
+            binding.up,
+            binding.down,
+            binding.d_ff,
+            output,
+        );
     }
 
     fn layerProgramResidualAddAdapter(
         self: *CudaBackend,
         _: *BlockRuntimeLayer,
         op: layer_ops.LayerOp,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
         ctx: *LayerProgramExecutionContext,
     ) !void {
         const add_op = switch (op) {
             .add => |add| add,
             else => return error.InvalidArgument,
         };
-        const branch = self.programBuffer(add_op.branch, ctx) orelse return error.UnsupportedModel;
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len < 2) return error.InvalidInstructionBinding;
+        const branch = bufferFromTensorHandle(io.inputs[1]);
         try self.addResidualWithScale(&self.prototype.input_dev, branch, ctx.d_model_u32, add_op.scale);
     }
 
     fn layerProgramNormRuntimeAdapter(
         rt_ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const exec_ctx = try layerProgramExecutionState(rt_ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
-        try exec_ctx.backend.layerProgramNormAdapter(exec_ctx.layer, op, exec_ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &exec_ctx.layer.compiled_plan.?.plan,
+            state_blocks,
+        );
+        try exec_ctx.backend.layerProgramNormAdapter(insn, registers, exec_ctx);
     }
 
     fn layerProgramAttentionRuntimeAdapter(
         rt_ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const exec_ctx = try layerProgramExecutionState(rt_ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
-        try exec_ctx.backend.layerProgramAttentionAdapter(exec_ctx.layer, op, exec_ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &exec_ctx.layer.compiled_plan.?.plan,
+            state_blocks,
+        );
+        try exec_ctx.backend.layerProgramAttentionAdapter(insn, registers, exec_ctx);
     }
 
     fn layerProgramShortConvRuntimeAdapter(
         rt_ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const exec_ctx = try layerProgramExecutionState(rt_ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
-        try exec_ctx.backend.layerProgramShortConvAdapter(exec_ctx.layer, op, exec_ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &exec_ctx.layer.compiled_plan.?.plan,
+            state_blocks,
+        );
+        try exec_ctx.backend.layerProgramShortConvAdapter(insn, registers, exec_ctx);
     }
 
     fn layerProgramFfnRuntimeAdapter(
         rt_ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const exec_ctx = try layerProgramExecutionState(rt_ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
-        try exec_ctx.backend.layerProgramFfnAdapter(exec_ctx.layer, op, exec_ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &exec_ctx.layer.compiled_plan.?.plan,
+            state_blocks,
+        );
+        try exec_ctx.backend.layerProgramFfnAdapter(insn, registers, exec_ctx);
     }
 
     fn layerProgramResidualAddRuntimeAdapter(
         rt_ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const exec_ctx = try layerProgramExecutionState(rt_ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
-        try exec_ctx.backend.layerProgramResidualAddAdapter(exec_ctx.layer, op, exec_ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &exec_ctx.layer.compiled_plan.?.plan,
+            state_blocks,
+        );
+        const op = try layerProgramOpForInstruction(exec_ctx.layer, insn, exec_ctx.op_index);
+        try exec_ctx.backend.layerProgramResidualAddAdapter(exec_ctx.layer, op, insn, registers, exec_ctx);
     }
 
     fn dispatchLayerProgramInstruction(
@@ -4159,7 +4505,6 @@ pub const CudaBackend = struct {
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
     ) !void {
-        if (insn.weights.len != 0) return error.InvalidWeightRefCount;
         const adapter = layerProgramAdapterForOpcode(insn.opcode) orelse return error.UnsupportedModel;
         self.recordLayerProgramDispatch(insn.opcode);
 
@@ -4170,20 +4515,26 @@ pub const CudaBackend = struct {
             .active_slots = active_slots[0..],
             .sequence_lengths = seq_lengths[0..],
             .batch_size = 1,
+            .dispatch_counters = &self.runtime_dispatch_counters,
             .stream_or_queue = null,
             .workspace = .{ .any = @ptrCast(ctx) },
         };
-        const no_registers: [0]runtime_contract.TensorHandle = .{};
-        const no_views: [0]runtime_contract.TensorViewDesc = .{};
+        var handle_storage: [MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorHandle = undefined;
+        var view_storage: [MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorViewDesc = undefined;
+        const built_handles = try self.buildLayerProgramInstructionHandles(insn, ctx, &handle_storage, &view_storage);
         var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks.slice());
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &ctx.layer.compiled_plan.?.plan,
+            state_blocks.slice(),
+        );
         try adapter(
             &rt_ctx,
             insn,
-            no_registers[0..],
-            no_views[0..],
+            built_handles.registers,
+            built_handles.views,
             state_blocks.slice(),
-            ctx.param_blocks,
+            &.{},
         );
     }
 
@@ -4212,7 +4563,6 @@ pub const CudaBackend = struct {
         var exec_ctx = LayerProgramExecutionContext{
             .backend = self,
             .layer = layer,
-            .param_blocks = compiled_plan.param_blocks,
             .op_index = 0,
             .d_model_u32 = d_model_u32,
             .head_dim_u32 = head_dim_u32,
@@ -4236,7 +4586,6 @@ pub const CudaBackend = struct {
                 &self.prototype.norm_out_dev,
                 &self.prototype.attn_out_dev,
             },
-            .norm_index = 0,
         };
 
         for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
@@ -6796,4 +7145,78 @@ test "materializeDenseOutInF32 handles out-in and in-out source layouts" {
         4, 8, 12,
     };
     try std.testing.expectEqualSlices(f32, expected[0..], in_out_view.values);
+}
+
+test "BlockRuntimeLayer.rebuildInstructionRefs binds per-op runtime refs" {
+    var layer: BlockRuntimeLayer = .{};
+    defer {
+        if (layer.instruction_ops.len > 0) std.testing.allocator.free(layer.instruction_ops);
+        if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
+        if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
+        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
+        if (layer.instruction_ffn_refs.len > 0) std.testing.allocator.free(layer.instruction_ffn_refs);
+        if (layer.compiled_plan) |*compiled| {
+            plan_compiler.deinitCompiledPlan(std.testing.allocator, compiled);
+            layer.compiled_plan = null;
+        }
+    }
+
+    var norm0: DeviceTensor = undefined;
+    var norm1: DeviceTensor = undefined;
+    var attention_runtime: AttentionMlpBlockRuntime = undefined;
+    var shortconv_runtime: ShortConvBlockRuntime = undefined;
+    var gate_weight: LinearWeight = undefined;
+    var up_weight: LinearWeight = undefined;
+    var down_weight: LinearWeight = undefined;
+
+    layer.norm_weights[0] = &norm0;
+    layer.norm_weights[1] = &norm1;
+    layer.norm_weight_count = 2;
+    layer.attention_binding = &attention_runtime;
+    layer.shortconv_binding = &shortconv_runtime;
+    layer.ffn_binding = .{
+        .gate = &gate_weight,
+        .up = &up_weight,
+        .down = &down_weight,
+        .d_ff = 32,
+    };
+
+    const ops = [_]layer_ops.LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .kernel = .{ .id = 2, .in = .branch_out, .out = .tmp3, .debug_type = .shortconv } },
+        .{ .kernel = .{ .id = 3, .in = .tmp3, .out = .branch_out, .debug_type = .mlp } },
+        .{ .kernel = .{ .id = 4, .in = .residual, .out = .norm_out, .debug_type = .norm } },
+    };
+    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode);
+
+    try layer.rebuildInstructionRefs(std.testing.allocator);
+
+    try std.testing.expect(layer.instruction_norm_weight_refs[0].? == &norm0);
+    try std.testing.expect(layer.instruction_attention_refs[1].? == &attention_runtime);
+    try std.testing.expect(layer.instruction_shortconv_refs[2].? == &shortconv_runtime);
+    try std.testing.expect(layer.instruction_ffn_refs[3] != null);
+    try std.testing.expect(layer.instruction_norm_weight_refs[4].? == &norm1);
+}
+
+test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound norm weights" {
+    var layer: BlockRuntimeLayer = .{};
+    defer {
+        if (layer.instruction_ops.len > 0) std.testing.allocator.free(layer.instruction_ops);
+        if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
+        if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
+        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
+        if (layer.instruction_ffn_refs.len > 0) std.testing.allocator.free(layer.instruction_ffn_refs);
+        if (layer.compiled_plan) |*compiled| {
+            plan_compiler.deinitCompiledPlan(std.testing.allocator, compiled);
+            layer.compiled_plan = null;
+        }
+    }
+
+    const ops = [_]layer_ops.LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
+    };
+    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode);
+
+    try std.testing.expectError(error.UnsupportedModel, layer.rebuildInstructionRefs(std.testing.allocator));
 }

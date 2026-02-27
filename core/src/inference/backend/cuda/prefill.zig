@@ -55,6 +55,10 @@ pub fn prefillSlot(
     tokens: []const u32,
     logits_out: []f32,
 ) !void {
+    const SelfType = @TypeOf(self.*);
+    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
+        try self.ensureSlotStateBlocksBoundForScheduler(slot_index);
+    }
     if (tokens.len == 0) {
         log.warn("inference", "CUDA prefillSlot invalid args", .{
             .reason = "empty_tokens",

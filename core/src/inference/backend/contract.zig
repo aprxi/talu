@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const topology = @import("../../models/op_types.zig");
+const runtime_contract = @import("../runtime_contract/root.zig");
 
 /// Pooling strategy for embedding extraction.
 pub const PoolingStrategy = enum(u8) {
@@ -448,12 +449,18 @@ pub fn assertBackendType(comptime T: type) void {
         requireDecl(T, "prefillSlot");
         requireDecl(T, "prefillSlotWithVision");
         requireDecl(T, "decodeBatch");
+        requireDecl(T, "stateDescriptors");
+        requireDecl(T, "bindSlotStateBlocks");
+        requireDecl(T, "unbindSlotStateBlocks");
         _ = @as(fn (*T) ?usize, T.allocSlot);
         _ = @as(fn (*T, usize) void, T.freeSlot);
         _ = @as(fn (*T, usize) void, T.resetSlot);
         _ = @as(fn (*const T, usize) usize, T.getPosition);
         _ = @as(fn (*T, usize, []const u32, []f32) anyerror!void, T.prefillSlot);
         _ = @as(fn (*T, []const DecodeRequest, []DecodeResult) anyerror!void, T.decodeBatch);
+        _ = @as(fn (*const T) []const runtime_contract.StateDescriptor, T.stateDescriptors);
+        _ = @as(fn (*T, usize, []const runtime_contract.StateBlockHandle) anyerror!void, T.bindSlotStateBlocks);
+        _ = @as(fn (*T, usize) void, T.unbindSlotStateBlocks);
 
         if (caps.decode_streaming) {
             requireDecl(T, "decodeStreaming");

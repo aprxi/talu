@@ -38,6 +38,7 @@ const log = @import("../../log.zig");
 const progress_mod = @import("../../progress.zig");
 const tensor = @import("../../tensor.zig");
 const compute = @import("../../compute/root.zig");
+const runtime_contract = @import("../runtime_contract/root.zig");
 const ModelConfig = tensor.ModelConfig;
 const dtype_mod = @import("../../dtype.zig");
 const DType = dtype_mod.DType;
@@ -432,6 +433,40 @@ pub const Backend = union(enum) {
             .cpu => |*b| b.freeSlot(slot_index),
             .metal => |*b| if (has_metal) b.freeSlot(slot_index) else unreachable,
             .cuda => |*b| if (has_cuda) b.freeSlot(slot_index) else unreachable,
+        }
+    }
+
+    pub fn stateDescriptors(self: *const Backend) []const runtime_contract.StateDescriptor {
+        switch (self.*) {
+            .cpu => |*b| return b.stateDescriptors(),
+            .metal => |*b| if (has_metal) return b.stateDescriptors() else unreachable,
+            .cuda => |*b| if (has_cuda) return b.stateDescriptors() else unreachable,
+        }
+    }
+
+    pub fn bindSlotStateBlocks(
+        self: *Backend,
+        slot_index: usize,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        switch (self.*) {
+            .cpu => |*b| try b.bindSlotStateBlocks(slot_index, state_blocks),
+            .metal => |*b| if (has_metal)
+                try b.bindSlotStateBlocks(slot_index, state_blocks)
+            else
+                unreachable,
+            .cuda => |*b| if (has_cuda)
+                try b.bindSlotStateBlocks(slot_index, state_blocks)
+            else
+                unreachable,
+        }
+    }
+
+    pub fn unbindSlotStateBlocks(self: *Backend, slot_index: usize) void {
+        switch (self.*) {
+            .cpu => |*b| b.unbindSlotStateBlocks(slot_index),
+            .metal => |*b| if (has_metal) b.unbindSlotStateBlocks(slot_index) else unreachable,
+            .cuda => |*b| if (has_cuda) b.unbindSlotStateBlocks(slot_index) else unreachable,
         }
     }
 

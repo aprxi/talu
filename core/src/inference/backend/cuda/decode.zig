@@ -23,6 +23,7 @@ pub fn decodeBatch(
     requests: []const contract.DecodeRequest,
     results: []contract.DecodeResult,
 ) !void {
+    const SelfType = @TypeOf(self.*);
     if (results.len < requests.len) {
         log.warn("inference", "CUDA decodeBatch invalid args", .{
             .reason = "results_short",
@@ -41,6 +42,9 @@ pub fn decodeBatch(
     }
 
     const req = requests[0];
+    if (comptime @hasDecl(SelfType, "ensureSlotStateBlocksBoundForScheduler")) {
+        try self.ensureSlotStateBlocksBoundForScheduler(req.slot_index);
+    }
     if (!self.slot_in_use or req.slot_index != 0) {
         log.warn("inference", "CUDA decodeBatch invalid args", .{
             .reason = "slot_state",
@@ -110,18 +114,28 @@ pub fn decodeStreaming(
 }
 
 pub fn allocSlot(self: anytype) ?usize {
+    const SelfType = @TypeOf(self.*);
     if (self.slot_in_use) return null;
     self.slot_in_use = true;
     self.slot_position = 0;
     self.slot_rope_position_delta = 0;
+    if (comptime @hasField(SelfType, "slot_state_bound")) {
+        self.slot_state_bound = false;
+        self.slot_state_block_count = 0;
+    }
     return 0;
 }
 
 pub fn freeSlot(self: anytype, slot_index: usize) void {
+    const SelfType = @TypeOf(self.*);
     if (slot_index != 0) return;
     self.slot_in_use = false;
     self.slot_position = 0;
     self.slot_rope_position_delta = 0;
+    if (comptime @hasField(SelfType, "slot_state_bound")) {
+        self.slot_state_bound = false;
+        self.slot_state_block_count = 0;
+    }
 }
 
 pub fn resetSlot(self: anytype, slot_index: usize) void {

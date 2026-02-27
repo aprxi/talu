@@ -150,6 +150,31 @@ pub const ExecutionMode = enum(u8) {
     scatter = 3,
 };
 
+pub const DispatchCounters = struct {
+    per_opcode: [256]u64 = [_]u64{0} ** 256,
+    total_instructions: u64 = 0,
+
+    pub fn reset(self: *DispatchCounters) void {
+        @memset(self.per_opcode[0..], 0);
+        @atomicStore(u64, &self.total_instructions, 0, .monotonic);
+    }
+
+    pub fn record(self: *DispatchCounters, opcode: Opcode) void {
+        const idx: usize = @intFromEnum(opcode);
+        _ = @atomicRmw(u64, &self.per_opcode[idx], .Add, 1, .monotonic);
+        _ = @atomicRmw(u64, &self.total_instructions, .Add, 1, .monotonic);
+    }
+
+    pub fn total(self: *const DispatchCounters) u64 {
+        return @atomicLoad(u64, &self.total_instructions, .monotonic);
+    }
+
+    pub fn countForOpcode(self: *const DispatchCounters, opcode: Opcode) u64 {
+        const idx: usize = @intFromEnum(opcode);
+        return @atomicLoad(u64, &self.per_opcode[idx], .monotonic);
+    }
+};
+
 pub const Workspace = struct {
     any: ?*anyopaque = null,
     matmul: ?*anyopaque = null,
@@ -161,8 +186,15 @@ pub const ExecutionContext = struct {
     sequence_lengths: []const u32,
     batch_size: usize,
     stream_or_queue: ?*anyopaque = null,
+    dispatch_counters: ?*DispatchCounters = null,
     workspace: Workspace = .{},
 };
+
+pub fn recordExecutionDispatch(ctx: *ExecutionContext, opcode: Opcode) void {
+    if (ctx.dispatch_counters) |counters| {
+        counters.record(opcode);
+    }
+}
 
 pub const KernelAdapterFn = *const fn (
     ctx: *ExecutionContext,
@@ -371,6 +403,752 @@ pub fn planHasStateDescriptor(plan: *const ExecutionPlan, state_id: u8) bool {
     return false;
 }
 
+pub fn stateDescriptorIndex(descriptors: []const StateDescriptor, state_id: u8) ?usize {
+    for (descriptors, 0..) |descriptor, idx| {
+        if (descriptor.id == state_id) return idx;
+    }
+    return null;
+}
+
+pub fn stateDescriptorSlicesEqual(a: StateDescriptor, b: StateDescriptor) bool {
+    return a.id == b.id and
+        a.size_bytes == b.size_bytes and
+        a.align_bytes == b.align_bytes and
+        a.zero_init == b.zero_init and
+        a.lifecycle == b.lifecycle;
+}
+
+pub fn appendUniqueStateDescriptor(
+    storage: []StateDescriptor,
+    count: *u8,
+    descriptor: StateDescriptor,
+) !void {
+    const used_count: usize = @intCast(count.*);
+    const used = storage[0..used_count];
+    if (stateDescriptorIndex(used, descriptor.id)) |idx| {
+        if (!stateDescriptorSlicesEqual(used[idx], descriptor)) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        return;
+    }
+    if (used_count >= storage.len) return error.InvalidStateDescriptorBinding;
+    storage[used_count] = descriptor;
+    count.* += 1;
+}
+
+pub fn appendUniquePlanStateDescriptors(
+    storage: []StateDescriptor,
+    count: *u8,
+    plan: *const ExecutionPlan,
+) !void {
+    for (plan.state_descs) |descriptor| {
+        switch (descriptor.id) {
+            @intFromEnum(StateBlockId.kv_cache),
+            @intFromEnum(StateBlockId.shortconv),
+            @intFromEnum(StateBlockId.mamba),
+            => {},
+            else => return error.UnknownStateDescriptorId,
+        }
+        if (descriptor.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+        try appendUniqueStateDescriptor(storage, count, descriptor);
+    }
+}
+
+pub const BuiltinStateFlags = struct {
+    has_kv: bool = false,
+    has_shortconv: bool = false,
+    has_mamba: bool = false,
+};
+
+pub fn collectBuiltinStateFlags(plan: *const ExecutionPlan) !BuiltinStateFlags {
+    var flags = BuiltinStateFlags{};
+    for (plan.state_descs) |state_desc| {
+        switch (state_desc.id) {
+            @intFromEnum(StateBlockId.kv_cache) => {
+                if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+                flags.has_kv = true;
+            },
+            @intFromEnum(StateBlockId.shortconv) => {
+                if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+                flags.has_shortconv = true;
+            },
+            @intFromEnum(StateBlockId.mamba) => {
+                if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+                flags.has_mamba = true;
+            },
+            else => return error.UnknownStateDescriptorId,
+        }
+    }
+    return flags;
+}
+
+const ParamKind = enum(u8) {
+    kernel = 1,
+    add = 2,
+    linear = 3,
+    matmul = 4,
+    split = 5,
+    softmax = 6,
+    silu = 7,
+    gelu = 8,
+    mul = 9,
+    add_tensor = 10,
+    add_scalar = 11,
+    mul_scalar = 12,
+    mean = 13,
+    pow = 14,
+    rsqrt = 15,
+    add_param = 16,
+    add_param_scalar = 17,
+    mul_param = 18,
+    reshape = 19,
+    transpose = 20,
+    rope = 21,
+    triu = 22,
+    sdpa = 23,
+    patch_embed = 24,
+    spatial_merge = 25,
+    deepstack_extract = 26,
+    scatter = 27,
+};
+
+fn paramKindForLayerOp(op: layer_ops.LayerOp) ParamKind {
+    return switch (op) {
+        .kernel => .kernel,
+        .add => .add,
+        .linear => .linear,
+        .matmul => .matmul,
+        .split => .split,
+        .softmax => .softmax,
+        .silu => .silu,
+        .gelu => .gelu,
+        .mul => .mul,
+        .add_tensor => .add_tensor,
+        .add_scalar => .add_scalar,
+        .mul_scalar => .mul_scalar,
+        .mean => .mean,
+        .pow => .pow,
+        .rsqrt => .rsqrt,
+        .add_param => .add_param,
+        .add_param_scalar => .add_param_scalar,
+        .mul_param => .mul_param,
+        .reshape => .reshape,
+        .transpose => .transpose,
+        .rope => .rope,
+        .triu => .triu,
+        .sdpa => .sdpa,
+        .patch_embed => .patch_embed,
+        .spatial_merge => .spatial_merge,
+        .deepstack_extract => .deepstack_extract,
+        .scatter => .scatter,
+    };
+}
+
+fn expectedParamKindForOpcode(opcode: Opcode) !ParamKind {
+    return switch (opcode) {
+        .rmsnorm,
+        .multihead_attention,
+        .swiglu,
+        .moe,
+        .mamba_mixer,
+        .shortconv,
+        .mla_attention,
+        .embedding,
+        => .kernel,
+        .residual_add => .add,
+        .linear => .linear,
+        .matmul => .matmul,
+        .split => .split,
+        .softmax => .softmax,
+        .silu => .silu,
+        .gelu => .gelu,
+        .mul => .mul,
+        .add_tensor => .add_tensor,
+        .add_scalar => .add_scalar,
+        .mul_scalar => .mul_scalar,
+        .mean => .mean,
+        .pow => .pow,
+        .rsqrt => .rsqrt,
+        .add_param => .add_param,
+        .add_param_scalar => .add_param_scalar,
+        .mul_param => .mul_param,
+        .reshape => .reshape,
+        .transpose => .transpose,
+        .rope => .rope,
+        .triu => .triu,
+        .scaled_dot_product_attention => .sdpa,
+        .vision_patch_embed => .patch_embed,
+        .vision_spatial_merge => .spatial_merge,
+        .vision_deepstack_extract => .deepstack_extract,
+        .vision_scatter => .scatter,
+        else => error.InvalidParamBlockABI,
+    };
+}
+
+fn expectedKernelDebugTypeForOpcode(opcode: Opcode) !op_types.OpType {
+    return switch (opcode) {
+        .rmsnorm => .norm,
+        .multihead_attention => .multihead_attention,
+        .swiglu => .mlp,
+        .moe => .moe,
+        .mamba_mixer => .mamba_mixer,
+        .shortconv => .shortconv,
+        .mla_attention => .multihead_attention,
+        .embedding => .embedding,
+        else => error.ParamBlockOpcodeMismatch,
+    };
+}
+
+fn opcodeMatchesLayerOp(opcode: Opcode, op: layer_ops.LayerOp) bool {
+    const actual = opcode_map.opcodeForLayerOp(op);
+    if (actual == opcode) return true;
+    return opcode == .mla_attention and actual == .multihead_attention;
+}
+
+fn encodeBufferId(id: layer_ops.BufferId) u8 {
+    return @intCast(@intFromEnum(id));
+}
+
+fn decodeBufferId(raw: u8) !layer_ops.BufferId {
+    if (raw > @intFromEnum(layer_ops.BufferId.tmp63)) return error.InvalidParamBlockABI;
+    return @enumFromInt(raw);
+}
+
+const ParamEncoder = struct {
+    bytes: std.ArrayListUnmanaged(u8) = .{},
+
+    fn deinit(self: *ParamEncoder, allocator: std.mem.Allocator) void {
+        self.bytes.deinit(allocator);
+    }
+
+    fn append(self: *ParamEncoder, allocator: std.mem.Allocator, raw: []const u8) !void {
+        try self.bytes.appendSlice(allocator, raw);
+    }
+
+    fn alignTo(self: *ParamEncoder, allocator: std.mem.Allocator, alignment: usize) !void {
+        const rem = self.bytes.items.len % alignment;
+        if (rem == 0) return;
+        try self.bytes.appendNTimes(allocator, 0, alignment - rem);
+    }
+
+    fn writeU8(self: *ParamEncoder, allocator: std.mem.Allocator, value: u8) !void {
+        try self.bytes.append(allocator, value);
+    }
+
+    fn writeI8(self: *ParamEncoder, allocator: std.mem.Allocator, value: i8) !void {
+        try self.writeU8(allocator, @bitCast(value));
+    }
+
+    fn writeBool(self: *ParamEncoder, allocator: std.mem.Allocator, value: bool) !void {
+        try self.writeU8(allocator, @intFromBool(value));
+    }
+
+    fn writeU16(self: *ParamEncoder, allocator: std.mem.Allocator, value: u16) !void {
+        var buf: [2]u8 = undefined;
+        std.mem.writeInt(u16, &buf, value, .little);
+        try self.append(allocator, &buf);
+    }
+
+    fn writeU32(self: *ParamEncoder, allocator: std.mem.Allocator, value: u32) !void {
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(u32, &buf, value, .little);
+        try self.append(allocator, &buf);
+    }
+
+    fn writeI32(self: *ParamEncoder, allocator: std.mem.Allocator, value: i32) !void {
+        var buf: [4]u8 = undefined;
+        std.mem.writeInt(i32, &buf, value, .little);
+        try self.append(allocator, &buf);
+    }
+
+    fn writeUsize(self: *ParamEncoder, allocator: std.mem.Allocator, value: usize) !void {
+        var buf: [@sizeOf(usize)]u8 = undefined;
+        std.mem.writeInt(usize, &buf, value, .little);
+        try self.append(allocator, &buf);
+    }
+
+    fn writeF32(self: *ParamEncoder, allocator: std.mem.Allocator, value: f32) !void {
+        try self.writeU32(allocator, @bitCast(value));
+    }
+
+    fn finish(self: *ParamEncoder, allocator: std.mem.Allocator, opcode: Opcode) !ParamBlock {
+        if (self.bytes.items.len > max_param_block_data_bytes_v1) return error.InvalidParamBlockABI;
+        const payload = try allocator.alignedAlloc(u8, .fromByteUnits(8), self.bytes.items.len);
+        @memcpy(payload, self.bytes.items);
+        return .{
+            .version = param_block_abi_version_v1,
+            .opcode = opcode,
+            .data = payload,
+        };
+    }
+};
+
+const ParamDecoder = struct {
+    data: []const u8,
+    offset: usize = 0,
+
+    fn init(data: []const u8) ParamDecoder {
+        return .{ .data = data, .offset = 0 };
+    }
+
+    fn alignTo(self: *ParamDecoder, alignment: usize) !void {
+        const rem = self.offset % alignment;
+        if (rem == 0) return;
+        const pad = alignment - rem;
+        _ = try self.readBytes(pad);
+    }
+
+    fn readBytes(self: *ParamDecoder, len: usize) ![]const u8 {
+        const end = std.math.add(usize, self.offset, len) catch return error.InvalidParamBlockABI;
+        if (end > self.data.len) return error.InvalidParamBlockABI;
+        const out = self.data[self.offset..end];
+        self.offset = end;
+        return out;
+    }
+
+    fn readU8(self: *ParamDecoder) !u8 {
+        return (try self.readBytes(1))[0];
+    }
+
+    fn readI8(self: *ParamDecoder) !i8 {
+        return @bitCast(try self.readU8());
+    }
+
+    fn readBool(self: *ParamDecoder) !bool {
+        return switch (try self.readU8()) {
+            0 => false,
+            1 => true,
+            else => error.InvalidParamBlockABI,
+        };
+    }
+
+    fn readU16(self: *ParamDecoder) !u16 {
+        const bytes = try self.readBytes(2);
+        var buf: [2]u8 = undefined;
+        @memcpy(&buf, bytes);
+        return std.mem.readInt(u16, &buf, .little);
+    }
+
+    fn readU32(self: *ParamDecoder) !u32 {
+        const bytes = try self.readBytes(4);
+        var buf: [4]u8 = undefined;
+        @memcpy(&buf, bytes);
+        return std.mem.readInt(u32, &buf, .little);
+    }
+
+    fn readI32(self: *ParamDecoder) !i32 {
+        const bytes = try self.readBytes(4);
+        var buf: [4]u8 = undefined;
+        @memcpy(&buf, bytes);
+        return std.mem.readInt(i32, &buf, .little);
+    }
+
+    fn readUsize(self: *ParamDecoder) !usize {
+        const bytes = try self.readBytes(@sizeOf(usize));
+        var buf: [@sizeOf(usize)]u8 = undefined;
+        @memcpy(&buf, bytes);
+        return std.mem.readInt(usize, &buf, .little);
+    }
+
+    fn readF32(self: *ParamDecoder) !f32 {
+        return @bitCast(try self.readU32());
+    }
+
+    fn finish(self: *const ParamDecoder) !void {
+        if (self.offset != self.data.len) return error.InvalidParamBlockABI;
+    }
+};
+
+pub fn encodeLayerOpParam(
+    allocator: std.mem.Allocator,
+    opcode: Opcode,
+    op: layer_ops.LayerOp,
+) !ParamBlock {
+    if (!opcodeMatchesLayerOp(opcode, op)) return error.ParamBlockOpcodeMismatch;
+    const kind = paramKindForLayerOp(op);
+
+    var enc = ParamEncoder{};
+    defer enc.deinit(allocator);
+    try enc.writeU8(allocator, @intFromEnum(kind));
+
+    switch (op) {
+        .kernel => |kernel_op| {
+            try enc.writeU32(allocator, kernel_op.id);
+            try enc.writeU8(allocator, encodeBufferId(kernel_op.in));
+            try enc.writeU8(allocator, encodeBufferId(kernel_op.out));
+            try enc.writeU8(allocator, @intFromEnum(kernel_op.debug_type));
+        },
+        .add => |add_op| {
+            try enc.writeU8(allocator, encodeBufferId(add_op.branch));
+            switch (add_op.scale) {
+                .one => {
+                    try enc.writeU8(allocator, 0);
+                    try enc.writeF32(allocator, 0.0);
+                },
+                .residual_multiplier => {
+                    try enc.writeU8(allocator, 1);
+                    try enc.writeF32(allocator, 0.0);
+                },
+                .literal => |value| {
+                    try enc.writeU8(allocator, 2);
+                    try enc.writeF32(allocator, value);
+                },
+            }
+        },
+        .linear => |linear_op| {
+            try enc.writeU8(allocator, encodeBufferId(linear_op.in));
+            try enc.writeU8(allocator, encodeBufferId(linear_op.out));
+        },
+        .matmul => |matmul_op| {
+            try enc.writeU8(allocator, encodeBufferId(matmul_op.in_a));
+            try enc.writeU8(allocator, encodeBufferId(matmul_op.in_b));
+            try enc.writeU8(allocator, encodeBufferId(matmul_op.out));
+        },
+        .split => |split_op| {
+            const count: u16 = std.math.cast(u16, split_op.split_sizes.len) orelse return error.InvalidParamBlockABI;
+            try enc.writeU8(allocator, encodeBufferId(split_op.in));
+            try enc.writeU8(allocator, encodeBufferId(split_op.out_start));
+            try enc.writeU8(allocator, split_op.num_outputs);
+            try enc.writeI8(allocator, split_op.dim);
+            try enc.writeU16(allocator, count);
+            if (count != 0) {
+                try enc.alignTo(allocator, @alignOf(usize));
+                for (split_op.split_sizes) |size| {
+                    try enc.writeUsize(allocator, size);
+                }
+            }
+        },
+        .softmax => |softmax_op| {
+            try enc.writeU8(allocator, encodeBufferId(softmax_op.in));
+            try enc.writeU8(allocator, encodeBufferId(softmax_op.out));
+            try enc.writeI8(allocator, softmax_op.dim);
+        },
+        .silu => |silu_op| {
+            try enc.writeU8(allocator, encodeBufferId(silu_op.in));
+            try enc.writeU8(allocator, encodeBufferId(silu_op.out));
+        },
+        .gelu => |gelu_op| {
+            try enc.writeU8(allocator, encodeBufferId(gelu_op.in));
+            try enc.writeU8(allocator, encodeBufferId(gelu_op.out));
+        },
+        .mul => |mul_op| {
+            try enc.writeU8(allocator, encodeBufferId(mul_op.in));
+            try enc.writeU8(allocator, encodeBufferId(mul_op.other));
+            try enc.writeU8(allocator, encodeBufferId(mul_op.out));
+        },
+        .add_tensor => |add_tensor_op| {
+            try enc.writeU8(allocator, encodeBufferId(add_tensor_op.in_a));
+            try enc.writeU8(allocator, encodeBufferId(add_tensor_op.in_b));
+            try enc.writeU8(allocator, encodeBufferId(add_tensor_op.out));
+        },
+        .add_scalar => |add_scalar_op| {
+            try enc.writeU8(allocator, encodeBufferId(add_scalar_op.in));
+            try enc.writeU8(allocator, encodeBufferId(add_scalar_op.out));
+            try enc.writeF32(allocator, add_scalar_op.scalar);
+        },
+        .mul_scalar => |mul_scalar_op| {
+            try enc.writeU8(allocator, encodeBufferId(mul_scalar_op.in));
+            try enc.writeU8(allocator, encodeBufferId(mul_scalar_op.out));
+            try enc.writeF32(allocator, mul_scalar_op.scalar);
+        },
+        .mean => |mean_op| {
+            try enc.writeU8(allocator, encodeBufferId(mean_op.in));
+            try enc.writeU8(allocator, encodeBufferId(mean_op.out));
+            try enc.writeI8(allocator, mean_op.dim);
+            try enc.writeBool(allocator, mean_op.keepdim);
+        },
+        .pow => |pow_op| {
+            try enc.writeU8(allocator, encodeBufferId(pow_op.in));
+            try enc.writeU8(allocator, encodeBufferId(pow_op.out));
+            try enc.writeF32(allocator, pow_op.exponent);
+        },
+        .rsqrt => |rsqrt_op| {
+            try enc.writeU8(allocator, encodeBufferId(rsqrt_op.in));
+            try enc.writeU8(allocator, encodeBufferId(rsqrt_op.out));
+        },
+        .add_param => |add_param_op| {
+            try enc.writeU8(allocator, encodeBufferId(add_param_op.in));
+            try enc.writeU8(allocator, encodeBufferId(add_param_op.out));
+        },
+        .add_param_scalar => |add_param_scalar_op| {
+            try enc.writeU8(allocator, encodeBufferId(add_param_scalar_op.out));
+            try enc.writeF32(allocator, add_param_scalar_op.scalar);
+        },
+        .mul_param => |mul_param_op| {
+            try enc.writeU8(allocator, encodeBufferId(mul_param_op.in));
+            try enc.writeU8(allocator, encodeBufferId(mul_param_op.out));
+        },
+        .reshape => |reshape_op| {
+            const count: u16 = std.math.cast(u16, reshape_op.shape.len) orelse return error.InvalidParamBlockABI;
+            try enc.writeU8(allocator, encodeBufferId(reshape_op.in));
+            try enc.writeU8(allocator, encodeBufferId(reshape_op.out));
+            try enc.writeU16(allocator, count);
+            if (count != 0) {
+                try enc.alignTo(allocator, @alignOf(i32));
+                for (reshape_op.shape) |shape_item| {
+                    try enc.writeI32(allocator, shape_item);
+                }
+            }
+        },
+        .transpose => |transpose_op| {
+            try enc.writeU8(allocator, encodeBufferId(transpose_op.in));
+            try enc.writeU8(allocator, encodeBufferId(transpose_op.out));
+            try enc.writeI8(allocator, transpose_op.dim0);
+            try enc.writeI8(allocator, transpose_op.dim1);
+        },
+        .rope => |rope_op| {
+            try enc.writeU8(allocator, encodeBufferId(rope_op.in));
+            try enc.writeU8(allocator, encodeBufferId(rope_op.out));
+        },
+        .triu => |triu_op| {
+            try enc.writeU8(allocator, encodeBufferId(triu_op.in));
+            try enc.writeU8(allocator, encodeBufferId(triu_op.out));
+            try enc.writeI32(allocator, triu_op.diagonal);
+        },
+        .sdpa => |sdpa_op| {
+            try enc.writeU8(allocator, encodeBufferId(sdpa_op.q));
+            try enc.writeU8(allocator, encodeBufferId(sdpa_op.k));
+            try enc.writeU8(allocator, encodeBufferId(sdpa_op.v));
+            try enc.writeU8(allocator, encodeBufferId(sdpa_op.out));
+            try enc.writeBool(allocator, sdpa_op.is_causal);
+            try enc.writeBool(allocator, sdpa_op.scale != null);
+            if (sdpa_op.scale) |scale| try enc.writeF32(allocator, scale);
+        },
+        .patch_embed => |patch_op| {
+            try enc.writeU8(allocator, encodeBufferId(patch_op.in));
+            try enc.writeU8(allocator, encodeBufferId(patch_op.out));
+        },
+        .spatial_merge => |spatial_op| {
+            try enc.writeU8(allocator, encodeBufferId(spatial_op.in));
+            try enc.writeU8(allocator, encodeBufferId(spatial_op.out));
+            try enc.writeU32(allocator, spatial_op.merge_size);
+        },
+        .deepstack_extract => |deepstack_op| {
+            try enc.writeU8(allocator, encodeBufferId(deepstack_op.in));
+            try enc.writeU8(allocator, encodeBufferId(deepstack_op.out));
+            try enc.writeU32(allocator, deepstack_op.layer_index);
+        },
+        .scatter => |scatter_op| {
+            try enc.writeU8(allocator, encodeBufferId(scatter_op.text_in));
+            try enc.writeU8(allocator, encodeBufferId(scatter_op.vision_in));
+            try enc.writeU8(allocator, encodeBufferId(scatter_op.out));
+            try enc.writeU32(allocator, scatter_op.image_token_id);
+        },
+    }
+
+    const param_block = try enc.finish(allocator, opcode);
+    try validateParamBlockAbi(&param_block);
+    return param_block;
+}
+
+fn decodeLayerOpFromParam(opcode: Opcode, data: []const u8) !layer_ops.LayerOp {
+    var dec = ParamDecoder.init(data);
+    const raw_kind = try dec.readU8();
+    const kind: ParamKind = std.meta.intToEnum(ParamKind, raw_kind) catch return error.InvalidParamBlockABI;
+    if (kind != try expectedParamKindForOpcode(opcode)) return error.ParamBlockOpcodeMismatch;
+
+    const op: layer_ops.LayerOp = switch (kind) {
+        .kernel => blk: {
+            const debug_type = try expectedKernelDebugTypeForOpcode(opcode);
+            const id = try dec.readU32();
+            const in = try decodeBufferId(try dec.readU8());
+            const out = try decodeBufferId(try dec.readU8());
+            const debug_type_raw = try dec.readU8();
+            const stored_debug_type: op_types.OpType = std.meta.intToEnum(op_types.OpType, debug_type_raw) catch return error.InvalidParamBlockABI;
+            if (stored_debug_type != debug_type) return error.ParamBlockOpcodeMismatch;
+            break :blk .{ .kernel = .{
+                .id = id,
+                .in = in,
+                .out = out,
+                .debug_type = debug_type,
+            } };
+        },
+        .add => blk: {
+            const branch = try decodeBufferId(try dec.readU8());
+            const scale_tag = try dec.readU8();
+            const literal = try dec.readF32();
+            const scale: layer_ops.ResidualScale = switch (scale_tag) {
+                0 => .one,
+                1 => .residual_multiplier,
+                2 => .{ .literal = literal },
+                else => return error.InvalidParamBlockABI,
+            };
+            break :blk .{ .add = .{
+                .branch = branch,
+                .scale = scale,
+            } };
+        },
+        .linear => .{ .linear = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .weight_name = &.{},
+        } },
+        .matmul => .{ .matmul = .{
+            .in_a = try decodeBufferId(try dec.readU8()),
+            .in_b = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .split => blk: {
+            const in = try decodeBufferId(try dec.readU8());
+            const out_start = try decodeBufferId(try dec.readU8());
+            const num_outputs = try dec.readU8();
+            const dim = try dec.readI8();
+            const count = try dec.readU16();
+            var split_sizes: []const usize = &.{};
+            if (count != 0) {
+                try dec.alignTo(@alignOf(usize));
+                const raw = try dec.readBytes(@as(usize, count) * @sizeOf(usize));
+                if ((@intFromPtr(raw.ptr) % @alignOf(usize)) != 0) return error.InvalidParamBlockABI;
+                const ptr: [*]const usize = @ptrCast(@alignCast(raw.ptr));
+                split_sizes = ptr[0..@as(usize, count)];
+            }
+            break :blk .{ .split = .{
+                .in = in,
+                .out_start = out_start,
+                .num_outputs = num_outputs,
+                .dim = dim,
+                .split_sizes = split_sizes,
+            } };
+        },
+        .softmax => .{ .softmax = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .dim = try dec.readI8(),
+        } },
+        .silu => .{ .silu = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .gelu => .{ .gelu = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .mul => .{ .mul = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .other = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .add_tensor => .{ .add_tensor = .{
+            .in_a = try decodeBufferId(try dec.readU8()),
+            .in_b = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .add_scalar => .{ .add_scalar = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .scalar = try dec.readF32(),
+        } },
+        .mul_scalar => .{ .mul_scalar = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .scalar = try dec.readF32(),
+        } },
+        .mean => .{ .mean = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .dim = try dec.readI8(),
+            .keepdim = try dec.readBool(),
+        } },
+        .pow => .{ .pow = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .exponent = try dec.readF32(),
+        } },
+        .rsqrt => .{ .rsqrt = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .add_param => .{ .add_param = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .param_name = &.{},
+        } },
+        .add_param_scalar => .{ .add_param_scalar = .{
+            .out = try decodeBufferId(try dec.readU8()),
+            .param_name = &.{},
+            .scalar = try dec.readF32(),
+        } },
+        .mul_param => .{ .mul_param = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .param_name = &.{},
+        } },
+        .reshape => blk: {
+            const in = try decodeBufferId(try dec.readU8());
+            const out = try decodeBufferId(try dec.readU8());
+            const count = try dec.readU16();
+            var shape: []const i32 = &.{};
+            if (count != 0) {
+                try dec.alignTo(@alignOf(i32));
+                const raw = try dec.readBytes(@as(usize, count) * @sizeOf(i32));
+                if ((@intFromPtr(raw.ptr) % @alignOf(i32)) != 0) return error.InvalidParamBlockABI;
+                const ptr: [*]const i32 = @ptrCast(@alignCast(raw.ptr));
+                shape = ptr[0..@as(usize, count)];
+            }
+            break :blk .{ .reshape = .{
+                .in = in,
+                .out = out,
+                .shape = shape,
+            } };
+        },
+        .transpose => .{ .transpose = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .dim0 = try dec.readI8(),
+            .dim1 = try dec.readI8(),
+        } },
+        .rope => .{ .rope = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .triu => .{ .triu = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .diagonal = try dec.readI32(),
+        } },
+        .sdpa => blk: {
+            const q = try decodeBufferId(try dec.readU8());
+            const k = try decodeBufferId(try dec.readU8());
+            const v = try decodeBufferId(try dec.readU8());
+            const out = try decodeBufferId(try dec.readU8());
+            const is_causal = try dec.readBool();
+            const has_scale = try dec.readBool();
+            break :blk .{ .sdpa = .{
+                .q = q,
+                .k = k,
+                .v = v,
+                .out = out,
+                .is_causal = is_causal,
+                .scale = if (has_scale) try dec.readF32() else null,
+            } };
+        },
+        .patch_embed => .{ .patch_embed = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+        } },
+        .spatial_merge => .{ .spatial_merge = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .merge_size = try dec.readU32(),
+        } },
+        .deepstack_extract => .{ .deepstack_extract = .{
+            .in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .layer_index = try dec.readU32(),
+        } },
+        .scatter => .{ .scatter = .{
+            .text_in = try decodeBufferId(try dec.readU8()),
+            .vision_in = try decodeBufferId(try dec.readU8()),
+            .out = try decodeBufferId(try dec.readU8()),
+            .image_token_id = try dec.readU32(),
+        } },
+    };
+
+    try dec.finish();
+    if (!opcodeMatchesLayerOp(opcode, op)) return error.ParamBlockOpcodeMismatch;
+    return op;
+}
+
 pub fn planUsesInstructionWeights(plan: *const ExecutionPlan) bool {
     for (plan.instructions) |insn| {
         if (insn.weights.len != 0) return true;
@@ -406,12 +1184,36 @@ pub fn instructionSingleWeightBindingName(compiled: *const CompiledPlan, instruc
     return instructionWeightBindingName(compiled, instruction_index, 0);
 }
 
+pub fn decodeInstructionLayerOp(
+    compiled: *const CompiledPlan,
+    insn: *const Instruction,
+    instruction_index: usize,
+) !layer_ops.LayerOp {
+    if (instruction_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
+    const param_id = insn.param_block_id orelse return error.MissingParamBlock;
+    if (param_id >= compiled.param_blocks.len) return error.MissingParamBlock;
+    const param_block = compiled.param_blocks[param_id];
+    try validateParamBlockAbi(&param_block);
+    if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
+    return decodeLayerOpFromParam(insn.opcode, param_block.data);
+}
+
 pub fn findStateBlock(
     state_blocks: []const StateBlockHandle,
     state_id: u8,
 ) ?*const StateBlockHandle {
     for (state_blocks) |*state_block| {
         if (state_block.id == state_id) return state_block;
+    }
+    return null;
+}
+
+pub fn findStateDescriptor(
+    plan: *const ExecutionPlan,
+    state_id: u8,
+) ?*const StateDescriptor {
+    for (plan.state_descs) |*state_desc| {
+        if (state_desc.id == state_id) return state_desc;
     }
     return null;
 }
@@ -426,6 +1228,52 @@ pub fn requireInstructionStateBlock(
         return block;
     }
     return null;
+}
+
+pub fn requireInstructionStateBlockForPlan(
+    insn: *const Instruction,
+    plan: *const ExecutionPlan,
+    state_blocks: []const StateBlockHandle,
+) !?*const StateBlockHandle {
+    const state_block = try requireInstructionStateBlock(insn, state_blocks);
+    if (insn.state_block_id) |state_id| {
+        const descriptor = findStateDescriptor(plan, state_id) orelse return error.UnknownStateDescriptorId;
+        if (descriptor.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+        if (descriptor.align_bytes == 0) return error.InvalidStateDescriptorBinding;
+        if (state_block.?.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
+        if (descriptor.size_bytes > 0 and state_block.?.size < descriptor.size_bytes) {
+            return error.InvalidStateDescriptorBinding;
+        }
+    }
+    return state_block;
+}
+
+pub fn validateStateBlocksForDescriptors(
+    descriptors: []const StateDescriptor,
+    state_blocks: []const StateBlockHandle,
+) !void {
+    var desc_seen: [256]bool = [_]bool{false} ** 256;
+    var block_seen: [256]bool = [_]bool{false} ** 256;
+
+    for (descriptors) |descriptor| {
+        if (desc_seen[descriptor.id]) return error.DuplicateStateDescriptorId;
+        desc_seen[descriptor.id] = true;
+        if (descriptor.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+        if (descriptor.align_bytes == 0) return error.InvalidStateAlignment;
+    }
+
+    for (state_blocks) |state_block| {
+        if (state_block.align_bytes == 0 or state_block.size == 0) return error.InvalidStateDescriptorBinding;
+        if (!desc_seen[state_block.id]) return error.UnknownStateDescriptorId;
+        if (block_seen[state_block.id]) return error.InvalidStateDescriptorBinding;
+        block_seen[state_block.id] = true;
+    }
+
+    for (descriptors) |descriptor| {
+        const state_block = findStateBlock(state_blocks, descriptor.id) orelse return error.InvalidStateDescriptorBinding;
+        if (state_block.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
+        if (descriptor.size_bytes > 0 and state_block.size < descriptor.size_bytes) return error.InvalidStateDescriptorBinding;
+    }
 }
 
 pub fn validateTensorViewDesc(view: *const TensorViewDesc) !void {
@@ -493,6 +1341,45 @@ pub fn validateExecutionPlanForBlockKind(plan: *const ExecutionPlan, kind: op_ty
     }
 }
 
+fn layerOpInputCount(op: layer_ops.LayerOp) usize {
+    return switch (op) {
+        .kernel => 1,
+        .add => 2,
+        .linear => 1,
+        .matmul => 2,
+        .split => 1,
+        .softmax => 1,
+        .silu => 1,
+        .gelu => 1,
+        .mul => 2,
+        .add_tensor => 2,
+        .add_scalar => 1,
+        .mul_scalar => 1,
+        .mean => 1,
+        .pow => 1,
+        .rsqrt => 1,
+        .add_param => 1,
+        .add_param_scalar => 0,
+        .mul_param => 1,
+        .reshape => 1,
+        .transpose => 1,
+        .rope => 1,
+        .triu => 1,
+        .sdpa => 3,
+        .patch_embed => 1,
+        .spatial_merge => 1,
+        .deepstack_extract => 1,
+        .scatter => 2,
+    };
+}
+
+fn layerOpOutputCount(op: layer_ops.LayerOp) usize {
+    return switch (op) {
+        .split => |split_op| split_op.num_outputs,
+        else => 1,
+    };
+}
+
 pub fn planFinalOutputRegister(plan: *const ExecutionPlan) RegisterRef {
     if (plan.instructions.len == 0) return registerFromIndex(0);
     const last = plan.instructions[plan.instructions.len - 1];
@@ -530,6 +1417,9 @@ pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
             const param_block = compiled.param_blocks[param_id];
             try validateParamBlockAbi(&param_block);
             if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
+            const decoded = try decodeLayerOpFromParam(insn.opcode, param_block.data);
+            if (layerOpInputCount(decoded) != insn.inputs.len) return error.InvalidInstructionRegisterRef;
+            if (layerOpOutputCount(decoded) != insn.outputs.len) return error.InvalidInstructionRegisterRef;
         }
     }
 }
@@ -730,6 +1620,116 @@ test "requireInstructionStateBlock enforces descriptor presence for stateful ins
     var bad_align = matching[0];
     bad_align.align_bytes = 0;
     try std.testing.expectError(error.InvalidStateDescriptorBinding, requireInstructionStateBlock(&stateful_insn, &.{bad_align}));
+}
+
+test "requireInstructionStateBlockForPlan validates descriptor size and alignment requirements" {
+    const stateful_insn = Instruction{
+        .opcode = .multihead_attention,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = @intFromEnum(StateBlockId.kv_cache),
+    };
+    const plan = ExecutionPlan{
+        .instructions = &.{stateful_insn},
+        .register_count = 2,
+        .state_descs = &.{.{
+            .id = @intFromEnum(StateBlockId.kv_cache),
+            .size_bytes = 128,
+            .align_bytes = 64,
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+        }},
+    };
+
+    var bytes align(64) = [_]u8{0} ** 256;
+    const ok_blocks = [_]StateBlockHandle{.{
+        .id = @intFromEnum(StateBlockId.kv_cache),
+        .ptr = bytes[0..].ptr,
+        .size = 256,
+        .align_bytes = 64,
+    }};
+    try std.testing.expect((try requireInstructionStateBlockForPlan(&stateful_insn, &plan, ok_blocks[0..])) != null);
+
+    const bad_align_blocks = [_]StateBlockHandle{.{
+        .id = @intFromEnum(StateBlockId.kv_cache),
+        .ptr = bytes[0..].ptr,
+        .size = 256,
+        .align_bytes = 32,
+    }};
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        requireInstructionStateBlockForPlan(&stateful_insn, &plan, bad_align_blocks[0..]),
+    );
+
+    const bad_size_blocks = [_]StateBlockHandle{.{
+        .id = @intFromEnum(StateBlockId.kv_cache),
+        .ptr = bytes[0..].ptr,
+        .size = 64,
+        .align_bytes = 64,
+    }};
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        requireInstructionStateBlockForPlan(&stateful_insn, &plan, bad_size_blocks[0..]),
+    );
+}
+
+test "validateStateBlocksForDescriptors enforces descriptor coverage and constraints" {
+    const descriptors = [_]StateDescriptor{
+        .{
+            .id = @intFromEnum(StateBlockId.kv_cache),
+            .size_bytes = 64,
+            .align_bytes = 64,
+            .zero_init = false,
+            .lifecycle = .slot_persistent,
+        },
+        .{
+            .id = @intFromEnum(StateBlockId.shortconv),
+            .size_bytes = 32,
+            .align_bytes = 32,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+        },
+    };
+
+    var kv_bytes align(64) = [_]u8{0} ** 64;
+    var sc_bytes align(64) = [_]u8{0} ** 64;
+    const ok_blocks = [_]StateBlockHandle{
+        .{
+            .id = @intFromEnum(StateBlockId.kv_cache),
+            .ptr = kv_bytes[0..].ptr,
+            .size = 64,
+            .align_bytes = 64,
+        },
+        .{
+            .id = @intFromEnum(StateBlockId.shortconv),
+            .ptr = sc_bytes[0..].ptr,
+            .size = 64,
+            .align_bytes = 64,
+        },
+    };
+    try validateStateBlocksForDescriptors(descriptors[0..], ok_blocks[0..]);
+
+    const missing_shortconv = [_]StateBlockHandle{ok_blocks[0]};
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        validateStateBlocksForDescriptors(descriptors[0..], missing_shortconv[0..]),
+    );
+
+    const bad_align_blocks = [_]StateBlockHandle{
+        ok_blocks[0],
+        .{
+            .id = @intFromEnum(StateBlockId.shortconv),
+            .ptr = sc_bytes[0..].ptr,
+            .size = 64,
+            .align_bytes = 16,
+        },
+    };
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        validateStateBlocksForDescriptors(descriptors[0..], bad_align_blocks[0..]),
+    );
 }
 
 test "validateExecutionPlan rejects missing state binding for stateful opcode" {
@@ -1090,6 +2090,222 @@ test "defaultStateDescriptor uses stable v1 compatibility defaults" {
     try std.testing.expectEqual(@as(u16, 64), kv_desc.align_bytes);
     try std.testing.expect(!kv_desc.zero_init);
     try std.testing.expectEqual(StateLifecycle.slot_persistent, kv_desc.lifecycle);
+}
+
+test "collectBuiltinStateFlags aggregates known descriptor ids" {
+    const plan = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 1,
+        .state_descs = &.{
+            defaultStateDescriptor(.kv_cache),
+            defaultStateDescriptor(.shortconv),
+        },
+    };
+    const flags = try collectBuiltinStateFlags(&plan);
+    try std.testing.expect(flags.has_kv);
+    try std.testing.expect(flags.has_shortconv);
+    try std.testing.expect(!flags.has_mamba);
+}
+
+test "collectBuiltinStateFlags rejects non-slot persistent lifecycle for builtin states" {
+    const plan = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 1,
+        .state_descs = &.{
+            .{
+                .id = @intFromEnum(StateBlockId.kv_cache),
+                .size_bytes = 0,
+                .align_bytes = 64,
+                .zero_init = false,
+                .lifecycle = .request_scoped,
+            },
+        },
+    };
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, collectBuiltinStateFlags(&plan));
+}
+
+test "stateDescriptorIndex finds descriptor by id" {
+    const descriptors = [_]StateDescriptor{
+        defaultStateDescriptor(.kv_cache),
+        defaultStateDescriptor(.shortconv),
+    };
+    try std.testing.expectEqual(@as(?usize, 0), stateDescriptorIndex(descriptors[0..], @intFromEnum(StateBlockId.kv_cache)));
+    try std.testing.expectEqual(@as(?usize, 1), stateDescriptorIndex(descriptors[0..], @intFromEnum(StateBlockId.shortconv)));
+    try std.testing.expectEqual(@as(?usize, null), stateDescriptorIndex(descriptors[0..], @intFromEnum(StateBlockId.mamba)));
+}
+
+test "appendUniqueStateDescriptor deduplicates identical descriptor and rejects mismatch" {
+    var storage: [3]StateDescriptor = undefined;
+    var count: u8 = 0;
+    const kv_desc = defaultStateDescriptor(.kv_cache);
+    try appendUniqueStateDescriptor(storage[0..], &count, kv_desc);
+    try std.testing.expectEqual(@as(u8, 1), count);
+    try appendUniqueStateDescriptor(storage[0..], &count, kv_desc);
+    try std.testing.expectEqual(@as(u8, 1), count);
+
+    var mismatched = kv_desc;
+    mismatched.align_bytes = 32;
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        appendUniqueStateDescriptor(storage[0..], &count, mismatched),
+    );
+}
+
+test "appendUniquePlanStateDescriptors merges unique builtin descriptors" {
+    var storage: [3]StateDescriptor = undefined;
+    var count: u8 = 0;
+    const plan_a = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 1,
+        .state_descs = &.{
+            defaultStateDescriptor(.kv_cache),
+            defaultStateDescriptor(.shortconv),
+        },
+    };
+    const plan_b = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 1,
+        .state_descs = &.{
+            defaultStateDescriptor(.shortconv),
+            defaultStateDescriptor(.mamba),
+        },
+    };
+    try appendUniquePlanStateDescriptors(storage[0..], &count, &plan_a);
+    try appendUniquePlanStateDescriptors(storage[0..], &count, &plan_b);
+    try std.testing.expectEqual(@as(u8, 3), count);
+    const used = storage[0..@as(usize, @intCast(count))];
+    try std.testing.expectEqual(@as(?usize, 0), stateDescriptorIndex(used, @intFromEnum(StateBlockId.kv_cache)));
+    try std.testing.expectEqual(@as(?usize, 1), stateDescriptorIndex(used, @intFromEnum(StateBlockId.shortconv)));
+    try std.testing.expectEqual(@as(?usize, 2), stateDescriptorIndex(used, @intFromEnum(StateBlockId.mamba)));
+}
+
+test "decodeInstructionLayerOp validates param block abi version" {
+    const op: layer_ops.LayerOp = .{
+        .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        },
+    };
+    const kill_row = [_]u64{0};
+    const kill_rows = [_][]const u64{kill_row[0..]};
+    const insn = Instruction{
+        .opcode = opcode_map.opcodeForLayerOp(op),
+        .inputs = &.{},
+        .outputs = &.{registerFromIndex(0)},
+        .weights = &.{},
+        .param_block_id = 0,
+        .state_block_id = null,
+    };
+    var param_block = try encodeLayerOpParam(std.testing.allocator, insn.opcode, op);
+    defer if (param_block.data.len != 0) std.testing.allocator.free(param_block.data);
+    param_block.version +%= 1;
+    const param_blocks = [_]ParamBlock{param_block};
+    const compiled = CompiledPlan{
+        .plan = .{
+            .instructions = &.{insn},
+            .register_count = 1,
+            .state_descs = &.{},
+        },
+        .liveness = .{
+            .register_last_read = &.{0},
+            .kill_after_instruction = kill_rows[0..],
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+        .weight_bindings = &.{},
+        .param_blocks = param_blocks[0..],
+    };
+    try std.testing.expectError(error.InvalidParamBlockABI, decodeInstructionLayerOp(&compiled, &compiled.plan.instructions[0], 0));
+}
+
+test "decodeInstructionLayerOp returns decoded layer op when abi is valid" {
+    const op: layer_ops.LayerOp = .{
+        .add = .{
+            .branch = .branch_out,
+            .scale = .one,
+        },
+    };
+    const kill_row = [_]u64{0};
+    const kill_rows = [_][]const u64{kill_row[0..]};
+    const insn = Instruction{
+        .opcode = opcode_map.opcodeForLayerOp(op),
+        .inputs = &.{},
+        .outputs = &.{registerFromIndex(0)},
+        .weights = &.{},
+        .param_block_id = 0,
+        .state_block_id = null,
+    };
+    const param_block = try encodeLayerOpParam(std.testing.allocator, insn.opcode, op);
+    defer if (param_block.data.len != 0) std.testing.allocator.free(param_block.data);
+    const param_blocks = [_]ParamBlock{param_block};
+    const compiled = CompiledPlan{
+        .plan = .{
+            .instructions = &.{insn},
+            .register_count = 1,
+            .state_descs = &.{},
+        },
+        .liveness = .{
+            .register_last_read = &.{0},
+            .kill_after_instruction = kill_rows[0..],
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+        .weight_bindings = &.{},
+        .param_blocks = param_blocks[0..],
+    };
+    const decoded = try decodeInstructionLayerOp(&compiled, &compiled.plan.instructions[0], 0);
+    try std.testing.expect(std.meta.eql(op, decoded));
+}
+
+test "encodeLayerOpParam strips runtime param names for bound primitive ops" {
+    const op: layer_ops.LayerOp = .{
+        .add_param = .{
+            .in = .tmp3,
+            .out = .tmp4,
+            .param_name = "w_param",
+        },
+    };
+    const opcode = opcode_map.opcodeForLayerOp(op);
+    const param_block = try encodeLayerOpParam(std.testing.allocator, opcode, op);
+    defer if (param_block.data.len != 0) std.testing.allocator.free(param_block.data);
+
+    const decoded = try decodeLayerOpFromParam(opcode, param_block.data);
+    switch (decoded) {
+        .add_param => |decoded_op| {
+            try std.testing.expectEqual(@as(usize, 0), decoded_op.param_name.len);
+            try std.testing.expectEqual(layer_ops.BufferId.tmp3, decoded_op.in);
+            try std.testing.expectEqual(layer_ops.BufferId.tmp4, decoded_op.out);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "encodeLayerOpParam round-trips split metadata including explicit split sizes" {
+    const split_sizes = [_]usize{ 2, 4, 8 };
+    const op: layer_ops.LayerOp = .{
+        .split = .{
+            .in = .tmp10,
+            .out_start = .tmp11,
+            .num_outputs = 3,
+            .dim = 1,
+            .split_sizes = split_sizes[0..],
+        },
+    };
+    const opcode = opcode_map.opcodeForLayerOp(op);
+    const param_block = try encodeLayerOpParam(std.testing.allocator, opcode, op);
+    defer if (param_block.data.len != 0) std.testing.allocator.free(param_block.data);
+
+    const decoded = try decodeLayerOpFromParam(opcode, param_block.data);
+    switch (decoded) {
+        .split => |decoded_op| {
+            try std.testing.expectEqual(layer_ops.BufferId.tmp10, decoded_op.in);
+            try std.testing.expectEqual(layer_ops.BufferId.tmp11, decoded_op.out_start);
+            try std.testing.expectEqual(@as(u8, 3), decoded_op.num_outputs);
+            try std.testing.expectEqual(@as(i8, 1), decoded_op.dim);
+            try std.testing.expectEqualSlices(usize, split_sizes[0..], decoded_op.split_sizes);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "blockKindSupportsState maps canonical block-state compatibility" {

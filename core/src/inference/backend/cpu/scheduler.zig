@@ -37,6 +37,7 @@ const sampling = @import("sampling.zig");
 const log = @import("../../../log.zig");
 const validate = @import("../../../validate/root.zig");
 const tokenizer_mod = @import("../../../tokenizer/root.zig");
+const runtime_contract = @import("../../runtime_contract/root.zig");
 
 /// Request state in the scheduler.
 pub const RequestState = enum {
@@ -152,6 +153,9 @@ pub const SchedulerConfig = struct {
 /// - `vocabSize(*const T) usize` - vocabulary size for logits
 /// - `allocSlot(*T) ?usize` - allocate a slot, returns null if full
 /// - `freeSlot(*T, usize) void` - release a slot
+/// - `stateDescriptors(*const T) []const runtime_contract.StateDescriptor` - per-slot state requirements
+/// - `bindSlotStateBlocks(*T, usize, []const runtime_contract.StateBlockHandle) !void` - bind opaque slot state
+/// - `unbindSlotStateBlocks(*T, usize) void` - unbind opaque slot state
 /// - `prefillSlot(*T, usize, []const u32, []f32) !void` - prefill
 /// - optional: `prefillSlotWithVision(*T, usize, []const u32, ?*const PrefillVisionInput, []f32) !void`
 /// - optional: `supportsSchedulerBackendDecodeStreamingRoute(*const T) bool`
@@ -189,6 +193,24 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
         /// Optimized sampler with SIMD and pre-allocated workspace
         sampler: sampling.Sampler,
+        /// Scheduler-owned opaque state blocks per active request.
+        request_state_blocks: std.AutoHashMap(u64, RequestStateBlocks),
+
+        const StateBlockStorage = struct {
+            bytes: []align(64) u8,
+        };
+
+        const RequestStateBlocks = struct {
+            handles: []runtime_contract.StateBlockHandle = &.{},
+            storage: []StateBlockStorage = &.{},
+
+            fn deinit(self: *RequestStateBlocks, allocator: std.mem.Allocator) void {
+                for (self.storage) |entry| allocator.free(entry.bytes);
+                if (self.storage.len > 0) allocator.free(self.storage);
+                if (self.handles.len > 0) allocator.free(self.handles);
+                self.* = .{};
+            }
+        };
 
         pub fn init(
             allocator: std.mem.Allocator,
@@ -231,10 +253,23 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .decode_results = decode_result_buffer,
                 .logits_buffer = logits_scratch,
                 .sampler = sampler_instance,
+                .request_state_blocks = std.AutoHashMap(u64, RequestStateBlocks).init(allocator),
             };
         }
 
         pub fn deinit(self: *Self) void {
+            var state_iter = self.request_state_blocks.iterator();
+            while (state_iter.next()) |entry| {
+                const request_id = entry.key_ptr.*;
+                if (self.requests.get(request_id)) |request_entry| {
+                    if (request_entry.slot_index) |slot_index| {
+                        self.backend.unbindSlotStateBlocks(slot_index);
+                    }
+                }
+                entry.value_ptr.deinit(self.allocator);
+            }
+            self.request_state_blocks.deinit();
+
             // Free all requests
             var request_iter = self.requests.valueIterator();
             while (request_iter.next()) |req_ptr| {
@@ -365,7 +400,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             // Free slot if allocated
             if (request_entry.slot_index) |slot_index| {
+                self.releaseRequestStateBlocks(request_id, slot_index);
                 self.backend.freeSlot(slot_index);
+                request_entry.slot_index = null;
             }
 
             // Remove from active list
@@ -559,6 +596,11 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         ///
         /// Should be called after retrieving results from a completed request.
         pub fn remove(self: *Self, request_id: u64) void {
+            if (self.requests.get(request_id)) |request_entry| {
+                self.releaseRequestStateBlocks(request_id, request_entry.slot_index);
+            } else {
+                self.releaseRequestStateBlocks(request_id, null);
+            }
             if (self.requests.fetchRemove(request_id)) |kv| {
                 kv.value.deinit(self.allocator);
                 self.allocator.destroy(kv.value);
@@ -686,6 +728,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Allocate slot directly (bypass request tracking)
             const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
             defer self.backend.freeSlot(slot_index);
+            var request_state_blocks = try self.allocateRequestStateBlocks();
+            defer request_state_blocks.deinit(self.allocator);
+            try self.backend.bindSlotStateBlocks(slot_index, request_state_blocks.handles);
+            defer self.backend.unbindSlotStateBlocks(slot_index);
 
             var prefill_timer = std.time.Timer.start() catch unreachable;
             // Prefill
@@ -976,6 +1022,78 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         // Internal helpers
         // =========================================================================
 
+        fn allocateStateBlockStorage(self: *Self, descriptor: runtime_contract.StateDescriptor) !StateBlockStorage {
+            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
+                return error.InvalidStateDescriptorBinding;
+            }
+            const descriptor_size = std.math.cast(usize, descriptor.size_bytes) orelse return error.InvalidStateDescriptorBinding;
+            const size_bytes: usize = @max(@as(usize, 1), descriptor_size);
+            const bytes = try self.allocator.alignedAlloc(u8, .@"64", size_bytes);
+            if (descriptor.zero_init) {
+                @memset(bytes, 0);
+            }
+            return .{
+                .bytes = bytes,
+            };
+        }
+
+        fn allocateRequestStateBlocks(self: *Self) !RequestStateBlocks {
+            const descriptors = self.backend.stateDescriptors();
+            if (descriptors.len == 0) return .{};
+
+            var request_state_blocks = RequestStateBlocks{};
+            request_state_blocks.handles = try self.allocator.alloc(runtime_contract.StateBlockHandle, descriptors.len);
+            errdefer self.allocator.free(request_state_blocks.handles);
+            request_state_blocks.storage = try self.allocator.alloc(StateBlockStorage, descriptors.len);
+            errdefer self.allocator.free(request_state_blocks.storage);
+
+            var initialized: usize = 0;
+            errdefer {
+                for (request_state_blocks.storage[0..initialized]) |entry| {
+                    self.allocator.free(entry.bytes);
+                }
+            }
+
+            for (descriptors, 0..) |descriptor, idx| {
+                const storage = try self.allocateStateBlockStorage(descriptor);
+                request_state_blocks.storage[idx] = storage;
+                request_state_blocks.handles[idx] = .{
+                    .id = descriptor.id,
+                    .ptr = @ptrCast(storage.bytes.ptr),
+                    .size = @intCast(storage.bytes.len),
+                    .align_bytes = 64,
+                };
+                initialized += 1;
+            }
+
+            try runtime_contract.validateStateBlocksForDescriptors(
+                descriptors,
+                request_state_blocks.handles,
+            );
+            return request_state_blocks;
+        }
+
+        fn bindAndTrackRequestStateBlocks(self: *Self, request_id: u64, slot_index: usize) !void {
+            if (self.request_state_blocks.contains(request_id)) {
+                return error.InvalidStateDescriptorBinding;
+            }
+            var request_state_blocks = try self.allocateRequestStateBlocks();
+            errdefer request_state_blocks.deinit(self.allocator);
+            try self.backend.bindSlotStateBlocks(slot_index, request_state_blocks.handles);
+            errdefer self.backend.unbindSlotStateBlocks(slot_index);
+            try self.request_state_blocks.put(request_id, request_state_blocks);
+        }
+
+        fn releaseRequestStateBlocks(self: *Self, request_id: u64, slot_index: ?usize) void {
+            if (self.request_state_blocks.fetchRemove(request_id)) |entry| {
+                if (slot_index) |slot| {
+                    self.backend.unbindSlotStateBlocks(slot);
+                }
+                var state_blocks = entry.value;
+                state_blocks.deinit(self.allocator);
+            }
+        }
+
         fn activatePending(self: *Self) !void {
             // Sort pending queue if priority scheduling
             if (self.config.priority_scheduling) {
@@ -993,6 +1111,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
                 // Try to allocate a slot
                 if (self.backend.allocSlot()) |slot_index| {
+                    errdefer self.backend.freeSlot(slot_index);
+                    try self.bindAndTrackRequestStateBlocks(pending_request_id, slot_index);
+                    errdefer self.releaseRequestStateBlocks(pending_request_id, slot_index);
                     request_entry.slot_index = slot_index;
                     request_entry.state = .pending_prefill;
                     try self.active_requests.append(self.allocator, pending_request_id);
@@ -1086,6 +1207,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
 
             // Free slot
             if (request_entry.slot_index) |slot_index| {
+                self.releaseRequestStateBlocks(request_entry.id, slot_index);
                 self.backend.freeSlot(slot_index);
                 request_entry.slot_index = null;
             }
@@ -2067,6 +2189,25 @@ const MockBackend = struct {
         }
     }
 
+    fn stateDescriptors(self: *const MockBackend) []const runtime_contract.StateDescriptor {
+        _ = self;
+        return &.{};
+    }
+
+    fn bindSlotStateBlocks(
+        self: *MockBackend,
+        slot_index: usize,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        _ = slot_index;
+        try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
+    }
+
+    fn unbindSlotStateBlocks(self: *MockBackend, slot_index: usize) void {
+        _ = self;
+        _ = slot_index;
+    }
+
     fn prefillSlot(self: *MockBackend, slot_index: usize, tokens: []const u32, logits_out: []f32) !void {
         // Record the call
         const tokens_copy = try self.allocator.dupe(u32, tokens);
@@ -2160,6 +2301,25 @@ const MockStreamingBackend = struct {
     fn freeSlot(self: *MockStreamingBackend, slot_index: usize) void {
         _ = slot_index;
         self.slot_in_use = false;
+    }
+
+    fn stateDescriptors(self: *const MockStreamingBackend) []const runtime_contract.StateDescriptor {
+        _ = self;
+        return &.{};
+    }
+
+    fn bindSlotStateBlocks(
+        self: *MockStreamingBackend,
+        slot_index: usize,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        _ = slot_index;
+        try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
+    }
+
+    fn unbindSlotStateBlocks(self: *MockStreamingBackend, slot_index: usize) void {
+        _ = self;
+        _ = slot_index;
     }
 
     fn prefillSlot(self: *MockStreamingBackend, slot_index: usize, tokens: []const u32, logits_out: []f32) !void {

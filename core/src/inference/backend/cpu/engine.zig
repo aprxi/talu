@@ -120,6 +120,10 @@ pub const FusedCpuBackend = struct {
     decode_batch_logits: []f32,
     /// Per-slot RoPE position delta used during decode for multimodal prompts.
     slot_rope_position_deltas: []isize,
+    state_descriptors_storage: [3]runtime_contract.StateDescriptor,
+    state_descriptor_count: u8,
+    slot_state_bindings: []SlotStateBinding,
+    implicit_slot0_state_storage: [3][64]u8 align(64) = [_][64]u8{[_]u8{0} ** 64} ** 3,
 
     // Model dimensions
     d_model: usize,
@@ -136,6 +140,19 @@ pub const FusedCpuBackend = struct {
 
     pub const PrefillProgressFn = *const fn (usize, usize, ?*anyopaque) callconv(.c) void;
     pub const PrefillVisionInput = vision_runtime_mod.PrefillVisionInput;
+
+    const max_state_bindings_per_slot: usize = 3;
+
+    const SlotStateBinding = struct {
+        handles: [max_state_bindings_per_slot]runtime_contract.StateBlockHandle = undefined,
+        count: u8 = 0,
+        bound: bool = false,
+
+        fn reset(self: *SlotStateBinding) void {
+            self.count = 0;
+            self.bound = false;
+        }
+    };
 
     pub fn maxBatchSize(self: *const FusedCpuBackend) usize {
         return self.max_batch_size;
@@ -336,34 +353,73 @@ pub const FusedCpuBackend = struct {
         errdefer model.deinit(allocator);
 
         // Initialize recurrent/latent state from compiled plan descriptors.
+        var attention_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer attention_layer_indices.deinit(allocator);
+        var mla_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer mla_layer_indices.deinit(allocator);
         var mamba_layer_indices = std.ArrayListUnmanaged(usize){};
         defer mamba_layer_indices.deinit(allocator);
         var shortconv_layer_indices = std.ArrayListUnmanaged(usize){};
         defer shortconv_layer_indices.deinit(allocator);
-        var kv_layer_indices = std.ArrayListUnmanaged(usize){};
-        defer kv_layer_indices.deinit(allocator);
-        var mla_layer_indices = std.ArrayListUnmanaged(usize){};
-        defer mla_layer_indices.deinit(allocator);
+        var state_descriptors_storage: [3]runtime_contract.StateDescriptor = undefined;
+        var state_descriptor_count: u8 = 0;
 
-        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
-        const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
-        const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
         for (model.layers, 0..) |*layer, layer_idx| {
-            for (layer.compiled_plan.plan.state_descs) |state_desc| {
-                switch (state_desc.id) {
-                    kv_state_id => try kv_layer_indices.append(allocator, layer_idx),
-                    mamba_state_id => try mamba_layer_indices.append(allocator, layer_idx),
-                    shortconv_state_id => try shortconv_layer_indices.append(allocator, layer_idx),
-                    else => return error.InvalidStateDescriptorBinding,
+            const plan = &layer.compiled_plan.plan;
+            const state_flags = try runtime_contract.collectBuiltinStateFlags(plan);
+            try runtime_contract.appendUniquePlanStateDescriptors(
+                state_descriptors_storage[0..],
+                &state_descriptor_count,
+                plan,
+            );
+
+            if (layer_idx >= cpu_block_set.len) return error.InvalidStateDescriptorBinding;
+            const block = &cpu_block_set[layer_idx];
+            const has_attention_kernel = block.getAttention() != null;
+            const has_mla_kernel = block.getMLAAttention() != null;
+            const has_mamba_kernel = block.getMambaKernel() != null;
+            const has_shortconv_kernel = block.getShortConvKernel() != null;
+
+            // Descriptor contract: descriptors and executable kernels must agree.
+            if ((has_attention_kernel or has_mla_kernel) != state_flags.has_kv) {
+                return error.InvalidStateDescriptorBinding;
+            }
+            if (has_mamba_kernel != state_flags.has_mamba) return error.InvalidStateDescriptorBinding;
+            if (has_shortconv_kernel != state_flags.has_shortconv) return error.InvalidStateDescriptorBinding;
+
+            if (has_attention_kernel and has_mla_kernel) return error.InvalidStateDescriptorBinding;
+            if (state_flags.has_kv) {
+                if (has_mla_kernel) {
+                    try mla_layer_indices.append(allocator, layer_idx);
+                } else {
+                    try attention_layer_indices.append(allocator, layer_idx);
                 }
             }
-            if (layer_idx < cpu_block_set.len and cpu_block_set[layer_idx].getMLAAttention() != null) {
-                try mla_layer_indices.append(allocator, layer_idx);
-            }
+            if (state_flags.has_mamba) try mamba_layer_indices.append(allocator, layer_idx);
+            if (state_flags.has_shortconv) try shortconv_layer_indices.append(allocator, layer_idx);
+        }
+        const descriptor_slice = state_descriptors_storage[0..state_descriptor_count];
+        const has_kv_descriptor = runtime_contract.stateDescriptorIndex(
+            descriptor_slice,
+            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+        ) != null;
+        const has_shortconv_descriptor = runtime_contract.stateDescriptorIndex(
+            descriptor_slice,
+            @intFromEnum(runtime_contract.StateBlockId.shortconv),
+        ) != null;
+        const has_mamba_descriptor = runtime_contract.stateDescriptorIndex(
+            descriptor_slice,
+            @intFromEnum(runtime_contract.StateBlockId.mamba),
+        ) != null;
+        if (has_kv_descriptor != (attention_layer_indices.items.len > 0 or mla_layer_indices.items.len > 0) or
+            has_shortconv_descriptor != (shortconv_layer_indices.items.len > 0) or
+            has_mamba_descriptor != (mamba_layer_indices.items.len > 0))
+        {
+            return error.InvalidStateDescriptorBinding;
         }
 
-        if (kv_layer_indices.items.len > 0) {
-            try scratch.initAttention(kv_layer_indices.items);
+        if (attention_layer_indices.items.len > 0) {
+            try scratch.initAttention(attention_layer_indices.items);
         }
 
         if (mamba_layer_indices.items.len > 0) {
@@ -437,6 +493,9 @@ pub const FusedCpuBackend = struct {
         const slot_rope_position_deltas = try allocator.alloc(isize, max_batch_size);
         errdefer allocator.free(slot_rope_position_deltas);
         @memset(slot_rope_position_deltas, 0);
+        const slot_state_bindings = try allocator.alloc(SlotStateBinding, max_batch_size);
+        errdefer allocator.free(slot_state_bindings);
+        for (slot_state_bindings) |*binding| binding.reset();
 
         return FusedCpuBackend{
             .allocator = allocator,
@@ -458,6 +517,9 @@ pub const FusedCpuBackend = struct {
             .decode_batch_slot_indices = decode_batch_slot_indices,
             .decode_batch_logits = decode_batch_logits,
             .slot_rope_position_deltas = slot_rope_position_deltas,
+            .state_descriptors_storage = state_descriptors_storage,
+            .state_descriptor_count = state_descriptor_count,
+            .slot_state_bindings = slot_state_bindings,
             .d_model = model_width,
             .vocab_size = vocab_size,
             .max_batch_size = max_batch_size,
@@ -487,6 +549,7 @@ pub const FusedCpuBackend = struct {
         self.allocator.free(self.attn_out_buffers);
         self.allocator.free(self.norm_buffers);
         self.allocator.free(self.hidden_buffers);
+        self.allocator.free(self.slot_state_bindings);
         self.allocator.free(self.slot_rope_position_deltas);
         self.model.deinit(self.allocator);
         for (self.blocks) |*block| block.deinit(self.allocator);
@@ -505,6 +568,7 @@ pub const FusedCpuBackend = struct {
     pub fn allocSlot(self: *FusedCpuBackend) ?usize {
         const slot = self.kv_cache.allocSlot() orelse return null;
         self.slot_rope_position_deltas[slot] = 0;
+        self.slot_state_bindings[slot].reset();
         return slot;
     }
 
@@ -512,6 +576,9 @@ pub const FusedCpuBackend = struct {
     pub fn freeSlot(self: *FusedCpuBackend, slot_index: usize) void {
         self.kv_cache.freeSlot(slot_index);
         self.slot_rope_position_deltas[slot_index] = 0;
+        if (slot_index < self.slot_state_bindings.len) {
+            self.slot_state_bindings[slot_index].reset();
+        }
     }
 
     /// Reset a slot for reuse (new conversation in same slot).
@@ -525,6 +592,67 @@ pub const FusedCpuBackend = struct {
         return self.kv_cache.getPosition(slot_index);
     }
 
+    pub fn stateDescriptors(self: *const FusedCpuBackend) []const runtime_contract.StateDescriptor {
+        return self.state_descriptors_storage[0..self.state_descriptor_count];
+    }
+
+    pub fn bindSlotStateBlocks(
+        self: *FusedCpuBackend,
+        slot_index: usize,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        if (slot_index >= self.slot_state_bindings.len) return error.InvalidArgument;
+        try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
+        if (state_blocks.len > max_state_bindings_per_slot) return error.InvalidStateDescriptorBinding;
+        var binding = &self.slot_state_bindings[slot_index];
+        for (state_blocks, 0..) |state_block, idx| {
+            binding.handles[idx] = state_block;
+        }
+        binding.count = @intCast(state_blocks.len);
+        binding.bound = true;
+    }
+
+    pub fn unbindSlotStateBlocks(self: *FusedCpuBackend, slot_index: usize) void {
+        if (slot_index >= self.slot_state_bindings.len) return;
+        self.slot_state_bindings[slot_index].reset();
+    }
+
+    fn slotStateBlocks(self: *const FusedCpuBackend, slot_index: usize) []const runtime_contract.StateBlockHandle {
+        const binding = &self.slot_state_bindings[slot_index];
+        return binding.handles[0..binding.count];
+    }
+
+    fn ensureSlotStateBlocksBound(self: *const FusedCpuBackend, slot_index: usize) !void {
+        if (self.state_descriptor_count == 0) return;
+        if (slot_index >= self.slot_state_bindings.len) return error.InvalidArgument;
+        const binding = &self.slot_state_bindings[slot_index];
+        if (!binding.bound) return error.InvalidStateDescriptorBinding;
+        try runtime_contract.validateStateBlocksForDescriptors(
+            self.stateDescriptors(),
+            self.slotStateBlocks(slot_index),
+        );
+    }
+
+    fn bindImplicitSlot0StateBlocks(self: *FusedCpuBackend) !void {
+        if (self.state_descriptor_count == 0) return;
+        if (self.slot_state_bindings[0].bound) return;
+        const descriptors = self.stateDescriptors();
+        var handles: [max_state_bindings_per_slot]runtime_contract.StateBlockHandle = undefined;
+        for (descriptors, 0..) |descriptor, idx| {
+            const size_bytes_u64 = if (descriptor.size_bytes == 0) @as(u64, 1) else descriptor.size_bytes;
+            const implicit_capacity = @as(u64, @intCast(self.implicit_slot0_state_storage[idx].len));
+            if (size_bytes_u64 > implicit_capacity) return error.InvalidStateDescriptorBinding;
+            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
+            handles[idx] = .{
+                .id = descriptor.id,
+                .ptr = @ptrCast(&self.implicit_slot0_state_storage[idx][0]),
+                .size = size_bytes_u64,
+                .align_bytes = 64,
+            };
+        }
+        try self.bindSlotStateBlocks(0, handles[0..descriptors.len]);
+    }
+
     // =========================================================================
     // Single-Sequence API (uses slot 0, compatible with Backend interface)
     // =========================================================================
@@ -535,6 +663,7 @@ pub const FusedCpuBackend = struct {
     pub fn prefill(self: *FusedCpuBackend, tokens: []const u32, logits_out: []f32) !void {
         // Always use slot 0 for single-sequence mode
         self.kv_cache.resetSlot(0);
+        try self.bindImplicitSlot0StateBlocks();
         try self.prefillSlot(0, tokens, logits_out);
     }
 
@@ -542,6 +671,7 @@ pub const FusedCpuBackend = struct {
     /// Returns logits for the next token prediction.
     /// Uses the graph-based model.forwardWithBatchedCache for architecture compatibility.
     pub fn decode(self: *FusedCpuBackend, token: u32, position: usize, logits_out: []f32) !void {
+        try self.bindImplicitSlot0StateBlocks();
         const model_dim = self.d_model;
         const token_ids = &[_]u32{token};
         self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[0]);
@@ -592,6 +722,7 @@ pub const FusedCpuBackend = struct {
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
     ) !usize {
+        try self.bindImplicitSlot0StateBlocks();
         _ = start_position; // Position tracked internally
 
         var current_token = first_token;
@@ -652,7 +783,8 @@ pub const FusedCpuBackend = struct {
 
     /// Single-step decode for one slot, returning logits for sampling.
     /// This is the minimal per-token operation used by the scheduler's single-request route.
-    pub fn decodeStep(self: *FusedCpuBackend, slot_index: usize, token: u32) []f32 {
+    pub fn decodeStep(self: *FusedCpuBackend, slot_index: usize, token: u32) ![]f32 {
+        try self.ensureSlotStateBlocksBound(slot_index);
         const model_dim = self.d_model;
         const hidden_buffer = self.getHiddenBuffer(slot_index);
         const logits_buffer = self.getLogitsBuffer(slot_index);
@@ -666,17 +798,17 @@ pub const FusedCpuBackend = struct {
             1,
             model_dim,
         );
-        self.model.embed_tokens.forward(token_ids, &hidden_view_3d) catch return logits_buffer;
+        try self.model.embed_tokens.forward(token_ids, &hidden_view_3d);
         cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
 
         // 2. Forward through transformer layers with batched cache
-        self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, &self.kv_cache, slot_index, true) catch return logits_buffer;
+        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, &self.kv_cache, slot_index, true);
 
         // 3. Final layer norm (if present)
         if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
 
         // 4. Compute logits
-        self.computeLogitsFromHidden(hidden_buffer, logits_buffer) catch return logits_buffer;
+        try self.computeLogitsFromHidden(hidden_buffer, logits_buffer);
 
         return logits_buffer;
     }
@@ -735,6 +867,7 @@ pub const FusedCpuBackend = struct {
         vision_input: ?*const PrefillVisionInput,
         logits_out: []f32,
     ) !void {
+        try self.ensureSlotStateBlocksBound(slot_index);
         const prompt_len = tokens.len;
         if (prompt_len == 0) return;
 
@@ -1117,6 +1250,7 @@ pub const FusedCpuBackend = struct {
 
         // 1) Batched embedding gather for all requests in one kernel call.
         for (requests, 0..) |request, request_index| {
+            try self.ensureSlotStateBlocksBound(request.slot_index);
             batch_tokens[request_index] = request.token;
             slot_indices[request_index] = request.slot_index;
         }

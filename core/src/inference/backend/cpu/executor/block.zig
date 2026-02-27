@@ -40,10 +40,14 @@ const ResidualScale = layer_ops.ResidualScale;
 const LayerOp = layer_ops.LayerOp;
 const SlotContext = runtime.SlotContext;
 const SharedPersistentState = runtime.SharedPersistentState;
+const CpuKernel = cpu_forward.CpuKernel;
 
 const addIntoScaled = cpu_forward.addIntoScaled;
 const copyTensor = cpu_forward.copyTensor;
 const TMP_BUFFER_MAP_LEN: usize = 64;
+const MAX_INSTRUCTION_TENSOR_HANDLES: usize = 16;
+const IMPLICIT_BINDING_REGISTER_BASE: u16 = 0xF000;
+var layer_program_dispatch_counters = runtime_contract.DispatchCounters{};
 
 fn identityTmpRegisterMap() [TMP_BUFFER_MAP_LEN]u8 {
     var map: [TMP_BUFFER_MAP_LEN]u8 = undefined;
@@ -133,6 +137,10 @@ pub const Block = struct {
     hidden_size: usize,
     /// Per-instruction resolved weight pointer for opcodes with single-weight arity.
     instruction_weight_refs: []?*const Tensor,
+    /// Decoded instruction payloads, resolved once at init.
+    instruction_ops: []LayerOp,
+    /// Per-instruction resolved kernel pointer for macro `kernel` opcodes.
+    instruction_kernel_refs: []?CpuKernel,
     /// Logical register index -> physical scratch tmp slot.
     /// Indices 0..2 (residual/norm_out/branch_out) always remain identity.
     tmp_register_to_scratch_idx: [TMP_BUFFER_MAP_LEN]u8 = identityTmpRegisterMap(),
@@ -148,22 +156,46 @@ pub const Block = struct {
         var compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, mode);
         errdefer plan_compiler.deinitCompiledPlan(allocator, &compiled_plan);
         const tmp_map = try buildTmpRegisterScratchMap(allocator, &compiled_plan);
+        const instruction_ops = try buildInstructionOps(allocator, &compiled_plan);
         const weight_refs = try buildInstructionWeightRefs(allocator, block, block_idx, &compiled_plan);
-        errdefer allocator.free(weight_refs);
+        const kernel_refs = try buildInstructionKernelRefs(allocator, block, block_idx, &compiled_plan, instruction_ops);
+        errdefer {
+            allocator.free(kernel_refs);
+            allocator.free(weight_refs);
+            allocator.free(instruction_ops);
+        }
         return .{
             .compiled_plan = compiled_plan,
             .block = block,
             .block_idx = block_idx,
             .hidden_size = hidden_size,
             .instruction_weight_refs = weight_refs,
+            .instruction_ops = instruction_ops,
+            .instruction_kernel_refs = kernel_refs,
             .tmp_register_to_scratch_idx = tmp_map,
         };
     }
 
     pub fn deinit(self: *Block, allocator: std.mem.Allocator) void {
+        allocator.free(self.instruction_kernel_refs);
         allocator.free(self.instruction_weight_refs);
+        allocator.free(self.instruction_ops);
         plan_compiler.deinitCompiledPlan(allocator, &self.compiled_plan);
         self.* = undefined;
+    }
+
+    fn buildInstructionOps(
+        allocator: std.mem.Allocator,
+        compiled_plan: *const runtime_contract.CompiledPlan,
+    ) ![]LayerOp {
+        const ops = try allocator.alloc(LayerOp, compiled_plan.plan.instructions.len);
+        errdefer allocator.free(ops);
+
+        for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
+            ops[op_index] = try runtime_contract.decodeInstructionLayerOp(compiled_plan, &insn, op_index);
+        }
+
+        return ops;
     }
 
     fn buildInstructionWeightRefs(
@@ -200,17 +232,174 @@ pub const Block = struct {
         return refs;
     }
 
+    fn buildInstructionKernelRefs(
+        allocator: std.mem.Allocator,
+        block: *const cpu_forward.TransformerBlock,
+        block_idx: usize,
+        compiled_plan: *const runtime_contract.CompiledPlan,
+        instruction_ops: []const LayerOp,
+    ) ![]?CpuKernel {
+        const refs = try allocator.alloc(?CpuKernel, compiled_plan.plan.instructions.len);
+        errdefer allocator.free(refs);
+        @memset(refs, null);
+
+        for (instruction_ops, 0..) |op, op_index| {
+            switch (op) {
+                .kernel => |kernel_op| {
+                    const kernel_id: usize = @intCast(kernel_op.id);
+                    if (kernel_id >= block.kernels.len) {
+                        error_context.setContext("block={d}, op={d}, kernel_id={d}, max={d}", .{
+                            block_idx,
+                            op_index,
+                            kernel_op.id,
+                            block.kernels.len,
+                        });
+                        return error.KernelIndexOutOfBounds;
+                    }
+                    refs[op_index] = block.kernels[kernel_id];
+                },
+                else => {},
+            }
+        }
+        return refs;
+    }
+
     fn decodeInstructionOp(self: *const Block, op_index: usize) !LayerOp {
-        if (op_index >= self.compiled_plan.plan.instructions.len) return error.InvalidInstructionIndex;
-        const insn = self.compiled_plan.plan.instructions[op_index];
-        const param_block_id = insn.param_block_id orelse return error.MissingParamBlock;
-        if (param_block_id >= self.compiled_plan.param_blocks.len) return error.MissingParamBlock;
-        const param_block = self.compiled_plan.param_blocks[param_block_id];
-        try runtime_contract.validateParamBlockAbi(&param_block);
-        if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
-        if (param_block.data.len != @sizeOf(LayerOp)) return error.InvalidParamBlockSize;
-        const op_ptr: *const LayerOp = @ptrCast(@alignCast(param_block.data.ptr));
-        return op_ptr.*;
+        if (op_index >= self.instruction_ops.len) return error.InvalidInstructionIndex;
+        return self.instruction_ops[op_index];
+    }
+
+    fn implicitBindingRegister(slot: usize) !runtime_contract.RegisterRef {
+        const slot_u16: u16 = std.math.cast(u16, slot) orelse return error.InvalidInstructionBinding;
+        return runtime_contract.registerFromIndex(IMPLICIT_BINDING_REGISTER_BASE + slot_u16);
+    }
+
+    fn tensorHandleToTensor(handle: runtime_contract.TensorHandle) *Tensor {
+        return @ptrCast(@alignCast(handle.ptr));
+    }
+
+    fn tensorViewDescFromTensor(value: *const Tensor) runtime_contract.TensorViewDesc {
+        var shape: [4]u32 = .{ 0, 0, 0, 0 };
+        var strides: [4]u32 = .{ 0, 0, 0, 0 };
+        const rank: usize = @intCast(@max(value.n_dims, 0));
+        const capped_rank = @min(rank, shape.len);
+        var dim: usize = 0;
+        while (dim < capped_rank) : (dim += 1) {
+            shape[dim] = @intCast(value.shape[dim]);
+        }
+        if (capped_rank != 0) {
+            var stride_acc: usize = 1;
+            var rev: usize = capped_rank;
+            while (rev > 0) {
+                rev -= 1;
+                strides[rev] = @intCast(stride_acc);
+                stride_acc *= @as(usize, @intCast(@max(shape[rev], 1)));
+            }
+        }
+        return .{
+            .dtype = value.dtype,
+            .rank = @intCast(capped_rank),
+            .shape = shape,
+            .stride_elems = strides,
+            .layout = .contiguous,
+        };
+    }
+
+    const BuiltInstructionHandles = struct {
+        registers: []runtime_contract.TensorHandle,
+        views: []const runtime_contract.TensorViewDesc,
+    };
+
+    fn buildInstructionHandles(
+        self: *const Block,
+        insn: *const runtime_contract.Instruction,
+        dispatch_state: *RuntimeDispatchState,
+        handle_storage: *[MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorHandle,
+        view_storage: *[MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorViewDesc,
+    ) !BuiltInstructionHandles {
+        var handle_count: usize = 0;
+        var view_count: usize = 0;
+
+        for (insn.inputs) |reg| {
+            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            const reg_idx = runtime_contract.registerToIndex(reg);
+            if (reg_idx >= dispatch_state.buffer_views.len) return error.InvalidInstructionBinding;
+            const value = &dispatch_state.buffer_views[reg_idx];
+            handle_storage[handle_count] = .{
+                .register = reg,
+                .ptr = @ptrCast(value),
+            };
+            view_storage[view_count] = tensorViewDescFromTensor(value);
+            handle_count += 1;
+            view_count += 1;
+        }
+        for (insn.outputs) |reg| {
+            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            const reg_idx = runtime_contract.registerToIndex(reg);
+            if (reg_idx >= dispatch_state.buffer_views.len) return error.InvalidInstructionBinding;
+            const value = &dispatch_state.buffer_views[reg_idx];
+            handle_storage[handle_count] = .{
+                .register = reg,
+                .ptr = @ptrCast(value),
+            };
+            view_storage[view_count] = tensorViewDescFromTensor(value);
+            handle_count += 1;
+            view_count += 1;
+        }
+        if (insn.weights.len != 0) {
+            if (insn.weights.len != 1) return error.InvalidWeightRefCount;
+            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            const weight_ref = try self.instructionWeightRef(dispatch_state.op_index);
+            handle_storage[handle_count] = .{
+                .register = try implicitBindingRegister(0),
+                .ptr = @ptrCast(@constCast(weight_ref)),
+            };
+            handle_count += 1;
+        }
+        if (self.instruction_kernel_refs[dispatch_state.op_index] != null) {
+            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            const kernel_ref: *const CpuKernel = &self.instruction_kernel_refs[dispatch_state.op_index].?;
+            handle_storage[handle_count] = .{
+                .register = try implicitBindingRegister(insn.weights.len),
+                .ptr = @ptrCast(@constCast(kernel_ref)),
+            };
+            handle_count += 1;
+        }
+
+        return .{
+            .registers = handle_storage[0..handle_count],
+            .views = view_storage[0..view_count],
+        };
+    }
+
+    fn instructionIoSlices(
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+    ) !struct { inputs: []const runtime_contract.TensorHandle, outputs: []const runtime_contract.TensorHandle } {
+        const io_count = insn.inputs.len + insn.outputs.len;
+        if (registers.len < io_count) return error.InvalidInstructionBinding;
+        return .{
+            .inputs = registers[0..insn.inputs.len],
+            .outputs = registers[insn.inputs.len..io_count],
+        };
+    }
+
+    fn instructionImplicitKernelBinding(
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+    ) !CpuKernel {
+        const base = insn.inputs.len + insn.outputs.len + insn.weights.len;
+        if (registers.len <= base) return error.MissingKernelBinding;
+        const kernel_ptr: *const CpuKernel = @ptrCast(@alignCast(registers[base].ptr));
+        return kernel_ptr.*;
+    }
+
+    fn instructionParams(self: *const Block, insn: *const runtime_contract.Instruction, param_storage: *[1]runtime_contract.ParamBlock) ![]const runtime_contract.ParamBlock {
+        const param_id = insn.param_block_id orelse return &.{};
+        if (param_id >= self.compiled_plan.param_blocks.len) return error.MissingParamBlock;
+        const param_block = self.compiled_plan.param_blocks[param_id];
+        param_storage[0] = param_block;
+        return param_storage[0..1];
     }
 
     fn instructionWeightRef(self: *const Block, op_index: usize) !*const Tensor {
@@ -221,12 +410,49 @@ pub const Block = struct {
         return self.instruction_weight_refs[op_index] orelse error.MissingWeight;
     }
 
+    fn instructionKernelRef(
+        self: *const Block,
+        op_index: usize,
+        kernel_id: u32,
+        expected_type: anytype,
+    ) !CpuKernel {
+        if (op_index >= self.compiled_plan.plan.instructions.len) return error.InvalidInstructionIndex;
+        if (op_index >= self.instruction_kernel_refs.len) return error.InvalidInstructionIndex;
+        const kernel = self.instruction_kernel_refs[op_index] orelse return error.MissingKernelBinding;
+        if (builtin.mode == .Debug) {
+            const actual_type = kernel.getOpType();
+            if (actual_type != expected_type) {
+                log.err("inference", "Graph/Kernel ordering mismatch", .{
+                    .block = self.block_idx,
+                    .kernel = kernel_id,
+                    .expected = @tagName(expected_type),
+                    .actual = @tagName(actual_type),
+                }, @src());
+                @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
+            }
+        }
+        return kernel;
+    }
+
+    fn planUsesOpcode(self: *const Block, opcode: runtime_contract.Opcode) bool {
+        for (self.compiled_plan.plan.instructions) |insn| {
+            if (insn.opcode == opcode) return true;
+        }
+        return false;
+    }
+
     const BatchedDispatchMode = enum {
         single_slot,
         slot_batch,
     };
 
     const RuntimeDispatchState = struct {
+        const MaxStateBindings = 256;
+        const StateBinding = struct {
+            id: u8,
+            ptr: *anyopaque,
+        };
+
         block: *const Block,
         op_index: usize,
         buffer_views: *[64]Tensor,
@@ -235,6 +461,31 @@ pub const Block = struct {
         mode: BatchedDispatchMode,
         slot_index: usize,
         slot_indices: []const usize,
+        state_bindings: [MaxStateBindings]?StateBinding = [_]?StateBinding{null} ** MaxStateBindings,
+        state_binding_count: u8 = 0,
+
+        fn bindState(self: *RuntimeDispatchState, state_id: u8, ptr: *anyopaque) !void {
+            var idx: usize = 0;
+            while (idx < self.state_binding_count) : (idx += 1) {
+                const existing = self.state_bindings[idx] orelse continue;
+                if (existing.id == state_id) {
+                    self.state_bindings[idx] = .{ .id = state_id, .ptr = ptr };
+                    return;
+                }
+            }
+            if (self.state_binding_count >= self.state_bindings.len) return error.InvalidStateDescriptorBinding;
+            self.state_bindings[self.state_binding_count] = .{ .id = state_id, .ptr = ptr };
+            self.state_binding_count += 1;
+        }
+
+        fn stateBinding(self: *const RuntimeDispatchState, state_id: u8) ?StateBinding {
+            var idx: usize = 0;
+            while (idx < self.state_binding_count) : (idx += 1) {
+                const binding = self.state_bindings[idx] orelse continue;
+                if (binding.id == state_id) return binding;
+            }
+            return null;
+        }
     };
 
     const StateRef = struct {
@@ -256,73 +507,65 @@ pub const Block = struct {
         return @ptrCast(@alignCast(raw_state));
     }
 
+    fn bindDispatchStateDescriptors(dispatch_state: *RuntimeDispatchState) !void {
+        dispatch_state.state_binding_count = 0;
+        dispatch_state.state_bindings = [_]?RuntimeDispatchState.StateBinding{null} ** RuntimeDispatchState.MaxStateBindings;
+        _ = try runtime_contract.collectBuiltinStateFlags(&dispatch_state.block.compiled_plan.plan);
+
+        const slot_state = dispatch_state.slot_ctx.slotState();
+        const shared_state = dispatch_state.slot_ctx.sharedState();
+        for (dispatch_state.block.compiled_plan.plan.state_descs) |state_desc| {
+            if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
+            switch (state_desc.id) {
+                @intFromEnum(runtime_contract.StateBlockId.kv_cache) => {
+                    const state_ptr: *anyopaque = blk: {
+                        if (dispatch_state.mode == .slot_batch) {
+                            const batched_cache = shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache;
+                            break :blk batched_cache;
+                        }
+                        if (slot_state.mla_cache) |*cache| break :blk cache;
+                        if (slot_state.attn_cache) |*cache| break :blk cache;
+                        const batched_cache = shared_state.batched_cache orelse return runtime.SlotContextError.MissingAttentionCache;
+                        break :blk batched_cache;
+                    };
+                    try dispatch_state.bindState(state_desc.id, state_ptr);
+                },
+                @intFromEnum(runtime_contract.StateBlockId.shortconv) => {
+                    if (slot_state.shortconv_state) |*state| {
+                        try dispatch_state.bindState(state_desc.id, state);
+                    } else return runtime.SlotContextError.MissingShortConvState;
+                },
+                @intFromEnum(runtime_contract.StateBlockId.mamba) => {
+                    if (slot_state.mamba_state) |*state| {
+                        try dispatch_state.bindState(state_desc.id, state);
+                    } else return runtime.SlotContextError.MissingMambaState;
+                },
+                else => return error.InvalidStateDescriptorBinding,
+            }
+        }
+    }
+
     fn buildInstructionStateBlocks(
         insn: *const runtime_contract.Instruction,
         dispatch_state: *RuntimeDispatchState,
     ) !InstructionStateBlocks {
         var blocks = InstructionStateBlocks{};
         const state_id = insn.state_block_id orelse return blocks;
-        const slot_state = dispatch_state.slot_ctx.slotState();
-        const shared_state = dispatch_state.slot_ctx.sharedState();
-
-        const state_ptr: *anyopaque = switch (state_id) {
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache) => blk: {
-                if (dispatch_state.mode == .slot_batch) {
-                    const batched_cache = shared_state.batched_cache orelse return runtime.SlotContextError.MissingBatchedCache;
-                    break :blk batched_cache;
-                }
-                if (slot_state.mla_cache) |*cache| break :blk cache;
-                if (slot_state.attn_cache) |*cache| break :blk cache;
-                const batched_cache = shared_state.batched_cache orelse return runtime.SlotContextError.MissingAttentionCache;
-                break :blk batched_cache;
-            },
-            @intFromEnum(runtime_contract.StateBlockId.shortconv) => blk: {
-                if (slot_state.shortconv_state) |*state| break :blk state;
-                return runtime.SlotContextError.MissingShortConvState;
-            },
-            @intFromEnum(runtime_contract.StateBlockId.mamba) => blk: {
-                if (slot_state.mamba_state) |*state| break :blk state;
-                return runtime.SlotContextError.MissingMambaState;
-            },
-            else => return error.InvalidStateDescriptorBinding,
+        const binding = dispatch_state.stateBinding(state_id) orelse return error.InvalidStateDescriptorBinding;
+        const descriptor = runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, state_id) orelse {
+            return error.UnknownStateDescriptorId;
         };
 
-        blocks.refs[0] = .{ .ptr = state_ptr };
+        blocks.refs[0] = .{ .ptr = binding.ptr };
         blocks.handles[0] = .{
             .id = state_id,
             .ptr = @ptrCast(&blocks.refs[0]),
-            .size = @sizeOf(StateRef),
-            .align_bytes = 64,
+            .size = if (descriptor.size_bytes > 0) descriptor.size_bytes else @sizeOf(StateRef),
+            .align_bytes = descriptor.align_bytes,
         };
         blocks.len = 1;
         return blocks;
     }
-
-    fn decodeInstructionLayerOp(
-        insn: *const runtime_contract.Instruction,
-        params: []const runtime_contract.ParamBlock,
-    ) !LayerOp {
-        const param_block_id = insn.param_block_id orelse return error.MissingParamBlock;
-        if (param_block_id >= params.len) return error.MissingParamBlock;
-        const param_block = params[param_block_id];
-        try runtime_contract.validateParamBlockAbi(&param_block);
-        if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
-        if (param_block.data.len != @sizeOf(LayerOp)) return error.InvalidParamBlockSize;
-        const op_ptr: *const LayerOp = @ptrCast(@alignCast(param_block.data.ptr));
-        return op_ptr.*;
-    }
-
-    const BatchedAdapterFn = *const fn (
-        self: *const Block,
-        op_index: usize,
-        op: LayerOp,
-        buffer_views: *[64]Tensor,
-        scratch: *ScratchBuffer,
-        slot_ctx: SlotContext,
-        mode: BatchedDispatchMode,
-        slot_index: usize,
-        slot_indices: []const usize,
-    ) anyerror!void;
 
     const batched_required_opcodes = [_]runtime_contract.Opcode{
         .rmsnorm,
@@ -364,17 +607,12 @@ pub const Block = struct {
         );
     }
 
-    fn dispatchBatchedInstruction(
+    fn dispatchBatchedInstructionWithState(
         self: *const Block,
-        op_index: usize,
         insn: *const runtime_contract.Instruction,
-        buffer_views: *[64]Tensor,
-        scratch: *ScratchBuffer,
-        slot_ctx: SlotContext,
-        mode: BatchedDispatchMode,
-        slot_index: usize,
-        slot_indices: []const usize,
+        dispatch_state: *RuntimeDispatchState,
     ) !void {
+        const op_index = dispatch_state.op_index;
         const adapter = batched_adapter_table[@intFromEnum(insn.opcode)] orelse {
             error_context.setContext("block={d}, op={d}, opcode={d}", .{
                 self.block_idx,
@@ -384,58 +622,57 @@ pub const Block = struct {
             return error.UnsupportedOpInBatchedMode;
         };
 
-        var dispatch_state = RuntimeDispatchState{
-            .block = self,
-            .op_index = op_index,
-            .buffer_views = buffer_views,
-            .scratch = scratch,
-            .slot_ctx = slot_ctx,
-            .mode = mode,
-            .slot_index = slot_index,
-            .slot_indices = slot_indices,
-        };
-        var active_slot: [1]usize = .{slot_index};
+        var active_slot: [1]usize = .{dispatch_state.slot_index};
         const no_seq_lengths: [0]u32 = .{};
-        const active_slots = switch (mode) {
+        const active_slots = switch (dispatch_state.mode) {
             .single_slot => active_slot[0..],
-            .slot_batch => slot_indices,
+            .slot_batch => dispatch_state.slot_indices,
         };
         var exec_ctx = runtime_contract.ExecutionContext{
             .mode = .decode,
             .active_slots = active_slots,
             .sequence_lengths = no_seq_lengths[0..],
             .batch_size = active_slots.len,
-            .workspace = .{ .any = @ptrCast(&dispatch_state) },
+            .dispatch_counters = &layer_program_dispatch_counters,
+            .workspace = .{ .any = @ptrCast(dispatch_state) },
         };
-        const no_registers: [0]runtime_contract.TensorHandle = .{};
-        const no_views: [0]runtime_contract.TensorViewDesc = .{};
-        var state_blocks = try buildInstructionStateBlocks(insn, &dispatch_state);
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks.slice());
+        runtime_contract.recordExecutionDispatch(&exec_ctx, insn.opcode);
+        var handle_storage: [MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorHandle = undefined;
+        var view_storage: [MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorViewDesc = undefined;
+        const built_handles = try self.buildInstructionHandles(insn, dispatch_state, &handle_storage, &view_storage);
+        var param_storage: [1]runtime_contract.ParamBlock = undefined;
+        const params = try self.instructionParams(insn, &param_storage);
+        var state_blocks = try buildInstructionStateBlocks(insn, dispatch_state);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &self.compiled_plan.plan, state_blocks.slice());
         try adapter(
             &exec_ctx,
             insn,
-            no_registers[0..],
-            no_views[0..],
+            built_handles.registers,
+            built_handles.views,
             state_blocks.slice(),
-            self.compiled_plan.param_blocks,
+            params,
         );
     }
 
     fn batchedKernelRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionPayload;
+        const input = tensorHandleToTensor(io.inputs[0]);
+        const output = tensorHandleToTensor(io.outputs[0]);
+        const kernel = try instructionImplicitKernelBinding(insn, registers);
         try state.block.batchedKernelAdapter(
-            state.op_index,
-            op,
-            state.buffer_views,
+            input,
+            output,
+            kernel,
             state.scratch,
             state.slot_ctx,
             state.mode,
@@ -450,11 +687,11 @@ pub const Block = struct {
         _: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const op = try state.block.decodeInstructionOp(state.op_index);
         try state.block.batchedResidualAddAdapter(
             state.op_index,
             op,
@@ -473,11 +710,11 @@ pub const Block = struct {
         _: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const op = try state.block.decodeInstructionOp(state.op_index);
         try state.block.batchedMulScalarAdapter(
             state.op_index,
             op,
@@ -496,11 +733,11 @@ pub const Block = struct {
         _: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const op = try state.block.decodeInstructionOp(state.op_index);
         try state.block.batchedAddTensorAdapter(
             state.op_index,
             op,
@@ -515,52 +752,20 @@ pub const Block = struct {
 
     fn batchedKernelAdapter(
         self: *const Block,
-        op_index: usize,
-        op: LayerOp,
-        buffer_views: *[64]Tensor,
+        input: *Tensor,
+        output: *Tensor,
+        kernel: CpuKernel,
         _: *ScratchBuffer,
         slot_ctx: SlotContext,
         mode: BatchedDispatchMode,
         slot_index: usize,
         slot_indices: []const usize,
     ) !void {
-        const kernel_op = switch (op) {
-            .kernel => |kernel| kernel,
-            else => return error.InvalidInstructionPayload,
-        };
-
-        const kernel_id: usize = @intCast(kernel_op.id);
-        if (kernel_id >= self.block.kernels.len) {
-            error_context.setContext("block={d}, kernel_id={d}, max={d}", .{
-                self.block_idx,
-                kernel_op.id,
-                self.block.kernels.len,
-            });
-            return error.KernelIndexOutOfBounds;
-        }
-
-        const kernel = self.block.kernels[kernel_id];
-        if (builtin.mode == .Debug) {
-            const actual_type = kernel.getOpType();
-            if (actual_type != kernel_op.debug_type) {
-                log.err("inference", "Graph/Kernel ordering mismatch", .{
-                    .block = self.block_idx,
-                    .kernel = kernel_op.id,
-                    .expected = @tagName(kernel_op.debug_type),
-                    .actual = @tagName(actual_type),
-                }, @src());
-                @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
-            }
-        }
-
-        const input = &buffer_views[@intFromEnum(kernel_op.in)];
-        const output = &buffer_views[@intFromEnum(kernel_op.out)];
         switch (mode) {
             .single_slot => try kernel.forwardBatched(input, output, slot_ctx, slot_index),
             .slot_batch => try kernel.forwardBatchedSlots(input, output, slot_ctx, slot_indices),
         }
-
-        _ = op_index;
+        _ = self;
     }
 
     fn batchedResidualAddAdapter(
@@ -658,15 +863,6 @@ pub const Block = struct {
         );
     }
 
-    const SequentialAdapterFn = *const fn (
-        self: *const Block,
-        op_index: usize,
-        op: LayerOp,
-        buffer_views: *[64]Tensor,
-        scratch: *ScratchBuffer,
-        slot_ctx: SlotContext,
-    ) anyerror!void;
-
     const sequential_required_opcodes = [_]runtime_contract.Opcode{
         .rmsnorm,
         .multihead_attention,
@@ -745,14 +941,12 @@ pub const Block = struct {
         );
     }
 
-    fn dispatchSequentialInstruction(
+    fn dispatchSequentialInstructionWithState(
         self: *const Block,
-        op_index: usize,
         insn: *const runtime_contract.Instruction,
-        buffer_views: *[64]Tensor,
-        scratch: *ScratchBuffer,
-        slot_ctx: SlotContext,
+        dispatch_state: *RuntimeDispatchState,
     ) !void {
+        const op_index = dispatch_state.op_index;
         const adapter = sequential_adapter_table[@intFromEnum(insn.opcode)] orelse {
             error_context.setContext("block={d}, op={d}, opcode={d}", .{
                 self.block_idx,
@@ -762,16 +956,6 @@ pub const Block = struct {
             return error.UnsupportedOpInSequentialMode;
         };
 
-        var dispatch_state = RuntimeDispatchState{
-            .block = self,
-            .op_index = op_index,
-            .buffer_views = buffer_views,
-            .scratch = scratch,
-            .slot_ctx = slot_ctx,
-            .mode = .single_slot,
-            .slot_index = 0,
-            .slot_indices = &.{},
-        };
         const active_slots: [1]usize = .{0};
         const no_seq_lengths: [0]u32 = .{};
         var exec_ctx = runtime_contract.ExecutionContext{
@@ -779,37 +963,46 @@ pub const Block = struct {
             .active_slots = active_slots[0..],
             .sequence_lengths = no_seq_lengths[0..],
             .batch_size = 1,
-            .workspace = .{ .any = @ptrCast(&dispatch_state) },
+            .dispatch_counters = &layer_program_dispatch_counters,
+            .workspace = .{ .any = @ptrCast(dispatch_state) },
         };
-        const no_registers: [0]runtime_contract.TensorHandle = .{};
-        const no_views: [0]runtime_contract.TensorViewDesc = .{};
-        var state_blocks = try buildInstructionStateBlocks(insn, &dispatch_state);
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks.slice());
+        runtime_contract.recordExecutionDispatch(&exec_ctx, insn.opcode);
+        var handle_storage: [MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorHandle = undefined;
+        var view_storage: [MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorViewDesc = undefined;
+        const built_handles = try self.buildInstructionHandles(insn, dispatch_state, &handle_storage, &view_storage);
+        var param_storage: [1]runtime_contract.ParamBlock = undefined;
+        const params = try self.instructionParams(insn, &param_storage);
+        var state_blocks = try buildInstructionStateBlocks(insn, dispatch_state);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &self.compiled_plan.plan, state_blocks.slice());
         try adapter(
             &exec_ctx,
             insn,
-            no_registers[0..],
-            no_views[0..],
+            built_handles.registers,
+            built_handles.views,
             state_blocks.slice(),
-            self.compiled_plan.param_blocks,
+            params,
         );
     }
 
     fn sequentialKernelRuntimeAdapter(
         ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
-        _: []runtime_contract.TensorHandle,
+        registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionPayload;
+        const input = tensorHandleToTensor(io.inputs[0]);
+        const output = tensorHandleToTensor(io.outputs[0]);
+        const kernel = try instructionImplicitKernelBinding(insn, registers);
         try state.block.sequentialKernelAdapter(
-            state.op_index,
-            op,
-            state.buffer_views,
+            input,
+            output,
+            kernel,
             state.scratch,
             state.slot_ctx,
         );
@@ -821,11 +1014,11 @@ pub const Block = struct {
         _: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const op = try state.block.decodeInstructionOp(state.op_index);
         try state.block.sequentialResidualAddAdapter(
             state.op_index,
             op,
@@ -841,11 +1034,11 @@ pub const Block = struct {
         _: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const op = try state.block.decodeInstructionOp(state.op_index);
         try state.block.sequentialMulScalarAdapter(
             state.op_index,
             op,
@@ -861,11 +1054,11 @@ pub const Block = struct {
         _: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const op = try state.block.decodeInstructionOp(state.op_index);
         try state.block.sequentialAddTensorAdapter(
             state.op_index,
             op,
@@ -881,11 +1074,11 @@ pub const Block = struct {
         _: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
         state_blocks: []runtime_contract.StateBlockHandle,
-        params: []const runtime_contract.ParamBlock,
+        _: []const runtime_contract.ParamBlock,
     ) !void {
-        _ = try runtime_contract.requireInstructionStateBlock(insn, state_blocks);
         const state = try runtimeDispatchState(ctx);
-        const op = try decodeInstructionLayerOp(insn, params);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        const op = try state.block.decodeInstructionOp(state.op_index);
         try state.block.sequentialPrimitiveAdapter(
             state.op_index,
             op,
@@ -897,43 +1090,14 @@ pub const Block = struct {
 
     fn sequentialKernelAdapter(
         self: *const Block,
-        op_index: usize,
-        op: LayerOp,
-        buffer_views: *[64]Tensor,
+        input: *Tensor,
+        output: *Tensor,
+        kernel: CpuKernel,
         _: *ScratchBuffer,
         slot_ctx: SlotContext,
     ) !void {
-        const kernel_op = switch (op) {
-            .kernel => |kernel| kernel,
-            else => return error.InvalidInstructionPayload,
-        };
-
-        const kernel_id: usize = @intCast(kernel_op.id);
-        if (kernel_id >= self.block.kernels.len) {
-            error_context.setContext("block={d}, kernel_id={d}, max={d}", .{
-                self.block_idx,
-                kernel_op.id,
-                self.block.kernels.len,
-            });
-            return error.KernelIndexOutOfBounds;
-        }
-        const kernel = self.block.kernels[kernel_id];
-        if (builtin.mode == .Debug) {
-            const actual_type = kernel.getOpType();
-            if (actual_type != kernel_op.debug_type) {
-                log.err("inference", "Graph/Kernel ordering mismatch", .{
-                    .block = self.block_idx,
-                    .kernel = kernel_op.id,
-                    .expected = @tagName(kernel_op.debug_type),
-                    .actual = @tagName(actual_type),
-                }, @src());
-                @panic("Graph/Kernel type mismatch - graph compiler and block init are out of sync");
-            }
-        }
-        const input = &buffer_views[@intFromEnum(kernel_op.in)];
-        const output = &buffer_views[@intFromEnum(kernel_op.out)];
         try kernel.forward(input, output, slot_ctx);
-        _ = op_index;
+        _ = self;
     }
 
     fn sequentialResidualAddAdapter(
@@ -1658,17 +1822,16 @@ pub const Block = struct {
         };
     }
 
-    fn writeLayerOpDescription(self: *const Block, layer_op: LayerOp, writer: anytype, indent: usize) !void {
+    fn writeLayerOpDescription(self: *const Block, op_index: usize, layer_op: LayerOp, writer: anytype, indent: usize) !void {
         try writer.writeByteNTimes(' ', indent);
         switch (layer_op) {
             .kernel => |kernel_op| {
                 try writer.print("kernel({s} -> {s}, id={}): ", .{ @tagName(kernel_op.in), @tagName(kernel_op.out), kernel_op.id });
-                const kernel_id: usize = @intCast(kernel_op.id);
-                if (kernel_id >= self.block.kernels.len) {
+                const kernel = self.instructionKernelRef(op_index, kernel_op.id, kernel_op.debug_type) catch {
                     try writer.writeAll("invalid\n");
                     return;
-                }
-                switch (self.block.kernels[kernel_id]) {
+                };
+                switch (kernel) {
                     .norm => |n| {
                         try formatRmsNormLike(writer, n.dim, n.eps, n.weight_offset);
                         try writer.writeAll("\n");
@@ -1726,7 +1889,7 @@ pub const Block = struct {
         copyTensor(x, out);
 
         // Populate shared scratch only for kernels present in this block.
-        const is_mla = self.block.getMLAAttention() != null;
+        const is_mla = self.planUsesOpcode(.mla_attention);
         const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
         var shared_state = SharedPersistentState{
             .mla_scratch = if (is_mla) scratch.getMLAScratch() else null,
@@ -1740,15 +1903,22 @@ pub const Block = struct {
             .use_cache = use_cache,
         };
 
+        var dispatch_state = RuntimeDispatchState{
+            .block = self,
+            .op_index = 0,
+            .buffer_views = &buffer_views,
+            .scratch = scratch,
+            .slot_ctx = ctx,
+            .mode = .single_slot,
+            .slot_index = 0,
+            .slot_indices = &.{},
+        };
+        try bindDispatchStateDescriptors(&dispatch_state);
+
         // Execute the operation sequence
         for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            try self.dispatchSequentialInstruction(
-                op_index,
-                &insn,
-                &buffer_views,
-                scratch,
-                ctx,
-            );
+            dispatch_state.op_index = op_index;
+            try self.dispatchSequentialInstructionWithState(&insn, &dispatch_state);
         }
 
         // Post-norm finalization: if the program's final output is not in the residual
@@ -1792,11 +1962,14 @@ pub const Block = struct {
             const op = try self.decodeInstructionOp(op_index);
             switch (op) {
                 .kernel => |kernel_op| {
-                    const kernel_id: usize = @intCast(kernel_op.id);
-                    if (kernel_id >= self.block.kernels.len) {
-                        error_context.setContext("block={d}, kernel_id={d}, max={d}", .{ self.block_idx, kernel_op.id, self.block.kernels.len });
+                    _ = self.instructionKernelRef(op_index, kernel_op.id, kernel_op.debug_type) catch |err| {
+                        error_context.setContext("block={d}, op={d}, kernel_ref={s}", .{
+                            self.block_idx,
+                            op_index,
+                            @errorName(err),
+                        });
                         return error.KernelIndexOutOfBounds;
-                    }
+                    };
                 },
                 .linear => {
                     const weight = self.instructionWeightRef(op_index) catch |err| {
@@ -1896,7 +2069,7 @@ pub const Block = struct {
             const op = try self.decodeInstructionOp(op_index);
             try writer.writeByteNTimes(' ', indent + 2);
             try writer.print("[{}] ", .{op_index});
-            try self.writeLayerOpDescription(op, writer, 0);
+            try self.writeLayerOpDescription(op_index, op, writer, 0);
         }
     }
 
@@ -1929,9 +2102,7 @@ pub const Block = struct {
             const op = self.decodeInstructionOp(op_index) catch return false;
             switch (op) {
                 .kernel => |kernel_op| {
-                    const kernel_id: usize = @intCast(kernel_op.id);
-                    if (kernel_id >= self.block.kernels.len) return false;
-                    const kernel = self.block.kernels[kernel_id];
+                    const kernel = self.instructionKernelRef(op_index, kernel_op.id, kernel_op.debug_type) catch return false;
                     switch (kernel) {
                         .attention, .swiglu, .moe, .norm => {},
                         .mla_attention, .mamba, .shortconv => return false,
@@ -1970,7 +2141,7 @@ pub const Block = struct {
 
         copyTensor(x, out);
 
-        const is_mla = self.block.getMLAAttention() != null;
+        const is_mla = self.planUsesOpcode(.mla_attention);
         const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
         var shared_state = SharedPersistentState{
             .batched_cache = batched_cache,
@@ -1985,18 +2156,22 @@ pub const Block = struct {
             .use_cache = use_cache,
         };
 
+        var dispatch_state = RuntimeDispatchState{
+            .block = self,
+            .op_index = 0,
+            .buffer_views = &buffer_views,
+            .scratch = scratch,
+            .slot_ctx = ctx,
+            .mode = .single_slot,
+            .slot_index = slot_index,
+            .slot_indices = &.{},
+        };
+        try bindDispatchStateDescriptors(&dispatch_state);
+
         // Execute the operation sequence
         for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            try self.dispatchBatchedInstruction(
-                op_index,
-                &insn,
-                &buffer_views,
-                scratch,
-                ctx,
-                .single_slot,
-                slot_index,
-                &.{},
-            );
+            dispatch_state.op_index = op_index;
+            try self.dispatchBatchedInstructionWithState(&insn, &dispatch_state);
         }
 
         // Post-norm finalization: if the program's final output is not in the residual
@@ -2034,7 +2209,7 @@ pub const Block = struct {
 
         copyTensor(x, out);
 
-        const is_mla = self.block.getMLAAttention() != null;
+        const is_mla = self.planUsesOpcode(.mla_attention);
         const slot_state = scratch.getSlotState(self.block_idx) orelse return error.InvalidState;
         var shared_state = SharedPersistentState{
             .batched_cache = batched_cache,
@@ -2049,17 +2224,21 @@ pub const Block = struct {
             .use_cache = use_cache,
         };
 
+        var dispatch_state = RuntimeDispatchState{
+            .block = self,
+            .op_index = 0,
+            .buffer_views = &buffer_views,
+            .scratch = scratch,
+            .slot_ctx = ctx,
+            .mode = .slot_batch,
+            .slot_index = 0,
+            .slot_indices = slot_indices,
+        };
+        try bindDispatchStateDescriptors(&dispatch_state);
+
         for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            try self.dispatchBatchedInstruction(
-                op_index,
-                &insn,
-                &buffer_views,
-                scratch,
-                ctx,
-                .slot_batch,
-                0,
-                slot_indices,
-            );
+            dispatch_state.op_index = op_index;
+            try self.dispatchBatchedInstructionWithState(&insn, &dispatch_state);
         }
 
         const final_buf = finalOutputBuffer(&self.compiled_plan);
@@ -2346,6 +2525,51 @@ test "Block caches primitive linear weight bindings at init" {
     try block.validate();
 }
 
+test "Block caches kernel instruction bindings at init" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    try testing.expectEqual(block.compiled_plan.plan.instructions.len, block.instruction_kernel_refs.len);
+    try testing.expect(block.instruction_kernel_refs[0] != null);
+    try testing.expect(block.instruction_kernel_refs[1] != null);
+    try block.validate();
+}
+
+test "Block.validate rejects missing cached kernel binding" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    const refs_mut = @constCast(block.instruction_kernel_refs.ptr);
+    refs_mut[0] = null;
+
+    try testing.expectError(error.KernelIndexOutOfBounds, block.validate());
+}
+
 test "Block.validate rejects missing cached primitive weight binding" {
     const allocator = testing.allocator;
 
@@ -2366,6 +2590,28 @@ test "Block.validate rejects missing cached primitive weight binding" {
     refs_mut[0] = null;
 
     try testing.expectError(error.MissingWeight, block.validate());
+}
+
+test "Block.validate rejects instructions without param block payload" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .add = .{ .branch = .branch_out, .scale = .one } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    const insn_mut = @constCast(block.compiled_plan.plan.instructions.ptr);
+    insn_mut[0].param_block_id = null;
+
+    try testing.expectError(error.MissingParamBlock, block.validate());
 }
 
 test "Block.validate rejects stateful opcode incompatible with block kind" {

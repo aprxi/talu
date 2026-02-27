@@ -8,6 +8,7 @@ const log = @import("../../../../log.zig");
 const tensor_mod = @import("../../../../tensor.zig");
 const Tensor = tensor_mod.Tensor;
 const models = @import("../../../../models/root.zig");
+const layer_ops = @import("../../../../models/layer_ops.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
@@ -178,22 +179,33 @@ fn buildMetalLayerProgramRegisterSlotMap(
 fn compileLayerProgramContract(
     allocator: std.mem.Allocator,
     layer: *WeightHandles.LayerWeights,
+    static_entry: ?models_registry.Entry,
+    block_kind: topology.BlockKind,
 ) !void {
     layer.compiled_plan = null;
+    layer.instruction_ops = &.{};
     layer.register_to_slot_map = [_]u8{WeightHandles.LayerWeights.invalid_slot} ** 64;
-    const program = layer.program orelse return;
+    const entry = static_entry orelse return error.NotImplemented;
+    const program = models_registry.blockProgramFor(entry, block_kind) orelse return error.NotImplemented;
 
     layer.compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode);
-    runtime_contract.validatePlanWithoutInstructionWeights(&layer.compiled_plan.?) catch {
-        log.warn("inference", "Metal layer program has unsupported instruction weight bindings", .{
-            .weight_bindings = layer.compiled_plan.?.weight_bindings.len,
-        });
-        return error.NotImplemented;
+    errdefer if (layer.compiled_plan) |*compiled_plan| {
+        plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
+        layer.compiled_plan = null;
     };
-    layer.register_to_slot_map = try buildMetalLayerProgramRegisterSlotMap(
+    const register_map = try buildMetalLayerProgramRegisterSlotMap(
         allocator,
         &layer.compiled_plan.?,
     );
+    layer.register_to_slot_map = register_map;
+
+    const instruction_count = layer.compiled_plan.?.plan.instructions.len;
+    const instruction_ops = try allocator.alloc(layer_ops.LayerOp, instruction_count);
+    errdefer allocator.free(instruction_ops);
+    for (layer.compiled_plan.?.plan.instructions, 0..) |insn, op_index| {
+        instruction_ops[op_index] = try runtime_contract.decodeInstructionLayerOp(&layer.compiled_plan.?, &insn, op_index);
+    }
+    layer.instruction_ops = instruction_ops;
 }
 
 /// Compute Llama3-style RoPE frequencies with wavelength-dependent scaling.
@@ -271,7 +283,6 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
 
     // Fill model-dependent metadata.
     weight_handles.is_moe = is_moe_model;
-    weight_handles.has_mamba = false;
     weight_handles.num_experts = if (is_moe_model) @intCast(loaded.config.num_experts) else 0;
     weight_handles.experts_per_token = if (is_moe_model) @intCast(loaded.config.experts_per_token) else 0;
 
@@ -355,11 +366,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         switch (block) {
             .attention_mlp => |attn_block| {
                 weight_handles.layers[layer_idx].kind = .attention_mlp;
-                if (static_entry) |entry| {
-                    weight_handles.layers[layer_idx].program =
-                        models_registry.blockProgramFor(entry, .attention_mlp);
-                }
-                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx]);
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .attention_mlp);
                 const is_mla = attn_block.isMLA();
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
@@ -561,12 +568,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             },
             .mamba => |mamba_block| {
                 weight_handles.layers[layer_idx].kind = .mamba;
-                if (static_entry) |entry| {
-                    weight_handles.layers[layer_idx].program =
-                        models_registry.blockProgramFor(entry, .mamba);
-                }
-                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx]);
-                weight_handles.has_mamba = true;
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .mamba);
 
                 var ln1_arr = try loadNormWeight(mamba_block.ln1_weight);
                 if (weight_handles.has_norm_weight_offset) {
@@ -638,11 +640,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
             },
             .shortconv => |shortconv_block| {
                 weight_handles.layers[layer_idx].kind = .shortconv;
-                if (static_entry) |entry| {
-                    weight_handles.layers[layer_idx].program =
-                        models_registry.blockProgramFor(entry, .shortconv);
-                }
-                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx]);
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx], static_entry, .shortconv);
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
                 var ln1_arr = try loadNormWeight(shortconv_block.ln1_weight);
@@ -969,20 +967,14 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         }
     }
 
-    weight_handles.has_kv_state = false;
-    weight_handles.has_shortconv = false;
-    weight_handles.has_mamba = false;
+    weight_handles.state_flags = .{};
     for (weight_handles.layers) |layer| {
         if (layer.compiled_plan == null) continue;
         const plan = &layer.compiled_plan.?.plan;
-        for (plan.state_descs) |state_desc| {
-            switch (state_desc.id) {
-                @intFromEnum(runtime_contract.StateBlockId.kv_cache) => weight_handles.has_kv_state = true,
-                @intFromEnum(runtime_contract.StateBlockId.shortconv) => weight_handles.has_shortconv = true,
-                @intFromEnum(runtime_contract.StateBlockId.mamba) => weight_handles.has_mamba = true,
-                else => return error.InvalidStateDescriptorBinding,
-            }
-        }
+        const state_flags = try runtime_contract.collectBuiltinStateFlags(plan);
+        if (state_flags.has_kv) weight_handles.state_flags.has_kv = true;
+        if (state_flags.has_shortconv) weight_handles.state_flags.has_shortconv = true;
+        if (state_flags.has_mamba) weight_handles.state_flags.has_mamba = true;
     }
 
     try createDecodeModel(allocator, weight_handles, loaded.config);
@@ -1443,6 +1435,10 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
             plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
             layer.compiled_plan = null;
         }
+        if (layer.instruction_ops.len != 0) {
+            allocator.free(layer.instruction_ops);
+            layer.instruction_ops = &.{};
+        }
         if (layer.ln1_weight) |h| mlx_graph.freeArray(h);
         if (layer.ln2_weight) |h| mlx_graph.freeArray(h);
 
@@ -1604,9 +1600,7 @@ pub const WeightHandles = struct {
 
     // MoE configuration
     is_moe: bool = false,
-    has_kv_state: bool = false,
-    has_mamba: bool = false,
-    has_shortconv: bool = false,
+    state_flags: runtime_contract.BuiltinStateFlags = .{},
     num_experts: usize = 0,
     experts_per_token: usize = 0,
 
@@ -1705,8 +1699,8 @@ pub const WeightHandles = struct {
         };
 
         kind: LayerKind = .attention_mlp,
-        program: ?[]const models.layer_ops.LayerOp = null,
         compiled_plan: ?runtime_contract.CompiledPlan = null,
+        instruction_ops: []const layer_ops.LayerOp = &.{},
         register_to_slot_map: [64]u8 = [_]u8{invalid_slot} ** 64,
         ln1_weight: ArrayHandle,
         ln2_weight: ArrayHandle,

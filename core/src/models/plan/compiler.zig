@@ -328,66 +328,11 @@ fn serializeLayerOpParam(
     opcode: runtime_contract.Opcode,
     op: layer_ops.LayerOp,
 ) !runtime_contract.ParamBlock {
-    if (@sizeOf(layer_ops.LayerOp) > runtime_contract.max_param_block_data_bytes_v1) {
-        return error.InvalidParamBlockABI;
-    }
-
-    var owned = try cloneLayerOpOwned(allocator, op);
-    errdefer deinitOwnedLayerOp(allocator, &owned);
-
-    const payload = try allocator.alignedAlloc(
-        u8,
-        .fromByteUnits(@alignOf(layer_ops.LayerOp)),
-        @sizeOf(layer_ops.LayerOp),
-    );
-    @memcpy(payload[0..@sizeOf(layer_ops.LayerOp)], std.mem.asBytes(&owned));
-    return .{
-        .version = runtime_contract.param_block_abi_version_v1,
-        .opcode = opcode,
-        .data = payload,
-    };
-}
-
-fn cloneLayerOpOwned(allocator: std.mem.Allocator, op: layer_ops.LayerOp) !layer_ops.LayerOp {
-    var owned = op;
-    switch (owned) {
-        // Weight names are compile-time metadata only; runtime uses instruction
-        // weight bindings by index. Avoid carrying name strings in ParamBlock.
-        .linear => |*linear_op| linear_op.weight_name = &.{},
-        .split => |*split_op| split_op.split_sizes = if (split_op.split_sizes.len == 0)
-            &.{}
-        else
-            try allocator.dupe(usize, split_op.split_sizes),
-        .add_param => |*add_param_op| add_param_op.param_name = &.{},
-        .add_param_scalar => |*add_param_scalar_op| add_param_scalar_op.param_name = &.{},
-        .mul_param => |*mul_param_op| mul_param_op.param_name = &.{},
-        .reshape => |*reshape_op| reshape_op.shape = if (reshape_op.shape.len == 0)
-            &.{}
-        else
-            try allocator.dupe(i32, reshape_op.shape),
-        else => {},
-    }
-    return owned;
-}
-
-fn deinitOwnedLayerOp(allocator: std.mem.Allocator, op: *layer_ops.LayerOp) void {
-    switch (op.*) {
-        .linear => |linear_op| if (linear_op.weight_name.len > 0) allocator.free(linear_op.weight_name),
-        .split => |split_op| if (split_op.split_sizes.len > 0) allocator.free(split_op.split_sizes),
-        .add_param => |add_param_op| if (add_param_op.param_name.len > 0) allocator.free(add_param_op.param_name),
-        .add_param_scalar => |add_param_scalar_op| if (add_param_scalar_op.param_name.len > 0) allocator.free(add_param_scalar_op.param_name),
-        .mul_param => |mul_param_op| if (mul_param_op.param_name.len > 0) allocator.free(mul_param_op.param_name),
-        .reshape => |reshape_op| if (reshape_op.shape.len > 0) allocator.free(reshape_op.shape),
-        else => {},
-    }
+    return runtime_contract.encodeLayerOpParam(allocator, opcode, op);
 }
 
 fn deinitParamBlock(allocator: std.mem.Allocator, param_block: runtime_contract.ParamBlock) void {
-    if (param_block.data.len == @sizeOf(layer_ops.LayerOp)) {
-        const op_ptr: *layer_ops.LayerOp = @ptrCast(@alignCast(@constCast(param_block.data.ptr)));
-        deinitOwnedLayerOp(allocator, op_ptr);
-    }
-    allocator.free(param_block.data);
+    if (param_block.data.len != 0) allocator.free(param_block.data);
 }
 
 fn buildLivenessMap(
@@ -1080,10 +1025,8 @@ test "compileLayerProgram strips runtime param-block weight names for bound prim
 
     inline for ([_]usize{ 0, 1, 2 }) |insn_idx| {
         const insn = compiled.plan.instructions[insn_idx];
-        const param_id = insn.param_block_id.?;
-        const param_block = compiled.param_blocks[param_id];
-        const op_ptr: *const layer_ops.LayerOp = @ptrCast(@alignCast(param_block.data.ptr));
-        switch (op_ptr.*) {
+        const decoded = try runtime_contract.decodeInstructionLayerOp(&compiled, &insn, insn_idx);
+        switch (decoded) {
             .linear => |linear_op| try std.testing.expectEqual(@as(usize, 0), linear_op.weight_name.len),
             .add_param => |add_param_op| try std.testing.expectEqual(@as(usize, 0), add_param_op.param_name.len),
             .mul_param => |mul_param_op| try std.testing.expectEqual(@as(usize, 0), mul_param_op.param_name.len),
@@ -1103,6 +1046,72 @@ test "compileLayerProgram emits param blocks compliant with runtime ABI contract
         );
         try std.testing.expect(param_block.data.len <= runtime_contract.max_param_block_data_bytes_v1);
         try runtime_contract.validateParamBlockAbi(&param_block);
+    }
+}
+
+test "compileLayerProgram param blocks decode back to executable layer ops" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 7,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+        .{ .add = .{
+            .branch = .branch_out,
+            .scale = .{ .literal = 0.25 },
+        } },
+        .{ .mul_scalar = .{
+            .in = .residual,
+            .out = .tmp3,
+            .scalar = 2.0,
+        } },
+        .{ .add_scalar = .{
+            .in = .tmp3,
+            .out = .residual,
+            .scalar = -1.0,
+        } },
+    };
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    for (program, compiled.plan.instructions, 0..) |source_op, insn, op_index| {
+        const decoded = try runtime_contract.decodeInstructionLayerOp(&compiled, &insn, op_index);
+        switch (source_op) {
+            .kernel => |kernel| switch (decoded) {
+                .kernel => |decoded_kernel| {
+                    try std.testing.expectEqual(kernel.id, decoded_kernel.id);
+                    try std.testing.expectEqual(kernel.in, decoded_kernel.in);
+                    try std.testing.expectEqual(kernel.out, decoded_kernel.out);
+                    try std.testing.expectEqual(kernel.debug_type, decoded_kernel.debug_type);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .add => |add_op| switch (decoded) {
+                .add => |decoded_add| {
+                    try std.testing.expectEqual(add_op.branch, decoded_add.branch);
+                    try std.testing.expect(std.meta.eql(add_op.scale, decoded_add.scale));
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .mul_scalar => |mul_scalar_op| switch (decoded) {
+                .mul_scalar => |decoded_mul| {
+                    try std.testing.expectEqual(mul_scalar_op.in, decoded_mul.in);
+                    try std.testing.expectEqual(mul_scalar_op.out, decoded_mul.out);
+                    try std.testing.expectEqual(mul_scalar_op.scalar, decoded_mul.scalar);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            .add_scalar => |add_scalar_op| switch (decoded) {
+                .add_scalar => |decoded_add_scalar| {
+                    try std.testing.expectEqual(add_scalar_op.in, decoded_add_scalar.in);
+                    try std.testing.expectEqual(add_scalar_op.out, decoded_add_scalar.out);
+                    try std.testing.expectEqual(add_scalar_op.scalar, decoded_add_scalar.scalar);
+                },
+                else => return error.TestUnexpectedResult,
+            },
+            else => return error.TestUnexpectedResult,
+        }
     }
 }
 
