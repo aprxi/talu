@@ -307,6 +307,49 @@ pub export fn talu_provider_config_health_free(result: ?*CProviderHealthResult) 
     ptr.error_message = null;
 }
 
+/// List models from a single named provider.
+///
+/// `db_root`: KV store root path.
+/// `name`: Provider name (e.g., "openai").
+///
+/// Returns model list. Caller must free with `talu_provider_config_list_provider_models_free`.
+pub export fn talu_provider_config_list_provider_models(
+    db_root: ?[*:0]const u8,
+    name: ?[*:0]const u8,
+) callconv(.c) capi_bridge.CRemoteModelListResult {
+    clearError();
+
+    const root_slice = if (db_root) |r| std.mem.sliceTo(r, 0) else {
+        setErrorWithCode(.invalid_argument, "db_root is null", .{});
+        var ret = std.mem.zeroes(capi_bridge.CRemoteModelListResult);
+        ret.error_code = @intFromEnum(ErrorCode.invalid_argument);
+        return ret;
+    };
+
+    const name_slice = if (name) |n| std.mem.sliceTo(n, 0) else {
+        setErrorWithCode(.invalid_argument, "name is null", .{});
+        var ret = std.mem.zeroes(capi_bridge.CRemoteModelListResult);
+        ret.error_code = @intFromEnum(ErrorCode.invalid_argument);
+        return ret;
+    };
+
+    const models = provider_config_mod.listProviderModels(allocator, root_slice, name_slice) catch |err| {
+        setError(err, "Failed to list models for provider '{s}': {s}", .{ name_slice, @errorName(err) });
+        var ret = std.mem.zeroes(capi_bridge.CRemoteModelListResult);
+        ret.error_code = @intFromEnum(errorToCode(err));
+        return ret;
+    };
+    defer provider_config_mod.freeRemoteModels(allocator, models);
+
+    return convertRemoteModels(models);
+}
+
+/// Free result from `talu_provider_config_list_provider_models`.
+pub export fn talu_provider_config_list_provider_models_free(result: ?*capi_bridge.CRemoteModelListResult) callconv(.c) void {
+    const ptr = result orelse return;
+    capi_bridge.freeModelListResult(allocator, ptr);
+}
+
 // =============================================================================
 // Internal Converters
 // =============================================================================

@@ -30,6 +30,7 @@ export interface RepoDom {
   providersView: HTMLElement;
   providersList: HTMLElement;
   addProviderSelect: HTMLSelectElement;
+  chatModelsList: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -72,6 +73,7 @@ export function getRepoDom(): RepoDom {
     providersView: root.querySelector<HTMLElement>("#rp-providers-view")!,
     providersList: root.querySelector<HTMLElement>("#rp-providers-list")!,
     addProviderSelect: root.querySelector<HTMLSelectElement>("#rp-add-provider")!,
+    chatModelsList: root.querySelector<HTMLElement>("#rp-chat-models-list")!,
   };
   return cached;
 }

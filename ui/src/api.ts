@@ -62,6 +62,7 @@ export interface ApiClient {
   listProviders(): Promise<ApiResult<ProviderList>>;
   updateProvider(name: string, body: { enabled: boolean; api_key?: string | null; base_url?: string | null }): Promise<ApiResult<ProviderList>>;
   testProvider(name: string): Promise<ApiResult<{ ok: boolean; model_count?: number; error?: string }>>;
+  listProviderModels(name: string): Promise<ApiResult<{ models: Array<{ id: string; object: string; created: number; owned_by: string }> }>>;
   kvGet(namespace: string, key: string): Promise<ApiResult<{ value: string | null; updated_at_ms: number }>>;
   kvPut(namespace: string, key: string, value: string): Promise<ApiResult<void>>;
   kvDelete(namespace: string, key: string): Promise<ApiResult<{ deleted: boolean }>>;
@@ -275,6 +276,7 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     listProviders: () => requestJson<ProviderList>("GET", "/v1/providers"),
     updateProvider: (name, body) => requestJson<ProviderList>("PATCH", `/v1/providers/${encodeURIComponent(name)}`, body),
     testProvider: (name) => requestJson<{ ok: boolean; model_count?: number; error?: string }>("POST", `/v1/providers/${encodeURIComponent(name)}/health`),
+    listProviderModels: (name) => requestJson<{ models: Array<{ id: string; object: string; created: number; owned_by: string }> }>("GET", `/v1/providers/${encodeURIComponent(name)}/models`),
     async kvGet(namespace, key) {
       try {
         const path = `/v1/db/kv/namespaces/${encodeURIComponent(namespace)}/entries/${encodeURIComponent(key)}`;

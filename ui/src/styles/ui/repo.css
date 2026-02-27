@@ -397,3 +397,154 @@
   color: var(--text-muted);
   font-family: var(--font-mono);
 }
+
+/* ── Chat Models section (curated model list) ────────────────────────── */
+
+.repo-chat-models-header {
+  display: flex;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.repo-chat-models-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.repo-chat-model-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+}
+
+.repo-chat-model-move {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  font-size: 10px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+.repo-chat-model-move:hover {
+  color: var(--text);
+  background: var(--bg-code);
+}
+
+.repo-chat-model-name {
+  flex: 1;
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.repo-chat-model-provider {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 3px;
+  text-transform: uppercase;
+  letter-spacing: 0.02em;
+  background: var(--bg-code);
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+
+.repo-chat-model-remove {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  background: none;
+  color: var(--text-muted);
+  cursor: pointer;
+  border-radius: 4px;
+  flex-shrink: 0;
+}
+
+.repo-chat-model-remove:hover {
+  color: var(--danger, #e55);
+  background: var(--bg-hover);
+}
+
+.repo-chat-models-divider {
+  border-top: 1px solid var(--border);
+  margin: 12px 0;
+}
+
+/* ── Browse model list (inline within provider row) ──────────────────── */
+
+.repo-browse-list {
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--border);
+  margin-top: 8px;
+  padding-top: 8px;
+  max-height: 240px;
+  overflow-y: auto;
+}
+
+.repo-browse-list.hidden {
+  display: none;
+}
+
+.repo-browse-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 4px 0;
+  gap: 8px;
+}
+
+.repo-browse-name {
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.repo-browse-added {
+  font-size: 11px;
+  color: var(--success);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.repo-browse-loading {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 8px 0;
+}
+
+.repo-browse-empty {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 8px 0;
+}
+
+/* Provider hint when no remote providers configured */
+.repo-provider-hint {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 12px 16px;
+}

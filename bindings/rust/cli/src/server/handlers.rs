@@ -2590,6 +2590,13 @@ async fn select_model_id_ex(
                 return Ok(configured);
             }
 
+            // Provider-prefixed model (e.g. "vllm::llama3") — accept directly.
+            // Routing to the correct provider backend happens later in
+            // create_backend_for_model_with_progress via parse_model_target.
+            if requested.contains("::") {
+                return Ok(requested);
+            }
+
             // Check remote backend models (e.g. OpenAI-compatible providers).
             let models = list_backend_models(state.clone()).await.unwrap_or_default();
             if models.iter().any(|model| model.id == requested) {

@@ -6,6 +6,8 @@ import { renderEmptyState } from "../../render/common.ts";
 import { getRepoDom } from "./dom.ts";
 import { repoState } from "./state.ts";
 import { addProvider, removeProvider, updateProvider, testProvider } from "./providers-data.ts";
+import { addChatModel, browseProviderModels, browseLocalModels } from "./chat-models-data.ts";
+import { renderChatModels } from "./chat-models-render.ts";
 import type { ProviderEntry } from "../../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -39,14 +41,48 @@ export function renderProviders(): void {
   }
   addSelect.classList.toggle("hidden", disabled.length === 0);
 
-  if (enabled.length === 0) {
-    list.appendChild(renderEmptyState("No providers configured. Add one above."));
-    return;
-  }
+  // Always show "local" as the first provider.
+  list.appendChild(buildLocalRow());
 
   for (const p of enabled) {
     list.appendChild(buildProviderRow(p));
   }
+
+  if (enabled.length === 0) {
+    // Show a hint if no remote providers are configured.
+    const hint = el("div", "repo-provider-hint", "Add a remote provider above to access cloud models.");
+    list.appendChild(hint);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// "Local" pseudo-provider row
+// ---------------------------------------------------------------------------
+
+function buildLocalRow(): HTMLElement {
+  const row = el("div", "repo-provider-row");
+  row.dataset["provider"] = "local";
+
+  const top = el("div", "repo-provider-row-top");
+  const nameEl = el("span", "repo-provider-name", "local");
+  top.appendChild(nameEl);
+
+  const actions = el("div", "repo-provider-row-actions");
+  const browseBtn = el("button", "btn btn-ghost btn-sm", "Browse");
+  browseBtn.dataset["action"] = "browse";
+  actions.appendChild(browseBtn);
+  top.appendChild(actions);
+  row.appendChild(top);
+
+  const meta = el("div", "repo-provider-row-meta", "Cached managed models");
+  row.appendChild(meta);
+
+  // Browse expansion (hidden).
+  const browseList = el("div", "repo-browse-list hidden");
+  browseList.dataset["browseFor"] = "local";
+  row.appendChild(browseList);
+
+  return row;
 }
 
 // ---------------------------------------------------------------------------
@@ -76,6 +112,10 @@ function buildProviderRow(p: ProviderEntry): HTMLElement {
     }
     actions.appendChild(badge);
   }
+
+  const browseBtn = el("button", "btn btn-ghost btn-sm", "Browse");
+  browseBtn.dataset["action"] = "browse";
+  actions.appendChild(browseBtn);
 
   const testBtn = el("button", "btn btn-ghost btn-sm", "Test");
   testBtn.dataset["action"] = "test";
@@ -134,7 +174,45 @@ function buildProviderRow(p: ProviderEntry): HTMLElement {
   form.appendChild(formActions);
 
   row.appendChild(form);
+
+  // Browse expansion (hidden).
+  const browseList = el("div", "repo-browse-list hidden");
+  browseList.dataset["browseFor"] = p.name;
+  row.appendChild(browseList);
+
   return row;
+}
+
+// ---------------------------------------------------------------------------
+// Browse model list rendering (inline within provider row)
+// ---------------------------------------------------------------------------
+
+function renderBrowseModels(container: HTMLElement, providerName: string, models: { id: string }[]): void {
+  container.innerHTML = "";
+  if (models.length === 0) {
+    container.appendChild(el("div", "repo-browse-empty", "No models found."));
+    return;
+  }
+
+  for (const m of models) {
+    const fullId = providerName === "local" ? m.id : `${providerName}::${m.id}`;
+    const item = el("div", "repo-browse-item");
+    item.dataset["modelId"] = fullId;
+
+    const nameEl = el("span", "repo-browse-name", m.id);
+    item.appendChild(nameEl);
+
+    if (repoState.chatModels.includes(fullId)) {
+      const addedEl = el("span", "repo-browse-added", "\u2713 Added");
+      item.appendChild(addedEl);
+    } else {
+      const addBtn = el("button", "btn btn-ghost btn-sm", "+ Add");
+      addBtn.dataset["action"] = "add-model";
+      item.appendChild(addBtn);
+    }
+
+    container.appendChild(item);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -170,6 +248,39 @@ export function wireProviderEvents(container: HTMLElement): void {
         form.classList.toggle("hidden");
         actionEl.textContent = isHidden ? "Cancel" : "Edit";
       }
+      return;
+    }
+
+    if (action === "browse") {
+      const browseList = row.querySelector<HTMLElement>(".repo-browse-list");
+      if (!browseList) return;
+      const isHidden = browseList.classList.contains("hidden");
+      if (!isHidden) {
+        browseList.classList.add("hidden");
+        actionEl.textContent = "Browse";
+        return;
+      }
+      browseList.classList.remove("hidden");
+      actionEl.textContent = "Close";
+      browseList.innerHTML = "";
+      browseList.appendChild(el("div", "repo-browse-loading", "Loading\u2026"));
+
+      const fetchModels = name === "local" ? browseLocalModels() : browseProviderModels(name);
+      fetchModels.then((models) => {
+        renderBrowseModels(browseList, name, models);
+      });
+      return;
+    }
+
+    if (action === "add-model") {
+      const browseItem = target.closest<HTMLElement>("[data-model-id]");
+      if (!browseItem) return;
+      const modelId = browseItem.dataset["modelId"]!;
+      addChatModel(modelId);
+      // Replace button with "Added" label.
+      actionEl.remove();
+      const addedEl = el("span", "repo-browse-added", "\u2713 Added");
+      browseItem.appendChild(addedEl);
       return;
     }
 

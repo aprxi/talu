@@ -518,6 +518,8 @@ pub const talu_provider_config_list_free = provider_config.talu_provider_config_
 pub const talu_provider_config_set = provider_config.talu_provider_config_set;
 pub const talu_provider_config_list_remote_models = provider_config.talu_provider_config_list_remote_models;
 pub const talu_provider_config_list_remote_models_free = provider_config.talu_provider_config_list_remote_models_free;
+pub const talu_provider_config_list_provider_models = provider_config.talu_provider_config_list_provider_models;
+pub const talu_provider_config_list_provider_models_free = provider_config.talu_provider_config_list_provider_models_free;
 pub const CProviderWithConfig = provider_config.CProviderWithConfig;
 pub const CProviderConfigList = provider_config.CProviderConfigList;
 

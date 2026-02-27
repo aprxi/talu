@@ -10,6 +10,8 @@ import { repoState } from "./state.ts";
 import { loadModels, searchHub } from "./data.ts";
 import { loadProviders } from "./providers-data.ts";
 import { wireProviderEvents } from "./providers-render.ts";
+import { loadChatModels } from "./chat-models-data.ts";
+import { renderChatModels, wireChatModelEvents } from "./chat-models-render.ts";
 import {
   renderModelsTable,
   renderStats,
@@ -49,7 +51,13 @@ export const repoPlugin: PluginDefinition = {
     buildRepoDOM(ctx.container);
     initRepoDom(ctx.container);
     wireRepoEvents();
-    wireProviderEvents(getRepoDom().providersList);
+
+    const dom = getRepoDom();
+    wireProviderEvents(dom.providersList);
+    wireChatModelEvents(dom.chatModelsList);
+
+    // Load chat models from KV (needed before providers render for "Added" state).
+    await loadChatModels();
 
     // Refresh models when the Models tab is activated.
     ctx.events.on<{ to: string }>("mode.changed", ({ to }) => {
@@ -61,7 +69,6 @@ export const repoPlugin: PluginDefinition = {
     ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
       if (tab !== "discover" && tab !== "local" && tab !== "providers") return;
       if (tab === repoState.tab) return;
-      const dom = getRepoDom();
       repoState.tab = tab as typeof repoState.tab;
       repoState.selectedIds.clear();
       repoState.searchQuery = "";
@@ -73,6 +80,7 @@ export const repoPlugin: PluginDefinition = {
         searchHub(repoState.searchQuery);
       } else if (tab === "providers") {
         loadProviders();
+        renderChatModels();
       } else {
         renderModelsTable();
       }

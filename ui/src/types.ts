@@ -246,6 +246,14 @@ export interface ProviderList {
   providers: ProviderEntry[];
 }
 
+/** Model info from a remote provider (GET /v1/providers/{name}/models). */
+export interface RemoteModelInfo {
+  id: string;
+  object: string;
+  created: number;
+  owned_by: string;
+}
+
 /** Bucket settings from GET /v1/settings. */
 export interface Settings {
   model: string | null;

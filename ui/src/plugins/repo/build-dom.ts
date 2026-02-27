@@ -101,8 +101,13 @@ export function buildRepoDOM(container: HTMLElement): void {
 
     <!-- ═══ Providers view: remote provider configuration ═══ -->
     <div id="rp-providers-view" class="hidden" style="flex:1; overflow-y:auto; padding:16px;">
+      <div class="repo-chat-models-header">
+        <span class="repo-providers-title">Chat Models</span>
+      </div>
+      <div id="rp-chat-models-list" class="repo-chat-models-list"></div>
+      <div class="repo-chat-models-divider"></div>
       <div class="repo-providers-header">
-        <span class="repo-providers-title">Configured Providers</span>
+        <span class="repo-providers-title">Providers</span>
         <select id="rp-add-provider" class="form-select-sm">
           <option value="" selected disabled>+ Add provider\u2026</option>
         </select>

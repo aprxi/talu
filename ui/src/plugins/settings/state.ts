@@ -10,6 +10,7 @@ export interface SettingsState {
   availableModels: ModelEntry[];
   changeHandlers: Set<() => void>;
   systemPromptEnabled: boolean;
+  chatModelsActive: boolean;
 }
 
 export const settingsState: SettingsState = {
@@ -17,6 +18,7 @@ export const settingsState: SettingsState = {
   availableModels: [],
   changeHandlers: new Set(),
   systemPromptEnabled: true,
+  chatModelsActive: false,
 };
 
 /** Notify internal change listeners (e.g. chat plugin's model service subscription). */

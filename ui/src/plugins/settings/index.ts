@@ -85,13 +85,35 @@ export const settingsPlugin: PluginDefinition = {
     );
 
     // Re-fetch available models when the repo plugin downloads or deletes models.
+    // Only update if chat models list is empty (user hasn't curated a list yet).
     ctx.events.on("repo.models.changed", async () => {
+      if (settingsState.chatModelsActive) return;
       const res = await api.getSettings();
       if (res.ok && res.data) {
         settingsState.availableModels = res.data.available_models ?? [];
         populateLocalModelSelect();
         emitModelChanged();
       }
+    });
+
+    // Chat models (user-curated list from providers tab) replaces available models.
+    ctx.events.on<{ models: string[] }>("repo.chatModels.changed", ({ models }) => {
+      if (models.length === 0) {
+        settingsState.chatModelsActive = false;
+        return;
+      }
+      settingsState.chatModelsActive = true;
+      settingsState.availableModels = models.map((id) => ({
+        id,
+        source: (id.includes("::") ? "hub" : "managed") as "hub" | "managed",
+        defaults: { temperature: 1.0, top_k: 50, top_p: 1.0, do_sample: true },
+        overrides: {},
+      }));
+      // If the active model is not in the new list, switch to the first entry.
+      if (!models.includes(settingsState.activeModel) && models.length > 0) {
+        settingsState.activeModel = models[0]!;
+      }
+      emitModelChanged();
     });
 
     ctx.log.info("Settings loaded.", { model: settingsState.activeModel, models: settingsState.availableModels.length });

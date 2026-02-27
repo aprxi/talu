@@ -80,4 +80,6 @@ export const repoState = {
   discoverTask: "text-generation" as TaskFilter,
   discoverLibrary: "safetensors" as LibraryFilter,
   providers: [] as ProviderEntry[],
+  chatModels: [] as string[],
+  browseModels: new Map<string, { id: string }[]>(),
 };

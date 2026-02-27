@@ -149,6 +149,43 @@ pub async fn handle_health(
     }
 }
 
+/// GET /v1/providers/{name}/models — list models from a single provider.
+pub async fn handle_list_models(
+    state: Arc<AppState>,
+    _req: Request<Incoming>,
+    _auth_ctx: Option<AuthContext>,
+    provider_name: String,
+) -> Response<BoxBody> {
+    let db_root = match kv_root(&state) {
+        Some(r) => r,
+        None => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Storage not configured"),
+    };
+
+    let result = tokio::task::spawn_blocking(move || {
+        talu::provider_config_list_provider_models(&db_root, &provider_name)
+    })
+    .await;
+
+    match result {
+        Ok(Ok(models)) => {
+            let models_json: Vec<serde_json::Value> = models
+                .iter()
+                .map(|m| {
+                    json!({
+                        "id": m.id,
+                        "object": m.object,
+                        "created": m.created,
+                        "owned_by": m.owned_by,
+                    })
+                })
+                .collect();
+            json_response(StatusCode::OK, &json!({ "models": models_json }))
+        }
+        Ok(Err(e)) => json_error(StatusCode::BAD_REQUEST, &format!("{e}")),
+        Err(e) => json_error(StatusCode::INTERNAL_SERVER_ERROR, &format!("{e}")),
+    }
+}
+
 fn providers_to_json(providers: &[talu::ProviderWithConfig]) -> Vec<serde_json::Value> {
     providers
         .iter()

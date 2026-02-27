@@ -507,6 +507,68 @@ pub fn freeRemoteModels(allocator: Allocator, models: []http_engine.ModelInfo) v
 }
 
 // ============================================================================
+// Single-Provider Model Listing
+// ============================================================================
+
+/// List models from a single named provider.
+/// Resolves credentials from KV → env → defaults, queries the provider's
+/// /models endpoint, and returns the model list (without provider:: prefix).
+/// Caller owns the returned slice and each ModelInfo.
+pub fn listProviderModels(allocator: Allocator, db_root: []const u8, name: []const u8) ![]http_engine.ModelInfo {
+    const p = provider_mod.getByName(name) orelse return error.UnknownProvider;
+
+    // Read config from KV.
+    const cfg = blk: {
+        var store = kv_store.KVStore.init(allocator, db_root, "provider_config") catch
+            break :blk ProviderConfig{};
+        defer store.deinit();
+
+        const kv_key = std.fmt.allocPrint(allocator, "{s}{s}", .{ kv_prefix, name }) catch
+            break :blk ProviderConfig{};
+        defer allocator.free(kv_key);
+
+        const json_bytes = (store.getCopy(allocator, kv_key) catch null) orelse
+            break :blk ProviderConfig{};
+        defer allocator.free(json_bytes);
+
+        break :blk parseConfigJson(json_bytes) catch ProviderConfig{};
+    };
+
+    // Resolve endpoint + API key.
+    const endpoint = resolveEndpointAlloc(allocator, p, cfg) catch return error.ResolveFailed;
+    defer allocator.free(endpoint);
+
+    const endpoint_z = try allocator.dupeZ(u8, endpoint);
+    defer allocator.free(endpoint_z);
+
+    const api_key = resolveApiKeyInternal(allocator, p, cfg) catch null;
+    const api_key_z: ?[:0]const u8 = if (api_key) |k| zblk: {
+        const z = allocator.dupeZ(u8, k) catch {
+            allocator.free(k);
+            break :zblk null;
+        };
+        allocator.free(k);
+        break :zblk z;
+    } else null;
+    defer if (api_key_z) |k| allocator.free(k);
+
+    var engine = http_engine.HttpEngine.init(allocator, .{
+        .base_url = endpoint_z,
+        .api_key = api_key_z,
+        .model = "unused",
+        .timeout_ms = 5_000,
+        .connect_timeout_ms = 3_000,
+        .max_retries = 0,
+    }) catch return error.EngineInitFailed;
+    defer engine.deinit();
+
+    const result = try engine.listModels();
+    // Transfer ownership of models slice to caller (don't deinit result).
+    // The caller will free via freeRemoteModels.
+    return result.models;
+}
+
+// ============================================================================
 // Endpoint / Key Resolution (pure helpers, no KV access)
 // ============================================================================
 

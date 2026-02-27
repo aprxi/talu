@@ -169,6 +169,17 @@ unsafe extern "C" {
     ) -> CProviderHealthResult;
     #[link_name = "talu_provider_config_health_free"]
     fn talu_provider_config_health_free_raw(result: *mut CProviderHealthResult);
+
+    // Per-provider model listing.
+    #[link_name = "talu_provider_config_list_provider_models"]
+    fn talu_provider_config_list_provider_models_raw(
+        db_root: *const std::os::raw::c_char,
+        name: *const std::os::raw::c_char,
+    ) -> talu_sys::CRemoteModelListResult;
+    #[link_name = "talu_provider_config_list_provider_models_free"]
+    fn talu_provider_config_list_provider_models_free_raw(
+        result: *mut talu_sys::CRemoteModelListResult,
+    );
 }
 
 /// C-ABI health check result (matches Zig CProviderHealthResult).
@@ -397,6 +408,43 @@ pub fn provider_config_health(db_root: &str, name: &str) -> ProviderHealthResult
     // SAFETY: result was returned by talu_provider_config_health.
     unsafe { talu_provider_config_health_free_raw(&mut result) };
     health
+}
+
+/// List models from a single named provider.
+///
+/// `db_root` is the KV store root path.
+/// Returns the model list without `provider::` prefix.
+pub fn provider_config_list_provider_models(
+    db_root: &str,
+    name: &str,
+) -> Result<Vec<crate::RemoteModelInfo>> {
+    let c_root = CString::new(db_root)?;
+    let c_name = CString::new(name)?;
+    // SAFETY: Both pointers are valid null-terminated strings.
+    let mut result = unsafe {
+        talu_provider_config_list_provider_models_raw(c_root.as_ptr(), c_name.as_ptr())
+    };
+    if result.error_code != 0 {
+        unsafe { talu_provider_config_list_provider_models_free_raw(&mut result) };
+        return Err(error_from_last_or("Failed to list provider models"));
+    }
+
+    let mut models = Vec::with_capacity(result.count);
+    if !result.models.is_null() && result.count > 0 {
+        // SAFETY: Non-null models ptr with valid count from C API.
+        let slice = unsafe { std::slice::from_raw_parts(result.models, result.count) };
+        for info in slice {
+            models.push(crate::RemoteModelInfo {
+                id: c_ptr_to_string(info.id),
+                object: c_ptr_to_string(info.object),
+                created: info.created,
+                owned_by: c_ptr_to_string(info.owned_by),
+            });
+        }
+    }
+
+    unsafe { talu_provider_config_list_provider_models_free_raw(&mut result) };
+    Ok(models)
 }
 
 fn c_ptr_to_string(ptr: *const std::os::raw::c_char) -> String {

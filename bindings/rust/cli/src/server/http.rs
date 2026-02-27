@@ -461,6 +461,10 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/providers") => {
                             providers::handle_list(state, req, auth).await
                         }
+                        (Method::GET, p) if p.starts_with("/v1/providers/") && p.ends_with("/models") => {
+                            let name = p["/v1/providers/".len()..p.len() - "/models".len()].to_string();
+                            providers::handle_list_models(state, req, auth, name).await
+                        }
                         (Method::POST, p) if p.starts_with("/v1/providers/") && p.ends_with("/health") => {
                             let name = p["/v1/providers/".len()..p.len() - "/health".len()].to_string();
                             providers::handle_health(state, req, auth, name).await
