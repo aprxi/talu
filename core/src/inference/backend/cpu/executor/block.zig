@@ -9,7 +9,6 @@ const layer_ops = @import("../../../../models/layer_ops.zig");
 const plan_compiler = @import("../../../../models/plan/compiler.zig");
 const tensor = @import("../../../../tensor.zig");
 const compute = @import("../../../../compute/root.zig");
-const backend_contract = @import("../../contract.zig");
 const error_context = @import("../../../../error_context.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const cpu_linalg = compute.cpu.linalg;
@@ -44,6 +43,58 @@ const SharedPersistentState = runtime.SharedPersistentState;
 
 const addIntoScaled = cpu_forward.addIntoScaled;
 const copyTensor = cpu_forward.copyTensor;
+const TMP_BUFFER_MAP_LEN: usize = 64;
+
+fn identityTmpRegisterMap() [TMP_BUFFER_MAP_LEN]u8 {
+    var map: [TMP_BUFFER_MAP_LEN]u8 = undefined;
+    for (0..TMP_BUFFER_MAP_LEN) |idx| {
+        map[idx] = @intCast(idx);
+    }
+    return map;
+}
+
+fn buildTmpRegisterScratchMap(
+    allocator: std.mem.Allocator,
+    compiled: *const runtime_contract.CompiledPlan,
+) ![TMP_BUFFER_MAP_LEN]u8 {
+    var map = identityTmpRegisterMap();
+    const register_count: usize = compiled.plan.register_count;
+    if (register_count <= @intFromEnum(BufferId.tmp3)) return map;
+    if (register_count > TMP_BUFFER_MAP_LEN) return map;
+
+    const specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, register_count);
+    defer allocator.free(specs);
+    for (specs) |*spec| {
+        spec.* = .{
+            .size = 1,
+            .@"align" = 4,
+        };
+    }
+
+    var physical_mapping = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, specs);
+    defer runtime_contract.deinitPhysicalMapping(allocator, &physical_mapping);
+    if (physical_mapping.physical_count == 0) return map;
+
+    const physical_to_tmp_slot = try allocator.alloc(u8, physical_mapping.physical_count);
+    defer allocator.free(physical_to_tmp_slot);
+    @memset(physical_to_tmp_slot, std.math.maxInt(u8));
+
+    var next_tmp_slot: usize = @intFromEnum(BufferId.tmp3);
+    for (@intFromEnum(BufferId.tmp3)..register_count) |reg_idx| {
+        const physical_id_u16 = physical_mapping.register_to_physical[reg_idx];
+        if (physical_id_u16 == std.math.maxInt(u16)) continue;
+        const physical_id: usize = physical_id_u16;
+        if (physical_id >= physical_to_tmp_slot.len) return error.InvalidState;
+        if (physical_to_tmp_slot[physical_id] == std.math.maxInt(u8)) {
+            if (next_tmp_slot >= cpu_forward.NUM_TMP_BUFFERS) return error.TooManySplitOutputs;
+            physical_to_tmp_slot[physical_id] = @intCast(next_tmp_slot);
+            next_tmp_slot += 1;
+        }
+        map[reg_idx] = physical_to_tmp_slot[physical_id];
+    }
+
+    return map;
+}
 
 /// Return the buffer that holds the final output of the block program.
 /// Pre-norm programs end on `.residual`; post-norm programs may end on `.norm_out`.
@@ -80,6 +131,9 @@ pub const Block = struct {
 
     /// Hidden size (d_model)
     hidden_size: usize,
+    /// Logical register index -> physical scratch tmp slot.
+    /// Indices 0..2 (residual/norm_out/branch_out) always remain identity.
+    tmp_register_to_scratch_idx: [TMP_BUFFER_MAP_LEN]u8 = identityTmpRegisterMap(),
 
     pub fn initWithProgram(
         allocator: std.mem.Allocator,
@@ -88,11 +142,15 @@ pub const Block = struct {
         hidden_size: usize,
         program: []const LayerOp,
     ) !Block {
+        var compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode);
+        errdefer plan_compiler.deinitCompiledPlan(allocator, &compiled_plan);
+        const tmp_map = try buildTmpRegisterScratchMap(allocator, &compiled_plan);
         return .{
-            .compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode),
+            .compiled_plan = compiled_plan,
             .block = block,
             .block_idx = block_idx,
             .hidden_size = hidden_size,
+            .tmp_register_to_scratch_idx = tmp_map,
         };
     }
 
@@ -107,6 +165,7 @@ pub const Block = struct {
         const param_block_id = insn.param_block_id orelse return error.MissingParamBlock;
         if (param_block_id >= self.compiled_plan.param_blocks.len) return error.MissingParamBlock;
         const param_block = self.compiled_plan.param_blocks[param_block_id];
+        try runtime_contract.validateParamBlockAbi(&param_block);
         if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
         if (param_block.data.len != @sizeOf(LayerOp)) return error.InvalidParamBlockSize;
         const op_ptr: *const LayerOp = @ptrCast(@alignCast(param_block.data.ptr));
@@ -177,7 +236,7 @@ pub const Block = struct {
     };
 
     comptime {
-        backend_contract.assertAdapterTableCoverage(
+        runtime_contract.assertAdapterTableCoverage(
             batched_adapter_table,
             batched_required_opcodes,
             "cpu.executor.block.batched_adapter_table",
@@ -288,7 +347,7 @@ pub const Block = struct {
     }
 
     fn batchedMulScalarAdapter(
-        _: *const Block,
+        self: *const Block,
         _: usize,
         op: LayerOp,
         buffer_views: *[64]Tensor,
@@ -307,7 +366,7 @@ pub const Block = struct {
         const input_data = input_tensor.asSlice(f32);
         const output_len = input_tensor.numel;
 
-        const output_slice = resolveOutputSlice(buffer_views, scratch, mul_scalar_op.out, output_len);
+        const output_slice = self.resolveOutputSlice(buffer_views, scratch, mul_scalar_op.out, output_len);
         cpu_elementwise.mulScalar(input_data, output_slice[0..output_len], mul_scalar_op.scalar);
 
         buffer_views[@intFromEnum(mul_scalar_op.out)] = tensorFromSlice(
@@ -318,7 +377,7 @@ pub const Block = struct {
     }
 
     fn batchedAddTensorAdapter(
-        _: *const Block,
+        self: *const Block,
         _: usize,
         op: LayerOp,
         buffer_views: *[64]Tensor,
@@ -337,7 +396,7 @@ pub const Block = struct {
         const right_tensor = buffer_views[@intFromEnum(add_tensor_op.in_b)];
         const output_len = @max(left_tensor.numel, right_tensor.numel);
 
-        const output_slice = resolveOutputSlice(buffer_views, scratch, add_tensor_op.out, output_len);
+        const output_slice = self.resolveOutputSlice(buffer_views, scratch, add_tensor_op.out, output_len);
         try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
             fn addScalar(lhs: f32, rhs: f32) f32 {
                 return lhs + rhs;
@@ -439,7 +498,7 @@ pub const Block = struct {
     };
 
     comptime {
-        backend_contract.assertAdapterTableCoverage(
+        runtime_contract.assertAdapterTableCoverage(
             sequential_adapter_table,
             sequential_required_opcodes,
             "cpu.executor.block.sequential_adapter_table",
@@ -579,7 +638,10 @@ pub const Block = struct {
                 const output_slice = blk: {
                     const out_idx = @intFromEnum(linear_op.out);
                     if (out_idx >= 3 and out_idx < cpu_forward.NUM_TMP_BUFFERS) {
-                        break :blk scratch.tmp[out_idx][0 .. seq_len * output_features];
+                        const mapped_idx: usize = self.tmp_register_to_scratch_idx[out_idx];
+                        std.debug.assert(mapped_idx >= @intFromEnum(BufferId.tmp3));
+                        std.debug.assert(mapped_idx < cpu_forward.NUM_TMP_BUFFERS);
+                        break :blk scratch.tmp[mapped_idx][0 .. seq_len * output_features];
                     }
                     if (linear_op.out == .norm_out) {
                         break :blk scratch.tmp[1][0 .. seq_len * output_features];
@@ -657,7 +719,8 @@ pub const Block = struct {
                     const split_size: usize = actual_sizes[split_idx];
                     const out_idx = @intFromEnum(split_op.out_start) + split_idx;
                     const out_elems = seq_len * split_size;
-                    out_slices[split_idx] = scratch.tmp[out_idx][0..out_elems];
+                    const out_id: BufferId = @enumFromInt(@as(u8, @intCast(out_idx)));
+                    out_slices[split_idx] = self.scratchTempSlice(scratch, out_id, out_elems);
                 }
                 try cpu_layout.splitLastDimContiguous(
                     input_data,
@@ -690,7 +753,7 @@ pub const Block = struct {
                 const n_dim: usize = @intCast(right_input.shape[1]);
 
                 const out_size = m_dim * n_dim;
-                const out_slice = scratch.tmp[0][0..out_size];
+                const out_slice = self.resolveOutputSlice(buffer_views, scratch, matmul_op.out, out_size);
                 const out_byte_size = out_size * @sizeOf(f32);
                 var output_view = Tensor.view2D(std.mem.sliceAsBytes(out_slice), m_dim, n_dim);
 
@@ -740,7 +803,7 @@ pub const Block = struct {
                 const right_tensor = buffer_views[@intFromEnum(mul_op.other)];
                 const output_len = @max(left_tensor.numel, right_tensor.numel);
 
-                const output_slice = resolveOutputSlice(buffer_views, scratch, mul_op.out, output_len);
+                const output_slice = self.resolveOutputSlice(buffer_views, scratch, mul_op.out, output_len);
                 try cpu_broadcast.applyElementwiseBinaryOp(left_tensor, right_tensor, output_slice, struct {
                     fn multiply(a: f32, b: f32) f32 {
                         return a * b;
@@ -765,7 +828,7 @@ pub const Block = struct {
                 const input_tensor = buffer_views[@intFromEnum(add_scalar_op.in)];
                 const input_data = input_tensor.asSlice(f32);
                 const output_len = input_tensor.numel;
-                const output_slice = resolveOutputSlice(buffer_views, scratch, add_scalar_op.out, output_len);
+                const output_slice = self.resolveOutputSlice(buffer_views, scratch, add_scalar_op.out, output_len);
                 cpu_elementwise.addScalar(input_data, output_slice[0..output_len], add_scalar_op.scalar);
 
                 buffer_views[@intFromEnum(add_scalar_op.out)] = tensorFromSlice(
@@ -785,7 +848,7 @@ pub const Block = struct {
                     const head_count: usize = @intCast(input_tensor.shape[2]);
                     const hidden_size: usize = @intCast(input_tensor.shape[3]);
                     const output_len = mean_seq_len * head_count;
-                    const output_slice = resolveOutputSlice(buffer_views, scratch, mean_op.out, output_len);
+                    const output_slice = self.resolveOutputSlice(buffer_views, scratch, mean_op.out, output_len);
                     try cpu_reduction.meanLastDim4D(
                         input_data,
                         mean_seq_len,
@@ -828,7 +891,7 @@ pub const Block = struct {
                     const mean_seq_len_3d: usize = @intCast(input_tensor.shape[1]);
                     const hidden_size: usize = @intCast(input_tensor.shape[2]);
                     const output_len = mean_seq_len_3d;
-                    const output_slice = resolveOutputSlice(buffer_views, scratch, mean_op.out, output_len);
+                    const output_slice = self.resolveOutputSlice(buffer_views, scratch, mean_op.out, output_len);
                     try cpu_reduction.meanLastDim3D(
                         input_data,
                         mean_seq_len_3d,
@@ -870,7 +933,7 @@ pub const Block = struct {
                 const input_tensor = buffer_views[@intFromEnum(pow_op.in)];
                 const input_data = input_tensor.asSlice(f32);
                 const output_len = input_tensor.numel;
-                const output_slice = resolveOutputSlice(buffer_views, scratch, pow_op.out, output_len);
+                const output_slice = self.resolveOutputSlice(buffer_views, scratch, pow_op.out, output_len);
                 cpu_elementwise.powScalar(input_data, output_slice[0..output_len], pow_op.exponent);
 
                 buffer_views[@intFromEnum(pow_op.out)] = tensorFromSlice(
@@ -883,7 +946,7 @@ pub const Block = struct {
                 const input_tensor = buffer_views[@intFromEnum(rsqrt_op.in)];
                 const input_data = input_tensor.asSlice(f32);
                 const output_len = input_tensor.numel;
-                const output_slice = resolveOutputSlice(buffer_views, scratch, rsqrt_op.out, output_len);
+                const output_slice = self.resolveOutputSlice(buffer_views, scratch, rsqrt_op.out, output_len);
                 cpu_elementwise.rsqrt(input_data, output_slice[0..output_len]);
 
                 buffer_views[@intFromEnum(rsqrt_op.out)] = tensorFromSlice(
@@ -905,7 +968,7 @@ pub const Block = struct {
                 };
 
                 const output_len = @max(input_tensor.numel, param.numel);
-                const output_slice = resolveOutputSlice(buffer_views, scratch, add_param_op.out, output_len);
+                const output_slice = self.resolveOutputSlice(buffer_views, scratch, add_param_op.out, output_len);
                 try cpu_broadcast.addParam(input_tensor, param, output_slice[0..output_len]);
 
                 buffer_views[@intFromEnum(add_param_op.out)] = tensorFromSlice(
@@ -925,7 +988,7 @@ pub const Block = struct {
                     return error.MissingParam;
                 };
                 const p_len = param.numel;
-                const output_slice = resolveOutputSlice(buffer_views, scratch, add_param_scalar_op.out, p_len);
+                const output_slice = self.resolveOutputSlice(buffer_views, scratch, add_param_scalar_op.out, p_len);
                 cpu_broadcast.addParamScalar(param, output_slice[0..p_len], add_param_scalar_op.scalar);
 
                 buffer_views[@intFromEnum(add_param_scalar_op.out)] = tensorFromSlice(
@@ -947,7 +1010,7 @@ pub const Block = struct {
                 };
 
                 const output_len = @max(input_tensor.numel, param.numel);
-                const output_slice = resolveOutputSlice(buffer_views, scratch, mul_param_op.out, output_len);
+                const output_slice = self.resolveOutputSlice(buffer_views, scratch, mul_param_op.out, output_len);
                 try cpu_broadcast.mulParam(input_tensor, param, output_slice[0..output_len]);
 
                 buffer_views[@intFromEnum(mul_param_op.out)] = tensorFromSlice(
@@ -1015,7 +1078,7 @@ pub const Block = struct {
             .transpose => |transpose_op| {
                 const in_tensor = &buffer_views[@intFromEnum(transpose_op.in)];
                 const out_len = in_tensor.numel;
-                const out_slice = resolveOutputSlice(buffer_views, scratch, transpose_op.out, out_len);
+                const out_slice = self.resolveOutputSlice(buffer_views, scratch, transpose_op.out, out_len);
 
                 const ndim: usize = @intCast(in_tensor.n_dims);
                 const dim0: usize = if (transpose_op.dim0 < 0)
@@ -1091,7 +1154,7 @@ pub const Block = struct {
                 };
 
                 if (rope_op.in != rope_op.out) {
-                    const out_slice = resolveOutputSlice(buffer_views, scratch, rope_op.out, in_tensor.numel);
+                    const out_slice = self.resolveOutputSlice(buffer_views, scratch, rope_op.out, in_tensor.numel);
                     @memcpy(out_slice, input_data);
                     buffer_views[@intFromEnum(rope_op.out)] = tensorFromSlice(
                         out_slice[0..in_tensor.numel],
@@ -1133,7 +1196,7 @@ pub const Block = struct {
                 const scale = sdpa_op.scale orelse 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
 
                 const out_numel = batch * n_heads * seq_q * head_dim;
-                const out_slice = resolveOutputSlice(buffer_views, scratch, sdpa_op.out, out_numel);
+                const out_slice = self.resolveOutputSlice(buffer_views, scratch, sdpa_op.out, out_numel);
 
                 const q_shape = [_]usize{ batch, n_heads, seq_q, head_dim };
                 const k_shape = [_]usize{ batch, n_heads, seq_k, head_dim };
@@ -1185,12 +1248,16 @@ pub const Block = struct {
         };
     }
 
-    fn scratchTempSlice(scratch: *ScratchBuffer, which: BufferId, len: usize) []f32 {
-        // BufferId maps directly to scratch.tmp array index for tmp3-tmp63
-        // Special buffer_views (residual=0, norm_out=1, branch_out=2) handled by resolveOutputSlice
+    fn scratchTempSlice(self: *const Block, scratch: *ScratchBuffer, which: BufferId, len: usize) []f32 {
+        // Logical tmp registers (tmp3..tmp63) map through the compiled liveness
+        // allocator to physical scratch slots. Special buffers
+        // (residual=0, norm_out=1, branch_out=2) are handled by resolveOutputSlice.
         const buffer_idx = @intFromEnum(which);
         if (buffer_idx >= 3 and buffer_idx < cpu_forward.NUM_TMP_BUFFERS) {
-            return scratch.tmp[buffer_idx][0..len];
+            const mapped_idx: usize = self.tmp_register_to_scratch_idx[buffer_idx];
+            std.debug.assert(mapped_idx >= @intFromEnum(BufferId.tmp3));
+            std.debug.assert(mapped_idx < cpu_forward.NUM_TMP_BUFFERS);
+            return scratch.tmp[mapped_idx][0..len];
         }
         return &.{};
     }
@@ -1220,10 +1287,10 @@ pub const Block = struct {
         };
     }
 
-    fn resolveOutputSlice(buffer_views: *[64]Tensor, scratch: *ScratchBuffer, buffer_id: BufferId, len: usize) []f32 {
+    fn resolveOutputSlice(self: *const Block, buffer_views: *[64]Tensor, scratch: *ScratchBuffer, buffer_id: BufferId, len: usize) []f32 {
         return switch (buffer_id) {
             .residual, .norm_out, .branch_out => buffer_views[@intFromEnum(buffer_id)].asSlice(f32)[0..len],
-            else => scratchTempSlice(scratch, buffer_id, len),
+            else => self.scratchTempSlice(scratch, buffer_id, len),
         };
     }
 
@@ -1350,15 +1417,16 @@ pub const Block = struct {
             return err;
         };
 
-        for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            if (sequential_adapter_table[@intFromEnum(insn.opcode)] == null) {
-                error_context.setContext("block={d}, op={d}, opcode={d}", .{
-                    self.block_idx,
-                    op_index,
-                    @intFromEnum(insn.opcode),
-                });
-                return error.UnsupportedOpInSequentialMode;
-            }
+        if (runtime_contract.firstUnsupportedInstructionOpcode(&self.compiled_plan.plan, sequential_adapter_table)) |unsupported| {
+            error_context.setContext("block={d}, op={d}, opcode={d}", .{
+                self.block_idx,
+                unsupported.instruction_index,
+                @intFromEnum(unsupported.opcode),
+            });
+            return error.UnsupportedOpInSequentialMode;
+        }
+
+        for (self.compiled_plan.plan.instructions, 0..) |_, op_index| {
             const op = try self.decodeInstructionOp(op_index);
             switch (op) {
                 .kernel => |kernel_op| {
@@ -2287,4 +2355,73 @@ test "finalOutputBuffer resolves vision ops output buffer" {
     var compiled = try plan_compiler.compileLayerProgram(allocator, &program, .vision_encode);
     defer plan_compiler.deinitCompiledPlan(allocator, &compiled);
     try testing.expectEqual(BufferId.branch_out, finalOutputBuffer(&compiled));
+}
+
+test "buildTmpRegisterScratchMap reuses physical tmp slots from liveness" {
+    const allocator = testing.allocator;
+    const reg0 = runtime_contract.registerFromIndex(0);
+    const reg3 = runtime_contract.registerFromIndex(3);
+    const reg4 = runtime_contract.registerFromIndex(4);
+    const reg5 = runtime_contract.registerFromIndex(5);
+
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .rmsnorm,
+            .inputs = &.{reg0},
+            .outputs = &.{reg3},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+        .{
+            .opcode = .silu,
+            .inputs = &.{reg3},
+            .outputs = &.{reg4},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+        .{
+            .opcode = .gelu,
+            .inputs = &.{reg4},
+            .outputs = &.{reg5},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+        .{
+            .opcode = .residual_add,
+            .inputs = &.{ reg0, reg5 },
+            .outputs = &.{reg0},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+    };
+
+    const kill0 = [_]u64{0};
+    const kill1 = [_]u64{1 << 3};
+    const kill2 = [_]u64{1 << 4};
+    const kill3 = [_]u64{(1 << 0) | (1 << 5)};
+
+    const compiled = runtime_contract.CompiledPlan{
+        .plan = .{
+            .instructions = &instructions,
+            .register_count = 6,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{},
+        .liveness = .{
+            .register_last_read = &.{ 3, std.math.maxInt(u32), std.math.maxInt(u32), 1, 2, 3 },
+            .kill_after_instruction = &.{ kill0[0..], kill1[0..], kill2[0..], kill3[0..] },
+        },
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+
+    const tmp_map = try buildTmpRegisterScratchMap(allocator, &compiled);
+    try testing.expectEqual(tmp_map[@intFromEnum(BufferId.tmp3)], tmp_map[@intFromEnum(BufferId.tmp5)]);
+    try testing.expect(tmp_map[@intFromEnum(BufferId.tmp4)] != tmp_map[@intFromEnum(BufferId.tmp3)]);
+    try testing.expect(tmp_map[@intFromEnum(BufferId.tmp3)] >= @intFromEnum(BufferId.tmp3));
 }

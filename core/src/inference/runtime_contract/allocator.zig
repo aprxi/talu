@@ -49,10 +49,10 @@ pub fn buildPhysicalMappingLinearScan(
         }
     }
 
-    var physical_specs = std.ArrayList(types.PhysicalBufferSpec).init(allocator);
-    errdefer physical_specs.deinit();
-    var free_list = std.ArrayList(u16).init(allocator);
-    defer free_list.deinit();
+    var physical_specs = std.ArrayList(types.PhysicalBufferSpec).empty;
+    errdefer physical_specs.deinit(allocator);
+    var free_list = std.ArrayList(u16).empty;
+    defer free_list.deinit(allocator);
 
     for (compiled.plan.instructions, 0..) |insn, instruction_idx| {
         const idx_u32: u32 = @intCast(instruction_idx);
@@ -78,7 +78,7 @@ pub fn buildPhysicalMappingLinearScan(
                 id
             else blk: {
                 const new_id: u16 = @intCast(physical_specs.items.len);
-                try physical_specs.append(.{
+                try physical_specs.append(allocator, .{
                     .size = desired.size,
                     .@"align" = desired.@"align",
                 });
@@ -98,11 +98,11 @@ pub fn buildPhysicalMappingLinearScan(
             if ((kill_row[word] & (@as(u64, 1) << bit)) == 0) continue;
             const physical_id = register_to_physical[reg_idx];
             if (physical_id == invalid_physical) continue;
-            try free_list.append(physical_id);
+            try free_list.append(allocator, physical_id);
         }
     }
 
-    const physical_specs_slice = try physical_specs.toOwnedSlice();
+    const physical_specs_slice = try physical_specs.toOwnedSlice(allocator);
     return .{
         .register_to_physical = register_to_physical,
         .physical_count = @intCast(physical_specs_slice.len),

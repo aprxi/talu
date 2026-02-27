@@ -5,6 +5,8 @@
 const std = @import("std");
 const dtype = @import("../../dtype.zig");
 const op_types = @import("../../models/op_types.zig");
+const layer_ops = @import("../../models/layer_ops.zig");
+const opcode_map = @import("../../models/plan/opcode_map.zig");
 const opcode_mod = @import("../../models/plan/opcode.zig");
 
 pub const Opcode = opcode_mod.Opcode;
@@ -118,6 +120,7 @@ pub const TensorLayout = enum(u8) {
 pub const TensorViewDesc = struct {
     dtype: dtype.DType,
     rank: u8,
+    // v1 runtime plan compatibility cap; fail validation when rank exceeds 4.
     shape: [4]u32,
     stride_elems: [4]u32,
     layout: TensorLayout,
@@ -135,6 +138,10 @@ pub const ParamBlock = struct {
     opcode: Opcode,
     data: []const u8,
 };
+
+pub const param_block_abi_version_v1: u8 = 1;
+pub const max_param_block_data_bytes_v1: usize = 256;
+pub const tensor_view_rank_cap_v1: u8 = 4;
 
 pub const ExecutionMode = enum(u8) {
     decode = 0,
@@ -176,6 +183,101 @@ pub const AdapterCapability = struct {
 
 pub const AdapterCapabilities = [256]AdapterCapability;
 
+pub const UnsupportedLayerProgramOpcode = struct {
+    op_index: usize,
+    opcode: Opcode,
+};
+
+pub const UnsupportedInstructionOpcode = struct {
+    instruction_index: usize,
+    opcode: Opcode,
+};
+
+pub const LayerProgramCompatibilityIssue = union(enum) {
+    unsupported_opcode: UnsupportedLayerProgramOpcode,
+    state_mismatch: LayerProgramStateMismatch,
+    buffer_violation: layer_ops.CoreProgramBufferViolation,
+};
+
+fn adapterSlotPresent(slot: anytype) bool {
+    return switch (@typeInfo(@TypeOf(slot))) {
+        .optional => slot != null,
+        else => @compileError("adapter table slot type must be optional"),
+    };
+}
+
+pub fn assertAdapterTableCoverage(
+    comptime table: anytype,
+    comptime required_opcodes: anytype,
+    comptime owner_name: []const u8,
+) void {
+    const table_type = @TypeOf(table);
+    const table_info = @typeInfo(table_type);
+    if (table_info != .array) {
+        @compileError("Contract for '" ++ owner_name ++ "' requires a fixed array adapter table");
+    }
+    if (table_info.array.len != 256) {
+        @compileError("Contract for '" ++ owner_name ++ "' adapter table must have 256 slots");
+    }
+    if (@typeInfo(table_info.array.child) != .optional) {
+        @compileError("Contract for '" ++ owner_name ++ "' adapter table elements must be optional");
+    }
+
+    inline for (required_opcodes) |opcode| {
+        const idx: usize = @intCast(@intFromEnum(opcode));
+        if (idx >= table_info.array.len) {
+            @compileError("Contract for '" ++ owner_name ++ "' opcode index out of bounds");
+        }
+        if (!adapterSlotPresent(table[idx])) {
+            @compileError(
+                "Contract for '" ++ owner_name ++ "' missing adapter for opcode '" ++ @tagName(opcode) ++ "'",
+            );
+        }
+    }
+}
+
+pub fn firstUnsupportedLayerProgramOpcode(program: []const layer_ops.LayerOp, adapter_table: anytype) ?UnsupportedLayerProgramOpcode {
+    for (program, 0..) |op, op_index| {
+        const opcode = opcode_map.opcodeForLayerOp(op);
+        if (!adapterSlotPresent(adapter_table[@intFromEnum(opcode)])) {
+            return .{
+                .op_index = op_index,
+                .opcode = opcode,
+            };
+        }
+    }
+    return null;
+}
+
+pub fn firstUnsupportedInstructionOpcode(plan: *const ExecutionPlan, adapter_table: anytype) ?UnsupportedInstructionOpcode {
+    for (plan.instructions, 0..) |insn, instruction_index| {
+        if (!adapterSlotPresent(adapter_table[@intFromEnum(insn.opcode)])) {
+            return .{
+                .instruction_index = instruction_index,
+                .opcode = insn.opcode,
+            };
+        }
+    }
+    return null;
+}
+
+pub fn firstLayerProgramCompatibilityIssue(
+    program: []const layer_ops.LayerOp,
+    kind: op_types.BlockKind,
+    adapter_table: anytype,
+) ?LayerProgramCompatibilityIssue {
+    if (firstUnsupportedLayerProgramOpcode(program, adapter_table)) |unsupported| {
+        return .{ .unsupported_opcode = unsupported };
+    }
+    if (firstLayerProgramStateMismatch(program, kind)) |mismatch| {
+        return .{ .state_mismatch = mismatch };
+    }
+    if (layer_ops.firstCoreProgramBufferViolation(program)) |violation| {
+        return .{ .buffer_violation = violation };
+    }
+    return null;
+}
+
 pub fn stateBlockIdForOpcode(opcode: Opcode) ?u8 {
     return switch (opcode) {
         .multihead_attention, .mla_attention => @intFromEnum(StateBlockId.kv_cache),
@@ -203,6 +305,29 @@ pub fn blockKindSupportsState(kind: op_types.BlockKind, state_id: u8) bool {
 pub fn opcodeStateCompatibleWithBlockKind(opcode: Opcode, kind: op_types.BlockKind) bool {
     const state_id = stateBlockIdForOpcode(opcode) orelse return true;
     return blockKindSupportsState(kind, state_id);
+}
+
+pub const LayerProgramStateMismatch = struct {
+    op_index: usize,
+    opcode: Opcode,
+    state_id: u8,
+};
+
+pub fn firstLayerProgramStateMismatch(
+    program: []const layer_ops.LayerOp,
+    kind: op_types.BlockKind,
+) ?LayerProgramStateMismatch {
+    for (program, 0..) |op, op_index| {
+        const opcode = opcode_map.opcodeForLayerOp(op);
+        if (!opcodeStateCompatibleWithBlockKind(opcode, kind)) {
+            return .{
+                .op_index = op_index,
+                .opcode = opcode,
+                .state_id = stateBlockIdForOpcode(opcode).?,
+            };
+        }
+    }
+    return null;
 }
 
 pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
@@ -261,12 +386,30 @@ pub fn instructionSingleWeightBindingName(compiled: *const CompiledPlan, instruc
 }
 
 pub fn validateTensorViewDesc(view: *const TensorViewDesc) !void {
-    if (view.rank > 4) return error.UnsupportedTensorRank;
+    if (view.rank > tensor_view_rank_cap_v1) return error.UnsupportedTensorRank;
 }
 
 pub fn validateExecutionContext(ctx: *const ExecutionContext) !void {
     if (ctx.batch_size != ctx.active_slots.len) return error.InvalidBatchSize;
     if (ctx.sequence_lengths.len != ctx.active_slots.len) return error.InvalidSequenceLengthCount;
+}
+
+pub fn validateBatchCapability(
+    ctx: *const ExecutionContext,
+    capability: AdapterCapability,
+) !void {
+    if (!capability.supports_batch and ctx.batch_size > 1) return error.BatchUnsupported;
+    if (capability.max_batch_size) |max_batch_size| {
+        if (ctx.batch_size > max_batch_size) return error.BatchUnsupported;
+    }
+}
+
+pub fn validateParamBlockAbi(param_block: *const ParamBlock) !void {
+    if (param_block.version != param_block_abi_version_v1) return error.InvalidParamBlockABI;
+    if (param_block.data.len > max_param_block_data_bytes_v1) return error.InvalidParamBlockABI;
+    if (param_block.data.len > 0 and (@intFromPtr(param_block.data.ptr) % 8) != 0) {
+        return error.InvalidParamBlockABI;
+    }
 }
 
 pub fn validateExecutionPlan(plan: *const ExecutionPlan) !void {
@@ -342,6 +485,7 @@ pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
         if (insn.param_block_id) |param_id| {
             if (param_id >= compiled.param_blocks.len) return error.UnknownParamBlockId;
             const param_block = compiled.param_blocks[param_id];
+            try validateParamBlockAbi(&param_block);
             if (param_block.opcode != insn.opcode) return error.ParamBlockOpcodeMismatch;
         }
     }
@@ -368,7 +512,7 @@ test "validateTensorViewDesc rejects rank above v1 cap" {
         .layout = .contiguous,
     };
     try std.testing.expectError(error.UnsupportedTensorRank, validateTensorViewDesc(&view));
-    view.rank = 4;
+    view.rank = tensor_view_rank_cap_v1;
     try validateTensorViewDesc(&view);
 }
 
@@ -382,6 +526,109 @@ test "validateExecutionContext checks batch invariants" {
         .batch_size = 1,
     };
     try std.testing.expectError(error.InvalidSequenceLengthCount, validateExecutionContext(&invalid));
+}
+
+test "validateBatchCapability enforces explicit adapter batch limits" {
+    var slots: [2]usize = .{ 0, 1 };
+    var lengths: [2]u32 = .{ 8, 8 };
+    const ctx = ExecutionContext{
+        .mode = .decode,
+        .active_slots = slots[0..],
+        .sequence_lengths = lengths[0..],
+        .batch_size = 2,
+    };
+
+    try std.testing.expectError(
+        error.BatchUnsupported,
+        validateBatchCapability(&ctx, .{
+            .supports_batch = false,
+            .supports_graph_emit = false,
+            .max_batch_size = null,
+        }),
+    );
+
+    try std.testing.expectError(
+        error.BatchUnsupported,
+        validateBatchCapability(&ctx, .{
+            .supports_batch = true,
+            .supports_graph_emit = false,
+            .max_batch_size = 1,
+        }),
+    );
+
+    try validateBatchCapability(&ctx, .{
+        .supports_batch = true,
+        .supports_graph_emit = false,
+        .max_batch_size = 4,
+    });
+}
+
+test "validateParamBlockAbi rejects invalid version, size, and alignment" {
+    const good_data: [8]u8 align(8) = .{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    const good = ParamBlock{
+        .version = param_block_abi_version_v1,
+        .opcode = .rmsnorm,
+        .data = good_data[0..],
+    };
+    try validateParamBlockAbi(&good);
+
+    const wrong_version = ParamBlock{
+        .version = param_block_abi_version_v1 + 1,
+        .opcode = .rmsnorm,
+        .data = good_data[0..],
+    };
+    try std.testing.expectError(error.InvalidParamBlockABI, validateParamBlockAbi(&wrong_version));
+
+    var large_backing: [max_param_block_data_bytes_v1 + 1]u8 = undefined;
+    @memset(large_backing[0..], 0);
+    const too_large = ParamBlock{
+        .version = param_block_abi_version_v1,
+        .opcode = .rmsnorm,
+        .data = large_backing[0..],
+    };
+    try std.testing.expectError(error.InvalidParamBlockABI, validateParamBlockAbi(&too_large));
+
+    var unaligned_backing: [16]u8 align(1) = undefined;
+    @memset(unaligned_backing[0..], 0);
+    const unaligned = ParamBlock{
+        .version = param_block_abi_version_v1,
+        .opcode = .rmsnorm,
+        .data = unaligned_backing[1..9],
+    };
+    try std.testing.expectError(error.InvalidParamBlockABI, validateParamBlockAbi(&unaligned));
+}
+
+test "validateCompiledPlan rejects invalid param block ABI" {
+    const insn = Instruction{
+        .opcode = .rmsnorm,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{},
+        .param_block_id = 0,
+        .state_block_id = null,
+    };
+    var large_backing: [max_param_block_data_bytes_v1 + 1]u8 = undefined;
+    @memset(large_backing[0..], 0);
+    const compiled = CompiledPlan{
+        .plan = .{
+            .instructions = &.{insn},
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{.{
+            .version = param_block_abi_version_v1,
+            .opcode = .rmsnorm,
+            .data = large_backing[0..],
+        }},
+        .weight_bindings = &.{},
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{&.{0}},
+        },
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+    try std.testing.expectError(error.InvalidParamBlockABI, validateCompiledPlan(&compiled));
 }
 
 test "validateExecutionPlan detects invalid register references" {
@@ -687,4 +934,139 @@ test "opcodeStateCompatibleWithBlockKind enforces stateful opcode topology compa
     try std.testing.expect(!opcodeStateCompatibleWithBlockKind(.multihead_attention, .shortconv));
     try std.testing.expect(opcodeStateCompatibleWithBlockKind(.shortconv, .shortconv));
     try std.testing.expect(!opcodeStateCompatibleWithBlockKind(.shortconv, .mamba));
+}
+
+test "firstLayerProgramStateMismatch returns first mismatched stateful opcode" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .shortconv } },
+    };
+    const mismatch = firstLayerProgramStateMismatch(&program, .attention_mlp) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), mismatch.op_index);
+    try std.testing.expectEqual(Opcode.shortconv, mismatch.opcode);
+    try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.shortconv)), mismatch.state_id);
+}
+
+test "firstUnsupportedLayerProgramOpcode returns first unsupported opcode in program" {
+    const table = [_]?u8{null} ** 256;
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+    };
+
+    const unsupported = firstUnsupportedLayerProgramOpcode(&program, table) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 0), unsupported.op_index);
+    try std.testing.expectEqual(Opcode.rmsnorm, unsupported.opcode);
+}
+
+test "firstUnsupportedInstructionOpcode returns first unsupported opcode in plan" {
+    const instructions = [_]Instruction{
+        .{
+            .opcode = .rmsnorm,
+            .inputs = &.{registerFromIndex(0)},
+            .outputs = &.{registerFromIndex(1)},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+        .{
+            .opcode = .swiglu,
+            .inputs = &.{registerFromIndex(1)},
+            .outputs = &.{registerFromIndex(0)},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+    };
+    const plan = ExecutionPlan{
+        .instructions = &instructions,
+        .register_count = 2,
+        .state_descs = &.{},
+    };
+
+    var table = [_]?u8{null} ** 256;
+    table[@intFromEnum(Opcode.rmsnorm)] = 1;
+
+    const unsupported = firstUnsupportedInstructionOpcode(&plan, table) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), unsupported.instruction_index);
+    try std.testing.expectEqual(Opcode.swiglu, unsupported.opcode);
+}
+
+test "assertAdapterTableCoverage requires all declared opcodes to be populated" {
+    comptime {
+        var table = [_]?u8{null} ** 256;
+        table[@intFromEnum(Opcode.rmsnorm)] = 1;
+        assertAdapterTableCoverage(
+            table,
+            [_]Opcode{.rmsnorm},
+            "runtime_contract.types.test_adapter_table",
+        );
+    }
+}
+
+test "firstLayerProgramCompatibilityIssue reports unsupported opcode first" {
+    const table = [_]?u8{null} ** 256;
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+    };
+    const issue = firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .unsupported_opcode => |unsupported| {
+            try std.testing.expectEqual(@as(usize, 0), unsupported.op_index);
+            try std.testing.expectEqual(Opcode.rmsnorm, unsupported.opcode);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "firstLayerProgramCompatibilityIssue reports state mismatch when opcodes are supported" {
+    var table = [_]?u8{null} ** 256;
+    table[@intFromEnum(Opcode.shortconv)] = 1;
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .shortconv,
+        } },
+    };
+    const issue = firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .state_mismatch => |mismatch| {
+            try std.testing.expectEqual(@as(usize, 0), mismatch.op_index);
+            try std.testing.expectEqual(Opcode.shortconv, mismatch.opcode);
+            try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.shortconv)), mismatch.state_id);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "firstLayerProgramCompatibilityIssue reports core buffer violation when other checks pass" {
+    var table = [_]?u8{null} ** 256;
+    table[@intFromEnum(Opcode.rmsnorm)] = 1;
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .tmp3,
+            .out = .norm_out,
+            .debug_type = .norm,
+        } },
+    };
+    const issue = firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .buffer_violation => |violation| switch (violation) {
+            .op_index => |op_index| try std.testing.expectEqual(@as(usize, 0), op_index),
+            .final_output => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }

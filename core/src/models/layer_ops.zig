@@ -343,6 +343,33 @@ pub fn isCoreProgramBuffer(id: BufferId) bool {
     };
 }
 
+/// Returns true when an op only touches core buffers for fields that
+/// participate in backend core-program constraints.
+pub fn opUsesOnlyCoreBuffers(op: LayerOp) bool {
+    return switch (op) {
+        .kernel => |kernel_op| isCoreProgramBuffer(kernel_op.in) and isCoreProgramBuffer(kernel_op.out),
+        .add => |add_op| isCoreProgramBuffer(add_op.branch),
+        else => true,
+    };
+}
+
+pub const CoreProgramBufferViolation = union(enum) {
+    op_index: usize,
+    final_output: BufferId,
+};
+
+/// Returns first core-buffer rule violation in program order.
+/// - `.op_index`: an op violates per-op core buffer constraints
+/// - `.final_output`: final output buffer is not a core buffer
+pub fn firstCoreProgramBufferViolation(program: []const LayerOp) ?CoreProgramBufferViolation {
+    for (program, 0..) |op, op_index| {
+        if (!opUsesOnlyCoreBuffers(op)) return .{ .op_index = op_index };
+    }
+    const out = finalOutputBuffer(program);
+    if (!isCoreProgramBuffer(out)) return .{ .final_output = out };
+    return null;
+}
+
 test "finalOutputBuffer defaults to residual for empty program" {
     const testing = @import("std").testing;
     try testing.expectEqual(BufferId.residual, finalOutputBuffer(&.{}));
@@ -363,4 +390,52 @@ test "isCoreProgramBuffer accepts residual/norm_out/branch_out only" {
     try testing.expect(isCoreProgramBuffer(.norm_out));
     try testing.expect(isCoreProgramBuffer(.branch_out));
     try testing.expect(!isCoreProgramBuffer(.tmp3));
+}
+
+test "opUsesOnlyCoreBuffers enforces kernel/add core buffer constraints" {
+    const testing = @import("std").testing;
+    const kernel_ok: LayerOp = .{ .kernel = .{
+        .id = 1,
+        .in = .residual,
+        .out = .norm_out,
+        .debug_type = .norm,
+    } };
+    const kernel_bad: LayerOp = .{ .kernel = .{
+        .id = 1,
+        .in = .tmp3,
+        .out = .norm_out,
+        .debug_type = .norm,
+    } };
+    const add_ok: LayerOp = .{ .add = .{ .branch = .branch_out, .scale = .one } };
+    const add_bad: LayerOp = .{ .add = .{ .branch = .tmp3, .scale = .one } };
+    const mul_other: LayerOp = .{ .mul_scalar = .{ .in = .tmp3, .out = .tmp4, .scalar = 1.0 } };
+
+    try testing.expect(opUsesOnlyCoreBuffers(kernel_ok));
+    try testing.expect(!opUsesOnlyCoreBuffers(kernel_bad));
+    try testing.expect(opUsesOnlyCoreBuffers(add_ok));
+    try testing.expect(!opUsesOnlyCoreBuffers(add_bad));
+    try testing.expect(opUsesOnlyCoreBuffers(mul_other));
+}
+
+test "firstCoreProgramBufferViolation detects first op violation and final output violation" {
+    const testing = @import("std").testing;
+    const op_violation_program = [_]LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .tmp3, .out = .norm_out, .debug_type = .norm } },
+        .{ .add = .{ .branch = .branch_out, .scale = .one } },
+    };
+    const final_violation_program = [_]LayerOp{
+        .{ .mul_scalar = .{ .in = .residual, .out = .tmp3, .scalar = 1.0 } },
+    };
+
+    const op_violation = firstCoreProgramBufferViolation(&op_violation_program) orelse return error.TestUnexpectedResult;
+    switch (op_violation) {
+        .op_index => |idx| try testing.expectEqual(@as(usize, 0), idx),
+        else => return error.TestUnexpectedResult,
+    }
+
+    const final_violation = firstCoreProgramBufferViolation(&final_violation_program) orelse return error.TestUnexpectedResult;
+    switch (final_violation) {
+        .final_output => |out| try testing.expectEqual(BufferId.tmp3, out),
+        else => return error.TestUnexpectedResult,
+    }
 }

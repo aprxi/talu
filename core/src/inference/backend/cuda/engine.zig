@@ -624,62 +624,49 @@ fn finalProgramOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.Buffer
 }
 
 fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
-    for (program, 0..) |op, op_idx| {
-        const opcode = opcode_map.opcodeForLayerOp(op);
-        if (CudaBackend.layerProgramAdapterForOpcode(opcode) == null) {
-            log.warn("inference", "CUDA LayerOp program contains unsupported opcode", .{
-                .layer = layer_idx,
-                .op_index = op_idx,
-                .kind = @intFromEnum(kind),
-                .op = @tagName(op),
-                .opcode = @intFromEnum(opcode),
-            });
-            return error.UnsupportedModel;
-        }
-        if (!runtime_contract.opcodeStateCompatibleWithBlockKind(opcode, kind)) {
-            const state_id = runtime_contract.stateBlockIdForOpcode(opcode).?;
-            log.warn("inference", "CUDA LayerOp program state binding mismatches block kind", .{
-                .layer = layer_idx,
-                .op_index = op_idx,
-                .kind = @intFromEnum(kind),
-                .op = @tagName(op),
-                .opcode = @intFromEnum(opcode),
-                .state_id = state_id,
-            });
-            return error.UnsupportedModel;
-        }
-
-        switch (op) {
-            .kernel => |kernel_op| {
-                if (!layer_ops.isCoreProgramBuffer(kernel_op.in) or !layer_ops.isCoreProgramBuffer(kernel_op.out)) {
+    if (runtime_contract.firstLayerProgramCompatibilityIssue(
+        program,
+        kind,
+        CudaBackend.layer_program_adapter_table,
+    )) |issue| {
+        switch (issue) {
+            .unsupported_opcode => |unsupported| {
+                log.warn("inference", "CUDA LayerOp program contains unsupported opcode", .{
+                    .layer = layer_idx,
+                    .op_index = unsupported.op_index,
+                    .kind = @intFromEnum(kind),
+                    .op = @tagName(program[unsupported.op_index]),
+                    .opcode = @intFromEnum(unsupported.opcode),
+                });
+            },
+            .state_mismatch => |mismatch| {
+                log.warn("inference", "CUDA LayerOp program state binding mismatches block kind", .{
+                    .layer = layer_idx,
+                    .op_index = mismatch.op_index,
+                    .kind = @intFromEnum(kind),
+                    .op = @tagName(program[mismatch.op_index]),
+                    .opcode = @intFromEnum(mismatch.opcode),
+                    .state_id = mismatch.state_id,
+                });
+            },
+            .buffer_violation => |violation| switch (violation) {
+                .op_index => |bad_op_idx| {
                     log.warn("inference", "CUDA LayerOp program uses unsupported buffer id", .{
                         .layer = layer_idx,
-                        .op_index = op_idx,
+                        .op_index = bad_op_idx,
                         .kind = @intFromEnum(kind),
-                        .debug_type = @tagName(kernel_op.debug_type),
+                        .op = @tagName(program[bad_op_idx]),
                     });
-                    return error.UnsupportedModel;
-                }
-            },
-            .add => |add_op| {
-                if (!layer_ops.isCoreProgramBuffer(add_op.branch)) {
-                    log.warn("inference", "CUDA LayerOp add uses unsupported buffer id", .{
+                },
+                .final_output => |out| {
+                    log.warn("inference", "CUDA LayerOp program final buffer is unsupported", .{
                         .layer = layer_idx,
-                        .op_index = op_idx,
                         .kind = @intFromEnum(kind),
+                        .out = @intFromEnum(out),
                     });
-                    return error.UnsupportedModel;
-                }
+                },
             },
-            else => {},
         }
-    }
-
-    if (!layer_ops.isCoreProgramBuffer(finalProgramOutputBuffer(program))) {
-        log.warn("inference", "CUDA LayerOp program final buffer is unsupported", .{
-            .layer = layer_idx,
-            .kind = @intFromEnum(kind),
-        });
         return error.UnsupportedModel;
     }
 }
@@ -3704,7 +3691,7 @@ pub const CudaBackend = struct {
     };
 
     comptime {
-        contract.assertAdapterTableCoverage(
+        runtime_contract.assertAdapterTableCoverage(
             layer_program_adapter_table,
             layer_program_required_opcodes,
             "cuda.engine.layer_program_adapter_table",

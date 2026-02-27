@@ -5,7 +5,6 @@
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
-const backend_contract = @import("../../contract.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const op_types = @import("../../../../models/op_types.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
@@ -61,7 +60,7 @@ pub const TransformerBlock = struct {
     };
 
     comptime {
-        backend_contract.assertAdapterTableCoverage(
+        runtime_contract.assertAdapterTableCoverage(
             layer_program_adapter_table,
             layer_program_required_opcodes,
             "metal.executor.block.layer_program_adapter_table",
@@ -73,62 +72,49 @@ pub const TransformerBlock = struct {
     }
 
     fn validateLayerProgram(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
-        for (program, 0..) |op, op_idx| {
-            const opcode = opcode_map.opcodeForLayerOp(op);
-            if (layerProgramAdapterForOpcode(opcode) == null) {
-                log.warn("inference", "Metal LayerOp program contains unsupported opcode", .{
-                    .layer = layer_idx,
-                    .op_index = op_idx,
-                    .kind = @intFromEnum(kind),
-                    .op = @tagName(op),
-                    .opcode = @intFromEnum(opcode),
-                });
-                return error.NotImplemented;
-            }
-            if (!runtime_contract.opcodeStateCompatibleWithBlockKind(opcode, kind)) {
-                const state_id = runtime_contract.stateBlockIdForOpcode(opcode).?;
-                log.warn("inference", "Metal LayerOp program state binding mismatches block kind", .{
-                    .layer = layer_idx,
-                    .op_index = op_idx,
-                    .kind = @intFromEnum(kind),
-                    .op = @tagName(op),
-                    .opcode = @intFromEnum(opcode),
-                    .state_id = state_id,
-                });
-                return error.NotImplemented;
-            }
-
-            switch (op) {
-                .kernel => |kernel_op| {
-                    if (!layer_ops.isCoreProgramBuffer(kernel_op.in) or !layer_ops.isCoreProgramBuffer(kernel_op.out)) {
+        if (runtime_contract.firstLayerProgramCompatibilityIssue(
+            program,
+            kind,
+            layer_program_adapter_table,
+        )) |issue| {
+            switch (issue) {
+                .unsupported_opcode => |unsupported| {
+                    log.warn("inference", "Metal LayerOp program contains unsupported opcode", .{
+                        .layer = layer_idx,
+                        .op_index = unsupported.op_index,
+                        .kind = @intFromEnum(kind),
+                        .op = @tagName(program[unsupported.op_index]),
+                        .opcode = @intFromEnum(unsupported.opcode),
+                    });
+                },
+                .state_mismatch => |mismatch| {
+                    log.warn("inference", "Metal LayerOp program state binding mismatches block kind", .{
+                        .layer = layer_idx,
+                        .op_index = mismatch.op_index,
+                        .kind = @intFromEnum(kind),
+                        .op = @tagName(program[mismatch.op_index]),
+                        .opcode = @intFromEnum(mismatch.opcode),
+                        .state_id = mismatch.state_id,
+                    });
+                },
+                .buffer_violation => |violation| switch (violation) {
+                    .op_index => |bad_op_idx| {
                         log.warn("inference", "Metal LayerOp program uses unsupported buffer id", .{
                             .layer = layer_idx,
-                            .op_index = op_idx,
-                            .kind = kind,
-                            .debug_type = @tagName(kernel_op.debug_type),
+                            .op_index = bad_op_idx,
+                            .kind = @intFromEnum(kind),
+                            .op = @tagName(program[bad_op_idx]),
                         });
-                        return error.NotImplemented;
-                    }
-                },
-                .add => |add_op| {
-                    if (!layer_ops.isCoreProgramBuffer(add_op.branch)) {
-                        log.warn("inference", "Metal LayerOp add uses unsupported buffer id", .{
+                    },
+                    .final_output => |out| {
+                        log.warn("inference", "Metal LayerOp program final buffer is unsupported", .{
                             .layer = layer_idx,
-                            .op_index = op_idx,
-                            .kind = kind,
+                            .kind = @intFromEnum(kind),
+                            .out = @intFromEnum(out),
                         });
-                        return error.NotImplemented;
-                    }
+                    },
                 },
-                else => {},
             }
-        }
-
-        if (!layer_ops.isCoreProgramBuffer(finalOutputBuffer(program))) {
-            log.warn("inference", "Metal LayerOp program final buffer is unsupported", .{
-                .layer = layer_idx,
-                .kind = @intFromEnum(kind),
-            });
             return error.NotImplemented;
         }
     }

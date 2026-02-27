@@ -11,12 +11,12 @@
 
 const std = @import("std");
 const tensor = @import("../../../../tensor.zig");
-const backend_contract = @import("../../contract.zig");
 const models = @import("../../../../models/root.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const compute = @import("../../../../compute/root.zig");
 const image_mod = @import("../../../../image/root.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 const common_vision = @import("../../../vision_types.zig");
 const vision_tensor_convert = @import("../../../vision_tensor_convert.zig");
 const vision_program_mod = @import("../../../vision_program.zig");
@@ -116,7 +116,7 @@ pub const VisionRuntime = struct {
     };
 
     comptime {
-        backend_contract.assertAdapterTableCoverage(
+        runtime_contract.assertAdapterTableCoverage(
             vision_program_adapter_table,
             vision_program_required_opcodes,
             "metal.vision.native_split_qkv.vision_program_adapter_table",

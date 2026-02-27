@@ -101,41 +101,6 @@ fn requireEnumTag(comptime E: type, comptime owner_name: []const u8, comptime ta
     @compileError("Contract for '" ++ owner_name ++ "' missing enum tag '" ++ tag_name ++ "'");
 }
 
-/// Assert a backend opcode adapter table exposes adapters for every opcode in
-/// `required_opcodes`.
-///
-/// This enforces adapter-table completeness at compile time to prevent runtime
-/// `Unsupported*` errors when a backend declares support for an opcode class.
-pub fn assertAdapterTableCoverage(
-    comptime table: anytype,
-    comptime required_opcodes: anytype,
-    comptime owner_name: []const u8,
-) void {
-    const table_type = @TypeOf(table);
-    const table_info = @typeInfo(table_type);
-    if (table_info != .array) {
-        @compileError("Contract for '" ++ owner_name ++ "' requires a fixed array adapter table");
-    }
-    if (table_info.array.len != 256) {
-        @compileError("Contract for '" ++ owner_name ++ "' adapter table must have 256 slots");
-    }
-    if (@typeInfo(table_info.array.child) != .optional) {
-        @compileError("Contract for '" ++ owner_name ++ "' adapter table elements must be optional");
-    }
-
-    inline for (required_opcodes) |opcode| {
-        const idx: usize = @intCast(@intFromEnum(opcode));
-        if (idx >= table_info.array.len) {
-            @compileError("Contract for '" ++ owner_name ++ "' opcode index out of bounds");
-        }
-        if (table[idx] == null) {
-            @compileError(
-                "Contract for '" ++ owner_name ++ "' missing adapter for opcode '" ++ @tagName(opcode) ++ "'",
-            );
-        }
-    }
-}
-
 const required_kernel_names = [_][]const u8{
     "attention",
     "describe_fmt",
@@ -510,8 +475,6 @@ pub fn assertBackendType(comptime T: type) void {
     }
 }
 
-fn demoAdapterNoop() void {}
-
 test "assertBackendModuleLayout validates CPU backend module layout" {
     const cpu = @import("cpu/root.zig");
     assertBackendModuleLayout(cpu, "cpu");
@@ -565,25 +528,4 @@ test "assertUnsupportedKernelPolicy validates unsupported-kernel contract" {
 test "assertBackendType validates backend trait contract" {
     const cpu = @import("cpu/root.zig");
     assertBackendType(cpu.BackendType);
-}
-
-test "assertAdapterTableCoverage validates required opcode slots" {
-    comptime {
-        const DemoOpcode = enum(u8) {
-            a = 0,
-            b = 3,
-        };
-        const DemoAdapter = *const fn () void;
-
-        const demo_table: [256]?DemoAdapter = blk: {
-            var table: [256]?DemoAdapter = [_]?DemoAdapter{null} ** 256;
-            table[@intFromEnum(DemoOpcode.a)] = demoAdapterNoop;
-            table[@intFromEnum(DemoOpcode.b)] = demoAdapterNoop;
-            break :blk table;
-        };
-        const required = [_]DemoOpcode{ .a, .b };
-        assertAdapterTableCoverage(demo_table, required, "demo.adapter_table");
-    }
-
-    try std.testing.expect(true);
 }

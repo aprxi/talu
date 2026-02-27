@@ -321,6 +321,10 @@ fn serializeLayerOpParam(
     opcode: runtime_contract.Opcode,
     op: layer_ops.LayerOp,
 ) !runtime_contract.ParamBlock {
+    if (@sizeOf(layer_ops.LayerOp) > runtime_contract.max_param_block_data_bytes_v1) {
+        return error.InvalidParamBlockABI;
+    }
+
     var owned = try cloneLayerOpOwned(allocator, op);
     errdefer deinitOwnedLayerOp(allocator, &owned);
 
@@ -331,7 +335,7 @@ fn serializeLayerOpParam(
     );
     @memcpy(payload[0..@sizeOf(layer_ops.LayerOp)], std.mem.asBytes(&owned));
     return .{
-        .version = 1,
+        .version = runtime_contract.param_block_abi_version_v1,
         .opcode = opcode,
         .data = payload,
     };
@@ -570,11 +574,8 @@ fn validateProgramBlockKindStateCompatibility(
     program: []const layer_ops.LayerOp,
     block_kind: op_types.BlockKind,
 ) !void {
-    for (program) |op| {
-        const opcode = opcode_map.opcodeForLayerOp(op);
-        if (!runtime_contract.opcodeStateCompatibleWithBlockKind(opcode, block_kind)) {
-            return error.InvalidStateDescriptorBinding;
-        }
+    if (runtime_contract.firstLayerProgramStateMismatch(program, block_kind) != null) {
+        return error.InvalidStateDescriptorBinding;
     }
 }
 
@@ -1030,6 +1031,20 @@ test "compileLayerProgram emits deterministic weight bindings for parameterized 
     try std.testing.expectEqual(@as(u32, 1), compiled.plan.instructions[2].weights[0].index);
 }
 
+test "compileLayerProgram emits param blocks compliant with runtime ABI contract" {
+    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    for (compiled.param_blocks) |param_block| {
+        try std.testing.expectEqual(
+            runtime_contract.param_block_abi_version_v1,
+            param_block.version,
+        );
+        try std.testing.expect(param_block.data.len <= runtime_contract.max_param_block_data_bytes_v1);
+        try runtime_contract.validateParamBlockAbi(&param_block);
+    }
+}
+
 test "compileProgramForArchitecture resolves registry programs" {
     var compiled = try compileProgramForArchitecture(std.testing.allocator, "granite_hybrid", .mamba, .decode);
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
@@ -1044,6 +1059,29 @@ test "compileLayerProgram emits summary diagnostics" {
     try std.testing.expect(compiled.diagnostics.len >= 1);
     try std.testing.expectEqual(runtime_contract.PlanDiagnosticLevel.info, compiled.diagnostics[0].level);
     try std.testing.expect(std.mem.startsWith(u8, compiled.diagnostics[0].message, "plan_compiled mode=decode"));
+}
+
+test "compileLayerProgram is deterministic across repeated compiles of same program" {
+    var first = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &first);
+    var second = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &second);
+
+    try std.testing.expectEqual(first.plan.instructions.len, second.plan.instructions.len);
+    try std.testing.expectEqual(first.param_blocks.len, second.param_blocks.len);
+    try std.testing.expectEqual(first.weight_bindings.len, second.weight_bindings.len);
+    try std.testing.expectEqual(first.plan.register_count, second.plan.register_count);
+    try std.testing.expectEqual(first.peak_registers, second.peak_registers);
+
+    for (first.weight_bindings, second.weight_bindings) |lhs, rhs| {
+        try std.testing.expectEqual(lhs.index, rhs.index);
+        try std.testing.expectEqualStrings(lhs.name, rhs.name);
+    }
+    for (first.param_blocks, second.param_blocks) |lhs, rhs| {
+        try std.testing.expectEqual(lhs.version, rhs.version);
+        try std.testing.expectEqual(lhs.opcode, rhs.opcode);
+        try std.testing.expectEqualSlices(u8, lhs.data, rhs.data);
+    }
 }
 
 test "compileLayerProgram emits empty plan warning diagnostics" {
