@@ -117,62 +117,8 @@ function makeModel(id: string, opts?: { pinned?: boolean; source?: string }): an
   };
 }
 
-// ── Tab switching ───────────────────────────────────────────────────────────
-
-describe("Tab switching", () => {
-  test("clicking local tab switches to local", () => {
-    wireRepoEvents();
-    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
-    expect(repoState.tab).toBe("local");
-  });
-
-  test("clicking discover tab switches to discover", () => {
-    repoState.tab = "local";
-    wireRepoEvents();
-    getRepoDom().tabDiscover.dispatchEvent(new Event("click"));
-    expect(repoState.tab).toBe("discover");
-  });
-
-  test("clicking same tab does nothing", () => {
-    repoState.tab = "discover";
-    wireRepoEvents();
-    getRepoDom().tabDiscover.dispatchEvent(new Event("click"));
-    // No API call should be made (no reload triggered).
-    expect(apiCalls.length).toBe(0);
-  });
-
-  test("tab switch clears selections", () => {
-    repoState.selectedIds.add("m1");
-    repoState.selectedIds.add("m2");
-    wireRepoEvents();
-    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
-    expect(repoState.selectedIds.size).toBe(0);
-  });
-
-  test("tab switch clears search query", () => {
-    repoState.searchQuery = "old query";
-    wireRepoEvents();
-    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
-    expect(repoState.searchQuery).toBe("");
-  });
-
-  test("switching to local tab does not call searchHub", async () => {
-    wireRepoEvents();
-    getRepoDom().tabLocal.dispatchEvent(new Event("click"));
-    await flushAsync();
-
-    expect(apiCalls.filter((c) => c.method === "searchRepoModels").length).toBe(0);
-  });
-
-  test("switching to discover tab triggers searchHub", async () => {
-    repoState.tab = "local";
-    wireRepoEvents();
-    getRepoDom().tabDiscover.dispatchEvent(new Event("click"));
-    await flushAsync();
-
-    expect(apiCalls.some((c) => c.method === "searchRepoModels")).toBe(true);
-  });
-});
+// Tab switching is now handled by the subnav event bus (subnav.tab) in index.ts,
+// not by wireRepoEvents(). Those tests have been removed.
 
 // ── Source toggle ───────────────────────────────────────────────────────────
 

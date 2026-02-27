@@ -9,11 +9,11 @@ import {
 
 const STORAGE_KEY = "talu.keybindings";
 
-beforeEach(() => {
+beforeEach(async () => {
   // loadKeybindingOverrides only overwrites the in-memory cache when
   // localStorage contains a parseable value, so seed an empty object first.
   localStorage.setItem(STORAGE_KEY, "{}");
-  loadKeybindingOverrides();
+  await loadKeybindingOverrides();
   localStorage.removeItem(STORAGE_KEY);
 });
 
@@ -76,19 +76,19 @@ describe("getKeybindingOverrides", () => {
 });
 
 describe("loadKeybindingOverrides", () => {
-  test("loads overrides from localStorage", () => {
+  test("loads overrides from localStorage", async () => {
     localStorage.setItem(STORAGE_KEY, JSON.stringify({ "cmd.x": "alt+x" }));
-    loadKeybindingOverrides();
+    await loadKeybindingOverrides();
     expect(resolveKeybinding("cmd.x")).toBe("alt+x");
   });
 
-  test("handles corrupt localStorage gracefully", () => {
+  test("handles corrupt localStorage gracefully", async () => {
     localStorage.setItem(STORAGE_KEY, "not-json{{{");
-    expect(() => loadKeybindingOverrides()).not.toThrow();
+    await loadKeybindingOverrides();
     expect(Object.keys(getKeybindingOverrides())).toHaveLength(0);
   });
 
-  test("handles missing localStorage gracefully", () => {
-    expect(() => loadKeybindingOverrides()).not.toThrow();
+  test("handles missing localStorage gracefully", async () => {
+    await loadKeybindingOverrides();
   });
 });

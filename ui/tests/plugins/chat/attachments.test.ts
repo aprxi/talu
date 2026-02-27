@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, test } from "bun:test";
 import {
-  buildAttachmentReferencePrefix,
-  composeUserInputWithAttachments,
+  composeUserInput,
   hasAttachments,
 } from "../../../src/plugins/chat/attachments.ts";
 import { chatState, type ChatAttachment } from "../../../src/plugins/chat/state.ts";
@@ -35,42 +34,38 @@ describe("chat attachments helpers", () => {
     expect(hasAttachments()).toBe(true);
   });
 
-  test("buildAttachmentReferencePrefix includes id, name, size, and mime when present", () => {
-    const prefix = buildAttachmentReferencePrefix([
-      makeAttachment("file_1", "report.pdf", 2048, "application/pdf"),
-      makeAttachment("file_2", "raw.bin", 99, null),
-    ]);
-
-    expect(prefix).toContain("<attachments>");
-    expect(prefix).toContain('<file_ref id="file_1" name="report.pdf" bytes="2048" mime_type="application/pdf" />');
-    expect(prefix).toContain('<file_ref id="file_2" name="raw.bin" bytes="99" />');
-    expect(prefix).toContain("</attachments>");
-  });
-
-  test("buildAttachmentReferencePrefix escapes XML attributes", () => {
-    const prefix = buildAttachmentReferencePrefix([
-      makeAttachment("file_1", 'a "b" <c>.txt', 12, 'text/plain; charset="utf-8"'),
-    ]);
-
-    expect(prefix).toContain('name="a &quot;b&quot; &lt;c&gt;.txt"');
-    expect(prefix).toContain('mime_type="text/plain; charset=&quot;utf-8&quot;"');
-  });
-
-  test("composeUserInputWithAttachments returns raw trimmed text when no attachments", () => {
-    const result = composeUserInputWithAttachments("  hello world  ");
+  test("composeUserInput returns raw trimmed text when no attachments", () => {
+    const result = composeUserInput("  hello world  ");
     expect(result).toBe("hello world");
   });
 
-  test("composeUserInputWithAttachments prefixes attachments before user text", () => {
+  test("composeUserInput returns structured input with file parts when attachments present", () => {
     chatState.attachments = [makeAttachment("file_1", "manual.pdf", 12345, "application/pdf")];
-    const result = composeUserInputWithAttachments("Please summarize this.");
-    expect(result).toContain('<file_ref id="file_1" name="manual.pdf" bytes="12345" mime_type="application/pdf" />');
-    expect(result).toContain("Please summarize this.");
+    const result = composeUserInput("Please summarize this.");
+    expect(Array.isArray(result)).toBe(true);
+    const items = result as any[];
+    expect(items.length).toBe(1);
+    expect(items[0].type).toBe("message");
+    expect(items[0].role).toBe("user");
+    const parts = items[0].content;
+    expect(parts.some((p: any) => p.type === "input_file" && p.file_url === "file_1")).toBe(true);
+    expect(parts.some((p: any) => p.type === "input_text" && p.text === "Please summarize this.")).toBe(true);
   });
 
-  test("composeUserInputWithAttachments emits instruction when text is empty", () => {
+  test("composeUserInput uses fallback text when input is empty", () => {
     chatState.attachments = [makeAttachment("file_1", "manual.pdf", 12345, "application/pdf")];
-    const result = composeUserInputWithAttachments("   ");
-    expect(result).toContain("Please use the attached files above.");
+    const result = composeUserInput("   ");
+    expect(Array.isArray(result)).toBe(true);
+    const items = result as any[];
+    const parts = items[0].content;
+    expect(parts.some((p: any) => p.type === "input_text" && p.text === "Describe the attached file.")).toBe(true);
+  });
+
+  test("composeUserInput creates input_image parts for image attachments", () => {
+    chatState.attachments = [makeAttachment("img_1", "photo.png", 5000, "image/png")];
+    const result = composeUserInput("Describe this image.");
+    expect(Array.isArray(result)).toBe(true);
+    const parts = (result as any[])[0].content;
+    expect(parts.some((p: any) => p.type === "input_image" && p.image_url === "img_1")).toBe(true);
   });
 });

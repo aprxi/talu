@@ -33,6 +33,9 @@ beforeEach(() => {
   fState.editingFileId = null;
   fState.selectedIds.clear();
   fState.tab = "all";
+  fState.sortBy = "name";
+  fState.sortDir = "asc";
+  fState.pagination = { currentPage: 1, pageSize: 50, totalItems: 0 };
 
   // DOM.
   initFilesDom(createDomRoot(FILES_DOM_IDS, FILES_DOM_EXTRAS, FILES_DOM_TAGS));
@@ -40,9 +43,9 @@ beforeEach(() => {
   // Deps with controllable timer.
   initFilesDeps({
     api: {
-      listFiles: async (limit: number, marker: string) => {
-        apiCalls.push({ method: "listFiles", args: [limit, marker] });
-        return { ok: true, data: { data: [], has_more: false } };
+      listFiles: async (opts?: any) => {
+        apiCalls.push({ method: "listFiles", args: [opts] });
+        return { ok: true, data: { data: [], total: 0 } };
       },
       updateFile: async (id: string, patch: any) => {
         apiCalls.push({ method: "updateFile", args: [id, patch] });
@@ -92,53 +95,8 @@ function makeFileList(...files: File[]): globalThis.FileList {
   return list as globalThis.FileList;
 }
 
-// ── Tab switching ────────────────────────────────────────────────────────────
-
-describe("Tab switching", () => {
-  test("clicking archived tab switches to archived", () => {
-    wireFileEvents();
-    getFilesDom().tabArchived.dispatchEvent(new Event("click"));
-    expect(fState.tab).toBe("archived");
-  });
-
-  test("clicking all tab switches back to all", () => {
-    fState.tab = "archived";
-    wireFileEvents();
-    getFilesDom().tabAll.dispatchEvent(new Event("click"));
-    expect(fState.tab).toBe("all");
-  });
-
-  test("tab switch clears selections", () => {
-    fState.selectedIds.add("f1");
-    fState.selectedIds.add("f2");
-    wireFileEvents();
-    getFilesDom().tabArchived.dispatchEvent(new Event("click"));
-    expect(fState.selectedIds.size).toBe(0);
-  });
-
-  test("tab switch clears preview", () => {
-    fState.selectedFileId = "f1";
-    wireFileEvents();
-    getFilesDom().tabArchived.dispatchEvent(new Event("click"));
-    expect(fState.selectedFileId).toBeNull();
-  });
-
-  test("no-op when clicking same tab", () => {
-    fState.tab = "all";
-    fState.selectedIds.add("f1");
-    wireFileEvents();
-    getFilesDom().tabAll.dispatchEvent(new Event("click"));
-    // Selection should NOT be cleared.
-    expect(fState.selectedIds.size).toBe(1);
-  });
-
-  test("tab switch triggers loadFiles", async () => {
-    wireFileEvents();
-    getFilesDom().tabArchived.dispatchEvent(new Event("click"));
-    await flushAsync();
-    expect(apiCalls.some((c) => c.method === "listFiles")).toBe(true);
-  });
-});
+// Tab switching is now handled by the subnav event bus (subnav.tab) in index.ts,
+// not by wireFileEvents(). Those tests have been removed.
 
 // ── Search debouncing ────────────────────────────────────────────────────────
 
@@ -259,8 +217,9 @@ describe("Select All / Cancel", () => {
     expect(fState.selectedIds.size).toBe(0);
   });
 
-  test("select all respects search filter", () => {
-    fState.files = [makeFile("f1", "alpha.txt"), makeFile("f2", "beta.txt")];
+  test("select all respects server-filtered files", () => {
+    // Search is server-side: fState.files already contains only matching results.
+    fState.files = [makeFile("f1", "alpha.txt")];
     fState.searchQuery = "alpha";
     wireFileEvents();
     getFilesDom().selectAllBtn.dispatchEvent(new Event("click"));

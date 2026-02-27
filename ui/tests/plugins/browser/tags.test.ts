@@ -36,20 +36,21 @@ beforeEach(() => {
   // Reset state.
   search.query = "";
   search.tagFilters = [];
-  search.results = [];
-  search.cursor = null;
-  search.hasMore = true;
-  search.isLoading = false;
   search.availableTags = [];
+  search.projectFilter = null;
   bState.selectedIds.clear();
   bState.conversations = [];
   bState.tab = "all";
+  bState.isLoading = false;
+  bState.loadGeneration = 0;
+  bState.pagination = { currentPage: 1, pageSize: 50, totalItems: 0 };
 
   initBrowserDom(createDomRoot(BROWSER_DOM_IDS, BROWSER_DOM_EXTRAS));
 
   // Initialize deps with mock API (search returns empty).
   initBrowserDeps({
     api: {
+      listConversations: async () => ({ ok: true, data: { data: [], total: 0 } }),
       search: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
       getConversation: async () => ({ ok: false, error: "mock" }),
     } as any,
@@ -83,15 +84,10 @@ describe("filterByTag", () => {
     expect(search.tagFilters).toEqual(["python"]);
   });
 
-  test("resets search pagination state", () => {
-    search.results = [makeConvo("c1")];
-    search.cursor = "abc";
-    search.hasMore = false;
+  test("resets pagination to page 1", () => {
+    bState.pagination.currentPage = 3;
     filterByTag("new");
-    expect(search.results).toEqual([]);
-    expect(search.cursor).toBeNull();
-    expect(search.hasMore).toBe(true);
-    // Note: isLoading is transiently set true by the async loadBrowserConversations().
+    expect(bState.pagination.currentPage).toBe(1);
   });
 
   test("clears selectedIds", () => {
@@ -133,14 +129,11 @@ describe("removeTagFilter", () => {
     expect(search.tagFilters).toEqual(["a"]);
   });
 
-  test("resets search pagination state", () => {
+  test("resets pagination to page 1", () => {
     search.tagFilters = ["a", "b"];
-    search.results = [makeConvo("c1")];
-    search.cursor = "xyz";
+    bState.pagination.currentPage = 5;
     removeTagFilter("a");
-    expect(search.results).toEqual([]);
-    expect(search.cursor).toBeNull();
-    expect(search.hasMore).toBe(true);
+    expect(bState.pagination.currentPage).toBe(1);
   });
 
   test("removing last tag leaves empty filters", () => {
@@ -159,17 +152,11 @@ describe("clearTagFilter", () => {
     expect(search.tagFilters).toEqual([]);
   });
 
-  test("resets search state", () => {
+  test("resets pagination to page 1", () => {
     search.tagFilters = ["a"];
-    search.results = [makeConvo("c1")];
-    search.cursor = "cur";
-    search.hasMore = false;
-    search.isLoading = true;
+    bState.pagination.currentPage = 4;
     clearTagFilter();
-    expect(search.results).toEqual([]);
-    expect(search.cursor).toBeNull();
-    expect(search.hasMore).toBe(true);
-    expect(search.isLoading).toBe(false);
+    expect(bState.pagination.currentPage).toBe(1);
   });
 
   test("no-op when already empty", () => {

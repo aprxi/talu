@@ -184,8 +184,8 @@ describe("loadAvailableTags", () => {
     await loadAvailableTags();
     expect(apiCalls.length).toBe(1);
     const req = apiCalls[0]!.args[0] as any;
-    expect(req.scope).toBe("conversations");
-    expect(req.aggregations).toEqual(["tags"]);
+    expect(req.scope).toBe("sessions");
+    expect(req.aggregations).toEqual(["tags", "projects"]);
     expect(req.limit).toBe(1);
   });
 

@@ -380,14 +380,15 @@ describe("renderTranscript", () => {
     expect(userMsgs[0]!.textContent).toContain("System prompt");
   });
 
-  test("drops standalone system messages", () => {
+  test("promotes standalone system message before assistant to user", () => {
     const items: Item[] = [
       { type: "message", role: "system", content: [{ type: "input_text", text: "Hidden" }] } as any,
       makeAssistantMessage("Response"),
     ];
     const el = renderTranscript(items);
     const userMsgs = el.querySelectorAll(".user-msg");
-    expect(userMsgs.length).toBe(0);
+    expect(userMsgs.length).toBe(1);
+    expect(userMsgs[0]!.textContent).toContain("Hidden");
   });
 
   test("renders multiple items in order", () => {

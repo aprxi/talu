@@ -10,11 +10,10 @@ import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
 import { createDomRoot, CHAT_DOM_IDS } from "../../helpers/dom.ts";
 import { mockNotifications } from "../../helpers/mocks.ts";
-import type { Disposable } from "../../../src/kernel/types.ts";
 
 /**
  * Tests for chat sidebar list — pagination (append semantics), rendering
- * (Pinned/Recent split, archived filtering, sentinel management),
+ * (project group headers, archived filtering, sentinel management),
  * refresh, and IntersectionObserver-driven infinite scroll.
  *
  * Strategy: mock API with controllable pagination results. The sentinel
@@ -35,7 +34,7 @@ beforeEach(() => {
 
   listResult = {
     ok: true,
-    data: { data: [], cursor: null, has_more: false },
+    data: { data: [], has_more: false },
   };
 
   // Reset state.
@@ -47,7 +46,10 @@ beforeEach(() => {
   chatState.streamAbort = null;
   chatState.backgroundStreamSessions = new Set();
   chatState.sidebarSearchQuery = "";
-  chatState.pagination = { cursor: null, hasMore: true, isLoading: false };
+  chatState.collapsedGroups = new Set();
+  chatState.expandedGroups = new Set();
+  chatState.sidebarSort = "recent";
+  chatState.pagination = { offset: 0, hasMore: true, isLoading: false };
 
   // DOM — sentinel must be inside sidebarList.
   const root = createDomRoot(CHAT_DOM_IDS);
@@ -59,8 +61,8 @@ beforeEach(() => {
   // Deps.
   initChatDeps({
     api: {
-      listConversations: async (cursor?: string, limit?: number) => {
-        apiCalls.push({ method: "listConversations", args: [cursor, limit] });
+      listConversations: async (params?: any) => {
+        apiCalls.push({ method: "listConversations", args: [params] });
         return listResult;
       },
     } as any,
@@ -101,11 +103,12 @@ beforeEach(() => {
 
 // -- Helpers -----------------------------------------------------------------
 
-function makeConvo(id: string, title = "Chat", marker = ""): any {
+function makeConvo(id: string, title = "Chat", marker = "", projectId?: string): any {
   return {
     id, title, marker,
     object: "conversation", created_at: 1700000000, updated_at: 1700000000,
     model: "gpt-4", items: [], metadata: {},
+    ...(projectId ? { project_id: projectId } : {}),
   };
 }
 
@@ -113,28 +116,27 @@ function sidebarItems(): HTMLElement[] {
   return [...getChatDom().sidebarList.querySelectorAll<HTMLElement>(".sidebar-item")];
 }
 
-function sectionLabels(): string[] {
-  return [...getChatDom().sidebarList.querySelectorAll<HTMLElement>(".sidebar-section-label")]
+function groupLabels(): string[] {
+  return [...getChatDom().sidebarList.querySelectorAll<HTMLElement>(".sidebar-group-label .sidebar-group-name")]
     .map((el) => el.textContent ?? "");
 }
 
 // ── loadSessions ──────────────────────────────────────────────────────────────
 
 describe("loadSessions", () => {
-  test("calls API with cursor and limit", async () => {
-    chatState.pagination.cursor = "abc";
+  test("calls API with offset and limit", async () => {
+    chatState.pagination.offset = 10;
     await loadSessions();
 
     expect(apiCalls.length).toBe(1);
-    expect(apiCalls[0]!.args[0]).toBe("abc");
-    expect(apiCalls[0]!.args[1]).toBe(100);
+    expect(apiCalls[0]!.args[0]).toEqual({ offset: 10, limit: 100 });
   });
 
   test("appends results to sessions (not replaces)", async () => {
     chatState.sessions = [makeConvo("existing")];
     listResult = {
       ok: true,
-      data: { data: [makeConvo("new-1"), makeConvo("new-2")], cursor: "c2", has_more: true },
+      data: { data: [makeConvo("new-1"), makeConvo("new-2")], has_more: true },
     };
 
     await loadSessions();
@@ -145,22 +147,22 @@ describe("loadSessions", () => {
     expect(chatState.sessions[2]!.id).toBe("new-2");
   });
 
-  test("updates pagination cursor and hasMore", async () => {
+  test("updates pagination offset and hasMore", async () => {
     listResult = {
       ok: true,
-      data: { data: [makeConvo("c1")], cursor: "next-page", has_more: true },
+      data: { data: [makeConvo("c1")], has_more: true },
     };
 
     await loadSessions();
 
-    expect(chatState.pagination.cursor).toBe("next-page");
+    expect(chatState.pagination.offset).toBe(1);
     expect(chatState.pagination.hasMore).toBe(true);
   });
 
   test("sets hasMore=false when no more pages", async () => {
     listResult = {
       ok: true,
-      data: { data: [makeConvo("c1")], cursor: null, has_more: false },
+      data: { data: [makeConvo("c1")], has_more: false },
     };
 
     await loadSessions();
@@ -223,14 +225,14 @@ describe("loadSessions", () => {
     // Page 1.
     listResult = {
       ok: true,
-      data: { data: [makeConvo("p1-a"), makeConvo("p1-b")], cursor: "c2", has_more: true },
+      data: { data: [makeConvo("p1-a"), makeConvo("p1-b")], has_more: true },
     };
     await loadSessions();
 
     // Page 2.
     listResult = {
       ok: true,
-      data: { data: [makeConvo("p2-a")], cursor: null, has_more: false },
+      data: { data: [makeConvo("p2-a")], has_more: false },
     };
     await loadSessions();
 
@@ -268,38 +270,30 @@ describe("renderSidebar", () => {
     expect(sidebarItems().map((el) => el.dataset["id"])).toEqual(["c1", "c3"]);
   });
 
-  test("splits into Pinned and Recent sections", () => {
+  test("renders pinned items before unpinned within a group", () => {
     chatState.sessions = [
-      makeConvo("c1", "Pinned Chat", "pinned"),
-      makeConvo("c2", "Regular Chat"),
+      makeConvo("c1", "Regular Chat"),
+      makeConvo("c2", "Pinned Chat", "pinned"),
     ];
     renderSidebar();
 
-    const labels = sectionLabels();
-    expect(labels).toContain("Pinned");
-    expect(labels).toContain("Recent");
-    expect(sidebarItems().length).toBe(2);
+    const items = sidebarItems();
+    expect(items.length).toBe(2);
+    // Pinned item should appear first.
+    expect(items[0]!.dataset["id"]).toBe("c2");
+    expect(items[1]!.dataset["id"]).toBe("c1");
   });
 
-  test("shows only Pinned label when all are pinned (no Recent label)", () => {
+  test("renders project group headers when multiple projects", () => {
     chatState.sessions = [
-      makeConvo("c1", "Pin 1", "pinned"),
-      makeConvo("c2", "Pin 2", "pinned"),
+      makeConvo("c1", "Chat A", "", "ProjectX"),
+      makeConvo("c2", "Chat B", "", "ProjectY"),
     ];
     renderSidebar();
 
-    const labels = sectionLabels();
-    expect(labels).toContain("Pinned");
-    expect(labels).not.toContain("Recent");
-  });
-
-  test("no section labels when only unpinned sessions", () => {
-    chatState.sessions = [makeConvo("c1", "Chat 1"), makeConvo("c2", "Chat 2")];
-    renderSidebar();
-
-    const labels = sectionLabels();
-    expect(labels).not.toContain("Pinned");
-    expect(labels).not.toContain("Recent");
+    const labels = groupLabels();
+    expect(labels).toContain("ProjectX");
+    expect(labels).toContain("ProjectY");
   });
 
   test("hides sentinel when no more pages", () => {
@@ -415,14 +409,14 @@ describe("renderSidebar", () => {
 // ── refreshSidebar ────────────────────────────────────────────────────────────
 
 describe("refreshSidebar", () => {
-  test("resets pagination state before reload", async () => {
+  test("replaces sessions with fresh data", async () => {
     chatState.sessions = [makeConvo("old")];
-    chatState.pagination.cursor = "old-cursor";
+    chatState.pagination.offset = 50;
     chatState.pagination.hasMore = false;
 
     listResult = {
       ok: true,
-      data: { data: [makeConvo("fresh")], cursor: null, has_more: false },
+      data: { data: [makeConvo("fresh")], has_more: false },
     };
 
     await refreshSidebar();
@@ -432,7 +426,7 @@ describe("refreshSidebar", () => {
     expect(chatState.sessions[0]!.id).toBe("fresh");
   });
 
-  test("resets cursor and hasMore before load", async () => {
+  test("fetches from offset 0", async () => {
     chatState.pagination.offset = 50;
     chatState.pagination.hasMore = false;
 
@@ -455,7 +449,7 @@ describe("setupInfiniteScroll", () => {
   test("triggers loadSessions when sentinel is intersecting", async () => {
     listResult = {
       ok: true,
-      data: { data: [makeConvo("scroll-1")], cursor: null, has_more: false },
+      data: { data: [makeConvo("scroll-1")], has_more: false },
     };
     setupInfiniteScroll();
 

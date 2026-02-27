@@ -1,7 +1,6 @@
 import { describe, test, expect, beforeEach } from "bun:test";
 import {
   loadFiles,
-  getFilteredFiles,
   renameFile,
   deleteFile,
   uploadFiles,
@@ -33,6 +32,7 @@ let confirmResult: boolean;
 let listFilesResult: any;
 let updateFileResult: any;
 let deleteFileResult: any;
+let batchFilesResult: any;
 
 beforeEach(() => {
   apiCalls = [];
@@ -40,9 +40,10 @@ beforeEach(() => {
   notif = mockNotifications();
   confirmResult = true;
 
-  listFilesResult = { ok: true, data: { data: [], has_more: false } };
+  listFilesResult = { ok: true, data: { data: [], total: 0 } };
   updateFileResult = { ok: true, data: makeFile("f1", "renamed.txt") };
   deleteFileResult = { ok: true };
+  batchFilesResult = { ok: true };
 
   // Reset state.
   fState.files = [];
@@ -52,6 +53,9 @@ beforeEach(() => {
   fState.editingFileId = null;
   fState.selectedIds.clear();
   fState.tab = "all";
+  fState.sortBy = "name";
+  fState.sortDir = "asc";
+  fState.pagination = { currentPage: 1, pageSize: 50, totalItems: 0 };
 
   // DOM.
   initFilesDom(createDomRoot(FILES_DOM_IDS, FILES_DOM_EXTRAS, FILES_DOM_TAGS));
@@ -59,8 +63,8 @@ beforeEach(() => {
   // Deps.
   initFilesDeps({
     api: {
-      listFiles: async (limit: number, marker: string) => {
-        apiCalls.push({ method: "listFiles", args: [limit, marker] });
+      listFiles: async (opts?: any) => {
+        apiCalls.push({ method: "listFiles", args: [opts] });
         return listFilesResult;
       },
       updateFile: async (id: string, patch: any) => {
@@ -70,6 +74,10 @@ beforeEach(() => {
       deleteFile: async (id: string) => {
         apiCalls.push({ method: "deleteFile", args: [id] });
         return deleteFileResult;
+      },
+      batchFiles: async (opts: any) => {
+        apiCalls.push({ method: "batchFiles", args: [opts] });
+        return batchFilesResult;
       },
     } as any,
     notify: notif.mock as any,
@@ -130,7 +138,7 @@ describe("loadFiles", () => {
     await loadFiles();
 
     expect(apiCalls[0]!.method).toBe("listFiles");
-    expect(apiCalls[0]!.args[1]).toBe("active");
+    expect((apiCalls[0]!.args[0] as any).marker).toBe("active");
   });
 
   test("calls API with archived marker on archived tab", async () => {
@@ -138,13 +146,13 @@ describe("loadFiles", () => {
     await loadFiles();
 
     expect(apiCalls[0]!.method).toBe("listFiles");
-    expect(apiCalls[0]!.args[1]).toBe("archived");
+    expect((apiCalls[0]!.args[0] as any).marker).toBe("archived");
   });
 
   test("populates fState.files on success", async () => {
     listFilesResult = {
       ok: true,
-      data: { data: [makeFile("f1"), makeFile("f2")], has_more: false },
+      data: { data: [makeFile("f1"), makeFile("f2")], total: 2 },
     };
     await loadFiles();
 
@@ -152,12 +160,13 @@ describe("loadFiles", () => {
     expect(fState.files[0]!.id).toBe("f1");
   });
 
-  test("clears files and notifies on API failure", async () => {
+  test("keeps existing files and notifies on API failure", async () => {
     fState.files = [makeFile("old")];
     listFilesResult = { ok: false, error: "Server error" };
     await loadFiles();
 
-    expect(fState.files.length).toBe(0);
+    // Files are preserved on failure (server-side pagination — don't discard cached data).
+    expect(fState.files.length).toBe(1);
     expect(notif.messages.some((m) => m.type === "error")).toBe(true);
   });
 
@@ -185,40 +194,6 @@ describe("loadFiles", () => {
     await loadFiles();
     expect(wasLoading).toBe(true);
     expect(fState.isLoading).toBe(false);
-  });
-});
-
-// ── getFilteredFiles ─────────────────────────────────────────────────────────
-
-describe("getFilteredFiles", () => {
-  test("returns all files when query is empty", () => {
-    fState.files = [makeFile("f1", "alpha.txt"), makeFile("f2", "beta.txt")];
-    fState.searchQuery = "";
-    expect(getFilteredFiles().length).toBe(2);
-  });
-
-  test("filters by case-insensitive substring", () => {
-    fState.files = [
-      makeFile("f1", "README.md"),
-      makeFile("f2", "index.ts"),
-      makeFile("f3", "readme.txt"),
-    ];
-    fState.searchQuery = "readme";
-    const result = getFilteredFiles();
-    expect(result.length).toBe(2);
-    expect(result.map((f) => f.id)).toEqual(["f1", "f3"]);
-  });
-
-  test("returns empty array when no match", () => {
-    fState.files = [makeFile("f1", "test.txt")];
-    fState.searchQuery = "nonexistent";
-    expect(getFilteredFiles().length).toBe(0);
-  });
-
-  test("trims whitespace from query", () => {
-    fState.files = [makeFile("f1", "test.txt")];
-    fState.searchQuery = "  test  ";
-    expect(getFilteredFiles().length).toBe(1);
   });
 });
 
@@ -419,14 +394,16 @@ describe("uploadFiles", () => {
 // ── archiveFiles ────────────────────────────────────────────────────────────
 
 describe("archiveFiles", () => {
-  test("archives all selected files", async () => {
+  test("archives all selected files via batch API", async () => {
     fState.selectedIds.add("f1");
     fState.selectedIds.add("f2");
     await archiveFiles();
 
-    const archiveCalls = apiCalls.filter((c) => c.method === "updateFile");
-    expect(archiveCalls.length).toBe(2);
-    expect((archiveCalls[0]!.args[1] as any).marker).toBe("archived");
+    const batchCalls = apiCalls.filter((c) => c.method === "batchFiles");
+    expect(batchCalls.length).toBe(1);
+    expect((batchCalls[0]!.args[0] as any).action).toBe("archive");
+    expect((batchCalls[0]!.args[0] as any).ids).toContain("f1");
+    expect((batchCalls[0]!.args[0] as any).ids).toContain("f2");
   });
 
   test("clears selection after archive", async () => {
@@ -453,14 +430,14 @@ describe("archiveFiles", () => {
 // ── restoreFiles ────────────────────────────────────────────────────────────
 
 describe("restoreFiles", () => {
-  test("restores all selected files", async () => {
+  test("restores all selected files via batch API", async () => {
     fState.selectedIds.add("f1");
     fState.selectedIds.add("f2");
     await restoreFiles();
 
-    const restoreCalls = apiCalls.filter((c) => c.method === "updateFile");
-    expect(restoreCalls.length).toBe(2);
-    expect((restoreCalls[0]!.args[1] as any).marker).toBe("active");
+    const batchCalls = apiCalls.filter((c) => c.method === "batchFiles");
+    expect(batchCalls.length).toBe(1);
+    expect((batchCalls[0]!.args[0] as any).action).toBe("unarchive");
   });
 
   test("clears selection after restore", async () => {
@@ -479,13 +456,16 @@ describe("restoreFiles", () => {
 // ── deleteFiles (bulk) ─────────────────────────────────────────────────────
 
 describe("deleteFiles", () => {
-  test("deletes all selected files after confirmation", async () => {
+  test("deletes all selected files after confirmation via batch API", async () => {
     fState.selectedIds.add("f1");
     fState.selectedIds.add("f2");
     await deleteFiles();
 
-    const delCalls = apiCalls.filter((c) => c.method === "deleteFile");
-    expect(delCalls.length).toBe(2);
+    const batchCalls = apiCalls.filter((c) => c.method === "batchFiles");
+    expect(batchCalls.length).toBe(1);
+    expect((batchCalls[0]!.args[0] as any).action).toBe("delete");
+    expect((batchCalls[0]!.args[0] as any).ids).toContain("f1");
+    expect((batchCalls[0]!.args[0] as any).ids).toContain("f2");
   });
 
   test("aborts if user cancels dialog", async () => {

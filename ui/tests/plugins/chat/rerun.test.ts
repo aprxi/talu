@@ -152,7 +152,7 @@ describe("getUserMessageInfo", () => {
     const result = getUserMessageInfo(0);
     expect(result).not.toBeNull();
     expect(result!.text).toBe("first");
-    expect(result!.forkBeforeIndex).toBe(0);
+    expect(result!.forkBeforeIndex).toBe(-1);
   });
 
   test("returns second user message at index 1", () => {
@@ -167,7 +167,7 @@ describe("getUserMessageInfo", () => {
     } as any;
     const result = getUserMessageInfo(1);
     expect(result!.text).toBe("second");
-    expect(result!.forkBeforeIndex).toBe(2);
+    expect(result!.forkBeforeIndex).toBe(1);
   });
 
   test("returns null for empty text at index", () => {
@@ -190,8 +190,8 @@ describe("getUserMessageInfo", () => {
     const result = getUserMessageInfo(0);
     expect(result).not.toBeNull();
     expect(result!.text).toBe("actual input");
-    // forkBeforeIndex points to the system message.
-    expect(result!.forkBeforeIndex).toBe(0);
+    // forkBeforeIndex is itemIndex-1; system workaround has itemIndex=0, so -1.
+    expect(result!.forkBeforeIndex).toBe(-1);
   });
 
   test("handles developer message workaround (same as system)", () => {
@@ -206,7 +206,7 @@ describe("getUserMessageInfo", () => {
     const result = getUserMessageInfo(0);
     expect(result).not.toBeNull();
     expect(result!.text).toBe("dev input");
-    expect(result!.forkBeforeIndex).toBe(0);
+    expect(result!.forkBeforeIndex).toBe(-1);
   });
 
   test("mixed normal and system-workaround messages index correctly", () => {
@@ -226,6 +226,6 @@ describe("getUserMessageInfo", () => {
 
     const second = getUserMessageInfo(1);
     expect(second!.text).toBe("normal input");
-    expect(second!.forkBeforeIndex).toBe(3);
+    expect(second!.forkBeforeIndex).toBe(2);
   });
 });

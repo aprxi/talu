@@ -26,14 +26,14 @@ beforeEach(() => {
   // Reset state.
   search.query = "";
   search.tagFilters = [];
-  search.results = [];
-  search.cursor = null;
-  search.hasMore = true;
-  search.isLoading = false;
   search.availableTags = [];
+  search.projectFilter = null;
   bState.selectedIds.clear();
   bState.conversations = [];
   bState.tab = "all";
+  bState.isLoading = false;
+  bState.loadGeneration = 0;
+  bState.pagination = { currentPage: 1, pageSize: 50, totalItems: 0 };
 
   // DOM.
   initBrowserDom(createDomRoot(BROWSER_DOM_IDS, BROWSER_DOM_EXTRAS));
@@ -41,6 +41,10 @@ beforeEach(() => {
   // Deps with controllable timer.
   initBrowserDeps({
     api: {
+      listConversations: async (opts: any) => {
+        apiCalls.push({ method: "listConversations", args: [opts] });
+        return { ok: true, data: { data: [], total: 0 } };
+      },
       search: async (req: any) => {
         apiCalls.push({ method: "search", args: [req] });
         return { ok: true, data: { data: [], cursor: null, has_more: false } };
@@ -143,10 +147,8 @@ describe("Search debouncing", () => {
     expect(ct.pending[2]!.disposed).toBe(false);
   });
 
-  test("debounce callback resets search state", async () => {
-    search.results = [makeConvo("old")];
-    search.cursor = "old-cursor";
-    search.hasMore = false;
+  test("debounce callback updates query and resets page", async () => {
+    bState.pagination.currentPage = 3;
 
     wireEvents();
     const dom = getBrowserDom();
@@ -158,10 +160,7 @@ describe("Search debouncing", () => {
     await new Promise((r) => setTimeout(r, 10));
 
     expect(search.query).toBe("new query");
-    expect(search.results).toEqual([]);
-    expect(search.cursor).toBeNull();
-    // Note: hasMore is transiently set true by the callback, then
-    // immediately overwritten by loadBrowserConversations() from the API response.
+    expect(bState.pagination.currentPage).toBe(1);
   });
 
   test("debounce no-op when query unchanged", async () => {
@@ -238,12 +237,12 @@ describe("Select All / Cancel", () => {
     expect(bState.selectedIds.size).toBe(0);
   });
 
-  test("select all on archived tab only selects archived", () => {
+  test("select all on archived tab selects all (server-filtered) conversations", () => {
     bState.tab = "archived";
+    // Server-side filtering: bState.conversations only contains archived results.
     bState.conversations = [
-      makeConvo("c1"),                   // not archived
-      makeConvo("c2", "archived"),       // archived
-      makeConvo("c3", "archived"),       // archived
+      makeConvo("c2", "archived"),
+      makeConvo("c3", "archived"),
     ];
     wireEvents();
     getBrowserDom().selectAllBtn.dispatchEvent(new Event("click"));

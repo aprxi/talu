@@ -3,7 +3,7 @@ import { setupInputEvents, cancelGeneration, streamResponse } from "../../../src
 import { chatState } from "../../../src/plugins/chat/state.ts";
 import { initChatDeps } from "../../../src/plugins/chat/deps.ts";
 import { initChatDom, getChatDom } from "../../../src/plugins/chat/dom.ts";
-import { createDomRoot, CHAT_DOM_IDS } from "../../helpers/dom.ts";
+import { createDomRoot, CHAT_DOM_IDS, CHAT_DOM_TAGS } from "../../helpers/dom.ts";
 import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.ts";
 
 /**
@@ -13,30 +13,6 @@ import { mockTimers, mockNotifications, flushAsync } from "../../helpers/mocks.t
  * Strategy: create DOM with proper textarea/button elements, wire events,
  * dispatch keyboard/click events and verify state mutations and API calls.
  */
-
-// -- Tag overrides for elements that need textarea/button/select/input --------
-
-const CHAT_TAGS: Record<string, string> = {
-  "welcome-input": "textarea",
-  "welcome-send": "button",
-  "welcome-attach": "button",
-  "welcome-model": "select",
-  "welcome-prompt": "select",
-  "input-text": "textarea",
-  "input-send": "button",
-  "input-attach": "button",
-  "chat-file-input": "input",
-  "close-right-panel": "button",
-  "panel-model": "select",
-  "panel-temperature": "input",
-  "panel-top-p": "input",
-  "panel-top-k": "input",
-  "panel-min-p": "input",
-  "panel-max-output-tokens": "input",
-  "panel-repetition-penalty": "input",
-  "panel-seed": "input",
-  "new-conversation": "button",
-};
 
 // -- Mock state --------------------------------------------------------------
 
@@ -58,10 +34,10 @@ beforeEach(() => {
   chatState.isUploadingAttachments = false;
   chatState.isGenerating = false;
   chatState.streamAbort = null;
-  chatState.pagination = { cursor: null, hasMore: true, isLoading: false };
+  chatState.pagination = { offset: 0, hasMore: true, isLoading: false };
 
   // DOM with proper element types.
-  const root = createDomRoot(CHAT_DOM_IDS, undefined, CHAT_TAGS);
+  const root = createDomRoot(CHAT_DOM_IDS, undefined, CHAT_DOM_TAGS);
   const list = root.querySelector("#sidebar-list")!;
   const sentinel = root.querySelector("#loader-sentinel")!;
   list.appendChild(sentinel);
@@ -75,9 +51,9 @@ beforeEach(() => {
         if (createResponseResult) return createResponseResult;
         return new Response(JSON.stringify({ error: { message: "mock" } }), { status: 500 });
       },
-      listConversations: async (_cursor?: any, _limit?: number) => {
-        apiCalls.push({ method: "listConversations", args: [_cursor, _limit] });
-        return { ok: true, data: { data: [{ id: "conv-1" }], cursor: null, has_more: false } };
+      listConversations: async (params?: any) => {
+        apiCalls.push({ method: "listConversations", args: [params] });
+        return { ok: true, data: { data: [{ id: "conv-1" }], has_more: false } };
       },
       getConversation: async (id: string) => {
         apiCalls.push({ method: "getConversation", args: [id] });
@@ -284,7 +260,7 @@ describe("streamResponse", () => {
           wasGenerating = chatState.isGenerating;
           return new Response(JSON.stringify({ error: { message: "err" } }), { status: 500 });
         },
-        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        listConversations: async () => ({ ok: true, data: { data: [], has_more: false } }),
         getConversation: async () => ({ ok: false, error: "not found" }),
       } as any,
       notifications: notif.mock as any,
@@ -331,7 +307,7 @@ describe("streamResponse", () => {
           expect(chatState.streamAbort!.signal).toBe(signal);
           return new Response(JSON.stringify({ error: { message: "err" } }), { status: 500 });
         },
-        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        listConversations: async () => ({ ok: true, data: { data: [], has_more: false } }),
         getConversation: async () => ({ ok: false, error: "not found" }),
       } as any,
       notifications: notif.mock as any,
@@ -390,13 +366,13 @@ describe("streamResponse", () => {
     initChatDeps({
       api: {
         createResponse: async () => new Response(sseBody, { status: 200 }),
-        listConversations: async (_cursor?: any, _limit?: number) => {
-          apiCalls.push({ method: "listConversations", args: [_cursor, _limit] });
+        listConversations: async (params?: any) => {
+          apiCalls.push({ method: "listConversations", args: [params] });
           return {
             ok: true,
             data: {
               data: [{ id: "conv-discovered", title: "D", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4", marker: "" }],
-              cursor: null, has_more: false,
+              has_more: false,
             },
           };
         },
@@ -436,13 +412,13 @@ describe("streamResponse", () => {
     initChatDeps({
       api: {
         createResponse: async () => new Response(sseBody, { status: 200 }),
-        listConversations: async (_cursor?: any, _limit?: number) => {
-          apiCalls.push({ method: "listConversations", args: [_cursor, _limit] });
+        listConversations: async (params?: any) => {
+          apiCalls.push({ method: "listConversations", args: [params] });
           return {
             ok: true,
             data: {
               data: [{ id: "existing-session", title: "S", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4", marker: "" }],
-              cursor: null, has_more: false,
+              has_more: false,
             },
           };
         },
@@ -471,7 +447,7 @@ describe("streamResponse", () => {
 
     // discoverSessionId calls listConversations(null, 1); should NOT be called
     // when activeSessionId is already set.
-    expect(apiCalls.some((c) => c.method === "listConversations" && c.args[1] === 1)).toBe(false);
+    expect(apiCalls.some((c) => c.method === "listConversations" && c.args[0]?.limit === 1)).toBe(false);
   });
 });
 
@@ -486,7 +462,7 @@ describe("chat.send.before hook", () => {
           apiCalls.push({ method: "createResponse", args: [body] });
           return new Response(JSON.stringify({ error: { message: "mock" } }), { status: 500 });
         }),
-        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        listConversations: async () => ({ ok: true, data: { data: [], has_more: false } }),
         getConversation: async (id: string) => ({
           ok: true, data: { id, title: "Test", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
         }),
@@ -529,7 +505,7 @@ describe("chat.send.before hook", () => {
       },
     );
 
-    await streamResponse({ text: "Hello" });
+    await streamResponse({ text: "Hello", input: "Hello" });
 
     expect(capturedBody.model).toBe("overridden-model");
     expect(capturedBody.input).toBe("Hello");
@@ -566,7 +542,7 @@ describe("chat.send.before hook", () => {
       },
     );
 
-    await streamResponse({ text: "Test message" });
+    await streamResponse({ text: "Test message", input: "Test message" });
 
     expect(capturedBody.input).toBe("Test message");
     expect(capturedBody.model).toBe("gpt-4");
@@ -586,7 +562,7 @@ describe("chat.receive.after hook", () => {
     initChatDeps({
       api: {
         createResponse: async () => new Response(sseBody, { status: 200 }),
-        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        listConversations: async () => ({ ok: true, data: { data: [], has_more: false } }),
         getConversation: async (id: string) => ({
           ok: true, data: { id, title: "Original Title", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
         }),
@@ -636,7 +612,7 @@ describe("chat.receive.after hook", () => {
     initChatDeps({
       api: {
         createResponse: async () => new Response(sseBody, { status: 200 }),
-        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        listConversations: async () => ({ ok: true, data: { data: [], has_more: false } }),
         getConversation: async (id: string) => ({
           ok: true, data: { id, title: "Chat", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
         }),
@@ -685,7 +661,7 @@ describe("chat.receive.after hook", () => {
     initChatDeps({
       api: {
         createResponse: async () => new Response(sseBody, { status: 200 }),
-        listConversations: async () => ({ ok: true, data: { data: [], cursor: null, has_more: false } }),
+        listConversations: async () => ({ ok: true, data: { data: [], has_more: false } }),
         getConversation: async (id: string) => ({
           ok: true, data: { id, title: "Original", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
         }),
@@ -720,5 +696,142 @@ describe("chat.receive.after hook", () => {
     // Should fall back to original data, not crash.
     expect(chatState.activeChat).not.toBeNull();
     expect(chatState.activeChat!.title).toBe("Original");
+  });
+});
+
+// ── Optimistic sidebar add (regression guard) ────────────────────────────────
+//
+// These tests guard the contract: "a new chat item appears in the sidebar the
+// moment the user presses send, regardless of strict_responses mode."  This
+// behavior has regressed multiple times — these are explicit regression guards.
+
+describe("optimistic sidebar add", () => {
+  test("new chat adds placeholder sidebar item immediately on send", async () => {
+    chatState.activeSessionId = null;
+    chatState.sessions = [];
+
+    // Default mock returns 500, which causes early return — placeholder persists.
+    await streamResponse({ text: "Hello", input: "Hello" });
+
+    expect(chatState.sessions.length).toBeGreaterThanOrEqual(1);
+    expect(chatState.sessions[0]!.id).toMatch(/^__pending_/);
+    expect(chatState.activeSessionId).toMatch(/^__pending_/);
+  });
+
+  test("placeholder has correct title and project_id", async () => {
+    chatState.activeSessionId = null;
+    chatState.sessions = [];
+    chatState.pendingProjectId = "proj-1";
+
+    await streamResponse({ text: "Hello world from test", input: "Hello world from test" });
+
+    const placeholder = chatState.sessions.find((s: any) => s.id.startsWith("__pending_"));
+    expect(placeholder).toBeDefined();
+    expect(placeholder!.title).toBe("Hello world from test");
+    expect(placeholder!.project_id).toBe("proj-1");
+  });
+
+  test("discoverSessionId replaces placeholder with real session ID", async () => {
+    chatState.activeSessionId = null;
+    chatState.sessions = [];
+
+    const sseBody = "event: response.completed\ndata: {}\n\n";
+    const now = Math.floor(Date.now() / 1000);
+
+    initChatDeps({
+      api: {
+        createResponse: async () => new Response(sseBody, { status: 200 }),
+        listConversations: async (params?: any) => ({
+          ok: true,
+          data: {
+            data: [{ id: "real-session-123", title: "T", object: "conversation", created_at: now, updated_at: now, model: "gpt-4", marker: "" }],
+            has_more: false,
+          },
+        }),
+        getConversation: async (id: string) => ({
+          ok: true,
+          data: { id, title: "Test", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
+        }),
+      } as any,
+      notifications: notif.mock as any,
+      services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      layout: { setTitle: () => {} } as any,
+      clipboard: { writeText: async () => {} } as any,
+      download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: { on: () => ({ dispose() {} }), run: async <T>(_: string, v: T) => v } as any,
+      timers: mockTimers(),
+      observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
+    });
+
+    await streamResponse({ text: "Hello", input: "Hello", discoverSession: true });
+
+    expect(chatState.activeSessionId).toBe("real-session-123");
+    expect(chatState.sessions.some((s: any) => s.id.startsWith("__pending_"))).toBe(false);
+  });
+
+  test("onSessionDiscovered removes placeholder and adds real session", async () => {
+    chatState.activeSessionId = null;
+    chatState.sessions = [];
+
+    const sseBody =
+      "event: response.created\n" +
+      'data: {"response":{"id":"resp-1","metadata":{"session_id":"real-session-456"}}}\n\n' +
+      "event: response.completed\n" +
+      'data: {"response":{"id":"resp-1"}}\n\n';
+    const now = Math.floor(Date.now() / 1000);
+
+    initChatDeps({
+      api: {
+        createResponse: async () => new Response(sseBody, { status: 200 }),
+        listConversations: async () => ({
+          ok: true,
+          data: {
+            data: [{ id: "real-session-456", title: "T", object: "conversation", created_at: now, updated_at: now, model: "gpt-4", marker: "" }],
+            has_more: false,
+          },
+        }),
+        getConversation: async (id: string) => ({
+          ok: true,
+          data: { id, title: "Test", items: [], object: "conversation", created_at: now, updated_at: now, model: "gpt-4" },
+        }),
+      } as any,
+      notifications: notif.mock as any,
+      services: { get: () => ({ getActiveModel: () => "gpt-4" }) } as any,
+      events: { emit: () => {}, on: () => ({ dispose() {} }) } as any,
+      layout: { setTitle: () => {} } as any,
+      clipboard: { writeText: async () => {} } as any,
+      download: { save: () => {} } as any,
+      upload: {} as any,
+      hooks: { on: () => ({ dispose() {} }), run: async <T>(_: string, v: T) => v } as any,
+      timers: mockTimers(),
+      observe: { intersection: () => ({ dispose() {} }), mutation: () => ({ dispose() {} }), resize: () => ({ dispose() {} }) } as any,
+      format: { date: () => "", dateTime: () => "", relativeTime: () => "", duration: () => "", number: () => "" } as any,
+      menus: {
+        registerItem: () => ({ dispose() {} }),
+        renderSlot: () => ({ dispose() {} }),
+      } as any,
+    });
+
+    await streamResponse({ text: "Hello", input: "Hello" });
+
+    expect(chatState.sessions.some((s: any) => s.id.startsWith("__pending_"))).toBe(false);
+    expect(chatState.sessions.some((s: any) => s.id === "real-session-456")).toBe(true);
+    expect(chatState.activeSessionId).toBe("real-session-456");
+  });
+
+  test("existing session does not create placeholder", async () => {
+    chatState.activeSessionId = "existing-session";
+    chatState.sessions = [];
+
+    await streamResponse({ text: "Hello", input: "Hello" });
+
+    expect(chatState.sessions.every((s: any) => !s.id.startsWith("__pending_"))).toBe(true);
   });
 });

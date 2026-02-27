@@ -68,16 +68,16 @@ describe("getSamplingParams", () => {
     expect(params.top_p).toBe(0.95);
   });
 
-  test("parses top_k as integer", () => {
+  test("does not include top_k in request params", () => {
     getChatDom().panelTopK.value = "40";
     const params = getSamplingParams();
-    expect(params.top_k).toBe(40);
+    expect(params.top_k).toBeUndefined();
   });
 
-  test("parses min_p as float", () => {
+  test("does not include min_p in request params", () => {
     getChatDom().panelMinP.value = "0.05";
     const params = getSamplingParams();
-    expect(params.min_p).toBe(0.05);
+    expect(params.min_p).toBeUndefined();
   });
 
   test("parses max_output_tokens as integer", () => {
@@ -86,16 +86,16 @@ describe("getSamplingParams", () => {
     expect(params.max_output_tokens).toBe(4096);
   });
 
-  test("parses repetition_penalty as float", () => {
+  test("does not include repetition_penalty in request params", () => {
     getChatDom().panelRepetitionPenalty.value = "1.1";
     const params = getSamplingParams();
-    expect(params.repetition_penalty).toBe(1.1);
+    expect(params.repetition_penalty).toBeUndefined();
   });
 
-  test("parses seed as integer", () => {
+  test("does not include seed in request params", () => {
     getChatDom().panelSeed.value = "42";
     const params = getSamplingParams();
-    expect(params.seed).toBe(42);
+    expect(params.seed).toBeUndefined();
   });
 
   test("skips whitespace-only fields", () => {
@@ -106,13 +106,12 @@ describe("getSamplingParams", () => {
 
   test("returns multiple params when set", () => {
     getChatDom().panelTemperature.value = "0.5";
-    getChatDom().panelTopK.value = "20";
-    getChatDom().panelSeed.value = "123";
+    getChatDom().panelTopP.value = "0.9";
+    getChatDom().panelMaxOutputTokens.value = "4096";
     const params = getSamplingParams();
     expect(params.temperature).toBe(0.5);
-    expect(params.top_k).toBe(20);
-    expect(params.seed).toBe(123);
-    expect(params.top_p).toBeUndefined();
+    expect(params.top_p).toBe(0.9);
+    expect(params.max_output_tokens).toBe(4096);
   });
 });
 

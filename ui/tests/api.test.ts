@@ -34,9 +34,9 @@ beforeEach(() => {
 // ── URL construction & HTTP methods ─────────────────────────────────────────
 
 describe("ApiClient — URL paths and methods", () => {
-  test("listConversations → GET /v1/sessions with default limit", async () => {
+  test("listConversations → GET /v1/chat/sessions with default limit", async () => {
     await client.listConversations();
-    expect(calls[0]!.url).toContain("/v1/sessions?");
+    expect(calls[0]!.url).toContain("/v1/chat/sessions?");
     expect(calls[0]!.url).toContain("limit=50");
     expect(calls[0]!.init?.method).toBe("GET");
   });
@@ -80,14 +80,14 @@ describe("ApiClient — URL paths and methods", () => {
 
   test("getConversation → GET with URL-encoded id", async () => {
     await client.getConversation("id/with special&chars");
-    expect(calls[0]!.url).toBe(`/v1/sessions/${encodeURIComponent("id/with special&chars")}`);
+    expect(calls[0]!.url).toBe(`/v1/chat/sessions/${encodeURIComponent("id/with special&chars")}`);
     expect(calls[0]!.init?.method).toBe("GET");
   });
 
   test("patchConversation → PATCH with body", async () => {
     const patch = { title: "new title" };
     await client.patchConversation("conv-1", patch);
-    expect(calls[0]!.url).toBe("/v1/sessions/conv-1");
+    expect(calls[0]!.url).toBe("/v1/chat/sessions/conv-1");
     expect(calls[0]!.init?.method).toBe("PATCH");
     expect(JSON.parse(calls[0]!.init!.body as string)).toEqual(patch);
   });
@@ -98,16 +98,16 @@ describe("ApiClient — URL paths and methods", () => {
     expect(calls[0]!.init?.method).toBe("DELETE");
   });
 
-  test("batchConversations → POST /v1/sessions/batch", async () => {
+  test("batchConversations → POST /v1/chat/sessions/batch", async () => {
     const req = { ids: ["a", "b"], action: "delete" };
     await client.batchConversations(req as any);
-    expect(calls[0]!.url).toBe("/v1/sessions/batch");
+    expect(calls[0]!.url).toBe("/v1/chat/sessions/batch");
     expect(calls[0]!.init?.method).toBe("POST");
   });
 
-  test("forkConversation → POST /v1/sessions/:id/fork", async () => {
+  test("forkConversation → POST /v1/chat/sessions/:id/fork", async () => {
     await client.forkConversation("conv-1", { target_item_id: 5 } as any);
-    expect(calls[0]!.url).toBe("/v1/sessions/conv-1/fork");
+    expect(calls[0]!.url).toBe("/v1/chat/sessions/conv-1/fork");
     expect(calls[0]!.init?.method).toBe("POST");
   });
 
@@ -240,16 +240,16 @@ describe("ApiClient — URL paths and methods", () => {
     expect(result.error).toBe("Invalid format");
   });
 
-  test("addConversationTags → POST /v1/sessions/:id/tags", async () => {
+  test("addConversationTags → POST /v1/chat/sessions/:id/tags", async () => {
     await client.addConversationTags("conv-1", ["rust", "wasm"]);
-    expect(calls[0]!.url).toBe("/v1/sessions/conv-1/tags");
+    expect(calls[0]!.url).toBe("/v1/chat/sessions/conv-1/tags");
     expect(calls[0]!.init?.method).toBe("POST");
     expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ tags: ["rust", "wasm"] });
   });
 
-  test("removeConversationTags → DELETE /v1/sessions/:id/tags", async () => {
+  test("removeConversationTags → DELETE /v1/chat/sessions/:id/tags", async () => {
     await client.removeConversationTags("conv-1", ["rust"]);
-    expect(calls[0]!.url).toBe("/v1/sessions/conv-1/tags");
+    expect(calls[0]!.url).toBe("/v1/chat/sessions/conv-1/tags");
     expect(calls[0]!.init?.method).toBe("DELETE");
     expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ tags: ["rust"] });
   });

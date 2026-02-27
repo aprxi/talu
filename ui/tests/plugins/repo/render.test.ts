@@ -792,22 +792,6 @@ describe("updateRepoToolbar", () => {
 // ── syncRepoTabs ────────────────────────────────────────────────────────────
 
 describe("syncRepoTabs", () => {
-  test("discover tab active on discover tab", () => {
-    repoState.tab = "discover";
-    syncRepoTabs();
-    const dom = getRepoDom();
-    expect(dom.tabDiscover.classList.contains("active")).toBe(true);
-    expect(dom.tabLocal.classList.contains("active")).toBe(false);
-  });
-
-  test("local tab active on local tab", () => {
-    repoState.tab = "local";
-    syncRepoTabs();
-    const dom = getRepoDom();
-    expect(dom.tabDiscover.classList.contains("active")).toBe(false);
-    expect(dom.tabLocal.classList.contains("active")).toBe(true);
-  });
-
   test("discover tab shows discover view and toolbar", () => {
     repoState.tab = "discover";
     syncRepoTabs();

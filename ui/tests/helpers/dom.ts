@@ -29,14 +29,17 @@ export function createDomRoot(
 
 /** Element IDs expected by getChatDom(). */
 export const CHAT_DOM_IDS = [
-  "sidebar-list", "loader-sentinel", "new-conversation", "sidebar-search", "sidebar-search-clear", "transcript",
-  "welcome-state", "welcome-input", "welcome-send", "welcome-attach", "welcome-library", "welcome-attachment-list", "welcome-model", "welcome-prompt",
+  "sidebar-list", "loader-sentinel", "sidebar-search", "sidebar-search-clear",
+  "sidebar-new-project-btn", "sidebar-collapse-all-btn", "sidebar-sort-btn",
+  "transcript",
+  "welcome-state", "welcome-project", "welcome-input", "welcome-send", "welcome-attach", "welcome-library", "welcome-attachment-list", "welcome-model", "welcome-prompt",
   "input-bar", "input-text", "input-send", "input-attach", "input-library", "input-attachment-list", "chat-file-input",
   "right-panel", "close-right-panel", "panel-model",
   "panel-temperature", "panel-top-p", "panel-top-k", "panel-min-p",
   "panel-max-output-tokens", "panel-repetition-penalty", "panel-seed",
   "panel-temperature-default", "panel-top-p-default", "panel-top-k-default",
   "panel-chat-info", "panel-info-created", "panel-info-forked-row", "panel-info-forked",
+  "panel-events-verbosity", "panel-events-clear", "panel-events-log",
 ];
 
 /** Tag overrides for chat DOM elements that need specific types. */
@@ -47,7 +50,9 @@ export const CHAT_DOM_TAGS: Record<string, string> = {
   "welcome-library": "button",
   "welcome-model": "select",
   "welcome-prompt": "select",
-  "new-conversation": "button",
+  "sidebar-new-project-btn": "button",
+  "sidebar-collapse-all-btn": "button",
+  "sidebar-sort-btn": "button",
   "sidebar-search": "input",
   "sidebar-search-clear": "button",
   "input-text": "textarea",
@@ -64,6 +69,8 @@ export const CHAT_DOM_TAGS: Record<string, string> = {
   "panel-max-output-tokens": "input",
   "panel-repetition-penalty": "input",
   "panel-seed": "input",
+  "panel-events-verbosity": "select",
+  "panel-events-clear": "button",
 };
 
 /** Element IDs expected by getBrowserDom(). */
@@ -110,11 +117,11 @@ export const SETTINGS_DOM_IDS = [
 /** Element IDs expected by getFilesDom(). */
 export const FILES_DOM_IDS = [
   "fp-upload", "fp-file-input", "fp-search", "fp-search-clear",
-  "fp-stats", "fp-count", "fp-tbody", "fp-table-container",
+  "fp-stats", "fp-count", "fp-thead", "fp-tbody", "fp-table-container",
   "fp-drop-overlay", "fp-preview", "fp-preview-content",
   "fp-tab-all", "fp-tab-archived", "fp-select-all",
   "fp-archive", "fp-restore", "fp-delete", "fp-cancel",
-  "fp-bulk-actions", "fp-toolbar",
+  "fp-bulk-actions", "fp-toolbar", "fp-pagination",
 ];
 
 /** Extra class-based elements for getFilesDom(). */
@@ -135,6 +142,7 @@ export const FILES_DOM_TAGS: Record<string, string> = {
   "fp-delete": "button",
   "fp-cancel": "button",
   "fp-search-clear": "button",
+  "fp-thead": "thead",
   "fp-tbody": "tbody",
 };
 

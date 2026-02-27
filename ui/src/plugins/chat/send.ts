@@ -102,6 +102,31 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
   let sidebarRefreshed = false;
   const projectIdForSession = chatState.pendingProjectId;
 
+  // For new chats, add an optimistic sidebar entry immediately so the item
+  // is visible the moment the user presses send — regardless of whether the
+  // server includes session_id in SSE metadata (strict_responses mode).
+  // refreshSidebar() at stream end replaces this with real API data.
+  if (!chatState.activeSessionId) {
+    const now = Math.floor(Date.now() / 1000);
+    const placeholderId = `__pending_${now}`;
+    chatState.activeSessionId = placeholderId;
+    chatState.sessions.unshift({
+      id: placeholderId,
+      object: "session",
+      created_at: now,
+      updated_at: now,
+      model: getModelsService()?.getActiveModel() ?? "",
+      title: opts.text.slice(0, 47) || null,
+      marker: "active",
+      group_id: null,
+      parent_session_id: null,
+      source_doc_id: null,
+      project_id: projectIdForSession ?? undefined,
+      metadata: {},
+    });
+    renderSidebar();
+  }
+
   const onSessionDiscovered = (sid: string) => {
     streamSessionId = sid;
     if (isActive()) {
@@ -109,8 +134,10 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
     } else {
       chatState.backgroundStreamSessions.add(sid);
     }
-    // Optimistically add to the sidebar so the session is navigable immediately,
-    // without waiting for the full API refresh round-trip.
+    // Replace the optimistic placeholder (if any) with the real session.
+    const pendingIdx = chatState.sessions.findIndex(s => s.id.startsWith("__pending_"));
+    if (pendingIdx !== -1) chatState.sessions.splice(pendingIdx, 1);
+
     if (!chatState.sessions.some(s => s.id === sid)) {
       const now = Math.floor(Date.now() / 1000);
       chatState.sessions.unshift({
@@ -127,8 +154,9 @@ export async function streamResponse(opts: StreamOptions): Promise<void> {
         project_id: projectIdForSession ?? undefined,
         metadata: {},
       });
-      renderSidebar();
     }
+    renderSidebar();
+
     if (!sidebarRefreshed) {
       sidebarRefreshed = true;
       void refreshSidebar();
@@ -323,11 +351,11 @@ async function handleSend(): Promise<void> {
 }
 
 /**
- * If the active session ID is still unknown after a send (SSE metadata didn't
- * include it), discover it by fetching the most recently updated conversation.
+ * If the active session ID is still unknown (or is a temporary placeholder)
+ * after a send, discover the real ID by fetching the most recent conversation.
  */
 async function discoverSessionId(): Promise<void> {
-  if (chatState.activeSessionId) return;
+  if (chatState.activeSessionId && !chatState.activeSessionId.startsWith("__pending_")) return;
   const list = await api.listConversations({ limit: 1 });
   if (list.ok && list.data && list.data.data.length > 0) {
     chatState.activeSessionId = list.data.data[0]!.id;

@@ -28,6 +28,9 @@ beforeEach(() => {
   fState.editingFileId = null;
   fState.selectedIds.clear();
   fState.tab = "all";
+  fState.sortBy = "name";
+  fState.sortDir = "asc";
+  fState.pagination = { currentPage: 1, pageSize: 50, totalItems: 0 };
 
   // DOM.
   const root = createDomRoot(FILES_DOM_IDS, FILES_DOM_EXTRAS, FILES_DOM_TAGS);
@@ -72,11 +75,17 @@ function makeFile(id: string, name = "test.txt", bytes = 1024, overrides: any = 
   };
 }
 
+/** Set files and sync pagination totalItems. */
+function setFiles(...files: any[]) {
+  fState.files = files;
+  fState.pagination.totalItems = files.length;
+}
+
 // ── renderFilesTable ─────────────────────────────────────────────────────────
 
 describe("renderFilesTable", () => {
   test("renders correct number of rows", () => {
-    fState.files = [makeFile("f1"), makeFile("f2"), makeFile("f3")];
+    setFiles(makeFile("f1"), makeFile("f2"), makeFile("f3"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -85,7 +94,7 @@ describe("renderFilesTable", () => {
   });
 
   test("renders empty state when no files", () => {
-    fState.files = [];
+    setFiles();
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -95,7 +104,7 @@ describe("renderFilesTable", () => {
   });
 
   test("renders 'No archived files' empty state on archived tab", () => {
-    fState.files = [];
+    setFiles();
     fState.tab = "archived";
     renderFilesTable();
 
@@ -105,7 +114,7 @@ describe("renderFilesTable", () => {
   });
 
   test("renders 'No matching files' when search has no results", () => {
-    fState.files = [];
+    setFiles();
     fState.searchQuery = "nonexistent";
     renderFilesTable();
 
@@ -115,7 +124,7 @@ describe("renderFilesTable", () => {
   });
 
   test("row contains filename in name cell", () => {
-    fState.files = [makeFile("f1", "myfile.txt")];
+    setFiles(makeFile("f1", "myfile.txt"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -125,7 +134,7 @@ describe("renderFilesTable", () => {
   });
 
   test("row has data-id attribute", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -134,7 +143,7 @@ describe("renderFilesTable", () => {
   });
 
   test("selected row has files-row-selected class", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     fState.selectedIds.add("f1");
     renderFilesTable();
 
@@ -144,7 +153,7 @@ describe("renderFilesTable", () => {
   });
 
   test("previewed row has files-row-previewed class", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     fState.selectedFileId = "f1";
     renderFilesTable();
 
@@ -154,7 +163,7 @@ describe("renderFilesTable", () => {
   });
 
   test("editing row shows input instead of text span", () => {
-    fState.files = [makeFile("f1", "original.txt")];
+    setFiles(makeFile("f1", "original.txt"));
     fState.editingFileId = "f1";
     renderFilesTable();
 
@@ -166,7 +175,7 @@ describe("renderFilesTable", () => {
   });
 
   test("updates file count display", () => {
-    fState.files = [makeFile("f1"), makeFile("f2")];
+    setFiles(makeFile("f1"), makeFile("f2"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -174,7 +183,7 @@ describe("renderFilesTable", () => {
   });
 
   test("singular count for single file", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -182,7 +191,7 @@ describe("renderFilesTable", () => {
   });
 
   test("row has checkbox toggle button", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -192,7 +201,7 @@ describe("renderFilesTable", () => {
   });
 
   test("row has delete button", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -202,7 +211,7 @@ describe("renderFilesTable", () => {
   });
 
   test("row has download link", () => {
-    fState.files = [makeFile("f1", "test.txt")];
+    setFiles(makeFile("f1", "test.txt"));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -212,7 +221,7 @@ describe("renderFilesTable", () => {
   });
 
   test("kind badge has correct class for image files", () => {
-    fState.files = [makeFile("f1", "photo.jpg", 2048, { kind: "image", mime_type: "image/jpeg" })];
+    setFiles(makeFile("f1", "photo.jpg", 2048, { kind: "image", mime_type: "image/jpeg" }));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -222,7 +231,7 @@ describe("renderFilesTable", () => {
   });
 
   test("kind badge has correct class for binary files", () => {
-    fState.files = [makeFile("f1", "data.bin", 2048, { kind: undefined, mime_type: "application/octet-stream" })];
+    setFiles(makeFile("f1", "data.bin", 2048, { kind: undefined, mime_type: "application/octet-stream" }));
     renderFilesTable();
 
     const dom = getFilesDom();
@@ -231,7 +240,8 @@ describe("renderFilesTable", () => {
   });
 
   test("respects search filter", () => {
-    fState.files = [makeFile("f1", "readme.md"), makeFile("f2", "index.ts")];
+    // Search filtering is server-side; only matching files appear in fState.files.
+    setFiles(makeFile("f1", "readme.md"));
     fState.searchQuery = "readme";
     renderFilesTable();
 
@@ -245,7 +255,7 @@ describe("renderFilesTable", () => {
 
 describe("renderStats", () => {
   test("shows file count and total size", () => {
-    fState.files = [makeFile("f1", "a.txt", 512), makeFile("f2", "b.txt", 512)];
+    setFiles(makeFile("f1", "a.txt", 512), makeFile("f2", "b.txt", 512));
     renderStats();
 
     const dom = getFilesDom();
@@ -254,7 +264,7 @@ describe("renderStats", () => {
   });
 
   test("shows 0 files when empty", () => {
-    fState.files = [];
+    setFiles();
     renderStats();
 
     const dom = getFilesDom();
@@ -263,7 +273,7 @@ describe("renderStats", () => {
   });
 
   test("formats large sizes correctly", () => {
-    fState.files = [makeFile("f1", "big.bin", 1024 * 1024 * 2.5)];
+    setFiles(makeFile("f1", "big.bin", 1024 * 1024 * 2.5));
     renderStats();
 
     const dom = getFilesDom();
@@ -391,24 +401,6 @@ describe("renderPreview", () => {
 // ── syncFilesTabs ────────────────────────────────────────────────────────────
 
 describe("syncFilesTabs", () => {
-  test("all tab gets active class when tab is all", () => {
-    fState.tab = "all";
-    syncFilesTabs();
-
-    const dom = getFilesDom();
-    expect(dom.tabAll.className).toContain("active");
-    expect(dom.tabArchived.className).not.toContain("active");
-  });
-
-  test("archived tab gets active class when tab is archived", () => {
-    fState.tab = "archived";
-    syncFilesTabs();
-
-    const dom = getFilesDom();
-    expect(dom.tabArchived.className).toContain("active");
-    expect(dom.tabAll.className).not.toContain("active");
-  });
-
   test("archive button visible on all tab", () => {
     fState.tab = "all";
     syncFilesTabs();
@@ -432,7 +424,7 @@ describe("syncFilesTabs", () => {
 
 describe("updateFilesToolbar", () => {
   test("disables action buttons when no selection", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     fState.selectedIds.clear();
     updateFilesToolbar();
 
@@ -442,7 +434,7 @@ describe("updateFilesToolbar", () => {
   });
 
   test("enables action buttons when files selected", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     fState.selectedIds.add("f1");
     updateFilesToolbar();
 
@@ -452,7 +444,7 @@ describe("updateFilesToolbar", () => {
   });
 
   test("shows cancel button when files selected", () => {
-    fState.files = [makeFile("f1")];
+    setFiles(makeFile("f1"));
     fState.selectedIds.add("f1");
     updateFilesToolbar();
 
@@ -469,7 +461,7 @@ describe("updateFilesToolbar", () => {
   });
 
   test("select all button shows 'Deselect All' when all selected", () => {
-    fState.files = [makeFile("f1"), makeFile("f2")];
+    setFiles(makeFile("f1"), makeFile("f2"));
     fState.selectedIds.add("f1");
     fState.selectedIds.add("f2");
     updateFilesToolbar();
@@ -479,7 +471,7 @@ describe("updateFilesToolbar", () => {
   });
 
   test("select all button shows 'Select All' when not all selected", () => {
-    fState.files = [makeFile("f1"), makeFile("f2")];
+    setFiles(makeFile("f1"), makeFile("f2"));
     fState.selectedIds.add("f1");
     updateFilesToolbar();
 

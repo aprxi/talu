@@ -79,11 +79,11 @@ describe("ModeManager", () => {
     expect(localStorage.getItem("talu-last-active-mode")).toBe("settings");
   });
 
-  test("restoreLastMode restores saved mode", () => {
+  test("restoreLastMode restores saved mode", async () => {
     const mgr = new ModeManager(eventBus);
     mgr.registerMode("settings", "Settings", "talu.settings");
     localStorage.setItem("talu-last-active-mode", "settings");
-    mgr.restoreLastMode();
+    await mgr.restoreLastMode();
     expect(mgr.getActiveMode()).toBe("settings");
   });
 

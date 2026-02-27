@@ -136,14 +136,11 @@ describe("setupSidebarEvents — chat selection", () => {
 // ── New conversation button ─────────────────────────────────────────────────
 
 describe("setupSidebarEvents — new conversation", () => {
-  test("clicking new conversation button resets state", () => {
-    chatState.activeSessionId = "sess-1";
-    chatState.activeChat = makeConvo("sess-1");
-
-    getChatDom().newConversationBtn.click();
-
-    expect(chatState.activeSessionId).toBeNull();
-    expect(chatState.activeChat).toBeNull();
+  test("clicking new project button exists", () => {
+    // The new-conversation button was replaced by sidebar-new-project-btn.
+    // The new project button is wired by setupSidebarEvents.
+    const dom = getChatDom();
+    expect(dom.sidebarNewProject).not.toBeNull();
   });
 });
 

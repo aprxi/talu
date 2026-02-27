@@ -1,5 +1,6 @@
 import { describe, test, expect, beforeEach, afterEach, spyOn } from "bun:test";
 import { verifyIntegrity } from "../../../src/kernel/security/integrity.ts";
+import { getSetting, initKvSettings } from "../../../src/kernel/system/kv-settings.ts";
 
 const HASH_CACHE_KEY = "talu:integrityHashes";
 
@@ -18,6 +19,8 @@ describe("verifyIntegrity", () => {
   beforeEach(() => {
     originalFetch = window.fetch;
     localStorage.removeItem(HASH_CACHE_KEY);
+    // Reset KV settings to localStorage fallback (another test may have initialized an API).
+    (initKvSettings as (api: any) => void)(null);
   });
 
   afterEach(() => {
@@ -72,9 +75,12 @@ describe("verifyIntegrity", () => {
 
     window.fetch = async () => new Response(content);
 
-    await verifyIntegrity("/plugin.js", `sha256-${hash}`);
+    const result = await verifyIntegrity("/plugin.js", `sha256-${hash}`);
+    expect(result).toBe(true);
 
-    const stored = JSON.parse(localStorage.getItem(HASH_CACHE_KEY) ?? "{}");
+    // Read through the KV settings layer (same backend integrity.ts uses).
+    const raw = await getSetting(HASH_CACHE_KEY);
+    const stored = JSON.parse(raw ?? "{}");
     expect(stored["/plugin.js"]).toBe(hash);
   });
 
@@ -84,7 +90,7 @@ describe("verifyIntegrity", () => {
 
     await verifyIntegrity("/plugin.js", "sha256-WRONGHASH");
 
-    const stored = localStorage.getItem(HASH_CACHE_KEY);
+    const stored = await getSetting(HASH_CACHE_KEY);
     expect(stored).toBeNull();
     spy.mockRestore();
   });
