@@ -1,4 +1,4 @@
-import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection, RepoModelList, RepoSearchResponse, Project, ProjectList } from "./types.ts";
+import type { ApiResult, Conversation, ConversationList, ConversationPatch, ConversationTag, ForkRequest, CreateResponseRequest, Settings, SettingsPatch, SearchRequest, SearchResponse, BatchRequest, Document, DocumentList, CreateDocumentRequest, UpdateDocumentRequest, FileObject, FileList, FileBatchRequest, FileInspection, RepoModelList, RepoSearchResponse, Project, ProjectList, ProviderList } from "./types.ts";
 
 const BASE = "";
 
@@ -59,6 +59,9 @@ export interface ApiClient {
   createProject(body: { name: string; description?: string }): Promise<ApiResult<Project>>;
   updateProject(id: string, body: { name?: string; description?: string }): Promise<ApiResult<Project>>;
   deleteProject(id: string): Promise<ApiResult<void>>;
+  listProviders(): Promise<ApiResult<ProviderList>>;
+  updateProvider(name: string, body: { enabled: boolean; api_key?: string | null; base_url?: string | null }): Promise<ApiResult<ProviderList>>;
+  testProvider(name: string): Promise<ApiResult<{ ok: boolean; model_count?: number; error?: string }>>;
   kvGet(namespace: string, key: string): Promise<ApiResult<{ value: string | null; updated_at_ms: number }>>;
   kvPut(namespace: string, key: string, value: string): Promise<ApiResult<void>>;
   kvDelete(namespace: string, key: string): Promise<ApiResult<{ deleted: boolean }>>;
@@ -269,6 +272,9 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
     createProject: (body) => requestJson<Project>("POST", "/v1/projects", body),
     updateProject: (id, body) => requestJson<Project>("PATCH", `/v1/projects/${encodeURIComponent(id)}`, body),
     deleteProject: (id) => requestJson<void>("DELETE", `/v1/projects/${encodeURIComponent(id)}`),
+    listProviders: () => requestJson<ProviderList>("GET", "/v1/providers"),
+    updateProvider: (name, body) => requestJson<ProviderList>("PATCH", `/v1/providers/${encodeURIComponent(name)}`, body),
+    testProvider: (name) => requestJson<{ ok: boolean; model_count?: number; error?: string }>("POST", `/v1/providers/${encodeURIComponent(name)}/health`),
     async kvGet(namespace, key) {
       try {
         const path = `/v1/db/kv/namespaces/${encodeURIComponent(namespace)}/entries/${encodeURIComponent(key)}`;

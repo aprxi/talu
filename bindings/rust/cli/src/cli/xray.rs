@@ -51,7 +51,7 @@ pub(super) fn cmd_xray(args: XrayArgs) -> Result<()> {
     let capture = XrayCaptureHandle::new()?;
     capture.enable();
 
-    let backend = create_backend_for_model(model)?;
+    let backend = create_backend_for_model(model, None)?;
     let chat = ChatHandle::new(None)?;
     let prompt = if args.prompt.is_empty() {
         "xray".to_string()

@@ -268,6 +268,44 @@ describe("populateModelSelect", () => {
     expect(sel.options.length).toBe(1);
     expect(sel.options[0]!.value).toBe("new-model");
   });
+
+  test("groups remote models by provider prefix", () => {
+    const models: ModelEntry[] = [
+      { id: "local-model", source: "managed", defaults: {} as any, overrides: {} as any },
+      { id: "openai::gpt-4o", source: "managed", defaults: {} as any, overrides: {} as any },
+      { id: "openai::gpt-3.5", source: "managed", defaults: {} as any, overrides: {} as any },
+    ];
+    populateModelSelect(sel, models, "openai::gpt-4o");
+    // Should have 2 optgroups: Local and Openai.
+    const groups = sel.querySelectorAll("optgroup");
+    expect(groups.length).toBe(2);
+    expect(groups[0]!.label).toBe("Local");
+    expect(groups[1]!.label).toBe("Openai");
+    // Labels should strip the provider prefix.
+    expect(sel.options.length).toBe(3);
+    expect(sel.options[1]!.textContent).toBe("gpt-4o");
+    expect(sel.value).toBe("openai::gpt-4o");
+  });
+
+  test("skips optgroup wrapper for single group", () => {
+    const models: ModelEntry[] = [
+      { id: "model-a", source: "managed", defaults: {} as any, overrides: {} as any },
+      { id: "model-b", source: "managed", defaults: {} as any, overrides: {} as any },
+    ];
+    populateModelSelect(sel, models, "model-a");
+    const groups = sel.querySelectorAll("optgroup");
+    expect(groups.length).toBe(0);
+    expect(sel.options.length).toBe(2);
+  });
+
+  test("preserves full ID as option value for remote models", () => {
+    const models: ModelEntry[] = [
+      { id: "openai::gpt-4o", source: "managed", defaults: {} as any, overrides: {} as any },
+    ];
+    populateModelSelect(sel, models, "openai::gpt-4o");
+    expect(sel.options[0]!.value).toBe("openai::gpt-4o");
+    expect(sel.options[0]!.textContent).toBe("gpt-4o");
+  });
 });
 
 // ── Thinking state ──────────────────────────────────────────────────────────

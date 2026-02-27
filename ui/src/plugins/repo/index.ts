@@ -8,6 +8,8 @@ import { initRepoDom } from "./dom.ts";
 import { wireRepoEvents } from "./events.ts";
 import { repoState } from "./state.ts";
 import { loadModels, searchHub } from "./data.ts";
+import { loadProviders } from "./providers-data.ts";
+import { wireProviderEvents } from "./providers-render.ts";
 import {
   renderModelsTable,
   renderStats,
@@ -47,6 +49,7 @@ export const repoPlugin: PluginDefinition = {
     buildRepoDOM(ctx.container);
     initRepoDom(ctx.container);
     wireRepoEvents();
+    wireProviderEvents(getRepoDom().providersList);
 
     // Refresh models when the Models tab is activated.
     ctx.events.on<{ to: string }>("mode.changed", ({ to }) => {
@@ -56,10 +59,10 @@ export const repoPlugin: PluginDefinition = {
     });
 
     ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
-      if (tab !== "discover" && tab !== "local") return;
+      if (tab !== "discover" && tab !== "local" && tab !== "providers") return;
       if (tab === repoState.tab) return;
       const dom = getRepoDom();
-      repoState.tab = tab;
+      repoState.tab = tab as typeof repoState.tab;
       repoState.selectedIds.clear();
       repoState.searchQuery = "";
       dom.search.value = "";
@@ -68,6 +71,8 @@ export const repoPlugin: PluginDefinition = {
       updateRepoToolbar();
       if (tab === "discover") {
         searchHub(repoState.searchQuery);
+      } else if (tab === "providers") {
+        loadProviders();
       } else {
         renderModelsTable();
       }

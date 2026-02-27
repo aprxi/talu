@@ -230,6 +230,22 @@ export interface ModelEntry {
   overrides: ModelOverrides;
 }
 
+/** Provider with runtime configuration from GET /v1/providers. */
+export interface ProviderEntry {
+  name: string;
+  default_endpoint: string;
+  api_key_env: string | null;
+  enabled: boolean;
+  has_api_key: boolean;
+  base_url_override: string | null;
+  effective_endpoint: string;
+}
+
+/** Response shape for GET /v1/providers. */
+export interface ProviderList {
+  providers: ProviderEntry[];
+}
+
 /** Bucket settings from GET /v1/settings. */
 export interface Settings {
   model: string | null;

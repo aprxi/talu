@@ -25,6 +25,7 @@ pub const validate = @import("validate.zig");
 pub const buffer = @import("buffer.zig");
 pub const types = @import("types.zig");
 pub const provider = @import("provider.zig");
+pub const provider_config = @import("provider_config.zig");
 pub const db_table = @import("db/table.zig");
 pub const db_vector = @import("db/vector.zig");
 pub const db_blob = @import("db/blob.zig");
@@ -40,6 +41,7 @@ comptime {
     _ = db_kv;
     _ = db_sql;
     _ = db_ops;
+    _ = provider_config;
 }
 
 pub const repo_meta = @import("repo_meta.zig");
@@ -509,6 +511,15 @@ pub const talu_provider_get_by_name = provider.talu_provider_get_by_name;
 pub const talu_provider_parse = provider.talu_provider_parse;
 pub const talu_provider_has_prefix = provider.talu_provider_has_prefix;
 pub const CProviderInfo = provider.CProviderInfo;
+
+// Re-export Provider Config C API functions (stateless, path-based).
+pub const talu_provider_config_list = provider_config.talu_provider_config_list;
+pub const talu_provider_config_list_free = provider_config.talu_provider_config_list_free;
+pub const talu_provider_config_set = provider_config.talu_provider_config_set;
+pub const talu_provider_config_list_remote_models = provider_config.talu_provider_config_list_remote_models;
+pub const talu_provider_config_list_remote_models_free = provider_config.talu_provider_config_list_remote_models_free;
+pub const CProviderWithConfig = provider_config.CProviderWithConfig;
+pub const CProviderConfigList = provider_config.CProviderConfigList;
 
 // Re-export Responses C API functions (Item-based data access).
 pub const talu_responses_create = responses.talu_responses_create;

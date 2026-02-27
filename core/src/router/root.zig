@@ -131,6 +131,7 @@ pub const capi_bridge = @import("capi_bridge.zig");
 pub const spec = @import("spec.zig");
 pub const http_engine = @import("http_engine.zig");
 pub const provider = @import("provider.zig");
+pub const provider_config = @import("provider_config.zig");
 pub const protocol = @import("protocol/root.zig");
 pub const tool_schema = @import("tool_schema.zig");
 pub const commit = @import("commit.zig");
@@ -160,6 +161,20 @@ pub const HttpListModelsResult = http_engine.ListModelsResult;
 pub const Provider = provider.Provider;
 pub const ProviderParseResult = provider.ParseResult;
 pub const PROVIDERS = provider.PROVIDERS;
+
+// Provider config exports (stateless, path-based runtime configuration)
+pub const ProviderConfigEntry = provider_config.ProviderConfig;
+pub const ProviderWithConfig = provider_config.ProviderWithConfig;
+pub const ConfigPatch = provider_config.ConfigPatch;
+pub const FieldAction = provider_config.FieldAction;
+pub const updateProviderConfig = provider_config.updateProviderConfig;
+pub const getProviderConfig = provider_config.getProviderConfig;
+pub const listProvidersWithConfig = provider_config.listProvidersWithConfig;
+pub const freeProvidersWithConfig = provider_config.freeProvidersWithConfig;
+pub const listRemoteModels = provider_config.listRemoteModels;
+pub const freeRemoteModels = provider_config.freeRemoteModels;
+pub const resolveEndpointAlloc = provider_config.resolveEndpointAlloc;
+pub const resolveApiKeyAlloc = provider_config.resolveApiKeyAlloc;
 
 // Primary exports
 pub const LocalEngine = local.LocalEngine;

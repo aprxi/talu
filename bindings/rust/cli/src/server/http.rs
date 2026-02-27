@@ -28,6 +28,7 @@ use crate::server::handlers;
 use crate::server::openapi;
 use crate::server::plugins;
 use crate::server::projects;
+use crate::server::providers;
 use crate::server::proxy;
 use crate::server::repo;
 use crate::server::responses;
@@ -455,6 +456,18 @@ impl Service<Request<Incoming>> for Router {
                             if p.starts_with("/v1/projects/") || p.starts_with("/projects/") =>
                         {
                             projects::handle_delete(state, req, auth).await
+                        }
+                        // Provider config endpoints
+                        (Method::GET, "/v1/providers") => {
+                            providers::handle_list(state, req, auth).await
+                        }
+                        (Method::POST, p) if p.starts_with("/v1/providers/") && p.ends_with("/health") => {
+                            let name = p["/v1/providers/".len()..p.len() - "/health".len()].to_string();
+                            providers::handle_health(state, req, auth, name).await
+                        }
+                        (Method::PATCH, p) if p.starts_with("/v1/providers/") => {
+                            let name = p["/v1/providers/".len()..].to_string();
+                            providers::handle_update(state, req, auth, name).await
                         }
                         // DB vector plane endpoints
                         (Method::POST, "/v1/db/vectors/collections") => {

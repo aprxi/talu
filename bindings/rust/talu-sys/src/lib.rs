@@ -770,6 +770,33 @@ impl Default for TaluModelBuffer {
     }
 }
 
+/// Source: core/src/capi/provider_config.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CProviderWithConfig {
+    pub name: *const c_char,
+    pub default_endpoint: *const c_char,
+    pub api_key_env: *const c_char,
+    pub enabled: u8,
+    pub has_api_key: u8,
+    pub base_url_override: *const c_char,
+    pub effective_endpoint: *const c_char,
+}
+
+impl Default for CProviderWithConfig {
+    fn default() -> Self {
+        Self {
+            name: std::ptr::null(),
+            default_endpoint: std::ptr::null(),
+            api_key_env: std::ptr::null(),
+            enabled: 0,
+            has_api_key: 0,
+            base_url_override: std::ptr::null(),
+            effective_endpoint: std::ptr::null(),
+        }
+    }
+}
+
 /// Source: core/src/capi/documents_impl.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1426,6 +1453,25 @@ impl Default for SamplingParams {
     }
 }
 
+/// Source: core/src/capi/provider_config.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CProviderConfigList {
+    pub items: *mut CProviderWithConfig,
+    pub count: usize,
+    pub error_code: c_int,
+}
+
+impl Default for CProviderConfigList {
+    fn default() -> Self {
+        Self {
+            items: std::ptr::null_mut(),
+            count: 0,
+            error_code: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/types.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1829,6 +1875,25 @@ impl Default for PaddedTensorResult {
     }
 }
 
+/// Source: core/src/capi/provider_config.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CProviderCredentials {
+    pub effective_endpoint: *const c_char,
+    pub api_key: *const c_char,
+    pub error_code: c_int,
+}
+
+impl Default for CProviderCredentials {
+    fn default() -> Self {
+        Self {
+            effective_endpoint: std::ptr::null(),
+            api_key: std::ptr::null(),
+            error_code: 0,
+        }
+    }
+}
+
 /// Source: core/src/capi/responses.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1936,6 +2001,31 @@ impl Default for CPinRecord {
     }
 }
 
+/// Source: core/src/capi/file.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TaluImage {
+    pub data: *const u8,
+    pub len: usize,
+    pub width: u32,
+    pub height: u32,
+    pub stride: u32,
+    pub format: c_int,
+}
+
+impl Default for TaluImage {
+    fn default() -> Self {
+        Self {
+            data: std::ptr::null(),
+            len: 0,
+            width: 0,
+            height: 0,
+            stride: 0,
+            format: 0,
+        }
+    }
+}
+
 /// Source: core/src/router/capi_bridge.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
@@ -1967,31 +2057,6 @@ impl Default for CGenerateResult {
             _padding: [0; 3],
             tool_calls: std::ptr::null(),
             tool_call_count: 0,
-        }
-    }
-}
-
-/// Source: core/src/capi/file.zig
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct TaluImage {
-    pub data: *const u8,
-    pub len: usize,
-    pub width: u32,
-    pub height: u32,
-    pub stride: u32,
-    pub format: c_int,
-}
-
-impl Default for TaluImage {
-    fn default() -> Self {
-        Self {
-            data: std::ptr::null(),
-            len: 0,
-            width: 0,
-            height: 0,
-            stride: 0,
-            format: 0,
         }
     }
 }
@@ -3983,6 +4048,20 @@ extern "C" {
     pub fn talu_policy_free(handle: *mut c_void);
     // core/src/capi/policy.zig
     pub fn talu_policy_get_mode(handle: *mut c_void) -> u8;
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_list(db_root: *const c_char) -> CProviderConfigList;
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_list_free(list: CProviderConfigList);
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_list_remote_models(db_root: *const c_char) -> *mut c_void;
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_list_remote_models_free(result: *mut CRemoteModelListResult);
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_resolve_credentials(db_root: *const c_char, name: *const c_char) -> CProviderCredentials;
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_resolve_credentials_free(creds: CProviderCredentials);
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_set(db_root: *const c_char, name: *const c_char, enabled: *mut c_void, api_key: *const c_char, base_url: *const c_char) -> c_int;
     // core/src/capi/provider.zig
     pub fn talu_provider_count() -> usize;
     // core/src/capi/provider.zig

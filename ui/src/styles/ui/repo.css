@@ -244,3 +244,156 @@
   background: var(--bg-hover);
   color: var(--text);
 }
+
+/* ── Providers view ────────────────────────────────────────────────────── */
+
+.repo-providers-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  max-width: 640px;
+}
+
+.repo-providers-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.repo-providers-list {
+  display: flex;
+  flex-direction: column;
+  max-width: 640px;
+}
+
+/* Compact provider row */
+.repo-provider-row {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  transition: background 0.1s;
+}
+
+.repo-provider-row:first-child {
+  border-top: 1px solid var(--border);
+}
+
+.repo-provider-row:hover {
+  background: var(--bg-hover);
+}
+
+.repo-provider-row-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 4px;
+}
+
+.repo-provider-name {
+  font-weight: 600;
+  font-size: 14px;
+  text-transform: capitalize;
+}
+
+.repo-provider-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.repo-provider-row-meta {
+  font-size: 11px;
+  font-family: var(--font-mono);
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Key status badge */
+.repo-provider-key-badge {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  border-radius: 3px;
+  white-space: nowrap;
+}
+
+.repo-provider-key-badge.key-set {
+  color: var(--success);
+  background: color-mix(in srgb, var(--success) 12%, transparent);
+}
+
+.repo-provider-key-badge.key-missing {
+  color: var(--warning, var(--secondary));
+  background: color-mix(in srgb, var(--warning, var(--secondary)) 12%, transparent);
+}
+
+/* Health check button states */
+.repo-provider-row-actions .test-ok { color: var(--success); }
+.repo-provider-row-actions .test-fail { color: var(--danger, #e55); }
+
+.repo-provider-remove-btn {
+  color: var(--text-muted);
+}
+
+.repo-provider-remove-btn:hover {
+  color: var(--danger, #e55);
+}
+
+/* Collapsible form within a row */
+.repo-provider-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding-top: 12px;
+  margin-top: 8px;
+  border-top: 1px solid var(--border);
+}
+
+.repo-provider-form.hidden {
+  display: none;
+}
+
+.repo-provider-form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.repo-provider-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.repo-provider-field label {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+
+.repo-provider-input {
+  padding: 6px 10px;
+  font-size: 12px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-mono);
+}
+
+.repo-provider-input:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+.repo-provider-input::placeholder {
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}

@@ -84,7 +84,10 @@ export function formatDate(epoch: number): string {
 
 // -- Model select helpers -----------------------------------------------------
 
-/** Populate a <select> element with model entries. */
+/** Populate a <select> element with model entries, grouped by provider.
+ *  Remote models use `provider::model_id` syntax — these are grouped under
+ *  an `<optgroup>` labeled with the provider name. Local models (no `::`)
+ *  appear under a "Local" group. */
 export function populateModelSelect(sel: HTMLSelectElement, models: ModelEntry[], selected: string): void {
   sel.innerHTML = "";
   if (models.length === 0) {
@@ -94,12 +97,41 @@ export function populateModelSelect(sel: HTMLSelectElement, models: ModelEntry[]
     sel.appendChild(opt);
     return;
   }
+
+  // Group models by provider prefix.
+  const groups = new Map<string, { value: string; label: string }[]>();
   for (const m of models) {
-    const opt = document.createElement("option");
-    opt.value = m.id;
-    opt.textContent = m.id;
-    sel.appendChild(opt);
+    const sep = m.id.indexOf("::");
+    const group = sep >= 0 ? m.id.substring(0, sep) : "Local";
+    const label = sep >= 0 ? m.id.substring(sep + 2) : m.id;
+    if (!groups.has(group)) groups.set(group, []);
+    groups.get(group)!.push({ value: m.id, label });
   }
+
+  // If only one group, skip the optgroup wrapper for cleaner UI.
+  if (groups.size === 1) {
+    for (const entries of groups.values()) {
+      for (const entry of entries) {
+        const opt = document.createElement("option");
+        opt.value = entry.value;
+        opt.textContent = entry.label;
+        sel.appendChild(opt);
+      }
+    }
+  } else {
+    for (const [groupName, entries] of groups) {
+      const optgroup = document.createElement("optgroup");
+      optgroup.label = groupName.charAt(0).toUpperCase() + groupName.slice(1);
+      for (const entry of entries) {
+        const opt = document.createElement("option");
+        opt.value = entry.value;
+        opt.textContent = entry.label;
+        optgroup.appendChild(opt);
+      }
+      sel.appendChild(optgroup);
+    }
+  }
+
   if (selected && models.some((m) => m.id === selected)) {
     sel.value = selected;
   } else if (models.length > 0 && models[0]) {

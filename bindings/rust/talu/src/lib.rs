@@ -103,6 +103,11 @@ pub use table::{
     ColumnFilter, ColumnShape, ColumnValue, CompactionPolicy, FilterOp, PhysicalType, Row,
     ScanParams, ScanResult, ScalarColumn, TableError, TableHandle,
 };
+pub use provider::{
+    ProviderCredentials, ProviderHealthResult, ProviderWithConfig, provider_config_health,
+    provider_config_list, provider_config_list_remote_models, provider_config_resolve_credentials,
+    provider_config_set,
+};
 pub use vector::{SearchBatchResult, VectorError, VectorStore};
 pub use xray::{TraceRecord, TraceStats, XrayCaptureHandle};
 

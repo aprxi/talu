@@ -21,6 +21,7 @@ mod logger;
 pub mod openapi;
 pub mod plugins;
 pub mod projects;
+pub mod providers;
 pub mod proxy;
 pub mod repo;
 pub mod responses;
@@ -109,19 +110,6 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     let profile = args.profile.clone();
     let socket_path = expand_socket_path(&args.socket);
 
-    let backend_state = if let Some(ref model_id) = model {
-        let backend = crate::provider::create_backend_for_model(model_id)?;
-        state::BackendState {
-            backend: Some(backend),
-            current_model: Some(model_id.clone()),
-        }
-    } else {
-        state::BackendState {
-            backend: None,
-            current_model: None,
-        }
-    };
-
     let (gateway_secret, tenant_registry) = match (args.gateway_secret, args.tenant_config) {
         (Some(secret), Some(path)) => {
             let registry = tenant::TenantRegistry::load(&path)
@@ -142,6 +130,20 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     if let Some(ref bucket) = bucket_path {
         crate::bucket_settings::migrate_layout_if_needed(bucket)?;
     }
+
+    let backend_state = if let Some(ref model_id) = model {
+        let kv_root = bucket_path.as_ref().map(|b| b.join("kv").to_string_lossy().into_owned());
+        let backend = crate::provider::create_backend_for_model(model_id, kv_root.as_deref())?;
+        state::BackendState {
+            backend: Some(backend),
+            current_model: Some(model_id.clone()),
+        }
+    } else {
+        state::BackendState {
+            backend: None,
+            current_model: None,
+        }
+    };
 
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),

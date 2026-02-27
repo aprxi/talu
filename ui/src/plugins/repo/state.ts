@@ -1,6 +1,8 @@
 /** Plugin-local state for the repository manager. */
 
-export type RepoTab = "discover" | "local";
+import type { ProviderEntry } from "../../types.ts";
+
+export type RepoTab = "discover" | "local" | "providers";
 export type LocalSourceFilter = "all" | "hub" | "managed";
 export type SortColumn = "name" | "size" | "date";
 export type SortDir = "asc" | "desc";
@@ -77,4 +79,5 @@ export const repoState = {
   discoverSize: "8" as SizeFilter,
   discoverTask: "text-generation" as TaskFilter,
   discoverLibrary: "safetensors" as LibraryFilter,
+  providers: [] as ProviderEntry[],
 };

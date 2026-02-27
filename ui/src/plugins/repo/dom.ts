@@ -27,6 +27,9 @@ export interface RepoDom {
   sizeFilter: HTMLSelectElement;
   taskFilter: HTMLSelectElement;
   libraryFilter: HTMLSelectElement;
+  providersView: HTMLElement;
+  providersList: HTMLElement;
+  addProviderSelect: HTMLSelectElement;
 }
 
 let root: HTMLElement;
@@ -66,6 +69,9 @@ export function getRepoDom(): RepoDom {
     sizeFilter: root.querySelector<HTMLSelectElement>("#rp-size-filter")!,
     taskFilter: root.querySelector<HTMLSelectElement>("#rp-task-filter")!,
     libraryFilter: root.querySelector<HTMLSelectElement>("#rp-library-filter")!,
+    providersView: root.querySelector<HTMLElement>("#rp-providers-view")!,
+    providersList: root.querySelector<HTMLElement>("#rp-providers-list")!,
+    addProviderSelect: root.querySelector<HTMLSelectElement>("#rp-add-provider")!,
   };
   return cached;
 }

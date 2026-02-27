@@ -369,6 +369,13 @@ export function syncRepoTabs(): void {
   dom.discoverToolbar.classList.toggle("hidden", tab !== "discover");
   dom.localView.classList.toggle("hidden", tab !== "local");
   dom.localToolbar.classList.toggle("hidden", tab !== "local");
+  dom.providersView.classList.toggle("hidden", tab !== "providers");
+
+  // Hide the search wrapper on the providers tab (not applicable there).
+  const searchWrapper = dom.search.closest(".search-wrapper");
+  if (searchWrapper) {
+    (searchWrapper as HTMLElement).classList.toggle("hidden", tab === "providers");
+  }
 }
 
 export function syncSourceToggle(): void {

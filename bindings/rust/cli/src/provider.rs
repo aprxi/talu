@@ -86,12 +86,13 @@ pub fn provider_from_prefix(s: &str) -> Option<String> {
     get_provider(name).map(|p| p.name)
 }
 
-pub fn create_backend_for_model(model: &str) -> Result<InferenceBackend> {
-    create_backend_for_model_with_progress(model, None)
+pub fn create_backend_for_model(model: &str, db_root: Option<&str>) -> Result<InferenceBackend> {
+    create_backend_for_model_with_progress(model, db_root, None)
 }
 
 pub fn create_backend_for_model_with_progress(
     model: &str,
+    db_root: Option<&str>,
     callback: Option<talu::LoadProgressCallback>,
 ) -> Result<InferenceBackend> {
     match parse_model_target(model)? {
@@ -99,6 +100,19 @@ pub fn create_backend_for_model_with_progress(
             Ok(InferenceBackend::new_with_progress(local_id, callback)?)
         }
         ModelTarget::Remote { provider, model } => {
+            // Try KV-backed credentials first (config > env > default).
+            if let Some(root) = db_root {
+                if let Ok(creds) = talu::provider_config_resolve_credentials(root, &provider) {
+                    return Ok(InferenceBackend::new_openai_compatible(
+                        model,
+                        &creds.effective_endpoint,
+                        creds.api_key.as_deref(),
+                        30_000,
+                    )?);
+                }
+            }
+
+            // Fallback: env vars only (no bucket / config lookup failed).
             let provider_info =
                 get_provider(&provider).ok_or_else(|| anyhow!("Unknown provider: {}", provider))?;
 

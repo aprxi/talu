@@ -380,6 +380,17 @@ pub async fn handle_models(
         }
     };
 
+    // Merge models from enabled remote providers (prefixed with "provider::").
+    if let Some(ref bucket) = state.bucket_path {
+        let db_root = bucket.join("kv").to_string_lossy().into_owned();
+        if let Ok(Ok(remote)) =
+            tokio::task::spawn_blocking(move || talu::provider_config_list_remote_models(&db_root))
+                .await
+        {
+            models.extend(remote);
+        }
+    }
+
     if !allowed_models.is_empty() {
         let allowed: HashSet<String> = allowed_models.into_iter().collect();
         models.retain(|model| allowed.contains(&model.id));
@@ -1230,6 +1241,11 @@ async fn stream_response(
     let events_response_id = response_id.clone();
     let events_session_id = session_id.clone();
 
+    let kv_root = state
+        .bucket_path
+        .as_ref()
+        .map(|b| b.join("kv").to_string_lossy().into_owned());
+
     let previous_response_id_for_ctx = previous_response_id.clone();
     tokio::task::spawn_blocking(move || {
         let mut seq = 0u64;
@@ -1303,7 +1319,7 @@ async fn stream_response(
                             p.total,
                         );
                     }));
-                match provider::create_backend_for_model_with_progress(&model_id, callback) {
+                match provider::create_backend_for_model_with_progress(&model_id, kv_root.as_deref(), callback) {
                     Ok(new_backend) => {
                         guard.backend = Some(new_backend);
                         guard.current_model = Some(model_id.clone());
@@ -2645,8 +2661,13 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
 
     log::info!(target: "server::gen", "loading backend for model {}", model_id);
     let model = model_id.to_string();
+    let db_root = state
+        .bucket_path
+        .as_ref()
+        .map(|b| b.join("kv").to_string_lossy().into_owned());
     let backend =
-        tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model)).await??;
+        tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model, db_root.as_deref()))
+            .await??;
 
     let mut guard = state.backend.lock().await;
     guard.backend = Some(backend);
