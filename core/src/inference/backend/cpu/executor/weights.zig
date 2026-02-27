@@ -1546,7 +1546,7 @@ test "ScratchBuffer: init and deinit basic lifecycle" {
     try std.testing.expectEqual(d_ff, scratch.d_ff);
     try std.testing.expectEqual(n_layers, scratch.slot_states.len);
     for (scratch.slot_states) |slot_state| {
-        try std.testing.expect(slot_state.attn_cache != null);
+        try std.testing.expect(slot_state.attn_cache == null);
     }
 
     // All tmp buffers should be initially empty
@@ -1687,6 +1687,7 @@ test "ScratchBuffer: resetCaches clears all attention caches" {
     const n_layers = 3;
     var scratch = try ScratchBuffer.init(allocator, 64, 256, n_layers);
     defer scratch.deinit();
+    try scratch.initAttention(&.{ 0, 1, 2 });
 
     // Simulate cache progression before reset.
     for (scratch.slot_states) |*slot_state| {
@@ -2356,18 +2357,23 @@ test "TransformerBlock.deinit frees all memory" {
     defer block.deinit(allocator);
 }
 
-test "init ScratchBuffer attn_caches" {
+test "ScratchBuffer initAttention initializes selected attention caches" {
     const allocator = std.testing.allocator;
     const n_layers = 5;
 
     var scratch = try ScratchBuffer.init(allocator, 128, 512, n_layers);
     defer scratch.deinit();
+    try scratch.initAttention(&.{ 1, 3 });
 
-    // All slot states should have initialized attention caches.
+    // Only descriptor-selected layers should have attention cache state.
     try std.testing.expectEqual(n_layers, scratch.slot_states.len);
-    for (scratch.slot_states) |slot_state| {
-        try std.testing.expect(slot_state.attn_cache != null);
-        try std.testing.expectEqual(@as(usize, 0), slot_state.attn_cache.?.cache_position);
+    for (scratch.slot_states, 0..) |slot_state, idx| {
+        if (idx == 1 or idx == 3) {
+            try std.testing.expect(slot_state.attn_cache != null);
+            try std.testing.expectEqual(@as(usize, 0), slot_state.attn_cache.?.cache_position);
+        } else {
+            try std.testing.expect(slot_state.attn_cache == null);
+        }
     }
 }
 
@@ -2615,6 +2621,7 @@ test "ScratchBuffer: per-layer attention cache is available via slot state" {
     const allocator = std.testing.allocator;
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 2);
     defer scratch.deinit();
+    try scratch.initAttention(&.{ 0, 1 });
 
     const slot0 = scratch.getSlotState(0);
     const slot1 = scratch.getSlotState(1);
@@ -2631,6 +2638,7 @@ test "ScratchBuffer: getSlotState returns persistent slot state" {
     const allocator = std.testing.allocator;
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 2);
     defer scratch.deinit();
+    try scratch.initAttention(&.{ 0, 1 });
 
     const slot0 = scratch.getSlotState(0);
     const slot1 = scratch.getSlotState(1);
@@ -2649,6 +2657,7 @@ test "ScratchBuffer: resetCaches resets both attention and mamba state" {
     const allocator = std.testing.allocator;
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 2);
     defer scratch.deinit();
+    try scratch.initAttention(&.{0});
 
     // Initialize Mamba state
     const mamba_config = mamba.MambaConfig{

@@ -15,6 +15,8 @@ const model_runtime = compute.metal.model_runtime;
 const runtime_graph = @import("../runtime_graph.zig");
 const topology = @import("../../../../models/op_types.zig");
 const models_registry = models.registry;
+const plan_compiler = models.plan.compiler;
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 
 const builtin = @import("builtin");
 const LoadedModel = models.LoadedModel;
@@ -126,6 +128,72 @@ fn quantBitsFor(dtype: dtype_mod.DType) !usize {
         .grouped_affine_u4 => 4,
         else => error.InvalidTensorType,
     };
+}
+
+fn buildMetalLayerProgramRegisterSlotMap(
+    allocator: std.mem.Allocator,
+    compiled: *const runtime_contract.CompiledPlan,
+) ![64]u8 {
+    const invalid_slot = std.math.maxInt(u8);
+    var register_to_slot: [64]u8 = [_]u8{invalid_slot} ** 64;
+    if (compiled.plan.register_count <= 1) return register_to_slot;
+    if (compiled.plan.register_count > 64) return error.NotImplemented;
+
+    const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, compiled.plan.register_count);
+    defer allocator.free(register_specs);
+    for (register_specs) |*spec| {
+        spec.* = .{
+            .size = 1,
+            .@"align" = 4,
+        };
+    }
+
+    var physical = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, register_specs);
+    defer runtime_contract.deinitPhysicalMapping(allocator, &physical);
+    if (physical.physical_count == 0) return register_to_slot;
+
+    const physical_to_slot = try allocator.alloc(u8, physical.physical_count);
+    defer allocator.free(physical_to_slot);
+    @memset(physical_to_slot, invalid_slot);
+
+    var next_slot: u8 = 0;
+    const invalid_physical = std.math.maxInt(u16);
+    var register_idx: usize = 1;
+    while (register_idx < compiled.plan.register_count) : (register_idx += 1) {
+        const physical_id_u16 = physical.register_to_physical[register_idx];
+        if (physical_id_u16 == invalid_physical) continue;
+        const physical_id: usize = physical_id_u16;
+        if (physical_id >= physical_to_slot.len) return error.NotImplemented;
+        if (physical_to_slot[physical_id] == invalid_slot) {
+            if (next_slot >= 2) return error.NotImplemented;
+            physical_to_slot[physical_id] = next_slot;
+            next_slot += 1;
+        }
+        register_to_slot[register_idx] = physical_to_slot[physical_id];
+    }
+
+    return register_to_slot;
+}
+
+fn compileLayerProgramContract(
+    allocator: std.mem.Allocator,
+    layer: *WeightHandles.LayerWeights,
+) !void {
+    layer.compiled_plan = null;
+    layer.register_to_slot_map = [_]u8{WeightHandles.LayerWeights.invalid_slot} ** 64;
+    const program = layer.program orelse return;
+
+    layer.compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode);
+    runtime_contract.validatePlanWithoutInstructionWeights(&layer.compiled_plan.?) catch {
+        log.warn("inference", "Metal layer program has unsupported instruction weight bindings", .{
+            .weight_bindings = layer.compiled_plan.?.weight_bindings.len,
+        });
+        return error.NotImplemented;
+    };
+    layer.register_to_slot_map = try buildMetalLayerProgramRegisterSlotMap(
+        allocator,
+        &layer.compiled_plan.?,
+    );
 }
 
 /// Compute Llama3-style RoPE frequencies with wavelength-dependent scaling.
@@ -240,15 +308,6 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         lm_head_is_quantized;
     weight_handles.is_quantized = is_quantized_model;
 
-    var has_shortconv_layers = false;
-    for (loaded.blocks) |layer| {
-        switch (layer.block_type) {
-            .shortconv => has_shortconv_layers = true,
-            else => {},
-        }
-    }
-    weight_handles.has_shortconv = has_shortconv_layers;
-
     // Load embedding weights
     // Keep embeddings quantized - will dequantize during lookup
     weight_handles.embed_tokens_quantized = null;
@@ -288,6 +347,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     // Initialize all layer weights to default values (null for optional fields)
     for (weight_handles.layers) |*layer| {
         layer.* = std.mem.zeroes(WeightHandles.LayerWeights);
+        layer.register_to_slot_map = [_]u8{WeightHandles.LayerWeights.invalid_slot} ** 64;
     }
 
     for (loaded.blocks, 0..) |*layer, layer_idx| {
@@ -299,6 +359,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].program =
                         models_registry.blockProgramFor(entry, .attention_mlp);
                 }
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx]);
                 const is_mla = attn_block.isMLA();
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
@@ -504,6 +565,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].program =
                         models_registry.blockProgramFor(entry, .mamba);
                 }
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx]);
                 weight_handles.has_mamba = true;
 
                 var ln1_arr = try loadNormWeight(mamba_block.ln1_weight);
@@ -580,6 +642,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.layers[layer_idx].program =
                         models_registry.blockProgramFor(entry, .shortconv);
                 }
+                try compileLayerProgramContract(allocator, &weight_handles.layers[layer_idx]);
 
                 // ln1_weight - load in native dtype (bf16, f16, or f32)
                 var ln1_arr = try loadNormWeight(shortconv_block.ln1_weight);
@@ -902,6 +965,22 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.lm_head = mlx_graph.createArrayF32(lm_head_tensor.asSlice(f32), lm_shape);
                 },
                 else => return error.InvalidTensorType,
+            }
+        }
+    }
+
+    weight_handles.has_kv_state = false;
+    weight_handles.has_shortconv = false;
+    weight_handles.has_mamba = false;
+    for (weight_handles.layers) |layer| {
+        if (layer.compiled_plan == null) continue;
+        const plan = &layer.compiled_plan.?.plan;
+        for (plan.state_descs) |state_desc| {
+            switch (state_desc.id) {
+                @intFromEnum(runtime_contract.StateBlockId.kv_cache) => weight_handles.has_kv_state = true,
+                @intFromEnum(runtime_contract.StateBlockId.shortconv) => weight_handles.has_shortconv = true,
+                @intFromEnum(runtime_contract.StateBlockId.mamba) => weight_handles.has_mamba = true,
+                else => return error.InvalidStateDescriptorBinding,
             }
         }
     }
@@ -1360,6 +1439,10 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
     }
 
     for (weight_handles.layers) |*layer| {
+        if (layer.compiled_plan) |*compiled_plan| {
+            plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
+            layer.compiled_plan = null;
+        }
         if (layer.ln1_weight) |h| mlx_graph.freeArray(h);
         if (layer.ln2_weight) |h| mlx_graph.freeArray(h);
 
@@ -1521,6 +1604,7 @@ pub const WeightHandles = struct {
 
     // MoE configuration
     is_moe: bool = false,
+    has_kv_state: bool = false,
     has_mamba: bool = false,
     has_shortconv: bool = false,
     num_experts: usize = 0,
@@ -1584,6 +1668,8 @@ pub const WeightHandles = struct {
     };
 
     pub const LayerWeights = struct {
+        pub const invalid_slot: u8 = std.math.maxInt(u8);
+
         pub const LayerKind = topology.BlockKind;
         pub const AttentionStorageKind = enum {
             quantized,
@@ -1620,6 +1706,8 @@ pub const WeightHandles = struct {
 
         kind: LayerKind = .attention_mlp,
         program: ?[]const models.layer_ops.LayerOp = null,
+        compiled_plan: ?runtime_contract.CompiledPlan = null,
+        register_to_slot_map: [64]u8 = [_]u8{invalid_slot} ** 64,
         ln1_weight: ArrayHandle,
         ln2_weight: ArrayHandle,
 
@@ -2446,4 +2534,64 @@ test "Model.forwardFromGPUToken produces logits from GPU token" {
     try testing.expectEqual(@as(usize, 32), shape_buffer[rank - 1]);
 
     mlx_graph.freeArray(logits_handle);
+}
+
+test "buildMetalLayerProgramRegisterSlotMap reuses temp slots from liveness" {
+    const inputs0 = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const outputs0 = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const inputs1 = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const outputs1 = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const inputs2 = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(2)};
+    const outputs2 = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(3)};
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .rmsnorm,
+            .inputs = inputs0[0..],
+            .outputs = outputs0[0..],
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+        .{
+            .opcode = .swiglu,
+            .inputs = inputs1[0..],
+            .outputs = outputs1[0..],
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+        .{
+            .opcode = .swiglu,
+            .inputs = inputs2[0..],
+            .outputs = outputs2[0..],
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+    };
+    const kill0 = [_]u64{0b0000};
+    const kill1 = [_]u64{0b0010};
+    const kill2 = [_]u64{0b1100};
+    const compiled = runtime_contract.CompiledPlan{
+        .plan = .{
+            .instructions = instructions[0..],
+            .register_count = 4,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{},
+        .liveness = .{
+            .register_last_read = &.{ 0, 1, 2, 2 },
+            .kill_after_instruction = &.{ kill0[0..], kill1[0..], kill2[0..] },
+        },
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+
+    const map = try buildMetalLayerProgramRegisterSlotMap(testing.allocator, &compiled);
+    try testing.expect(map[1] < 2);
+    try testing.expect(map[2] < 2);
+    try testing.expect(map[3] < 2);
+    try testing.expectEqual(map[1], map[3]);
+    try testing.expect(map[2] != map[1]);
 }

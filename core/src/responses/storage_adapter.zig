@@ -498,12 +498,14 @@ pub const TableAdapter = struct {
         const vector_bytes = std.mem.sliceAsBytes(vector);
         var doc_id_value = doc_id;
         var ts_value = std.time.milliTimestamp();
+        var session_hash_value = self.session_hash;
         var group_hash_value: u64 = 0;
         var ttl_ts_value: i64 = 0;
 
         const columns = [_]ColumnValue{
             .{ .column_id = col_item_id, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&doc_id_value) },
             .{ .column_id = col_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ts_value) },
+            .{ .column_id = col_session_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&session_hash_value) },
             .{ .column_id = col_group_hash, .shape = .SCALAR, .phys_type = .U64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&group_hash_value) },
             .{ .column_id = col_ttl_ts, .shape = .SCALAR, .phys_type = .I64, .encoding = .RAW, .dims = 1, .data = std.mem.asBytes(&ttl_ts_value) },
             .{ .column_id = col_embedding, .shape = .VECTOR, .phys_type = .F32, .encoding = .RAW, .dims = @intCast(vector.len), .data = vector_bytes },

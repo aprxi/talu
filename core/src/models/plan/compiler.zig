@@ -83,11 +83,18 @@ fn maxRegisterInInstruction(insn: runtime_contract.Instruction) u16 {
 fn compileOneInstruction(
     allocator: std.mem.Allocator,
     op: layer_ops.LayerOp,
+    mode: CompileMode,
     param_block_id: u16,
     weight_bindings: *std.ArrayListUnmanaged(runtime_contract.WeightBinding),
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
-    const state_block_id = runtime_contract.stateBlockIdForOpcode(opcode);
+    const state_block_id = switch (mode) {
+        .vision_encode, .scatter => switch (opcode) {
+            .multihead_attention, .mla_attention => null,
+            else => runtime_contract.stateBlockIdForOpcode(opcode),
+        },
+        else => runtime_contract.stateBlockIdForOpcode(opcode),
+    };
     return switch (op) {
         .kernel => |kernel_op| .{
             .opcode = opcode,
@@ -344,14 +351,16 @@ fn serializeLayerOpParam(
 fn cloneLayerOpOwned(allocator: std.mem.Allocator, op: layer_ops.LayerOp) !layer_ops.LayerOp {
     var owned = op;
     switch (owned) {
-        .linear => |*linear_op| linear_op.weight_name = try allocator.dupe(u8, linear_op.weight_name),
+        // Weight names are compile-time metadata only; runtime uses instruction
+        // weight bindings by index. Avoid carrying name strings in ParamBlock.
+        .linear => |*linear_op| linear_op.weight_name = &.{},
         .split => |*split_op| split_op.split_sizes = if (split_op.split_sizes.len == 0)
             &.{}
         else
             try allocator.dupe(usize, split_op.split_sizes),
-        .add_param => |*add_param_op| add_param_op.param_name = try allocator.dupe(u8, add_param_op.param_name),
-        .add_param_scalar => |*add_param_scalar_op| add_param_scalar_op.param_name = try allocator.dupe(u8, add_param_scalar_op.param_name),
-        .mul_param => |*mul_param_op| mul_param_op.param_name = try allocator.dupe(u8, mul_param_op.param_name),
+        .add_param => |*add_param_op| add_param_op.param_name = &.{},
+        .add_param_scalar => |*add_param_scalar_op| add_param_scalar_op.param_name = &.{},
+        .mul_param => |*mul_param_op| mul_param_op.param_name = &.{},
         .reshape => |*reshape_op| reshape_op.shape = if (reshape_op.shape.len == 0)
             &.{}
         else
@@ -363,11 +372,11 @@ fn cloneLayerOpOwned(allocator: std.mem.Allocator, op: layer_ops.LayerOp) !layer
 
 fn deinitOwnedLayerOp(allocator: std.mem.Allocator, op: *layer_ops.LayerOp) void {
     switch (op.*) {
-        .linear => |linear_op| allocator.free(linear_op.weight_name),
+        .linear => |linear_op| if (linear_op.weight_name.len > 0) allocator.free(linear_op.weight_name),
         .split => |split_op| if (split_op.split_sizes.len > 0) allocator.free(split_op.split_sizes),
-        .add_param => |add_param_op| allocator.free(add_param_op.param_name),
-        .add_param_scalar => |add_param_scalar_op| allocator.free(add_param_scalar_op.param_name),
-        .mul_param => |mul_param_op| allocator.free(mul_param_op.param_name),
+        .add_param => |add_param_op| if (add_param_op.param_name.len > 0) allocator.free(add_param_op.param_name),
+        .add_param_scalar => |add_param_scalar_op| if (add_param_scalar_op.param_name.len > 0) allocator.free(add_param_scalar_op.param_name),
+        .mul_param => |mul_param_op| if (mul_param_op.param_name.len > 0) allocator.free(mul_param_op.param_name),
         .reshape => |reshape_op| if (reshape_op.shape.len > 0) allocator.free(reshape_op.shape),
         else => {},
     }
@@ -605,7 +614,7 @@ pub fn compileLayerProgram(
         const opcode = opcode_map.opcodeForLayerOp(op);
         const param_block_id: u16 = @intCast(param_blocks.items.len);
         try param_blocks.append(allocator, try serializeLayerOpParam(allocator, opcode, op));
-        const insn = try compileOneInstruction(allocator, op, param_block_id, &weight_bindings);
+        const insn = try compileOneInstruction(allocator, op, mode, param_block_id, &weight_bindings);
         if (insn.weights.len != runtime_contract.expectedWeightRefCount(insn.opcode)) {
             return error.InvalidWeightRefCount;
         }
@@ -967,6 +976,23 @@ test "compileLayerProgram emits KV state descriptor and attention state referenc
     try std.testing.expect(saw_attention);
 }
 
+test "compileLayerProgram omits attention state in vision mode" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 0,
+            .in = .residual,
+            .out = .norm_out,
+            .debug_type = .multihead_attention,
+        } },
+    };
+
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .vision_encode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    try std.testing.expectEqual(@as(usize, 0), compiled.plan.state_descs.len);
+    try std.testing.expectEqual(@as(?u8, null), compiled.plan.instructions[0].state_block_id);
+}
+
 test "compileLayerProgram emits mamba state descriptor and mixer state references" {
     var compiled = try compileLayerProgram(std.testing.allocator, granite_hybrid.mamba_program, .prefill);
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
@@ -1029,6 +1055,41 @@ test "compileLayerProgram emits deterministic weight bindings for parameterized 
     try std.testing.expectEqual(@as(u32, 0), compiled.plan.instructions[0].weights[0].index);
     try std.testing.expectEqual(@as(u32, 1), compiled.plan.instructions[1].weights[0].index);
     try std.testing.expectEqual(@as(u32, 1), compiled.plan.instructions[2].weights[0].index);
+}
+
+test "compileLayerProgram strips runtime param-block weight names for bound primitives" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .linear = .{
+            .in = .residual,
+            .out = .tmp3,
+            .weight_name = "w_linear",
+        } },
+        .{ .add_param = .{
+            .in = .tmp3,
+            .out = .tmp4,
+            .param_name = "p_add",
+        } },
+        .{ .mul_param = .{
+            .in = .tmp4,
+            .out = .residual,
+            .param_name = "p_add",
+        } },
+    };
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    inline for ([_]usize{ 0, 1, 2 }) |insn_idx| {
+        const insn = compiled.plan.instructions[insn_idx];
+        const param_id = insn.param_block_id.?;
+        const param_block = compiled.param_blocks[param_id];
+        const op_ptr: *const layer_ops.LayerOp = @ptrCast(@alignCast(param_block.data.ptr));
+        switch (op_ptr.*) {
+            .linear => |linear_op| try std.testing.expectEqual(@as(usize, 0), linear_op.weight_name.len),
+            .add_param => |add_param_op| try std.testing.expectEqual(@as(usize, 0), add_param_op.param_name.len),
+            .mul_param => |mul_param_op| try std.testing.expectEqual(@as(usize, 0), mul_param_op.param_name.len),
+            else => return error.TestUnexpectedResult,
+        }
+    }
 }
 
 test "compileLayerProgram emits param blocks compliant with runtime ABI contract" {

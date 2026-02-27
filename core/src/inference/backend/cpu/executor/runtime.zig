@@ -126,9 +126,7 @@ pub const ScratchBuffer = struct {
         const slot_state_buffer = try allocator.alloc(SlotPersistentState, n_layers);
         errdefer allocator.free(slot_state_buffer);
         for (slot_state_buffer) |*slot_state| {
-            slot_state.* = .{
-                .attn_cache = .{},
-            };
+            slot_state.* = .{};
         }
         var matmul_workspace = try cpu_linalg.MatmulScratch.init(allocator);
         errdefer matmul_workspace.deinit();
@@ -139,6 +137,15 @@ pub const ScratchBuffer = struct {
             .slot_states = slot_state_buffer,
             .matmul_scratch = matmul_workspace,
         };
+    }
+
+    /// Initialize attention cache state for descriptor-selected layers.
+    pub fn initAttention(self: *ScratchBuffer, layer_indices: []const usize) !void {
+        for (layer_indices) |layer_idx| {
+            if (layer_idx >= self.slot_states.len) return error.InvalidLayerIndex;
+            if (self.slot_states[layer_idx].attn_cache != null) return error.AlreadyInitialized;
+            self.slot_states[layer_idx].attn_cache = .{};
+        }
     }
 
     pub fn ensure(self: *ScratchBuffer, seq_len: usize) !void {

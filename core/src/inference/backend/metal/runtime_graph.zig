@@ -76,11 +76,17 @@ pub const Cache = struct {
         return .{ .handle = handle, .use_bfloat16 = use_bfloat16 };
     }
 
+    pub fn disabled(use_bfloat16: bool) Cache {
+        return .{ .handle = null, .use_bfloat16 = use_bfloat16 };
+    }
+
     pub fn deinit(self: Cache) void {
+        if (self.handle == null) return;
         mlx_cache_free(self.handle);
     }
 
     pub fn updateAndFetch(self: Cache, layer_idx: usize, k_new: ArrayHandle, v_new: ArrayHandle) struct { k: ArrayHandle, v: ArrayHandle, is_prefill: bool } {
+        if (self.handle == null) return .{ .k = k_new, .v = v_new, .is_prefill = false };
         var k_cache: ArrayHandle = null;
         var v_cache: ArrayHandle = null;
         var is_prefill: bool = false;
@@ -94,6 +100,7 @@ pub const Cache = struct {
     }
 
     pub fn get(self: Cache, layer_idx: usize) struct { k: ArrayHandle, v: ArrayHandle } {
+        if (self.handle == null) return .{ .k = null, .v = null };
         var k_cache: ArrayHandle = null;
         var v_cache: ArrayHandle = null;
         mlx_cache_get_bfloat16(self.handle, layer_idx, &k_cache, &v_cache);
@@ -101,10 +108,12 @@ pub const Cache = struct {
     }
 
     pub fn setFull(self: Cache, layer_idx: usize, k_full: ArrayHandle, v_full: ArrayHandle) void {
+        if (self.handle == null) return;
         mlx_cache_set_full_bfloat16(self.handle, layer_idx, k_full, v_full);
     }
 
     pub fn evalAll(self: Cache, n_layers: usize) void {
+        if (self.handle == null) return;
         mlx_cache_eval_all(self.handle, n_layers);
     }
 
@@ -116,6 +125,16 @@ pub const Cache = struct {
         v_scales: ArrayHandle,
         v_biases: ArrayHandle,
     } {
+        if (self.handle == null) {
+            return .{
+                .k_weights = null,
+                .k_scales = null,
+                .k_biases = null,
+                .v_weights = null,
+                .v_scales = null,
+                .v_biases = null,
+            };
+        }
         var k_w: ArrayHandle = null;
         var k_s: ArrayHandle = null;
         var k_b: ArrayHandle = null;
@@ -141,11 +160,17 @@ pub const ShortConvCache = struct {
         return .{ .handle = mlx_shortconv_cache_create(n_layers) };
     }
 
+    pub fn disabled() ShortConvCache {
+        return .{ .handle = null };
+    }
+
     pub fn reset(self: ShortConvCache) void {
+        if (self.handle == null) return;
         mlx_shortconv_cache_reset(self.handle);
     }
 
     pub fn deinit(self: ShortConvCache) void {
+        if (self.handle == null) return;
         mlx_shortconv_cache_free(self.handle);
     }
 };
@@ -157,11 +182,17 @@ pub const MambaCache = struct {
         return .{ .handle = mlx_mamba_cache_create(n_layers) };
     }
 
+    pub fn disabled() MambaCache {
+        return .{ .handle = null };
+    }
+
     pub fn reset(self: MambaCache) void {
+        if (self.handle == null) return;
         mlx_mamba_cache_reset(self.handle);
     }
 
     pub fn deinit(self: MambaCache) void {
+        if (self.handle == null) return;
         mlx_mamba_cache_free(self.handle);
     }
 };

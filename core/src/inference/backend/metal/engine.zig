@@ -57,7 +57,9 @@ pub const MetalBackend = struct {
     mamba_cache: runtime_graph_mod.MambaCache,
     vocab_size: usize,
     d_model: usize,
+    has_kv_state: bool,
     has_shortconv: bool,
+    has_mamba_state: bool,
     max_batch_size: usize,
     slot_in_use: bool,
     /// Slots 1..N-1 for scheduler-managed multi-slot decode.
@@ -176,14 +178,18 @@ pub const MetalBackend = struct {
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
-        slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(
-            @intCast(self.config.n_layers),
-            true,
-            self.cacheMaxSeqLen(),
-        );
-        slot_shortconv_cache.reset();
-        slot_mamba_cache.reset();
+        if (self.has_kv_state) {
+            slot_cache.deinit();
+            slot_cache.* = runtime_graph_mod.Cache.init(
+                @intCast(self.config.n_layers),
+                true,
+                self.cacheMaxSeqLen(),
+            );
+        } else {
+            slot_cache.* = runtime_graph_mod.Cache.disabled(true);
+        }
+        if (self.has_shortconv) slot_shortconv_cache.reset();
+        if (self.has_mamba_state) slot_mamba_cache.reset();
         slot_position.* = 0;
         slot_rope_delta.* = 0;
     }
@@ -200,14 +206,18 @@ pub const MetalBackend = struct {
         slot_rope_delta.* = 0;
 
         // Reset cache for new sequence in this scheduler slot.
-        slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(
-            @intCast(self.config.n_layers),
-            true,
-            self.cacheMaxSeqLen(),
-        );
-        slot_shortconv_cache.reset();
-        slot_mamba_cache.reset();
+        if (self.has_kv_state) {
+            slot_cache.deinit();
+            slot_cache.* = runtime_graph_mod.Cache.init(
+                @intCast(self.config.n_layers),
+                true,
+                self.cacheMaxSeqLen(),
+            );
+        } else {
+            slot_cache.* = runtime_graph_mod.Cache.disabled(true);
+        }
+        if (self.has_shortconv) slot_shortconv_cache.reset();
+        if (self.has_mamba_state) slot_mamba_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazy(
             self.allocator,
@@ -304,9 +314,21 @@ pub const MetalBackend = struct {
             .cache_max_seq_len = cache_max_seq_len,
             .dynamic_growth = @as(u8, @intFromBool(cache_max_seq_len == 0)),
         }, @src());
-        const kv_cache = runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len);
-        const shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count);
-        const mamba_cache = runtime_graph_mod.MambaCache.init(layer_count);
+        const has_kv_state = weight_handles.has_kv_state;
+        const has_shortconv_state = weight_handles.has_shortconv;
+        const has_mamba_state = weight_handles.has_mamba;
+        const kv_cache = if (has_kv_state)
+            runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len)
+        else
+            runtime_graph_mod.Cache.disabled(true);
+        const shortconv_cache = if (has_shortconv_state)
+            runtime_graph_mod.ShortConvCache.init(layer_count)
+        else
+            runtime_graph_mod.ShortConvCache.disabled();
+        const mamba_cache = if (has_mamba_state)
+            runtime_graph_mod.MambaCache.init(layer_count)
+        else
+            runtime_graph_mod.MambaCache.disabled();
         errdefer mamba_cache.deinit();
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
@@ -318,9 +340,18 @@ pub const MetalBackend = struct {
         errdefer allocator.free(extra_slots);
         for (extra_slots) |*slot| {
             slot.* = .{
-                .cache = runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len),
-                .shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count),
-                .mamba_cache = runtime_graph_mod.MambaCache.init(layer_count),
+                .cache = if (has_kv_state)
+                    runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len)
+                else
+                    runtime_graph_mod.Cache.disabled(true),
+                .shortconv_cache = if (has_shortconv_state)
+                    runtime_graph_mod.ShortConvCache.init(layer_count)
+                else
+                    runtime_graph_mod.ShortConvCache.disabled(),
+                .mamba_cache = if (has_mamba_state)
+                    runtime_graph_mod.MambaCache.init(layer_count)
+                else
+                    runtime_graph_mod.MambaCache.disabled(),
                 .in_use = false,
                 .position = 0,
                 .rope_position_delta = 0,
@@ -344,7 +375,9 @@ pub const MetalBackend = struct {
             .mamba_cache = mamba_cache,
             .vocab_size = @intCast(loaded.config.vocab_size),
             .d_model = @intCast(loaded.config.d_model),
-            .has_shortconv = weight_handles.has_shortconv,
+            .has_kv_state = has_kv_state,
+            .has_shortconv = has_shortconv_state,
+            .has_mamba_state = has_mamba_state,
             .max_batch_size = max_batch_size,
             .slot_in_use = false,
             .extra_slots = extra_slots,
@@ -607,14 +640,18 @@ pub const MetalBackend = struct {
         }
 
         // Reset selected slot cache for new sequence.
-        slot_cache.deinit();
-        slot_cache.* = runtime_graph_mod.Cache.init(
-            @intCast(self.config.n_layers),
-            true,
-            self.cacheMaxSeqLen(),
-        );
-        slot_shortconv_cache.reset();
-        slot_mamba_cache.reset();
+        if (self.has_kv_state) {
+            slot_cache.deinit();
+            slot_cache.* = runtime_graph_mod.Cache.init(
+                @intCast(self.config.n_layers),
+                true,
+                self.cacheMaxSeqLen(),
+            );
+        } else {
+            slot_cache.* = runtime_graph_mod.Cache.disabled(true);
+        }
+        if (self.has_shortconv) slot_shortconv_cache.reset();
+        if (self.has_mamba_state) slot_mamba_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,

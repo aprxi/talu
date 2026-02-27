@@ -897,6 +897,7 @@ pub const Transformer = struct {
             layer_idx,
             @intCast(model_config.d_model),
             program,
+            .decode,
         );
     }
 

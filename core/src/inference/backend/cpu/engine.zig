@@ -252,10 +252,6 @@ pub const FusedCpuBackend = struct {
         }
     }
 
-    fn layerHasStateDescriptor(layer: *const cpu_executor.Block, state_id: u8) bool {
-        return runtime_contract.planHasStateDescriptor(&layer.compiled_plan.plan, state_id);
-    }
-
     pub fn init(
         allocator: std.mem.Allocator,
         loaded: *LoadedModel,
@@ -344,21 +340,30 @@ pub const FusedCpuBackend = struct {
         defer mamba_layer_indices.deinit(allocator);
         var shortconv_layer_indices = std.ArrayListUnmanaged(usize){};
         defer shortconv_layer_indices.deinit(allocator);
+        var kv_layer_indices = std.ArrayListUnmanaged(usize){};
+        defer kv_layer_indices.deinit(allocator);
         var mla_layer_indices = std.ArrayListUnmanaged(usize){};
         defer mla_layer_indices.deinit(allocator);
 
+        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
         const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
         for (model.layers, 0..) |*layer, layer_idx| {
-            if (layerHasStateDescriptor(layer, mamba_state_id)) {
-                try mamba_layer_indices.append(allocator, layer_idx);
-            }
-            if (layerHasStateDescriptor(layer, shortconv_state_id)) {
-                try shortconv_layer_indices.append(allocator, layer_idx);
+            for (layer.compiled_plan.plan.state_descs) |state_desc| {
+                switch (state_desc.id) {
+                    kv_state_id => try kv_layer_indices.append(allocator, layer_idx),
+                    mamba_state_id => try mamba_layer_indices.append(allocator, layer_idx),
+                    shortconv_state_id => try shortconv_layer_indices.append(allocator, layer_idx),
+                    else => return error.InvalidStateDescriptorBinding,
+                }
             }
             if (layer_idx < cpu_block_set.len and cpu_block_set[layer_idx].getMLAAttention() != null) {
                 try mla_layer_indices.append(allocator, layer_idx);
             }
+        }
+
+        if (kv_layer_indices.items.len > 0) {
+            try scratch.initAttention(kv_layer_indices.items);
         }
 
         if (mamba_layer_indices.items.len > 0) {

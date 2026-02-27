@@ -127,6 +127,31 @@ pub const VisionRuntime = struct {
         return vision_program_adapter_table[@intFromEnum(opcode)];
     }
 
+    fn initVisionScratch(
+        allocator: std.mem.Allocator,
+        vision_hidden_size: usize,
+        vision_intermediate_size: usize,
+        vision_depth: usize,
+    ) !cpu_blocks.ScratchBuffer {
+        var scratch = try cpu_blocks.ScratchBuffer.init(
+            allocator,
+            vision_hidden_size,
+            vision_intermediate_size,
+            vision_depth,
+        );
+        errdefer scratch.deinit();
+
+        if (vision_depth > 0) {
+            const attention_layer_indices = try allocator.alloc(usize, vision_depth);
+            defer allocator.free(attention_layer_indices);
+            for (attention_layer_indices, 0..) |*layer_idx, idx| {
+                layer_idx.* = idx;
+            }
+            try scratch.initAttention(attention_layer_indices);
+        }
+        return scratch;
+    }
+
     const LayerWeights = struct {
         ln1_weight: Tensor,
         ln1_bias: Tensor,
@@ -443,6 +468,7 @@ pub const VisionRuntime = struct {
                 layer_idx,
                 vision_hidden_size,
                 &vision_block_program,
+                .vision_encode,
             );
             built_layers = layer_idx + 1;
             try exec_blocks[layer_idx].validate();
@@ -452,7 +478,7 @@ pub const VisionRuntime = struct {
         const use_vision_rope = saw_fused_qkv;
         const token_order: TokenOrder = if (use_vision_rope) .merge_block else .row_major;
 
-        var scratch = try cpu_blocks.ScratchBuffer.init(
+        var scratch = try initVisionScratch(
             allocator,
             vision_hidden_size,
             vision_intermediate_size,
@@ -1218,4 +1244,15 @@ test "visionProgramAdapterForOpcode covers CPU split vision execution subset" {
 
     try std.testing.expect(VisionRuntime.visionProgramAdapterForOpcode(.rmsnorm) == null);
     try std.testing.expect(VisionRuntime.visionProgramAdapterForOpcode(.mul_scalar) == null);
+}
+
+test "initVisionScratch initializes attention cache for every vision layer" {
+    const allocator = std.testing.allocator;
+    var scratch = try VisionRuntime.initVisionScratch(allocator, 16, 32, 3);
+    defer scratch.deinit();
+
+    for (0..3) |layer_idx| {
+        const slot_state = scratch.getSlotState(layer_idx) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(slot_state.attn_cache != null);
+    }
 }
