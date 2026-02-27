@@ -74,7 +74,9 @@ deps:
 	@printf '%s\n%s\n' '//! Mozilla CA certificates - auto-generated, do not edit' 'pub const data = @embedFile("cacert.pem");' > deps/cacert.zig
 	@printf '%s\n%s\n' '//! Compiled magic database - auto-generated, do not edit' 'pub const data = @embedFile("file/magic.mgc");' > deps/magic_db.zig
 	@test -d deps/freetype || git clone --branch VER-2-13-3 --depth 1 https://github.com/freetype/freetype.git deps/freetype
-	@test -d deps/pdfium || git clone --depth 1 https://pdfium.googlesource.com/pdfium deps/pdfium
+	@test -d deps/pdfium || (git init deps/pdfium && \
+		git -C deps/pdfium fetch --depth 1 https://pdfium.googlesource.com/pdfium 65f4269f6accf48306adb7fff10c07d72d56b1ea && \
+		git -C deps/pdfium checkout FETCH_HEAD)
 	@test -d deps/pdfium/third_party/fast_float/src || \
 		git clone --branch v8.2.3 --depth 1 https://github.com/fastfloat/fast_float.git deps/pdfium/third_party/fast_float/src
 	@# Tree-sitter core runtime + language grammars

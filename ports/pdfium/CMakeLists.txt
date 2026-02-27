@@ -452,7 +452,7 @@ set(PDFIUM_SOURCES
     core/fxge/cfx_path.cpp
     core/fxge/cfx_renderdevice.cpp
     core/fxge/cfx_substfont.cpp
-    core/fxge/cfx_unicodeencoding.cpp
+    core/fxge/cfx_charmap_resolver.cpp
     core/fxge/dib/blend.cpp
     core/fxge/dib/cfx_bitmapstorer.cpp
     core/fxge/dib/cfx_cmyk_to_srgb.cpp
