@@ -60,6 +60,16 @@ export const settingsPlugin: PluginDefinition = {
     initSettingsDom(ctx.container);
     wireEvents();
 
+    // Tab switching: show/hide settings tab pages via subnav buttons.
+    const SETTINGS_TABS = ["model", "appearance", "generation"] as const;
+    ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
+      if (!(SETTINGS_TABS as readonly string[]).includes(tab)) return;
+      for (const t of SETTINGS_TABS) {
+        const el = ctx.container.querySelector<HTMLElement>(`[data-settings-tab="${t}"]`);
+        if (el) el.style.display = t === tab ? "" : "none";
+      }
+    });
+
     // Load persisted custom themes and register with kernel.
     await loadCustomThemes();
     populateThemeSelects();

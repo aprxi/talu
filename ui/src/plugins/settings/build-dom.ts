@@ -1,37 +1,15 @@
 /**
  * Settings plugin DOM construction — builds the full layout HTML.
+ * Content is split into tabs (model, appearance, generation) controlled
+ * by the subnav sidebar.
  */
 
 export function buildSettingsDOM(root: HTMLElement): void {
   root.innerHTML = `
     <div class="settings-content scroll-thin">
-      <div class="settings-page">
 
-        <div class="settings-section">
-          <div class="settings-section-title">Appearance</div>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <div class="settings-row-label">Dark Theme</div>
-            </div>
-            <div class="settings-row-control">
-              <select id="sp-theme-dark" class="form-select"></select>
-            </div>
-          </div>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <div class="settings-row-label">Light Theme</div>
-            </div>
-            <div class="settings-row-control">
-              <select id="sp-theme-light" class="form-select"></select>
-            </div>
-          </div>
-          <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.25rem 0;">
-            <button id="sp-theme-new" class="btn btn-ghost btn-sm">New Theme</button>
-            <button id="sp-theme-import" class="btn btn-ghost btn-sm">Import</button>
-          </div>
-          <div id="sp-theme-editor"></div>
-        </div>
-
+      <!-- Tab: Model (default visible) -->
+      <div data-settings-tab="model" class="settings-page">
         <div class="settings-section">
           <div class="settings-section-title">Model</div>
           <div style="padding: 0.75rem 0;">
@@ -68,6 +46,52 @@ export function buildSettingsDOM(root: HTMLElement): void {
         </div>
 
         <div class="settings-section">
+          <div class="settings-section-title">Features</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Auto-generate titles</div>
+              <div class="settings-row-desc">Automatically name new conversations</div>
+            </div>
+            <label class="toggle">
+              <input type="checkbox" id="sp-auto-title" checked>
+              <span class="toggle-track"></span>
+            </label>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab: Appearance -->
+      <div data-settings-tab="appearance" class="settings-page" style="display: none;">
+        <div class="settings-section">
+          <div class="settings-section-title">Theme</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Dark Theme</div>
+            </div>
+            <div class="settings-row-control">
+              <select id="sp-theme-dark" class="form-select"></select>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Light Theme</div>
+            </div>
+            <div class="settings-row-control">
+              <select id="sp-theme-light" class="form-select"></select>
+            </div>
+          </div>
+          <div id="sp-theme-list"></div>
+          <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.25rem 0;">
+            <button id="sp-theme-new" class="btn btn-ghost btn-sm">New Theme</button>
+            <button id="sp-theme-import" class="btn btn-ghost btn-sm">Import</button>
+          </div>
+          <div id="sp-theme-editor"></div>
+        </div>
+      </div>
+
+      <!-- Tab: Generation -->
+      <div data-settings-tab="generation" class="settings-page" style="display: none;">
+        <div class="settings-section">
           <div class="settings-section-title">Generation</div>
           <div class="settings-row">
             <div class="settings-row-info">
@@ -102,22 +126,8 @@ export function buildSettingsDOM(root: HTMLElement): void {
             </div>
           </div>
         </div>
-
-        <div class="settings-section">
-          <div class="settings-section-title">Features</div>
-          <div class="settings-row">
-            <div class="settings-row-info">
-              <div class="settings-row-label">Auto-generate titles</div>
-              <div class="settings-row-desc">Automatically name new conversations</div>
-            </div>
-            <label class="toggle">
-              <input type="checkbox" id="sp-auto-title" checked>
-              <span class="toggle-track"></span>
-            </label>
-          </div>
-        </div>
-
-        <div id="sp-status" class="settings-status"></div>
       </div>
+
+      <div id="sp-status" class="settings-status"></div>
     </div>`;
 }

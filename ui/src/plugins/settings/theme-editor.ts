@@ -361,6 +361,9 @@ export function populateThemeSelects(): void {
     if (t.id === lightSlot) opt.selected = true;
     dom.themeLightSelect.appendChild(opt);
   }
+
+  // Keep the custom theme list in sync.
+  renderThemeList();
 }
 
 // ── Mode slot change handlers ────────────────────────────────────────────────
@@ -542,6 +545,77 @@ export async function handleDelete(id: string): Promise<void> {
   closeEditor();
   populateThemeSelects();
   notifications.info(`Deleted "${custom.name}"`);
+}
+
+// ── Custom theme list (inline in settings) ───────────────────────────────────
+
+const ICON_EDIT = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 3a2.85 2.83 0 1 1 4 4L7.5 20.5 2 22l1.5-5.5Z"/><path d="m15 5 4 4"/></svg>';
+const ICON_EXPORT = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" x2="12" y1="15" y2="3"/></svg>';
+const ICON_DELETE = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>';
+
+export function renderThemeList(): void {
+  const dom = getSettingsDom();
+  const customs = settingsState.customThemes;
+
+  if (customs.length === 0) {
+    dom.themeList.innerHTML = "";
+    return;
+  }
+
+  dom.themeList.innerHTML = "";
+  for (const ct of customs) {
+    const row = document.createElement("div");
+    row.className = "settings-row";
+    row.style.padding = "0.25rem 0";
+
+    const info = document.createElement("div");
+    info.className = "settings-row-info";
+
+    const name = document.createElement("div");
+    name.className = "settings-row-label";
+    name.textContent = ct.name;
+    info.appendChild(name);
+
+    const badge = document.createElement("div");
+    badge.className = "settings-row-desc";
+    badge.textContent = ct.category;
+    info.appendChild(badge);
+
+    row.appendChild(info);
+
+    const actions = document.createElement("div");
+    actions.style.cssText = "display: flex; gap: 0.25rem;";
+
+    const editBtn = document.createElement("button");
+    editBtn.className = "btn btn-ghost btn-sm btn-icon";
+    editBtn.title = "Edit";
+    editBtn.innerHTML = ICON_EDIT;
+    editBtn.addEventListener("click", () => {
+      // Assign to matching slot and apply so the editor shows it live.
+      setSlotTheme(ct.category, ct.id);
+      theme.setActiveTheme(ct.id);
+      populateThemeSelects();
+      renderEditor(ct.id);
+    });
+    actions.appendChild(editBtn);
+
+    const exportBtn = document.createElement("button");
+    exportBtn.className = "btn btn-ghost btn-sm btn-icon";
+    exportBtn.title = "Export";
+    exportBtn.innerHTML = ICON_EXPORT;
+    exportBtn.addEventListener("click", () => handleExport(ct.id));
+    actions.appendChild(exportBtn);
+
+    const deleteBtn = document.createElement("button");
+    deleteBtn.className = "btn btn-danger btn-sm btn-icon";
+    deleteBtn.title = "Delete";
+    deleteBtn.innerHTML = ICON_DELETE;
+    deleteBtn.addEventListener("click", () => void handleDelete(ct.id));
+    actions.appendChild(deleteBtn);
+
+    row.appendChild(actions);
+    dom.themeList.appendChild(row);
+  }
 }
 
 // ── Load from storage ────────────────────────────────────────────────────────

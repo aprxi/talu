@@ -24,6 +24,7 @@ export interface SettingsDom {
   themeLightSelect: HTMLSelectElement;
   themeNewBtn: HTMLButtonElement;
   themeImportBtn: HTMLButtonElement;
+  themeList: HTMLElement;
   themeEditorHost: HTMLElement;
 }
 
@@ -62,6 +63,7 @@ export function getSettingsDom(): SettingsDom {
     themeLightSelect: q<HTMLSelectElement>("sp-theme-light"),
     themeNewBtn: q<HTMLButtonElement>("sp-theme-new"),
     themeImportBtn: q<HTMLButtonElement>("sp-theme-import"),
+    themeList: q("sp-theme-list"),
     themeEditorHost: q("sp-theme-editor"),
   };
 
