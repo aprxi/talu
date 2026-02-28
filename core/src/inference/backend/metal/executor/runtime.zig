@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const model_executor = @import("model.zig");
 const weights_executor = @import("weights.zig");
@@ -29,10 +30,8 @@ pub fn transformerForwardLazy(
     allocator: std.mem.Allocator,
     weight_handles: *const WeightHandles,
     input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
-    cache: ?Cache,
-    shortconv_cache: ?ShortConvCache,
-    mamba_cache: ?MambaCache,
     pos_offset: usize,
     use_compiled: bool,
 ) !ArrayHandle {
@@ -40,10 +39,8 @@ pub fn transformerForwardLazy(
         allocator,
         weight_handles,
         input_ids,
+        state_blocks,
         config,
-        cache,
-        shortconv_cache,
-        mamba_cache,
         pos_offset,
         use_compiled,
     );
@@ -53,10 +50,8 @@ pub fn transformerForwardHiddenLazy(
     allocator: std.mem.Allocator,
     weight_handles: *const WeightHandles,
     input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
-    cache: ?Cache,
-    shortconv_cache: ?ShortConvCache,
-    mamba_cache: ?MambaCache,
     pos_offset: usize,
     use_compiled: bool,
 ) !ArrayHandle {
@@ -64,10 +59,8 @@ pub fn transformerForwardHiddenLazy(
         allocator,
         weight_handles,
         input_ids,
+        state_blocks,
         config,
-        cache,
-        shortconv_cache,
-        mamba_cache,
         pos_offset,
         use_compiled,
     );
@@ -77,10 +70,8 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
     allocator: std.mem.Allocator,
     weight_handles: *const WeightHandles,
     input_ids: []const u32,
+    state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
-    cache: ?Cache,
-    shortconv_cache: ?ShortConvCache,
-    mamba_cache: ?MambaCache,
     pos_offset: usize,
     use_compiled: bool,
     embedding_override: ?[]const f32,
@@ -91,10 +82,8 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
         allocator,
         weight_handles,
         input_ids,
+        state_blocks,
         config,
-        cache,
-        shortconv_cache,
-        mamba_cache,
         pos_offset,
         use_compiled,
         embedding_override,
@@ -107,48 +96,44 @@ pub fn transformerForwardFromGPUToken(
     allocator: std.mem.Allocator,
     weight_handles: *const WeightHandles,
     token_handle: ArrayHandle,
+    state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
-    cache: ?Cache,
-    shortconv_cache: ?ShortConvCache,
-    mamba_cache: ?MambaCache,
     pos_offset: usize,
 ) !ArrayHandle {
     return model_executor.Model.forwardFromGPUToken(
         allocator,
         weight_handles,
         token_handle,
+        state_blocks,
         config,
-        cache,
-        shortconv_cache,
-        mamba_cache,
         pos_offset,
     );
 }
 
 test "transformerForwardLazy exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardLazy)).@"fn";
-    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 8), fn_info.params.len);
     const f = transformerForwardLazy;
     _ = f;
 }
 
 test "transformerForwardHiddenLazy exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardHiddenLazy)).@"fn";
-    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 8), fn_info.params.len);
     const f = transformerForwardHiddenLazy;
     _ = f;
 }
 
 test "transformerForwardLazyWithEmbeddingOverride exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardLazyWithEmbeddingOverride)).@"fn";
-    try std.testing.expectEqual(@as(usize, 13), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 11), fn_info.params.len);
     const f = transformerForwardLazyWithEmbeddingOverride;
     _ = f;
 }
 
 test "transformerForwardFromGPUToken exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardFromGPUToken)).@"fn";
-    try std.testing.expectEqual(@as(usize, 9), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
     const f = transformerForwardFromGPUToken;
     _ = f;
 }

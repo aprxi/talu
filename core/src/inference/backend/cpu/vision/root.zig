@@ -142,6 +142,39 @@ pub const VisionRuntime = struct {
             },
         }
     }
+
+    pub fn scatterIntoHidden(
+        self: *VisionRuntime,
+        hidden_states: []f32,
+        seq_len: usize,
+        d_model: usize,
+        token_ids: []const u32,
+        image_token_id: u32,
+        embeddings: []const f32,
+    ) !void {
+        switch (self.impl) {
+            .fused_qkv => |*rt| {
+                return rt.scatterIntoHidden(
+                    hidden_states,
+                    seq_len,
+                    d_model,
+                    token_ids,
+                    image_token_id,
+                    embeddings,
+                );
+            },
+            .split_qkv => |*rt| {
+                return rt.scatterIntoHidden(
+                    hidden_states,
+                    seq_len,
+                    d_model,
+                    token_ids,
+                    image_token_id,
+                    embeddings,
+                );
+            },
+        }
+    }
 };
 
 pub fn scatterVisionEmbeddings(

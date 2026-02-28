@@ -37,142 +37,9 @@ pub fn decodeModelFree(model: DecodeModel) void {
     mlx_decode_model_free(model.handle);
 }
 
-pub fn decodeStepLogits(
-    model: DecodeModel,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    token_id: u32,
-    pos_offset: usize,
-) ArrayHandle {
-    return mlx_decode_model_step_logits(model.handle, cache, shortconv_cache, mamba_cache, token_id, pos_offset);
-}
-
-pub fn decodeStepLogitsBatch(
-    model: DecodeModel,
-    caches: []const CacheHandle,
-    shortconv_caches: []const ShortConvCacheHandle,
-    mamba_caches: []const MambaCacheHandle,
-    token_ids: []const u32,
-    pos_offsets: []const usize,
-    out_logits: []ArrayHandle,
-) void {
-    std.debug.assert(caches.len == shortconv_caches.len);
-    std.debug.assert(caches.len == mamba_caches.len);
-    std.debug.assert(caches.len == token_ids.len);
-    std.debug.assert(caches.len == pos_offsets.len);
-    std.debug.assert(caches.len == out_logits.len);
-    mlx_decode_model_step_logits_batch(
-        model.handle,
-        caches.ptr,
-        shortconv_caches.ptr,
-        mamba_caches.ptr,
-        token_ids.ptr,
-        pos_offsets.ptr,
-        out_logits.ptr,
-        out_logits.len,
-    );
-}
-
-pub fn decodeBatch(
-    model: DecodeModel,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    first_token: u32,
-    start_pos: usize,
-    out_tokens: [*]u32,
-    max_tokens: usize,
-    eos_ids: [*]const u32,
-    n_eos_ids: usize,
-) u32 {
-    return mlx_decode_model_decode_batch(model.handle, cache, shortconv_cache, mamba_cache, first_token, start_pos, out_tokens, max_tokens, eos_ids, n_eos_ids);
-}
-
-pub fn pipelinePrime(
-    model: DecodeModel,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    first_token_id: u32,
-    pos_offset: usize,
-) void {
-    mlx_decode_model_pipeline_prime(model.handle, cache, shortconv_cache, mamba_cache, first_token_id, pos_offset);
-}
-
-pub fn pipelineStep(
-    model: DecodeModel,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    pos_offset: usize,
-) u32 {
-    return mlx_decode_model_pipeline_step(model.handle, cache, shortconv_cache, mamba_cache, pos_offset);
-}
-
-pub fn pipelineFlushWithCache(
-    model: DecodeModel,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-) u32 {
-    return mlx_decode_model_pipeline_flush(model.handle, cache, shortconv_cache, mamba_cache);
-}
-
 pub extern fn mlx_decode_model_wrap_fused(model: *anyopaque) ?*anyopaque;
 pub extern fn mlx_decode_model_wrap_dense(model: *anyopaque) ?*anyopaque;
 pub extern fn mlx_decode_model_free(model: *anyopaque) void;
-pub extern fn mlx_decode_model_step_logits(
-    model: *anyopaque,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    token_id: u32,
-    pos_offset: usize,
-) ArrayHandle;
-pub extern fn mlx_decode_model_step_logits_batch(
-    model: *anyopaque,
-    caches: [*]const CacheHandle,
-    shortconv_caches: [*]const ShortConvCacheHandle,
-    mamba_caches: [*]const MambaCacheHandle,
-    token_ids: [*]const u32,
-    pos_offsets: [*]const usize,
-    out_logits: [*]ArrayHandle,
-    count: usize,
-) void;
-pub extern fn mlx_decode_model_decode_batch(
-    model: *anyopaque,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    first_token: u32,
-    start_pos: usize,
-    out_tokens: [*]u32,
-    max_tokens: usize,
-    eos_ids: [*]const u32,
-    n_eos_ids: usize,
-) u32;
-pub extern fn mlx_decode_model_pipeline_prime(
-    model: *anyopaque,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    first_token_id: u32,
-    pos_offset: usize,
-) void;
-pub extern fn mlx_decode_model_pipeline_step(
-    model: *anyopaque,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-    pos_offset: usize,
-) u32;
-pub extern fn mlx_decode_model_pipeline_flush(
-    model: *anyopaque,
-    cache: CacheHandle,
-    shortconv_cache: ShortConvCacheHandle,
-    mamba_cache: MambaCacheHandle,
-) u32;
 
 pub extern fn mlx_fused_model_create(
     n_layers: usize,
@@ -488,13 +355,6 @@ pub extern fn mlx_dense_decode_batch(
     eos_ids: [*]const u32,
     n_eos_ids: usize,
 ) u32;
-
-test "pipelineFlushWithCache exposes stable callable signature" {
-    const fn_info = @typeInfo(@TypeOf(pipelineFlushWithCache)).@"fn";
-    try std.testing.expectEqual(@as(usize, 4), fn_info.params.len);
-    const f = pipelineFlushWithCache;
-    _ = f;
-}
 
 test "mlx_fused_model_compile exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(mlx_fused_model_compile)).@"fn";

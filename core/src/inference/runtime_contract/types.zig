@@ -36,6 +36,85 @@ pub const StateLifecycle = enum(u8) {
     step_scoped = 2,
 };
 
+pub const StateLifecycleAction = enum(u8) {
+    alloc = 0,
+    reset = 1,
+    reuse = 2,
+    evict = 3,
+    clone_for_fork = 4,
+    deinit = 5,
+};
+
+pub const StateLifecyclePolicy = struct {
+    allow_reset: bool,
+    allow_reuse: bool,
+    allow_evict: bool,
+    allow_clone_for_fork: bool,
+    zero_on_alloc: bool,
+    zero_on_reset: bool,
+    zero_on_evict: bool,
+};
+
+pub fn stateLifecyclePolicy(lifecycle: StateLifecycle) StateLifecyclePolicy {
+    return switch (lifecycle) {
+        .slot_persistent => .{
+            .allow_reset = true,
+            .allow_reuse = true,
+            .allow_evict = true,
+            .allow_clone_for_fork = false,
+            .zero_on_alloc = false,
+            .zero_on_reset = false,
+            .zero_on_evict = false,
+        },
+        .request_scoped => .{
+            .allow_reset = false,
+            .allow_reuse = false,
+            .allow_evict = true,
+            .allow_clone_for_fork = false,
+            .zero_on_alloc = true,
+            .zero_on_reset = false,
+            .zero_on_evict = true,
+        },
+        .step_scoped => .{
+            .allow_reset = true,
+            .allow_reuse = false,
+            .allow_evict = true,
+            .allow_clone_for_fork = false,
+            .zero_on_alloc = true,
+            .zero_on_reset = true,
+            .zero_on_evict = true,
+        },
+    };
+}
+
+pub fn validateStateLifecycleAction(
+    lifecycle: StateLifecycle,
+    action: StateLifecycleAction,
+) !void {
+    const policy = stateLifecyclePolicy(lifecycle);
+    switch (action) {
+        .alloc, .deinit => return,
+        .reset => if (!policy.allow_reset) return error.InvalidStateLifecycleAction,
+        .reuse => if (!policy.allow_reuse) return error.InvalidStateLifecycleAction,
+        .evict => if (!policy.allow_evict) return error.InvalidStateLifecycleAction,
+        .clone_for_fork => if (!policy.allow_clone_for_fork) return error.InvalidStateLifecycleAction,
+    }
+}
+
+pub fn shouldZeroStateForLifecycleAction(
+    descriptor: *const StateDescriptor,
+    action: StateLifecycleAction,
+) !bool {
+    try validateStateLifecycleAction(descriptor.lifecycle, action);
+    const policy = stateLifecyclePolicy(descriptor.lifecycle);
+    return switch (action) {
+        .alloc => descriptor.zero_init or policy.zero_on_alloc,
+        .reset => descriptor.zero_init or policy.zero_on_reset,
+        .evict => descriptor.zero_init or policy.zero_on_evict,
+        .reuse, .clone_for_fork, .deinit => false,
+    };
+}
+
 pub const StateDescriptor = struct {
     id: u8,
     size_bytes: u64,
@@ -90,6 +169,7 @@ pub const CompiledPlan = struct {
     plan: ExecutionPlan,
     param_blocks: []const ParamBlock,
     weight_bindings: []const WeightBinding = &.{},
+    register_buffer_specs: []const PhysicalBufferSpec = &.{},
     liveness: LivenessMap,
     peak_registers: u16,
     diagnostics: []const PlanDiagnostic,
@@ -133,6 +213,12 @@ pub const StateBlockHandle = struct {
     align_bytes: u16,
 };
 
+/// Backend-owned opaque state reference carried inside StateBlockHandle.ptr.
+/// Backends populate this with pointers to concrete runtime state objects.
+pub const OpaqueStateRef = extern struct {
+    ptr: ?*anyopaque = null,
+};
+
 pub const ParamBlock = struct {
     version: u8,
     opcode: Opcode,
@@ -151,27 +237,29 @@ pub const ExecutionMode = enum(u8) {
 };
 
 pub const DispatchCounters = struct {
-    per_opcode: [256]u64 = [_]u64{0} ** 256,
-    total_instructions: u64 = 0,
+    per_opcode: [256]std.atomic.Value(u64) = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** 256,
+    total_instructions: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
 
     pub fn reset(self: *DispatchCounters) void {
-        @memset(self.per_opcode[0..], 0);
-        @atomicStore(u64, &self.total_instructions, 0, .monotonic);
+        for (&self.per_opcode) |*counter| {
+            counter.store(0, .monotonic);
+        }
+        self.total_instructions.store(0, .monotonic);
     }
 
     pub fn record(self: *DispatchCounters, opcode: Opcode) void {
         const idx: usize = @intFromEnum(opcode);
-        _ = @atomicRmw(u64, &self.per_opcode[idx], .Add, 1, .monotonic);
-        _ = @atomicRmw(u64, &self.total_instructions, .Add, 1, .monotonic);
+        _ = self.per_opcode[idx].fetchAdd(1, .monotonic);
+        _ = self.total_instructions.fetchAdd(1, .monotonic);
     }
 
     pub fn total(self: *const DispatchCounters) u64 {
-        return @atomicLoad(u64, &self.total_instructions, .monotonic);
+        return self.total_instructions.load(.monotonic);
     }
 
     pub fn countForOpcode(self: *const DispatchCounters, opcode: Opcode) u64 {
         const idx: usize = @intFromEnum(opcode);
-        return @atomicLoad(u64, &self.per_opcode[idx], .monotonic);
+        return self.per_opcode[idx].load(.monotonic);
     }
 };
 
@@ -215,6 +303,14 @@ pub const AdapterCapability = struct {
 
 pub const AdapterCapabilities = [256]AdapterCapability;
 
+pub fn validateBatchCapability(capability: AdapterCapability, batch_size: usize) !void {
+    if (batch_size == 0) return error.InvalidBatchSize;
+    if (!capability.supports_batch and batch_size > 1) return error.UnsupportedBatchSize;
+    if (capability.max_batch_size) |max_batch_size| {
+        if (batch_size > max_batch_size) return error.UnsupportedBatchSize;
+    }
+}
+
 pub const UnsupportedLayerProgramOpcode = struct {
     op_index: usize,
     opcode: Opcode,
@@ -228,7 +324,6 @@ pub const UnsupportedInstructionOpcode = struct {
 pub const LayerProgramCompatibilityIssue = union(enum) {
     unsupported_opcode: UnsupportedLayerProgramOpcode,
     state_mismatch: LayerProgramStateMismatch,
-    buffer_violation: layer_ops.CoreProgramBufferViolation,
 };
 
 fn adapterSlotPresent(slot: anytype) bool {
@@ -304,9 +399,6 @@ pub fn firstLayerProgramCompatibilityIssue(
     if (firstLayerProgramStateMismatch(program, kind)) |mismatch| {
         return .{ .state_mismatch = mismatch };
     }
-    if (layer_ops.firstCoreProgramBufferViolation(program)) |violation| {
-        return .{ .buffer_violation = violation };
-    }
     return null;
 }
 
@@ -327,10 +419,54 @@ pub fn requiredStateBlockIdForOpcode(opcode: Opcode) ?u8 {
     };
 }
 
+pub fn expectedKernelWeightSlots(opcode: Opcode) []const []const u8 {
+    return switch (opcode) {
+        .rmsnorm => &.{"norm_weight"},
+        .multihead_attention => &.{ "q_proj", "k_proj", "v_proj", "o_proj" },
+        .swiglu => &.{ "w1", "w3", "w2" },
+        .moe => &.{"router"},
+        .mamba_mixer => &.{ "in_proj", "out_proj" },
+        .shortconv => &.{ "in_proj", "conv_weight", "out_proj" },
+        .mla_attention => &.{"mla_weights"},
+        .embedding => &.{"embedding"},
+        else => &.{},
+    };
+}
+
 pub fn expectedWeightRefCount(opcode: Opcode) usize {
+    const kernel_slots = expectedKernelWeightSlots(opcode);
+    if (kernel_slots.len != 0) return kernel_slots.len;
     return switch (opcode) {
         .linear, .add_param, .add_param_scalar, .mul_param => 1,
         else => 0,
+    };
+}
+
+pub const kernel_weight_binding_prefix = "__kernel_weight::";
+
+pub const KernelWeightBindingName = struct {
+    kernel_id: u32,
+    slot_name: []const u8,
+};
+
+pub fn parseKernelWeightBindingName(name: []const u8) !KernelWeightBindingName {
+    if (!std.mem.startsWith(u8, name, kernel_weight_binding_prefix)) return error.InvalidWeightBindingName;
+    const remainder = name[kernel_weight_binding_prefix.len..];
+    const first_sep = std.mem.indexOf(u8, remainder, "::") orelse return error.InvalidWeightBindingName;
+    if (first_sep == 0) return error.InvalidWeightBindingName;
+    const kernel_id = std.fmt.parseUnsigned(u32, remainder[0..first_sep], 10) catch {
+        return error.InvalidWeightBindingName;
+    };
+    const slot_and_tail = remainder[first_sep + 2 ..];
+    const second_sep = std.mem.indexOf(u8, slot_and_tail, "::") orelse return error.InvalidWeightBindingName;
+    if (second_sep == 0) return error.InvalidWeightBindingName;
+    const slot_name = slot_and_tail[0..second_sep];
+    const instruction_suffix = slot_and_tail[second_sep + 2 ..];
+    if (instruction_suffix.len == 0) return error.InvalidWeightBindingName;
+    _ = std.fmt.parseUnsigned(u32, instruction_suffix, 10) catch return error.InvalidWeightBindingName;
+    return .{
+        .kernel_id = kernel_id,
+        .slot_name = slot_name,
     };
 }
 
@@ -673,7 +809,7 @@ const ParamEncoder = struct {
 
     fn finish(self: *ParamEncoder, allocator: std.mem.Allocator, opcode: Opcode) !ParamBlock {
         if (self.bytes.items.len > max_param_block_data_bytes_v1) return error.InvalidParamBlockABI;
-        const payload = try allocator.alignedAlloc(u8, .fromByteUnits(8), self.bytes.items.len);
+        const payload = try allocator.alloc(u8, self.bytes.items.len);
         @memcpy(payload, self.bytes.items);
         return .{
             .version = param_block_abi_version_v1,
@@ -683,22 +819,22 @@ const ParamEncoder = struct {
     }
 };
 
-const ParamDecoder = struct {
+pub const ParamDecoder = struct {
     data: []const u8,
     offset: usize = 0,
 
-    fn init(data: []const u8) ParamDecoder {
+    pub fn init(data: []const u8) ParamDecoder {
         return .{ .data = data, .offset = 0 };
     }
 
-    fn alignTo(self: *ParamDecoder, alignment: usize) !void {
+    pub fn alignTo(self: *ParamDecoder, alignment: usize) !void {
         const rem = self.offset % alignment;
         if (rem == 0) return;
         const pad = alignment - rem;
         _ = try self.readBytes(pad);
     }
 
-    fn readBytes(self: *ParamDecoder, len: usize) ![]const u8 {
+    pub fn readBytes(self: *ParamDecoder, len: usize) ![]const u8 {
         const end = std.math.add(usize, self.offset, len) catch return error.InvalidParamBlockABI;
         if (end > self.data.len) return error.InvalidParamBlockABI;
         const out = self.data[self.offset..end];
@@ -706,15 +842,15 @@ const ParamDecoder = struct {
         return out;
     }
 
-    fn readU8(self: *ParamDecoder) !u8 {
+    pub fn readU8(self: *ParamDecoder) !u8 {
         return (try self.readBytes(1))[0];
     }
 
-    fn readI8(self: *ParamDecoder) !i8 {
+    pub fn readI8(self: *ParamDecoder) !i8 {
         return @bitCast(try self.readU8());
     }
 
-    fn readBool(self: *ParamDecoder) !bool {
+    pub fn readBool(self: *ParamDecoder) !bool {
         return switch (try self.readU8()) {
             0 => false,
             1 => true,
@@ -722,39 +858,39 @@ const ParamDecoder = struct {
         };
     }
 
-    fn readU16(self: *ParamDecoder) !u16 {
+    pub fn readU16(self: *ParamDecoder) !u16 {
         const bytes = try self.readBytes(2);
         var buf: [2]u8 = undefined;
         @memcpy(&buf, bytes);
         return std.mem.readInt(u16, &buf, .little);
     }
 
-    fn readU32(self: *ParamDecoder) !u32 {
+    pub fn readU32(self: *ParamDecoder) !u32 {
         const bytes = try self.readBytes(4);
         var buf: [4]u8 = undefined;
         @memcpy(&buf, bytes);
         return std.mem.readInt(u32, &buf, .little);
     }
 
-    fn readI32(self: *ParamDecoder) !i32 {
+    pub fn readI32(self: *ParamDecoder) !i32 {
         const bytes = try self.readBytes(4);
         var buf: [4]u8 = undefined;
         @memcpy(&buf, bytes);
         return std.mem.readInt(i32, &buf, .little);
     }
 
-    fn readUsize(self: *ParamDecoder) !usize {
+    pub fn readUsize(self: *ParamDecoder) !usize {
         const bytes = try self.readBytes(@sizeOf(usize));
         var buf: [@sizeOf(usize)]u8 = undefined;
         @memcpy(&buf, bytes);
         return std.mem.readInt(usize, &buf, .little);
     }
 
-    fn readF32(self: *ParamDecoder) !f32 {
+    pub fn readF32(self: *ParamDecoder) !f32 {
         return @bitCast(try self.readU32());
     }
 
-    fn finish(self: *const ParamDecoder) !void {
+    pub fn finish(self: *const ParamDecoder) !void {
         if (self.offset != self.data.len) return error.InvalidParamBlockABI;
     }
 };
@@ -1208,6 +1344,22 @@ pub fn findStateBlock(
     return null;
 }
 
+pub fn stateValueFromBlock(comptime T: type, state_block: *const StateBlockHandle) ?T {
+    comptime {
+        if (@typeInfo(T) != .pointer) @compileError("stateValueFromBlock requires a pointer type");
+    }
+    if (state_block.size < @sizeOf(OpaqueStateRef)) return null;
+    if (state_block.align_bytes < @alignOf(OpaqueStateRef)) return null;
+    const state_ref: *const OpaqueStateRef = @ptrCast(@alignCast(state_block.ptr));
+    const raw = state_ref.ptr orelse return null;
+    return @ptrCast(@alignCast(raw));
+}
+
+pub fn findStateValue(comptime T: type, state_blocks: []const StateBlockHandle, state_id: u8) ?T {
+    const state_block = findStateBlock(state_blocks, state_id) orelse return null;
+    return stateValueFromBlock(T, state_block);
+}
+
 pub fn findStateDescriptor(
     plan: *const ExecutionPlan,
     state_id: u8,
@@ -1283,16 +1435,6 @@ pub fn validateTensorViewDesc(view: *const TensorViewDesc) !void {
 pub fn validateExecutionContext(ctx: *const ExecutionContext) !void {
     if (ctx.batch_size != ctx.active_slots.len) return error.InvalidBatchSize;
     if (ctx.sequence_lengths.len != ctx.active_slots.len) return error.InvalidSequenceLengthCount;
-}
-
-pub fn validateBatchCapability(
-    ctx: *const ExecutionContext,
-    capability: AdapterCapability,
-) !void {
-    if (!capability.supports_batch and ctx.batch_size > 1) return error.BatchUnsupported;
-    if (capability.max_batch_size) |max_batch_size| {
-        if (ctx.batch_size > max_batch_size) return error.BatchUnsupported;
-    }
 }
 
 pub fn validateParamBlockAbi(param_block: *const ParamBlock) !void {
@@ -1398,6 +1540,13 @@ pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
     if (compiled.liveness.register_last_read.len != compiled.plan.register_count) {
         return error.InvalidLivenessRegisterCount;
     }
+    if (compiled.register_buffer_specs.len != 0 and compiled.register_buffer_specs.len != compiled.plan.register_count) {
+        return error.InvalidRegisterSpecCount;
+    }
+    for (compiled.register_buffer_specs) |spec| {
+        if (spec.size == 0) return error.InvalidRegisterSpecSize;
+        if (spec.@"align" == 0) return error.InvalidStateAlignment;
+    }
     if (compiled.liveness.kill_after_instruction.len != compiled.plan.instructions.len) {
         return error.InvalidLivenessInstructionCount;
     }
@@ -1461,39 +1610,22 @@ test "validateExecutionContext checks batch invariants" {
     try std.testing.expectError(error.InvalidSequenceLengthCount, validateExecutionContext(&invalid));
 }
 
-test "validateBatchCapability enforces explicit adapter batch limits" {
-    var slots: [2]usize = .{ 0, 1 };
-    var lengths: [2]u32 = .{ 8, 8 };
-    const ctx = ExecutionContext{
-        .mode = .decode,
-        .active_slots = slots[0..],
-        .sequence_lengths = lengths[0..],
-        .batch_size = 2,
+test "validateBatchCapability enforces backend batch limits" {
+    const single_only = AdapterCapability{
+        .supports_batch = false,
+        .supports_graph_emit = false,
+        .max_batch_size = 1,
     };
+    try validateBatchCapability(single_only, 1);
+    try std.testing.expectError(error.UnsupportedBatchSize, validateBatchCapability(single_only, 2));
 
-    try std.testing.expectError(
-        error.BatchUnsupported,
-        validateBatchCapability(&ctx, .{
-            .supports_batch = false,
-            .supports_graph_emit = false,
-            .max_batch_size = null,
-        }),
-    );
-
-    try std.testing.expectError(
-        error.BatchUnsupported,
-        validateBatchCapability(&ctx, .{
-            .supports_batch = true,
-            .supports_graph_emit = false,
-            .max_batch_size = 1,
-        }),
-    );
-
-    try validateBatchCapability(&ctx, .{
+    const batched = AdapterCapability{
         .supports_batch = true,
         .supports_graph_emit = false,
-        .max_batch_size = 4,
-    });
+        .max_batch_size = 8,
+    };
+    try validateBatchCapability(batched, 8);
+    try std.testing.expectError(error.UnsupportedBatchSize, validateBatchCapability(batched, 9));
 }
 
 test "validateParamBlockAbi rejects invalid version, size, and alignment" {
@@ -1533,8 +1665,8 @@ test "validateParamBlockAbi rejects invalid version, size, and alignment" {
 
 test "validateCompiledPlan rejects invalid param block ABI" {
     const insn = Instruction{
-        .opcode = .rmsnorm,
-        .inputs = &.{registerFromIndex(0)},
+        .opcode = .residual_add,
+        .inputs = &.{ registerFromIndex(0), registerFromIndex(1) },
         .outputs = &.{registerFromIndex(1)},
         .weights = &.{},
         .param_block_id = 0,
@@ -1550,7 +1682,7 @@ test "validateCompiledPlan rejects invalid param block ABI" {
         },
         .param_blocks = &.{.{
             .version = param_block_abi_version_v1,
-            .opcode = .rmsnorm,
+            .opcode = .residual_add,
             .data = large_backing[0..],
         }},
         .weight_bindings = &.{},
@@ -1915,7 +2047,7 @@ test "validateCompiledPlan enforces liveness dimensions" {
         .opcode = .rmsnorm,
         .inputs = &.{registerFromIndex(0)},
         .outputs = &.{registerFromIndex(1)},
-        .weights = &.{},
+        .weights = &.{.{ .index = 0 }},
         .param_block_id = null,
         .state_block_id = null,
     };
@@ -1931,7 +2063,7 @@ test "validateCompiledPlan enforces liveness dimensions" {
     const compiled = CompiledPlan{
         .plan = plan,
         .param_blocks = &.{},
-        .weight_bindings = &.{},
+        .weight_bindings = &.{.{ .index = 0, .name = "norm_w" }},
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
@@ -2051,6 +2183,26 @@ test "instructionSingleWeightBindingName rejects non-single weight arity" {
     try std.testing.expectError(error.InvalidWeightRefCount, instructionSingleWeightBindingName(&compiled, 0));
 }
 
+test "parseKernelWeightBindingName parses kernel id and slot name" {
+    const parsed = try parseKernelWeightBindingName("__kernel_weight::7::q_proj::12");
+    try std.testing.expectEqual(@as(u32, 7), parsed.kernel_id);
+    try std.testing.expectEqualStrings("q_proj", parsed.slot_name);
+}
+
+test "parseKernelWeightBindingName rejects malformed names" {
+    try std.testing.expectError(error.InvalidWeightBindingName, parseKernelWeightBindingName("q_proj"));
+    try std.testing.expectError(error.InvalidWeightBindingName, parseKernelWeightBindingName("__kernel_weight::x::q_proj::0"));
+    try std.testing.expectError(error.InvalidWeightBindingName, parseKernelWeightBindingName("__kernel_weight::1::::0"));
+    try std.testing.expectError(error.InvalidWeightBindingName, parseKernelWeightBindingName("__kernel_weight::1::q_proj::"));
+}
+
+test "expectedWeightRefCount returns macro-op arities" {
+    try std.testing.expectEqual(@as(usize, 4), expectedWeightRefCount(.multihead_attention));
+    try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.swiglu));
+    try std.testing.expectEqual(@as(usize, 2), expectedWeightRefCount(.mamba_mixer));
+    try std.testing.expectEqual(@as(usize, 3), expectedWeightRefCount(.shortconv));
+}
+
 test "AdapterTable keeps 256 opcode slots" {
     try std.testing.expectEqual(@as(usize, 256), @typeInfo(AdapterTable).array.len);
 }
@@ -2090,6 +2242,58 @@ test "defaultStateDescriptor uses stable v1 compatibility defaults" {
     try std.testing.expectEqual(@as(u16, 64), kv_desc.align_bytes);
     try std.testing.expect(!kv_desc.zero_init);
     try std.testing.expectEqual(StateLifecycle.slot_persistent, kv_desc.lifecycle);
+}
+
+test "stateLifecyclePolicy defines matrix for all lifecycle classes" {
+    const slot = stateLifecyclePolicy(.slot_persistent);
+    try std.testing.expect(slot.allow_reset);
+    try std.testing.expect(slot.allow_reuse);
+    try std.testing.expect(slot.allow_evict);
+    try std.testing.expect(!slot.allow_clone_for_fork);
+
+    const request = stateLifecyclePolicy(.request_scoped);
+    try std.testing.expect(!request.allow_reset);
+    try std.testing.expect(!request.allow_reuse);
+    try std.testing.expect(request.allow_evict);
+
+    const step = stateLifecyclePolicy(.step_scoped);
+    try std.testing.expect(step.allow_reset);
+    try std.testing.expect(!step.allow_reuse);
+    try std.testing.expect(step.allow_evict);
+    try std.testing.expect(step.zero_on_alloc);
+    try std.testing.expect(step.zero_on_reset);
+}
+
+test "validateStateLifecycleAction enforces lifecycle action support matrix" {
+    try validateStateLifecycleAction(.slot_persistent, .reset);
+    try validateStateLifecycleAction(.slot_persistent, .reuse);
+    try std.testing.expectError(error.InvalidStateLifecycleAction, validateStateLifecycleAction(.request_scoped, .reset));
+    try std.testing.expectError(error.InvalidStateLifecycleAction, validateStateLifecycleAction(.request_scoped, .reuse));
+    try std.testing.expectError(error.InvalidStateLifecycleAction, validateStateLifecycleAction(.step_scoped, .clone_for_fork));
+}
+
+test "shouldZeroStateForLifecycleAction applies descriptor and lifecycle policy" {
+    const slot_desc = StateDescriptor{
+        .id = @intFromEnum(StateBlockId.kv_cache),
+        .size_bytes = 0,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .slot_persistent,
+    };
+    try std.testing.expect(!(try shouldZeroStateForLifecycleAction(&slot_desc, .alloc)));
+    try std.testing.expect(!(try shouldZeroStateForLifecycleAction(&slot_desc, .reset)));
+    try std.testing.expect(!(try shouldZeroStateForLifecycleAction(&slot_desc, .evict)));
+
+    const request_desc = StateDescriptor{
+        .id = @intFromEnum(StateBlockId.shortconv),
+        .size_bytes = 128,
+        .align_bytes = 64,
+        .zero_init = false,
+        .lifecycle = .request_scoped,
+    };
+    try std.testing.expect(try shouldZeroStateForLifecycleAction(&request_desc, .alloc));
+    try std.testing.expect(try shouldZeroStateForLifecycleAction(&request_desc, .evict));
+    try std.testing.expectError(error.InvalidStateLifecycleAction, shouldZeroStateForLifecycleAction(&request_desc, .reset));
 }
 
 test "collectBuiltinStateFlags aggregates known descriptor ids" {
@@ -2434,27 +2638,6 @@ test "firstLayerProgramCompatibilityIssue reports state mismatch when opcodes ar
             try std.testing.expectEqual(@as(usize, 0), mismatch.op_index);
             try std.testing.expectEqual(Opcode.shortconv, mismatch.opcode);
             try std.testing.expectEqual(@as(u8, @intFromEnum(StateBlockId.shortconv)), mismatch.state_id);
-        },
-        else => return error.TestUnexpectedResult,
-    }
-}
-
-test "firstLayerProgramCompatibilityIssue reports core buffer violation when other checks pass" {
-    var table = [_]?u8{null} ** 256;
-    table[@intFromEnum(Opcode.rmsnorm)] = 1;
-    const program = [_]layer_ops.LayerOp{
-        .{ .kernel = .{
-            .id = 0,
-            .in = .tmp3,
-            .out = .norm_out,
-            .debug_type = .norm,
-        } },
-    };
-    const issue = firstLayerProgramCompatibilityIssue(&program, .attention_mlp, table) orelse return error.TestUnexpectedResult;
-    switch (issue) {
-        .buffer_violation => |violation| switch (violation) {
-            .op_index => |op_index| try std.testing.expectEqual(@as(usize, 0), op_index),
-            .final_output => return error.TestUnexpectedResult,
         },
         else => return error.TestUnexpectedResult,
     }

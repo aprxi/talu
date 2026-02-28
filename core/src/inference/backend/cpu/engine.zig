@@ -133,6 +133,8 @@ pub const FusedCpuBackend = struct {
     n_heads: usize,
     n_kv_heads: usize,
     head_dim: usize,
+    /// Cached at init: whether all layers support batched slot decode.
+    supports_batched_decode_slots: bool,
 
     // Optional prefill progress callback (set by caller before generation)
     prefill_progress_fn: ?PrefillProgressFn = null,
@@ -366,7 +368,7 @@ pub const FusedCpuBackend = struct {
 
         for (model.layers, 0..) |*layer, layer_idx| {
             const plan = &layer.compiled_plan.plan;
-            const state_flags = try runtime_contract.collectBuiltinStateFlags(plan);
+            var state_flags = try runtime_contract.collectBuiltinStateFlags(plan);
             try runtime_contract.appendUniquePlanStateDescriptors(
                 state_descriptors_storage[0..],
                 &state_descriptor_count,
@@ -380,12 +382,46 @@ pub const FusedCpuBackend = struct {
             const has_mamba_kernel = block.getMambaKernel() != null;
             const has_shortconv_kernel = block.getShortConvKernel() != null;
 
-            // Descriptor contract: descriptors and executable kernels must agree.
-            if ((has_attention_kernel or has_mla_kernel) != state_flags.has_kv) {
+            // Descriptor contract with compatibility repair:
+            // if the executable kernel requires builtin state but the plan does not
+            // expose that descriptor, synthesize the builtin descriptor so scheduler
+            // state binding remains valid for this backend.
+            if (has_attention_kernel or has_mla_kernel) {
+                if (!state_flags.has_kv) {
+                    try runtime_contract.appendUniqueStateDescriptor(
+                        state_descriptors_storage[0..],
+                        &state_descriptor_count,
+                        runtime_contract.defaultStateDescriptor(.kv_cache),
+                    );
+                    state_flags.has_kv = true;
+                }
+            } else if (state_flags.has_kv) {
                 return error.InvalidStateDescriptorBinding;
             }
-            if (has_mamba_kernel != state_flags.has_mamba) return error.InvalidStateDescriptorBinding;
-            if (has_shortconv_kernel != state_flags.has_shortconv) return error.InvalidStateDescriptorBinding;
+            if (has_mamba_kernel) {
+                if (!state_flags.has_mamba) {
+                    try runtime_contract.appendUniqueStateDescriptor(
+                        state_descriptors_storage[0..],
+                        &state_descriptor_count,
+                        runtime_contract.defaultStateDescriptor(.mamba),
+                    );
+                    state_flags.has_mamba = true;
+                }
+            } else if (state_flags.has_mamba) {
+                return error.InvalidStateDescriptorBinding;
+            }
+            if (has_shortconv_kernel) {
+                if (!state_flags.has_shortconv) {
+                    try runtime_contract.appendUniqueStateDescriptor(
+                        state_descriptors_storage[0..],
+                        &state_descriptor_count,
+                        runtime_contract.defaultStateDescriptor(.shortconv),
+                    );
+                    state_flags.has_shortconv = true;
+                }
+            } else if (state_flags.has_shortconv) {
+                return error.InvalidStateDescriptorBinding;
+            }
 
             if (has_attention_kernel and has_mla_kernel) return error.InvalidStateDescriptorBinding;
             if (state_flags.has_kv) {
@@ -452,7 +488,7 @@ pub const FusedCpuBackend = struct {
         }
 
         // Ensure scratch has space for at least 1 token
-        try scratch.ensure(1);
+        try scratch.ensureForMode(.decode, 1);
         progress.updateLine(1, @intCast(layer_total + 2), null);
 
         progress.updateLine(1, progress_total, null);
@@ -527,6 +563,7 @@ pub const FusedCpuBackend = struct {
             .n_heads = head_total,
             .n_kv_heads = kv_head_total,
             .head_dim = head_dim,
+            .supports_batched_decode_slots = model.supportsBatchedDecodeSlots(),
         };
     }
 
@@ -605,8 +642,35 @@ pub const FusedCpuBackend = struct {
         try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
         if (state_blocks.len > max_state_bindings_per_slot) return error.InvalidStateDescriptorBinding;
         var binding = &self.slot_state_bindings[slot_index];
+        const descriptors = self.stateDescriptors();
         for (state_blocks, 0..) |state_block, idx| {
-            binding.handles[idx] = state_block;
+            const descriptor_index = runtime_contract.stateDescriptorIndex(descriptors, state_block.id) orelse {
+                return error.UnknownStateDescriptorId;
+            };
+            const descriptor = descriptors[descriptor_index];
+            const resolved_ptr: *anyopaque = switch (state_block.id) {
+                @intFromEnum(runtime_contract.StateBlockId.kv_cache) => @ptrCast(&self.kv_cache),
+                @intFromEnum(runtime_contract.StateBlockId.shortconv) => blk: {
+                    const shortconv_scratch = self.scratch.getShortConvScratch() orelse return error.InvalidStateDescriptorBinding;
+                    break :blk @ptrCast(shortconv_scratch);
+                },
+                @intFromEnum(runtime_contract.StateBlockId.mamba) => blk: {
+                    const mamba_scratch = self.scratch.getMambaScratch() orelse return error.InvalidStateDescriptorBinding;
+                    break :blk @ptrCast(mamba_scratch);
+                },
+                else => return error.UnknownStateDescriptorId,
+            };
+            if (state_block.align_bytes < @alignOf(runtime_contract.OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
+            if (state_block.size < @sizeOf(runtime_contract.OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
+            const state_ref: *runtime_contract.OpaqueStateRef = @ptrCast(@alignCast(state_block.ptr));
+            state_ref.* = .{ .ptr = resolved_ptr };
+            const handle_size: u64 = if (descriptor.size_bytes == 0) state_block.size else descriptor.size_bytes;
+            binding.handles[idx] = .{
+                .id = state_block.id,
+                .ptr = state_block.ptr,
+                .size = handle_size,
+                .align_bytes = state_block.align_bytes,
+            };
         }
         binding.count = @intCast(state_blocks.len);
         binding.bound = true;
@@ -639,7 +703,10 @@ pub const FusedCpuBackend = struct {
         const descriptors = self.stateDescriptors();
         var handles: [max_state_bindings_per_slot]runtime_contract.StateBlockHandle = undefined;
         for (descriptors, 0..) |descriptor, idx| {
-            const size_bytes_u64 = if (descriptor.size_bytes == 0) @as(u64, 1) else descriptor.size_bytes;
+            const size_bytes_u64 = if (descriptor.size_bytes == 0)
+                @as(u64, @sizeOf(runtime_contract.OpaqueStateRef))
+            else
+                descriptor.size_bytes;
             const implicit_capacity = @as(u64, @intCast(self.implicit_slot0_state_storage[idx].len));
             if (size_bytes_u64 > implicit_capacity) return error.InvalidStateDescriptorBinding;
             if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
@@ -672,6 +739,7 @@ pub const FusedCpuBackend = struct {
     /// Uses the graph-based model.forwardWithBatchedCache for architecture compatibility.
     pub fn decode(self: *FusedCpuBackend, token: u32, position: usize, logits_out: []f32) !void {
         try self.bindImplicitSlot0StateBlocks();
+        try self.scratch.ensureForMode(.decode, 1);
         const model_dim = self.d_model;
         const token_ids = &[_]u32{token};
         self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[0]);
@@ -701,7 +769,7 @@ pub const FusedCpuBackend = struct {
         }
 
         // 2. Forward through transformer layers using the graph with batched cache
-        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, &self.kv_cache, 0, true);
+        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, true);
 
         // 3. Apply final layer norm (if present — embed-only models skip this)
         if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
@@ -723,6 +791,7 @@ pub const FusedCpuBackend = struct {
         callback_data: ?*anyopaque,
     ) !usize {
         try self.bindImplicitSlot0StateBlocks();
+        try self.scratch.ensureForMode(.decode, 1);
         _ = start_position; // Position tracked internally
 
         var current_token = first_token;
@@ -747,7 +816,7 @@ pub const FusedCpuBackend = struct {
             cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
 
             // 2. Forward through transformer layers with batched cache
-            try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, &self.kv_cache, 0, true);
+            try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, true);
 
             // 3. Final layer norm
             if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
@@ -785,6 +854,7 @@ pub const FusedCpuBackend = struct {
     /// This is the minimal per-token operation used by the scheduler's single-request route.
     pub fn decodeStep(self: *FusedCpuBackend, slot_index: usize, token: u32) ![]f32 {
         try self.ensureSlotStateBlocksBound(slot_index);
+        try self.scratch.ensureForMode(.decode, 1);
         const model_dim = self.d_model;
         const hidden_buffer = self.getHiddenBuffer(slot_index);
         const logits_buffer = self.getLogitsBuffer(slot_index);
@@ -802,7 +872,7 @@ pub const FusedCpuBackend = struct {
         cpu_rowwise.scaleInPlace(hidden_buffer, self.loaded.config.embedding_multiplier);
 
         // 2. Forward through transformer layers with batched cache
-        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, &self.kv_cache, slot_index, true);
+        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(slot_index), slot_index, true);
 
         // 3. Final layer norm (if present)
         if (self.model.norm) |*n| n.forward(&hidden_view_3d, &hidden_view_3d);
@@ -820,6 +890,10 @@ pub const FusedCpuBackend = struct {
         trace.setHandler(null);
         defer trace.setHandler(saved_handler);
 
+        // Warmup runs through the same stateful layer program as real inference.
+        // Ensure slot-0 descriptor bindings exist before dispatch.
+        try self.bindImplicitSlot0StateBlocks();
+
         // Full single-token forward pass to warm up all layer weights.
         // This forces mmap pages to load, so the user doesn't wait during
         // the first real inference with no progress feedback.
@@ -835,7 +909,8 @@ pub const FusedCpuBackend = struct {
         try self.model.embed_tokens.forward(token_ids, &hidden_view_3d);
 
         // Forward through all transformer layers (triggers mmap page loads)
-        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, &self.kv_cache, 0, false);
+        try self.scratch.ensureForMode(.prefill, 1);
+        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, false);
 
         // Reset after warmup
         self.kv_cache.resetSlot(0);
@@ -882,7 +957,7 @@ pub const FusedCpuBackend = struct {
         defer self.allocator.free(prefill_buffer);
 
         // Ensure scratch has space for this sequence
-        try self.scratch.ensure(prompt_len);
+        try self.scratch.ensureForMode(.prefill, prompt_len);
 
         // 1. Gather embeddings
         var prefill_view_3d = Tensor.view3D(
@@ -924,7 +999,7 @@ pub const FusedCpuBackend = struct {
                 .prefill_buf_len = prefill_buffer.len,
             }, @src());
 
-            try vision_runtime_mod.scatterVisionEmbeddings(
+            try vision.scatterIntoHidden(
                 prefill_buffer,
                 prompt_len,
                 model_dim,
@@ -1028,7 +1103,7 @@ pub const FusedCpuBackend = struct {
                 &prefill_view_3d,
                 &prefill_view_3d,
                 &self.scratch,
-                &self.kv_cache,
+                self.slotStateBlocks(slot_index),
                 slot_index,
                 false,
                 ctx,
@@ -1038,7 +1113,7 @@ pub const FusedCpuBackend = struct {
                 &prefill_view_3d,
                 &prefill_view_3d,
                 &self.scratch,
-                &self.kv_cache,
+                self.slotStateBlocks(slot_index),
                 slot_index,
                 false,
             );
@@ -1247,6 +1322,7 @@ pub const FusedCpuBackend = struct {
         const slot_indices = self.decode_batch_slot_indices[0..request_total];
         const compact_hidden = self.norm_buffers[0 .. request_total * model_width];
         const compact_logits = self.decode_batch_logits[0 .. request_total * vocab_size];
+        try self.scratch.ensureForMode(.decode, 1);
 
         // 1) Batched embedding gather for all requests in one kernel call.
         for (requests, 0..) |request, request_index| {
@@ -1272,25 +1348,18 @@ pub const FusedCpuBackend = struct {
             }
         }
 
-        var used_batched_transformer = false;
-        if (slot_delta_equal and self.model.supportsBatchedDecodeSlots()) {
+        if (slot_delta_equal and self.supports_batched_decode_slots) {
             self.setPositionDeltaForTextLayers(shared_delta);
-            self.model.forwardWithBatchedCacheSlots(
+            try self.model.forwardWithBatchedCacheSlots(
                 &compact_hidden_view,
                 &compact_hidden_view,
                 &self.scratch,
-                &self.kv_cache,
+                self.slotStateBlocks(slot_indices[0]),
                 slot_indices,
                 true,
-            ) catch |err| switch (err) {
-                error.UnsupportedBatchedDecodeKernel, error.UnsupportedOpInBatchedMode => {},
-                else => return err,
-            };
+            );
             if (self.model.norm) |*n| n.forward(&compact_hidden_view, &compact_hidden_view);
-            used_batched_transformer = true;
-        }
-
-        if (!used_batched_transformer) {
+        } else {
             for (requests, 0..) |request, request_index| {
                 self.setPositionDeltaForTextLayers(self.slot_rope_position_deltas[request.slot_index]);
                 const compact_hidden_row = compact_hidden[request_index * model_width ..][0..model_width];
@@ -1303,7 +1372,7 @@ pub const FusedCpuBackend = struct {
                     &hidden_tensor_view,
                     &hidden_tensor_view,
                     &self.scratch,
-                    &self.kv_cache,
+                    self.slotStateBlocks(request.slot_index),
                     request.slot_index,
                     true,
                 ) catch return;
@@ -1464,6 +1533,7 @@ pub const FusedCpuBackend = struct {
 
         // Use slot 0 for embedding extraction
         const slot_index: usize = 0;
+        try self.bindImplicitSlot0StateBlocks();
         self.kv_cache.resetSlot(slot_index);
 
         // Allocate temporary buffer for full sequence hidden states
@@ -1471,7 +1541,7 @@ pub const FusedCpuBackend = struct {
         defer self.allocator.free(hidden_data);
 
         // Ensure scratch has space for this sequence
-        try self.scratch.ensure(seq_len);
+        try self.scratch.ensureForMode(.prefill, seq_len);
 
         // 1. Gather embeddings for all tokens
         var hidden_view_3d = Tensor.view3D(
@@ -1516,7 +1586,7 @@ pub const FusedCpuBackend = struct {
 
         // 2. Forward through transformer layers using the graph with batched cache
         // use_cache=false triggers prefill mode which processes all positions
-        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, &self.kv_cache, slot_index, false);
+        try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(slot_index), slot_index, false);
         // 3. Apply final layer norm to ALL positions (if present — embed-only models skip this)
         if (self.model.norm) |*n| {
             for (0..seq_len) |pos| {

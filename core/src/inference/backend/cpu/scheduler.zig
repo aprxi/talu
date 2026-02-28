@@ -203,11 +203,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         const RequestStateBlocks = struct {
             handles: []runtime_contract.StateBlockHandle = &.{},
             storage: []StateBlockStorage = &.{},
+            descriptors: []runtime_contract.StateDescriptor = &.{},
 
             fn deinit(self: *RequestStateBlocks, allocator: std.mem.Allocator) void {
                 for (self.storage) |entry| allocator.free(entry.bytes);
                 if (self.storage.len > 0) allocator.free(self.storage);
                 if (self.handles.len > 0) allocator.free(self.handles);
+                if (self.descriptors.len > 0) allocator.free(self.descriptors);
                 self.* = .{};
             }
         };
@@ -1022,14 +1024,44 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         // Internal helpers
         // =========================================================================
 
+        fn applyLifecycleActionToRequestStateBlocks(
+            self: *Self,
+            request_state_blocks: *RequestStateBlocks,
+            action: runtime_contract.StateLifecycleAction,
+        ) !void {
+            _ = self;
+            if (request_state_blocks.descriptors.len == 0) return;
+            if (request_state_blocks.descriptors.len != request_state_blocks.storage.len) {
+                return error.InvalidStateDescriptorBinding;
+            }
+            for (request_state_blocks.descriptors, 0..) |descriptor, idx| {
+                const should_zero = runtime_contract.shouldZeroStateForLifecycleAction(&descriptor, action) catch |err| switch (err) {
+                    error.InvalidStateLifecycleAction => false,
+                    else => return err,
+                };
+                if (should_zero) {
+                    @memset(request_state_blocks.storage[idx].bytes, 0);
+                }
+            }
+        }
+
+        fn resetRequestStateBlocks(self: *Self, request_id: u64) !void {
+            const request_state_blocks = self.request_state_blocks.getPtr(request_id) orelse return;
+            try self.applyLifecycleActionToRequestStateBlocks(request_state_blocks, .reset);
+        }
+
         fn allocateStateBlockStorage(self: *Self, descriptor: runtime_contract.StateDescriptor) !StateBlockStorage {
             if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
                 return error.InvalidStateDescriptorBinding;
             }
             const descriptor_size = std.math.cast(usize, descriptor.size_bytes) orelse return error.InvalidStateDescriptorBinding;
-            const size_bytes: usize = @max(@as(usize, 1), descriptor_size);
+            // Runtime state descriptors currently carry backend-owned pointers via
+            // OpaqueStateRef when size_bytes is 0 (compat mode), so storage must
+            // always fit at least one OpaqueStateRef payload.
+            const size_bytes: usize = @max(@sizeOf(runtime_contract.OpaqueStateRef), descriptor_size);
             const bytes = try self.allocator.alignedAlloc(u8, .@"64", size_bytes);
-            if (descriptor.zero_init) {
+            const should_zero_on_alloc = try runtime_contract.shouldZeroStateForLifecycleAction(&descriptor, .alloc);
+            if (should_zero_on_alloc) {
                 @memset(bytes, 0);
             }
             return .{
@@ -1046,6 +1078,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             errdefer self.allocator.free(request_state_blocks.handles);
             request_state_blocks.storage = try self.allocator.alloc(StateBlockStorage, descriptors.len);
             errdefer self.allocator.free(request_state_blocks.storage);
+            request_state_blocks.descriptors = try self.allocator.alloc(runtime_contract.StateDescriptor, descriptors.len);
+            errdefer self.allocator.free(request_state_blocks.descriptors);
+            @memcpy(request_state_blocks.descriptors, descriptors);
 
             var initialized: usize = 0;
             errdefer {
@@ -1090,6 +1125,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     self.backend.unbindSlotStateBlocks(slot);
                 }
                 var state_blocks = entry.value;
+                self.applyLifecycleActionToRequestStateBlocks(&state_blocks, .evict) catch {};
                 state_blocks.deinit(self.allocator);
             }
         }
@@ -1144,6 +1180,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 if (request_entry.slot_index == null) continue;
 
                 // Run prefill for this request
+                try self.resetRequestStateBlocks(request_entry.id);
                 try self.prefillWithOptionalVision(
                     request_entry.slot_index.?,
                     request_entry.prompt_tokens,

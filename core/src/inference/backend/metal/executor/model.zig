@@ -6,6 +6,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compute = @import("../../../../compute/root.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 const runtime_graph = @import("../runtime_graph.zig");
 const block_executor = @import("block.zig");
 
@@ -149,10 +150,8 @@ pub const Model = struct {
         allocator: std.mem.Allocator,
         weight_handles: anytype,
         input_ids: []const u32,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
-        cache: ?Cache,
-        shortconv_cache: ?ShortConvCache,
-        mamba_cache: ?MambaCache,
         pos_offset: usize,
         use_compiled: bool,
     ) !ArrayHandle {
@@ -160,10 +159,8 @@ pub const Model = struct {
             allocator,
             weight_handles,
             input_ids,
+            state_blocks,
             config,
-            cache,
-            shortconv_cache,
-            mamba_cache,
             pos_offset,
             use_compiled,
             null,
@@ -176,10 +173,8 @@ pub const Model = struct {
         allocator: std.mem.Allocator,
         weight_handles: anytype,
         input_ids: []const u32,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
-        cache: ?Cache,
-        shortconv_cache: ?ShortConvCache,
-        mamba_cache: ?MambaCache,
         pos_offset: usize,
         use_compiled: bool,
         embedding_override: ?[]const f32,
@@ -190,10 +185,8 @@ pub const Model = struct {
             allocator,
             weight_handles,
             input_ids,
+            state_blocks,
             config,
-            cache,
-            shortconv_cache,
-            mamba_cache,
             pos_offset,
             use_compiled,
             embedding_override,
@@ -207,10 +200,8 @@ pub const Model = struct {
         allocator: std.mem.Allocator,
         weight_handles: anytype,
         input_ids: []const u32,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
-        cache: ?Cache,
-        shortconv_cache: ?ShortConvCache,
-        mamba_cache: ?MambaCache,
         pos_offset: usize,
         use_compiled: bool,
     ) !ArrayHandle {
@@ -218,10 +209,8 @@ pub const Model = struct {
             allocator,
             weight_handles,
             input_ids,
+            state_blocks,
             config,
-            cache,
-            shortconv_cache,
-            mamba_cache,
             pos_offset,
             use_compiled,
             null,
@@ -234,10 +223,8 @@ pub const Model = struct {
         allocator: std.mem.Allocator,
         weight_handles: anytype,
         input_ids: []const u32,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
-        cache: ?Cache,
-        shortconv_cache: ?ShortConvCache,
-        mamba_cache: ?MambaCache,
         pos_offset: usize,
         use_compiled: bool,
         embedding_override: ?[]const f32,
@@ -248,10 +235,8 @@ pub const Model = struct {
             allocator,
             weight_handles,
             input_ids,
+            state_blocks,
             config,
-            cache,
-            shortconv_cache,
-            mamba_cache,
             pos_offset,
             use_compiled,
             embedding_override,
@@ -265,10 +250,8 @@ pub const Model = struct {
         allocator: std.mem.Allocator,
         weight_handles: anytype,
         input_ids: []const u32,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
-        cache: ?Cache,
-        shortconv_cache: ?ShortConvCache,
-        mamba_cache: ?MambaCache,
         pos_offset: usize,
         use_compiled: bool,
         embedding_override: ?[]const f32,
@@ -279,8 +262,7 @@ pub const Model = struct {
             return error.MLXNotAvailable;
         }
 
-        var trace = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
-        if (trace and cache != null) trace = false;
+        const trace = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
         const phase: []const u8 = if (input_ids.len == 1) "decode" else "prefill";
 
         const layer_count: usize = @intCast(config.n_layers);
@@ -329,14 +311,15 @@ pub const Model = struct {
                 layer_idx,
                 config,
                 weight_handles,
-                cache,
-                shortconv_cache,
-                mamba_cache,
+                state_blocks,
                 pos_offset,
                 runtime_rope_cos_handle,
                 runtime_rope_sin_handle,
                 runtime_rope_dim,
             );
+            // Deepstack: per-request feature addition between block-level adapter
+            // dispatches. Operates outside the per-instruction adapter table — same
+            // pattern as embedding lookup and final logit projection.
             if (layer_idx < deepstack_layer_additions.len) {
                 hidden = mlx_graph.mlx_lazy_add(hidden, deepstack_layer_additions[layer_idx]);
             }
@@ -353,18 +336,15 @@ pub const Model = struct {
         allocator: std.mem.Allocator,
         weight_handles: anytype,
         token_handle: ArrayHandle,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
-        cache: ?Cache,
-        shortconv_cache: ?ShortConvCache,
-        mamba_cache: ?MambaCache,
         pos_offset: usize,
     ) !ArrayHandle {
         if (builtin.os.tag != .macos) {
             return error.MLXNotAvailable;
         }
 
-        var trace = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
-        if (trace and cache != null) trace = false;
+        const trace = std.posix.getenv("TALU_TRACE_METAL_UNSAFE") != null;
 
         const norm_eps = config.norm_eps;
         const layer_count: usize = @intCast(config.n_layers);
@@ -386,9 +366,7 @@ pub const Model = struct {
                 layer_idx,
                 config,
                 weight_handles,
-                cache,
-                shortconv_cache,
-                mamba_cache,
+                state_blocks,
                 pos_offset,
                 null,
                 null,
@@ -423,12 +401,12 @@ test "buildDeepstackLayerAdditions rejects misaligned feature rows" {
 
 test "Model.forwardHidden exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(Model.forwardHidden)).@"fn";
-    try std.testing.expectEqual(@as(usize, 9), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
 }
 
 test "Model.forwardHiddenWithEmbeddingOverride exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(Model.forwardHiddenWithEmbeddingOverride)).@"fn";
-    try std.testing.expectEqual(@as(usize, 12), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
 }
 
 test "Model.forward matches forwardFromGPUToken for single-token zero-layer model" {
@@ -490,10 +468,8 @@ test "Model.forward matches forwardFromGPUToken for single-token zero-layer mode
         allocator,
         &weight_handles,
         input_ids[0..],
+        &.{},
         cfg,
-        null,
-        null,
-        null,
         0,
         false,
     );
@@ -507,10 +483,8 @@ test "Model.forward matches forwardFromGPUToken for single-token zero-layer mode
         allocator,
         &weight_handles,
         token_handle,
+        &.{},
         cfg,
-        null,
-        null,
-        null,
         0,
     );
     defer mlx_graph.freeArray(logits_from_gpu_token);

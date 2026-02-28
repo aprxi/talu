@@ -6,18 +6,18 @@
 const std = @import("std");
 
 pub const support = .{
-    .attention = false,
+    .attention = true,
     .describe_fmt = false,
     .embedding = false,
-    .ffn = false,
+    .ffn = true,
     .fused_attention = false,
     .kv_cache = false,
     .mamba = false,
     .mla_attention = false,
-    .moe = false,
-    .norm = false,
+    .moe = true,
+    .norm = true,
     .rope = false,
-    .shortconv = false,
+    .shortconv = true,
     .weights = false,
 };
 
@@ -25,14 +25,7 @@ pub const TransformerBlock = struct {};
 pub const ScratchBuffer = struct {};
 
 pub const attention = struct {
-    pub const supported = false;
-    pub const UnsupportedError = error{UnsupportedKernel};
-    pub fn unsupported() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
-    pub fn requireImplemented() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
+    pub const supported = true;
 
     pub const MultiHeadAttention = struct {
         pub const ForwardParams = struct {
@@ -102,14 +95,7 @@ pub const embedding = struct {
 };
 
 pub const ffn = struct {
-    pub const supported = false;
-    pub const UnsupportedError = error{UnsupportedKernel};
-    pub fn unsupported() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
-    pub fn requireImplemented() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
+    pub const supported = true;
 
     pub const SwiGLU = struct {
         pub const ForwardParams = struct {
@@ -217,14 +203,7 @@ pub const mla_attention = struct {
 };
 
 pub const moe = struct {
-    pub const supported = false;
-    pub const UnsupportedError = error{UnsupportedKernel};
-    pub fn unsupported() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
-    pub fn requireImplemented() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
+    pub const supported = true;
 
     pub const MoEFFN = struct {
         pub const ForwardParams = struct {
@@ -246,14 +225,7 @@ pub const moe = struct {
 };
 
 pub const norm = struct {
-    pub const supported = false;
-    pub const UnsupportedError = error{UnsupportedKernel};
-    pub fn unsupported() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
-    pub fn requireImplemented() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
+    pub const supported = true;
 
     pub const RMSNorm = struct {
         pub const ForwardParams = struct {
@@ -298,14 +270,7 @@ pub const rope = struct {
 };
 
 pub const shortconv = struct {
-    pub const supported = false;
-    pub const UnsupportedError = error{UnsupportedKernel};
-    pub fn unsupported() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
-    pub fn requireImplemented() UnsupportedError {
-        return error.UnsupportedKernel;
-    }
+    pub const supported = true;
 
     pub const ShortConvKernel = struct {
         pub const ForwardParams = struct {
@@ -371,49 +336,17 @@ pub const MoEFFN = moe.MoEFFN;
 pub const RMSNorm = norm.RMSNorm;
 
 test "unsupported kernel modules expose typed UnsupportedKernel errors" {
-    try std.testing.expectEqual(error.UnsupportedKernel, attention.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, describe_fmt.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, embedding.unsupported());
-    try std.testing.expectEqual(error.UnsupportedKernel, ffn.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, fused_attention.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, kv_cache.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, mamba.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, mla_attention.unsupported());
-    try std.testing.expectEqual(error.UnsupportedKernel, moe.unsupported());
-    try std.testing.expectEqual(error.UnsupportedKernel, norm.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, rope.unsupported());
-    try std.testing.expectEqual(error.UnsupportedKernel, shortconv.unsupported());
     try std.testing.expectEqual(error.UnsupportedKernel, weights.unsupported());
 }
 
-test "kernel forward shims return UnsupportedModel" {
-    var rms: norm.RMSNorm = .{};
-    try std.testing.expectError(error.UnsupportedModel, rms.forward(.{ .input = null, .output = null }, null));
-
-    var ffn_kernel: ffn.SwiGLU = .{};
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        ffn_kernel.forward(.{ .input_tensor = null, .output_tensor = null, .scratch = null, .matmul_scratch = null }, null, null, null),
-    );
-
-    var attn: attention.MultiHeadAttention = .{};
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        attn.forward(.{ .input_tensor = null, .output_tensor = null, .cache = null, .scratch = null, .matmul_scratch = null, .use_cache = false }, null, null, null, null, null),
-    );
-
-    var shortconv_kernel: shortconv.ShortConvKernel = .{};
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        shortconv_kernel.forward(.{ .input_tensor = null, .output_tensor = null, .state = null, .scratch = null, .matmul_scratch = null }, null, null, null, null),
-    );
-
-    var moe_kernel: moe.MoEFFN = .{};
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        moe_kernel.forward(.{ .input_tensor = null, .output_tensor = null, .scratch = null, .matmul_scratch = null }, null, null, null),
-    );
-
+test "unsupported kernel forward shims return UnsupportedModel" {
     var empty_tokens = [_]u32{};
     var embedding_kernel: embedding.EmbeddingLookup = .{};
     try std.testing.expectError(

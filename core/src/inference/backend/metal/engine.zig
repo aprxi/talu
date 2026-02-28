@@ -15,7 +15,6 @@ const log = @import("../../../log.zig");
 const compute = @import("../../../compute/root.zig");
 const metal_compute = compute.metal;
 const graph = metal_compute.graph;
-const model_runtime = metal_compute.model_runtime;
 const runtime_graph_mod = @import("runtime_graph.zig");
 const runtime_contract = @import("../../runtime_contract/root.zig");
 const LoadedModel = models.LoadedModel;
@@ -73,8 +72,6 @@ pub const MetalBackend = struct {
 
     // Track position for decode
     current_position: usize,
-    // Prepared decode model for fused dense/quantized decode.
-    decode_model: ?model_runtime.DecodeModel,
 
     const SlotState = struct {
         cache: runtime_graph_mod.Cache,
@@ -186,6 +183,47 @@ pub const MetalBackend = struct {
         return &self.extra_slots[extra_idx].rope_position_delta;
     }
 
+    const BoundSlotState = struct {
+        cache: *runtime_graph_mod.Cache,
+        shortconv_cache: *runtime_graph_mod.ShortConvCache,
+        mamba_cache: *runtime_graph_mod.MambaCache,
+    };
+
+    fn boundSlotState(self: *MetalBackend, slot_index: usize) !BoundSlotState {
+        const slot_blocks = try self.slotStateBlocks(slot_index);
+        var slot_cache = try self.slotCache(slot_index);
+        var slot_shortconv_cache = try self.slotShortConvCache(slot_index);
+        var slot_mamba_cache = try self.slotMambaCache(slot_index);
+
+        if (self.state_flags.has_kv) {
+            slot_cache = runtime_contract.findStateValue(
+                *runtime_graph_mod.Cache,
+                slot_blocks,
+                @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+            ) orelse return error.InvalidStateDescriptorBinding;
+        }
+        if (self.state_flags.has_shortconv) {
+            slot_shortconv_cache = runtime_contract.findStateValue(
+                *runtime_graph_mod.ShortConvCache,
+                slot_blocks,
+                @intFromEnum(runtime_contract.StateBlockId.shortconv),
+            ) orelse return error.InvalidStateDescriptorBinding;
+        }
+        if (self.state_flags.has_mamba) {
+            slot_mamba_cache = runtime_contract.findStateValue(
+                *runtime_graph_mod.MambaCache,
+                slot_blocks,
+                @intFromEnum(runtime_contract.StateBlockId.mamba),
+            ) orelse return error.InvalidStateDescriptorBinding;
+        }
+
+        return .{
+            .cache = slot_cache,
+            .shortconv_cache = slot_shortconv_cache,
+            .mamba_cache = slot_mamba_cache,
+        };
+    }
+
     fn resetSlotState(self: *MetalBackend, slot_index: usize) !void {
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
@@ -213,9 +251,10 @@ pub const MetalBackend = struct {
         const sequence_len = tokens.len;
         if (sequence_len == 0) return;
 
-        const slot_cache = try self.slotCache(slot_index);
-        const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
-        const slot_mamba_cache = try self.slotMambaCache(slot_index);
+        const slot_state = try self.boundSlotState(slot_index);
+        const slot_cache = slot_state.cache;
+        const slot_shortconv_cache = slot_state.shortconv_cache;
+        const slot_mamba_cache = slot_state.mamba_cache;
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         slot_rope_delta.* = 0;
@@ -238,10 +277,8 @@ pub const MetalBackend = struct {
             self.allocator,
             self.weights,
             tokens,
+            try self.slotStateBlocks(slot_index),
             self.config,
-            slot_cache.*,
-            slot_shortconv_cache.*,
-            slot_mamba_cache.*,
             0, // pos_offset
             false, // use_compiled (prefill must use manual path)
         );
@@ -273,21 +310,17 @@ pub const MetalBackend = struct {
         position: usize,
         logits_out: []f32,
     ) !void {
-        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
-        const slot_cache = try self.slotCache(slot_index);
-        const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
-        const slot_mamba_cache = try self.slotMambaCache(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
         const effective_position = try common_mrope.applyPositionDelta(position, slot_rope_delta.*);
-        const logits_handle = model_runtime.decodeStepLogits(
-            decode_model,
-            slot_cache.handle,
-            slot_shortconv_cache.handle,
-            slot_mamba_cache.handle,
-            token,
+        const logits_handle = try runtime_trait.transformerForwardLazy(
+            self.allocator,
+            self.weights,
+            &[_]u32{token},
+            try self.slotStateBlocks(slot_index),
+            self.config,
             effective_position,
+            true,
         );
-        if (logits_handle == null) return error.InvalidState;
         defer graph.freeArray(logits_handle);
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
         graph.copyToHost(logits_handle, logits_out);
@@ -318,7 +351,6 @@ pub const MetalBackend = struct {
         // Load weights to GPU
         const weight_handles = try weights_trait.loadWeightsToGPU(allocator, loaded);
         errdefer weights_trait.freeWeights(allocator, weight_handles);
-        if (weight_handles.decode_model == null) return error.DecodeModelUnavailable;
 
         // Initialize slot 0 cache (single-sequence compatibility path).
         const layer_count: usize = @intCast(loaded.config.n_layers);
@@ -432,7 +464,6 @@ pub const MetalBackend = struct {
             .state_descriptors_storage = state_descriptors_storage,
             .state_descriptor_count = state_descriptor_count,
             .current_position = 0,
-            .decode_model = weight_handles.decode_model,
         };
     }
 
@@ -469,15 +500,14 @@ pub const MetalBackend = struct {
     ) !void {
         if (tokens.len == 0) return error.EmptyInput;
         if (embedding_out.len < self.d_model) return error.BufferTooSmall;
+        try self.bindImplicitSlot0StateBlocks();
 
         const hidden_handle = try runtime_trait.transformerForwardHiddenLazy(
             self.allocator,
             self.weights,
             tokens,
+            try self.slotStateBlocks(0),
             self.config,
-            null,
-            null,
-            null,
             0,
             false,
         );
@@ -602,7 +632,10 @@ pub const MetalBackend = struct {
         const descriptors = self.stateDescriptors();
         var handles: [3]runtime_contract.StateBlockHandle = undefined;
         for (descriptors, 0..) |descriptor, idx| {
-            const size_bytes = if (descriptor.size_bytes == 0) @as(u64, 1) else descriptor.size_bytes;
+            const size_bytes = if (descriptor.size_bytes == 0)
+                @as(u64, @sizeOf(runtime_contract.OpaqueStateRef))
+            else
+                descriptor.size_bytes;
             const implicit_capacity = @as(u64, @intCast(self.implicit_slot0_state_storage[idx].len));
             if (size_bytes > implicit_capacity) return error.InvalidStateDescriptorBinding;
             if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
@@ -621,12 +654,32 @@ pub const MetalBackend = struct {
         slot_index: usize,
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
-        _ = try self.slotStateBinding(slot_index);
         try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
         if (state_blocks.len > 3) return error.InvalidStateDescriptorBinding;
         const binding = try self.slotStateBinding(slot_index);
-        for (state_blocks, 0..) |state_block, idx| {
-            binding.handles[idx] = state_block;
+        const slot_cache = try self.slotCache(slot_index);
+        const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
+        const slot_mamba_cache = try self.slotMambaCache(slot_index);
+        for (self.stateDescriptors(), 0..) |descriptor, idx| {
+            const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            if (incoming.align_bytes < @alignOf(runtime_contract.OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
+            if (incoming.size < @sizeOf(runtime_contract.OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
+            const state_ptr: *anyopaque = switch (descriptor.id) {
+                @intFromEnum(runtime_contract.StateBlockId.kv_cache) => @ptrCast(slot_cache),
+                @intFromEnum(runtime_contract.StateBlockId.shortconv) => @ptrCast(slot_shortconv_cache),
+                @intFromEnum(runtime_contract.StateBlockId.mamba) => @ptrCast(slot_mamba_cache),
+                else => return error.InvalidStateDescriptorBinding,
+            };
+            const state_ref: *runtime_contract.OpaqueStateRef = @ptrCast(@alignCast(incoming.ptr));
+            state_ref.* = .{ .ptr = state_ptr };
+            binding.handles[idx] = .{
+                .id = descriptor.id,
+                .ptr = incoming.ptr,
+                .size = if (descriptor.size_bytes == 0) incoming.size else descriptor.size_bytes,
+                .align_bytes = incoming.align_bytes,
+            };
         }
         binding.count = @intCast(state_blocks.len);
         binding.bound = true;
@@ -664,9 +717,10 @@ pub const MetalBackend = struct {
 
         const sequence_len = tokens.len;
         if (sequence_len == 0) return;
-        const slot_cache = try self.slotCache(slot_index);
-        const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
-        const slot_mamba_cache = try self.slotMambaCache(slot_index);
+        const slot_state = try self.boundSlotState(slot_index);
+        const slot_cache = slot_state.cache;
+        const slot_shortconv_cache = slot_state.shortconv_cache;
+        const slot_mamba_cache = slot_state.mamba_cache;
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
@@ -699,7 +753,7 @@ pub const MetalBackend = struct {
         defer self.allocator.free(hidden_values);
         graph.copyToHost(embedding_handle, hidden_values);
 
-        try vision_runtime_mod.scatterVisionEmbeddings(
+        try vision.scatterIntoHidden(
             hidden_values,
             sequence_len,
             self.d_model,
@@ -776,10 +830,8 @@ pub const MetalBackend = struct {
             self.allocator,
             self.weights,
             tokens,
+            try self.slotStateBlocks(slot_index),
             self.config,
-            slot_cache.*,
-            slot_shortconv_cache.*,
-            slot_mamba_cache.*,
             0,
             false,
             hidden_values,
@@ -809,7 +861,6 @@ pub const MetalBackend = struct {
 
     /// Scheduler decode entrypoint.
     pub fn decodeBatch(self: *MetalBackend, requests: []const contract.DecodeRequest, results: []contract.DecodeResult) !void {
-        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
         if (requests.len == 0) return;
         if (results.len < requests.len) return error.InvalidArgument;
         if (requests.len > self.max_batch_size) return error.InvalidArgument;
@@ -830,56 +881,14 @@ pub const MetalBackend = struct {
 
         if (has_duplicate_slot) return error.InvalidArgument;
 
-        const cache_handles = try self.allocator.alloc(runtime_graph_mod.CacheHandle, requests.len);
-        defer self.allocator.free(cache_handles);
-        const shortconv_handles = try self.allocator.alloc(runtime_graph_mod.ShortConvCacheHandle, requests.len);
-        defer self.allocator.free(shortconv_handles);
-        const mamba_handles = try self.allocator.alloc(runtime_graph_mod.MambaCacheHandle, requests.len);
-        defer self.allocator.free(mamba_handles);
-        const token_ids = try self.allocator.alloc(u32, requests.len);
-        defer self.allocator.free(token_ids);
-        const pos_offsets = try self.allocator.alloc(usize, requests.len);
-        defer self.allocator.free(pos_offsets);
-        const logits_handles = try self.allocator.alloc(graph.ArrayHandle, requests.len);
-        defer self.allocator.free(logits_handles);
-        for (logits_handles) |*handle| handle.* = null;
-        errdefer for (logits_handles) |handle| {
-            if (handle != null) graph.freeArray(handle);
-        };
-
         for (requests, 0..) |request, idx| {
             const logits = try self.slotLogits(request.slot_index);
-            const slot_cache = try self.slotCache(request.slot_index);
-            const slot_shortconv_cache = try self.slotShortConvCache(request.slot_index);
-            const slot_mamba_cache = try self.slotMambaCache(request.slot_index);
             const slot_position = try self.slotPositionPtr(request.slot_index);
-            const slot_rope_delta = try self.slotRopeDeltaPtr(request.slot_index);
-            cache_handles[idx] = slot_cache.handle;
-            shortconv_handles[idx] = slot_shortconv_cache.handle;
-            mamba_handles[idx] = slot_mamba_cache.handle;
-            token_ids[idx] = request.token;
-            pos_offsets[idx] = try common_mrope.applyPositionDelta(slot_position.*, slot_rope_delta.*);
+            try self.decodeSlot(request.slot_index, request.token, slot_position.*, logits);
             results[idx] = .{
                 .slot_index = request.slot_index,
                 .logits = logits,
             };
-        }
-
-        model_runtime.decodeStepLogitsBatch(
-            decode_model,
-            cache_handles,
-            shortconv_handles,
-            mamba_handles,
-            token_ids,
-            pos_offsets,
-            logits_handles,
-        );
-        for (requests, 0..) |request, idx| {
-            if (logits_handles[idx] == null) return error.InvalidState;
-            graph.copyToHost(logits_handles[idx], results[idx].logits);
-            graph.freeArray(logits_handles[idx]);
-            const slot_position = try self.slotPositionPtr(request.slot_index);
-            slot_position.* += 1;
         }
     }
 
@@ -891,7 +900,7 @@ pub const MetalBackend = struct {
         try self.decodeSlot(0, token, position, logits_out);
     }
 
-    /// Decode with streaming - Metal uses pipelined execution for better throughput
+    /// Decode with streaming — token-by-token loop through adapter table path.
     pub fn decodeStreaming(
         self: *MetalBackend,
         first_token: u32,
@@ -902,30 +911,41 @@ pub const MetalBackend = struct {
         callback: ?*const fn (u32, ?*anyopaque) void,
         callback_data: ?*anyopaque,
     ) !usize {
-        const decode_model = self.decode_model orelse return error.DecodeModelUnavailable;
         if (max_tokens == 0 or output_tokens.len == 0) return 0;
         try self.bindImplicitSlot0StateBlocks();
         self.slot_in_use = true;
 
         var decode_timer = std.time.Timer.start() catch unreachable;
         const budget = @min(max_tokens, output_tokens.len);
-        const effective_start_position = try common_mrope.applyPositionDelta(start_position, self.slot_rope_position_delta);
-        const generated_u32 = model_runtime.decodeBatch(
-            decode_model,
-            self.cache.handle,
-            self.shortconv_cache.handle,
-            self.mamba_cache.handle,
-            first_token,
-            effective_start_position,
-            output_tokens.ptr,
-            budget,
-            eos_token_ids.ptr,
-            eos_token_ids.len,
-        );
-        const generated_count: usize = @intCast(@min(generated_u32, budget));
+        var current_token = first_token;
+        var current_position = start_position;
+        var generated_count: usize = 0;
+        const logits = self.slot_logits_buffer[0..self.vocab_size];
+
+        while (generated_count < budget) {
+            try self.decodeSlot(0, current_token, current_position, logits);
+            const next_token = try self.selectNextTokenFromLogits(logits);
+            output_tokens[generated_count] = next_token;
+            generated_count += 1;
+            current_position += 1;
+
+            if (callback) |cb| cb(next_token, callback_data);
+
+            var is_eos = false;
+            for (eos_token_ids) |eos_id| {
+                if (next_token == eos_id) {
+                    is_eos = true;
+                    break;
+                }
+            }
+            if (is_eos) break;
+
+            current_token = next_token;
+        }
+
         const decode_ns = decode_timer.read();
         log.debug("inference", "Metal decode route complete", .{
-            .route = "decode_model_batch",
+            .route = "adapter_table_streaming",
             .requested_tokens = budget,
             .generated_tokens = generated_count,
             .duration_ms = @as(f64, @floatFromInt(decode_ns)) / 1_000_000.0,
@@ -936,9 +956,6 @@ pub const MetalBackend = struct {
             .has_callback = @as(u8, @intFromBool(callback != null)),
             .eos_count = eos_token_ids.len,
         }, @src());
-        if (callback) |cb| {
-            for (output_tokens[0..generated_count]) |token_id| cb(token_id, callback_data);
-        }
         const slot_position = try self.slotPositionPtr(0);
         slot_position.* = start_position + generated_count;
         self.current_position = slot_position.*;

@@ -18,6 +18,7 @@ const inspect = @import("../../../../xray/root.zig");
 const kernel_info = inspect.kernel_info;
 const perf_estimate = inspect.perf_estimate;
 const trace = @import("../../../../xray/trace.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 const dump = if (build_options.dump_tensors) @import("../../../../xray/dump/capture.zig") else struct {
     pub fn recordGlobal(_: anytype, _: anytype, _: anytype, _: anytype, _: anytype, _: anytype) void {}
 };
@@ -45,7 +46,6 @@ const LoadedModel = models.LoadedModel;
 const ModelConfig = tensor_mod.ModelConfig;
 const LayerOp = layer_ops.LayerOp;
 const BlockKind = block_kernels.BlockType;
-
 pub fn formatLinearLike(
     writer: anytype,
     weight: *const Tensor,
@@ -270,7 +270,7 @@ pub const Transformer = struct {
     ) !void {
         if (!use_cache) scratch.resetCaches();
         const seq_len: usize = @intCast(input_tensor.shape[1]);
-        try scratch.ensure(seq_len);
+        try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
 
         // Use pre-allocated scratch buffer for alternating input/output
         var scratch_tensor_view = Tensor.view3DSlice(scratch.tmp[0], seq_len, self.hidden_size);
@@ -334,7 +334,7 @@ pub const Transformer = struct {
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         scratch: *ScratchBuffer,
-        batched_cache: *LayeredBatchedKVCache,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         slot_index: usize,
         use_cache: bool,
     ) !void {
@@ -342,7 +342,7 @@ pub const Transformer = struct {
             input_tensor,
             output_tensor,
             scratch,
-            batched_cache,
+            state_blocks,
             slot_index,
             use_cache,
             null,
@@ -362,14 +362,21 @@ pub const Transformer = struct {
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         scratch: *ScratchBuffer,
-        batched_cache: *LayeredBatchedKVCache,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         slot_index: usize,
         use_cache: bool,
         deepstack: ?*const DeepstackAdditions,
     ) !void {
-        if (!use_cache) batched_cache.resetSlot(slot_index);
+        const layered_cache = runtime_contract.findStateValue(
+            *LayeredBatchedKVCache,
+            state_blocks,
+            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+        );
+        if (!use_cache) {
+            if (layered_cache) |cache| cache.resetSlot(slot_index);
+        }
         const seq_len: usize = @intCast(input_tensor.shape[1]);
-        try scratch.ensure(seq_len);
+        try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
 
         // Use pre-allocated scratch buffer for alternating input/output
         var scratch_tensor_view = Tensor.view3DSlice(scratch.tmp[0], seq_len, self.hidden_size);
@@ -390,9 +397,8 @@ pub const Transformer = struct {
                 null,
             );
 
-            const layer_cache = batched_cache.getLayer(layer_idx);
             if (write_to_scratch_view) {
-                try layer.forwardWithBatchedCache(current_input_tensor, &scratch_tensor_view, scratch, layer_cache, slot_index, use_cache);
+                try layer.forwardWithBatchedCache(current_input_tensor, &scratch_tensor_view, scratch, state_blocks, slot_index, use_cache);
                 current_input_tensor = &scratch_tensor_view;
                 if (deepstack) |ctx| {
                     if (layer_idx < ctx.layer_features.len) {
@@ -400,7 +406,7 @@ pub const Transformer = struct {
                     }
                 }
             } else {
-                try layer.forwardWithBatchedCache(current_input_tensor, output_tensor, scratch, layer_cache, slot_index, use_cache);
+                try layer.forwardWithBatchedCache(current_input_tensor, output_tensor, scratch, state_blocks, slot_index, use_cache);
                 current_input_tensor = output_tensor;
                 if (deepstack) |ctx| {
                     if (layer_idx < ctx.layer_features.len) {
@@ -449,19 +455,26 @@ pub const Transformer = struct {
         input_tensor: *const Tensor,
         output_tensor: *Tensor,
         scratch: *ScratchBuffer,
-        batched_cache: *LayeredBatchedKVCache,
+        state_blocks: []const runtime_contract.StateBlockHandle,
         slot_indices: []const usize,
         use_cache: bool,
     ) !void {
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
         std.debug.assert(@as(usize, @intCast(input_tensor.shape[1])) == slot_indices.len);
         std.debug.assert(@as(usize, @intCast(output_tensor.shape[1])) == slot_indices.len);
+        const layered_cache = runtime_contract.findStateValue(
+            *LayeredBatchedKVCache,
+            state_blocks,
+            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+        );
         if (!use_cache) {
-            for (slot_indices) |slot_index| batched_cache.resetSlot(slot_index);
+            if (layered_cache) |cache| {
+                for (slot_indices) |slot_index| cache.resetSlot(slot_index);
+            }
         }
 
         const batch_size: usize = @intCast(input_tensor.shape[1]);
-        try scratch.ensure(batch_size);
+        try scratch.ensureForMode(if (use_cache) .decode else .prefill, batch_size);
 
         var scratch_tensor_view = Tensor.view3DSlice(scratch.tmp[0], batch_size, self.hidden_size);
         var current_input_tensor: *const Tensor = input_tensor;
@@ -480,12 +493,11 @@ pub const Transformer = struct {
                 null,
             );
 
-            const layer_cache = batched_cache.getLayer(layer_idx);
             if (write_to_scratch_view) {
-                try layer.forwardWithBatchedCacheSlots(current_input_tensor, &scratch_tensor_view, scratch, layer_cache, slot_indices, use_cache);
+                try layer.forwardWithBatchedCacheSlots(current_input_tensor, &scratch_tensor_view, scratch, state_blocks, slot_indices, use_cache);
                 current_input_tensor = &scratch_tensor_view;
             } else {
-                try layer.forwardWithBatchedCacheSlots(current_input_tensor, output_tensor, scratch, layer_cache, slot_indices, use_cache);
+                try layer.forwardWithBatchedCacheSlots(current_input_tensor, output_tensor, scratch, state_blocks, slot_indices, use_cache);
                 current_input_tensor = output_tensor;
             }
             write_to_scratch_view = !write_to_scratch_view;

@@ -20,10 +20,6 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     }
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
     self.slot_rope_position_delta = 0;
-    if (try self.trySequencePrefill(tokens, logits_out, "prefill_seq")) {
-        self.slot_position = tokens.len;
-        return;
-    }
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
     try self.ensureKvCapacity(tokens.len);
 
@@ -85,10 +81,6 @@ pub fn prefillSlot(
     }
     if (tokens.len > self.max_seq_len) return error.InvalidArgument;
     self.slot_rope_position_delta = 0;
-    if (try self.trySequencePrefill(tokens, logits_out, "prefill_slot_seq")) {
-        self.slot_position = tokens.len;
-        return;
-    }
     const prefill_start_ns: i128 = std.time.nanoTimestamp();
     try self.ensureKvCapacity(tokens.len);
     var i: usize = 0;
@@ -128,28 +120,14 @@ const MockBackend = struct {
     slot_in_use: bool = true,
     slot_logits_storage: [8]f32 = [_]f32{0.0} ** 8,
     slot_logits: []f32 = undefined,
-    try_sequence_prefill_calls: usize = 0,
     ensure_kv_capacity_calls: usize = 0,
     compute_calls: usize = 0,
     timing_calls: usize = 0,
-    fast_path_should_handle: bool = true,
-    last_mode: []const u8 = "",
 
     fn init() MockBackend {
         var backend = MockBackend{};
         backend.slot_logits = backend.slot_logits_storage[0..];
         return backend;
-    }
-
-    fn trySequencePrefill(self: *MockBackend, tokens: []const u32, logits_out: []f32, mode: []const u8) !bool {
-        _ = tokens;
-        self.try_sequence_prefill_calls += 1;
-        self.last_mode = mode;
-        if (!self.fast_path_should_handle) return false;
-        for (logits_out, 0..) |*logit, idx| {
-            logit.* = @floatFromInt(idx);
-        }
-        return true;
     }
 
     fn ensureKvCapacity(self: *MockBackend, required_tokens: usize) !void {
@@ -200,30 +178,26 @@ const MockBackend = struct {
     }
 };
 
-test "prefill uses trySequencePrefill fast path when available" {
+test "prefill executes token-wise prefill path" {
     var backend = MockBackend.init();
     const tokens = [_]u32{ 1, 2, 3 };
     var logits_out: [8]f32 = undefined;
 
     try prefill(&backend, tokens[0..], logits_out[0..]);
 
-    try testing.expectEqual(@as(usize, 1), backend.try_sequence_prefill_calls);
-    try testing.expectEqual(@as(usize, 0), backend.ensure_kv_capacity_calls);
-    try testing.expectEqual(@as(usize, 0), backend.compute_calls);
-    try testing.expect(std.mem.eql(u8, "prefill_seq", backend.last_mode));
+    try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
+    try testing.expectEqual(tokens.len, backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
 }
 
-test "prefillSlot uses trySequencePrefill fast path when available" {
+test "prefillSlot executes token-wise prefill path" {
     var backend = MockBackend.init();
     const tokens = [_]u32{ 4, 5 };
     var logits_out: [8]f32 = undefined;
 
     try prefillSlot(&backend, 0, tokens[0..], logits_out[0..]);
 
-    try testing.expectEqual(@as(usize, 1), backend.try_sequence_prefill_calls);
-    try testing.expectEqual(@as(usize, 0), backend.ensure_kv_capacity_calls);
-    try testing.expectEqual(@as(usize, 0), backend.compute_calls);
-    try testing.expect(std.mem.eql(u8, "prefill_slot_seq", backend.last_mode));
+    try testing.expectEqual(@as(usize, 1), backend.ensure_kv_capacity_calls);
+    try testing.expectEqual(tokens.len, backend.compute_calls);
     try testing.expectEqual(tokens.len, backend.slot_position);
 }

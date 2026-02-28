@@ -8,7 +8,6 @@ const log = @import("../../../../log.zig");
 const tensor_mod = @import("../../../../tensor.zig");
 const Tensor = tensor_mod.Tensor;
 const models = @import("../../../../models/root.zig");
-const layer_ops = @import("../../../../models/layer_ops.zig");
 const dtype_mod = @import("../../../../dtype.zig");
 const compute = @import("../../../../compute/root.zig");
 const mlx_graph = compute.metal.graph;
@@ -142,11 +141,19 @@ fn buildMetalLayerProgramRegisterSlotMap(
 
     const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, compiled.plan.register_count);
     defer allocator.free(register_specs);
-    for (register_specs) |*spec| {
-        spec.* = .{
-            .size = 1,
-            .@"align" = 4,
-        };
+    for (register_specs, 0..) |*spec, idx| {
+        if (idx < compiled.register_buffer_specs.len) {
+            const plan_spec = compiled.register_buffer_specs[idx];
+            spec.* = .{
+                .size = @max(plan_spec.size, 1),
+                .@"align" = @max(plan_spec.@"align", @as(u16, 4)),
+            };
+        } else {
+            spec.* = .{
+                .size = 1,
+                .@"align" = 4,
+            };
+        }
     }
 
     var physical = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, register_specs);
@@ -166,7 +173,7 @@ fn buildMetalLayerProgramRegisterSlotMap(
         const physical_id: usize = physical_id_u16;
         if (physical_id >= physical_to_slot.len) return error.NotImplemented;
         if (physical_to_slot[physical_id] == invalid_slot) {
-            if (next_slot >= 2) return error.NotImplemented;
+            if (@as(usize, next_slot) >= register_to_slot.len) return error.NotImplemented;
             physical_to_slot[physical_id] = next_slot;
             next_slot += 1;
         }
@@ -176,6 +183,49 @@ fn buildMetalLayerProgramRegisterSlotMap(
     return register_to_slot;
 }
 
+fn instructionKernelIdFromWeightBindings(
+    compiled: *const runtime_contract.CompiledPlan,
+    op_index: usize,
+    opcode: runtime_contract.Opcode,
+) !u32 {
+    if (op_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
+    const insn = compiled.plan.instructions[op_index];
+    const expected_slots = runtime_contract.expectedKernelWeightSlots(opcode);
+    if (expected_slots.len == 0) return error.InvalidInstructionPayload;
+    if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
+    var kernel_id: ?u32 = null;
+    for (insn.weights, 0..) |_, slot_idx| {
+        const binding_name = try runtime_contract.instructionWeightBindingName(compiled, op_index, slot_idx);
+        const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
+        if (!std.mem.eql(u8, parsed.slot_name, expected_slots[slot_idx])) return error.InvalidWeightBindingName;
+        if (kernel_id == null) {
+            kernel_id = parsed.kernel_id;
+        } else if (kernel_id.? != parsed.kernel_id) {
+            return error.InvalidWeightBindingName;
+        }
+    }
+    return kernel_id orelse error.InvalidInstructionPayload;
+}
+
+fn validateKernelWeightBindings(compiled: *const runtime_contract.CompiledPlan) !void {
+    for (compiled.plan.instructions, 0..) |insn, op_index| {
+        switch (insn.opcode) {
+            .rmsnorm,
+            .multihead_attention,
+            .mla_attention,
+            .swiglu,
+            .moe,
+            .mamba_mixer,
+            .shortconv,
+            .embedding,
+            => {
+                _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+            },
+            else => {},
+        }
+    }
+}
+
 fn compileLayerProgramContract(
     allocator: std.mem.Allocator,
     layer: *WeightHandles.LayerWeights,
@@ -183,7 +233,6 @@ fn compileLayerProgramContract(
     block_kind: topology.BlockKind,
 ) !void {
     layer.compiled_plan = null;
-    layer.instruction_ops = &.{};
     layer.register_to_slot_map = [_]u8{WeightHandles.LayerWeights.invalid_slot} ** 64;
     const entry = static_entry orelse return error.NotImplemented;
     const program = models_registry.blockProgramFor(entry, block_kind) orelse return error.NotImplemented;
@@ -193,19 +242,12 @@ fn compileLayerProgramContract(
         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
         layer.compiled_plan = null;
     };
+    try validateKernelWeightBindings(&layer.compiled_plan.?);
     const register_map = try buildMetalLayerProgramRegisterSlotMap(
         allocator,
         &layer.compiled_plan.?,
     );
     layer.register_to_slot_map = register_map;
-
-    const instruction_count = layer.compiled_plan.?.plan.instructions.len;
-    const instruction_ops = try allocator.alloc(layer_ops.LayerOp, instruction_count);
-    errdefer allocator.free(instruction_ops);
-    for (layer.compiled_plan.?.plan.instructions, 0..) |insn, op_index| {
-        instruction_ops[op_index] = try runtime_contract.decodeInstructionLayerOp(&layer.compiled_plan.?, &insn, op_index);
-    }
-    layer.instruction_ops = instruction_ops;
 }
 
 /// Compute Llama3-style RoPE frequencies with wavelength-dependent scaling.
@@ -1435,10 +1477,6 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
             plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
             layer.compiled_plan = null;
         }
-        if (layer.instruction_ops.len != 0) {
-            allocator.free(layer.instruction_ops);
-            layer.instruction_ops = &.{};
-        }
         if (layer.ln1_weight) |h| mlx_graph.freeArray(h);
         if (layer.ln2_weight) |h| mlx_graph.freeArray(h);
 
@@ -1700,7 +1738,6 @@ pub const WeightHandles = struct {
 
         kind: LayerKind = .attention_mlp,
         compiled_plan: ?runtime_contract.CompiledPlan = null,
-        instruction_ops: []const layer_ops.LayerOp = &.{},
         register_to_slot_map: [64]u8 = [_]u8{invalid_slot} ** 64,
         ln1_weight: ArrayHandle,
         ln2_weight: ArrayHandle,

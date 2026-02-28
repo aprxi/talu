@@ -80,6 +80,10 @@ fn maxRegisterInInstruction(insn: runtime_contract.Instruction) u16 {
     return max_register;
 }
 
+fn kernelWeightSlots(opcode: runtime_contract.Opcode) []const []const u8 {
+    return runtime_contract.expectedKernelWeightSlots(opcode);
+}
+
 fn compileOneInstruction(
     allocator: std.mem.Allocator,
     op: layer_ops.LayerOp,
@@ -96,13 +100,34 @@ fn compileOneInstruction(
         else => runtime_contract.stateBlockIdForOpcode(opcode),
     };
     return switch (op) {
-        .kernel => |kernel_op| .{
-            .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.out}),
-            .weights = &.{},
-            .param_block_id = param_block_id,
-            .state_block_id = state_block_id,
+        .kernel => |kernel_op| blk: {
+            const slots = kernelWeightSlots(opcode);
+            const refs = try allocator.alloc(runtime_contract.WeightRef, slots.len);
+            errdefer allocator.free(refs);
+            for (slots, 0..) |slot_name, idx| {
+                const binding_name = try std.fmt.allocPrint(
+                    allocator,
+                    "{s}{d}::{s}::{d}",
+                    .{
+                        runtime_contract.kernel_weight_binding_prefix,
+                        kernel_op.id,
+                        slot_name,
+                        param_block_id,
+                    },
+                );
+                defer allocator.free(binding_name);
+                refs[idx] = .{
+                    .index = try ensureWeightBindingIndex(allocator, weight_bindings, binding_name),
+                };
+            }
+            break :blk .{
+                .opcode = opcode,
+                .inputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.in}),
+                .outputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.out}),
+                .weights = refs,
+                .param_block_id = param_block_id,
+                .state_block_id = state_block_id,
+            };
         },
         .add => |add_op| .{
             .opcode = opcode,
@@ -433,6 +458,70 @@ fn buildStateDescriptors(
     return descriptors;
 }
 
+fn buildRegisterBufferSpecs(
+    allocator: std.mem.Allocator,
+    program: []const layer_ops.LayerOp,
+    instructions: []const runtime_contract.Instruction,
+    register_count: u16,
+) ![]runtime_contract.PhysicalBufferSpec {
+    if (register_count == 0) return &.{};
+    if (instructions.len != program.len) return error.InvalidInstructionCount;
+
+    const reg_count: usize = register_count;
+    const specs = try allocator.alloc(runtime_contract.PhysicalBufferSpec, reg_count);
+    for (specs) |*spec| {
+        spec.* = .{
+            .size = 1,
+            .@"align" = 64,
+        };
+    }
+
+    for (program, 0..) |op, op_index| {
+        const insn = instructions[op_index];
+        var input_width: usize = 1;
+        for (insn.inputs) |input_reg| {
+            const input_idx = runtime_contract.registerToIndex(input_reg);
+            if (input_idx < specs.len) input_width = @max(input_width, specs[input_idx].size);
+        }
+
+        // Default propagation keeps conservative non-zero sizes on all outputs.
+        for (insn.outputs) |output_reg| {
+            const output_idx = runtime_contract.registerToIndex(output_reg);
+            if (output_idx >= specs.len) continue;
+            specs[output_idx].size = @max(specs[output_idx].size, input_width);
+        }
+
+        // Override for ops that explicitly carry output-width metadata.
+        switch (op) {
+            .split => |split_op| {
+                if (split_op.split_sizes.len == split_op.num_outputs and split_op.split_sizes.len != 0) {
+                    for (insn.outputs, 0..) |output_reg, out_idx| {
+                        const output_idx = runtime_contract.registerToIndex(output_reg);
+                        if (output_idx >= specs.len) continue;
+                        specs[output_idx].size = @max(specs[output_idx].size, split_op.split_sizes[out_idx]);
+                    }
+                }
+            },
+            .reshape => |reshape_op| {
+                if (reshape_op.shape.len != 0) {
+                    const tail_dim = reshape_op.shape[reshape_op.shape.len - 1];
+                    if (tail_dim > 0) {
+                        const width: usize = @intCast(tail_dim);
+                        for (insn.outputs) |output_reg| {
+                            const output_idx = runtime_contract.registerToIndex(output_reg);
+                            if (output_idx >= specs.len) continue;
+                            specs[output_idx].size = @max(specs[output_idx].size, width);
+                        }
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    return specs;
+}
+
 fn computePeakRegisters(
     allocator: std.mem.Allocator,
     compiled: *const runtime_contract.CompiledPlan,
@@ -599,6 +688,13 @@ pub fn compileLayerProgram(
 
     const state_descs = try buildStateDescriptors(allocator, instruction_slice);
     errdefer if (state_descs.len > 0) allocator.free(state_descs);
+    const register_buffer_specs = try buildRegisterBufferSpecs(
+        allocator,
+        program,
+        instruction_slice,
+        register_count,
+    );
+    errdefer if (register_buffer_specs.len > 0) allocator.free(register_buffer_specs);
 
     var compiled = runtime_contract.CompiledPlan{
         .plan = .{
@@ -608,6 +704,7 @@ pub fn compileLayerProgram(
         },
         .param_blocks = param_block_slice,
         .weight_bindings = weight_binding_slice,
+        .register_buffer_specs = register_buffer_specs,
         .liveness = liveness,
         .peak_registers = register_count,
         .diagnostics = &.{},
@@ -643,6 +740,7 @@ pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contr
 
     for (compiled.weight_bindings) |binding| allocator.free(binding.name);
     if (compiled.weight_bindings.len > 0) allocator.free(compiled.weight_bindings);
+    if (compiled.register_buffer_specs.len > 0) allocator.free(compiled.register_buffer_specs);
 
     if (compiled.plan.state_descs.len > 0) allocator.free(compiled.plan.state_descs);
 
@@ -695,6 +793,7 @@ fn expectedOutputCount(op: layer_ops.LayerOp) usize {
 
 fn expectedWeightCount(op: layer_ops.LayerOp) usize {
     return switch (op) {
+        .kernel => runtime_contract.expectedWeightRefCount(opcode_map.opcodeForLayerOp(op)),
         .linear, .add_param, .add_param_scalar, .mul_param => 1,
         else => 0,
     };
@@ -968,6 +1067,29 @@ test "compileLayerProgram emits shortconv state descriptor when shortconv op is 
 
     try std.testing.expect(hasStateDescriptor(&compiled, shortconv_state_id));
     try std.testing.expectEqual(@as(?u8, shortconv_state_id), compiled.plan.instructions[0].state_block_id);
+}
+
+test "compileLayerProgram emits structured kernel weight refs for macro attention ops" {
+    const program = [_]layer_ops.LayerOp{
+        .{ .kernel = .{
+            .id = 7,
+            .in = .residual,
+            .out = .branch_out,
+            .debug_type = .multihead_attention,
+        } },
+    };
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    const insn = compiled.plan.instructions[0];
+    try std.testing.expectEqual(@as(usize, 4), insn.weights.len);
+    const expected_slots = [_][]const u8{ "q_proj", "k_proj", "v_proj", "o_proj" };
+    for (expected_slots, 0..) |slot_name, idx| {
+        const binding_name = try runtime_contract.instructionWeightBindingName(&compiled, 0, idx);
+        const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
+        try std.testing.expectEqual(@as(u32, 7), parsed.kernel_id);
+        try std.testing.expectEqualStrings(slot_name, parsed.slot_name);
+    }
 }
 
 test "compileLayerProgram emits deterministic weight bindings for parameterized primitive ops" {

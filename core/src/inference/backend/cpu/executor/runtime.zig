@@ -7,6 +7,7 @@ const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const graph_types = @import("../../../../models/op_types.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
+const runtime_contract = @import("../../../runtime_contract/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
 const tensor = @import("../../../../tensor.zig");
@@ -64,6 +65,7 @@ pub const SharedPersistentState = struct {
     mla_scratch: ?*MLATemp = null,
     mamba_scratch: ?*MambaScratch = null,
     shortconv_scratch: ?*ShortConvScratch = null,
+    state_blocks: []const runtime_contract.StateBlockHandle = &.{},
 };
 
 /// Number of temporary buffers available.
@@ -85,6 +87,14 @@ pub const ScratchBuffer = struct {
     /// Unified temporary buffer array. See NUM_TMP_BUFFERS doc for index mapping.
     /// Access via getTmp(BufferId, len) or getLayerTmp(len) for index 0.
     tmp: [NUM_TMP_BUFFERS][]f32 = [_][]f32{&.{}} ** NUM_TMP_BUFFERS,
+    /// Per-slot width hints (in f32 elements) derived from compiled-plan
+    /// physical mapping.
+    tmp_slot_width_hints: [NUM_TMP_BUFFERS]usize = [_]usize{0} ** NUM_TMP_BUFFERS,
+    /// Per-slot active mask. Inactive slots are not ensured.
+    tmp_slot_active: [NUM_TMP_BUFFERS]bool = [_]bool{false} ** NUM_TMP_BUFFERS,
+    /// Last execution mode used to size scratch; enables deterministic
+    /// prefill->decode shrink without per-token realloc churn.
+    last_mode: runtime_contract.ExecutionMode = .decode,
     slot_states: []SlotPersistentState = &.{},
 
     attn_scratch: attn.AttnTemp = .{},
@@ -148,18 +158,82 @@ pub const ScratchBuffer = struct {
         }
     }
 
+    pub fn registerTmpLayout(
+        self: *ScratchBuffer,
+        slot_width_hints: [NUM_TMP_BUFFERS]usize,
+        slot_active: [NUM_TMP_BUFFERS]bool,
+    ) void {
+        for (0..NUM_TMP_BUFFERS) |idx| {
+            if (!slot_active[idx]) continue;
+            self.tmp_slot_active[idx] = true;
+            if (slot_width_hints[idx] > self.tmp_slot_width_hints[idx]) {
+                self.tmp_slot_width_hints[idx] = slot_width_hints[idx];
+            }
+        }
+    }
+
     pub fn ensure(self: *ScratchBuffer, seq_len: usize) !void {
-        // Account for fused projections which can be larger than d_model or d_ff alone:
+        // Account for fused projections which can be larger than d_model:
         // - Fused QKV: ~1.5x d_model (Q + K + V)
         // - Fused gate_up: 2x d_ff (gate + up)
-        // Use 2x d_ff as the max to handle all cases
-        const max_buffer_dim = @max(self.d_model, self.d_ff * 2);
-        const buffer_len = seq_len * max_buffer_dim;
+        const fallback_dim = @max(self.d_model, self.d_ff * 2);
+        var has_registered_layout = false;
+        for (self.tmp_slot_active[1..]) |active| {
+            if (active) {
+                has_registered_layout = true;
+                break;
+            }
+        }
 
-        // Ensure all temporary buffers in a single loop
-        for (&self.tmp) |*temp_slice| {
+        // Without a registered mapping, preserve legacy behavior and ensure all
+        // tmp buffers to the conservative fallback size.
+        if (!has_registered_layout) {
+            const full_len = seq_len * fallback_dim;
+            for (&self.tmp) |*temp_slice| {
+                try cpu_common.ensureF32Slice(self.allocator, temp_slice, full_len);
+            }
+            return;
+        }
+
+        // Ensure layer_tmp (index 0) and active mapped scratch slots.
+        for (&self.tmp, 0..) |*temp_slice, idx| {
+            if (idx != 0 and !self.tmp_slot_active[idx]) continue;
+            const width_hint = if (self.tmp_slot_width_hints[idx] > 0)
+                self.tmp_slot_width_hints[idx]
+            else
+                fallback_dim;
+            const buffer_len = seq_len * width_hint;
             try cpu_common.ensureF32Slice(self.allocator, temp_slice, buffer_len);
         }
+    }
+
+    fn shrinkForDecodeTransition(self: *ScratchBuffer, seq_len: usize) !void {
+        const decode_len = @max(seq_len, 1);
+        const fallback_dim = @max(self.d_model, self.d_ff * 2);
+        const shrink_factor: usize = 4;
+        const keep_factor: usize = 2;
+
+        for (&self.tmp, 0..) |*temp_slice, idx| {
+            if (idx != 0 and !self.tmp_slot_active[idx]) continue;
+            if (temp_slice.len == 0) continue;
+            const width_hint = if (self.tmp_slot_width_hints[idx] > 0)
+                self.tmp_slot_width_hints[idx]
+            else
+                fallback_dim;
+            const decode_target_len = decode_len * width_hint;
+            if (temp_slice.len <= decode_target_len * shrink_factor) continue;
+            const keep_len = @max(decode_target_len * keep_factor, width_hint);
+            self.allocator.free(temp_slice.*);
+            temp_slice.* = try self.allocator.alloc(f32, keep_len);
+        }
+    }
+
+    pub fn ensureForMode(self: *ScratchBuffer, mode: runtime_contract.ExecutionMode, seq_len: usize) !void {
+        if (mode == .decode and self.last_mode != .decode) {
+            try self.shrinkForDecodeTransition(seq_len);
+        }
+        self.last_mode = mode;
+        try self.ensure(seq_len);
     }
 
     pub fn deinit(self: *ScratchBuffer) void {
