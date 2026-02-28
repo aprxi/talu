@@ -36,27 +36,6 @@ export interface ChatDom {
   inputAttachmentList: HTMLElement;
   fileInput: HTMLInputElement;
 
-  // Right panel
-  rightPanel: HTMLElement;
-  closeRightPanelBtn: HTMLButtonElement;
-  panelModel: HTMLSelectElement;
-  panelTemperature: HTMLInputElement;
-  panelTopP: HTMLInputElement;
-  panelTopK: HTMLInputElement;
-  panelMinP: HTMLInputElement;
-  panelMaxOutputTokens: HTMLInputElement;
-  panelRepetitionPenalty: HTMLInputElement;
-  panelSeed: HTMLInputElement;
-  panelTemperatureDefault: HTMLElement;
-  panelTopPDefault: HTMLElement;
-  panelTopKDefault: HTMLElement;
-  panelChatInfo: HTMLElement;
-  panelInfoCreated: HTMLElement;
-  panelInfoForkedRow: HTMLElement;
-  panelInfoForked: HTMLElement;
-  panelEventsVerbosity: HTMLSelectElement;
-  panelEventsClear: HTMLButtonElement;
-  panelEventsLog: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -102,26 +81,6 @@ export function getChatDom(): ChatDom {
     inputAttachmentList: q("#input-attachment-list"),
     fileInput: q<HTMLInputElement>("#chat-file-input"),
 
-    rightPanel: q("#right-panel"),
-    closeRightPanelBtn: q<HTMLButtonElement>("#close-right-panel"),
-    panelModel: q<HTMLSelectElement>("#panel-model"),
-    panelTemperature: q<HTMLInputElement>("#panel-temperature"),
-    panelTopP: q<HTMLInputElement>("#panel-top-p"),
-    panelTopK: q<HTMLInputElement>("#panel-top-k"),
-    panelMinP: q<HTMLInputElement>("#panel-min-p"),
-    panelMaxOutputTokens: q<HTMLInputElement>("#panel-max-output-tokens"),
-    panelRepetitionPenalty: q<HTMLInputElement>("#panel-repetition-penalty"),
-    panelSeed: q<HTMLInputElement>("#panel-seed"),
-    panelTemperatureDefault: q("#panel-temperature-default"),
-    panelTopPDefault: q("#panel-top-p-default"),
-    panelTopKDefault: q("#panel-top-k-default"),
-    panelChatInfo: q("#panel-chat-info"),
-    panelInfoCreated: q("#panel-info-created"),
-    panelInfoForkedRow: q("#panel-info-forked-row"),
-    panelInfoForked: q("#panel-info-forked"),
-    panelEventsVerbosity: q<HTMLSelectElement>("#panel-events-verbosity"),
-    panelEventsClear: q<HTMLButtonElement>("#panel-events-clear"),
-    panelEventsLog: q("#panel-events-log"),
   };
 
   return cached;

@@ -8,6 +8,31 @@ export function buildSettingsDOM(root: HTMLElement): void {
       <div class="settings-page">
 
         <div class="settings-section">
+          <div class="settings-section-title">Appearance</div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Dark Theme</div>
+            </div>
+            <div class="settings-row-control">
+              <select id="sp-theme-dark" class="form-select"></select>
+            </div>
+          </div>
+          <div class="settings-row">
+            <div class="settings-row-info">
+              <div class="settings-row-label">Light Theme</div>
+            </div>
+            <div class="settings-row-control">
+              <select id="sp-theme-light" class="form-select"></select>
+            </div>
+          </div>
+          <div style="display: flex; gap: 0.5rem; flex-wrap: wrap; padding: 0.25rem 0;">
+            <button id="sp-theme-new" class="btn btn-ghost btn-sm">New Theme</button>
+            <button id="sp-theme-import" class="btn btn-ghost btn-sm">Import</button>
+          </div>
+          <div id="sp-theme-editor"></div>
+        </div>
+
+        <div class="settings-section">
           <div class="settings-section-title">Model</div>
           <div style="padding: 0.75rem 0;">
             <select id="sp-model" class="form-select">

@@ -1,5 +1,5 @@
 /**
- * Settings plugin — global model and sampling configuration.
+ * Settings plugin — global model, sampling configuration, and theme management.
  *
  * Renders into a Shadow DOM container created by the kernel.
  * Provides "talu.models" service for model selection across plugins.
@@ -14,6 +14,7 @@ import { initSettingsDom } from "./dom.ts";
 import { buildSettingsDOM } from "./build-dom.ts";
 import { populateForm, populateLocalModelSelect, updateSystemPromptDisplay, showModelParams, handleModelChange } from "./form.ts";
 import { wireEvents } from "./events.ts";
+import { loadCustomThemes, populateThemeSelects } from "./theme-editor.ts";
 
 export const settingsPlugin: PluginDefinition = {
   manifest: {
@@ -42,11 +43,26 @@ export const settingsPlugin: PluginDefinition = {
 
   async run(ctx: PluginContext): Promise<void> {
     const api = createApiClient((url, init) => ctx.network.fetch(url, init));
-    initSettingsDeps({ api, events: ctx.events, timers: ctx.timers, mode: ctx.mode });
+    initSettingsDeps({
+      api,
+      events: ctx.events,
+      timers: ctx.timers,
+      mode: ctx.mode,
+      layout: ctx.layout,
+      theme: ctx.theme,
+      storage: ctx.storage,
+      download: ctx.download,
+      notifications: ctx.notifications,
+      dialogs: ctx.dialogs,
+    });
 
     buildSettingsDOM(ctx.container);
     initSettingsDom(ctx.container);
     wireEvents();
+
+    // Load persisted custom themes and register with kernel.
+    await loadCustomThemes();
+    populateThemeSelects();
 
     // Fetch settings from API.
     const result = await api.getSettings();

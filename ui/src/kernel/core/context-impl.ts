@@ -19,6 +19,7 @@ import type { ToolRegistryImpl } from "../registries/tools.ts";
 import type { CommandRegistryImpl } from "../registries/commands.ts";
 import type { ThemeAccessImpl } from "../ui/theme.ts";
 import type { PopoverManager } from "../ui/popover.ts";
+import type { AppPanelManager } from "../ui/layout.ts";
 import type { RendererRegistryImpl } from "../registries/renderers.ts";
 import { createLogger } from "../system/log.ts";
 import { namespacedId, validateLocalId } from "./id-namespace.ts";
@@ -51,6 +52,7 @@ export interface KernelInfrastructure {
   commandRegistry: CommandRegistryImpl;
   themeAccess: ThemeAccessImpl;
   popoverManager: PopoverManager;
+  panelManager: AppPanelManager;
   rendererRegistry: RendererRegistryImpl;
   statusBarManager: StatusBarManager;
   viewManager: ViewManager;
@@ -270,6 +272,8 @@ export function createPluginContext(
         return infra.viewManager.registerView(pluginId, slot, manifest.name, isBuiltin, factory, priority);
       },
       showPopover: (options) => infra.popoverManager.showPopover(pluginId, options),
+      showPanel: (options) => infra.panelManager.show(options),
+      hidePanel: (owner?) => infra.panelManager.hide(owner),
     },
     hooks,
     tools,

@@ -20,6 +20,11 @@ export interface SettingsDom {
   modelLabel: HTMLElement;
   resetModel: HTMLButtonElement;
   status: HTMLElement;
+  themeDarkSelect: HTMLSelectElement;
+  themeLightSelect: HTMLSelectElement;
+  themeNewBtn: HTMLButtonElement;
+  themeImportBtn: HTMLButtonElement;
+  themeEditorHost: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -53,6 +58,11 @@ export function getSettingsDom(): SettingsDom {
     modelLabel: q("sp-model-label"),
     resetModel: q<HTMLButtonElement>("sp-reset-model"),
     status: q("sp-status"),
+    themeDarkSelect: q<HTMLSelectElement>("sp-theme-dark"),
+    themeLightSelect: q<HTMLSelectElement>("sp-theme-light"),
+    themeNewBtn: q<HTMLButtonElement>("sp-theme-new"),
+    themeImportBtn: q<HTMLButtonElement>("sp-theme-import"),
+    themeEditorHost: q("sp-theme-editor"),
   };
 
   return cached;

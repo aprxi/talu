@@ -1,4 +1,4 @@
-import { getChatDom } from "./dom.ts";
+import { getChatPanelDom } from "./chat-panel-dom.ts";
 import { chatState } from "./state.ts";
 import { api } from "./deps.ts";
 import { updateProgressBar } from "./messages.ts";
@@ -15,28 +15,28 @@ interface EventEnvelope {
 }
 
 function addPlaceholderIfEmpty(): void {
-  const dom = getChatDom();
-  if (dom.panelEventsLog.childElementCount > 0) return;
+  const pd = getChatPanelDom();
+  if (pd.panelEventsLog.childElementCount > 0) return;
   const empty = document.createElement("div");
   empty.className = "chat-events-empty";
   empty.textContent = "No events yet.";
-  dom.panelEventsLog.appendChild(empty);
+  pd.panelEventsLog.appendChild(empty);
 }
 
 function appendEventsLine(text: string, level: string = "info"): void {
-  const dom = getChatDom();
-  const empty = dom.panelEventsLog.querySelector(".chat-events-empty");
+  const pd = getChatPanelDom();
+  const empty = pd.panelEventsLog.querySelector(".chat-events-empty");
   if (empty) empty.remove();
 
   const line = document.createElement("div");
   line.className = `chat-events-line chat-events-level-${level.toLowerCase()}`;
   line.textContent = text;
-  dom.panelEventsLog.appendChild(line);
+  pd.panelEventsLog.appendChild(line);
 
-  while (dom.panelEventsLog.childElementCount > MAX_EVENT_LINES) {
-    dom.panelEventsLog.firstElementChild?.remove();
+  while (pd.panelEventsLog.childElementCount > MAX_EVENT_LINES) {
+    pd.panelEventsLog.firstElementChild?.remove();
   }
-  dom.panelEventsLog.scrollTop = dom.panelEventsLog.scrollHeight;
+  pd.panelEventsLog.scrollTop = pd.panelEventsLog.scrollHeight;
 }
 
 function formatTime(tsMs: number): string {
@@ -159,19 +159,19 @@ async function runResponseEventsStream(
 }
 
 export function setupEventsPanelEvents(): void {
-  const dom = getChatDom();
-  dom.panelEventsVerbosity.value = String(chatState.eventsVerbosity);
-  dom.panelEventsVerbosity.addEventListener("change", () => {
-    const v = Number.parseInt(dom.panelEventsVerbosity.value, 10);
+  const pd = getChatPanelDom();
+  pd.panelEventsVerbosity.value = String(chatState.eventsVerbosity);
+  pd.panelEventsVerbosity.addEventListener("change", () => {
+    const v = Number.parseInt(pd.panelEventsVerbosity.value, 10);
     chatState.eventsVerbosity = v === 2 ? 2 : v === 3 ? 3 : 1;
   });
-  dom.panelEventsClear.addEventListener("click", clearEventsLog);
+  pd.panelEventsClear.addEventListener("click", clearEventsLog);
   addPlaceholderIfEmpty();
 }
 
 export function clearEventsLog(): void {
-  const dom = getChatDom();
-  dom.panelEventsLog.innerHTML = "";
+  const pd = getChatPanelDom();
+  pd.panelEventsLog.innerHTML = "";
   addPlaceholderIfEmpty();
 }
 

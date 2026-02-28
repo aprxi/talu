@@ -15,6 +15,7 @@
 }
 
 .app-content {
+  display: flex;
   flex: 1;
   overflow: hidden;
   position: relative;
@@ -22,6 +23,8 @@
 
 .mode-view {
   display: flex;
+  flex: 1;
+  min-width: 0;
   height: 100%;
   overflow: hidden;
   contain: layout style;
@@ -447,30 +450,6 @@
   overflow-y: auto;
 }
 
-/* =============================================================================
-   Right Panel
-   ============================================================================= */
-
-.right-panel {
-  width: 256px;
-  flex-shrink: 0;
-  display: flex;
-  flex-direction: column;
-  border-left: 1px solid var(--border);
-  background: var(--bg-sidebar);
-  overflow-y: auto;
-}
-
-.right-panel.hidden { display: none; }
-
-/* Read-only mode for right panel */
-.right-panel.read-only .form-input,
-.right-panel.read-only .form-select {
-  opacity: 0.7;
-  cursor: not-allowed;
-  background: var(--bg);
-}
-
 .panel-section {
   padding: 1rem;
 }
@@ -487,6 +466,51 @@
   letter-spacing: 0.05em;
   color: var(--text-muted);
   margin-bottom: 0.5rem;
+}
+
+/* =============================================================================
+   App Panel (generic slide-out overlay)
+   ============================================================================= */
+
+.app-panel {
+  width: 256px;
+  flex-shrink: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg-sidebar);
+  border-left: 1px solid var(--border);
+  overflow: hidden;
+}
+
+.app-panel.hidden { display: none; }
+
+.app-panel-header {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.75rem 1rem;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.app-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.app-panel-content {
+  flex: 1;
+  overflow-y: auto;
+  padding: 1rem;
+}
+
+/* Read-only mode for panel content (e.g., past message stats) */
+.app-panel-content .read-only .form-input,
+.app-panel-content .read-only .form-select {
+  opacity: 0.7;
+  cursor: not-allowed;
+  background: var(--bg);
 }
 
 /* =============================================================================
@@ -560,7 +584,7 @@
    ============================================================================= */
 
 .settings-content {
-  flex: 1;
+  height: 100%;
   overflow-y: auto;
 }
 

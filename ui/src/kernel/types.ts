@@ -292,8 +292,10 @@ export interface Notifications {
 export interface ThemeAccess {
   readonly tokens: Record<string, string>;
   readonly activeThemeId: string;
+  setActiveTheme(id: string): void;
   onChange(callback: () => void): Disposable;
-  registerTheme(id: string, tokens: Record<string, string>): Disposable;
+  registerTheme(id: string, name: string, category: string, tokens?: Record<string, string>): Disposable;
+  updateThemeTokens(id: string, tokens: Record<string, string>): void;
   getRegisteredThemes(): { id: string; name: string; category: string }[];
 }
 
@@ -307,6 +309,9 @@ export interface LayoutAccess {
     content: HTMLElement;
     placement?: "top" | "bottom" | "left" | "right";
   }): Disposable;
+  showPanel(options: { title: string; content: HTMLElement; owner?: string; onHide?: () => void }): Disposable;
+  /** Hide the panel. If owner is specified, only hides if the current panel belongs to that owner. */
+  hidePanel(owner?: string): void;
 }
 
 // --- Command Registry ---

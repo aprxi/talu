@@ -1,10 +1,12 @@
 /**
- * Shadow DOM slot creation for plugin view containers.
+ * Shadow DOM slot creation for plugin view containers + app panel manager.
  *
  * CSS custom properties (--text, --bg, --accent, etc.) inherit through shadow
  * boundaries automatically. Class-based selectors are shared via a constructed
  * stylesheet applied through adoptedStyleSheets (synchronous, no FOUC).
  */
+
+import type { Disposable } from "../types.ts";
 
 let sharedSheet: CSSStyleSheet | null = null;
 
@@ -64,4 +66,73 @@ export function createPluginSlot(pluginId: string, hostElement: HTMLElement): HT
   shadowRoot.appendChild(container);
 
   return container;
+}
+
+// ── App Panel Manager ───────────────────────────────────────────────────────
+
+export class AppPanelManager {
+  private panelEl: HTMLElement;
+  private titleEl: HTMLElement;
+  private contentEl: HTMLElement;
+  private closeBtn: HTMLElement;
+  private escHandler: ((e: KeyboardEvent) => void) | null = null;
+  private onHideFn: (() => void) | null = null;
+  private currentOwner: string | null = null;
+
+  constructor() {
+    this.panelEl = document.getElementById("app-panel")!;
+    this.titleEl = document.getElementById("app-panel-title")!;
+    this.contentEl = document.getElementById("app-panel-content")!;
+    this.closeBtn = document.getElementById("app-panel-close")!;
+
+    this.closeBtn.addEventListener("click", () => this.hide());
+  }
+
+  show(options: { title: string; content: HTMLElement; owner?: string; onHide?: () => void }): Disposable {
+    // Fire previous consumer's onHide (being displaced by new content).
+    if (this.onHideFn) {
+      this.onHideFn();
+      this.onHideFn = null;
+    }
+
+    this.currentOwner = options.owner ?? null;
+    this.onHideFn = options.onHide ?? null;
+    this.titleEl.textContent = options.title;
+    this.contentEl.innerHTML = "";
+    this.contentEl.appendChild(options.content);
+    this.panelEl.classList.remove("hidden");
+
+    // Escape key dismisses the panel.
+    if (!this.escHandler) {
+      this.escHandler = (e: KeyboardEvent) => {
+        if (e.key === "Escape") this.hide();
+      };
+      document.addEventListener("keydown", this.escHandler);
+    }
+
+    return { dispose: () => this.hide() };
+  }
+
+  /**
+   * Hide the panel. If `owner` is specified, only hides when the current
+   * panel belongs to that owner — otherwise it's a no-op (won't close
+   * another consumer's content).
+   */
+  hide(owner?: string): void {
+    if (owner && this.currentOwner !== owner) return;
+
+    this.panelEl.classList.add("hidden");
+    this.contentEl.innerHTML = "";
+    this.titleEl.textContent = "";
+    this.currentOwner = null;
+    if (this.escHandler) {
+      document.removeEventListener("keydown", this.escHandler);
+      this.escHandler = null;
+    }
+    if (this.onHideFn) {
+      const fn = this.onHideFn;
+      this.onHideFn = null;
+      fn();
+    }
+  }
 }

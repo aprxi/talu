@@ -1,38 +1,38 @@
 /**
  * Theme toggle wiring for the kernel top bar.
  *
- * Built-in runtime exposes only dark/light (`talu` / `light-talu`).
- * Additional overrides can still be registered later by plugins.
+ * Flips between "dark" and "light" mode slots. Each slot maps to a
+ * user-configurable theme ID stored in localStorage.
  */
 
 import type { Disposable } from "../types.ts";
 import type { ThemeAccessImpl } from "./theme.ts";
-import { setTheme, getCurrentTheme } from "../../styles/theme.ts";
-import { DARK_SCHEME_ID, LIGHT_SCHEME_ID } from "../../styles/color-schemes.ts";
+import { getThemeMode, setThemeMode, getSlotTheme } from "../../styles/theme.ts";
 
 export function setupThemePicker(themeAccess: ThemeAccessImpl): Disposable {
   const toggleBtn = document.querySelector(".theme-toggle-btn") as HTMLButtonElement | null;
   if (!toggleBtn) return { dispose() {} };
 
-  function updateThemeUI(theme: string): void {
-    const next = theme === LIGHT_SCHEME_ID ? DARK_SCHEME_ID : LIGHT_SCHEME_ID;
-    const label = next === LIGHT_SCHEME_ID ? "Switch to light mode" : "Switch to dark mode";
+  function updateThemeUI(mode: "dark" | "light"): void {
+    const nextMode = mode === "dark" ? "light" : "dark";
+    const label = `Switch to ${nextMode} mode`;
     toggleBtn.setAttribute("aria-label", label);
     toggleBtn.setAttribute("title", label);
-    toggleBtn.setAttribute("aria-pressed", theme === LIGHT_SCHEME_ID ? "true" : "false");
+    toggleBtn.setAttribute("aria-pressed", mode === "light" ? "true" : "false");
   }
 
   const clickHandler = () => {
-    const current = getCurrentTheme();
-    const next = current === LIGHT_SCHEME_ID ? DARK_SCHEME_ID : LIGHT_SCHEME_ID;
-    setTheme(next);
-    themeAccess.notifyChange();
-    updateThemeUI(next);
+    const currentMode = getThemeMode();
+    const newMode = currentMode === "dark" ? "light" : "dark";
+    setThemeMode(newMode);
+    const themeId = getSlotTheme(newMode);
+    themeAccess.setActiveTheme(themeId);
+    updateThemeUI(newMode);
   };
   toggleBtn.addEventListener("click", clickHandler);
 
   // Sync initial state.
-  updateThemeUI(getCurrentTheme());
+  updateThemeUI(getThemeMode());
 
   return {
     dispose() {

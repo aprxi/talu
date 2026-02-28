@@ -1,19 +1,19 @@
 import { getChatDom } from "./dom.ts";
+import { getChatPanelDom } from "./chat-panel-dom.ts";
 import { api, notifications, getModelsService, format, timers } from "./deps.ts";
-import { isPanelReadOnly, restoreEditableParams, hideRightPanel } from "./panel-readonly.ts";
 import type { Conversation, CreateResponseRequest, SettingsPatch } from "../../types.ts";
 import type { Disposable } from "../../kernel/types.ts";
 
-/** Get current sampling parameters from the right panel inputs. */
+/** Get current sampling parameters from the panel inputs. */
 export function getSamplingParams(): Partial<CreateResponseRequest> {
-  const dom = getChatDom();
-  const temp = dom.panelTemperature.value.trim();
-  const topP = dom.panelTopP.value.trim();
-  const topK = dom.panelTopK.value.trim();
-  const minP = dom.panelMinP.value.trim();
-  const maxTok = dom.panelMaxOutputTokens.value.trim();
-  const repPen = dom.panelRepetitionPenalty.value.trim();
-  const seed = dom.panelSeed.value.trim();
+  const pd = getChatPanelDom();
+  const temp = pd.panelTemperature.value.trim();
+  const topP = pd.panelTopP.value.trim();
+  const topK = pd.panelTopK.value.trim();
+  const minP = pd.panelMinP.value.trim();
+  const maxTok = pd.panelMaxOutputTokens.value.trim();
+  const repPen = pd.panelRepetitionPenalty.value.trim();
+  const seed = pd.panelSeed.value.trim();
 
   const params: Partial<CreateResponseRequest> = {};
   if (temp) params.temperature = parseFloat(temp);
@@ -22,16 +22,16 @@ export function getSamplingParams(): Partial<CreateResponseRequest> {
   return params;
 }
 
-/** Save sampling overrides from the right panel inputs. */
+/** Save sampling overrides from the panel inputs. */
 export async function savePanelOverrides(): Promise<void> {
-  const dom = getChatDom();
-  const temp = dom.panelTemperature.value.trim();
-  const topP = dom.panelTopP.value.trim();
-  const topK = dom.panelTopK.value.trim();
-  const minP = dom.panelMinP.value.trim();
-  const maxTok = dom.panelMaxOutputTokens.value.trim();
-  const repPen = dom.panelRepetitionPenalty.value.trim();
-  const seed = dom.panelSeed.value.trim();
+  const pd = getChatPanelDom();
+  const temp = pd.panelTemperature.value.trim();
+  const topP = pd.panelTopP.value.trim();
+  const topK = pd.panelTopK.value.trim();
+  const minP = pd.panelMinP.value.trim();
+  const maxTok = pd.panelMaxOutputTokens.value.trim();
+  const repPen = pd.panelRepetitionPenalty.value.trim();
+  const seed = pd.panelSeed.value.trim();
 
   const patch: SettingsPatch = {
     model_overrides: {
@@ -51,9 +51,9 @@ export async function savePanelOverrides(): Promise<void> {
   }
 }
 
-/** Sync right panel sampling params for a given model. */
+/** Sync panel sampling params for a given model. */
 export function syncRightPanelParams(modelId: string): void {
-  const dom = getChatDom();
+  const pd = getChatPanelDom();
   const models = getModelsService()?.getAvailableModels() ?? [];
   const entry = models.find((m) => m.id === modelId);
   if (!entry) return;
@@ -61,56 +61,49 @@ export function syncRightPanelParams(modelId: string): void {
   const d = entry.defaults;
   const o = entry.overrides;
 
-  dom.panelTemperature.placeholder = String(d.temperature);
-  dom.panelTemperature.value = o.temperature != null ? String(o.temperature) : "";
-  dom.panelTemperatureDefault.textContent = `Default: ${d.temperature}`;
+  pd.panelTemperature.placeholder = String(d.temperature);
+  pd.panelTemperature.value = o.temperature != null ? String(o.temperature) : "";
+  pd.panelTemperatureDefault.textContent = `Default: ${d.temperature}`;
 
-  dom.panelTopP.placeholder = String(d.top_p);
-  dom.panelTopP.value = o.top_p != null ? String(o.top_p) : "";
-  dom.panelTopPDefault.textContent = `Default: ${d.top_p}`;
+  pd.panelTopP.placeholder = String(d.top_p);
+  pd.panelTopP.value = o.top_p != null ? String(o.top_p) : "";
+  pd.panelTopPDefault.textContent = `Default: ${d.top_p}`;
 
-  dom.panelTopK.placeholder = String(d.top_k);
-  dom.panelTopK.value = o.top_k != null ? String(o.top_k) : "";
-  dom.panelTopKDefault.textContent = `Default: ${d.top_k}`;
+  pd.panelTopK.placeholder = String(d.top_k);
+  pd.panelTopK.value = o.top_k != null ? String(o.top_k) : "";
+  pd.panelTopKDefault.textContent = `Default: ${d.top_k}`;
 }
 
-/** Update right panel chat info section. */
+/** Update panel chat info section. */
 export function updatePanelChatInfo(chat: Conversation | null): void {
-  const dom = getChatDom();
+  const pd = getChatPanelDom();
   if (!chat) return;
 
-  dom.panelInfoCreated.textContent = format.dateTime(chat.created_at);
+  pd.panelInfoCreated.textContent = format.dateTime(chat.created_at);
 
   if (chat.parent_session_id) {
-    dom.panelInfoForkedRow.classList.remove("hidden");
-    dom.panelInfoForked.textContent = chat.parent_session_id.slice(0, 8) + "...";
+    pd.panelInfoForkedRow.classList.remove("hidden");
+    pd.panelInfoForked.textContent = chat.parent_session_id.slice(0, 8) + "...";
   } else {
-    dom.panelInfoForkedRow.classList.add("hidden");
+    pd.panelInfoForkedRow.classList.add("hidden");
   }
 }
 
-/** Wire up right panel event handlers (close button, model change, sampling saves). */
+/** Wire up panel event handlers (model change, sampling saves). */
 export function setupPanelEvents(): void {
   const dom = getChatDom();
-
-  // Close button
-  dom.closeRightPanelBtn.addEventListener("click", () => {
-    if (isPanelReadOnly()) {
-      restoreEditableParams();
-    }
-    hideRightPanel();
-  });
+  const pd = getChatPanelDom();
 
   // Model selectors — sync each other and notify settings service
   dom.welcomeModel.addEventListener("change", () => {
     const modelId = dom.welcomeModel.value;
-    dom.panelModel.value = modelId;
+    pd.panelModel.value = modelId;
     getModelsService()?.setActiveModel(modelId);
     syncRightPanelParams(modelId);
   });
 
-  dom.panelModel.addEventListener("change", () => {
-    const modelId = dom.panelModel.value;
+  pd.panelModel.addEventListener("change", () => {
+    const modelId = pd.panelModel.value;
     dom.welcomeModel.value = modelId;
     getModelsService()?.setActiveModel(modelId);
     syncRightPanelParams(modelId);
@@ -122,11 +115,11 @@ export function setupPanelEvents(): void {
     saveDebounce?.dispose();
     saveDebounce = timers.setTimeout(() => savePanelOverrides(), 400);
   };
-  dom.panelTemperature.addEventListener("input", scheduleSave);
-  dom.panelTopP.addEventListener("input", scheduleSave);
-  dom.panelTopK.addEventListener("input", scheduleSave);
-  dom.panelMinP.addEventListener("input", scheduleSave);
-  dom.panelMaxOutputTokens.addEventListener("input", scheduleSave);
-  dom.panelRepetitionPenalty.addEventListener("input", scheduleSave);
-  dom.panelSeed.addEventListener("input", scheduleSave);
+  pd.panelTemperature.addEventListener("input", scheduleSave);
+  pd.panelTopP.addEventListener("input", scheduleSave);
+  pd.panelTopK.addEventListener("input", scheduleSave);
+  pd.panelMinP.addEventListener("input", scheduleSave);
+  pd.panelMaxOutputTokens.addEventListener("input", scheduleSave);
+  pd.panelRepetitionPenalty.addEventListener("input", scheduleSave);
+  pd.panelSeed.addEventListener("input", scheduleSave);
 }

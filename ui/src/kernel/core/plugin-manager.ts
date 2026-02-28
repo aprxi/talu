@@ -20,6 +20,7 @@ import { checkCapabilities } from "../security/capabilities.ts";
 import { validateManifest } from "./manifest-validator.ts";
 import { registerAliases } from "./alias.ts";
 import { PopoverManager } from "../ui/popover.ts";
+import { AppPanelManager } from "../ui/layout.ts";
 import { RendererRegistryImpl } from "../registries/renderers.ts";
 import { loadKeybindingOverrides } from "../registries/keybindings.ts";
 import { StatusBarManager } from "../ui/status-bar.ts";
@@ -33,7 +34,7 @@ import { ContextKeyService } from "../registries/context-keys.ts";
 import { MenuRegistry } from "../registries/menus.ts";
 import { installFocusTracking } from "../ui/focus.ts";
 import { restoreThemeSync } from "../../styles/theme.ts";
-import { BUILTIN_SCHEMES } from "../../styles/color-schemes.ts";
+import { BUILTIN_THEMES } from "../../styles/color-schemes.ts";
 import { setupThemePicker } from "../ui/theme-picker.ts";
 import { createApiClient } from "../../api.ts";
 import { initKvSettings, migrateLocalStorageToKv } from "../system/kv-settings.ts";
@@ -421,8 +422,9 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
   const commandRegistry = new CommandRegistryImpl(contextKeys);
   const menuRegistry = new MenuRegistry(contextKeys, commandRegistry);
   const themeAccess = new ThemeAccessImpl();
-  themeAccess.registerBuiltinSchemes(BUILTIN_SCHEMES);
+  themeAccess.registerBuiltinThemes(BUILTIN_THEMES);
   const popoverManager = new PopoverManager();
+  const panelManager = new AppPanelManager();
   const rendererRegistry = new RendererRegistryImpl();
   const statusBarManager = new StatusBarManager();
   const viewManager = new ViewManager();
@@ -437,6 +439,7 @@ export async function bootKernel(builtinPlugins: PluginDefinition[]): Promise<vo
     commandRegistry,
     themeAccess,
     popoverManager,
+    panelManager,
     rendererRegistry,
     statusBarManager,
     viewManager,

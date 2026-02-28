@@ -3,7 +3,15 @@
  */
 
 import type { ModelEntry } from "../../types.ts";
+import type { Disposable } from "../../kernel/types.ts";
 import { events } from "./deps.ts";
+
+export interface CustomTheme {
+  id: string;
+  name: string;
+  category: "dark" | "light";
+  tokens: Record<string, string>;
+}
 
 export interface SettingsState {
   activeModel: string;
@@ -11,6 +19,9 @@ export interface SettingsState {
   changeHandlers: Set<() => void>;
   systemPromptEnabled: boolean;
   chatModelsActive: boolean;
+  customThemes: CustomTheme[];
+  /** Disposables for registered custom themes (keyed by theme ID). */
+  themeDisposables: Map<string, Disposable>;
 }
 
 export const settingsState: SettingsState = {
@@ -19,6 +30,8 @@ export const settingsState: SettingsState = {
   changeHandlers: new Set(),
   systemPromptEnabled: true,
   chatModelsActive: false,
+  customThemes: [],
+  themeDisposables: new Map(),
 };
 
 /** Notify internal change listeners (e.g. chat plugin's model service subscription). */

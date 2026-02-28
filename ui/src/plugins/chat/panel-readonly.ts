@@ -1,6 +1,7 @@
 import { getChatDom } from "./dom.ts";
+import { getChatPanelDom } from "./chat-panel-dom.ts";
 import { chatState } from "./state.ts";
-import { getModelsService, getPromptsService, format } from "./deps.ts";
+import { getModelsService, getPromptsService, format, layout } from "./deps.ts";
 import { syncRightPanelParams } from "./panel-params.ts";
 import { escapeHtml } from "../../utils/helpers.ts";
 import type { GenerationSettings, UsageStats } from "../../types.ts";
@@ -12,57 +13,46 @@ export function isPanelReadOnly(): boolean {
   return panelReadOnlyMode;
 }
 
-/** Show generation params in the right panel (read-only mode for past messages). */
+/** Show generation params in the panel (read-only mode for past messages). */
 export function showReadOnlyParams(
   gen: GenerationSettings | null,
   usage: UsageStats | null,
 ): void {
-  const dom = getChatDom();
+  const pd = getChatPanelDom();
   if (!gen) return;
-
-  // Open right panel if hidden
-  if (dom.rightPanel.classList.contains("hidden")) {
-    dom.rightPanel.classList.remove("hidden");
-    dom.rightPanel.classList.add("flex");
-    const tuningBtn = dom.transcriptContainer.querySelector<HTMLButtonElement>('[data-action="toggle-tuning"]');
-    if (tuningBtn) {
-      tuningBtn.classList.add("active");
-    }
-  }
 
   panelReadOnlyMode = true;
 
   // Set values from the past message's generation params
   if (gen.model) {
-    const modelOption = Array.from(dom.panelModel.options).find(opt => opt.value === gen.model);
+    const modelOption = Array.from(pd.panelModel.options).find(opt => opt.value === gen.model);
     if (modelOption) {
-      dom.panelModel.value = gen.model;
+      pd.panelModel.value = gen.model;
     }
   }
-  dom.panelTemperature.value = gen.temperature?.toString() ?? "";
-  dom.panelTopP.value = gen.top_p?.toString() ?? "";
-  dom.panelTopK.value = gen.top_k?.toString() ?? "";
-  dom.panelMinP.value = gen.min_p?.toString() ?? "";
-  dom.panelMaxOutputTokens.value = gen.max_output_tokens?.toString() ?? "";
-  dom.panelRepetitionPenalty.value = gen.repetition_penalty?.toString() ?? "";
-  dom.panelSeed.value = gen.seed?.toString() ?? "";
+  pd.panelTemperature.value = gen.temperature?.toString() ?? "";
+  pd.panelTopP.value = gen.top_p?.toString() ?? "";
+  pd.panelTopK.value = gen.top_k?.toString() ?? "";
+  pd.panelMinP.value = gen.min_p?.toString() ?? "";
+  pd.panelMaxOutputTokens.value = gen.max_output_tokens?.toString() ?? "";
+  pd.panelRepetitionPenalty.value = gen.repetition_penalty?.toString() ?? "";
+  pd.panelSeed.value = gen.seed?.toString() ?? "";
 
   // Disable all inputs
-  dom.panelModel.disabled = true;
-  dom.panelTemperature.disabled = true;
-  dom.panelTopP.disabled = true;
-  dom.panelTopK.disabled = true;
-  dom.panelMinP.disabled = true;
-  dom.panelMaxOutputTokens.disabled = true;
-  dom.panelRepetitionPenalty.disabled = true;
-  dom.panelSeed.disabled = true;
+  pd.panelModel.disabled = true;
+  pd.panelTemperature.disabled = true;
+  pd.panelTopP.disabled = true;
+  pd.panelTopK.disabled = true;
+  pd.panelMinP.disabled = true;
+  pd.panelMaxOutputTokens.disabled = true;
+  pd.panelRepetitionPenalty.disabled = true;
+  pd.panelSeed.disabled = true;
 
   // Add visual indicator
-  dom.rightPanel.classList.add("read-only");
+  pd.root.classList.add("read-only");
 
   // Update the Info section with stats
   if (usage) {
-    const panelChatInfo = dom.panelChatInfo;
     const rows: string[] = [];
     rows.push(`<div class="info-row"><span class="info-label">Output tokens</span><span class="info-value">${usage.output_tokens}</span></div>`);
     if (usage.input_tokens) {
@@ -74,39 +64,48 @@ export function showReadOnlyParams(
     if (usage.duration_ms) {
       rows.push(`<div class="info-row"><span class="info-label">Duration</span><span class="info-value">${(usage.duration_ms / 1000).toFixed(2)}s</span></div>`);
     }
-    panelChatInfo.innerHTML = rows.join("\n");
+    pd.panelChatInfo.innerHTML = rows.join("\n");
+  }
+
+  // Open the panel with the chat content
+  showChatPanel();
+
+  // Activate tuning button
+  const tuningBtn = getChatDom().transcriptContainer.querySelector<HTMLButtonElement>('[data-action="toggle-tuning"]');
+  if (tuningBtn) {
+    tuningBtn.classList.add("active");
   }
 }
 
 /** Restore panel to editable mode with current settings. */
 export function restoreEditableParams(): void {
-  const dom = getChatDom();
+  const pd = getChatPanelDom();
   if (!panelReadOnlyMode) return;
 
   panelReadOnlyMode = false;
 
   // Re-enable all inputs
-  dom.panelModel.disabled = false;
-  dom.panelTemperature.disabled = false;
-  dom.panelTopP.disabled = false;
-  dom.panelTopK.disabled = false;
-  dom.panelMinP.disabled = false;
-  dom.panelMaxOutputTokens.disabled = false;
-  dom.panelRepetitionPenalty.disabled = false;
-  dom.panelSeed.disabled = false;
+  pd.panelModel.disabled = false;
+  pd.panelTemperature.disabled = false;
+  pd.panelTopP.disabled = false;
+  pd.panelTopK.disabled = false;
+  pd.panelMinP.disabled = false;
+  pd.panelMaxOutputTokens.disabled = false;
+  pd.panelRepetitionPenalty.disabled = false;
+  pd.panelSeed.disabled = false;
 
   // Remove visual indicator
-  dom.rightPanel.classList.remove("read-only");
+  pd.root.classList.remove("read-only");
 
   // Restore the Info section to show chat info
   if (chatState.activeChat) {
     const createdStr = format.dateTime(chatState.activeChat.created_at);
 
-    let infoHtml = `<div class="info-row"><span class="info-label">Created</span><span id="panel-info-created" class="info-value">${createdStr}</span></div>`;
+    let infoHtml = `<div class="info-row"><span class="info-label">Created</span><span class="info-value">${createdStr}</span></div>`;
 
     if (chatState.activeChat.parent_session_id) {
       const shortId = chatState.activeChat.parent_session_id.slice(0, 8);
-      infoHtml += `<div id="panel-info-forked-row" class="info-row"><span class="info-label">Forked from</span><span id="panel-info-forked" class="info-value mono">${shortId}</span></div>`;
+      infoHtml += `<div class="info-row"><span class="info-label">Forked from</span><span class="info-value mono">${shortId}</span></div>`;
     }
 
     // Show source prompt if this conversation was created from one
@@ -120,7 +119,7 @@ export function restoreEditableParams(): void {
       }
     }
 
-    dom.panelChatInfo.innerHTML = infoHtml;
+    pd.panelChatInfo.innerHTML = infoHtml;
   }
 
   // Restore right panel to current settings values
@@ -128,27 +127,43 @@ export function restoreEditableParams(): void {
   syncRightPanelParams(modelId);
 }
 
-export function hideRightPanel(): void {
-  const dom = getChatDom();
-  dom.rightPanel.classList.add("hidden");
-  dom.rightPanel.classList.remove("flex");
+export function hideChatPanel(): void {
+  layout.hidePanel("chat");
   // Reset the tuning button appearance if visible
-  const tuningBtn = dom.transcriptContainer.querySelector<HTMLButtonElement>('[data-action="toggle-tuning"]');
+  const tuningBtn = getChatDom().transcriptContainer.querySelector<HTMLButtonElement>('[data-action="toggle-tuning"]');
   if (tuningBtn) {
     tuningBtn.classList.remove("active");
   }
 }
 
-/** Open the right panel in editable mode. Only X closes it. */
+/** Open the chat panel via the unified app panel. */
+function showChatPanel(): void {
+  const pd = getChatPanelDom();
+  layout.showPanel({
+    title: "Chat",
+    content: pd.root,
+    owner: "chat",
+    onHide: () => {
+      if (panelReadOnlyMode) {
+        restoreEditableParams();
+      }
+      // Reset the tuning button appearance
+      const tuningBtn = getChatDom().transcriptContainer.querySelector<HTMLButtonElement>('[data-action="toggle-tuning"]');
+      if (tuningBtn) {
+        tuningBtn.classList.remove("active");
+      }
+    },
+  });
+}
+
+/** Open the panel in editable mode. Only X closes it. */
 export function handleToggleTuning(btn: HTMLButtonElement): void {
-  const dom = getChatDom();
   // Always restore editable mode
   if (panelReadOnlyMode) {
     restoreEditableParams();
   }
 
-  // Always open (never close via this button)
-  dom.rightPanel.classList.remove("hidden");
-  dom.rightPanel.classList.add("flex");
+  // Show the chat panel
+  showChatPanel();
   btn.classList.add("active");
 }

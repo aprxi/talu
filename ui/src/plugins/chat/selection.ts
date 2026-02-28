@@ -6,6 +6,7 @@ import { renderEmptyState, renderLoadingSpinner } from "../../render/common.ts";
 import { showInputBar, hideWelcome, hideInputBar, setInputEnabled } from "./welcome.ts";
 import { layout } from "./deps.ts";
 import { updatePanelChatInfo } from "./panel-params.ts";
+import { hideChatPanel } from "./panel-readonly.ts";
 import { handleTitleRename } from "./sidebar-actions.ts";
 import { renderSidebar } from "./sidebar-list.ts";
 import { appendGeneratingIndicator } from "./messages.ts";
@@ -35,6 +36,7 @@ export async function selectChat(id: string): Promise<void> {
   renderSidebar();
 
   hideWelcome();
+  hideChatPanel();
 
   // If navigating to a background-streaming chat with saved DOM, restore it
   // so the user sees live-streaming text instead of a stale API snapshot.

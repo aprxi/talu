@@ -29,6 +29,8 @@ import { setStreamRenderers } from "./streaming.ts";
 import { setupSidebarEvents } from "./sidebar-events.ts";
 import { setupInfiniteScroll, loadSessions, refreshSidebar } from "./sidebar-list.ts";
 import { syncRightPanelParams, setupPanelEvents } from "./panel-params.ts";
+import { hideChatPanel } from "./panel-readonly.ts";
+import { getChatPanelDom } from "./chat-panel-dom.ts";
 import { chatState, getActiveProjectId, loadCollapsedGroups } from "./state.ts";
 import { getModelsService, getPromptsService } from "./deps.ts";
 import { initProjectStore, loadApiProjects, migrateLocalStorageProjects } from "../../render/project-combo.ts";
@@ -146,8 +148,9 @@ export const chatPlugin: PluginDefinition = {
     // Listen for cross-plugin events.
     ctx.events.on<{ modelId: string; availableModels: ModelEntry[] }>("model.changed", ({ modelId, availableModels }) => {
       const dom = getChatDom();
+      const pd = getChatPanelDom();
       populateModelSelect(dom.welcomeModel, availableModels, modelId);
-      populateModelSelect(dom.panelModel, availableModels, modelId);
+      populateModelSelect(pd.panelModel, availableModels, modelId);
       syncRightPanelParams(modelId);
     });
 
@@ -163,14 +166,18 @@ export const chatPlugin: PluginDefinition = {
       chatState.systemPromptEnabled = enabled;
     });
 
+    // Close the chat panel when leaving chat mode.
+    ctx.mode.onChange(({ from }) => {
+      if (from === "chat") hideChatPanel();
+    });
+
     // Pull initial state from services (events fired before our listeners existed).
     const models = getModelsService();
     if (models) {
       const modelId = models.getActiveModel();
       const available = models.getAvailableModels();
-      const dom = getChatDom();
-      populateModelSelect(dom.welcomeModel, available, modelId);
-      populateModelSelect(dom.panelModel, available, modelId);
+      populateModelSelect(getChatDom().welcomeModel, available, modelId);
+      populateModelSelect(getChatPanelDom().panelModel, available, modelId);
       syncRightPanelParams(modelId);
     }
 

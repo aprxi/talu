@@ -1,7 +1,7 @@
 import { getChatDom } from "./dom.ts";
 import { chatState } from "./state.ts";
 import { SEND_ICON, STOP_ICON } from "../../icons.ts";
-import { hideRightPanel } from "./panel-readonly.ts";
+import { hideChatPanel } from "./panel-readonly.ts";
 import { updatePanelChatInfo } from "./panel-params.ts";
 import { layout } from "./deps.ts";
 import { renderSidebar } from "./sidebar-list.ts";
@@ -11,7 +11,7 @@ export function showWelcome(): void {
   const dom = getChatDom();
   dom.welcomeState.classList.remove("hidden");
   hideInputBar();
-  hideRightPanel();
+  hideChatPanel();
   updatePanelChatInfo(null);
   layout.setTitle("");
 }

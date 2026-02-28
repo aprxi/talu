@@ -88,6 +88,18 @@
       <!-- ═══ SETTINGS MODE (settings plugin builds its own DOM) ═══ -->
       <div id="settings-mode" class="mode-view hidden"></div>
 
+      <!-- Generic app panel (slides in from right, overlays content) -->
+      <aside id="app-panel" class="app-panel hidden">
+        <div class="app-panel-header">
+          <span id="app-panel-title" class="app-panel-title"></span>
+          <div class="flex-1"></div>
+          <button id="app-panel-close" class="btn btn-ghost btn-icon" title="Close">
+            <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M18 6 6 18"/><path d="m6 6 12 12"/></svg>
+          </button>
+        </div>
+        <div id="app-panel-content" class="app-panel-content"></div>
+      </aside>
+
       </div><!-- /app-content -->
     </div><!-- /app-main -->
 
