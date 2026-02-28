@@ -8,6 +8,8 @@ export const bState = {
   selectedIds: new Set<string>(),
   conversations: [] as Conversation[],
   tab: "all" as "all" | "archived",
+  /** Sub-page drill-down (null = conversations list, "context" = prompts management). */
+  subPage: null as null | "context",
   /** Guard against overlapping non-search loads. */
   isLoading: false,
   /** Incremented on each load to detect stale completions. */

@@ -21,6 +21,11 @@ export interface BrowserDom {
   bulkActions: HTMLElement;
   toolbarEl: HTMLElement;
   paginationEl: HTMLElement;
+  conversationsView: HTMLElement;
+  contextView: HTMLElement;
+  contextBackBtn: HTMLButtonElement;
+  contextBtn: HTMLButtonElement;
+  promptsHost: HTMLElement;
 }
 
 let root: HTMLElement;
@@ -53,6 +58,11 @@ export function getBrowserDom(): BrowserDom {
     bulkActions: q("#bp-bulk-actions"),
     toolbarEl: q("#bp-toolbar"),
     paginationEl: q("#bp-pagination"),
+    conversationsView: q("#bp-conversations-view"),
+    contextView: q("#bp-context-view"),
+    contextBackBtn: q("#bp-context-back") as HTMLButtonElement,
+    contextBtn: q("#bp-context-btn") as HTMLButtonElement,
+    promptsHost: q("#bp-prompts-host"),
   };
   return cached;
 }

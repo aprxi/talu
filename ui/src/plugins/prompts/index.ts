@@ -17,13 +17,11 @@ import {
   BUILTIN_PROMPT_CONTENT,
   type SavedPrompt,
 } from "./state.ts";
-import { initPromptsDom } from "./dom.ts";
-import { buildPromptsDOM } from "./build-dom.ts";
 import { renderList } from "./list.ts";
-import { selectPrompt, showEmpty, wireEvents, emitPromptsChanged } from "./editor.ts";
+import { selectPrompt, showEmpty, emitPromptsChanged } from "./editor.ts";
 
-/** Auto-select the effective default prompt on first load. */
-function initPage(): void {
+/** Auto-select the effective default prompt. Exported for use by hosting plugin. */
+export function initPage(): void {
   const effectiveId = promptsState.defaultId ?? promptsState.builtinId;
   if (effectiveId && promptsState.prompts.some((p) => p.id === effectiveId)) {
     selectPrompt(effectiveId);
@@ -39,7 +37,6 @@ export const promptsPlugin: PluginDefinition = {
     name: "Prompts",
     version: "0.1.0",
     builtin: true,
-    contributes: { mode: { key: "prompts", label: "Prompts" } },
   },
 
   register(ctx: PluginContext): void {
@@ -66,10 +63,6 @@ export const promptsPlugin: PluginDefinition = {
       notifications: ctx.notifications,
       log: ctx.log,
     });
-
-    buildPromptsDOM(ctx.container);
-    initPromptsDom(ctx.container);
-    wireEvents();
 
     // Load prompts from API.
     try {
@@ -149,7 +142,6 @@ export const promptsPlugin: PluginDefinition = {
     }
 
     emitPromptsChanged();
-    initPage();
 
     ctx.log.info("Prompts loaded.", { count: promptsState.prompts.length });
   },

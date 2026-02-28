@@ -2,6 +2,9 @@
  * Browser plugin — conversations browser with search, tag filtering,
  * tab switching (active/archived), batch actions (delete, archive, restore, export).
  *
+ * Also hosts the Context sub-page (prompts management), accessible from
+ * the sidebar "Context" section.
+ *
  * Owns its own search/filter state. Communicates with the chat plugin
  * via the "talu.chat" service for selectChat/refreshSidebar operations.
  */
@@ -13,9 +16,15 @@ import { initBrowserDeps } from "./deps.ts";
 import { bState, search } from "./state.ts";
 import { initBrowserDom, getBrowserDom } from "./dom.ts";
 import { buildBrowserDOM } from "./build-dom.ts";
-import { syncBrowserTabs, updateBrowserToolbar } from "./render.ts";
+import { syncBrowserTabs, syncBrowserSubPage, updateBrowserToolbar } from "./render.ts";
 import { loadBrowserConversations, loadAvailableTags } from "./data.ts";
 import { wireEvents } from "./events.ts";
+
+// Prompts UI modules — built inside the context sub-page host.
+import { buildPromptsDOM } from "../prompts/build-dom.ts";
+import { initPromptsDom } from "../prompts/dom.ts";
+import { wireEvents as wirePromptsEvents } from "../prompts/editor.ts";
+import { initPage as initPromptsPage } from "../prompts/index.ts";
 
 function initConversationsBrowser(): void {
   // Cancel any in-flight load so it won't overwrite state.
@@ -24,6 +33,7 @@ function initConversationsBrowser(): void {
 
   const dom = getBrowserDom();
   bState.selectedIds.clear();
+  bState.subPage = null;
   dom.searchInput.value = "";
   search.query = "";
   search.tagFilters = [];
@@ -31,6 +41,7 @@ function initConversationsBrowser(): void {
   bState.tab = "all";
   bState.pagination.currentPage = 1;
   bState.pagination.totalItems = 0;
+  syncBrowserSubPage();
   syncBrowserTabs();
   dom.clearBtn.classList.add("hidden");
   updateBrowserToolbar();
@@ -78,6 +89,25 @@ export const browserPlugin: PluginDefinition = {
     buildBrowserDOM(ctx.container);
     initBrowserDom(ctx.container);
     wireEvents();
+
+    // Build prompts UI inside the context sub-page host (once).
+    const dom = getBrowserDom();
+    buildPromptsDOM(dom.promptsHost);
+    initPromptsDom(dom.promptsHost);
+    wirePromptsEvents();
+
+    // Context entry: sidebar button → show prompts management.
+    dom.contextBtn.addEventListener("click", () => {
+      bState.subPage = "context";
+      syncBrowserSubPage();
+      initPromptsPage();
+    });
+
+    // Context exit: back button → return to conversations.
+    dom.contextBackBtn.addEventListener("click", () => {
+      bState.subPage = null;
+      syncBrowserSubPage();
+    });
 
     // Activate contributed menu slot in the toolbar.
     const toolbarSlot = ctx.container.querySelector<HTMLElement>('[data-slot="browser:toolbar"]');

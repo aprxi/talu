@@ -46,7 +46,6 @@
 
 .app-layout[data-mode="chat"] .subnav,
 .app-layout[data-mode="conversations"] .subnav,
-.app-layout[data-mode="prompts"] .subnav,
 .app-layout[data-mode="routing"] .subnav,
 .app-layout[data-mode="files"] .subnav {
   display: flex;
@@ -56,7 +55,6 @@
 
 .app-layout[data-mode="chat"] .subnav-group[data-subnav-group="chat"],
 .app-layout[data-mode="conversations"] .subnav-group[data-subnav-group="chat"],
-.app-layout[data-mode="prompts"] .subnav-group[data-subnav-group="chat"],
 .app-layout[data-mode="routing"] .subnav-group[data-subnav-group="chat"] { display: contents; }
 
 .app-layout[data-mode="files"] .subnav-group[data-subnav-group="files"] { display: contents; }

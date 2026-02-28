@@ -13,6 +13,13 @@ import { loadBrowserConversations, loadAvailableTags } from "./data.ts";
 import { handleRenameProject, handleDeleteProject } from "./actions.ts";
 import { chatService } from "./deps.ts";
 
+export function syncBrowserSubPage(): void {
+  const dom = getBrowserDom();
+  const isContext = bState.subPage === "context";
+  dom.conversationsView.classList.toggle("hidden", isContext);
+  dom.contextView.classList.toggle("hidden", !isContext);
+}
+
 export function syncBrowserTabs(): void {
   const dom = getBrowserDom();
   const baseClass = "browser-tab";

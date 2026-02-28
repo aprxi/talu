@@ -582,3 +582,24 @@
   margin: 0.5rem 0;
   background: var(--border);
 }
+
+/* =============================================================================
+   Context Sub-page Header (prompts management within browser)
+   ============================================================================= */
+
+.bp-context-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.bp-context-title {
+  font-weight: 600;
+  font-size: 13px;
+  color: var(--text-secondary);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
