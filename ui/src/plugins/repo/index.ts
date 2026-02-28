@@ -23,11 +23,11 @@ import { getRepoDom } from "./dom.ts";
 export const repoPlugin: PluginDefinition = {
   manifest: {
     id: "talu.repo",
-    name: "Models",
+    name: "Routing",
     version: "0.1.0",
     builtin: true,
     contributes: {
-      mode: { key: "models", label: "Models" },
+      mode: { key: "routing", label: "Routing" },
     },
   },
 
@@ -59,41 +59,56 @@ export const repoPlugin: PluginDefinition = {
     // Load chat models from KV (needed before providers render for "Added" state).
     await loadChatModels();
 
-    // Refresh models when the Models tab is activated.
+    // Refresh when the Routing mode is activated.
     ctx.events.on<{ to: string }>("mode.changed", ({ to }) => {
-      if (to === "models") {
+      if (to === "routing") {
         initRepoView();
       }
     });
 
-    ctx.events.on<{ tab: string }>("subnav.tab", ({ tab }) => {
-      if (tab !== "discover" && tab !== "local" && tab !== "providers") return;
-      if (tab === repoState.tab) return;
-      repoState.tab = tab as typeof repoState.tab;
+    // Back button: exit manage-local sub-page → return to providers view.
+    dom.manageBackBtn.addEventListener("click", () => {
+      repoState.subPage = null;
       repoState.selectedIds.clear();
       repoState.searchQuery = "";
       dom.search.value = "";
       dom.searchClear.classList.add("hidden");
       syncRepoTabs();
-      updateRepoToolbar();
-      if (tab === "discover") {
-        searchHub(repoState.searchQuery);
-      } else if (tab === "providers") {
-        loadProviders();
-        renderChatModels();
-      } else {
-        renderModelsTable();
-      }
+      loadProviders();
+      renderChatModels();
     });
+
+    // Manage-local tab switching (Local ↔ Discover).
+    for (const btn of [dom.manageLocalTabBtn, dom.manageDiscoverTabBtn]) {
+      btn.addEventListener("click", () => {
+        const tab = btn.dataset["manageTab"] as "discover" | "local";
+        if (tab === repoState.manageLocalTab) return;
+        repoState.manageLocalTab = tab;
+        repoState.selectedIds.clear();
+        repoState.searchQuery = "";
+        dom.search.value = "";
+        dom.searchClear.classList.add("hidden");
+        syncRepoTabs();
+        updateRepoToolbar();
+        if (tab === "discover") {
+          searchHub(repoState.searchQuery);
+        } else {
+          renderModelsTable();
+        }
+      });
+    }
 
     ctx.log.info("Repo plugin ready.");
   },
 };
 
-/** Reset state and reload data when the mode becomes active. */
+/** Reset state and show providers view when the mode becomes active. */
 function initRepoView(): void {
   repoState.selectedIds.clear();
+  repoState.subPage = null;
+  repoState.tab = "providers";
   syncRepoTabs();
   updateRepoToolbar();
-  loadModels();
+  loadProviders();
+  renderChatModels();
 }

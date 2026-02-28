@@ -204,7 +204,7 @@ export async function deleteModel(modelId: string): Promise<void> {
     renderModelsTable();
     renderStats();
     updateRepoToolbar();
-    if (repoState.tab === "discover") renderDiscoverResults();
+    if (repoState.manageLocalTab === "discover") renderDiscoverResults();
     notifications.success(`Deleted ${modelId}`);
     events.emit("repo.models.changed", {});
   } else {

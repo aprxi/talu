@@ -3,6 +3,8 @@
 import type { ProviderEntry } from "../../types.ts";
 
 export type RepoTab = "discover" | "local" | "providers";
+export type RepoSubPage = null | "manage-local";
+export type ManageLocalTab = "discover" | "local";
 export type LocalSourceFilter = "all" | "hub" | "managed";
 export type SortColumn = "name" | "size" | "date";
 export type SortDir = "asc" | "desc";
@@ -62,7 +64,9 @@ export interface DownloadProgress {
 }
 
 export const repoState = {
-  tab: "discover" as RepoTab,
+  tab: "providers" as RepoTab,
+  subPage: null as RepoSubPage,
+  manageLocalTab: "local" as ManageLocalTab,
   localSourceFilter: "all" as LocalSourceFilter,
   models: [] as CachedModel[],
   totalSizeBytes: 0,

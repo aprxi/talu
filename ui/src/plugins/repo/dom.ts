@@ -31,6 +31,11 @@ export interface RepoDom {
   providersList: HTMLElement;
   addProviderSelect: HTMLSelectElement;
   chatModelsList: HTMLElement;
+  routingMain: HTMLElement;
+  manageLocal: HTMLElement;
+  manageBackBtn: HTMLButtonElement;
+  manageLocalTabBtn: HTMLButtonElement;
+  manageDiscoverTabBtn: HTMLButtonElement;
 }
 
 let root: HTMLElement;
@@ -74,6 +79,11 @@ export function getRepoDom(): RepoDom {
     providersList: root.querySelector<HTMLElement>("#rp-providers-list")!,
     addProviderSelect: root.querySelector<HTMLSelectElement>("#rp-add-provider")!,
     chatModelsList: root.querySelector<HTMLElement>("#rp-chat-models-list")!,
+    routingMain: root.querySelector<HTMLElement>("#rp-routing-main")!,
+    manageLocal: root.querySelector<HTMLElement>("#rp-manage-local")!,
+    manageBackBtn: root.querySelector<HTMLButtonElement>("#rp-manage-back")!,
+    manageLocalTabBtn: root.querySelector<HTMLButtonElement>('[data-manage-tab="local"]')!,
+    manageDiscoverTabBtn: root.querySelector<HTMLButtonElement>('[data-manage-tab="discover"]')!,
   };
   return cached;
 }

@@ -548,3 +548,51 @@
   color: var(--text-muted);
   padding: 12px 16px;
 }
+
+/* ── Manage-local sub-page ──────────────────────────────────────────── */
+
+.rp-subpage-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 8px 16px;
+  border-bottom: 1px solid var(--border);
+  flex-shrink: 0;
+}
+
+.rp-back-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.rp-manage-tabs {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.rp-manage-tab {
+  padding: 4px 12px;
+  font-size: 12px;
+  font-weight: 500;
+  border: none;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+
+.rp-manage-tab + .rp-manage-tab {
+  border-left: 1px solid var(--border);
+}
+
+.rp-manage-tab:hover {
+  color: var(--text);
+}
+
+.rp-manage-tab.active {
+  background: color-mix(in srgb, var(--primary) 12%, transparent);
+  color: var(--primary);
+}

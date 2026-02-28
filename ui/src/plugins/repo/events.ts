@@ -55,7 +55,7 @@ export function wireRepoEvents(): void {
     searchDebounce?.dispose();
     searchDebounce = timers.setTimeout(() => {
       searchDebounce = null;
-      if (repoState.tab === "discover") {
+      if (repoState.manageLocalTab === "discover") {
         searchHub(query);
       } else {
         renderModelsTable();
@@ -72,7 +72,7 @@ export function wireRepoEvents(): void {
     dom.searchClear.classList.add("hidden");
     // Bump generation so any in-flight searchHub response is discarded.
     repoState.searchGeneration++;
-    if (repoState.tab === "discover") {
+    if (repoState.manageLocalTab === "discover") {
       searchHub("");
     } else {
       renderModelsTable();

@@ -12,7 +12,7 @@ import { updateProvenance } from "./provenance.ts";
 import { getSetting, setSetting } from "../system/kv-settings.ts";
 
 const STORAGE_KEY = "talu-last-active-mode";
-const CHAT_GROUP_MODES = new Set(["chat", "conversations", "prompts"]);
+const CHAT_GROUP_MODES = new Set(["chat", "conversations", "prompts", "routing"]);
 
 export class ModeManager {
   private active: string;

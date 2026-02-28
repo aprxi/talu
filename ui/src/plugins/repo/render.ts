@@ -363,18 +363,21 @@ export function updateRepoToolbar(): void {
 
 export function syncRepoTabs(): void {
   const dom = getRepoDom();
-  const { tab } = repoState;
+  const isManaging = repoState.subPage === "manage-local";
 
-  dom.discoverView.classList.toggle("hidden", tab !== "discover");
-  dom.discoverToolbar.classList.toggle("hidden", tab !== "discover");
-  dom.localView.classList.toggle("hidden", tab !== "local");
-  dom.localToolbar.classList.toggle("hidden", tab !== "local");
-  dom.providersView.classList.toggle("hidden", tab !== "providers");
+  // Top-level: show either routing-main (providers) or manage-local sub-page.
+  dom.routingMain.classList.toggle("hidden", isManaging);
+  dom.manageLocal.classList.toggle("hidden", !isManaging);
 
-  // Hide the search wrapper on the providers tab (not applicable there).
-  const searchWrapper = dom.search.closest(".search-wrapper");
-  if (searchWrapper) {
-    (searchWrapper as HTMLElement).classList.toggle("hidden", tab === "providers");
+  if (isManaging) {
+    const tab = repoState.manageLocalTab;
+    dom.discoverView.classList.toggle("hidden", tab !== "discover");
+    dom.discoverToolbar.classList.toggle("hidden", tab !== "discover");
+    dom.localView.classList.toggle("hidden", tab !== "local");
+    dom.localToolbar.classList.toggle("hidden", tab !== "local");
+
+    dom.manageLocalTabBtn.classList.toggle("active", tab === "local");
+    dom.manageDiscoverTabBtn.classList.toggle("active", tab === "discover");
   }
 }
 

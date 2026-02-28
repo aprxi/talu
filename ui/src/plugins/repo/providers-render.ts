@@ -8,6 +8,8 @@ import { repoState } from "./state.ts";
 import { addProvider, removeProvider, updateProvider, testProvider } from "./providers-data.ts";
 import { addChatModel, browseProviderModels, browseLocalModels } from "./chat-models-data.ts";
 import { renderChatModels } from "./chat-models-render.ts";
+import { syncRepoTabs, updateRepoToolbar } from "./render.ts";
+import { loadModels } from "./data.ts";
 import type { ProviderEntry } from "../../types.ts";
 
 // ---------------------------------------------------------------------------
@@ -68,9 +70,15 @@ function buildLocalRow(): HTMLElement {
   top.appendChild(nameEl);
 
   const actions = el("div", "repo-provider-row-actions");
+
   const browseBtn = el("button", "btn btn-ghost btn-sm", "Browse");
   browseBtn.dataset["action"] = "browse";
   actions.appendChild(browseBtn);
+
+  const manageBtn = el("button", "btn btn-ghost btn-sm", "Manage");
+  manageBtn.dataset["action"] = "manage-local";
+  actions.appendChild(manageBtn);
+
   top.appendChild(actions);
   row.appendChild(top);
 
@@ -248,6 +256,20 @@ export function wireProviderEvents(container: HTMLElement): void {
         form.classList.toggle("hidden");
         actionEl.textContent = isHidden ? "Cancel" : "Edit";
       }
+      return;
+    }
+
+    if (action === "manage-local") {
+      repoState.subPage = "manage-local";
+      repoState.manageLocalTab = "local";
+      repoState.selectedIds.clear();
+      repoState.searchQuery = "";
+      const dom = getRepoDom();
+      dom.search.value = "";
+      dom.searchClear.classList.add("hidden");
+      syncRepoTabs();
+      updateRepoToolbar();
+      loadModels();
       return;
     }
 
