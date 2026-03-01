@@ -60,6 +60,7 @@ pub const TaluAgentBus = opaque {};
 /// Opaque handle for workspace-scoped filesystem operations.
 pub const TaluFs = fs_api.TaluFs;
 pub const TaluFsStat = fs_api.TaluFsStat;
+pub const TaluShell = shell_api.TaluShell;
 
 pub export fn talu_fs_create(
     workspace_dir: ?[*:0]const u8,
@@ -171,6 +172,28 @@ pub export fn talu_shell_exec(
     return shell_api.talu_shell_exec(command, out_stdout, out_stdout_len, out_stderr, out_stderr_len, out_exit_code);
 }
 
+pub export fn talu_shell_exec_streaming(
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    timeout_ms: u64,
+    on_stdout: ?shell_api.StreamCallback,
+    on_stdout_ctx: ?*anyopaque,
+    on_stderr: ?shell_api.StreamCallback,
+    on_stderr_ctx: ?*anyopaque,
+    out_exit_code: ?*i32,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_exec_streaming(
+        command,
+        cwd,
+        timeout_ms,
+        on_stdout,
+        on_stdout_ctx,
+        on_stderr,
+        on_stderr_ctx,
+        out_exit_code,
+    );
+}
+
 pub export fn talu_shell_check_command(
     command: ?[*:0]const u8,
     out_allowed: ?*bool,
@@ -197,6 +220,63 @@ pub export fn talu_shell_normalize_command(
 
 pub export fn talu_shell_free_string(ptr: ?[*]const u8, len: usize) callconv(.c) void {
     shell_api.talu_shell_free_string(ptr, len);
+}
+
+pub export fn talu_shell_open(
+    cols: u16,
+    rows: u16,
+    cwd: ?[*:0]const u8,
+    out_shell: ?*?*TaluShell,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_open(cols, rows, cwd, out_shell);
+}
+
+pub export fn talu_shell_close(shell_handle: ?*TaluShell) callconv(.c) void {
+    shell_api.talu_shell_close(shell_handle);
+}
+
+pub export fn talu_shell_write(
+    shell_handle: ?*TaluShell,
+    data: ?[*]const u8,
+    len: usize,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_write(shell_handle, data, len);
+}
+
+pub export fn talu_shell_read(
+    shell_handle: ?*TaluShell,
+    buf: ?[*]u8,
+    buf_len: usize,
+    out_read: ?*usize,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_read(shell_handle, buf, buf_len, out_read);
+}
+
+pub export fn talu_shell_resize(
+    shell_handle: ?*TaluShell,
+    cols: u16,
+    rows: u16,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_resize(shell_handle, cols, rows);
+}
+
+pub export fn talu_shell_signal(
+    shell_handle: ?*TaluShell,
+    sig: u8,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_signal(shell_handle, sig);
+}
+
+pub export fn talu_shell_alive(shell_handle: ?*TaluShell) callconv(.c) bool {
+    return shell_api.talu_shell_alive(shell_handle);
+}
+
+pub export fn talu_shell_scrollback(
+    shell_handle: ?*TaluShell,
+    out_data: ?*?[*]const u8,
+    out_len: ?*usize,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_scrollback(shell_handle, out_data, out_len);
 }
 
 // =============================================================================

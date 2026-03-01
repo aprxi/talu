@@ -21,6 +21,8 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         max_file_inspect_bytes: 50 * 1024 * 1024,
         code_sessions: Mutex::new(HashMap::new()),
         code_session_ttl: std::time::Duration::ZERO,
+        shell_sessions: Mutex::new(HashMap::new()),
+        shell_session_ttl: std::time::Duration::from_secs(15 * 60),
     });
     let router = Router::new(state.clone());
     (router, state)

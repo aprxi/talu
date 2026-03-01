@@ -745,6 +745,23 @@ pub const talu_fs_mkdir = agent.talu_fs_mkdir;
 pub const talu_fs_rename = agent.talu_fs_rename;
 pub const talu_fs_free_string = agent.talu_fs_free_string;
 
+// Re-export Agent shell C API functions.
+pub const talu_shell_exec = agent.talu_shell_exec;
+pub const talu_shell_exec_streaming = agent.talu_shell_exec_streaming;
+pub const talu_shell_check_command = agent.talu_shell_check_command;
+pub const talu_shell_default_policy_json = agent.talu_shell_default_policy_json;
+pub const talu_shell_normalize_command = agent.talu_shell_normalize_command;
+pub const talu_shell_free_string = agent.talu_shell_free_string;
+pub const talu_shell_open = agent.talu_shell_open;
+pub const talu_shell_close = agent.talu_shell_close;
+pub const talu_shell_write = agent.talu_shell_write;
+pub const talu_shell_read = agent.talu_shell_read;
+pub const talu_shell_resize = agent.talu_shell_resize;
+pub const talu_shell_signal = agent.talu_shell_signal;
+pub const talu_shell_alive = agent.talu_shell_alive;
+pub const talu_shell_scrollback = agent.talu_shell_scrollback;
+pub const TaluShell = agent.TaluShell;
+
 // Re-export Tree-sitter C API functions (code parsing, highlighting, querying).
 pub const talu_treesitter_parser_create = treesitter.talu_treesitter_parser_create;
 pub const talu_treesitter_parser_free = treesitter.talu_treesitter_parser_free;

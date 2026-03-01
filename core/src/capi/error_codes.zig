@@ -67,6 +67,9 @@ pub const ErrorCode = enum(i32) {
     // Shell errors (800-899)
     shell_command_denied = 800,
     shell_exec_failed = 801,
+    shell_session_closed = 802,
+    shell_timeout = 803,
+    shell_process_exited = 804,
 
     // System errors (900-999)
     out_of_memory = 900,
@@ -135,6 +138,10 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.TagNotFound => .tag_not_found,
         error.StorageForkFailed => .storage_error,
         error.InvalidTokenId => .tokenizer_invalid_token_id,
+        // Shell errors
+        error.SessionClosed => .shell_session_closed,
+        error.Timeout => .shell_timeout,
+        error.ProcessExited => .shell_process_exited,
         // Image pipeline errors
         error.UnsupportedImageFormat => .convert_unsupported_format,
         error.ImageInputTooLarge,

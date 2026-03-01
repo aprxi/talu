@@ -11,10 +11,7 @@ fn config_with_workspace(workspace: &TempDir) -> ServerConfig {
 }
 
 /// Helper: create a server with a workspace, write a file, return (ctx, workspace).
-fn setup_with_file(
-    rel_path: &str,
-    content: &str,
-) -> (ServerTestContext, TempDir) {
+fn setup_with_file(rel_path: &str, content: &str) -> (ServerTestContext, TempDir) {
     let workspace = TempDir::new().expect("workspace");
     let ctx = ServerTestContext::new(config_with_workspace(&workspace));
     let resp = post_json(
@@ -431,7 +428,11 @@ fn agent_fs_read_dot_dot_traversal_blocked() {
     );
     // The `../` path resolves to nothing inside the workspace → 404.
     // The key assertion: it never returns 200 with content from outside.
-    assert_eq!(resp.status, 404, "path traversal must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 404,
+        "path traversal must be blocked: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "not_found");
 }
 
@@ -548,7 +549,8 @@ fn agent_fs_write_response_path_is_workspace_relative() {
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     assert_eq!(
-        resp.json()["path"], "abs.txt",
+        resp.json()["path"],
+        "abs.txt",
         "response path should be workspace-relative even when request used absolute"
     );
 }
@@ -633,7 +635,10 @@ fn agent_fs_edit_preserves_surrounding_content() {
     );
     let content = read.json()["content"].as_str().unwrap().to_string();
     assert!(content.contains("return 42"), "edit should apply");
-    assert!(content.contains("def bar():\n    pass"), "surrounding content must be preserved");
+    assert!(
+        content.contains("def bar():\n    pass"),
+        "surrounding content must be preserved"
+    );
 }
 
 #[test]
@@ -676,7 +681,10 @@ fn agent_fs_stat_existing_file_returns_full_metadata() {
     assert_eq!(j["is_symlink"], false);
     assert_eq!(j["size"], 12);
     assert!(j["mode"].is_string(), "mode should be octal string");
-    assert!(j["modified_at"].as_i64().unwrap() > 0, "modified_at should be set");
+    assert!(
+        j["modified_at"].as_i64().unwrap() > 0,
+        "modified_at should be set"
+    );
 }
 
 #[test]
@@ -707,7 +715,11 @@ fn agent_fs_stat_missing_path_returns_exists_false() {
         "/v1/agent/fs/stat",
         &serde_json::json!({ "path": "nonexistent.txt" }),
     );
-    assert_eq!(resp.status, 200, "stat on missing should be 200 with exists=false: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "stat on missing should be 200 with exists=false: {}",
+        resp.body
+    );
     let j = resp.json();
     assert_eq!(j["exists"], false);
     assert_eq!(j["is_file"], false);
@@ -735,7 +747,10 @@ fn agent_fs_list_without_glob_returns_all_entries() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let j = resp.json();
     let entries = j["entries"].as_array().expect("entries");
-    let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|e| e["name"].as_str().unwrap())
+        .collect();
     assert!(names.contains(&"a.txt"), "missing a.txt in {names:?}");
     assert!(names.contains(&"b.rs"), "missing b.rs in {names:?}");
     assert!(names.contains(&"sub"), "missing sub in {names:?}");
@@ -1038,11 +1053,7 @@ fn agent_fs_missing_required_field_returns_400() {
     let ctx = ServerTestContext::new(config_with_workspace(&workspace));
 
     // Read without path field
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/fs/read",
-        &serde_json::json!({}),
-    );
+    let resp = post_json(ctx.addr(), "/v1/agent/fs/read", &serde_json::json!({}));
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     assert_eq!(resp.json()["error"]["code"], "invalid_json");
 }
@@ -1085,7 +1096,11 @@ fn agent_fs_read_symlink_outside_workspace_blocked() {
         "/v1/agent/fs/read",
         &serde_json::json!({ "path": "escape.txt" }),
     );
-    assert_eq!(resp.status, 403, "symlink escape must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "symlink escape must be blocked: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "permission_denied");
 }
 
@@ -1112,7 +1127,11 @@ fn agent_fs_edit_symlink_outside_workspace_blocked() {
             "new_text": "hacked"
         }),
     );
-    assert_eq!(resp.status, 403, "symlink edit escape must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "symlink edit escape must be blocked: {}",
+        resp.body
+    );
 
     // Verify the outside file was not modified
     let content = std::fs::read_to_string(outside.path().join("target.txt")).expect("read");
@@ -1138,10 +1157,17 @@ fn agent_fs_remove_symlink_outside_workspace_blocked() {
         "/v1/agent/fs/rm",
         &serde_json::json!({ "path": "link.txt" }),
     );
-    assert_eq!(resp.status, 403, "symlink remove escape must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "symlink remove escape must be blocked: {}",
+        resp.body
+    );
 
     // Verify the outside file still exists
-    assert!(outside.path().join("keep.txt").exists(), "outside file must survive");
+    assert!(
+        outside.path().join("keep.txt").exists(),
+        "outside file must survive"
+    );
 }
 
 #[test]
@@ -1163,7 +1189,11 @@ fn agent_fs_stat_symlink_outside_workspace_blocked() {
         "/v1/agent/fs/stat",
         &serde_json::json!({ "path": "link.txt" }),
     );
-    assert_eq!(resp.status, 403, "stat on symlink escape must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "stat on symlink escape must be blocked: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "permission_denied");
 }
 
@@ -1190,7 +1220,11 @@ fn agent_fs_write_through_symlink_dir_outside_workspace_blocked() {
             "content": "escaped"
         }),
     );
-    assert_eq!(resp.status, 403, "write through symlinked dir must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "write through symlinked dir must be blocked: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "permission_denied");
 
     // Verify nothing was written outside
@@ -1218,7 +1252,11 @@ fn agent_fs_stat_outside_workspace_blocked() {
             "path": outside.path().join("probe.txt").to_string_lossy().to_string()
         }),
     );
-    assert_eq!(resp.status, 403, "stat outside workspace must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "stat outside workspace must be blocked: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "permission_denied");
 }
 
@@ -1236,7 +1274,11 @@ fn agent_fs_list_outside_workspace_blocked() {
             "path": outside.path().to_string_lossy().to_string()
         }),
     );
-    assert_eq!(resp.status, 403, "list outside workspace must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "list outside workspace must be blocked: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "permission_denied");
 }
 
@@ -1256,7 +1298,10 @@ fn agent_fs_mkdir_outside_workspace_blocked() {
         }),
     );
     assert_eq!(resp.status, 403, "body: {}", resp.body);
-    assert!(!target.exists(), "directory must not be created outside workspace");
+    assert!(
+        !target.exists(),
+        "directory must not be created outside workspace"
+    );
 }
 
 // ===========================================================================
@@ -1335,7 +1380,11 @@ fn agent_fs_list_file_path_returns_error() {
         "/v1/agent/fs/ls",
         &serde_json::json!({ "path": "just_a_file.txt" }),
     );
-    assert_ne!(resp.status, 200, "listing a file should fail: {}", resp.body);
+    assert_ne!(
+        resp.status, 200,
+        "listing a file should fail: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "not_directory");
 }
 
@@ -1351,7 +1400,11 @@ fn agent_fs_mkdir_already_exists_returns_error() {
         &serde_json::json!({ "path": "existing" }),
     );
     // mkdir is not idempotent — creating an already-existing dir is an error
-    assert_eq!(resp.status, 500, "mkdir on existing dir should fail: {}", resp.body);
+    assert_eq!(
+        resp.status, 500,
+        "mkdir on existing dir should fail: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "io_error");
     // The directory should still exist unchanged
     assert!(workspace.path().join("existing").is_dir());
@@ -1455,7 +1508,11 @@ fn agent_fs_write_to_symlink_file_outside_workspace_blocked() {
             "content": "overwritten"
         }),
     );
-    assert_eq!(resp.status, 403, "write to symlink file escape must be blocked: {}", resp.body);
+    assert_eq!(
+        resp.status, 403,
+        "write to symlink file escape must be blocked: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["error"]["code"], "permission_denied");
 
     // Verify the outside file was not modified
@@ -1479,7 +1536,11 @@ fn agent_fs_rename_overwrites_existing_destination() {
             "to": "dst.txt"
         }),
     );
-    assert_eq!(resp.status, 200, "rename to existing should succeed: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "rename to existing should succeed: {}",
+        resp.body
+    );
 
     // Source is gone
     let stat_src = post_json(
@@ -1513,7 +1574,11 @@ fn agent_fs_remove_empty_dir_without_recursive_succeeds() {
             "recursive": false
         }),
     );
-    assert_eq!(resp.status, 200, "removing empty dir should work: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "removing empty dir should work: {}",
+        resp.body
+    );
     assert_eq!(resp.json()["removed"], true);
 
     // Verify it's gone

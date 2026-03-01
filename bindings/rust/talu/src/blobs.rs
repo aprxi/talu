@@ -117,7 +117,7 @@ impl BlobsHandle {
                 self.path_cstr.as_ptr(),
                 bytes_ptr,
                 bytes.len(),
-                blob_ref_buf.as_mut_ptr() as *const u8,
+                blob_ref_buf.as_mut_ptr(),
                 blob_ref_buf.len(),
             )
         };
@@ -299,7 +299,7 @@ impl BlobReadStream {
         let code = unsafe {
             talu_sys::talu_db_blob_stream_read(
                 self.handle,
-                buffer.as_mut_ptr() as *const u8,
+                buffer.as_mut_ptr(),
                 buffer.len(),
                 &mut out_read as *mut _ as *mut c_void,
             )
@@ -385,7 +385,7 @@ impl BlobWriteStream {
         let code = unsafe {
             talu_sys::talu_db_blob_write_stream_finish(
                 self.handle,
-                blob_ref_buf.as_mut_ptr() as *const u8,
+                blob_ref_buf.as_mut_ptr(),
                 blob_ref_buf.len(),
             )
         };

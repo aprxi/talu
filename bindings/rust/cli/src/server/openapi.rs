@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    agent_fs, code, db, events, file, files, handlers, http, plugins, projects, proxy, repo,
-    responses, responses_types, search, sessions, settings, tags,
+    agent_exec, agent_fs, agent_shell, code, db, events, file, files, handlers, http, plugins,
+    projects, proxy, repo, responses, responses_types, search, sessions, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -40,6 +40,8 @@ use crate::server::{
         (name = "Repository", description = "Model cache management (list, search, download, delete)"),
         (name = "Code", description = "Tree-sitter code analysis and incremental parsing"),
         (name = "Agent::FS", description = "Workspace filesystem capabilities"),
+        (name = "Agent::Exec", description = "One-shot shell command execution (SSE)"),
+        (name = "Agent::Shell", description = "Interactive shell lifecycle and WebSocket attach"),
     ),
     security(
         ("gateway_secret" = []),
@@ -57,6 +59,12 @@ use crate::server::{
         agent_fs::handle_remove,
         agent_fs::handle_mkdir,
         agent_fs::handle_rename,
+        agent_exec::handle_exec,
+        agent_shell::handle_create,
+        agent_shell::handle_list,
+        agent_shell::handle_get,
+        agent_shell::handle_delete,
+        agent_shell::handle_ws,
         events::handle_replay,
         events::handle_stream,
         events::handle_topics,
@@ -197,6 +205,12 @@ use crate::server::{
         agent_fs::FsMkdirResponse,
         agent_fs::FsRenameRequest,
         agent_fs::FsRenameResponse,
+        agent_exec::ExecRequest,
+        agent_exec::ExecEvent,
+        agent_shell::ShellCreateRequest,
+        agent_shell::ShellSessionResponse,
+        agent_shell::ShellListResponse,
+        agent_shell::ShellDeleteResponse,
         // Events
         events::EventCorrelation,
         events::EventEnvelope,
