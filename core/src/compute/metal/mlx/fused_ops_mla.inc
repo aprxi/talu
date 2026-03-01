@@ -33,16 +33,19 @@ static array mla_attention_core(
         throw std::invalid_argument("[mla] invalid projection dimensions");
     }
 
+    // FP32 allowlist: stabilize LoRA-rank reduction before RMS norm.
     array q_comp = astype(q_a_proj_fn(input), float32);
     if (q_comp.shape(2) != q_lora_rank) {
         throw std::invalid_argument("[mla] q_a_proj output does not match q_lora_rank");
     }
     q_comp = fast::rms_norm(q_comp, q_a_norm_w, rms_eps);
+    // FP32 allowlist: keep Q projection accumulation in FP32 for attention logits.
     array q_proj = astype(q_b_proj_fn(q_comp), float32);
     if (q_proj.shape(2) != n_heads * qk_head_dim) {
         throw std::invalid_argument("[mla] q_b_proj output shape mismatch");
     }
 
+    // FP32 allowlist: stabilize KV compressed projection before split + RMS norm.
     array kv_comp = astype(kv_a_proj_fn(input), float32);
     if (kv_comp.shape(2) != kv_lora_rank + qk_rope_head_dim) {
         throw std::invalid_argument("[mla] kv_a_proj output shape mismatch");
@@ -50,6 +53,7 @@ static array mla_attention_core(
     array kv_nope = slice(kv_comp, {0, 0, 0}, {batch_size, seq_len, kv_lora_rank});
     array k_rope_shared = slice(kv_comp, {0, 0, kv_lora_rank}, {batch_size, seq_len, kv_lora_rank + qk_rope_head_dim});
     kv_nope = fast::rms_norm(kv_nope, kv_a_norm_w, rms_eps);
+    // FP32 allowlist: keep KV expansion accumulation in FP32 for attention logits.
     array kv_proj = astype(kv_b_proj_fn(kv_nope), float32);
     if (kv_proj.shape(2) != n_heads * (qk_nope_head_dim + v_head_dim)) {
         throw std::invalid_argument("[mla] kv_b_proj output shape mismatch");
@@ -162,6 +166,7 @@ void* mlx_lazy_mla_attention_quantized(
     float rms_eps,
     size_t group_size, size_t bits
 ) {
+    mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
     const auto& q_a_norm = *static_cast<const array*>(q_a_norm_w);
     const auto& kv_a_norm = *static_cast<const array*>(kv_a_norm_w);
@@ -260,6 +265,7 @@ void* mlx_lazy_mla_attention_bf16(
     const void* runtime_rope_cos, const void* runtime_rope_sin, size_t runtime_rope_dim,
     float rms_eps
 ) {
+    mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
     const auto& q_a_norm = *static_cast<const array*>(q_a_norm_w);
     const auto& kv_a_norm = *static_cast<const array*>(kv_a_norm_w);

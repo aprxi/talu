@@ -8,9 +8,28 @@
 #include <unordered_map>
 #include <vector>
 
+static constexpr size_t kGqaIndexCacheMaxEntries = 64;
+
 static inline uint64_t gqa_index_cache_key(int q_heads, int kv_heads) {
     return (static_cast<uint64_t>(static_cast<uint32_t>(q_heads)) << 32) |
            static_cast<uint64_t>(static_cast<uint32_t>(kv_heads));
+}
+
+static inline std::unordered_map<uint64_t, array>& gqa_index_cache_store() {
+    static thread_local std::unordered_map<uint64_t, array> gqa_index_cache;
+    return gqa_index_cache;
+}
+
+static inline void gqa_index_cache_clear() {
+    gqa_index_cache_store().clear();
+}
+
+static inline size_t gqa_index_cache_size() {
+    return gqa_index_cache_store().size();
+}
+
+static inline size_t gqa_index_cache_max_entries() {
+    return kGqaIndexCacheMaxEntries;
 }
 
 static inline array gqa_cached_gather_indices(int q_heads, int kv_heads) {
@@ -18,11 +37,14 @@ static inline array gqa_cached_gather_indices(int q_heads, int kv_heads) {
         throw std::invalid_argument("invalid GQA head layout");
     }
 
-    thread_local std::unordered_map<uint64_t, array> gqa_index_cache;
+    auto& gqa_index_cache = gqa_index_cache_store();
     const uint64_t key = gqa_index_cache_key(q_heads, kv_heads);
     auto it = gqa_index_cache.find(key);
     if (it != gqa_index_cache.end()) {
         return it->second;
+    }
+    if (gqa_index_cache.size() >= kGqaIndexCacheMaxEntries) {
+        gqa_index_cache.clear();
     }
 
     const int heads_per_kv = q_heads / kv_heads;

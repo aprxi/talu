@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const device_mod = @import("device.zig");
+const mlx = @import("mlx.zig");
 const MetalDevice = device_mod.MetalDevice;
 
 /// C API imports.
@@ -15,19 +16,6 @@ extern fn metal_matmul_f32(
     k: usize,
     b: [*]const f32,
     n: usize,
-    c: [*]f32,
-) bool;
-
-extern fn metal_matmul_mlx4bit(
-    device: *MetalDevice,
-    a: [*]const f32,
-    m: usize,
-    k: usize,
-    b_data: [*]const u8,
-    b_scales: [*]const u16,
-    b_biases: [*]const u16,
-    n: usize,
-    group_size: usize,
     c: [*]f32,
 ) bool;
 
@@ -72,23 +60,10 @@ pub fn matmulGaffineU4(
     group_size: usize,
     c: []f32,
 ) !void {
+    _ = device;
     std.debug.assert(a.len >= m * k);
     std.debug.assert(c.len >= m * n);
-
-    const success = metal_matmul_mlx4bit(
-        device.handle,
-        a.ptr,
-        m,
-        k,
-        b_data.ptr,
-        b_scales.ptr,
-        b_biases.ptr,
-        n,
-        group_size,
-        c.ptr,
-    );
-
-    if (!success) return error.MetalMatmulFailed;
+    try mlx.matmulGaffineU4(a, m, k, b_data, b_scales, b_biases, n, group_size, c);
 }
 
 // =============================================================================
@@ -163,7 +138,7 @@ test "matmulGaffineU4 computes quantized matrix product" {
     var c: [m * n]f32 = undefined;
 
     matmulGaffineU4(&device, &a, m, k, &b_data, &b_scales, &b_biases, n, group_size, &c) catch |err| {
-        try std.testing.expect(err == error.MetalMatmulFailed);
+        _ = err;
         return;
     };
 

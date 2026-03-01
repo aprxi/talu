@@ -30,6 +30,9 @@ struct CacheLayer {
 // ============================================================================
 struct MLXCache {
     std::vector<CacheLayer> layers;
+    // Explicit decode pipeline state owned by caller-visible cache handle.
+    // This avoids hidden global request maps in compute runtime.
+    std::optional<array> pipeline_current_token;
 };
 
 // ============================================================================

@@ -24,6 +24,15 @@ pub extern fn mlx_clear_memory_cache() void;
 
 /// Get pool stats (for debugging)
 pub extern fn mlx_pool_stats(pool_size: *usize, used: *usize) void;
+pub extern fn mlx_pool_max_retained() usize;
+pub extern fn mlx_pool_clear_if_idle() bool;
+pub extern fn mlx_pool_compact_if_idle(max_retained: usize) bool;
+pub extern fn mlx_gqa_index_cache_clear() void;
+pub extern fn mlx_gqa_index_cache_size() usize;
+pub extern fn mlx_gqa_index_cache_max_entries() usize;
+pub extern fn mlx_gqa_index_cache_touch(q_heads: usize, kv_heads: usize) void;
+pub extern fn mlx_array_ingest_stats(zero_copy_count: *usize, copy_count: *usize) void;
+pub extern fn mlx_array_ingest_stats_reset() void;
 
 /// Start counting operations (for debugging)
 pub extern fn mlx_start_counting() void;
@@ -1523,4 +1532,85 @@ test "shortconv op count scales sublinearly across sequence lengths" {
 
     try std.testing.expect(ops_small > 0);
     try std.testing.expect(ops_large <= (ops_small * 3 + 32));
+}
+
+test "array pool clear and compact require idle reset barrier" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const shape = [_]i64{ 2, 2 };
+    const a = createArrayF32(&data, &shape);
+    defer freeArray(a);
+    const b = createArrayF32(&data, &shape);
+    defer freeArray(b);
+
+    const out = mlx_lazy_add(a, b);
+    var eval_handles = [_]ArrayHandle{out};
+    eval(&eval_handles);
+
+    try std.testing.expect(!mlx_pool_clear_if_idle());
+    try std.testing.expect(!mlx_pool_compact_if_idle(1));
+
+    mlx_pool_reset();
+    try std.testing.expect(mlx_pool_compact_if_idle(1));
+
+    var pool_size: usize = 0;
+    var used: usize = 0;
+    mlx_pool_stats(&pool_size, &used);
+    try std.testing.expect(used == 0);
+    try std.testing.expect(pool_size <= 1);
+    try std.testing.expect(mlx_pool_clear_if_idle());
+}
+
+test "gqa index cache is bounded and resettable" {
+    if (comptime builtin.os.tag != .macos) return;
+
+    mlx_gqa_index_cache_clear();
+    const max_entries = mlx_gqa_index_cache_max_entries();
+    try std.testing.expect(max_entries > 0);
+
+    var kv_heads: usize = 1;
+    var touched: usize = 0;
+    while (touched < max_entries * 2) : (touched += 1) {
+        mlx_gqa_index_cache_touch(kv_heads * 2, kv_heads);
+        kv_heads += 1;
+    }
+
+    try std.testing.expect(mlx_gqa_index_cache_size() <= max_entries);
+    mlx_gqa_index_cache_clear();
+    try std.testing.expect(mlx_gqa_index_cache_size() == 0);
+}
+
+test "array ingest uses zero-copy for aligned pointers and copy for unaligned pointers" {
+    if (comptime builtin.os.tag != .macos) return;
+
+    const shape = [_]usize{ 2, 2 };
+    const bytes_len = shape[0] * shape[1] * @sizeOf(f32);
+    mlx_array_ingest_stats_reset();
+
+    const page_align = std.heap.page_size_min;
+    const aligned_bytes = try std.heap.c_allocator.alignedAlloc(u8, .fromByteUnits(page_align), bytes_len);
+    defer std.heap.c_allocator.free(aligned_bytes);
+    const aligned_f32 = std.mem.bytesAsSlice(f32, aligned_bytes[0..bytes_len]);
+    aligned_f32[0] = 1.0;
+    aligned_f32[1] = 2.0;
+    aligned_f32[2] = 3.0;
+    aligned_f32[3] = 4.0;
+
+    const aligned_arr = mlx_array_from_float32(@ptrCast(aligned_f32.ptr), &shape, shape.len);
+    defer freeArray(aligned_arr);
+
+    var unaligned_storage: [bytes_len + 1]u8 = undefined;
+    @memcpy(unaligned_storage[1 .. 1 + bytes_len], aligned_bytes[0..bytes_len]);
+    const unaligned_ptr: *const anyopaque = @ptrCast(unaligned_storage[1 .. 1 + bytes_len].ptr);
+    const unaligned_arr = mlx_array_from_float32(unaligned_ptr, &shape, shape.len);
+    defer freeArray(unaligned_arr);
+
+    var zero_copy_count: usize = 0;
+    var copy_count: usize = 0;
+    mlx_array_ingest_stats(&zero_copy_count, &copy_count);
+
+    try std.testing.expect(zero_copy_count >= 1);
+    try std.testing.expect(copy_count >= 1);
 }

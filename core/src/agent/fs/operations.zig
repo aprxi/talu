@@ -163,7 +163,7 @@ pub fn stat(path: []const u8) !StatResult {
         .is_dir = metadata.kind == .directory,
         .is_symlink = metadata.kind == .sym_link,
         .size = metadata.size,
-        .mode = @intCast(metadata.mode & 0xffff_ffff),
+        .mode = @intCast(metadata.mode),
         .modified_at = clampI128ToI64(metadata.mtime),
         .created_at = clampI128ToI64(metadata.ctime),
     };

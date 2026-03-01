@@ -5,6 +5,8 @@
 
 #include "compute_common.h"
 #include "../device.h"
+#include <atomic>
+#include <cstdint>
 
 // ============================================================================
 // Global state
@@ -13,15 +15,52 @@
 // Array pool - thread-local for safety
 thread_local std::deque<std::optional<array>> g_array_pool;
 thread_local size_t g_pool_index = 0;
+static constexpr size_t kArrayPoolMaxRetained = 4096;
 
 // Heap-owned handles created via make_owned_array()/array_from_* APIs.
 // Freed by mlx_array_free() and guarded for cross-thread lifecycle safety.
 static std::mutex g_owned_arrays_mu;
 static std::unordered_set<void*> g_owned_arrays;
+static std::atomic_size_t g_ingest_zero_copy_count{0};
+static std::atomic_size_t g_ingest_copy_count{0};
+static constexpr size_t kIngestZeroCopyAlignment = 16 * 1024;
 
 // Pre-computed constants
 const std::vector<int> g_transpose_perm = {0, 2, 1, 3};
 const Shape g_slice_start = {0, 0, 0, 0};
+
+template <typename T>
+static void* create_ingested_array(
+    const void* data,
+    const size_t* shape,
+    size_t ndim,
+    Dtype dtype
+) {
+    Shape shape_dims;
+    size_t element_count = 1;
+    for (size_t i = 0; i < ndim; i++) {
+        shape_dims.push_back(static_cast<int>(shape[i]));
+        element_count *= shape[i];
+    }
+
+    const auto* typed_data = static_cast<const T*>(data);
+    const auto ptr_value = reinterpret_cast<std::uintptr_t>(data);
+    const bool can_zero_copy = (ptr_value % kIngestZeroCopyAlignment) == 0;
+
+    if (can_zero_copy) {
+        // Zero-copy path: caller-owned backing store must outlive resulting array.
+        g_ingest_zero_copy_count.fetch_add(1, std::memory_order_relaxed);
+        auto no_op_deleter = [](void*) {};
+        return make_owned_array(array(const_cast<T*>(typed_data), shape_dims, dtype, no_op_deleter));
+    }
+
+    // Fallback copy path for unaligned pointers.
+    g_ingest_copy_count.fetch_add(1, std::memory_order_relaxed);
+    auto vec_data = std::make_shared<std::vector<T>>(element_count);
+    std::memcpy(vec_data->data(), data, element_count * sizeof(T));
+    auto shared_deleter = [vec_data](void*) { /* ref-counts vec_data */ };
+    return make_owned_array(array(vec_data->data(), shape_dims, dtype, shared_deleter));
+}
 
 // ============================================================================
 // MLX Initialization
@@ -73,7 +112,29 @@ void* make_owned_array(array&& result) {
 extern "C" {
 
 void mlx_pool_reset() {
+    // reset is the explicit eval-complete barrier for pooled temporaries
     g_pool_index = 0;
+    if (g_array_pool.size() > kArrayPoolMaxRetained) {
+        g_array_pool.resize(kArrayPoolMaxRetained);
+    }
+}
+
+size_t mlx_pool_max_retained() {
+    return kArrayPoolMaxRetained;
+}
+
+bool mlx_pool_clear_if_idle() {
+    if (g_pool_index != 0) return false;
+    g_array_pool.clear();
+    return true;
+}
+
+bool mlx_pool_compact_if_idle(size_t max_retained) {
+    if (g_pool_index != 0) return false;
+    if (g_array_pool.size() > max_retained) {
+        g_array_pool.resize(max_retained);
+    }
+    return true;
 }
 
 void mlx_clear_memory_cache() {
@@ -83,6 +144,16 @@ void mlx_clear_memory_cache() {
 void mlx_pool_stats(size_t* pool_size, size_t* used) {
     *pool_size = g_array_pool.size();
     *used = g_pool_index;
+}
+
+void mlx_array_ingest_stats(size_t* zero_copy_count, size_t* copy_count) {
+    *zero_copy_count = g_ingest_zero_copy_count.load(std::memory_order_relaxed);
+    *copy_count = g_ingest_copy_count.load(std::memory_order_relaxed);
+}
+
+void mlx_array_ingest_stats_reset() {
+    g_ingest_zero_copy_count.store(0, std::memory_order_relaxed);
+    g_ingest_copy_count.store(0, std::memory_order_relaxed);
 }
 
 // ============================================================================
@@ -99,74 +170,26 @@ void* mlx_array_from_ptr(void* mlx_array_ptr) {
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_float32(const void* data, const size_t* shape, size_t ndim) {
-    Shape shape_dims;
-    size_t element_count = 1;
-    for (size_t i = 0; i < ndim; i++) {
-        shape_dims.push_back(static_cast<int>(shape[i]));
-        element_count *= shape[i];
-    }
-    // Use memcpy to handle potentially unaligned mmap'd data from safetensors
-    auto vec_data = std::make_shared<std::vector<float>>(element_count);
-    std::memcpy(vec_data->data(), data, element_count * sizeof(float));
-    auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return make_owned_array(array(vec_data->data(), shape_dims, float32, deleter));
+    return create_ingested_array<float>(data, shape, ndim, float32);
 }
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_uint32(const void* data, const size_t* shape, size_t ndim) {
-    Shape shape_dims;
-    size_t element_count = 1;
-    for (size_t i = 0; i < ndim; i++) {
-        shape_dims.push_back(static_cast<int>(shape[i]));
-        element_count *= shape[i];
-    }
-    // Use memcpy to handle potentially unaligned mmap'd data from safetensors
-    auto vec_data = std::make_shared<std::vector<uint32_t>>(element_count);
-    std::memcpy(vec_data->data(), data, element_count * sizeof(uint32_t));
-    auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return make_owned_array(array(vec_data->data(), shape_dims, uint32, deleter));
+    return create_ingested_array<uint32_t>(data, shape, ndim, uint32);
 }
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_bfloat16(const void* data, const size_t* shape, size_t ndim) {
-    Shape shape_dims;
-    size_t element_count = 1;
-    for (size_t i = 0; i < ndim; i++) {
-        shape_dims.push_back(static_cast<int>(shape[i]));
-        element_count *= shape[i];
-    }
-    // Use memcpy to handle potentially unaligned mmap'd data from safetensors
-    auto vec_data = std::make_shared<std::vector<uint16_t>>(element_count);
-    std::memcpy(vec_data->data(), data, element_count * sizeof(uint16_t));
-    auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return make_owned_array(array(vec_data->data(), shape_dims, bfloat16, deleter));
+    return create_ingested_array<uint16_t>(data, shape, ndim, bfloat16);
 }
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_float16(const void* data, const size_t* shape, size_t ndim) {
-    Shape shape_dims;
-    size_t element_count = 1;
-    for (size_t i = 0; i < ndim; i++) {
-        shape_dims.push_back(static_cast<int>(shape[i]));
-        element_count *= shape[i];
-    }
-    // Use memcpy to handle potentially unaligned mmap'd data from safetensors
-    auto vec_data = std::make_shared<std::vector<uint16_t>>(element_count);
-    std::memcpy(vec_data->data(), data, element_count * sizeof(uint16_t));
-    auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return make_owned_array(array(vec_data->data(), shape_dims, float16, deleter));
+    return create_ingested_array<uint16_t>(data, shape, ndim, float16);
 }
 
 void* mlx_array_from_uint8(const uint8_t* data, const size_t* shape, size_t ndim) {
-    Shape shape_dims;
-    size_t element_count = 1;
-    for (size_t i = 0; i < ndim; i++) {
-        shape_dims.push_back(static_cast<int>(shape[i]));
-        element_count *= shape[i];
-    }
-    auto vec_data = std::make_shared<std::vector<uint8_t>>(data, data + element_count);
-    auto deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return make_owned_array(array(vec_data->data(), shape_dims, uint8, deleter));
+    return create_ingested_array<uint8_t>(data, shape, ndim, uint8);
 }
 
 void mlx_array_free(void* arr) {
