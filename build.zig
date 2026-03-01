@@ -265,7 +265,6 @@ fn addMetalSupport(
 
     mod.addIncludePath(b.path("core/src/compute/metal"));
     mod.addIncludePath(b.path("core/src/compute/metal/mlx"));
-    mod.addIncludePath(b.path("core/src/inference/backend/metal/mlx"));
     mod.addIncludePath(b.path("deps/mlx/include"));
 
     artifact.linkFramework("Metal");
@@ -293,9 +292,6 @@ fn addMetalSupport(
             "core/src/compute/metal/mlx/ops.cpp",
             "core/src/compute/metal/mlx/cache.cpp",
             "core/src/compute/metal/mlx/fused_ops.cpp",
-            "core/src/compute/metal/mlx/decode_model.cpp",
-            "core/src/compute/metal/mlx/model_dense.cpp",
-            "core/src/compute/metal/mlx/model_quantized.cpp",
         },
         .flags = &.{
             "-std=c++17",

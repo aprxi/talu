@@ -262,6 +262,7 @@ void* mlx_lazy_fused_attention(
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier    // 0 for default, >0 uses this directly as scale
 ) {
+    mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
     const int group_size_int = static_cast<int>(group_size);
     const int bits_int = static_cast<int>(bits);
@@ -373,6 +374,7 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier    // 0 for default, >0 uses this directly as scale
 ) {
+    mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
     const int group_size_int = static_cast<int>(group_size);
     const int bits_int = static_cast<int>(bits);
@@ -466,6 +468,7 @@ void* mlx_lazy_fused_ffn(
     size_t group_size, size_t bits,
     bool use_gelu  // true for GELU activation, false for SwiGLU
 ) {
+    mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
     int gs = static_cast<int>(group_size);
     int b = static_cast<int>(bits);
@@ -529,6 +532,7 @@ void* mlx_lazy_fused_attention_bf16(
     float query_pre_attn_scalar,  // 0 for default (head_dim), >0 for custom scaling
     float attention_multiplier    // 0 for default, >0 uses this directly as scale
 ) {
+    mlx_count_op();
     const auto& x = *static_cast<const array*>(input);
     const int batch_size = x.shape(0);
     const int seq_len = x.shape(1);

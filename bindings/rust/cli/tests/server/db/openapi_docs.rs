@@ -142,9 +142,15 @@ fn openapi_plane_specs_include_expected_paths_and_methods() {
             &[
                 ("/v1/db/tables/{table}", &["get", "post"]),
                 ("/v1/db/tables/{table}/insert", &["post"]),
-                ("/v1/db/tables/{table}/{doc_id}", &["get", "patch", "delete"]),
+                (
+                    "/v1/db/tables/{table}/{doc_id}",
+                    &["get", "patch", "delete"],
+                ),
                 ("/v1/db/tables/{table}/search", &["post"]),
-                ("/v1/db/tables/{table}/{doc_id}/tags", &["get", "post", "delete"]),
+                (
+                    "/v1/db/tables/{table}/{doc_id}/tags",
+                    &["get", "post", "delete"],
+                ),
             ],
         ),
         (
@@ -152,32 +158,14 @@ fn openapi_plane_specs_include_expected_paths_and_methods() {
             &[
                 ("/v1/db/vectors/collections", &["get", "post"]),
                 ("/v1/db/vectors/collections/{name}", &["get", "delete"]),
-                (
-                    "/v1/db/vectors/collections/{name}/points/append",
-                    &["post"],
-                ),
-                (
-                    "/v1/db/vectors/collections/{name}/points/upsert",
-                    &["post"],
-                ),
-                (
-                    "/v1/db/vectors/collections/{name}/points/delete",
-                    &["post"],
-                ),
-                (
-                    "/v1/db/vectors/collections/{name}/points/fetch",
-                    &["post"],
-                ),
-                (
-                    "/v1/db/vectors/collections/{name}/points/query",
-                    &["post"],
-                ),
+                ("/v1/db/vectors/collections/{name}/points/append", &["post"]),
+                ("/v1/db/vectors/collections/{name}/points/upsert", &["post"]),
+                ("/v1/db/vectors/collections/{name}/points/delete", &["post"]),
+                ("/v1/db/vectors/collections/{name}/points/fetch", &["post"]),
+                ("/v1/db/vectors/collections/{name}/points/query", &["post"]),
                 ("/v1/db/vectors/collections/{name}/stats", &["get"]),
                 ("/v1/db/vectors/collections/{name}/compact", &["post"]),
-                (
-                    "/v1/db/vectors/collections/{name}/indexes/build",
-                    &["post"],
-                ),
+                ("/v1/db/vectors/collections/{name}/indexes/build", &["post"]),
                 ("/v1/db/vectors/collections/{name}/changes", &["get"]),
             ],
         ),

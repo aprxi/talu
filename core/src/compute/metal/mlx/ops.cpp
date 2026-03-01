@@ -5,26 +5,59 @@
 // Call mlx_eval() to execute the graph.
 
 #include "compute_common.h"
+#include "attention_utils.h"
+
+thread_local bool g_count_ops_enabled = false;
+thread_local size_t g_count_ops_value = 0;
 
 extern "C" {
+
+void mlx_start_counting() {
+    g_count_ops_value = 0;
+    g_count_ops_enabled = true;
+}
+
+size_t mlx_stop_counting() {
+    g_count_ops_enabled = false;
+    return g_count_ops_value;
+}
+
+void mlx_gqa_index_cache_clear() {
+    gqa_index_cache_clear();
+}
+
+size_t mlx_gqa_index_cache_size() {
+    return gqa_index_cache_size();
+}
+
+size_t mlx_gqa_index_cache_max_entries() {
+    return gqa_index_cache_max_entries();
+}
+
+void mlx_gqa_index_cache_touch(size_t q_heads, size_t kv_heads) {
+    (void)gqa_cached_gather_indices(static_cast<int>(q_heads), static_cast<int>(kv_heads));
+}
 
 // ============================================================================
 // Arithmetic Operations
 // ============================================================================
 
 void* mlx_lazy_add(const void* a, const void* b) {
+    mlx_count_op();
     const auto& lhs = *static_cast<const array*>(a);
     const auto& rhs = *static_cast<const array*>(b);
     return pool_array(lhs + rhs);
 }
 
 void* mlx_lazy_multiply(const void* a, const void* b) {
+    mlx_count_op();
     const auto& lhs = *static_cast<const array*>(a);
     const auto& rhs = *static_cast<const array*>(b);
     return pool_array(lhs * rhs);
 }
 
 void* mlx_lazy_multiply_scalar(const void* a, float scalar) {
+    mlx_count_op();
     const auto& input = *static_cast<const array*>(a);
     return pool_array(input * scalar);
 }
@@ -34,6 +67,7 @@ void* mlx_lazy_multiply_scalar(const void* a, float scalar) {
 // ============================================================================
 
 void* mlx_lazy_matmul(const void* a, const void* b) {
+    mlx_count_op();
     const auto& lhs = *static_cast<const array*>(a);
     const auto& rhs = *static_cast<const array*>(b);
     return pool_array(matmul(lhs, rhs));
@@ -43,6 +77,7 @@ void* mlx_lazy_quantized_matmul(
     const void* input, const void* weights, const void* scales, const void* biases,
     size_t group_size, size_t bits, bool transpose_weights
 ) {
+    mlx_count_op();
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& weights_arr = *static_cast<const array*>(weights);
     const auto& scales_arr = *static_cast<const array*>(scales);

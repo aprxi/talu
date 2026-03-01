@@ -4,6 +4,7 @@
 //! Run: `cargo test --test server`
 
 mod server {
+    pub mod agent;
     pub mod auth;
     pub mod chat;
     pub mod code;

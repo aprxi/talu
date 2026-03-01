@@ -65,6 +65,8 @@ pub struct AppState {
     pub tenant_registry: Option<TenantRegistry>,
     /// TaluDB storage bucket for `/v1/chat/sessions` endpoints.
     pub bucket_path: Option<PathBuf>,
+    /// Canonical workspace root for `/v1/agent/fs/*` endpoints.
+    pub workspace_dir: PathBuf,
     /// Serve console UI from this directory instead of bundled assets.
     pub html_dir: Option<PathBuf>,
     /// Plugin capability tokens — maps bearer token → plugin_id + permissions.

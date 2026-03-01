@@ -150,8 +150,9 @@ pub fn migrate_layout_if_needed(bucket: &Path) -> Result<()> {
             .with_context(|| format!("create {}", docs_dst.display()))?;
         let docs_final = docs_dst.join("docs");
         if !docs_final.exists() {
-            std::fs::rename(&docs_src, &docs_final)
-                .with_context(|| format!("move {} → {}", docs_src.display(), docs_final.display()))?;
+            std::fs::rename(&docs_src, &docs_final).with_context(|| {
+                format!("move {} → {}", docs_src.display(), docs_final.display())
+            })?;
         }
     }
 
@@ -163,8 +164,9 @@ pub fn migrate_layout_if_needed(bucket: &Path) -> Result<()> {
             .with_context(|| format!("create {}", chat_dst.display()))?;
         let chat_final = chat_dst.join("chat");
         if !chat_final.exists() {
-            std::fs::rename(&chat_src, &chat_final)
-                .with_context(|| format!("move {} → {}", chat_src.display(), chat_final.display()))?;
+            std::fs::rename(&chat_src, &chat_final).with_context(|| {
+                format!("move {} → {}", chat_src.display(), chat_final.display())
+            })?;
         }
     }
 

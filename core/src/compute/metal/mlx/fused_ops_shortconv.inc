@@ -1,31 +1,3 @@
-// ============================================================================
-// ShortConv macro operations (inference-owned)
-// ============================================================================
-
-static array shortconv_run_sequence_conv(
-    array* conv_state,
-    const array& bx,
-    const array& conv_kernel_broadcast,
-    int seq_len,
-    int d_conv_i,
-    int conv_dim_i
-) {
-    if (conv_state == nullptr) {
-        throw std::invalid_argument("[shortconv] null conv_state");
-    }
-    // Build history [state, sequence] then run depthwise grouped 1D convolution.
-    // Input layout for conv1d is [N, L, C]; weight is [C_out, K, C_in/groups].
-    const array history = concatenate({*conv_state, bx}, 1);
-    const array weight = transpose(conv_kernel_broadcast, {2, 1, 0}); // [conv_dim, d_conv, 1]
-    const array conv_full = conv1d(history, weight, 1, 0, 1, conv_dim_i);
-
-    // Keep windows that include each new token (skip first warmup window).
-    const array conv_seq = slice(conv_full, {0, 1, 0}, {1, seq_len + 1, conv_dim_i});
-    // Persist final rolling state for next invocation.
-    *conv_state = slice(history, {0, seq_len, 0}, {1, seq_len + d_conv_i, conv_dim_i});
-    return conv_seq;
-}
-
 void* mlx_lazy_shortconv_mixer_bf16(
     const void* input,
     const void* in_proj,
@@ -37,6 +9,7 @@ void* mlx_lazy_shortconv_mixer_bf16(
     size_t d_conv,
     size_t conv_dim
 ) {
+    mlx_count_op();
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& in_proj_arr = *static_cast<const array*>(in_proj);
     const auto& conv_weight_arr = *static_cast<const array*>(conv_weight);
@@ -49,6 +22,8 @@ void* mlx_lazy_shortconv_mixer_bf16(
 
     // in_proj is stored as [3*conv_dim, d_model], so transpose for [d_model, 3*conv_dim].
     array bcx = matmul(input_arr, transpose(in_proj_arr));
+    // FP32 allowlist: shortconv recurrence is stateful; keep conv inputs in FP32
+    // to avoid drift across long prefill/decode sequences.
     bcx = astype(bcx, float32);
 
     array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
@@ -58,6 +33,7 @@ void* mlx_lazy_shortconv_mixer_bf16(
 
     array conv_kernel = conv_weight_arr;
     const auto ensure_f32 = [](const array& arr) -> array {
+        // FP32 allowlist: depthwise conv kernel/state math remains in FP32.
         return arr.dtype() == float32 ? arr : astype(arr, float32);
     };
     array conv_kernel_broadcast(0.0f, float32);
@@ -92,6 +68,7 @@ void* mlx_lazy_shortconv_mixer_bf16(
         layer_state = &state_cache->layers[layer_idx];
     }
 
+    // FP32 allowlist: recurrent shortconv state accumulation.
     array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
@@ -147,6 +124,7 @@ void* mlx_lazy_shortconv_mixer_quantized(
     size_t d_conv,
     size_t conv_dim
 ) {
+    mlx_count_op();
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& in_w_arr = *static_cast<const array*>(in_w);
     const auto& in_s_arr = *static_cast<const array*>(in_s);
@@ -173,6 +151,8 @@ void* mlx_lazy_shortconv_mixer_quantized(
         bits_i,
         "affine"
     );
+    // FP32 allowlist: shortconv recurrence is stateful; keep conv inputs in FP32
+    // to avoid drift across long prefill/decode sequences.
     bcx = astype(bcx, float32);
 
     array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
@@ -182,6 +162,7 @@ void* mlx_lazy_shortconv_mixer_quantized(
 
     array conv_kernel = conv_weight_arr;
     const auto ensure_f32 = [](const array& arr) -> array {
+        // FP32 allowlist: depthwise conv kernel/state math remains in FP32.
         return arr.dtype() == float32 ? arr : astype(arr, float32);
     };
     array conv_kernel_broadcast(0.0f, float32);
@@ -214,6 +195,7 @@ void* mlx_lazy_shortconv_mixer_quantized(
         layer_state = &state_cache->layers[layer_idx];
     }
 
+    // FP32 allowlist: recurrent shortconv state accumulation.
     array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =

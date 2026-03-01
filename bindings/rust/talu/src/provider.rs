@@ -388,8 +388,7 @@ pub fn provider_config_health(db_root: &str, name: &str) -> ProviderHealthResult
     };
 
     // SAFETY: Both pointers are valid null-terminated strings.
-    let mut result =
-        unsafe { talu_provider_config_health_raw(c_root.as_ptr(), c_name.as_ptr()) };
+    let mut result = unsafe { talu_provider_config_health_raw(c_root.as_ptr(), c_name.as_ptr()) };
 
     let health = ProviderHealthResult {
         ok: result.ok != 0,
@@ -421,9 +420,8 @@ pub fn provider_config_list_provider_models(
     let c_root = CString::new(db_root)?;
     let c_name = CString::new(name)?;
     // SAFETY: Both pointers are valid null-terminated strings.
-    let mut result = unsafe {
-        talu_provider_config_list_provider_models_raw(c_root.as_ptr(), c_name.as_ptr())
-    };
+    let mut result =
+        unsafe { talu_provider_config_list_provider_models_raw(c_root.as_ptr(), c_name.as_ptr()) };
     if result.error_code != 0 {
         unsafe { talu_provider_config_list_provider_models_free_raw(&mut result) };
         return Err(error_from_last_or("Failed to list provider models"));

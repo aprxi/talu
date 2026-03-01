@@ -52,3 +52,15 @@ void* make_owned_array(array&& result);
 // ============================================================================
 extern const std::vector<int> g_transpose_perm; // {0, 2, 1, 3}
 extern const Shape g_slice_start; // {0, 0, 0, 0}
+
+// ============================================================================
+// Lightweight op counting (test instrumentation).
+// ============================================================================
+extern thread_local bool g_count_ops_enabled;
+extern thread_local size_t g_count_ops_value;
+
+inline void mlx_count_op(size_t n = 1) {
+    if (g_count_ops_enabled) {
+        g_count_ops_value += n;
+    }
+}

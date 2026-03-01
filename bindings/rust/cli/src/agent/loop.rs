@@ -136,22 +136,27 @@ fn run_shell_command(command: &str, policy: &Policy, has_custom_policy: bool) ->
     // as plain text (grammar incomplete), so the core never evaluates.
     // We evaluate here as well to cover that fallback path.
     use talu::policy::Effect;
-    let action = normalize_command(command);
+    let action = talu::shell::normalize_command(command)
+        .unwrap_or_else(|_| command.to_string());
     if policy.evaluate(&action) == Effect::Deny {
         eprintln!("\x1b[1;31m[POLICY DENIED]\x1b[0m \x1b[1m{}\x1b[0m", command,);
         return Ok(());
     }
 
-    // Rust-side whitelist: defense-in-depth for the built-in default policy.
-    // When a custom --policy is provided, the core policy is the authority
-    // and the Rust whitelist is skipped.
+    // Whitelist check via Zig core: defense-in-depth for the built-in default
+    // policy. When a custom --policy is provided, the core policy is the
+    // authority and the whitelist check is skipped.
     if !has_custom_policy {
-        if let Some(reason) = check_allowed(command) {
-            eprintln!(
-                "\x1b[1;31m[BLOCKED]\x1b[0m \x1b[1m{}\x1b[0m\n  Reason: {}",
-                command, reason,
-            );
-            return Ok(());
+        match talu::shell::check_command(command) {
+            Ok(check) if !check.allowed => {
+                let reason = check.reason.as_deref().unwrap_or("blocked by safety policy");
+                eprintln!(
+                    "\x1b[1;31m[BLOCKED]\x1b[0m \x1b[1m{}\x1b[0m\n  Reason: {}",
+                    command, reason,
+                );
+                return Ok(());
+            }
+            _ => {}
         }
     }
 
@@ -251,271 +256,6 @@ fn prompt_allow(display: &str) -> Result<bool> {
     Ok(answer == "y" || answer == "yes")
 }
 
-/// Checks that every executable in the command is on the whitelist.
-/// Returns `Some(reason)` if the command should be blocked, `None` if allowed.
-fn check_allowed(command: &str) -> Option<&'static str> {
-    // Split on shell chain operators so `ls && rm -rf /` checks both sides.
-    for segment in split_chain(command) {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            continue;
-        }
-
-        // Strip leading env vars (FOO=bar cmd ...) and sudo/env wrappers
-        let exe = leading_executable(segment);
-
-        if !ALLOWED_COMMANDS.contains(&exe) {
-            return Some("command not in whitelist");
-        }
-
-        // Commands that are allowed but have dangerous argument patterns.
-        if let Some(reason) = check_dangerous_args(exe, segment) {
-            return Some(reason);
-        }
-    }
-    None
-}
-
-/// Per-command argument restrictions for whitelisted commands that can
-/// delegate execution (e.g. `find -exec`, `xargs rm`).
-fn check_dangerous_args(exe: &str, segment: &str) -> Option<&'static str> {
-    let tokens: Vec<&str> = segment.split_whitespace().collect();
-
-    match exe {
-        "find" => {
-            if tokens.iter().any(|t| *t == "-exec" || *t == "-execdir") {
-                return Some("find with -exec/-execdir");
-            }
-        }
-        "xargs" => {
-            // xargs <cmd> — check that <cmd> is itself whitelisted.
-            // First non-flag token after "xargs" is the delegated command.
-            let after_xargs = tokens
-                .iter()
-                .skip_while(|t| **t != "xargs")
-                .skip(1) // skip "xargs" itself
-                .find(|t| !t.starts_with('-'));
-            if let Some(delegated) = after_xargs {
-                if !ALLOWED_COMMANDS.contains(delegated) {
-                    return Some("xargs delegates to non-whitelisted command");
-                }
-            }
-        }
-        _ => {}
-    }
-    None
-}
-
-/// Split a command string on shell chain operators: `|`, `&&`, `||`, `;`.
-/// Does NOT handle subshells / $() — intentionally conservative.
-fn split_chain(cmd: &str) -> Vec<&str> {
-    let mut segments = Vec::new();
-    let mut start = 0;
-    let bytes = cmd.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        match bytes[i] {
-            b'|' => {
-                if i + 1 < len && bytes[i + 1] == b'|' {
-                    // ||
-                    segments.push(&cmd[start..i]);
-                    i += 2;
-                    start = i;
-                } else {
-                    // | (pipe)
-                    segments.push(&cmd[start..i]);
-                    i += 1;
-                    start = i;
-                }
-            }
-            b'&' if i + 1 < len && bytes[i + 1] == b'&' => {
-                segments.push(&cmd[start..i]);
-                i += 2;
-                start = i;
-            }
-            b';' => {
-                segments.push(&cmd[start..i]);
-                i += 1;
-                start = i;
-            }
-            _ => {
-                i += 1;
-            }
-        }
-    }
-    if start < len {
-        segments.push(&cmd[start..]);
-    }
-    segments
-}
-
-/// Extract the leading executable from a shell segment, skipping:
-/// - leading env assignments (`FOO=bar`)
-/// - `sudo`, `env`, `nice`, `nohup`, `time` prefixes
-///
-/// Absolute paths are resolved to their basename:
-/// `/bin/ls` → `ls`, `/usr/bin/git` → `git`.
-fn leading_executable(segment: &str) -> &str {
-    let mut tokens = segment.split_whitespace();
-    loop {
-        let tok = match tokens.next() {
-            Some(t) => t,
-            None => return "",
-        };
-        // Skip env assignments (KEY=VALUE)
-        if tok.contains('=') && !tok.starts_with('-') && !tok.starts_with('/') {
-            continue;
-        }
-        // Skip common wrappers (check after basename for absolute paths)
-        let name = basename(tok);
-        match name {
-            "sudo" | "env" | "nice" | "nohup" | "time" => continue,
-            _ => return name,
-        }
-    }
-}
-
-/// Return the basename of a path: `/usr/bin/git` → `git`, `ls` → `ls`.
-fn basename(path: &str) -> &str {
-    match path.rfind('/') {
-        Some(i) => &path[i + 1..],
-        None => path,
-    }
-}
-
-/// Normalize command for policy evaluation: replace leading absolute path
-/// with its basename. `/bin/ls -la` → `ls -la`.
-fn normalize_command(cmd: &str) -> String {
-    if !cmd.starts_with('/') {
-        return cmd.to_string();
-    }
-    match cmd.find(' ') {
-        Some(space) => {
-            let exe = &cmd[..space];
-            let rest = &cmd[space..];
-            format!("{}{}", basename(exe), rest)
-        }
-        None => basename(cmd).to_string(),
-    }
-}
-
-/// Read-only / informational commands allowed in shell mode.
-///
-/// Philosophy: whitelist is conservative. Users always see the command
-/// and must confirm, so the whitelist prevents obviously destructive
-/// executables while allowing useful inspection commands.
-const ALLOWED_COMMANDS: &[&str] = &[
-    // filesystem browsing
-    "ls",
-    "exa",
-    "eza",
-    "tree",
-    "find",
-    "fd",
-    "locate",
-    "stat",
-    "file",
-    "df",
-    "lsblk",
-    "mount",
-    // file reading
-    "cat",
-    "bat",
-    "less",
-    "more",
-    "head",
-    "tail",
-    "wc",
-    "nl",
-    "xxd",
-    "hexdump",
-    "od",
-    // search
-    "grep",
-    "rg",
-    "ag",
-    "ack",
-    "sed",
-    "awk",
-    // text processing (read-oriented)
-    "sort",
-    "uniq",
-    "cut",
-    "tr",
-    "paste",
-    "column",
-    "jq",
-    "yq",
-    "xq",
-    "diff",
-    "comm",
-    "tee",
-    // process / system info
-    "ps",
-    "top",
-    "htop",
-    "uptime",
-    "free",
-    "vmstat",
-    "lscpu",
-    "lsusb",
-    "lspci",
-    "uname",
-    "hostname",
-    "id",
-    "whoami",
-    "who",
-    "w",
-    "last",
-    "groups",
-    // network inspection
-    "ip",
-    "ifconfig",
-    "ss",
-    "netstat",
-    "ping",
-    "dig",
-    "nslookup",
-    "host",
-    "traceroute",
-    "curl",
-    "wget",
-    // package / language info
-    "dpkg",
-    "rpm",
-    "apt",
-    "pip",
-    "python",
-    "python3",
-    "node",
-    "npm",
-    "cargo",
-    "rustc",
-    "zig",
-    "go",
-    "git",
-    "gh",
-    // misc
-    "date",
-    "cal",
-    "echo",
-    "printf",
-    "env",
-    "printenv",
-    "which",
-    "whereis",
-    "type",
-    "man",
-    "help",
-    "xargs",
-    "basename",
-    "dirname",
-    "realpath",
-    "readlink",
-];
-
 #[derive(Debug)]
 struct ToolCallRequest {
     name: String,
@@ -576,29 +316,12 @@ fn extract_command_from_json(text: &str) -> Option<String> {
 
 /// Builds the default shell policy (IAM-style, default-deny).
 ///
-/// Mirrors `ALLOWED_COMMANDS` as allow statements with glob patterns.
-/// Adds explicit deny rules for dangerous argument combinations
-/// (e.g., `find * -exec *`).
+/// Delegates to the Zig core for the whitelist + deny rules, then
+/// injects custom tool allows on top.
 pub fn default_shell_policy(tool_registry: &ToolRegistry) -> Result<Policy> {
-    let mut statements = Vec::new();
-
-    // Deny dangerous patterns first (explicit deny always wins in IAM)
-    statements.push(r#"{"effect":"deny","action":"find * -exec *"}"#.to_string());
-    statements.push(r#"{"effect":"deny","action":"find * -execdir *"}"#.to_string());
-
-    // Allow each whitelisted command with wildcard args
-    for cmd in ALLOWED_COMMANDS {
-        // Allow bare command and command with any arguments
-        statements.push(format!(r#"{{"effect":"allow","action":"{}"}}"#, cmd));
-        statements.push(format!(r#"{{"effect":"allow","action":"{} *"}}"#, cmd));
-    }
-
-    for name in tool_registry.names() {
-        statements.push(format!(r#"{{"effect":"allow","action":"tool:{}"}}"#, name));
-    }
-
-    let stmts_json = statements.join(",");
-    let json = format!(r#"{{"default":"deny","statements":[{}]}}"#, stmts_json);
+    let json = talu::shell::default_policy_json()
+        .map_err(|e| anyhow!("Failed to get default policy JSON: {}", e))?;
+    let json = add_custom_tool_allows(&json, tool_registry)?;
     Policy::from_json(&json).map_err(|e| anyhow!("Failed to create shell policy: {}", e))
 }
 

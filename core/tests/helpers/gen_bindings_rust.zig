@@ -221,6 +221,7 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
             if (eql(pointee, "TaluFileInfo")) return if (is_const) "*const TaluFileInfo" else "*mut TaluFileInfo";
             if (eql(pointee, "TaluImageInfo")) return if (is_const) "*const TaluImageInfo" else "*mut TaluImageInfo";
             if (eql(pointee, "TaluFileTransformOptions")) return if (is_const) "*const TaluFileTransformOptions" else "*mut TaluFileTransformOptions";
+            if (eql(pointee, "TaluFsStat")) return if (is_const) "*const TaluFsStat" else "*mut TaluFsStat";
             // Document types
             if (eql(pointee, "CDocumentRecord")) return if (is_const) "*const CDocumentRecord" else "*mut CDocumentRecord";
             if (eql(pointee, "CDocumentSummary")) return if (is_const) "*const CDocumentSummary" else "*mut CDocumentSummary";

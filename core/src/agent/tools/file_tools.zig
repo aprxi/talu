@@ -9,17 +9,11 @@
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
+const fs = @import("../fs/root.zig");
 const Tool = @import("../tool.zig").Tool;
 const ToolResult = @import("../tool.zig").ToolResult;
 
 const default_read_max_bytes: usize = 256 * 1024;
-
-const ToolError = error{
-    InvalidArguments,
-    InvalidPath,
-    PathOutsideWorkspace,
-    ParentNotFound,
-};
 
 pub const FileReadTool = struct {
     allocator: Allocator,
@@ -30,7 +24,7 @@ pub const FileReadTool = struct {
         const self = try allocator.create(FileReadTool);
         errdefer allocator.destroy(self);
 
-        const canonical_workspace = try canonicalizeWorkspace(allocator, workspace_dir);
+        const canonical_workspace = try fs.path.canonicalizeWorkspace(allocator, workspace_dir);
         errdefer allocator.free(canonical_workspace);
 
         self.* = .{
@@ -97,28 +91,25 @@ pub const FileReadTool = struct {
             }
         }
 
-        const resolved = resolveExistingPath(allocator, self.workspace_dir, path) catch |err| {
+        const resolved = fs.path.resolveExistingPath(allocator, self.workspace_dir, path) catch |err| {
             return toolErrorFmt(allocator, "read_file path error: {s}", .{@errorName(err)});
         };
         defer allocator.free(resolved);
 
-        const bytes = std.fs.cwd().readFileAlloc(allocator, resolved, max_bytes) catch |err| switch (err) {
+        const read_result = fs.operations.readFile(allocator, resolved, max_bytes) catch |err| switch (err) {
             error.FileTooBig => return toolErrorFmt(allocator, "File exceeds max_bytes ({d}).", .{max_bytes}),
+            error.NonUtf8 => return toolError(allocator, "read_file supports UTF-8 text files only."),
             else => return toolErrorFmt(allocator, "read_file failed: {s}", .{@errorName(err)}),
         };
-        defer allocator.free(bytes);
+        defer allocator.free(read_result.content);
 
-        if (!std.unicode.utf8ValidateSlice(bytes)) {
-            return toolError(allocator, "read_file supports UTF-8 text files only.");
-        }
-
-        const rel = try toWorkspaceRelative(allocator, self.workspace_dir, resolved);
+        const rel = try fs.path.toWorkspaceRelative(allocator, self.workspace_dir, resolved);
         defer allocator.free(rel);
 
         return toolSuccessJson(allocator, .{
             .path = rel,
-            .content = bytes,
-            .bytes = bytes.len,
+            .content = read_result.content,
+            .bytes = read_result.size,
         });
     }
 
@@ -144,7 +135,7 @@ pub const FileWriteTool = struct {
         const self = try allocator.create(FileWriteTool);
         errdefer allocator.destroy(self);
 
-        const canonical_workspace = try canonicalizeWorkspace(allocator, workspace_dir);
+        const canonical_workspace = try fs.path.canonicalizeWorkspace(allocator, workspace_dir);
         errdefer allocator.free(canonical_workspace);
 
         self.* = .{
@@ -205,30 +196,21 @@ pub const FileWriteTool = struct {
             else => return toolError(allocator, "Field 'content' must be a string."),
         };
 
-        const resolved = resolveWritablePath(allocator, self.workspace_dir, path) catch |err| {
+        const resolved = fs.path.resolveWritablePath(allocator, self.workspace_dir, path) catch |err| {
             return toolErrorFmt(allocator, "write_file path error: {s}", .{@errorName(err)});
         };
         defer allocator.free(resolved);
 
-        const file = std.fs.cwd().createFile(resolved, .{
-            .truncate = true,
-            .read = false,
-            .exclusive = false,
-        }) catch |err| {
-            return toolErrorFmt(allocator, "write_file failed: {s}", .{@errorName(err)});
-        };
-        defer file.close();
-
-        file.writeAll(content) catch |err| {
+        const write_result = fs.operations.writeFile(resolved, content) catch |err| {
             return toolErrorFmt(allocator, "write_file failed: {s}", .{@errorName(err)});
         };
 
-        const rel = try toWorkspaceRelative(allocator, self.workspace_dir, resolved);
+        const rel = try fs.path.toWorkspaceRelative(allocator, self.workspace_dir, resolved);
         defer allocator.free(rel);
 
         return toolSuccessJson(allocator, .{
             .path = rel,
-            .bytes_written = content.len,
+            .bytes_written = write_result.bytes_written,
         });
     }
 
@@ -255,7 +237,7 @@ pub const FileEditTool = struct {
         const self = try allocator.create(FileEditTool);
         errdefer allocator.destroy(self);
 
-        const canonical_workspace = try canonicalizeWorkspace(allocator, workspace_dir);
+        const canonical_workspace = try fs.path.canonicalizeWorkspace(allocator, workspace_dir);
         errdefer allocator.free(canonical_workspace);
 
         self.* = .{
@@ -324,53 +306,33 @@ pub const FileEditTool = struct {
 
         if (old_text.len == 0) return toolError(allocator, "Field 'old_text' must be non-empty.");
 
-        const resolved = resolveExistingPath(allocator, self.workspace_dir, path) catch |err| {
+        const resolved = fs.path.resolveExistingPath(allocator, self.workspace_dir, path) catch |err| {
             return toolErrorFmt(allocator, "edit_file path error: {s}", .{@errorName(err)});
         };
         defer allocator.free(resolved);
 
-        const original = std.fs.cwd().readFileAlloc(allocator, resolved, self.max_read_bytes) catch |err| switch (err) {
+        const edit_result = fs.operations.editFile(
+            allocator,
+            resolved,
+            old_text,
+            new_text,
+            replace_all,
+            self.max_read_bytes,
+        ) catch |err| switch (err) {
             error.FileTooBig => return toolErrorFmt(allocator, "File exceeds edit limit ({d} bytes).", .{self.max_read_bytes}),
-            else => return toolErrorFmt(allocator, "edit_file read failed: {s}", .{@errorName(err)}),
-        };
-        defer allocator.free(original);
-
-        if (!std.unicode.utf8ValidateSlice(original)) {
-            return toolError(allocator, "edit_file supports UTF-8 text files only.");
-        }
-
-        const replacements = countOccurrences(original, old_text);
-        if (replacements == 0) return toolError(allocator, "edit_file could not find old_text.");
-        if (!replace_all and replacements != 1) {
-            return toolErrorFmt(allocator, "edit_file expected exactly one match, found {d}. Set replace_all=true to replace all matches.", .{replacements});
-        }
-
-        const updated = if (replace_all)
-            try replaceAll(allocator, original, old_text, new_text)
-        else
-            try replaceFirst(allocator, original, old_text, new_text);
-        defer allocator.free(updated);
-
-        const file = std.fs.cwd().createFile(resolved, .{
-            .truncate = true,
-            .read = false,
-            .exclusive = false,
-        }) catch |err| {
-            return toolErrorFmt(allocator, "edit_file write failed: {s}", .{@errorName(err)});
-        };
-        defer file.close();
-
-        file.writeAll(updated) catch |err| {
-            return toolErrorFmt(allocator, "edit_file write failed: {s}", .{@errorName(err)});
+            error.NonUtf8 => return toolError(allocator, "edit_file supports UTF-8 text files only."),
+            error.NoMatches => return toolError(allocator, "edit_file could not find old_text."),
+            error.MultipleMatches => return toolErrorFmt(allocator, "edit_file expected exactly one match, found multiple. Set replace_all=true to replace all matches.", .{}),
+            else => return toolErrorFmt(allocator, "edit_file write failed: {s}", .{@errorName(err)}),
         };
 
-        const rel = try toWorkspaceRelative(allocator, self.workspace_dir, resolved);
+        const rel = try fs.path.toWorkspaceRelative(allocator, self.workspace_dir, resolved);
         defer allocator.free(rel);
 
         return toolSuccessJson(allocator, .{
             .path = rel,
-            .replacements = if (replace_all) replacements else @as(usize, 1),
-            .bytes_written = updated.len,
+            .replacements = edit_result.replacements,
+            .bytes_written = edit_result.bytes_written,
         });
     }
 
@@ -387,150 +349,6 @@ pub const FileEditTool = struct {
         self.deinit();
     }
 };
-
-fn canonicalizeWorkspace(allocator: Allocator, workspace_dir: []const u8) ![]u8 {
-    if (workspace_dir.len == 0) return ToolError.InvalidPath;
-    return std.fs.cwd().realpathAlloc(allocator, workspace_dir);
-}
-
-fn resolveExistingPath(allocator: Allocator, workspace_dir: []const u8, requested_path: []const u8) ![]u8 {
-    if (requested_path.len == 0) return ToolError.InvalidPath;
-    const candidate = try buildCandidatePath(allocator, workspace_dir, requested_path);
-    defer allocator.free(candidate);
-
-    const canonical = std.fs.cwd().realpathAlloc(allocator, candidate) catch |err| switch (err) {
-        error.FileNotFound => return ToolError.InvalidPath,
-        else => return err,
-    };
-    errdefer allocator.free(canonical);
-
-    if (!isWithinWorkspace(workspace_dir, canonical)) return ToolError.PathOutsideWorkspace;
-    return canonical;
-}
-
-fn resolveWritablePath(allocator: Allocator, workspace_dir: []const u8, requested_path: []const u8) ![]u8 {
-    if (requested_path.len == 0) return ToolError.InvalidPath;
-    const candidate = try buildCandidatePath(allocator, workspace_dir, requested_path);
-    defer allocator.free(candidate);
-
-    const existing = std.fs.cwd().realpathAlloc(allocator, candidate) catch |err| switch (err) {
-        error.FileNotFound => null,
-        else => return err,
-    };
-    if (existing) |canonical_existing| {
-        errdefer allocator.free(canonical_existing);
-        if (!isWithinWorkspace(workspace_dir, canonical_existing)) return ToolError.PathOutsideWorkspace;
-        return canonical_existing;
-    }
-
-    const parent = std.fs.path.dirname(candidate) orelse return ToolError.InvalidPath;
-    const basename = std.fs.path.basename(candidate);
-    if (basename.len == 0 or std.mem.eql(u8, basename, ".") or std.mem.eql(u8, basename, "..")) {
-        return ToolError.InvalidPath;
-    }
-
-    const canonical_parent = std.fs.cwd().realpathAlloc(allocator, parent) catch |err| switch (err) {
-        error.FileNotFound => return ToolError.ParentNotFound,
-        else => return err,
-    };
-    defer allocator.free(canonical_parent);
-
-    if (!isWithinWorkspace(workspace_dir, canonical_parent)) return ToolError.PathOutsideWorkspace;
-    return std.fs.path.join(allocator, &.{ canonical_parent, basename });
-}
-
-fn buildCandidatePath(allocator: Allocator, workspace_dir: []const u8, requested_path: []const u8) ![]u8 {
-    if (std.fs.path.isAbsolute(requested_path)) {
-        return allocator.dupe(u8, requested_path);
-    }
-    return std.fs.path.join(allocator, &.{ workspace_dir, requested_path });
-}
-
-fn isWithinWorkspace(workspace_dir: []const u8, path: []const u8) bool {
-    if (std.mem.eql(u8, workspace_dir, "/") or std.mem.eql(u8, workspace_dir, "\\")) {
-        return std.fs.path.isAbsolute(path);
-    }
-    if (std.mem.eql(u8, workspace_dir, path)) return true;
-    if (!std.mem.startsWith(u8, path, workspace_dir)) return false;
-    if (path.len <= workspace_dir.len) return false;
-
-    const separator = path[workspace_dir.len];
-    return separator == '/' or separator == '\\';
-}
-
-fn toWorkspaceRelative(allocator: Allocator, workspace_dir: []const u8, absolute_path: []const u8) ![]u8 {
-    if (std.mem.eql(u8, workspace_dir, "/") or std.mem.eql(u8, workspace_dir, "\\")) {
-        if (absolute_path.len <= 1) return allocator.dupe(u8, ".");
-        return allocator.dupe(u8, absolute_path[1..]);
-    }
-    if (!isWithinWorkspace(workspace_dir, absolute_path)) {
-        return allocator.dupe(u8, absolute_path);
-    }
-    if (std.mem.eql(u8, workspace_dir, absolute_path)) {
-        return allocator.dupe(u8, ".");
-    }
-    const rel_start = workspace_dir.len + 1;
-    if (rel_start >= absolute_path.len) return allocator.dupe(u8, ".");
-    return allocator.dupe(u8, absolute_path[rel_start..]);
-}
-
-fn countOccurrences(haystack: []const u8, needle: []const u8) usize {
-    if (needle.len == 0) return 0;
-    var count: usize = 0;
-    var start: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, start, needle)) |idx| {
-        count += 1;
-        start = idx + needle.len;
-    }
-    return count;
-}
-
-fn replaceFirst(allocator: Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
-    const first_idx = std.mem.indexOf(u8, haystack, needle) orelse return allocator.dupe(u8, haystack);
-
-    const new_len = haystack.len - needle.len + replacement.len;
-    const out = try allocator.alloc(u8, new_len);
-
-    var cursor: usize = 0;
-    @memcpy(out[cursor..][0..first_idx], haystack[0..first_idx]);
-    cursor += first_idx;
-    @memcpy(out[cursor..][0..replacement.len], replacement);
-    cursor += replacement.len;
-
-    const tail_start = first_idx + needle.len;
-    @memcpy(out[cursor..], haystack[tail_start..]);
-    return out;
-}
-
-fn replaceAll(allocator: Allocator, haystack: []const u8, needle: []const u8, replacement: []const u8) ![]u8 {
-    const occurrences = countOccurrences(haystack, needle);
-    if (occurrences == 0) return allocator.dupe(u8, haystack);
-
-    const shrink = occurrences * needle.len;
-    const grow = occurrences * replacement.len;
-    const new_len = haystack.len - shrink + grow;
-    const out = try allocator.alloc(u8, new_len);
-
-    var read_idx: usize = 0;
-    var write_idx: usize = 0;
-    while (std.mem.indexOfPos(u8, haystack, read_idx, needle)) |idx| {
-        const chunk = haystack[read_idx..idx];
-        @memcpy(out[write_idx..][0..chunk.len], chunk);
-        write_idx += chunk.len;
-
-        @memcpy(out[write_idx..][0..replacement.len], replacement);
-        write_idx += replacement.len;
-
-        read_idx = idx + needle.len;
-    }
-
-    const tail = haystack[read_idx..];
-    @memcpy(out[write_idx..][0..tail.len], tail);
-    write_idx += tail.len;
-
-    std.debug.assert(write_idx == new_len);
-    return out;
-}
 
 fn toolSuccessJson(allocator: Allocator, value: anytype) !ToolResult {
     const output = try std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(value, .{})});
@@ -555,10 +373,10 @@ fn toolErrorFmt(allocator: Allocator, comptime fmt: []const u8, args: anytype) !
 }
 
 test "isWithinWorkspace allows descendants and rejects outside" {
-    try std.testing.expect(isWithinWorkspace("/tmp/work", "/tmp/work"));
-    try std.testing.expect(isWithinWorkspace("/tmp/work", "/tmp/work/src/a.txt"));
-    try std.testing.expect(!isWithinWorkspace("/tmp/work", "/tmp/workspace/file.txt"));
-    try std.testing.expect(!isWithinWorkspace("/tmp/work", "/tmp/other/file.txt"));
+    try std.testing.expect(fs.path.isWithinWorkspace("/tmp/work", "/tmp/work"));
+    try std.testing.expect(fs.path.isWithinWorkspace("/tmp/work", "/tmp/work/src/a.txt"));
+    try std.testing.expect(!fs.path.isWithinWorkspace("/tmp/work", "/tmp/workspace/file.txt"));
+    try std.testing.expect(!fs.path.isWithinWorkspace("/tmp/work", "/tmp/other/file.txt"));
 }
 
 test "FileReadTool.execute reads UTF-8 files in workspace" {

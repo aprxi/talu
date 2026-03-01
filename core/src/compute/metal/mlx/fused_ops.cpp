@@ -6,6 +6,7 @@
 
 #include "compute_common.h"
 #include "model_state.h"
+#include "shortconv_utils.h"
 
 extern "C" {
 

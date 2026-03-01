@@ -83,9 +83,7 @@ pub async fn handle_update(
         None => None,
         Some(serde_json::Value::Null) => Some(String::new()),
         Some(serde_json::Value::String(s)) => Some(s.clone()),
-        Some(_) => {
-            return json_error(StatusCode::BAD_REQUEST, "base_url must be a string or null")
-        }
+        Some(_) => return json_error(StatusCode::BAD_REQUEST, "base_url must be a string or null"),
     };
 
     let name = provider_name.clone();
@@ -131,10 +129,9 @@ pub async fn handle_health(
         None => return json_error(StatusCode::SERVICE_UNAVAILABLE, "Storage not configured"),
     };
 
-    let result = tokio::task::spawn_blocking(move || {
-        talu::provider_config_health(&db_root, &provider_name)
-    })
-    .await;
+    let result =
+        tokio::task::spawn_blocking(move || talu::provider_config_health(&db_root, &provider_name))
+            .await;
 
     match result {
         Ok(health) => {

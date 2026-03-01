@@ -40,6 +40,13 @@ pub const ErrorCode = enum(i32) {
     io_read_failed = 502,
     io_write_failed = 503,
     io_network_failed = 504,
+    io_path_invalid = 505,
+    io_path_outside_workspace = 506,
+    io_parent_not_found = 507,
+    io_is_directory = 508,
+    io_not_directory = 509,
+    io_not_empty = 510,
+    io_file_too_big = 511,
 
     // Template errors (600-699)
     template_syntax_error = 600,
@@ -56,6 +63,10 @@ pub const ErrorCode = enum(i32) {
     item_not_found = 702, // Requested item_id does not exist
     session_not_found = 703, // Requested session does not exist
     tag_not_found = 704, // Requested tag does not exist
+
+    // Shell errors (800-899)
+    shell_command_denied = 800,
+    shell_exec_failed = 801,
 
     // System errors (900-999)
     out_of_memory = 900,
@@ -74,6 +85,13 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.ModelNotCached => .model_not_found,
         error.OutOfMemory => .out_of_memory,
         error.AccessDenied => .io_permission_denied,
+        error.InvalidPath => .io_path_invalid,
+        error.PathOutsideWorkspace => .io_path_outside_workspace,
+        error.ParentNotFound => .io_parent_not_found,
+        error.IsDir => .io_is_directory,
+        error.NotDir => .io_not_directory,
+        error.DirNotEmpty => .io_not_empty,
+        error.FileTooBig => .io_file_too_big,
         error.InvalidArgument => .invalid_argument,
         error.AlreadyExists => .invalid_argument,
         error.IdempotencyConflict => .invalid_argument,

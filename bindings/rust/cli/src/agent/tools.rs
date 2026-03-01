@@ -35,22 +35,21 @@ fn execute_command_schema() -> serde_json::Value {
 
 /// Runs a shell command and returns the combined stdout + stderr output.
 ///
-/// Returns an error description string on spawn failure; never panics.
+/// Delegates to the Zig core via `talu::shell::exec`.
+/// Returns an error description string on failure; never panics.
 pub fn run_shell_command(cmd: &str) -> String {
-    match Command::new("sh").arg("-c").arg(cmd).output() {
+    match talu::shell::exec(cmd) {
         Ok(output) => {
             let mut result = String::new();
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            if !stdout.is_empty() {
-                result.push_str(&stdout);
+            if !output.stdout.is_empty() {
+                result.push_str(&output.stdout);
             }
-            if !stderr.is_empty() {
+            if !output.stderr.is_empty() {
                 if !result.is_empty() {
                     result.push('\n');
                 }
                 result.push_str("[stderr] ");
-                result.push_str(&stderr);
+                result.push_str(&output.stderr);
             }
             if result.is_empty() {
                 result.push_str("(no output)");

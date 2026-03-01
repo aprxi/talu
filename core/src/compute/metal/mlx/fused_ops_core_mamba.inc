@@ -69,6 +69,8 @@ static array gelu_approx(const array& x) {
 }
 
 static inline array ensure_float32(const array& arr) {
+    // FP32 allowlist: recurrent Mamba SSM/conv state updates are numerically
+    // sensitive across long contexts; keep state math in FP32.
     return arr.dtype() == float32 ? arr : astype(arr, float32);
 }
 
@@ -373,6 +375,7 @@ void* mlx_lazy_mamba_block_bf16(
     size_t n_groups,
     uint8_t gate_up_layout
 ) {
+    mlx_count_op();
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& ln1_w = *static_cast<const array*>(ln1_weight);
     const auto& in_proj_w = *static_cast<const array*>(in_proj);
@@ -535,6 +538,7 @@ void* mlx_lazy_mamba_block_quantized(
     size_t n_groups,
     uint8_t gate_up_layout
 ) {
+    mlx_count_op();
     const auto& input_arr = *static_cast<const array*>(input);
     const auto& ln1_w = *static_cast<const array*>(ln1_weight);
     const auto& in_proj_w = *static_cast<const array*>(in_w);

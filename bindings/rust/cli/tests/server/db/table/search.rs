@@ -76,7 +76,11 @@ fn search_finds_matching_title() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert_eq!(data.len(), 1, "query should match only the Rust-titled document");
+    assert_eq!(
+        data.len(),
+        1,
+        "query should match only the Rust-titled document"
+    );
     assert_eq!(data[0]["title"], "Rust Programming Guide");
 }
 
@@ -101,7 +105,11 @@ fn search_finds_matching_content() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert_eq!(data.len(), 1, "content query should match exactly one document");
+    assert_eq!(
+        data.len(),
+        1,
+        "content query should match exactly one document"
+    );
     assert_eq!(data[0]["title"], "Generic Title");
 }
 
@@ -204,7 +212,11 @@ fn search_case_insensitive() {
 
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
-    assert_eq!(data.len(), 1, "case-insensitive query should match one document");
+    assert_eq!(
+        data.len(),
+        1,
+        "case-insensitive query should match one document"
+    );
     assert_eq!(data[0]["title"], "UPPERCASE Title");
 }
 

@@ -83,7 +83,10 @@ pub async fn handle_list(
         .unwrap_or(100);
 
     if limit == 0 {
-        let body = BlobListResponse { data: vec![], count: 0 };
+        let body = BlobListResponse {
+            data: vec![],
+            count: 0,
+        };
         return Response::builder()
             .status(StatusCode::OK)
             .header("content-type", "application/json")

@@ -152,7 +152,11 @@ fn kv_rejects_invalid_namespace_and_entry_paths() {
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
     let missing_namespace = get(ctx.addr(), "/v1/db/kv/namespaces//entries");
-    assert_eq!(missing_namespace.status, 400, "body: {}", missing_namespace.body);
+    assert_eq!(
+        missing_namespace.status, 400,
+        "body: {}",
+        missing_namespace.body
+    );
     assert_eq!(missing_namespace.json()["error"]["code"], "invalid_path");
 
     let missing_key = get(ctx.addr(), "/v1/db/kv/namespaces/ns/entries/");
@@ -165,7 +169,10 @@ fn kv_rejects_invalid_namespace_and_entry_paths() {
         "body: {}",
         whitespace_namespace.body
     );
-    assert_eq!(whitespace_namespace.json()["error"]["code"], "invalid_argument");
+    assert_eq!(
+        whitespace_namespace.json()["error"]["code"],
+        "invalid_argument"
+    );
 }
 
 #[test]
@@ -184,10 +191,7 @@ fn kv_paths_are_percent_decoded_for_namespace_and_key() {
     assert_eq!(put.json()["namespace"], "ns x");
     assert_eq!(put.json()["key"], "key/part");
 
-    let get_resp = get(
-        ctx.addr(),
-        "/v1/db/kv/namespaces/ns%20x/entries/key%2Fpart",
-    );
+    let get_resp = get(ctx.addr(), "/v1/db/kv/namespaces/ns%20x/entries/key%2Fpart");
     assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
     assert_eq!(get_resp.json()["key"], "key/part");
     assert_eq!(get_resp.json()["value_hex"], "6465636f646564");
@@ -209,10 +213,7 @@ fn kv_path_segments_preserve_literal_plus_signs() {
     assert_eq!(put.json()["namespace"], "ns+plus");
     assert_eq!(put.json()["key"], "key+plus");
 
-    let get_resp = get(
-        ctx.addr(),
-        "/v1/db/kv/namespaces/ns+plus/entries/key+plus",
-    );
+    let get_resp = get(ctx.addr(), "/v1/db/kv/namespaces/ns+plus/entries/key+plus");
     assert_eq!(get_resp.status, 200, "body: {}", get_resp.body);
     assert_eq!(get_resp.json()["key"], "key+plus");
     assert_eq!(get_resp.json()["value_hex"], "706c75732d76616c7565");

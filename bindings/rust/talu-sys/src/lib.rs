@@ -257,6 +257,13 @@ pub enum ErrorCode {
     IoReadFailed = 502,
     IoWriteFailed = 503,
     IoNetworkFailed = 504,
+    IoPathInvalid = 505,
+    IoPathOutsideWorkspace = 506,
+    IoParentNotFound = 507,
+    IoIsDirectory = 508,
+    IoNotDirectory = 509,
+    IoNotEmpty = 510,
+    IoFileTooBig = 511,
     TemplateSyntaxError = 600,
     TemplateUndefinedVar = 601,
     TemplateTypeError = 602,
@@ -269,6 +276,8 @@ pub enum ErrorCode {
     ItemNotFound = 702,
     SessionNotFound = 703,
     TagNotFound = 704,
+    ShellCommandDenied = 800,
+    ShellExecFailed = 801,
     OutOfMemory = 900,
     InvalidArgument = 901,
     InvalidHandle = 902,
@@ -306,6 +315,13 @@ impl From<i32> for ErrorCode {
             502 => ErrorCode::IoReadFailed,
             503 => ErrorCode::IoWriteFailed,
             504 => ErrorCode::IoNetworkFailed,
+            505 => ErrorCode::IoPathInvalid,
+            506 => ErrorCode::IoPathOutsideWorkspace,
+            507 => ErrorCode::IoParentNotFound,
+            508 => ErrorCode::IoIsDirectory,
+            509 => ErrorCode::IoNotDirectory,
+            510 => ErrorCode::IoNotEmpty,
+            511 => ErrorCode::IoFileTooBig,
             600 => ErrorCode::TemplateSyntaxError,
             601 => ErrorCode::TemplateUndefinedVar,
             602 => ErrorCode::TemplateTypeError,
@@ -318,6 +334,8 @@ impl From<i32> for ErrorCode {
             702 => ErrorCode::ItemNotFound,
             703 => ErrorCode::SessionNotFound,
             704 => ErrorCode::TagNotFound,
+            800 => ErrorCode::ShellCommandDenied,
+            801 => ErrorCode::ShellExecFailed,
             900 => ErrorCode::OutOfMemory,
             901 => ErrorCode::InvalidArgument,
             902 => ErrorCode::InvalidHandle,
@@ -604,6 +622,25 @@ impl Default for TokenizeResult {
             tokens: std::ptr::null(),
             num_tokens: 0,
             error_msg: std::ptr::null(),
+        }
+    }
+}
+
+/// Source: core/src/capi/provider_config.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CProviderHealthResult {
+    pub ok: u8,
+    pub model_count: usize,
+    pub error_message: *const c_char,
+}
+
+impl Default for CProviderHealthResult {
+    fn default() -> Self {
+        Self {
+            ok: 0,
+            model_count: 0,
+            error_message: std::ptr::null(),
         }
     }
 }
@@ -1714,7 +1751,7 @@ impl Default for CDocumentRecord {
     }
 }
 
-/// Source: core/src/capi/agent.zig
+/// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CAgentCreateConfig {
@@ -2227,7 +2264,7 @@ impl Default for EncodeResult {
     }
 }
 
-/// Source: core/src/capi/agent.zig
+/// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CAgentLoopResult {
@@ -2496,7 +2533,7 @@ impl Default for CRelationStringList {
     }
 }
 
-/// Source: core/src/capi/agent.zig
+/// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CRagConfig {
@@ -2886,7 +2923,7 @@ impl Default for ExecutionPlanInfo {
     }
 }
 
-/// Source: core/src/capi/agent.zig
+/// Source: core/src/capi/agent/root.zig
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct CAgentLoopConfig {
@@ -3090,6 +3127,37 @@ impl Default for DownloadOptions {
             endpoint_url: std::ptr::null(),
             skip_weights: false,
             cancel_flag: std::ptr::null_mut(),
+        }
+    }
+}
+
+/// Source: core/src/capi/agent/fs.zig
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct TaluFsStat {
+    pub exists: bool,
+    pub is_file: bool,
+    pub is_dir: bool,
+    pub is_symlink: bool,
+    pub size: u64,
+    pub mode: u32,
+    pub modified_at: i64,
+    pub created_at: i64,
+    pub _reserved: [u8; 32],
+}
+
+impl Default for TaluFsStat {
+    fn default() -> Self {
+        Self {
+            exists: false,
+            is_file: false,
+            is_dir: false,
+            is_symlink: false,
+            size: 0,
+            mode: 0,
+            modified_at: 0,
+            created_at: 0,
+            _reserved: [0; 32],
         }
     }
 }
@@ -3486,79 +3554,79 @@ impl From<u8> for ItemStatus {
 // =============================================================================
 
 extern "C" {
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_abort(handle: *mut c_void);
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_add_goal(handle: *mut c_void, goal: *const c_char) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_add_peer(handle: *mut c_void, agent_id: *const c_char, url: *const c_char, transport: u8) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_broadcast(handle: *mut c_void, from: *const c_char, payload: *const c_char) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_create(out_bus: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_deliver(handle: *mut c_void, from: *const c_char, to: *const c_char, payload: *const c_char) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_free(handle: *mut c_void);
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_pending(handle: *mut c_void, agent_id: *const c_char) -> usize;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_register(handle: *mut c_void, agent_id: *const c_char) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_remove_peer(handle: *mut c_void, agent_id: *const c_char);
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_send(handle: *mut c_void, from: *const c_char, to: *const c_char, payload: *const c_char) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_set_notify(handle: *mut c_void, agent_id: *const c_char, notify_fn: *mut c_void, user_data: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_bus_unregister(handle: *mut c_void, agent_id: *const c_char);
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_clear_goals(handle: *mut c_void);
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_continue(handle: *mut c_void, out_result: CAgentLoopResult) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_create(backend_handle: *mut c_void, config_ptr: CAgentCreateConfig, out_agent: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_free(handle: *mut c_void);
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_get_chat(handle: *mut c_void) -> *mut c_void;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_get_id(handle: *mut c_void, out_ptr: *mut c_void, out_len: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_goal_count(handle: *mut c_void) -> usize;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_heartbeat(handle: *mut c_void, out_result: CAgentLoopResult) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_prompt(handle: *mut c_void, message: *const c_char, out_result: CAgentLoopResult) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_register_tool(handle: *mut c_void, name_ptr: *const c_char, description_ptr: *const c_char, parameters_schema_ptr: *const c_char, execute_fn: *mut c_void, user_data: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_registry_add(handle: *mut c_void, name_ptr: *const c_char, description_ptr: *const c_char, parameters_schema_ptr: *const c_char, execute_fn: *mut c_void, user_data: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_registry_count(handle: *mut c_void) -> usize;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_registry_create(out_registry: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_registry_free(handle: *mut c_void);
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_remove_goal(handle: *mut c_void, goal: *const c_char) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_run(chat_handle: *mut c_void, backend_handle: *mut c_void, registry_handle: *mut c_void, config_ptr: CAgentLoopConfig, out_result: CAgentLoopResult) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_run_loop(handle: *mut c_void, idle_timeout_ms: u64, out_result: CAgentLoopResult) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_set_after_tool(handle: *mut c_void, after_fn: *mut c_void, user_data: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_set_before_tool(handle: *mut c_void, before_fn: *mut c_void, user_data: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_set_bus(handle: *mut c_void, bus_handle: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_set_context_inject(handle: *mut c_void, inject_fn: *mut c_void, user_data: *mut c_void) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_set_system(handle: *mut c_void, system_prompt: *const c_char) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_set_vector_store(agent_handle: *mut c_void, store_handle: *mut c_void, config_ptr: CRagConfig) -> c_int;
-    // core/src/capi/agent.zig
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_wait_for_message(handle: *mut c_void, timeout_ms: u64, out_received: *mut c_void) -> c_int;
     // core/src/capi/memory.zig
     pub fn talu_alloc_string(len: usize) -> *const u8;
@@ -3988,6 +4056,28 @@ extern "C" {
     pub fn talu_free_spans(spans: COutputSpan, count: u32);
     // core/src/capi/memory.zig
     pub fn talu_free_string(ptr: *const u8, len: usize);
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_create(workspace_dir: *const c_char, out_handle: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_edit(handle: *mut c_void, path: *const c_char, old_text: *const u8, old_len: usize, new_text: *const u8, new_len: usize, replace_all: bool, out_replacements: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_free(handle: *mut c_void);
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_free_string(ptr: *const u8, len: usize);
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_list(handle: *mut c_void, path: *const c_char, glob: *const c_char, recursive: bool, limit: usize, out_json: *mut c_void, out_json_len: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_mkdir(handle: *mut c_void, path: *const c_char, recursive: bool) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_read(handle: *mut c_void, path: *const c_char, max_bytes: usize, out_content: *mut c_void, out_content_len: *mut c_void, out_size: *mut c_void, out_truncated: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_remove(handle: *mut c_void, path: *const c_char, recursive: bool) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_rename(handle: *mut c_void, from: *const c_char, to: *const c_char) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_stat(handle: *mut c_void, path: *const c_char, out_stat: *mut TaluFsStat) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_fs_write(handle: *mut c_void, path: *const c_char, content: *const u8, content_len: usize, mkdir: bool, out_bytes_written: *mut c_void) -> c_int;
     // core/src/capi/template.zig
     pub fn talu_get_chat_template_source(model_path: *const c_char, out_source: *mut c_void) -> c_int;
     // core/src/capi/session.zig
@@ -4049,9 +4139,17 @@ extern "C" {
     // core/src/capi/policy.zig
     pub fn talu_policy_get_mode(handle: *mut c_void) -> u8;
     // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_health(db_root: *const c_char, name: *const c_char) -> CProviderHealthResult;
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_health_free(result: CProviderHealthResult);
+    // core/src/capi/provider_config.zig
     pub fn talu_provider_config_list(db_root: *const c_char) -> CProviderConfigList;
     // core/src/capi/provider_config.zig
     pub fn talu_provider_config_list_free(list: CProviderConfigList);
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_list_provider_models(db_root: *const c_char, name: *const c_char) -> *mut c_void;
+    // core/src/capi/provider_config.zig
+    pub fn talu_provider_config_list_provider_models_free(result: *mut CRemoteModelListResult);
     // core/src/capi/provider_config.zig
     pub fn talu_provider_config_list_remote_models(db_root: *const c_char) -> *mut c_void;
     // core/src/capi/provider_config.zig
@@ -4308,6 +4406,16 @@ extern "C" {
     pub fn talu_set_response_format(chat_handle: *mut c_void, schema_json: *const c_char, config: ValidateConfigC, stop_tokens: *const u32, stop_tokens_len: usize, prefix_token_ids: *const u32, prefix_token_ids_len: usize) -> c_int;
     // core/src/capi/validate.zig
     pub fn talu_set_response_format_handle(chat_handle: *mut c_void, grammar_handle: *mut c_void, config: ValidateConfigC, stop_tokens: *const u32, stop_tokens_len: usize, prefix_token_ids: *const u32, prefix_token_ids_len: usize) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_check_command(command: *const c_char, out_allowed: *mut c_void, out_reason: *mut c_void, out_reason_len: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_default_policy_json(out_json: *mut c_void, out_json_len: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_exec(command: *const c_char, out_stdout: *mut c_void, out_stdout_len: *mut c_void, out_stderr: *mut c_void, out_stderr_len: *mut c_void, out_exit_code: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_free_string(ptr: *const u8, len: usize);
+    // core/src/capi/agent/root.zig
+    pub fn talu_shell_normalize_command(command: *const c_char, out_normalized: *mut c_void, out_normalized_len: *mut c_void) -> c_int;
     // core/src/capi/sql.zig
     pub fn talu_sql_query(db_path: *const c_char, query: *const c_char, out_json: *mut c_void) -> c_int;
     // core/src/capi/sql.zig

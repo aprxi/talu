@@ -205,10 +205,7 @@ impl TableHandle {
     }
 
     /// Open a read-only table.
-    pub fn open_readonly(
-        db_root: &Path,
-        namespace: &str,
-    ) -> Result<Self, TableError> {
+    pub fn open_readonly(db_root: &Path, namespace: &str) -> Result<Self, TableError> {
         let root_str = db_root.to_string_lossy();
         let root_bytes = root_str.as_bytes();
         let ns_bytes = namespace.as_bytes();
@@ -231,11 +228,7 @@ impl TableHandle {
     }
 
     /// Append a row with the given schema ID and column values.
-    pub fn append_row(
-        &self,
-        schema_id: u16,
-        columns: &[ColumnValue],
-    ) -> Result<(), TableError> {
+    pub fn append_row(&self, schema_id: u16, columns: &[ColumnValue]) -> Result<(), TableError> {
         let c_cols: Vec<talu_sys::CColumnValue> = columns
             .iter()
             .map(|c| talu_sys::CColumnValue {
@@ -327,9 +320,7 @@ impl TableHandle {
         };
 
         let mut iter = std::mem::MaybeUninit::<talu_sys::CRowIterator>::uninit();
-        let code = unsafe {
-            talu_sys::talu_db_table_scan(self.raw, &c_params, iter.as_mut_ptr())
-        };
+        let code = unsafe { talu_sys::talu_db_table_scan(self.raw, &c_params, iter.as_mut_ptr()) };
 
         if code != ERROR_CODE_OK {
             return Err(TableError::from_code(code));

@@ -104,7 +104,11 @@ fn kv_invalid_path_error_does_not_create_entries() {
 
     let list = get(ctx.addr(), "/v1/db/kv/namespaces/ns/entries");
     assert_eq!(list.status, 200, "body: {}", list.body);
-    assert_eq!(list.json()["count"], 0, "invalid path must not create entries");
+    assert_eq!(
+        list.json()["count"],
+        0,
+        "invalid path must not create entries"
+    );
 }
 
 #[test]
@@ -144,7 +148,11 @@ fn unauthorized_table_rows_write_does_not_mutate_tenant_storage() {
         ],
         None,
     );
-    assert_eq!(authorized_scan.status, 200, "body: {}", authorized_scan.body);
+    assert_eq!(
+        authorized_scan.status, 200,
+        "body: {}",
+        authorized_scan.body
+    );
     assert_eq!(
         authorized_scan.json()["rows"]
             .as_array()
