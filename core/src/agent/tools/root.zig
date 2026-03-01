@@ -3,6 +3,7 @@
 //! This module provides a minimal built-in toolset for agentic execution:
 //! - File tools: `read_file`, `write_file`, `edit_file`
 //! - HTTP tool: `http_fetch`
+//! - Shell tool: `execute_command` (opt-in)
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -10,6 +11,7 @@ const tool_mod = @import("../tool.zig");
 
 pub const file = @import("file_tools.zig");
 pub const http = @import("http_tool.zig");
+pub const exec = @import("exec_tool.zig");
 
 pub const BuiltinToolsConfig = struct {
     /// Root directory for file tool sandboxing.
@@ -18,6 +20,9 @@ pub const BuiltinToolsConfig = struct {
     file_max_read_bytes: usize = 256 * 1024,
     /// Maximum bytes returned by `http_fetch`.
     http_max_response_bytes: usize = 1024 * 1024,
+    /// Register the `execute_command` shell tool. Not all contexts need
+    /// shell access, so this is opt-in.
+    enable_shell: bool = false,
 };
 
 /// Register built-in tools into the provided registry.
@@ -52,6 +57,11 @@ pub fn registerDefaultTools(
         config.http_max_response_bytes,
     );
     try registerOwnedTool(registry, http_tool.asTool());
+
+    if (config.enable_shell) {
+        const exec_tool = try exec.ExecCommandTool.init(allocator);
+        try registerOwnedTool(registry, exec_tool.asTool());
+    }
 }
 
 fn registerOwnedTool(registry: *tool_mod.ToolRegistry, tool: tool_mod.Tool) !void {

@@ -18,6 +18,7 @@ const db_mod = @import("../../db/root.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 const fs_api = @import("fs.zig");
+const shell_api = @import("shell.zig");
 
 const ToolRegistry = agent_mod.ToolRegistry;
 const Agent = agent_mod.Agent;
@@ -153,6 +154,49 @@ pub export fn talu_fs_rename(
 
 pub export fn talu_fs_free_string(ptr: ?[*]const u8, len: usize) callconv(.c) void {
     fs_api.talu_fs_free_string(ptr, len);
+}
+
+// =============================================================================
+// Shell execution
+// =============================================================================
+
+pub export fn talu_shell_exec(
+    command: ?[*:0]const u8,
+    out_stdout: ?*?[*]const u8,
+    out_stdout_len: ?*usize,
+    out_stderr: ?*?[*]const u8,
+    out_stderr_len: ?*usize,
+    out_exit_code: ?*i32,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_exec(command, out_stdout, out_stdout_len, out_stderr, out_stderr_len, out_exit_code);
+}
+
+pub export fn talu_shell_check_command(
+    command: ?[*:0]const u8,
+    out_allowed: ?*bool,
+    out_reason: ?*?[*]const u8,
+    out_reason_len: ?*usize,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_check_command(command, out_allowed, out_reason, out_reason_len);
+}
+
+pub export fn talu_shell_default_policy_json(
+    out_json: ?*?[*]const u8,
+    out_json_len: ?*usize,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_default_policy_json(out_json, out_json_len);
+}
+
+pub export fn talu_shell_normalize_command(
+    command: ?[*:0]const u8,
+    out_normalized: ?*?[*]const u8,
+    out_normalized_len: ?*usize,
+) callconv(.c) i32 {
+    return shell_api.talu_shell_normalize_command(command, out_normalized, out_normalized_len);
+}
+
+pub export fn talu_shell_free_string(ptr: ?[*]const u8, len: usize) callconv(.c) void {
+    shell_api.talu_shell_free_string(ptr, len);
 }
 
 // =============================================================================

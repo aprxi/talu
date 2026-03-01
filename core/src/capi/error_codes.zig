@@ -64,6 +64,10 @@ pub const ErrorCode = enum(i32) {
     session_not_found = 703, // Requested session does not exist
     tag_not_found = 704, // Requested tag does not exist
 
+    // Shell errors (800-899)
+    shell_command_denied = 800,
+    shell_exec_failed = 801,
+
     // System errors (900-999)
     out_of_memory = 900,
     invalid_argument = 901,

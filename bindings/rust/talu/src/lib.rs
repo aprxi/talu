@@ -63,6 +63,7 @@ pub mod repo;
 pub mod repo_meta;
 pub mod responses;
 pub mod router;
+pub mod shell;
 pub mod sql;
 pub mod storage;
 pub mod table;
