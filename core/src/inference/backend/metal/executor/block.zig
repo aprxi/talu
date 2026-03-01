@@ -7,7 +7,7 @@ const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const op_types = @import("../../../../models/op_types.zig");
-const models = @import("../../../../models/root.zig");
+const tensor = @import("../../../../tensor.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const log = @import("../../../../log.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
@@ -27,7 +27,7 @@ var layer_program_dispatch_counters = runtime_contract.DispatchCounters{};
 pub const Cache = runtime_graph.Cache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
 pub const MambaCache = runtime_graph.MambaCache;
-const ModelConfig = models.ModelConfig;
+const ModelConfig = tensor.ModelConfig;
 const WeightHandles = weights_mod.WeightHandles;
 const LayerWeights = WeightHandles.LayerWeights;
 
@@ -452,7 +452,7 @@ pub const TransformerBlock = struct {
                 if (ctx.bindings.ffn) |*ffn_binding| switch (ffn_binding.*) {
                     .moe => |*moe_binding| {
                         if (!std.mem.eql(u8, parsed.slot_name, "router")) return error.InvalidWeightBindingName;
-                        return @ptrCast(&moe_binding.weights.router_w);
+                        return @ptrCast(@constCast(&moe_binding.weights.router_w));
                     },
                     .dense => return error.InvalidWeightBindingName,
                 } else return error.MissingField;
