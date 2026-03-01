@@ -4,48 +4,7 @@
 // Uses pre-allocated buffers with slice_update for efficiency.
 
 #include "model_state.h"
-
-namespace {
-
-static int round_up_step(size_t value, int step) {
-    const size_t s = static_cast<size_t>(step);
-    return static_cast<int>(((value + s - 1) / s) * s);
-}
-
-static int next_cache_capacity(const CacheLayer& layer, size_t required, int current_capacity) {
-    if (required == 0) return current_capacity;
-
-    const size_t current = current_capacity > 0 ? static_cast<size_t>(current_capacity) : 0;
-
-    if (layer.max_seq_len > 0) {
-        const size_t max_cap = layer.max_seq_len;
-        if (required > max_cap) {
-            throw std::invalid_argument("[cache] kv cache capacity exceeded");
-        }
-        // Fixed-capacity mode: allocate full context once to avoid periodic
-        // O(N) cache growth copies during long decode.
-        if (current == 0) return static_cast<int>(max_cap);
-        if (required > current) return static_cast<int>(max_cap);
-        return static_cast<int>(current);
-    }
-
-    const size_t step = static_cast<size_t>(layer.step);
-    size_t capacity = current;
-    if (capacity == 0) {
-        const size_t base = std::max(required, step);
-        capacity = static_cast<size_t>(round_up_step(base, layer.step));
-    }
-    while (capacity < required) {
-        const size_t doubled = capacity * 2;
-        if (doubled <= capacity) {
-            throw std::invalid_argument("[cache] kv cache capacity exceeded");
-        }
-        capacity = doubled;
-    }
-    return static_cast<int>(capacity);
-}
-
-} // namespace
+#include "cache_utils.h"
 
 extern "C" {
 
@@ -111,7 +70,7 @@ void mlx_cache_update_and_fetch_bfloat16(
 
     // Initialize backing storage or grow geometrically as needed.
     if (layer.k_bfloat16 == nullptr) {
-        const int capacity = next_cache_capacity(layer, required, 0);
+        const int capacity = mlx_next_cache_capacity(layer, required, 0, "[cache]");
         Shape k_shape = {batch, n_kv_heads, capacity, k_head_dim};
         Shape v_shape = {batch, n_kv_heads, capacity, v_head_dim};
         layer.k_bfloat16 = new array(zeros(k_shape, k_new_arr.dtype()));
@@ -119,7 +78,7 @@ void mlx_cache_update_and_fetch_bfloat16(
     } else {
         const int current_capacity = layer.k_bfloat16->shape(2);
         if (required > static_cast<size_t>(current_capacity)) {
-            const int new_capacity = next_cache_capacity(layer, required, current_capacity);
+            const int new_capacity = mlx_next_cache_capacity(layer, required, current_capacity, "[cache]");
             Shape new_k_shape = {batch, n_kv_heads, new_capacity, k_head_dim};
             Shape new_v_shape = {batch, n_kv_heads, new_capacity, v_head_dim};
             array new_k = zeros(new_k_shape, layer.k_bfloat16->dtype());

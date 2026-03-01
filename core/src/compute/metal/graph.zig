@@ -9,6 +9,8 @@ const std = @import("std");
 
 /// Opaque handle to MLX array (GPU memory)
 pub const ArrayHandle = ?*anyopaque;
+pub const MambaCacheHandle = ?*anyopaque;
+pub const ShortConvCacheHandle = ?*anyopaque;
 
 // ============================================================================
 // Array Pool - call reset() before each forward pass to reuse allocations
@@ -267,6 +269,57 @@ pub extern fn mlx_lazy_slice_update(
     ends: [*]const c_int,
     ndim: usize,
 ) ArrayHandle;
+
+/// Fused ShortConv mixer (dense/bfloat16 path)
+pub extern fn mlx_lazy_shortconv_mixer_bf16(
+    input: ArrayHandle,
+    in_proj: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    out_proj: ArrayHandle,
+    shortconv_cache: ShortConvCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) ArrayHandle;
+
+/// ShortConv recurrent state cache lifecycle
+pub extern fn mlx_shortconv_cache_create(n_layers: usize) ShortConvCacheHandle;
+pub extern fn mlx_shortconv_cache_reset(cache: ShortConvCacheHandle) void;
+pub extern fn mlx_shortconv_cache_free(cache: ShortConvCacheHandle) void;
+
+/// Fused Mamba block (dense/bfloat16 path)
+pub extern fn mlx_lazy_mamba_block_bf16(
+    input: ArrayHandle,
+    ln1_weight: ArrayHandle,
+    in_proj: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    a_log: ArrayHandle,
+    d_skip: ArrayHandle,
+    dt_bias: ArrayHandle,
+    norm_weight: ArrayHandle,
+    out_proj: ArrayHandle,
+    ln2_weight: ArrayHandle,
+    gate_up: ArrayHandle,
+    down_proj: ArrayHandle,
+    use_gelu: bool,
+    residual_multiplier: f32,
+    norm_eps: f32,
+    mamba_cache: MambaCacheHandle,
+    layer_idx: usize,
+    d_state: usize,
+    d_conv: usize,
+    n_heads: usize,
+    d_head: usize,
+    n_groups: usize,
+    gate_up_layout: u8,
+) ArrayHandle;
+
+/// Mamba recurrent state cache lifecycle
+pub extern fn mlx_mamba_cache_create(n_layers: usize) MambaCacheHandle;
+pub extern fn mlx_mamba_cache_reset(cache: MambaCacheHandle) void;
+pub extern fn mlx_mamba_cache_free(cache: MambaCacheHandle) void;
 
 // ============================================================================
 // Graph Execution
@@ -655,4 +708,819 @@ test "getShape returns ndim and shape entries" {
     try std.testing.expectEqual(@as(usize, 2), ndim);
     try std.testing.expectEqual(@as(usize, 2), out_shape[0]);
     try std.testing.expectEqual(@as(usize, 2), out_shape[1]);
+}
+
+test "mlx_lazy_mamba_block_bf16 prefill matches token-by-token path" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const seq_len: usize = 4;
+    const d_state: usize = 1;
+    const d_conv: usize = 2;
+    const n_heads: usize = 1;
+    const d_head: usize = 1;
+    const n_groups: usize = 1;
+
+    const ln1_w_data = [_]f32{1.0};
+    const in_proj_data = [_]f32{ 0.6, -0.2, 0.4, -0.3, 0.1 }; // [d_model=1, proj=5]
+    const conv_weight_data = [_]f32{
+        0.10, 0.20,  -0.05,
+        0.05, -0.15, 0.12,
+    }; // [d_conv=2, xbc_len=3]
+    const conv_bias_data = [_]f32{ 0.01, -0.02, 0.03 };
+    const a_log_data = [_]f32{-1.2};
+    const d_skip_data = [_]f32{0.5};
+    const dt_bias_data = [_]f32{-0.6};
+    const out_proj_data = [_]f32{0.9}; // [d_inner=1, d_model=1]
+    const input_seq_data = [_]f32{ 0.2, -0.1, 0.3, -0.25 }; // [1, L, 1]
+
+    const s1 = [_]i64{1};
+    const in_proj_shape = [_]i64{ 1, 5 };
+    const conv_weight_shape = [_]i64{ 2, 3 };
+    const s3 = [_]i64{3};
+    const out_proj_shape = [_]i64{ 1, 1 };
+    const input_seq_shape = [_]i64{ 1, @intCast(seq_len), 1 };
+    const input_tok_shape = [_]i64{ 1, 1, 1 };
+
+    const ln1_w = createArrayF32(&ln1_w_data, &s1);
+    defer freeArray(ln1_w);
+    const in_proj = createArrayF32(&in_proj_data, &in_proj_shape);
+    defer freeArray(in_proj);
+    const conv_weight = createArrayF32(&conv_weight_data, &conv_weight_shape);
+    defer freeArray(conv_weight);
+    const conv_bias = createArrayF32(&conv_bias_data, &s3);
+    defer freeArray(conv_bias);
+    const a_log = createArrayF32(&a_log_data, &s1);
+    defer freeArray(a_log);
+    const d_skip = createArrayF32(&d_skip_data, &s1);
+    defer freeArray(d_skip);
+    const dt_bias = createArrayF32(&dt_bias_data, &s1);
+    defer freeArray(dt_bias);
+    const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
+    defer freeArray(out_proj);
+
+    const prefill_cache = mlx_mamba_cache_create(1);
+    defer mlx_mamba_cache_free(prefill_cache);
+    const step_cache = mlx_mamba_cache_create(1);
+    defer mlx_mamba_cache_free(step_cache);
+
+    const input_seq = createArrayF32(&input_seq_data, &input_seq_shape);
+    defer freeArray(input_seq);
+    const prefill_out = mlx_lazy_mamba_block_bf16(
+        input_seq,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        null,
+        out_proj,
+        null,
+        null,
+        null,
+        false,
+        1.0,
+        1.0e-5,
+        prefill_cache,
+        0,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+        0,
+    );
+    defer freeArray(prefill_out);
+
+    var prefill_eval_handles = [_]ArrayHandle{prefill_out};
+    eval(&prefill_eval_handles);
+
+    var prefill_host: [seq_len]f32 = undefined;
+    copyToHost(prefill_out, &prefill_host);
+
+    var step_host: [seq_len]f32 = undefined;
+    for (input_seq_data, 0..) |tok, i| {
+        const token_data = [_]f32{tok};
+        const input_tok = createArrayF32(&token_data, &input_tok_shape);
+        const step_out = mlx_lazy_mamba_block_bf16(
+            input_tok,
+            ln1_w,
+            in_proj,
+            conv_weight,
+            conv_bias,
+            a_log,
+            d_skip,
+            dt_bias,
+            null,
+            out_proj,
+            null,
+            null,
+            null,
+            false,
+            1.0,
+            1.0e-5,
+            step_cache,
+            0,
+            d_state,
+            d_conv,
+            n_heads,
+            d_head,
+            n_groups,
+            0,
+        );
+
+        var step_eval_handles = [_]ArrayHandle{step_out};
+        eval(&step_eval_handles);
+        var step_scalar: [1]f32 = undefined;
+        copyToHost(step_out, &step_scalar);
+        step_host[i] = step_scalar[0];
+
+        freeArray(step_out);
+        freeArray(input_tok);
+    }
+
+    for (prefill_host, step_host) |prefill_value, step_value| {
+        try std.testing.expectApproxEqAbs(prefill_value, step_value, 1.0e-3);
+    }
+}
+
+test "mlx_lazy_shortconv_mixer_bf16 prefill matches token-by-token path" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const seq_len: usize = 5;
+    const d_model: usize = 2;
+    const d_conv: usize = 3;
+    const conv_dim: usize = 2;
+
+    const input_seq_data = [_]f32{
+        0.2,  -0.1,
+        0.3,  0.05,
+        -0.2, 0.4,
+        0.1,  -0.3,
+        0.25, 0.15,
+    }; // [1, 5, 2]
+    const in_proj_data = [_]f32{
+        0.7,  -0.1,
+        -0.2, 0.4,
+        0.3,  0.5,
+        -0.4, 0.2,
+        0.1,  -0.6,
+        0.2,  0.3,
+    }; // [3*conv_dim=6, d_model=2]
+    const conv_weight_data = [_]f32{
+        0.2,   -0.1, 0.05,
+        -0.15, 0.25, 0.1,
+    }; // [conv_dim=2, d_conv=3]
+    const conv_bias_data = [_]f32{ 0.01, -0.03 };
+    const out_proj_data = [_]f32{
+        0.8, -0.2,
+        0.1, 0.6,
+    }; // [d_model=2, conv_dim=2]
+
+    const input_seq_shape = [_]i64{ 1, @intCast(seq_len), @intCast(d_model) };
+    const input_tok_shape = [_]i64{ 1, 1, @intCast(d_model) };
+    const in_proj_shape = [_]i64{ 3 * @as(i64, @intCast(conv_dim)), @intCast(d_model) };
+    const conv_weight_shape = [_]i64{ @intCast(conv_dim), @intCast(d_conv) };
+    const conv_bias_shape = [_]i64{@intCast(conv_dim)};
+    const out_proj_shape = [_]i64{ @intCast(d_model), @intCast(conv_dim) };
+
+    const input_seq = createArrayF32(&input_seq_data, &input_seq_shape);
+    defer freeArray(input_seq);
+    const in_proj = createArrayF32(&in_proj_data, &in_proj_shape);
+    defer freeArray(in_proj);
+    const conv_weight = createArrayF32(&conv_weight_data, &conv_weight_shape);
+    defer freeArray(conv_weight);
+    const conv_bias = createArrayF32(&conv_bias_data, &conv_bias_shape);
+    defer freeArray(conv_bias);
+    const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
+    defer freeArray(out_proj);
+
+    const prefill_cache = mlx_shortconv_cache_create(1);
+    defer mlx_shortconv_cache_free(prefill_cache);
+    const step_cache = mlx_shortconv_cache_create(1);
+    defer mlx_shortconv_cache_free(step_cache);
+
+    const prefill_out = mlx_lazy_shortconv_mixer_bf16(
+        input_seq,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        out_proj,
+        prefill_cache,
+        0,
+        d_conv,
+        conv_dim,
+    );
+    defer freeArray(prefill_out);
+
+    var prefill_eval_handles = [_]ArrayHandle{prefill_out};
+    eval(&prefill_eval_handles);
+
+    var prefill_host: [seq_len * d_model]f32 = undefined;
+    copyToHost(prefill_out, &prefill_host);
+
+    var step_host: [seq_len * d_model]f32 = undefined;
+    for (0..seq_len) |i| {
+        const token_data = [_]f32{
+            input_seq_data[i * d_model],
+            input_seq_data[i * d_model + 1],
+        };
+        const input_tok = createArrayF32(&token_data, &input_tok_shape);
+        const step_out = mlx_lazy_shortconv_mixer_bf16(
+            input_tok,
+            in_proj,
+            conv_weight,
+            conv_bias,
+            out_proj,
+            step_cache,
+            0,
+            d_conv,
+            conv_dim,
+        );
+
+        var step_eval_handles = [_]ArrayHandle{step_out};
+        eval(&step_eval_handles);
+
+        var out_tok: [d_model]f32 = undefined;
+        copyToHost(step_out, &out_tok);
+        step_host[i * d_model] = out_tok[0];
+        step_host[i * d_model + 1] = out_tok[1];
+
+        freeArray(step_out);
+        freeArray(input_tok);
+    }
+
+    for (prefill_host, step_host) |prefill_value, step_value| {
+        try std.testing.expectApproxEqAbs(prefill_value, step_value, 1.0e-3);
+    }
+}
+
+test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next token" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const seq_len: usize = 5;
+    const chunk_len: usize = 2;
+    const rem_len: usize = seq_len - chunk_len;
+    const d_state: usize = 1;
+    const d_conv: usize = 2;
+    const n_heads: usize = 1;
+    const d_head: usize = 1;
+    const n_groups: usize = 1;
+
+    const ln1_w_data = [_]f32{1.0};
+    const in_proj_data = [_]f32{ 0.6, -0.2, 0.4, -0.3, 0.1 };
+    const conv_weight_data = [_]f32{
+        0.10, 0.20,  -0.05,
+        0.05, -0.15, 0.12,
+    };
+    const conv_bias_data = [_]f32{ 0.01, -0.02, 0.03 };
+    const a_log_data = [_]f32{-1.2};
+    const d_skip_data = [_]f32{0.5};
+    const dt_bias_data = [_]f32{-0.6};
+    const out_proj_data = [_]f32{0.9};
+    const input_seq_data = [_]f32{ 0.2, -0.1, 0.3, -0.25, 0.15 };
+    const next_token_data = [_]f32{-0.05};
+
+    const s1 = [_]i64{1};
+    const in_proj_shape = [_]i64{ 1, 5 };
+    const conv_weight_shape = [_]i64{ 2, 3 };
+    const s3 = [_]i64{3};
+    const out_proj_shape = [_]i64{ 1, 1 };
+    const input_seq_shape = [_]i64{ 1, @intCast(seq_len), 1 };
+    const chunk_shape = [_]i64{ 1, @intCast(chunk_len), 1 };
+    const rem_shape = [_]i64{ 1, @intCast(rem_len), 1 };
+    const input_tok_shape = [_]i64{ 1, 1, 1 };
+
+    const input_seq = createArrayF32(&input_seq_data, &input_seq_shape);
+    defer freeArray(input_seq);
+    const input_chunk = createArrayF32(input_seq_data[0..chunk_len], &chunk_shape);
+    defer freeArray(input_chunk);
+    const input_rem = createArrayF32(input_seq_data[chunk_len..], &rem_shape);
+    defer freeArray(input_rem);
+    const input_next = createArrayF32(&next_token_data, &input_tok_shape);
+    defer freeArray(input_next);
+
+    const ln1_w = createArrayF32(&ln1_w_data, &s1);
+    defer freeArray(ln1_w);
+    const in_proj = createArrayF32(&in_proj_data, &in_proj_shape);
+    defer freeArray(in_proj);
+    const conv_weight = createArrayF32(&conv_weight_data, &conv_weight_shape);
+    defer freeArray(conv_weight);
+    const conv_bias = createArrayF32(&conv_bias_data, &s3);
+    defer freeArray(conv_bias);
+    const a_log = createArrayF32(&a_log_data, &s1);
+    defer freeArray(a_log);
+    const d_skip = createArrayF32(&d_skip_data, &s1);
+    defer freeArray(d_skip);
+    const dt_bias = createArrayF32(&dt_bias_data, &s1);
+    defer freeArray(dt_bias);
+    const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
+    defer freeArray(out_proj);
+
+    const full_cache = mlx_mamba_cache_create(1);
+    defer mlx_mamba_cache_free(full_cache);
+    const chunk_cache = mlx_mamba_cache_create(1);
+    defer mlx_mamba_cache_free(chunk_cache);
+
+    const full_out = mlx_lazy_mamba_block_bf16(
+        input_seq,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        null,
+        out_proj,
+        null,
+        null,
+        null,
+        false,
+        1.0,
+        1.0e-5,
+        full_cache,
+        0,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+        0,
+    );
+    defer freeArray(full_out);
+    var full_eval = [_]ArrayHandle{full_out};
+    eval(&full_eval);
+
+    var full_host: [seq_len]f32 = undefined;
+    copyToHost(full_out, &full_host);
+
+    const chunk_out_1 = mlx_lazy_mamba_block_bf16(
+        input_chunk,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        null,
+        out_proj,
+        null,
+        null,
+        null,
+        false,
+        1.0,
+        1.0e-5,
+        chunk_cache,
+        0,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+        0,
+    );
+    defer freeArray(chunk_out_1);
+    var chunk_eval_1 = [_]ArrayHandle{chunk_out_1};
+    eval(&chunk_eval_1);
+
+    const chunk_out_2 = mlx_lazy_mamba_block_bf16(
+        input_rem,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        null,
+        out_proj,
+        null,
+        null,
+        null,
+        false,
+        1.0,
+        1.0e-5,
+        chunk_cache,
+        0,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+        0,
+    );
+    defer freeArray(chunk_out_2);
+    var chunk_eval_2 = [_]ArrayHandle{chunk_out_2};
+    eval(&chunk_eval_2);
+
+    var chunk_host_1: [chunk_len]f32 = undefined;
+    var chunk_host_2: [rem_len]f32 = undefined;
+    copyToHost(chunk_out_1, &chunk_host_1);
+    copyToHost(chunk_out_2, &chunk_host_2);
+
+    var stitched: [seq_len]f32 = undefined;
+    for (0..chunk_len) |i| stitched[i] = chunk_host_1[i];
+    for (0..rem_len) |i| stitched[chunk_len + i] = chunk_host_2[i];
+
+    for (full_host, stitched) |full_value, chunked_value| {
+        try std.testing.expectApproxEqAbs(full_value, chunked_value, 1.0e-3);
+    }
+
+    const full_next = mlx_lazy_mamba_block_bf16(
+        input_next,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        null,
+        out_proj,
+        null,
+        null,
+        null,
+        false,
+        1.0,
+        1.0e-5,
+        full_cache,
+        0,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+        0,
+    );
+    defer freeArray(full_next);
+    var full_next_eval = [_]ArrayHandle{full_next};
+    eval(&full_next_eval);
+    var full_next_host: [1]f32 = undefined;
+    copyToHost(full_next, &full_next_host);
+
+    const chunk_next = mlx_lazy_mamba_block_bf16(
+        input_next,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        null,
+        out_proj,
+        null,
+        null,
+        null,
+        false,
+        1.0,
+        1.0e-5,
+        chunk_cache,
+        0,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+        0,
+    );
+    defer freeArray(chunk_next);
+    var chunk_next_eval = [_]ArrayHandle{chunk_next};
+    eval(&chunk_next_eval);
+    var chunk_next_host: [1]f32 = undefined;
+    copyToHost(chunk_next, &chunk_next_host);
+
+    try std.testing.expectApproxEqAbs(full_next_host[0], chunk_next_host[0], 1.0e-3);
+}
+
+test "mamba op count scales sublinearly across sequence lengths" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const d_state: usize = 1;
+    const d_conv: usize = 2;
+    const n_heads: usize = 1;
+    const d_head: usize = 1;
+    const n_groups: usize = 1;
+
+    const ln1_w_data = [_]f32{1.0};
+    const in_proj_data = [_]f32{ 0.6, -0.2, 0.4, -0.3, 0.1 };
+    const conv_weight_data = [_]f32{
+        0.10, 0.20,  -0.05,
+        0.05, -0.15, 0.12,
+    };
+    const conv_bias_data = [_]f32{ 0.01, -0.02, 0.03 };
+    const a_log_data = [_]f32{-1.2};
+    const d_skip_data = [_]f32{0.5};
+    const dt_bias_data = [_]f32{-0.6};
+    const out_proj_data = [_]f32{0.9};
+    const input_max_data = [_]f32{
+        0.2,  -0.1,  0.3,  -0.25, 0.15,  -0.05, 0.4,   -0.3,
+        0.11, -0.08, 0.06, 0.19,  -0.12, 0.09,  -0.02, 0.07,
+    };
+
+    const s1 = [_]i64{1};
+    const in_proj_shape = [_]i64{ 1, 5 };
+    const conv_weight_shape = [_]i64{ 2, 3 };
+    const s3 = [_]i64{3};
+    const out_proj_shape = [_]i64{ 1, 1 };
+
+    const ln1_w = createArrayF32(&ln1_w_data, &s1);
+    defer freeArray(ln1_w);
+    const in_proj = createArrayF32(&in_proj_data, &in_proj_shape);
+    defer freeArray(in_proj);
+    const conv_weight = createArrayF32(&conv_weight_data, &conv_weight_shape);
+    defer freeArray(conv_weight);
+    const conv_bias = createArrayF32(&conv_bias_data, &s3);
+    defer freeArray(conv_bias);
+    const a_log = createArrayF32(&a_log_data, &s1);
+    defer freeArray(a_log);
+    const d_skip = createArrayF32(&d_skip_data, &s1);
+    defer freeArray(d_skip);
+    const dt_bias = createArrayF32(&dt_bias_data, &s1);
+    defer freeArray(dt_bias);
+    const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
+    defer freeArray(out_proj);
+
+    const cache = mlx_mamba_cache_create(1);
+    defer mlx_mamba_cache_free(cache);
+
+    const seq_small: usize = 2;
+    const seq_large: usize = 16;
+    const shape_small = [_]i64{ 1, @intCast(seq_small), 1 };
+    const shape_large = [_]i64{ 1, @intCast(seq_large), 1 };
+
+    const run_count = struct {
+        fn run(
+            input_data: []const f32,
+            shape: []const i64,
+            cache_handle: MambaCacheHandle,
+            ln1_weight: ArrayHandle,
+            in_proj_weight: ArrayHandle,
+            conv_w: ArrayHandle,
+            conv_b: ArrayHandle,
+            a_log_arr: ArrayHandle,
+            d_skip_arr: ArrayHandle,
+            dt_bias_arr: ArrayHandle,
+            out_proj_weight: ArrayHandle,
+            d_state_: usize,
+            d_conv_: usize,
+            n_heads_: usize,
+            d_head_: usize,
+            n_groups_: usize,
+        ) usize {
+            mlx_mamba_cache_reset(cache_handle);
+            const input = createArrayF32(input_data, shape);
+            defer freeArray(input);
+            mlx_start_counting();
+            const out = mlx_lazy_mamba_block_bf16(
+                input,
+                ln1_weight,
+                in_proj_weight,
+                conv_w,
+                conv_b,
+                a_log_arr,
+                d_skip_arr,
+                dt_bias_arr,
+                null,
+                out_proj_weight,
+                null,
+                null,
+                null,
+                false,
+                1.0,
+                1.0e-5,
+                cache_handle,
+                0,
+                d_state_,
+                d_conv_,
+                n_heads_,
+                d_head_,
+                n_groups_,
+                0,
+            );
+            defer freeArray(out);
+            var handles = [_]ArrayHandle{out};
+            eval(&handles);
+            return mlx_stop_counting();
+        }
+    };
+
+    _ = run_count.run(
+        input_max_data[0..seq_small],
+        &shape_small,
+        cache,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        out_proj,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+    );
+    const ops_small = run_count.run(
+        input_max_data[0..seq_small],
+        &shape_small,
+        cache,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        out_proj,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+    );
+    _ = run_count.run(
+        input_max_data[0..seq_large],
+        &shape_large,
+        cache,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        out_proj,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+    );
+    const ops_large = run_count.run(
+        input_max_data[0..seq_large],
+        &shape_large,
+        cache,
+        ln1_w,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        a_log,
+        d_skip,
+        dt_bias,
+        out_proj,
+        d_state,
+        d_conv,
+        n_heads,
+        d_head,
+        n_groups,
+    );
+
+    try std.testing.expect(ops_small > 0);
+    try std.testing.expect(ops_large <= (ops_small * 3 + 32));
+}
+
+test "shortconv op count scales sublinearly across sequence lengths" {
+    if (comptime builtin.os.tag != .macos) return;
+    if (!device_mod.isAvailable()) return;
+
+    const d_model: usize = 2;
+    const d_conv: usize = 3;
+    const conv_dim: usize = 2;
+    const seq_small: usize = 2;
+    const seq_large: usize = 16;
+
+    const input_max_data = [_]f32{
+        0.2,   -0.1,  0.3,   0.05,  -0.2,  0.4,   0.1,   -0.3,
+        0.25,  0.15,  -0.14, 0.08,  0.06,  -0.07, 0.11,  0.09,
+        -0.12, 0.03,  0.21,  -0.17, 0.05,  0.04,  -0.09, 0.02,
+        0.18,  -0.16, 0.07,  0.01,  -0.03, 0.13,  0.22,  -0.05,
+    }; // [1,16,2]
+    const in_proj_data = [_]f32{
+        0.7,  -0.1,
+        -0.2, 0.4,
+        0.3,  0.5,
+        -0.4, 0.2,
+        0.1,  -0.6,
+        0.2,  0.3,
+    }; // [6,2]
+    const conv_weight_data = [_]f32{
+        0.2,   -0.1, 0.05,
+        -0.15, 0.25, 0.1,
+    }; // [2,3]
+    const conv_bias_data = [_]f32{ 0.01, -0.03 };
+    const out_proj_data = [_]f32{
+        0.8, -0.2,
+        0.1, 0.6,
+    }; // [2,2]
+
+    const in_proj_shape = [_]i64{ 3 * @as(i64, @intCast(conv_dim)), @intCast(d_model) };
+    const conv_weight_shape = [_]i64{ @intCast(conv_dim), @intCast(d_conv) };
+    const conv_bias_shape = [_]i64{@intCast(conv_dim)};
+    const out_proj_shape = [_]i64{ @intCast(d_model), @intCast(conv_dim) };
+    const input_small_shape = [_]i64{ 1, @intCast(seq_small), @intCast(d_model) };
+    const input_large_shape = [_]i64{ 1, @intCast(seq_large), @intCast(d_model) };
+
+    const in_proj = createArrayF32(&in_proj_data, &in_proj_shape);
+    defer freeArray(in_proj);
+    const conv_weight = createArrayF32(&conv_weight_data, &conv_weight_shape);
+    defer freeArray(conv_weight);
+    const conv_bias = createArrayF32(&conv_bias_data, &conv_bias_shape);
+    defer freeArray(conv_bias);
+    const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
+    defer freeArray(out_proj);
+
+    const cache = mlx_shortconv_cache_create(1);
+    defer mlx_shortconv_cache_free(cache);
+
+    const run_count = struct {
+        fn run(
+            input_data: []const f32,
+            shape: []const i64,
+            cache_handle: ShortConvCacheHandle,
+            in_proj_weight: ArrayHandle,
+            conv_w: ArrayHandle,
+            conv_b: ArrayHandle,
+            out_proj_weight: ArrayHandle,
+            d_conv_: usize,
+            conv_dim_: usize,
+        ) usize {
+            mlx_shortconv_cache_reset(cache_handle);
+            const input = createArrayF32(input_data, shape);
+            defer freeArray(input);
+            mlx_start_counting();
+            const out = mlx_lazy_shortconv_mixer_bf16(
+                input,
+                in_proj_weight,
+                conv_w,
+                conv_b,
+                out_proj_weight,
+                cache_handle,
+                0,
+                d_conv_,
+                conv_dim_,
+            );
+            defer freeArray(out);
+            var handles = [_]ArrayHandle{out};
+            eval(&handles);
+            return mlx_stop_counting();
+        }
+    };
+
+    _ = run_count.run(
+        input_max_data[0 .. seq_small * d_model],
+        &input_small_shape,
+        cache,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        out_proj,
+        d_conv,
+        conv_dim,
+    );
+    const ops_small = run_count.run(
+        input_max_data[0 .. seq_small * d_model],
+        &input_small_shape,
+        cache,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        out_proj,
+        d_conv,
+        conv_dim,
+    );
+    _ = run_count.run(
+        input_max_data[0 .. seq_large * d_model],
+        &input_large_shape,
+        cache,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        out_proj,
+        d_conv,
+        conv_dim,
+    );
+    const ops_large = run_count.run(
+        input_max_data[0 .. seq_large * d_model],
+        &input_large_shape,
+        cache,
+        in_proj,
+        conv_weight,
+        conv_bias,
+        out_proj,
+        d_conv,
+        conv_dim,
+    );
+
+    try std.testing.expect(ops_small > 0);
+    try std.testing.expect(ops_large <= (ops_small * 3 + 32));
 }

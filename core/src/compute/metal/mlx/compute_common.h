@@ -6,8 +6,8 @@
 // - array pool declarations
 // - shared compile-time constants
 //
-// Runtime state containers (for example slotted history/cache structs) must live
-// outside compute and be owned by inference runtime code.
+// Runtime state containers for the MLX backend live in model_state.h alongside
+// this compute bridge code to keep includes local to core/src/compute/metal/mlx.
 
 #pragma once
 
