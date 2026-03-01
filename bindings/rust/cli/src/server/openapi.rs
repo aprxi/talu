@@ -7,8 +7,8 @@ use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
 use crate::server::{
-    code, db, events, file, files, handlers, http, plugins, projects, proxy, repo, responses,
-    responses_types, search, sessions, settings, tags,
+    agent_fs, code, db, events, file, files, handlers, http, plugins, projects, proxy, repo,
+    responses, responses_types, search, sessions, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -39,6 +39,7 @@ use crate::server::{
         (name = "Proxy", description = "Plugin outbound HTTP proxy"),
         (name = "Repository", description = "Model cache management (list, search, download, delete)"),
         (name = "Code", description = "Tree-sitter code analysis and incremental parsing"),
+        (name = "Agent::FS", description = "Workspace filesystem capabilities"),
     ),
     security(
         ("gateway_secret" = []),
@@ -48,6 +49,14 @@ use crate::server::{
         // Models + responses
         handlers::handle_models,
         responses::handle_create,
+        agent_fs::handle_read,
+        agent_fs::handle_write,
+        agent_fs::handle_edit,
+        agent_fs::handle_stat,
+        agent_fs::handle_list,
+        agent_fs::handle_remove,
+        agent_fs::handle_mkdir,
+        agent_fs::handle_rename,
         events::handle_replay,
         events::handle_stream,
         events::handle_topics,
@@ -170,6 +179,24 @@ use crate::server::{
         responses_types::ResponseResource,
         responses_types::ResponsesErrorResponse,
         responses_types::ResponsesErrorBody,
+        // Agent::FS
+        agent_fs::FsReadRequest,
+        agent_fs::FsReadResponse,
+        agent_fs::FsWriteRequest,
+        agent_fs::FsWriteResponse,
+        agent_fs::FsEditRequest,
+        agent_fs::FsEditResponse,
+        agent_fs::FsStatRequest,
+        agent_fs::FsStatResponse,
+        agent_fs::FsListRequest,
+        agent_fs::FsListResponse,
+        agent_fs::FsListEntry,
+        agent_fs::FsRemoveRequest,
+        agent_fs::FsRemoveResponse,
+        agent_fs::FsMkdirRequest,
+        agent_fs::FsMkdirResponse,
+        agent_fs::FsRenameRequest,
+        agent_fs::FsRenameResponse,
         // Events
         events::EventCorrelation,
         events::EventEnvelope,

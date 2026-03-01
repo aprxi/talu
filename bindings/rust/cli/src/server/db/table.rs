@@ -193,7 +193,9 @@ pub async fn handle_write_row(
     let ns = match parse_namespace(&path) {
         Ok(ns) => ns,
         Err(Some(resp)) => return resp,
-        Err(None) => return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace"),
+        Err(None) => {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace")
+        }
     };
 
     let body = match read_json_body::<WriteRowRequest>(req).await {
@@ -274,7 +276,9 @@ pub async fn handle_scan(
     let ns = match parse_namespace(&path) {
         Ok(ns) => ns,
         Err(Some(resp)) => return resp,
-        Err(None) => return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace"),
+        Err(None) => {
+            return json_error(StatusCode::BAD_REQUEST, "invalid_path", "missing namespace")
+        }
     };
 
     let query = req
@@ -567,7 +571,9 @@ pub async fn handle_scan_post(
                 "le" => Ok(FilterOp::Le),
                 "gt" => Ok(FilterOp::Gt),
                 "ge" => Ok(FilterOp::Ge),
-                other => Err(format!("invalid filter op '{other}'; expected eq/ne/lt/le/gt/ge")),
+                other => Err(format!(
+                    "invalid filter op '{other}'; expected eq/ne/lt/le/gt/ge"
+                )),
             }?;
             Ok(ColumnFilter {
                 column_id: f.column_id,
@@ -704,7 +710,11 @@ pub async fn handle_get_policy(
     let data = match std::fs::read(&policy_path) {
         Ok(d) => d,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return json_error(StatusCode::NOT_FOUND, "not_found", "no policy for this namespace")
+            return json_error(
+                StatusCode::NOT_FOUND,
+                "not_found",
+                "no policy for this namespace",
+            )
         }
         Err(e) => {
             return json_error(
@@ -780,8 +790,7 @@ fn parse_namespace_and_hash(path: &str) -> Option<(String, u64)> {
     if parts.next().is_some() {
         return None;
     }
-    let decoded_hash = percent_encoding::percent_decode_str(hash_str)
-        .decode_utf8_lossy();
+    let decoded_hash = percent_encoding::percent_decode_str(hash_str).decode_utf8_lossy();
     let hash: u64 = decoded_hash.parse().ok()?;
     let decoded_ns = percent_encoding::percent_decode_str(ns)
         .decode_utf8_lossy()
@@ -990,7 +999,13 @@ async fn read_json_body<T: serde::de::DeserializeOwned>(
         .into_body()
         .collect()
         .await
-        .map_err(|_| json_error(StatusCode::BAD_REQUEST, "invalid_body", "Failed to read body"))?
+        .map_err(|_| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "invalid_body",
+                "Failed to read body",
+            )
+        })?
         .to_bytes();
     serde_json::from_slice(&body).map_err(|e| {
         json_error(
@@ -1063,8 +1078,10 @@ fn decode_hex(hex: &str) -> Result<Vec<u8>, String> {
     }
     let mut out = Vec::with_capacity(hex.len() / 2);
     for chunk in hex.as_bytes().chunks(2) {
-        let hi = hex_nibble(chunk[0]).ok_or_else(|| format!("invalid hex char '{}'", chunk[0] as char))?;
-        let lo = hex_nibble(chunk[1]).ok_or_else(|| format!("invalid hex char '{}'", chunk[1] as char))?;
+        let hi = hex_nibble(chunk[0])
+            .ok_or_else(|| format!("invalid hex char '{}'", chunk[0] as char))?;
+        let lo = hex_nibble(chunk[1])
+            .ok_or_else(|| format!("invalid hex char '{}'", chunk[1] as char))?;
         out.push((hi << 4) | lo);
     }
     Ok(out)

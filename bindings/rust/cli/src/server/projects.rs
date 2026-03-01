@@ -99,7 +99,10 @@ fn open_documents(
     })?;
 
     let path = match auth {
-        Some(ctx) => bucket.join(&ctx.storage_prefix).join("tables").join("documents"),
+        Some(ctx) => bucket
+            .join(&ctx.storage_prefix)
+            .join("tables")
+            .join("documents"),
         None => bucket.join("tables").join("documents"),
     };
 

@@ -62,10 +62,7 @@ fn json_params_to_sql(
                     })?;
                     floats.push(f as f32);
                 }
-                let bytes: Vec<u8> = floats
-                    .iter()
-                    .flat_map(|f| f.to_le_bytes())
-                    .collect();
+                let bytes: Vec<u8> = floats.iter().flat_map(|f| f.to_le_bytes()).collect();
                 blob_bufs.push(bytes);
                 let buf = blob_bufs.last().unwrap();
                 params.push(SqlParam::blob(buf));

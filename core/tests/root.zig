@@ -107,6 +107,9 @@ pub const policy = @import("policy/root.zig");
 // agent (tool registry + agent loop orchestration)
 pub const agent = @import("agent/root.zig");
 
+// agent filesystem (workspace sandbox + fs operations)
+pub const fs = @import("fs/root.zig");
+
 // image (decode/convert/model_input/encode/capi)
 pub const image = @import("image/root.zig");
 

@@ -14,7 +14,11 @@ fn create_collection(ctx: &ServerTestContext, name: &str, dims: u32) {
             "dims": dims
         }),
     );
-    assert_eq!(resp.status, 201, "status={}, body={}", resp.status, resp.body);
+    assert_eq!(
+        resp.status, 201,
+        "status={}, body={}",
+        resp.status, resp.body
+    );
 }
 
 fn post_json_with_headers(
@@ -1155,8 +1159,15 @@ fn build_indexes_requires_non_empty_body_and_positive_max_segments() {
             "max_segments": 0
         }),
     );
-    assert_eq!(zero_max_segments.status, 400, "body: {}", zero_max_segments.body);
-    assert_eq!(zero_max_segments.json()["error"]["code"], "invalid_argument");
+    assert_eq!(
+        zero_max_segments.status, 400,
+        "body: {}",
+        zero_max_segments.body
+    );
+    assert_eq!(
+        zero_max_segments.json()["error"]["code"],
+        "invalid_argument"
+    );
 }
 
 #[test]
@@ -1202,7 +1213,10 @@ fn stats_changes_and_compact_return_not_found_for_missing_collection() {
     assert_eq!(stats.status, 404, "body: {}", stats.body);
     assert_eq!(stats.json()["error"]["code"], "collection_not_found");
 
-    let changes = get(ctx.addr(), "/v1/db/vectors/collections/missing/changes?since=0&limit=10");
+    let changes = get(
+        ctx.addr(),
+        "/v1/db/vectors/collections/missing/changes?since=0&limit=10",
+    );
     assert_eq!(changes.status, 404, "body: {}", changes.body);
     assert_eq!(changes.json()["error"]["code"], "collection_not_found");
 
@@ -1314,12 +1328,9 @@ fn changes_since_filters_out_older_events() {
     assert_eq!(filtered.status, 200, "body: {}", filtered.body);
     let filtered_data = filtered.json()["data"].as_array().expect("data").clone();
     assert!(
-        filtered_data.iter().all(|event| {
-            event["seq"]
-                .as_u64()
-                .expect("event seq")
-                > first_seq
-        }),
+        filtered_data
+            .iter()
+            .all(|event| { event["seq"].as_u64().expect("event seq") > first_seq }),
         "all returned seq values must be strictly greater than since"
     );
     assert!(
@@ -1435,7 +1446,11 @@ fn upsert_and_delete_support_idempotency_replay_and_conflict() {
             ]
         }),
     );
-    assert_eq!(upsert_conflict.status, 409, "body: {}", upsert_conflict.body);
+    assert_eq!(
+        upsert_conflict.status, 409,
+        "body: {}",
+        upsert_conflict.body
+    );
     assert_eq!(
         upsert_conflict.json()["error"]["code"],
         "idempotency_conflict"
@@ -1469,7 +1484,11 @@ fn upsert_and_delete_support_idempotency_replay_and_conflict() {
             "ids": [1]
         }),
     );
-    assert_eq!(delete_conflict.status, 409, "body: {}", delete_conflict.body);
+    assert_eq!(
+        delete_conflict.status, 409,
+        "body: {}",
+        delete_conflict.body
+    );
     assert_eq!(
         delete_conflict.json()["error"]["code"],
         "idempotency_conflict"

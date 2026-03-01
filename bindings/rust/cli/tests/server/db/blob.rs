@@ -116,7 +116,10 @@ fn blob_list_returns_hashes_and_honors_limit() {
     assert_eq!(limited.status, 200, "body: {}", limited.body);
     let limited_json = limited.json();
     assert_eq!(limited_json["count"], 1);
-    assert_eq!(limited_json["data"].as_array().expect("data array").len(), 1);
+    assert_eq!(
+        limited_json["data"].as_array().expect("data array").len(),
+        1
+    );
 }
 
 #[test]
@@ -145,7 +148,10 @@ fn blob_list_negative_limit_falls_back_to_default() {
     let resp = get(ctx.addr(), "/v1/db/blobs?limit=-1");
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let json = resp.json();
-    assert_eq!(json["count"], 2, "negative limit should use default listing");
+    assert_eq!(
+        json["count"], 2,
+        "negative limit should use default listing"
+    );
     assert_eq!(json["data"].as_array().expect("data array").len(), 2);
 }
 
@@ -213,7 +219,10 @@ fn blob_get_rejects_prefixed_sha256_reference() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
-    let resp = get(ctx.addr(), &format!("/v1/db/blobs/sha256:{}", "a".repeat(64)));
+    let resp = get(
+        ctx.addr(),
+        &format!("/v1/db/blobs/sha256:{}", "a".repeat(64)),
+    );
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     assert_eq!(resp.json()["error"]["code"], "invalid_argument");
 }
@@ -301,10 +310,7 @@ fn blob_list_is_tenant_isolated() {
     let refs_a = list_a_json["data"].as_array().expect("tenant-a data");
     assert_eq!(refs_a.len(), 1, "tenant-a should see exactly one blob");
     let expected_a = format!("sha256:{hash_a}");
-    assert_eq!(
-        refs_a[0].as_str(),
-        Some(expected_a.as_str())
-    );
+    assert_eq!(refs_a[0].as_str(), Some(expected_a.as_str()));
 
     let list_b = get_with_headers(ctx.addr(), "/v1/db/blobs", &tenant_b);
     assert_eq!(list_b.status, 200, "body: {}", list_b.body);
@@ -312,10 +318,7 @@ fn blob_list_is_tenant_isolated() {
     let refs_b = list_b_json["data"].as_array().expect("tenant-b data");
     assert_eq!(refs_b.len(), 1, "tenant-b should see exactly one blob");
     let expected_b = format!("sha256:{hash_b}");
-    assert_eq!(
-        refs_b[0].as_str(),
-        Some(expected_b.as_str())
-    );
+    assert_eq!(refs_b[0].as_str(), Some(expected_b.as_str()));
 }
 
 #[test]
@@ -353,8 +356,7 @@ fn blob_get_is_tenant_scoped_for_same_hash() {
     let list_a = get_with_headers(ctx.addr(), "/v1/db/blobs", &tenant_a);
     assert_eq!(list_a.status, 200, "body: {}", list_a.body);
     assert!(
-        list_a
-            .json()["data"]
+        list_a.json()["data"]
             .as_array()
             .expect("data")
             .iter()

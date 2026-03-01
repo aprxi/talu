@@ -14,7 +14,11 @@ fn known_db_paths_with_wrong_methods_return_not_implemented() {
     assert_eq!(sql_get.json()["error"]["code"], "not_implemented");
 
     let sql_explain_get = send_request(ctx.addr(), "GET", "/v1/db/sql/explain", &[], None);
-    assert_eq!(sql_explain_get.status, 501, "body: {}", sql_explain_get.body);
+    assert_eq!(
+        sql_explain_get.status, 501,
+        "body: {}",
+        sql_explain_get.body
+    );
     assert_eq!(sql_explain_get.json()["error"]["code"], "not_implemented");
 
     let blobs_post = send_request(
@@ -80,7 +84,11 @@ fn known_dynamic_db_paths_with_wrong_methods_return_not_implemented() {
         &[],
         None,
     );
-    assert_eq!(vector_query_get.status, 501, "body: {}", vector_query_get.body);
+    assert_eq!(
+        vector_query_get.status, 501,
+        "body: {}",
+        vector_query_get.body
+    );
     assert_eq!(
         vector_query_get.json()["error"]["code"],
         "not_implemented",
@@ -94,6 +102,13 @@ fn known_dynamic_db_paths_with_wrong_methods_return_not_implemented() {
         &[("Content-Type", "application/json")],
         Some(r#"{"query":"hello"}"#),
     );
-    assert_eq!(table_search_patch.status, 501, "body: {}", table_search_patch.body);
-    assert_eq!(table_search_patch.json()["error"]["code"], "not_implemented");
+    assert_eq!(
+        table_search_patch.status, 501,
+        "body: {}",
+        table_search_patch.body
+    );
+    assert_eq!(
+        table_search_patch.json()["error"]["code"],
+        "not_implemented"
+    );
 }

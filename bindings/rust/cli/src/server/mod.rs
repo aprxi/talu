@@ -7,6 +7,7 @@ use clap::Args;
 use log::LevelFilter;
 use talu::blobs::BlobsHandle;
 
+pub mod agent_fs;
 pub mod auth_gateway;
 pub mod code;
 pub mod code_ws;
@@ -132,7 +133,9 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     }
 
     let backend_state = if let Some(ref model_id) = model {
-        let kv_root = bucket_path.as_ref().map(|b| b.join("kv").to_string_lossy().into_owned());
+        let kv_root = bucket_path
+            .as_ref()
+            .map(|b| b.join("kv").to_string_lossy().into_owned());
         let backend = crate::provider::create_backend_for_model(model_id, kv_root.as_deref())?;
         state::BackendState {
             backend: Some(backend),
@@ -145,6 +148,16 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         }
     };
 
+    let workspace_dir = std::env::var_os("TALU_WORKSPACE_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| std::env::current_dir().expect("current dir"));
+    let workspace_dir = workspace_dir.canonicalize().with_context(|| {
+        format!(
+            "canonicalize agent fs workspace path: {}",
+            workspace_dir.display()
+        )
+    })?;
+
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
         configured_model: model,
@@ -152,6 +165,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         gateway_secret,
         tenant_registry,
         bucket_path,
+        workspace_dir,
         html_dir: args.html_dir,
         plugin_tokens: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         max_file_upload_bytes: args.max_file_upload_bytes,

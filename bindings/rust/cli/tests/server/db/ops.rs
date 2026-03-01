@@ -128,7 +128,11 @@ fn compact_validates_request_body_fields() {
         "/v1/db/ops/compact",
         &json!({"collection": "   ", "dims": 3}),
     );
-    assert_eq!(missing_collection.status, 400, "body: {}", missing_collection.body);
+    assert_eq!(
+        missing_collection.status, 400,
+        "body: {}",
+        missing_collection.body
+    );
     assert_eq!(
         missing_collection.json()["error"]["code"],
         "invalid_argument"
@@ -163,7 +167,11 @@ fn simulate_crash_validates_collection_field() {
         "/v1/db/ops/simulate_crash",
         &json!({"collection": ""}),
     );
-    assert_eq!(missing_collection.status, 400, "body: {}", missing_collection.body);
+    assert_eq!(
+        missing_collection.status, 400,
+        "body: {}",
+        missing_collection.body
+    );
     assert_eq!(
         missing_collection.json()["error"]["code"],
         "invalid_argument"

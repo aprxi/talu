@@ -17,6 +17,7 @@ use tower_service::Service;
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::server::agent_fs;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
@@ -92,6 +93,8 @@ static OPENAPI_DB_SQL_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/sql/"]));
 static OPENAPI_DB_OPS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/ops/"]));
+static OPENAPI_AGENT_FS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/fs/"]));
 
 // Console UI assets — only compiled in when `make ui` has been run.
 // build.rs sets cfg(bundled_ui) when ui/dist/ contains the required files.
@@ -260,6 +263,11 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_DB_OPS_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/agent/fs.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_FS_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/docs") => docs_hub_response(),
                 (Method::GET, "/docs/chat") => {
                     swagger_ui_response("/openapi/chat.json", "Talu API :: Chat")
@@ -315,6 +323,9 @@ impl Service<Request<Incoming>> for Router {
                 }
                 (Method::GET, "/docs/db/ops") => {
                     swagger_ui_response("/openapi/db/ops.json", "Talu API :: DB::Ops")
+                }
+                (Method::GET, "/docs/agent/fs") => {
+                    swagger_ui_response("/openapi/agent/fs.json", "Talu API :: Agent::FS")
                 }
                 // Console UI (auth-exempt)
                 (Method::GET, "/") => {
@@ -376,6 +387,30 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/responses") => {
                             responses::handle_create(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/read") => {
+                            agent_fs::handle_read(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/write") => {
+                            agent_fs::handle_write(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/edit") => {
+                            agent_fs::handle_edit(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/stat") => {
+                            agent_fs::handle_stat(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/ls") => {
+                            agent_fs::handle_list(state, req, auth).await
+                        }
+                        (Method::DELETE, "/v1/agent/fs/rm") => {
+                            agent_fs::handle_remove(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/mkdir") => {
+                            agent_fs::handle_mkdir(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/fs/rename") => {
+                            agent_fs::handle_rename(state, req, auth).await
                         }
                         (Method::GET, "/v1/events") => {
                             events::handle_replay(state, req, auth).await
@@ -461,12 +496,18 @@ impl Service<Request<Incoming>> for Router {
                         (Method::GET, "/v1/providers") => {
                             providers::handle_list(state, req, auth).await
                         }
-                        (Method::GET, p) if p.starts_with("/v1/providers/") && p.ends_with("/models") => {
-                            let name = p["/v1/providers/".len()..p.len() - "/models".len()].to_string();
+                        (Method::GET, p)
+                            if p.starts_with("/v1/providers/") && p.ends_with("/models") =>
+                        {
+                            let name =
+                                p["/v1/providers/".len()..p.len() - "/models".len()].to_string();
                             providers::handle_list_models(state, req, auth, name).await
                         }
-                        (Method::POST, p) if p.starts_with("/v1/providers/") && p.ends_with("/health") => {
-                            let name = p["/v1/providers/".len()..p.len() - "/health".len()].to_string();
+                        (Method::POST, p)
+                            if p.starts_with("/v1/providers/") && p.ends_with("/health") =>
+                        {
+                            let name =
+                                p["/v1/providers/".len()..p.len() - "/health".len()].to_string();
                             providers::handle_health(state, req, auth, name).await
                         }
                         (Method::PATCH, p) if p.starts_with("/v1/providers/") => {
@@ -1377,6 +1418,11 @@ a:hover {
           <td class="mono"><a href="/docs/files"><code>files</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/files.json" title="/openapi/files.json">json</a><button class="copy-btn" data-url="/openapi/files.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">File upload/list/get plus stateless inspect and transform APIs.</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/agent/fs"><code>agent/fs</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Workspace filesystem runtime APIs (`/v1/agent/fs/*`).</td>
         </tr>
         <tr>
           <td class="mono"><a href="/docs/repo"><code>repo</code></a></td>

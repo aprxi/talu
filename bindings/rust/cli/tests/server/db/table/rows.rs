@@ -66,7 +66,10 @@ fn write_row_with_policy(
 }
 
 fn scan_rows(addr: std::net::SocketAddr, ns: &str, schema_id: u16) -> HttpResponse {
-    get(addr, &format!("/v1/db/tables/{ns}/rows?schema_id={schema_id}"))
+    get(
+        addr,
+        &format!("/v1/db/tables/{ns}/rows?schema_id={schema_id}"),
+    )
 }
 
 fn scan_rows_with_headers(
@@ -232,13 +235,19 @@ fn rows_storage_is_tenant_isolated_by_storage_prefix() {
 
     let scan_a_again = scan_rows_with_headers(ctx.addr(), "shared_ns", 10, &tenant_a);
     assert_eq!(scan_a_again.status, 200, "body: {}", scan_a_again.body);
-    let rows_a_again = scan_a_again.json()["rows"].as_array().expect("rows").clone();
+    let rows_a_again = scan_a_again.json()["rows"]
+        .as_array()
+        .expect("rows")
+        .clone();
     assert_eq!(rows_a_again.len(), 1);
     assert_eq!(rows_a_again[0]["payload"], "from-a");
 
     let scan_b_again = scan_rows_with_headers(ctx.addr(), "shared_ns", 10, &tenant_b);
     assert_eq!(scan_b_again.status, 200, "body: {}", scan_b_again.body);
-    let rows_b_again = scan_b_again.json()["rows"].as_array().expect("rows").clone();
+    let rows_b_again = scan_b_again.json()["rows"]
+        .as_array()
+        .expect("rows")
+        .clone();
     assert_eq!(rows_b_again.len(), 1);
     assert_eq!(rows_b_again[0]["payload"], "from-b");
 }
@@ -461,7 +470,10 @@ fn get_row_returns_null_for_missing_hash() {
         "/v1/db/tables/missns/rows/9999999999?schema_id=10",
     );
     assert_eq!(resp.status, 200, "get: {}", resp.body);
-    assert!(resp.json()["row"].is_null(), "row should be null for missing hash");
+    assert!(
+        resp.json()["row"].is_null(),
+        "row should be null for missing hash"
+    );
 }
 
 // =============================================================================
@@ -490,10 +502,7 @@ fn delete_row_hides_from_get() {
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 1);
     let scalars = rows[0]["scalars"].as_array().expect("scalars");
-    let hash = scalars
-        .iter()
-        .find(|s| s["column_id"] == 1)
-        .expect("col 1")["value"]
+    let hash = scalars.iter().find(|s| s["column_id"] == 1).expect("col 1")["value"]
         .as_u64()
         .expect("hash");
 
@@ -503,13 +512,13 @@ fn delete_row_hides_from_get() {
         &format!("/v1/db/tables/delns/rows/{hash}?schema_id=10"),
     );
     assert_eq!(resp.status, 200, "get before delete: {}", resp.body);
-    assert!(resp.json()["row"].is_object(), "row should exist before delete");
+    assert!(
+        resp.json()["row"].is_object(),
+        "row should exist before delete"
+    );
 
     // Delete.
-    let resp = delete(
-        ctx.addr(),
-        &format!("/v1/db/tables/delns/rows/{hash}"),
-    );
+    let resp = delete(ctx.addr(), &format!("/v1/db/tables/delns/rows/{hash}"));
     assert_eq!(resp.status, 200, "delete: {}", resp.body);
     assert_eq!(resp.json()["status"], "deleted");
 
@@ -598,9 +607,7 @@ fn write_rejects_invalid_column_type() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let cols = vec![
-        serde_json::json!({"column_id": 1, "type": "bogus_type", "value": 1}),
-    ];
+    let cols = vec![serde_json::json!({"column_id": 1, "type": "bogus_type", "value": 1})];
     let resp = write_row(ctx.addr(), "errns", 10, &cols);
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     assert_eq!(resp.json()["error"]["code"], "invalid_column");
@@ -627,9 +634,8 @@ fn write_rejects_type_value_mismatch() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let cols = vec![
-        serde_json::json!({"column_id": 1, "type": "scalar_u64", "value": "not_a_number"}),
-    ];
+    let cols =
+        vec![serde_json::json!({"column_id": 1, "type": "scalar_u64", "value": "not_a_number"})];
     let resp = write_row(ctx.addr(), "errns", 10, &cols);
     assert_eq!(resp.status, 400, "body: {}", resp.body);
     assert_eq!(resp.json()["error"]["code"], "invalid_column");
@@ -767,9 +773,15 @@ fn scan_cursor_pagination() {
     // Extract cursor from the last row of page 1.
     let last = &rows[1];
     let scalars = last["scalars"].as_array().expect("scalars");
-    let ts_scalar = scalars.iter().find(|s| s["column_id"] == 2).expect("ts col");
+    let ts_scalar = scalars
+        .iter()
+        .find(|s| s["column_id"] == 2)
+        .expect("ts col");
     let cursor_ts = ts_scalar["value"].as_u64().expect("cursor ts");
-    let pk_scalar = scalars.iter().find(|s| s["column_id"] == 1).expect("pk col");
+    let pk_scalar = scalars
+        .iter()
+        .find(|s| s["column_id"] == 1)
+        .expect("pk col");
     let cursor_hash = pk_scalar["value"].as_u64().expect("cursor hash");
 
     // Page 2: use cursor from page 1.
@@ -1055,10 +1067,18 @@ fn scan_accepts_delete_schema_id_param() {
         ctx.addr(),
         "/v1/db/tables/dsparam/rows?schema_id=10&delete_schema_id=2",
     );
-    assert_eq!(resp.status, 200, "scan with delete_schema_id: {}", resp.body);
+    assert_eq!(
+        resp.status, 200,
+        "scan with delete_schema_id: {}",
+        resp.body
+    );
     let json = resp.json();
     let rows = json["rows"].as_array().expect("rows");
-    assert_eq!(rows.len(), 1, "row should still be present (no tombstone written)");
+    assert_eq!(
+        rows.len(),
+        1,
+        "row should still be present (no tombstone written)"
+    );
 }
 
 // =============================================================================
@@ -1085,9 +1105,14 @@ fn delete_with_tombstone_schema_id_query_param() {
     // Discover hash.
     let resp = scan_rows(ctx.addr(), "tsqpns", 10);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
-    let hash = rows[0]["scalars"].as_array().expect("scalars")
-        .iter().find(|s| s["column_id"] == 1).expect("col 1")["value"]
-        .as_u64().expect("hash");
+    let hash = rows[0]["scalars"]
+        .as_array()
+        .expect("scalars")
+        .iter()
+        .find(|s| s["column_id"] == 1)
+        .expect("col 1")["value"]
+        .as_u64()
+        .expect("hash");
 
     // Delete using tombstone_schema_id query param.
     let resp = delete(
@@ -1103,7 +1128,10 @@ fn delete_with_tombstone_schema_id_query_param() {
         &format!("/v1/db/tables/tsqpns/rows/{hash}?schema_id=10"),
     );
     assert_eq!(resp.status, 200, "get after delete: {}", resp.body);
-    assert!(resp.json()["row"].is_null(), "row should be null after delete");
+    assert!(
+        resp.json()["row"].is_null(),
+        "row should be null after delete"
+    );
 }
 
 // =============================================================================
@@ -1129,7 +1157,10 @@ fn get_row_rejects_non_numeric_hash() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    let resp = get(ctx.addr(), "/v1/db/tables/anyns/rows/not_a_number?schema_id=10");
+    let resp = get(
+        ctx.addr(),
+        "/v1/db/tables/anyns/rows/not_a_number?schema_id=10",
+    );
     // The router won't match this to the rows/{hash} handler (hash must parse as u64),
     // so it falls through to 404.
     assert_eq!(resp.status, 404, "non-numeric hash: {}", resp.body);
@@ -1232,8 +1263,11 @@ fn post_scan_with_extra_columns() {
     let resp = scan_rows(ctx.addr(), "extrans", 10);
     assert_eq!(resp.status, 200, "default scan: {}", resp.body);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
-    let has_col5 = rows[0]["scalars"].as_array().expect("scalars")
-        .iter().any(|s| s["column_id"] == 5);
+    let has_col5 = rows[0]["scalars"]
+        .as_array()
+        .expect("scalars")
+        .iter()
+        .any(|s| s["column_id"] == 5);
     assert!(!has_col5, "col 5 should not appear in default scan");
 
     // POST scan with extra_columns=[5] — col 5 SHOULD appear.
@@ -1274,8 +1308,14 @@ fn post_scan_reverse_false() {
     let json = resp.json();
     let rows = json["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0]["payload"], "old", "first should be oldest with reverse=false");
-    assert_eq!(rows[1]["payload"], "new", "second should be newest with reverse=false");
+    assert_eq!(
+        rows[0]["payload"], "old",
+        "first should be oldest with reverse=false"
+    );
+    assert_eq!(
+        rows[1]["payload"], "new",
+        "second should be newest with reverse=false"
+    );
 }
 
 /// POST scan with dedup=false returns all row versions.
@@ -1305,7 +1345,10 @@ fn post_scan_dedup_false() {
     assert_eq!(resp.status, 200, "no-dedup scan: {}", resp.body);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 2, "dedup=false should return both versions");
-    let payloads: Vec<&str> = rows.iter().map(|r| r["payload"].as_str().unwrap()).collect();
+    let payloads: Vec<&str> = rows
+        .iter()
+        .map(|r| r["payload"].as_str().unwrap())
+        .collect();
     assert_eq!(payloads[0], "v2", "newest version first");
     assert_eq!(payloads[1], "v1", "oldest version second");
 }
@@ -1341,9 +1384,16 @@ fn post_scan_additional_schema_ids() {
     assert_eq!(resp.status, 200, "multi-schema scan: {}", resp.body);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 2, "should see rows from both schemas");
-    let mut payloads: Vec<&str> = rows.iter().map(|r| r["payload"].as_str().unwrap()).collect();
+    let mut payloads: Vec<&str> = rows
+        .iter()
+        .map(|r| r["payload"].as_str().unwrap())
+        .collect();
     payloads.sort();
-    assert_eq!(payloads, vec!["schema-10", "schema-11"], "should contain both schema rows");
+    assert_eq!(
+        payloads,
+        vec!["schema-10", "schema-11"],
+        "should contain both schema rows"
+    );
 }
 
 /// POST scan requires schema_id.
@@ -1475,8 +1525,13 @@ fn get_policy() {
     assert_eq!(pol["dedup_column_id"], 1);
     assert_eq!(pol["ts_column_id"], 2);
     assert_eq!(pol["tombstone_schema_id"], 2);
-    let ids = pol["active_schema_ids"].as_array().expect("active_schema_ids");
-    assert!(ids.contains(&serde_json::json!(10)), "active_schema_ids should include 10");
+    let ids = pol["active_schema_ids"]
+        .as_array()
+        .expect("active_schema_ids");
+    assert!(
+        ids.contains(&serde_json::json!(10)),
+        "active_schema_ids should include 10"
+    );
 }
 
 /// Read policy returns 404 for nonexistent namespace.
@@ -1578,8 +1633,14 @@ fn post_scan_custom_ts_column_id() {
     assert_eq!(resp.status, 200);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     let scalars = rows[0]["scalars"].as_array().expect("scalars");
-    assert!(scalars.iter().any(|s| s["column_id"] == 2), "default: col 2 in scalars");
-    assert!(!scalars.iter().any(|s| s["column_id"] == 4), "default: col 4 NOT in scalars");
+    assert!(
+        scalars.iter().any(|s| s["column_id"] == 2),
+        "default: col 2 in scalars"
+    );
+    assert!(
+        !scalars.iter().any(|s| s["column_id"] == 4),
+        "default: col 4 NOT in scalars"
+    );
 
     // Custom ts_column_id=4 — col 4 should appear in scalars.
     let body = serde_json::json!({"schema_id": 10, "ts_column_id": 4});
@@ -1587,7 +1648,10 @@ fn post_scan_custom_ts_column_id() {
     assert_eq!(resp.status, 200);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     let scalars = rows[0]["scalars"].as_array().expect("scalars");
-    assert!(scalars.iter().any(|s| s["column_id"] == 4), "custom: col 4 in scalars");
+    assert!(
+        scalars.iter().any(|s| s["column_id"] == 4),
+        "custom: col 4 in scalars"
+    );
     let col4 = scalars.iter().find(|s| s["column_id"] == 4).unwrap();
     // First row is row-B (reverse=true, ordered by policy ts_column=2, B has ts=2000>1000).
     assert_eq!(col4["value"], 8000_u64, "row-B should have col 4 = 8000");
@@ -1608,9 +1672,14 @@ fn get_row_with_legacy_hash() {
 
     let resp = scan_rows(ctx.addr(), "legns", 10);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
-    let hash = rows[0]["scalars"].as_array().expect("scalars")
-        .iter().find(|s| s["column_id"] == 1).expect("col 1")["value"]
-        .as_u64().expect("hash");
+    let hash = rows[0]["scalars"]
+        .as_array()
+        .expect("scalars")
+        .iter()
+        .find(|s| s["column_id"] == 1)
+        .expect("col 1")["value"]
+        .as_u64()
+        .expect("hash");
 
     // Wrong primary hash but correct legacy_hash → should find the row.
     let resp = get(
@@ -1618,13 +1687,19 @@ fn get_row_with_legacy_hash() {
         &format!("/v1/db/tables/legns/rows/99999?schema_id=10&legacy_hash={hash}"),
     );
     assert_eq!(resp.status, 200, "legacy get: {}", resp.body);
-    assert!(resp.json()["row"].is_object(), "legacy_hash should find the row");
+    assert!(
+        resp.json()["row"].is_object(),
+        "legacy_hash should find the row"
+    );
     assert_eq!(resp.json()["row"]["payload"], "legacy test");
 
     // Wrong primary hash and no legacy_hash → should NOT find.
     let resp = get(ctx.addr(), "/v1/db/tables/legns/rows/99999?schema_id=10");
     assert_eq!(resp.status, 200);
-    assert!(resp.json()["row"].is_null(), "without legacy_hash, should not find");
+    assert!(
+        resp.json()["row"].is_null(),
+        "without legacy_hash, should not find"
+    );
 }
 
 // =============================================================================
@@ -1657,9 +1732,11 @@ fn post_scan_cursor_pagination() {
     let last = &rows[1];
     let scalars = last["scalars"].as_array().expect("scalars");
     let cursor_ts = scalars.iter().find(|s| s["column_id"] == 2).expect("ts")["value"]
-        .as_u64().expect("ts val");
+        .as_u64()
+        .expect("ts val");
     let cursor_hash = scalars.iter().find(|s| s["column_id"] == 1).expect("pk")["value"]
-        .as_u64().expect("pk val");
+        .as_u64()
+        .expect("pk val");
 
     // Page 2: cursor via POST body.
     let body = serde_json::json!({
@@ -1724,7 +1801,10 @@ fn post_scan_custom_dedup_column_id() {
     assert_eq!(resp.status, 200);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 2, "dedup on col 1 should see both rows");
-    let mut payloads: Vec<&str> = rows.iter().map(|r| r["payload"].as_str().unwrap()).collect();
+    let mut payloads: Vec<&str> = rows
+        .iter()
+        .map(|r| r["payload"].as_str().unwrap())
+        .collect();
     payloads.sort();
     assert_eq!(payloads, vec!["new-version", "old-version"]);
 }
@@ -1752,7 +1832,10 @@ fn post_scan_filter_ne() {
     assert_eq!(resp.status, 200);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 2, "ne should exclude one row");
-    let payloads: Vec<&str> = rows.iter().map(|r| r["payload"].as_str().unwrap()).collect();
+    let payloads: Vec<&str> = rows
+        .iter()
+        .map(|r| r["payload"].as_str().unwrap())
+        .collect();
     assert!(!payloads.contains(&"key-20"), "key-20 should be excluded");
     assert!(payloads.contains(&"key-10"));
     assert!(payloads.contains(&"key-30"));
@@ -1823,12 +1906,18 @@ fn post_scan_with_custom_payload_column_id() {
     let body = serde_json::json!({"schema_id": 10});
     let resp = post_json(ctx.addr(), "/v1/db/tables/postpayns/rows/scan", &body);
     assert_eq!(resp.status, 200);
-    assert_eq!(resp.json()["rows"].as_array().expect("rows").clone()[0]["payload"], "col-20");
+    assert_eq!(
+        resp.json()["rows"].as_array().expect("rows").clone()[0]["payload"],
+        "col-20"
+    );
 
     let body = serde_json::json!({"schema_id": 10, "payload_column_id": 30});
     let resp = post_json(ctx.addr(), "/v1/db/tables/postpayns/rows/scan", &body);
     assert_eq!(resp.status, 200);
-    assert_eq!(resp.json()["rows"].as_array().expect("rows").clone()[0]["payload"], "col-30");
+    assert_eq!(
+        resp.json()["rows"].as_array().expect("rows").clone()[0]["payload"],
+        "col-30"
+    );
 }
 
 /// POST scan with delete_schema_id passes the parameter through.
@@ -1890,8 +1979,15 @@ fn meta_namespace_not_intercepted_by_docs() {
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
     let resp = get(ctx.addr(), "/v1/db/tables/_meta/namespaces");
-    assert_eq!(resp.status, 200, "should be handled by meta endpoint: {}", resp.body);
-    assert!(resp.json()["namespaces"].is_array(), "should have namespaces array");
+    assert_eq!(
+        resp.status, 200,
+        "should be handled by meta endpoint: {}",
+        resp.body
+    );
+    assert!(
+        resp.json()["namespaces"].is_array(),
+        "should have namespaces array"
+    );
 }
 
 // =============================================================================
@@ -1904,7 +2000,12 @@ fn post_scan_combined_features() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(documents_config(temp.path()));
 
-    for (key, ts, col5_val) in [(1, 1000, 100), (2, 2000, 200), (3, 3000, 300), (4, 4000, 400)] {
+    for (key, ts, col5_val) in [
+        (1, 1000, 100),
+        (2, 2000, 200),
+        (3, 3000, 300),
+        (4, 4000, 400),
+    ] {
         let cols = vec![
             serde_json::json!({"column_id": 1, "type": "scalar_u64", "value": key}),
             serde_json::json!({"column_id": 2, "type": "scalar_i64", "value": ts}),
@@ -1933,15 +2034,29 @@ fn post_scan_combined_features() {
     assert_eq!(rows.len(), 2, "filter should select keys 2 and 3");
 
     // reverse=false → oldest first.
-    assert_eq!(rows[0]["payload"], "row-2", "oldest first with reverse=false");
-    assert_eq!(rows[1]["payload"], "row-3", "newest second with reverse=false");
+    assert_eq!(
+        rows[0]["payload"], "row-2",
+        "oldest first with reverse=false"
+    );
+    assert_eq!(
+        rows[1]["payload"], "row-3",
+        "newest second with reverse=false"
+    );
 
     // extra_columns=[5] → col 5 should appear in scalars with correct values.
-    let col5_row2 = rows[0]["scalars"].as_array().unwrap()
-        .iter().find(|s| s["column_id"] == 5).expect("col 5 in row-2");
+    let col5_row2 = rows[0]["scalars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["column_id"] == 5)
+        .expect("col 5 in row-2");
     assert_eq!(col5_row2["value"], 200);
-    let col5_row3 = rows[1]["scalars"].as_array().unwrap()
-        .iter().find(|s| s["column_id"] == 5).expect("col 5 in row-3");
+    let col5_row3 = rows[1]["scalars"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["column_id"] == 5)
+        .expect("col 5 in row-3");
     assert_eq!(col5_row3["value"], 300);
 }
 
@@ -2086,7 +2201,10 @@ fn post_scan_limit_one() {
     let rows = json["rows"].as_array().expect("rows");
     assert_eq!(rows.len(), 1, "limit=1 should return exactly 1 row");
     assert_eq!(json["has_more"], true);
-    assert_eq!(rows[0]["payload"], "row-3", "newest first (reverse=true default)");
+    assert_eq!(
+        rows[0]["payload"], "row-3",
+        "newest first (reverse=true default)"
+    );
 }
 
 /// GET policy with ttl_column_id verifies all fields roundtrip.
@@ -2116,7 +2234,9 @@ fn get_policy_with_ttl() {
     assert_eq!(pol["dedup_column_id"], 3);
     assert_eq!(pol["ts_column_id"], 4);
     assert_eq!(pol["tombstone_schema_id"], 2);
-    let ids = pol["active_schema_ids"].as_array().expect("active_schema_ids");
+    let ids = pol["active_schema_ids"]
+        .as_array()
+        .expect("active_schema_ids");
     assert!(ids.contains(&serde_json::json!(10)));
     assert!(ids.contains(&serde_json::json!(11)));
 }
@@ -2168,10 +2288,18 @@ fn delete_row_hides_from_scan() {
     let resp = scan_rows(ctx.addr(), "delscanns", 10);
     let rows = resp.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 2);
-    let remove_row = rows.iter().find(|r| r["payload"] == "remove").expect("find remove");
-    let hash = remove_row["scalars"].as_array().expect("scalars")
-        .iter().find(|s| s["column_id"] == 1).expect("col 1")["value"]
-        .as_u64().expect("hash");
+    let remove_row = rows
+        .iter()
+        .find(|r| r["payload"] == "remove")
+        .expect("find remove");
+    let hash = remove_row["scalars"]
+        .as_array()
+        .expect("scalars")
+        .iter()
+        .find(|s| s["column_id"] == 1)
+        .expect("col 1")["value"]
+        .as_u64()
+        .expect("hash");
 
     // Delete the "remove" row.
     let resp = delete(ctx.addr(), &format!("/v1/db/tables/delscanns/rows/{hash}"));
@@ -2291,10 +2419,7 @@ fn row_hash_path_params_are_percent_decoded_for_get_and_delete() {
     let rows = scan.json()["rows"].as_array().expect("rows").clone();
     assert_eq!(rows.len(), 1, "expected exactly one row");
     let scalars = rows[0]["scalars"].as_array().expect("scalars");
-    let hash = scalars
-        .iter()
-        .find(|s| s["column_id"] == 1)
-        .expect("col 1")["value"]
+    let hash = scalars.iter().find(|s| s["column_id"] == 1).expect("col 1")["value"]
         .as_u64()
         .expect("hash");
     assert_eq!(hash, 123, "dedup key should match written value");

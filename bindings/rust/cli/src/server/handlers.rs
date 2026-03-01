@@ -1319,7 +1319,11 @@ async fn stream_response(
                             p.total,
                         );
                     }));
-                match provider::create_backend_for_model_with_progress(&model_id, kv_root.as_deref(), callback) {
+                match provider::create_backend_for_model_with_progress(
+                    &model_id,
+                    kv_root.as_deref(),
+                    callback,
+                ) {
                     Ok(new_backend) => {
                         guard.backend = Some(new_backend);
                         guard.current_model = Some(model_id.clone());
@@ -2672,9 +2676,10 @@ async fn ensure_backend_for_model(state: Arc<AppState>, model_id: &str) -> Resul
         .bucket_path
         .as_ref()
         .map(|b| b.join("kv").to_string_lossy().into_owned());
-    let backend =
-        tokio::task::spawn_blocking(move || provider::create_backend_for_model(&model, db_root.as_deref()))
-            .await??;
+    let backend = tokio::task::spawn_blocking(move || {
+        provider::create_backend_for_model(&model, db_root.as_deref())
+    })
+    .await??;
 
     let mut guard = state.backend.lock().await;
     guard.backend = Some(backend);

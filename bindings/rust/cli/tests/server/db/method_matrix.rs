@@ -140,10 +140,22 @@ fn db_unsupported_methods_return_not_implemented_matrix() {
         ("PUT", "/v1/db/blobs"),
         ("PATCH", "/v1/db/blobs"),
         ("DELETE", "/v1/db/blobs"),
-        ("POST", "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        ("PUT", "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        ("PATCH", "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
-        ("DELETE", "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        (
+            "POST",
+            "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "PUT",
+            "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "PATCH",
+            "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+        (
+            "DELETE",
+            "/v1/db/blobs/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
         // SQL endpoints.
         ("GET", "/v1/db/sql/query"),
         ("PUT", "/v1/db/sql/query"),

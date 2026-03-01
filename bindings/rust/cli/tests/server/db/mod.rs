@@ -11,8 +11,8 @@ mod ops;
 mod routing;
 mod side_effects;
 mod sql;
-mod tenant_isolation;
 mod table;
+mod tenant_isolation;
 mod vector;
 
 use std::path::Path;

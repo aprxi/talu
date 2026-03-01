@@ -22,6 +22,7 @@ pub const bus = @import("bus.zig");
 pub const compaction = @import("compaction.zig");
 pub const tools = @import("tools/root.zig");
 pub const memory = @import("memory/root.zig");
+pub const fs = @import("fs/root.zig");
 
 // Re-export primary types at module level
 

@@ -58,8 +58,8 @@ fn null_output_returns_error() {
             ptr::null(),
             ptr::null(),
             ptr::null(),
-            ptr::null(), // no project_id
-            0,           // no project_id_null
+            ptr::null(),     // no project_id
+            0,               // no project_id_null
             ptr::null_mut(), // null output pointer
         )
     };

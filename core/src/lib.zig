@@ -412,6 +412,19 @@ comptime {
     _ = &capi.talu_agent_registry_count;
     _ = &capi.talu_agent_run;
 
+    // Agent filesystem API
+    _ = &capi.talu_fs_create;
+    _ = &capi.talu_fs_free;
+    _ = &capi.talu_fs_read;
+    _ = &capi.talu_fs_write;
+    _ = &capi.talu_fs_edit;
+    _ = &capi.talu_fs_stat;
+    _ = &capi.talu_fs_list;
+    _ = &capi.talu_fs_remove;
+    _ = &capi.talu_fs_mkdir;
+    _ = &capi.talu_fs_rename;
+    _ = &capi.talu_fs_free_string;
+
     // Stateful Agent API
     _ = &capi.talu_agent_create;
     _ = &capi.talu_agent_free;

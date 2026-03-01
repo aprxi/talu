@@ -235,7 +235,10 @@ fn add_tags_succeeds() {
     );
     assert_eq!(resp.status, 200, "body: {}", resp.body);
     let tags = tag_names_from_response(&resp);
-    assert!(tags.contains("important"), "missing tag 'important': {tags:?}");
+    assert!(
+        tags.contains("important"),
+        "missing tag 'important': {tags:?}"
+    );
     assert!(tags.contains("urgent"), "missing tag 'urgent': {tags:?}");
 }
 
@@ -570,11 +573,17 @@ fn tags_are_isolated_per_table_name_even_with_same_doc_id() {
     assert_eq!(get_a.status, 200, "body: {}", get_a.body);
     let tags_a = tag_names_from_response(&get_a);
     assert!(tags_a.contains("a-only"), "team_a missing tag: {tags_a:?}");
-    assert!(!tags_a.contains("b-only"), "team_a leaked team_b tag: {tags_a:?}");
+    assert!(
+        !tags_a.contains("b-only"),
+        "team_a leaked team_b tag: {tags_a:?}"
+    );
 
     let get_b = get(ctx.addr(), &format!("/v1/db/tables/team_b/{doc_id}/tags"));
     assert_eq!(get_b.status, 200, "body: {}", get_b.body);
     let tags_b = tag_names_from_response(&get_b);
     assert!(tags_b.contains("b-only"), "team_b missing tag: {tags_b:?}");
-    assert!(!tags_b.contains("a-only"), "team_b leaked team_a tag: {tags_b:?}");
+    assert!(
+        !tags_b.contains("a-only"),
+        "team_b leaked team_a tag: {tags_b:?}"
+    );
 }

@@ -52,6 +52,7 @@ pub mod convert;
 pub mod documents;
 pub mod error;
 pub mod file;
+pub mod fs;
 pub mod kv;
 pub mod logging;
 pub mod model;
@@ -89,9 +90,15 @@ pub use file::{
     FileInfo, FileKind, FitMode, ImageFormat, ImageInfo, Limits as FileLimits, OutputFormat,
     ResizeFilter, ResizeOptions, TransformOptions as FileTransformOptions, TransformResult,
 };
+pub use fs::{FsEditResult, FsError, FsHandle, FsReadResult, FsStat, FsWriteResult};
 pub use kv::{KvEntry, KvError, KvHandle, KvValue};
 pub use logging::{LogFormat, LogLevel};
 pub use model::{GenerationConfigInfo, ModelInfo, QuantMethod};
+pub use provider::{
+    provider_config_health, provider_config_list, provider_config_list_provider_models,
+    provider_config_list_remote_models, provider_config_resolve_credentials, provider_config_set,
+    ProviderCredentials, ProviderHealthResult, ProviderWithConfig,
+};
 pub use repo::{
     CacheOrigin, CachedModel, DownloadOptions, DownloadProgress, HfSearchResult,
     ProgressAction as RepoProgressAction, SearchDirection, SearchSort,
@@ -101,12 +108,7 @@ pub use sql::{SqlEngine, SqlError};
 pub use storage::{SessionRecord, StorageError, StorageHandle};
 pub use table::{
     ColumnFilter, ColumnShape, ColumnValue, CompactionPolicy, FilterOp, PhysicalType, Row,
-    ScanParams, ScanResult, ScalarColumn, TableError, TableHandle,
-};
-pub use provider::{
-    ProviderCredentials, ProviderHealthResult, ProviderWithConfig, provider_config_health,
-    provider_config_list, provider_config_list_provider_models, provider_config_list_remote_models,
-    provider_config_resolve_credentials, provider_config_set,
+    ScalarColumn, ScanParams, ScanResult, TableError, TableHandle,
 };
 pub use vector::{SearchBatchResult, VectorError, VectorStore};
 pub use xray::{TraceRecord, TraceStats, XrayCaptureHandle};

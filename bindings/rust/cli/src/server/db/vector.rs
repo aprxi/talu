@@ -521,10 +521,11 @@ pub async fn handle_append_points(
         Err(resp) => return resp,
     };
 
-    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/append") {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let collection_name =
+        match extract_collection_name_with_suffix(req.uri().path(), "/points/append") {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     let collection = match require_collection(&storage_root, &collection_name) {
         Ok(c) => c,
@@ -630,10 +631,11 @@ pub async fn handle_upsert_points(
         Err(resp) => return resp,
     };
 
-    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/upsert") {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let collection_name =
+        match extract_collection_name_with_suffix(req.uri().path(), "/points/upsert") {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     let collection = match require_collection(&storage_root, &collection_name) {
         Ok(c) => c,
@@ -730,10 +732,11 @@ pub async fn handle_delete_points(
         Err(resp) => return resp,
     };
 
-    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/delete") {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let collection_name =
+        match extract_collection_name_with_suffix(req.uri().path(), "/points/delete") {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     let collection = match require_collection(&storage_root, &collection_name) {
         Ok(c) => c,
@@ -801,10 +804,11 @@ pub async fn handle_fetch_points(
         Err(resp) => return resp,
     };
 
-    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/fetch") {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let collection_name =
+        match extract_collection_name_with_suffix(req.uri().path(), "/points/fetch") {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     let collection = match require_collection(&storage_root, &collection_name) {
         Ok(c) => c,
@@ -884,10 +888,11 @@ pub async fn handle_query_points(
         Err(resp) => return resp,
     };
 
-    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/points/query") {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let collection_name =
+        match extract_collection_name_with_suffix(req.uri().path(), "/points/query") {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     let collection = match require_collection(&storage_root, &collection_name) {
         Ok(c) => c,
@@ -1171,10 +1176,11 @@ pub async fn handle_build_collection_indexes(
         Err(resp) => return resp,
     };
 
-    let collection_name = match extract_collection_name_with_suffix(req.uri().path(), "/indexes/build") {
-        Ok(n) => n,
-        Err(resp) => return resp,
-    };
+    let collection_name =
+        match extract_collection_name_with_suffix(req.uri().path(), "/indexes/build") {
+            Ok(n) => n,
+            Err(resp) => return resp,
+        };
 
     if let Err(resp) = require_collection(&storage_root, &collection_name).map(|_| ()) {
         return resp;

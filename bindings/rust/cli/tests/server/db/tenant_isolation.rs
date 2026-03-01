@@ -94,14 +94,22 @@ fn docs_table_storage_is_tenant_isolated_even_with_same_explicit_doc_id() {
     let list_a = get_with_headers(ctx.addr(), "/v1/db/tables/documents", &tenant_a);
     assert_eq!(list_a.status, 200, "body: {}", list_a.body);
     let list_a_data = list_a.json()["data"].as_array().expect("data").clone();
-    assert_eq!(list_a_data.len(), 1, "tenant-a should only see one document");
+    assert_eq!(
+        list_a_data.len(),
+        1,
+        "tenant-a should only see one document"
+    );
     assert_eq!(list_a_data[0]["id"], "shared-id");
     assert_eq!(list_a_data[0]["title"], "tenant-a-doc");
 
     let list_b = get_with_headers(ctx.addr(), "/v1/db/tables/documents", &tenant_b);
     assert_eq!(list_b.status, 200, "body: {}", list_b.body);
     let list_b_data = list_b.json()["data"].as_array().expect("data").clone();
-    assert_eq!(list_b_data.len(), 1, "tenant-b should only see one document");
+    assert_eq!(
+        list_b_data.len(),
+        1,
+        "tenant-b should only see one document"
+    );
     assert_eq!(list_b_data[0]["id"], "shared-id");
     assert_eq!(list_b_data[0]["title"], "tenant-b-doc");
 }
@@ -216,10 +224,13 @@ fn docs_tags_are_tenant_isolated_for_same_doc_id() {
         "/v1/db/tables/documents/shared-tag-id/tags",
         &tenant_b,
     );
-    assert_eq!(tags_b_after_create.status, 200, "body: {}", tags_b_after_create.body);
     assert_eq!(
-        tags_b_after_create
-            .json()["tags"]
+        tags_b_after_create.status, 200,
+        "body: {}",
+        tags_b_after_create.body
+    );
+    assert_eq!(
+        tags_b_after_create.json()["tags"]
             .as_array()
             .expect("tags")
             .len(),

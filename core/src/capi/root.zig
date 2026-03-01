@@ -55,7 +55,7 @@ pub const file_api = @import("file.zig");
 pub const treesitter = @import("code.zig");
 
 pub const router = @import("router.zig");
-pub const agent = @import("agent.zig");
+pub const agent = @import("agent/root.zig");
 
 // Re-export Chat/session lifecycle APIs.
 pub const talu_chat_set_ttl_ts = responses.talu_chat_set_ttl_ts;
@@ -679,6 +679,8 @@ pub const TaluToolRegistry = agent.TaluToolRegistry;
 pub const CAgentLoopConfig = agent.CAgentLoopConfig;
 pub const CAgentLoopResult = agent.CAgentLoopResult;
 pub const CToolExecuteFn = agent.CToolExecuteFn;
+pub const TaluFs = agent.TaluFs;
+pub const TaluFsStat = agent.TaluFsStat;
 
 // Re-export Stateful Agent C API functions.
 pub const talu_agent_create = agent.talu_agent_create;
@@ -729,6 +731,19 @@ pub const talu_agent_bus_broadcast = agent.talu_agent_bus_broadcast;
 pub const talu_agent_bus_pending = agent.talu_agent_bus_pending;
 pub const talu_agent_bus_set_notify = agent.talu_agent_bus_set_notify;
 pub const TaluAgentBus = agent.TaluAgentBus;
+
+// Re-export Agent filesystem C API functions.
+pub const talu_fs_create = agent.talu_fs_create;
+pub const talu_fs_free = agent.talu_fs_free;
+pub const talu_fs_read = agent.talu_fs_read;
+pub const talu_fs_write = agent.talu_fs_write;
+pub const talu_fs_edit = agent.talu_fs_edit;
+pub const talu_fs_stat = agent.talu_fs_stat;
+pub const talu_fs_list = agent.talu_fs_list;
+pub const talu_fs_remove = agent.talu_fs_remove;
+pub const talu_fs_mkdir = agent.talu_fs_mkdir;
+pub const talu_fs_rename = agent.talu_fs_rename;
+pub const talu_fs_free_string = agent.talu_fs_free_string;
 
 // Re-export Tree-sitter C API functions (code parsing, highlighting, querying).
 pub const talu_treesitter_parser_create = treesitter.talu_treesitter_parser_create;

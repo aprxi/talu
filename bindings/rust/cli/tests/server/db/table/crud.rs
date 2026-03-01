@@ -182,7 +182,10 @@ fn list_respects_limit() {
     let json = resp.json();
     let data = json["data"].as_array().expect("data array");
     assert_eq!(data.len(), 2, "limit=2 should return exactly 2 items");
-    assert_eq!(json["has_more"], true, "limit=2 over 5 docs should set has_more=true");
+    assert_eq!(
+        json["has_more"], true,
+        "limit=2 over 5 docs should set has_more=true"
+    );
 }
 
 #[test]
@@ -812,7 +815,10 @@ fn get_returns_full_content() {
     let json = resp.json();
     assert_eq!(json["type"], "prompt");
     assert_eq!(json["title"], "Full Content");
-    assert_eq!(json["content"], content, "content object should round-trip exactly");
+    assert_eq!(
+        json["content"], content,
+        "content object should round-trip exactly"
+    );
 }
 
 // =============================================================================

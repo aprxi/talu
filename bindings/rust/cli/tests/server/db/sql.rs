@@ -264,10 +264,7 @@ fn query_without_params_returns_raw_json_array() {
     let body = serde_json::json!({"query": "SELECT 1 AS val, 'hello' AS msg"});
     let resp = post_json(ctx.addr(), "/v1/db/sql/query", &body);
     assert_eq!(resp.status, 200, "body: {}", resp.body);
-    assert_eq!(
-        resp.header("content-type").unwrap(),
-        "application/json",
-    );
+    assert_eq!(resp.header("content-type").unwrap(), "application/json",);
 
     // Legacy path returns a raw JSON array of row objects.
     let json = resp.json();
@@ -288,7 +285,10 @@ fn query_with_null_params_uses_legacy_path() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
-    assert!(json.is_array(), "null params should use legacy path: {json}");
+    assert!(
+        json.is_array(),
+        "null params should use legacy path: {json}"
+    );
 }
 
 #[test]
@@ -319,7 +319,10 @@ fn query_with_empty_params_uses_structured_path() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
-    assert!(json.is_object(), "empty params should use structured path: {json}");
+    assert!(
+        json.is_object(),
+        "empty params should use structured path: {json}"
+    );
     assert!(json["columns"].is_array(), "missing columns: {json}");
     assert!(json["rows"].is_array(), "missing rows: {json}");
     assert_eq!(json["row_count"], 1);
@@ -454,7 +457,11 @@ fn query_with_null_param() {
 
     let json = resp.json();
     let rows = json["rows"].as_array().unwrap();
-    assert!(rows[0]["empty"].is_null(), "expected null, got: {}", rows[0]["empty"]);
+    assert!(
+        rows[0]["empty"].is_null(),
+        "expected null, got: {}",
+        rows[0]["empty"]
+    );
 }
 
 #[test]
@@ -620,11 +627,16 @@ fn sql_vector_search_returns_results() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
-    setup_vector_collection(&ctx, "emb", 3, &[
-        (1, vec![1.0, 0.0, 0.0]),
-        (2, vec![0.0, 1.0, 0.0]),
-        (3, vec![0.0, 0.0, 1.0]),
-    ]);
+    setup_vector_collection(
+        &ctx,
+        "emb",
+        3,
+        &[
+            (1, vec![1.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0]),
+        ],
+    );
 
     let body = serde_json::json!({
         "query": "SELECT id, score FROM vector_search(?1, ?2, ?3)",
@@ -673,11 +685,16 @@ fn sql_vector_search_scores_descending() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
-    setup_vector_collection(&ctx, "emb_sort", 3, &[
-        (1, vec![1.0, 0.0, 0.0]),
-        (2, vec![0.5, 0.5, 0.0]),
-        (3, vec![0.0, 0.0, 1.0]),
-    ]);
+    setup_vector_collection(
+        &ctx,
+        "emb_sort",
+        3,
+        &[
+            (1, vec![1.0, 0.0, 0.0]),
+            (2, vec![0.5, 0.5, 0.0]),
+            (3, vec![0.0, 0.0, 1.0]),
+        ],
+    );
 
     let body = serde_json::json!({
         "query": "SELECT id, score FROM vector_search(?1, ?2, ?3)",
@@ -716,7 +733,10 @@ fn sql_vector_search_missing_collection_returns_empty() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
-    assert_eq!(json["row_count"], 0, "empty collection should return 0 rows: {json}");
+    assert_eq!(
+        json["row_count"], 0,
+        "empty collection should return 0 rows: {json}"
+    );
 }
 
 #[test]
@@ -805,7 +825,11 @@ fn sql_query_uses_tenant_scoped_storage_prefix() {
         }),
     );
     assert_eq!(query_a.status, 200, "body: {}", query_a.body);
-    assert_eq!(query_a.json()["row_count"], 1, "tenant-a should see one row");
+    assert_eq!(
+        query_a.json()["row_count"],
+        1,
+        "tenant-a should see one row"
+    );
 
     let query_b = post_json_with_headers(
         ctx.addr(),
@@ -817,7 +841,11 @@ fn sql_query_uses_tenant_scoped_storage_prefix() {
         }),
     );
     assert_eq!(query_b.status, 200, "body: {}", query_b.body);
-    assert_eq!(query_b.json()["row_count"], 0, "tenant-b should see no rows");
+    assert_eq!(
+        query_b.json()["row_count"],
+        0,
+        "tenant-b should see no rows"
+    );
 }
 
 // =============================================================================
@@ -835,7 +863,10 @@ fn error_responses_have_standard_shape() {
 
     let json = resp.json();
     assert!(json["error"].is_object(), "error should be object: {json}");
-    assert!(json["error"]["code"].is_string(), "error.code missing: {json}");
+    assert!(
+        json["error"]["code"].is_string(),
+        "error.code missing: {json}"
+    );
     assert!(
         json["error"]["message"].is_string(),
         "error.message missing: {json}"
@@ -866,9 +897,7 @@ fn explain_with_vector_search() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
-    setup_vector_collection(&ctx, "emb_explain", 3, &[
-        (1, vec![1.0, 0.0, 0.0]),
-    ]);
+    setup_vector_collection(&ctx, "emb_explain", 3, &[(1, vec![1.0, 0.0, 0.0])]);
 
     let body = serde_json::json!({
         "query": "SELECT id, score FROM vector_search(?1, ?2, ?3)",
@@ -908,11 +937,16 @@ fn sql_vector_search_with_filter_ids() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
-    setup_vector_collection(&ctx, "emb_filt", 3, &[
-        (1, vec![1.0, 0.0, 0.0]),
-        (2, vec![0.0, 1.0, 0.0]),
-        (3, vec![0.0, 0.0, 1.0]),
-    ]);
+    setup_vector_collection(
+        &ctx,
+        "emb_filt",
+        3,
+        &[
+            (1, vec![1.0, 0.0, 0.0]),
+            (2, vec![0.0, 1.0, 0.0]),
+            (3, vec![0.0, 0.0, 1.0]),
+        ],
+    );
 
     let body = serde_json::json!({
         "query": "SELECT id, score FROM vector_search(?1, ?2, ?3, ?4)",
@@ -922,7 +956,10 @@ fn sql_vector_search_with_filter_ids() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
-    assert_eq!(json["row_count"], 2, "filter_ids [1,3] should return 2 rows: {json}");
+    assert_eq!(
+        json["row_count"], 2,
+        "filter_ids [1,3] should return 2 rows: {json}"
+    );
 
     let rows = json["rows"].as_array().unwrap();
     let ids: Vec<i64> = rows.iter().map(|r| r["id"].as_i64().unwrap()).collect();
@@ -936,10 +973,12 @@ fn sql_vector_search_with_empty_filter_ids_returns_empty() {
     let temp = TempDir::new().expect("temp dir");
     let ctx = ServerTestContext::new(db_config(temp.path()));
 
-    setup_vector_collection(&ctx, "emb_filt_empty", 3, &[
-        (1, vec![1.0, 0.0, 0.0]),
-        (2, vec![0.0, 1.0, 0.0]),
-    ]);
+    setup_vector_collection(
+        &ctx,
+        "emb_filt_empty",
+        3,
+        &[(1, vec![1.0, 0.0, 0.0]), (2, vec![0.0, 1.0, 0.0])],
+    );
 
     let body = serde_json::json!({
         "query": "SELECT id, score FROM vector_search(?1, ?2, ?3, ?4)",
@@ -949,5 +988,8 @@ fn sql_vector_search_with_empty_filter_ids_returns_empty() {
     assert_eq!(resp.status, 200, "body: {}", resp.body);
 
     let json = resp.json();
-    assert_eq!(json["row_count"], 0, "empty filter_ids should return 0 rows: {json}");
+    assert_eq!(
+        json["row_count"], 0,
+        "empty filter_ids should return 0 rows: {json}"
+    );
 }

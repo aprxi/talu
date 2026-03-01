@@ -352,9 +352,7 @@ impl StorageHandle {
         let project_cstr = project_id
             .map(|p| CString::new(p))
             .transpose()
-            .map_err(|_| {
-                StorageError::InvalidArgument("project_id contains null bytes".into())
-            })?;
+            .map_err(|_| StorageError::InvalidArgument("project_id contains null bytes".into()))?;
 
         let group_ptr = group_cstr.as_ref().map_or(std::ptr::null(), |c| c.as_ptr());
         let marker_ptr = marker_cstr
@@ -439,10 +437,7 @@ impl StorageHandle {
         // Call C API
         // SAFETY: path_cstr and session_id_cstr are valid
         let result = unsafe {
-            talu_sys::talu_db_session_delete(
-                self.path_cstr.as_ptr(),
-                session_id_cstr.as_ptr(),
-            )
+            talu_sys::talu_db_session_delete(self.path_cstr.as_ptr(), session_id_cstr.as_ptr())
         };
 
         if result != ERROR_CODE_OK {
@@ -1221,9 +1216,8 @@ impl StorageHandle {
         let tag_id_cstr = CString::new(tag_id)
             .map_err(|_| StorageError::InvalidArgument("Tag ID contains null bytes".to_string()))?;
 
-        let result = unsafe {
-            talu_sys::talu_db_tag_delete(self.path_cstr.as_ptr(), tag_id_cstr.as_ptr())
-        };
+        let result =
+            unsafe { talu_sys::talu_db_tag_delete(self.path_cstr.as_ptr(), tag_id_cstr.as_ptr()) };
 
         if result != ERROR_CODE_OK {
             return Err(StorageError::from_code(result, tag_id));
@@ -1362,9 +1356,7 @@ impl StorageHandle {
             .iter()
             .map(|s| {
                 CString::new(*s).map_err(|_| {
-                    StorageError::InvalidArgument(
-                        "Session ID contains null bytes".to_string(),
-                    )
+                    StorageError::InvalidArgument("Session ID contains null bytes".to_string())
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
