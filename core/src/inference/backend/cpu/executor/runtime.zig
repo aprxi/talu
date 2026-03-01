@@ -6,7 +6,6 @@
 const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const graph_types = @import("../../../../models/op_types.zig");
-const layer_ops = @import("../../../../models/layer_ops.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
 const cpu_linalg = compute.cpu.linalg;
 const cpu_common = compute.cpu.common;
@@ -23,7 +22,6 @@ const norm = @import("../kernels/norm.zig");
 const kv_cache = @import("../kernels/kv_cache.zig");
 
 const OpType = graph_types.OpType;
-pub const BufferId = layer_ops.BufferId;
 
 pub const AttnCache = attn.AttnCache;
 pub const AttnTemp = attn.AttnTemp;
@@ -68,30 +66,22 @@ pub const SharedPersistentState = struct {
     state_blocks: []const runtime_contract.StateBlockHandle = &.{},
 };
 
-/// Number of temporary buffers available.
-/// Array index maps to BufferId enum values (except index 0):
-/// - [0] = layer_tmp (internal use for Model.forward alternating buffer)
-/// - [1] = norm_out (BufferId.norm_out = 1)
-/// - [2] = branch_out (BufferId.branch_out = 2)
-/// - [3..63] = tmp3..tmp63 (BufferId.tmp3 = 3, etc.)
-/// Note: BufferId.residual (0) is NOT stored here - it uses the model output buffer.
-pub const NUM_TMP_BUFFERS: usize = 64;
-
 /// Scratch buffers shared across transformer forward pass.
-/// Uses an array for tmp buffers to simplify allocation/deallocation.
+/// Slot arrays are dynamically sized based on compiled-plan physical mapping.
 pub const ScratchBuffer = struct {
     allocator: std.mem.Allocator,
     d_model: usize,
     d_ff: usize,
 
-    /// Unified temporary buffer array. See NUM_TMP_BUFFERS doc for index mapping.
-    /// Access via getTmp(BufferId, len) or getLayerTmp(len) for index 0.
-    tmp: [NUM_TMP_BUFFERS][]f32 = [_][]f32{&.{}} ** NUM_TMP_BUFFERS,
+    /// Temporary buffer array, dynamically sized. Slot 0 is layer_tmp
+    /// (Model.forward alternating buffer), slots 1+ are register-mapped
+    /// scratch assigned through liveness analysis.
+    tmp: [][]f32 = &.{},
     /// Per-slot width hints (in f32 elements) derived from compiled-plan
     /// physical mapping.
-    tmp_slot_width_hints: [NUM_TMP_BUFFERS]usize = [_]usize{0} ** NUM_TMP_BUFFERS,
+    tmp_slot_width_hints: []usize = &.{},
     /// Per-slot active mask. Inactive slots are not ensured.
-    tmp_slot_active: [NUM_TMP_BUFFERS]bool = [_]bool{false} ** NUM_TMP_BUFFERS,
+    tmp_slot_active: []bool = &.{},
     /// Last execution mode used to size scratch; enables deterministic
     /// prefill->decode shrink without per-token realloc churn.
     last_mode: runtime_contract.ExecutionMode = .decode,
@@ -108,20 +98,6 @@ pub const ScratchBuffer = struct {
     shortconv_scratch: ?shortconv.ShortConvScratch = null,
 
     mla_scratch: ?mla.MLATemp = null,
-
-    /// Get a temporary buffer by BufferId and length.
-    /// This is the canonical way to access scratch buffers.
-    /// Asserts that:
-    /// - id is not .residual (which uses the model output buffer, not scratch)
-    /// - the requested length fits within the allocated buffer
-    pub fn getTmp(self: *ScratchBuffer, id: BufferId, len: usize) []f32 {
-        const buffer_idx = @intFromEnum(id);
-        std.debug.assert(id != .residual); // residual uses model output, not scratch
-        std.debug.assert(buffer_idx < NUM_TMP_BUFFERS);
-        const buffer_slice = self.tmp[buffer_idx];
-        std.debug.assert(len <= buffer_slice.len); // buffer must be allocated via ensure()
-        return buffer_slice[0..len];
-    }
 
     /// Get layer_tmp buffer (internal use, index 0).
     /// This buffer is used by Model.forward for alternating input/output between layers.
@@ -140,10 +116,28 @@ pub const ScratchBuffer = struct {
         }
         var matmul_workspace = try cpu_linalg.MatmulScratch.init(allocator);
         errdefer matmul_workspace.deinit();
+
+        // Pre-allocate slot 0 (layer_tmp) so getLayerTmp is always valid.
+        const tmp = try allocator.alloc([]f32, 1);
+        errdefer allocator.free(tmp);
+        tmp[0] = &.{};
+        const width_hints = try allocator.alloc(usize, 1);
+        errdefer allocator.free(width_hints);
+        // Slot 0 is the model-level alternating residual workspace (`layer_tmp`).
+        // It must always be active before any per-block layout registration,
+        // because model.forward() uses tmp[0] directly.
+        width_hints[0] = @max(d_model, 1);
+        const active = try allocator.alloc(bool, 1);
+        errdefer allocator.free(active);
+        active[0] = true;
+
         return .{
             .allocator = allocator,
             .d_model = d_model,
             .d_ff = d_ff,
+            .tmp = tmp,
+            .tmp_slot_width_hints = width_hints,
+            .tmp_slot_active = active,
             .slot_states = slot_state_buffer,
             .matmul_scratch = matmul_workspace,
         };
@@ -160,79 +154,75 @@ pub const ScratchBuffer = struct {
 
     pub fn registerTmpLayout(
         self: *ScratchBuffer,
-        slot_width_hints: [NUM_TMP_BUFFERS]usize,
-        slot_active: [NUM_TMP_BUFFERS]bool,
-    ) void {
-        for (0..NUM_TMP_BUFFERS) |idx| {
-            if (!slot_active[idx]) continue;
-            self.tmp_slot_active[idx] = true;
-            if (slot_width_hints[idx] > self.tmp_slot_width_hints[idx]) {
-                self.tmp_slot_width_hints[idx] = slot_width_hints[idx];
+        slot_width_hints: []const usize,
+        slot_active: []const bool,
+    ) !void {
+        const required = @max(slot_width_hints.len, slot_active.len);
+        try self.ensureSlotCapacity(required);
+        for (0..required) |idx| {
+            if (idx < slot_active.len and slot_active[idx]) {
+                self.tmp_slot_active[idx] = true;
+                if (idx < slot_width_hints.len and slot_width_hints[idx] > self.tmp_slot_width_hints[idx]) {
+                    self.tmp_slot_width_hints[idx] = slot_width_hints[idx];
+                }
             }
         }
     }
 
+    fn ensureSlotCapacity(self: *ScratchBuffer, count: usize) !void {
+        if (count <= self.tmp.len) return;
+        const new_tmp = try self.allocator.alloc([]f32, count);
+        @memcpy(new_tmp[0..self.tmp.len], self.tmp);
+        @memset(new_tmp[self.tmp.len..], &.{});
+        if (self.tmp.len > 0) self.allocator.free(self.tmp);
+        self.tmp = new_tmp;
+
+        const new_hints = try self.allocator.alloc(usize, count);
+        @memcpy(new_hints[0..self.tmp_slot_width_hints.len], self.tmp_slot_width_hints);
+        @memset(new_hints[self.tmp_slot_width_hints.len..], 0);
+        if (self.tmp_slot_width_hints.len > 0) self.allocator.free(self.tmp_slot_width_hints);
+        self.tmp_slot_width_hints = new_hints;
+
+        const new_active = try self.allocator.alloc(bool, count);
+        @memcpy(new_active[0..self.tmp_slot_active.len], self.tmp_slot_active);
+        @memset(new_active[self.tmp_slot_active.len..], false);
+        if (self.tmp_slot_active.len > 0) self.allocator.free(self.tmp_slot_active);
+        self.tmp_slot_active = new_active;
+    }
+
     pub fn ensure(self: *ScratchBuffer, seq_len: usize) !void {
-        // Account for fused projections which can be larger than d_model:
-        // - Fused QKV: ~1.5x d_model (Q + K + V)
-        // - Fused gate_up: 2x d_ff (gate + up)
-        const fallback_dim = @max(self.d_model, self.d_ff * 2);
-        var has_registered_layout = false;
-        for (self.tmp_slot_active[1..]) |active| {
-            if (active) {
-                has_registered_layout = true;
-                break;
-            }
-        }
-
-        // Without a registered mapping, preserve legacy behavior and ensure all
-        // tmp buffers to the conservative fallback size.
-        if (!has_registered_layout) {
-            const full_len = seq_len * fallback_dim;
-            for (&self.tmp) |*temp_slice| {
-                try cpu_common.ensureF32Slice(self.allocator, temp_slice, full_len);
-            }
-            return;
-        }
-
-        // Ensure layer_tmp (index 0) and active mapped scratch slots.
-        for (&self.tmp, 0..) |*temp_slice, idx| {
-            if (idx != 0 and !self.tmp_slot_active[idx]) continue;
-            const width_hint = if (idx == 0 and self.tmp_slot_width_hints[0] == 0)
-                // layer_tmp (index 0) is a general scratch workspace, not a
-                // register-mapped buffer. Its size depends on model dimensions.
-                fallback_dim
-            else if (self.tmp_slot_width_hints[idx] > 0)
+        // Ensure active scratch slots; widths must come from compiled-plan
+        // tmp layout registration (no runtime sizing heuristics).
+        for (self.tmp, 0..) |*temp_slice, idx| {
+            if (!self.tmp_slot_active[idx]) continue;
+            const width_hint = if (self.tmp_slot_width_hints[idx] > 0)
                 self.tmp_slot_width_hints[idx]
             else
-                // Active mapped slots must have a valid width from
-                // buildTmpRegisterScratchMap; a zero here is a bug.
+                // Any active slot without a width is an invalid compiled layout.
                 return error.InvalidScratchLayout;
             const buffer_len = seq_len * width_hint;
-            try cpu_common.ensureF32Slice(self.allocator, temp_slice, buffer_len);
+            try cpu_common.ensureAligned64F32Slice(self.allocator, temp_slice, buffer_len);
         }
     }
 
     fn shrinkForDecodeTransition(self: *ScratchBuffer, seq_len: usize) !void {
         const decode_len = @max(seq_len, 1);
-        const fallback_dim = @max(self.d_model, self.d_ff * 2);
         const shrink_factor: usize = 4;
         const keep_factor: usize = 2;
 
-        for (&self.tmp, 0..) |*temp_slice, idx| {
-            if (idx != 0 and !self.tmp_slot_active[idx]) continue;
+        for (self.tmp, 0..) |*temp_slice, idx| {
+            if (!self.tmp_slot_active[idx]) continue;
             if (temp_slice.len == 0) continue;
-            const width_hint = if (idx == 0 and self.tmp_slot_width_hints[0] == 0)
-                fallback_dim
-            else if (self.tmp_slot_width_hints[idx] > 0)
+            const width_hint = if (self.tmp_slot_width_hints[idx] > 0)
                 self.tmp_slot_width_hints[idx]
             else
                 return error.InvalidScratchLayout;
             const decode_target_len = decode_len * width_hint;
             if (temp_slice.len <= decode_target_len * shrink_factor) continue;
             const keep_len = @max(decode_target_len * keep_factor, width_hint);
-            self.allocator.free(temp_slice.*);
-            temp_slice.* = try self.allocator.alloc(f32, keep_len);
+            cpu_common.freeAligned64F32Slice(self.allocator, temp_slice.*);
+            const aligned = try self.allocator.alignedAlloc(f32, .@"64", keep_len);
+            temp_slice.* = aligned;
         }
     }
 
@@ -245,13 +235,16 @@ pub const ScratchBuffer = struct {
     }
 
     pub fn deinit(self: *ScratchBuffer) void {
-        // Free all temporary buffers in a single loop
-        for (&self.tmp) |*temp_slice| {
+        // Free all temporary buffer contents.
+        for (self.tmp) |temp_slice| {
             if (temp_slice.len > 0) {
-                self.allocator.free(temp_slice.*);
-                temp_slice.* = &.{};
+                cpu_common.freeAligned64F32Slice(self.allocator, temp_slice);
             }
         }
+        // Free the dynamic slot arrays.
+        if (self.tmp.len > 0) self.allocator.free(self.tmp);
+        if (self.tmp_slot_width_hints.len > 0) self.allocator.free(self.tmp_slot_width_hints);
+        if (self.tmp_slot_active.len > 0) self.allocator.free(self.tmp_slot_active);
 
         self.attn_scratch.deinit(self.allocator);
         for (self.slot_states) |*slot_state| {

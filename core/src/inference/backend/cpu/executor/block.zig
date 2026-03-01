@@ -46,23 +46,17 @@ const CpuKernel = cpu_forward.CpuKernel;
 
 const addIntoScaled = cpu_forward.addIntoScaled;
 const copyTensor = cpu_forward.copyTensor;
-const TMP_BUFFER_MAP_LEN: usize = 64;
-const MAX_INSTRUCTION_TENSOR_HANDLES: usize = 16;
+// Optional dispatch observability. Keep disabled by default so production
+// execution adds zero atomic overhead in the token loop.
+const enable_dispatch_observability: bool = false;
 var layer_program_dispatch_counters = runtime_contract.DispatchCounters{};
 
 const TmpRegisterLayout = struct {
-    map: [TMP_BUFFER_MAP_LEN]u8,
-    slot_width_hints: [TMP_BUFFER_MAP_LEN]usize,
-    slot_active: [TMP_BUFFER_MAP_LEN]bool,
+    map: []u8,
+    slot_count: usize,
+    slot_width_hints: []usize,
+    slot_active: []bool,
 };
-
-fn identityTmpRegisterMap() [TMP_BUFFER_MAP_LEN]u8 {
-    var map: [TMP_BUFFER_MAP_LEN]u8 = undefined;
-    for (0..TMP_BUFFER_MAP_LEN) |idx| {
-        map[idx] = @intCast(idx);
-    }
-    return map;
-}
 
 fn blockTempWidthHint(block: *const cpu_forward.TransformerBlock, hidden_size: usize) usize {
     var hint = @max(hidden_size, 1);
@@ -75,45 +69,82 @@ fn blockTempWidthHint(block: *const cpu_forward.TransformerBlock, hidden_size: u
     return hint;
 }
 
+fn maxInstructionHandleCapacity(plan: *const runtime_contract.ExecutionPlan) usize {
+    var max_handles: usize = 0;
+    for (plan.instructions) |insn| {
+        const handle_count = insn.inputs.len + insn.outputs.len + insn.weights.len;
+        if (handle_count > max_handles) max_handles = handle_count;
+    }
+    return max_handles;
+}
+
 fn buildTmpRegisterScratchMap(
     allocator: std.mem.Allocator,
     compiled: *const runtime_contract.CompiledPlan,
-    register_width_hint: usize,
 ) !TmpRegisterLayout {
-    var layout = TmpRegisterLayout{
-        .map = identityTmpRegisterMap(),
-        .slot_width_hints = [_]usize{0} ** TMP_BUFFER_MAP_LEN,
-        .slot_active = [_]bool{false} ** TMP_BUFFER_MAP_LEN,
-    };
     const register_count: usize = compiled.plan.register_count;
-    if (register_count <= 1) return layout;
-    if (register_count > TMP_BUFFER_MAP_LEN) return error.UnsupportedModel;
+    const map = try allocator.alloc(u8, register_count);
+    @memset(map, 0);
+    errdefer allocator.free(map);
+
+    if (compiled.register_buffer_specs.len != register_count) return error.InvalidRegisterSpecCount;
+    const layer_tmp_width: usize = if (compiled.register_buffer_specs.len > 0)
+        compiled.register_buffer_specs[0].size
+    else
+        0;
+
+    if (register_count <= 1) {
+        if (register_count == 0) {
+            return .{ .map = map, .slot_count = 0, .slot_width_hints = &.{}, .slot_active = &.{} };
+        }
+        if (layer_tmp_width == 0) return error.InvalidRegisterSpecSize;
+        const slot_width_hints = try allocator.alloc(usize, 1);
+        errdefer allocator.free(slot_width_hints);
+        slot_width_hints[0] = layer_tmp_width;
+        const slot_active = try allocator.alloc(bool, 1);
+        errdefer allocator.free(slot_active);
+        slot_active[0] = true;
+        return .{ .map = map, .slot_count = 1, .slot_width_hints = slot_width_hints, .slot_active = slot_active };
+    }
 
     const specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, register_count);
     defer allocator.free(specs);
     // Register 0 (residual) uses the model output buffer, not scratch.
     // Mark exempt via size=0 so the allocator skips it.
     specs[0] = .{ .size = 0, .@"align" = 0 };
-    if (compiled.register_buffer_specs.len != register_count) return error.InvalidRegisterSpecCount;
-    // Plan specs carry relative width relationships (e.g., split ratios).
-    // The model-dimension floor ensures absolute sizing is at least the
-    // backend's required minimum (d_model or d_ff-based).
-    const model_dim_floor = @max(register_width_hint, 1);
+    // Plan specs already contain the model-dimension floor applied at compile
+    // time (via CompileOptions.size_floor). Backends consume specs exactly.
     for (specs[1..], 1..) |*spec, idx| {
         const plan_spec = compiled.register_buffer_specs[idx];
         spec.* = .{
-            .size = @max(plan_spec.size, model_dim_floor),
-            .@"align" = @max(plan_spec.@"align", @as(u16, 64)),
+            .size = plan_spec.size,
+            .@"align" = plan_spec.@"align",
+            .dtype = plan_spec.dtype,
+            .layout = plan_spec.layout,
         };
     }
 
     var physical_mapping = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, specs);
     defer runtime_contract.deinitPhysicalMapping(allocator, &physical_mapping);
-    if (physical_mapping.physical_count == 0) return layout;
+    if (physical_mapping.physical_count == 0) {
+        return .{ .map = map, .slot_count = 0, .slot_width_hints = &.{}, .slot_active = &.{} };
+    }
 
     const physical_to_tmp_slot = try allocator.alloc(u8, physical_mapping.physical_count);
     defer allocator.free(physical_to_tmp_slot);
     @memset(physical_to_tmp_slot, std.math.maxInt(u8));
+
+    // Allocate slot arrays sized to max possible slots (1 + physical_count).
+    const max_slots = 1 + physical_mapping.physical_count;
+    const slot_width_hints = try allocator.alloc(usize, max_slots);
+    errdefer allocator.free(slot_width_hints);
+    @memset(slot_width_hints, 0);
+    const slot_active = try allocator.alloc(bool, max_slots);
+    errdefer allocator.free(slot_active);
+    @memset(slot_active, false);
+    if (layer_tmp_width == 0) return error.InvalidRegisterSpecSize;
+    slot_width_hints[0] = layer_tmp_width;
+    slot_active[0] = true;
 
     var next_tmp_slot: usize = 1;
     for (0..register_count) |reg_idx| {
@@ -122,29 +153,20 @@ fn buildTmpRegisterScratchMap(
         const physical_id: usize = physical_id_u16;
         if (physical_id >= physical_to_tmp_slot.len) return error.InvalidState;
         if (physical_to_tmp_slot[physical_id] == std.math.maxInt(u8)) {
-            if (next_tmp_slot >= cpu_forward.NUM_TMP_BUFFERS) return error.TooManySplitOutputs;
             physical_to_tmp_slot[physical_id] = @intCast(next_tmp_slot);
             next_tmp_slot += 1;
         }
         const mapped_slot = physical_to_tmp_slot[physical_id];
-        layout.map[reg_idx] = mapped_slot;
-        layout.slot_active[mapped_slot] = true;
-        layout.slot_width_hints[mapped_slot] = @max(
-            layout.slot_width_hints[mapped_slot],
-            physical_mapping.physical_specs[physical_id].size,
-        );
+        map[reg_idx] = mapped_slot;
+        slot_active[mapped_slot] = true;
+        if (slot_width_hints[mapped_slot] == 0) {
+            slot_width_hints[mapped_slot] = physical_mapping.physical_specs[physical_id].size;
+        } else if (slot_width_hints[mapped_slot] != physical_mapping.physical_specs[physical_id].size) {
+            return error.InvalidRegisterSpecSize;
+        }
     }
 
-    return layout;
-}
-
-/// Return the buffer that holds the final output of the block program.
-/// Pre-norm programs end on `.residual`; post-norm programs may end on `.norm_out`.
-fn finalOutputBuffer(compiled: *const runtime_contract.CompiledPlan) BufferId {
-    const out_reg = runtime_contract.planFinalOutputRegister(&compiled.plan);
-    const out_idx = runtime_contract.registerToIndex(out_reg);
-    if (out_idx >= compiled.register_to_buffer_id.len) return .residual;
-    return @enumFromInt(compiled.register_to_buffer_id[out_idx]);
+    return .{ .map = map, .slot_count = next_tmp_slot, .slot_width_hints = slot_width_hints, .slot_active = slot_active };
 }
 
 fn formatRmsNormLike(writer: anytype, dim: usize, eps: f32, weight_offset: f32) !void {
@@ -176,14 +198,16 @@ pub const Block = struct {
     instruction_weight_refs: []?*const Tensor,
     /// Per-instruction resolved kernel pointer for macro `kernel` opcodes.
     instruction_kernel_refs: []?CpuKernel,
-    /// Logical register index -> physical scratch tmp slot.
+    /// Logical register index -> physical scratch tmp slot (dynamically sized to register_count).
     /// Index 0 (residual) always remains identity (maps to output buffer, not scratch).
     /// Indices 1+ are mapped through liveness analysis.
-    tmp_register_to_scratch_idx: [TMP_BUFFER_MAP_LEN]u8 = identityTmpRegisterMap(),
+    tmp_register_to_scratch_idx: []const u8 = &.{},
     /// Physical slot width hints derived from compiled-plan liveness allocation.
-    tmp_slot_width_hints: [TMP_BUFFER_MAP_LEN]usize = [_]usize{0} ** TMP_BUFFER_MAP_LEN,
+    tmp_slot_width_hints: []usize = &.{},
     /// Physical scratch slot activity mask.
-    tmp_slot_active: [TMP_BUFFER_MAP_LEN]bool = [_]bool{false} ** TMP_BUFFER_MAP_LEN,
+    tmp_slot_active: []bool = &.{},
+    /// Maximum tensor handles required by any instruction in the compiled plan.
+    instruction_handle_capacity: usize = 0,
 
     pub fn initWithProgram(
         allocator: std.mem.Allocator,
@@ -193,13 +217,10 @@ pub const Block = struct {
         program: []const LayerOp,
         mode: runtime_contract.ExecutionMode,
     ) !Block {
-        var compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, mode);
-        errdefer plan_compiler.deinitCompiledPlan(allocator, &compiled_plan);
         const width_hint = blockTempWidthHint(block, hidden_size);
-        var tmp_layout = try buildTmpRegisterScratchMap(allocator, &compiled_plan, width_hint);
-        for (&tmp_layout.slot_active, &tmp_layout.slot_width_hints) |active, *slot_width| {
-            if (active and slot_width.* < width_hint) slot_width.* = width_hint;
-        }
+        var compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, mode, .{ .size_floor = width_hint });
+        errdefer plan_compiler.deinitCompiledPlan(allocator, &compiled_plan);
+        const tmp_layout = try buildTmpRegisterScratchMap(allocator, &compiled_plan);
         const weight_refs = try buildInstructionWeightRefs(allocator, block, block_idx, &compiled_plan);
         const kernel_refs = try buildInstructionKernelRefs(allocator, block, block_idx, &compiled_plan);
         errdefer {
@@ -216,14 +237,27 @@ pub const Block = struct {
             .tmp_register_to_scratch_idx = tmp_layout.map,
             .tmp_slot_width_hints = tmp_layout.slot_width_hints,
             .tmp_slot_active = tmp_layout.slot_active,
+            .instruction_handle_capacity = maxInstructionHandleCapacity(&compiled_plan.plan),
         };
     }
 
     pub fn deinit(self: *Block, allocator: std.mem.Allocator) void {
+        if (self.tmp_register_to_scratch_idx.len > 0) {
+            allocator.free(self.tmp_register_to_scratch_idx);
+        }
+        if (self.tmp_slot_width_hints.len > 0) allocator.free(self.tmp_slot_width_hints);
+        if (self.tmp_slot_active.len > 0) allocator.free(self.tmp_slot_active);
         allocator.free(self.instruction_kernel_refs);
         allocator.free(self.instruction_weight_refs);
         plan_compiler.deinitCompiledPlan(allocator, &self.compiled_plan);
         self.* = undefined;
+    }
+
+    /// Register this block's scratch layout requirements with the shared
+    /// scratch allocator. Callers can aggregate all layer layouts up front
+    /// before taking long-lived views into `scratch.tmp[0]`.
+    pub fn registerScratchLayout(self: *const Block, scratch: *ScratchBuffer) !void {
+        try scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
     }
 
     fn buildInstructionWeightRefs(
@@ -238,21 +272,10 @@ pub const Block = struct {
 
         for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
             if (insn.weights.len == 0) continue;
-            switch (insn.opcode) {
-                .rmsnorm,
-                .multihead_attention,
-                .swiglu,
-                .moe,
-                .mamba_mixer,
-                .shortconv,
-                .mla_attention,
-                .embedding,
-                => {
-                    // Macro-op kernel bindings are resolved through instruction_kernel_refs.
-                    // They intentionally do not map through tensor weight_registry.
-                    continue;
-                },
-                else => {},
+            if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len != 0) {
+                // Macro-op kernel bindings are resolved through instruction_kernel_refs.
+                // They intentionally do not map through tensor weight_registry.
+                continue;
             }
             if (insn.weights.len != 1) return error.InvalidWeightRefCount;
             const weight_name = runtime_contract.instructionSingleWeightBindingName(compiled_plan, op_index) catch |err| {
@@ -310,18 +333,7 @@ pub const Block = struct {
         @memset(refs, null);
 
         for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            switch (insn.opcode) {
-                .rmsnorm,
-                .multihead_attention,
-                .swiglu,
-                .moe,
-                .mamba_mixer,
-                .shortconv,
-                .mla_attention,
-                .embedding,
-                => {},
-                else => continue,
-            }
+            if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len == 0) continue;
             const kernel_id = try instructionKernelIdFromWeightBindings(compiled_plan, op_index, &insn);
             const kernel_idx: usize = @intCast(kernel_id);
             if (kernel_idx >= block.kernels.len) {
@@ -374,8 +386,8 @@ pub const Block = struct {
         self: *const Block,
         insn: *const runtime_contract.Instruction,
         dispatch_state: *RuntimeDispatchState,
-        handle_storage: *[MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorHandle,
-        view_storage: *[MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorViewDesc,
+        handle_storage: []runtime_contract.TensorHandle,
+        view_storage: []runtime_contract.TensorViewDesc,
     ) !BuiltInstructionHandles {
         var handle_count: usize = 0;
         var view_count: usize = 0;
@@ -406,20 +418,8 @@ pub const Block = struct {
             handle_count += 1;
             view_count += 1;
         }
-        if (insn.weights.len != 0) switch (insn.opcode) {
-            .rmsnorm,
-            .multihead_attention,
-            .swiglu,
-            .moe,
-            .mamba_mixer,
-            .shortconv,
-            .mla_attention,
-            .embedding,
-            => {
-                // Macro-op adapters resolve kernels via instruction_kernel_refs.
-                // They do not consume weight tensor handles from registers.
-            },
-            else => {
+        if (insn.weights.len != 0) {
+            if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len == 0) {
                 if (insn.weights.len != 1) return error.InvalidWeightRefCount;
                 if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
                 const weight_ref = try self.instructionWeightRef(dispatch_state.op_index);
@@ -428,8 +428,11 @@ pub const Block = struct {
                     .ptr = @ptrCast(@constCast(weight_ref)),
                 };
                 handle_count += 1;
-            },
-        };
+            } else {
+                // Macro-op adapters resolve kernels via instruction_kernel_refs.
+                // They do not consume weight tensor handles from registers.
+            }
+        }
 
         return .{
             .registers = handle_storage[0..handle_count],
@@ -571,21 +574,18 @@ pub const Block = struct {
         return shape;
     }
 
-    fn instructionRegisterToBufferIndex(reg: runtime_contract.RegisterRef) !usize {
-        const idx = runtime_contract.registerToIndex(reg);
-        if (idx >= TMP_BUFFER_MAP_LEN) return error.InvalidInstructionBinding;
-        return idx;
+    fn instructionRegisterToBufferIndex(reg: runtime_contract.RegisterRef) usize {
+        return runtime_contract.registerToIndex(reg);
     }
 
     fn instructionOutputSlice(
         self: *const Block,
-        buffer_views: *[64]Tensor,
+        buffer_views: []Tensor,
         scratch: *ScratchBuffer,
         reg: runtime_contract.RegisterRef,
         len: usize,
-    ) ![]f32 {
+    ) []f32 {
         const reg_idx = runtime_contract.registerToIndex(reg);
-        if (reg_idx >= cpu_forward.NUM_TMP_BUFFERS) return error.InvalidInstructionBinding;
         return self.resolveOutputSlice(buffer_views, scratch, reg_idx, len);
     }
 
@@ -641,13 +641,15 @@ pub const Block = struct {
 
         block: *const Block,
         op_index: usize,
-        buffer_views: *[64]Tensor,
+        buffer_views: []Tensor,
         scratch: *ScratchBuffer,
         slot_ctx: SlotContext,
         mode: BatchedDispatchMode,
         slot_index: usize,
         slot_indices: []const usize,
         use_batched_dispatch: bool,
+        instruction_handles: []runtime_contract.TensorHandle,
+        instruction_views: []runtime_contract.TensorViewDesc,
         state_bindings: [MaxStateBindings]?StateBinding = [_]?StateBinding{null} ** MaxStateBindings,
         state_binding_count: u8 = 0,
 
@@ -765,11 +767,8 @@ pub const Block = struct {
         plan: *const runtime_contract.ExecutionPlan,
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
-        if (state_blocks.len == 0 and mode == .single_slot) {
-            switch (insn.opcode) {
-                .multihead_attention, .mla_attention => return,
-                else => {},
-            }
+        if (state_blocks.len == 0 and mode == .single_slot and singleSlotStateBindingOptional(insn.opcode)) {
+            return;
         }
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, plan, state_blocks);
     }
@@ -781,10 +780,7 @@ pub const Block = struct {
         var blocks = InstructionStateBlocks{};
         const state_id = insn.state_block_id orelse return blocks;
         const binding = dispatch_state.stateBinding(state_id) orelse {
-            if (dispatch_state.mode == .single_slot) switch (insn.opcode) {
-                .multihead_attention, .mla_attention => return blocks,
-                else => {},
-            };
+            if (dispatch_state.mode == .single_slot and singleSlotStateBindingOptional(insn.opcode)) return blocks;
             return error.InvalidStateDescriptorBinding;
         };
         const descriptor = runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, state_id) orelse {
@@ -796,6 +792,13 @@ pub const Block = struct {
         blocks.handles[0] = state_block;
         blocks.len = 1;
         return blocks;
+    }
+
+    fn singleSlotStateBindingOptional(opcode: runtime_contract.Opcode) bool {
+        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
+        const state_id = runtime_contract.stateBlockIdForOpcode(opcode) orelse return false;
+        if (state_id != kv_state_id) return false;
+        return runtime_contract.requiredStateBlockIdForOpcode(opcode) == null;
     }
 
     const required_opcodes = [_]runtime_contract.Opcode{
@@ -915,6 +918,83 @@ pub const Block = struct {
         );
     }
 
+    fn validateRequiresKernelBinding(opcode: runtime_contract.Opcode) bool {
+        return validate_requires_kernel_binding[@intFromEnum(opcode)];
+    }
+
+    fn validateRequiresLinearWeightCheck(opcode: runtime_contract.Opcode) bool {
+        return validate_requires_linear_weight_check[@intFromEnum(opcode)];
+    }
+
+    fn validateRequiresParamWeightBinding(opcode: runtime_contract.Opcode) bool {
+        return validate_requires_param_weight_binding[@intFromEnum(opcode)];
+    }
+
+    fn validateRequiresSplitBoundsCheck(opcode: runtime_contract.Opcode) bool {
+        return validate_requires_split_bounds_check[@intFromEnum(opcode)];
+    }
+
+    fn batchedDecodeUnsupportedOpcode(opcode: runtime_contract.Opcode) bool {
+        return batched_decode_unsupported[@intFromEnum(opcode)];
+    }
+
+    fn batchedDecodeSupportedWithoutKernel(opcode: runtime_contract.Opcode) bool {
+        return batched_decode_supported_without_kernel[@intFromEnum(opcode)];
+    }
+
+    const validate_requires_kernel_binding: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.shortconv)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.embedding)] = true;
+        break :blk table;
+    };
+
+    const validate_requires_linear_weight_check: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.linear)] = true;
+        break :blk table;
+    };
+
+    const validate_requires_param_weight_binding: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.add_param)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.add_param_scalar)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.mul_param)] = true;
+        break :blk table;
+    };
+
+    const validate_requires_split_bounds_check: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.split)] = true;
+        break :blk table;
+    };
+
+    const batched_decode_unsupported: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.shortconv)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = true;
+        break :blk table;
+    };
+
+    const batched_decode_supported_without_kernel: [256]bool = blk: {
+        var table = [_]bool{false} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.residual_add)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.mul_scalar)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.add_tensor)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.vision_patch_embed)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.vision_deepstack_extract)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.vision_spatial_merge)] = true;
+        table[@intFromEnum(runtime_contract.Opcode.vision_scatter)] = true;
+        break :blk table;
+    };
+
     fn dispatchInstructionWithState(
         self: *const Block,
         insn: *const runtime_contract.Instruction,
@@ -933,7 +1013,7 @@ pub const Block = struct {
             .active_slots = active_slots,
             .sequence_lengths = no_seq_lengths[0..],
             .batch_size = active_slots.len,
-            .dispatch_counters = &layer_program_dispatch_counters,
+            .dispatch_counters = if (enable_dispatch_observability) &layer_program_dispatch_counters else null,
             .workspace = .{ .any = @ptrCast(dispatch_state) },
         };
         try runtime_contract.validateBatchCapability(
@@ -941,9 +1021,12 @@ pub const Block = struct {
             exec_ctx.batch_size,
         );
         runtime_contract.recordExecutionDispatch(&exec_ctx, insn.opcode);
-        var handle_storage: [MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorHandle = undefined;
-        var view_storage: [MAX_INSTRUCTION_TENSOR_HANDLES]runtime_contract.TensorViewDesc = undefined;
-        const built_handles = try self.buildInstructionHandles(insn, dispatch_state, &handle_storage, &view_storage);
+        const built_handles = try self.buildInstructionHandles(
+            insn,
+            dispatch_state,
+            dispatch_state.instruction_handles,
+            dispatch_state.instruction_views,
+        );
         var param_storage: [1]runtime_contract.ParamBlock = undefined;
         const params = try self.instructionParams(insn, &param_storage);
         var state_blocks = try buildInstructionStateBlocks(insn, dispatch_state);
@@ -1020,7 +1103,7 @@ pub const Block = struct {
         const input_view = views[0];
         const output_len = viewNumel(input_view);
         const input_data = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])].asSlice(f32);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1028,7 +1111,7 @@ pub const Block = struct {
         );
         const p = try runtime_contract.paramAs(runtime_contract.ScalarOpParam, params, .mul_scalar);
         cpu_elementwise.mulScalar(input_data[0..output_len], output_slice[0..output_len], @bitCast(p.scalar));
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(input_view),
@@ -1052,7 +1135,7 @@ pub const Block = struct {
         const left_tensor = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const right_tensor = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[1])];
         const output_len = @max(left_numel, right_numel);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1064,7 +1147,7 @@ pub const Block = struct {
             }
         }.addScalar);
         const larger_view = if (left_numel >= right_numel) views[0] else views[1];
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(larger_view),
@@ -1100,32 +1183,25 @@ pub const Block = struct {
             @intCast(weight.shape[0]);
 
         const out_raw_idx = runtime_contract.registerToIndex(insn.outputs[0]);
-        if (out_raw_idx > @intFromEnum(BufferId.tmp63)) return error.InvalidInstructionBinding;
+        if (out_raw_idx >= state.block.tmp_register_to_scratch_idx.len) return error.InvalidInstructionBinding;
         const output_slice = blk: {
             // Registers 1+ are mapped through liveness analysis.
-            if (out_raw_idx >= 1 and out_raw_idx < cpu_forward.NUM_TMP_BUFFERS) {
+            if (out_raw_idx >= 1) {
                 const mapped_idx: usize = state.block.tmp_register_to_scratch_idx[out_raw_idx];
                 std.debug.assert(mapped_idx >= 1);
-                std.debug.assert(mapped_idx < cpu_forward.NUM_TMP_BUFFERS);
+                std.debug.assert(mapped_idx < state.scratch.tmp.len);
                 break :blk state.scratch.tmp[mapped_idx][0 .. seq_len * output_features];
             }
 
-            // Fallback for residual output: alias-safe buffer selection.
+            // Residual output staging uses dedicated layer_tmp (slot 0), whose
+            // width is registered from compiled plan specs at block init.
+            // Slot 0 is never register-mapped and therefore alias-safe.
             const input_ptr = @intFromPtr(input_buf.data().ptr);
-            const branch_ptr = @intFromPtr(state.scratch.tmp[2].ptr);
-            const input_aliases_branch = input_ptr == branch_ptr;
-
-            const residual_ptr = @intFromPtr(state.buffer_views[@intFromEnum(BufferId.residual)].data().ptr);
-            const layer_tmp_buf_ptr = @intFromPtr(state.scratch.tmp[0].ptr);
-            const residual_uses_layer_tmp = residual_ptr == layer_tmp_buf_ptr;
-
-            break :blk if (input_aliases_branch)
-                if (residual_uses_layer_tmp)
-                    state.scratch.tmp[1][0 .. seq_len * output_features]
-                else
-                    state.scratch.tmp[0][0 .. seq_len * output_features]
-            else
-                state.scratch.tmp[2][0 .. seq_len * output_features];
+            const layer_tmp_ptr = @intFromPtr(state.scratch.tmp[0].ptr);
+            if (input_ptr == layer_tmp_ptr) {
+                return error.InvalidScratchLayout;
+            }
+            break :blk state.scratch.tmp[0][0 .. seq_len * output_features];
         };
 
         var input_2d = Tensor.view2D(input_buf.data(), seq_len, input_view.shape[2]);
@@ -1140,7 +1216,7 @@ pub const Block = struct {
         };
         dk.func(&input_2d, weight, &output_2d, &state.scratch.matmul_scratch);
 
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         const out_byte_size = seq_len * output_features * @sizeOf(f32);
         const out_bytes = std.mem.sliceAsBytes(output_slice)[0..out_byte_size];
         state.buffer_views[out_idx] = Tensor.view(
@@ -1170,7 +1246,7 @@ pub const Block = struct {
         const m_dim: usize = left_view.shape[1];
         const n_dim: usize = right_view.shape[1];
         const out_size = m_dim * n_dim;
-        const out_slice = try state.block.instructionOutputSlice(
+        const out_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1181,7 +1257,7 @@ pub const Block = struct {
         var b_view = Tensor.view2D(right_buf.data(), n_dim, right_view.shape[2]);
         try cpu_linalg.matmulAuto(&a_view, &b_view, &output_2d, &state.scratch.matmul_scratch);
 
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         const out_byte_size = out_size * @sizeOf(f32);
         const out_bytes = std.mem.sliceAsBytes(out_slice)[0..out_byte_size];
         state.buffer_views[out_idx] = Tensor.view(
@@ -1231,7 +1307,7 @@ pub const Block = struct {
         for (0..split_outputs) |out_idx| {
             const split_size = actual_sizes[out_idx];
             const out_elems = seq_len * split_size;
-            out_slices[out_idx] = try state.block.instructionOutputSlice(
+            out_slices[out_idx] = state.block.instructionOutputSlice(
                 state.buffer_views,
                 state.scratch,
                 insn.outputs[out_idx],
@@ -1249,7 +1325,7 @@ pub const Block = struct {
         for (0..split_outputs) |out_idx| {
             const split_size = actual_sizes[out_idx];
             const out_slice = out_slices[out_idx];
-            const out_buf_idx = try instructionRegisterToBufferIndex(insn.outputs[out_idx]);
+            const out_buf_idx = instructionRegisterToBufferIndex(insn.outputs[out_idx]);
             const out_bytes = std.mem.sliceAsBytes(out_slice);
             state.buffer_views[out_buf_idx] = Tensor.view(
                 out_bytes.ptr,
@@ -1330,7 +1406,7 @@ pub const Block = struct {
         const left_tensor = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const right_tensor = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[1])];
         const output_len = @max(left_numel, right_numel);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1342,7 +1418,7 @@ pub const Block = struct {
             }
         }.multiply);
         const larger_view = if (left_numel >= right_numel) views[0] else views[1];
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(larger_view),
@@ -1364,7 +1440,7 @@ pub const Block = struct {
         const input_view = views[0];
         const output_len = viewNumel(input_view);
         const input_data = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])].asSlice(f32);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1372,7 +1448,7 @@ pub const Block = struct {
         );
         const p = try runtime_contract.paramAs(runtime_contract.ScalarOpParam, params, .add_scalar);
         cpu_elementwise.addScalar(input_data[0..output_len], output_slice[0..output_len], @bitCast(p.scalar));
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(input_view),
@@ -1402,7 +1478,7 @@ pub const Block = struct {
             const head_count: usize = input_view.shape[2];
             const hidden_size: usize = input_view.shape[3];
             const output_len = mean_seq_len * head_count;
-            const output_slice = try state.block.instructionOutputSlice(
+            const output_slice = state.block.instructionOutputSlice(
                 state.buffer_views,
                 state.scratch,
                 insn.outputs[0],
@@ -1420,7 +1496,7 @@ pub const Block = struct {
             else
                 .{ 1, @as(i64, @intCast(mean_seq_len)), @as(i64, @intCast(head_count)), 0, 0, 0, 0, 0 };
             const mean_dims: i32 = if (keepdim) 4 else 3;
-            const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+            const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
             state.buffer_views[out_idx] = tensorFromSlice(
                 output_slice[0..output_len],
                 mean_shape,
@@ -1433,7 +1509,7 @@ pub const Block = struct {
         const mean_seq_len_3d: usize = input_view.shape[1];
         const hidden_size: usize = input_view.shape[2];
         const output_len = mean_seq_len_3d;
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1450,7 +1526,7 @@ pub const Block = struct {
         else
             .{ 1, @as(i64, @intCast(mean_seq_len_3d)), 0, 0, 0, 0, 0, 0 };
         const mean_dims_3d: i32 = if (keepdim) 3 else 2;
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             mean_shape_3d,
@@ -1472,7 +1548,7 @@ pub const Block = struct {
         const input_view = views[0];
         const output_len = viewNumel(input_view);
         const input_data = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])].asSlice(f32);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1480,7 +1556,7 @@ pub const Block = struct {
         );
         const p = try runtime_contract.paramAs(runtime_contract.ScalarOpParam, params, .pow);
         cpu_elementwise.powScalar(input_data[0..output_len], output_slice[0..output_len], @bitCast(p.scalar));
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(input_view),
@@ -1502,14 +1578,14 @@ pub const Block = struct {
         const input_view = views[0];
         const output_len = viewNumel(input_view);
         const input_data = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])].asSlice(f32);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
             output_len,
         );
         cpu_elementwise.rsqrt(input_data[0..output_len], output_slice[0..output_len]);
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(input_view),
@@ -1540,14 +1616,14 @@ pub const Block = struct {
             return err;
         };
         const output_len = @max(input_numel, param.numel);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
             output_len,
         );
         try cpu_broadcast.addParam(input_tensor, param, output_slice[0..output_len]);
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(input_view),
@@ -1574,7 +1650,7 @@ pub const Block = struct {
             return err;
         };
         const p_len = param.numel;
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1582,7 +1658,7 @@ pub const Block = struct {
         );
         const p = try runtime_contract.paramAs(runtime_contract.AddParamScalarParam, params, .add_param_scalar);
         cpu_broadcast.addParamScalar(param, output_slice[0..p_len], @bitCast(p.scalar));
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..p_len],
             param.shape,
@@ -1613,14 +1689,14 @@ pub const Block = struct {
             return err;
         };
         const output_len = @max(input_numel, param.numel);
-        const output_slice = try state.block.instructionOutputSlice(
+        const output_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
             output_len,
         );
         try cpu_broadcast.mulParam(input_tensor, param, output_slice[0..output_len]);
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             output_slice[0..output_len],
             viewToTensorShape(input_view),
@@ -1697,7 +1773,7 @@ pub const Block = struct {
             output_tensor.n_dims = 3;
         }
 
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = output_tensor;
     }
 
@@ -1716,7 +1792,7 @@ pub const Block = struct {
         const input_view = views[0];
         const in_buf = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const out_len = viewNumel(input_view);
-        const out_slice = try state.block.instructionOutputSlice(
+        const out_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1750,7 +1826,7 @@ pub const Block = struct {
         const tmp_i64 = out_shape_i64[dim0];
         out_shape_i64[dim0] = out_shape_i64[dim1];
         out_shape_i64[dim1] = tmp_i64;
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             out_slice[0..out_len],
             out_shape_i64,
@@ -1803,14 +1879,14 @@ pub const Block = struct {
         };
         if (insn.inputs[0] == insn.outputs[0]) return;
         const numel = viewNumel(input_view);
-        const out_slice = try state.block.instructionOutputSlice(
+        const out_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
             numel,
         );
         @memcpy(out_slice, input_data[0..numel]);
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             out_slice[0..numel],
             rope_shape,
@@ -1877,7 +1953,7 @@ pub const Block = struct {
             break :blk @bitCast(std.mem.readInt(u32, data[@sizeOf(runtime_contract.SdpaOpParam)..][0..4], .little));
         } else 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
         const out_numel = batch * n_heads * seq_q * head_dim;
-        const out_slice = try state.block.instructionOutputSlice(
+        const out_slice = state.block.instructionOutputSlice(
             state.buffer_views,
             state.scratch,
             insn.outputs[0],
@@ -1916,7 +1992,7 @@ pub const Block = struct {
             0,
             0,
         };
-        const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
+        const out_idx = instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
             out_slice[0..out_numel],
             sdpa_shape,
@@ -1930,40 +2006,40 @@ pub const Block = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
         const shared_state = state.slot_ctx.sharedState();
-        switch (insn.opcode) {
-            .multihead_attention, .mla_attention => {
-                if (insn.state_block_id) |state_id| {
-                    const layered_cache = runtime_contract.findStateValue(
-                        *LayeredBatchedKVCache,
-                        state_blocks,
-                        state_id,
-                    ) orelse return error.InvalidStateDescriptorBinding;
-                    if (state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
-                    shared_state.batched_cache = layered_cache.getLayer(state.block.block_idx);
-                }
-            },
-            .shortconv => {
-                if (insn.state_block_id) |state_id| {
-                    const shortconv_scratch = runtime_contract.findStateValue(
-                        *runtime.ShortConvScratch,
-                        state_blocks,
-                        state_id,
-                    ) orelse return error.InvalidStateDescriptorBinding;
-                    shared_state.shortconv_scratch = shortconv_scratch;
-                }
-            },
-            .mamba_mixer => {
-                if (insn.state_block_id) |state_id| {
-                    const mamba_scratch = runtime_contract.findStateValue(
-                        *runtime.MambaScratch,
-                        state_blocks,
-                        state_id,
-                    ) orelse return error.InvalidStateDescriptorBinding;
-                    shared_state.mamba_scratch = mamba_scratch;
-                }
-            },
-            else => {},
+        const state_id = insn.state_block_id orelse return;
+        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
+        const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
+        const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
+
+        if (state_id == kv_state_id) {
+            const layered_cache = runtime_contract.findStateValue(
+                *LayeredBatchedKVCache,
+                state_blocks,
+                state_id,
+            ) orelse return error.InvalidStateDescriptorBinding;
+            if (state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
+            shared_state.batched_cache = layered_cache.getLayer(state.block.block_idx);
+            return;
         }
+        if (state_id == shortconv_state_id) {
+            const shortconv_scratch = runtime_contract.findStateValue(
+                *runtime.ShortConvScratch,
+                state_blocks,
+                state_id,
+            ) orelse return error.InvalidStateDescriptorBinding;
+            shared_state.shortconv_scratch = shortconv_scratch;
+            return;
+        }
+        if (state_id == mamba_state_id) {
+            const mamba_scratch = runtime_contract.findStateValue(
+                *runtime.MambaScratch,
+                state_blocks,
+                state_id,
+            ) orelse return error.InvalidStateDescriptorBinding;
+            shared_state.mamba_scratch = mamba_scratch;
+            return;
+        }
+        return error.InvalidStateDescriptorBinding;
     }
 
     fn residualScaleValue(self: *const Block, scale: ResidualScale) f32 {
@@ -1975,13 +2051,13 @@ pub const Block = struct {
     }
 
     fn scratchTempSlice(self: *const Block, scratch: *ScratchBuffer, reg_idx: usize, len: usize) []f32 {
-        // All non-residual registers (1..63) map through the compiled liveness
+        // All non-residual registers map through the compiled liveness
         // allocator to physical scratch slots. Register 0 (residual) is handled
         // by resolveOutputSlice directly.
-        if (reg_idx >= 1 and reg_idx < cpu_forward.NUM_TMP_BUFFERS) {
+        if (reg_idx >= 1 and reg_idx < self.tmp_register_to_scratch_idx.len) {
             const mapped_idx: usize = self.tmp_register_to_scratch_idx[reg_idx];
             std.debug.assert(mapped_idx >= 1);
-            std.debug.assert(mapped_idx < cpu_forward.NUM_TMP_BUFFERS);
+            std.debug.assert(mapped_idx < scratch.tmp.len);
             return scratch.tmp[mapped_idx][0..len];
         }
         return &.{};
@@ -2012,7 +2088,7 @@ pub const Block = struct {
         };
     }
 
-    fn resolveOutputSlice(self: *const Block, buffer_views: *[64]Tensor, scratch: *ScratchBuffer, reg_idx: usize, len: usize) []f32 {
+    fn resolveOutputSlice(self: *const Block, buffer_views: []Tensor, scratch: *ScratchBuffer, reg_idx: usize, len: usize) []f32 {
         if (reg_idx == 0) return buffer_views[0].asSlice(f32)[0..len];
         return self.scratchTempSlice(scratch, reg_idx, len);
     }
@@ -2027,15 +2103,17 @@ pub const Block = struct {
     ) !void {
         std.debug.assert(x.shape[0] == 1 and out.shape[0] == 1); // Only batch=1 supported
         const seq_len: usize = @intCast(x.shape[1]);
-        scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
+        try scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
 
         // Buffer lookup table: register index -> Tensor
         // Register 0 (residual) maps to the output buffer; all other registers
         // are backed by scratch slots assigned through liveness analysis.
-        var buffer_views: [64]Tensor = undefined;
-        buffer_views[@intFromEnum(BufferId.residual)] = out.*;
-        for (1..self.compiled_plan.plan.register_count) |reg_idx| {
+        const reg_count = self.compiled_plan.plan.register_count;
+        var buffer_views_arr: [runtime_contract.max_register_count]Tensor = undefined;
+        const buffer_views = buffer_views_arr[0..reg_count];
+        buffer_views[0] = out.*;
+        for (1..reg_count) |reg_idx| {
             const mapped = self.tmp_register_to_scratch_idx[reg_idx];
             buffer_views[reg_idx] = Tensor.view3DSlice(scratch.tmp[mapped], seq_len, self.hidden_size);
         }
@@ -2057,17 +2135,29 @@ pub const Block = struct {
             .scratch = scratch,
             .use_cache = use_cache,
         };
+        const instruction_handles = try scratch.allocator.alloc(
+            runtime_contract.TensorHandle,
+            self.instruction_handle_capacity,
+        );
+        defer if (instruction_handles.len > 0) scratch.allocator.free(instruction_handles);
+        const instruction_views = try scratch.allocator.alloc(
+            runtime_contract.TensorViewDesc,
+            self.instruction_handle_capacity,
+        );
+        defer if (instruction_views.len > 0) scratch.allocator.free(instruction_views);
 
         var dispatch_state = RuntimeDispatchState{
             .block = self,
             .op_index = 0,
-            .buffer_views = &buffer_views,
+            .buffer_views = buffer_views,
             .scratch = scratch,
             .slot_ctx = ctx,
             .mode = .single_slot,
             .slot_index = 0,
             .slot_indices = &.{},
             .use_batched_dispatch = false,
+            .instruction_handles = instruction_handles,
+            .instruction_views = instruction_views,
         };
         try bindDispatchStateDescriptors(&dispatch_state);
 
@@ -2080,9 +2170,11 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = finalOutputBuffer(&self.compiled_plan);
-        if (final_buf != .residual) {
-            copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
+        const final_reg_idx = runtime_contract.registerToIndex(
+            runtime_contract.planFinalOutputRegister(&self.compiled_plan.plan),
+        );
+        if (final_reg_idx != 0) {
+            copyTensor(&buffer_views[final_reg_idx], &buffer_views[0]);
         }
     }
 
@@ -2123,80 +2215,48 @@ pub const Block = struct {
                 });
                 return error.MissingParamBlock;
             }
-            switch (insn.opcode) {
-                .rmsnorm,
-                .multihead_attention,
-                .mla_attention,
-                .swiglu,
-                .moe,
-                .mamba_mixer,
-                .shortconv,
-                .embedding,
-                => {
-                    if (self.instruction_kernel_refs[op_index] == null) {
-                        error_context.setContext("block={d}, op={d}, kernel_ref=MissingKernelBinding", .{
-                            self.block_idx,
-                            op_index,
-                        });
-                        return error.KernelIndexOutOfBounds;
-                    }
-                },
-                .linear => {
-                    const weight = self.instructionWeightRef(op_index) catch |err| {
-                        error_context.setContext("block={d}, op={d}, weight_ref={s}", .{
-                            self.block_idx,
-                            op_index,
-                            @errorName(err),
-                        });
-                        return err;
-                    };
-                    _ = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
-                        error_context.setContext("block={d}, op={d}, dtype={}", .{ self.block_idx, op_index, weight.dtype });
-                        return err;
-                    };
-                },
-                .add_param => {
-                    _ = self.instructionWeightRef(op_index) catch |err| {
-                        error_context.setContext("block={d}, op={d}, param_ref={s}", .{
-                            self.block_idx,
-                            op_index,
-                            @errorName(err),
-                        });
-                        return err;
-                    };
-                },
-                .add_param_scalar => {
-                    _ = self.instructionWeightRef(op_index) catch |err| {
-                        error_context.setContext("block={d}, op={d}, param_ref={s}", .{
-                            self.block_idx,
-                            op_index,
-                            @errorName(err),
-                        });
-                        return err;
-                    };
-                },
-                .mul_param => {
-                    _ = self.instructionWeightRef(op_index) catch |err| {
-                        error_context.setContext("block={d}, op={d}, param_ref={s}", .{
-                            self.block_idx,
-                            op_index,
-                            @errorName(err),
-                        });
-                        return err;
-                    };
-                },
-                .split => {
-                    if (insn.outputs.len == 0) return error.TooManySplitOutputs;
-                    const out_start_idx = runtime_contract.registerToIndex(insn.outputs[0]);
-                    const max_outputs = cpu_forward.NUM_TMP_BUFFERS - out_start_idx;
-                    if (out_start_idx < @intFromEnum(BufferId.tmp3) or insn.outputs.len > max_outputs) {
-                        return error.TooManySplitOutputs;
-                    }
-                },
-                .rope, .transpose, .scaled_dot_product_attention => {
-                    // implemented
-                },
-                else => {},
+            if (validateRequiresKernelBinding(insn.opcode)) {
+                if (self.instruction_kernel_refs[op_index] == null) {
+                    error_context.setContext("block={d}, op={d}, kernel_ref=MissingKernelBinding", .{
+                        self.block_idx,
+                        op_index,
+                    });
+                    return error.KernelIndexOutOfBounds;
+                }
+            }
+
+            if (validateRequiresLinearWeightCheck(insn.opcode)) {
+                const weight = self.instructionWeightRef(op_index) catch |err| {
+                    error_context.setContext("block={d}, op={d}, weight_ref={s}", .{
+                        self.block_idx,
+                        op_index,
+                        @errorName(err),
+                    });
+                    return err;
+                };
+                _ = cpu_linalg.matmulKernel(weight.dtype) catch |err| {
+                    error_context.setContext("block={d}, op={d}, dtype={}", .{ self.block_idx, op_index, weight.dtype });
+                    return err;
+                };
+            }
+
+            if (validateRequiresParamWeightBinding(insn.opcode)) {
+                _ = self.instructionWeightRef(op_index) catch |err| {
+                    error_context.setContext("block={d}, op={d}, param_ref={s}", .{
+                        self.block_idx,
+                        op_index,
+                        @errorName(err),
+                    });
+                    return err;
+                };
+            }
+
+            if (validateRequiresSplitBoundsCheck(insn.opcode)) {
+                if (insn.outputs.len == 0) return error.TooManySplitOutputs;
+                const out_start_idx = runtime_contract.registerToIndex(insn.outputs[0]);
+                if (out_start_idx == 0 or insn.outputs.len + out_start_idx > self.compiled_plan.plan.register_count) {
+                    return error.TooManySplitOutputs;
+                }
             }
         }
     }
@@ -2284,17 +2344,13 @@ pub const Block = struct {
     pub fn supportsBatchedDecodeSlots(self: *const Block) bool {
         for (self.compiled_plan.plan.instructions, 0..) |insn, op_index| {
             if (adapter_table[@intFromEnum(insn.opcode)] == null) return false;
-            switch (insn.opcode) {
-                .rmsnorm, .multihead_attention, .swiglu, .moe, .embedding => {
-                    if (self.instruction_kernel_refs[op_index] == null) return false;
-                },
-                // These kernel opcodes are in the batched table but their
-                // forwardBatchedSlots returns UnsupportedBatchedDecodeKernel.
-                .mamba_mixer, .shortconv, .mla_attention => return false,
-                .residual_add, .mul_scalar, .add_tensor => {},
-                .vision_patch_embed, .vision_deepstack_extract, .vision_spatial_merge, .vision_scatter => {},
-                else => return false,
+            if (batchedDecodeUnsupportedOpcode(insn.opcode)) return false;
+            if (batchedDecodeSupportedWithoutKernel(insn.opcode)) continue;
+            if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len != 0) {
+                if (self.instruction_kernel_refs[op_index] == null) return false;
+                continue;
             }
+            return false;
         }
         return true;
     }
@@ -2312,12 +2368,14 @@ pub const Block = struct {
     ) !void {
         std.debug.assert(x.shape[0] == 1 and out.shape[0] == 1);
         const seq_len: usize = @intCast(x.shape[1]);
-        scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
+        try scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
 
-        var buffer_views: [64]Tensor = undefined;
-        buffer_views[@intFromEnum(BufferId.residual)] = out.*;
-        for (1..self.compiled_plan.plan.register_count) |reg_idx| {
+        const reg_count = self.compiled_plan.plan.register_count;
+        var buffer_views_arr: [runtime_contract.max_register_count]Tensor = undefined;
+        const buffer_views = buffer_views_arr[0..reg_count];
+        buffer_views[0] = out.*;
+        for (1..reg_count) |reg_idx| {
             const mapped = self.tmp_register_to_scratch_idx[reg_idx];
             buffer_views[reg_idx] = Tensor.view3DSlice(scratch.tmp[mapped], seq_len, self.hidden_size);
         }
@@ -2338,17 +2396,29 @@ pub const Block = struct {
             .scratch = scratch,
             .use_cache = use_cache,
         };
+        const instruction_handles = try scratch.allocator.alloc(
+            runtime_contract.TensorHandle,
+            self.instruction_handle_capacity,
+        );
+        defer if (instruction_handles.len > 0) scratch.allocator.free(instruction_handles);
+        const instruction_views = try scratch.allocator.alloc(
+            runtime_contract.TensorViewDesc,
+            self.instruction_handle_capacity,
+        );
+        defer if (instruction_views.len > 0) scratch.allocator.free(instruction_views);
 
         var dispatch_state = RuntimeDispatchState{
             .block = self,
             .op_index = 0,
-            .buffer_views = &buffer_views,
+            .buffer_views = buffer_views,
             .scratch = scratch,
             .slot_ctx = ctx,
             .mode = .single_slot,
             .slot_index = slot_index,
             .slot_indices = &.{},
             .use_batched_dispatch = true,
+            .instruction_handles = instruction_handles,
+            .instruction_views = instruction_views,
         };
         try bindDispatchStateDescriptors(&dispatch_state);
 
@@ -2361,9 +2431,11 @@ pub const Block = struct {
         // Post-norm finalization: if the program's final output is not in the residual
         // buffer (e.g., post-norm architectures like BERT end with a norm → norm_out),
         // copy the result to residual so the caller sees it in `out`.
-        const final_buf = finalOutputBuffer(&self.compiled_plan);
-        if (final_buf != .residual) {
-            copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
+        const final_reg_idx = runtime_contract.registerToIndex(
+            runtime_contract.planFinalOutputRegister(&self.compiled_plan.plan),
+        );
+        if (final_reg_idx != 0) {
+            copyTensor(&buffer_views[final_reg_idx], &buffer_views[0]);
         }
     }
 
@@ -2381,12 +2453,14 @@ pub const Block = struct {
         std.debug.assert(x.shape[0] == 1 and out.shape[0] == 1);
         const batch_size: usize = @intCast(x.shape[1]);
         std.debug.assert(batch_size == slot_indices.len);
-        scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
+        try scratch.registerTmpLayout(self.tmp_slot_width_hints, self.tmp_slot_active);
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, batch_size);
 
-        var buffer_views: [64]Tensor = undefined;
-        buffer_views[@intFromEnum(BufferId.residual)] = out.*;
-        for (1..self.compiled_plan.plan.register_count) |reg_idx| {
+        const reg_count = self.compiled_plan.plan.register_count;
+        var buffer_views_arr: [runtime_contract.max_register_count]Tensor = undefined;
+        const buffer_views = buffer_views_arr[0..reg_count];
+        buffer_views[0] = out.*;
+        for (1..reg_count) |reg_idx| {
             const mapped = self.tmp_register_to_scratch_idx[reg_idx];
             buffer_views[reg_idx] = Tensor.view3DSlice(scratch.tmp[mapped], batch_size, self.hidden_size);
         }
@@ -2407,17 +2481,29 @@ pub const Block = struct {
             .scratch = scratch,
             .use_cache = use_cache,
         };
+        const instruction_handles = try scratch.allocator.alloc(
+            runtime_contract.TensorHandle,
+            self.instruction_handle_capacity,
+        );
+        defer if (instruction_handles.len > 0) scratch.allocator.free(instruction_handles);
+        const instruction_views = try scratch.allocator.alloc(
+            runtime_contract.TensorViewDesc,
+            self.instruction_handle_capacity,
+        );
+        defer if (instruction_views.len > 0) scratch.allocator.free(instruction_views);
 
         var dispatch_state = RuntimeDispatchState{
             .block = self,
             .op_index = 0,
-            .buffer_views = &buffer_views,
+            .buffer_views = buffer_views,
             .scratch = scratch,
             .slot_ctx = ctx,
             .mode = .slot_batch,
             .slot_index = 0,
             .slot_indices = slot_indices,
             .use_batched_dispatch = true,
+            .instruction_handles = instruction_handles,
+            .instruction_views = instruction_views,
         };
         try bindDispatchStateDescriptors(&dispatch_state);
 
@@ -2426,9 +2512,11 @@ pub const Block = struct {
             try self.dispatchInstructionWithState(&insn, &dispatch_state);
         }
 
-        const final_buf = finalOutputBuffer(&self.compiled_plan);
-        if (final_buf != .residual) {
-            copyTensor(&buffer_views[@intFromEnum(final_buf)], &buffer_views[@intFromEnum(BufferId.residual)]);
+        const final_reg_idx = runtime_contract.registerToIndex(
+            runtime_contract.planFinalOutputRegister(&self.compiled_plan.plan),
+        );
+        if (final_reg_idx != 0) {
+            copyTensor(&buffer_views[final_reg_idx], &buffer_views[0]);
         }
     }
 };
@@ -2860,7 +2948,7 @@ test "Block.validate detects split with invalid num_outputs" {
     try testing.expectError(error.TooManySplitOutputs, block.validate());
 }
 
-test "Block rejects split with too many outputs at construction" {
+test "Block handles large split output count dynamically" {
     const allocator = testing.allocator;
 
     var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
@@ -2869,13 +2957,15 @@ test "Block rejects split with too many outputs at construction" {
     var transformer_block = try createTestTransformerBlock(allocator, &weights);
     defer transformer_block.deinit(allocator);
 
-    // Split starting at tmp3 with 62 outputs (tmp3..tmp64) exceeds TMP_BUFFER_MAP_LEN (64).
-    // register_count > TMP_BUFFER_MAP_LEN → error.UnsupportedModel from buildTmpRegisterScratchMap.
+    // Split starting at tmp3 with 64 outputs: residual(0) + norm_out(1) + 64 splits = 66 registers.
+    // With dynamic slot arrays, this succeeds — no fixed cap.
     const program = [_]LayerOp{
-        .{ .split = .{ .in = .norm_out, .out_start = .tmp3, .num_outputs = 62, .split_sizes = &.{}, .dim = -1 } },
+        .{ .split = .{ .in = .norm_out, .out_start = .tmp3, .num_outputs = 64, .split_sizes = &.{}, .dim = -1 } },
     };
 
-    try testing.expectError(error.UnsupportedModel, createTestBlock(allocator, &transformer_block, 128, &program));
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+    try testing.expect(block.tmp_slot_active.len >= 65); // 1 + 64 physical slots
 }
 
 test "Block.forward executes simple norm-attn-add program" {
@@ -2914,7 +3004,6 @@ test "Block.forward executes simple norm-attn-add program" {
     var scratch = try ScratchBuffer.init(allocator, 128, 512, 1);
     defer scratch.deinit();
     try scratch.initAttention(&.{0});
-    try scratch.ensure(4);
 
     // Execute forward pass
     try block.forward(&input, &output, &scratch, false);
@@ -2969,7 +3058,6 @@ test "Block.forward executes full norm-attn-norm-ffn-add program" {
     var scratch = try ScratchBuffer.init(allocator, 128, 512, 1);
     defer scratch.deinit();
     try scratch.initAttention(&.{0});
-    try scratch.ensure(2);
 
     // Execute forward pass
     try block.forward(&input, &output, &scratch, false);
@@ -3018,7 +3106,6 @@ test "Block.forward executes mean primitive over last dim" {
 
     var scratch = try ScratchBuffer.init(allocator, hidden, 512, 1);
     defer scratch.deinit();
-    try scratch.ensure(seq_len);
 
     try block.forward(&input, &output, &scratch, false);
 
@@ -3064,7 +3151,6 @@ test "Block.forwardWithBatchedCache executes with batched cache" {
     // Create scratch buffer
     var scratch = try ScratchBuffer.init(allocator, 128, 512, 1);
     defer scratch.deinit();
-    try scratch.ensure(2);
 
     // Create layered KV cache state descriptor binding for block 0.
     var layered_cache = try LayeredBatchedKVCache.init(allocator, 1, 4, 2, 32, 2048);
@@ -3125,26 +3211,12 @@ test "Block.forwardWithBatchedCache handles mul_scalar" {
 
     var scratch = try ScratchBuffer.init(allocator, 128, 512, 1);
     defer scratch.deinit();
-    try scratch.ensure(2);
 
     try block.forwardWithBatchedCache(&input, &output, &scratch, &.{}, 0, false);
 
     for (output_data, 0..) |val, i| {
         try testing.expectApproxEqAbs(input_data[i] * 0.5, val, 1e-6);
     }
-}
-
-test "finalOutputBuffer resolves vision ops output buffer" {
-    const allocator = testing.allocator;
-    const program = [_]LayerOp{
-        .{ .patch_embed = .{ .in = .residual, .out = .tmp3 } },
-        .{ .spatial_merge = .{ .in = .tmp3, .out = .tmp4, .merge_size = 2 } },
-        .{ .deepstack_extract = .{ .in = .tmp4, .out = .tmp5, .layer_index = 3 } },
-        .{ .scatter = .{ .text_in = .residual, .vision_in = .tmp5, .out = .branch_out, .image_token_id = 99 } },
-    };
-    var compiled = try plan_compiler.compileLayerProgram(allocator, &program, .vision_encode);
-    defer plan_compiler.deinitCompiledPlan(allocator, &compiled);
-    try testing.expectEqual(BufferId.branch_out, finalOutputBuffer(&compiled));
 }
 
 test "buildTmpRegisterScratchMap reuses physical tmp slots from liveness" {
@@ -3218,7 +3290,7 @@ test "buildTmpRegisterScratchMap reuses physical tmp slots from liveness" {
         .diagnostics = &.{},
     };
 
-    const tmp_layout = try buildTmpRegisterScratchMap(allocator, &compiled, 256);
+    const tmp_layout = try buildTmpRegisterScratchMap(allocator, &compiled);
     const tmp_map = tmp_layout.map;
     try testing.expectEqual(tmp_map[@intFromEnum(BufferId.tmp3)], tmp_map[@intFromEnum(BufferId.tmp5)]);
     try testing.expect(tmp_map[@intFromEnum(BufferId.tmp4)] != tmp_map[@intFromEnum(BufferId.tmp3)]);

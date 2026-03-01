@@ -74,7 +74,6 @@ pub const ShortConvScratch = shortconv.ShortConvScratch;
 
 pub const CpuKernel = runtime_mod.CpuKernel;
 
-pub const NUM_TMP_BUFFERS = runtime_mod.NUM_TMP_BUFFERS;
 pub const ScratchBuffer = runtime_mod.ScratchBuffer;
 
 pub const FusedBlockWeights = runtime_blocks.FusedBlockWeights;
@@ -1555,7 +1554,7 @@ test "ScratchBuffer: init and deinit basic lifecycle" {
     }
 }
 
-test "ScratchBuffer: ensure allocates all buffers correctly" {
+test "ScratchBuffer: ensure allocates layer_tmp correctly" {
     const allocator = std.testing.allocator;
     const d_model = 64;
     const d_ff = 256;
@@ -1565,16 +1564,33 @@ test "ScratchBuffer: ensure allocates all buffers correctly" {
     var scratch = try ScratchBuffer.init(allocator, d_model, d_ff, n_layers);
     defer scratch.deinit();
 
+    const max_dim = @max(d_model, d_ff * 2);
+    const width_hints = [_]usize{max_dim};
+    const active = [_]bool{true};
+    try scratch.registerTmpLayout(&width_hints, &active);
     try scratch.ensure(seq_len);
 
-    // Expected buffer length: seq_len * max(d_model, d_ff * 2)
-    const max_dim = @max(d_model, d_ff * 2);
+    // Expected buffer length: seq_len * compiler/plan-provided width hint.
     const expected_buffer_len = seq_len * max_dim;
 
-    // All tmp buffers should be allocated to the same size
-    for (scratch.tmp) |temp_slice| {
-        try std.testing.expectEqual(expected_buffer_len, temp_slice.len);
-    }
+    // layer_tmp (slot 0) should be allocated to registered layout size.
+    try std.testing.expectEqual(expected_buffer_len, scratch.tmp[0].len);
+}
+
+test "ScratchBuffer: ensure allocates layer_tmp before layout registration" {
+    const allocator = std.testing.allocator;
+    const d_model = 64;
+    const d_ff = 256;
+    const n_layers = 1;
+    const seq_len = 3;
+
+    var scratch = try ScratchBuffer.init(allocator, d_model, d_ff, n_layers);
+    defer scratch.deinit();
+
+    // Model.forward consumes tmp[0] even before per-block register layouts are
+    // registered. Ensure must allocate layer_tmp in this state.
+    try scratch.ensure(seq_len);
+    try std.testing.expectEqual(seq_len * d_model, scratch.tmp[0].len);
 }
 
 test "ScratchBuffer: ensure handles fused projection size (2x d_ff)" {
@@ -1587,9 +1603,12 @@ test "ScratchBuffer: ensure handles fused projection size (2x d_ff)" {
     var scratch = try ScratchBuffer.init(allocator, d_model, d_ff, n_layers);
     defer scratch.deinit();
 
+    const width_hints = [_]usize{d_ff * 2};
+    const active = [_]bool{true};
+    try scratch.registerTmpLayout(&width_hints, &active);
     try scratch.ensure(seq_len);
 
-    // With d_ff * 2 > d_model, buffer should be sized for fused gate_up
+    // With d_ff * 2 > d_model, registered layout width should drive sizing.
     const expected_buffer_len = seq_len * (d_ff * 2);
     try std.testing.expectEqual(expected_buffer_len, scratch.tmp[0].len);
 }
@@ -1599,6 +1618,9 @@ test "ScratchBuffer: ensure is idempotent" {
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 1);
     defer scratch.deinit();
 
+    const width_hints = [_]usize{512};
+    const active = [_]bool{true};
+    try scratch.registerTmpLayout(&width_hints, &active);
     try scratch.ensure(4);
     const initial_ptr = scratch.tmp[0].ptr;
     const initial_len = scratch.tmp[0].len;
@@ -1614,6 +1636,9 @@ test "ScratchBuffer: ensure grows buffer when needed" {
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 1);
     defer scratch.deinit();
 
+    const width_hints = [_]usize{512};
+    const active = [_]bool{true};
+    try scratch.registerTmpLayout(&width_hints, &active);
     try scratch.ensure(2);
     const initial_len = scratch.tmp[0].len;
 
@@ -1624,36 +1649,43 @@ test "ScratchBuffer: ensure grows buffer when needed" {
     try std.testing.expect(expanded_len > initial_len);
 }
 
-test "ScratchBuffer: getTmp returns correct buffer slice" {
+test "ScratchBuffer: slot slices return expected lengths" {
     const allocator = std.testing.allocator;
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 1);
     defer scratch.deinit();
 
+    // Register layout for slots 0-3 (layer_tmp, norm_out, branch_out, tmp3).
+    const width_hints = [_]usize{ 512, 64, 64, 64 };
+    const active = [_]bool{ true, true, true, true };
+    try scratch.registerTmpLayout(&width_hints, &active);
     const seq_len = 4;
     try scratch.ensure(seq_len);
 
-    // Test norm_out buffer (BufferId = 1)
-    const norm_out = scratch.getTmp(.norm_out, 100);
+    // Test slot 1 buffer (historically norm_out)
+    const norm_out = scratch.tmp[1][0..100];
     try std.testing.expectEqual(@as(usize, 100), norm_out.len);
 
-    // Test branch_out buffer (BufferId = 2)
-    const branch_out = scratch.getTmp(.branch_out, 200);
+    // Test slot 2 buffer (historically branch_out)
+    const branch_out = scratch.tmp[2][0..200];
     try std.testing.expectEqual(@as(usize, 200), branch_out.len);
 
-    // Test tmp3 buffer (BufferId = 3)
-    const tmp3 = scratch.getTmp(.tmp3, 50);
+    // Test slot 3 buffer
+    const tmp3 = scratch.tmp[3][0..50];
     try std.testing.expectEqual(@as(usize, 50), tmp3.len);
 }
 
-test "ScratchBuffer: getTmp with different BufferIds returns different buffers" {
+test "ScratchBuffer: different slots are independent" {
     const allocator = std.testing.allocator;
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 1);
     defer scratch.deinit();
 
+    const width_hints = [_]usize{ 512, 64, 64 };
+    const active = [_]bool{ true, true, true };
+    try scratch.registerTmpLayout(&width_hints, &active);
     try scratch.ensure(4);
 
-    const norm_out = scratch.getTmp(.norm_out, 10);
-    const branch_out = scratch.getTmp(.branch_out, 10);
+    const norm_out = scratch.tmp[1][0..10];
+    const branch_out = scratch.tmp[2][0..10];
 
     // Write different values to each buffer
     norm_out[0] = 1.0;
@@ -1669,14 +1701,17 @@ test "ScratchBuffer: getLayerTmp returns layer_tmp buffer" {
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 1);
     defer scratch.deinit();
 
+    const width_hints = [_]usize{ 512, 64 };
+    const active = [_]bool{ true, true };
+    try scratch.registerTmpLayout(&width_hints, &active);
     try scratch.ensure(4);
 
     const layer_tmp = scratch.getLayerTmp(100);
     try std.testing.expectEqual(@as(usize, 100), layer_tmp.len);
 
-    // layer_tmp should be index 0, independent from other BufferIds
+    // layer_tmp should be index 0, independent from other slots.
     layer_tmp[0] = 42.0;
-    const norm_out = scratch.getTmp(.norm_out, 10);
+    const norm_out = scratch.tmp[1][0..10];
     norm_out[0] = 99.0;
 
     try std.testing.expectEqual(@as(f32, 42.0), layer_tmp[0]);
@@ -1711,6 +1746,9 @@ test "ScratchBuffer: multiple ensure calls with decreasing size" {
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 1);
     defer scratch.deinit();
 
+    const width_hints = [_]usize{512};
+    const active = [_]bool{true};
+    try scratch.registerTmpLayout(&width_hints, &active);
     // Allocate large buffer
     try scratch.ensure(10);
     const allocated_len = scratch.tmp[0].len;
@@ -2377,19 +2415,22 @@ test "ScratchBuffer initAttention initializes selected attention caches" {
     }
 }
 
-test "getTmp getLayerTmp BufferId coverage" {
+test "scratch slot coverage" {
     const allocator = std.testing.allocator;
     var scratch = try ScratchBuffer.init(allocator, 64, 256, 1);
     defer scratch.deinit();
 
+    const width_hints = [_]usize{ 512, 64, 64, 64, 64, 64 };
+    const active = [_]bool{ true, true, true, true, true, true };
+    try scratch.registerTmpLayout(&width_hints, &active);
     try scratch.ensure(2);
 
-    // Test various BufferId values
-    _ = scratch.getTmp(.norm_out, 10);
-    _ = scratch.getTmp(.branch_out, 10);
-    _ = scratch.getTmp(.tmp3, 10);
-    _ = scratch.getTmp(.tmp4, 10);
-    _ = scratch.getTmp(.tmp5, 10);
+    // Test various active slot values directly.
+    _ = scratch.tmp[1][0..10];
+    _ = scratch.tmp[2][0..10];
+    _ = scratch.tmp[3][0..10];
+    _ = scratch.tmp[4][0..10];
+    _ = scratch.tmp[5][0..10];
 
     // All should succeed without panic
 }

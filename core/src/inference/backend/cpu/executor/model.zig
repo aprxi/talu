@@ -270,6 +270,9 @@ pub const Transformer = struct {
     ) !void {
         if (!use_cache) scratch.resetCaches();
         const seq_len: usize = @intCast(input_tensor.shape[1]);
+        for (self.layers) |*layer| {
+            try layer.registerScratchLayout(scratch);
+        }
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
 
         // Use pre-allocated scratch buffer for alternating input/output
@@ -376,6 +379,9 @@ pub const Transformer = struct {
             if (layered_cache) |cache| cache.resetSlot(slot_index);
         }
         const seq_len: usize = @intCast(input_tensor.shape[1]);
+        for (self.layers) |*layer| {
+            try layer.registerScratchLayout(scratch);
+        }
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, seq_len);
 
         // Use pre-allocated scratch buffer for alternating input/output
@@ -474,6 +480,9 @@ pub const Transformer = struct {
         }
 
         const batch_size: usize = @intCast(input_tensor.shape[1]);
+        for (self.layers) |*layer| {
+            try layer.registerScratchLayout(scratch);
+        }
         try scratch.ensureForMode(if (use_cache) .decode else .prefill, batch_size);
 
         var scratch_tensor_view = Tensor.view3DSlice(scratch.tmp[0], batch_size, self.hidden_size);

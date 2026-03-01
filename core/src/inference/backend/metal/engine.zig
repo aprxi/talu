@@ -660,6 +660,7 @@ pub const MetalBackend = struct {
         if (state_blocks.len > binding.handles.len or state_blocks.len > std.math.maxInt(u8)) {
             return error.InvalidStateDescriptorBinding;
         }
+        if (state_blocks.len != self.stateDescriptors().len) return error.InvalidStateDescriptorBinding;
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
         const slot_mamba_cache = try self.slotMambaCache(slot_index);

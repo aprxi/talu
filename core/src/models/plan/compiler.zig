@@ -20,32 +20,25 @@ const mamba_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.mamba);
 
 /// Allocation-order register assignment.
 ///
-/// Fixed slots: residual=0, norm_out=1, branch_out=2.
-/// All tmp buffers (tmp3+) are assigned dense register indices starting from 3
-/// in first-use order. This breaks the identity mapping between BufferId enum
-/// values and RegisterRef indices.
+/// Only residual (0) is architecturally fixed. All intermediates (norm_out,
+/// branch_out, tmp*) are dynamically assigned dense register indices in
+/// first-use order.
 const RegisterMap = struct {
     buffer_to_register: [64]u16,
-    register_to_buffer: [max_registers]u8,
     next_register: u16,
 
-    const max_registers = 128;
+    const max_registers = runtime_contract.max_register_count;
     const sentinel: u16 = std.math.maxInt(u16);
-    const no_buffer: u8 = std.math.maxInt(u8);
 
     fn init() RegisterMap {
         var map = RegisterMap{
             .buffer_to_register = [_]u16{sentinel} ** 64,
-            .register_to_buffer = [_]u8{no_buffer} ** max_registers,
-            .next_register = 3,
+            .next_register = 1,
         };
-        // Fixed: residual=0, norm_out=1, branch_out=2
+        // Only residual is architecturally fixed (block input/output boundary).
+        // All intermediates (norm_out, branch_out, tmp*) are dynamically assigned
+        // by first-use order.
         map.buffer_to_register[0] = 0;
-        map.buffer_to_register[1] = 1;
-        map.buffer_to_register[2] = 2;
-        map.register_to_buffer[0] = 0;
-        map.register_to_buffer[1] = 1;
-        map.register_to_buffer[2] = 2;
         return map;
     }
 
@@ -57,9 +50,6 @@ const RegisterMap = struct {
         const reg_idx = self.next_register;
         self.next_register += 1;
         self.buffer_to_register[buf_idx] = reg_idx;
-        if (reg_idx < max_registers) {
-            self.register_to_buffer[reg_idx] = @intCast(buf_idx);
-        }
         return runtime_contract.registerFromIndex(reg_idx);
     }
 
@@ -86,24 +76,13 @@ const RegisterMap = struct {
             if (buf_val < 64) {
                 regs[idx] = self.registerFor(@enumFromInt(buf_val));
             } else {
-                // Buffer index exceeds BufferId range — assign register without
-                // BufferId tracking. Backend will reject via register_count check.
+                // Buffer index exceeds BufferId range — assign register directly.
                 const reg_idx = self.next_register;
                 self.next_register += 1;
-                if (reg_idx < max_registers) {
-                    self.register_to_buffer[reg_idx] = no_buffer;
-                }
                 regs[idx] = runtime_contract.registerFromIndex(reg_idx);
             }
         }
         return regs;
-    }
-
-    fn toOwnedSlice(self: *const RegisterMap, allocator: std.mem.Allocator) ![]u8 {
-        const count = @min(self.next_register, max_registers);
-        const slice = try allocator.alloc(u8, count);
-        @memcpy(slice, self.register_to_buffer[0..count]);
-        return slice;
     }
 };
 
@@ -436,6 +415,10 @@ fn buildLivenessMap(
     defer allocator.free(produced);
     @memset(produced, false);
 
+    var first_write = try allocator.alloc(u32, register_count_usize);
+    defer allocator.free(first_write);
+    @memset(first_write, sentinel);
+
     for (instructions, 0..) |insn, instruction_idx| {
         const idx_u32: u32 = @intCast(instruction_idx);
         for (insn.inputs) |reg| {
@@ -445,6 +428,9 @@ fn buildLivenessMap(
         for (insn.outputs) |reg| {
             const reg_idx = runtime_contract.registerToIndex(reg);
             produced[reg_idx] = true;
+            if (first_write[reg_idx] == sentinel) {
+                first_write[reg_idx] = idx_u32;
+            }
         }
     }
 
@@ -466,8 +452,13 @@ fn buildLivenessMap(
         );
         for (register_last_read, 0..) |last_read, idx| {
             if (produced[idx] and last_read == sentinel) {
-                register_last_read[idx] = terminal_idx;
-                if (idx != final_output_idx) {
+                if (idx == final_output_idx) {
+                    // Final output is consumed by runtime after plan execution;
+                    // keep alive until terminal instruction.
+                    register_last_read[idx] = terminal_idx;
+                } else {
+                    // Dead output: kill at producer for immediate physical buffer reclaim.
+                    register_last_read[idx] = first_write[idx];
                     try never_read.append(allocator, @intCast(idx));
                 }
             }
@@ -545,15 +536,17 @@ fn buildRegisterBufferSpecs(
     program: []const layer_ops.LayerOp,
     instructions: []const runtime_contract.Instruction,
     register_count: u16,
+    size_floor: usize,
 ) ![]runtime_contract.PhysicalBufferSpec {
     if (register_count == 0) return &.{};
     if (instructions.len != program.len) return error.InvalidInstructionCount;
 
     const reg_count: usize = register_count;
     const specs = try allocator.alloc(runtime_contract.PhysicalBufferSpec, reg_count);
+    const floor = @max(size_floor, 1);
     for (specs) |*spec| {
         spec.* = .{
-            .size = 1,
+            .size = floor,
             .@"align" = 64,
         };
     }
@@ -717,10 +710,20 @@ fn validateProgramBlockKindStateCompatibility(
     }
 }
 
+/// Options for plan compilation.
+pub const CompileOptions = struct {
+    /// Minimum buffer size for all register specs. The compiler guarantees
+    /// that every `PhysicalBufferSpec.size` in the compiled plan is at
+    /// least this value. Backends should consume plan specs exactly; any
+    /// model-dimension floor must be provided here, not post-hoc.
+    size_floor: usize = 1,
+};
+
 pub fn compileLayerProgram(
     allocator: std.mem.Allocator,
     program: []const layer_ops.LayerOp,
     mode: CompileMode,
+    options: CompileOptions,
 ) !runtime_contract.CompiledPlan {
     var instructions = std.ArrayListUnmanaged(runtime_contract.Instruction){};
     var param_blocks = std.ArrayListUnmanaged(runtime_contract.ParamBlock){};
@@ -761,8 +764,6 @@ pub fn compileLayerProgram(
     }
 
     const register_count: u16 = if (instruction_slice.len == 0) 0 else reg_map.next_register;
-    const register_to_buffer_id = if (register_count > 0) try reg_map.toOwnedSlice(allocator) else &[_]u8{};
-    errdefer if (register_to_buffer_id.len > 0) allocator.free(register_to_buffer_id);
     const liveness_result = try buildLivenessMap(allocator, instruction_slice, register_count);
     const liveness = liveness_result.map;
     defer if (liveness_result.never_read_registers.len > 0)
@@ -792,6 +793,7 @@ pub fn compileLayerProgram(
         program,
         instruction_slice,
         register_count,
+        options.size_floor,
     );
     errdefer if (register_buffer_specs.len > 0) allocator.free(register_buffer_specs);
 
@@ -804,7 +806,6 @@ pub fn compileLayerProgram(
         .param_blocks = param_block_slice,
         .weight_bindings = weight_binding_slice,
         .register_buffer_specs = register_buffer_specs,
-        .register_to_buffer_id = register_to_buffer_id,
         .liveness = liveness,
         .peak_registers = register_count,
         .diagnostics = &.{},
@@ -821,11 +822,12 @@ pub fn compileProgramForArchitecture(
     architecture_id: []const u8,
     block_kind: op_types.BlockKind,
     mode: CompileMode,
+    options: CompileOptions,
 ) !runtime_contract.CompiledPlan {
     const entry = registry.detectByArchitectureId(architecture_id) orelse return error.UnknownArchitecture;
     const program = registry.blockProgramFor(entry, block_kind) orelse return error.MissingBlockProgram;
     try validateProgramBlockKindStateCompatibility(program, block_kind);
-    return compileLayerProgram(allocator, program, mode);
+    return compileLayerProgram(allocator, program, mode, options);
 }
 
 pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contract.CompiledPlan) void {
@@ -841,7 +843,6 @@ pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contr
     for (compiled.weight_bindings) |binding| allocator.free(binding.name);
     if (compiled.weight_bindings.len > 0) allocator.free(compiled.weight_bindings);
     if (compiled.register_buffer_specs.len > 0) allocator.free(compiled.register_buffer_specs);
-    if (compiled.register_to_buffer_id.len > 0) allocator.free(compiled.register_to_buffer_id);
 
     if (compiled.plan.state_descs.len > 0) allocator.free(compiled.plan.state_descs);
 
@@ -1088,28 +1089,28 @@ fn hasStateDescriptor(compiled: *const runtime_contract.CompiledPlan, id: u8) bo
 }
 
 test "compileLayerProgram preserves structural parity for llama3" {
-    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try expectProgramParity(llama3.attention_mlp_program, &compiled);
 }
 
 test "compileLayerProgram preserves structural parity for granite_hybrid mamba" {
-    var compiled = try compileLayerProgram(std.testing.allocator, granite_hybrid.mamba_program, .prefill);
+    var compiled = try compileLayerProgram(std.testing.allocator, granite_hybrid.mamba_program, .prefill, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try expectProgramParity(granite_hybrid.mamba_program, &compiled);
 }
 
 test "compileLayerProgram preserves structural parity for qwen3_moe" {
-    var compiled = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try expectProgramParity(qwen3_moe.attention_mlp_program, &compiled);
 }
 
 test "compileLayerProgram emits KV state descriptor and attention state references" {
-    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expect(hasStateDescriptor(&compiled, kv_state_id));
@@ -1134,7 +1135,7 @@ test "compileLayerProgram omits attention state in vision mode" {
         } },
     };
 
-    var compiled = try compileLayerProgram(std.testing.allocator, &program, .vision_encode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .vision_encode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expectEqual(@as(usize, 0), compiled.plan.state_descs.len);
@@ -1142,7 +1143,7 @@ test "compileLayerProgram omits attention state in vision mode" {
 }
 
 test "compileLayerProgram emits mamba state descriptor and mixer state references" {
-    var compiled = try compileLayerProgram(std.testing.allocator, granite_hybrid.mamba_program, .prefill);
+    var compiled = try compileLayerProgram(std.testing.allocator, granite_hybrid.mamba_program, .prefill, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expect(hasStateDescriptor(&compiled, mamba_state_id));
@@ -1166,7 +1167,7 @@ test "compileLayerProgram emits shortconv state descriptor when shortconv op is 
             .debug_type = .shortconv,
         } },
     };
-    var compiled = try compileLayerProgram(std.testing.allocator, &shortconv_program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &shortconv_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expect(hasStateDescriptor(&compiled, shortconv_state_id));
@@ -1182,7 +1183,7 @@ test "compileLayerProgram emits structured kernel weight refs for macro attentio
             .debug_type = .multihead_attention,
         } },
     };
-    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     const insn = compiled.plan.instructions[0];
@@ -1214,7 +1215,7 @@ test "compileLayerProgram emits deterministic weight bindings for parameterized 
             .param_name = "p_add",
         } },
     };
-    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expectEqual(@as(usize, 2), compiled.weight_bindings.len);
@@ -1246,7 +1247,7 @@ test "compileLayerProgram strips runtime param-block weight names for bound prim
             .param_name = "p_add",
         } },
     };
-    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     inline for ([_]usize{ 0, 1, 2 }) |insn_idx| {
@@ -1262,7 +1263,7 @@ test "compileLayerProgram strips runtime param-block weight names for bound prim
 }
 
 test "compileLayerProgram emits param blocks compliant with runtime ABI contract" {
-    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     for (compiled.param_blocks) |param_block| {
@@ -1298,7 +1299,7 @@ test "compileLayerProgram param blocks decode back to executable layer ops" {
             .scalar = -1.0,
         } },
     };
-    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     for (program, compiled.plan.instructions, 0..) |source_op, insn, op_index| {
@@ -1307,31 +1308,24 @@ test "compileLayerProgram param blocks decode back to executable layer ops" {
             .kernel => |kernel| switch (decoded) {
                 .kernel => |decoded_kernel| {
                     try std.testing.expectEqual(kernel.id, decoded_kernel.id);
-                    try std.testing.expectEqual(kernel.in, decoded_kernel.in);
-                    try std.testing.expectEqual(kernel.out, decoded_kernel.out);
                     try std.testing.expectEqual(kernel.debug_type, decoded_kernel.debug_type);
                 },
                 else => return error.TestUnexpectedResult,
             },
             .add => |add_op| switch (decoded) {
                 .add => |decoded_add| {
-                    try std.testing.expectEqual(add_op.branch, decoded_add.branch);
                     try std.testing.expect(std.meta.eql(add_op.scale, decoded_add.scale));
                 },
                 else => return error.TestUnexpectedResult,
             },
             .mul_scalar => |mul_scalar_op| switch (decoded) {
                 .mul_scalar => |decoded_mul| {
-                    try std.testing.expectEqual(mul_scalar_op.in, decoded_mul.in);
-                    try std.testing.expectEqual(mul_scalar_op.out, decoded_mul.out);
                     try std.testing.expectEqual(mul_scalar_op.scalar, decoded_mul.scalar);
                 },
                 else => return error.TestUnexpectedResult,
             },
             .add_scalar => |add_scalar_op| switch (decoded) {
                 .add_scalar => |decoded_add_scalar| {
-                    try std.testing.expectEqual(add_scalar_op.in, decoded_add_scalar.in);
-                    try std.testing.expectEqual(add_scalar_op.out, decoded_add_scalar.out);
                     try std.testing.expectEqual(add_scalar_op.scalar, decoded_add_scalar.scalar);
                 },
                 else => return error.TestUnexpectedResult,
@@ -1342,14 +1336,14 @@ test "compileLayerProgram param blocks decode back to executable layer ops" {
 }
 
 test "compileProgramForArchitecture resolves registry programs" {
-    var compiled = try compileProgramForArchitecture(std.testing.allocator, "granite_hybrid", .mamba, .decode);
+    var compiled = try compileProgramForArchitecture(std.testing.allocator, "granite_hybrid", .mamba, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expect(compiled.plan.instructions.len > 0);
 }
 
 test "compileLayerProgram emits summary diagnostics" {
-    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, llama3.attention_mlp_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expect(compiled.diagnostics.len >= 1);
@@ -1358,9 +1352,9 @@ test "compileLayerProgram emits summary diagnostics" {
 }
 
 test "compileLayerProgram is deterministic across repeated compiles of same program" {
-    var first = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode);
+    var first = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &first);
-    var second = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode);
+    var second = try compileLayerProgram(std.testing.allocator, qwen3_moe.attention_mlp_program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &second);
 
     try std.testing.expectEqual(first.plan.instructions.len, second.plan.instructions.len);
@@ -1381,7 +1375,7 @@ test "compileLayerProgram is deterministic across repeated compiles of same prog
 }
 
 test "compileLayerProgram emits empty plan warning diagnostics" {
-    var compiled = try compileLayerProgram(std.testing.allocator, &.{}, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &.{}, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     try std.testing.expect(compiled.diagnostics.len >= 2);
@@ -1397,7 +1391,7 @@ test "compileLayerProgram emits never_read diagnostic for unused output" {
         .{ .mul_scalar = .{ .in = .residual, .out = .norm_out, .scalar = 1.0 } },
         .{ .mul_scalar = .{ .in = .residual, .out = .branch_out, .scalar = 2.0 } },
     };
-    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode, .{});
     defer deinitCompiledPlan(std.testing.allocator, &compiled);
 
     var found_never_read = false;
@@ -1414,35 +1408,26 @@ test "compileLayerProgram emits never_read diagnostic for unused output" {
 test "compileLayerProgram assigns dense registers for sparse tmp buffers" {
     const allocator = std.testing.allocator;
     // Program uses tmp3, tmp10, tmp20 — sparse BufferIds (values 3, 10, 20).
-    // Dense allocation should assign registers 3, 4, 5 (not 3, 10, 20).
+    // Dense allocation: only residual=0 is fixed; all others by first-use order.
     const program = [_]layer_ops.LayerOp{
         .{ .silu = .{ .in = .norm_out, .out = .tmp3 } },
         .{ .silu = .{ .in = .tmp3, .out = .tmp10 } },
         .{ .silu = .{ .in = .tmp10, .out = .tmp20 } },
     };
-    var compiled = try compileLayerProgram(allocator, &program, .decode);
+    var compiled = try compileLayerProgram(allocator, &program, .decode, .{});
     defer deinitCompiledPlan(allocator, &compiled);
 
-    // Fixed slots: residual=0, norm_out=1, branch_out=2
-    // Dense tmp allocation: tmp3→3, tmp10→4, tmp20→5
-    try std.testing.expectEqual(@as(u16, 6), compiled.plan.register_count);
-
-    // register_to_buffer_id mapping: register index → BufferId value
-    try std.testing.expectEqual(@as(u8, 0), compiled.register_to_buffer_id[0]); // residual
-    try std.testing.expectEqual(@as(u8, 1), compiled.register_to_buffer_id[1]); // norm_out
-    try std.testing.expectEqual(@as(u8, 2), compiled.register_to_buffer_id[2]); // branch_out
-    try std.testing.expectEqual(@as(u8, 3), compiled.register_to_buffer_id[3]); // tmp3
-    try std.testing.expectEqual(@as(u8, 10), compiled.register_to_buffer_id[4]); // tmp10
-    try std.testing.expectEqual(@as(u8, 20), compiled.register_to_buffer_id[5]); // tmp20
+    // residual=0 (fixed), norm_out→1, tmp3→2, tmp10→3, tmp20→4 (by first-use)
+    try std.testing.expectEqual(@as(u16, 5), compiled.plan.register_count);
 
     // Verify registers in instructions are NOT identity-cast BufferIds
     const insn1 = compiled.plan.instructions[1]; // silu: tmp3→tmp10
-    try std.testing.expectEqual(@as(u16, 3), runtime_contract.registerToIndex(insn1.inputs[0])); // tmp3 → register 3
-    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn1.outputs[0])); // tmp10 → register 4 (NOT 10)
+    try std.testing.expectEqual(@as(u16, 2), runtime_contract.registerToIndex(insn1.inputs[0])); // tmp3 → register 2
+    try std.testing.expectEqual(@as(u16, 3), runtime_contract.registerToIndex(insn1.outputs[0])); // tmp10 → register 3 (NOT 10)
 
     const insn2 = compiled.plan.instructions[2]; // silu: tmp10→tmp20
-    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn2.inputs[0])); // tmp10 → register 4
-    try std.testing.expectEqual(@as(u16, 5), runtime_contract.registerToIndex(insn2.outputs[0])); // tmp20 → register 5 (NOT 20)
+    try std.testing.expectEqual(@as(u16, 3), runtime_contract.registerToIndex(insn2.inputs[0])); // tmp10 → register 3
+    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn2.outputs[0])); // tmp20 → register 4 (NOT 20)
 }
 
 test "compileLayerProgram assigns dense registers for split outputs" {
@@ -1450,19 +1435,65 @@ test "compileLayerProgram assigns dense registers for split outputs" {
     const program = [_]layer_ops.LayerOp{
         .{ .split = .{ .in = .norm_out, .out_start = .tmp10, .num_outputs = 3, .split_sizes = &.{}, .dim = -1 } },
     };
-    var compiled = try compileLayerProgram(allocator, &program, .decode);
+    var compiled = try compileLayerProgram(allocator, &program, .decode, .{});
     defer deinitCompiledPlan(allocator, &compiled);
 
-    // Split outputs tmp10, tmp11, tmp12 → registers 3, 4, 5 (dense from 3, not 10, 11, 12)
+    // norm_out→1 (first-use as input), split outputs tmp10→2, tmp11→3, tmp12→4
     const insn = compiled.plan.instructions[0];
-    try std.testing.expectEqual(@as(u16, 3), runtime_contract.registerToIndex(insn.outputs[0])); // tmp10 → 3
-    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn.outputs[1])); // tmp11 → 4
-    try std.testing.expectEqual(@as(u16, 5), runtime_contract.registerToIndex(insn.outputs[2])); // tmp12 → 5
+    try std.testing.expectEqual(@as(u16, 2), runtime_contract.registerToIndex(insn.outputs[0])); // tmp10 → 2
+    try std.testing.expectEqual(@as(u16, 3), runtime_contract.registerToIndex(insn.outputs[1])); // tmp11 → 3
+    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn.outputs[2])); // tmp12 → 4
 
-    // Mapping round-trip
-    try std.testing.expectEqual(@as(u8, 10), compiled.register_to_buffer_id[3]); // register 3 → tmp10
-    try std.testing.expectEqual(@as(u8, 11), compiled.register_to_buffer_id[4]); // register 4 → tmp11
-    try std.testing.expectEqual(@as(u8, 12), compiled.register_to_buffer_id[5]); // register 5 → tmp12
+}
+
+test "compileLayerProgram does not pin intermediates to legacy IDs" {
+    const allocator = std.testing.allocator;
+    // Program where branch_out is used BEFORE norm_out.
+    // With dynamic assignment, branch_out gets the lower register (first-use).
+    const program = [_]layer_ops.LayerOp{
+        .{ .silu = .{ .in = .residual, .out = .branch_out } }, // branch_out used first
+        .{ .silu = .{ .in = .branch_out, .out = .norm_out } }, // norm_out used second
+    };
+    var compiled = try compileLayerProgram(allocator, &program, .decode, .{});
+    defer deinitCompiledPlan(allocator, &compiled);
+    // branch_out → register 1 (first intermediate), norm_out → register 2 (second)
+    const insn0 = compiled.plan.instructions[0];
+    try std.testing.expectEqual(@as(u16, 1), runtime_contract.registerToIndex(insn0.outputs[0]));
+    const insn1 = compiled.plan.instructions[1];
+    try std.testing.expectEqual(@as(u16, 2), runtime_contract.registerToIndex(insn1.outputs[0]));
+}
+
+test "dead output is killed at producer for immediate physical reclaim" {
+    const allocator = std.testing.allocator;
+    // insn0: residual → tmp3 (never read)
+    // insn1: residual → tmp10 (never read)
+    // insn2: residual → branch_out (final output — must survive)
+    const program = [_]layer_ops.LayerOp{
+        .{ .silu = .{ .in = .residual, .out = .tmp3 } },
+        .{ .silu = .{ .in = .residual, .out = .tmp10 } },
+        .{ .silu = .{ .in = .residual, .out = .branch_out } },
+    };
+    var compiled = try compileLayerProgram(allocator, &program, .decode, .{});
+    defer deinitCompiledPlan(allocator, &compiled);
+
+    // tmp3 and tmp10 are dead → killed at their producers → can share physical buffer.
+    // Only branch_out (final output) stays live → reduced peak pressure.
+    const tmp3_reg = runtime_contract.registerToIndex(compiled.plan.instructions[0].outputs[0]);
+    const tmp10_reg = runtime_contract.registerToIndex(compiled.plan.instructions[1].outputs[0]);
+    const branch_reg = runtime_contract.registerToIndex(compiled.plan.instructions[2].outputs[0]);
+
+    // tmp3 killed at instruction 0 (its producer), tmp10 killed at instruction 1 (its producer).
+    const kill0 = compiled.liveness.kill_after_instruction[0];
+    const kill1 = compiled.liveness.kill_after_instruction[1];
+    try std.testing.expect((kill0[tmp3_reg / 64] & (@as(u64, 1) << @intCast(tmp3_reg % 64))) != 0);
+    try std.testing.expect((kill1[tmp10_reg / 64] & (@as(u64, 1) << @intCast(tmp10_reg % 64))) != 0);
+
+    // Final output (branch_out) must NOT be killed at its producer — it stays live until terminal.
+    const kill2 = compiled.liveness.kill_after_instruction[2];
+    try std.testing.expect((kill2[branch_reg / 64] & (@as(u64, 1) << @intCast(branch_reg % 64))) != 0);
+    // And branch_out must NOT appear in kill0 or kill1.
+    try std.testing.expect((kill0[branch_reg / 64] & (@as(u64, 1) << @intCast(branch_reg % 64))) == 0);
+    try std.testing.expect((kill1[branch_reg / 64] & (@as(u64, 1) << @intCast(branch_reg % 64))) == 0);
 }
 
 test "validateProgramBlockKindStateCompatibility rejects mismatched stateful opcode" {

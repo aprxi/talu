@@ -26,7 +26,7 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
         const download_logits = self.shouldDownloadPrefillLogitsImpl(i, tokens.len);
-        try self.computeGpuPrototypeLogitsWithLayerLimit(
+        self.computeGpuPrototypeLogitsWithLayerLimit(
             tokens[i],
             i,
             if (download_logits) self.slot_logits else null,
@@ -37,7 +37,14 @@ pub fn prefill(self: anytype, tokens: []const u32, logits_out: []f32) !void {
             null,
             null,
             null,
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA prefill token step failed", .{
+                .token_index = i,
+                .token_id = tokens[i],
+                .reason = @errorName(err),
+            });
+            return err;
+        };
     }
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill", tokens.len, prefill_elapsed_ns);
@@ -86,7 +93,7 @@ pub fn prefillSlot(
     var i: usize = 0;
     while (i < tokens.len) : (i += 1) {
         const download_logits = self.shouldDownloadPrefillLogitsImpl(i, tokens.len);
-        try self.computeGpuPrototypeLogitsWithLayerLimit(
+        self.computeGpuPrototypeLogitsWithLayerLimit(
             tokens[i],
             i,
             if (download_logits) self.slot_logits else null,
@@ -97,7 +104,15 @@ pub fn prefillSlot(
             null,
             null,
             null,
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA prefillSlot token step failed", .{
+                .slot_index = slot_index,
+                .token_index = i,
+                .token_id = tokens[i],
+                .reason = @errorName(err),
+            });
+            return err;
+        };
     }
     const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
     self.logPrefillTimingImpl("prefill_slot", tokens.len, prefill_elapsed_ns);

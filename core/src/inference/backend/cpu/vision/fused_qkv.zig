@@ -76,7 +76,6 @@ pub const VisionRuntime = struct {
     scratch: cpu_blocks.ScratchBuffer,
     vision_program: []const layer_ops.LayerOp,
     vision_stage_plans: vision_program_mod.VisionStagePlans,
-    dispatch_counters: runtime_contract.DispatchCounters = .{},
 
     fn initVisionScratch(
         allocator: std.mem.Allocator,
@@ -388,7 +387,6 @@ pub const VisionRuntime = struct {
             .scratch = scratch,
             .vision_program = vision_program,
             .vision_stage_plans = vision_stage_plans,
-            .dispatch_counters = .{},
         };
     }
 
@@ -492,8 +490,8 @@ pub const VisionRuntime = struct {
         embeddings: []const f32,
     ) !void {
         try vision_adapters.runScatterProgram(
-            &self.vision_stage_plans.scatter,
-            &self.dispatch_counters,
+            self.vision_stage_plans.scatter(),
+            null,
             vision_adapters.adapter_table,
             hidden_states,
             seq_len,
@@ -631,8 +629,8 @@ pub const VisionRuntime = struct {
             @ptrCast(self),
             &VTable.vtable,
             self.allocator,
-            &self.vision_stage_plans.vision_encode,
-            &self.dispatch_counters,
+            self.vision_stage_plans.vision_encode(),
+            null,
             vision_adapters.adapter_table,
             image.grid,
             current,
