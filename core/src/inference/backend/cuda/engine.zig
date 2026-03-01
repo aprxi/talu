@@ -3573,8 +3573,8 @@ pub const CudaBackend = struct {
         table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = layerProgramNormRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = layerProgramAttentionRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.shortconv)] = layerProgramShortConvRuntimeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramFfnRuntimeAdapter;
-        table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramFfnRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.swiglu)] = layerProgramSwiGluRuntimeAdapter;
+        table[@intFromEnum(opcode_map.Opcode.moe)] = layerProgramMoeRuntimeAdapter;
         table[@intFromEnum(opcode_map.Opcode.residual_add)] = layerProgramResidualAddRuntimeAdapter;
         break :blk table;
     };
@@ -3981,7 +3981,7 @@ pub const CudaBackend = struct {
         try self.runShortConvMixerStep(&binding, input, output, ctx.shortconv_step_function);
     }
 
-    fn layerProgramFfnAdapter(
+    fn layerProgramSwiGluAdapter(
         self: *CudaBackend,
         layer: *BlockRuntimeLayer,
         insn: *const runtime_contract.Instruction,
@@ -3992,20 +3992,30 @@ pub const CudaBackend = struct {
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
-        if (insn.opcode == .swiglu) {
-            const weight_handles = try instructionWeightSlice(insn, registers);
-            if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-            const binding = try layer.instructionFfnRef(ctx.op_index);
-            try self.runFfnStep(
-                input,
-                linearWeightFromWeightHandle(weight_handles[0]),
-                linearWeightFromWeightHandle(weight_handles[1]),
-                linearWeightFromWeightHandle(weight_handles[2]),
-                binding.d_ff,
-                output,
-            );
-            return;
-        }
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != 3) return error.InvalidWeightRefCount;
+        const binding = try layer.instructionFfnRef(ctx.op_index);
+        try self.runFfnStep(
+            input,
+            linearWeightFromWeightHandle(weight_handles[0]),
+            linearWeightFromWeightHandle(weight_handles[1]),
+            linearWeightFromWeightHandle(weight_handles[2]),
+            binding.d_ff,
+            output,
+        );
+    }
+
+    fn layerProgramMoeAdapter(
+        self: *CudaBackend,
+        layer: *BlockRuntimeLayer,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        ctx: *LayerProgramExecutionContext,
+    ) !void {
+        const io = try instructionIoSlices(insn, registers);
+        if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
+        const input = bufferFromTensorHandle(io.inputs[0]);
+        const output = bufferFromTensorHandle(io.outputs[0]);
         const binding = try layer.instructionFfnRef(ctx.op_index);
         try self.runFfnStep(input, binding.gate, binding.up, binding.down, binding.d_ff, output);
     }
@@ -4077,7 +4087,7 @@ pub const CudaBackend = struct {
         try exec_ctx.backend.layerProgramShortConvAdapter(layer, insn, registers, exec_ctx);
     }
 
-    fn layerProgramFfnRuntimeAdapter(
+    fn layerProgramSwiGluRuntimeAdapter(
         rt_ctx: *runtime_contract.ExecutionContext,
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
@@ -4092,7 +4102,25 @@ pub const CudaBackend = struct {
             state_blocks,
         );
         const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
-        try exec_ctx.backend.layerProgramFfnAdapter(layer, insn, registers, exec_ctx);
+        try exec_ctx.backend.layerProgramSwiGluAdapter(layer, insn, registers, exec_ctx);
+    }
+
+    fn layerProgramMoeRuntimeAdapter(
+        rt_ctx: *runtime_contract.ExecutionContext,
+        insn: *const runtime_contract.Instruction,
+        registers: []runtime_contract.TensorHandle,
+        _: []const runtime_contract.TensorViewDesc,
+        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []const runtime_contract.ParamBlock,
+    ) !void {
+        const exec_ctx = try layerProgramExecutionState(rt_ctx);
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(
+            insn,
+            &exec_ctx.layer.compiled_plan.?.plan,
+            state_blocks,
+        );
+        const layer = try requireLayerProgramRuntimeState(exec_ctx, insn, state_blocks);
+        try exec_ctx.backend.layerProgramMoeAdapter(layer, insn, registers, exec_ctx);
     }
 
     fn layerProgramResidualAddRuntimeAdapter(

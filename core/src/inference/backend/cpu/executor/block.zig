@@ -440,6 +440,33 @@ pub const Block = struct {
         };
     }
 
+    const KernelWeightResolverFn = *const fn (kernel: CpuKernel, slot_name: []const u8) anyerror!*const Tensor;
+
+    const kernel_expected_op_type_table: [256]?op_types.OpType = blk: {
+        var table = [_]?op_types.OpType{null} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = .norm;
+        table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = .multihead_attention;
+        table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = .multihead_attention;
+        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = .mlp;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = .moe;
+        table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = .mamba_mixer;
+        table[@intFromEnum(runtime_contract.Opcode.shortconv)] = .shortconv;
+        table[@intFromEnum(runtime_contract.Opcode.embedding)] = .embedding;
+        break :blk table;
+    };
+
+    const kernel_weight_resolver_table: [256]?KernelWeightResolverFn = blk: {
+        var table = [_]?KernelWeightResolverFn{null} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = resolveRmsNormWeightRef;
+        table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = resolveAttentionWeightRef;
+        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = resolveSwiGluWeightRef;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = resolveMoeWeightRef;
+        table[@intFromEnum(runtime_contract.Opcode.mamba_mixer)] = resolveMambaWeightRef;
+        table[@intFromEnum(runtime_contract.Opcode.shortconv)] = resolveShortConvWeightRef;
+        table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = resolveMlaWeightRef;
+        break :blk table;
+    };
+
     fn instructionKernelBinding(
         self: *const Block,
         op_index: usize,
@@ -448,15 +475,8 @@ pub const Block = struct {
         if (op_index >= self.instruction_kernel_refs.len) return error.InvalidInstructionIndex;
         const kernel = self.instruction_kernel_refs[op_index] orelse return error.MissingKernelBinding;
         if (builtin.mode == .Debug) {
-            const expected_type: op_types.OpType = switch (opcode) {
-                .rmsnorm => .norm,
-                .multihead_attention, .mla_attention => .multihead_attention,
-                .swiglu => .mlp,
-                .moe => .moe,
-                .mamba_mixer => .mamba_mixer,
-                .shortconv => .shortconv,
-                .embedding => .embedding,
-                else => return error.InvalidInstructionBinding,
+            const expected_type = kernel_expected_op_type_table[@intFromEnum(opcode)] orelse {
+                return error.InvalidInstructionBinding;
             };
             if (kernel.getOpType() != expected_type) return error.InvalidInstructionBinding;
         }
@@ -464,77 +484,99 @@ pub const Block = struct {
     }
 
     fn kernelWeightRefForSlot(kernel: CpuKernel, opcode: runtime_contract.Opcode, slot_name: []const u8) !*const Tensor {
-        return switch (opcode) {
-            .rmsnorm => switch (kernel) {
-                .norm => |norm_inst| switch (norm_inst.*) {
-                    .rms => |rms| if (std.mem.eql(u8, slot_name, "norm_weight")) rms.weight else error.InvalidWeightBindingName,
-                    .layer => |layer_norm| if (std.mem.eql(u8, slot_name, "norm_weight")) layer_norm.weight else error.InvalidWeightBindingName,
-                },
-                else => error.InvalidInstructionBinding,
+        const resolver = kernel_weight_resolver_table[@intFromEnum(opcode)] orelse {
+            return error.InvalidInstructionBinding;
+        };
+        return resolver(kernel, slot_name);
+    }
+
+    fn resolveRmsNormWeightRef(kernel: CpuKernel, slot_name: []const u8) !*const Tensor {
+        return switch (kernel) {
+            .norm => |norm_inst| switch (norm_inst.*) {
+                .rms => |rms| if (std.mem.eql(u8, slot_name, "norm_weight")) rms.weight else error.InvalidWeightBindingName,
+                .layer => |layer_norm| if (std.mem.eql(u8, slot_name, "norm_weight")) layer_norm.weight else error.InvalidWeightBindingName,
             },
-            .multihead_attention => switch (kernel) {
-                .attention => |attn_inst| {
-                    if (std.mem.eql(u8, slot_name, "q_proj")) {
-                        if (attn_inst.q_proj) |weight| return weight;
-                        if (attn_inst.fused_qkv) |*fused| return fused;
-                    } else if (std.mem.eql(u8, slot_name, "k_proj")) {
-                        if (attn_inst.k_proj) |weight| return weight;
-                        if (attn_inst.fused_qkv) |*fused| return fused;
-                    } else if (std.mem.eql(u8, slot_name, "v_proj")) {
-                        if (attn_inst.v_proj) |weight| return weight;
-                        if (attn_inst.fused_qkv) |*fused| return fused;
-                    } else if (std.mem.eql(u8, slot_name, "o_proj")) {
-                        return attn_inst.o_proj;
-                    }
-                    return error.MissingWeight;
-                },
-                else => error.InvalidInstructionBinding,
+            else => error.InvalidInstructionBinding,
+        };
+    }
+
+    fn resolveAttentionWeightRef(kernel: CpuKernel, slot_name: []const u8) !*const Tensor {
+        return switch (kernel) {
+            .attention => |attn_inst| {
+                if (std.mem.eql(u8, slot_name, "q_proj")) {
+                    if (attn_inst.q_proj) |weight| return weight;
+                    if (attn_inst.fused_qkv) |*fused| return fused;
+                } else if (std.mem.eql(u8, slot_name, "k_proj")) {
+                    if (attn_inst.k_proj) |weight| return weight;
+                    if (attn_inst.fused_qkv) |*fused| return fused;
+                } else if (std.mem.eql(u8, slot_name, "v_proj")) {
+                    if (attn_inst.v_proj) |weight| return weight;
+                    if (attn_inst.fused_qkv) |*fused| return fused;
+                } else if (std.mem.eql(u8, slot_name, "o_proj")) {
+                    return attn_inst.o_proj;
+                }
+                return error.MissingWeight;
             },
-            .swiglu => switch (kernel) {
-                .swiglu => |ffn_inst| {
-                    if (std.mem.eql(u8, slot_name, "w1")) {
-                        if (ffn_inst.w1) |weight| return weight;
-                        if (ffn_inst.fused_gate_up) |*fused| return fused;
-                    } else if (std.mem.eql(u8, slot_name, "w3")) {
-                        if (ffn_inst.w3) |weight| return weight;
-                        if (ffn_inst.fused_gate_up) |*fused| return fused;
-                    } else if (std.mem.eql(u8, slot_name, "w2")) {
-                        return ffn_inst.w2;
-                    }
-                    return error.MissingWeight;
-                },
-                else => error.InvalidInstructionBinding,
+            else => error.InvalidInstructionBinding,
+        };
+    }
+
+    fn resolveSwiGluWeightRef(kernel: CpuKernel, slot_name: []const u8) !*const Tensor {
+        return switch (kernel) {
+            .swiglu => |ffn_inst| {
+                if (std.mem.eql(u8, slot_name, "w1")) {
+                    if (ffn_inst.w1) |weight| return weight;
+                    if (ffn_inst.fused_gate_up) |*fused| return fused;
+                } else if (std.mem.eql(u8, slot_name, "w3")) {
+                    if (ffn_inst.w3) |weight| return weight;
+                    if (ffn_inst.fused_gate_up) |*fused| return fused;
+                } else if (std.mem.eql(u8, slot_name, "w2")) {
+                    return ffn_inst.w2;
+                }
+                return error.MissingWeight;
             },
-            .moe => switch (kernel) {
-                .moe => |moe_inst| {
-                    if (!std.mem.eql(u8, slot_name, "router")) return error.InvalidWeightBindingName;
-                    return &moe_inst.router_weight;
-                },
-                else => error.InvalidInstructionBinding,
+            else => error.InvalidInstructionBinding,
+        };
+    }
+
+    fn resolveMoeWeightRef(kernel: CpuKernel, slot_name: []const u8) !*const Tensor {
+        return switch (kernel) {
+            .moe => |moe_inst| {
+                if (!std.mem.eql(u8, slot_name, "router")) return error.InvalidWeightBindingName;
+                return &moe_inst.router_weight;
             },
-            .mamba_mixer => switch (kernel) {
-                .mamba => |mamba_inst| {
-                    if (std.mem.eql(u8, slot_name, "in_proj")) return mamba_inst.weights.in_proj;
-                    if (std.mem.eql(u8, slot_name, "out_proj")) return mamba_inst.weights.out_proj;
-                    return error.InvalidWeightBindingName;
-                },
-                else => error.InvalidInstructionBinding,
+            else => error.InvalidInstructionBinding,
+        };
+    }
+
+    fn resolveMambaWeightRef(kernel: CpuKernel, slot_name: []const u8) !*const Tensor {
+        return switch (kernel) {
+            .mamba => |mamba_inst| {
+                if (std.mem.eql(u8, slot_name, "in_proj")) return mamba_inst.weights.in_proj;
+                if (std.mem.eql(u8, slot_name, "out_proj")) return mamba_inst.weights.out_proj;
+                return error.InvalidWeightBindingName;
             },
-            .shortconv => switch (kernel) {
-                .shortconv => |shortconv_inst| {
-                    if (std.mem.eql(u8, slot_name, "in_proj")) return shortconv_inst.weights.in_proj;
-                    if (std.mem.eql(u8, slot_name, "conv_weight")) return shortconv_inst.weights.conv1d_weight;
-                    if (std.mem.eql(u8, slot_name, "out_proj")) return shortconv_inst.weights.out_proj;
-                    return error.InvalidWeightBindingName;
-                },
-                else => error.InvalidInstructionBinding,
+            else => error.InvalidInstructionBinding,
+        };
+    }
+
+    fn resolveShortConvWeightRef(kernel: CpuKernel, slot_name: []const u8) !*const Tensor {
+        return switch (kernel) {
+            .shortconv => |shortconv_inst| {
+                if (std.mem.eql(u8, slot_name, "in_proj")) return shortconv_inst.weights.in_proj;
+                if (std.mem.eql(u8, slot_name, "conv_weight")) return shortconv_inst.weights.conv1d_weight;
+                if (std.mem.eql(u8, slot_name, "out_proj")) return shortconv_inst.weights.out_proj;
+                return error.InvalidWeightBindingName;
             },
-            .mla_attention => switch (kernel) {
-                .mla_attention => |mla_inst| {
-                    if (!std.mem.eql(u8, slot_name, "mla_weights")) return error.InvalidWeightBindingName;
-                    return mla_inst.o_proj;
-                },
-                else => error.InvalidInstructionBinding,
+            else => error.InvalidInstructionBinding,
+        };
+    }
+
+    fn resolveMlaWeightRef(kernel: CpuKernel, slot_name: []const u8) !*const Tensor {
+        return switch (kernel) {
+            .mla_attention => |mla_inst| {
+                if (!std.mem.eql(u8, slot_name, "mla_weights")) return error.InvalidWeightBindingName;
+                return mla_inst.o_proj;
             },
             else => error.InvalidInstructionBinding,
         };

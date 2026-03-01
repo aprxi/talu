@@ -205,20 +205,8 @@ fn instructionKernelIdFromWeightBindings(
 
 fn validateKernelWeightBindings(compiled: *const runtime_contract.CompiledPlan) !void {
     for (compiled.plan.instructions, 0..) |insn, op_index| {
-        switch (insn.opcode) {
-            .rmsnorm,
-            .multihead_attention,
-            .mla_attention,
-            .swiglu,
-            .moe,
-            .mamba_mixer,
-            .shortconv,
-            .embedding,
-            => {
-                _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
-            },
-            else => {},
-        }
+        if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len == 0) continue;
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
     }
 }
 
