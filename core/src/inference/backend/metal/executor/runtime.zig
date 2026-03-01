@@ -33,7 +33,6 @@ pub fn transformerForwardLazy(
     state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
     pos_offset: usize,
-    use_compiled: bool,
 ) !ArrayHandle {
     return model_executor.Model.forward(
         allocator,
@@ -42,7 +41,6 @@ pub fn transformerForwardLazy(
         state_blocks,
         config,
         pos_offset,
-        use_compiled,
     );
 }
 
@@ -53,7 +51,6 @@ pub fn transformerForwardHiddenLazy(
     state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
     pos_offset: usize,
-    use_compiled: bool,
 ) !ArrayHandle {
     return model_executor.Model.forwardHidden(
         allocator,
@@ -62,7 +59,6 @@ pub fn transformerForwardHiddenLazy(
         state_blocks,
         config,
         pos_offset,
-        use_compiled,
     );
 }
 
@@ -73,7 +69,6 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
     state_blocks: []const runtime_contract.StateBlockHandle,
     config: anytype,
     pos_offset: usize,
-    use_compiled: bool,
     embedding_override: ?[]const f32,
     deepstack: ?DeepstackAdditions,
     runtime_rope: ?RuntimeRoPEOverride,
@@ -85,7 +80,6 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
         state_blocks,
         config,
         pos_offset,
-        use_compiled,
         embedding_override,
         deepstack,
         runtime_rope,
@@ -112,21 +106,21 @@ pub fn transformerForwardFromGPUToken(
 
 test "transformerForwardLazy exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardLazy)).@"fn";
-    try std.testing.expectEqual(@as(usize, 8), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
     const f = transformerForwardLazy;
     _ = f;
 }
 
 test "transformerForwardHiddenLazy exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardHiddenLazy)).@"fn";
-    try std.testing.expectEqual(@as(usize, 8), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
     const f = transformerForwardHiddenLazy;
     _ = f;
 }
 
 test "transformerForwardLazyWithEmbeddingOverride exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(transformerForwardLazyWithEmbeddingOverride)).@"fn";
-    try std.testing.expectEqual(@as(usize, 11), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
     const f = transformerForwardLazyWithEmbeddingOverride;
     _ = f;
 }

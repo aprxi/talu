@@ -38,9 +38,12 @@ pub const Cache = runtime_graph_mod.Cache;
 pub const WeightHandles = weights_trait.WeightHandles;
 /// Metal backend for GPU-accelerated transformer inference
 pub const MetalBackend = struct {
+    const MaxStateDescriptors: usize = std.math.maxInt(u8);
+    const ImplicitStateBlockBytes: usize = 64;
+
     pub const capabilities: contract.Capabilities = .{
         .vision_prefill = true,
-        .decode_batch = true,
+        .decode_batch = false,
         .decode_streaming = true,
         .embedding = true,
         .warmup = false,
@@ -65,10 +68,11 @@ pub const MetalBackend = struct {
     slot_logits_buffer: []f32,
     vision_runtime: ?vision_runtime_mod.VisionRuntime = null,
     slot_rope_position_delta: isize,
-    state_descriptors_storage: [3]runtime_contract.StateDescriptor,
+    state_descriptors_storage: [MaxStateDescriptors]runtime_contract.StateDescriptor,
     state_descriptor_count: u8,
     slot0_state_binding: SlotStateBinding = .{},
-    implicit_slot0_state_storage: [3][64]u8 align(64) = [_][64]u8{[_]u8{0} ** 64} ** 3,
+    implicit_slot0_state_storage: [MaxStateDescriptors][ImplicitStateBlockBytes]u8 align(64) =
+        [_][ImplicitStateBlockBytes]u8{[_]u8{0} ** ImplicitStateBlockBytes} ** MaxStateDescriptors,
 
     // Track position for decode
     current_position: usize,
@@ -84,7 +88,7 @@ pub const MetalBackend = struct {
     };
 
     const SlotStateBinding = struct {
-        handles: [3]runtime_contract.StateBlockHandle = undefined,
+        handles: [MaxStateDescriptors]runtime_contract.StateBlockHandle = undefined,
         count: u8 = 0,
         bound: bool = false,
 
@@ -280,7 +284,6 @@ pub const MetalBackend = struct {
             try self.slotStateBlocks(slot_index),
             self.config,
             0, // pos_offset
-            false, // use_compiled (prefill must use manual path)
         );
 
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
@@ -319,7 +322,6 @@ pub const MetalBackend = struct {
             try self.slotStateBlocks(slot_index),
             self.config,
             effective_position,
-            true,
         );
         defer graph.freeArray(logits_handle);
         graph.eval(&[_]graph.ArrayHandle{logits_handle});
@@ -414,7 +416,7 @@ pub const MetalBackend = struct {
         const slot_logits_buffer = try allocator.alloc(f32, max_batch_size * @as(usize, @intCast(loaded.config.vocab_size)));
         errdefer allocator.free(slot_logits_buffer);
 
-        var state_descriptors_storage: [3]runtime_contract.StateDescriptor = undefined;
+        var state_descriptors_storage: [MaxStateDescriptors]runtime_contract.StateDescriptor = undefined;
         var state_descriptor_count: u8 = 0;
         for (weight_handles.layers) |*layer| {
             if (layer.compiled_plan) |*compiled_plan| {
@@ -509,7 +511,6 @@ pub const MetalBackend = struct {
             try self.slotStateBlocks(0),
             self.config,
             0,
-            false,
         );
         defer graph.freeArray(hidden_handle);
 
@@ -630,7 +631,7 @@ pub const MetalBackend = struct {
     fn bindImplicitSlot0StateBlocks(self: *MetalBackend) !void {
         if (self.state_descriptor_count == 0 or self.slot0_state_binding.bound) return;
         const descriptors = self.stateDescriptors();
-        var handles: [3]runtime_contract.StateBlockHandle = undefined;
+        var handles: [MaxStateDescriptors]runtime_contract.StateBlockHandle = undefined;
         for (descriptors, 0..) |descriptor, idx| {
             const size_bytes = if (descriptor.size_bytes == 0)
                 @as(u64, @sizeOf(runtime_contract.OpaqueStateRef))
@@ -655,8 +656,10 @@ pub const MetalBackend = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
         try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
-        if (state_blocks.len > 3) return error.InvalidStateDescriptorBinding;
         const binding = try self.slotStateBinding(slot_index);
+        if (state_blocks.len > binding.handles.len or state_blocks.len > std.math.maxInt(u8)) {
+            return error.InvalidStateDescriptorBinding;
+        }
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
         const slot_mamba_cache = try self.slotMambaCache(slot_index);
@@ -833,7 +836,6 @@ pub const MetalBackend = struct {
             try self.slotStateBlocks(slot_index),
             self.config,
             0,
-            false,
             hidden_values,
             deepstack_ctx,
             runtime_rope_ctx,

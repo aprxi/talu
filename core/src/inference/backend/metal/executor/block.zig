@@ -83,7 +83,7 @@ pub const TransformerBlock = struct {
         norm_index: *usize,
         bindings: LayerProgramRuntimeBindings,
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
-        state_binding_count: u8 = 0,
+        state_binding_count: usize = 0,
     };
     const MAX_LAYER_PROGRAM_HANDLES: usize = 8;
 
@@ -1160,15 +1160,16 @@ pub const TransformerBlock = struct {
     ) !void {
         const adapter = layer_program_adapter_table[@intFromEnum(insn.opcode)].?;
         const active_slots: [1]usize = .{0};
-        const no_seq_lengths: [0]u32 = .{};
+        const sequence_lengths: [1]u32 = .{0};
         var rt_ctx = runtime_contract.ExecutionContext{
             .mode = .decode,
             .active_slots = active_slots[0..],
-            .sequence_lengths = no_seq_lengths[0..],
+            .sequence_lengths = sequence_lengths[0..],
             .batch_size = 1,
             .dispatch_counters = &layer_program_dispatch_counters,
             .workspace = .{ .any = @ptrCast(ctx) },
         };
+        try runtime_contract.validateExecutionContext(&rt_ctx);
         try runtime_contract.validateBatchCapability(
             layer_program_adapter_capabilities[@intFromEnum(insn.opcode)],
             rt_ctx.batch_size,

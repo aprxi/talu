@@ -153,7 +153,6 @@ pub const Model = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
         pos_offset: usize,
-        use_compiled: bool,
     ) !ArrayHandle {
         return forwardWithEmbeddingOverride(
             allocator,
@@ -162,7 +161,6 @@ pub const Model = struct {
             state_blocks,
             config,
             pos_offset,
-            use_compiled,
             null,
             null,
             null,
@@ -176,7 +174,6 @@ pub const Model = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
         pos_offset: usize,
-        use_compiled: bool,
         embedding_override: ?[]const f32,
         deepstack: ?DeepstackAdditions,
         runtime_rope: ?RuntimeRoPEOverride,
@@ -188,7 +185,6 @@ pub const Model = struct {
             state_blocks,
             config,
             pos_offset,
-            use_compiled,
             embedding_override,
             deepstack,
             runtime_rope,
@@ -203,7 +199,6 @@ pub const Model = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
         pos_offset: usize,
-        use_compiled: bool,
     ) !ArrayHandle {
         return forwardHiddenWithEmbeddingOverride(
             allocator,
@@ -212,7 +207,6 @@ pub const Model = struct {
             state_blocks,
             config,
             pos_offset,
-            use_compiled,
             null,
             null,
             null,
@@ -226,7 +220,6 @@ pub const Model = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
         pos_offset: usize,
-        use_compiled: bool,
         embedding_override: ?[]const f32,
         deepstack: ?DeepstackAdditions,
         runtime_rope: ?RuntimeRoPEOverride,
@@ -238,7 +231,6 @@ pub const Model = struct {
             state_blocks,
             config,
             pos_offset,
-            use_compiled,
             embedding_override,
             deepstack,
             runtime_rope,
@@ -253,7 +245,6 @@ pub const Model = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         config: anytype,
         pos_offset: usize,
-        use_compiled: bool,
         embedding_override: ?[]const f32,
         deepstack: ?DeepstackAdditions,
         runtime_rope: ?RuntimeRoPEOverride,
@@ -267,7 +258,6 @@ pub const Model = struct {
 
         const layer_count: usize = @intCast(config.n_layers);
         const sequence_len = input_ids.len;
-        _ = use_compiled;
         const hidden_dim = @as(usize, @intCast(weight_handles.d_model));
 
         var runtime_rope_cos_handle: ArrayHandle = null;
@@ -401,12 +391,12 @@ test "buildDeepstackLayerAdditions rejects misaligned feature rows" {
 
 test "Model.forwardHidden exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(Model.forwardHidden)).@"fn";
-    try std.testing.expectEqual(@as(usize, 7), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 6), fn_info.params.len);
 }
 
 test "Model.forwardHiddenWithEmbeddingOverride exposes stable callable signature" {
     const fn_info = @typeInfo(@TypeOf(Model.forwardHiddenWithEmbeddingOverride)).@"fn";
-    try std.testing.expectEqual(@as(usize, 10), fn_info.params.len);
+    try std.testing.expectEqual(@as(usize, 9), fn_info.params.len);
 }
 
 test "Model.forward matches forwardFromGPUToken for single-token zero-layer model" {
@@ -417,14 +407,14 @@ test "Model.forward matches forwardFromGPUToken for single-token zero-layer mode
     const vocab_size: usize = 8;
 
     const embeddings_data = [_]f32{
-        0.11, -0.05, 0.23, 0.07,
-        -0.18, 0.09, 0.04, -0.12,
-        0.31, 0.08, -0.21, 0.16,
-        0.27, -0.14, 0.19, 0.05,
-        -0.07, 0.22, 0.13, -0.04,
-        0.15, -0.11, 0.06, 0.29,
-        -0.03, 0.17, -0.26, 0.10,
-        0.24, 0.02, -0.09, -0.19,
+        0.11,  -0.05, 0.23,  0.07,
+        -0.18, 0.09,  0.04,  -0.12,
+        0.31,  0.08,  -0.21, 0.16,
+        0.27,  -0.14, 0.19,  0.05,
+        -0.07, 0.22,  0.13,  -0.04,
+        0.15,  -0.11, 0.06,  0.29,
+        -0.03, 0.17,  -0.26, 0.10,
+        0.24,  0.02,  -0.09, -0.19,
     };
     const embeddings_shape = [_]i64{ @intCast(vocab_size), @intCast(d_model) };
     const embeddings = mlx_graph.createArrayF32(embeddings_data[0..], &embeddings_shape);
@@ -436,10 +426,10 @@ test "Model.forward matches forwardFromGPUToken for single-token zero-layer mode
     defer mlx_graph.freeArray(ln_final);
 
     const lm_head_data = [_]f32{
-        0.05, -0.02, 0.11, 0.07, -0.09, 0.03, 0.04, -0.01,
-        0.08, 0.12, -0.05, 0.06, 0.02, -0.04, 0.10, 0.09,
-        -0.03, 0.01, 0.07, -0.08, 0.13, 0.05, -0.06, 0.02,
-        0.14, -0.10, 0.03, 0.12, -0.07, 0.11, 0.00, -0.05,
+        0.05,  -0.02, 0.11,  0.07,  -0.09, 0.03,  0.04,  -0.01,
+        0.08,  0.12,  -0.05, 0.06,  0.02,  -0.04, 0.10,  0.09,
+        -0.03, 0.01,  0.07,  -0.08, 0.13,  0.05,  -0.06, 0.02,
+        0.14,  -0.10, 0.03,  0.12,  -0.07, 0.11,  0.00,  -0.05,
     };
     const lm_head_shape = [_]i64{ @intCast(d_model), @intCast(vocab_size) };
     const lm_head = mlx_graph.createArrayF32(lm_head_data[0..], &lm_head_shape);
@@ -471,7 +461,6 @@ test "Model.forward matches forwardFromGPUToken for single-token zero-layer mode
         &.{},
         cfg,
         0,
-        false,
     );
     defer mlx_graph.freeArray(logits_from_ids);
 
