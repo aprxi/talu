@@ -9,9 +9,9 @@ void* mlx_lazy_fused_ffn_bf16(
     const auto& x = *static_cast<const array*>(input);
     const int in_features = x.shape(2);
 
-    auto gate_wt = orient_matmul_rhs(*static_cast<const array*>(gate_w), in_features, std::nullopt, true);
-    auto up_wt = orient_matmul_rhs(*static_cast<const array*>(up_w), in_features, gate_wt.shape(1), true);
-    auto down_wt = orient_matmul_rhs(*static_cast<const array*>(down_w), gate_wt.shape(1), in_features, true);
+    auto gate_wt = orient_matmul_rhs_cached(gate_w, *static_cast<const array*>(gate_w), in_features, std::nullopt, true);
+    auto up_wt = orient_matmul_rhs_cached(up_w, *static_cast<const array*>(up_w), in_features, gate_wt.shape(1), true);
+    auto down_wt = orient_matmul_rhs_cached(down_w, *static_cast<const array*>(down_w), gate_wt.shape(1), in_features, true);
 
     auto gate = matmul(x, gate_wt);
     auto up = matmul(x, up_wt);
@@ -22,7 +22,7 @@ void* mlx_lazy_fused_ffn_bf16(
 }
 
 // ============================================================================
-// Fused MoE FFN Block (MXFP4 quantized experts)
+// Fused ExpertMix FFN Block (MXFP4 quantized experts)
 // ============================================================================
 // Implements: router -> topk -> gather_qmm (gate/up/down) -> weighted sum
 //
@@ -52,7 +52,7 @@ static array swiglu_variant(const array& x_linear, const array& x_glu) {
     return out_glu * (x_linear_clipped + 1.0f);
 }
 
-void* mlx_lazy_fused_moe_ffn_mxfp4(
+void* mlx_lazy_fused_expert_mix_ffn_mxfp4(
     const void* input,
     // Router weights (8-bit affine quantized)
     const void* router_w, const void* router_s, const void* router_b,
@@ -84,11 +84,21 @@ void* mlx_lazy_fused_moe_ffn_mxfp4(
             *static_cast<const array*>(router_s),
             *static_cast<const array*>(router_b),
             true, static_cast<int>(router_group_size), 8, "affine")
-        : matmul(x, transpose(*static_cast<const array*>(router_w)));
+        : matmul(
+            x,
+            orient_matmul_rhs_cached(
+                router_w,
+                *static_cast<const array*>(router_w),
+                x.shape(x.ndim() - 1),
+                static_cast<int>(num_experts),
+                true
+            )
+        );
 
     // Add router bias if present
     if (router_bias != nullptr) {
-        router_logits = router_logits + *static_cast<const array*>(router_bias);
+        const auto& bias = *static_cast<const array*>(router_bias);
+        router_logits = router_logits + cast_bias_cached(router_bias, bias, router_logits.dtype());
     }
 
     // TopK: select top experts
@@ -154,14 +164,16 @@ void* mlx_lazy_fused_moe_ffn_mxfp4(
         // Reshape to match gate_out: [B, L, K, 1, d_ff]
         auto shape = gate_out.shape();
         gate_b = reshape(gate_b, {shape[0], shape[1], shape[2], 1, shape[4]});
-        gate_out = gate_out + gate_b;
+        const array gate_b_cast = (gate_b.dtype() == gate_out.dtype()) ? gate_b : astype(gate_b, gate_out.dtype());
+        gate_out = gate_out + gate_b_cast;
     }
     if (up_bias != nullptr) {
         auto indices_flat = flatten(top_k_indices, 0, -1);
         auto up_b = take(*static_cast<const array*>(up_bias), indices_flat, 0);
         auto shape = up_out.shape();
         up_b = reshape(up_b, {shape[0], shape[1], shape[2], 1, shape[4]});
-        up_out = up_out + up_b;
+        const array up_b_cast = (up_b.dtype() == up_out.dtype()) ? up_b : astype(up_b, up_out.dtype());
+        up_out = up_out + up_b_cast;
     }
 
     // SwiGLU variant activation
@@ -187,7 +199,8 @@ void* mlx_lazy_fused_moe_ffn_mxfp4(
         auto down_b = take(*static_cast<const array*>(down_bias), indices_flat, 0);
         auto shape = down_out.shape();
         down_b = reshape(down_b, {shape[0], shape[1], shape[2], 1, shape[4]});
-        down_out = down_out + down_b;
+        const array down_b_cast = (down_b.dtype() == down_out.dtype()) ? down_b : astype(down_b, down_out.dtype());
+        down_out = down_out + down_b_cast;
     }
 
     // Squeeze out singleton dimensions: [B, L, K, 1, hidden_dim] -> [B, L, K, hidden_dim]

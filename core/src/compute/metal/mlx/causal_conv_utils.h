@@ -1,4 +1,4 @@
-// MLX Bridge - shared ShortConv sequence utilities.
+// MLX Bridge - shared causal-conv sequence utilities.
 //
 // This helper keeps dense and fused paths on one vectorized convolution
 // implementation: no token-by-token graph construction in hot paths.
@@ -7,7 +7,7 @@
 
 #include "compute_common.h"
 
-inline array shortconv_run_sequence_conv(
+inline array causal_conv_run_sequence(
     array* conv_state,
     const array& bx,
     const array& conv_kernel_broadcast,
@@ -16,7 +16,7 @@ inline array shortconv_run_sequence_conv(
     int conv_dim_i
 ) {
     if (conv_state == nullptr) {
-        throw std::invalid_argument("[shortconv] null conv_state");
+        throw std::invalid_argument("[causal_conv] null conv_state");
     }
 
     // Build [history, new_tokens] and run grouped depthwise conv1d in one op.

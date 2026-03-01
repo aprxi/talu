@@ -142,6 +142,37 @@ void* mlx_persistent_reshape(const void* input, const size_t* shape, size_t ndim
     return make_owned_array(contiguous(reshape(input_arr, shape_dims)));
 }
 
+// Persistent transpose - heap-allocated, survives pool resets
+void* mlx_persistent_transpose(const void* input, const size_t* axes, size_t ndim) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    if (ndim == 2) {
+        return make_owned_array(contiguous(transpose(input_arr,
+            {static_cast<int>(axes[0]), static_cast<int>(axes[1])})));
+    } else if (ndim == 3) {
+        return make_owned_array(contiguous(transpose(input_arr,
+            {static_cast<int>(axes[0]), static_cast<int>(axes[1]),
+             static_cast<int>(axes[2])})));
+    } else if (ndim == 4) {
+        return make_owned_array(contiguous(transpose(input_arr,
+            {static_cast<int>(axes[0]), static_cast<int>(axes[1]),
+             static_cast<int>(axes[2]), static_cast<int>(axes[3])})));
+    }
+    std::vector<int> axes_vec;
+    for (size_t dim_idx = 0; dim_idx < ndim; dim_idx++) {
+        axes_vec.push_back(static_cast<int>(axes[dim_idx]));
+    }
+    return make_owned_array(contiguous(transpose(input_arr, axes_vec)));
+}
+
+// Persistent cast to float16 - heap-allocated, survives pool resets
+void* mlx_persistent_cast_f16(const void* input) {
+    const auto& input_arr = *static_cast<const array*>(input);
+    if (input_arr.dtype() == float16) {
+        return make_owned_array(contiguous(input_arr));
+    }
+    return make_owned_array(contiguous(astype(input_arr, float16)));
+}
+
 void* mlx_lazy_transpose(const void* input, const size_t* axes, size_t ndim) {
     const auto& input_arr = *static_cast<const array*>(input);
     // Optimized paths for common dimensions

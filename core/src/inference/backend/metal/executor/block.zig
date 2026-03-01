@@ -1266,7 +1266,7 @@ pub const TransformerBlock = struct {
         }
 
         const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
-        const final_slot = try bufferSlotForRegister(final_register, residual, slot_buffers, lw.register_to_slot_map);
+        const final_slot = try bufferSlotForRegister(final_register, &residual, slot_buffers, lw.register_to_slot_map);
         return final_slot.*;
     }
 
@@ -1323,13 +1323,7 @@ pub const TransformerBlock = struct {
                 true,
             );
         } else blk: {
-            if (weight_handles.lm_head_needs_transpose) {
-                const transpose_axes = [_]usize{ 1, 0 };
-                const lm_head_t = mlx_graph.mlx_lazy_transpose(weight_handles.lm_head.?, &transpose_axes, 2);
-                break :blk mlx_graph.mlx_lazy_matmul(final_normed, lm_head_t);
-            } else {
-                break :blk mlx_graph.mlx_lazy_matmul(final_normed, weight_handles.lm_head.?);
-            }
+            break :blk mlx_graph.mlx_lazy_matmul(final_normed, weight_handles.lm_head.?);
         };
         return if (weight_handles.logits_scaling != 1.0)
             mlx_graph.mlx_lazy_multiply_scalar(logits, 1.0 / weight_handles.logits_scaling)

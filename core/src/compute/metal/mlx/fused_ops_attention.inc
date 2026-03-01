@@ -31,7 +31,8 @@ static void maybe_add_linear_bias(array* values, const void* bias_ptr) {
         throw std::invalid_argument("[attention] null tensor for bias add");
     }
     if (bias_ptr != nullptr) {
-        *values = *values + *static_cast<const array*>(bias_ptr);
+        const auto& bias = *static_cast<const array*>(bias_ptr);
+        *values = *values + cast_bias_cached(bias_ptr, bias, values->dtype());
     }
 }
 
@@ -340,7 +341,8 @@ void* mlx_lazy_fused_attention(
 
     // Add output bias if present
     if (o_bias != nullptr) {
-        out = out + *static_cast<const array*>(o_bias);
+        const auto& bias = *static_cast<const array*>(o_bias);
+        out = out + cast_bias_cached(o_bias, bias, out.dtype());
     }
 
     return pool_array(std::move(out));
@@ -443,13 +445,20 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
     );
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, n_heads_int * head_dim_int);
 
-    // Dense output projection (o_w stored as [out, in])
-    auto o_wt = transpose(*static_cast<const array*>(o_w), {1, 0});
+    // Dense output projection (o_w stored as [out, in]).
+    auto o_wt = orient_matmul_rhs_cached(
+        o_w,
+        *static_cast<const array*>(o_w),
+        n_heads_int * head_dim_int,
+        x.shape(2),
+        true
+    );
     auto out = matmul(attn_out, o_wt);
 
     // Add output bias if present
     if (o_bias != nullptr) {
-        out = out + *static_cast<const array*>(o_bias);
+        const auto& bias = *static_cast<const array*>(o_bias);
+        out = out + cast_bias_cached(o_bias, bias, out.dtype());
     }
 
     return pool_array(std::move(out));
@@ -494,7 +503,7 @@ void* mlx_lazy_fused_ffn(
             auto inner = sqrt_2_over_pi * (gate + 0.044715f * x3);
             return 0.5f * gate * (1.0f + tanh(inner)) * up;
         } else {
-            // SwiGLU: silu(gate) * up
+            // SwiGLU: gate * sigmoid(gate) * up
             return (gate * sigmoid(gate)) * up;
         }
     }();
@@ -544,10 +553,10 @@ void* mlx_lazy_fused_attention_bf16(
     const int kv_out = n_kv_heads_int * head_dim_int;
     const float scale_value = resolve_attention_scale(query_pre_attn_scalar, attention_multiplier, head_dim_int);
 
-    auto q_wt = orient_matmul_rhs(*static_cast<const array*>(q_w), hidden_dim, q_out, true);
-    auto k_wt = orient_matmul_rhs(*static_cast<const array*>(k_w), hidden_dim, kv_out, true);
-    auto v_wt = orient_matmul_rhs(*static_cast<const array*>(v_w), hidden_dim, kv_out, true);
-    auto o_wt = orient_matmul_rhs(*static_cast<const array*>(o_w), q_out, hidden_dim, true);
+    auto q_wt = orient_matmul_rhs_cached(q_w, *static_cast<const array*>(q_w), hidden_dim, q_out, true);
+    auto k_wt = orient_matmul_rhs_cached(k_w, *static_cast<const array*>(k_w), hidden_dim, kv_out, true);
+    auto v_wt = orient_matmul_rhs_cached(v_w, *static_cast<const array*>(v_w), hidden_dim, kv_out, true);
+    auto o_wt = orient_matmul_rhs_cached(o_w, *static_cast<const array*>(o_w), q_out, hidden_dim, true);
 
     array q = matmul(x, q_wt);
     array k = matmul(x, k_wt);
@@ -601,7 +610,8 @@ void* mlx_lazy_fused_attention_bf16(
 
     // Add output bias if present
     if (o_bias != nullptr) {
-        out = out + *static_cast<const array*>(o_bias);
+        const auto& bias = *static_cast<const array*>(o_bias);
+        out = out + cast_bias_cached(o_bias, bias, out.dtype());
     }
 
     return pool_array(std::move(out));

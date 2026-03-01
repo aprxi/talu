@@ -443,7 +443,6 @@ test "Model.forward matches forwardFromGPUToken for single-token zero-layer mode
         .ln_final = ln_final,
         .lm_head = lm_head,
         .lm_head_quantized = null,
-        .lm_head_needs_transpose = false,
         .d_model = d_model,
         .is_quantized = false,
     };

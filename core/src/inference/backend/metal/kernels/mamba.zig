@@ -93,7 +93,7 @@ pub const MambaKernel = struct {
                 }
             }
 
-            output_tensor.* = mlx_fused.mlx_lazy_mamba_block_quantized(
+            output_tensor.* = mlx_fused.mlx_lazy_state_space_block_quantized(
                 input_tensor,
                 self.ln1_weight,
                 in_proj.weights,
@@ -132,7 +132,7 @@ pub const MambaKernel = struct {
             return;
         }
 
-        output_tensor.* = mlx_fused.mlx_lazy_mamba_block_bf16(
+        output_tensor.* = mlx_fused.mlx_lazy_state_space_block_bf16(
             input_tensor,
             self.ln1_weight,
             self.in_proj_bf16.?,

@@ -1,9 +1,14 @@
 //! Linux PTY helpers for interactive shell sessions.
 
 const std = @import("std");
+const builtin = @import("builtin");
 
 const c = @cImport({
-    @cInclude("pty.h");
+    if (builtin.os.tag == .macos) {
+        @cInclude("util.h");
+    } else {
+        @cInclude("pty.h");
+    }
     @cInclude("fcntl.h");
     @cInclude("sys/ioctl.h");
 });

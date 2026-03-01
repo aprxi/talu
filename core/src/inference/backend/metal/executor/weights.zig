@@ -764,14 +764,11 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 .experts_per_token = moe_block_weights.experts_per_token,
             };
 
-            // Router weights are stored for CPU as f32 [d_model, num_experts].
-            // MLX fused op expects router_w shaped [num_experts, d_model] and transposes internally.
+            // Router weights are stored as [d_model, num_experts], which matches
+            // the dense matmul RHS layout used by the MLX fused MoE router path.
             if (moe_block_weights.router_weight.n_dims != 2 or moe_block_weights.router_weight.dtype != .f32) return error.InvalidShape;
             const router_shape = moe_block_weights.router_weight.shape[0..@intCast(moe_block_weights.router_weight.n_dims)];
-            var router_arr = mlx_graph.createArrayF32(moe_block_weights.router_weight.asSlice(f32), router_shape);
-            const router_axes = [_]usize{ 1, 0 };
-            router_arr = mlx_graph.mlx_lazy_transpose(router_arr, &router_axes, 2);
-            moe_weights.router_w = router_arr;
+            moe_weights.router_w = mlx_graph.createArrayF32(moe_block_weights.router_weight.asSlice(f32), router_shape);
             moe_weights.router_s = null;
             moe_weights.router_b = null;
 
@@ -961,7 +958,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
         const lm_shape = lm_head_tensor.shape[0..@as(usize, @intCast(lm_head_tensor.n_dims))];
         const d_model: usize = @intCast(loaded.config.d_model);
         const vocab_size: usize = @intCast(loaded.config.vocab_size);
-        weight_handles.lm_head_needs_transpose = if (lm_shape.len >= 2)
+        const lm_head_needs_transpose = if (lm_shape.len >= 2)
             (lm_shape[0] == vocab_size and lm_shape[1] == d_model)
         else
             false;
@@ -989,6 +986,15 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                     weight_handles.lm_head = mlx_graph.createArrayF32(lm_head_tensor.asSlice(f32), lm_shape);
                 },
                 else => return error.InvalidTensorType,
+            }
+
+            // Keep logits projection on one fast path by pre-orienting lm_head
+            // once at load time instead of transposing on every decode token.
+            if (lm_head_needs_transpose) {
+                const transpose_axes = [_]usize{ 1, 0 };
+                const lm_head_t = mlx_graph.mlx_persistent_transpose(weight_handles.lm_head.?, &transpose_axes, 2);
+                mlx_graph.freeArray(weight_handles.lm_head.?);
+                weight_handles.lm_head = lm_head_t;
             }
         }
     }
@@ -1176,7 +1182,6 @@ pub const WeightHandles = struct {
     ln_final: ArrayHandle,
     lm_head: ?ArrayHandle, // F32/BF16 lm_head
     lm_head_quantized: ?*QuantizedWeight, // Quantized lm_head
-    lm_head_needs_transpose: bool = true, // True if lm_head is (vocab_size, d_model), needs transpose for matmul
 
     // Track if model is quantized (affects which forward path to use)
     is_quantized: bool = true,

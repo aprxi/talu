@@ -280,19 +280,19 @@ void* mlx_lazy_mla_attention_bf16(
     const int hidden_dim = x.shape(2);
 
     const auto q_a_fn = [q_a_w, q_lora_rank_i](const array& in) -> array {
-        return dense_linear_no_bias(in, *static_cast<const array*>(q_a_w), q_lora_rank_i);
+        return dense_linear_no_bias(in, *static_cast<const array*>(q_a_w), q_lora_rank_i, q_a_w);
     };
     const auto q_b_fn = [q_b_w, n_heads_i, qk_head_dim_i](const array& in) -> array {
-        return dense_linear_no_bias(in, *static_cast<const array*>(q_b_w), n_heads_i * qk_head_dim_i);
+        return dense_linear_no_bias(in, *static_cast<const array*>(q_b_w), n_heads_i * qk_head_dim_i, q_b_w);
     };
     const auto kv_a_fn = [kv_a_w, kv_lora_rank_i, qk_rope_head_dim_i](const array& in) -> array {
-        return dense_linear_no_bias(in, *static_cast<const array*>(kv_a_w), kv_lora_rank_i + qk_rope_head_dim_i);
+        return dense_linear_no_bias(in, *static_cast<const array*>(kv_a_w), kv_lora_rank_i + qk_rope_head_dim_i, kv_a_w);
     };
     const auto kv_b_fn = [kv_b_w, n_heads_i, qk_nope_head_dim_i, v_head_dim_i](const array& in) -> array {
-        return dense_linear_no_bias(in, *static_cast<const array*>(kv_b_w), n_heads_i * (qk_nope_head_dim_i + v_head_dim_i));
+        return dense_linear_no_bias(in, *static_cast<const array*>(kv_b_w), n_heads_i * (qk_nope_head_dim_i + v_head_dim_i), kv_b_w);
     };
     const auto out_fn = [o_w, hidden_dim](const array& in) -> array {
-        return dense_linear_no_bias(in, *static_cast<const array*>(o_w), hidden_dim);
+        return dense_linear_no_bias(in, *static_cast<const array*>(o_w), hidden_dim, o_w);
     };
 
     array out = mla_attention_core(

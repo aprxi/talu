@@ -6,7 +6,7 @@
 
 #include "compute_common.h"
 #include "model_state.h"
-#include "shortconv_utils.h"
+#include "causal_conv_utils.h"
 
 extern "C" {
 
@@ -20,11 +20,11 @@ void mlx_cache_update_and_fetch_bfloat16(
     bool* is_prefill_out
 );
 
-#include "fused_ops_shortconv.inc"
-#include "fused_ops_core_mamba.inc"
+#include "fused_ops_core_state_space.inc"
+#include "fused_ops_causal_conv.inc"
 #include "fused_ops_vision.inc"
 #include "fused_ops_attention.inc"
 #include "fused_ops_mla.inc"
-#include "fused_ops_ffn_moe.inc"
+#include "fused_ops_ffn_expert_mix.inc"
 
 } // extern "C"

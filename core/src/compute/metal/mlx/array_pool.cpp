@@ -158,6 +158,7 @@ bool mlx_pool_compact_if_idle(size_t max_retained) {
 
 void mlx_clear_memory_cache() {
     clear_cache();
+    mlx_weight_transform_cache_clear();
 }
 
 void mlx_pool_stats(size_t* pool_size, size_t* used) {
@@ -221,6 +222,9 @@ void mlx_array_free(void* arr) {
         owned = static_cast<array*>(*it);
         g_owned_arrays.erase(it);
     }
+    // Weight-handle addresses may be reused by allocator after delete.
+    // Clearing transform caches here prevents stale pointer-key hits.
+    mlx_weight_transform_cache_clear();
     delete owned;
 }
 
