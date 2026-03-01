@@ -61,6 +61,216 @@ static array orient_matmul_rhs(
     throw std::invalid_argument("[dense] weight orientation incompatible with matmul shape");
 }
 
+static constexpr size_t kOrientedRhsCacheMaxEntries = 2048;
+static constexpr size_t kStateSpaceConvKernelCacheMaxEntries = 512;
+static constexpr size_t kCausalConvKernelCacheMaxEntries = 512;
+static constexpr size_t kCausalConvBiasCacheMaxEntries = 512;
+static constexpr size_t kBiasCastCacheMaxEntries = 1024;
+
+struct OrientedRhsCacheKey {
+    const void* weight_handle = nullptr;
+    int in_features = 0;
+    int out_features = -1;
+    bool transpose_when_ambiguous = true;
+
+    bool operator==(const OrientedRhsCacheKey& other) const {
+        return weight_handle == other.weight_handle &&
+               in_features == other.in_features &&
+               out_features == other.out_features &&
+               transpose_when_ambiguous == other.transpose_when_ambiguous;
+    }
+};
+
+struct OrientedRhsCacheKeyHash {
+    size_t operator()(const OrientedRhsCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.weight_handle);
+        h ^= std::hash<int>{}(key.in_features) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.out_features) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<bool>{}(key.transpose_when_ambiguous) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<OrientedRhsCacheKey, array, OrientedRhsCacheKeyHash>& oriented_rhs_cache_store() {
+    static thread_local std::unordered_map<OrientedRhsCacheKey, array, OrientedRhsCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void oriented_rhs_cache_clear() {
+    oriented_rhs_cache_store().clear();
+}
+
+struct StateSpaceConvKernelCacheKey {
+    const void* weight_handle = nullptr;
+    int d_conv = 0;
+    int xbc_len = 0;
+
+    bool operator==(const StateSpaceConvKernelCacheKey& other) const {
+        return weight_handle == other.weight_handle &&
+               d_conv == other.d_conv &&
+               xbc_len == other.xbc_len;
+    }
+};
+
+struct StateSpaceConvKernelCacheKeyHash {
+    size_t operator()(const StateSpaceConvKernelCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.weight_handle);
+        h ^= std::hash<int>{}(key.d_conv) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.xbc_len) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<StateSpaceConvKernelCacheKey, array, StateSpaceConvKernelCacheKeyHash>& state_space_conv_kernel_cache_store() {
+    static thread_local std::unordered_map<StateSpaceConvKernelCacheKey, array, StateSpaceConvKernelCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void state_space_conv_kernel_cache_clear() {
+    state_space_conv_kernel_cache_store().clear();
+}
+
+struct CausalConvKernelCacheKey {
+    const void* weight_handle = nullptr;
+    int d_conv = 0;
+    int conv_dim = 0;
+
+    bool operator==(const CausalConvKernelCacheKey& other) const {
+        return weight_handle == other.weight_handle &&
+               d_conv == other.d_conv &&
+               conv_dim == other.conv_dim;
+    }
+};
+
+struct CausalConvKernelCacheKeyHash {
+    size_t operator()(const CausalConvKernelCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.weight_handle);
+        h ^= std::hash<int>{}(key.d_conv) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.conv_dim) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<CausalConvKernelCacheKey, array, CausalConvKernelCacheKeyHash>& causal_conv_kernel_cache_store() {
+    static thread_local std::unordered_map<CausalConvKernelCacheKey, array, CausalConvKernelCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void causal_conv_kernel_cache_clear() {
+    causal_conv_kernel_cache_store().clear();
+}
+
+struct CausalConvBiasCacheKey {
+    const void* bias_handle = nullptr;
+    int conv_dim = 0;
+
+    bool operator==(const CausalConvBiasCacheKey& other) const {
+        return bias_handle == other.bias_handle &&
+               conv_dim == other.conv_dim;
+    }
+};
+
+struct CausalConvBiasCacheKeyHash {
+    size_t operator()(const CausalConvBiasCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.bias_handle);
+        h ^= std::hash<int>{}(key.conv_dim) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<CausalConvBiasCacheKey, array, CausalConvBiasCacheKeyHash>& causal_conv_bias_cache_store() {
+    static thread_local std::unordered_map<CausalConvBiasCacheKey, array, CausalConvBiasCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void causal_conv_bias_cache_clear() {
+    causal_conv_bias_cache_store().clear();
+}
+
+struct BiasCastCacheKey {
+    const void* bias_handle = nullptr;
+    int target_dtype = 0;
+
+    bool operator==(const BiasCastCacheKey& other) const {
+        return bias_handle == other.bias_handle &&
+               target_dtype == other.target_dtype;
+    }
+};
+
+struct BiasCastCacheKeyHash {
+    size_t operator()(const BiasCastCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.bias_handle);
+        h ^= std::hash<int>{}(key.target_dtype) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<BiasCastCacheKey, array, BiasCastCacheKeyHash>& bias_cast_cache_store() {
+    static thread_local std::unordered_map<BiasCastCacheKey, array, BiasCastCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void bias_cast_cache_clear() {
+    bias_cast_cache_store().clear();
+}
+
+static inline array orient_matmul_rhs_cached(
+    const void* weight_handle,
+    const array& weight,
+    int in_features,
+    std::optional<int> out_features = std::nullopt,
+    bool transpose_when_ambiguous = true
+) {
+    if (weight_handle == nullptr) {
+        return orient_matmul_rhs(weight, in_features, out_features, transpose_when_ambiguous);
+    }
+
+    auto& cache = oriented_rhs_cache_store();
+    if (cache.size() >= kOrientedRhsCacheMaxEntries) {
+        cache.clear();
+    }
+
+    OrientedRhsCacheKey key;
+    key.weight_handle = weight_handle;
+    key.in_features = in_features;
+    key.out_features = out_features.has_value() ? out_features.value() : -1;
+    key.transpose_when_ambiguous = transpose_when_ambiguous;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    if (weight.ndim() != 2) {
+        throw std::invalid_argument("[dense] expected 2D weight for matmul rhs");
+    }
+    const int rows = weight.shape(0);
+    const int cols = weight.shape(1);
+    const bool direct = rows == in_features && (!out_features.has_value() || cols == out_features.value());
+    const bool transposed = cols == in_features && (!out_features.has_value() || rows == out_features.value());
+
+    array rhs(0.0f, weight.dtype());
+    if (direct && !transposed) {
+        rhs = weight;
+    } else if (transposed && !direct) {
+        rhs = contiguous(transpose(weight));
+    } else if (direct && transposed) {
+        rhs = transpose_when_ambiguous ? contiguous(transpose(weight)) : weight;
+    } else {
+        throw std::invalid_argument("[dense] weight orientation incompatible with matmul shape");
+    }
+
+    auto [inserted_it, _] = cache.emplace(key, rhs);
+    return inserted_it->second;
+}
+
+void mlx_weight_transform_cache_clear() {
+    oriented_rhs_cache_clear();
+    state_space_conv_kernel_cache_clear();
+    causal_conv_kernel_cache_clear();
+    causal_conv_bias_cache_clear();
+    bias_cast_cache_clear();
+}
+
 static array gelu_approx(const array& x) {
     constexpr float kSqrt2OverPi = 0.7978845608f;
     constexpr float kCoeff = 0.044715f;
@@ -69,7 +279,7 @@ static array gelu_approx(const array& x) {
 }
 
 static inline array ensure_float32(const array& arr) {
-    // FP32 allowlist: recurrent Mamba SSM/conv state updates are numerically
+    // FP32 allowlist: recurrent state-space SSM/conv state updates are numerically
     // sensitive across long contexts; keep state math in FP32.
     return arr.dtype() == float32 ? arr : astype(arr, float32);
 }
@@ -92,10 +302,11 @@ static array linear_bf16_with_bias(
     const array& input,
     const array& weight,
     const array& bias,
-    std::optional<int> out_features = std::nullopt
+    std::optional<int> out_features = std::nullopt,
+    const void* weight_handle = nullptr
 ) {
     const int in_features = input.shape(input.ndim() - 1);
-    const auto rhs = orient_matmul_rhs(weight, in_features, out_features, true);
+    const auto rhs = orient_matmul_rhs_cached(weight_handle, weight, in_features, out_features, true);
     return matmul(input, rhs) + bias;
 }
 
@@ -135,10 +346,11 @@ static array apply_optional_runtime_rope(
 static array dense_linear_no_bias(
     const array& input,
     const array& weight,
-    std::optional<int> out_features = std::nullopt
+    std::optional<int> out_features = std::nullopt,
+    const void* weight_handle = nullptr
 ) {
     const int in_features = input.shape(input.ndim() - 1);
-    const auto rhs = orient_matmul_rhs(weight, in_features, out_features, true);
+    const auto rhs = orient_matmul_rhs_cached(weight_handle, weight, in_features, out_features, true);
     return matmul(input, rhs);
 }
 
@@ -162,7 +374,7 @@ static array quantized_linear_no_bias(
     );
 }
 
-static array resolve_mamba_conv_kernel(
+static array resolve_state_space_conv_kernel_uncached(
     const array& conv_weight,
     int d_conv,
     int xbc_len
@@ -180,20 +392,171 @@ static array resolve_mamba_conv_kernel(
         kernel = reshape(kernel, {kernel.shape(0), kernel.shape(2)});
     }
     if (kernel.ndim() != 2) {
-        throw std::invalid_argument("[mamba] conv1d_weight must be rank-2 or rank-3");
+        throw std::invalid_argument("[state_space] conv1d_weight must be rank-2 or rank-3");
     }
 
     if (kernel.shape(0) == xbc_len and kernel.shape(1) == d_conv) {
-        kernel = transpose(kernel);
+        kernel = contiguous(transpose(kernel));
     } else if (!(kernel.shape(0) == d_conv and kernel.shape(1) == xbc_len)) {
-        throw std::invalid_argument("[mamba] conv1d_weight shape incompatible with xbc_len/d_conv");
+        throw std::invalid_argument("[state_space] conv1d_weight shape incompatible with xbc_len/d_conv");
     }
 
     kernel = ensure_float32(kernel);
     return reshape(kernel, {1, d_conv, xbc_len});
 }
 
-static array mamba_forward_core(
+static array resolve_state_space_conv_kernel(
+    const void* conv_weight_handle,
+    const array& conv_weight,
+    int d_conv,
+    int xbc_len
+) {
+    if (conv_weight_handle == nullptr) {
+        return resolve_state_space_conv_kernel_uncached(conv_weight, d_conv, xbc_len);
+    }
+
+    auto& cache = state_space_conv_kernel_cache_store();
+    if (cache.size() >= kStateSpaceConvKernelCacheMaxEntries) {
+        cache.clear();
+    }
+
+    StateSpaceConvKernelCacheKey key;
+    key.weight_handle = conv_weight_handle;
+    key.d_conv = d_conv;
+    key.xbc_len = xbc_len;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    array kernel = resolve_state_space_conv_kernel_uncached(conv_weight, d_conv, xbc_len);
+    auto [inserted_it, _] = cache.emplace(key, kernel);
+    return inserted_it->second;
+}
+
+static array resolve_causal_conv_kernel(
+    const void* conv_weight_handle,
+    const array& conv_weight,
+    int d_conv,
+    int conv_dim
+) {
+    const auto uncached = [&]() -> array {
+        array kernel = conv_weight;
+        if (kernel.ndim() == 3 &&
+            kernel.shape(0) == 1 &&
+            kernel.shape(1) == d_conv &&
+            kernel.shape(2) == conv_dim) {
+            return ensure_float32(kernel);
+        }
+        if (kernel.ndim() == 3) {
+            // [conv_dim, 1, d_conv] -> [conv_dim, d_conv]
+            kernel = reshape(kernel, {kernel.shape(0), kernel.shape(2)});
+        }
+        if (kernel.ndim() != 2) {
+            throw std::invalid_argument("[causal_conv] conv weight must be rank-2 or rank-3");
+        }
+        if (kernel.shape(0) == conv_dim and kernel.shape(1) == d_conv) {
+            kernel = contiguous(transpose(kernel));
+        } else if (!(kernel.shape(0) == d_conv and kernel.shape(1) == conv_dim)) {
+            throw std::invalid_argument("[causal_conv] conv weight shape incompatible with d_conv/conv_dim");
+        }
+        kernel = ensure_float32(kernel);
+        return reshape(kernel, {1, d_conv, conv_dim});
+    };
+
+    if (conv_weight_handle == nullptr) {
+        return uncached();
+    }
+
+    auto& cache = causal_conv_kernel_cache_store();
+    if (cache.size() >= kCausalConvKernelCacheMaxEntries) {
+        cache.clear();
+    }
+
+    CausalConvKernelCacheKey key;
+    key.weight_handle = conv_weight_handle;
+    key.d_conv = d_conv;
+    key.conv_dim = conv_dim;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    array kernel = uncached();
+    auto [inserted_it, _] = cache.emplace(key, kernel);
+    return inserted_it->second;
+}
+
+static std::optional<array> resolve_causal_conv_bias_row(
+    const void* conv_bias_handle,
+    const array* conv_bias_arr,
+    int conv_dim
+) {
+    if (conv_bias_arr == nullptr) {
+        return std::nullopt;
+    }
+
+    const auto uncached = [&]() -> array {
+        const array conv_bias_f32 = ensure_float32(*conv_bias_arr);
+        if (conv_bias_f32.ndim() == 2 && conv_bias_f32.shape(0) == 1 && conv_bias_f32.shape(1) == conv_dim) {
+            return conv_bias_f32;
+        }
+        return reshape(conv_bias_f32, {1, conv_dim});
+    };
+
+    if (conv_bias_handle == nullptr) {
+        return std::optional<array>(uncached());
+    }
+
+    auto& cache = causal_conv_bias_cache_store();
+    if (cache.size() >= kCausalConvBiasCacheMaxEntries) {
+        cache.clear();
+    }
+
+    CausalConvBiasCacheKey key;
+    key.bias_handle = conv_bias_handle;
+    key.conv_dim = conv_dim;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return std::optional<array>(it->second);
+    }
+
+    array bias_row = uncached();
+    auto [inserted_it, _] = cache.emplace(key, bias_row);
+    return std::optional<array>(inserted_it->second);
+}
+
+static array cast_bias_cached(
+    const void* bias_handle,
+    const array& bias,
+    Dtype target_dtype
+) {
+    if (bias.dtype() == target_dtype) {
+        return bias;
+    }
+    if (bias_handle == nullptr) {
+        return astype(bias, target_dtype);
+    }
+
+    auto& cache = bias_cast_cache_store();
+    if (cache.size() >= kBiasCastCacheMaxEntries) {
+        cache.clear();
+    }
+
+    BiasCastCacheKey key;
+    key.bias_handle = bias_handle;
+    key.target_dtype = static_cast<int>(target_dtype.val());
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    array casted = astype(bias, target_dtype);
+    auto [inserted_it, _] = cache.emplace(key, casted);
+    return inserted_it->second;
+}
+
+static array state_space_forward_core(
     const array& input, // [1, L, d_model]
     const array& ln1_weight,
     const std::function<array(const array&)>& in_proj_fn,
@@ -225,10 +588,10 @@ static array mamba_forward_core(
     const int bc_len = n_groups * d_state;
     const int xbc_len = d_inner + 2 * bc_len;
     if (n_heads <= 0 or d_head <= 0 or d_state <= 0 or d_conv <= 0 or n_groups <= 0) {
-        throw std::invalid_argument("[mamba] invalid config dims");
+        throw std::invalid_argument("[state_space] invalid config dims");
     }
     if ((n_heads % n_groups) != 0) {
-        throw std::invalid_argument("[mamba] n_heads must be divisible by n_groups");
+        throw std::invalid_argument("[state_space] n_heads must be divisible by n_groups");
     }
 
     const array a_log_row = reshape(a_log, {1, n_heads, 1, 1});
@@ -241,7 +604,7 @@ static array mamba_forward_core(
     const array proj_all = in_proj_fn(norm_all);
     const int proj_dim = proj_all.shape(2);
     if (proj_dim < min_proj_dim) {
-        throw std::invalid_argument("[mamba] in_proj output too small");
+        throw std::invalid_argument("[state_space] in_proj output too small");
     }
 
     const array z_all = slice(proj_all, {0, 0, 0}, {1, seq_len, d_inner});
@@ -306,21 +669,26 @@ static array mamba_forward_core(
         ssm_out = fast::rms_norm(ssm_out, *norm_weight, 1e-5f);
     }
 
-    array mixer_out = ensure_float32(out_proj_fn(ssm_out));
+    const Dtype model_dtype = input.dtype();
+    // FP32 allowlist ends at recurrent-state math; projections stay in model
+    // dtype to use bf16/f16 tensor-core kernels.
+    const array ssm_out_proj_in = (ssm_out.dtype() == model_dtype) ? ssm_out : astype(ssm_out, model_dtype);
+    const array mixer_out = out_proj_fn(ssm_out_proj_in);
     array hidden_1 = input + mixer_out * residual_multiplier;
 
     if (!has_ffn) {
         return hidden_1;
     }
     if (!ln2_weight.has_value()) {
-        throw std::invalid_argument("[mamba] missing ln2 weight for FFN path");
+        throw std::invalid_argument("[state_space] missing ln2 weight for FFN path");
     }
 
     const array norm2 = fast::rms_norm(hidden_1, *ln2_weight, norm_eps);
-    const array gate_up = ensure_float32(gate_up_fn(norm2));
+    const array norm2_proj_in = (norm2.dtype() == model_dtype) ? norm2 : astype(norm2, model_dtype);
+    const array gate_up = gate_up_fn(norm2_proj_in);
     const int gate_up_dim = gate_up.shape(2);
     if ((gate_up_dim % 2) != 0) {
-        throw std::invalid_argument("[mamba] fused gate_up must have even width");
+        throw std::invalid_argument("[state_space] fused gate_up must have even width");
     }
     const int d_ff = gate_up_dim / 2;
 
@@ -345,11 +713,12 @@ static array mamba_forward_core(
         return activated * up;
     }();
 
-    const array ffn_out = ensure_float32(down_proj_fn(mid));
+    const array mid_proj_in = (mid.dtype() == model_dtype) ? mid : astype(mid, model_dtype);
+    const array ffn_out = down_proj_fn(mid_proj_in);
     return hidden_1 + ffn_out * residual_multiplier;
 }
 
-void* mlx_lazy_mamba_block_bf16(
+void* mlx_lazy_state_space_block_bf16(
     const void* input,
     const void* ln1_weight,
     const void* in_proj,
@@ -366,7 +735,7 @@ void* mlx_lazy_mamba_block_bf16(
     bool use_gelu,
     float residual_multiplier,
     float norm_eps,
-    void* mamba_cache_ptr,
+    void* state_space_cache_ptr,
     size_t layer_idx,
     size_t d_state,
     size_t d_conv,
@@ -398,7 +767,7 @@ void* mlx_lazy_mamba_block_bf16(
     const int d_inner = n_heads_i * d_head_i;
     const int xbc_len = d_inner + 2 * n_groups_i * d_state_i;
 
-    const array conv_kernel_broadcast = resolve_mamba_conv_kernel(conv_w, d_conv_i, xbc_len);
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, xbc_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
         ? std::optional<array>(
             (conv_b->ndim() == 2 && conv_b->shape(0) == 1 && conv_b->shape(1) == xbc_len)
@@ -409,14 +778,14 @@ void* mlx_lazy_mamba_block_bf16(
         ? std::optional<array>(reshape(ensure_float32(*dt_b), {1, n_heads_i}))
         : std::nullopt;
     const std::optional<array> norm_weight_arr = (norm_w != nullptr)
-        ? std::optional<array>(ensure_float32(*norm_w))
+        ? std::optional<array>(*norm_w)
         : std::nullopt;
     const std::optional<array> ln2_weight_arr = (ln2_w != nullptr)
-        ? std::optional<array>(ensure_float32(*ln2_w))
+        ? std::optional<array>(*ln2_w)
         : std::nullopt;
 
-    auto* cache = static_cast<MLXMambaCache*>(mamba_cache_ptr);
-    MambaLayer* layer_state = nullptr;
+    auto* cache = static_cast<MLXStateSpaceCache*>(state_space_cache_ptr);
+    StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
     }
@@ -452,21 +821,21 @@ void* mlx_lazy_mamba_block_bf16(
         ssm_state = zeros({1, n_heads_i, d_head_i, d_state_i}, float32);
     }
 
-    const auto in_proj_fn = [&in_proj_w](const array& x) -> array {
-        return dense_linear_no_bias(x, in_proj_w, std::nullopt);
+    const auto in_proj_fn = [&in_proj_w, in_proj](const array& x) -> array {
+        return dense_linear_no_bias(x, in_proj_w, std::nullopt, in_proj);
     };
-    const auto out_proj_fn = [&out_proj_w](const array& x) -> array {
-        return dense_linear_no_bias(x, out_proj_w, std::nullopt);
+    const auto out_proj_fn = [&out_proj_w, out_proj](const array& x) -> array {
+        return dense_linear_no_bias(x, out_proj_w, std::nullopt, out_proj);
     };
     const bool has_ffn = gate_up_w != nullptr && down_proj_w != nullptr && ln2_w != nullptr;
-    const auto gate_up_fn = [&gate_up_w](const array& x) -> array {
-        return dense_linear_no_bias(x, *gate_up_w, std::nullopt);
+    const auto gate_up_fn = [&gate_up_w, gate_up](const array& x) -> array {
+        return dense_linear_no_bias(x, *gate_up_w, std::nullopt, gate_up);
     };
-    const auto down_proj_fn = [&down_proj_w](const array& x) -> array {
-        return dense_linear_no_bias(x, *down_proj_w, std::nullopt);
+    const auto down_proj_fn = [&down_proj_w, down_proj](const array& x) -> array {
+        return dense_linear_no_bias(x, *down_proj_w, std::nullopt, down_proj);
     };
 
-    array out = mamba_forward_core(
+    array out = state_space_forward_core(
         input_arr,
         ln1_w,
         in_proj_fn,
@@ -502,7 +871,7 @@ void* mlx_lazy_mamba_block_bf16(
     return pool_array(out);
 }
 
-void* mlx_lazy_mamba_block_quantized(
+void* mlx_lazy_state_space_block_quantized(
     const void* input,
     const void* ln1_weight,
     const void* in_w,
@@ -529,7 +898,7 @@ void* mlx_lazy_mamba_block_quantized(
     bool use_gelu,
     float residual_multiplier,
     float norm_eps,
-    void* mamba_cache_ptr,
+    void* state_space_cache_ptr,
     size_t layer_idx,
     size_t d_state,
     size_t d_conv,
@@ -571,7 +940,7 @@ void* mlx_lazy_mamba_block_quantized(
     const int group_size_i = static_cast<int>(group_size);
     const int bits_i = static_cast<int>(bits);
 
-    const array conv_kernel_broadcast = resolve_mamba_conv_kernel(conv_w, d_conv_i, xbc_len);
+    const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, xbc_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
         ? std::optional<array>(
             (conv_b->ndim() == 2 && conv_b->shape(0) == 1 && conv_b->shape(1) == xbc_len)
@@ -582,14 +951,14 @@ void* mlx_lazy_mamba_block_quantized(
         ? std::optional<array>(reshape(ensure_float32(*dt_b), {1, n_heads_i}))
         : std::nullopt;
     const std::optional<array> norm_weight_arr = (norm_w != nullptr)
-        ? std::optional<array>(ensure_float32(*norm_w))
+        ? std::optional<array>(*norm_w)
         : std::nullopt;
     const std::optional<array> ln2_weight_arr = (ln2_w != nullptr)
-        ? std::optional<array>(ensure_float32(*ln2_w))
+        ? std::optional<array>(*ln2_w)
         : std::nullopt;
 
-    auto* cache = static_cast<MLXMambaCache*>(mamba_cache_ptr);
-    MambaLayer* layer_state = nullptr;
+    auto* cache = static_cast<MLXStateSpaceCache*>(state_space_cache_ptr);
+    StateSpaceLayer* layer_state = nullptr;
     if (cache != nullptr && layer_idx < cache->layers.size()) {
         layer_state = &cache->layers[layer_idx];
     }
@@ -642,7 +1011,7 @@ void* mlx_lazy_mamba_block_quantized(
         return quantized_linear_no_bias(x, *down_w_arr, *down_s_arr, *down_b_arr, group_size_i, bits_i);
     };
 
-    array out = mamba_forward_core(
+    array out = state_space_forward_core(
         input_arr,
         ln1_w,
         in_proj_fn,

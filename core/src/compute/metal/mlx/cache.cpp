@@ -208,17 +208,17 @@ void mlx_cache_get_quantized(
 extern "C" {
 
 // ============================================================================
-// ShortConv Cache Lifecycle
+// CausalConv Cache Lifecycle
 // ============================================================================
 
-void* mlx_shortconv_cache_create(size_t n_layers) {
-    auto* cache_state = new MLXShortConvCache();
+void* mlx_causal_conv_cache_create(size_t n_layers) {
+    auto* cache_state = new MLXCausalConvCache();
     cache_state->layers.resize(n_layers);
     return cache_state;
 }
 
-void mlx_shortconv_cache_reset(void* cache_ptr) {
-    auto* cache_state = static_cast<MLXShortConvCache*>(cache_ptr);
+void mlx_causal_conv_cache_reset(void* cache_ptr) {
+    auto* cache_state = static_cast<MLXCausalConvCache*>(cache_ptr);
     if (cache_state == nullptr) return;
     for (auto& layer : cache_state->layers) {
         if (layer.conv_state != nullptr) {
@@ -228,8 +228,8 @@ void mlx_shortconv_cache_reset(void* cache_ptr) {
     }
 }
 
-void mlx_shortconv_cache_free(void* cache_ptr) {
-    auto* cache_state = static_cast<MLXShortConvCache*>(cache_ptr);
+void mlx_causal_conv_cache_free(void* cache_ptr) {
+    auto* cache_state = static_cast<MLXCausalConvCache*>(cache_ptr);
     if (cache_state == nullptr) return;
     for (auto& layer : cache_state->layers) {
         delete layer.conv_state;
@@ -242,17 +242,17 @@ void mlx_shortconv_cache_free(void* cache_ptr) {
 extern "C" {
 
 // ============================================================================
-// Mamba Cache Lifecycle
+// StateSpace Cache Lifecycle
 // ============================================================================
 
-void* mlx_mamba_cache_create(size_t n_layers) {
-    auto* cache_state = new MLXMambaCache();
+void* mlx_state_space_cache_create(size_t n_layers) {
+    auto* cache_state = new MLXStateSpaceCache();
     cache_state->layers.resize(n_layers);
     return cache_state;
 }
 
-void mlx_mamba_cache_reset(void* cache_ptr) {
-    auto* cache_state = static_cast<MLXMambaCache*>(cache_ptr);
+void mlx_state_space_cache_reset(void* cache_ptr) {
+    auto* cache_state = static_cast<MLXStateSpaceCache*>(cache_ptr);
     if (cache_state == nullptr) return;
     for (auto& layer : cache_state->layers) {
         if (layer.conv_state != nullptr) {
@@ -266,8 +266,8 @@ void mlx_mamba_cache_reset(void* cache_ptr) {
     }
 }
 
-void mlx_mamba_cache_free(void* cache_ptr) {
-    auto* cache_state = static_cast<MLXMambaCache*>(cache_ptr);
+void mlx_state_space_cache_free(void* cache_ptr) {
+    auto* cache_state = static_cast<MLXStateSpaceCache*>(cache_ptr);
     if (cache_state == nullptr) return;
     for (auto& layer : cache_state->layers) {
         delete layer.conv_state;

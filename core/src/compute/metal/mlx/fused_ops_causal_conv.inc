@@ -1,10 +1,10 @@
-void* mlx_lazy_shortconv_mixer_bf16(
+void* mlx_lazy_causal_conv_mixer_bf16(
     const void* input,
     const void* in_proj,
     const void* conv_weight,
     const void* conv_bias,
     const void* out_proj,
-    void* shortconv_cache_ptr,
+    void* causal_conv_cache_ptr,
     size_t layer_idx,
     size_t d_conv,
     size_t conv_dim
@@ -19,56 +19,34 @@ void* mlx_lazy_shortconv_mixer_bf16(
     const int seq_len = input_arr.shape(1);
     const int d_conv_i = static_cast<int>(d_conv);
     const int conv_dim_i = static_cast<int>(conv_dim);
+    const int hidden_dim = input_arr.shape(2);
 
-    // in_proj is stored as [3*conv_dim, d_model], so transpose for [d_model, 3*conv_dim].
-    array bcx = matmul(input_arr, transpose(in_proj_arr));
-    // FP32 allowlist: shortconv recurrence is stateful; keep conv inputs in FP32
-    // to avoid drift across long prefill/decode sequences.
-    bcx = astype(bcx, float32);
-
-    array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
-    array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
-    array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
-    array bx = b_gate * x_proj;
-
-    array conv_kernel = conv_weight_arr;
     const auto ensure_f32 = [](const array& arr) -> array {
         // FP32 allowlist: depthwise conv kernel/state math remains in FP32.
         return arr.dtype() == float32 ? arr : astype(arr, float32);
     };
-    array conv_kernel_broadcast(0.0f, float32);
-    if (conv_kernel.ndim() == 3 &&
-        conv_kernel.shape(0) == 1 &&
-        conv_kernel.shape(1) == d_conv_i &&
-        conv_kernel.shape(2) == conv_dim_i) {
-        conv_kernel_broadcast = ensure_f32(conv_kernel);
-    } else {
-        if (conv_kernel.ndim() == 3) {
-            // [conv_dim, 1, d_conv] -> [conv_dim, d_conv]
-            conv_kernel = reshape(conv_kernel, {conv_kernel.shape(0), conv_kernel.shape(2)});
-        }
-        // [conv_dim, d_conv] -> [d_conv, conv_dim] for contiguous time-major access.
-        array conv_kernel_t = ensure_f32(transpose(conv_kernel));
-        conv_kernel_broadcast = reshape(conv_kernel_t, {1, d_conv_i, conv_dim_i});
-    }
 
-    std::optional<array> conv_bias_row;
-    if (conv_bias_arr != nullptr) {
-        const array conv_bias_f32 = ensure_f32(*conv_bias_arr);
-        if (conv_bias_f32.ndim() == 2 && conv_bias_f32.shape(0) == 1 && conv_bias_f32.shape(1) == conv_dim_i) {
-            conv_bias_row = conv_bias_f32;
-        } else {
-            conv_bias_row = reshape(conv_bias_f32, {1, conv_dim_i});
-        }
-    }
+    const array in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_arr, hidden_dim, 3 * conv_dim_i, true);
+    const array bcx = matmul(input_arr, in_proj_rhs);
 
-    auto* state_cache = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
-    ShortConvLayer* layer_state = nullptr;
+    array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
+    array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
+    array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
+    // FP32 allowlist: causal_conv recurrence is stateful; keep conv stream update
+    // in FP32 while preserving bf16/f16 for output projection.
+    array bx = ensure_f32(b_gate) * ensure_f32(x_proj);
+
+    array conv_kernel_broadcast = resolve_causal_conv_kernel(conv_weight, conv_weight_arr, d_conv_i, conv_dim_i);
+
+    std::optional<array> conv_bias_row = resolve_causal_conv_bias_row(conv_bias, conv_bias_arr, conv_dim_i);
+
+    auto* state_cache = static_cast<MLXCausalConvCache*>(causal_conv_cache_ptr);
+    CausalConvLayer* layer_state = nullptr;
     if (state_cache != nullptr && layer_idx < state_cache->layers.size()) {
         layer_state = &state_cache->layers[layer_idx];
     }
 
-    // FP32 allowlist: recurrent shortconv state accumulation.
+    // FP32 allowlist: recurrent causal_conv state accumulation.
     array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
@@ -84,7 +62,7 @@ void* mlx_lazy_shortconv_mixer_bf16(
         conv_state = zeros({1, d_conv_i, conv_dim_i}, float32);
     }
 
-    array conv_seq = shortconv_run_sequence_conv(
+    array conv_seq = causal_conv_run_sequence(
         &conv_state,
         bx,
         conv_kernel_broadcast,
@@ -96,9 +74,10 @@ void* mlx_lazy_shortconv_mixer_bf16(
         conv_seq = conv_seq + reshape(*conv_bias_row, {1, 1, conv_dim_i});
     }
 
-    const array out_proj_t = transpose(out_proj_arr);
-    const array gated = conv_seq * c_gate;
-    const array out = matmul(gated, out_proj_t);
+    const array conv_seq_model = (conv_seq.dtype() == c_gate.dtype()) ? conv_seq : astype(conv_seq, c_gate.dtype());
+    const array gated = conv_seq_model * c_gate;
+    const array out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_arr, conv_dim_i, hidden_dim, true);
+    const array out = matmul(gated, out_proj_rhs);
 
     if (layer_state != nullptr) {
         *layer_state->conv_state = conv_state;
@@ -107,7 +86,7 @@ void* mlx_lazy_shortconv_mixer_bf16(
     return pool_array(out);
 }
 
-void* mlx_lazy_shortconv_mixer_quantized(
+void* mlx_lazy_causal_conv_mixer_quantized(
     const void* input,
     const void* in_w,
     const void* in_s,
@@ -119,7 +98,7 @@ void* mlx_lazy_shortconv_mixer_quantized(
     const void* out_b,
     size_t group_size,
     size_t bits,
-    void* shortconv_cache_ptr,
+    void* causal_conv_cache_ptr,
     size_t layer_idx,
     size_t d_conv,
     size_t conv_dim
@@ -151,7 +130,7 @@ void* mlx_lazy_shortconv_mixer_quantized(
         bits_i,
         "affine"
     );
-    // FP32 allowlist: shortconv recurrence is stateful; keep conv inputs in FP32
+    // FP32 allowlist: causal_conv recurrence is stateful; keep conv inputs in FP32
     // to avoid drift across long prefill/decode sequences.
     bcx = astype(bcx, float32);
 
@@ -160,42 +139,17 @@ void* mlx_lazy_shortconv_mixer_quantized(
     array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
     array bx = b_gate * x_proj;
 
-    array conv_kernel = conv_weight_arr;
-    const auto ensure_f32 = [](const array& arr) -> array {
-        // FP32 allowlist: depthwise conv kernel/state math remains in FP32.
-        return arr.dtype() == float32 ? arr : astype(arr, float32);
-    };
-    array conv_kernel_broadcast(0.0f, float32);
-    if (conv_kernel.ndim() == 3 &&
-        conv_kernel.shape(0) == 1 &&
-        conv_kernel.shape(1) == d_conv_i &&
-        conv_kernel.shape(2) == conv_dim_i) {
-        conv_kernel_broadcast = ensure_f32(conv_kernel);
-    } else {
-        if (conv_kernel.ndim() == 3) {
-            conv_kernel = reshape(conv_kernel, {conv_kernel.shape(0), conv_kernel.shape(2)});
-        }
-        array conv_kernel_t = ensure_f32(transpose(conv_kernel));
-        conv_kernel_broadcast = reshape(conv_kernel_t, {1, d_conv_i, conv_dim_i});
-    }
+    array conv_kernel_broadcast = resolve_causal_conv_kernel(conv_weight, conv_weight_arr, d_conv_i, conv_dim_i);
 
-    std::optional<array> conv_bias_row;
-    if (conv_bias_arr != nullptr) {
-        const array conv_bias_f32 = ensure_f32(*conv_bias_arr);
-        if (conv_bias_f32.ndim() == 2 && conv_bias_f32.shape(0) == 1 && conv_bias_f32.shape(1) == conv_dim_i) {
-            conv_bias_row = conv_bias_f32;
-        } else {
-            conv_bias_row = reshape(conv_bias_f32, {1, conv_dim_i});
-        }
-    }
+    std::optional<array> conv_bias_row = resolve_causal_conv_bias_row(conv_bias, conv_bias_arr, conv_dim_i);
 
-    auto* state_cache = static_cast<MLXShortConvCache*>(shortconv_cache_ptr);
-    ShortConvLayer* layer_state = nullptr;
+    auto* state_cache = static_cast<MLXCausalConvCache*>(causal_conv_cache_ptr);
+    CausalConvLayer* layer_state = nullptr;
     if (state_cache != nullptr && layer_idx < state_cache->layers.size()) {
         layer_state = &state_cache->layers[layer_idx];
     }
 
-    // FP32 allowlist: recurrent shortconv state accumulation.
+    // FP32 allowlist: recurrent causal_conv state accumulation.
     array conv_state(0.0f, float32);
     if (layer_state != nullptr) {
         const bool need_init =
@@ -211,7 +165,7 @@ void* mlx_lazy_shortconv_mixer_quantized(
         conv_state = zeros({1, d_conv_i, conv_dim_i}, float32);
     }
 
-    array conv_seq = shortconv_run_sequence_conv(
+    array conv_seq = causal_conv_run_sequence(
         &conv_state,
         bx,
         conv_kernel_broadcast,

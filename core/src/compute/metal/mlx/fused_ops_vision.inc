@@ -45,7 +45,7 @@ void* mlx_lazy_vision_block_fused_qkv_bf16(
     const int expected_qkv_dim = 3 * hidden_dim;
 
     auto ln1 = layer_norm_last_dim(x, ln1_w, ln1_b, norm_eps);
-    auto qkv = linear_bf16_with_bias(ln1, qkv_w, qkv_b, expected_qkv_dim);
+    auto qkv = linear_bf16_with_bias(ln1, qkv_w, qkv_b, expected_qkv_dim, qkv_weight);
     auto q = slice(qkv, {0, 0, 0}, {batch, seq_len, hidden_dim});
     auto k = slice(qkv, {0, 0, hidden_dim}, {batch, seq_len, 2 * hidden_dim});
     auto v = slice(qkv, {0, 0, 2 * hidden_dim}, {batch, seq_len, 3 * hidden_dim});
@@ -63,13 +63,13 @@ void* mlx_lazy_vision_block_fused_qkv_bf16(
     auto attn = fast::scaled_dot_product_attention(q, k, v, attn_scale, "");
     attn = transpose(attn, {0, 2, 1, 3});
     attn = reshape(attn, {batch, seq_len, hidden_dim});
-    const auto attn_out = linear_bf16_with_bias(attn, o_w, o_b, hidden_dim);
+    const auto attn_out = linear_bf16_with_bias(attn, o_w, o_b, hidden_dim, o_weight);
     const auto hidden_1 = x + attn_out;
 
     auto ln2 = layer_norm_last_dim(hidden_1, ln2_w, ln2_b, norm_eps);
-    auto ffn = linear_bf16_with_bias(ln2, fc1_w, fc1_b, std::nullopt);
+    auto ffn = linear_bf16_with_bias(ln2, fc1_w, fc1_b, std::nullopt, fc1_weight);
     ffn = gelu_approx(ffn);
-    const auto ffn_out = linear_bf16_with_bias(ffn, fc2_w, fc2_b, hidden_dim);
+    const auto ffn_out = linear_bf16_with_bias(ffn, fc2_w, fc2_b, hidden_dim, fc2_weight);
     return pool_array(hidden_1 + ffn_out);
 }
 
@@ -127,9 +127,9 @@ void* mlx_lazy_vision_block_split_qkv_bf16(
     const int rope_dim = static_cast<int>(runtime_rope_dim);
 
     auto ln1 = layer_norm_last_dim(x, ln1_w, ln1_b, norm_eps);
-    auto q = linear_bf16_with_bias(ln1, q_w, q_b, hidden_dim);
-    auto k = linear_bf16_with_bias(ln1, k_w, k_b, hidden_dim);
-    auto v = linear_bf16_with_bias(ln1, v_w, v_b, hidden_dim);
+    auto q = linear_bf16_with_bias(ln1, q_w, q_b, hidden_dim, q_weight);
+    auto k = linear_bf16_with_bias(ln1, k_w, k_b, hidden_dim, k_weight);
+    auto v = linear_bf16_with_bias(ln1, v_w, v_b, hidden_dim, v_weight);
 
     q = reshape(q, {batch, seq_len, heads, hd});
     k = reshape(k, {batch, seq_len, heads, hd});
@@ -144,12 +144,12 @@ void* mlx_lazy_vision_block_split_qkv_bf16(
     auto attn = fast::scaled_dot_product_attention(q, k, v, attn_scale, "");
     attn = transpose(attn, {0, 2, 1, 3});
     attn = reshape(attn, {batch, seq_len, hidden_dim});
-    const auto attn_out = linear_bf16_with_bias(attn, o_w, o_b, hidden_dim);
+    const auto attn_out = linear_bf16_with_bias(attn, o_w, o_b, hidden_dim, o_weight);
     const auto hidden_1 = x + attn_out;
 
     auto ln2 = layer_norm_last_dim(hidden_1, ln2_w, ln2_b, norm_eps);
-    auto ffn = linear_bf16_with_bias(ln2, fc1_w, fc1_b, std::nullopt);
+    auto ffn = linear_bf16_with_bias(ln2, fc1_w, fc1_b, std::nullopt, fc1_weight);
     ffn = gelu_approx(ffn);
-    const auto ffn_out = linear_bf16_with_bias(ffn, fc2_w, fc2_b, hidden_dim);
+    const auto ffn_out = linear_bf16_with_bias(ffn, fc2_w, fc2_b, hidden_dim, fc2_weight);
     return pool_array(hidden_1 + ffn_out);
 }

@@ -9,8 +9,8 @@ const std = @import("std");
 
 /// Opaque handle to MLX array (GPU memory)
 pub const ArrayHandle = ?*anyopaque;
-pub const MambaCacheHandle = ?*anyopaque;
-pub const ShortConvCacheHandle = ?*anyopaque;
+pub const StateSpaceCacheHandle = ?*anyopaque;
+pub const CausalConvCacheHandle = ?*anyopaque;
 
 // ============================================================================
 // Array Pool - call reset() before each forward pass to reuse allocations
@@ -201,6 +201,13 @@ pub extern fn mlx_persistent_reshape(
     ndim: usize,
 ) ArrayHandle;
 
+/// Persistent transpose - heap-allocated, survives pool resets
+pub extern fn mlx_persistent_transpose(
+    input: ArrayHandle,
+    axes: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
 /// Transpose - >>> Lazy
 pub extern fn mlx_lazy_transpose(
     input: ArrayHandle,
@@ -279,26 +286,26 @@ pub extern fn mlx_lazy_slice_update(
     ndim: usize,
 ) ArrayHandle;
 
-/// Fused ShortConv mixer (dense/bfloat16 path)
-pub extern fn mlx_lazy_shortconv_mixer_bf16(
+/// Fused causal-conv mixer (dense/bfloat16 path)
+pub extern fn mlx_lazy_causal_conv_mixer_bf16(
     input: ArrayHandle,
     in_proj: ArrayHandle,
     conv_weight: ArrayHandle,
     conv_bias: ArrayHandle,
     out_proj: ArrayHandle,
-    shortconv_cache: ShortConvCacheHandle,
+    causal_conv_cache: CausalConvCacheHandle,
     layer_idx: usize,
     d_conv: usize,
     conv_dim: usize,
 ) ArrayHandle;
 
-/// ShortConv recurrent state cache lifecycle
-pub extern fn mlx_shortconv_cache_create(n_layers: usize) ShortConvCacheHandle;
-pub extern fn mlx_shortconv_cache_reset(cache: ShortConvCacheHandle) void;
-pub extern fn mlx_shortconv_cache_free(cache: ShortConvCacheHandle) void;
+/// Causal-conv recurrent state cache lifecycle
+pub extern fn mlx_causal_conv_cache_create(n_layers: usize) CausalConvCacheHandle;
+pub extern fn mlx_causal_conv_cache_reset(cache: CausalConvCacheHandle) void;
+pub extern fn mlx_causal_conv_cache_free(cache: CausalConvCacheHandle) void;
 
-/// Fused Mamba block (dense/bfloat16 path)
-pub extern fn mlx_lazy_mamba_block_bf16(
+/// Fused state-space block (dense/bfloat16 path)
+pub extern fn mlx_lazy_state_space_block_bf16(
     input: ArrayHandle,
     ln1_weight: ArrayHandle,
     in_proj: ArrayHandle,
@@ -315,7 +322,7 @@ pub extern fn mlx_lazy_mamba_block_bf16(
     use_gelu: bool,
     residual_multiplier: f32,
     norm_eps: f32,
-    mamba_cache: MambaCacheHandle,
+    state_space_cache: StateSpaceCacheHandle,
     layer_idx: usize,
     d_state: usize,
     d_conv: usize,
@@ -325,10 +332,10 @@ pub extern fn mlx_lazy_mamba_block_bf16(
     gate_up_layout: u8,
 ) ArrayHandle;
 
-/// Mamba recurrent state cache lifecycle
-pub extern fn mlx_mamba_cache_create(n_layers: usize) MambaCacheHandle;
-pub extern fn mlx_mamba_cache_reset(cache: MambaCacheHandle) void;
-pub extern fn mlx_mamba_cache_free(cache: MambaCacheHandle) void;
+/// State-space recurrent state cache lifecycle
+pub extern fn mlx_state_space_cache_create(n_layers: usize) StateSpaceCacheHandle;
+pub extern fn mlx_state_space_cache_reset(cache: StateSpaceCacheHandle) void;
+pub extern fn mlx_state_space_cache_free(cache: StateSpaceCacheHandle) void;
 
 // ============================================================================
 // Graph Execution
@@ -719,7 +726,7 @@ test "getShape returns ndim and shape entries" {
     try std.testing.expectEqual(@as(usize, 2), out_shape[1]);
 }
 
-test "mlx_lazy_mamba_block_bf16 prefill matches token-by-token path" {
+test "mlx_lazy_state_space_block_bf16 prefill matches token-by-token path" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
@@ -768,14 +775,14 @@ test "mlx_lazy_mamba_block_bf16 prefill matches token-by-token path" {
     const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
     defer freeArray(out_proj);
 
-    const prefill_cache = mlx_mamba_cache_create(1);
-    defer mlx_mamba_cache_free(prefill_cache);
-    const step_cache = mlx_mamba_cache_create(1);
-    defer mlx_mamba_cache_free(step_cache);
+    const prefill_cache = mlx_state_space_cache_create(1);
+    defer mlx_state_space_cache_free(prefill_cache);
+    const step_cache = mlx_state_space_cache_create(1);
+    defer mlx_state_space_cache_free(step_cache);
 
     const input_seq = createArrayF32(&input_seq_data, &input_seq_shape);
     defer freeArray(input_seq);
-    const prefill_out = mlx_lazy_mamba_block_bf16(
+    const prefill_out = mlx_lazy_state_space_block_bf16(
         input_seq,
         ln1_w,
         in_proj,
@@ -813,7 +820,7 @@ test "mlx_lazy_mamba_block_bf16 prefill matches token-by-token path" {
     for (input_seq_data, 0..) |tok, i| {
         const token_data = [_]f32{tok};
         const input_tok = createArrayF32(&token_data, &input_tok_shape);
-        const step_out = mlx_lazy_mamba_block_bf16(
+        const step_out = mlx_lazy_state_space_block_bf16(
             input_tok,
             ln1_w,
             in_proj,
@@ -855,7 +862,7 @@ test "mlx_lazy_mamba_block_bf16 prefill matches token-by-token path" {
     }
 }
 
-test "mlx_lazy_shortconv_mixer_bf16 prefill matches token-by-token path" {
+test "mlx_lazy_causal_conv_mixer_bf16 prefill matches token-by-token path" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
@@ -907,12 +914,12 @@ test "mlx_lazy_shortconv_mixer_bf16 prefill matches token-by-token path" {
     const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
     defer freeArray(out_proj);
 
-    const prefill_cache = mlx_shortconv_cache_create(1);
-    defer mlx_shortconv_cache_free(prefill_cache);
-    const step_cache = mlx_shortconv_cache_create(1);
-    defer mlx_shortconv_cache_free(step_cache);
+    const prefill_cache = mlx_causal_conv_cache_create(1);
+    defer mlx_causal_conv_cache_free(prefill_cache);
+    const step_cache = mlx_causal_conv_cache_create(1);
+    defer mlx_causal_conv_cache_free(step_cache);
 
-    const prefill_out = mlx_lazy_shortconv_mixer_bf16(
+    const prefill_out = mlx_lazy_causal_conv_mixer_bf16(
         input_seq,
         in_proj,
         conv_weight,
@@ -938,7 +945,7 @@ test "mlx_lazy_shortconv_mixer_bf16 prefill matches token-by-token path" {
             input_seq_data[i * d_model + 1],
         };
         const input_tok = createArrayF32(&token_data, &input_tok_shape);
-        const step_out = mlx_lazy_shortconv_mixer_bf16(
+        const step_out = mlx_lazy_causal_conv_mixer_bf16(
             input_tok,
             in_proj,
             conv_weight,
@@ -967,7 +974,7 @@ test "mlx_lazy_shortconv_mixer_bf16 prefill matches token-by-token path" {
     }
 }
 
-test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next token" {
+test "mlx_lazy_state_space_block_bf16 chunked prefill matches full prefill and next token" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
@@ -1030,12 +1037,12 @@ test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next to
     const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
     defer freeArray(out_proj);
 
-    const full_cache = mlx_mamba_cache_create(1);
-    defer mlx_mamba_cache_free(full_cache);
-    const chunk_cache = mlx_mamba_cache_create(1);
-    defer mlx_mamba_cache_free(chunk_cache);
+    const full_cache = mlx_state_space_cache_create(1);
+    defer mlx_state_space_cache_free(full_cache);
+    const chunk_cache = mlx_state_space_cache_create(1);
+    defer mlx_state_space_cache_free(chunk_cache);
 
-    const full_out = mlx_lazy_mamba_block_bf16(
+    const full_out = mlx_lazy_state_space_block_bf16(
         input_seq,
         ln1_w,
         in_proj,
@@ -1068,7 +1075,7 @@ test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next to
     var full_host: [seq_len]f32 = undefined;
     copyToHost(full_out, &full_host);
 
-    const chunk_out_1 = mlx_lazy_mamba_block_bf16(
+    const chunk_out_1 = mlx_lazy_state_space_block_bf16(
         input_chunk,
         ln1_w,
         in_proj,
@@ -1098,7 +1105,7 @@ test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next to
     var chunk_eval_1 = [_]ArrayHandle{chunk_out_1};
     eval(&chunk_eval_1);
 
-    const chunk_out_2 = mlx_lazy_mamba_block_bf16(
+    const chunk_out_2 = mlx_lazy_state_space_block_bf16(
         input_rem,
         ln1_w,
         in_proj,
@@ -1141,7 +1148,7 @@ test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next to
         try std.testing.expectApproxEqAbs(full_value, chunked_value, 1.0e-3);
     }
 
-    const full_next = mlx_lazy_mamba_block_bf16(
+    const full_next = mlx_lazy_state_space_block_bf16(
         input_next,
         ln1_w,
         in_proj,
@@ -1173,7 +1180,7 @@ test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next to
     var full_next_host: [1]f32 = undefined;
     copyToHost(full_next, &full_next_host);
 
-    const chunk_next = mlx_lazy_mamba_block_bf16(
+    const chunk_next = mlx_lazy_state_space_block_bf16(
         input_next,
         ln1_w,
         in_proj,
@@ -1208,7 +1215,7 @@ test "mlx_lazy_mamba_block_bf16 chunked prefill matches full prefill and next to
     try std.testing.expectApproxEqAbs(full_next_host[0], chunk_next_host[0], 1.0e-3);
 }
 
-test "mamba op count scales sublinearly across sequence lengths" {
+test "state-space op count scales sublinearly across sequence lengths" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
@@ -1257,8 +1264,8 @@ test "mamba op count scales sublinearly across sequence lengths" {
     const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
     defer freeArray(out_proj);
 
-    const cache = mlx_mamba_cache_create(1);
-    defer mlx_mamba_cache_free(cache);
+    const cache = mlx_state_space_cache_create(1);
+    defer mlx_state_space_cache_free(cache);
 
     const seq_small: usize = 2;
     const seq_large: usize = 16;
@@ -1269,7 +1276,7 @@ test "mamba op count scales sublinearly across sequence lengths" {
         fn run(
             input_data: []const f32,
             shape: []const i64,
-            cache_handle: MambaCacheHandle,
+            cache_handle: StateSpaceCacheHandle,
             ln1_weight: ArrayHandle,
             in_proj_weight: ArrayHandle,
             conv_w: ArrayHandle,
@@ -1284,11 +1291,11 @@ test "mamba op count scales sublinearly across sequence lengths" {
             d_head_: usize,
             n_groups_: usize,
         ) usize {
-            mlx_mamba_cache_reset(cache_handle);
+            mlx_state_space_cache_reset(cache_handle);
             const input = createArrayF32(input_data, shape);
             defer freeArray(input);
             mlx_start_counting();
-            const out = mlx_lazy_mamba_block_bf16(
+            const out = mlx_lazy_state_space_block_bf16(
                 input,
                 ln1_weight,
                 in_proj_weight,
@@ -1398,7 +1405,7 @@ test "mamba op count scales sublinearly across sequence lengths" {
     try std.testing.expect(ops_large <= (ops_small * 3 + 32));
 }
 
-test "shortconv op count scales sublinearly across sequence lengths" {
+test "causal_conv op count scales sublinearly across sequence lengths" {
     if (comptime builtin.os.tag != .macos) return;
     if (!device_mod.isAvailable()) return;
 
@@ -1448,14 +1455,14 @@ test "shortconv op count scales sublinearly across sequence lengths" {
     const out_proj = createArrayF32(&out_proj_data, &out_proj_shape);
     defer freeArray(out_proj);
 
-    const cache = mlx_shortconv_cache_create(1);
-    defer mlx_shortconv_cache_free(cache);
+    const cache = mlx_causal_conv_cache_create(1);
+    defer mlx_causal_conv_cache_free(cache);
 
     const run_count = struct {
         fn run(
             input_data: []const f32,
             shape: []const i64,
-            cache_handle: ShortConvCacheHandle,
+            cache_handle: CausalConvCacheHandle,
             in_proj_weight: ArrayHandle,
             conv_w: ArrayHandle,
             conv_b: ArrayHandle,
@@ -1463,11 +1470,11 @@ test "shortconv op count scales sublinearly across sequence lengths" {
             d_conv_: usize,
             conv_dim_: usize,
         ) usize {
-            mlx_shortconv_cache_reset(cache_handle);
+            mlx_causal_conv_cache_reset(cache_handle);
             const input = createArrayF32(input_data, shape);
             defer freeArray(input);
             mlx_start_counting();
-            const out = mlx_lazy_shortconv_mixer_bf16(
+            const out = mlx_lazy_causal_conv_mixer_bf16(
                 input,
                 in_proj_weight,
                 conv_w,

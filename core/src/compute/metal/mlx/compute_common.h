@@ -22,6 +22,7 @@
 #include <algorithm>
 #include <functional>
 #include <mutex>
+#include <unordered_map>
 #include <unordered_set>
 
 using namespace mlx::core;
@@ -64,3 +65,7 @@ inline void mlx_count_op(size_t n = 1) {
         g_count_ops_value += n;
     }
 }
+
+// Clears bounded thread-local caches for static weight transforms (e.g.
+// oriented/transpose matmul RHS views) used by fused kernels.
+extern "C" void mlx_weight_transform_cache_clear();

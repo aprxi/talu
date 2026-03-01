@@ -10,7 +10,7 @@ pub const CacheHandle = runtime_graph.CacheHandle;
 pub const ShortConvCacheHandle = runtime_graph.ShortConvCacheHandle;
 pub const MambaCacheHandle = runtime_graph.MambaCacheHandle;
 
-pub extern fn mlx_lazy_shortconv_mixer_bf16(
+pub extern fn mlx_lazy_causal_conv_mixer_bf16(
     input: ArrayHandle,
     in_proj: ArrayHandle,
     conv_weight: ArrayHandle,
@@ -22,7 +22,7 @@ pub extern fn mlx_lazy_shortconv_mixer_bf16(
     conv_dim: usize,
 ) ArrayHandle;
 
-pub extern fn mlx_lazy_shortconv_mixer_quantized(
+pub extern fn mlx_lazy_causal_conv_mixer_quantized(
     input: ArrayHandle,
     in_w: ArrayHandle,
     in_s: ArrayHandle,
@@ -40,7 +40,7 @@ pub extern fn mlx_lazy_shortconv_mixer_quantized(
     conv_dim: usize,
 ) ArrayHandle;
 
-pub extern fn mlx_lazy_mamba_block_bf16(
+pub extern fn mlx_lazy_state_space_block_bf16(
     input: ArrayHandle,
     ln1_weight: ArrayHandle,
     in_proj: ArrayHandle,
@@ -67,7 +67,7 @@ pub extern fn mlx_lazy_mamba_block_bf16(
     gate_up_layout: u8,
 ) ArrayHandle;
 
-pub extern fn mlx_lazy_mamba_block_quantized(
+pub extern fn mlx_lazy_state_space_block_quantized(
     input: ArrayHandle,
     ln1_weight: ArrayHandle,
     in_w: ArrayHandle,
@@ -293,7 +293,7 @@ pub extern fn mlx_lazy_fused_ffn_bf16(
     down_w: ArrayHandle,
 ) ArrayHandle;
 
-pub extern fn mlx_lazy_fused_moe_ffn_mxfp4(
+pub extern fn mlx_lazy_fused_expert_mix_ffn_mxfp4(
     input: ArrayHandle,
     router_w: ArrayHandle,
     router_s: ArrayHandle,

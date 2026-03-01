@@ -57,12 +57,12 @@ extern fn mlx_cache_get_quantized(
     v_biases_out: *ArrayHandle,
 ) void;
 
-extern fn mlx_shortconv_cache_create(n_layers: usize) ShortConvCacheHandle;
-extern fn mlx_shortconv_cache_reset(cache: ShortConvCacheHandle) void;
-extern fn mlx_shortconv_cache_free(cache: ShortConvCacheHandle) void;
-extern fn mlx_mamba_cache_create(n_layers: usize) MambaCacheHandle;
-extern fn mlx_mamba_cache_reset(cache: MambaCacheHandle) void;
-extern fn mlx_mamba_cache_free(cache: MambaCacheHandle) void;
+extern fn mlx_causal_conv_cache_create(n_layers: usize) ShortConvCacheHandle;
+extern fn mlx_causal_conv_cache_reset(cache: ShortConvCacheHandle) void;
+extern fn mlx_causal_conv_cache_free(cache: ShortConvCacheHandle) void;
+extern fn mlx_state_space_cache_create(n_layers: usize) MambaCacheHandle;
+extern fn mlx_state_space_cache_reset(cache: MambaCacheHandle) void;
+extern fn mlx_state_space_cache_free(cache: MambaCacheHandle) void;
 
 pub const Cache = struct {
     handle: CacheHandle,
@@ -157,7 +157,7 @@ pub const ShortConvCache = struct {
     handle: ShortConvCacheHandle,
 
     pub fn init(n_layers: usize) ShortConvCache {
-        return .{ .handle = mlx_shortconv_cache_create(n_layers) };
+        return .{ .handle = mlx_causal_conv_cache_create(n_layers) };
     }
 
     pub fn disabled() ShortConvCache {
@@ -166,12 +166,12 @@ pub const ShortConvCache = struct {
 
     pub fn reset(self: ShortConvCache) void {
         if (self.handle == null) return;
-        mlx_shortconv_cache_reset(self.handle);
+        mlx_causal_conv_cache_reset(self.handle);
     }
 
     pub fn deinit(self: ShortConvCache) void {
         if (self.handle == null) return;
-        mlx_shortconv_cache_free(self.handle);
+        mlx_causal_conv_cache_free(self.handle);
     }
 };
 
@@ -179,7 +179,7 @@ pub const MambaCache = struct {
     handle: MambaCacheHandle,
 
     pub fn init(n_layers: usize) MambaCache {
-        return .{ .handle = mlx_mamba_cache_create(n_layers) };
+        return .{ .handle = mlx_state_space_cache_create(n_layers) };
     }
 
     pub fn disabled() MambaCache {
@@ -188,11 +188,11 @@ pub const MambaCache = struct {
 
     pub fn reset(self: MambaCache) void {
         if (self.handle == null) return;
-        mlx_mamba_cache_reset(self.handle);
+        mlx_state_space_cache_reset(self.handle);
     }
 
     pub fn deinit(self: MambaCache) void {
         if (self.handle == null) return;
-        mlx_mamba_cache_free(self.handle);
+        mlx_state_space_cache_free(self.handle);
     }
 };

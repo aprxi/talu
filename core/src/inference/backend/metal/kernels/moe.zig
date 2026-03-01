@@ -33,7 +33,7 @@ pub const MoEFFN = struct {
         _ = scratch;
         _ = matmul_scratch;
         const moe = self.weights;
-        output_tensor.* = mlx_fused.mlx_lazy_fused_moe_ffn_mxfp4(
+        output_tensor.* = mlx_fused.mlx_lazy_fused_expert_mix_ffn_mxfp4(
             input_tensor,
             moe.router_w,
             if (moe.router_s) |rs| rs else null,
