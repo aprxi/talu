@@ -1266,7 +1266,7 @@ pub const TransformerBlock = struct {
         }
 
         const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
-        const final_slot = try bufferSlotForRegister(final_register, residual, slot_buffers, lw.register_to_slot_map);
+        const final_slot = try bufferSlotForRegister(final_register, &residual, slot_buffers, lw.register_to_slot_map);
         return final_slot.*;
     }
 
