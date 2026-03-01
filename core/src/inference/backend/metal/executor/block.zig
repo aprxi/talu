@@ -7,7 +7,7 @@ const std = @import("std");
 const compute = @import("../../../../compute/root.zig");
 const layer_ops = @import("../../../../models/layer_ops.zig");
 const op_types = @import("../../../../models/op_types.zig");
-const models = @import("../../../../models/root.zig");
+const tensor = @import("../../../../tensor.zig");
 const opcode_map = @import("../../../../models/plan/opcode_map.zig");
 const log = @import("../../../../log.zig");
 const runtime_contract = @import("../../../runtime_contract/root.zig");
@@ -27,7 +27,7 @@ var layer_program_dispatch_counters = runtime_contract.DispatchCounters{};
 pub const Cache = runtime_graph.Cache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
 pub const MambaCache = runtime_graph.MambaCache;
-const ModelConfig = models.ModelConfig;
+const ModelConfig = tensor.ModelConfig;
 const WeightHandles = weights_mod.WeightHandles;
 const LayerWeights = WeightHandles.LayerWeights;
 
@@ -36,10 +36,6 @@ pub const TransformerBlock = struct {
     const StateRef = struct {
         ptr: *anyopaque,
     };
-
-    fn finalOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
-        return layer_ops.finalOutputBuffer(program);
-    }
 
     fn planUsesOpcode(plan: *const runtime_contract.ExecutionPlan, opcode: opcode_map.Opcode) bool {
         for (plan.instructions) |insn| {
@@ -249,30 +245,6 @@ pub const TransformerBlock = struct {
         }
     }
 
-    fn validateLayerProgram(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
-        if (runtime_contract.firstUnsupportedLayerProgramOpcode(program, layer_program_adapter_table)) |unsupported| {
-            log.warn("inference", "Metal LayerOp program contains unsupported opcode", .{
-                .layer = layer_idx,
-                .op_index = unsupported.op_index,
-                .kind = @intFromEnum(kind),
-                .op = @tagName(program[unsupported.op_index]),
-                .opcode = @intFromEnum(unsupported.opcode),
-            });
-            return error.NotImplemented;
-        }
-        if (runtime_contract.firstLayerProgramStateMismatch(program, kind)) |mismatch| {
-            log.warn("inference", "Metal LayerOp program state binding mismatches block kind", .{
-                .layer = layer_idx,
-                .op_index = mismatch.op_index,
-                .kind = @intFromEnum(kind),
-                .op = @tagName(program[mismatch.op_index]),
-                .opcode = @intFromEnum(mismatch.opcode),
-                .state_id = mismatch.state_id,
-            });
-            return error.NotImplemented;
-        }
-    }
-
     fn getBuffer(
         buffer_id: layer_ops.BufferId,
         residual: mlx_graph.ArrayHandle,
@@ -311,11 +283,10 @@ pub const TransformerBlock = struct {
         slot_buffers: []mlx_graph.ArrayHandle,
         register_to_slot_map: *const [64]u8,
     ) !*mlx_graph.ArrayHandle {
-        const buffer_id: layer_ops.BufferId = @enumFromInt(runtime_contract.registerToIndex(reg));
-        if (buffer_id == .residual) return residual;
-        const register_idx = @intFromEnum(buffer_id);
-        if (register_idx >= register_to_slot_map.len) return error.NotImplemented;
-        const slot_idx = register_to_slot_map[register_idx];
+        const reg_idx = runtime_contract.registerToIndex(reg);
+        if (reg_idx == 0) return residual;
+        if (reg_idx >= register_to_slot_map.len) return error.NotImplemented;
+        const slot_idx = register_to_slot_map[reg_idx];
         if (slot_idx == std.math.maxInt(u8) or slot_idx >= slot_buffers.len) return error.NotImplemented;
         return &slot_buffers[slot_idx];
     }
@@ -452,7 +423,7 @@ pub const TransformerBlock = struct {
                 if (ctx.bindings.ffn) |*ffn_binding| switch (ffn_binding.*) {
                     .moe => |*moe_binding| {
                         if (!std.mem.eql(u8, parsed.slot_name, "router")) return error.InvalidWeightBindingName;
-                        return @ptrCast(&moe_binding.weights.router_w);
+                        return @ptrCast(@constCast(&moe_binding.weights.router_w));
                     },
                     .dense => return error.InvalidWeightBindingName,
                 } else return error.MissingField;
@@ -487,31 +458,6 @@ pub const TransformerBlock = struct {
         if (param_id >= compiled_plan.param_blocks.len) return error.MissingParamBlock;
         param_storage[0] = compiled_plan.param_blocks[param_id];
         return param_storage[0..1];
-    }
-
-    // --- ABI-stable packed param structs ---
-    //
-    // These match the byte layout produced by `encodeLayerOpParam` in
-    // runtime_contract/types.zig.  Adapters cast `ParamBlock.data` to
-    // these via `@ptrCast` — zero parsing, zero allocation, zero branching.
-
-    const ResidualAddParam = packed struct {
-        param_kind: u8,
-        branch_buffer_id: u8,
-        scale_tag: u8,
-        scale_literal: u32,
-    };
-
-    fn paramAs(
-        comptime T: type,
-        params: []const runtime_contract.ParamBlock,
-        expected_opcode: opcode_map.Opcode,
-    ) !*const T {
-        if (params.len == 0) return error.MissingParamBlock;
-        const param_block = params[0];
-        if (param_block.opcode != expected_opcode) return error.ParamBlockOpcodeMismatch;
-        if (param_block.data.len < @bitSizeOf(T) / 8) return error.InvalidParamBlockABI;
-        return @ptrCast(@alignCast(param_block.data.ptr));
     }
 
     fn optionalStateValue(
@@ -1193,7 +1139,7 @@ pub const TransformerBlock = struct {
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
-        const p = try paramAs(ResidualAddParam, params, .residual_add);
+        const p = try runtime_contract.paramAs(runtime_contract.ResidualAddParam, params, .residual_add);
         const scale_kind: layer_ops.ResidualScale = switch (p.scale_tag) {
             0 => .one,
             1 => .residual_multiplier,
@@ -1397,7 +1343,7 @@ test "finalOutputBuffer returns residual when program ends with add" {
             .scale = .one,
         } },
     };
-    try std.testing.expectEqual(layer_ops.BufferId.residual, TransformerBlock.finalOutputBuffer(&program));
+    try std.testing.expectEqual(layer_ops.BufferId.residual, layer_ops.finalOutputBuffer(&program));
 }
 
 test "finalOutputBuffer returns kernel output buffer for post-norm endings" {
@@ -1409,10 +1355,10 @@ test "finalOutputBuffer returns kernel output buffer for post-norm endings" {
             .debug_type = .norm,
         } },
     };
-    try std.testing.expectEqual(layer_ops.BufferId.norm_out, TransformerBlock.finalOutputBuffer(&program));
+    try std.testing.expectEqual(layer_ops.BufferId.norm_out, layer_ops.finalOutputBuffer(&program));
 }
 
-test "validateLayerProgram accepts kernel-add programs" {
+test "layer program compatibility accepts kernel-add programs" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
@@ -1431,7 +1377,13 @@ test "validateLayerProgram accepts kernel-add programs" {
             .scale = .one,
         } },
     };
-    try TransformerBlock.validateLayerProgram(&program, 0, .attention_mlp);
+    try std.testing.expect(
+        runtime_contract.firstLayerProgramCompatibilityIssue(
+            &program,
+            .attention_mlp,
+            TransformerBlock.layer_program_adapter_table,
+        ) == null,
+    );
 }
 
 test "layer_program_adapter_table covers Metal LayerOp execution subset" {
@@ -1456,7 +1408,7 @@ test "layer_program_adapter_table covers Metal LayerOp execution subset" {
     try std.testing.expect(TransformerBlock.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.mul_scalar)] == null);
 }
 
-test "validateLayerProgram rejects unsupported primitive ops" {
+test "layer program compatibility rejects unsupported primitive ops" {
     const program = [_]layer_ops.LayerOp{
         .{ .mul_scalar = .{
             .in = .residual,
@@ -1464,10 +1416,18 @@ test "validateLayerProgram rejects unsupported primitive ops" {
             .scalar = 0.5,
         } },
     };
-    try std.testing.expectError(error.NotImplemented, TransformerBlock.validateLayerProgram(&program, 0, .attention_mlp));
+    const issue = runtime_contract.firstLayerProgramCompatibilityIssue(
+        &program,
+        .attention_mlp,
+        TransformerBlock.layer_program_adapter_table,
+    ) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .unsupported_opcode => |unsupported| try std.testing.expectEqual(opcode_map.Opcode.mul_scalar, unsupported.opcode),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
-test "validateLayerProgram rejects stateful opcode bound to wrong block kind" {
+test "layer program compatibility rejects stateful opcode bound to wrong block kind" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
@@ -1480,8 +1440,13 @@ test "validateLayerProgram rejects stateful opcode bound to wrong block kind" {
             .scale = .one,
         } },
     };
-    try std.testing.expectError(
-        error.NotImplemented,
-        TransformerBlock.validateLayerProgram(&program, 0, .attention_mlp),
-    );
+    const issue = runtime_contract.firstLayerProgramCompatibilityIssue(
+        &program,
+        .attention_mlp,
+        TransformerBlock.layer_program_adapter_table,
+    ) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .state_mismatch => |mismatch| try std.testing.expectEqual(opcode_map.Opcode.shortconv, mismatch.opcode),
+        else => return error.TestUnexpectedResult,
+    }
 }

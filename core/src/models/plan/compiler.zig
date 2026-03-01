@@ -18,31 +18,94 @@ const kv_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
 const shortconv_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.shortconv);
 const mamba_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.mamba);
 
-fn registerFromBuffer(buffer: layer_ops.BufferId) runtime_contract.RegisterRef {
-    return runtime_contract.registerFromIndex(@intFromEnum(buffer));
-}
+/// Allocation-order register assignment.
+///
+/// Fixed slots: residual=0, norm_out=1, branch_out=2.
+/// All tmp buffers (tmp3+) are assigned dense register indices starting from 3
+/// in first-use order. This breaks the identity mapping between BufferId enum
+/// values and RegisterRef indices.
+const RegisterMap = struct {
+    buffer_to_register: [64]u16,
+    register_to_buffer: [max_registers]u8,
+    next_register: u16,
 
-fn allocRegistersFromBuffers(
-    allocator: std.mem.Allocator,
-    buffers: []const layer_ops.BufferId,
-) ![]runtime_contract.RegisterRef {
-    var regs = try allocator.alloc(runtime_contract.RegisterRef, buffers.len);
-    for (buffers, 0..) |buffer, idx| regs[idx] = registerFromBuffer(buffer);
-    return regs;
-}
+    const max_registers = 128;
+    const sentinel: u16 = std.math.maxInt(u16);
+    const no_buffer: u8 = std.math.maxInt(u8);
 
-fn allocSequentialRegisters(
-    allocator: std.mem.Allocator,
-    first: layer_ops.BufferId,
-    count: usize,
-) ![]runtime_contract.RegisterRef {
-    var regs = try allocator.alloc(runtime_contract.RegisterRef, count);
-    const first_index: u16 = @intFromEnum(first);
-    for (0..count) |idx| {
-        regs[idx] = runtime_contract.registerFromIndex(first_index + @as(u16, @intCast(idx)));
+    fn init() RegisterMap {
+        var map = RegisterMap{
+            .buffer_to_register = [_]u16{sentinel} ** 64,
+            .register_to_buffer = [_]u8{no_buffer} ** max_registers,
+            .next_register = 3,
+        };
+        // Fixed: residual=0, norm_out=1, branch_out=2
+        map.buffer_to_register[0] = 0;
+        map.buffer_to_register[1] = 1;
+        map.buffer_to_register[2] = 2;
+        map.register_to_buffer[0] = 0;
+        map.register_to_buffer[1] = 1;
+        map.register_to_buffer[2] = 2;
+        return map;
     }
-    return regs;
-}
+
+    fn registerFor(self: *RegisterMap, buffer: layer_ops.BufferId) runtime_contract.RegisterRef {
+        const buf_idx: usize = @intFromEnum(buffer);
+        if (self.buffer_to_register[buf_idx] != sentinel) {
+            return runtime_contract.registerFromIndex(self.buffer_to_register[buf_idx]);
+        }
+        const reg_idx = self.next_register;
+        self.next_register += 1;
+        self.buffer_to_register[buf_idx] = reg_idx;
+        if (reg_idx < max_registers) {
+            self.register_to_buffer[reg_idx] = @intCast(buf_idx);
+        }
+        return runtime_contract.registerFromIndex(reg_idx);
+    }
+
+    fn allocRegisters(
+        self: *RegisterMap,
+        allocator: std.mem.Allocator,
+        buffers: []const layer_ops.BufferId,
+    ) ![]runtime_contract.RegisterRef {
+        var regs = try allocator.alloc(runtime_contract.RegisterRef, buffers.len);
+        for (buffers, 0..) |buffer, idx| regs[idx] = self.registerFor(buffer);
+        return regs;
+    }
+
+    fn allocSequential(
+        self: *RegisterMap,
+        allocator: std.mem.Allocator,
+        first: layer_ops.BufferId,
+        count: usize,
+    ) ![]runtime_contract.RegisterRef {
+        var regs = try allocator.alloc(runtime_contract.RegisterRef, count);
+        const first_index: u16 = @intFromEnum(first);
+        for (0..count) |idx| {
+            const buf_val = first_index + @as(u16, @intCast(idx));
+            if (buf_val < 64) {
+                regs[idx] = self.registerFor(@enumFromInt(buf_val));
+            } else {
+                // Buffer index exceeds BufferId range — assign register without
+                // BufferId tracking. Backend will reject via register_count check.
+                const reg_idx = self.next_register;
+                self.next_register += 1;
+                if (reg_idx < max_registers) {
+                    self.register_to_buffer[reg_idx] = no_buffer;
+                }
+                regs[idx] = runtime_contract.registerFromIndex(reg_idx);
+            }
+        }
+        return regs;
+    }
+
+    fn toOwnedSlice(self: *const RegisterMap, allocator: std.mem.Allocator) ![]u8 {
+        const count = @min(self.next_register, max_registers);
+        const slice = try allocator.alloc(u8, count);
+        @memcpy(slice, self.register_to_buffer[0..count]);
+        return slice;
+    }
+};
 
 fn allocWeightRefs(
     allocator: std.mem.Allocator,
@@ -73,13 +136,6 @@ fn ensureWeightBindingIndex(
     return binding_index;
 }
 
-fn maxRegisterInInstruction(insn: runtime_contract.Instruction) u16 {
-    var max_register: u16 = 0;
-    for (insn.inputs) |reg| max_register = @max(max_register, runtime_contract.registerToIndex(reg));
-    for (insn.outputs) |reg| max_register = @max(max_register, runtime_contract.registerToIndex(reg));
-    return max_register;
-}
-
 fn kernelWeightSlots(opcode: runtime_contract.Opcode) []const []const u8 {
     return runtime_contract.expectedKernelWeightSlots(opcode);
 }
@@ -90,6 +146,7 @@ fn compileOneInstruction(
     mode: CompileMode,
     param_block_id: u16,
     weight_bindings: *std.ArrayListUnmanaged(runtime_contract.WeightBinding),
+    reg_map: *RegisterMap,
 ) !runtime_contract.Instruction {
     const opcode = opcode_map.opcodeForLayerOp(op);
     const state_block_id = switch (mode) {
@@ -122,8 +179,8 @@ fn compileOneInstruction(
             }
             break :blk .{
                 .opcode = opcode,
-                .inputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.in}),
-                .outputs = try allocRegistersFromBuffers(allocator, &.{kernel_op.out}),
+                .inputs = try reg_map.allocRegisters(allocator, &.{kernel_op.in}),
+                .outputs = try reg_map.allocRegisters(allocator, &.{kernel_op.out}),
                 .weights = refs,
                 .param_block_id = param_block_id,
                 .state_block_id = state_block_id,
@@ -131,16 +188,16 @@ fn compileOneInstruction(
         },
         .add => |add_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{ .residual, add_op.branch }),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{.residual}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{ .residual, add_op.branch }),
+            .outputs = try reg_map.allocRegisters(allocator, &.{.residual}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .linear => |linear_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{linear_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{linear_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{linear_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{linear_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, linear_op.weight_name),
             }}),
@@ -149,104 +206,104 @@ fn compileOneInstruction(
         },
         .matmul => |matmul_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{ matmul_op.in_a, matmul_op.in_b }),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{matmul_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{ matmul_op.in_a, matmul_op.in_b }),
+            .outputs = try reg_map.allocRegisters(allocator, &.{matmul_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .split => |split_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{split_op.in}),
-            .outputs = try allocSequentialRegisters(allocator, split_op.out_start, split_op.num_outputs),
+            .inputs = try reg_map.allocRegisters(allocator, &.{split_op.in}),
+            .outputs = try reg_map.allocSequential(allocator, split_op.out_start, split_op.num_outputs),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .softmax => |softmax_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{softmax_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{softmax_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{softmax_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{softmax_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .silu => |silu_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{silu_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{silu_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{silu_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{silu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .gelu => |gelu_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{gelu_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{gelu_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{gelu_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{gelu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .mul => |mul_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{ mul_op.in, mul_op.other }),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{mul_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{ mul_op.in, mul_op.other }),
+            .outputs = try reg_map.allocRegisters(allocator, &.{mul_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .add_tensor => |add_tensor_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{ add_tensor_op.in_a, add_tensor_op.in_b }),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{add_tensor_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{ add_tensor_op.in_a, add_tensor_op.in_b }),
+            .outputs = try reg_map.allocRegisters(allocator, &.{add_tensor_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .add_scalar => |add_scalar_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{add_scalar_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{add_scalar_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{add_scalar_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{add_scalar_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .mul_scalar => |mul_scalar_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{mul_scalar_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{mul_scalar_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{mul_scalar_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{mul_scalar_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .mean => |mean_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{mean_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{mean_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{mean_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{mean_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .pow => |pow_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{pow_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{pow_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{pow_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{pow_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .rsqrt => |rsqrt_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{rsqrt_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{rsqrt_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{rsqrt_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{rsqrt_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .add_param => |add_param_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{add_param_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{add_param_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{add_param_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, add_param_op.param_name),
             }}),
@@ -255,8 +312,8 @@ fn compileOneInstruction(
         },
         .add_param_scalar => |add_param_scalar_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{add_param_scalar_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{add_param_scalar_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, add_param_scalar_op.param_name),
             }}),
@@ -265,8 +322,8 @@ fn compileOneInstruction(
         },
         .mul_param => |mul_param_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{mul_param_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{mul_param_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{mul_param_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{mul_param_op.out}),
             .weights = try allocWeightRefs(allocator, &.{.{
                 .index = try ensureWeightBindingIndex(allocator, weight_bindings, mul_param_op.param_name),
             }}),
@@ -275,72 +332,72 @@ fn compileOneInstruction(
         },
         .reshape => |reshape_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{reshape_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{reshape_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{reshape_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{reshape_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .transpose => |transpose_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{transpose_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{transpose_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{transpose_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{transpose_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .rope => |rope_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{rope_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{rope_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{rope_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{rope_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .triu => |triu_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{triu_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{triu_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{triu_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{triu_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .sdpa => |sdpa_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{ sdpa_op.q, sdpa_op.k, sdpa_op.v }),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{sdpa_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{ sdpa_op.q, sdpa_op.k, sdpa_op.v }),
+            .outputs = try reg_map.allocRegisters(allocator, &.{sdpa_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .patch_embed => |patch_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{patch_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{patch_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{patch_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{patch_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .spatial_merge => |spatial_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{spatial_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{spatial_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{spatial_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{spatial_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .deepstack_extract => |deepstack_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{deepstack_op.in}),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{deepstack_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{deepstack_op.in}),
+            .outputs = try reg_map.allocRegisters(allocator, &.{deepstack_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
         },
         .scatter => |scatter_op| .{
             .opcode = opcode,
-            .inputs = try allocRegistersFromBuffers(allocator, &.{ scatter_op.text_in, scatter_op.vision_in }),
-            .outputs = try allocRegistersFromBuffers(allocator, &.{scatter_op.out}),
+            .inputs = try reg_map.allocRegisters(allocator, &.{ scatter_op.text_in, scatter_op.vision_in }),
+            .outputs = try reg_map.allocRegisters(allocator, &.{scatter_op.out}),
             .weights = &.{},
             .param_block_id = param_block_id,
             .state_block_id = state_block_id,
@@ -360,11 +417,16 @@ fn deinitParamBlock(allocator: std.mem.Allocator, param_block: runtime_contract.
     if (param_block.data.len != 0) allocator.free(param_block.data);
 }
 
+const LivenessResult = struct {
+    map: runtime_contract.LivenessMap,
+    never_read_registers: []const u16,
+};
+
 fn buildLivenessMap(
     allocator: std.mem.Allocator,
     instructions: []const runtime_contract.Instruction,
     register_count: u16,
-) !runtime_contract.LivenessMap {
+) !LivenessResult {
     const register_count_usize = @as(usize, register_count);
     const sentinel = std.math.maxInt(u32);
     var register_last_read = try allocator.alloc(u32, register_count_usize);
@@ -386,11 +448,28 @@ fn buildLivenessMap(
         }
     }
 
+    var never_read = std.ArrayListUnmanaged(u16){};
+    errdefer {
+        if (never_read.items.len > 0) allocator.free(never_read.items);
+    }
+
     if (instructions.len > 0) {
         const terminal_idx: u32 = @intCast(instructions.len - 1);
+        // The plan's final output register is consumed by the runtime outside
+        // the plan, so it is expected to have no internal readers.
+        const final_output_idx: u16 = runtime_contract.registerToIndex(
+            runtime_contract.planFinalOutputRegister(&.{
+                .instructions = instructions,
+                .register_count = register_count,
+                .state_descs = &.{},
+            }),
+        );
         for (register_last_read, 0..) |last_read, idx| {
             if (produced[idx] and last_read == sentinel) {
                 register_last_read[idx] = terminal_idx;
+                if (idx != final_output_idx) {
+                    try never_read.append(allocator, @intCast(idx));
+                }
             }
         }
     }
@@ -414,8 +493,11 @@ fn buildLivenessMap(
     }
 
     return .{
-        .register_last_read = register_last_read,
-        .kill_after_instruction = kill_after_instruction,
+        .map = .{
+            .register_last_read = register_last_read,
+            .kill_after_instruction = kill_after_instruction,
+        },
+        .never_read_registers = try never_read.toOwnedSlice(allocator),
     };
 }
 
@@ -557,6 +639,7 @@ fn buildDiagnostics(
     allocator: std.mem.Allocator,
     mode: CompileMode,
     compiled: *const runtime_contract.CompiledPlan,
+    never_read_registers: []const u16,
 ) ![]runtime_contract.PlanDiagnostic {
     var diagnostics = std.ArrayListUnmanaged(runtime_contract.PlanDiagnostic){};
     errdefer {
@@ -605,6 +688,18 @@ fn buildDiagnostics(
         });
     }
 
+    for (never_read_registers) |reg_idx| {
+        const msg = try std.fmt.allocPrint(
+            allocator,
+            "never_read register={d}",
+            .{reg_idx},
+        );
+        try diagnostics.append(allocator, .{
+            .level = .warn,
+            .message = msg,
+        });
+    }
+
     return diagnostics.toOwnedSlice(allocator);
 }
 
@@ -643,16 +738,15 @@ pub fn compileLayerProgram(
         weight_bindings.deinit(allocator);
     }
 
-    var max_register: u16 = 0;
+    var reg_map = RegisterMap.init();
     for (program) |op| {
         const opcode = opcode_map.opcodeForLayerOp(op);
         const param_block_id: u16 = @intCast(param_blocks.items.len);
         try param_blocks.append(allocator, try serializeLayerOpParam(allocator, opcode, op));
-        const insn = try compileOneInstruction(allocator, op, mode, param_block_id, &weight_bindings);
+        const insn = try compileOneInstruction(allocator, op, mode, param_block_id, &weight_bindings, &reg_map);
         if (insn.weights.len != runtime_contract.expectedWeightRefCount(insn.opcode)) {
             return error.InvalidWeightRefCount;
         }
-        max_register = @max(max_register, maxRegisterInInstruction(insn));
         try instructions.append(allocator, insn);
     }
 
@@ -666,8 +760,13 @@ pub fn compileLayerProgram(
         allocator.free(instruction_slice);
     }
 
-    const register_count: u16 = if (instruction_slice.len == 0) 0 else max_register + 1;
-    const liveness = try buildLivenessMap(allocator, instruction_slice, register_count);
+    const register_count: u16 = if (instruction_slice.len == 0) 0 else reg_map.next_register;
+    const register_to_buffer_id = if (register_count > 0) try reg_map.toOwnedSlice(allocator) else &[_]u8{};
+    errdefer if (register_to_buffer_id.len > 0) allocator.free(register_to_buffer_id);
+    const liveness_result = try buildLivenessMap(allocator, instruction_slice, register_count);
+    const liveness = liveness_result.map;
+    defer if (liveness_result.never_read_registers.len > 0)
+        allocator.free(liveness_result.never_read_registers);
     errdefer {
         allocator.free(liveness.register_last_read);
         for (liveness.kill_after_instruction) |row| allocator.free(row);
@@ -705,6 +804,7 @@ pub fn compileLayerProgram(
         .param_blocks = param_block_slice,
         .weight_bindings = weight_binding_slice,
         .register_buffer_specs = register_buffer_specs,
+        .register_to_buffer_id = register_to_buffer_id,
         .liveness = liveness,
         .peak_registers = register_count,
         .diagnostics = &.{},
@@ -712,7 +812,7 @@ pub fn compileLayerProgram(
     compiled.peak_registers = try computePeakRegisters(allocator, &compiled);
 
     try runtime_contract.validateCompiledPlan(&compiled);
-    compiled.diagnostics = try buildDiagnostics(allocator, mode, &compiled);
+    compiled.diagnostics = try buildDiagnostics(allocator, mode, &compiled, liveness_result.never_read_registers);
     return compiled;
 }
 
@@ -741,6 +841,7 @@ pub fn deinitCompiledPlan(allocator: std.mem.Allocator, compiled: *runtime_contr
     for (compiled.weight_bindings) |binding| allocator.free(binding.name);
     if (compiled.weight_bindings.len > 0) allocator.free(compiled.weight_bindings);
     if (compiled.register_buffer_specs.len > 0) allocator.free(compiled.register_buffer_specs);
+    if (compiled.register_to_buffer_id.len > 0) allocator.free(compiled.register_to_buffer_id);
 
     if (compiled.plan.state_descs.len > 0) allocator.free(compiled.plan.state_descs);
 
@@ -800,153 +901,155 @@ fn expectedWeightCount(op: layer_ops.LayerOp) usize {
 }
 
 fn collectExpectedRegisters(
+    reg_map: *RegisterMap,
     op: layer_ops.LayerOp,
     input_buffer: *[64]runtime_contract.RegisterRef,
     output_buffer: *[64]runtime_contract.RegisterRef,
 ) struct { input_count: usize, output_count: usize } {
     return switch (op) {
         .kernel => |kernel_op| blk: {
-            input_buffer[0] = registerFromBuffer(kernel_op.in);
-            output_buffer[0] = registerFromBuffer(kernel_op.out);
+            input_buffer[0] = reg_map.registerFor(kernel_op.in);
+            output_buffer[0] = reg_map.registerFor(kernel_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .add => |add_op| blk: {
-            input_buffer[0] = registerFromBuffer(.residual);
-            input_buffer[1] = registerFromBuffer(add_op.branch);
-            output_buffer[0] = registerFromBuffer(.residual);
+            input_buffer[0] = reg_map.registerFor(.residual);
+            input_buffer[1] = reg_map.registerFor(add_op.branch);
+            output_buffer[0] = reg_map.registerFor(.residual);
             break :blk .{ .input_count = 2, .output_count = 1 };
         },
         .linear => |linear_op| blk: {
-            input_buffer[0] = registerFromBuffer(linear_op.in);
-            output_buffer[0] = registerFromBuffer(linear_op.out);
+            input_buffer[0] = reg_map.registerFor(linear_op.in);
+            output_buffer[0] = reg_map.registerFor(linear_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .matmul => |matmul_op| blk: {
-            input_buffer[0] = registerFromBuffer(matmul_op.in_a);
-            input_buffer[1] = registerFromBuffer(matmul_op.in_b);
-            output_buffer[0] = registerFromBuffer(matmul_op.out);
+            input_buffer[0] = reg_map.registerFor(matmul_op.in_a);
+            input_buffer[1] = reg_map.registerFor(matmul_op.in_b);
+            output_buffer[0] = reg_map.registerFor(matmul_op.out);
             break :blk .{ .input_count = 2, .output_count = 1 };
         },
         .split => |split_op| blk: {
-            input_buffer[0] = registerFromBuffer(split_op.in);
-            const first: u16 = @intFromEnum(split_op.out_start);
+            input_buffer[0] = reg_map.registerFor(split_op.in);
+            const first_index: u16 = @intFromEnum(split_op.out_start);
             for (0..split_op.num_outputs) |idx| {
-                output_buffer[idx] = runtime_contract.registerFromIndex(first + @as(u16, @intCast(idx)));
+                const buf_id: layer_ops.BufferId = @enumFromInt(first_index + @as(u16, @intCast(idx)));
+                output_buffer[idx] = reg_map.registerFor(buf_id);
             }
             break :blk .{ .input_count = 1, .output_count = split_op.num_outputs };
         },
         .softmax => |softmax_op| blk: {
-            input_buffer[0] = registerFromBuffer(softmax_op.in);
-            output_buffer[0] = registerFromBuffer(softmax_op.out);
+            input_buffer[0] = reg_map.registerFor(softmax_op.in);
+            output_buffer[0] = reg_map.registerFor(softmax_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .silu => |silu_op| blk: {
-            input_buffer[0] = registerFromBuffer(silu_op.in);
-            output_buffer[0] = registerFromBuffer(silu_op.out);
+            input_buffer[0] = reg_map.registerFor(silu_op.in);
+            output_buffer[0] = reg_map.registerFor(silu_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .gelu => |gelu_op| blk: {
-            input_buffer[0] = registerFromBuffer(gelu_op.in);
-            output_buffer[0] = registerFromBuffer(gelu_op.out);
+            input_buffer[0] = reg_map.registerFor(gelu_op.in);
+            output_buffer[0] = reg_map.registerFor(gelu_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .mul => |mul_op| blk: {
-            input_buffer[0] = registerFromBuffer(mul_op.in);
-            input_buffer[1] = registerFromBuffer(mul_op.other);
-            output_buffer[0] = registerFromBuffer(mul_op.out);
+            input_buffer[0] = reg_map.registerFor(mul_op.in);
+            input_buffer[1] = reg_map.registerFor(mul_op.other);
+            output_buffer[0] = reg_map.registerFor(mul_op.out);
             break :blk .{ .input_count = 2, .output_count = 1 };
         },
         .add_tensor => |add_tensor_op| blk: {
-            input_buffer[0] = registerFromBuffer(add_tensor_op.in_a);
-            input_buffer[1] = registerFromBuffer(add_tensor_op.in_b);
-            output_buffer[0] = registerFromBuffer(add_tensor_op.out);
+            input_buffer[0] = reg_map.registerFor(add_tensor_op.in_a);
+            input_buffer[1] = reg_map.registerFor(add_tensor_op.in_b);
+            output_buffer[0] = reg_map.registerFor(add_tensor_op.out);
             break :blk .{ .input_count = 2, .output_count = 1 };
         },
         .add_scalar => |add_scalar_op| blk: {
-            input_buffer[0] = registerFromBuffer(add_scalar_op.in);
-            output_buffer[0] = registerFromBuffer(add_scalar_op.out);
+            input_buffer[0] = reg_map.registerFor(add_scalar_op.in);
+            output_buffer[0] = reg_map.registerFor(add_scalar_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .mul_scalar => |mul_scalar_op| blk: {
-            input_buffer[0] = registerFromBuffer(mul_scalar_op.in);
-            output_buffer[0] = registerFromBuffer(mul_scalar_op.out);
+            input_buffer[0] = reg_map.registerFor(mul_scalar_op.in);
+            output_buffer[0] = reg_map.registerFor(mul_scalar_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .mean => |mean_op| blk: {
-            input_buffer[0] = registerFromBuffer(mean_op.in);
-            output_buffer[0] = registerFromBuffer(mean_op.out);
+            input_buffer[0] = reg_map.registerFor(mean_op.in);
+            output_buffer[0] = reg_map.registerFor(mean_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .pow => |pow_op| blk: {
-            input_buffer[0] = registerFromBuffer(pow_op.in);
-            output_buffer[0] = registerFromBuffer(pow_op.out);
+            input_buffer[0] = reg_map.registerFor(pow_op.in);
+            output_buffer[0] = reg_map.registerFor(pow_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .rsqrt => |rsqrt_op| blk: {
-            input_buffer[0] = registerFromBuffer(rsqrt_op.in);
-            output_buffer[0] = registerFromBuffer(rsqrt_op.out);
+            input_buffer[0] = reg_map.registerFor(rsqrt_op.in);
+            output_buffer[0] = reg_map.registerFor(rsqrt_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .add_param => |add_param_op| blk: {
-            input_buffer[0] = registerFromBuffer(add_param_op.in);
-            output_buffer[0] = registerFromBuffer(add_param_op.out);
+            input_buffer[0] = reg_map.registerFor(add_param_op.in);
+            output_buffer[0] = reg_map.registerFor(add_param_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .add_param_scalar => |add_param_scalar_op| blk: {
-            output_buffer[0] = registerFromBuffer(add_param_scalar_op.out);
+            output_buffer[0] = reg_map.registerFor(add_param_scalar_op.out);
             break :blk .{ .input_count = 0, .output_count = 1 };
         },
         .mul_param => |mul_param_op| blk: {
-            input_buffer[0] = registerFromBuffer(mul_param_op.in);
-            output_buffer[0] = registerFromBuffer(mul_param_op.out);
+            input_buffer[0] = reg_map.registerFor(mul_param_op.in);
+            output_buffer[0] = reg_map.registerFor(mul_param_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .reshape => |reshape_op| blk: {
-            input_buffer[0] = registerFromBuffer(reshape_op.in);
-            output_buffer[0] = registerFromBuffer(reshape_op.out);
+            input_buffer[0] = reg_map.registerFor(reshape_op.in);
+            output_buffer[0] = reg_map.registerFor(reshape_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .transpose => |transpose_op| blk: {
-            input_buffer[0] = registerFromBuffer(transpose_op.in);
-            output_buffer[0] = registerFromBuffer(transpose_op.out);
+            input_buffer[0] = reg_map.registerFor(transpose_op.in);
+            output_buffer[0] = reg_map.registerFor(transpose_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .rope => |rope_op| blk: {
-            input_buffer[0] = registerFromBuffer(rope_op.in);
-            output_buffer[0] = registerFromBuffer(rope_op.out);
+            input_buffer[0] = reg_map.registerFor(rope_op.in);
+            output_buffer[0] = reg_map.registerFor(rope_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .triu => |triu_op| blk: {
-            input_buffer[0] = registerFromBuffer(triu_op.in);
-            output_buffer[0] = registerFromBuffer(triu_op.out);
+            input_buffer[0] = reg_map.registerFor(triu_op.in);
+            output_buffer[0] = reg_map.registerFor(triu_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .sdpa => |sdpa_op| blk: {
-            input_buffer[0] = registerFromBuffer(sdpa_op.q);
-            input_buffer[1] = registerFromBuffer(sdpa_op.k);
-            input_buffer[2] = registerFromBuffer(sdpa_op.v);
-            output_buffer[0] = registerFromBuffer(sdpa_op.out);
+            input_buffer[0] = reg_map.registerFor(sdpa_op.q);
+            input_buffer[1] = reg_map.registerFor(sdpa_op.k);
+            input_buffer[2] = reg_map.registerFor(sdpa_op.v);
+            output_buffer[0] = reg_map.registerFor(sdpa_op.out);
             break :blk .{ .input_count = 3, .output_count = 1 };
         },
         .patch_embed => |patch_op| blk: {
-            input_buffer[0] = registerFromBuffer(patch_op.in);
-            output_buffer[0] = registerFromBuffer(patch_op.out);
+            input_buffer[0] = reg_map.registerFor(patch_op.in);
+            output_buffer[0] = reg_map.registerFor(patch_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .spatial_merge => |spatial_op| blk: {
-            input_buffer[0] = registerFromBuffer(spatial_op.in);
-            output_buffer[0] = registerFromBuffer(spatial_op.out);
+            input_buffer[0] = reg_map.registerFor(spatial_op.in);
+            output_buffer[0] = reg_map.registerFor(spatial_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .deepstack_extract => |deepstack_op| blk: {
-            input_buffer[0] = registerFromBuffer(deepstack_op.in);
-            output_buffer[0] = registerFromBuffer(deepstack_op.out);
+            input_buffer[0] = reg_map.registerFor(deepstack_op.in);
+            output_buffer[0] = reg_map.registerFor(deepstack_op.out);
             break :blk .{ .input_count = 1, .output_count = 1 };
         },
         .scatter => |scatter_op| blk: {
-            input_buffer[0] = registerFromBuffer(scatter_op.text_in);
-            input_buffer[1] = registerFromBuffer(scatter_op.vision_in);
-            output_buffer[0] = registerFromBuffer(scatter_op.out);
+            input_buffer[0] = reg_map.registerFor(scatter_op.text_in);
+            input_buffer[1] = reg_map.registerFor(scatter_op.vision_in);
+            output_buffer[0] = reg_map.registerFor(scatter_op.out);
             break :blk .{ .input_count = 2, .output_count = 1 };
         },
     };
@@ -954,6 +1057,7 @@ fn collectExpectedRegisters(
 
 fn expectProgramParity(source: []const layer_ops.LayerOp, compiled: *const runtime_contract.CompiledPlan) !void {
     try std.testing.expectEqual(source.len, compiled.plan.instructions.len);
+    var reg_map = RegisterMap.init();
     for (source, compiled.plan.instructions) |source_op, compiled_insn| {
         try std.testing.expectEqual(opcode_map.opcodeForLayerOp(source_op), compiled_insn.opcode);
         try std.testing.expectEqual(expectedInputCount(source_op), compiled_insn.inputs.len);
@@ -962,7 +1066,7 @@ fn expectProgramParity(source: []const layer_ops.LayerOp, compiled: *const runti
 
         var expected_inputs: [64]runtime_contract.RegisterRef = undefined;
         var expected_outputs: [64]runtime_contract.RegisterRef = undefined;
-        const expected = collectExpectedRegisters(source_op, &expected_inputs, &expected_outputs);
+        const expected = collectExpectedRegisters(&reg_map, source_op, &expected_inputs, &expected_outputs);
         try std.testing.expectEqualSlices(
             runtime_contract.RegisterRef,
             expected_inputs[0..expected.input_count],
@@ -1283,6 +1387,82 @@ test "compileLayerProgram emits empty plan warning diagnostics" {
     try std.testing.expect(compiled.diagnostics.len >= 2);
     try std.testing.expectEqual(runtime_contract.PlanDiagnosticLevel.warn, compiled.diagnostics[1].level);
     try std.testing.expect(std.mem.startsWith(u8, compiled.diagnostics[1].message, "empty_plan mode=decode"));
+}
+
+test "compileLayerProgram emits never_read diagnostic for unused output" {
+    // Op 0 outputs to norm_out (reg 1), but op 1 reads residual (reg 0) only.
+    // norm_out is produced but never read — should emit a never_read diagnostic.
+    // branch_out (reg 2) is the plan's final output, so it is NOT flagged.
+    const program = [_]layer_ops.LayerOp{
+        .{ .mul_scalar = .{ .in = .residual, .out = .norm_out, .scalar = 1.0 } },
+        .{ .mul_scalar = .{ .in = .residual, .out = .branch_out, .scalar = 2.0 } },
+    };
+    var compiled = try compileLayerProgram(std.testing.allocator, &program, .decode);
+    defer deinitCompiledPlan(std.testing.allocator, &compiled);
+
+    var found_never_read = false;
+    for (compiled.diagnostics) |diag| {
+        if (diag.level == .warn and std.mem.startsWith(u8, diag.message, "never_read register=")) {
+            // Should flag register 1 (norm_out), not register 2 (branch_out = final output)
+            try std.testing.expect(std.mem.eql(u8, diag.message, "never_read register=1"));
+            found_never_read = true;
+        }
+    }
+    try std.testing.expect(found_never_read);
+}
+
+test "compileLayerProgram assigns dense registers for sparse tmp buffers" {
+    const allocator = std.testing.allocator;
+    // Program uses tmp3, tmp10, tmp20 — sparse BufferIds (values 3, 10, 20).
+    // Dense allocation should assign registers 3, 4, 5 (not 3, 10, 20).
+    const program = [_]layer_ops.LayerOp{
+        .{ .silu = .{ .in = .norm_out, .out = .tmp3 } },
+        .{ .silu = .{ .in = .tmp3, .out = .tmp10 } },
+        .{ .silu = .{ .in = .tmp10, .out = .tmp20 } },
+    };
+    var compiled = try compileLayerProgram(allocator, &program, .decode);
+    defer deinitCompiledPlan(allocator, &compiled);
+
+    // Fixed slots: residual=0, norm_out=1, branch_out=2
+    // Dense tmp allocation: tmp3→3, tmp10→4, tmp20→5
+    try std.testing.expectEqual(@as(u16, 6), compiled.plan.register_count);
+
+    // register_to_buffer_id mapping: register index → BufferId value
+    try std.testing.expectEqual(@as(u8, 0), compiled.register_to_buffer_id[0]); // residual
+    try std.testing.expectEqual(@as(u8, 1), compiled.register_to_buffer_id[1]); // norm_out
+    try std.testing.expectEqual(@as(u8, 2), compiled.register_to_buffer_id[2]); // branch_out
+    try std.testing.expectEqual(@as(u8, 3), compiled.register_to_buffer_id[3]); // tmp3
+    try std.testing.expectEqual(@as(u8, 10), compiled.register_to_buffer_id[4]); // tmp10
+    try std.testing.expectEqual(@as(u8, 20), compiled.register_to_buffer_id[5]); // tmp20
+
+    // Verify registers in instructions are NOT identity-cast BufferIds
+    const insn1 = compiled.plan.instructions[1]; // silu: tmp3→tmp10
+    try std.testing.expectEqual(@as(u16, 3), runtime_contract.registerToIndex(insn1.inputs[0])); // tmp3 → register 3
+    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn1.outputs[0])); // tmp10 → register 4 (NOT 10)
+
+    const insn2 = compiled.plan.instructions[2]; // silu: tmp10→tmp20
+    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn2.inputs[0])); // tmp10 → register 4
+    try std.testing.expectEqual(@as(u16, 5), runtime_contract.registerToIndex(insn2.outputs[0])); // tmp20 → register 5 (NOT 20)
+}
+
+test "compileLayerProgram assigns dense registers for split outputs" {
+    const allocator = std.testing.allocator;
+    const program = [_]layer_ops.LayerOp{
+        .{ .split = .{ .in = .norm_out, .out_start = .tmp10, .num_outputs = 3, .split_sizes = &.{}, .dim = -1 } },
+    };
+    var compiled = try compileLayerProgram(allocator, &program, .decode);
+    defer deinitCompiledPlan(allocator, &compiled);
+
+    // Split outputs tmp10, tmp11, tmp12 → registers 3, 4, 5 (dense from 3, not 10, 11, 12)
+    const insn = compiled.plan.instructions[0];
+    try std.testing.expectEqual(@as(u16, 3), runtime_contract.registerToIndex(insn.outputs[0])); // tmp10 → 3
+    try std.testing.expectEqual(@as(u16, 4), runtime_contract.registerToIndex(insn.outputs[1])); // tmp11 → 4
+    try std.testing.expectEqual(@as(u16, 5), runtime_contract.registerToIndex(insn.outputs[2])); // tmp12 → 5
+
+    // Mapping round-trip
+    try std.testing.expectEqual(@as(u8, 10), compiled.register_to_buffer_id[3]); // register 3 → tmp10
+    try std.testing.expectEqual(@as(u8, 11), compiled.register_to_buffer_id[4]); // register 4 → tmp11
+    try std.testing.expectEqual(@as(u8, 12), compiled.register_to_buffer_id[5]); // register 5 → tmp12
 }
 
 test "validateProgramBlockKindStateCompatibility rejects mismatched stateful opcode" {

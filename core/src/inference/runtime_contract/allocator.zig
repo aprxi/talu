@@ -6,6 +6,8 @@ const std = @import("std");
 const types = @import("types.zig");
 
 pub const RegisterBufferSpec = struct {
+    /// Buffer size hint. Set to 0 to exempt a register from physical allocation
+    /// (e.g., register 0 / residual uses the caller's output buffer, not scratch).
     size: usize,
     @"align": u16,
 };
@@ -61,6 +63,7 @@ pub fn buildPhysicalMappingLinearScan(
             const reg_idx = types.registerToIndex(reg);
             if (register_first_write[reg_idx] != idx_u32) continue;
             const desired = register_specs[reg_idx];
+            if (desired.size == 0) continue; // Exempt from physical allocation
 
             var chosen: ?u16 = null;
             var free_idx: usize = 0;
@@ -168,4 +171,49 @@ test "buildPhysicalMappingLinearScan reuses physical buffers with liveness" {
 
     try std.testing.expect(mapping.physical_count <= compiled.peak_registers);
     try std.testing.expectEqual(mapping.register_to_physical[1], mapping.register_to_physical[2]);
+}
+
+test "buildPhysicalMappingLinearScan skips exempt registers" {
+    const reg0 = types.registerFromIndex(0);
+    const reg1 = types.registerFromIndex(1);
+
+    const instructions = [_]types.Instruction{
+        .{
+            .opcode = .rmsnorm,
+            .inputs = &.{reg0},
+            .outputs = &.{reg1},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+    };
+
+    const kill0 = [_]u64{0b11};
+    const liveness = types.LivenessMap{
+        .register_last_read = &.{ 0, 0 },
+        .kill_after_instruction = &.{kill0[0..]},
+    };
+    const compiled = types.CompiledPlan{
+        .plan = .{
+            .instructions = instructions[0..],
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .liveness = liveness,
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+
+    // Register 0 exempt (size=0), register 1 allocated normally.
+    const specs = [_]RegisterBufferSpec{
+        .{ .size = 0, .@"align" = 0 },
+        .{ .size = 1024, .@"align" = 16 },
+    };
+    var mapping = try buildPhysicalMappingLinearScan(std.testing.allocator, &compiled, specs[0..]);
+    defer deinitPhysicalMapping(std.testing.allocator, &mapping);
+
+    try std.testing.expectEqual(std.math.maxInt(u16), mapping.register_to_physical[0]);
+    try std.testing.expect(mapping.register_to_physical[1] != std.math.maxInt(u16));
+    try std.testing.expectEqual(@as(u16, 1), mapping.physical_count);
 }

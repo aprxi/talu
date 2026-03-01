@@ -87,26 +87,24 @@ fn buildTmpRegisterScratchMap(
     };
     const register_count: usize = compiled.plan.register_count;
     if (register_count <= 1) return layout;
-    if (register_count > TMP_BUFFER_MAP_LEN) return layout;
+    if (register_count > TMP_BUFFER_MAP_LEN) return error.UnsupportedModel;
 
     const specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, register_count);
     defer allocator.free(specs);
-    // Width is activation elements-per-row. Use compiler-emitted per-register
-    // hints when present; otherwise fall back to a conservative block hint.
-    const fallback_width = @max(register_width_hint, 1);
-    for (specs, 0..) |*spec, idx| {
-        if (idx < compiled.register_buffer_specs.len) {
-            const plan_spec = compiled.register_buffer_specs[idx];
-            spec.* = .{
-                .size = @max(plan_spec.size, fallback_width),
-                .@"align" = @max(plan_spec.@"align", @as(u16, 64)),
-            };
-        } else {
-            spec.* = .{
-                .size = fallback_width,
-                .@"align" = 64,
-            };
-        }
+    // Register 0 (residual) uses the model output buffer, not scratch.
+    // Mark exempt via size=0 so the allocator skips it.
+    specs[0] = .{ .size = 0, .@"align" = 0 };
+    if (compiled.register_buffer_specs.len != register_count) return error.InvalidRegisterSpecCount;
+    // Plan specs carry relative width relationships (e.g., split ratios).
+    // The model-dimension floor ensures absolute sizing is at least the
+    // backend's required minimum (d_model or d_ff-based).
+    const model_dim_floor = @max(register_width_hint, 1);
+    for (specs[1..], 1..) |*spec, idx| {
+        const plan_spec = compiled.register_buffer_specs[idx];
+        spec.* = .{
+            .size = @max(plan_spec.size, model_dim_floor),
+            .@"align" = @max(plan_spec.@"align", @as(u16, 64)),
+        };
     }
 
     var physical_mapping = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, specs);
@@ -117,10 +115,8 @@ fn buildTmpRegisterScratchMap(
     defer allocator.free(physical_to_tmp_slot);
     @memset(physical_to_tmp_slot, std.math.maxInt(u8));
 
-    // Map registers 1+ through liveness analysis. Register 0 (residual) is
-    // the model output buffer, not scratch, so it stays identity-mapped.
     var next_tmp_slot: usize = 1;
-    for (1..register_count) |reg_idx| {
+    for (0..register_count) |reg_idx| {
         const physical_id_u16 = physical_mapping.register_to_physical[reg_idx];
         if (physical_id_u16 == std.math.maxInt(u16)) continue;
         const physical_id: usize = physical_id_u16;
@@ -147,9 +143,8 @@ fn buildTmpRegisterScratchMap(
 fn finalOutputBuffer(compiled: *const runtime_contract.CompiledPlan) BufferId {
     const out_reg = runtime_contract.planFinalOutputRegister(&compiled.plan);
     const out_idx = runtime_contract.registerToIndex(out_reg);
-    const max_buffer_idx: u16 = @intFromEnum(BufferId.tmp63);
-    if (out_idx > max_buffer_idx) return .residual;
-    return @enumFromInt(out_idx);
+    if (out_idx >= compiled.register_to_buffer_id.len) return .residual;
+    return @enumFromInt(compiled.register_to_buffer_id[out_idx]);
 }
 
 fn formatRmsNormLike(writer: anytype, dim: usize, eps: f32, weight_offset: f32) !void {
@@ -562,84 +557,6 @@ pub const Block = struct {
         return param_storage[0..1];
     }
 
-    // ---- ABI-stable packed param structs ----
-    //
-    // Layouts match the byte encoding produced by `encodeLayerOpParam` in
-    // runtime_contract/types.zig.  Adapters cast `ParamBlock.data` to these
-    // via `@ptrCast` — zero parsing, zero allocation, zero branching.
-
-    const ResidualAddParam = packed struct {
-        param_kind: u8,
-        branch_buffer_id: u8,
-        scale_tag: u8,
-        scale_literal: u32,
-    };
-
-    const ScalarOpParam = packed struct {
-        param_kind: u8,
-        in_buffer_id: u8,
-        out_buffer_id: u8,
-        scalar: u32,
-    };
-
-    const AddParamScalarParam = packed struct {
-        param_kind: u8,
-        out_buffer_id: u8,
-        scalar: u32,
-    };
-
-    const MeanOpParam = packed struct {
-        param_kind: u8,
-        in_buffer_id: u8,
-        out_buffer_id: u8,
-        dim: i8,
-        keepdim: u8,
-    };
-
-    const TransposeOpParam = packed struct {
-        param_kind: u8,
-        in_buffer_id: u8,
-        out_buffer_id: u8,
-        dim0: i8,
-        dim1: i8,
-    };
-
-    const TriuOpParam = packed struct {
-        param_kind: u8,
-        in_buffer_id: u8,
-        out_buffer_id: u8,
-        diagonal: i32,
-    };
-
-    const SdpaOpParam = packed struct {
-        param_kind: u8,
-        q_buffer_id: u8,
-        k_buffer_id: u8,
-        v_buffer_id: u8,
-        out_buffer_id: u8,
-        is_causal: u8,
-        has_scale: u8,
-    };
-
-    const ReshapeOpParam = packed struct {
-        param_kind: u8,
-        in_buffer_id: u8,
-        out_buffer_id: u8,
-        count: u16,
-    };
-
-    fn paramAs(
-        comptime T: type,
-        params: []const runtime_contract.ParamBlock,
-        expected_opcode: runtime_contract.Opcode,
-    ) !*const T {
-        if (params.len == 0) return error.MissingParamBlock;
-        const param_block = params[0];
-        if (param_block.opcode != expected_opcode) return error.ParamBlockOpcodeMismatch;
-        if (param_block.data.len < @bitSizeOf(T) / 8) return error.InvalidParamBlockABI;
-        return @ptrCast(@alignCast(param_block.data.ptr));
-    }
-
     /// Compute total element count from a TensorViewDesc.
     fn viewNumel(view: runtime_contract.TensorViewDesc) usize {
         var n: usize = 1;
@@ -667,10 +584,9 @@ pub const Block = struct {
         reg: runtime_contract.RegisterRef,
         len: usize,
     ) ![]f32 {
-        const raw_idx = runtime_contract.registerToIndex(reg);
-        if (raw_idx > @intFromEnum(BufferId.tmp63)) return error.InvalidInstructionBinding;
-        const out_id: BufferId = @enumFromInt(raw_idx);
-        return self.resolveOutputSlice(buffer_views, scratch, out_id, len);
+        const reg_idx = runtime_contract.registerToIndex(reg);
+        if (reg_idx >= cpu_forward.NUM_TMP_BUFFERS) return error.InvalidInstructionBinding;
+        return self.resolveOutputSlice(buffer_views, scratch, reg_idx, len);
     }
 
     fn instructionWeightRef(self: *const Block, op_index: usize) !*const Tensor {
@@ -780,17 +696,17 @@ pub const Block = struct {
 
         const shared_state = dispatch_state.slot_ctx.sharedState();
         const bound_state_blocks = shared_state.state_blocks;
-        if (bound_state_blocks.len == 0) {
-            if (dispatch_state.block.compiled_plan.plan.state_descs.len != 0) {
-                return error.InvalidStateDescriptorBinding;
-            }
-            return;
-        }
+        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         for (dispatch_state.block.compiled_plan.plan.state_descs) |state_desc| {
             if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
-            const state_block = runtime_contract.findStateBlock(bound_state_blocks, state_desc.id) orelse {
+            const maybe_state_block = runtime_contract.findStateBlock(bound_state_blocks, state_desc.id);
+            if (maybe_state_block == null) {
+                // Single-slot decode/prefill uses per-slot attn cache and does
+                // not require scheduler-supplied KV descriptor bindings.
+                if (dispatch_state.mode == .single_slot and state_desc.id == kv_state_id) continue;
                 return error.InvalidStateDescriptorBinding;
-            };
+            }
+            const state_block = maybe_state_block.?;
             var normalized_state_block = state_block.*;
             if (normalized_state_block.size < @sizeOf(runtime_contract.OpaqueStateRef)) {
                 return error.InvalidStateDescriptorBinding;
@@ -804,15 +720,18 @@ pub const Block = struct {
             try dispatch_state.bindState(normalized_state_block);
         }
 
-        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, kv_state_id) != null) {
-            const layered_cache = runtime_contract.findStateValue(
-                *LayeredBatchedKVCache,
-                bound_state_blocks,
-                kv_state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
-            if (dispatch_state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
-            shared_state.batched_cache = layered_cache.getLayer(dispatch_state.block.block_idx);
+            if (dispatch_state.mode == .single_slot and runtime_contract.findStateBlock(bound_state_blocks, kv_state_id) == null) {
+                shared_state.batched_cache = null;
+            } else {
+                const layered_cache = runtime_contract.findStateValue(
+                    *LayeredBatchedKVCache,
+                    bound_state_blocks,
+                    kv_state_id,
+                ) orelse return error.InvalidStateDescriptorBinding;
+                if (dispatch_state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
+                shared_state.batched_cache = layered_cache.getLayer(dispatch_state.block.block_idx);
+            }
         } else {
             shared_state.batched_cache = null;
         }
@@ -840,13 +759,34 @@ pub const Block = struct {
         }
     }
 
+    fn requireInstructionStateBinding(
+        mode: BatchedDispatchMode,
+        insn: *const runtime_contract.Instruction,
+        plan: *const runtime_contract.ExecutionPlan,
+        state_blocks: []const runtime_contract.StateBlockHandle,
+    ) !void {
+        if (state_blocks.len == 0 and mode == .single_slot) {
+            switch (insn.opcode) {
+                .multihead_attention, .mla_attention => return,
+                else => {},
+            }
+        }
+        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, plan, state_blocks);
+    }
+
     fn buildInstructionStateBlocks(
         insn: *const runtime_contract.Instruction,
         dispatch_state: *RuntimeDispatchState,
     ) !InstructionStateBlocks {
         var blocks = InstructionStateBlocks{};
         const state_id = insn.state_block_id orelse return blocks;
-        const binding = dispatch_state.stateBinding(state_id) orelse return error.InvalidStateDescriptorBinding;
+        const binding = dispatch_state.stateBinding(state_id) orelse {
+            if (dispatch_state.mode == .single_slot) switch (insn.opcode) {
+                .multihead_attention, .mla_attention => return blocks,
+                else => {},
+            };
+            return error.InvalidStateDescriptorBinding;
+        };
         const descriptor = runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, state_id) orelse {
             return error.UnknownStateDescriptorId;
         };
@@ -1007,7 +947,7 @@ pub const Block = struct {
         var param_storage: [1]runtime_contract.ParamBlock = undefined;
         const params = try self.instructionParams(insn, &param_storage);
         var state_blocks = try buildInstructionStateBlocks(insn, dispatch_state);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &self.compiled_plan.plan, state_blocks.slice());
+        try requireInstructionStateBinding(dispatch_state.mode, insn, &self.compiled_plan.plan, state_blocks.slice());
         try adapter(
             &exec_ctx,
             insn,
@@ -1027,7 +967,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionPayload;
         const input = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const output = &state.buffer_views[runtime_contract.registerToIndex(insn.outputs[0])];
@@ -1052,11 +992,11 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len < 2) return error.InvalidInstructionBinding;
         const residual = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const branch = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[1])];
-        const p = try paramAs(ResidualAddParam, params, .residual_add);
+        const p = try runtime_contract.paramAs(runtime_contract.ResidualAddParam, params, .residual_add);
         const scale = state.block.residualScaleValue(switch (p.scale_tag) {
             0 => .one,
             1 => .residual_multiplier,
@@ -1075,7 +1015,7 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const output_len = viewNumel(input_view);
@@ -1086,7 +1026,7 @@ pub const Block = struct {
             insn.outputs[0],
             output_len,
         );
-        const p = try paramAs(ScalarOpParam, params, .mul_scalar);
+        const p = try runtime_contract.paramAs(runtime_contract.ScalarOpParam, params, .mul_scalar);
         cpu_elementwise.mulScalar(input_data[0..output_len], output_slice[0..output_len], @bitCast(p.scalar));
         const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
@@ -1105,7 +1045,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 2 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const left_numel = viewNumel(views[0]);
         const right_numel = viewNumel(views[1]);
@@ -1141,7 +1081,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const input_buf = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
@@ -1220,7 +1160,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 2 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const left_view = views[0];
         const right_view = views[1];
@@ -1261,7 +1201,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         const split_outputs = insn.outputs.len;
         if (insn.inputs.len != 1) return error.InvalidInstructionBinding;
         if (split_outputs == 0 or split_outputs > 3) return error.TooManySplitOutputs;
@@ -1329,7 +1269,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_tensor = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const output_tensor = &state.buffer_views[runtime_contract.registerToIndex(insn.outputs[0])];
@@ -1347,7 +1287,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_tensor = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const output_tensor = &state.buffer_views[runtime_contract.registerToIndex(insn.outputs[0])];
@@ -1365,7 +1305,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_tensor = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
         const output_tensor = &state.buffer_views[runtime_contract.registerToIndex(insn.outputs[0])];
@@ -1383,7 +1323,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 2 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const left_numel = viewNumel(views[0]);
         const right_numel = viewNumel(views[1]);
@@ -1419,7 +1359,7 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const output_len = viewNumel(input_view);
@@ -1430,7 +1370,7 @@ pub const Block = struct {
             insn.outputs[0],
             output_len,
         );
-        const p = try paramAs(ScalarOpParam, params, .add_scalar);
+        const p = try runtime_contract.paramAs(runtime_contract.ScalarOpParam, params, .add_scalar);
         cpu_elementwise.addScalar(input_data[0..output_len], output_slice[0..output_len], @bitCast(p.scalar));
         const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
@@ -1449,8 +1389,8 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
-        const p = try paramAs(MeanOpParam, params, .mean);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
+        const p = try runtime_contract.paramAs(runtime_contract.MeanOpParam, params, .mean);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const input_data = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])].asSlice(f32);
@@ -1527,7 +1467,7 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const output_len = viewNumel(input_view);
@@ -1538,7 +1478,7 @@ pub const Block = struct {
             insn.outputs[0],
             output_len,
         );
-        const p = try paramAs(ScalarOpParam, params, .pow);
+        const p = try runtime_contract.paramAs(runtime_contract.ScalarOpParam, params, .pow);
         cpu_elementwise.powScalar(input_data[0..output_len], output_slice[0..output_len], @bitCast(p.scalar));
         const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
@@ -1557,7 +1497,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const output_len = viewNumel(input_view);
@@ -1586,7 +1526,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const input_numel = viewNumel(input_view);
@@ -1624,7 +1564,7 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         const param = state.block.instructionWeightRef(state.op_index) catch |err| {
             error_context.setContext("block={d}, op={d}, param_ref={s}", .{
                 state.block.block_idx,
@@ -1640,7 +1580,7 @@ pub const Block = struct {
             insn.outputs[0],
             p_len,
         );
-        const p = try paramAs(AddParamScalarParam, params, .add_param_scalar);
+        const p = try runtime_contract.paramAs(runtime_contract.AddParamScalarParam, params, .add_param_scalar);
         cpu_broadcast.addParamScalar(param, output_slice[0..p_len], @bitCast(p.scalar));
         const out_idx = try instructionRegisterToBufferIndex(insn.outputs[0]);
         state.buffer_views[out_idx] = tensorFromSlice(
@@ -1659,7 +1599,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const input_numel = viewNumel(input_view);
@@ -1697,8 +1637,8 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
-        const p = try paramAs(ReshapeOpParam, params, .reshape);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
+        const p = try runtime_contract.paramAs(runtime_contract.ReshapeOpParam, params, .reshape);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         var output_tensor = state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
@@ -1706,7 +1646,7 @@ pub const Block = struct {
         if (p.count > 0) {
             // Decode variable-length shape from param data after fixed header.
             const data = params[0].data;
-            const aligned_offset = std.mem.alignForward(usize, @sizeOf(ReshapeOpParam), @alignOf(i32));
+            const aligned_offset = std.mem.alignForward(usize, @sizeOf(runtime_contract.ReshapeOpParam), @alignOf(i32));
             const decode_count: usize = @min(@as(usize, p.count), 8);
             const byte_count = decode_count * @sizeOf(i32);
             if (aligned_offset + byte_count > data.len) return error.InvalidParamBlockABI;
@@ -1770,8 +1710,8 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
-        const p = try paramAs(TransposeOpParam, params, .transpose);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
+        const p = try runtime_contract.paramAs(runtime_contract.TransposeOpParam, params, .transpose);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const in_buf = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
@@ -1827,7 +1767,7 @@ pub const Block = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const in_buf = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
@@ -1887,8 +1827,8 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
-        const p = try paramAs(TriuOpParam, params, .triu);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
+        const p = try runtime_contract.paramAs(runtime_contract.TriuOpParam, params, .triu);
         if (insn.inputs.len != 1 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const input_view = views[0];
         const in_buf = &state.buffer_views[runtime_contract.registerToIndex(insn.inputs[0])];
@@ -1910,8 +1850,8 @@ pub const Block = struct {
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try runtimeDispatchState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.block.compiled_plan.plan, state_blocks);
-        const p = try paramAs(SdpaOpParam, params, .scaled_dot_product_attention);
+        try requireInstructionStateBinding(state.mode, insn, &state.block.compiled_plan.plan, state_blocks);
+        const p = try runtime_contract.paramAs(runtime_contract.SdpaOpParam, params, .scaled_dot_product_attention);
         if (insn.inputs.len != 3 or insn.outputs.len != 1) return error.InvalidInstructionBinding;
         const q_view = views[0];
         const k_view = views[1];
@@ -1933,8 +1873,8 @@ pub const Block = struct {
         const is_causal = p.is_causal != 0;
         const sdpa_scale: f32 = if (p.has_scale != 0) blk: {
             const data = params[0].data;
-            if (data.len < @sizeOf(SdpaOpParam) + 4) return error.InvalidParamBlockABI;
-            break :blk @bitCast(std.mem.readInt(u32, data[@sizeOf(SdpaOpParam)..][0..4], .little));
+            if (data.len < @sizeOf(runtime_contract.SdpaOpParam) + 4) return error.InvalidParamBlockABI;
+            break :blk @bitCast(std.mem.readInt(u32, data[@sizeOf(runtime_contract.SdpaOpParam)..][0..4], .little));
         } else 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
         const out_numel = batch * n_heads * seq_q * head_dim;
         const out_slice = try state.block.instructionOutputSlice(
@@ -2034,13 +1974,12 @@ pub const Block = struct {
         };
     }
 
-    fn scratchTempSlice(self: *const Block, scratch: *ScratchBuffer, which: BufferId, len: usize) []f32 {
+    fn scratchTempSlice(self: *const Block, scratch: *ScratchBuffer, reg_idx: usize, len: usize) []f32 {
         // All non-residual registers (1..63) map through the compiled liveness
         // allocator to physical scratch slots. Register 0 (residual) is handled
         // by resolveOutputSlice directly.
-        const buffer_idx = @intFromEnum(which);
-        if (buffer_idx >= 1 and buffer_idx < cpu_forward.NUM_TMP_BUFFERS) {
-            const mapped_idx: usize = self.tmp_register_to_scratch_idx[buffer_idx];
+        if (reg_idx >= 1 and reg_idx < cpu_forward.NUM_TMP_BUFFERS) {
+            const mapped_idx: usize = self.tmp_register_to_scratch_idx[reg_idx];
             std.debug.assert(mapped_idx >= 1);
             std.debug.assert(mapped_idx < cpu_forward.NUM_TMP_BUFFERS);
             return scratch.tmp[mapped_idx][0..len];
@@ -2073,11 +2012,9 @@ pub const Block = struct {
         };
     }
 
-    fn resolveOutputSlice(self: *const Block, buffer_views: *[64]Tensor, scratch: *ScratchBuffer, buffer_id: BufferId, len: usize) []f32 {
-        return switch (buffer_id) {
-            .residual => buffer_views[0].asSlice(f32)[0..len],
-            else => self.scratchTempSlice(scratch, buffer_id, len),
-        };
+    fn resolveOutputSlice(self: *const Block, buffer_views: *[64]Tensor, scratch: *ScratchBuffer, reg_idx: usize, len: usize) []f32 {
+        if (reg_idx == 0) return buffer_views[0].asSlice(f32)[0..len];
+        return self.scratchTempSlice(scratch, reg_idx, len);
     }
 
     /// Forward pass - executes the operation sequence
@@ -2923,7 +2860,7 @@ test "Block.validate detects split with invalid num_outputs" {
     try testing.expectError(error.TooManySplitOutputs, block.validate());
 }
 
-test "Block.validate detects split with too many outputs" {
+test "Block rejects split with too many outputs at construction" {
     const allocator = testing.allocator;
 
     var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
@@ -2932,34 +2869,13 @@ test "Block.validate detects split with too many outputs" {
     var transformer_block = try createTestTransformerBlock(allocator, &weights);
     defer transformer_block.deinit(allocator);
 
-    // Split starting at tmp3 with 62 outputs (tmp3..tmp64) exceeds NUM_TMP_BUFFERS (64)
+    // Split starting at tmp3 with 62 outputs (tmp3..tmp64) exceeds TMP_BUFFER_MAP_LEN (64).
+    // register_count > TMP_BUFFER_MAP_LEN → error.UnsupportedModel from buildTmpRegisterScratchMap.
     const program = [_]LayerOp{
         .{ .split = .{ .in = .norm_out, .out_start = .tmp3, .num_outputs = 62, .split_sizes = &.{}, .dim = -1 } },
     };
 
-    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
-    defer block.deinit(allocator);
-
-    try testing.expectError(error.TooManySplitOutputs, block.validate());
-}
-
-test "Block.validate rejects opcode without sequential adapter" {
-    const allocator = testing.allocator;
-
-    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
-    defer weights.deinit(allocator);
-
-    var transformer_block = try createTestTransformerBlock(allocator, &weights);
-    defer transformer_block.deinit(allocator);
-
-    const program = [_]LayerOp{
-        .{ .patch_embed = .{ .in = .residual, .out = .tmp3 } },
-    };
-
-    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
-    defer block.deinit(allocator);
-
-    try testing.expectError(error.UnsupportedOpInSequentialMode, block.validate());
+    try testing.expectError(error.UnsupportedModel, createTestBlock(allocator, &transformer_block, 128, &program));
 }
 
 test "Block.forward executes simple norm-attn-add program" {
@@ -3286,6 +3202,14 @@ test "buildTmpRegisterScratchMap reuses physical tmp slots from liveness" {
         },
         .param_blocks = &.{},
         .weight_bindings = &.{},
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+        },
         .liveness = .{
             .register_last_read = &.{ 3, std.math.maxInt(u32), std.math.maxInt(u32), 1, 2, 3 },
             .kill_after_instruction = &.{ kill0[0..], kill1[0..], kill2[0..], kill3[0..] },

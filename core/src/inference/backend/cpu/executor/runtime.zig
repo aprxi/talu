@@ -198,10 +198,16 @@ pub const ScratchBuffer = struct {
         // Ensure layer_tmp (index 0) and active mapped scratch slots.
         for (&self.tmp, 0..) |*temp_slice, idx| {
             if (idx != 0 and !self.tmp_slot_active[idx]) continue;
-            const width_hint = if (self.tmp_slot_width_hints[idx] > 0)
+            const width_hint = if (idx == 0 and self.tmp_slot_width_hints[0] == 0)
+                // layer_tmp (index 0) is a general scratch workspace, not a
+                // register-mapped buffer. Its size depends on model dimensions.
+                fallback_dim
+            else if (self.tmp_slot_width_hints[idx] > 0)
                 self.tmp_slot_width_hints[idx]
             else
-                fallback_dim;
+                // Active mapped slots must have a valid width from
+                // buildTmpRegisterScratchMap; a zero here is a bug.
+                return error.InvalidScratchLayout;
             const buffer_len = seq_len * width_hint;
             try cpu_common.ensureF32Slice(self.allocator, temp_slice, buffer_len);
         }
@@ -216,10 +222,12 @@ pub const ScratchBuffer = struct {
         for (&self.tmp, 0..) |*temp_slice, idx| {
             if (idx != 0 and !self.tmp_slot_active[idx]) continue;
             if (temp_slice.len == 0) continue;
-            const width_hint = if (self.tmp_slot_width_hints[idx] > 0)
+            const width_hint = if (idx == 0 and self.tmp_slot_width_hints[0] == 0)
+                fallback_dim
+            else if (self.tmp_slot_width_hints[idx] > 0)
                 self.tmp_slot_width_hints[idx]
             else
-                fallback_dim;
+                return error.InvalidScratchLayout;
             const decode_target_len = decode_len * width_hint;
             if (temp_slice.len <= decode_target_len * shrink_factor) continue;
             const keep_len = @max(decode_target_len * keep_factor, width_hint);

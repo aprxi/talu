@@ -170,6 +170,10 @@ pub const CompiledPlan = struct {
     param_blocks: []const ParamBlock,
     weight_bindings: []const WeightBinding = &.{},
     register_buffer_specs: []const PhysicalBufferSpec = &.{},
+    /// Maps register index → legacy BufferId value. Populated by the compiler
+    /// during allocation-order register assignment. Backends use this to resolve
+    /// which physical buffer a register represents (e.g., residual vs scratch).
+    register_to_buffer_id: []const u8 = &.{},
     liveness: LivenessMap,
     peak_registers: u16,
     diagnostics: []const PlanDiagnostic,
@@ -222,7 +226,7 @@ pub const OpaqueStateRef = extern struct {
 pub const ParamBlock = struct {
     version: u8,
     opcode: Opcode,
-    data: []const u8,
+    data: []align(8) const u8,
 };
 
 pub const param_block_abi_version_v1: u8 = 1;
@@ -809,7 +813,7 @@ const ParamEncoder = struct {
 
     fn finish(self: *ParamEncoder, allocator: std.mem.Allocator, opcode: Opcode) !ParamBlock {
         if (self.bytes.items.len > max_param_block_data_bytes_v1) return error.InvalidParamBlockABI;
-        const payload = try allocator.alloc(u8, self.bytes.items.len);
+        const payload = try allocator.alignedAlloc(u8, .@"8", self.bytes.items.len);
         @memcpy(payload, self.bytes.items);
         return .{
             .version = param_block_abi_version_v1,
@@ -894,6 +898,88 @@ pub const ParamDecoder = struct {
         if (self.offset != self.data.len) return error.InvalidParamBlockABI;
     }
 };
+
+// ---- ABI-stable packed param structs ----
+//
+// Layouts match the byte encoding produced by `encodeLayerOpParam`.
+// Backends cast `ParamBlock.data` to these via `paramAs` — zero parsing,
+// zero allocation, zero branching.
+
+pub const ResidualAddParam = packed struct {
+    param_kind: u8,
+    branch_buffer_id: u8,
+    scale_tag: u8,
+    scale_literal: u32,
+};
+
+pub const ScalarOpParam = packed struct {
+    param_kind: u8,
+    in_buffer_id: u8,
+    out_buffer_id: u8,
+    scalar: u32,
+};
+
+pub const AddParamScalarParam = packed struct {
+    param_kind: u8,
+    out_buffer_id: u8,
+    scalar: u32,
+};
+
+pub const MeanOpParam = packed struct {
+    param_kind: u8,
+    in_buffer_id: u8,
+    out_buffer_id: u8,
+    dim: i8,
+    keepdim: u8,
+};
+
+pub const TransposeOpParam = packed struct {
+    param_kind: u8,
+    in_buffer_id: u8,
+    out_buffer_id: u8,
+    dim0: i8,
+    dim1: i8,
+};
+
+pub const TriuOpParam = packed struct {
+    param_kind: u8,
+    in_buffer_id: u8,
+    out_buffer_id: u8,
+    diagonal: i32,
+};
+
+pub const SdpaOpParam = packed struct {
+    param_kind: u8,
+    q_buffer_id: u8,
+    k_buffer_id: u8,
+    v_buffer_id: u8,
+    out_buffer_id: u8,
+    is_causal: u8,
+    has_scale: u8,
+};
+
+pub const ReshapeOpParam = packed struct {
+    param_kind: u8,
+    in_buffer_id: u8,
+    out_buffer_id: u8,
+    count: u16,
+};
+
+/// Cast raw `ParamBlock.data` to an ABI-stable packed param struct.
+///
+/// Validates opcode match and minimum size. Returns a pointer into the
+/// existing `data` slice — no allocation, no copy.
+pub fn paramAs(
+    comptime T: type,
+    params: []const ParamBlock,
+    expected_opcode: Opcode,
+) !*const T {
+    if (params.len == 0) return error.MissingParamBlock;
+    const param_block = params[0];
+    if (param_block.opcode != expected_opcode) return error.ParamBlockOpcodeMismatch;
+    if (param_block.data.len < @bitSizeOf(T) / 8) return error.InvalidParamBlockABI;
+    return @ptrCast(@alignCast(param_block.data.ptr));
+}
 
 pub fn encodeLayerOpParam(
     allocator: std.mem.Allocator,
@@ -1540,12 +1626,15 @@ pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
     if (compiled.liveness.register_last_read.len != compiled.plan.register_count) {
         return error.InvalidLivenessRegisterCount;
     }
-    if (compiled.register_buffer_specs.len != 0 and compiled.register_buffer_specs.len != compiled.plan.register_count) {
+    if (compiled.plan.register_count > 0 and compiled.register_buffer_specs.len != compiled.plan.register_count) {
         return error.InvalidRegisterSpecCount;
     }
     for (compiled.register_buffer_specs) |spec| {
         if (spec.size == 0) return error.InvalidRegisterSpecSize;
         if (spec.@"align" == 0) return error.InvalidStateAlignment;
+    }
+    if (compiled.register_to_buffer_id.len != 0 and compiled.register_to_buffer_id.len != compiled.plan.register_count) {
+        return error.InvalidRegisterSpecCount;
     }
     if (compiled.liveness.kill_after_instruction.len != compiled.plan.instructions.len) {
         return error.InvalidLivenessInstructionCount;
@@ -1644,7 +1733,7 @@ test "validateParamBlockAbi rejects invalid version, size, and alignment" {
     };
     try std.testing.expectError(error.InvalidParamBlockABI, validateParamBlockAbi(&wrong_version));
 
-    var large_backing: [max_param_block_data_bytes_v1 + 1]u8 = undefined;
+    var large_backing: [max_param_block_data_bytes_v1 + 1]u8 align(8) = undefined;
     @memset(large_backing[0..], 0);
     const too_large = ParamBlock{
         .version = param_block_abi_version_v1,
@@ -1653,14 +1742,8 @@ test "validateParamBlockAbi rejects invalid version, size, and alignment" {
     };
     try std.testing.expectError(error.InvalidParamBlockABI, validateParamBlockAbi(&too_large));
 
-    var unaligned_backing: [16]u8 align(1) = undefined;
-    @memset(unaligned_backing[0..], 0);
-    const unaligned = ParamBlock{
-        .version = param_block_abi_version_v1,
-        .opcode = .rmsnorm,
-        .data = unaligned_backing[1..9],
-    };
-    try std.testing.expectError(error.InvalidParamBlockABI, validateParamBlockAbi(&unaligned));
+    // Alignment is enforced by the type system: ParamBlock.data is []align(8) const u8.
+    // The runtime check in validateParamBlockAbi is defense-in-depth.
 }
 
 test "validateCompiledPlan rejects invalid param block ABI" {
@@ -1672,7 +1755,7 @@ test "validateCompiledPlan rejects invalid param block ABI" {
         .param_block_id = 0,
         .state_block_id = null,
     };
-    var large_backing: [max_param_block_data_bytes_v1 + 1]u8 = undefined;
+    var large_backing: [max_param_block_data_bytes_v1 + 1]u8 align(8) = undefined;
     @memset(large_backing[0..], 0);
     const compiled = CompiledPlan{
         .plan = .{
@@ -1686,6 +1769,10 @@ test "validateCompiledPlan rejects invalid param block ABI" {
             .data = large_backing[0..],
         }},
         .weight_bindings = &.{},
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+        },
         .liveness = .{
             .register_last_read = &.{ 0, 0 },
             .kill_after_instruction = &.{&.{0}},
@@ -2064,6 +2151,10 @@ test "validateCompiledPlan enforces liveness dimensions" {
         .plan = plan,
         .param_blocks = &.{},
         .weight_bindings = &.{.{ .index = 0, .name = "norm_w" }},
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+        },
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
@@ -2093,6 +2184,10 @@ test "validateCompiledPlan rejects out-of-range instruction weight refs" {
         .plan = plan,
         .param_blocks = &.{},
         .weight_bindings = &.{.{ .index = 0, .name = "w0" }},
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+        },
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
@@ -2122,6 +2217,10 @@ test "validateCompiledPlan rejects invalid instruction weight ref count for opco
         .plan = plan,
         .param_blocks = &.{},
         .weight_bindings = &.{},
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 64 },
+            .{ .size = 1, .@"align" = 64 },
+        },
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
@@ -2641,4 +2740,21 @@ test "firstLayerProgramCompatibilityIssue reports state mismatch when opcodes ar
         },
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "paramAs round-trip with encodeLayerOpParam" {
+    const param_block = try encodeLayerOpParam(
+        std.testing.allocator,
+        .residual_add,
+        .{ .add = .{ .branch = .norm_out, .scale = .{ .literal = 1.5 } } },
+    );
+    defer std.testing.allocator.free(param_block.data);
+
+    const p = try paramAs(ResidualAddParam, &.{param_block}, .residual_add);
+    // norm_out = 1 in BufferId enum
+    try std.testing.expectEqual(@as(u8, 1), p.branch_buffer_id);
+    // literal = scale_tag 2
+    try std.testing.expectEqual(@as(u8, 2), p.scale_tag);
+    // f32 1.5 stored as u32 via @bitCast
+    try std.testing.expectEqual(@as(u32, @bitCast(@as(f32, 1.5))), p.scale_literal);
 }

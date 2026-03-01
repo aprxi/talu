@@ -759,19 +759,15 @@ fn buildCudaLayerProgramRegisterSlotMap(
 
     const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, compiled.plan.register_count);
     defer allocator.free(register_specs);
-    for (register_specs, 0..) |*spec, idx| {
-        if (idx < compiled.register_buffer_specs.len) {
-            const plan_spec = compiled.register_buffer_specs[idx];
-            spec.* = .{
-                .size = @max(plan_spec.size, 1),
-                .@"align" = @max(plan_spec.@"align", @as(u16, 4)),
-            };
-        } else {
-            spec.* = .{
-                .size = 1,
-                .@"align" = 4,
-            };
-        }
+    // Register 0 (residual) uses prototype.input_dev, not a slot buffer.
+    register_specs[0] = .{ .size = 0, .@"align" = 0 };
+    if (compiled.register_buffer_specs.len != compiled.plan.register_count) return error.InvalidRegisterSpecCount;
+    for (register_specs[1..], 1..) |*spec, idx| {
+        const plan_spec = compiled.register_buffer_specs[idx];
+        spec.* = .{
+            .size = @max(plan_spec.size, 1),
+            .@"align" = @max(plan_spec.@"align", @as(u16, 4)),
+        };
     }
 
     var physical = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, register_specs);
@@ -784,7 +780,7 @@ fn buildCudaLayerProgramRegisterSlotMap(
 
     var next_slot: u8 = 0;
     const invalid_physical = std.math.maxInt(u16);
-    var register_idx: usize = 1;
+    var register_idx: usize = 0;
     while (register_idx < compiled.plan.register_count) : (register_idx += 1) {
         const physical_id_u16 = physical.register_to_physical[register_idx];
         if (physical_id_u16 == invalid_physical) continue;
@@ -799,34 +795,6 @@ fn buildCudaLayerProgramRegisterSlotMap(
     }
 
     return register_to_slot;
-}
-
-fn finalProgramOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
-    return layer_ops.finalOutputBuffer(program);
-}
-
-fn validateLayerProgramForCuda(program: []const layer_ops.LayerOp, layer_idx: usize, kind: op_types.BlockKind) !void {
-    if (runtime_contract.firstUnsupportedLayerProgramOpcode(program, CudaBackend.layer_program_adapter_table)) |unsupported| {
-        log.warn("inference", "CUDA LayerOp program contains unsupported opcode", .{
-            .layer = layer_idx,
-            .op_index = unsupported.op_index,
-            .kind = @intFromEnum(kind),
-            .op = @tagName(program[unsupported.op_index]),
-            .opcode = @intFromEnum(unsupported.opcode),
-        });
-        return error.UnsupportedModel;
-    }
-    if (runtime_contract.firstLayerProgramStateMismatch(program, kind)) |mismatch| {
-        log.warn("inference", "CUDA LayerOp program state binding mismatches block kind", .{
-            .layer = layer_idx,
-            .op_index = mismatch.op_index,
-            .kind = @intFromEnum(kind),
-            .op = @tagName(program[mismatch.op_index]),
-            .opcode = @intFromEnum(mismatch.opcode),
-            .state_id = mismatch.state_id,
-        });
-        return error.UnsupportedModel;
-    }
 }
 
 fn validateCompiledLayerPlanForCuda(
@@ -3054,17 +3022,12 @@ pub const CudaBackend = struct {
         }
     }
 
-    fn programBuffer(self: *CudaBackend, id: layer_ops.BufferId, ctx: *const LayerProgramExecutionContext) ?*compute.cuda.Buffer {
-        if (id == .residual) return &self.prototype.input_dev;
-        const register_idx = @intFromEnum(id);
-        if (register_idx >= ctx.register_to_slot_map.len) return null;
-        const slot_idx = ctx.register_to_slot_map[register_idx];
+    fn programBuffer(self: *CudaBackend, reg_idx: usize, ctx: *const LayerProgramExecutionContext) ?*compute.cuda.Buffer {
+        if (reg_idx == 0) return &self.prototype.input_dev;
+        if (reg_idx >= ctx.register_to_slot_map.len) return null;
+        const slot_idx = ctx.register_to_slot_map[reg_idx];
         if (slot_idx == BlockRuntimeLayer.invalid_slot or slot_idx >= ctx.slot_buffers.len) return null;
         return ctx.slot_buffers[slot_idx];
-    }
-
-    fn finalOutputBuffer(program: []const layer_ops.LayerOp) layer_ops.BufferId {
-        return finalProgramOutputBuffer(program);
     }
 
     fn appendLayerNormWeight(layer: *BlockRuntimeLayer, weight: ?*const DeviceTensor) void {
@@ -3467,27 +3430,8 @@ pub const CudaBackend = struct {
         return @ptrCast(@alignCast(handle.ptr));
     }
 
-    const ResidualAddParam = packed struct {
-        param_kind: u8,
-        branch_buffer_id: u8,
-        scale_tag: u8,
-        scale_literal: u32,
-    };
-
-    fn paramAs(
-        comptime T: type,
-        params: []const runtime_contract.ParamBlock,
-        expected_opcode: runtime_contract.Opcode,
-    ) !*const T {
-        if (params.len == 0) return error.MissingParamBlock;
-        const param_block = params[0];
-        if (param_block.opcode != expected_opcode) return error.ParamBlockOpcodeMismatch;
-        if (param_block.data.len < @bitSizeOf(T) / 8) return error.InvalidParamBlockABI;
-        return @ptrCast(@alignCast(param_block.data.ptr));
-    }
-
     fn decodeResidualScaleFromParams(params: []const runtime_contract.ParamBlock) !layer_ops.ResidualScale {
-        const p = try paramAs(ResidualAddParam, params, .residual_add);
+        const p = try runtime_contract.paramAs(runtime_contract.ResidualAddParam, params, .residual_add);
         return switch (p.scale_tag) {
             0 => .one,
             1 => .residual_multiplier,
@@ -3589,8 +3533,8 @@ pub const CudaBackend = struct {
 
         for (insn.inputs) |reg| {
             if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
-            const buffer_id: layer_ops.BufferId = @enumFromInt(runtime_contract.registerToIndex(reg));
-            const input = self.programBuffer(buffer_id, ctx) orelse return error.UnsupportedModel;
+            const reg_idx = runtime_contract.registerToIndex(reg);
+            const input = self.programBuffer(reg_idx, ctx) orelse return error.UnsupportedModel;
             handle_storage[handle_count] = .{
                 .register = reg,
                 .ptr = @ptrCast(input),
@@ -3601,8 +3545,8 @@ pub const CudaBackend = struct {
         }
         for (insn.outputs) |reg| {
             if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
-            const buffer_id: layer_ops.BufferId = @enumFromInt(runtime_contract.registerToIndex(reg));
-            const output = self.programBuffer(buffer_id, ctx) orelse return error.UnsupportedModel;
+            const reg_idx = runtime_contract.registerToIndex(reg);
+            const output = self.programBuffer(reg_idx, ctx) orelse return error.UnsupportedModel;
             handle_storage[handle_count] = .{
                 .register = reg,
                 .ptr = @ptrCast(output),
@@ -4025,21 +3969,16 @@ pub const CudaBackend = struct {
 
         const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
         const final_register_idx = runtime_contract.registerToIndex(final_register);
-        if (final_register_idx > @intFromEnum(layer_ops.BufferId.tmp63)) return error.UnsupportedModel;
-        const final_buf_id: layer_ops.BufferId = @enumFromInt(final_register_idx);
-        switch (final_buf_id) {
-            .residual => {},
-            else => {
-                const final_buf = self.programBuffer(final_buf_id, &exec_ctx) orelse return error.UnsupportedModel;
-                try compute.cuda.copy.runWithFunction(
-                    &self.kernel_arg_pack,
-                    &self.device,
-                    copy_function,
-                    final_buf,
-                    &self.prototype.input_dev,
-                    d_model_u32,
-                );
-            },
+        if (final_register_idx != 0) {
+            const final_buf = self.programBuffer(final_register_idx, &exec_ctx) orelse return error.UnsupportedModel;
+            try compute.cuda.copy.runWithFunction(
+                &self.kernel_arg_pack,
+                &self.device,
+                copy_function,
+                final_buf,
+                &self.prototype.input_dev,
+                d_model_u32,
+            );
         }
     }
 
@@ -5957,7 +5896,7 @@ test "finalOutputBuffer returns residual when program ends with add" {
             .scale = .one,
         } },
     };
-    try std.testing.expectEqual(layer_ops.BufferId.residual, CudaBackend.finalOutputBuffer(&program));
+    try std.testing.expectEqual(layer_ops.BufferId.residual, layer_ops.finalOutputBuffer(&program));
 }
 
 test "finalOutputBuffer returns kernel output buffer for post-norm endings" {
@@ -5969,10 +5908,10 @@ test "finalOutputBuffer returns kernel output buffer for post-norm endings" {
             .debug_type = .norm,
         } },
     };
-    try std.testing.expectEqual(layer_ops.BufferId.norm_out, CudaBackend.finalOutputBuffer(&program));
+    try std.testing.expectEqual(layer_ops.BufferId.norm_out, layer_ops.finalOutputBuffer(&program));
 }
 
-test "validateLayerProgramForCuda accepts kernel-add programs" {
+test "layer program compatibility accepts kernel-add programs" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
@@ -5991,7 +5930,13 @@ test "validateLayerProgramForCuda accepts kernel-add programs" {
             .scale = .one,
         } },
     };
-    try validateLayerProgramForCuda(&program, 0, .attention_mlp);
+    try std.testing.expect(
+        runtime_contract.firstLayerProgramCompatibilityIssue(
+            &program,
+            .attention_mlp,
+            CudaBackend.layer_program_adapter_table,
+        ) == null,
+    );
 }
 
 test "layer_program_adapter_table covers CUDA LayerOp execution subset" {
@@ -6011,7 +5956,7 @@ test "layer_program_adapter_table covers CUDA LayerOp execution subset" {
     try std.testing.expect(CudaBackend.layer_program_adapter_table[@intFromEnum(opcode_map.Opcode.vision_patch_embed)] == null);
 }
 
-test "validateLayerProgramForCuda rejects unsupported primitive ops" {
+test "layer program compatibility rejects unsupported primitive ops" {
     const program = [_]layer_ops.LayerOp{
         .{ .mul_scalar = .{
             .in = .residual,
@@ -6019,13 +5964,18 @@ test "validateLayerProgramForCuda rejects unsupported primitive ops" {
             .scalar = 0.5,
         } },
     };
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        validateLayerProgramForCuda(&program, 0, .attention_mlp),
-    );
+    const issue = runtime_contract.firstLayerProgramCompatibilityIssue(
+        &program,
+        .attention_mlp,
+        CudaBackend.layer_program_adapter_table,
+    ) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .unsupported_opcode => |unsupported| try std.testing.expectEqual(opcode_map.Opcode.mul_scalar, unsupported.opcode),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
-test "validateLayerProgramForCuda rejects stateful opcode bound to wrong block kind" {
+test "layer program compatibility rejects stateful opcode bound to wrong block kind" {
     const program = [_]layer_ops.LayerOp{
         .{ .kernel = .{
             .id = 0,
@@ -6038,10 +5988,15 @@ test "validateLayerProgramForCuda rejects stateful opcode bound to wrong block k
             .scale = .one,
         } },
     };
-    try std.testing.expectError(
-        error.UnsupportedModel,
-        validateLayerProgramForCuda(&program, 0, .attention_mlp),
-    );
+    const issue = runtime_contract.firstLayerProgramCompatibilityIssue(
+        &program,
+        .attention_mlp,
+        CudaBackend.layer_program_adapter_table,
+    ) orelse return error.TestUnexpectedResult;
+    switch (issue) {
+        .state_mismatch => |mismatch| try std.testing.expectEqual(opcode_map.Opcode.shortconv, mismatch.opcode),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "buildCudaLayerProgramRegisterSlotMap reuses temp slots from liveness" {
@@ -6088,6 +6043,12 @@ test "buildCudaLayerProgramRegisterSlotMap reuses temp slots from liveness" {
         },
         .param_blocks = &.{},
         .weight_bindings = &.{},
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+        },
         .liveness = .{
             .register_last_read = &.{ 0, 1, 2, 2 },
             .kill_after_instruction = &.{ kill0[0..], kill1[0..], kill2[0..] },
@@ -6357,9 +6318,11 @@ test "populatePrefillHiddenFromTokens zero-fills configured skip token rows" {
     const bytes = std.mem.sliceAsBytes(embedding_data[0..]);
     const embeddings = Tensor.view(bytes.ptr, &.{ 2, 3 }, .f32, bytes.len);
 
+    var cfg = std.mem.zeroes(tensor.ModelConfig);
+    cfg.embedding_multiplier = 1.0;
     var loaded = LoadedModel{
         .arena = std.heap.ArenaAllocator.init(std.testing.allocator),
-        .config = std.mem.zeroes(tensor.ModelConfig),
+        .config = cfg,
         .token_embeddings = embeddings,
         .blocks = &.{},
         .original_weight_dtype = .f32,

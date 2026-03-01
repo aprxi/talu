@@ -141,19 +141,15 @@ fn buildMetalLayerProgramRegisterSlotMap(
 
     const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, compiled.plan.register_count);
     defer allocator.free(register_specs);
-    for (register_specs, 0..) |*spec, idx| {
-        if (idx < compiled.register_buffer_specs.len) {
-            const plan_spec = compiled.register_buffer_specs[idx];
-            spec.* = .{
-                .size = @max(plan_spec.size, 1),
-                .@"align" = @max(plan_spec.@"align", @as(u16, 4)),
-            };
-        } else {
-            spec.* = .{
-                .size = 1,
-                .@"align" = 4,
-            };
-        }
+    // Register 0 (residual) uses the residual handle, not a slot buffer.
+    register_specs[0] = .{ .size = 0, .@"align" = 0 };
+    if (compiled.register_buffer_specs.len != compiled.plan.register_count) return error.NotImplemented;
+    for (register_specs[1..], 1..) |*spec, idx| {
+        const plan_spec = compiled.register_buffer_specs[idx];
+        spec.* = .{
+            .size = @max(plan_spec.size, 1),
+            .@"align" = @max(plan_spec.@"align", @as(u16, 4)),
+        };
     }
 
     var physical = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, register_specs);
@@ -166,7 +162,7 @@ fn buildMetalLayerProgramRegisterSlotMap(
 
     var next_slot: u8 = 0;
     const invalid_physical = std.math.maxInt(u16);
-    var register_idx: usize = 1;
+    var register_idx: usize = 0;
     while (register_idx < compiled.plan.register_count) : (register_idx += 1) {
         const physical_id_u16 = physical.register_to_physical[register_idx];
         if (physical_id_u16 == invalid_physical) continue;
@@ -2611,6 +2607,12 @@ test "buildMetalLayerProgramRegisterSlotMap reuses temp slots from liveness" {
         },
         .param_blocks = &.{},
         .weight_bindings = &.{},
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+        },
         .liveness = .{
             .register_last_read = &.{ 0, 1, 2, 2 },
             .kill_after_instruction = &.{ kill0[0..], kill1[0..], kill2[0..] },

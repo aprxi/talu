@@ -98,6 +98,34 @@ pub fn parseVisionProgram(
     };
 }
 
+/// Validate register-level handoff between vision_encode and scatter plans.
+///
+/// Ensures the vision encoder's final output register matches the scatter
+/// stage's expected vision embedding input, and that scatter outputs to
+/// register 0 (residual) for decoder consumption.
+fn validateVisionStageHandoff(
+    vision_encode: *const runtime_contract.CompiledPlan,
+    scatter: *const runtime_contract.CompiledPlan,
+) !void {
+    if (vision_encode.plan.instructions.len == 0) return error.InvalidVisionProgram;
+    if (scatter.plan.instructions.len == 0) return error.InvalidVisionProgram;
+
+    const encode_output = runtime_contract.planFinalOutputRegister(&vision_encode.plan);
+    const scatter_insn = scatter.plan.instructions[0];
+
+    // Scatter inputs: [text_in, vision_in]. Vision encode output must match vision_in.
+    if (scatter_insn.inputs.len < 2) return error.InvalidVisionStageHandoff;
+    if (@intFromEnum(encode_output) != @intFromEnum(scatter_insn.inputs[1])) {
+        return error.InvalidVisionStageHandoff;
+    }
+
+    // Scatter output must be register 0 (residual) for decoder handoff.
+    if (scatter_insn.outputs.len == 0) return error.InvalidVisionStageHandoff;
+    if (runtime_contract.registerToIndex(scatter_insn.outputs[0]) != 0) {
+        return error.InvalidVisionStageHandoff;
+    }
+}
+
 /// Compile staged vision plans from a single model-declared vision program.
 ///
 /// This creates explicit handoff boundaries:
@@ -144,6 +172,8 @@ pub fn compileVisionStagePlans(
     for (scatter.plan.instructions) |insn| {
         if (insn.opcode != .vision_scatter) return error.InvalidVisionProgram;
     }
+
+    try validateVisionStageHandoff(&vision_encode, &scatter);
 
     return .{
         .vision_encode = vision_encode,
@@ -210,4 +240,23 @@ test "compileVisionStagePlans splits encode and scatter stages" {
     try std.testing.expectEqual(@as(usize, 1), plans.scatter.plan.instructions.len);
     try std.testing.expectEqual(runtime_contract.Opcode.vision_scatter, plans.scatter.plan.instructions[0].opcode);
     try std.testing.expectEqual(@as(u32, 151655), plans.scatter_image_token_id);
+}
+
+test "compileVisionStagePlans rejects mismatched handoff registers" {
+    // spatial_merge outputs to norm_out, but scatter expects vision_in = branch_out.
+    // This mismatch should be caught by handoff validation.
+    const program = [_]layer_ops.LayerOp{
+        .{ .patch_embed = .{ .in = .residual, .out = .norm_out } },
+        .{ .spatial_merge = .{ .in = .norm_out, .out = .norm_out, .merge_size = 2 } },
+        .{ .scatter = .{
+            .text_in = .residual,
+            .vision_in = .branch_out,
+            .out = .residual,
+            .image_token_id = 151655,
+        } },
+    };
+    try std.testing.expectError(
+        error.InvalidVisionStageHandoff,
+        compileVisionStagePlans(std.testing.allocator, &program),
+    );
 }
