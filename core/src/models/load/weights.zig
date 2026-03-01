@@ -210,21 +210,44 @@ fn inferShortConvDims(
     weight_map: *const runtime_blocks.WeightMap,
     source_weight_id: ?[]const u8,
 ) !void {
-    if (config.conv_dim != 0 and config.conv_dim_out != 0 and config.d_conv != 0) return;
+    const id = source_weight_id orelse return error.MissingShortConvSourceWeightId;
+    const conv_w = weight_map.get(id) orelse return error.MissingShortConvSourceWeight;
+    if (conv_w.n_dims != 2 and conv_w.n_dims != 3) return error.InvalidShortConvSourceWeightShape;
 
-    const needs_source = config.conv_dim == 0 or config.d_conv == 0;
-    if (needs_source) {
-        const id = source_weight_id orelse return error.MissingShortConvSourceWeightId;
-        const conv_w = weight_map.get(id) orelse return error.MissingShortConvSourceWeight;
-        if (conv_w.n_dims != 2 and conv_w.n_dims != 3) return error.InvalidShortConvSourceWeightShape;
-        if (config.conv_dim == 0) config.conv_dim = @intCast(conv_w.shape[0]);
-        const d_idx: usize = if (conv_w.n_dims == 3) 2 else 1;
-        if (config.d_conv == 0) config.d_conv = @intCast(conv_w.shape[d_idx]);
+    const prev_conv_dim = config.conv_dim;
+    const inferred_conv_dim: u32 = @intCast(conv_w.shape[0]);
+    const d_idx: usize = if (conv_w.n_dims == 3) 2 else 1;
+    const inferred_d_conv: u32 = @intCast(conv_w.shape[d_idx]);
+
+    if (config.conv_dim == 0 or config.conv_dim != inferred_conv_dim) {
+        if (config.conv_dim != 0 and config.conv_dim != inferred_conv_dim) {
+            log.info("load", "Corrected shortconv conv_dim from source weight", .{
+                .config_conv_dim = config.conv_dim,
+                .inferred_conv_dim = inferred_conv_dim,
+                .weight_id = id,
+            });
+        }
+        config.conv_dim = inferred_conv_dim;
+    }
+
+    if (config.d_conv == 0 or config.d_conv != inferred_d_conv) {
+        if (config.d_conv != 0 and config.d_conv != inferred_d_conv) {
+            log.info("load", "Corrected shortconv d_conv from source weight", .{
+                .config_d_conv = config.d_conv,
+                .inferred_d_conv = inferred_d_conv,
+                .weight_id = id,
+            });
+        }
+        config.d_conv = inferred_d_conv;
     }
 
     // conv_dim_out is typically equal to conv_dim for known architectures.
     // Cannot reliably infer from out_proj since it may be quantized (packed shape).
     if (config.conv_dim_out == 0 and config.conv_dim != 0) {
+        config.conv_dim_out = config.conv_dim;
+    } else if (prev_conv_dim != 0 and config.conv_dim_out == prev_conv_dim and config.conv_dim != prev_conv_dim) {
+        // If conv_dim changed due to source-weight correction and conv_dim_out
+        // matched the stale conv_dim, keep them aligned.
         config.conv_dim_out = config.conv_dim;
     }
 
@@ -861,6 +884,31 @@ test "inferShortConvDims infers missing dimensions from source weight" {
     try std.testing.expectEqual(@as(u32, 512), cfg.conv_dim);
     try std.testing.expectEqual(@as(u32, 512), cfg.conv_dim_out);
     try std.testing.expectEqual(@as(u32, 4), cfg.d_conv);
+}
+
+test "inferShortConvDims corrects stale configured dimensions from source weight" {
+    var cfg = runtime_blocks.ShortConvConfig{
+        .d_model = 2048,
+        .d_conv = 3,
+        .conv_dim = 1024,
+        .conv_dim_out = 1024,
+    };
+    var map: runtime_blocks.WeightMap = .{};
+    defer map.deinit(std.testing.allocator);
+
+    var conv_weight = Tensor{
+        .dtype = .f32,
+        .n_dims = 3,
+        .shape = .{ 2048, 1, 3, 0, 0, 0, 0, 0 },
+        .data_ptr = null,
+        .data_size = 0,
+    };
+    try map.put(std.testing.allocator, "conv.conv.weight", &conv_weight);
+
+    try inferShortConvDims(&cfg, &map, "conv.conv.weight");
+    try std.testing.expectEqual(@as(u32, 2048), cfg.conv_dim);
+    try std.testing.expectEqual(@as(u32, 2048), cfg.conv_dim_out);
+    try std.testing.expectEqual(@as(u32, 3), cfg.d_conv);
 }
 
 test "orientWeightF32: transpose [out, in] to [in, out]" {

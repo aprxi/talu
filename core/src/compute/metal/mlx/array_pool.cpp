@@ -7,6 +7,9 @@
 #include "../device.h"
 #include <atomic>
 #include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <memory>
 
 // ============================================================================
 // Global state
@@ -55,11 +58,27 @@ static void* create_ingested_array(
     }
 
     // Fallback copy path for unaligned pointers.
+    // Copy into page-aligned storage so MLX/Metal can consume it without an
+    // additional internal realignment copy.
     g_ingest_copy_count.fetch_add(1, std::memory_order_relaxed);
-    auto vec_data = std::make_shared<std::vector<T>>(element_count);
-    std::memcpy(vec_data->data(), data, element_count * sizeof(T));
-    auto shared_deleter = [vec_data](void*) { /* ref-counts vec_data */ };
-    return make_owned_array(array(vec_data->data(), shape_dims, dtype, shared_deleter));
+    const size_t byte_count = element_count * sizeof(T);
+    const size_t alloc_bytes = std::max(byte_count, sizeof(T));
+    void* aligned_ptr = nullptr;
+    if (posix_memalign(&aligned_ptr, kIngestZeroCopyAlignment, alloc_bytes) != 0 || aligned_ptr == nullptr) {
+        throw std::bad_alloc();
+    }
+    if (byte_count > 0) {
+        std::memcpy(aligned_ptr, data, byte_count);
+    }
+    // Keep aligned storage ownership in a ref-counted holder. This avoids
+    // double-free hazards if MLX copies/moves array handles internally.
+    auto aligned_owner = std::shared_ptr<void>(aligned_ptr, [](void* ptr) {
+        std::free(ptr);
+    });
+    auto shared_deleter = [aligned_owner](void*) {
+        // ownership retained by closure capture
+    };
+    return make_owned_array(array(static_cast<T*>(aligned_ptr), shape_dims, dtype, shared_deleter));
 }
 
 // ============================================================================
@@ -194,11 +213,15 @@ void* mlx_array_from_uint8(const uint8_t* data, const size_t* shape, size_t ndim
 
 void mlx_array_free(void* arr) {
     if (arr == nullptr) return;
-    std::lock_guard<std::mutex> lock(g_owned_arrays_mu);
-    auto it = g_owned_arrays.find(arr);
-    if (it == g_owned_arrays.end()) return;
-    delete static_cast<array*>(arr);
-    g_owned_arrays.erase(it);
+    array* owned = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_owned_arrays_mu);
+        auto it = g_owned_arrays.find(arr);
+        if (it == g_owned_arrays.end()) return;
+        owned = static_cast<array*>(*it);
+        g_owned_arrays.erase(it);
+    }
+    delete owned;
 }
 
 // ============================================================================
