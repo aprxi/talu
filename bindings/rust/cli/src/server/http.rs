@@ -17,7 +17,9 @@ use tower_service::Service;
 use serde::Serialize;
 use utoipa::ToSchema;
 
+use crate::server::agent_exec;
 use crate::server::agent_fs;
+use crate::server::agent_shell;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
@@ -95,6 +97,10 @@ static OPENAPI_DB_OPS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/db/ops/"]));
 static OPENAPI_AGENT_FS_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/fs/"]));
+static OPENAPI_AGENT_EXEC_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/exec"]));
+static OPENAPI_AGENT_SHELL_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/shells"]));
 
 // Console UI assets — only compiled in when `make ui` has been run.
 // build.rs sets cfg(bundled_ui) when ui/dist/ contains the required files.
@@ -268,6 +274,16 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_AGENT_FS_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/agent/exec.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_EXEC_SPEC.clone())).boxed())
+                    .unwrap(),
+                (Method::GET, "/openapi/agent/shell.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_SHELL_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/docs") => docs_hub_response(),
                 (Method::GET, "/docs/chat") => {
                     swagger_ui_response("/openapi/chat.json", "Talu API :: Chat")
@@ -326,6 +342,12 @@ impl Service<Request<Incoming>> for Router {
                 }
                 (Method::GET, "/docs/agent/fs") => {
                     swagger_ui_response("/openapi/agent/fs.json", "Talu API :: Agent::FS")
+                }
+                (Method::GET, "/docs/agent/exec") => {
+                    swagger_ui_response("/openapi/agent/exec.json", "Talu API :: Agent::Exec")
+                }
+                (Method::GET, "/docs/agent/shell") => {
+                    swagger_ui_response("/openapi/agent/shell.json", "Talu API :: Agent::Shell")
                 }
                 // Console UI (auth-exempt)
                 (Method::GET, "/") => {
@@ -411,6 +433,32 @@ impl Service<Request<Incoming>> for Router {
                         }
                         (Method::POST, "/v1/agent/fs/rename") => {
                             agent_fs::handle_rename(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/exec") => {
+                            agent_exec::handle_exec(state, req, auth).await
+                        }
+                        (Method::POST, "/v1/agent/shells") => {
+                            agent_shell::handle_create(state, req, auth).await
+                        }
+                        (Method::GET, "/v1/agent/shells") => {
+                            agent_shell::handle_list(state, req, auth).await
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/agent/shells/")
+                                && p.ends_with("/ws")
+                                && req
+                                    .headers()
+                                    .get("upgrade")
+                                    .and_then(|v| v.to_str().ok())
+                                    .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
+                        {
+                            agent_shell::handle_ws(state, req, auth).await
+                        }
+                        (Method::GET, p) if p.starts_with("/v1/agent/shells/") => {
+                            agent_shell::handle_get(state, req, auth).await
+                        }
+                        (Method::DELETE, p) if p.starts_with("/v1/agent/shells/") => {
+                            agent_shell::handle_delete(state, req, auth).await
                         }
                         (Method::GET, "/v1/events") => {
                             events::handle_replay(state, req, auth).await
@@ -1423,6 +1471,16 @@ a:hover {
           <td class="mono"><a href="/docs/agent/fs"><code>agent/fs</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/agent/fs.json" title="/openapi/agent/fs.json">json</a><button class="copy-btn" data-url="/openapi/agent/fs.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Workspace filesystem runtime APIs (`/v1/agent/fs/*`).</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/agent/exec"><code>agent/exec</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/exec.json" title="/openapi/agent/exec.json">json</a><button class="copy-btn" data-url="/openapi/agent/exec.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">One-shot shell command execution streamed as SSE (`/v1/agent/exec`).</td>
+        </tr>
+        <tr>
+          <td class="mono"><a href="/docs/agent/shell"><code>agent/shell</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/shell.json" title="/openapi/agent/shell.json">json</a><button class="copy-btn" data-url="/openapi/agent/shell.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Interactive PTY shell lifecycle and WebSocket attach endpoints.</td>
         </tr>
         <tr>
           <td class="mono"><a href="/docs/repo"><code>repo</code></a></td>

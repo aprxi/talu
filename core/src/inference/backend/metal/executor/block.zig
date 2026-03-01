@@ -22,6 +22,9 @@ const norm_kernel = @import("../kernels/norm.zig");
 const shortconv_kernel = @import("../kernels/shortconv.zig");
 const vision_adapters = @import("../../../vision_program_adapters.zig");
 const mlx_graph = compute.metal.graph;
+// Optional dispatch observability. Keep disabled by default so production
+// execution adds zero atomic overhead in the token loop.
+const enable_dispatch_observability: bool = false;
 var layer_program_dispatch_counters = runtime_contract.DispatchCounters{};
 
 pub const Cache = runtime_graph.Cache;
@@ -79,13 +82,14 @@ pub const TransformerBlock = struct {
         runtime_rope_dim: usize,
         residual: *mlx_graph.ArrayHandle,
         slot_buffers: []mlx_graph.ArrayHandle,
-        register_to_slot_map: *const [64]u8,
+        register_to_slot_map: []const u8,
+        instruction_handles: []runtime_contract.TensorHandle,
+        instruction_views: []runtime_contract.TensorViewDesc,
         norm_index: *usize,
         bindings: LayerProgramRuntimeBindings,
         state_bindings: [MaxLayerProgramStateBindings]?LayerProgramStateBinding = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings,
         state_binding_count: usize = 0,
     };
-    const MAX_LAYER_PROGRAM_HANDLES: usize = 8;
 
     const BuiltLayerProgramHandles = struct {
         registers: []runtime_contract.TensorHandle,
@@ -245,43 +249,11 @@ pub const TransformerBlock = struct {
         }
     }
 
-    fn getBuffer(
-        buffer_id: layer_ops.BufferId,
-        residual: mlx_graph.ArrayHandle,
-        slot_buffers: []const mlx_graph.ArrayHandle,
-        register_to_slot_map: *const [64]u8,
-    ) !mlx_graph.ArrayHandle {
-        if (buffer_id == .residual) return residual;
-        const register_idx = @intFromEnum(buffer_id);
-        if (register_idx >= register_to_slot_map.len) return error.NotImplemented;
-        const slot_idx = register_to_slot_map[register_idx];
-        if (slot_idx == std.math.maxInt(u8) or slot_idx >= slot_buffers.len) return error.NotImplemented;
-        return slot_buffers[slot_idx];
-    }
-
-    fn setBuffer(
-        buffer_id: layer_ops.BufferId,
-        residual: *mlx_graph.ArrayHandle,
-        slot_buffers: []mlx_graph.ArrayHandle,
-        register_to_slot_map: *const [64]u8,
-        value: mlx_graph.ArrayHandle,
-    ) !void {
-        if (buffer_id == .residual) {
-            residual.* = value;
-            return;
-        }
-        const register_idx = @intFromEnum(buffer_id);
-        if (register_idx >= register_to_slot_map.len) return error.NotImplemented;
-        const slot_idx = register_to_slot_map[register_idx];
-        if (slot_idx == std.math.maxInt(u8) or slot_idx >= slot_buffers.len) return error.NotImplemented;
-        slot_buffers[slot_idx] = value;
-    }
-
     fn bufferSlotForRegister(
         reg: runtime_contract.RegisterRef,
         residual: *mlx_graph.ArrayHandle,
         slot_buffers: []mlx_graph.ArrayHandle,
-        register_to_slot_map: *const [64]u8,
+        register_to_slot_map: []const u8,
     ) !*mlx_graph.ArrayHandle {
         const reg_idx = runtime_contract.registerToIndex(reg);
         if (reg_idx == 0) return residual;
@@ -326,6 +298,163 @@ pub const TransformerBlock = struct {
         return @ptrCast(@alignCast(handle.ptr));
     }
 
+    const LayerProgramWeightResolverFn = *const fn (
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) anyerror!*anyopaque;
+
+    const layer_program_weight_resolver_table: [256]?LayerProgramWeightResolverFn = blk: {
+        var table = [_]?LayerProgramWeightResolverFn{null} ** 256;
+        table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = resolveLayerProgramNormWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = resolveLayerProgramAttentionWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.swiglu)] = resolveLayerProgramSwiGluWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.moe)] = resolveLayerProgramMoeWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.shortconv)] = resolveLayerProgramShortconvWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] = resolveLayerProgramMambaWeightPtr;
+        break :blk table;
+    };
+
+    fn resolveLayerProgramNormWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        if (!std.mem.eql(u8, slot_name, "norm_weight")) return error.InvalidWeightBindingName;
+        const idx = ctx.norm_index.*;
+        if (idx >= ctx.bindings.norm_weight_count) return error.InvalidInstructionBinding;
+        if (ctx.bindings.norm_weights[idx]) |*weight| return @ptrCast(weight);
+        return error.MissingWeight;
+    }
+
+    fn resolveLayerProgramAttentionWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const attention_binding = if (ctx.bindings.attention) |*binding|
+            binding
+        else
+            return error.MissingField;
+        switch (attention_binding.*) {
+            .multihead => |*multihead| {
+                if (std.mem.eql(u8, slot_name, "q_proj")) {
+                    if (multihead.q_proj) |*weight| return @ptrCast(weight);
+                    if (multihead.q_proj_bf16) |*weight| return @ptrCast(weight);
+                    return error.MissingWeight;
+                }
+                if (std.mem.eql(u8, slot_name, "k_proj")) {
+                    if (multihead.k_proj) |*weight| return @ptrCast(weight);
+                    if (multihead.k_proj_bf16) |*weight| return @ptrCast(weight);
+                    return error.MissingWeight;
+                }
+                if (std.mem.eql(u8, slot_name, "v_proj")) {
+                    if (multihead.v_proj) |*weight| return @ptrCast(weight);
+                    if (multihead.v_proj_bf16) |*weight| return @ptrCast(weight);
+                    return error.MissingWeight;
+                }
+                if (std.mem.eql(u8, slot_name, "o_proj")) {
+                    if (multihead.o_proj) |*weight| return @ptrCast(weight);
+                    if (multihead.o_proj_bf16) |*weight| return @ptrCast(weight);
+                    return error.MissingWeight;
+                }
+                return error.InvalidWeightBindingName;
+            },
+            .mla => |*mla| {
+                if (!std.mem.eql(u8, slot_name, "mla_weights")) return error.InvalidWeightBindingName;
+                if (mla.o_proj) |*weight| return @ptrCast(weight);
+                if (mla.o_proj_bf16) |*weight| return @ptrCast(weight);
+                return error.MissingWeight;
+            },
+        }
+    }
+
+    fn resolveLayerProgramShortconvWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const shortconv_binding = if (ctx.bindings.shortconv) |*binding|
+            binding
+        else
+            return error.MissingField;
+        if (std.mem.eql(u8, slot_name, "in_proj")) {
+            if (shortconv_binding.in_proj) |*weight| return @ptrCast(weight);
+            if (shortconv_binding.in_proj_bf16) |*weight| return @ptrCast(weight);
+            return error.MissingWeight;
+        }
+        if (std.mem.eql(u8, slot_name, "conv_weight")) return @ptrCast(&shortconv_binding.conv_weight);
+        if (std.mem.eql(u8, slot_name, "out_proj")) {
+            if (shortconv_binding.out_proj) |*weight| return @ptrCast(weight);
+            if (shortconv_binding.out_proj_bf16) |*weight| return @ptrCast(weight);
+            return error.MissingWeight;
+        }
+        return error.InvalidWeightBindingName;
+    }
+
+    fn resolveLayerProgramSwiGluWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const ffn_binding = if (ctx.bindings.ffn) |*binding|
+            binding
+        else
+            return error.MissingField;
+        return switch (ffn_binding.*) {
+            .dense => |*dense| blk: {
+                if (std.mem.eql(u8, slot_name, "w1")) {
+                    if (dense.w1) |*weight| break :blk @ptrCast(weight);
+                    if (dense.w1_bf16) |*weight| break :blk @ptrCast(weight);
+                    return error.MissingWeight;
+                }
+                if (std.mem.eql(u8, slot_name, "w3")) {
+                    if (dense.w3) |*weight| break :blk @ptrCast(weight);
+                    if (dense.w3_bf16) |*weight| break :blk @ptrCast(weight);
+                    return error.MissingWeight;
+                }
+                if (std.mem.eql(u8, slot_name, "w2")) {
+                    if (dense.w2) |*weight| break :blk @ptrCast(weight);
+                    if (dense.w2_bf16) |*weight| break :blk @ptrCast(weight);
+                    return error.MissingWeight;
+                }
+                return error.InvalidWeightBindingName;
+            },
+            .moe => error.InvalidWeightBindingName,
+        };
+    }
+
+    fn resolveLayerProgramMoeWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        if (!std.mem.eql(u8, slot_name, "router")) return error.InvalidWeightBindingName;
+        const ffn_binding = if (ctx.bindings.ffn) |*binding|
+            binding
+        else
+            return error.MissingField;
+        return switch (ffn_binding.*) {
+            .moe => |*moe_binding| @ptrCast(@constCast(&moe_binding.weights.router_w)),
+            .dense => error.InvalidWeightBindingName,
+        };
+    }
+
+    fn resolveLayerProgramMambaWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const mamba_binding = if (ctx.bindings.mamba) |*binding|
+            binding
+        else
+            return error.MissingField;
+        if (std.mem.eql(u8, slot_name, "in_proj")) {
+            if (mamba_binding.in_proj) |*weight| return @ptrCast(weight);
+            if (mamba_binding.in_proj_bf16) |*weight| return @ptrCast(weight);
+            return error.MissingWeight;
+        }
+        if (std.mem.eql(u8, slot_name, "out_proj")) {
+            if (mamba_binding.out_proj) |*weight| return @ptrCast(weight);
+            if (mamba_binding.out_proj_bf16) |*weight| return @ptrCast(weight);
+            return error.MissingWeight;
+        }
+        return error.InvalidWeightBindingName;
+    }
+
     fn layerProgramWeightHandlePtr(
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
@@ -333,120 +462,10 @@ pub const TransformerBlock = struct {
     ) !*anyopaque {
         const binding_name = try runtime_contract.instructionWeightBindingName(ctx.compiled_plan, ctx.op_index, slot_idx);
         const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
-        return switch (insn.opcode) {
-            .rmsnorm => {
-                if (!std.mem.eql(u8, parsed.slot_name, "norm_weight")) return error.InvalidWeightBindingName;
-                const idx = ctx.norm_index.*;
-                if (idx >= ctx.bindings.norm_weight_count) return error.InvalidInstructionBinding;
-                if (ctx.bindings.norm_weights[idx]) |*weight| {
-                    return @ptrCast(weight);
-                }
-                return error.MissingWeight;
-            },
-            .multihead_attention => {
-                if (ctx.bindings.attention) |*attention_binding| switch (attention_binding.*) {
-                    .multihead => |*multihead| {
-                        if (std.mem.eql(u8, parsed.slot_name, "q_proj")) {
-                            if (multihead.q_proj) |*weight| return @ptrCast(weight);
-                            if (multihead.q_proj_bf16) |*weight| return @ptrCast(weight);
-                            return error.MissingWeight;
-                        }
-                        if (std.mem.eql(u8, parsed.slot_name, "k_proj")) {
-                            if (multihead.k_proj) |*weight| return @ptrCast(weight);
-                            if (multihead.k_proj_bf16) |*weight| return @ptrCast(weight);
-                            return error.MissingWeight;
-                        }
-                        if (std.mem.eql(u8, parsed.slot_name, "v_proj")) {
-                            if (multihead.v_proj) |*weight| return @ptrCast(weight);
-                            if (multihead.v_proj_bf16) |*weight| return @ptrCast(weight);
-                            return error.MissingWeight;
-                        }
-                        if (std.mem.eql(u8, parsed.slot_name, "o_proj")) {
-                            if (multihead.o_proj) |*weight| return @ptrCast(weight);
-                            if (multihead.o_proj_bf16) |*weight| return @ptrCast(weight);
-                            return error.MissingWeight;
-                        }
-                    },
-                    .mla => |*mla| {
-                        if (!std.mem.eql(u8, parsed.slot_name, "mla_weights")) return error.InvalidWeightBindingName;
-                        if (mla.o_proj) |*weight| return @ptrCast(weight);
-                        if (mla.o_proj_bf16) |*weight| return @ptrCast(weight);
-                        return error.MissingWeight;
-                    },
-                } else return error.MissingField;
-                return error.InvalidWeightBindingName;
-            },
-            .shortconv => {
-                const shortconv_binding = if (ctx.bindings.shortconv) |*binding|
-                    binding
-                else
-                    return error.MissingField;
-                if (std.mem.eql(u8, parsed.slot_name, "in_proj")) {
-                    if (shortconv_binding.in_proj) |*weight| return @ptrCast(weight);
-                    if (shortconv_binding.in_proj_bf16) |*weight| return @ptrCast(weight);
-                    return error.MissingWeight;
-                }
-                if (std.mem.eql(u8, parsed.slot_name, "conv_weight")) {
-                    return @ptrCast(&shortconv_binding.conv_weight);
-                }
-                if (std.mem.eql(u8, parsed.slot_name, "out_proj")) {
-                    if (shortconv_binding.out_proj) |*weight| return @ptrCast(weight);
-                    if (shortconv_binding.out_proj_bf16) |*weight| return @ptrCast(weight);
-                    return error.MissingWeight;
-                }
-                return error.InvalidWeightBindingName;
-            },
-            .swiglu => {
-                if (ctx.bindings.ffn) |*ffn_binding| switch (ffn_binding.*) {
-                    .dense => |*dense| {
-                        if (std.mem.eql(u8, parsed.slot_name, "w1")) {
-                            if (dense.w1) |*weight| return @ptrCast(weight);
-                            if (dense.w1_bf16) |*weight| return @ptrCast(weight);
-                            return error.MissingWeight;
-                        }
-                        if (std.mem.eql(u8, parsed.slot_name, "w3")) {
-                            if (dense.w3) |*weight| return @ptrCast(weight);
-                            if (dense.w3_bf16) |*weight| return @ptrCast(weight);
-                            return error.MissingWeight;
-                        }
-                        if (std.mem.eql(u8, parsed.slot_name, "w2")) {
-                            if (dense.w2) |*weight| return @ptrCast(weight);
-                            if (dense.w2_bf16) |*weight| return @ptrCast(weight);
-                            return error.MissingWeight;
-                        }
-                    },
-                    .moe => return error.InvalidWeightBindingName,
-                } else return error.MissingField;
-                return error.InvalidWeightBindingName;
-            },
-            .moe => {
-                if (ctx.bindings.ffn) |*ffn_binding| switch (ffn_binding.*) {
-                    .moe => |*moe_binding| {
-                        if (!std.mem.eql(u8, parsed.slot_name, "router")) return error.InvalidWeightBindingName;
-                        return @ptrCast(@constCast(&moe_binding.weights.router_w));
-                    },
-                    .dense => return error.InvalidWeightBindingName,
-                } else return error.MissingField;
-            },
-            .mamba_mixer => {
-                const mamba_binding = if (ctx.bindings.mamba) |*binding|
-                    binding
-                else
-                    return error.MissingField;
-                if (std.mem.eql(u8, parsed.slot_name, "in_proj")) {
-                    if (mamba_binding.in_proj) |*weight| return @ptrCast(weight);
-                    if (mamba_binding.in_proj_bf16) |*weight| return @ptrCast(weight);
-                    return error.MissingWeight;
-                }
-                if (std.mem.eql(u8, parsed.slot_name, "out_proj")) {
-                    if (mamba_binding.out_proj) |*weight| return @ptrCast(weight);
-                    if (mamba_binding.out_proj_bf16) |*weight| return @ptrCast(weight);
-                    return error.MissingWeight;
-                }
-                return error.InvalidWeightBindingName;
-            },
-            else => error.InvalidInstructionBinding,
+        const resolver = layer_program_weight_resolver_table[@intFromEnum(insn.opcode)] orelse {
+            return error.InvalidInstructionBinding;
         };
+        return resolver(ctx, parsed.slot_name);
     }
 
     fn instructionParams(
@@ -482,8 +501,8 @@ pub const TransformerBlock = struct {
     fn buildLayerProgramInstructionHandles(
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
-        handle_storage: *[MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorHandle,
-        view_storage: *[MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorViewDesc,
+        handle_storage: []runtime_contract.TensorHandle,
+        view_storage: []runtime_contract.TensorViewDesc,
     ) !BuiltLayerProgramHandles {
         var handle_count: usize = 0;
         var view_count: usize = 0;
@@ -1166,7 +1185,7 @@ pub const TransformerBlock = struct {
             .active_slots = active_slots[0..],
             .sequence_lengths = sequence_lengths[0..],
             .batch_size = 1,
-            .dispatch_counters = &layer_program_dispatch_counters,
+            .dispatch_counters = if (enable_dispatch_observability) &layer_program_dispatch_counters else null,
             .workspace = .{ .any = @ptrCast(ctx) },
         };
         try runtime_contract.validateExecutionContext(&rt_ctx);
@@ -1175,9 +1194,12 @@ pub const TransformerBlock = struct {
             rt_ctx.batch_size,
         );
         runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
-        var handle_storage: [MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorHandle = undefined;
-        var view_storage: [MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorViewDesc = undefined;
-        const built_handles = try buildLayerProgramInstructionHandles(insn, ctx, &handle_storage, &view_storage);
+        const built_handles = try buildLayerProgramInstructionHandles(
+            insn,
+            ctx,
+            ctx.instruction_handles,
+            ctx.instruction_views,
+        );
         var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
         var param_storage: [1]runtime_contract.ParamBlock = undefined;
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &ctx.compiled_plan.plan, state_blocks.slice());
@@ -1214,11 +1236,10 @@ pub const TransformerBlock = struct {
             }
             break :blk required;
         };
-        var slot_buffers_storage: [64]mlx_graph.ArrayHandle = undefined;
-        for (0..required_slot_count) |slot_idx| {
-            slot_buffers_storage[slot_idx] = hidden;
+        for (lw.slot_scratch[0..required_slot_count]) |*slot| {
+            slot.* = hidden;
         }
-        const slot_buffers = slot_buffers_storage[0..required_slot_count];
+        const slot_buffers = lw.slot_scratch[0..required_slot_count];
         var norm_index: usize = 0;
         var exec_ctx = LayerProgramExecutionContext{
             .compiled_plan = &compiled_plan,
@@ -1230,7 +1251,9 @@ pub const TransformerBlock = struct {
             .runtime_rope_dim = runtime_rope_dim,
             .residual = &residual,
             .slot_buffers = slot_buffers,
-            .register_to_slot_map = &lw.register_to_slot_map,
+            .register_to_slot_map = lw.register_to_slot_map,
+            .instruction_handles = lw.instruction_handle_scratch,
+            .instruction_views = lw.instruction_view_scratch,
             .norm_index = &norm_index,
             .bindings = try buildLayerProgramRuntimeBindings(&compiled_plan.plan, lw, config, weight_handles),
         };
@@ -1243,10 +1266,8 @@ pub const TransformerBlock = struct {
         }
 
         const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
-        const final_register_idx = runtime_contract.registerToIndex(final_register);
-        if (final_register_idx > @intFromEnum(layer_ops.BufferId.tmp63)) return error.NotImplemented;
-        const final_buffer_id: layer_ops.BufferId = @enumFromInt(final_register_idx);
-        return getBuffer(final_buffer_id, residual, slot_buffers, &lw.register_to_slot_map);
+        const final_slot = try bufferSlotForRegister(final_register, residual, slot_buffers, lw.register_to_slot_map);
+        return final_slot.*;
     }
 
     pub fn forward(

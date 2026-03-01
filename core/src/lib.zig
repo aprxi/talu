@@ -425,6 +425,22 @@ comptime {
     _ = &capi.talu_fs_rename;
     _ = &capi.talu_fs_free_string;
 
+    // Agent shell API
+    _ = &capi.talu_shell_exec;
+    _ = &capi.talu_shell_exec_streaming;
+    _ = &capi.talu_shell_check_command;
+    _ = &capi.talu_shell_default_policy_json;
+    _ = &capi.talu_shell_normalize_command;
+    _ = &capi.talu_shell_free_string;
+    _ = &capi.talu_shell_open;
+    _ = &capi.talu_shell_close;
+    _ = &capi.talu_shell_write;
+    _ = &capi.talu_shell_read;
+    _ = &capi.talu_shell_resize;
+    _ = &capi.talu_shell_signal;
+    _ = &capi.talu_shell_alive;
+    _ = &capi.talu_shell_scrollback;
+
     // Stateful Agent API
     _ = &capi.talu_agent_create;
     _ = &capi.talu_agent_free;

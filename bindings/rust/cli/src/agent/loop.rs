@@ -136,8 +136,7 @@ fn run_shell_command(command: &str, policy: &Policy, has_custom_policy: bool) ->
     // as plain text (grammar incomplete), so the core never evaluates.
     // We evaluate here as well to cover that fallback path.
     use talu::policy::Effect;
-    let action = talu::shell::normalize_command(command)
-        .unwrap_or_else(|_| command.to_string());
+    let action = talu::shell::normalize_command(command).unwrap_or_else(|_| command.to_string());
     if policy.evaluate(&action) == Effect::Deny {
         eprintln!("\x1b[1;31m[POLICY DENIED]\x1b[0m \x1b[1m{}\x1b[0m", command,);
         return Ok(());
@@ -149,7 +148,10 @@ fn run_shell_command(command: &str, policy: &Policy, has_custom_policy: bool) ->
     if !has_custom_policy {
         match talu::shell::check_command(command) {
             Ok(check) if !check.allowed => {
-                let reason = check.reason.as_deref().unwrap_or("blocked by safety policy");
+                let reason = check
+                    .reason
+                    .as_deref()
+                    .unwrap_or("blocked by safety policy");
                 eprintln!(
                     "\x1b[1;31m[BLOCKED]\x1b[0m \x1b[1m{}\x1b[0m\n  Reason: {}",
                     command, reason,

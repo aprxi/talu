@@ -7,7 +7,7 @@ const op_types = @import("op_types.zig");
 
 /// Buffer slots for layer operation operands.
 /// Maps to physical scratch buffers via array indexing: scratch.tmp[@intFromEnum(id)].
-/// Access scratch buffers via ScratchBuffer.getTmp(id, len).
+/// Runtime executors resolve these logical slots through plan register mapping.
 pub const BufferId = enum(u6) {
     /// The residual stream (input/output). NOT in scratch.tmp - uses model output buffer.
     residual = 0,
@@ -349,4 +349,3 @@ test "finalOutputBuffer resolves last op output for vision scatter" {
     };
     try testing.expectEqual(BufferId.branch_out, finalOutputBuffer(&program));
 }
-

@@ -168,7 +168,7 @@ pub fn transform_image_bytes(bytes: &[u8], opts: TransformOptions) -> Result<Tra
     };
 
     // SAFETY: out buffer was allocated by C API and must be freed once copied.
-    unsafe { talu_sys::talu_file_bytes_free(c_out_ptr, c_out_len) };
+    unsafe { talu_sys::talu_file_bytes_free(c_out_ptr.cast_mut(), c_out_len) };
 
     Ok(TransformResult {
         bytes: out_bytes,
@@ -344,7 +344,7 @@ pub fn pdf_transform_page(
     };
 
     // SAFETY: out buffer was allocated by C API and must be freed once copied.
-    unsafe { talu_sys::talu_file_bytes_free(c_out_ptr, c_out_len) };
+    unsafe { talu_sys::talu_file_bytes_free(c_out_ptr.cast_mut(), c_out_len) };
 
     Ok(TransformResult {
         bytes: out_bytes,

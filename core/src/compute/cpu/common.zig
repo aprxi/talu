@@ -20,6 +20,21 @@ pub fn ensureU32Slice(allocator: std.mem.Allocator, storage: *[]u32, needed: usi
     storage.* = try allocator.alloc(u32, needed);
 }
 
+/// Ensure a reusable f32 buffer with 64-byte alignment (cache-line / SIMD).
+/// Free via freeAligned64F32Slice.
+pub fn ensureAligned64F32Slice(allocator: std.mem.Allocator, storage: *[]f32, needed: usize) !void {
+    if (storage.*.len >= needed) return;
+    if (storage.*.len > 0) freeAligned64F32Slice(allocator, storage.*);
+    const aligned = try allocator.alignedAlloc(f32, .@"64", needed);
+    storage.* = aligned;
+}
+
+/// Free a []f32 that was allocated with 64-byte alignment.
+pub fn freeAligned64F32Slice(allocator: std.mem.Allocator, slice: []f32) void {
+    const aligned: []align(64) f32 = @alignCast(slice);
+    allocator.free(aligned);
+}
+
 /// Add a 1-D bias vector to each row of a [rows, dim] f32 buffer.
 pub fn addBiasRows(data: []f32, bias: []const f32, rows: usize, dim: usize) void {
     std.debug.assert(bias.len == dim);
@@ -74,4 +89,14 @@ test "ensureU32Slice grows buffer" {
 
     try ensureU32Slice(allocator, &storage, 8);
     try std.testing.expect(storage.len >= 8);
+}
+
+test "ensureAligned64F32Slice provides 64-byte alignment" {
+    const allocator = std.testing.allocator;
+    var storage: []f32 = &.{};
+    defer if (storage.len > 0) freeAligned64F32Slice(allocator, storage);
+
+    try ensureAligned64F32Slice(allocator, &storage, 32);
+    try std.testing.expect(storage.len >= 32);
+    try std.testing.expect(@intFromPtr(storage.ptr) % 64 == 0);
 }

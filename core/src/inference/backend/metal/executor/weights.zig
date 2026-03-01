@@ -128,22 +128,28 @@ fn quantBitsFor(dtype: dtype_mod.DType) !usize {
 fn buildMetalLayerProgramRegisterSlotMap(
     allocator: std.mem.Allocator,
     compiled: *const runtime_contract.CompiledPlan,
-) ![64]u8 {
+) ![]u8 {
     const invalid_slot = std.math.maxInt(u8);
-    var register_to_slot: [64]u8 = [_]u8{invalid_slot} ** 64;
-    if (compiled.plan.register_count <= 1) return register_to_slot;
-    if (compiled.plan.register_count > 64) return error.NotImplemented;
+    const register_count = compiled.plan.register_count;
+    const register_to_slot = try allocator.alloc(u8, register_count);
+    @memset(register_to_slot, invalid_slot);
+    errdefer allocator.free(register_to_slot);
+    if (register_count <= 1) return register_to_slot;
 
-    const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, compiled.plan.register_count);
+    const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, register_count);
     defer allocator.free(register_specs);
     // Register 0 (residual) uses the residual handle, not a slot buffer.
     register_specs[0] = .{ .size = 0, .@"align" = 0 };
-    if (compiled.register_buffer_specs.len != compiled.plan.register_count) return error.NotImplemented;
+    if (compiled.register_buffer_specs.len != register_count) return error.NotImplemented;
+    // Plan specs already contain floors applied at compile time.
+    // Backends consume specs exactly.
     for (register_specs[1..], 1..) |*spec, idx| {
         const plan_spec = compiled.register_buffer_specs[idx];
         spec.* = .{
-            .size = @max(plan_spec.size, 1),
-            .@"align" = @max(plan_spec.@"align", @as(u16, 4)),
+            .size = plan_spec.size,
+            .@"align" = plan_spec.@"align",
+            .dtype = plan_spec.dtype,
+            .layout = plan_spec.layout,
         };
     }
 
@@ -158,13 +164,12 @@ fn buildMetalLayerProgramRegisterSlotMap(
     var next_slot: u8 = 0;
     const invalid_physical = std.math.maxInt(u16);
     var register_idx: usize = 0;
-    while (register_idx < compiled.plan.register_count) : (register_idx += 1) {
+    while (register_idx < register_count) : (register_idx += 1) {
         const physical_id_u16 = physical.register_to_physical[register_idx];
         if (physical_id_u16 == invalid_physical) continue;
         const physical_id: usize = physical_id_u16;
         if (physical_id >= physical_to_slot.len) return error.NotImplemented;
         if (physical_to_slot[physical_id] == invalid_slot) {
-            if (@as(usize, next_slot) >= register_to_slot.len) return error.NotImplemented;
             physical_to_slot[physical_id] = next_slot;
             next_slot += 1;
         }
@@ -224,11 +229,14 @@ fn compileLayerProgramContract(
     block_kind: topology.BlockKind,
 ) !void {
     layer.compiled_plan = null;
-    layer.register_to_slot_map = [_]u8{WeightHandles.LayerWeights.invalid_slot} ** 64;
+    layer.register_to_slot_map = &.{};
+    layer.slot_scratch = &.{};
+    layer.instruction_handle_scratch = &.{};
+    layer.instruction_view_scratch = &.{};
     const entry = static_entry orelse return error.NotImplemented;
     const program = models_registry.blockProgramFor(entry, block_kind) orelse return error.NotImplemented;
 
-    layer.compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode);
+    layer.compiled_plan = try plan_compiler.compileLayerProgram(allocator, program, .decode, .{});
     errdefer if (layer.compiled_plan) |*compiled_plan| {
         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
         layer.compiled_plan = null;
@@ -239,6 +247,46 @@ fn compileLayerProgramContract(
         &layer.compiled_plan.?,
     );
     layer.register_to_slot_map = register_map;
+    errdefer if (layer.register_to_slot_map.len > 0) {
+        allocator.free(layer.register_to_slot_map);
+        layer.register_to_slot_map = &.{};
+    };
+
+    // Pre-allocate scratch array for slot buffer handles during execution.
+    var required_slots: usize = 0;
+    for (register_map) |slot_idx| {
+        if (slot_idx == std.math.maxInt(u8)) continue;
+        const next = @as(usize, slot_idx) + 1;
+        if (next > required_slots) required_slots = next;
+    }
+    if (required_slots > 0) {
+        layer.slot_scratch = try allocator.alloc(mlx_graph.ArrayHandle, required_slots);
+        errdefer if (layer.slot_scratch.len > 0) {
+            allocator.free(layer.slot_scratch);
+            layer.slot_scratch = &.{};
+        };
+    }
+
+    var handle_capacity: usize = 0;
+    for (layer.compiled_plan.?.plan.instructions) |insn| {
+        const count = insn.inputs.len + insn.outputs.len + insn.weights.len;
+        if (count > handle_capacity) handle_capacity = count;
+    }
+    if (handle_capacity > 0) {
+        const handle_scratch = try allocator.alloc(runtime_contract.TensorHandle, handle_capacity);
+        const view_scratch = allocator.alloc(runtime_contract.TensorViewDesc, handle_capacity) catch |err| {
+            allocator.free(handle_scratch);
+            return err;
+        };
+        layer.instruction_handle_scratch = handle_scratch;
+        layer.instruction_view_scratch = view_scratch;
+        errdefer {
+            allocator.free(layer.instruction_handle_scratch);
+            allocator.free(layer.instruction_view_scratch);
+            layer.instruction_handle_scratch = &.{};
+            layer.instruction_view_scratch = &.{};
+        }
+    }
 }
 
 /// Load model weights as MLX array handles on GPU.
@@ -348,7 +396,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     // Initialize all layer weights to default values (null for optional fields)
     for (weight_handles.layers) |*layer| {
         layer.* = std.mem.zeroes(WeightHandles.LayerWeights);
-        layer.register_to_slot_map = [_]u8{WeightHandles.LayerWeights.invalid_slot} ** 64;
+        layer.register_to_slot_map = &.{};
     }
 
     for (loaded.blocks, 0..) |*layer, layer_idx| {
@@ -991,6 +1039,10 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
             plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
             layer.compiled_plan = null;
         }
+        if (layer.register_to_slot_map.len > 0) allocator.free(layer.register_to_slot_map);
+        if (layer.slot_scratch.len > 0) allocator.free(layer.slot_scratch);
+        if (layer.instruction_handle_scratch.len > 0) allocator.free(layer.instruction_handle_scratch);
+        if (layer.instruction_view_scratch.len > 0) allocator.free(layer.instruction_view_scratch);
         if (layer.ln1_weight) |h| mlx_graph.freeArray(h);
         if (layer.ln2_weight) |h| mlx_graph.freeArray(h);
 
@@ -1248,7 +1300,13 @@ pub const WeightHandles = struct {
 
         kind: LayerKind = .attention_mlp,
         compiled_plan: ?runtime_contract.CompiledPlan = null,
-        register_to_slot_map: [64]u8 = [_]u8{invalid_slot} ** 64,
+        register_to_slot_map: []const u8 = &.{},
+        /// Pre-allocated scratch for slot buffer handles during execution.
+        slot_scratch: []mlx_graph.ArrayHandle = &.{},
+        /// Pre-allocated per-instruction tensor handle scratch.
+        instruction_handle_scratch: []runtime_contract.TensorHandle = &.{},
+        /// Pre-allocated per-instruction tensor view scratch.
+        instruction_view_scratch: []runtime_contract.TensorViewDesc = &.{},
         ln1_weight: ArrayHandle,
         ln2_weight: ArrayHandle,
 
@@ -2061,6 +2119,7 @@ test "buildMetalLayerProgramRegisterSlotMap reuses temp slots from liveness" {
             .{ .size = 1, .@"align" = 4 },
             .{ .size = 1, .@"align" = 4 },
         },
+
         .liveness = .{
             .register_last_read = &.{ 0, 1, 2, 2 },
             .kill_after_instruction = &.{ kill0[0..], kill1[0..], kill2[0..] },
@@ -2070,6 +2129,7 @@ test "buildMetalLayerProgramRegisterSlotMap reuses temp slots from liveness" {
     };
 
     const map = try buildMetalLayerProgramRegisterSlotMap(testing.allocator, &compiled);
+    defer testing.allocator.free(map);
     try testing.expect(map[1] < 2);
     try testing.expect(map[2] < 2);
     try testing.expect(map[3] < 2);

@@ -8,6 +8,15 @@ const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
 const allocator = std.heap.c_allocator;
+const DEFAULT_SCROLLBACK_BYTES: usize = 64 * 1024;
+
+pub const TaluShell = opaque {};
+
+pub const StreamCallback = *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) bool;
+
+fn toShell(handle: ?*TaluShell) !*shell.session.ShellSession {
+    return @ptrCast(@alignCast(handle orelse return error.InvalidHandle));
+}
 
 /// Execute a shell command and capture output.
 ///
@@ -59,6 +68,84 @@ pub fn talu_shell_exec(
     result.stderr = &.{};
 
     return 0;
+}
+
+/// Execute a command with execution options and stream chunks via callbacks.
+pub fn talu_shell_exec_streaming(
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    timeout_ms: u64,
+    on_stdout: ?StreamCallback,
+    on_stdout_ctx: ?*anyopaque,
+    on_stderr: ?StreamCallback,
+    on_stderr_ctx: ?*anyopaque,
+    out_exit_code: ?*i32,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    if (out_exit_code) |code| code.* = -1;
+
+    const cmd = std.mem.sliceTo(command orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "command is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }, 0);
+    if (cmd.len == 0) {
+        capi_error.setErrorWithCode(.invalid_argument, "command is empty", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    }
+
+    const cwd_slice: ?[]const u8 = if (cwd) |value| blk: {
+        const slice = std.mem.sliceTo(value, 0);
+        if (slice.len == 0) {
+            capi_error.setErrorWithCode(.invalid_argument, "cwd is empty", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        }
+        break :blk slice;
+    } else null;
+
+    var stdout_stream_ctx = CStreamCtx{ .callback = cNoopStreamCallback, .ctx = null };
+    var stderr_stream_ctx = CStreamCtx{ .callback = cNoopStreamCallback, .ctx = null };
+    if (on_stdout) |cb| {
+        stdout_stream_ctx = .{ .callback = cb, .ctx = on_stdout_ctx };
+    }
+    if (on_stderr) |cb| {
+        stderr_stream_ctx = .{ .callback = cb, .ctx = on_stderr_ctx };
+    }
+
+    var result = shell.exec.execStreaming(
+        allocator,
+        cmd,
+        .{
+            .cwd = cwd_slice,
+            .timeout_ms = timeout_ms,
+            .max_output_bytes = 1024 * 1024,
+        },
+        if (on_stdout != null) cStreamForward else null,
+        if (on_stdout != null) &stdout_stream_ctx else null,
+        if (on_stderr != null) cStreamForward else null,
+        if (on_stderr != null) &stderr_stream_ctx else null,
+    ) catch |err| {
+        capi_error.setError(err, "shell streaming exec failed", .{});
+        return @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
+    };
+    defer result.deinit(allocator);
+
+    if (out_exit_code) |code| code.* = result.exit_code orelse -1;
+    return 0;
+}
+
+const CStreamCtx = struct {
+    callback: StreamCallback,
+    ctx: ?*anyopaque,
+};
+
+fn cNoopStreamCallback(_: ?*anyopaque, _: [*]const u8, _: usize) callconv(.c) bool {
+    return true;
+}
+
+fn cStreamForward(ctx: ?*anyopaque, data: []const u8) bool {
+    const stream_ctx: *const CStreamCtx = @ptrCast(@alignCast(ctx orelse return true));
+    if (data.len == 0) return true;
+    return stream_ctx.callback(stream_ctx.ctx, data.ptr, data.len);
 }
 
 /// Check whether a command is allowed by the built-in whitelist.
@@ -158,8 +245,197 @@ pub fn talu_shell_normalize_command(
     return 0;
 }
 
-/// Free a string returned by `talu_shell_exec`, `talu_shell_default_policy_json`,
-/// or `talu_shell_normalize_command`.
+/// Open an interactive shell session.
+pub fn talu_shell_open(
+    cols: u16,
+    rows: u16,
+    cwd: ?[*:0]const u8,
+    out_shell: ?*?*TaluShell,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const out = out_shell orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_shell is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    out.* = null;
+
+    const cwd_slice: ?[]const u8 = if (cwd) |value| blk: {
+        const slice = std.mem.sliceTo(value, 0);
+        if (slice.len == 0) {
+            capi_error.setErrorWithCode(.invalid_argument, "cwd is empty", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        }
+        break :blk slice;
+    } else null;
+
+    const session_ptr = shell.session.ShellSession.open(
+        allocator,
+        cols,
+        rows,
+        cwd_slice,
+        DEFAULT_SCROLLBACK_BYTES,
+    ) catch |err| {
+        capi_error.setError(err, "failed to open shell session", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    out.* = @ptrCast(session_ptr);
+    return 0;
+}
+
+/// Close an interactive shell session.
+pub fn talu_shell_close(shell_handle: ?*TaluShell) callconv(.c) void {
+    capi_error.clearError();
+    const session_ptr: *shell.session.ShellSession = @ptrCast(@alignCast(shell_handle orelse return));
+    session_ptr.close();
+}
+
+/// Write bytes to a shell session PTY.
+pub fn talu_shell_write(
+    shell_handle: ?*TaluShell,
+    data: ?[*]const u8,
+    len: usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const session_ptr = toShell(shell_handle) catch |err| {
+        capi_error.setError(err, "invalid shell handle", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    const data_slice: []const u8 = if (len == 0) &.{} else blk: {
+        const ptr = data orelse {
+            capi_error.setErrorWithCode(.invalid_argument, "data is null but len > 0", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        };
+        break :blk ptr[0..len];
+    };
+
+    _ = session_ptr.write(data_slice) catch |err| {
+        capi_error.setError(err, "failed to write shell session", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
+/// Read bytes from a shell session PTY into caller buffer.
+pub fn talu_shell_read(
+    shell_handle: ?*TaluShell,
+    buf: ?[*]u8,
+    buf_len: usize,
+    out_read: ?*usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    if (out_read) |n| n.* = 0;
+    const out_read_ptr = out_read orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_read is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const session_ptr = toShell(shell_handle) catch |err| {
+        capi_error.setError(err, "invalid shell handle", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    const read_buf: []u8 = if (buf_len == 0) &.{} else blk: {
+        const ptr = buf orelse {
+            capi_error.setErrorWithCode(.invalid_argument, "buf is null but buf_len > 0", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        };
+        break :blk ptr[0..buf_len];
+    };
+
+    const n = session_ptr.read(read_buf) catch |err| {
+        capi_error.setError(err, "failed to read shell session", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    out_read_ptr.* = n;
+    return 0;
+}
+
+/// Resize shell session PTY.
+pub fn talu_shell_resize(
+    shell_handle: ?*TaluShell,
+    cols: u16,
+    rows: u16,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const session_ptr = toShell(shell_handle) catch |err| {
+        capi_error.setError(err, "invalid shell handle", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    session_ptr.resize(cols, rows) catch |err| {
+        capi_error.setError(err, "failed to resize shell session", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
+/// Send a POSIX signal to the shell session process.
+pub fn talu_shell_signal(
+    shell_handle: ?*TaluShell,
+    sig: u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const session_ptr = toShell(shell_handle) catch |err| {
+        capi_error.setError(err, "invalid shell handle", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    session_ptr.sendSignal(sig) catch |err| {
+        capi_error.setError(err, "failed to signal shell session", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    return 0;
+}
+
+/// Return true if shell session process is still alive.
+pub fn talu_shell_alive(shell_handle: ?*TaluShell) callconv(.c) bool {
+    capi_error.clearError();
+    const session_ptr = toShell(shell_handle) catch |err| {
+        capi_error.setError(err, "invalid shell handle", .{});
+        return false;
+    };
+    return session_ptr.isAlive() catch |err| {
+        capi_error.setError(err, "shell session closed", .{});
+        return false;
+    };
+}
+
+/// Copy shell session scrollback buffer.
+pub fn talu_shell_scrollback(
+    shell_handle: ?*TaluShell,
+    out_data: ?*?[*]const u8,
+    out_len: ?*usize,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    if (out_data) |ptr| ptr.* = null;
+    if (out_len) |len| len.* = 0;
+    const out_data_ptr = out_data orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_data is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const out_len_ptr = out_len orelse {
+        capi_error.setErrorWithCode(.invalid_argument, "out_len is null", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    const session_ptr = toShell(shell_handle) catch |err| {
+        capi_error.setError(err, "invalid shell handle", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+
+    const copied = session_ptr.scrollbackCopy(allocator) catch |err| {
+        capi_error.setError(err, "failed to copy shell scrollback", .{});
+        return @intFromEnum(error_codes.errorToCode(err));
+    };
+    out_data_ptr.* = if (copied.len == 0) null else copied.ptr;
+    out_len_ptr.* = copied.len;
+    return 0;
+}
+
+/// Free bytes returned by shell APIs that transfer ownership to the caller,
+/// including `talu_shell_exec`, `talu_shell_default_policy_json`,
+/// `talu_shell_normalize_command`, and `talu_shell_scrollback`.
 pub fn talu_shell_free_string(ptr: ?[*]const u8, len: usize) callconv(.c) void {
     if (ptr == null or len == 0) return;
     const mutable: [*]u8 = @constCast(ptr.?);
@@ -248,4 +524,77 @@ test "talu_shell_normalize_command strips path" {
 
     try std.testing.expectEqual(@as(i32, 0), rc);
     try std.testing.expectEqualStrings("git status", out_ptr.?[0..out_len]);
+}
+
+test "talu_shell_exec_streaming invokes callbacks and returns exit" {
+    const callbacks = struct {
+        fn onStdout(ctx: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) bool {
+            const saw: *bool = @ptrCast(@alignCast(ctx.?));
+            if (len > 0 and std.mem.indexOf(u8, ptr[0..len], "out") != null) {
+                saw.* = true;
+            }
+            return true;
+        }
+
+        fn onStderr(ctx: ?*anyopaque, ptr: [*]const u8, len: usize) callconv(.c) bool {
+            const saw: *bool = @ptrCast(@alignCast(ctx.?));
+            if (len > 0 and std.mem.indexOf(u8, ptr[0..len], "err") != null) {
+                saw.* = true;
+            }
+            return true;
+        }
+    };
+
+    var saw_stdout = false;
+    var saw_stderr = false;
+    var exit_code: i32 = -1;
+    const rc = talu_shell_exec_streaming(
+        "echo out && echo err >&2",
+        null,
+        30_000,
+        callbacks.onStdout,
+        &saw_stdout,
+        callbacks.onStderr,
+        &saw_stderr,
+        &exit_code,
+    );
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    try std.testing.expect(saw_stdout);
+    try std.testing.expect(saw_stderr);
+    try std.testing.expectEqual(@as(i32, 0), exit_code);
+}
+
+test "talu_shell_open write read and scrollback" {
+    var handle: ?*TaluShell = null;
+    try std.testing.expectEqual(@as(i32, 0), talu_shell_open(80, 24, null, &handle));
+    defer talu_shell_close(handle);
+
+    const command = "echo hello\nexit\n";
+    try std.testing.expectEqual(@as(i32, 0), talu_shell_write(handle, command.ptr, command.len));
+
+    var read_buffer: [2048]u8 = undefined;
+    var output = std.ArrayList(u8).empty;
+    defer output.deinit(std.testing.allocator);
+
+    var guard: usize = 0;
+    while (talu_shell_alive(handle) and guard < 50_000) : (guard += 1) {
+        var n: usize = 0;
+        try std.testing.expectEqual(@as(i32, 0), talu_shell_read(handle, read_buffer[0..].ptr, read_buffer.len, &n));
+        if (n > 0) try output.appendSlice(std.testing.allocator, read_buffer[0..n]);
+    }
+    while (true) {
+        var n: usize = 0;
+        try std.testing.expectEqual(@as(i32, 0), talu_shell_read(handle, read_buffer[0..].ptr, read_buffer.len, &n));
+        if (n == 0) break;
+        try output.appendSlice(std.testing.allocator, read_buffer[0..n]);
+    }
+
+    try std.testing.expect(std.mem.indexOf(u8, output.items, "hello") != null);
+
+    var scroll_ptr: ?[*]const u8 = null;
+    var scroll_len: usize = 0;
+    try std.testing.expectEqual(@as(i32, 0), talu_shell_scrollback(handle, &scroll_ptr, &scroll_len));
+    defer talu_shell_free_string(scroll_ptr, scroll_len);
+    try std.testing.expect(scroll_ptr != null);
+    try std.testing.expect(std.mem.indexOf(u8, scroll_ptr.?[0..scroll_len], "hello") != null);
 }

@@ -643,6 +643,7 @@ pub const FusedCpuBackend = struct {
         if (state_blocks.len > max_state_bindings_per_slot) return error.InvalidStateDescriptorBinding;
         var binding = &self.slot_state_bindings[slot_index];
         const descriptors = self.stateDescriptors();
+        if (state_blocks.len != descriptors.len) return error.InvalidStateDescriptorBinding;
         for (state_blocks, 0..) |state_block, idx| {
             const descriptor_index = runtime_contract.stateDescriptorIndex(descriptors, state_block.id) orelse {
                 return error.UnknownStateDescriptorId;

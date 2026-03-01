@@ -20,9 +20,16 @@ pub const ParsedVisionProgram = struct {
 /// `vision_encode` drives patch/deepstack/spatial-merge operations.
 /// `scatter` drives token-stream embedding scatter.
 pub const VisionStagePlans = struct {
-    vision_encode: runtime_contract.CompiledPlan,
-    scatter: runtime_contract.CompiledPlan,
+    plans: runtime_contract.ModelPlans,
     scatter_image_token_id: u32,
+
+    pub inline fn vision_encode(self: *const VisionStagePlans) *const runtime_contract.CompiledPlan {
+        return &self.plans.vision_encode.?;
+    }
+
+    pub inline fn scatter(self: *const VisionStagePlans) *const runtime_contract.CompiledPlan {
+        return &self.plans.scatter.?;
+    }
 };
 
 /// Parse model-declared vision pipeline ops and resolve runtime parameters.
@@ -115,8 +122,19 @@ fn validateVisionStageHandoff(
 
     // Scatter inputs: [text_in, vision_in]. Vision encode output must match vision_in.
     if (scatter_insn.inputs.len < 2) return error.InvalidVisionStageHandoff;
-    if (@intFromEnum(encode_output) != @intFromEnum(scatter_insn.inputs[1])) {
-        return error.InvalidVisionStageHandoff;
+
+    // Validate dtype/layout compatibility at stage handoff boundary (ADR A9.7).
+    const encode_out_idx = runtime_contract.registerToIndex(encode_output);
+    const scatter_in_idx = runtime_contract.registerToIndex(scatter_insn.inputs[1]);
+    const encode_specs = vision_encode.register_buffer_specs;
+    const scatter_specs = scatter.register_buffer_specs;
+    if (encode_out_idx < encode_specs.len and scatter_in_idx < scatter_specs.len) {
+        if (encode_specs[encode_out_idx].dtype != scatter_specs[scatter_in_idx].dtype) {
+            return error.InvalidVisionStageHandoff;
+        }
+        if (encode_specs[encode_out_idx].layout != scatter_specs[scatter_in_idx].layout) {
+            return error.InvalidVisionStageHandoff;
+        }
     }
 
     // Scatter output must be register 0 (residual) for decoder handoff.
@@ -158,6 +176,7 @@ pub fn compileVisionStagePlans(
         allocator,
         encode_ops.items,
         .vision_encode,
+        .{},
     );
     errdefer plan_compiler.deinitCompiledPlan(allocator, &vision_encode);
 
@@ -165,6 +184,7 @@ pub fn compileVisionStagePlans(
         allocator,
         scatter_ops.items,
         .scatter,
+        .{},
     );
     errdefer plan_compiler.deinitCompiledPlan(allocator, &scatter);
 
@@ -176,8 +196,10 @@ pub fn compileVisionStagePlans(
     try validateVisionStageHandoff(&vision_encode, &scatter);
 
     return .{
-        .vision_encode = vision_encode,
-        .scatter = scatter,
+        .plans = .{
+            .vision_encode = vision_encode,
+            .scatter = scatter,
+        },
         .scatter_image_token_id = parsed.scatter_image_token_id,
     };
 }
@@ -186,8 +208,8 @@ pub fn deinitVisionStagePlans(
     allocator: std.mem.Allocator,
     plans: *VisionStagePlans,
 ) void {
-    plan_compiler.deinitCompiledPlan(allocator, &plans.vision_encode);
-    plan_compiler.deinitCompiledPlan(allocator, &plans.scatter);
+    if (plans.plans.vision_encode) |*ve| plan_compiler.deinitCompiledPlan(allocator, ve);
+    if (plans.plans.scatter) |*sc| plan_compiler.deinitCompiledPlan(allocator, sc);
     plans.* = undefined;
 }
 
@@ -236,15 +258,16 @@ test "compileVisionStagePlans splits encode and scatter stages" {
     var plans = try compileVisionStagePlans(std.testing.allocator, &program);
     defer deinitVisionStagePlans(std.testing.allocator, &plans);
 
-    try std.testing.expect(plans.vision_encode.plan.instructions.len >= 2);
-    try std.testing.expectEqual(@as(usize, 1), plans.scatter.plan.instructions.len);
-    try std.testing.expectEqual(runtime_contract.Opcode.vision_scatter, plans.scatter.plan.instructions[0].opcode);
+    try std.testing.expect(plans.vision_encode().plan.instructions.len >= 2);
+    try std.testing.expectEqual(@as(usize, 1), plans.scatter().plan.instructions.len);
+    try std.testing.expectEqual(runtime_contract.Opcode.vision_scatter, plans.scatter().plan.instructions[0].opcode);
     try std.testing.expectEqual(@as(u32, 151655), plans.scatter_image_token_id);
 }
 
-test "compileVisionStagePlans rejects mismatched handoff registers" {
-    // spatial_merge outputs to norm_out, but scatter expects vision_in = branch_out.
-    // This mismatch should be caught by handoff validation.
+test "compileVisionStagePlans accepts register-level mismatched handoff when dtype matches" {
+    // spatial_merge outputs to norm_out, scatter expects vision_in = branch_out.
+    // Since BufferId identity is no longer part of handoff validation (R4),
+    // this compiles successfully — dtype/layout compatibility is what matters.
     const program = [_]layer_ops.LayerOp{
         .{ .patch_embed = .{ .in = .residual, .out = .norm_out } },
         .{ .spatial_merge = .{ .in = .norm_out, .out = .norm_out, .merge_size = 2 } },
@@ -255,8 +278,94 @@ test "compileVisionStagePlans rejects mismatched handoff registers" {
             .image_token_id = 151655,
         } },
     };
+    var result = try compileVisionStagePlans(std.testing.allocator, &program);
+    defer deinitVisionStagePlans(std.testing.allocator, &result);
+}
+
+test "validateVisionStageHandoff rejects mismatched dtype" {
+    const DType = @import("../dtype.zig").DType;
+    const reg0 = runtime_contract.registerFromIndex(0);
+    const reg1 = runtime_contract.registerFromIndex(1);
+
+    // Encode plan: single instruction outputting to reg1.
+    const encode_insn = runtime_contract.Instruction{
+        .opcode = .vision_patch_embed,
+        .inputs = &.{reg0},
+        .outputs = &.{reg1},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    // Scatter plan: single instruction taking [reg0, reg1] -> reg0.
+    const scatter_insn = runtime_contract.Instruction{
+        .opcode = .vision_scatter,
+        .inputs = &.{ reg0, reg1 },
+        .outputs = &.{reg0},
+        .weights = &.{},
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+
+
+
+    // Encode output is f32; scatter input is bf16 — mismatch.
+    const encode_specs = [_]runtime_contract.PhysicalBufferSpec{
+        .{ .size = 1, .@"align" = 64, .dtype = .f32 },
+        .{ .size = 1, .@"align" = 64, .dtype = .f32 },
+    };
+    const scatter_specs = [_]runtime_contract.PhysicalBufferSpec{
+        .{ .size = 1, .@"align" = 64, .dtype = .f32 },
+        .{ .size = 1, .@"align" = 64, .dtype = DType.bf16 },
+    };
+
+    const encode_last_read = [_]u32{ 0, 0 };
+    const scatter_last_read = [_]u32{ 0, 0 };
+
+    const encode_plan = runtime_contract.CompiledPlan{
+        .plan = .{
+            .instructions = &[_]runtime_contract.Instruction{encode_insn},
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .register_buffer_specs = &encode_specs,
+
+        .liveness = .{ .register_last_read = &encode_last_read, .kill_after_instruction = &.{} },
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+    const scatter_plan = runtime_contract.CompiledPlan{
+        .plan = .{
+            .instructions = &[_]runtime_contract.Instruction{scatter_insn},
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .register_buffer_specs = &scatter_specs,
+
+        .liveness = .{ .register_last_read = &scatter_last_read, .kill_after_instruction = &.{} },
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+
     try std.testing.expectError(
         error.InvalidVisionStageHandoff,
-        compileVisionStagePlans(std.testing.allocator, &program),
+        validateVisionStageHandoff(&encode_plan, &scatter_plan),
     );
+
+    // Same dtype should pass.
+    const scatter_specs_ok = [_]runtime_contract.PhysicalBufferSpec{
+        .{ .size = 1, .@"align" = 64, .dtype = .f32 },
+        .{ .size = 1, .@"align" = 64, .dtype = .f32 },
+    };
+    const scatter_plan_ok = runtime_contract.CompiledPlan{
+        .plan = scatter_plan.plan,
+        .param_blocks = &.{},
+        .register_buffer_specs = &scatter_specs_ok,
+
+        .liveness = scatter_plan.liveness,
+        .peak_registers = 2,
+        .diagnostics = &.{},
+    };
+    try validateVisionStageHandoff(&encode_plan, &scatter_plan_ok);
 }

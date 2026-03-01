@@ -35,6 +35,9 @@ const enable_fused_attention_f16_kv: bool = true;
 const max_fused_attention_f16_kv_seq_len: u32 = 384;
 const enable_device_embedding_lookup: bool = true;
 const max_supported_fused_f16_kv_head_dim = 512;
+// Optional dispatch observability. Keep disabled by default so production
+// execution adds zero atomic overhead in the token loop.
+const enable_dispatch_observability: bool = false;
 const attention_policy_config = attention_policy.Config{
     .kv_cache_dtype_fp16 = kv_cache_dtype_fp16,
     .enable_fused_attention_f16_kv = enable_fused_attention_f16_kv,
@@ -624,7 +627,8 @@ const BlockRuntimeLayer = struct {
     instruction_attention_refs: []?*AttentionMlpBlockRuntime = &.{},
     instruction_shortconv_refs: []?*ShortConvBlockRuntime = &.{},
     instruction_ffn_refs: []?FfnBinding = &.{},
-    register_to_slot_map: [64]u8 = [_]u8{invalid_slot} ** 64,
+    register_to_slot_map: []const u8 = &.{},
+    slot_width_hints: []const usize = &.{},
     attention_runtime: ?AttentionMlpBlockRuntime = null,
     shortconv_runtime: ?ShortConvBlockRuntime = null,
     attention_binding: ?*AttentionMlpBlockRuntime = null,
@@ -657,6 +661,80 @@ const BlockRuntimeLayer = struct {
         return kernel_id orelse error.InvalidInstructionPayload;
     }
 
+    const InstructionRefBinderFn = *const fn (
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        norm_index: *usize,
+    ) anyerror!void;
+
+    fn bindInstructionNoop(
+        _: *BlockRuntimeLayer,
+        _: *const runtime_contract.CompiledPlan,
+        _: usize,
+        _: *const runtime_contract.Instruction,
+        _: *usize,
+    ) !void {}
+
+    fn bindInstructionRmsNorm(
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        norm_index: *usize,
+    ) !void {
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        if (norm_index.* >= self.norm_weight_count) return error.UnsupportedModel;
+        const weight = self.norm_weights[norm_index.*] orelse return error.UnsupportedModel;
+        self.instruction_norm_weight_refs[op_index] = weight;
+        norm_index.* += 1;
+    }
+
+    fn bindInstructionAttention(
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        _: *usize,
+    ) !void {
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        self.instruction_attention_refs[op_index] = self.attention_binding orelse return error.UnsupportedModel;
+    }
+
+    fn bindInstructionShortConv(
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        _: *usize,
+    ) !void {
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        self.instruction_shortconv_refs[op_index] = self.shortconv_binding orelse return error.UnsupportedModel;
+    }
+
+    fn bindInstructionFfn(
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        _: *usize,
+    ) !void {
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        self.instruction_ffn_refs[op_index] = self.ffn_binding orelse return error.UnsupportedModel;
+    }
+
+    const instruction_ref_binder_table: [256]?InstructionRefBinderFn = blk: {
+        var table: [256]?InstructionRefBinderFn = [_]?InstructionRefBinderFn{bindInstructionNoop} ** 256;
+        table[@intFromEnum(runtime_contract.Opcode.rmsnorm)] = bindInstructionRmsNorm;
+        table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = bindInstructionAttention;
+        table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = bindInstructionAttention;
+        table[@intFromEnum(runtime_contract.Opcode.shortconv)] = bindInstructionShortConv;
+        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = bindInstructionFfn;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = bindInstructionFfn;
+        break :blk table;
+    };
+
     fn rebuildInstructionRefs(self: *BlockRuntimeLayer, allocator: std.mem.Allocator) !void {
         if (self.instruction_norm_weight_refs.len != 0) {
             allocator.free(self.instruction_norm_weight_refs);
@@ -688,28 +766,8 @@ const BlockRuntimeLayer = struct {
 
         var norm_index: usize = 0;
         for (compiled.plan.instructions, 0..) |insn, op_index| {
-            switch (insn.opcode) {
-                .rmsnorm => {
-                    _ = try instructionKernelIdFromWeightBindings(&compiled, op_index, insn.opcode);
-                    if (norm_index >= self.norm_weight_count) return error.UnsupportedModel;
-                    const weight = self.norm_weights[norm_index] orelse return error.UnsupportedModel;
-                    self.instruction_norm_weight_refs[op_index] = weight;
-                    norm_index += 1;
-                },
-                .multihead_attention, .mla_attention => {
-                    _ = try instructionKernelIdFromWeightBindings(&compiled, op_index, insn.opcode);
-                    self.instruction_attention_refs[op_index] = self.attention_binding orelse return error.UnsupportedModel;
-                },
-                .shortconv => {
-                    _ = try instructionKernelIdFromWeightBindings(&compiled, op_index, insn.opcode);
-                    self.instruction_shortconv_refs[op_index] = self.shortconv_binding orelse return error.UnsupportedModel;
-                },
-                .swiglu, .moe => {
-                    _ = try instructionKernelIdFromWeightBindings(&compiled, op_index, insn.opcode);
-                    self.instruction_ffn_refs[op_index] = self.ffn_binding orelse return error.UnsupportedModel;
-                },
-                else => {},
-            }
+            const binder = instruction_ref_binder_table[@intFromEnum(insn.opcode)] orelse continue;
+            try binder(self, &compiled, op_index, &insn, &norm_index);
         }
     }
 
@@ -734,6 +792,8 @@ const BlockRuntimeLayer = struct {
     }
 
     fn deinit(self: *BlockRuntimeLayer, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
+        if (self.register_to_slot_map.len != 0) allocator.free(self.register_to_slot_map);
+        if (self.slot_width_hints.len != 0) allocator.free(self.slot_width_hints);
         if (self.instruction_norm_weight_refs.len != 0) allocator.free(self.instruction_norm_weight_refs);
         if (self.instruction_attention_refs.len != 0) allocator.free(self.instruction_attention_refs);
         if (self.instruction_shortconv_refs.len != 0) allocator.free(self.instruction_shortconv_refs);
@@ -751,22 +811,28 @@ const BlockRuntimeLayer = struct {
 fn buildCudaLayerProgramRegisterSlotMap(
     allocator: std.mem.Allocator,
     compiled: *const runtime_contract.CompiledPlan,
-) ![64]u8 {
-    const invalid_slot = std.math.maxInt(u8);
-    var register_to_slot: [64]u8 = [_]u8{invalid_slot} ** 64;
-    if (compiled.plan.register_count <= 1) return register_to_slot;
-    if (compiled.plan.register_count > 64) return error.UnsupportedModel;
+) ![]u8 {
+    const invalid_slot = BlockRuntimeLayer.invalid_slot;
+    const register_count = compiled.plan.register_count;
+    const register_to_slot = try allocator.alloc(u8, register_count);
+    @memset(register_to_slot, invalid_slot);
+    errdefer allocator.free(register_to_slot);
+    if (register_count <= 1) return register_to_slot;
 
-    const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, compiled.plan.register_count);
+    const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, register_count);
     defer allocator.free(register_specs);
     // Register 0 (residual) uses prototype.input_dev, not a slot buffer.
     register_specs[0] = .{ .size = 0, .@"align" = 0 };
-    if (compiled.register_buffer_specs.len != compiled.plan.register_count) return error.InvalidRegisterSpecCount;
+    if (compiled.register_buffer_specs.len != register_count) return error.InvalidRegisterSpecCount;
+    // Plan specs already contain floors applied at compile time.
+    // Backends consume specs exactly.
     for (register_specs[1..], 1..) |*spec, idx| {
         const plan_spec = compiled.register_buffer_specs[idx];
         spec.* = .{
-            .size = @max(plan_spec.size, 1),
-            .@"align" = @max(plan_spec.@"align", @as(u16, 4)),
+            .size = plan_spec.size,
+            .@"align" = plan_spec.@"align",
+            .dtype = plan_spec.dtype,
+            .layout = plan_spec.layout,
         };
     }
 
@@ -781,13 +847,12 @@ fn buildCudaLayerProgramRegisterSlotMap(
     var next_slot: u8 = 0;
     const invalid_physical = std.math.maxInt(u16);
     var register_idx: usize = 0;
-    while (register_idx < compiled.plan.register_count) : (register_idx += 1) {
+    while (register_idx < register_count) : (register_idx += 1) {
         const physical_id_u16 = physical.register_to_physical[register_idx];
         if (physical_id_u16 == invalid_physical) continue;
         const physical_id: usize = physical_id_u16;
         if (physical_id >= physical_to_slot.len) return error.UnsupportedModel;
         if (physical_to_slot[physical_id] == invalid_slot) {
-            if (@as(usize, next_slot) >= register_to_slot.len) return error.UnsupportedModel;
             physical_to_slot[physical_id] = next_slot;
             next_slot += 1;
         }
@@ -795,6 +860,65 @@ fn buildCudaLayerProgramRegisterSlotMap(
     }
 
     return register_to_slot;
+}
+
+fn buildCudaLayerProgramSlotWidthHints(
+    allocator: std.mem.Allocator,
+    compiled: *const runtime_contract.CompiledPlan,
+    register_to_slot_map: []const u8,
+) ![]usize {
+    const invalid_slot = BlockRuntimeLayer.invalid_slot;
+    const register_count: usize = compiled.plan.register_count;
+    if (register_to_slot_map.len != register_count) return error.InvalidRegisterSpecCount;
+    if (compiled.register_buffer_specs.len != register_count) return error.InvalidRegisterSpecCount;
+
+    var required_slots: usize = 0;
+    for (register_to_slot_map) |slot_idx| {
+        if (slot_idx == invalid_slot) continue;
+        const next = @as(usize, slot_idx) + 1;
+        if (next > required_slots) required_slots = next;
+    }
+    if (required_slots == 0) return &.{};
+
+    const slot_width_hints = try allocator.alloc(usize, required_slots);
+    @memset(slot_width_hints, 0);
+    errdefer allocator.free(slot_width_hints);
+
+    const register_specs = try allocator.alloc(runtime_contract.RegisterBufferSpec, register_count);
+    defer allocator.free(register_specs);
+    register_specs[0] = .{ .size = 0, .@"align" = 0 };
+    for (register_specs[1..], 1..) |*spec, idx| {
+        const plan_spec = compiled.register_buffer_specs[idx];
+        spec.* = .{
+            .size = plan_spec.size,
+            .@"align" = plan_spec.@"align",
+            .dtype = plan_spec.dtype,
+            .layout = plan_spec.layout,
+        };
+    }
+    var physical = try runtime_contract.buildPhysicalMappingLinearScan(allocator, compiled, register_specs);
+    defer runtime_contract.deinitPhysicalMapping(allocator, &physical);
+
+    const invalid_physical = std.math.maxInt(u16);
+    for (0..register_count) |reg_idx| {
+        const slot_idx = register_to_slot_map[reg_idx];
+        if (slot_idx == invalid_slot) continue;
+        const physical_id_u16 = physical.register_to_physical[reg_idx];
+        if (physical_id_u16 == invalid_physical) continue;
+        const physical_id: usize = physical_id_u16;
+        const width = physical.physical_specs[physical_id].size;
+        if (width == 0) return error.InvalidRegisterSpecSize;
+        const slot_usize: usize = @intCast(slot_idx);
+        if (slot_width_hints[slot_usize] == 0) {
+            slot_width_hints[slot_usize] = width;
+        } else if (slot_width_hints[slot_usize] != width) {
+            return error.InvalidRegisterSpecSize;
+        }
+    }
+    for (slot_width_hints) |width| {
+        if (width == 0) return error.InvalidRegisterSpecSize;
+    }
+    return slot_width_hints;
 }
 
 fn validateCompiledLayerPlanForCuda(
@@ -895,6 +1019,7 @@ const BlockRuntime = struct {
                         allocator,
                         program,
                         .decode,
+                        .{ .size_floor = d_model },
                     );
                     try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .attention_mlp);
                     errdefer if (blocks[layer_idx].compiled_plan) |*compiled_plan| {
@@ -905,6 +1030,19 @@ const BlockRuntime = struct {
                         allocator,
                         &blocks[layer_idx].compiled_plan.?,
                     );
+                    errdefer if (blocks[layer_idx].register_to_slot_map.len != 0) {
+                        allocator.free(blocks[layer_idx].register_to_slot_map);
+                        blocks[layer_idx].register_to_slot_map = &.{};
+                    };
+                    blocks[layer_idx].slot_width_hints = try buildCudaLayerProgramSlotWidthHints(
+                        allocator,
+                        &blocks[layer_idx].compiled_plan.?,
+                        blocks[layer_idx].register_to_slot_map,
+                    );
+                    errdefer if (blocks[layer_idx].slot_width_hints.len != 0) {
+                        allocator.free(blocks[layer_idx].slot_width_hints);
+                        blocks[layer_idx].slot_width_hints = &.{};
+                    };
                     const state_flags = try runtime_contract.collectBuiltinStateFlags(&blocks[layer_idx].compiled_plan.?.plan);
                     if (state_flags.has_mamba or state_flags.has_shortconv) return error.InvalidStateDescriptorBinding;
                     if (!state_flags.has_kv) {
@@ -1246,6 +1384,7 @@ const BlockRuntime = struct {
                         allocator,
                         program,
                         .decode,
+                        .{ .size_floor = d_model },
                     );
                     try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .shortconv);
                     errdefer if (blocks[layer_idx].compiled_plan) |*compiled_plan| {
@@ -1256,6 +1395,19 @@ const BlockRuntime = struct {
                         allocator,
                         &blocks[layer_idx].compiled_plan.?,
                     );
+                    errdefer if (blocks[layer_idx].register_to_slot_map.len != 0) {
+                        allocator.free(blocks[layer_idx].register_to_slot_map);
+                        blocks[layer_idx].register_to_slot_map = &.{};
+                    };
+                    blocks[layer_idx].slot_width_hints = try buildCudaLayerProgramSlotWidthHints(
+                        allocator,
+                        &blocks[layer_idx].compiled_plan.?,
+                        blocks[layer_idx].register_to_slot_map,
+                    );
+                    errdefer if (blocks[layer_idx].slot_width_hints.len != 0) {
+                        allocator.free(blocks[layer_idx].slot_width_hints);
+                        blocks[layer_idx].slot_width_hints = &.{};
+                    };
                     const state_flags = try runtime_contract.collectBuiltinStateFlags(&blocks[layer_idx].compiled_plan.?.plan);
                     if (state_flags.has_kv or state_flags.has_mamba) return error.InvalidStateDescriptorBinding;
                     if (!state_flags.has_shortconv) {
@@ -1659,6 +1811,7 @@ pub const CudaBackend = struct {
     layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
     layer_program_slot_buffers: []compute.cuda.Buffer = &.{},
+    layer_program_slot_ptrs: []*compute.cuda.Buffer = &.{},
     argmax_index_dev: compute.cuda.Buffer,
 
     pub fn init(allocator: std.mem.Allocator, loaded: *LoadedModel) !CudaBackend {
@@ -1953,10 +2106,23 @@ pub const CudaBackend = struct {
         const required = self.layerProgramRequiredSlotCount();
         if (required == 0) {
             self.layer_program_slot_buffers = &.{};
+            self.layer_program_slot_ptrs = &.{};
             return;
         }
 
-        const bytes = std.math.mul(usize, self.d_model, @sizeOf(f32)) catch return error.InvalidArgument;
+        const slot_width_max = try self.allocator.alloc(usize, required);
+        defer self.allocator.free(slot_width_max);
+        @memset(slot_width_max, 0);
+        for (self.block_runtime.blocks) |layer| {
+            for (layer.slot_width_hints, 0..) |width, slot_idx| {
+                if (slot_idx >= slot_width_max.len) continue;
+                if (slot_width_max[slot_idx] == 0) {
+                    slot_width_max[slot_idx] = width;
+                } else if (width != 0 and slot_width_max[slot_idx] != width) {
+                    return error.InvalidRegisterSpecSize;
+                }
+            }
+        }
         self.layer_program_slot_buffers = try self.allocator.alloc(compute.cuda.Buffer, required);
         errdefer self.allocator.free(self.layer_program_slot_buffers);
 
@@ -1968,12 +2134,25 @@ pub const CudaBackend = struct {
         }
 
         for (0..required) |idx| {
+            const width = slot_width_max[idx];
+            if (width == 0) return error.InvalidRegisterSpecSize;
+            const bytes = std.math.mul(usize, width, @sizeOf(f32)) catch return error.InvalidArgument;
             self.layer_program_slot_buffers[idx] = try self.device.allocBuffer(bytes);
             initialized += 1;
+        }
+
+        // Pre-allocate pointer array for execution dispatch.
+        self.layer_program_slot_ptrs = try self.allocator.alloc(*compute.cuda.Buffer, required);
+        for (self.layer_program_slot_buffers, 0..) |*buf, idx| {
+            self.layer_program_slot_ptrs[idx] = buf;
         }
     }
 
     fn deinitLayerProgramSlotBuffers(self: *CudaBackend) void {
+        if (self.layer_program_slot_ptrs.len > 0) {
+            self.allocator.free(self.layer_program_slot_ptrs);
+            self.layer_program_slot_ptrs = &.{};
+        }
         if (self.layer_program_slot_buffers.len == 0) return;
         for (self.layer_program_slot_buffers) |*buf| {
             buf.deinit(&self.device);
@@ -2238,23 +2417,23 @@ pub const CudaBackend = struct {
 
         var image_token_positions: []usize = &.{};
         defer if (image_token_positions.len > 0) self.allocator.free(image_token_positions);
+        var deepstack_layer_features_opt: ?[]const []const f32 = null;
         if (encoded_vision_output.deepstack_layer_embeddings.len > 0) {
             image_token_positions = try collectTokenPositions(self.allocator, tokens, vi.image_token_id);
             if (image_token_positions.len == 0) return error.InvalidPromptImageTokens;
-
-            const expected_values = std.math.mul(usize, image_token_positions.len, self.d_model) catch return error.InvalidArgument;
-            for (encoded_vision_output.deepstack_layer_embeddings, 0..) |layer_features, layer_idx| {
-                if (layer_features.len != expected_values) {
-                    log.warn("inference", "CUDA vision deepstack shape mismatch", .{
-                        .slot_index = slot_index,
-                        .layer_index = layer_idx,
-                        .expected_values = expected_values,
-                        .actual_values = layer_features.len,
-                        .image_positions = image_token_positions.len,
-                        .d_model = self.d_model,
-                    });
-                    return error.InvalidArgument;
-                }
+            if (deepstackLayersCompatibleWithPrompt(
+                encoded_vision_output.deepstack_layer_embeddings,
+                image_token_positions.len,
+                self.d_model,
+            )) {
+                deepstack_layer_features_opt = encoded_vision_output.deepstack_layer_embeddings;
+            } else {
+                log.warn("inference", "CUDA vision deepstack disabled: incompatible layer feature shapes", .{
+                    .slot_index = slot_index,
+                    .deepstack_layers = encoded_vision_output.deepstack_layer_embeddings.len,
+                    .image_positions = image_token_positions.len,
+                    .d_model = self.d_model,
+                });
             }
         }
 
@@ -2267,29 +2446,48 @@ pub const CudaBackend = struct {
         const hidden_host = try self.allocator.alloc(f32, hidden_count);
         defer self.allocator.free(hidden_host);
 
-        try populatePrefillHiddenFromTokens(
+        populatePrefillHiddenFromTokens(
             self.loaded,
             tokens,
             self.d_model,
             hidden_host,
             vi.image_token_id,
-        );
-        try vision.scatterIntoHidden(
+        ) catch |err| {
+            log.warn("inference", "CUDA vision prefill hidden population failed", .{
+                .slot_index = slot_index,
+                .tokens = tokens.len,
+                .reason = @errorName(err),
+            });
+            return err;
+        };
+        vision.scatterIntoHidden(
             hidden_host,
             tokens.len,
             self.d_model,
             tokens,
             vi.image_token_id,
             encoded_vision_output.merged_embeddings,
-        );
+        ) catch |err| {
+            log.warn("inference", "CUDA vision scatter into hidden failed", .{
+                .slot_index = slot_index,
+                .tokens = tokens.len,
+                .reason = @errorName(err),
+                .merged_embeddings = encoded_vision_output.merged_embeddings.len,
+                .d_model = self.d_model,
+            });
+            return err;
+        };
 
         var i: usize = 0;
         while (i < tokens.len) : (i += 1) {
             const row_start = std.math.mul(usize, i, self.d_model) catch return error.InvalidArgument;
             const hidden_override = hidden_host[row_start .. row_start + self.d_model];
             const download_logits = self.shouldDownloadPrefillLogitsImpl(i, tokens.len);
-            const deepstack_feature_index = if (image_token_positions.len > 0) findPositionIndex(image_token_positions, i) else null;
-            try self.computeGpuPrototypeLogitsWithLayerLimit(
+            const deepstack_feature_index = if (deepstack_layer_features_opt != null and image_token_positions.len > 0)
+                findPositionIndex(image_token_positions, i)
+            else
+                null;
+            self.computeGpuPrototypeLogitsWithLayerLimit(
                 tokens[i],
                 i,
                 if (download_logits) self.slot_logits else null,
@@ -2298,9 +2496,19 @@ pub const CudaBackend = struct {
                 download_logits,
                 false,
                 hidden_override,
-                if (encoded_vision_output.deepstack_layer_embeddings.len > 0) encoded_vision_output.deepstack_layer_embeddings else null,
+                deepstack_layer_features_opt,
                 deepstack_feature_index,
-            );
+            ) catch |err| {
+                log.warn("inference", "CUDA vision token prefill step failed", .{
+                    .slot_index = slot_index,
+                    .token_index = i,
+                    .token_id = tokens[i],
+                    .reason = @errorName(err),
+                    .has_deepstack = @as(u8, @intFromBool(deepstack_layer_features_opt != null)),
+                    .deepstack_feature_index = if (deepstack_feature_index) |idx| idx else std.math.maxInt(usize),
+                });
+                return err;
+            };
         }
 
         const prefill_elapsed_ns: u64 = @intCast(std.time.nanoTimestamp() - prefill_start_ns);
@@ -2621,9 +2829,30 @@ pub const CudaBackend = struct {
                 if (deepstack_feature_index_opt) |deepstack_feature_index| {
                     if (layer_idx < deepstack_layer_features.len) {
                         const layer_features = deepstack_layer_features[layer_idx];
-                        const feature_rows = std.math.divExact(usize, layer_features.len, self.d_model) catch return error.InvalidArgument;
-                        if (deepstack_feature_index >= feature_rows) return error.InvalidArgument;
-                        const row_start = std.math.mul(usize, deepstack_feature_index, self.d_model) catch return error.InvalidArgument;
+                        const feature_rows = std.math.divExact(usize, layer_features.len, self.d_model) catch {
+                            log.warn("inference", "CUDA deepstack add skipped: incompatible layer feature stride", .{
+                                .layer_index = layer_idx,
+                                .feature_len = layer_features.len,
+                                .d_model = self.d_model,
+                            });
+                            continue;
+                        };
+                        if (deepstack_feature_index >= feature_rows) {
+                            log.warn("inference", "CUDA deepstack add skipped: feature row index out of range", .{
+                                .layer_index = layer_idx,
+                                .feature_index = deepstack_feature_index,
+                                .feature_rows = feature_rows,
+                            });
+                            continue;
+                        }
+                        const row_start = std.math.mul(usize, deepstack_feature_index, self.d_model) catch {
+                            log.warn("inference", "CUDA deepstack add skipped: row offset overflow", .{
+                                .layer_index = layer_idx,
+                                .feature_index = deepstack_feature_index,
+                                .d_model = self.d_model,
+                            });
+                            continue;
+                        };
                         const feature_row = layer_features[row_start .. row_start + self.d_model];
                         try self.prototype.deepstack_add_dev.upload(&self.device, std.mem.sliceAsBytes(feature_row));
                         try compute.cuda.vector_add.runWithFunction(
@@ -3310,10 +3539,11 @@ pub const CudaBackend = struct {
         rope_store_f16_function: ?compute.cuda.Function,
         shortconv_step_function: compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
-        register_to_slot_map: *const [64]u8,
+        register_to_slot_map: []const u8,
         slot_buffers: []*compute.cuda.Buffer,
+        instruction_handles: []runtime_contract.TensorHandle,
+        instruction_views: []runtime_contract.TensorViewDesc,
     };
-    const MAX_LAYER_PROGRAM_HANDLES: usize = 8;
 
     const BuiltLayerProgramHandles = struct {
         registers: []runtime_contract.TensorHandle,
@@ -3422,6 +3652,15 @@ pub const CudaBackend = struct {
         return weights;
     }
 
+    fn layerProgramInstructionHandleCapacity(plan: *const runtime_contract.ExecutionPlan) usize {
+        var max_handles: usize = 0;
+        for (plan.instructions) |insn| {
+            const handle_count = insn.inputs.len + insn.outputs.len + insn.weights.len;
+            if (handle_count > max_handles) max_handles = handle_count;
+        }
+        return max_handles;
+    }
+
     fn deviceTensorFromWeightHandle(handle: runtime_contract.TensorHandle) *const DeviceTensor {
         return @ptrCast(@alignCast(handle.ptr));
     }
@@ -3476,6 +3715,73 @@ pub const CudaBackend = struct {
         };
     }
 
+    const LayerProgramWeightResolverFn = *const fn (
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) anyerror!*anyopaque;
+
+    const layer_program_weight_resolver_table: [256]?LayerProgramWeightResolverFn = blk: {
+        var table = [_]?LayerProgramWeightResolverFn{null} ** 256;
+        table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = resolveLayerProgramNormWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = resolveLayerProgramAttentionWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.swiglu)] = resolveLayerProgramSwiGluWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.moe)] = resolveLayerProgramMoeWeightPtr;
+        table[@intFromEnum(opcode_map.Opcode.shortconv)] = resolveLayerProgramShortconvWeightPtr;
+        break :blk table;
+    };
+
+    fn resolveLayerProgramNormWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        if (!std.mem.eql(u8, slot_name, "norm_weight")) return error.InvalidWeightBindingName;
+        const weight = try ctx.layer.instructionNormWeightRef(ctx.op_index);
+        return @ptrCast(@constCast(weight));
+    }
+
+    fn resolveLayerProgramAttentionWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const binding = try ctx.layer.instructionAttentionRef(ctx.op_index);
+        if (std.mem.eql(u8, slot_name, "q_proj")) return @ptrCast(@constCast(&binding.q_proj));
+        if (std.mem.eql(u8, slot_name, "k_proj")) return @ptrCast(@constCast(&binding.k_proj));
+        if (std.mem.eql(u8, slot_name, "v_proj")) return @ptrCast(@constCast(&binding.v_proj));
+        if (std.mem.eql(u8, slot_name, "o_proj")) return @ptrCast(@constCast(&binding.o_proj));
+        return error.InvalidWeightBindingName;
+    }
+
+    fn resolveLayerProgramSwiGluWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const binding = try ctx.layer.instructionFfnRef(ctx.op_index);
+        if (std.mem.eql(u8, slot_name, "w1")) return @ptrCast(@constCast(binding.gate));
+        if (std.mem.eql(u8, slot_name, "w3")) return @ptrCast(@constCast(binding.up));
+        if (std.mem.eql(u8, slot_name, "w2")) return @ptrCast(@constCast(binding.down));
+        return error.InvalidWeightBindingName;
+    }
+
+    fn resolveLayerProgramMoeWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const binding = try ctx.layer.instructionFfnRef(ctx.op_index);
+        if (!std.mem.eql(u8, slot_name, "router")) return error.InvalidWeightBindingName;
+        return @ptrCast(@constCast(binding.gate));
+    }
+
+    fn resolveLayerProgramShortconvWeightPtr(
+        ctx: *LayerProgramExecutionContext,
+        slot_name: []const u8,
+    ) !*anyopaque {
+        const binding = try ctx.layer.instructionShortConvRef(ctx.op_index);
+        if (std.mem.eql(u8, slot_name, "in_proj")) return @ptrCast(@constCast(&binding.in_proj));
+        if (std.mem.eql(u8, slot_name, "conv_weight")) return @ptrCast(@constCast(&binding.conv_weight_time_major));
+        if (std.mem.eql(u8, slot_name, "out_proj")) return @ptrCast(@constCast(&binding.out_proj));
+        return error.InvalidWeightBindingName;
+    }
+
     fn layerProgramWeightHandlePtr(
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
@@ -3484,49 +3790,18 @@ pub const CudaBackend = struct {
         const compiled = ctx.layer.compiled_plan orelse return error.InvalidInstructionBinding;
         const binding_name = try runtime_contract.instructionWeightBindingName(&compiled, ctx.op_index, slot_idx);
         const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
-        return switch (insn.opcode) {
-            .rmsnorm => {
-                if (!std.mem.eql(u8, parsed.slot_name, "norm_weight")) return error.InvalidWeightBindingName;
-                const weight = try ctx.layer.instructionNormWeightRef(ctx.op_index);
-                return @ptrCast(@constCast(weight));
-            },
-            .multihead_attention => {
-                const binding = try ctx.layer.instructionAttentionRef(ctx.op_index);
-                if (std.mem.eql(u8, parsed.slot_name, "q_proj")) return @ptrCast(@constCast(&binding.q_proj));
-                if (std.mem.eql(u8, parsed.slot_name, "k_proj")) return @ptrCast(@constCast(&binding.k_proj));
-                if (std.mem.eql(u8, parsed.slot_name, "v_proj")) return @ptrCast(@constCast(&binding.v_proj));
-                if (std.mem.eql(u8, parsed.slot_name, "o_proj")) return @ptrCast(@constCast(&binding.o_proj));
-                return error.InvalidWeightBindingName;
-            },
-            .swiglu => {
-                const binding = try ctx.layer.instructionFfnRef(ctx.op_index);
-                if (std.mem.eql(u8, parsed.slot_name, "w1")) return @ptrCast(@constCast(binding.gate));
-                if (std.mem.eql(u8, parsed.slot_name, "w3")) return @ptrCast(@constCast(binding.up));
-                if (std.mem.eql(u8, parsed.slot_name, "w2")) return @ptrCast(@constCast(binding.down));
-                return error.InvalidWeightBindingName;
-            },
-            .moe => {
-                const binding = try ctx.layer.instructionFfnRef(ctx.op_index);
-                if (!std.mem.eql(u8, parsed.slot_name, "router")) return error.InvalidWeightBindingName;
-                return @ptrCast(@constCast(binding.gate));
-            },
-            .shortconv => {
-                const binding = try ctx.layer.instructionShortConvRef(ctx.op_index);
-                if (std.mem.eql(u8, parsed.slot_name, "in_proj")) return @ptrCast(@constCast(&binding.in_proj));
-                if (std.mem.eql(u8, parsed.slot_name, "conv_weight")) return @ptrCast(@constCast(&binding.conv_weight_time_major));
-                if (std.mem.eql(u8, parsed.slot_name, "out_proj")) return @ptrCast(@constCast(&binding.out_proj));
-                return error.InvalidWeightBindingName;
-            },
-            else => error.InvalidInstructionBinding,
+        const resolver = layer_program_weight_resolver_table[@intFromEnum(insn.opcode)] orelse {
+            return error.InvalidInstructionBinding;
         };
+        return resolver(ctx, parsed.slot_name);
     }
 
     fn buildLayerProgramInstructionHandles(
         self: *CudaBackend,
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
-        handle_storage: *[MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorHandle,
-        view_storage: *[MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorViewDesc,
+        handle_storage: []runtime_contract.TensorHandle,
+        view_storage: []runtime_contract.TensorViewDesc,
     ) !BuiltLayerProgramHandles {
         var handle_count: usize = 0;
         var view_count: usize = 0;
@@ -3576,7 +3851,9 @@ pub const CudaBackend = struct {
     fn recordLayerProgramDispatch(self: *CudaBackend, opcode: opcode_map.Opcode) void {
         const opcode_idx = @intFromEnum(opcode);
         self.layer_program_dispatch_total[opcode_idx] +%= 1;
-        self.runtime_dispatch_counters.record(opcode);
+        if (enable_dispatch_observability) {
+            self.runtime_dispatch_counters.record(opcode);
+        }
     }
 
     fn prefillDispatchDelta(self: *const CudaBackend, opcode: opcode_map.Opcode) u64 {
@@ -3590,41 +3867,6 @@ pub const CudaBackend = struct {
             total += self.layer_program_dispatch_total[idx] - self.prefill_dispatch_window_start[idx];
         }
         return total;
-    }
-
-    fn selectKernelOutputBuffer(
-        self: *CudaBackend,
-        ctx: *const LayerProgramExecutionContext,
-        out_id: layer_ops.BufferId,
-        branch_output_default: *compute.cuda.Buffer,
-    ) !*compute.cuda.Buffer {
-        return switch (out_id) {
-            .norm_out => &self.prototype.norm_out_dev,
-            .branch_out => branch_output_default,
-            .residual => error.UnsupportedModel,
-            else => blk: {
-                const register_idx = @intFromEnum(out_id);
-                if (register_idx >= ctx.register_to_slot_map.len) return error.UnsupportedModel;
-                const slot_idx = ctx.register_to_slot_map[register_idx];
-                if (slot_idx == BlockRuntimeLayer.invalid_slot or slot_idx >= ctx.slot_buffers.len) {
-                    return error.UnsupportedModel;
-                }
-                break :blk ctx.slot_buffers[slot_idx];
-            },
-        };
-    }
-
-    fn updateProgramOutputBinding(
-        ctx: *LayerProgramExecutionContext,
-        out_id: layer_ops.BufferId,
-        output: *compute.cuda.Buffer,
-    ) !void {
-        if (out_id == .residual) return error.UnsupportedModel;
-        const register_idx = @intFromEnum(out_id);
-        if (register_idx >= ctx.register_to_slot_map.len) return error.UnsupportedModel;
-        const slot_idx = ctx.register_to_slot_map[register_idx];
-        if (slot_idx == BlockRuntimeLayer.invalid_slot or slot_idx >= ctx.slot_buffers.len) return error.UnsupportedModel;
-        ctx.slot_buffers[slot_idx] = output;
     }
 
     fn layerProgramNormAdapter(
@@ -3641,7 +3883,7 @@ pub const CudaBackend = struct {
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
         const weight = deviceTensorFromWeightHandle(weight_handles[0]);
-        try compute.cuda.rmsnorm.runWithFunction(
+        compute.cuda.rmsnorm.runWithFunction(
             &self.kernel_arg_pack,
             &self.device,
             self.rmsnorm_function orelse return error.CudaKernelUnavailable,
@@ -3652,7 +3894,24 @@ pub const CudaBackend = struct {
             ctx.d_model_u32,
             self.norm_eps,
             self.loaded.runtime.weight_offset,
-        );
+        ) catch |err| {
+            if (err == error.InvalidArgument) {
+                const expected_io_bytes = std.math.mul(usize, @as(usize, 1), @as(usize, ctx.d_model_u32) * @sizeOf(f32)) catch 0;
+                const expected_weight_bytes = std.math.mul(usize, @as(usize, ctx.d_model_u32), @sizeOf(f32)) catch 0;
+                log.warn("inference", "CUDA rmsnorm adapter invalid args", .{
+                    .layer_index = ctx.layer_index,
+                    .op_index = ctx.op_index,
+                    .input_bytes = input.size,
+                    .output_bytes = output.size,
+                    .weight_bytes = weight.buffer.size,
+                    .expected_io_bytes = expected_io_bytes,
+                    .expected_weight_bytes = expected_weight_bytes,
+                    .d_model = ctx.d_model_u32,
+                    .seq_len = ctx.seq_len_u32,
+                });
+            }
+            return err;
+        };
     }
 
     fn layerProgramAttentionAdapter(
@@ -3870,7 +4129,7 @@ pub const CudaBackend = struct {
             .active_slots = active_slots[0..],
             .sequence_lengths = seq_lengths[0..],
             .batch_size = 1,
-            .dispatch_counters = &self.runtime_dispatch_counters,
+            .dispatch_counters = if (enable_dispatch_observability) &self.runtime_dispatch_counters else null,
             .stream_or_queue = null,
             .workspace = .{ .any = @ptrCast(ctx) },
         };
@@ -3878,9 +4137,12 @@ pub const CudaBackend = struct {
             layer_program_adapter_capabilities[@intFromEnum(insn.opcode)],
             rt_ctx.batch_size,
         );
-        var handle_storage: [MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorHandle = undefined;
-        var view_storage: [MAX_LAYER_PROGRAM_HANDLES]runtime_contract.TensorViewDesc = undefined;
-        const built_handles = try self.buildLayerProgramInstructionHandles(insn, ctx, &handle_storage, &view_storage);
+        const built_handles = try self.buildLayerProgramInstructionHandles(
+            insn,
+            ctx,
+            ctx.instruction_handles,
+            ctx.instruction_views,
+        );
         var param_storage: [1]runtime_contract.ParamBlock = undefined;
         const params = try instructionParams(insn, &ctx.layer.compiled_plan.?, &param_storage);
         var state_blocks = try layerProgramStateBlocksForInstruction(insn, ctx);
@@ -3932,10 +4194,11 @@ pub const CudaBackend = struct {
             break :blk required;
         };
         if (required_slot_count > self.layer_program_slot_buffers.len) return error.UnsupportedModel;
-        var slot_buffer_ptrs: [64]*compute.cuda.Buffer = undefined;
-        for (self.layer_program_slot_buffers, 0..) |*buf, idx| {
-            slot_buffer_ptrs[idx] = buf;
-        }
+        const handle_capacity = layerProgramInstructionHandleCapacity(&compiled_plan.plan);
+        const instruction_handles = try self.allocator.alloc(runtime_contract.TensorHandle, handle_capacity);
+        defer if (instruction_handles.len > 0) self.allocator.free(instruction_handles);
+        const instruction_views = try self.allocator.alloc(runtime_contract.TensorViewDesc, handle_capacity);
+        defer if (instruction_views.len > 0) self.allocator.free(instruction_views);
         var exec_ctx = LayerProgramExecutionContext{
             .backend = self,
             .layer = layer,
@@ -3958,13 +4221,25 @@ pub const CudaBackend = struct {
             .rope_store_f16_function = rope_store_f16_function,
             .shortconv_step_function = shortconv_step_function,
             .attention_kernels = attention_kernels,
-            .register_to_slot_map = &layer.register_to_slot_map,
-            .slot_buffers = slot_buffer_ptrs[0..required_slot_count],
+            .register_to_slot_map = layer.register_to_slot_map,
+            .slot_buffers = self.layer_program_slot_ptrs[0..required_slot_count],
+            .instruction_handles = instruction_handles,
+            .instruction_views = instruction_views,
         };
 
         for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
             exec_ctx.op_index = op_index;
-            try self.dispatchLayerProgramInstruction(&insn, &exec_ctx);
+            self.dispatchLayerProgramInstruction(&insn, &exec_ctx) catch |err| {
+                log.warn("inference", "CUDA layer program instruction failed", .{
+                    .layer_index = layer_index,
+                    .op_index = op_index,
+                    .opcode = @tagName(insn.opcode),
+                    .seq_len = seq_len_u32,
+                    .position = position,
+                    .reason = @errorName(err),
+                });
+                return err;
+            };
         }
 
         const final_register = runtime_contract.planFinalOutputRegister(&compiled_plan.plan);
@@ -4719,6 +4994,21 @@ fn logPrefillTiming(self: *const CudaBackend, mode: []const u8, token_count: usi
         .attention_blocks = self.block_runtime.attention_block_count,
         .shortconv_blocks = self.block_runtime.shortconv_block_count,
     });
+}
+
+fn deepstackLayersCompatibleWithPrompt(
+    layers: []const []const f32,
+    image_positions: usize,
+    d_model: usize,
+) bool {
+    if (d_model == 0) return false;
+    for (layers) |layer_features| {
+        if (layer_features.len == 0) return false;
+        if (layer_features.len % d_model != 0) return false;
+        const feature_rows = layer_features.len / d_model;
+        if (feature_rows < image_positions) return false;
+    }
+    return true;
 }
 
 fn collectTokenPositions(
@@ -6049,6 +6339,7 @@ test "buildCudaLayerProgramRegisterSlotMap reuses temp slots from liveness" {
             .{ .size = 1, .@"align" = 4 },
             .{ .size = 1, .@"align" = 4 },
         },
+
         .liveness = .{
             .register_last_read = &.{ 0, 1, 2, 2 },
             .kill_after_instruction = &.{ kill0[0..], kill1[0..], kill2[0..] },
@@ -6058,6 +6349,7 @@ test "buildCudaLayerProgramRegisterSlotMap reuses temp slots from liveness" {
     };
 
     const map = try buildCudaLayerProgramRegisterSlotMap(std.testing.allocator, &compiled);
+    defer std.testing.allocator.free(map);
     try std.testing.expect(map[1] < 2);
     try std.testing.expect(map[2] < 2);
     try std.testing.expect(map[3] < 2);
@@ -6512,6 +6804,32 @@ test "findPositionIndex locates mapped image feature index" {
     try std.testing.expectEqual(@as(?usize, null), findPositionIndex(positions[0..], 7));
 }
 
+test "deepstackLayersCompatibleWithPrompt accepts compatible layers" {
+    const d_model: usize = 4;
+    const image_positions: usize = 2;
+    const layer0 = [_]f32{0} ** (2 * 4);
+    const layer1 = [_]f32{0} ** (3 * 4);
+    const layers = [_][]const f32{ layer0[0..], layer1[0..] };
+    try std.testing.expect(deepstackLayersCompatibleWithPrompt(layers[0..], image_positions, d_model));
+}
+
+test "deepstackLayersCompatibleWithPrompt rejects malformed layers" {
+    const d_model: usize = 4;
+    const image_positions: usize = 2;
+    const too_few_rows = [_]f32{0} ** (1 * 4);
+    const bad_stride = [_]f32{0} ** 7;
+    const valid = [_]f32{0} ** (2 * 4);
+
+    const layers_few = [_][]const f32{ too_few_rows[0..] };
+    try std.testing.expect(!deepstackLayersCompatibleWithPrompt(layers_few[0..], image_positions, d_model));
+
+    const layers_stride = [_][]const f32{ bad_stride[0..] };
+    try std.testing.expect(!deepstackLayersCompatibleWithPrompt(layers_stride[0..], image_positions, d_model));
+
+    const layers_zero_dim = [_][]const f32{ valid[0..] };
+    try std.testing.expect(!deepstackLayersCompatibleWithPrompt(layers_zero_dim[0..], image_positions, 0));
+}
+
 test "materializeDenseOutInU16 handles out-in and in-out source layouts" {
     var out_in_data = [_]u16{
         1,  2,  3,
@@ -6618,7 +6936,7 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds per-op runtime refs" {
         .{ .kernel = .{ .id = 3, .in = .tmp3, .out = .branch_out, .debug_type = .mlp } },
         .{ .kernel = .{ .id = 4, .in = .residual, .out = .norm_out, .debug_type = .norm } },
     };
-    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode);
+    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode, .{});
 
     try layer.rebuildInstructionRefs(std.testing.allocator);
 
@@ -6645,7 +6963,7 @@ test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound nor
     const ops = [_]layer_ops.LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
     };
-    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode);
+    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode, .{});
 
     try std.testing.expectError(error.UnsupportedModel, layer.rebuildInstructionRefs(std.testing.allocator));
 }

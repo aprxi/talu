@@ -13,6 +13,10 @@ pub const Opcode = opcode_mod.Opcode;
 
 pub const RegisterRef = enum(u16) { _ };
 
+/// Maximum register index a compiled plan may reference. Backends use this
+/// for stack-local execution arrays; stored lookup maps are dynamically sized.
+pub const max_register_count: u16 = 256;
+
 pub fn registerFromIndex(index: u16) RegisterRef {
     return @enumFromInt(index);
 }
@@ -170,18 +174,32 @@ pub const CompiledPlan = struct {
     param_blocks: []const ParamBlock,
     weight_bindings: []const WeightBinding = &.{},
     register_buffer_specs: []const PhysicalBufferSpec = &.{},
-    /// Maps register index → legacy BufferId value. Populated by the compiler
-    /// during allocation-order register assignment. Backends use this to resolve
-    /// which physical buffer a register represents (e.g., residual vs scratch).
-    register_to_buffer_id: []const u8 = &.{},
     liveness: LivenessMap,
     peak_registers: u16,
     diagnostics: []const PlanDiagnostic,
 };
 
+pub const RegisterLayout = enum(u8) {
+    contiguous = 0,
+};
+
 pub const PhysicalBufferSpec = struct {
     size: usize,
     @"align": u16,
+    dtype: dtype.DType = .f32,
+    layout: RegisterLayout = .contiguous,
+};
+
+/// Unified plan container for all model stages (ADR A6).
+/// Vision-capable models populate vision_encode + scatter.
+/// Decoder plans are populated per-block; the top-level fields here serve
+/// as the lifecycle anchor and will be wired through scheduler integration
+/// (Phase 4).
+pub const ModelPlans = struct {
+    vision_encode: ?CompiledPlan = null,
+    scatter: ?CompiledPlan = null,
+    decoder_prefill: ?CompiledPlan = null,
+    decoder_decode: ?CompiledPlan = null,
 };
 
 pub const PhysicalMapping = struct {
@@ -745,14 +763,6 @@ fn opcodeMatchesLayerOp(opcode: Opcode, op: layer_ops.LayerOp) bool {
     return opcode == .mla_attention and actual == .multihead_attention;
 }
 
-fn encodeBufferId(id: layer_ops.BufferId) u8 {
-    return @intCast(@intFromEnum(id));
-}
-
-fn decodeBufferId(raw: u8) !layer_ops.BufferId {
-    if (raw > @intFromEnum(layer_ops.BufferId.tmp63)) return error.InvalidParamBlockABI;
-    return @enumFromInt(raw);
-}
 
 const ParamEncoder = struct {
     bytes: std.ArrayListUnmanaged(u8) = .{},
@@ -907,62 +917,65 @@ pub const ParamDecoder = struct {
 
 pub const ResidualAddParam = packed struct {
     param_kind: u8,
-    branch_buffer_id: u8,
     scale_tag: u8,
     scale_literal: u32,
 };
 
 pub const ScalarOpParam = packed struct {
     param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
     scalar: u32,
 };
 
 pub const AddParamScalarParam = packed struct {
     param_kind: u8,
-    out_buffer_id: u8,
     scalar: u32,
 };
 
 pub const MeanOpParam = packed struct {
     param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
     dim: i8,
     keepdim: u8,
 };
 
 pub const TransposeOpParam = packed struct {
     param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
     dim0: i8,
     dim1: i8,
 };
 
 pub const TriuOpParam = packed struct {
     param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
     diagonal: i32,
 };
 
 pub const SdpaOpParam = packed struct {
     param_kind: u8,
-    q_buffer_id: u8,
-    k_buffer_id: u8,
-    v_buffer_id: u8,
-    out_buffer_id: u8,
     is_causal: u8,
     has_scale: u8,
 };
 
 pub const ReshapeOpParam = packed struct {
     param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
     count: u16,
+};
+
+pub const PatchEmbedParam = packed struct {
+    param_kind: u8,
+};
+
+pub const SpatialMergeParam = packed struct {
+    param_kind: u8,
+    merge_size: u32,
+};
+
+pub const DeepstackExtractParam = packed struct {
+    param_kind: u8,
+    layer_index: u32,
+};
+
+pub const ScatterParam = packed struct {
+    param_kind: u8,
+    image_token_id: u32,
 };
 
 /// Cast raw `ParamBlock.data` to an ABI-stable packed param struct.
@@ -996,12 +1009,9 @@ pub fn encodeLayerOpParam(
     switch (op) {
         .kernel => |kernel_op| {
             try enc.writeU32(allocator, kernel_op.id);
-            try enc.writeU8(allocator, encodeBufferId(kernel_op.in));
-            try enc.writeU8(allocator, encodeBufferId(kernel_op.out));
             try enc.writeU8(allocator, @intFromEnum(kernel_op.debug_type));
         },
         .add => |add_op| {
-            try enc.writeU8(allocator, encodeBufferId(add_op.branch));
             switch (add_op.scale) {
                 .one => {
                     try enc.writeU8(allocator, 0);
@@ -1017,19 +1027,10 @@ pub fn encodeLayerOpParam(
                 },
             }
         },
-        .linear => |linear_op| {
-            try enc.writeU8(allocator, encodeBufferId(linear_op.in));
-            try enc.writeU8(allocator, encodeBufferId(linear_op.out));
-        },
-        .matmul => |matmul_op| {
-            try enc.writeU8(allocator, encodeBufferId(matmul_op.in_a));
-            try enc.writeU8(allocator, encodeBufferId(matmul_op.in_b));
-            try enc.writeU8(allocator, encodeBufferId(matmul_op.out));
-        },
+        .linear => {},
+        .matmul => {},
         .split => |split_op| {
             const count: u16 = std.math.cast(u16, split_op.split_sizes.len) orelse return error.InvalidParamBlockABI;
-            try enc.writeU8(allocator, encodeBufferId(split_op.in));
-            try enc.writeU8(allocator, encodeBufferId(split_op.out_start));
             try enc.writeU8(allocator, split_op.num_outputs);
             try enc.writeI8(allocator, split_op.dim);
             try enc.writeU16(allocator, count);
@@ -1041,69 +1042,33 @@ pub fn encodeLayerOpParam(
             }
         },
         .softmax => |softmax_op| {
-            try enc.writeU8(allocator, encodeBufferId(softmax_op.in));
-            try enc.writeU8(allocator, encodeBufferId(softmax_op.out));
             try enc.writeI8(allocator, softmax_op.dim);
         },
-        .silu => |silu_op| {
-            try enc.writeU8(allocator, encodeBufferId(silu_op.in));
-            try enc.writeU8(allocator, encodeBufferId(silu_op.out));
-        },
-        .gelu => |gelu_op| {
-            try enc.writeU8(allocator, encodeBufferId(gelu_op.in));
-            try enc.writeU8(allocator, encodeBufferId(gelu_op.out));
-        },
-        .mul => |mul_op| {
-            try enc.writeU8(allocator, encodeBufferId(mul_op.in));
-            try enc.writeU8(allocator, encodeBufferId(mul_op.other));
-            try enc.writeU8(allocator, encodeBufferId(mul_op.out));
-        },
-        .add_tensor => |add_tensor_op| {
-            try enc.writeU8(allocator, encodeBufferId(add_tensor_op.in_a));
-            try enc.writeU8(allocator, encodeBufferId(add_tensor_op.in_b));
-            try enc.writeU8(allocator, encodeBufferId(add_tensor_op.out));
-        },
+        .silu => {},
+        .gelu => {},
+        .mul => {},
+        .add_tensor => {},
         .add_scalar => |add_scalar_op| {
-            try enc.writeU8(allocator, encodeBufferId(add_scalar_op.in));
-            try enc.writeU8(allocator, encodeBufferId(add_scalar_op.out));
             try enc.writeF32(allocator, add_scalar_op.scalar);
         },
         .mul_scalar => |mul_scalar_op| {
-            try enc.writeU8(allocator, encodeBufferId(mul_scalar_op.in));
-            try enc.writeU8(allocator, encodeBufferId(mul_scalar_op.out));
             try enc.writeF32(allocator, mul_scalar_op.scalar);
         },
         .mean => |mean_op| {
-            try enc.writeU8(allocator, encodeBufferId(mean_op.in));
-            try enc.writeU8(allocator, encodeBufferId(mean_op.out));
             try enc.writeI8(allocator, mean_op.dim);
             try enc.writeBool(allocator, mean_op.keepdim);
         },
         .pow => |pow_op| {
-            try enc.writeU8(allocator, encodeBufferId(pow_op.in));
-            try enc.writeU8(allocator, encodeBufferId(pow_op.out));
             try enc.writeF32(allocator, pow_op.exponent);
         },
-        .rsqrt => |rsqrt_op| {
-            try enc.writeU8(allocator, encodeBufferId(rsqrt_op.in));
-            try enc.writeU8(allocator, encodeBufferId(rsqrt_op.out));
-        },
-        .add_param => |add_param_op| {
-            try enc.writeU8(allocator, encodeBufferId(add_param_op.in));
-            try enc.writeU8(allocator, encodeBufferId(add_param_op.out));
-        },
+        .rsqrt => {},
+        .add_param => {},
         .add_param_scalar => |add_param_scalar_op| {
-            try enc.writeU8(allocator, encodeBufferId(add_param_scalar_op.out));
             try enc.writeF32(allocator, add_param_scalar_op.scalar);
         },
-        .mul_param => |mul_param_op| {
-            try enc.writeU8(allocator, encodeBufferId(mul_param_op.in));
-            try enc.writeU8(allocator, encodeBufferId(mul_param_op.out));
-        },
+        .mul_param => {},
         .reshape => |reshape_op| {
             const count: u16 = std.math.cast(u16, reshape_op.shape.len) orelse return error.InvalidParamBlockABI;
-            try enc.writeU8(allocator, encodeBufferId(reshape_op.in));
-            try enc.writeU8(allocator, encodeBufferId(reshape_op.out));
             try enc.writeU16(allocator, count);
             if (count != 0) {
                 try enc.alignTo(allocator, @alignOf(i32));
@@ -1113,47 +1078,26 @@ pub fn encodeLayerOpParam(
             }
         },
         .transpose => |transpose_op| {
-            try enc.writeU8(allocator, encodeBufferId(transpose_op.in));
-            try enc.writeU8(allocator, encodeBufferId(transpose_op.out));
             try enc.writeI8(allocator, transpose_op.dim0);
             try enc.writeI8(allocator, transpose_op.dim1);
         },
-        .rope => |rope_op| {
-            try enc.writeU8(allocator, encodeBufferId(rope_op.in));
-            try enc.writeU8(allocator, encodeBufferId(rope_op.out));
-        },
+        .rope => {},
         .triu => |triu_op| {
-            try enc.writeU8(allocator, encodeBufferId(triu_op.in));
-            try enc.writeU8(allocator, encodeBufferId(triu_op.out));
             try enc.writeI32(allocator, triu_op.diagonal);
         },
         .sdpa => |sdpa_op| {
-            try enc.writeU8(allocator, encodeBufferId(sdpa_op.q));
-            try enc.writeU8(allocator, encodeBufferId(sdpa_op.k));
-            try enc.writeU8(allocator, encodeBufferId(sdpa_op.v));
-            try enc.writeU8(allocator, encodeBufferId(sdpa_op.out));
             try enc.writeBool(allocator, sdpa_op.is_causal);
             try enc.writeBool(allocator, sdpa_op.scale != null);
             if (sdpa_op.scale) |scale| try enc.writeF32(allocator, scale);
         },
-        .patch_embed => |patch_op| {
-            try enc.writeU8(allocator, encodeBufferId(patch_op.in));
-            try enc.writeU8(allocator, encodeBufferId(patch_op.out));
-        },
+        .patch_embed => {},
         .spatial_merge => |spatial_op| {
-            try enc.writeU8(allocator, encodeBufferId(spatial_op.in));
-            try enc.writeU8(allocator, encodeBufferId(spatial_op.out));
             try enc.writeU32(allocator, spatial_op.merge_size);
         },
         .deepstack_extract => |deepstack_op| {
-            try enc.writeU8(allocator, encodeBufferId(deepstack_op.in));
-            try enc.writeU8(allocator, encodeBufferId(deepstack_op.out));
             try enc.writeU32(allocator, deepstack_op.layer_index);
         },
         .scatter => |scatter_op| {
-            try enc.writeU8(allocator, encodeBufferId(scatter_op.text_in));
-            try enc.writeU8(allocator, encodeBufferId(scatter_op.vision_in));
-            try enc.writeU8(allocator, encodeBufferId(scatter_op.out));
             try enc.writeU32(allocator, scatter_op.image_token_id);
         },
     }
@@ -1173,20 +1117,17 @@ fn decodeLayerOpFromParam(opcode: Opcode, data: []const u8) !layer_ops.LayerOp {
         .kernel => blk: {
             const debug_type = try expectedKernelDebugTypeForOpcode(opcode);
             const id = try dec.readU32();
-            const in = try decodeBufferId(try dec.readU8());
-            const out = try decodeBufferId(try dec.readU8());
             const debug_type_raw = try dec.readU8();
             const stored_debug_type: op_types.OpType = std.meta.intToEnum(op_types.OpType, debug_type_raw) catch return error.InvalidParamBlockABI;
             if (stored_debug_type != debug_type) return error.ParamBlockOpcodeMismatch;
             break :blk .{ .kernel = .{
                 .id = id,
-                .in = in,
-                .out = out,
+                .in = .residual,
+                .out = .residual,
                 .debug_type = debug_type,
             } };
         },
         .add => blk: {
-            const branch = try decodeBufferId(try dec.readU8());
             const scale_tag = try dec.readU8();
             const literal = try dec.readF32();
             const scale: layer_ops.ResidualScale = switch (scale_tag) {
@@ -1196,23 +1137,21 @@ fn decodeLayerOpFromParam(opcode: Opcode, data: []const u8) !layer_ops.LayerOp {
                 else => return error.InvalidParamBlockABI,
             };
             break :blk .{ .add = .{
-                .branch = branch,
+                .branch = .residual,
                 .scale = scale,
             } };
         },
         .linear => .{ .linear = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .weight_name = &.{},
         } },
         .matmul => .{ .matmul = .{
-            .in_a = try decodeBufferId(try dec.readU8()),
-            .in_b = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in_a = .residual,
+            .in_b = .residual,
+            .out = .residual,
         } },
         .split => blk: {
-            const in = try decodeBufferId(try dec.readU8());
-            const out_start = try decodeBufferId(try dec.readU8());
             const num_outputs = try dec.readU8();
             const dim = try dec.readI8();
             const count = try dec.readU16();
@@ -1225,79 +1164,77 @@ fn decodeLayerOpFromParam(opcode: Opcode, data: []const u8) !layer_ops.LayerOp {
                 split_sizes = ptr[0..@as(usize, count)];
             }
             break :blk .{ .split = .{
-                .in = in,
-                .out_start = out_start,
+                .in = .residual,
+                .out_start = .residual,
                 .num_outputs = num_outputs,
                 .dim = dim,
                 .split_sizes = split_sizes,
             } };
         },
         .softmax => .{ .softmax = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .dim = try dec.readI8(),
         } },
         .silu => .{ .silu = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
         } },
         .gelu => .{ .gelu = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
         } },
         .mul => .{ .mul = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .other = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .other = .residual,
+            .out = .residual,
         } },
         .add_tensor => .{ .add_tensor = .{
-            .in_a = try decodeBufferId(try dec.readU8()),
-            .in_b = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in_a = .residual,
+            .in_b = .residual,
+            .out = .residual,
         } },
         .add_scalar => .{ .add_scalar = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .scalar = try dec.readF32(),
         } },
         .mul_scalar => .{ .mul_scalar = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .scalar = try dec.readF32(),
         } },
         .mean => .{ .mean = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .dim = try dec.readI8(),
             .keepdim = try dec.readBool(),
         } },
         .pow => .{ .pow = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .exponent = try dec.readF32(),
         } },
         .rsqrt => .{ .rsqrt = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
         } },
         .add_param => .{ .add_param = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .param_name = &.{},
         } },
         .add_param_scalar => .{ .add_param_scalar = .{
-            .out = try decodeBufferId(try dec.readU8()),
+            .out = .residual,
             .param_name = &.{},
             .scalar = try dec.readF32(),
         } },
         .mul_param => .{ .mul_param = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .param_name = &.{},
         } },
         .reshape => blk: {
-            const in = try decodeBufferId(try dec.readU8());
-            const out = try decodeBufferId(try dec.readU8());
             const count = try dec.readU16();
             var shape: []const i32 = &.{};
             if (count != 0) {
@@ -1308,60 +1245,56 @@ fn decodeLayerOpFromParam(opcode: Opcode, data: []const u8) !layer_ops.LayerOp {
                 shape = ptr[0..@as(usize, count)];
             }
             break :blk .{ .reshape = .{
-                .in = in,
-                .out = out,
+                .in = .residual,
+                .out = .residual,
                 .shape = shape,
             } };
         },
         .transpose => .{ .transpose = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .dim0 = try dec.readI8(),
             .dim1 = try dec.readI8(),
         } },
         .rope => .{ .rope = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
         } },
         .triu => .{ .triu = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .diagonal = try dec.readI32(),
         } },
         .sdpa => blk: {
-            const q = try decodeBufferId(try dec.readU8());
-            const k = try decodeBufferId(try dec.readU8());
-            const v = try decodeBufferId(try dec.readU8());
-            const out = try decodeBufferId(try dec.readU8());
             const is_causal = try dec.readBool();
             const has_scale = try dec.readBool();
             break :blk .{ .sdpa = .{
-                .q = q,
-                .k = k,
-                .v = v,
-                .out = out,
+                .q = .residual,
+                .k = .residual,
+                .v = .residual,
+                .out = .residual,
                 .is_causal = is_causal,
                 .scale = if (has_scale) try dec.readF32() else null,
             } };
         },
         .patch_embed => .{ .patch_embed = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
         } },
         .spatial_merge => .{ .spatial_merge = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .merge_size = try dec.readU32(),
         } },
         .deepstack_extract => .{ .deepstack_extract = .{
-            .in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .in = .residual,
+            .out = .residual,
             .layer_index = try dec.readU32(),
         } },
         .scatter => .{ .scatter = .{
-            .text_in = try decodeBufferId(try dec.readU8()),
-            .vision_in = try decodeBufferId(try dec.readU8()),
-            .out = try decodeBufferId(try dec.readU8()),
+            .text_in = .residual,
+            .vision_in = .residual,
+            .out = .residual,
             .image_token_id = try dec.readU32(),
         } },
     };
@@ -1633,7 +1566,7 @@ pub fn validateCompiledPlan(compiled: *const CompiledPlan) !void {
         if (spec.size == 0) return error.InvalidRegisterSpecSize;
         if (spec.@"align" == 0) return error.InvalidStateAlignment;
     }
-    if (compiled.register_to_buffer_id.len != 0 and compiled.register_to_buffer_id.len != compiled.plan.register_count) {
+    if (compiled.plan.register_count > max_register_count) {
         return error.InvalidRegisterSpecCount;
     }
     if (compiled.liveness.kill_after_instruction.len != compiled.plan.instructions.len) {
@@ -1773,6 +1706,7 @@ test "validateCompiledPlan rejects invalid param block ABI" {
             .{ .size = 1, .@"align" = 64 },
             .{ .size = 1, .@"align" = 64 },
         },
+
         .liveness = .{
             .register_last_read = &.{ 0, 0 },
             .kill_after_instruction = &.{&.{0}},
@@ -2155,6 +2089,7 @@ test "validateCompiledPlan enforces liveness dimensions" {
             .{ .size = 1, .@"align" = 64 },
             .{ .size = 1, .@"align" = 64 },
         },
+
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
@@ -2188,6 +2123,7 @@ test "validateCompiledPlan rejects out-of-range instruction weight refs" {
             .{ .size = 1, .@"align" = 64 },
             .{ .size = 1, .@"align" = 64 },
         },
+
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
@@ -2221,6 +2157,7 @@ test "validateCompiledPlan rejects invalid instruction weight ref count for opco
             .{ .size = 1, .@"align" = 64 },
             .{ .size = 1, .@"align" = 64 },
         },
+
         .liveness = liveness,
         .peak_registers = 2,
         .diagnostics = &.{},
@@ -2557,7 +2494,10 @@ test "decodeInstructionLayerOp returns decoded layer op when abi is valid" {
         .param_blocks = param_blocks[0..],
     };
     const decoded = try decodeInstructionLayerOp(&compiled, &compiled.plan.instructions[0], 0);
-    try std.testing.expect(std.meta.eql(op, decoded));
+    switch (decoded) {
+        .add => |decoded_add| try std.testing.expect(std.meta.eql(op.add.scale, decoded_add.scale)),
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "encodeLayerOpParam strips runtime param names for bound primitive ops" {
@@ -2576,8 +2516,6 @@ test "encodeLayerOpParam strips runtime param names for bound primitive ops" {
     switch (decoded) {
         .add_param => |decoded_op| {
             try std.testing.expectEqual(@as(usize, 0), decoded_op.param_name.len);
-            try std.testing.expectEqual(layer_ops.BufferId.tmp3, decoded_op.in);
-            try std.testing.expectEqual(layer_ops.BufferId.tmp4, decoded_op.out);
         },
         else => return error.TestUnexpectedResult,
     }
@@ -2601,8 +2539,6 @@ test "encodeLayerOpParam round-trips split metadata including explicit split siz
     const decoded = try decodeLayerOpFromParam(opcode, param_block.data);
     switch (decoded) {
         .split => |decoded_op| {
-            try std.testing.expectEqual(layer_ops.BufferId.tmp10, decoded_op.in);
-            try std.testing.expectEqual(layer_ops.BufferId.tmp11, decoded_op.out_start);
             try std.testing.expectEqual(@as(u8, 3), decoded_op.num_outputs);
             try std.testing.expectEqual(@as(i8, 1), decoded_op.dim);
             try std.testing.expectEqualSlices(usize, split_sizes[0..], decoded_op.split_sizes);
@@ -2751,8 +2687,6 @@ test "paramAs round-trip with encodeLayerOpParam" {
     defer std.testing.allocator.free(param_block.data);
 
     const p = try paramAs(ResidualAddParam, &.{param_block}, .residual_add);
-    // norm_out = 1 in BufferId enum
-    try std.testing.expectEqual(@as(u8, 1), p.branch_buffer_id);
     // literal = scale_tag 2
     try std.testing.expectEqual(@as(u8, 2), p.scale_tag);
     // f32 1.5 stored as u32 via @bitCast

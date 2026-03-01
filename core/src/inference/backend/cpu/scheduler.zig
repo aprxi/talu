@@ -2153,6 +2153,12 @@ const MockBackend = struct {
     allocated_logits: std.ArrayList([]f32),
     /// Token that always wins greedy sampling (default: 100)
     greedy_token: usize = 100,
+    state_descriptors: []const runtime_contract.StateDescriptor = &.{},
+    bind_slot_state_blocks_calls: usize = 0,
+    unbind_slot_state_blocks_calls: usize = 0,
+    last_bound_state_block_count: usize = 0,
+    saw_state_blocks_valid: bool = true,
+    saw_zero_init_shortconv_state: bool = false,
 
     const PrefillCall = struct {
         slot_index: usize,
@@ -2192,6 +2198,10 @@ const MockBackend = struct {
         self.greedy_token = token;
     }
 
+    fn setStateDescriptors(self: *MockBackend, descriptors: []const runtime_contract.StateDescriptor) void {
+        self.state_descriptors = descriptors;
+    }
+
     fn deinit(self: *MockBackend) void {
         self.slots_used.deinit();
         for (self.prefill_calls.items) |call| {
@@ -2227,8 +2237,7 @@ const MockBackend = struct {
     }
 
     fn stateDescriptors(self: *const MockBackend) []const runtime_contract.StateDescriptor {
-        _ = self;
-        return &.{};
+        return self.state_descriptors;
     }
 
     fn bindSlotStateBlocks(
@@ -2237,12 +2246,29 @@ const MockBackend = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
         _ = slot_index;
+        self.bind_slot_state_blocks_calls += 1;
+        self.last_bound_state_block_count = state_blocks.len;
         try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
+        const descriptors = self.stateDescriptors();
+        for (descriptors) |descriptor| {
+            const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
+                self.saw_state_blocks_valid = false;
+                return error.InvalidStateDescriptorBinding;
+            };
+            if (incoming.align_bytes < descriptor.align_bytes) self.saw_state_blocks_valid = false;
+            if (descriptor.size_bytes > 0 and incoming.size < descriptor.size_bytes) self.saw_state_blocks_valid = false;
+            if (incoming.size < @sizeOf(runtime_contract.OpaqueStateRef)) self.saw_state_blocks_valid = false;
+
+            if (descriptor.id == @intFromEnum(runtime_contract.StateBlockId.shortconv) and descriptor.zero_init and incoming.size > 0) {
+                const first_byte = incoming.ptr[0];
+                if (first_byte == 0) self.saw_zero_init_shortconv_state = true;
+            }
+        }
     }
 
     fn unbindSlotStateBlocks(self: *MockBackend, slot_index: usize) void {
-        _ = self;
         _ = slot_index;
+        self.unbind_slot_state_blocks_calls += 1;
     }
 
     fn prefillSlot(self: *MockBackend, slot_index: usize, tokens: []const u32, logits_out: []f32) !void {
@@ -3574,6 +3600,49 @@ test "generateSync single-request route - basic generation" {
     // Should generate up to max_tokens
     try std.testing.expectEqual(@as(usize, 5), result.tokens.len);
     try std.testing.expectEqual(FinishReason.length, result.finish_reason);
+}
+
+test "Scheduler descriptor-backed state blocks are bound and validated" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 2);
+    defer backend.deinit();
+    backend.setStateDescriptors(&.{
+        runtime_contract.defaultStateDescriptor(.shortconv),
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .default_eos_token_ids = &[_]u32{100},
+    });
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    _ = try scheduler.submit(&prompt, 1, null);
+
+    // One step triggers activation, descriptor state allocation, bind, and unbind.
+    _ = try scheduler.step();
+
+    try std.testing.expect(backend.bind_slot_state_blocks_calls > 0);
+    try std.testing.expect(backend.unbind_slot_state_blocks_calls > 0);
+    try std.testing.expectEqual(@as(usize, 1), backend.last_bound_state_block_count);
+    try std.testing.expect(backend.saw_state_blocks_valid);
+}
+
+test "Scheduler zero-inits shortconv descriptor state on alloc" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 2);
+    defer backend.deinit();
+    backend.setStateDescriptors(&.{
+        runtime_contract.defaultStateDescriptor(.shortconv),
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{});
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 7, 8, 9 };
+    _ = try scheduler.submit(&prompt, 1, null);
+    _ = try scheduler.step();
+
+    try std.testing.expect(backend.saw_zero_init_shortconv_state);
 }
 
 test "generateSync single-request route - EOS detection" {

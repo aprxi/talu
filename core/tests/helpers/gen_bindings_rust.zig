@@ -291,11 +291,12 @@ fn zigToRustType(zig_type: []const u8, known_structs: *std.StringHashMap(StructI
         }
 
         // Check element type
+        const elem_is_const = std.mem.indexOf(u8, zig_type, "const ") != null;
         if (std.mem.indexOf(u8, zig_type, "f32") != null) return "*const f32";
-        if (std.mem.indexOf(u8, zig_type, "u32") != null) return "*const u32";
-        if (std.mem.indexOf(u8, zig_type, "u16") != null) return "*const u16";
-        if (std.mem.indexOf(u8, zig_type, "usize") != null) return "*const usize";
-        if (std.mem.indexOf(u8, zig_type, "u8") != null) return "*const u8";
+        if (std.mem.indexOf(u8, zig_type, "u32") != null) return if (elem_is_const) "*const u32" else "*mut u32";
+        if (std.mem.indexOf(u8, zig_type, "u16") != null) return if (elem_is_const) "*const u16" else "*mut u16";
+        if (std.mem.indexOf(u8, zig_type, "usize") != null) return if (elem_is_const) "*const usize" else "*mut usize";
+        if (std.mem.indexOf(u8, zig_type, "u8") != null) return if (elem_is_const) "*const u8" else "*mut u8";
 
         // Check if pointer to known struct
         const start_idx = if (std.mem.startsWith(u8, zig_type, "?[*]")) @as(usize, 4) else @as(usize, 3);

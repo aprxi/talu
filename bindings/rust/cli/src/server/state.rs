@@ -56,6 +56,19 @@ pub struct CodeSession {
     pub last_access: std::time::Instant,
 }
 
+/// An interactive shell session backed by core `talu_shell_*` APIs.
+pub struct ShellSession {
+    pub shell: Arc<Mutex<talu::shell::ShellSession>>,
+    pub owner_key: String,
+    pub cwd: Option<String>,
+    pub cols: u16,
+    pub rows: u16,
+    pub created_at: std::time::Instant,
+    pub last_access: std::time::Instant,
+    /// Number of currently attached WebSocket clients.
+    pub attached_clients: usize,
+}
+
 pub struct AppState {
     pub backend: Arc<Mutex<BackendState>>,
     pub configured_model: Option<String>,
@@ -79,4 +92,8 @@ pub struct AppState {
     pub code_sessions: Mutex<HashMap<String, CodeSession>>,
     /// Max idle time before a code session is evicted by the reaper.
     pub code_session_ttl: std::time::Duration,
+    /// In-memory shell session store for `/v1/agent/shells/*`.
+    pub shell_sessions: Mutex<HashMap<String, ShellSession>>,
+    /// Max idle time before a detached shell session is evicted by the reaper.
+    pub shell_session_ttl: std::time::Duration,
 }

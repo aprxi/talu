@@ -19,9 +19,13 @@ use crate::server::state::AppState;
 
 /// Default max idle time before a code session is evicted.
 pub const CODE_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+/// Default max idle time before a detached shell session is evicted.
+pub const SHELL_SESSION_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 /// How often the session reaper runs.
 const CODE_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+/// How often the shell session reaper runs.
+const SHELL_SESSION_REAP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
 pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result<()> {
     let state = Arc::new(state);
@@ -41,6 +45,30 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
                 log::info!(
                     target: "server::code",
                     "evicted {} stale code session(s) ({} remaining)",
+                    evicted,
+                    sessions.len(),
+                );
+            }
+        }
+    });
+
+    // Background task: evict detached stale shell sessions.
+    let shell_gc_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(SHELL_SESSION_REAP_INTERVAL);
+        loop {
+            interval.tick().await;
+            let mut sessions = shell_gc_state.shell_sessions.lock().await;
+            let before = sessions.len();
+            let ttl = shell_gc_state.shell_session_ttl;
+            sessions.retain(|_, session| {
+                session.attached_clients > 0 || session.last_access.elapsed() < ttl
+            });
+            let evicted = before.saturating_sub(sessions.len());
+            if evicted > 0 {
+                log::info!(
+                    target: "server::agent_shell",
+                    "evicted {} stale shell session(s) ({} remaining)",
                     evicted,
                     sessions.len(),
                 );

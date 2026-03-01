@@ -4,12 +4,15 @@
 
 const std = @import("std");
 const types = @import("types.zig");
+const DType = @import("../../dtype.zig").DType;
 
 pub const RegisterBufferSpec = struct {
     /// Buffer size hint. Set to 0 to exempt a register from physical allocation
     /// (e.g., register 0 / residual uses the caller's output buffer, not scratch).
     size: usize,
     @"align": u16,
+    dtype: DType = .f32,
+    layout: types.RegisterLayout = .contiguous,
 };
 
 const invalid_physical: u16 = std.math.maxInt(u16);
@@ -70,7 +73,9 @@ pub fn buildPhysicalMappingLinearScan(
             while (free_idx < free_list.items.len) : (free_idx += 1) {
                 const candidate = free_list.items[free_idx];
                 const spec = physical_specs.items[candidate];
-                if (spec.size >= desired.size and spec.@"align" >= desired.@"align") {
+                if (spec.size >= desired.size and spec.@"align" >= desired.@"align" and
+                    spec.dtype == desired.dtype and spec.layout == desired.layout)
+                {
                     chosen = candidate;
                     _ = free_list.swapRemove(free_idx);
                     break;
@@ -84,6 +89,8 @@ pub fn buildPhysicalMappingLinearScan(
                 try physical_specs.append(allocator, .{
                     .size = desired.size,
                     .@"align" = desired.@"align",
+                    .dtype = desired.dtype,
+                    .layout = desired.layout,
                 });
                 break :blk new_id;
             };

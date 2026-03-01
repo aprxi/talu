@@ -60,6 +60,8 @@ fn build_app() -> Router {
         max_file_inspect_bytes: 50 * 1024 * 1024,
         code_sessions: Mutex::new(HashMap::new()),
         code_session_ttl: std::time::Duration::from_secs(15 * 60),
+        shell_sessions: Mutex::new(HashMap::new()),
+        shell_session_ttl: std::time::Duration::from_secs(15 * 60),
     };
     Router::new(Arc::new(state))
 }
@@ -82,6 +84,8 @@ fn build_app_with_inspect_limit(limit: u64) -> Router {
         max_file_inspect_bytes: limit,
         code_sessions: Mutex::new(HashMap::new()),
         code_session_ttl: std::time::Duration::from_secs(15 * 60),
+        shell_sessions: Mutex::new(HashMap::new()),
+        shell_session_ttl: std::time::Duration::from_secs(15 * 60),
     };
     Router::new(Arc::new(state))
 }

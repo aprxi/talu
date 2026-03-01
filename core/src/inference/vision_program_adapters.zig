@@ -116,7 +116,7 @@ pub fn runVisionProgram(
     vtable: *const VisionRuntimeVTable,
     allocator: std.mem.Allocator,
     compiled_vision_plan: *const runtime_contract.CompiledPlan,
-    dispatch_counters: *runtime_contract.DispatchCounters,
+    dispatch_counters: ?*runtime_contract.DispatchCounters,
     dispatch_table: runtime_contract.AdapterTable,
     grid: image_mod.VisionGrid,
     merged_hidden_in: []const f32,
@@ -151,13 +151,19 @@ pub fn runVisionProgram(
             .workspace = .{ .any = @ptrCast(&exec_state) },
         };
         runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
+        var param_storage: [1]runtime_contract.ParamBlock = undefined;
+        const params: []const runtime_contract.ParamBlock = if (insn.param_block_id) |pid| blk: {
+            if (pid >= compiled_vision_plan.param_blocks.len) return error.MissingParamBlock;
+            param_storage[0] = compiled_vision_plan.param_blocks[pid];
+            break :blk param_storage[0..1];
+        } else &.{};
         try adapter_fn(
             &rt_ctx,
             &insn,
             no_registers[0..],
             no_views[0..],
             no_state_blocks[0..],
-            compiled_vision_plan.param_blocks,
+            params,
         );
     }
 
@@ -174,7 +180,7 @@ pub fn runVisionProgram(
 /// Execute a compiled scatter stage through the main adapter table.
 pub fn runScatterProgram(
     compiled_scatter_plan: *const runtime_contract.CompiledPlan,
-    dispatch_counters: *runtime_contract.DispatchCounters,
+    dispatch_counters: ?*runtime_contract.DispatchCounters,
     dispatch_table: runtime_contract.AdapterTable,
     hidden_states: []f32,
     seq_len: usize,
@@ -211,50 +217,22 @@ pub fn runScatterProgram(
             .workspace = .{ .any = @ptrCast(&scatter_ctx) },
         };
         runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
+        var param_storage: [1]runtime_contract.ParamBlock = undefined;
+        const params: []const runtime_contract.ParamBlock = if (insn.param_block_id) |pid| blk: {
+            if (pid >= compiled_scatter_plan.param_blocks.len) return error.MissingParamBlock;
+            param_storage[0] = compiled_scatter_plan.param_blocks[pid];
+            break :blk param_storage[0..1];
+        } else &.{};
         try adapter_fn(
             &rt_ctx,
             &insn,
             no_registers[0..],
             no_views[0..],
             no_state_blocks[0..],
-            compiled_scatter_plan.param_blocks,
+            params,
         );
     }
 }
-
-// --- ABI-stable packed param structs ---
-//
-// These match the byte layout produced by `encodeLayerOpParam` in
-// runtime_contract/types.zig.  Adapters cast `ParamBlock.data` to
-// these via `@ptrCast` — zero parsing, zero allocation, zero branching.
-
-pub const PatchEmbedParam = packed struct {
-    param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
-};
-
-pub const SpatialMergeParam = packed struct {
-    param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
-    merge_size: u32,
-};
-
-pub const DeepstackExtractParam = packed struct {
-    param_kind: u8,
-    in_buffer_id: u8,
-    out_buffer_id: u8,
-    layer_index: u32,
-};
-
-pub const ScatterParam = packed struct {
-    param_kind: u8,
-    text_in_buffer_id: u8,
-    vision_in_buffer_id: u8,
-    out_buffer_id: u8,
-    image_token_id: u32,
-};
 
 // --- Private helpers ---
 
@@ -268,19 +246,6 @@ fn scatterExecutionState(ctx: *runtime_contract.ExecutionContext) !*ScatterExecu
     return @ptrCast(@alignCast(raw_state));
 }
 
-fn paramAs(
-    comptime T: type,
-    insn: *const runtime_contract.Instruction,
-    params: []const runtime_contract.ParamBlock,
-    expected_opcode: runtime_contract.Opcode,
-) !*const T {
-    const param_id = insn.param_block_id orelse return error.MissingParamBlock;
-    if (param_id >= params.len) return error.MissingParamBlock;
-    const param_block = params[param_id];
-    if (param_block.opcode != expected_opcode) return error.ParamBlockOpcodeMismatch;
-    if (param_block.data.len < @bitSizeOf(T) / 8) return error.InvalidParamBlockABI;
-    return @ptrCast(@alignCast(param_block.data.ptr));
-}
 
 // --- Adapter functions (KernelAdapterFn signature) ---
 
@@ -294,7 +259,7 @@ fn patchEmbedRuntimeAdapter(
 ) !void {
     const exec_ctx = try executionState(ctx);
     _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &exec_ctx.compiled_plan.plan, state_blocks);
-    _ = try paramAs(PatchEmbedParam, insn, params, .vision_patch_embed);
+    _ = try runtime_contract.paramAs(runtime_contract.PatchEmbedParam, params, .vision_patch_embed);
     const state = exec_ctx.state;
     if (state.saw_patch_embed or state.saw_spatial_merge) return error.InvalidVisionProgram;
     state.saw_patch_embed = true;
@@ -310,7 +275,7 @@ fn deepstackExtractRuntimeAdapter(
 ) !void {
     const exec_ctx = try executionState(ctx);
     _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &exec_ctx.compiled_plan.plan, state_blocks);
-    const param = try paramAs(DeepstackExtractParam, insn, params, .vision_deepstack_extract);
+    const param = try runtime_contract.paramAs(runtime_contract.DeepstackExtractParam, params, .vision_deepstack_extract);
     const layer_idx: usize = std.math.cast(usize, param.layer_index) orelse return error.InvalidVisionProgram;
     const state = exec_ctx.state;
     if (!state.saw_patch_embed) return error.InvalidVisionProgram;
@@ -330,7 +295,7 @@ fn spatialMergeRuntimeAdapter(
 ) !void {
     const exec_ctx = try executionState(ctx);
     _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &exec_ctx.compiled_plan.plan, state_blocks);
-    _ = try paramAs(SpatialMergeParam, insn, params, .vision_spatial_merge);
+    _ = try runtime_contract.paramAs(runtime_contract.SpatialMergeParam, params, .vision_spatial_merge);
     const state = exec_ctx.state;
     if (!state.saw_patch_embed or state.saw_spatial_merge) return error.InvalidVisionProgram;
     state.saw_spatial_merge = true;
@@ -345,7 +310,7 @@ fn scatterRuntimeAdapter(
     state_blocks: []runtime_contract.StateBlockHandle,
     params: []const runtime_contract.ParamBlock,
 ) !void {
-    const param = try paramAs(ScatterParam, insn, params, .vision_scatter);
+    const param = try runtime_contract.paramAs(runtime_contract.ScatterParam, params, .vision_scatter);
     switch (ctx.mode) {
         .vision_encode => {
             const exec_ctx = try executionState(ctx);
