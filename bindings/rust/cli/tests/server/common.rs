@@ -27,6 +27,10 @@ pub struct ServerConfig {
     pub no_bucket: bool,
     /// Serve console UI from this directory instead of bundled assets.
     pub html_dir: Option<PathBuf>,
+    /// Workspace root passed via `talu serve --workspace-dir`.
+    pub workspace_dir: Option<PathBuf>,
+    /// Policy file passed via `talu serve --policy-file`.
+    pub policy_file: Option<PathBuf>,
     /// Extra environment variables to set on the server process.
     pub env_vars: Vec<(String, String)>,
 }
@@ -40,6 +44,8 @@ impl ServerConfig {
             bucket: None,
             no_bucket: false,
             html_dir: None,
+            workspace_dir: None,
+            policy_file: None,
             env_vars: Vec::new(),
         }
     }
@@ -49,6 +55,39 @@ pub struct ServerTestContext {
     _temp_dir: TempDir,
     addr: SocketAddr,
     child: Child,
+}
+
+/// Assert that server startup fails before becoming ready.
+///
+/// Use this for invalid startup configuration (for example malformed policy
+/// JSON), where the server should fail fast and never accept requests.
+pub fn assert_server_startup_fails(config: ServerConfig, expected_log_fragment: &str) {
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ctx = ServerTestContext::new(config);
+    }));
+
+    let panic_payload = result.expect_err("expected server startup failure");
+    let panic_message = if let Some(msg) = panic_payload.downcast_ref::<String>() {
+        msg.as_str()
+    } else if let Some(msg) = panic_payload.downcast_ref::<&str>() {
+        msg
+    } else {
+        "<non-string panic payload>"
+    };
+
+    if panic_message.contains(expected_log_fragment) {
+        return;
+    }
+
+    // Reader threads can race with early process exit; when that happens the
+    // panic may still prove startup failed, but without log payload attached.
+    let has_startup_failure_shape = panic_message.contains("server exited early")
+        || panic_message.contains("server did not become ready")
+        || panic_message.contains("server output closed");
+    assert!(
+        has_startup_failure_shape,
+        "panic must mention {expected_log_fragment:?} or a startup-failure shape, got: {panic_message}"
+    );
 }
 
 impl ServerTestContext {
@@ -98,6 +137,12 @@ impl ServerTestContext {
 
         if let Some(ref html_dir) = config.html_dir {
             command.arg("--html-dir").arg(html_dir);
+        }
+        if let Some(ref workspace_dir) = config.workspace_dir {
+            command.arg("--workspace-dir").arg(workspace_dir);
+        }
+        if let Some(ref policy_file) = config.policy_file {
+            command.arg("--policy-file").arg(policy_file);
         }
 
         for (key, value) in &config.env_vars {
@@ -443,10 +488,12 @@ where
 fn wait_for_ready(rx: &Receiver<String>, child: &mut Child) -> SocketAddr {
     let marker = "TCP listener bound at ";
     let deadline = Instant::now() + Duration::from_secs(10);
+    const POLL_INTERVAL: Duration = Duration::from_millis(100);
     let mut logs = Vec::new();
 
     loop {
         if let Ok(Some(status)) = child.try_wait() {
+            drain_available_logs(rx, &mut logs);
             panic!("server exited early: {status}\nlogs: {logs:?}");
         }
 
@@ -455,7 +502,7 @@ fn wait_for_ready(rx: &Receiver<String>, child: &mut Child) -> SocketAddr {
             panic!("server did not become ready\nlogs: {logs:?}");
         }
 
-        match rx.recv_timeout(timeout) {
+        match rx.recv_timeout(timeout.min(POLL_INTERVAL)) {
             Ok(line) => {
                 if let Some(addr_str) = line.find(marker).map(|i| &line[i + marker.len()..]) {
                     let addr: SocketAddr = addr_str
@@ -469,9 +516,7 @@ fn wait_for_ready(rx: &Receiver<String>, child: &mut Child) -> SocketAddr {
                 }
                 logs.push(line);
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                panic!("server did not become ready\nlogs: {logs:?}");
-            }
+            Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 panic!("server output closed\nlogs: {logs:?}");
             }
@@ -479,7 +524,35 @@ fn wait_for_ready(rx: &Receiver<String>, child: &mut Child) -> SocketAddr {
     }
 }
 
+fn drain_available_logs(rx: &Receiver<String>, logs: &mut Vec<String>) {
+    // Collect immediately available lines.
+    while let Ok(line) = rx.try_recv() {
+        logs.push(line);
+    }
+
+    // Give reader threads a short chance to flush late lines after process exit.
+    let flush_deadline = Instant::now() + Duration::from_millis(200);
+    loop {
+        let timeout = flush_deadline.saturating_duration_since(Instant::now());
+        if timeout.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(timeout.min(Duration::from_millis(25))) {
+            Ok(line) => logs.push(line),
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+    }
+}
+
 fn talu_bin_path() -> PathBuf {
+    if let Some(path) = option_env!("CARGO_BIN_EXE_talu") {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            return path;
+        }
+    }
+
     if let Ok(path) = std::env::var("TALU_CLI_BIN") {
         let path = PathBuf::from(path);
         if path.exists() {

@@ -138,9 +138,9 @@ export interface PluginContext {
   readonly clipboard: ClipboardAccess;
   readonly download: DownloadAccess;
   readonly upload: UploadAccess;
+  readonly agent: AgentAccess;
   readonly context: ContextAccess;
   readonly menus: MenuAccess;
-
 }
 
 // --- Lifecycle ---
@@ -437,4 +437,120 @@ export interface MenuAccess {
   }): Disposable;
   /** Render contributed menu items for a slot. Re-renders reactively when items change. */
   renderSlot(slot: string, container: HTMLElement): Disposable;
+}
+
+// --- Agent Access ---
+
+export interface AgentReadResult {
+  path: string;
+  content: string;
+  encoding: "utf-8" | "base64";
+  size: number;
+  truncated: boolean;
+}
+
+export interface AgentWriteResult {
+  path: string;
+  bytesWritten: number;
+}
+
+export interface AgentEditResult {
+  path: string;
+  replacements: number;
+}
+
+export interface AgentStatResult {
+  path: string;
+  exists: boolean;
+  isFile: boolean;
+  isDir: boolean;
+  isSymlink: boolean;
+  size: number;
+  mode: string;
+  modifiedAt: number;
+  createdAt: number;
+}
+
+export interface AgentLsEntry {
+  name: string;
+  path: string;
+  isDir: boolean;
+  isSymlink: boolean;
+  size: number;
+  modifiedAt: number;
+}
+
+export interface AgentLsResult {
+  path: string;
+  entries: AgentLsEntry[];
+  truncated: boolean;
+}
+
+export interface AgentExecEvent {
+  type: "stdout" | "stderr" | "exit" | "error";
+  data?: string;
+  code?: number;
+  message?: string;
+}
+
+export interface AgentExecOptions {
+  cwd?: string;
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  onEvent?: (event: AgentExecEvent) => void;
+}
+
+export interface AgentExecResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number | null;
+  events: AgentExecEvent[];
+}
+
+export interface AgentShellEvent {
+  type: "data" | "exit" | "error";
+  data?: string;
+  code?: number;
+  message?: string;
+}
+
+export interface AgentShellOpenOptions {
+  cwd?: string;
+  cols?: number;
+  rows?: number;
+  onEvent?: (event: AgentShellEvent) => void;
+}
+
+export interface AgentShellSession {
+  readonly id: string;
+  readonly cols: number;
+  readonly rows: number;
+  readonly cwd: string | null;
+  send(data: string): void;
+  resize(cols: number, rows: number): void;
+  signal(name: string): void;
+  onEvent(handler: (event: AgentShellEvent) => void): Disposable;
+  close(): Promise<void>;
+}
+
+export interface AgentFsAccess {
+  readFile(path: string, opts?: { encoding?: "utf-8" | "base64"; maxBytes?: number }): Promise<AgentReadResult>;
+  writeFile(path: string, content: string, opts?: { encoding?: "utf-8" | "base64"; mkdir?: boolean }): Promise<AgentWriteResult>;
+  editFile(path: string, oldText: string, newText: string, opts?: { replaceAll?: boolean }): Promise<AgentEditResult>;
+  stat(path: string): Promise<AgentStatResult>;
+  ls(path: string, opts?: { glob?: string; recursive?: boolean; limit?: number }): Promise<AgentLsResult>;
+  rm(path: string, opts?: { recursive?: boolean }): Promise<void>;
+  mkdir(path: string): Promise<void>;
+  rename(from: string, to: string): Promise<void>;
+}
+
+export interface AgentShellAccess {
+  exec(command: string, opts?: AgentExecOptions): Promise<AgentExecResult>;
+  open(opts?: AgentShellOpenOptions): Promise<AgentShellSession>;
+}
+
+export interface AgentAccess {
+  readonly fs: AgentFsAccess;
+  readonly shell: AgentShellAccess;
+  cwd: string;
 }

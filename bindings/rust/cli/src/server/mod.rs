@@ -87,6 +87,19 @@ pub struct ServerArgs {
     /// Max request body size for `POST /v1/file/inspect` and `POST /v1/file/transform` (bytes).
     #[arg(long, env = "TALU_MAX_FILE_INSPECT_BYTES", default_value_t = DEFAULT_MAX_FILE_INSPECT_BYTES)]
     pub max_file_inspect_bytes: u64,
+
+    /// Path to runtime policy JSON file applied to `/v1/agent/*`.
+    ///
+    /// This is equivalent to setting `TALU_AGENT_POLICY_JSON` with the file
+    /// content, but is safer and easier to manage operationally.
+    #[arg(long, env = "TALU_POLICY_FILE")]
+    pub policy_file: Option<PathBuf>,
+
+    /// Canonical workspace root for `/v1/agent/fs/*` endpoint sandboxing.
+    ///
+    /// Relative request paths are resolved against this directory.
+    #[arg(long, env = "TALU_WORKSPACE_DIR")]
+    pub workspace_dir: Option<PathBuf>,
 }
 
 pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Result<()> {
@@ -148,8 +161,9 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         }
     };
 
-    let workspace_dir = std::env::var_os("TALU_WORKSPACE_DIR")
-        .map(PathBuf::from)
+    let workspace_dir = args
+        .workspace_dir
+        .or_else(|| std::env::var_os("TALU_WORKSPACE_DIR").map(PathBuf::from))
         .unwrap_or_else(|| std::env::current_dir().expect("current dir"));
     let workspace_dir = workspace_dir.canonicalize().with_context(|| {
         format!(
@@ -157,7 +171,22 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             workspace_dir.display()
         )
     })?;
-    let agent_policy_json = std::env::var("TALU_AGENT_POLICY_JSON").ok();
+    let env_agent_policy_json = std::env::var("TALU_AGENT_POLICY_JSON").ok();
+    if args.policy_file.is_some() && env_agent_policy_json.is_some() {
+        bail!("--policy-file conflicts with TALU_AGENT_POLICY_JSON; use exactly one source");
+    }
+    let agent_policy_json = if let Some(path) = args.policy_file.as_ref() {
+        Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("read agent policy file {}", path.display()))?,
+        )
+    } else {
+        env_agent_policy_json
+    };
+    if let Some(policy_json) = agent_policy_json.as_deref() {
+        // Validate once at startup so policy mistakes fail fast before serving.
+        talu::policy::Policy::from_json(policy_json).context("parse agent runtime policy JSON")?;
+    }
 
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
@@ -207,6 +236,20 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         log::info!(target: "server::init", "bucket: {}", bucket.display());
     } else {
         log::info!(target: "server::init", "storage disabled (--no-bucket)");
+    }
+    if let Some(path) = args.policy_file.as_ref() {
+        log::info!(
+            target: "server::init",
+            "agent runtime policy file: {}",
+            path.display()
+        );
+    } else if state.agent_policy_json.is_some() {
+        log::info!(
+            target: "server::init",
+            "agent runtime policy loaded from TALU_AGENT_POLICY_JSON"
+        );
+    } else {
+        log::info!(target: "server::init", "agent runtime policy: none");
     }
     log::info!(target: "server::init", "console: http://{}/", addr);
     log::info!(target: "server::init", "listening on http://{}", addr);

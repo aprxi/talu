@@ -1,9 +1,11 @@
 use crate::server::common::{
-    delete, get, post_json, send_request, ServerConfig, ServerTestContext, TenantSpec,
+    assert_server_startup_fails, delete, get, post_json, send_request, ServerConfig,
+    ServerTestContext, TenantSpec,
 };
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+use tempfile::TempDir;
 
 fn parse_sse_events(body: &str) -> Vec<serde_json::Value> {
     body.lines()
@@ -18,6 +20,12 @@ fn config_with_policy(policy_json: &str) -> ServerConfig {
         "TALU_AGENT_POLICY_JSON".to_string(),
         policy_json.to_string(),
     ));
+    cfg
+}
+
+fn config_with_policy_file(path: &std::path::Path) -> ServerConfig {
+    let mut cfg = ServerConfig::new();
+    cfg.policy_file = Some(path.to_path_buf());
     cfg
 }
 
@@ -211,54 +219,66 @@ fn agent_process_spawn_denied_by_policy() {
 }
 
 #[test]
-fn agent_process_spawn_with_invalid_policy_json_returns_500() {
+fn agent_process_spawn_policy_file_flag_enforces_policy() {
+    let temp = TempDir::new().expect("temp dir");
+    let policy_path = temp.path().join("policy.json");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.process","command":"echo hi"}
+        ]
+    }"#;
+    std::fs::write(&policy_path, policy).expect("write policy file");
+
+    let ctx = ServerTestContext::new(config_with_policy_file(&policy_path));
+
+    let allowed = post_json(
+        ctx.addr(),
+        "/v1/agent/processes/spawn",
+        &serde_json::json!({ "command": "echo hi" }),
+    );
+    assert_eq!(allowed.status, 200, "body: {}", allowed.body);
+
+    let denied = post_json(
+        ctx.addr(),
+        "/v1/agent/processes/spawn",
+        &serde_json::json!({ "command": "echo bye" }),
+    );
+    assert_eq!(denied.status, 403, "body: {}", denied.body);
+    assert_eq!(denied.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_process_spawn_with_invalid_policy_json_fails_startup() {
     let mut cfg = ServerConfig::new();
     cfg.env_vars.push((
         "TALU_AGENT_POLICY_JSON".to_string(),
         "{not-valid-json".to_string(),
     ));
-    let ctx = ServerTestContext::new(cfg);
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/processes/spawn",
-        &serde_json::json!({ "command": "echo hi" }),
-    );
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+    assert_server_startup_fails(cfg, "parse agent runtime policy JSON");
 }
 
 #[test]
-fn agent_process_spawn_with_invalid_policy_schema_returns_500() {
+fn agent_process_spawn_with_invalid_policy_schema_fails_startup() {
     let policy = r#"{
         "default":"maybe",
         "statements":[]
     }"#;
-    let ctx = ServerTestContext::new(config_with_policy(policy));
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/processes/spawn",
-        &serde_json::json!({ "command": "echo hi" }),
+    assert_server_startup_fails(
+        config_with_policy(policy),
+        "parse agent runtime policy JSON",
     );
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
 }
 
 #[test]
-fn agent_process_spawn_with_invalid_policy_schema_missing_statements_returns_500() {
+fn agent_process_spawn_with_invalid_policy_schema_missing_statements_fails_startup() {
     let policy = r#"{
         "default":"deny"
     }"#;
-    let ctx = ServerTestContext::new(config_with_policy(policy));
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/processes/spawn",
-        &serde_json::json!({ "command": "echo hi" }),
+    assert_server_startup_fails(
+        config_with_policy(policy),
+        "parse agent runtime policy JSON",
     );
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
 }
 
 #[test]

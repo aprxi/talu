@@ -18,7 +18,7 @@ describe("checkCapabilities", () => {
   });
 
   test("known capabilities → satisfied", () => {
-    const result = checkCapabilities(["hooks", "tools", "storage"]);
+    const result = checkCapabilities(["hooks", "tools", "storage", "filesystem", "exec"]);
     expect(result.satisfied).toBe(true);
     expect(result.unsatisfied).toHaveLength(0);
   });
@@ -52,5 +52,7 @@ describe("getKnownCapabilities", () => {
     expect(caps).toContain("commands");
     expect(caps).toContain("storage");
     expect(caps).toContain("upload");
+    expect(caps).toContain("filesystem");
+    expect(caps).toContain("exec");
   });
 });

@@ -137,6 +137,11 @@ describe("validateManifest", () => {
     expect(result.valid).toBe(true);
   });
 
+  test("filesystem and exec permissions are recognized", () => {
+    const result = validateManifest(builtinManifest({ permissions: ["filesystem", "exec"] }));
+    expect(result.valid).toBe(true);
+  });
+
   // --- String length / control characters ---
 
   test("name exceeds max length → error", () => {

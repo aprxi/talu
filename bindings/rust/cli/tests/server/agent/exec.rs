@@ -1,4 +1,6 @@
-use crate::server::common::{post_json, send_request, ServerConfig, ServerTestContext};
+use crate::server::common::{
+    assert_server_startup_fails, post_json, send_request, ServerConfig, ServerTestContext,
+};
 
 /// Parse SSE `data: {...}\n\n` lines into JSON values.
 fn parse_sse_events(body: &str) -> Vec<serde_json::Value> {
@@ -139,54 +141,36 @@ fn agent_exec_policy_denied_surfaces_error_event() {
 }
 
 #[test]
-fn agent_exec_invalid_policy_json_returns_500() {
+fn agent_exec_invalid_policy_json_fails_startup() {
     let mut cfg = ServerConfig::new();
     cfg.env_vars.push((
         "TALU_AGENT_POLICY_JSON".to_string(),
         "{not-valid-json".to_string(),
     ));
-    let ctx = ServerTestContext::new(cfg);
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/exec",
-        &serde_json::json!({ "command": "echo hello" }),
-    );
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+    assert_server_startup_fails(cfg, "parse agent runtime policy JSON");
 }
 
 #[test]
-fn agent_exec_invalid_policy_schema_returns_500() {
+fn agent_exec_invalid_policy_schema_fails_startup() {
     let policy = r#"{
         "default":"maybe",
         "statements":[]
     }"#;
-    let ctx = ServerTestContext::new(config_with_policy(policy));
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/exec",
-        &serde_json::json!({ "command": "echo hello" }),
+    assert_server_startup_fails(
+        config_with_policy(policy),
+        "parse agent runtime policy JSON",
     );
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
 }
 
 #[test]
-fn agent_exec_invalid_policy_schema_missing_statements_returns_500() {
+fn agent_exec_invalid_policy_schema_missing_statements_fails_startup() {
     let policy = r#"{
         "default":"deny"
     }"#;
-    let ctx = ServerTestContext::new(config_with_policy(policy));
-
-    let resp = post_json(
-        ctx.addr(),
-        "/v1/agent/exec",
-        &serde_json::json!({ "command": "echo hello" }),
+    assert_server_startup_fails(
+        config_with_policy(policy),
+        "parse agent runtime policy JSON",
     );
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
 }
 
 #[test]

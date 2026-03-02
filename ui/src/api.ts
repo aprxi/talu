@@ -9,6 +9,137 @@ const BASE = "";
 
 type FetchFn = (url: string, init?: RequestInit) => Promise<Response>;
 
+export interface AgentFsReadRequest {
+  path: string;
+  encoding?: "utf-8" | "base64";
+  max_bytes?: number;
+}
+
+export interface AgentFsReadResponse {
+  path: string;
+  content: string;
+  encoding: "utf-8" | "base64";
+  size: number;
+  truncated: boolean;
+}
+
+export interface AgentFsWriteRequest {
+  path: string;
+  content: string;
+  encoding?: "utf-8" | "base64";
+  mkdir?: boolean;
+}
+
+export interface AgentFsWriteResponse {
+  path: string;
+  bytes_written: number;
+}
+
+export interface AgentFsEditRequest {
+  path: string;
+  old_text: string;
+  new_text: string;
+  replace_all?: boolean;
+}
+
+export interface AgentFsEditResponse {
+  path: string;
+  replacements: number;
+}
+
+export interface AgentFsStatRequest {
+  path: string;
+}
+
+export interface AgentFsStatResponse {
+  path: string;
+  exists: boolean;
+  is_file: boolean;
+  is_dir: boolean;
+  is_symlink: boolean;
+  size: number;
+  mode: string;
+  modified_at: number;
+  created_at: number;
+}
+
+export interface AgentFsListRequest {
+  path: string;
+  glob?: string;
+  recursive?: boolean;
+  limit?: number;
+}
+
+export interface AgentFsListEntry {
+  name: string;
+  path: string;
+  is_dir: boolean;
+  is_symlink: boolean;
+  size: number;
+  modified_at: number;
+}
+
+export interface AgentFsListResponse {
+  path: string;
+  entries: AgentFsListEntry[];
+  truncated: boolean;
+}
+
+export interface AgentFsRemoveRequest {
+  path: string;
+  recursive?: boolean;
+}
+
+export interface AgentFsRemoveResponse {
+  path: string;
+  removed: boolean;
+}
+
+export interface AgentFsMkdirRequest {
+  path: string;
+  recursive?: boolean;
+}
+
+export interface AgentFsMkdirResponse {
+  path: string;
+  created: boolean;
+}
+
+export interface AgentFsRenameRequest {
+  from: string;
+  to: string;
+}
+
+export interface AgentFsRenameResponse {
+  from: string;
+  to: string;
+}
+
+export interface AgentExecRequest {
+  command: string;
+  cwd?: string;
+  timeout_ms?: number;
+}
+
+export interface AgentShellCreateRequest {
+  cols?: number;
+  rows?: number;
+  cwd?: string;
+}
+
+export interface AgentShellSessionResponse {
+  shell_id: string;
+  cols: number;
+  rows: number;
+  cwd?: string | null;
+  attached_clients: number;
+}
+
+export interface AgentShellDeleteResponse {
+  shell_id: string;
+  terminated: boolean;
+}
+
 export interface ApiClient {
   listConversations(opts?: { offset?: number; limit?: number; marker?: string; search?: string; tags_any?: string; project_id?: string }): Promise<ApiResult<ConversationList>>;
   search(req: SearchRequest): Promise<ApiResult<SearchResponse>>;
@@ -67,6 +198,17 @@ export interface ApiClient {
   kvPut(namespace: string, key: string, value: string): Promise<ApiResult<void>>;
   kvDelete(namespace: string, key: string): Promise<ApiResult<{ deleted: boolean }>>;
   kvList(namespace: string): Promise<ApiResult<{ count: number; data: Array<{ key: string; value_hex: string; updated_at_ms: number }> }>>;
+  agentFsRead(body: AgentFsReadRequest): Promise<ApiResult<AgentFsReadResponse>>;
+  agentFsWrite(body: AgentFsWriteRequest): Promise<ApiResult<AgentFsWriteResponse>>;
+  agentFsEdit(body: AgentFsEditRequest): Promise<ApiResult<AgentFsEditResponse>>;
+  agentFsStat(body: AgentFsStatRequest): Promise<ApiResult<AgentFsStatResponse>>;
+  agentFsList(body: AgentFsListRequest): Promise<ApiResult<AgentFsListResponse>>;
+  agentFsRemove(body: AgentFsRemoveRequest): Promise<ApiResult<AgentFsRemoveResponse>>;
+  agentFsMkdir(body: AgentFsMkdirRequest): Promise<ApiResult<AgentFsMkdirResponse>>;
+  agentFsRename(body: AgentFsRenameRequest): Promise<ApiResult<AgentFsRenameResponse>>;
+  agentExec(body: AgentExecRequest, signal?: AbortSignal): Promise<Response>;
+  agentShellCreate(body: AgentShellCreateRequest): Promise<ApiResult<AgentShellSessionResponse>>;
+  agentShellDelete(shellId: string): Promise<ApiResult<AgentShellDeleteResponse>>;
 }
 
 function hexToUtf8(hex: string): string {
@@ -99,6 +241,33 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
       if (!resp.ok) {
         const msg = await parseErrorMessage(resp);
         return { ok: false, error: msg };
+      }
+
+      const data = (await resp.json()) as T;
+      return { ok: true, data };
+    } catch (e) {
+      return { ok: false, error: e instanceof Error ? e.message : String(e) };
+    }
+  }
+
+  async function requestAgentJson<T>(method: string, path: string, body?: unknown): Promise<ApiResult<T>> {
+    try {
+      const opts: RequestInit = {
+        method,
+        headers: body ? { "Content-Type": "application/json" } : undefined,
+        body: body ? JSON.stringify(body) : undefined,
+      };
+      const resp = await fetchFn(`${BASE}${path}`, opts);
+
+      if (resp.status === 204) {
+        return { ok: true };
+      }
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => null);
+        const code = err?.error?.code;
+        const message = err?.error?.message ?? `${resp.status} ${resp.statusText}`;
+        return { ok: false, error: code ? `${code}: ${message}` : message };
       }
 
       const data = (await resp.json()) as T;
@@ -317,5 +486,21 @@ export function createApiClient(fetchFn: FetchFn): ApiClient {
         return { ok: true, data: json };
       } catch (e) { return { ok: false, error: e instanceof Error ? e.message : String(e) }; }
     },
+    agentFsRead: (body) => requestAgentJson<AgentFsReadResponse>("POST", "/v1/agent/fs/read", body),
+    agentFsWrite: (body) => requestAgentJson<AgentFsWriteResponse>("POST", "/v1/agent/fs/write", body),
+    agentFsEdit: (body) => requestAgentJson<AgentFsEditResponse>("POST", "/v1/agent/fs/edit", body),
+    agentFsStat: (body) => requestAgentJson<AgentFsStatResponse>("POST", "/v1/agent/fs/stat", body),
+    agentFsList: (body) => requestAgentJson<AgentFsListResponse>("POST", "/v1/agent/fs/ls", body),
+    agentFsRemove: (body) => requestAgentJson<AgentFsRemoveResponse>("DELETE", "/v1/agent/fs/rm", body),
+    agentFsMkdir: (body) => requestAgentJson<AgentFsMkdirResponse>("POST", "/v1/agent/fs/mkdir", body),
+    agentFsRename: (body) => requestAgentJson<AgentFsRenameResponse>("POST", "/v1/agent/fs/rename", body),
+    agentExec: (body, signal) => fetchFn(`${BASE}/v1/agent/exec`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Accept": "text/event-stream" },
+      body: JSON.stringify(body),
+      signal,
+    }),
+    agentShellCreate: (body) => requestAgentJson<AgentShellSessionResponse>("POST", "/v1/agent/shells", body),
+    agentShellDelete: (shellId) => requestAgentJson<AgentShellDeleteResponse>("DELETE", `/v1/agent/shells/${encodeURIComponent(shellId)}`),
   };
 }

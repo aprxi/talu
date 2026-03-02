@@ -253,6 +253,51 @@ describe("ApiClient — URL paths and methods", () => {
     expect(calls[0]!.init?.method).toBe("DELETE");
     expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ tags: ["rust"] });
   });
+
+  test("agentFsRead → POST /v1/agent/fs/read", async () => {
+    await client.agentFsRead({ path: "notes.txt", max_bytes: 128 });
+    expect(calls[0]!.url).toBe("/v1/agent/fs/read");
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ path: "notes.txt", max_bytes: 128 });
+  });
+
+  test("agentFsRemove → DELETE /v1/agent/fs/rm with JSON body", async () => {
+    await client.agentFsRemove({ path: "notes.txt", recursive: true });
+    expect(calls[0]!.url).toBe("/v1/agent/fs/rm");
+    expect(calls[0]!.init?.method).toBe("DELETE");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ path: "notes.txt", recursive: true });
+  });
+
+  test("agentExec → POST /v1/agent/exec with SSE accept header", async () => {
+    const signal = new AbortController().signal;
+    await client.agentExec({ command: "echo hi", cwd: ".", timeout_ms: 1000 }, signal);
+    expect(calls[0]!.url).toBe("/v1/agent/exec");
+    expect(calls[0]!.init?.method).toBe("POST");
+    const headers = new Headers(calls[0]!.init?.headers);
+    expect(headers.get("Content-Type")).toBe("application/json");
+    expect(headers.get("Accept")).toBe("text/event-stream");
+    expect(calls[0]!.init?.signal).toBe(signal);
+  });
+
+  test("agentShellCreate → POST /v1/agent/shells", async () => {
+    await client.agentShellCreate({ cols: 100, rows: 30, cwd: "." });
+    expect(calls[0]!.url).toBe("/v1/agent/shells");
+    expect(calls[0]!.init?.method).toBe("POST");
+    expect(JSON.parse(calls[0]!.init!.body as string)).toEqual({ cols: 100, rows: 30, cwd: "." });
+  });
+
+  test("agentShellDelete → DELETE /v1/agent/shells/:id", async () => {
+    await client.agentShellDelete("shell/1");
+    expect(calls[0]!.url).toBe(`/v1/agent/shells/${encodeURIComponent("shell/1")}`);
+    expect(calls[0]!.init?.method).toBe("DELETE");
+  });
+
+  test("agentFsRead includes error code in ApiResult.error when server provides one", async () => {
+    mockResponse = jsonResponse({ error: { code: "policy_denied_file_read", message: "blocked" } }, 403);
+    const result = await client.agentFsRead({ path: "secret.txt" });
+    expect(result.ok).toBe(false);
+    expect(result.error).toBe("policy_denied_file_read: blocked");
+  });
 });
 
 // ── Headers ─────────────────────────────────────────────────────────────────

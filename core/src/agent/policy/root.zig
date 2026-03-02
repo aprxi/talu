@@ -27,6 +27,44 @@ pub const ProcessCheckResult = struct {
     deny_reason: ?ProcessDenyReason = null,
 };
 
+/// Return a definitive effect for all descendants of `directory_resource`, when
+/// it can be proven from recursive resource rules.
+///
+/// Returns `null` when per-entry evaluation is required.
+pub fn checkFileDescendantSubtree(
+    policy: *const Policy,
+    action: []const u8,
+    directory_resource: []const u8,
+) ?Effect {
+    var has_action_deny = false;
+    var has_universal_allow = false;
+
+    for (policy.statements) |stmt| {
+        if (!actionPatternMatches(stmt.action_pattern, action)) continue;
+
+        switch (stmt.effect) {
+            .deny => {
+                has_action_deny = true;
+                if (resourceMatchesAllDescendants(stmt.resource_pattern, directory_resource)) {
+                    return .deny;
+                }
+            },
+            .allow => {
+                if (resourceMatchesAllDescendants(stmt.resource_pattern, directory_resource)) {
+                    has_universal_allow = true;
+                }
+            },
+        }
+    }
+
+    // Conservative allow short-circuit: only when this action has no deny
+    // statements at all.
+    if (has_action_deny) return null;
+    if (policy.default_effect == .allow) return .allow;
+    if (has_universal_allow) return .allow;
+    return null;
+}
+
 /// Parse a policy from JSON.
 ///
 /// Accepted schema:
@@ -144,6 +182,50 @@ pub fn checkProcessAction(
     }
 
     return .{ .allowed = false, .deny_reason = .action };
+}
+
+fn actionPatternMatches(pattern_value: []const u8, action: []const u8) bool {
+    if (pattern.globMatch(pattern_value, action)) return true;
+
+    // Keep parity with evaluate.actionMatch for trailing " *".
+    if (pattern_value.len >= 2 and
+        pattern_value[pattern_value.len - 1] == '*' and
+        pattern_value[pattern_value.len - 2] == ' ')
+    {
+        const prefix = pattern_value[0 .. pattern_value.len - 2];
+        return pattern.globMatch(prefix, action);
+    }
+    return false;
+}
+
+fn resourceMatchesAllDescendants(resource_pattern: ?[]const u8, directory_resource: []const u8) bool {
+    const raw = resource_pattern orelse return true;
+    if (raw.len == 0) return false;
+
+    var pattern_value = raw;
+    if (pattern_value[0] == '/') {
+        pattern_value = pattern_value[1..];
+        if (pattern_value.len == 0) return true;
+    }
+
+    if (std.mem.eql(u8, pattern_value, "**")) return true;
+    if (!std.mem.endsWith(u8, pattern_value, "/**")) return false;
+
+    const base = pattern_value[0 .. pattern_value.len - 3];
+    if (base.len == 0) return true;
+    if (std.mem.indexOfAny(u8, base, "*?") != null) return false;
+
+    return isAncestorOrSelf(base, directory_resource);
+}
+
+fn isAncestorOrSelf(ancestor: []const u8, candidate: []const u8) bool {
+    if (ancestor.len == 0) return true;
+    if (std.mem.eql(u8, ancestor, candidate)) return true;
+    if (!std.mem.startsWith(u8, candidate, ancestor)) return false;
+    if (candidate.len <= ancestor.len) return false;
+
+    const sep = candidate[ancestor.len];
+    return sep == '/' or sep == '\\';
 }
 
 fn copyInto(storage: []u8, offset: *usize, value: []const u8) []const u8 {
@@ -321,4 +403,51 @@ test "parsePolicy explicit deny wins regardless of statement order" {
 
     try std.testing.expectEqual(Effect.deny, policy_a.evaluate("rm -rf /tmp"));
     try std.testing.expectEqual(Effect.deny, policy_b.evaluate("rm -rf /tmp"));
+}
+
+test "checkFileDescendantSubtree returns deny for recursive deny ancestor" {
+    var policy_obj = try parsePolicy(std.testing.allocator,
+        \\{"default":"allow","statements":[
+        \\  {"effect":"deny","action":"tool.fs.read","resource":"src/**"}
+        \\]}
+    );
+    defer policy_obj.deinit();
+
+    try std.testing.expectEqual(
+        Effect.deny,
+        checkFileDescendantSubtree(&policy_obj, "tool.fs.read", "src").?,
+    );
+    try std.testing.expectEqual(
+        Effect.deny,
+        checkFileDescendantSubtree(&policy_obj, "tool.fs.read", "src/deep").?,
+    );
+}
+
+test "checkFileDescendantSubtree returns allow only when deny-free for action" {
+    var policy_obj = try parsePolicy(std.testing.allocator,
+        \\{"default":"deny","statements":[
+        \\  {"effect":"allow","action":"tool.fs.read","resource":"src/**"},
+        \\  {"effect":"deny","action":"tool.exec","command":"rm *"}
+        \\]}
+    );
+    defer policy_obj.deinit();
+
+    try std.testing.expectEqual(
+        Effect.allow,
+        checkFileDescendantSubtree(&policy_obj, "tool.fs.read", "src").?,
+    );
+}
+
+test "checkFileDescendantSubtree is conservative when action has deny statements" {
+    var policy_obj = try parsePolicy(std.testing.allocator,
+        \\{"default":"deny","statements":[
+        \\  {"effect":"allow","action":"tool.fs.read","resource":"src/**"},
+        \\  {"effect":"deny","action":"tool.fs.read","resource":"src/private/**"}
+        \\]}
+    );
+    defer policy_obj.deinit();
+
+    try std.testing.expect(
+        checkFileDescendantSubtree(&policy_obj, "tool.fs.read", "src") == null,
+    );
 }

@@ -188,7 +188,8 @@ test "Policy parsePolicy rejects invalid JSON" {
 test "Policy checkProcessAction classifies cwd denial" {
     var policy = try parsePolicy(std.testing.allocator,
         \\{"default":"deny","statements":[
-        \\  {"effect":"allow","action":"tool.exec","command":"rg *","cwd":"repo/**"}
+        \\  {"effect":"allow","action":"tool.exec","command":"rg *"},
+        \\  {"effect":"deny","action":"tool.exec","command":"rg *","cwd":"tmp/**"}
         \\]}
     );
     defer policy.deinit();
@@ -212,4 +213,32 @@ test "Policy checkFileAction enforces resource globs" {
 
     try std.testing.expect(policy_mod.checkFileAction(&policy, "tool.fs.read", "src/main.zig", false));
     try std.testing.expect(!policy_mod.checkFileAction(&policy, "tool.fs.read", "src/secrets/key.txt", false));
+}
+
+test "Policy checkFileDescendantSubtree returns recursive deny for descendants" {
+    var policy = try parsePolicy(std.testing.allocator,
+        \\{"default":"allow","statements":[
+        \\  {"effect":"deny","action":"tool.fs.read","resource":"src/**"}
+        \\]}
+    );
+    defer policy.deinit();
+
+    try std.testing.expectEqual(
+        Effect.deny,
+        policy_mod.checkFileDescendantSubtree(&policy, "tool.fs.read", "src").?,
+    );
+}
+
+test "Policy checkFileDescendantSubtree remains conservative when read has denies" {
+    var policy = try parsePolicy(std.testing.allocator,
+        \\{"default":"deny","statements":[
+        \\  {"effect":"allow","action":"tool.fs.read","resource":"src/**"},
+        \\  {"effect":"deny","action":"tool.fs.read","resource":"src/private/**"}
+        \\]}
+    );
+    defer policy.deinit();
+
+    try std.testing.expect(
+        policy_mod.checkFileDescendantSubtree(&policy, "tool.fs.read", "src") == null,
+    );
 }

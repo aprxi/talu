@@ -42,6 +42,7 @@ import type { ModeManager } from "../ui/mode-manager.ts";
 import type { ContextKeyService } from "../registries/context-keys.ts";
 import type { MenuRegistry } from "../registries/menus.ts";
 import { createApiClient } from "../../api.ts";
+import { createAgentAccess } from "../system/agent.ts";
 
 /** Shared kernel infrastructure passed to all plugin contexts. */
 export interface KernelInfrastructure {
@@ -99,6 +100,12 @@ export function createPluginContext(
   // Network + API must be created before storage (KvStorageFacade needs api).
   const rawNetwork = new NetworkAccessImpl(pluginId, token, infra.networkConnectivity);
   const api = createApiClient((url, init) => rawNetwork.fetch(url, init));
+  const agentApi = createApiClient((url, init) => {
+    if (!isBuiltin) {
+      return rawNetwork.fetch(url, init);
+    }
+    return window.fetch(url, init);
+  });
 
   // Built-in plugins get KV-backed storage (no server token needed).
   // Third-party plugins get server-backed storage via /v1/db/tables/documents with a
@@ -318,6 +325,11 @@ export function createPluginContext(
       },
     },
     upload: uploadAccess,
+    agent: createAgentAccess({
+      api: agentApi,
+      requirePermission,
+      defaultCwd: ".",
+    }),
     context,
     menus,
   };

@@ -104,6 +104,31 @@ describe("createPluginContext — permission gates", () => {
     expect(promise).toBeInstanceOf(Promise);
   });
 
+  test("builtin plugin agent requests do not attach plugin capability headers", async () => {
+    const disposables = new DisposableStore();
+    let capturedHeaders: Headers | null = null;
+    const fetchSpy = spyOn(window, "fetch").mockImplementation(async (_url, init?: RequestInit) => {
+      capturedHeaders = new Headers(init?.headers);
+      return new Response(
+        JSON.stringify({
+          path: "notes.txt",
+          content: "hello",
+          encoding: "utf-8",
+          size: 5,
+          truncated: false,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+
+    const ctx = createPluginContext(builtinManifest(), document.createElement("div"), infra, disposables, new AbortController());
+    const file = await ctx.agent.fs.readFile("notes.txt");
+    expect(file.content).toBe("hello");
+    expect(capturedHeaders?.has("X-Talu-Plugin-Id")).toBe(false);
+    expect(capturedHeaders?.has("Authorization")).toBe(false);
+    fetchSpy.mockRestore();
+  });
+
   // --- Third-party: permission gates ---
 
   test("third-party without 'network' permission → throws on fetch", async () => {
@@ -286,6 +311,55 @@ describe("createPluginContext — permission gates", () => {
     const content = await ctx.upload.getContent("file_2");
     expect(await content.text()).toBe("abc");
     expect(fetchSpy).toHaveBeenCalledTimes(3);
+    fetchSpy.mockRestore();
+  });
+
+  test("third-party without 'filesystem' permission → throws on agent.fs.readFile", async () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
+    await expect(ctx.agent.fs.readFile("notes.txt")).rejects.toThrow(/filesystem/);
+  });
+
+  test("third-party with 'filesystem' permission → agent.fs.readFile allowed", async () => {
+    const disposables = new DisposableStore();
+    const fetchSpy = spyOn(window, "fetch").mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          path: "notes.txt",
+          content: "hello",
+          encoding: "utf-8",
+          size: 5,
+          truncated: false,
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const ctx = createPluginContext(thirdPartyManifest(["filesystem"]), document.createElement("div"), infra, disposables, new AbortController());
+    const file = await ctx.agent.fs.readFile("notes.txt");
+    expect(file.content).toBe("hello");
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
+    fetchSpy.mockRestore();
+  });
+
+  test("third-party without 'exec' permission → throws on agent.shell.exec", async () => {
+    const disposables = new DisposableStore();
+    const ctx = createPluginContext(thirdPartyManifest([]), document.createElement("div"), infra, disposables, new AbortController());
+    await expect(ctx.agent.shell.exec("echo hello")).rejects.toThrow(/exec/);
+  });
+
+  test("third-party with 'exec' permission → agent.shell.exec allowed", async () => {
+    const disposables = new DisposableStore();
+    const fetchSpy = spyOn(window, "fetch").mockResolvedValue(
+      new Response("data: {\"type\":\"stdout\",\"data\":\"ok\"}\n\ndata: {\"type\":\"exit\",\"code\":0}\n\n", {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      }),
+    );
+    const ctx = createPluginContext(thirdPartyManifest(["exec"]), document.createElement("div"), infra, disposables, new AbortController());
+    const result = await ctx.agent.shell.exec("echo ok");
+    expect(result.stdout).toBe("ok");
+    expect(result.exitCode).toBe(0);
+    expect(fetchSpy).toHaveBeenCalledTimes(1);
     fetchSpy.mockRestore();
   });
 });

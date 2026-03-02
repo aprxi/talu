@@ -975,6 +975,35 @@ mod tests {
     }
 
     #[test]
+    fn parse_serve_policy_file_flag() {
+        let cli = parse(&["talu", "serve", "--policy-file", "/tmp/agent-policy.json"])
+            .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Serve(args)) => {
+                assert_eq!(
+                    args.policy_file,
+                    Some(PathBuf::from("/tmp/agent-policy.json"))
+                );
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
+    fn parse_serve_workspace_dir_flag() {
+        let cli = parse(&["talu", "serve", "--workspace-dir", "/tmp/workspace"])
+            .expect("parse should succeed");
+
+        match cli.command {
+            Some(Commands::Serve(args)) => {
+                assert_eq!(args.workspace_dir, Some(PathBuf::from("/tmp/workspace")));
+            }
+            _ => panic!("expected serve command"),
+        }
+    }
+
+    #[test]
     fn parse_get_sync_pins_flag() {
         let cli = parse(&["talu", "get", "--sync-pins"]).expect("parse should succeed");
 

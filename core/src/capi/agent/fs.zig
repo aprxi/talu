@@ -23,6 +23,11 @@ const FsHandle = struct {
     policy: ?*policy_api.TaluAgentPolicy,
 };
 
+const SubtreeOverride = struct {
+    prefix: []u8,
+    decision: policy_api.FileSubtreeDecision,
+};
+
 /// Opaque handle for workspace-scoped filesystem operations.
 pub const TaluFs = opaque {};
 
@@ -96,6 +101,33 @@ fn enforceFilePolicyOrDeny(
         return @intFromEnum(error_codes.ErrorCode.policy_denied_file_write);
     }
     return @intFromEnum(error_codes.ErrorCode.policy_denied_file_delete);
+}
+
+fn pathIsInOrUnderSubtree(prefix: []const u8, path: []const u8) bool {
+    if (prefix.len == 0) return true;
+    if (std.mem.eql(u8, prefix, path)) return true;
+    if (!std.mem.startsWith(u8, path, prefix)) return false;
+    if (path.len <= prefix.len) return false;
+
+    const sep = path[prefix.len];
+    return sep == '/' or sep == '\\';
+}
+
+fn findSubtreeOverride(
+    overrides: []const SubtreeOverride,
+    path: []const u8,
+) ?policy_api.FileSubtreeDecision {
+    var best: ?policy_api.FileSubtreeDecision = null;
+    var best_len: usize = 0;
+
+    for (overrides) |entry| {
+        if (!pathIsInOrUnderSubtree(entry.prefix, path)) continue;
+        if (best == null or entry.prefix.len > best_len) {
+            best = entry.decision;
+            best_len = entry.prefix.len;
+        }
+    }
+    return best;
 }
 
 /// Create a workspace-scoped filesystem handle.
@@ -410,6 +442,14 @@ pub fn talu_fs_list(
             filtered.deinit(allocator);
         }
 
+        var subtree_overrides = std.ArrayList(SubtreeOverride).empty;
+        defer {
+            for (subtree_overrides.items) |entry| {
+                allocator.free(entry.prefix);
+            }
+            subtree_overrides.deinit(allocator);
+        }
+
         for (result.entries) |entry| {
             const abs_entry_path = if (entry.path.len == 0)
                 allocator.dupe(u8, resolved) catch |err| {
@@ -426,13 +466,43 @@ pub fn talu_fs_list(
             };
             defer allocator.free(relative_entry);
 
-            if (policy_api.enforceFilePolicy(state.policy, ACTION_FS_READ, relative_entry, entry.is_dir)) {
+            var decision = if (recursive)
+                findSubtreeOverride(subtree_overrides.items, relative_entry)
+            else
+                null;
+            if (decision == null) {
+                const allowed = policy_api.enforceFilePolicy(state.policy, ACTION_FS_READ, relative_entry, entry.is_dir);
+                decision = if (allowed) .allow else .deny;
+            }
+
+            if (decision.? == .allow) {
                 filtered.append(allocator, entry) catch |err| {
                     return returnFsError(err, "failed to append filtered list entry");
                 };
             } else {
                 allocator.free(entry.path);
                 allocator.free(entry.name);
+            }
+
+            // Recursive list responses are depth-first. Cache a definitive
+            // subtree decision from parent `/**`-style policy statements to
+            // avoid evaluating every child entry individually.
+            if (recursive and entry.is_dir and
+                findSubtreeOverride(subtree_overrides.items, relative_entry) == null)
+            {
+                if (policy_api.fileSubtreeDecision(state.policy, ACTION_FS_READ, relative_entry)) |subtree_decision| {
+                    const subtree_prefix = allocator.dupe(u8, relative_entry) catch |err| {
+                        return returnFsError(err, "failed to allocate subtree override prefix");
+                    };
+                    errdefer allocator.free(subtree_prefix);
+
+                    subtree_overrides.append(allocator, .{
+                        .prefix = subtree_prefix,
+                        .decision = subtree_decision,
+                    }) catch |err| {
+                        return returnFsError(err, "failed to append subtree override");
+                    };
+                }
             }
         }
 
@@ -696,6 +766,72 @@ test "talu_fs_write enforces agent policy when provided" {
         @as(i32, @intFromEnum(error_codes.ErrorCode.policy_denied_file_write)),
         rc,
     );
+}
+
+test "talu_fs_list recursive policy filter preserves nested deny semantics" {
+    const test_allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.makePath("src/private");
+    try tmp.dir.writeFile(.{ .sub_path = "src/a.txt", .data = "a" });
+    try tmp.dir.writeFile(.{ .sub_path = "src/private/secret.txt", .data = "s" });
+
+    const workspace = try tmp.dir.realpathAlloc(test_allocator, ".");
+    defer test_allocator.free(workspace);
+
+    const workspace_z = try test_allocator.allocSentinel(u8, workspace.len, 0);
+    defer test_allocator.free(workspace_z);
+    @memcpy(workspace_z, workspace);
+
+    var policy_handle: ?*policy_api.TaluAgentPolicy = null;
+    const policy_json =
+        \\{"default":"deny","statements":[
+        \\  {"effect":"allow","action":"tool.fs.read","resource":"src/**"},
+        \\  {"effect":"deny","action":"tool.fs.read","resource":"src/private/**"}
+        \\]}
+    ;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        policy_api.talu_agent_policy_create(policy_json.ptr, policy_json.len, &policy_handle),
+    );
+    defer policy_api.talu_agent_policy_free(policy_handle);
+
+    var fs_handle: ?*TaluFs = null;
+    try std.testing.expectEqual(@as(i32, 0), talu_fs_create(workspace_z.ptr, policy_handle, &fs_handle));
+    defer talu_fs_free(fs_handle);
+
+    const list_path = "src";
+    const list_path_z = try test_allocator.allocSentinel(u8, list_path.len, 0);
+    defer test_allocator.free(list_path_z);
+    @memcpy(list_path_z, list_path);
+
+    var out_json: ?[*]const u8 = null;
+    var out_len: usize = 0;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_fs_list(fs_handle, list_path_z.ptr, null, true, 100, &out_json, &out_len),
+    );
+    defer talu_fs_free_string(out_json, out_len);
+
+    const EntryView = struct {
+        path: []const u8,
+        name: []const u8,
+        is_dir: bool,
+        is_symlink: bool,
+        size: u64,
+        modified_at: i64,
+    };
+    const ListResponse = struct {
+        entries: []const EntryView,
+        truncated: bool,
+    };
+    const parsed = try std.json.parseFromSlice(ListResponse, test_allocator, out_json.?[0..out_len], .{});
+    defer parsed.deinit();
+
+    try std.testing.expect(!parsed.value.truncated);
+    try std.testing.expectEqual(@as(usize, 1), parsed.value.entries.len);
+    try std.testing.expectEqualStrings("a.txt", parsed.value.entries[0].path);
 }
 
 test "fuzz talu_fs_stat path handling" {

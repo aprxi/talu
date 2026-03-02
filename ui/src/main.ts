@@ -5,7 +5,16 @@ import { browserPlugin } from "./plugins/browser/index.ts";
 import { filesPlugin } from "./plugins/files/index.ts";
 import { chatPlugin } from "./plugins/chat/index.ts";
 import { repoPlugin } from "./plugins/repo/index.ts";
+import { workspaceOpsPlugin } from "./plugins/workspace-ops/index.ts";
 
 document.addEventListener("DOMContentLoaded", () => {
-  bootKernel([settingsPlugin, promptsPlugin, browserPlugin, filesPlugin, chatPlugin, repoPlugin]);
+  bootKernel([
+    settingsPlugin,
+    promptsPlugin,
+    browserPlugin,
+    filesPlugin,
+    workspaceOpsPlugin,
+    chatPlugin,
+    repoPlugin,
+  ]);
 });

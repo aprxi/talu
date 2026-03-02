@@ -16,6 +16,11 @@ pub const ProcessPolicyResult = struct {
     deny_reason: ?ProcessDenyReason = null,
 };
 
+pub const FileSubtreeDecision = enum {
+    allow,
+    deny,
+};
+
 pub fn toPolicyConst(handle: ?*TaluAgentPolicy) ?*const Policy {
     if (handle) |h| {
         return @ptrCast(@alignCast(h));
@@ -36,6 +41,19 @@ pub fn enforceFilePolicy(
 ) bool {
     const p = toPolicyConst(policy) orelse return true;
     return policy_mod.checkFileAction(p, action, resource, is_dir);
+}
+
+pub fn fileSubtreeDecision(
+    policy: ?*TaluAgentPolicy,
+    action: []const u8,
+    directory_resource: []const u8,
+) ?FileSubtreeDecision {
+    const p = toPolicyConst(policy) orelse return null;
+    const effect = policy_mod.checkFileDescendantSubtree(p, action, directory_resource) orelse return null;
+    return switch (effect) {
+        .allow => .allow,
+        .deny => .deny,
+    };
 }
 
 pub fn enforceProcessPolicy(

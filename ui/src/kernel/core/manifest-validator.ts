@@ -23,6 +23,8 @@ export const KNOWN_PERMISSIONS = new Set([
   "clipboard",  // ctx.clipboard — write to system clipboard
   "download",   // ctx.download — trigger file downloads
   "upload",     // ctx.upload — file upload/download APIs
+  "filesystem", // ctx.agent.fs — workspace filesystem operations
+  "exec",       // ctx.agent.shell — command execution and shell sessions
   "hooks",      // ctx.hooks — intercept/transform kernel operations
   "tools",      // ctx.tools — register LLM-callable tools
   "menus",      // ctx.menus.registerItem — contribute UI actions to slots

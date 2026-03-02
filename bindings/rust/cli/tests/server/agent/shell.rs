@@ -1,5 +1,6 @@
 use crate::server::common::{
-    delete, get, post_json, send_request, ServerConfig, ServerTestContext,
+    assert_server_startup_fails, delete, get, post_json, send_request, ServerConfig,
+    ServerTestContext,
 };
 use futures_util::{SinkExt, StreamExt};
 use tokio_tungstenite::tungstenite::Message;
@@ -299,42 +300,36 @@ fn agent_shell_create_denied_by_policy_cwd_filter() {
 }
 
 #[test]
-fn agent_shell_create_with_invalid_policy_json_returns_500() {
+fn agent_shell_create_with_invalid_policy_json_fails_startup() {
     let mut cfg = ServerConfig::new();
     cfg.env_vars.push((
         "TALU_AGENT_POLICY_JSON".to_string(),
         "{not-valid-json".to_string(),
     ));
-    let ctx = ServerTestContext::new(cfg);
-
-    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+    assert_server_startup_fails(cfg, "parse agent runtime policy JSON");
 }
 
 #[test]
-fn agent_shell_create_with_invalid_policy_schema_returns_500() {
+fn agent_shell_create_with_invalid_policy_schema_fails_startup() {
     let policy = r#"{
         "default":"maybe",
         "statements":[]
     }"#;
-    let ctx = ServerTestContext::new(config_with_policy(policy));
-
-    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+    assert_server_startup_fails(
+        config_with_policy(policy),
+        "parse agent runtime policy JSON",
+    );
 }
 
 #[test]
-fn agent_shell_create_with_invalid_policy_schema_missing_statements_returns_500() {
+fn agent_shell_create_with_invalid_policy_schema_missing_statements_fails_startup() {
     let policy = r#"{
         "default":"deny"
     }"#;
-    let ctx = ServerTestContext::new(config_with_policy(policy));
-
-    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
-    assert_eq!(resp.status, 500, "body: {}", resp.body);
-    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+    assert_server_startup_fails(
+        config_with_policy(policy),
+        "parse agent runtime policy JSON",
+    );
 }
 
 #[test]

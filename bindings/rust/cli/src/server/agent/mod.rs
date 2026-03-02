@@ -14,5 +14,5 @@ pub(crate) fn load_runtime_policy(state: &AppState) -> Result<Option<Policy>, St
 
     Policy::from_json(json)
         .map(Some)
-        .map_err(|err| format!("failed to parse TALU_AGENT_POLICY_JSON: {err}"))
+        .map_err(|err| format!("failed to parse agent runtime policy JSON: {err}"))
 }
