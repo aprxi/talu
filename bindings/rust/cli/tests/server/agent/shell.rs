@@ -582,13 +582,24 @@ async fn agent_shell_ws_resize_zero_returns_error() {
 }
 
 #[tokio::test]
-async fn agent_shell_ws_signal_term_kills_shell() {
+async fn agent_shell_ws_signal_kill_terminates_shell() {
     let ctx = ServerTestContext::new(ServerConfig::new());
     let shell_id = create_shell(&ctx);
     let mut ws = ws_connect(&ctx, &shell_id).await;
 
+    // Wait for shell to produce initial output (prompt/banner).
+    // This confirms the PTY child is running and the WS loops are active.
+    // Timeout is a deadlock guard only — the shell always produces output.
+    match tokio::time::timeout(std::time::Duration::from_secs(5), ws.next()).await {
+        Ok(Some(Ok(_))) => {}
+        other => panic!("shell did not produce initial output: {other:?}"),
+    }
+
+    // Use SIGKILL: interactive shells ignore SIGTERM (POSIX behaviour),
+    // so only SIGKILL (which cannot be caught/ignored) reliably terminates
+    // an idle interactive shell.
     ws.send(Message::Text(
-        serde_json::json!({"type": "signal", "signal": "TERM"})
+        serde_json::json!({"type": "signal", "signal": "KILL"})
             .to_string()
             .into(),
     ))
@@ -596,7 +607,7 @@ async fn agent_shell_ws_signal_term_kills_shell() {
     .expect("ws send");
 
     let (_, exit_event) = ws_drain_output(&mut ws).await;
-    let exit = exit_event.expect("should receive exit event after SIGTERM");
+    let exit = exit_event.expect("should receive exit event after SIGKILL");
     assert_eq!(exit["type"], "exit");
 }
 
