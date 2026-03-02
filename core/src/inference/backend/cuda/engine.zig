@@ -540,7 +540,7 @@ const PrototypeRuntime = struct {
     }
 };
 
-const AttentionMlpBlockRuntime = struct {
+const LayerAttentionRuntime = struct {
     q_dim: usize,
     kv_dim: usize,
     d_ff: usize,
@@ -563,7 +563,7 @@ const AttentionMlpBlockRuntime = struct {
     v_cache: compute.cuda.Buffer,
     kv_capacity: usize,
 
-    fn deinit(self: *AttentionMlpBlockRuntime, device: *compute.cuda.Device) void {
+    fn deinit(self: *LayerAttentionRuntime, device: *compute.cuda.Device) void {
         self.v_cache.deinit(device);
         self.k_cache.deinit(device);
         if (self.post_ffn_norm_weight) |*w| w.deinit(device);
@@ -580,6 +580,17 @@ const AttentionMlpBlockRuntime = struct {
         self.ln2_weight.deinit(device);
         self.ln1_weight.deinit(device);
     }
+};
+
+const LayerAttentionExecConfig = struct {
+    q_dim: usize,
+    kv_dim: usize,
+    sliding_window: usize,
+    is_causal: bool,
+    q_norm_weight: ?*const DeviceTensor = null,
+    k_norm_weight: ?*const DeviceTensor = null,
+    k_cache: *const compute.cuda.Buffer,
+    v_cache: *const compute.cuda.Buffer,
 };
 
 const ShortConvBlockRuntime = struct {
@@ -611,54 +622,68 @@ const ShortConvBlockRuntime = struct {
     }
 };
 
+const ShortConvExecConfig = struct {
+    conv_dim: usize,
+    d_conv: usize,
+    conv_bias: ?*const DeviceTensor = null,
+    conv_state: *compute.cuda.Buffer,
+};
+
 const BlockRuntimeLayer = struct {
     const invalid_slot = std.math.maxInt(u8);
     const MaxNormWeights = 4;
 
-    const FfnBinding = struct {
-        gate: *const LinearWeight,
+    const MoeExecConfig = struct {
+        router: *const LinearWeight,
         up: *const LinearWeight,
         down: *const LinearWeight,
         d_ff: u32,
     };
 
+    const FfnExecConfig = struct {
+        w1: *const LinearWeight,
+        w3: *const LinearWeight,
+        w2: *const LinearWeight,
+    };
+
+    const AttentionWeightRefs = struct {
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
+        o_proj: *const LinearWeight,
+    };
+
+    const ShortConvWeightRefs = struct {
+        in_proj: *const LinearWeight,
+        conv_weight: *const DeviceTensor,
+        out_proj: *const LinearWeight,
+    };
+
     compiled_plan: ?runtime_contract.CompiledPlan = null,
     instruction_norm_weight_refs: []?*const DeviceTensor = &.{},
-    instruction_attention_refs: []?*AttentionMlpBlockRuntime = &.{},
-    instruction_shortconv_refs: []?*ShortConvBlockRuntime = &.{},
-    instruction_ffn_refs: []?FfnBinding = &.{},
+    instruction_attention_refs: []?LayerAttentionExecConfig = &.{},
+    instruction_shortconv_refs: []?ShortConvExecConfig = &.{},
+    instruction_attention_weight_refs: []?AttentionWeightRefs = &.{},
+    instruction_shortconv_weight_refs: []?ShortConvWeightRefs = &.{},
+    instruction_swiglu_refs: []?FfnExecConfig = &.{},
+    instruction_moe_refs: []?MoeExecConfig = &.{},
+    instruction_weight_offsets: []u32 = &.{},
+    instruction_weight_ptrs: []?*anyopaque = &.{},
     register_to_slot_map: []const u8 = &.{},
     slot_width_hints: []const usize = &.{},
-    attention_runtime: ?AttentionMlpBlockRuntime = null,
+    attention_runtime: ?LayerAttentionRuntime = null,
     shortconv_runtime: ?ShortConvBlockRuntime = null,
-    attention_binding: ?*AttentionMlpBlockRuntime = null,
+    attention_binding: ?*LayerAttentionRuntime = null,
     shortconv_binding: ?*ShortConvBlockRuntime = null,
     norm_weights: [MaxNormWeights]?*const DeviceTensor = [_]?*const DeviceTensor{null} ** MaxNormWeights,
     norm_weight_count: u8 = 0,
-    ffn_binding: ?FfnBinding = null,
 
     fn instructionKernelIdFromWeightBindings(
         compiled: *const runtime_contract.CompiledPlan,
         op_index: usize,
         opcode: runtime_contract.Opcode,
     ) !u32 {
-        if (op_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
-        const insn = compiled.plan.instructions[op_index];
-        const expected_slots = runtime_contract.expectedKernelWeightSlots(opcode);
-        if (expected_slots.len == 0) return error.InvalidInstructionPayload;
-        if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
-        var kernel_id: ?u32 = null;
-        for (insn.weights, 0..) |_, slot_idx| {
-            const binding_name = try runtime_contract.instructionWeightBindingName(compiled, op_index, slot_idx);
-            const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
-            if (!std.mem.eql(u8, parsed.slot_name, expected_slots[slot_idx])) return error.InvalidWeightBindingName;
-            if (kernel_id == null) {
-                kernel_id = parsed.kernel_id;
-            } else if (kernel_id.? != parsed.kernel_id) {
-                return error.InvalidWeightBindingName;
-            }
-        }
-        return kernel_id orelse error.InvalidInstructionPayload;
+        return runtime_contract.instructionKernelBindingId(compiled, op_index, opcode);
     }
 
     const InstructionRefBinderFn = *const fn (
@@ -699,7 +724,23 @@ const BlockRuntimeLayer = struct {
         _: *usize,
     ) !void {
         _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
-        self.instruction_attention_refs[op_index] = self.attention_binding orelse return error.UnsupportedModel;
+        const binding = self.attention_binding orelse return error.UnsupportedModel;
+        self.instruction_attention_refs[op_index] = .{
+            .q_dim = binding.q_dim,
+            .kv_dim = binding.kv_dim,
+            .sliding_window = binding.sliding_window,
+            .is_causal = binding.is_causal,
+            .q_norm_weight = if (binding.q_norm_weight) |*weight| weight else null,
+            .k_norm_weight = if (binding.k_norm_weight) |*weight| weight else null,
+            .k_cache = &binding.k_cache,
+            .v_cache = &binding.v_cache,
+        };
+        self.instruction_attention_weight_refs[op_index] = .{
+            .q_proj = &binding.q_proj,
+            .k_proj = &binding.k_proj,
+            .v_proj = &binding.v_proj,
+            .o_proj = &binding.o_proj,
+        };
     }
 
     fn bindInstructionShortConv(
@@ -710,10 +751,21 @@ const BlockRuntimeLayer = struct {
         _: *usize,
     ) !void {
         _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
-        self.instruction_shortconv_refs[op_index] = self.shortconv_binding orelse return error.UnsupportedModel;
+        const binding = self.shortconv_binding orelse return error.UnsupportedModel;
+        self.instruction_shortconv_refs[op_index] = .{
+            .conv_dim = binding.conv_dim,
+            .d_conv = binding.d_conv,
+            .conv_bias = if (binding.conv_bias) |*weight| weight else null,
+            .conv_state = &binding.conv_state,
+        };
+        self.instruction_shortconv_weight_refs[op_index] = .{
+            .in_proj = &binding.in_proj,
+            .conv_weight = &binding.conv_weight_time_major,
+            .out_proj = &binding.out_proj,
+        };
     }
 
-    fn bindInstructionFfn(
+    fn bindInstructionMoe(
         self: *BlockRuntimeLayer,
         compiled: *const runtime_contract.CompiledPlan,
         op_index: usize,
@@ -721,7 +773,63 @@ const BlockRuntimeLayer = struct {
         _: *usize,
     ) !void {
         _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
-        self.instruction_ffn_refs[op_index] = self.ffn_binding orelse return error.UnsupportedModel;
+        self.instruction_moe_refs[op_index] = try self.resolveMoeExecConfig();
+    }
+
+    fn bindInstructionSwiGlu(
+        self: *BlockRuntimeLayer,
+        compiled: *const runtime_contract.CompiledPlan,
+        op_index: usize,
+        insn: *const runtime_contract.Instruction,
+        _: *usize,
+    ) !void {
+        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        self.instruction_swiglu_refs[op_index] = try self.resolveFfnExecConfig();
+    }
+
+    fn resolveMoeExecConfig(self: *const BlockRuntimeLayer) !MoeExecConfig {
+        if (self.attention_binding) |binding| {
+            return .{
+                .router = &binding.w1,
+                .up = &binding.w3,
+                .down = &binding.w2,
+                .d_ff = @intCast(binding.d_ff),
+            };
+        }
+        if (self.shortconv_binding) |binding| {
+            const router = if (binding.ffn_w1) |*w| w else return error.UnsupportedModel;
+            const up = if (binding.ffn_w3) |*w| w else return error.UnsupportedModel;
+            const down = if (binding.ffn_w2) |*w| w else return error.UnsupportedModel;
+            if (binding.d_ff == 0) return error.UnsupportedModel;
+            return .{
+                .router = router,
+                .up = up,
+                .down = down,
+                .d_ff = @intCast(binding.d_ff),
+            };
+        }
+        return error.UnsupportedModel;
+    }
+
+    fn resolveFfnExecConfig(self: *const BlockRuntimeLayer) !FfnExecConfig {
+        if (self.attention_binding) |binding| {
+            return .{
+                .w1 = &binding.w1,
+                .w3 = &binding.w3,
+                .w2 = &binding.w2,
+            };
+        }
+        if (self.shortconv_binding) |binding| {
+            const w1 = if (binding.ffn_w1) |*w| w else return error.MissingWeight;
+            const w3 = if (binding.ffn_w3) |*w| w else return error.MissingWeight;
+            const w2 = if (binding.ffn_w2) |*w| w else return error.MissingWeight;
+            return .{
+                .w1 = w1,
+                .w3 = w3,
+                .w2 = w2,
+            };
+        }
+        return error.UnsupportedModel;
     }
 
     const instruction_ref_binder_table: [256]?InstructionRefBinderFn = blk: {
@@ -730,8 +838,8 @@ const BlockRuntimeLayer = struct {
         table[@intFromEnum(runtime_contract.Opcode.multihead_attention)] = bindInstructionAttention;
         table[@intFromEnum(runtime_contract.Opcode.mla_attention)] = bindInstructionAttention;
         table[@intFromEnum(runtime_contract.Opcode.shortconv)] = bindInstructionShortConv;
-        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = bindInstructionFfn;
-        table[@intFromEnum(runtime_contract.Opcode.moe)] = bindInstructionFfn;
+        table[@intFromEnum(runtime_contract.Opcode.swiglu)] = bindInstructionSwiGlu;
+        table[@intFromEnum(runtime_contract.Opcode.moe)] = bindInstructionMoe;
         break :blk table;
     };
 
@@ -748,27 +856,158 @@ const BlockRuntimeLayer = struct {
             allocator.free(self.instruction_shortconv_refs);
             self.instruction_shortconv_refs = &.{};
         }
-        if (self.instruction_ffn_refs.len != 0) {
-            allocator.free(self.instruction_ffn_refs);
-            self.instruction_ffn_refs = &.{};
+        if (self.instruction_attention_weight_refs.len != 0) {
+            allocator.free(self.instruction_attention_weight_refs);
+            self.instruction_attention_weight_refs = &.{};
+        }
+        if (self.instruction_shortconv_weight_refs.len != 0) {
+            allocator.free(self.instruction_shortconv_weight_refs);
+            self.instruction_shortconv_weight_refs = &.{};
+        }
+        if (self.instruction_swiglu_refs.len != 0) {
+            allocator.free(self.instruction_swiglu_refs);
+            self.instruction_swiglu_refs = &.{};
+        }
+        if (self.instruction_moe_refs.len != 0) {
+            allocator.free(self.instruction_moe_refs);
+            self.instruction_moe_refs = &.{};
+        }
+        if (self.instruction_weight_offsets.len != 0) {
+            allocator.free(self.instruction_weight_offsets);
+            self.instruction_weight_offsets = &.{};
+        }
+        if (self.instruction_weight_ptrs.len != 0) {
+            allocator.free(self.instruction_weight_ptrs);
+            self.instruction_weight_ptrs = &.{};
         }
 
         const compiled = self.compiled_plan orelse return;
         const len = compiled.plan.instructions.len;
         self.instruction_norm_weight_refs = try allocator.alloc(?*const DeviceTensor, len);
-        self.instruction_attention_refs = try allocator.alloc(?*AttentionMlpBlockRuntime, len);
-        self.instruction_shortconv_refs = try allocator.alloc(?*ShortConvBlockRuntime, len);
-        self.instruction_ffn_refs = try allocator.alloc(?FfnBinding, len);
+        self.instruction_attention_refs = try allocator.alloc(?LayerAttentionExecConfig, len);
+        self.instruction_shortconv_refs = try allocator.alloc(?ShortConvExecConfig, len);
+        self.instruction_attention_weight_refs = try allocator.alloc(?AttentionWeightRefs, len);
+        self.instruction_shortconv_weight_refs = try allocator.alloc(?ShortConvWeightRefs, len);
+        self.instruction_swiglu_refs = try allocator.alloc(?FfnExecConfig, len);
+        self.instruction_moe_refs = try allocator.alloc(?MoeExecConfig, len);
         @memset(self.instruction_norm_weight_refs, null);
         @memset(self.instruction_attention_refs, null);
         @memset(self.instruction_shortconv_refs, null);
-        @memset(self.instruction_ffn_refs, null);
+        @memset(self.instruction_attention_weight_refs, null);
+        @memset(self.instruction_shortconv_weight_refs, null);
+        @memset(self.instruction_swiglu_refs, null);
+        @memset(self.instruction_moe_refs, null);
 
         var norm_index: usize = 0;
         for (compiled.plan.instructions, 0..) |insn, op_index| {
             const binder = instruction_ref_binder_table[@intFromEnum(insn.opcode)] orelse continue;
             try binder(self, &compiled, op_index, &insn, &norm_index);
         }
+        try self.buildInstructionWeightTable(allocator, &compiled);
+    }
+
+    fn resolveInstructionWeightPtrForSlot(
+        self: *const BlockRuntimeLayer,
+        opcode: runtime_contract.Opcode,
+        op_index: usize,
+        slot_idx: usize,
+    ) !*anyopaque {
+        switch (opcode) {
+            .rmsnorm => {
+                if (slot_idx != 0) return error.InvalidWeightRefCount;
+                const weight = try self.instructionNormWeightRef(op_index);
+                return @ptrCast(@constCast(weight));
+            },
+            .multihead_attention => {
+                const binding = try self.instructionAttentionWeightRef(op_index);
+                return switch (slot_idx) {
+                    0 => @ptrCast(@constCast(binding.q_proj)),
+                    1 => @ptrCast(@constCast(binding.k_proj)),
+                    2 => @ptrCast(@constCast(binding.v_proj)),
+                    3 => @ptrCast(@constCast(binding.o_proj)),
+                    else => error.InvalidWeightRefCount,
+                };
+            },
+            .mla_attention => {
+                if (slot_idx != 0) return error.InvalidWeightRefCount;
+                const binding = try self.instructionAttentionWeightRef(op_index);
+                return @ptrCast(@constCast(binding.o_proj));
+            },
+            .swiglu => {
+                const binding = try self.instructionSwiGluRef(op_index);
+                return switch (slot_idx) {
+                    0 => @ptrCast(@constCast(binding.w1)),
+                    1 => @ptrCast(@constCast(binding.w3)),
+                    2 => @ptrCast(@constCast(binding.w2)),
+                    else => error.InvalidWeightRefCount,
+                };
+            },
+            .moe => {
+                if (slot_idx != 0) return error.InvalidWeightRefCount;
+                const binding = try self.instructionMoeRef(op_index);
+                return @ptrCast(@constCast(binding.router));
+            },
+            .shortconv => {
+                const binding = try self.instructionShortConvWeightRef(op_index);
+                return switch (slot_idx) {
+                    0 => @ptrCast(@constCast(binding.in_proj)),
+                    1 => @ptrCast(@constCast(binding.conv_weight)),
+                    2 => @ptrCast(@constCast(binding.out_proj)),
+                    else => error.InvalidWeightRefCount,
+                };
+            },
+            else => return error.InvalidInstructionBinding,
+        }
+    }
+
+    fn resolveInstructionWeightPtr(
+        self: *const BlockRuntimeLayer,
+        opcode: runtime_contract.Opcode,
+        op_index: usize,
+        slot_name: []const u8,
+        slot_idx: usize,
+    ) !*anyopaque {
+        const expected_slots = runtime_contract.expectedKernelWeightSlots(opcode);
+        if (slot_idx >= expected_slots.len) return error.InvalidWeightRefCount;
+        if (!std.mem.eql(u8, expected_slots[slot_idx], slot_name)) return error.InvalidWeightBindingName;
+        return self.resolveInstructionWeightPtrForSlot(opcode, op_index, slot_idx);
+    }
+
+    fn buildInstructionWeightTable(
+        self: *BlockRuntimeLayer,
+        allocator: std.mem.Allocator,
+        compiled: *const runtime_contract.CompiledPlan,
+    ) !void {
+        const insn_len = compiled.plan.instructions.len;
+        const offsets = try allocator.alloc(u32, insn_len + 1);
+        errdefer allocator.free(offsets);
+
+        var total_slots: usize = 0;
+        for (compiled.plan.instructions) |insn| total_slots += insn.weights.len;
+        const ptrs = try allocator.alloc(?*anyopaque, total_slots);
+        errdefer allocator.free(ptrs);
+        @memset(ptrs, null);
+
+        var cursor: usize = 0;
+        for (compiled.plan.instructions, 0..) |insn, op_index| {
+            offsets[op_index] = @intCast(cursor);
+            const expected_slots = runtime_contract.expectedKernelWeightSlots(insn.opcode);
+            if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
+            for (insn.weights, 0..) |_, slot_idx| {
+                const parsed = try runtime_contract.instructionKernelWeightBinding(
+                    compiled,
+                    op_index,
+                    insn.opcode,
+                    slot_idx,
+                );
+                const weight_ptr = try self.resolveInstructionWeightPtr(insn.opcode, op_index, parsed.slot_name, slot_idx);
+                ptrs[cursor] = weight_ptr;
+                cursor += 1;
+            }
+        }
+        offsets[insn_len] = @intCast(cursor);
+        self.instruction_weight_offsets = offsets;
+        self.instruction_weight_ptrs = ptrs;
     }
 
     fn instructionNormWeightRef(self: *const BlockRuntimeLayer, op_index: usize) !*const DeviceTensor {
@@ -776,19 +1015,36 @@ const BlockRuntimeLayer = struct {
         return self.instruction_norm_weight_refs[op_index] orelse return error.UnsupportedModel;
     }
 
-    fn instructionAttentionRef(self: *const BlockRuntimeLayer, op_index: usize) !*const AttentionMlpBlockRuntime {
+    fn instructionAttentionRef(self: *const BlockRuntimeLayer, op_index: usize) !*const LayerAttentionExecConfig {
         if (op_index >= self.instruction_attention_refs.len) return error.InvalidInstructionIndex;
-        return self.instruction_attention_refs[op_index] orelse return error.UnsupportedModel;
+        if (self.instruction_attention_refs[op_index]) |*binding| return binding;
+        return error.UnsupportedModel;
     }
 
-    fn instructionShortConvRef(self: *const BlockRuntimeLayer, op_index: usize) !*ShortConvBlockRuntime {
+    fn instructionShortConvRef(self: *const BlockRuntimeLayer, op_index: usize) !*const ShortConvExecConfig {
         if (op_index >= self.instruction_shortconv_refs.len) return error.InvalidInstructionIndex;
-        return self.instruction_shortconv_refs[op_index] orelse return error.UnsupportedModel;
+        if (self.instruction_shortconv_refs[op_index]) |*binding| return binding;
+        return error.UnsupportedModel;
     }
 
-    fn instructionFfnRef(self: *const BlockRuntimeLayer, op_index: usize) !FfnBinding {
-        if (op_index >= self.instruction_ffn_refs.len) return error.InvalidInstructionIndex;
-        return self.instruction_ffn_refs[op_index] orelse return error.UnsupportedModel;
+    fn instructionAttentionWeightRef(self: *const BlockRuntimeLayer, op_index: usize) !AttentionWeightRefs {
+        if (op_index >= self.instruction_attention_weight_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_attention_weight_refs[op_index] orelse return error.UnsupportedModel;
+    }
+
+    fn instructionShortConvWeightRef(self: *const BlockRuntimeLayer, op_index: usize) !ShortConvWeightRefs {
+        if (op_index >= self.instruction_shortconv_weight_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_shortconv_weight_refs[op_index] orelse return error.UnsupportedModel;
+    }
+
+    fn instructionMoeRef(self: *const BlockRuntimeLayer, op_index: usize) !MoeExecConfig {
+        if (op_index >= self.instruction_moe_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_moe_refs[op_index] orelse return error.UnsupportedModel;
+    }
+
+    fn instructionSwiGluRef(self: *const BlockRuntimeLayer, op_index: usize) !FfnExecConfig {
+        if (op_index >= self.instruction_swiglu_refs.len) return error.InvalidInstructionIndex;
+        return self.instruction_swiglu_refs[op_index] orelse return error.UnsupportedModel;
     }
 
     fn deinit(self: *BlockRuntimeLayer, allocator: std.mem.Allocator, device: *compute.cuda.Device) void {
@@ -797,7 +1053,12 @@ const BlockRuntimeLayer = struct {
         if (self.instruction_norm_weight_refs.len != 0) allocator.free(self.instruction_norm_weight_refs);
         if (self.instruction_attention_refs.len != 0) allocator.free(self.instruction_attention_refs);
         if (self.instruction_shortconv_refs.len != 0) allocator.free(self.instruction_shortconv_refs);
-        if (self.instruction_ffn_refs.len != 0) allocator.free(self.instruction_ffn_refs);
+        if (self.instruction_attention_weight_refs.len != 0) allocator.free(self.instruction_attention_weight_refs);
+        if (self.instruction_shortconv_weight_refs.len != 0) allocator.free(self.instruction_shortconv_weight_refs);
+        if (self.instruction_swiglu_refs.len != 0) allocator.free(self.instruction_swiglu_refs);
+        if (self.instruction_moe_refs.len != 0) allocator.free(self.instruction_moe_refs);
+        if (self.instruction_weight_offsets.len != 0) allocator.free(self.instruction_weight_offsets);
+        if (self.instruction_weight_ptrs.len != 0) allocator.free(self.instruction_weight_ptrs);
         if (self.compiled_plan) |*compiled_plan| {
             plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
             self.compiled_plan = null;
@@ -1350,12 +1611,6 @@ const BlockRuntime = struct {
                         .kv_capacity = kv_capacity,
                     };
                     blocks[layer_idx].attention_binding = &blocks[layer_idx].attention_runtime.?;
-                    blocks[layer_idx].ffn_binding = .{
-                        .gate = &blocks[layer_idx].attention_runtime.?.w1,
-                        .up = &blocks[layer_idx].attention_runtime.?.w3,
-                        .down = &blocks[layer_idx].attention_runtime.?.w2,
-                        .d_ff = @intCast(blocks[layer_idx].attention_runtime.?.d_ff),
-                    };
                     CudaBackend.bindAttentionNormWeights(&blocks[layer_idx], &blocks[layer_idx].attention_runtime.?);
                     attention_block_count += 1;
                 },
@@ -1587,17 +1842,6 @@ const BlockRuntime = struct {
                         .ffn_w3 = ffn_w3,
                     };
                     blocks[layer_idx].shortconv_binding = &blocks[layer_idx].shortconv_runtime.?;
-                    if (blocks[layer_idx].shortconv_runtime.?.ffn_w1 != null and
-                        blocks[layer_idx].shortconv_runtime.?.ffn_w2 != null and
-                        blocks[layer_idx].shortconv_runtime.?.ffn_w3 != null)
-                    {
-                        blocks[layer_idx].ffn_binding = .{
-                            .gate = &blocks[layer_idx].shortconv_runtime.?.ffn_w1.?,
-                            .up = &blocks[layer_idx].shortconv_runtime.?.ffn_w3.?,
-                            .down = &blocks[layer_idx].shortconv_runtime.?.ffn_w2.?,
-                            .d_ff = @intCast(blocks[layer_idx].shortconv_runtime.?.d_ff),
-                        };
-                    }
                     CudaBackend.bindShortConvNormWeights(&blocks[layer_idx], &blocks[layer_idx].shortconv_runtime.?);
                     shortconv_block_count += 1;
                 },
@@ -3020,20 +3264,22 @@ pub const CudaBackend = struct {
     fn runQkvProjection(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
-        block: *const AttentionMlpBlockRuntime,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
     ) !ProjectionPath {
-        if (try self.tryFusedQkvForward(input, block)) return .fused;
+        if (try self.tryFusedQkvForward(input, q_proj, k_proj, v_proj)) return .fused;
 
-        try self.linearForward(input, &block.q_proj, &self.prototype.attn_q_dev);
-        try self.linearForward(input, &block.k_proj, &self.prototype.attn_k_dev);
-        try self.linearForward(input, &block.v_proj, &self.prototype.attn_v_dev);
+        try self.linearForward(input, q_proj, &self.prototype.attn_q_dev);
+        try self.linearForward(input, k_proj, &self.prototype.attn_k_dev);
+        try self.linearForward(input, v_proj, &self.prototype.attn_v_dev);
         return .unfused;
     }
 
     fn runGateUpProjection(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
-        block: *const AttentionMlpBlockRuntime,
+        block: *const LayerAttentionRuntime,
     ) !ProjectionPath {
         return self.runGateUpProjectionWithWeights(input, &block.w1, &block.w3);
     }
@@ -3175,7 +3421,7 @@ pub const CudaBackend = struct {
         layer.norm_weight_count += 1;
     }
 
-    fn bindAttentionNormWeights(layer: *BlockRuntimeLayer, block: *const AttentionMlpBlockRuntime) void {
+    fn bindAttentionNormWeights(layer: *BlockRuntimeLayer, block: *const LayerAttentionRuntime) void {
         appendLayerNormWeight(layer, &block.ln1_weight);
         appendLayerNormWeight(layer, &block.ln2_weight);
         if (block.pre_ffn_norm_weight) |*weight| {
@@ -3197,7 +3443,11 @@ pub const CudaBackend = struct {
 
     fn runAttentionMixerStep(
         self: *CudaBackend,
-        block: *const AttentionMlpBlockRuntime,
+        cfg: *const LayerAttentionExecConfig,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
+        o_proj: *const LinearWeight,
         input: *const compute.cuda.Buffer,
         output: *compute.cuda.Buffer,
         d_model_u32: u32,
@@ -3217,10 +3467,10 @@ pub const CudaBackend = struct {
         rope_store_f16_function: ?compute.cuda.Function,
         attention_kernels: AttentionKernelSet,
     ) !void {
-        const layer_rope_theta = if (block.sliding_window > 0) local_rope_theta else global_rope_theta;
-        _ = try self.runQkvProjection(input, block);
+        const layer_rope_theta = if (cfg.sliding_window > 0) local_rope_theta else global_rope_theta;
+        _ = try self.runQkvProjection(input, q_proj, k_proj, v_proj);
 
-        if (block.q_norm_weight) |*q_norm| {
+        if (cfg.q_norm_weight) |q_norm| {
             try compute.cuda.rmsnorm.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
@@ -3234,7 +3484,7 @@ pub const CudaBackend = struct {
                 self.loaded.runtime.qk_norm_weight_offset,
             );
         }
-        if (block.k_norm_weight) |*k_norm| {
+        if (cfg.k_norm_weight) |k_norm| {
             try compute.cuda.rmsnorm.runWithFunction(
                 &self.kernel_arg_pack,
                 &self.device,
@@ -3252,8 +3502,8 @@ pub const CudaBackend = struct {
         const use_fused_attention_heads_f16_kv = attention_mod.useFusedHeadsF16Kv(
             attention_policy_config,
             seq_len_u32,
-            block.sliding_window,
-            block.is_causal,
+            cfg.sliding_window,
+            cfg.is_causal,
             head_dim_u32,
             attention_kernels.attn_fused_heads_f16_kv_function != null,
         );
@@ -3286,10 +3536,10 @@ pub const CudaBackend = struct {
         }
 
         const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
-        const kv_row_bytes = std.math.mul(usize, block.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
+        const kv_row_bytes = std.math.mul(usize, cfg.kv_dim, kv_elem_bytes) catch return error.InvalidArgument;
         const kv_row_offset = std.math.mul(usize, position, kv_row_bytes) catch return error.InvalidArgument;
-        var k_row = try bufferSlice(&block.k_cache, kv_row_offset, kv_row_bytes);
-        var v_row = try bufferSlice(&block.v_cache, kv_row_offset, kv_row_bytes);
+        var k_row = try bufferSlice(cfg.k_cache, kv_row_offset, kv_row_bytes);
+        var v_row = try bufferSlice(cfg.v_cache, kv_row_offset, kv_row_bytes);
         if (kv_cache_dtype_fp16) {
             if (kv_write_f16_function) |kv_write_f16| {
                 try compute.cuda.kv_write_f16.runWithFunction(
@@ -3325,7 +3575,7 @@ pub const CudaBackend = struct {
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
                     &self.prototype.attn_v_dev,
                     &v_row,
-                    @intCast(block.kv_dim),
+                    @intCast(cfg.kv_dim),
                 );
             } else {
                 try compute.cuda.cast_f32_to_f16.runWithFunction(
@@ -3334,7 +3584,7 @@ pub const CudaBackend = struct {
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
                     &self.prototype.attn_k_dev,
                     &k_row,
-                    @intCast(block.kv_dim),
+                    @intCast(cfg.kv_dim),
                 );
                 try compute.cuda.cast_f32_to_f16.runWithFunction(
                     &self.kernel_arg_pack,
@@ -3342,7 +3592,7 @@ pub const CudaBackend = struct {
                     cast_f32_to_f16_function orelse return error.CudaKernelUnavailable,
                     &self.prototype.attn_v_dev,
                     &v_row,
-                    @intCast(block.kv_dim),
+                    @intCast(cfg.kv_dim),
                 );
             }
         } else {
@@ -3352,7 +3602,7 @@ pub const CudaBackend = struct {
                 copy_function,
                 &self.prototype.attn_k_dev,
                 &k_row,
-                @intCast(block.kv_dim),
+                @intCast(cfg.kv_dim),
             );
             try compute.cuda.copy.runWithFunction(
                 &self.kernel_arg_pack,
@@ -3360,15 +3610,15 @@ pub const CudaBackend = struct {
                 copy_function,
                 &self.prototype.attn_v_dev,
                 &v_row,
-                @intCast(block.kv_dim),
+                @intCast(cfg.kv_dim),
             );
         }
 
         const kv_groups = self.n_heads / self.n_kv_heads;
         const kv_groups_u32: u32 = @intCast(kv_groups);
-        const kv_dim_u32: u32 = @intCast(block.kv_dim);
+        const kv_dim_u32: u32 = @intCast(cfg.kv_dim);
         _ = try self.runAttentionContext(
-            block,
+            cfg,
             attention_kernels,
             seq_len_u32,
             head_dim_u32,
@@ -3378,19 +3628,22 @@ pub const CudaBackend = struct {
             position_u32,
             layer_rope_theta,
         );
-        try self.linearForward(&self.prototype.attn_context_dev, &block.o_proj, output);
+        try self.linearForward(&self.prototype.attn_context_dev, o_proj, output);
         _ = d_model_u32;
     }
 
     fn runShortConvMixerStep(
         self: *CudaBackend,
-        block: *ShortConvBlockRuntime,
+        cfg: *const ShortConvExecConfig,
+        in_proj: *const LinearWeight,
+        out_proj: *const LinearWeight,
+        conv_weight_time_major: *const DeviceTensor,
         input: *const compute.cuda.Buffer,
         output: *compute.cuda.Buffer,
         shortconv_step_function: compute.cuda.Function,
     ) !void {
-        try self.linearForward(input, &block.in_proj, &self.prototype.shortconv_proj_dev);
-        const conv_bytes = std.math.mul(usize, block.conv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
+        try self.linearForward(input, in_proj, &self.prototype.shortconv_proj_dev);
+        const conv_bytes = std.math.mul(usize, cfg.conv_dim, @sizeOf(f32)) catch return error.InvalidArgument;
         var b_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, 0, conv_bytes);
         var c_gate = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes, conv_bytes);
         var x_proj = try bufferSlice(&self.prototype.shortconv_proj_dev, conv_bytes * 2, conv_bytes);
@@ -3402,14 +3655,14 @@ pub const CudaBackend = struct {
             &b_gate,
             &c_gate,
             &x_proj,
-            &block.conv_state,
-            &block.conv_weight_time_major.buffer,
-            if (block.conv_bias) |*w| &w.buffer else null,
+            cfg.conv_state,
+            &conv_weight_time_major.buffer,
+            if (cfg.conv_bias) |w| &w.buffer else null,
             &self.prototype.shortconv_conv_dev,
-            @intCast(block.conv_dim),
-            @intCast(block.d_conv),
+            @intCast(cfg.conv_dim),
+            @intCast(cfg.d_conv),
         );
-        try self.linearForward(&self.prototype.shortconv_conv_dev, &block.out_proj, output);
+        try self.linearForward(&self.prototype.shortconv_conv_dev, out_proj, output);
     }
 
     fn runFfnStep(
@@ -3623,85 +3876,16 @@ pub const CudaBackend = struct {
         };
     }
 
-    const LayerProgramWeightResolverFn = *const fn (
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) anyerror!*anyopaque;
-
-    const layer_program_weight_resolver_table: [256]?LayerProgramWeightResolverFn = blk: {
-        var table = [_]?LayerProgramWeightResolverFn{null} ** 256;
-        table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = resolveLayerProgramNormWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = resolveLayerProgramAttentionWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.swiglu)] = resolveLayerProgramSwiGluWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.moe)] = resolveLayerProgramMoeWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.shortconv)] = resolveLayerProgramShortconvWeightPtr;
-        break :blk table;
-    };
-
-    fn resolveLayerProgramNormWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) !*anyopaque {
-        if (!std.mem.eql(u8, slot_name, "norm_weight")) return error.InvalidWeightBindingName;
-        const weight = try ctx.layer.instructionNormWeightRef(ctx.op_index);
-        return @ptrCast(@constCast(weight));
-    }
-
-    fn resolveLayerProgramAttentionWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) !*anyopaque {
-        const binding = try ctx.layer.instructionAttentionRef(ctx.op_index);
-        if (std.mem.eql(u8, slot_name, "q_proj")) return @ptrCast(@constCast(&binding.q_proj));
-        if (std.mem.eql(u8, slot_name, "k_proj")) return @ptrCast(@constCast(&binding.k_proj));
-        if (std.mem.eql(u8, slot_name, "v_proj")) return @ptrCast(@constCast(&binding.v_proj));
-        if (std.mem.eql(u8, slot_name, "o_proj")) return @ptrCast(@constCast(&binding.o_proj));
-        return error.InvalidWeightBindingName;
-    }
-
-    fn resolveLayerProgramSwiGluWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) !*anyopaque {
-        const binding = try ctx.layer.instructionFfnRef(ctx.op_index);
-        if (std.mem.eql(u8, slot_name, "w1")) return @ptrCast(@constCast(binding.gate));
-        if (std.mem.eql(u8, slot_name, "w3")) return @ptrCast(@constCast(binding.up));
-        if (std.mem.eql(u8, slot_name, "w2")) return @ptrCast(@constCast(binding.down));
-        return error.InvalidWeightBindingName;
-    }
-
-    fn resolveLayerProgramMoeWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) !*anyopaque {
-        const binding = try ctx.layer.instructionFfnRef(ctx.op_index);
-        if (!std.mem.eql(u8, slot_name, "router")) return error.InvalidWeightBindingName;
-        return @ptrCast(@constCast(binding.gate));
-    }
-
-    fn resolveLayerProgramShortconvWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) !*anyopaque {
-        const binding = try ctx.layer.instructionShortConvRef(ctx.op_index);
-        if (std.mem.eql(u8, slot_name, "in_proj")) return @ptrCast(@constCast(&binding.in_proj));
-        if (std.mem.eql(u8, slot_name, "conv_weight")) return @ptrCast(@constCast(&binding.conv_weight_time_major));
-        if (std.mem.eql(u8, slot_name, "out_proj")) return @ptrCast(@constCast(&binding.out_proj));
-        return error.InvalidWeightBindingName;
-    }
-
-    fn layerProgramWeightHandlePtr(
-        insn: *const runtime_contract.Instruction,
-        ctx: *LayerProgramExecutionContext,
-        slot_idx: usize,
-    ) !*anyopaque {
-        const compiled = ctx.layer.compiled_plan orelse return error.InvalidInstructionBinding;
-        const binding_name = try runtime_contract.instructionWeightBindingName(&compiled, ctx.op_index, slot_idx);
-        const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
-        const resolver = layer_program_weight_resolver_table[@intFromEnum(insn.opcode)] orelse {
-            return error.InvalidInstructionBinding;
-        };
-        return resolver(ctx, parsed.slot_name);
+    fn layerProgramWeightHandlePtr(ctx: *LayerProgramExecutionContext, slot_idx: usize) !*anyopaque {
+        if (ctx.op_index + 1 >= ctx.layer.instruction_weight_offsets.len) return error.InvalidInstructionBinding;
+        const start: usize = ctx.layer.instruction_weight_offsets[ctx.op_index];
+        const end: usize = ctx.layer.instruction_weight_offsets[ctx.op_index + 1];
+        if (end < start) return error.InvalidInstructionBinding;
+        const count = end - start;
+        if (slot_idx >= count) return error.InvalidWeightRefCount;
+        const idx = start + slot_idx;
+        if (idx >= ctx.layer.instruction_weight_ptrs.len) return error.InvalidInstructionBinding;
+        return ctx.layer.instruction_weight_ptrs[idx] orelse error.MissingWeight;
     }
 
     fn buildLayerProgramInstructionHandles(
@@ -3740,7 +3924,7 @@ pub const CudaBackend = struct {
         }
         for (insn.weights, 0..) |_, slot_idx| {
             if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
-            const weight_ptr = try layerProgramWeightHandlePtr(insn, ctx, slot_idx);
+            const weight_ptr = try layerProgramWeightHandlePtr(ctx, slot_idx);
             handle_storage[handle_count] = .{
                 .register = runtime_contract.registerFromIndex(@intCast(slot_idx)),
                 .ptr = weight_ptr,
@@ -3835,16 +4019,19 @@ pub const CudaBackend = struct {
         if (weight_handles.len != 4) return error.InvalidWeightRefCount;
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
-        const binding_ref = try layer.instructionAttentionRef(ctx.op_index);
-        var binding = binding_ref.*;
-        binding.q_proj = linearWeightFromWeightHandle(weight_handles[0]).*;
-        binding.k_proj = linearWeightFromWeightHandle(weight_handles[1]).*;
-        binding.v_proj = linearWeightFromWeightHandle(weight_handles[2]).*;
-        binding.o_proj = linearWeightFromWeightHandle(weight_handles[3]).*;
-        if (binding.q_proj.cols() != binding.q_dim) return error.InvalidInstructionBinding;
-        if (binding.k_proj.cols() != binding.kv_dim or binding.v_proj.cols() != binding.kv_dim) return error.InvalidInstructionBinding;
+        const cfg = try layer.instructionAttentionRef(ctx.op_index);
+        const q_proj = linearWeightFromWeightHandle(weight_handles[0]).*;
+        const k_proj = linearWeightFromWeightHandle(weight_handles[1]).*;
+        const v_proj = linearWeightFromWeightHandle(weight_handles[2]).*;
+        const o_proj = linearWeightFromWeightHandle(weight_handles[3]).*;
+        if (q_proj.cols() != cfg.q_dim) return error.InvalidInstructionBinding;
+        if (k_proj.cols() != cfg.kv_dim or v_proj.cols() != cfg.kv_dim) return error.InvalidInstructionBinding;
         try self.runAttentionMixerStep(
-            &binding,
+            cfg,
+            &q_proj,
+            &k_proj,
+            &v_proj,
+            &o_proj,
             input,
             output,
             ctx.d_model_u32,
@@ -3879,22 +4066,29 @@ pub const CudaBackend = struct {
         if (weight_handles.len != 3) return error.InvalidWeightRefCount;
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
-        const binding_ref = try layer.instructionShortConvRef(ctx.op_index);
-        var binding = binding_ref.*;
-        binding.in_proj = linearWeightFromWeightHandle(weight_handles[0]).*;
-        binding.conv_weight_time_major = deviceTensorFromWeightHandle(weight_handles[1]).*;
-        binding.out_proj = linearWeightFromWeightHandle(weight_handles[2]).*;
-        if (binding.in_proj.cols() != (3 * binding.conv_dim)) return error.InvalidInstructionBinding;
-        if (binding.out_proj.cols() != self.d_model) return error.InvalidInstructionBinding;
-        try self.runShortConvMixerStep(&binding, input, output, ctx.shortconv_step_function);
+        const cfg = try layer.instructionShortConvRef(ctx.op_index);
+        const in_proj = linearWeightFromWeightHandle(weight_handles[0]).*;
+        const conv_weight = deviceTensorFromWeightHandle(weight_handles[1]).*;
+        const out_proj = linearWeightFromWeightHandle(weight_handles[2]).*;
+        if (in_proj.cols() != (3 * cfg.conv_dim)) return error.InvalidInstructionBinding;
+        if (out_proj.cols() != self.d_model) return error.InvalidInstructionBinding;
+        try self.runShortConvMixerStep(
+            cfg,
+            &in_proj,
+            &out_proj,
+            &conv_weight,
+            input,
+            output,
+            ctx.shortconv_step_function,
+        );
     }
 
     fn layerProgramSwiGluAdapter(
         self: *CudaBackend,
-        layer: *BlockRuntimeLayer,
+        _: *BlockRuntimeLayer,
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
-        ctx: *LayerProgramExecutionContext,
+        _: *LayerProgramExecutionContext,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
@@ -3902,13 +4096,19 @@ pub const CudaBackend = struct {
         const output = bufferFromTensorHandle(io.outputs[0]);
         const weight_handles = try instructionWeightSlice(insn, registers);
         if (weight_handles.len != 3) return error.InvalidWeightRefCount;
-        const binding = try layer.instructionFfnRef(ctx.op_index);
+        const gate_weight = linearWeightFromWeightHandle(weight_handles[0]);
+        const up_weight = linearWeightFromWeightHandle(weight_handles[1]);
+        const down_weight = linearWeightFromWeightHandle(weight_handles[2]);
+        const d_ff = gate_weight.cols();
+        if (up_weight.cols() != d_ff) return error.InvalidInstructionBinding;
+        if (down_weight.rows() != d_ff) return error.InvalidInstructionBinding;
+        const d_ff_u32: u32 = @intCast(d_ff);
         try self.runFfnStep(
             input,
-            linearWeightFromWeightHandle(weight_handles[0]),
-            linearWeightFromWeightHandle(weight_handles[1]),
-            linearWeightFromWeightHandle(weight_handles[2]),
-            binding.d_ff,
+            gate_weight,
+            up_weight,
+            down_weight,
+            d_ff_u32,
             output,
         );
     }
@@ -3924,8 +4124,12 @@ pub const CudaBackend = struct {
         if (io.inputs.len != 1 or io.outputs.len != 1) return error.InvalidInstructionBinding;
         const input = bufferFromTensorHandle(io.inputs[0]);
         const output = bufferFromTensorHandle(io.outputs[0]);
-        const binding = try layer.instructionFfnRef(ctx.op_index);
-        try self.runFfnStep(input, binding.gate, binding.up, binding.down, binding.d_ff, output);
+        const weight_handles = try instructionWeightSlice(insn, registers);
+        if (weight_handles.len != 1) return error.InvalidWeightRefCount;
+        const router_weight = linearWeightFromWeightHandle(weight_handles[0]);
+        const binding = try layer.instructionMoeRef(ctx.op_index);
+        if (router_weight.cols() != @as(usize, binding.d_ff)) return error.InvalidInstructionBinding;
+        try self.runFfnStep(input, router_weight, binding.up, binding.down, binding.d_ff, output);
     }
 
     fn layerProgramResidualAddAdapter(
@@ -4195,7 +4399,7 @@ pub const CudaBackend = struct {
 
     fn runAttentionContext(
         self: *CudaBackend,
-        block: *const AttentionMlpBlockRuntime,
+        cfg: *const LayerAttentionExecConfig,
         kernels: AttentionKernelSet,
         seq_len_u32: u32,
         head_dim_u32: u32,
@@ -4206,18 +4410,18 @@ pub const CudaBackend = struct {
         theta: f32,
     ) !AttentionPath {
         var effective_seq_len_u32 = seq_len_u32;
-        var k_cache_view = block.k_cache;
-        var v_cache_view = block.v_cache;
+        var k_cache_view = cfg.k_cache.*;
+        var v_cache_view = cfg.v_cache.*;
 
-        if (block.sliding_window > 0 and block.is_causal) {
-            const window_u32 = std.math.cast(u32, block.sliding_window) orelse std.math.maxInt(u32);
+        if (cfg.sliding_window > 0 and cfg.is_causal) {
+            const window_u32 = std.math.cast(u32, cfg.sliding_window) orelse std.math.maxInt(u32);
             if (effective_seq_len_u32 > window_u32) {
                 const kv_elem_bytes: usize = if (kv_cache_dtype_fp16) @sizeOf(u16) else @sizeOf(f32);
                 const row_bytes = std.math.mul(usize, @as(usize, kv_dim_u32), kv_elem_bytes) catch return error.InvalidArgument;
                 const start_row = effective_seq_len_u32 - window_u32;
                 const start_offset = std.math.mul(usize, @as(usize, start_row), row_bytes) catch return error.InvalidArgument;
-                k_cache_view = try bufferSlice(&block.k_cache, start_offset, block.k_cache.size - start_offset);
-                v_cache_view = try bufferSlice(&block.v_cache, start_offset, block.v_cache.size - start_offset);
+                k_cache_view = try bufferSlice(cfg.k_cache, start_offset, cfg.k_cache.size - start_offset);
+                v_cache_view = try bufferSlice(cfg.v_cache, start_offset, cfg.v_cache.size - start_offset);
                 effective_seq_len_u32 = window_u32;
             }
         }
@@ -4226,8 +4430,8 @@ pub const CudaBackend = struct {
             if (attention_mod.useFusedHeadsF16Kv(
                 attention_policy_config,
                 seq_len_u32,
-                block.sliding_window,
-                block.is_causal,
+                cfg.sliding_window,
+                cfg.is_causal,
                 head_dim_u32,
                 kernels.attn_fused_heads_f16_kv_function != null,
             )) {
@@ -4340,20 +4544,22 @@ pub const CudaBackend = struct {
     fn tryFusedQkvForward(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
-        block: *const AttentionMlpBlockRuntime,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
     ) !bool {
-        if (try self.tryFusedDenseU16QkvForward(input, block)) return true;
+        if (try self.tryFusedDenseU16QkvForward(input, q_proj, k_proj, v_proj)) return true;
 
         const fused_kernel = self.gaffine_u4_matvec_qkv_function orelse return false;
-        const q = switch (block.q_proj) {
+        const q = switch (q_proj.*) {
             .gaffine_u4 => |w| w,
             else => return false,
         };
-        const k = switch (block.k_proj) {
+        const k = switch (k_proj.*) {
             .gaffine_u4 => |w| w,
             else => return false,
         };
-        const v = switch (block.v_proj) {
+        const v = switch (v_proj.*) {
             .gaffine_u4 => |w| w,
             else => return false,
         };
@@ -4403,17 +4609,19 @@ pub const CudaBackend = struct {
     fn tryFusedDenseU16QkvForward(
         self: *CudaBackend,
         input: *const compute.cuda.Buffer,
-        block: *const AttentionMlpBlockRuntime,
+        q_proj: *const LinearWeight,
+        k_proj: *const LinearWeight,
+        v_proj: *const LinearWeight,
     ) !bool {
-        const q = switch (block.q_proj) {
+        const q = switch (q_proj.*) {
             .dense_u16 => |w| w,
             else => return false,
         };
-        const k = switch (block.k_proj) {
+        const k = switch (k_proj.*) {
             .dense_u16 => |w| w,
             else => return false,
         };
-        const v = switch (block.v_proj) {
+        const v = switch (v_proj.*) {
             .dense_u16 => |w| w,
             else => return false,
         };
@@ -6838,32 +7046,78 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds per-op runtime refs" {
         if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
         if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
         if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
-        if (layer.instruction_ffn_refs.len > 0) std.testing.allocator.free(layer.instruction_ffn_refs);
+        if (layer.instruction_attention_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_weight_refs);
+        if (layer.instruction_shortconv_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_weight_refs);
+        if (layer.instruction_swiglu_refs.len > 0) std.testing.allocator.free(layer.instruction_swiglu_refs);
+        if (layer.instruction_moe_refs.len > 0) std.testing.allocator.free(layer.instruction_moe_refs);
+        if (layer.instruction_weight_offsets.len > 0) std.testing.allocator.free(layer.instruction_weight_offsets);
+        if (layer.instruction_weight_ptrs.len > 0) std.testing.allocator.free(layer.instruction_weight_ptrs);
         if (layer.compiled_plan) |*compiled| {
             plan_compiler.deinitCompiledPlan(std.testing.allocator, compiled);
             layer.compiled_plan = null;
         }
     }
 
-    var norm0: DeviceTensor = undefined;
-    var norm1: DeviceTensor = undefined;
-    var attention_runtime: AttentionMlpBlockRuntime = undefined;
-    var shortconv_runtime: ShortConvBlockRuntime = undefined;
-    var gate_weight: LinearWeight = undefined;
-    var up_weight: LinearWeight = undefined;
-    var down_weight: LinearWeight = undefined;
+    const zero_buffer = std.mem.zeroes(compute.cuda.Buffer);
+    const zero_tensor = DeviceTensor{
+        .rows = 0,
+        .cols = 0,
+        .buffer = zero_buffer,
+    };
+    const zero_weight = LinearWeight{ .dense_f32 = zero_tensor };
+    var norm0: DeviceTensor = zero_tensor;
+    var norm1: DeviceTensor = zero_tensor;
+    var attention_runtime: LayerAttentionRuntime = .{
+        .q_dim = 0,
+        .kv_dim = 0,
+        .d_ff = 0,
+        .sliding_window = 0,
+        .is_causal = true,
+        .ln1_weight = zero_tensor,
+        .ln2_weight = zero_tensor,
+        .pre_ffn_norm_weight = null,
+        .post_ffn_norm_weight = null,
+        .q_norm_weight = null,
+        .k_norm_weight = null,
+        .q_proj = zero_weight,
+        .k_proj = zero_weight,
+        .v_proj = zero_weight,
+        .o_proj = zero_weight,
+        .w1 = zero_weight,
+        .w2 = zero_weight,
+        .w3 = zero_weight,
+        .k_cache = zero_buffer,
+        .v_cache = zero_buffer,
+        .kv_capacity = 0,
+    };
+    var shortconv_runtime: ShortConvBlockRuntime = .{
+        .conv_dim = 0,
+        .d_conv = 0,
+        .d_ff = 0,
+        .ln1_weight = zero_tensor,
+        .ln2_weight = null,
+        .in_proj = zero_weight,
+        .out_proj = zero_weight,
+        .conv_weight_time_major = zero_tensor,
+        .conv_bias = null,
+        .conv_state = zero_buffer,
+        .ffn_w1 = null,
+        .ffn_w2 = null,
+        .ffn_w3 = null,
+    };
+    const gate_weight: LinearWeight = zero_weight;
+    const up_weight: LinearWeight = zero_weight;
+    const down_weight: LinearWeight = zero_weight;
 
     layer.norm_weights[0] = &norm0;
     layer.norm_weights[1] = &norm1;
     layer.norm_weight_count = 2;
+    attention_runtime.w1 = gate_weight;
+    attention_runtime.w3 = up_weight;
+    attention_runtime.w2 = down_weight;
+    attention_runtime.d_ff = 32;
     layer.attention_binding = &attention_runtime;
     layer.shortconv_binding = &shortconv_runtime;
-    layer.ffn_binding = .{
-        .gate = &gate_weight,
-        .up = &up_weight,
-        .down = &down_weight,
-        .d_ff = 32,
-    };
 
     const ops = [_]layer_ops.LayerOp{
         .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
@@ -6877,10 +7131,25 @@ test "BlockRuntimeLayer.rebuildInstructionRefs binds per-op runtime refs" {
     try layer.rebuildInstructionRefs(std.testing.allocator);
 
     try std.testing.expect(layer.instruction_norm_weight_refs[0].? == &norm0);
-    try std.testing.expect(layer.instruction_attention_refs[1].? == &attention_runtime);
-    try std.testing.expect(layer.instruction_shortconv_refs[2].? == &shortconv_runtime);
-    try std.testing.expect(layer.instruction_ffn_refs[3] != null);
+    try std.testing.expect(layer.instruction_attention_refs[1] != null);
+    try std.testing.expect(layer.instruction_attention_weight_refs[1] != null);
+    try std.testing.expect(layer.instruction_attention_refs[1].?.k_cache == &attention_runtime.k_cache);
+    try std.testing.expect(layer.instruction_attention_refs[1].?.v_cache == &attention_runtime.v_cache);
+    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.q_proj == &attention_runtime.q_proj);
+    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.k_proj == &attention_runtime.k_proj);
+    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.v_proj == &attention_runtime.v_proj);
+    try std.testing.expect(layer.instruction_attention_weight_refs[1].?.o_proj == &attention_runtime.o_proj);
+    try std.testing.expect(layer.instruction_shortconv_refs[2] != null);
+    try std.testing.expect(layer.instruction_shortconv_weight_refs[2] != null);
+    try std.testing.expect(layer.instruction_shortconv_refs[2].?.conv_state == &shortconv_runtime.conv_state);
+    try std.testing.expect(layer.instruction_shortconv_weight_refs[2].?.in_proj == &shortconv_runtime.in_proj);
+    try std.testing.expect(layer.instruction_shortconv_weight_refs[2].?.conv_weight == &shortconv_runtime.conv_weight_time_major);
+    try std.testing.expect(layer.instruction_shortconv_weight_refs[2].?.out_proj == &shortconv_runtime.out_proj);
+    try std.testing.expect(layer.instruction_swiglu_refs[3] != null);
+    try std.testing.expect(layer.instruction_moe_refs[3] == null);
     try std.testing.expect(layer.instruction_norm_weight_refs[4].? == &norm1);
+    try std.testing.expectEqual(@as(usize, ops.len + 1), layer.instruction_weight_offsets.len);
+    try std.testing.expect(layer.instruction_weight_ptrs.len != 0);
 }
 
 test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound norm weights" {
@@ -6889,7 +7158,12 @@ test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound nor
         if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
         if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
         if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
-        if (layer.instruction_ffn_refs.len > 0) std.testing.allocator.free(layer.instruction_ffn_refs);
+        if (layer.instruction_attention_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_weight_refs);
+        if (layer.instruction_shortconv_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_weight_refs);
+        if (layer.instruction_swiglu_refs.len > 0) std.testing.allocator.free(layer.instruction_swiglu_refs);
+        if (layer.instruction_moe_refs.len > 0) std.testing.allocator.free(layer.instruction_moe_refs);
+        if (layer.instruction_weight_offsets.len > 0) std.testing.allocator.free(layer.instruction_weight_offsets);
+        if (layer.instruction_weight_ptrs.len > 0) std.testing.allocator.free(layer.instruction_weight_ptrs);
         if (layer.compiled_plan) |*compiled| {
             plan_compiler.deinitCompiledPlan(std.testing.allocator, compiled);
             layer.compiled_plan = null;
@@ -6902,4 +7176,79 @@ test "BlockRuntimeLayer.rebuildInstructionRefs rejects norm op without bound nor
     layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode, .{});
 
     try std.testing.expectError(error.UnsupportedModel, layer.rebuildInstructionRefs(std.testing.allocator));
+}
+
+test "BlockRuntimeLayer.rebuildInstructionRefs binds moe instruction typed refs" {
+    var layer: BlockRuntimeLayer = .{};
+    defer {
+        if (layer.instruction_norm_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_norm_weight_refs);
+        if (layer.instruction_attention_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_refs);
+        if (layer.instruction_shortconv_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_refs);
+        if (layer.instruction_attention_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_attention_weight_refs);
+        if (layer.instruction_shortconv_weight_refs.len > 0) std.testing.allocator.free(layer.instruction_shortconv_weight_refs);
+        if (layer.instruction_swiglu_refs.len > 0) std.testing.allocator.free(layer.instruction_swiglu_refs);
+        if (layer.instruction_moe_refs.len > 0) std.testing.allocator.free(layer.instruction_moe_refs);
+        if (layer.instruction_weight_offsets.len > 0) std.testing.allocator.free(layer.instruction_weight_offsets);
+        if (layer.instruction_weight_ptrs.len > 0) std.testing.allocator.free(layer.instruction_weight_ptrs);
+        if (layer.compiled_plan) |*compiled| {
+            plan_compiler.deinitCompiledPlan(std.testing.allocator, compiled);
+            layer.compiled_plan = null;
+        }
+    }
+
+    const zero_buffer = std.mem.zeroes(compute.cuda.Buffer);
+    const zero_tensor = DeviceTensor{
+        .rows = 0,
+        .cols = 0,
+        .buffer = zero_buffer,
+    };
+    const zero_weight = LinearWeight{ .dense_f32 = zero_tensor };
+    var attention_runtime: LayerAttentionRuntime = .{
+        .q_dim = 0,
+        .kv_dim = 0,
+        .d_ff = 0,
+        .sliding_window = 0,
+        .is_causal = true,
+        .ln1_weight = zero_tensor,
+        .ln2_weight = zero_tensor,
+        .pre_ffn_norm_weight = null,
+        .post_ffn_norm_weight = null,
+        .q_norm_weight = null,
+        .k_norm_weight = null,
+        .q_proj = zero_weight,
+        .k_proj = zero_weight,
+        .v_proj = zero_weight,
+        .o_proj = zero_weight,
+        .w1 = zero_weight,
+        .w2 = zero_weight,
+        .w3 = zero_weight,
+        .k_cache = zero_buffer,
+        .v_cache = zero_buffer,
+        .kv_capacity = 0,
+    };
+    const router_weight: LinearWeight = zero_weight;
+    const up_weight: LinearWeight = zero_weight;
+    const down_weight: LinearWeight = zero_weight;
+    attention_runtime.w1 = router_weight;
+    attention_runtime.w3 = up_weight;
+    attention_runtime.w2 = down_weight;
+    attention_runtime.d_ff = 64;
+    layer.attention_binding = &attention_runtime;
+
+    const ops = [_]layer_ops.LayerOp{
+        .{ .kernel = .{ .id = 7, .in = .residual, .out = .branch_out, .debug_type = .moe } },
+    };
+    layer.compiled_plan = try plan_compiler.compileLayerProgram(std.testing.allocator, ops[0..], .decode, .{});
+
+    try layer.rebuildInstructionRefs(std.testing.allocator);
+
+    const moe_ref = layer.instruction_moe_refs[0] orelse return error.UnsupportedModel;
+    try std.testing.expect(moe_ref.router == &attention_runtime.w1);
+    try std.testing.expect(moe_ref.up == &attention_runtime.w3);
+    try std.testing.expect(moe_ref.down == &attention_runtime.w2);
+    try std.testing.expectEqual(@as(u32, 64), moe_ref.d_ff);
+    try std.testing.expectEqual(@as(usize, 2), layer.instruction_weight_offsets.len);
+    try std.testing.expectEqual(@as(usize, 1), layer.instruction_weight_ptrs.len);
+    const router_ptr = layer.instruction_weight_ptrs[0] orelse return error.MissingWeight;
+    try std.testing.expectEqual(@intFromPtr(router_ptr), @intFromPtr(&attention_runtime.w1));
 }

@@ -1372,6 +1372,48 @@ pub fn instructionSingleWeightBindingName(compiled: *const CompiledPlan, instruc
     return instructionWeightBindingName(compiled, instruction_index, 0);
 }
 
+pub fn instructionKernelWeightBinding(
+    compiled: *const CompiledPlan,
+    instruction_index: usize,
+    opcode: Opcode,
+    weight_slot: usize,
+) !KernelWeightBindingName {
+    if (instruction_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
+    const insn = compiled.plan.instructions[instruction_index];
+    const expected_slots = expectedKernelWeightSlots(opcode);
+    if (expected_slots.len == 0) return error.InvalidInstructionPayload;
+    if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
+    if (weight_slot >= insn.weights.len) return error.InvalidWeightRefIndex;
+
+    const binding_name = try instructionWeightBindingName(compiled, instruction_index, weight_slot);
+    const parsed = try parseKernelWeightBindingName(binding_name);
+    if (!std.mem.eql(u8, parsed.slot_name, expected_slots[weight_slot])) return error.InvalidWeightBindingName;
+    return parsed;
+}
+
+pub fn instructionKernelBindingId(
+    compiled: *const CompiledPlan,
+    instruction_index: usize,
+    opcode: Opcode,
+) !u32 {
+    if (instruction_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
+    const insn = compiled.plan.instructions[instruction_index];
+    const expected_slots = expectedKernelWeightSlots(opcode);
+    if (expected_slots.len == 0) return error.InvalidInstructionPayload;
+    if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
+
+    var kernel_id: ?u32 = null;
+    for (insn.weights, 0..) |_, slot_idx| {
+        const parsed = try instructionKernelWeightBinding(compiled, instruction_index, opcode, slot_idx);
+        if (kernel_id == null) {
+            kernel_id = parsed.kernel_id;
+        } else if (kernel_id.? != parsed.kernel_id) {
+            return error.InvalidWeightBindingName;
+        }
+    }
+    return kernel_id orelse error.InvalidInstructionPayload;
+}
+
 pub fn decodeInstructionLayerOp(
     compiled: *const CompiledPlan,
     insn: *const Instruction,
@@ -2247,6 +2289,80 @@ test "instructionSingleWeightBindingName rejects non-single weight arity" {
         .diagnostics = &.{},
     };
     try std.testing.expectError(error.InvalidWeightRefCount, instructionSingleWeightBindingName(&compiled, 0));
+}
+
+test "instructionKernelWeightBinding validates slot contract" {
+    const insn = Instruction{
+        .opcode = .multihead_attention,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{
+            .{ .index = 0 },
+            .{ .index = 1 },
+            .{ .index = 2 },
+            .{ .index = 3 },
+        },
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const compiled = CompiledPlan{
+        .plan = .{
+            .instructions = &.{insn},
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{
+            .{ .index = 0, .name = "__kernel_weight::7::q_proj::0" },
+            .{ .index = 1, .name = "__kernel_weight::7::k_proj::0" },
+            .{ .index = 2, .name = "__kernel_weight::7::v_proj::0" },
+            .{ .index = 3, .name = "__kernel_weight::7::o_proj::0" },
+        },
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{&.{0}},
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+    };
+    const parsed = try instructionKernelWeightBinding(&compiled, 0, .multihead_attention, 2);
+    try std.testing.expectEqual(@as(u32, 7), parsed.kernel_id);
+    try std.testing.expectEqualStrings("v_proj", parsed.slot_name);
+}
+
+test "instructionKernelBindingId enforces consistent kernel id across slots" {
+    const insn = Instruction{
+        .opcode = .swiglu,
+        .inputs = &.{registerFromIndex(0)},
+        .outputs = &.{registerFromIndex(1)},
+        .weights = &.{
+            .{ .index = 0 },
+            .{ .index = 1 },
+            .{ .index = 2 },
+        },
+        .param_block_id = null,
+        .state_block_id = null,
+    };
+    const compiled = CompiledPlan{
+        .plan = .{
+            .instructions = &.{insn},
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{
+            .{ .index = 0, .name = "__kernel_weight::4::w1::0" },
+            .{ .index = 1, .name = "__kernel_weight::4::w3::0" },
+            .{ .index = 2, .name = "__kernel_weight::9::w2::0" },
+        },
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{&.{0}},
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+    };
+    try std.testing.expectError(error.InvalidWeightBindingName, instructionKernelBindingId(&compiled, 0, .swiglu));
 }
 
 test "parseKernelWeightBindingName parses kernel id and slot name" {

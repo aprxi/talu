@@ -132,18 +132,39 @@ pub fn checkProcessAction(
     }) == .allow;
     if (full_allowed) return .{ .allowed = true };
 
-    if (cwd != null) {
-        const without_cwd = policy.evaluateDetailed(.{
-            .action = action,
-            .command = command,
-            .cwd = null,
-        }) == .allow;
-        if (without_cwd) {
-            return .{ .allowed = false, .deny_reason = .cwd };
+    if (cwd) |cwd_value| {
+        for (policy.statements) |stmt| {
+            if (stmt.effect != .allow) continue;
+            if (!processActionPatternMatches(stmt.action_pattern, action)) continue;
+            if (!processOptionalCommandMatches(stmt.command_pattern, command)) continue;
+            if (stmt.cwd_pattern) |cwd_pattern| {
+                if (!processCwdPatternMatches(cwd_pattern, cwd_value)) {
+                    return .{ .allowed = false, .deny_reason = .cwd };
+                }
+            }
         }
     }
 
     return .{ .allowed = false, .deny_reason = .action };
+}
+
+fn processActionPatternMatches(pattern_text: []const u8, value: []const u8) bool {
+    if (pattern.globMatch(pattern_text, value)) return true;
+    if (pattern_text.len >= 2 and pattern_text[pattern_text.len - 1] == '*' and pattern_text[pattern_text.len - 2] == ' ') {
+        return pattern.globMatch(pattern_text[0 .. pattern_text.len - 2], value);
+    }
+    return false;
+}
+
+fn processOptionalCommandMatches(pattern_text: ?[]const u8, command: ?[]const u8) bool {
+    if (pattern_text == null) return true;
+    const command_text = command orelse return false;
+    return processActionPatternMatches(pattern_text.?, command_text);
+}
+
+fn processCwdPatternMatches(cwd_pattern: []const u8, cwd_value: []const u8) bool {
+    if (pattern.pathMatch(cwd_pattern, cwd_value, true)) return true;
+    return pattern.globMatch(cwd_pattern, cwd_value);
 }
 
 fn copyInto(storage: []u8, offset: *usize, value: []const u8) []const u8 {
