@@ -762,6 +762,16 @@ pub const talu_shell_alive = agent.talu_shell_alive;
 pub const talu_shell_scrollback = agent.talu_shell_scrollback;
 pub const TaluShell = agent.TaluShell;
 
+// Process sessions (non-PTY)
+pub const talu_process_open = agent.talu_process_open;
+pub const talu_process_close = agent.talu_process_close;
+pub const talu_process_write = agent.talu_process_write;
+pub const talu_process_read = agent.talu_process_read;
+pub const talu_process_signal = agent.talu_process_signal;
+pub const talu_process_alive = agent.talu_process_alive;
+pub const talu_process_exit_code = agent.talu_process_exit_code;
+pub const TaluProcess = agent.TaluProcess;
+
 // Re-export Tree-sitter C API functions (code parsing, highlighting, querying).
 pub const talu_treesitter_parser_create = treesitter.talu_treesitter_parser_create;
 pub const talu_treesitter_parser_free = treesitter.talu_treesitter_parser_free;

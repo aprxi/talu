@@ -6,7 +6,7 @@ const std = @import("std");
 const io = @import("../io/root.zig");
 const log = @import("../log.zig");
 const responses_mod = @import("../responses/root.zig");
-const policy_mod = @import("../policy/evaluate.zig");
+const policy_mod = @import("../agent/policy/evaluate.zig");
 
 const Chat = responses_mod.Chat;
 const Policy = policy_mod.Policy;

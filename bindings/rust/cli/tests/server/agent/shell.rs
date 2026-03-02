@@ -253,10 +253,7 @@ fn agent_shell_list_multiple_shells() {
     let data = json["data"].as_array().expect("data array");
     assert_eq!(data.len(), 3, "expected 3 shells, got: {}", data.len());
 
-    let ids: Vec<&str> = data
-        .iter()
-        .filter_map(|e| e["shell_id"].as_str())
-        .collect();
+    let ids: Vec<&str> = data.iter().filter_map(|e| e["shell_id"].as_str()).collect();
     assert!(ids.contains(&id1.as_str()), "missing id1");
     assert!(ids.contains(&id2.as_str()), "missing id2");
     assert!(ids.contains(&id3.as_str()), "missing id3");
@@ -356,10 +353,7 @@ fn agent_shell_delete_removes_from_list() {
 
     let list_json = list.json();
     let data = list_json["data"].as_array().expect("data array");
-    let ids: Vec<&str> = data
-        .iter()
-        .filter_map(|e| e["shell_id"].as_str())
-        .collect();
+    let ids: Vec<&str> = data.iter().filter_map(|e| e["shell_id"].as_str()).collect();
     assert!(!ids.contains(&id1.as_str()), "deleted shell still listed");
     assert!(ids.contains(&id2.as_str()), "surviving shell missing");
 }
@@ -548,7 +542,9 @@ async fn agent_shell_ws_unsupported_message_type() {
     let mut ws = ws_connect(&ctx, &shell_id).await;
 
     ws.send(Message::Text(
-        serde_json::json!({"type": "unknown_type"}).to_string().into(),
+        serde_json::json!({"type": "unknown_type"})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("ws send");

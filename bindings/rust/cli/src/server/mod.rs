@@ -7,9 +7,7 @@ use clap::Args;
 use log::LevelFilter;
 use talu::blobs::BlobsHandle;
 
-pub mod agent_exec;
-pub mod agent_fs;
-pub mod agent_shell;
+pub mod agent;
 pub mod auth_gateway;
 pub mod code;
 pub mod code_ws;
@@ -176,6 +174,8 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         code_session_ttl: listen::CODE_SESSION_TTL,
         shell_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         shell_session_ttl: listen::SHELL_SESSION_TTL,
+        process_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        process_session_ttl: listen::PROCESS_SESSION_TTL,
     };
 
     let addr = SocketAddr::new(args.host, args.port);

@@ -106,7 +106,6 @@ fn agent_exec_denies_chained_dangerous_command() {
     assert_eq!(resp.json()["error"]["code"], "command_denied");
 }
 
-
 // ---------------------------------------------------------------------------
 // SSE streaming — happy path
 // ---------------------------------------------------------------------------
@@ -248,7 +247,10 @@ fn agent_exec_invalid_cwd_streams_error_event() {
 
     let events = parse_sse_events(&resp.body);
     let has_error = events.iter().any(|e| e["type"] == "error");
-    assert!(has_error, "expected SSE error event for bad cwd: {events:?}");
+    assert!(
+        has_error,
+        "expected SSE error event for bad cwd: {events:?}"
+    );
 
     // Should NOT have a normal exit event.
     let has_exit = events.iter().any(|e| e["type"] == "exit");

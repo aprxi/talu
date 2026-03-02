@@ -105,7 +105,7 @@ pub const Chat = struct {
     /// When set, tool calls are evaluated against this policy before
     /// being committed to the conversation. The policy must outlive the Chat.
     /// Not owned by Chat — caller manages the Policy lifecycle.
-    policy: ?*const @import("../policy/evaluate.zig").Policy = null,
+    policy: ?*const @import("../agent/policy/evaluate.zig").Policy = null,
 
     /// Prompt document ID for lineage tracking.
     /// When the system prompt comes from a Document, this records the document ID.

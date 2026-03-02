@@ -1,10 +1,10 @@
 //! C API for the tool call firewall (policy engine).
 //!
 //! Provides create/free/evaluate/attach functions for IAM-style policies.
-//! See core/src/policy/ for the implementation.
+//! See core/src/agent/policy/ for the implementation.
 
 const std = @import("std");
-const policy_mod = @import("../policy/root.zig");
+const policy_mod = @import("../agent/policy/root.zig");
 const chat_mod = @import("../responses/chat.zig");
 const capi_error = @import("error.zig");
 const error_codes = @import("error_codes.zig");

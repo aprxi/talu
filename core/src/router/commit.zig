@@ -303,7 +303,7 @@ test "commitGenerationResult: tool calls create FunctionCallItems" {
 test "commitGenerationResult: tool calls with policy denial set status=failed" {
     const allocator = std.testing.allocator;
 
-    const policy_mod = @import("../policy/evaluate.zig");
+    const policy_mod = @import("../agent/policy/evaluate.zig");
 
     var chat = try Chat.init(allocator);
     defer chat.deinit();

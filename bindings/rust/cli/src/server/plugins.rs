@@ -75,12 +75,16 @@ pub async fn handle_list(
 
             let token = generate_token();
             let network_permissions = extract_network_permissions(&manifest);
+            let allow_filesystem = has_exact_permission(&manifest, "filesystem");
+            let allow_exec = has_exact_permission(&manifest, "exec");
 
             tokens.insert(
                 token.clone(),
                 PluginTokenEntry {
                     plugin_id: p.plugin_id.clone(),
                     network_permissions,
+                    allow_filesystem,
+                    allow_exec,
                 },
             );
 
@@ -215,10 +219,20 @@ pub async fn handle_asset(
 /// Returns `Some(plugin_id)` if the `Authorization: Bearer <token>` header
 /// contains a valid plugin capability token. Returns `None` otherwise.
 pub async fn resolve_bearer_token(state: &AppState, headers: &hyper::HeaderMap) -> Option<String> {
+    resolve_bearer_token_entry(state, headers)
+        .await
+        .map(|entry| entry.plugin_id)
+}
+
+/// Resolve full plugin token entry from request headers.
+pub async fn resolve_bearer_token_entry(
+    state: &AppState,
+    headers: &hyper::HeaderMap,
+) -> Option<PluginTokenEntry> {
     let auth_header = headers.get("authorization")?.to_str().ok()?;
     let token = auth_header.strip_prefix("Bearer ")?;
     let tokens = state.plugin_tokens.lock().await;
-    tokens.get(token).map(|entry| entry.plugin_id.clone())
+    tokens.get(token).cloned()
 }
 
 /// Generate a cryptographically random 32-byte hex token.
@@ -250,6 +264,18 @@ fn extract_network_permissions(manifest: &serde_json::Value) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+fn has_exact_permission(manifest: &serde_json::Value, permission: &str) -> bool {
+    manifest
+        .get("permissions")
+        .and_then(|p| p.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|v| v.as_str())
+                .any(|s| s == permission)
+        })
+        .unwrap_or(false)
 }
 
 // =============================================================================

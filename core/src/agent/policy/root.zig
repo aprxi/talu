@@ -15,7 +15,7 @@
 //! create a new Policy and swap the pointer on the Chat.
 
 const std = @import("std");
-const json_mod = @import("../io/json/root.zig");
+const json_mod = @import("../../io/json/root.zig");
 pub const pattern = @import("pattern.zig");
 pub const evaluate = @import("evaluate.zig");
 

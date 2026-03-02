@@ -18,6 +18,7 @@ const db_mod = @import("../../db/root.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 const fs_api = @import("fs.zig");
+const process_api = @import("process.zig");
 const shell_api = @import("shell.zig");
 
 const ToolRegistry = agent_mod.ToolRegistry;
@@ -60,6 +61,7 @@ pub const TaluAgentBus = opaque {};
 /// Opaque handle for workspace-scoped filesystem operations.
 pub const TaluFs = fs_api.TaluFs;
 pub const TaluFsStat = fs_api.TaluFsStat;
+pub const TaluProcess = process_api.TaluProcess;
 pub const TaluShell = shell_api.TaluShell;
 
 pub export fn talu_fs_create(
@@ -277,6 +279,58 @@ pub export fn talu_shell_scrollback(
     out_len: ?*usize,
 ) callconv(.c) i32 {
     return shell_api.talu_shell_scrollback(shell_handle, out_data, out_len);
+}
+
+// =============================================================================
+// Process sessions (non-PTY)
+// =============================================================================
+
+pub export fn talu_process_open(
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    out_process: ?*?*TaluProcess,
+) callconv(.c) i32 {
+    return process_api.talu_process_open(command, cwd, out_process);
+}
+
+pub export fn talu_process_close(process_handle: ?*TaluProcess) callconv(.c) void {
+    process_api.talu_process_close(process_handle);
+}
+
+pub export fn talu_process_write(
+    process_handle: ?*TaluProcess,
+    data: ?[*]const u8,
+    len: usize,
+) callconv(.c) i32 {
+    return process_api.talu_process_write(process_handle, data, len);
+}
+
+pub export fn talu_process_read(
+    process_handle: ?*TaluProcess,
+    buf: ?[*]u8,
+    buf_len: usize,
+    out_read: ?*usize,
+) callconv(.c) i32 {
+    return process_api.talu_process_read(process_handle, buf, buf_len, out_read);
+}
+
+pub export fn talu_process_signal(
+    process_handle: ?*TaluProcess,
+    sig: u8,
+) callconv(.c) i32 {
+    return process_api.talu_process_signal(process_handle, sig);
+}
+
+pub export fn talu_process_alive(process_handle: ?*TaluProcess) callconv(.c) bool {
+    return process_api.talu_process_alive(process_handle);
+}
+
+pub export fn talu_process_exit_code(
+    process_handle: ?*TaluProcess,
+    out_code: ?*i32,
+    out_has_code: ?*bool,
+) callconv(.c) i32 {
+    return process_api.talu_process_exit_code(process_handle, out_code, out_has_code);
 }
 
 // =============================================================================

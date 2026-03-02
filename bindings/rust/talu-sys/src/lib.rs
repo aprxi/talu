@@ -278,6 +278,9 @@ pub enum ErrorCode {
     TagNotFound = 704,
     ShellCommandDenied = 800,
     ShellExecFailed = 801,
+    ShellSessionClosed = 802,
+    ShellTimeout = 803,
+    ShellProcessExited = 804,
     OutOfMemory = 900,
     InvalidArgument = 901,
     InvalidHandle = 902,
@@ -336,6 +339,9 @@ impl From<i32> for ErrorCode {
             704 => ErrorCode::TagNotFound,
             800 => ErrorCode::ShellCommandDenied,
             801 => ErrorCode::ShellExecFailed,
+            802 => ErrorCode::ShellSessionClosed,
+            803 => ErrorCode::ShellTimeout,
+            804 => ErrorCode::ShellProcessExited,
             900 => ErrorCode::OutOfMemory,
             901 => ErrorCode::InvalidArgument,
             902 => ErrorCode::InvalidHandle,
@@ -5537,6 +5543,33 @@ extern "C" {
     pub fn talu_shell_signal(shell_handle: *mut c_void, sig: u8) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_write(shell_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_alive(process_handle: *mut c_void) -> bool;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_close(process_handle: *mut c_void);
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_exit_code(
+        process_handle: *mut c_void,
+        out_code: *mut c_void,
+        out_has_code: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_open(
+        command: *const c_char,
+        cwd: *const c_char,
+        out_process: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_read(
+        process_handle: *mut c_void,
+        buf: *mut u8,
+        buf_len: usize,
+        out_read: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_signal(process_handle: *mut c_void, sig: u8) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_write(process_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
     // core/src/capi/sql.zig
     pub fn talu_sql_query(
         db_path: *const c_char,

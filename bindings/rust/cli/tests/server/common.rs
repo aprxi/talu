@@ -324,7 +324,12 @@ pub fn send_request(
                 // WebSocket 101 has no body — stop after headers.
                 if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
                     let head = String::from_utf8_lossy(&raw[..pos]);
-                    if head.contains("101") {
+                    let is_switching_protocols = head
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        == Some("101");
+                    if is_switching_protocols {
                         eprintln!("[DEBUG] WebSocket 101 upgrade — done");
                         break;
                     }

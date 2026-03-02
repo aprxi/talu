@@ -71,6 +71,143 @@ fn discover_and_get_tokens(addr: std::net::SocketAddr, plugin_ids: &[&str]) -> V
         .collect()
 }
 
+fn setup_plugin_with_manifest(dir: &std::path::Path, id: &str, permissions: &[&str]) {
+    let plugin_dir = dir.join(id);
+    fs::create_dir_all(&plugin_dir).unwrap();
+    let manifest = serde_json::json!({
+        "id": id,
+        "activationEvents": ["*"],
+        "permissions": permissions,
+    });
+    fs::write(plugin_dir.join("talu.json"), manifest.to_string()).unwrap();
+    fs::write(plugin_dir.join("index.js"), "export default function(){}").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Agent route capability enforcement
+// ---------------------------------------------------------------------------
+
+#[test]
+fn agent_fs_requires_filesystem_permission() {
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_manifest(dir.path(), "exec-only", &["exec"]);
+
+    let ctx = ServerTestContext::new(plugins_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "exec-only");
+    let auth = format!("Bearer {token}");
+
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/agent/fs/read",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &auth),
+        ],
+        Some(r#"{"path":"Cargo.toml"}"#),
+    );
+
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "forbidden");
+}
+
+#[test]
+fn agent_exec_requires_exec_permission() {
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_manifest(dir.path(), "fs-only", &["filesystem"]);
+
+    let ctx = ServerTestContext::new(plugins_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "fs-only");
+    let auth = format!("Bearer {token}");
+
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/agent/exec",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &auth),
+        ],
+        Some(r#"{"command":"echo hi"}"#),
+    );
+
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "forbidden");
+}
+
+#[test]
+fn agent_process_requires_exec_permission() {
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_manifest(dir.path(), "fs-only", &["filesystem"]);
+
+    let ctx = ServerTestContext::new(plugins_config(dir.path()));
+    let token = discover_and_get_token(ctx.addr(), "fs-only");
+    let auth = format!("Bearer {token}");
+
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/agent/processes/spawn",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &auth),
+        ],
+        Some(r#"{"command":"echo hi"}"#),
+    );
+
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "forbidden");
+}
+
+#[test]
+fn agent_routes_with_plugin_id_header_require_token() {
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_manifest(dir.path(), "header-only", &["filesystem"]);
+
+    let ctx = ServerTestContext::new(plugins_config(dir.path()));
+    let _ = discover_and_get_token(ctx.addr(), "header-only");
+
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/agent/fs/read",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Talu-Plugin-Id", "header-only"),
+        ],
+        Some(r#"{"path":"Cargo.toml"}"#),
+    );
+
+    assert_eq!(resp.status, 401, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "unauthorized");
+}
+
+#[test]
+fn agent_routes_reject_plugin_id_and_token_mismatch() {
+    let dir = TempDir::new().unwrap();
+    setup_plugin_with_manifest(dir.path(), "plugin-a", &["filesystem"]);
+    setup_plugin_with_manifest(dir.path(), "plugin-b", &["filesystem"]);
+
+    let ctx = ServerTestContext::new(plugins_config(dir.path()));
+    let token_a = discover_and_get_token(ctx.addr(), "plugin-a");
+    let auth_a = format!("Bearer {token_a}");
+
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/agent/fs/read",
+        &[
+            ("Content-Type", "application/json"),
+            ("Authorization", &auth_a),
+            ("X-Talu-Plugin-Id", "plugin-b"),
+        ],
+        Some(r#"{"path":"Cargo.toml"}"#),
+    );
+
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "forbidden");
+}
+
 // ---------------------------------------------------------------------------
 // Token uniqueness per plugin
 // ---------------------------------------------------------------------------

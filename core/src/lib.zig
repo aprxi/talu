@@ -50,7 +50,7 @@ pub const compute = @import("compute/root.zig");
 pub const xray = @import("xray/root.zig");
 pub const validate = @import("validate/root.zig");
 pub const db = @import("db/root.zig");
-pub const policy = @import("policy/root.zig");
+pub const policy = @import("agent/policy/root.zig");
 pub const dump = @import("xray/dump/root.zig");
 pub const agent = @import("agent/root.zig");
 

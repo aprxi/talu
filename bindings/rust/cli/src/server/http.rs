@@ -17,9 +17,10 @@ use tower_service::Service;
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::server::agent_exec;
-use crate::server::agent_fs;
-use crate::server::agent_shell;
+use crate::server::agent::exec as agent_exec;
+use crate::server::agent::fs as agent_fs;
+use crate::server::agent::process as agent_process;
+use crate::server::agent::shell as agent_shell;
 use crate::server::auth_gateway::AuthContext;
 use crate::server::code;
 use crate::server::code_ws;
@@ -39,6 +40,7 @@ use crate::server::search;
 use crate::server::sessions;
 use crate::server::settings;
 use crate::server::state::AppState;
+use crate::server::state::PluginTokenEntry;
 use crate::server::tags;
 
 type BoxBody = http_body_util::combinators::BoxBody<Bytes, Infallible>;
@@ -101,6 +103,8 @@ static OPENAPI_AGENT_EXEC_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/exec"]));
 static OPENAPI_AGENT_SHELL_SPEC: Lazy<Vec<u8>> =
     Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/shells"]));
+static OPENAPI_AGENT_PROCESS_SPEC: Lazy<Vec<u8>> =
+    Lazy::new(|| filter_openapi_paths(&OPENAPI_SPEC, &["/v1/agent/processes"]));
 
 // Console UI assets — only compiled in when `make ui` has been run.
 // build.rs sets cfg(bundled_ui) when ui/dist/ contains the required files.
@@ -284,6 +288,11 @@ impl Service<Request<Incoming>> for Router {
                     .header("content-type", "application/json")
                     .body(Full::new(Bytes::from(OPENAPI_AGENT_SHELL_SPEC.clone())).boxed())
                     .unwrap(),
+                (Method::GET, "/openapi/agent/process.json") => Response::builder()
+                    .status(StatusCode::OK)
+                    .header("content-type", "application/json")
+                    .body(Full::new(Bytes::from(OPENAPI_AGENT_PROCESS_SPEC.clone())).boxed())
+                    .unwrap(),
                 (Method::GET, "/docs") => docs_hub_response(),
                 (Method::GET, "/docs/chat") => {
                     swagger_ui_response("/openapi/chat.json", "Talu API :: Chat")
@@ -349,6 +358,9 @@ impl Service<Request<Incoming>> for Router {
                 (Method::GET, "/docs/agent/shell") => {
                     swagger_ui_response("/openapi/agent/shell.json", "Talu API :: Agent::Shell")
                 }
+                (Method::GET, "/docs/agent/process") => {
+                    swagger_ui_response("/openapi/agent/process.json", "Talu API :: Agent::Process")
+                }
                 // Console UI (auth-exempt)
                 (Method::GET, "/") => {
                     let mut resp = serve_ui_asset(&state, "index.html", "text/html; charset=utf-8");
@@ -400,8 +412,12 @@ impl Service<Request<Incoming>> for Router {
                         }
                     };
 
-                    // Resolve plugin Bearer token for document/proxy routes.
-                    let plugin_owner = plugins::resolve_bearer_token(&state, req.headers()).await;
+                    // Resolve plugin Bearer token for plugin-scoped routes.
+                    let plugin_token_entry =
+                        plugins::resolve_bearer_token_entry(&state, req.headers()).await;
+                    let plugin_owner = plugin_token_entry
+                        .as_ref()
+                        .map(|entry| entry.plugin_id.clone());
 
                     match (method, path.as_str()) {
                         (Method::GET, "/v1/models") | (Method::GET, "/models") => {
@@ -411,37 +427,125 @@ impl Service<Request<Incoming>> for Router {
                             responses::handle_create(state, req, auth).await
                         }
                         (Method::POST, "/v1/agent/fs/read") => {
-                            agent_fs::handle_read(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_read(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/fs/write") => {
-                            agent_fs::handle_write(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_write(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/fs/edit") => {
-                            agent_fs::handle_edit(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_edit(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/fs/stat") => {
-                            agent_fs::handle_stat(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_stat(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/fs/ls") => {
-                            agent_fs::handle_list(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_list(state, req, auth).await
+                            }
                         }
                         (Method::DELETE, "/v1/agent/fs/rm") => {
-                            agent_fs::handle_remove(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_remove(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/fs/mkdir") => {
-                            agent_fs::handle_mkdir(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_mkdir(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/fs/rename") => {
-                            agent_fs::handle_rename(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Filesystem,
+                            ) {
+                                resp
+                            } else {
+                                agent_fs::handle_rename(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/exec") => {
-                            agent_exec::handle_exec(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_exec::handle_exec(state, req, auth).await
+                            }
                         }
                         (Method::POST, "/v1/agent/shells") => {
-                            agent_shell::handle_create(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_shell::handle_create(state, req, auth).await
+                            }
                         }
                         (Method::GET, "/v1/agent/shells") => {
-                            agent_shell::handle_list(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_shell::handle_list(state, req, auth).await
+                            }
                         }
                         (Method::GET, p)
                             if p.starts_with("/v1/agent/shells/")
@@ -452,13 +556,96 @@ impl Service<Request<Incoming>> for Router {
                                     .and_then(|v| v.to_str().ok())
                                     .is_some_and(|v| v.eq_ignore_ascii_case("websocket")) =>
                         {
-                            agent_shell::handle_ws(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_shell::handle_ws(state, req, auth).await
+                            }
                         }
                         (Method::GET, p) if p.starts_with("/v1/agent/shells/") => {
-                            agent_shell::handle_get(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_shell::handle_get(state, req, auth).await
+                            }
                         }
                         (Method::DELETE, p) if p.starts_with("/v1/agent/shells/") => {
-                            agent_shell::handle_delete(state, req, auth).await
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_shell::handle_delete(state, req, auth).await
+                            }
+                        }
+                        (Method::POST, "/v1/agent/processes/spawn") => {
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_process::handle_spawn(state, req, auth).await
+                            }
+                        }
+                        (Method::GET, "/v1/agent/processes") => {
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_process::handle_list(state, req, auth).await
+                            }
+                        }
+                        (Method::POST, p)
+                            if p.starts_with("/v1/agent/processes/") && p.ends_with("/send") =>
+                        {
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_process::handle_send(state, req, auth).await
+                            }
+                        }
+                        (Method::GET, p)
+                            if p.starts_with("/v1/agent/processes/") && p.ends_with("/stream") =>
+                        {
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_process::handle_stream(state, req, auth).await
+                            }
+                        }
+                        (Method::DELETE, p) if p.starts_with("/v1/agent/processes/") => {
+                            if let Some(resp) = enforce_plugin_agent_capability(
+                                req.headers(),
+                                plugin_token_entry.as_ref(),
+                                AgentCapability::Exec,
+                            ) {
+                                resp
+                            } else {
+                                agent_process::handle_delete(state, req, auth).await
+                            }
                         }
                         (Method::GET, "/v1/events") => {
                             events::handle_replay(state, req, auth).await
@@ -1483,6 +1670,11 @@ a:hover {
           <td class="desc">Interactive PTY shell lifecycle and WebSocket attach endpoints.</td>
         </tr>
         <tr>
+          <td class="mono"><a href="/docs/agent/process"><code>agent/process</code></a></td>
+          <td class="json-cell"><a class="json-link" href="/openapi/agent/process.json" title="/openapi/agent/process.json">json</a><button class="copy-btn" data-url="/openapi/agent/process.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
+          <td class="desc">Long-lived process sessions with stdin send and SSE stream endpoints (`/v1/agent/processes/*`).</td>
+        </tr>
+        <tr>
           <td class="mono"><a href="/docs/repo"><code>repo</code></a></td>
           <td class="json-cell"><a class="json-link" href="/openapi/repo.json" title="/openapi/repo.json">json</a><button class="copy-btn" data-url="/openapi/repo.json" title="Copy JSON URL" aria-label="Copy JSON URL">⧉</button></td>
           <td class="desc">Repository model management, pin lifecycle, and sync endpoints.</td>
@@ -1635,6 +1827,76 @@ fn filter_openapi_paths(spec: &[u8], prefixes: &[&str]) -> Vec<u8> {
     }
 
     serde_json::to_vec_pretty(&doc).unwrap_or_else(|_| spec.to_vec())
+}
+
+#[derive(Clone, Copy)]
+enum AgentCapability {
+    Filesystem,
+    Exec,
+}
+
+fn enforce_plugin_agent_capability(
+    headers: &hyper::HeaderMap,
+    plugin_token_entry: Option<&PluginTokenEntry>,
+    required: AgentCapability,
+) -> Option<Response<BoxBody>> {
+    let plugin_id_header = headers
+        .get("x-talu-plugin-id")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    let bearer_token_present = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .is_some();
+
+    // Non-plugin callers are allowed through. Plugin requests must present a
+    // valid capability token with the required permission.
+    if plugin_id_header.is_none() && !bearer_token_present {
+        return None;
+    }
+
+    let token_entry = match plugin_token_entry {
+        Some(entry) => entry,
+        None => {
+            return Some(json_error(
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                "Missing or invalid plugin capability token",
+            ))
+        }
+    };
+
+    if let Some(plugin_id) = plugin_id_header {
+        if plugin_id != token_entry.plugin_id {
+            return Some(json_error(
+                StatusCode::FORBIDDEN,
+                "forbidden",
+                "Plugin token does not match X-Talu-Plugin-Id",
+            ));
+        }
+    }
+
+    let allowed = match required {
+        AgentCapability::Filesystem => token_entry.allow_filesystem,
+        AgentCapability::Exec => token_entry.allow_exec,
+    };
+    if !allowed {
+        let permission = match required {
+            AgentCapability::Filesystem => "filesystem",
+            AgentCapability::Exec => "exec",
+        };
+        return Some(json_error(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            &format!(
+                "Plugin '{}' lacks '{}' permission for this endpoint",
+                token_entry.plugin_id, permission
+            ),
+        ));
+    }
+
+    None
 }
 
 fn json_error(status: StatusCode, code: &str, message: &str) -> Response<BoxBody> {

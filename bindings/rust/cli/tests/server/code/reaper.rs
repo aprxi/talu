@@ -23,6 +23,8 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         code_session_ttl: std::time::Duration::ZERO,
         shell_sessions: Mutex::new(HashMap::new()),
         shell_session_ttl: std::time::Duration::from_secs(15 * 60),
+        process_sessions: Mutex::new(HashMap::new()),
+        process_session_ttl: std::time::Duration::from_secs(15 * 60),
     });
     let router = Router::new(state.clone());
     (router, state)
