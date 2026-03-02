@@ -10,6 +10,7 @@ const Policy = policy_mod.Policy;
 
 pub const TaluAgentPolicy = opaque {};
 pub const ProcessDenyReason = policy_mod.ProcessDenyReason;
+pub const TerminalShellMode = policy_mod.TerminalShellMode;
 
 pub const ProcessPolicyResult = struct {
     allowed: bool,
@@ -68,6 +69,11 @@ pub fn enforceProcessPolicy(
         .allowed = result.allowed,
         .deny_reason = result.deny_reason,
     };
+}
+
+pub fn terminalShellMode(policy: ?*TaluAgentPolicy) TerminalShellMode {
+    const p = toPolicyConst(policy) orelse return .host;
+    return p.terminal_shell_mode;
 }
 
 pub fn talu_agent_policy_create(

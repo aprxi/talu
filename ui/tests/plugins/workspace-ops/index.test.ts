@@ -98,7 +98,7 @@ describe("workspaceOpsPlugin", () => {
     expect(ctx.container.querySelector("#wop-read-btn")).not.toBeNull();
     expect(ctx.container.querySelector("#wop-write-btn")).not.toBeNull();
     expect(ctx.container.querySelector("#wop-edit-btn")).not.toBeNull();
-    expect(ctx.container.querySelector("#wop-terminal-send-btn")).not.toBeNull();
+    expect(ctx.container.querySelector("#wop-terminal-host")).not.toBeNull();
     const text = ctx.container.textContent ?? "";
     expect(text).toContain("Terminal");
     expect(text.indexOf("Terminal")).toBeLessThan(text.indexOf("Write / Edit"));
@@ -189,8 +189,7 @@ describe("workspaceOpsPlugin", () => {
     expect(payload.error.code).toBe("invalid_request");
   });
 
-  test("terminal auto-opens and send streams output", async () => {
-    const sent: string[] = [];
+  test("terminal auto-opens and handles stream events", async () => {
     let onEventHandler: ((event: { type: "data" | "exit" | "error"; data?: string; code?: number; message?: string }) => void) | null = null;
 
     const ctx = createContext({
@@ -201,9 +200,7 @@ describe("workspaceOpsPlugin", () => {
             cols: 120,
             rows: 32,
             cwd: ".",
-            send(data: string): void {
-              sent.push(data);
-            },
+            send(): void {},
             resize(): void {},
             signal(): void {},
             onEvent(handler: (event: { type: "data" | "exit" | "error"; data?: string; code?: number; message?: string }) => void) {
@@ -219,10 +216,7 @@ describe("workspaceOpsPlugin", () => {
     await workspaceOpsPlugin.run(ctx, new AbortController().signal);
     await flushAsync();
 
-    const input = ctx.container.querySelector<HTMLInputElement>("#wop-terminal-input")!;
-    const sendBtn = ctx.container.querySelector<HTMLButtonElement>("#wop-terminal-send-btn")!;
     const shellState = ctx.container.querySelector<HTMLElement>("#wop-shell-state")!;
-    const terminalOutput = ctx.container.querySelector<HTMLElement>("#wop-terminal-output")!;
     const output = ctx.container.querySelector<HTMLElement>("#wop-output")!;
     const status = ctx.container.querySelector<HTMLElement>("#wop-status")!;
 
@@ -230,20 +224,12 @@ describe("workspaceOpsPlugin", () => {
     expect(status.dataset["state"]).toBe("success");
     expect(JSON.parse(output.textContent ?? "{}").operation).toBe("shell.open");
 
-    input.value = "ls";
-    sendBtn.click();
-    await flushAsync();
-
-    expect(sent).toEqual(["ls\n"]);
-    expect(status.dataset["state"]).toBe("success");
-    expect(JSON.parse(output.textContent ?? "{}").operation).toBe("shell.send");
-    expect(terminalOutput.textContent).toBe("");
-
     onEventHandler?.({ type: "data", data: "file-a\n" });
-    expect(terminalOutput.textContent).toContain("file-a");
+    onEventHandler?.({ type: "exit", code: 0 });
+    expect(shellState.textContent).toBe("disconnected");
   });
 
-  test("terminal send reports open failure when shell cannot be created", async () => {
+  test("terminal open failure is reported", async () => {
     const ctx = createContext({
       agent: {
         shell: {
@@ -256,14 +242,8 @@ describe("workspaceOpsPlugin", () => {
     await workspaceOpsPlugin.run(ctx, new AbortController().signal);
     await flushAsync();
 
-    const input = ctx.container.querySelector<HTMLInputElement>("#wop-terminal-input")!;
-    const sendBtn = ctx.container.querySelector<HTMLButtonElement>("#wop-terminal-send-btn")!;
     const output = ctx.container.querySelector<HTMLElement>("#wop-output")!;
     const status = ctx.container.querySelector<HTMLElement>("#wop-status")!;
-
-    input.value = "pwd";
-    sendBtn.click();
-    await flushAsync();
 
     const payload = JSON.parse(output.textContent ?? "{}");
     expect(status.dataset["state"]).toBe("error");

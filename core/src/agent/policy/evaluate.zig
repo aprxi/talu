@@ -18,6 +18,11 @@ pub const Mode = enum(u8) {
     audit = 1,
 };
 
+pub const TerminalShellMode = enum(u8) {
+    host = 0,
+    builtin = 1,
+};
+
 pub const Statement = struct {
     effect: Effect,
     action_pattern: []const u8,
@@ -42,6 +47,7 @@ pub const Policy = struct {
     _pattern_buf: []u8,
     allocator: std.mem.Allocator,
     max_timeout_ms: ?u64 = null,
+    terminal_shell_mode: TerminalShellMode = .host,
 
     /// Evaluate a simple action string.
     pub fn evaluate(self: *const Policy, action: []const u8) Effect {

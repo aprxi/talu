@@ -17,6 +17,12 @@ fn config_with_policy(policy_json: &str) -> ServerConfig {
     cfg
 }
 
+fn config_with_policy_and_shell_env(policy_json: &str, shell: &str) -> ServerConfig {
+    let mut cfg = config_with_policy(policy_json);
+    cfg.env_vars.push(("SHELL".to_string(), shell.to_string()));
+    cfg
+}
+
 fn gateway_config() -> ServerConfig {
     let mut cfg = ServerConfig::new();
     cfg.gateway_secret = Some("secret".to_string());
@@ -325,6 +331,19 @@ fn agent_shell_create_with_invalid_policy_schema_fails_startup() {
 fn agent_shell_create_with_invalid_policy_schema_missing_statements_fails_startup() {
     let policy = r#"{
         "default":"deny"
+    }"#;
+    assert_server_startup_fails(
+        config_with_policy(policy),
+        "parse agent runtime policy JSON",
+    );
+}
+
+#[test]
+fn agent_shell_create_with_invalid_terminal_shell_mode_fails_startup() {
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"invalid",
+        "statements":[]
     }"#;
     assert_server_startup_fails(
         config_with_policy(policy),
@@ -833,6 +852,67 @@ async fn agent_shell_ws_echo_command_output() {
     assert!(
         text.contains("hello"),
         "expected 'hello' in PTY output, got: {text}"
+    );
+
+    let exit = exit_event.expect("should receive exit event");
+    assert_eq!(exit["type"], "exit");
+}
+
+#[tokio::test]
+async fn agent_shell_ws_terminal_shell_mode_builtin_uses_sh() {
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"builtin",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy_and_shell_env(policy, "/bin/bash"));
+    let shell_id = create_shell(&ctx);
+    let mut ws = ws_connect(&ctx, &shell_id).await;
+
+    ws.send(Message::Binary(b"echo $0\nexit\n".to_vec().into()))
+        .await
+        .expect("ws send");
+
+    let (output, exit_event) = ws_drain_output(&mut ws).await;
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("/bin/sh"),
+        "expected builtin mode shell to be /bin/sh, got: {text}"
+    );
+
+    let exit = exit_event.expect("should receive exit event");
+    assert_eq!(exit["type"], "exit");
+}
+
+#[tokio::test]
+async fn agent_shell_ws_terminal_shell_mode_host_honors_shell_env() {
+    if !std::path::Path::new("/bin/bash").exists() {
+        eprintln!("Skipped: /bin/bash not available in test environment");
+        return;
+    }
+
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"host",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy_and_shell_env(policy, "/bin/bash"));
+    let shell_id = create_shell(&ctx);
+    let mut ws = ws_connect(&ctx, &shell_id).await;
+
+    ws.send(Message::Binary(b"echo $0\nexit\n".to_vec().into()))
+        .await
+        .expect("ws send");
+
+    let (output, exit_event) = ws_drain_output(&mut ws).await;
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("/bin/bash"),
+        "expected host mode shell to honor SHELL=/bin/bash, got: {text}"
     );
 
     let exit = exit_event.expect("should receive exit event");

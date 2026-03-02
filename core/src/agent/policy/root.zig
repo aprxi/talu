@@ -13,6 +13,7 @@ pub const Policy = evaluate.Policy;
 pub const Statement = evaluate.Statement;
 pub const Effect = evaluate.Effect;
 pub const Mode = evaluate.Mode;
+pub const TerminalShellMode = evaluate.TerminalShellMode;
 pub const EvaluateInput = evaluate.EvaluateInput;
 pub const globMatch = pattern.globMatch;
 pub const pathMatch = pattern.pathMatch;
@@ -73,6 +74,7 @@ pub fn checkFileDescendantSubtree(
 ///   "version": 1,
 ///   "default": "deny",
 ///   "mode": "enforce",
+///   "terminal_shell_mode": "host",
 ///   "max_timeout_ms": 120000,
 ///   "statements": [
 ///     {"effect":"allow","action":"tool.exec","command":"rg *","cwd":"repo/**"},
@@ -100,6 +102,10 @@ pub fn parsePolicy(allocator: std.mem.Allocator, json_bytes: []const u8) !Policy
 
     const default_effect = try parseEffect(pj.default);
     const mode: Mode = if (pj.mode) |m| try parseMode(m) else .enforce;
+    const terminal_shell_mode: TerminalShellMode = if (pj.terminal_shell_mode) |value|
+        try parseTerminalShellMode(value)
+    else
+        .host;
 
     const stmt_count = pj.statements.len;
     const statements = try allocator.alloc(Statement, stmt_count);
@@ -139,6 +145,7 @@ pub fn parsePolicy(allocator: std.mem.Allocator, json_bytes: []const u8) !Policy
         ._pattern_buf = pattern_buf,
         .allocator = allocator,
         .max_timeout_ms = pj.max_timeout_ms,
+        .terminal_shell_mode = terminal_shell_mode,
     };
 }
 
@@ -240,6 +247,7 @@ const PolicyJson = struct {
     version: ?u32 = null,
     default: []const u8,
     mode: ?[]const u8 = null,
+    terminal_shell_mode: ?[]const u8 = null,
     max_timeout_ms: ?u64 = null,
     statements: []const StatementJson,
 };
@@ -262,6 +270,12 @@ fn parseMode(s: []const u8) !Mode {
     if (std.mem.eql(u8, s, "enforce")) return .enforce;
     if (std.mem.eql(u8, s, "audit")) return .audit;
     return error.InvalidMode;
+}
+
+fn parseTerminalShellMode(s: []const u8) !TerminalShellMode {
+    if (std.mem.eql(u8, s, "host")) return .host;
+    if (std.mem.eql(u8, s, "builtin")) return .builtin;
+    return error.InvalidTerminalShellMode;
 }
 
 // =============================================================================
@@ -315,6 +329,29 @@ test "parsePolicy audit mode" {
     defer policy.deinit();
 
     try std.testing.expectEqual(Mode.audit, policy.mode);
+}
+
+test "parsePolicy terminal shell mode host and builtin" {
+    const host_json =
+        \\{"default":"deny","terminal_shell_mode":"host","statements":[]}
+    ;
+    var host_policy = try parsePolicy(std.testing.allocator, host_json);
+    defer host_policy.deinit();
+    try std.testing.expectEqual(TerminalShellMode.host, host_policy.terminal_shell_mode);
+
+    const builtin_json =
+        \\{"default":"deny","terminal_shell_mode":"builtin","statements":[]}
+    ;
+    var builtin_policy = try parsePolicy(std.testing.allocator, builtin_json);
+    defer builtin_policy.deinit();
+    try std.testing.expectEqual(TerminalShellMode.builtin, builtin_policy.terminal_shell_mode);
+}
+
+test "parsePolicy invalid terminal shell mode" {
+    const json =
+        \\{"default":"deny","terminal_shell_mode":"custom","statements":[]}
+    ;
+    try std.testing.expectError(error.InvalidTerminalShellMode, parsePolicy(std.testing.allocator, json));
 }
 
 test "parsePolicy default allow with denies" {

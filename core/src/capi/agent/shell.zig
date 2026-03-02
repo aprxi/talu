@@ -343,12 +343,18 @@ pub fn talu_shell_open(
         return setPolicyDeniedError(policy_result.deny_reason);
     }
 
+    const spawn_mode: shell.pty.ShellSpawnMode = switch (policy_api.terminalShellMode(policy)) {
+        .host => .host,
+        .builtin => .builtin,
+    };
+
     const session_ptr = shell.session.ShellSession.open(
         allocator,
         cols,
         rows,
         cwd_slice,
         DEFAULT_SCROLLBACK_BYTES,
+        spawn_mode,
     ) catch |err| {
         capi_error.setError(err, "failed to open shell session", .{});
         return @intFromEnum(error_codes.errorToCode(err));

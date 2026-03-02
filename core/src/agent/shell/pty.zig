@@ -18,6 +18,11 @@ pub const SpawnResult = struct {
     child_pid: std.posix.pid_t,
 };
 
+pub const ShellSpawnMode = enum(u8) {
+    host = 0,
+    builtin = 1,
+};
+
 pub const Pty = struct {
     master_fd: std.posix.fd_t,
 
@@ -50,8 +55,8 @@ pub const Pty = struct {
     }
 };
 
-/// Spawn `/bin/sh` attached to a PTY and return the parent-side master fd.
-pub fn spawnShell(cols: u16, rows: u16, cwd: ?[]const u8) !SpawnResult {
+/// Spawn an interactive shell attached to a PTY and return the parent-side master fd.
+pub fn spawnShell(cols: u16, rows: u16, cwd: ?[]const u8, mode: ShellSpawnMode) !SpawnResult {
     var winsize = std.mem.zeroes(c.struct_winsize);
     winsize.ws_col = cols;
     winsize.ws_row = rows;
@@ -64,9 +69,17 @@ pub fn spawnShell(cols: u16, rows: u16, cwd: ?[]const u8) !SpawnResult {
         if (cwd) |dir| {
             std.posix.chdir(dir) catch std.posix.exit(1);
         }
-        const shell_path: [*:0]const u8 = "/bin/sh";
-        const argv = [_:null]?[*:0]const u8{shell_path};
-        std.posix.execvpeZ(shell_path, &argv, std.c.environ) catch std.posix.exit(127);
+
+        if (mode == .host) {
+            if (resolveInteractiveShellFromEnv()) |shell_path| {
+                execInteractiveShell(shell_path);
+            }
+
+            execInteractiveShell("/bin/bash");
+            execInteractiveShell("/bin/zsh");
+        }
+        execInteractiveShell("/bin/sh");
+        std.posix.exit(127);
         unreachable;
     }
 
@@ -80,10 +93,34 @@ pub fn spawnShell(cols: u16, rows: u16, cwd: ?[]const u8) !SpawnResult {
     };
 }
 
+fn resolveInteractiveShellFromEnv() ?[*:0]const u8 {
+    const shell_ptr = std.posix.getenv("SHELL") orelse return null;
+    const shell = std.mem.sliceTo(shell_ptr, 0);
+    if (!isValidShellPath(shell)) return null;
+    return shell_ptr;
+}
+
+fn isValidShellPath(path: []const u8) bool {
+    if (path.len == 0) return false;
+    return std.fs.path.isAbsolute(path);
+}
+
+fn execInteractiveShell(shell_path: [*:0]const u8) void {
+    const argv = [_:null]?[*:0]const u8{ shell_path, "-i" };
+    std.posix.execvpeZ(shell_path, &argv, std.c.environ) catch {};
+}
+
 fn setNonBlocking(fd: std.posix.fd_t) !void {
     const current = c.fcntl(fd, c.F_GETFL, @as(c_int, 0));
     if (current < 0) return error.FcntlFailed;
     if (c.fcntl(fd, c.F_SETFL, current | c.O_NONBLOCK) < 0) {
         return error.FcntlFailed;
     }
+}
+
+test "isValidShellPath accepts absolute paths only" {
+    try std.testing.expect(isValidShellPath("/bin/bash"));
+    try std.testing.expect(!isValidShellPath(""));
+    try std.testing.expect(!isValidShellPath("bash"));
+    try std.testing.expect(!isValidShellPath("./bin/zsh"));
 }

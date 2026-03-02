@@ -7,6 +7,17 @@ import type {
 
 type StatusState = "idle" | "running" | "success" | "error";
 
+interface TerminalHandle {
+  write(text: string): void;
+  writeln(text: string): void;
+  focus(): void;
+  fit(): void;
+  getCols(): number;
+  getRows(): number;
+  onData(handler: (data: string) => void): Disposable;
+  dispose(): void;
+}
+
 function setStatus(statusEl: HTMLElement, state: StatusState, message: string): void {
   statusEl.dataset["state"] = state;
   statusEl.textContent = message;
@@ -60,17 +71,155 @@ function requireFilePath(pathInput: HTMLInputElement): string {
   return path;
 }
 
+function createFallbackTerminal(host: HTMLElement): TerminalHandle {
+  host.innerHTML = "";
+  host.tabIndex = 0;
+
+  const pre = document.createElement("pre");
+  pre.style.margin = "0";
+  pre.style.padding = "12px";
+  pre.style.whiteSpace = "pre-wrap";
+  pre.style.wordBreak = "break-word";
+  pre.style.minHeight = "220px";
+  pre.style.maxHeight = "320px";
+  pre.style.overflow = "auto";
+  host.appendChild(pre);
+
+  const listeners = new Set<(data: string) => void>();
+  const emitData = (data: string): void => {
+    for (const listener of listeners) {
+      listener(data);
+    }
+  };
+
+  const keyHandler = (event: KeyboardEvent): void => {
+    if (event.key === "Tab") {
+      event.preventDefault();
+      emitData("\t");
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      emitData("\r");
+      return;
+    }
+    if (event.key === "Backspace") {
+      emitData("\u007f");
+      return;
+    }
+    if (event.ctrlKey && (event.key === "c" || event.key === "C")) {
+      event.preventDefault();
+      emitData("\u0003");
+      return;
+    }
+    if (event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      emitData(event.key);
+    }
+  };
+
+  host.addEventListener("keydown", keyHandler);
+
+  return {
+    write(text: string): void {
+      pre.textContent = `${pre.textContent ?? ""}${text}`;
+      pre.scrollTop = pre.scrollHeight;
+    },
+    writeln(text: string): void {
+      pre.textContent = `${pre.textContent ?? ""}${text}\n`;
+      pre.scrollTop = pre.scrollHeight;
+    },
+    focus(): void {
+      host.focus();
+    },
+    fit(): void {
+      // no-op
+    },
+    getCols(): number {
+      return 120;
+    },
+    getRows(): number {
+      return 32;
+    },
+    onData(handler: (data: string) => void): Disposable {
+      listeners.add(handler);
+      return {
+        dispose(): void {
+          listeners.delete(handler);
+        },
+      };
+    },
+    dispose(): void {
+      host.removeEventListener("keydown", keyHandler);
+      listeners.clear();
+      host.innerHTML = "";
+    },
+  };
+}
+
+async function createTerminal(host: HTMLElement): Promise<TerminalHandle> {
+  try {
+    const [{ Terminal }, { FitAddon }] = await Promise.all([
+      import("xterm"),
+      import("xterm-addon-fit"),
+    ]);
+
+    host.innerHTML = "";
+    const terminal = new Terminal({
+      cursorBlink: true,
+      scrollback: 10_000,
+      fontSize: 13,
+      fontFamily:
+        "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, Liberation Mono, monospace",
+    });
+    const fitAddon = new FitAddon();
+    terminal.loadAddon(fitAddon);
+    terminal.open(host);
+    fitAddon.fit();
+
+    return {
+      write(text: string): void {
+        terminal.write(text);
+      },
+      writeln(text: string): void {
+        terminal.writeln(text);
+      },
+      focus(): void {
+        terminal.focus();
+      },
+      fit(): void {
+        fitAddon.fit();
+      },
+      getCols(): number {
+        return terminal.cols;
+      },
+      getRows(): number {
+        return terminal.rows;
+      },
+      onData(handler: (data: string) => void): Disposable {
+        const sub = terminal.onData(handler);
+        return {
+          dispose(): void {
+            sub.dispose();
+          },
+        };
+      },
+      dispose(): void {
+        terminal.dispose();
+      },
+    };
+  } catch (error) {
+    console.warn("[workspace-ops] xterm unavailable, using fallback terminal", error);
+    return createFallbackTerminal(host);
+  }
+}
+
 function buildWorkspaceOpsDom(root: HTMLElement): void {
   root.innerHTML = `
     <div style="display:flex;flex-direction:column;gap:12px;padding:12px;height:100%;overflow:auto;">
       <div class="panel-section" style="display:flex;flex-direction:column;gap:8px;">
         <div class="panel-heading">Terminal</div>
         <div id="wop-shell-state" style="font-size:12px;color:var(--text-muted);">disconnected</div>
-        <pre id="wop-terminal-output" style="margin:0;padding:12px;border:1px solid var(--border);border-radius:8px;background:var(--bg-code);color:var(--text);white-space:pre-wrap;word-break:break-word;min-height:180px;max-height:280px;overflow:auto;"></pre>
-        <div style="display:grid;grid-template-columns:1fr auto;gap:8px;">
-          <input id="wop-terminal-input" class="form-input mono" type="text" placeholder="Type a command and press Send">
-          <button id="wop-terminal-send-btn" class="btn btn-primary">Send >_</button>
-        </div>
+        <div id="wop-terminal-host" style="border:1px solid var(--border);border-radius:8px;background:var(--bg-code);min-height:360px;max-height:65vh;overflow:auto;"></div>
       </div>
 
       <div class="panel-section" style="display:flex;flex-direction:column;gap:8px;">
@@ -138,13 +287,18 @@ export const workspaceOpsPlugin: PluginDefinition = {
     const writeBtn = requiredElement<HTMLButtonElement>(ctx.container, "wop-write-btn");
     const editBtn = requiredElement<HTMLButtonElement>(ctx.container, "wop-edit-btn");
     const shellState = requiredElement<HTMLElement>(ctx.container, "wop-shell-state");
-    const shellOutput = requiredElement<HTMLElement>(ctx.container, "wop-terminal-output");
-    const shellInput = requiredElement<HTMLInputElement>(ctx.container, "wop-terminal-input");
-    const shellSendBtn = requiredElement<HTMLButtonElement>(ctx.container, "wop-terminal-send-btn");
+    const terminalHost = requiredElement<HTMLElement>(ctx.container, "wop-terminal-host");
     const statusEl = requiredElement<HTMLElement>(ctx.container, "wop-status");
     const outputEl = requiredElement<HTMLElement>(ctx.container, "wop-output");
+
+    const terminal = await createTerminal(terminalHost);
+    terminal.focus();
+
     let shell: AgentShellSession | null = null;
     let shellEventSub: Disposable | null = null;
+    let openInFlight:
+      | Promise<{ shellId: string; cols: number; rows: number; cwd: string | null } | { shellId: string; status: string }>
+      | null = null;
 
     const runAction = async (operation: string, fn: () => Promise<unknown>): Promise<void> => {
       setStatus(statusEl, "running", `running ${operation}...`);
@@ -156,11 +310,6 @@ export const workspaceOpsPlugin: PluginDefinition = {
         setStatus(statusEl, "error", `${operation} failed`);
         renderError(outputEl, operation, err);
       }
-    };
-
-    const appendTerminal = (text: string): void => {
-      shellOutput.textContent = `${shellOutput.textContent ?? ""}${text}`;
-      shellOutput.scrollTop = shellOutput.scrollHeight;
     };
 
     const resetShell = (): void => {
@@ -202,50 +351,81 @@ export const workspaceOpsPlugin: PluginDefinition = {
       if (shell) {
         return { shellId: shell.id, status: "already_open" };
       }
+      if (openInFlight) {
+        return openInFlight;
+      }
 
-      shellOutput.textContent = "";
-      const opened = await ctx.agent.shell.open({ cwd: ctx.agent.cwd, cols: 120, rows: 32 });
-      shell = opened;
-      shellState.textContent = `connected (${opened.id})`;
-      shellEventSub = opened.onEvent((event) => {
-        if (event.type === "data") {
-          appendTerminal(event.data ?? "");
-        } else if (event.type === "error") {
-          appendTerminal(`\n[error] ${event.message ?? "shell error"}\n`);
-        } else if (event.type === "exit") {
-          appendTerminal(`\n[exit] code=${event.code ?? "unknown"}\n`);
-          resetShell();
-        }
-      });
+      openInFlight = (async () => {
+        terminal.fit();
+        const cols = terminal.getCols() > 0 ? terminal.getCols() : 120;
+        const rows = terminal.getRows() > 0 ? terminal.getRows() : 32;
+        const opened = await ctx.agent.shell.open({ cwd: ctx.agent.cwd, cols, rows });
+        shell = opened;
+        shellState.textContent = `connected (${opened.id})`;
+        shellEventSub = opened.onEvent((event) => {
+          if (event.type === "data") {
+            terminal.write(event.data ?? "");
+          } else if (event.type === "error") {
+            terminal.writeln(`[error] ${event.message ?? "shell error"}`);
+          } else if (event.type === "exit") {
+            terminal.writeln(`[exit] code=${event.code ?? "unknown"}`);
+            resetShell();
+          }
+        });
+        terminal.focus();
+        return { shellId: opened.id, cols: opened.cols, rows: opened.rows, cwd: opened.cwd };
+      })();
 
-      return { shellId: opened.id, cols: opened.cols, rows: opened.rows, cwd: opened.cwd };
+      try {
+        return await openInFlight;
+      } finally {
+        openInFlight = null;
+      }
     };
 
-    shellSendBtn.addEventListener("click", () => {
-      void runAction("shell.send", async () => {
-        const line = shellInput.value;
-        if (line.trim().length === 0) {
-          throw new Error("invalid_request: command is required");
-        }
+    const sendShellInput = (data: string): void => {
+      if (!shell) return;
+      try {
+        shell.send(data);
+      } catch (err) {
+        setStatus(statusEl, "error", "shell.input failed");
+        renderError(outputEl, "shell.input", err);
+      }
+    };
 
-        await openShell();
-        if (!shell) {
-          throw new Error("shell_not_open: open a terminal session first");
-        }
-
-        shell.send(`${line}\n`);
-        shellInput.value = "";
-        return { sent: true };
-      });
+    const terminalInputSub = terminal.onData((data) => {
+      sendShellInput(data);
     });
 
-    shellInput.addEventListener("keydown", (event) => {
-      if (event.key !== "Enter") return;
+    const tabKeyHandler = (event: KeyboardEvent): void => {
+      if (event.key !== "Tab") return;
+      if (event.altKey || event.ctrlKey || event.metaKey) return;
       event.preventDefault();
-      shellSendBtn.click();
+      event.stopPropagation();
+      sendShellInput("\t");
+    };
+    terminalHost.addEventListener("keydown", tabKeyHandler, { capture: true });
+
+    const resizeObserver = new ResizeObserver(() => {
+      terminal.fit();
+      if (!shell) return;
+      const cols = terminal.getCols();
+      const rows = terminal.getRows();
+      if (cols <= 0 || rows <= 0) return;
+      try {
+        shell.resize(cols, rows);
+      } catch (err) {
+        setStatus(statusEl, "error", "shell.resize failed");
+        renderError(outputEl, "shell.resize", err);
+      }
     });
+    resizeObserver.observe(terminalHost);
 
     signal.addEventListener("abort", () => {
+      terminalHost.removeEventListener("keydown", tabKeyHandler, { capture: true } as EventListenerOptions);
+      terminalInputSub.dispose();
+      resizeObserver.disconnect();
+      terminal.dispose();
       if (!shell) return;
       const active = shell;
       resetShell();

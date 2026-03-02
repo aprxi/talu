@@ -23,11 +23,12 @@ pub const ShellSession = struct {
         rows: u16,
         cwd: ?[]const u8,
         max_scrollback_bytes: usize,
+        spawn_mode: pty_mod.ShellSpawnMode,
     ) !*ShellSession {
         const resolved_cwd = try resolveCwd(allocator, cwd);
         errdefer allocator.free(resolved_cwd);
 
-        var spawned = try pty_mod.spawnShell(cols, rows, resolved_cwd);
+        var spawned = try pty_mod.spawnShell(cols, rows, resolved_cwd, spawn_mode);
         errdefer spawned.pty.close();
 
         const now = std.time.timestamp();
@@ -211,7 +212,7 @@ test "ShellSession open write read close roundtrip" {
     const cwd = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    var session = try ShellSession.open(allocator, 80, 24, cwd, 64 * 1024);
+    var session = try ShellSession.open(allocator, 80, 24, cwd, 64 * 1024, .host);
     defer session.close();
 
     _ = try session.write("echo hello\n");
