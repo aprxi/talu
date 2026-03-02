@@ -18,6 +18,8 @@ const db_mod = @import("../../db/root.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 const fs_api = @import("fs.zig");
+const policy_api = @import("policy.zig");
+const process_api = @import("process.zig");
 const shell_api = @import("shell.zig");
 
 const ToolRegistry = agent_mod.ToolRegistry;
@@ -60,13 +62,72 @@ pub const TaluAgentBus = opaque {};
 /// Opaque handle for workspace-scoped filesystem operations.
 pub const TaluFs = fs_api.TaluFs;
 pub const TaluFsStat = fs_api.TaluFsStat;
+pub const TaluProcess = process_api.TaluProcess;
 pub const TaluShell = shell_api.TaluShell;
+pub const TaluAgentPolicy = policy_api.TaluAgentPolicy;
+
+pub export fn talu_agent_policy_create(
+    json: ?[*]const u8,
+    len: usize,
+    out_policy: ?*?*TaluAgentPolicy,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_create(json, len, out_policy);
+}
+
+pub export fn talu_agent_policy_free(policy: ?*TaluAgentPolicy) callconv(.c) void {
+    policy_api.talu_agent_policy_free(policy);
+}
+
+pub export fn talu_agent_policy_check_action(
+    policy: ?*TaluAgentPolicy,
+    action: ?[*:0]const u8,
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    resource: ?[*:0]const u8,
+    timeout_ms: u64,
+    out_allowed: ?*bool,
+    out_reason: ?*?[*]const u8,
+    out_reason_len: ?*usize,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_check_action(
+        policy,
+        action,
+        command,
+        cwd,
+        resource,
+        timeout_ms,
+        out_allowed,
+        out_reason,
+        out_reason_len,
+    );
+}
+
+pub export fn talu_agent_policy_check_file(
+    policy: ?*TaluAgentPolicy,
+    action: ?[*:0]const u8,
+    resource: ?[*:0]const u8,
+    is_dir: bool,
+    out_allowed: ?*bool,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_check_file(policy, action, resource, is_dir, out_allowed);
+}
+
+pub export fn talu_agent_policy_check_process(
+    policy: ?*TaluAgentPolicy,
+    action: ?[*:0]const u8,
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    out_allowed: ?*bool,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_check_process(policy, action, command, cwd, out_allowed);
+}
 
 pub export fn talu_fs_create(
     workspace_dir: ?[*:0]const u8,
+    policy: ?*TaluAgentPolicy,
     out_handle: ?*?*TaluFs,
 ) callconv(.c) i32 {
-    return fs_api.talu_fs_create(workspace_dir, out_handle);
+    return fs_api.talu_fs_create(workspace_dir, policy, out_handle);
 }
 
 pub export fn talu_fs_free(handle: ?*TaluFs) callconv(.c) void {
@@ -163,18 +224,21 @@ pub export fn talu_fs_free_string(ptr: ?[*]const u8, len: usize) callconv(.c) vo
 
 pub export fn talu_shell_exec(
     command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    policy: ?*TaluAgentPolicy,
     out_stdout: ?*?[*]const u8,
     out_stdout_len: ?*usize,
     out_stderr: ?*?[*]const u8,
     out_stderr_len: ?*usize,
     out_exit_code: ?*i32,
 ) callconv(.c) i32 {
-    return shell_api.talu_shell_exec(command, out_stdout, out_stdout_len, out_stderr, out_stderr_len, out_exit_code);
+    return shell_api.talu_shell_exec(command, cwd, policy, out_stdout, out_stdout_len, out_stderr, out_stderr_len, out_exit_code);
 }
 
 pub export fn talu_shell_exec_streaming(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
+    policy: ?*TaluAgentPolicy,
     timeout_ms: u64,
     on_stdout: ?shell_api.StreamCallback,
     on_stdout_ctx: ?*anyopaque,
@@ -185,6 +249,7 @@ pub export fn talu_shell_exec_streaming(
     return shell_api.talu_shell_exec_streaming(
         command,
         cwd,
+        policy,
         timeout_ms,
         on_stdout,
         on_stdout_ctx,
@@ -226,9 +291,10 @@ pub export fn talu_shell_open(
     cols: u16,
     rows: u16,
     cwd: ?[*:0]const u8,
+    policy: ?*TaluAgentPolicy,
     out_shell: ?*?*TaluShell,
 ) callconv(.c) i32 {
-    return shell_api.talu_shell_open(cols, rows, cwd, out_shell);
+    return shell_api.talu_shell_open(cols, rows, cwd, policy, out_shell);
 }
 
 pub export fn talu_shell_close(shell_handle: ?*TaluShell) callconv(.c) void {
@@ -277,6 +343,59 @@ pub export fn talu_shell_scrollback(
     out_len: ?*usize,
 ) callconv(.c) i32 {
     return shell_api.talu_shell_scrollback(shell_handle, out_data, out_len);
+}
+
+// =============================================================================
+// Process sessions (non-PTY)
+// =============================================================================
+
+pub export fn talu_process_open(
+    command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    policy: ?*TaluAgentPolicy,
+    out_process: ?*?*TaluProcess,
+) callconv(.c) i32 {
+    return process_api.talu_process_open(command, cwd, policy, out_process);
+}
+
+pub export fn talu_process_close(process_handle: ?*TaluProcess) callconv(.c) void {
+    process_api.talu_process_close(process_handle);
+}
+
+pub export fn talu_process_write(
+    process_handle: ?*TaluProcess,
+    data: ?[*]const u8,
+    len: usize,
+) callconv(.c) i32 {
+    return process_api.talu_process_write(process_handle, data, len);
+}
+
+pub export fn talu_process_read(
+    process_handle: ?*TaluProcess,
+    buf: ?[*]u8,
+    buf_len: usize,
+    out_read: ?*usize,
+) callconv(.c) i32 {
+    return process_api.talu_process_read(process_handle, buf, buf_len, out_read);
+}
+
+pub export fn talu_process_signal(
+    process_handle: ?*TaluProcess,
+    sig: u8,
+) callconv(.c) i32 {
+    return process_api.talu_process_signal(process_handle, sig);
+}
+
+pub export fn talu_process_alive(process_handle: ?*TaluProcess) callconv(.c) bool {
+    return process_api.talu_process_alive(process_handle);
+}
+
+pub export fn talu_process_exit_code(
+    process_handle: ?*TaluProcess,
+    out_code: ?*i32,
+    out_has_code: ?*bool,
+) callconv(.c) i32 {
+    return process_api.talu_process_exit_code(process_handle, out_code, out_has_code);
 }
 
 // =============================================================================

@@ -8,6 +8,15 @@ fn parse_sse_events(body: &str) -> Vec<serde_json::Value> {
         .collect()
 }
 
+fn config_with_policy(policy_json: &str) -> ServerConfig {
+    let mut cfg = ServerConfig::new();
+    cfg.env_vars.push((
+        "TALU_AGENT_POLICY_JSON".to_string(),
+        policy_json.to_string(),
+    ));
+    cfg
+}
+
 // ---------------------------------------------------------------------------
 // Input validation
 // ---------------------------------------------------------------------------
@@ -106,6 +115,679 @@ fn agent_exec_denies_chained_dangerous_command() {
     assert_eq!(resp.json()["error"]["code"], "command_denied");
 }
 
+#[test]
+fn agent_exec_policy_denied_surfaces_error_event() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    assert!(
+        events.iter().any(|e| e["type"] == "error"),
+        "expected error event: {events:?}"
+    );
+}
+
+#[test]
+fn agent_exec_invalid_policy_json_returns_500() {
+    let mut cfg = ServerConfig::new();
+    cfg.env_vars.push((
+        "TALU_AGENT_POLICY_JSON".to_string(),
+        "{not-valid-json".to_string(),
+    ));
+    let ctx = ServerTestContext::new(cfg);
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_exec_invalid_policy_schema_returns_500() {
+    let policy = r#"{
+        "default":"maybe",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_exec_invalid_policy_schema_missing_statements_returns_500() {
+    let policy = r#"{
+        "default":"deny"
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_exec_policy_cwd_denied_surfaces_error_event() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"},
+            {"effect":"deny","action":"tool.exec","command":"echo *","cwd":"."}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello", "cwd": "." }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied cwd"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_deny_wins_even_with_later_allow() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"deny","action":"tool.exec","command":"echo secret*"},
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo secret-value" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_deny_wins_regardless_of_statement_order() {
+    let policies = [
+        r#"{
+            "default":"allow",
+            "statements":[
+                {"effect":"allow","action":"tool.exec","command":"echo *"},
+                {"effect":"deny","action":"tool.exec","command":"echo secret*"}
+            ]
+        }"#,
+        r#"{
+            "default":"allow",
+            "statements":[
+                {"effect":"deny","action":"tool.exec","command":"echo secret*"},
+                {"effect":"allow","action":"tool.exec","command":"echo *"}
+            ]
+        }"#,
+    ];
+
+    for policy in policies {
+        let ctx = ServerTestContext::new(config_with_policy(policy));
+        let resp = post_json(
+            ctx.addr(),
+            "/v1/agent/exec",
+            &serde_json::json!({ "command": "echo secret-value" }),
+        );
+        assert_eq!(resp.status, 200, "body: {}", resp.body);
+        let events = parse_sse_events(&resp.body);
+        let error_event = events
+            .iter()
+            .find(|e| e["type"] == "error")
+            .expect("expected error event");
+        let message = error_event["message"].as_str().unwrap_or("");
+        assert!(
+            message.contains("policy denied exec"),
+            "unexpected error event: {error_event}"
+        );
+    }
+}
+
+#[test]
+fn agent_exec_policy_tool_process_does_not_grant_tool_exec() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.process","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_tool_shell_does_not_grant_tool_exec() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_allows_absolute_executable_via_normalization() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "/bin/echo hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    assert!(
+        !events.iter().any(|e| e["type"] == "error"),
+        "did not expect policy error: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == "exit"),
+        "expected exit event: {events:?}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_denies_absolute_executable_when_pattern_mismatches() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"printf *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "/bin/echo hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_exact_command_without_wildcard_does_not_allow_arguments() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_exact_command_without_wildcard_allows_bare_command() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+    let events = parse_sse_events(&resp.body);
+    assert!(
+        !events.iter().any(|e| e["type"] == "error"),
+        "did not expect policy error: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == "exit"),
+        "expected exit event: {events:?}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_cwd_scope_allows_tmp_and_denies_non_matching_cwd() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *","cwd":"/tmp"},
+            {"effect":"deny","action":"tool.exec","command":"echo *","cwd":"."}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let allowed = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo ok", "cwd": "/tmp" }),
+    );
+    assert_eq!(allowed.status, 200, "body: {}", allowed.body);
+    let allowed_events = parse_sse_events(&allowed.body);
+    assert!(
+        !allowed_events.iter().any(|e| e["type"] == "error"),
+        "did not expect policy error in /tmp: {allowed_events:?}"
+    );
+    assert!(
+        allowed_events.iter().any(|e| e["type"] == "exit"),
+        "expected exit event: {allowed_events:?}"
+    );
+
+    let denied = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo nope", "cwd": "." }),
+    );
+    assert_eq!(denied.status, 200, "body: {}", denied.body);
+    let denied_events = parse_sse_events(&denied.body);
+    let error_event = denied_events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected policy error in workspace cwd");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_denies_andand_segment_not_explicitly_allowed() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello && ls" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_denies_or_segment_not_explicitly_allowed() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello || ls" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_denies_pipe_segment_not_explicitly_allowed() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello | grep hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_denies_semicolon_segment_not_explicitly_allowed() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello ; grep hello /dev/null" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_explicit_cwd_deny_reports_cwd_reason() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"},
+            {"effect":"deny","action":"tool.exec","command":"echo *","cwd":"/tmp"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello", "cwd": "/tmp" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied cwd"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_default_allow_with_explicit_deny_blocks_matching_command() {
+    let policy = r#"{
+        "default":"allow",
+        "statements":[
+            {"effect":"deny","action":"tool.exec","command":"echo secret*"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo secret-value" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let error_event = events
+        .iter()
+        .find(|e| e["type"] == "error")
+        .expect("expected error event");
+    let message = error_event["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("policy denied exec"),
+        "unexpected error event: {error_event}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_allow_command_pattern_matches_bare_command() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    assert!(
+        !events.iter().any(|e| e["type"] == "error"),
+        "did not expect policy error: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == "exit"),
+        "expected exit event: {events:?}"
+    );
+}
+
+#[test]
+fn agent_exec_policy_cwd_deny_does_not_apply_when_cwd_not_provided() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"},
+            {"effect":"deny","action":"tool.exec","command":"echo *","cwd":"."}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "echo hello" }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    assert!(
+        !events.iter().any(|e| e["type"] == "error"),
+        "did not expect policy error when cwd is omitted: {events:?}"
+    );
+    assert!(
+        events.iter().any(|e| e["type"] == "exit"),
+        "expected exit event: {events:?}"
+    );
+}
+
+#[test]
+fn agent_exec_allow_all_policy_still_enforces_baseline_safety() {
+    let policy = r#"{
+        "default":"allow",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({ "command": "rm -rf /" }),
+    );
+
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "command_denied");
+}
+
+#[test]
+fn agent_exec_policy_max_timeout_clamps_request_timeout() {
+    let policy = r#"{
+        "default":"allow",
+        "max_timeout_ms": 20,
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/exec",
+        &serde_json::json!({
+            "command": "tail -f /dev/null",
+            "timeout_ms": 30_000
+        }),
+    );
+    assert_eq!(resp.status, 200, "body: {}", resp.body);
+
+    let events = parse_sse_events(&resp.body);
+    let has_error = events.iter().any(|e| e["type"] == "error");
+    let has_done_stdout = events
+        .iter()
+        .filter(|e| e["type"] == "stdout")
+        .filter_map(|e| e["data"].as_str())
+        .any(|s| s.contains("done"));
+    let has_exit = events.iter().any(|e| e["type"] == "exit");
+
+    assert!(has_error, "expected timeout error event: {events:?}");
+    assert!(
+        !has_done_stdout,
+        "command should not complete when timeout is clamped: {events:?}"
+    );
+    assert!(
+        !has_exit,
+        "timed-out execution should not emit normal exit: {events:?}"
+    );
+}
 
 // ---------------------------------------------------------------------------
 // SSE streaming — happy path
@@ -248,7 +930,10 @@ fn agent_exec_invalid_cwd_streams_error_event() {
 
     let events = parse_sse_events(&resp.body);
     let has_error = events.iter().any(|e| e["type"] == "error");
-    assert!(has_error, "expected SSE error event for bad cwd: {events:?}");
+    assert!(
+        has_error,
+        "expected SSE error event for bad cwd: {events:?}"
+    );
 
     // Should NOT have a normal exit event.
     let has_exit = events.iter().any(|e| e["type"] == "exit");

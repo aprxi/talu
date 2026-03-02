@@ -483,12 +483,7 @@ pub const TransformerBlock = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
         state_id: u8,
     ) !T {
-        const state_view = runtime_contract.findStateValue(
-            *const runtime_contract.CompatibilityStateView,
-            state_blocks,
-            state_id,
-        ) orelse return error.InvalidStateDescriptorBinding;
-        const raw = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
+        const raw = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
             return error.InvalidStateDescriptorBinding;
         };
         const ptr: *const T = @ptrCast(@alignCast(raw));

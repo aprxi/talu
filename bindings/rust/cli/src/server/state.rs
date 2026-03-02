@@ -30,10 +30,15 @@ pub struct StoredResponse {
 
 /// Per-plugin capability token entry.
 /// Maps a bearer token to the plugin that owns it and its permissions.
+#[derive(Clone)]
 pub struct PluginTokenEntry {
     pub plugin_id: String,
     /// Network domain permissions extracted from manifest (e.g., "api.example.com", "*.google.com").
     pub network_permissions: Vec<String>,
+    /// Whether this token may access `/v1/agent/fs/*`.
+    pub allow_filesystem: bool,
+    /// Whether this token may access `/v1/agent/exec`, `/v1/agent/shells/*`, and `/v1/agent/processes/*`.
+    pub allow_exec: bool,
 }
 
 /// In-memory store for plugin capability tokens.
@@ -69,6 +74,18 @@ pub struct ShellSession {
     pub attached_clients: usize,
 }
 
+/// A long-lived non-PTY process session backed by core `talu_process_*` APIs.
+pub struct ProcessSession {
+    pub process: Arc<Mutex<talu::process::ProcessSession>>,
+    pub owner_key: String,
+    pub command: String,
+    pub cwd: Option<String>,
+    pub created_at: std::time::Instant,
+    pub last_access: std::time::Instant,
+    /// Number of currently attached SSE stream clients.
+    pub attached_streams: usize,
+}
+
 pub struct AppState {
     pub backend: Arc<Mutex<BackendState>>,
     pub configured_model: Option<String>,
@@ -80,6 +97,8 @@ pub struct AppState {
     pub bucket_path: Option<PathBuf>,
     /// Canonical workspace root for `/v1/agent/fs/*` endpoints.
     pub workspace_dir: PathBuf,
+    /// Optional JSON policy applied to `/v1/agent/*` runtime operations.
+    pub agent_policy_json: Option<String>,
     /// Serve console UI from this directory instead of bundled assets.
     pub html_dir: Option<PathBuf>,
     /// Plugin capability tokens — maps bearer token → plugin_id + permissions.
@@ -96,4 +115,8 @@ pub struct AppState {
     pub shell_sessions: Mutex<HashMap<String, ShellSession>>,
     /// Max idle time before a detached shell session is evicted by the reaper.
     pub shell_session_ttl: std::time::Duration,
+    /// In-memory process session store for `/v1/agent/processes/*`.
+    pub process_sessions: Mutex<HashMap<String, ProcessSession>>,
+    /// Max idle time before a detached process session is evicted by the reaper.
+    pub process_session_ttl: std::time::Duration,
 }

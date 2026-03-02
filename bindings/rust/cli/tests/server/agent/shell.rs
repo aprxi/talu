@@ -7,9 +7,50 @@ use tokio_tungstenite::tungstenite::Message;
 type WsStream =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
+fn config_with_policy(policy_json: &str) -> ServerConfig {
+    let mut cfg = ServerConfig::new();
+    cfg.env_vars.push((
+        "TALU_AGENT_POLICY_JSON".to_string(),
+        policy_json.to_string(),
+    ));
+    cfg
+}
+
+fn gateway_config() -> ServerConfig {
+    let mut cfg = ServerConfig::new();
+    cfg.gateway_secret = Some("secret".to_string());
+    cfg.tenants = vec![crate::server::common::TenantSpec {
+        id: "tenant-a".to_string(),
+        storage_prefix: "tenant-a".to_string(),
+        allowed_models: vec![],
+    }];
+    cfg
+}
+
 /// Helper: create a shell and return its id.
 fn create_shell(ctx: &ServerTestContext) -> String {
     let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 200, "create failed: {}", resp.body);
+    resp.json()["shell_id"]
+        .as_str()
+        .expect("shell_id")
+        .to_string()
+}
+
+fn create_shell_as_user(ctx: &ServerTestContext, user_id: &str) -> String {
+    let body = serde_json::json!({}).to_string();
+    let resp = send_request(
+        ctx.addr(),
+        "POST",
+        "/v1/agent/shells",
+        &[
+            ("Content-Type", "application/json"),
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "tenant-a"),
+            ("X-Talu-User-Id", user_id),
+        ],
+        Some(&body),
+    );
     assert_eq!(resp.status, 200, "create failed: {}", resp.body);
     resp.json()["shell_id"]
         .as_str()
@@ -222,6 +263,270 @@ fn agent_shell_create_with_cwd_returns_it_in_response() {
     assert_eq!(resp.json()["cwd"], "/tmp");
 }
 
+#[test]
+fn agent_shell_create_denied_by_policy() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_shell_create_denied_by_policy_cwd_filter() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"},
+            {"effect":"deny","action":"tool.shell","cwd":"."}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/shells",
+        &serde_json::json!({ "cwd": "." }),
+    );
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_cwd");
+}
+
+#[test]
+fn agent_shell_create_with_invalid_policy_json_returns_500() {
+    let mut cfg = ServerConfig::new();
+    cfg.env_vars.push((
+        "TALU_AGENT_POLICY_JSON".to_string(),
+        "{not-valid-json".to_string(),
+    ));
+    let ctx = ServerTestContext::new(cfg);
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_shell_create_with_invalid_policy_schema_returns_500() {
+    let policy = r#"{
+        "default":"maybe",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_shell_create_with_invalid_policy_schema_missing_statements_returns_500() {
+    let policy = r#"{
+        "default":"deny"
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 500, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_shell_create_default_deny_without_statements_blocks() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_shell_create_default_deny_with_explicit_allow_succeeds() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let shell_id = create_shell(&ctx);
+    let del = delete(ctx.addr(), &format!("/v1/agent/shells/{shell_id}"));
+    assert_eq!(del.status, 200, "body: {}", del.body);
+}
+
+#[test]
+fn agent_shell_create_default_allow_with_explicit_deny_blocks() {
+    let policy = r#"{
+        "default":"allow",
+        "statements":[
+            {"effect":"deny","action":"tool.shell"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_shell_create_policy_deny_wins_even_with_later_allow() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"deny","action":"tool.shell","cwd":"."},
+            {"effect":"allow","action":"tool.shell"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/shells",
+        &serde_json::json!({ "cwd": "." }),
+    );
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_cwd");
+}
+
+#[test]
+fn agent_shell_create_policy_deny_wins_regardless_of_statement_order() {
+    let policies = [
+        r#"{
+            "default":"allow",
+            "statements":[
+                {"effect":"allow","action":"tool.shell"},
+                {"effect":"deny","action":"tool.shell","cwd":"/tmp"}
+            ]
+        }"#,
+        r#"{
+            "default":"allow",
+            "statements":[
+                {"effect":"deny","action":"tool.shell","cwd":"/tmp"},
+                {"effect":"allow","action":"tool.shell"}
+            ]
+        }"#,
+    ];
+
+    for policy in policies {
+        let ctx = ServerTestContext::new(config_with_policy(policy));
+        let resp = post_json(
+            ctx.addr(),
+            "/v1/agent/shells",
+            &serde_json::json!({ "cwd": "/tmp" }),
+        );
+        assert_eq!(resp.status, 403, "body: {}", resp.body);
+        assert_eq!(resp.json()["error"]["code"], "policy_denied_cwd");
+    }
+}
+
+#[test]
+fn agent_shell_create_policy_tool_process_does_not_grant_tool_shell() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.process","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_shell_create_policy_tool_exec_does_not_grant_tool_shell() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.exec","command":"echo *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_shell_create_policy_tool_fs_write_does_not_grant_tool_shell() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.write","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(ctx.addr(), "/v1/agent/shells", &serde_json::json!({}));
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_shell_create_policy_cwd_scope_allows_tmp_and_denies_non_matching_cwd() {
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.shell","cwd":"/tmp"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let allowed = post_json(
+        ctx.addr(),
+        "/v1/agent/shells",
+        &serde_json::json!({ "cwd": "/tmp" }),
+    );
+    assert_eq!(allowed.status, 200, "body: {}", allowed.body);
+    let allowed_id = allowed.json()["shell_id"]
+        .as_str()
+        .expect("shell_id")
+        .to_string();
+    let del = delete(ctx.addr(), &format!("/v1/agent/shells/{allowed_id}"));
+    assert_eq!(del.status, 200, "body: {}", del.body);
+
+    let denied = post_json(
+        ctx.addr(),
+        "/v1/agent/shells",
+        &serde_json::json!({ "cwd": "." }),
+    );
+    assert_eq!(denied.status, 403, "body: {}", denied.body);
+    assert_eq!(denied.json()["error"]["code"], "policy_denied_exec");
+}
+
+#[test]
+fn agent_shell_create_default_allow_with_explicit_cwd_deny_blocks_matching_cwd() {
+    let policy = r#"{
+        "default":"allow",
+        "statements":[
+            {"effect":"deny","action":"tool.shell","cwd":"/tmp"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_policy(policy));
+
+    let resp = post_json(
+        ctx.addr(),
+        "/v1/agent/shells",
+        &serde_json::json!({ "cwd": "/tmp" }),
+    );
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "policy_denied_cwd");
+}
+
 // ---------------------------------------------------------------------------
 // LIST (GET /v1/agent/shells)
 // ---------------------------------------------------------------------------
@@ -253,10 +558,7 @@ fn agent_shell_list_multiple_shells() {
     let data = json["data"].as_array().expect("data array");
     assert_eq!(data.len(), 3, "expected 3 shells, got: {}", data.len());
 
-    let ids: Vec<&str> = data
-        .iter()
-        .filter_map(|e| e["shell_id"].as_str())
-        .collect();
+    let ids: Vec<&str> = data.iter().filter_map(|e| e["shell_id"].as_str()).collect();
     assert!(ids.contains(&id1.as_str()), "missing id1");
     assert!(ids.contains(&id2.as_str()), "missing id2");
     assert!(ids.contains(&id3.as_str()), "missing id3");
@@ -356,10 +658,7 @@ fn agent_shell_delete_removes_from_list() {
 
     let list_json = list.json();
     let data = list_json["data"].as_array().expect("data array");
-    let ids: Vec<&str> = data
-        .iter()
-        .filter_map(|e| e["shell_id"].as_str())
-        .collect();
+    let ids: Vec<&str> = data.iter().filter_map(|e| e["shell_id"].as_str()).collect();
     assert!(!ids.contains(&id1.as_str()), "deleted shell still listed");
     assert!(ids.contains(&id2.as_str()), "surviving shell missing");
 }
@@ -398,6 +697,43 @@ fn agent_shell_ws_upgrade_returns_switching_protocols() {
         "headers: {} body: {}",
         resp.headers, resp.body
     );
+}
+
+#[test]
+fn agent_shell_ws_upgrade_forbidden_for_non_owner_under_gateway_auth() {
+    let ctx = ServerTestContext::new(gateway_config());
+    let shell_id = create_shell_as_user(&ctx, "user-a");
+
+    let resp = send_request(
+        ctx.addr(),
+        "GET",
+        &format!("/v1/agent/shells/{shell_id}/ws"),
+        &[
+            ("Connection", "Upgrade"),
+            ("Upgrade", "websocket"),
+            ("Sec-WebSocket-Version", "13"),
+            ("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ=="),
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "tenant-a"),
+            ("X-Talu-User-Id", "user-b"),
+        ],
+        None,
+    );
+    assert_eq!(resp.status, 403, "body: {}", resp.body);
+    assert_eq!(resp.json()["error"]["code"], "forbidden");
+
+    let delete_owner = send_request(
+        ctx.addr(),
+        "DELETE",
+        &format!("/v1/agent/shells/{shell_id}"),
+        &[
+            ("X-Talu-Gateway-Secret", "secret"),
+            ("X-Talu-Tenant-Id", "tenant-a"),
+            ("X-Talu-User-Id", "user-a"),
+        ],
+        None,
+    );
+    assert_eq!(delete_owner.status, 200, "body: {}", delete_owner.body);
 }
 
 #[test]
@@ -548,7 +884,9 @@ async fn agent_shell_ws_unsupported_message_type() {
     let mut ws = ws_connect(&ctx, &shell_id).await;
 
     ws.send(Message::Text(
-        serde_json::json!({"type": "unknown_type"}).to_string().into(),
+        serde_json::json!({"type": "unknown_type"})
+            .to_string()
+            .into(),
     ))
     .await
     .expect("ws send");

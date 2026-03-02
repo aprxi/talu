@@ -24,6 +24,8 @@ pub const tools = @import("tools/root.zig");
 pub const memory = @import("memory/root.zig");
 pub const fs = @import("fs/root.zig");
 pub const shell = @import("shell/root.zig");
+pub const process = @import("process/root.zig");
+pub const policy = @import("policy/root.zig");
 
 // Re-export primary types at module level
 

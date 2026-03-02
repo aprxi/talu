@@ -269,9 +269,14 @@ const UnitTestCfg = struct {
     sqlite3: Sqlite3,
     tree_sitter: TreeSitter,
 
-    fn add(self: UnitTestCfg, comptime name: []const u8, comptime root_path: []const u8) void {
+    fn addLazy(
+        self: UnitTestCfg,
+        comptime name: []const u8,
+        root_source_file: std.Build.LazyPath,
+        filters: []const []const u8,
+    ) void {
         const mod = self.b.createModule(.{
-            .root_source_file = self.b.path(root_path),
+            .root_source_file = root_source_file,
             .target = self.target,
             .optimize = self.optimize,
             .link_libc = true,
@@ -280,11 +285,18 @@ const UnitTestCfg = struct {
         mod.addOptions("build_options", self.build_options);
         addCDependencies(self.b, mod, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter);
 
-        const test_artifact = self.b.addTest(.{ .root_module = mod });
+        const test_artifact = self.b.addTest(.{
+            .root_module = mod,
+            .filters = filters,
+        });
         linkCDependencies(self.b, test_artifact, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter, false);
         const run = self.b.addRunArtifact(test_artifact);
         const step = self.b.step("test-" ++ name, "Run " ++ name ++ " unit tests");
         step.dependOn(&run.step);
+    }
+
+    fn add(self: UnitTestCfg, comptime name: []const u8, comptime root_path: []const u8) void {
+        self.addLazy(name, self.b.path(root_path), &.{});
     }
 };
 
@@ -753,7 +765,12 @@ pub fn build(b: *std.Build) void {
     ut.add("io", "core/src/io/root.zig");
     ut.add("db", "core/src/db/root.zig");
     ut.add("template", "core/src/template/root.zig");
-    ut.add("policy", "core/src/policy/root.zig");
+    ut.addLazy("policy", b.path("core/src/lib.zig"), &.{
+        "parsePolicy",
+        "globMatch",
+        "Policy.evaluate",
+        "evaluate ",
+    });
     ut.add("models", "core/src/models/root.zig");
     ut.add("responses", "core/src/responses/root.zig");
     ut.add("converter", "core/src/converter/root.zig");
@@ -761,7 +778,15 @@ pub fn build(b: *std.Build) void {
     ut.add("image", "core/src/image/root.zig");
     ut.add("compute", "core/src/compute/root.zig");
     ut.add("inference", "core/src/inference/root.zig");
-    ut.add("agent", "core/src/test_agent.zig");
+    ut.addLazy("agent", b.path("core/src/lib.zig"), &.{
+        "ToolRegistry",
+        "MessageBus",
+        "buildSystemPrompt",
+        "ProcessSession",
+        "ShellSession",
+        "checkCommand",
+        "compactTurns",
+    });
 
     // Build integration tests against a separate copy of core/src/lib.zig.
     // Keep integration on CPU-only to avoid MLX/Metal runtime coupling and

@@ -145,14 +145,30 @@ pub async fn handle_create(
         );
     }
 
-    let shell = match talu::shell::ShellSession::open(cols, rows, request.cwd.as_deref()) {
+    let policy = match super::load_runtime_policy(&state) {
+        Ok(policy) => policy,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "policy_invalid", &err),
+    };
+
+    let shell = match talu::shell::ShellSession::open_with_policy(
+        cols,
+        rows,
+        request.cwd.as_deref(),
+        policy.as_ref(),
+    ) {
         Ok(value) => value,
         Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "shell_error",
-                &format!("failed to open shell: {e}"),
-            )
+            let (status, code) = match &e {
+                talu::shell::ShellError::PolicyDeniedCwd(_) => {
+                    (StatusCode::FORBIDDEN, "policy_denied_cwd")
+                }
+                talu::shell::ShellError::PolicyDeniedExec(_)
+                | talu::shell::ShellError::CommandDenied(_) => {
+                    (StatusCode::FORBIDDEN, "policy_denied_exec")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "shell_error"),
+            };
+            return json_error(status, code, &format!("failed to open shell: {e}"));
         }
     };
 

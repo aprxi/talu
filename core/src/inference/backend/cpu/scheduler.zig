@@ -2402,8 +2402,6 @@ const MockBackend = struct {
             };
             if (incoming.align_bytes < descriptor.align_bytes) self.saw_state_blocks_valid = false;
             if (descriptor.size_bytes > 0 and incoming.size < descriptor.size_bytes) self.saw_state_blocks_valid = false;
-            if (incoming.size < @sizeOf(runtime_contract.OpaqueStateRef)) self.saw_state_blocks_valid = false;
-
             if (descriptor.id == shortconv_id and descriptor.zero_init and incoming.size > 0) {
                 const first_byte = incoming.ptr[0];
                 if (first_byte == 0) self.saw_zero_init_shortconv_state = true;
@@ -3757,7 +3755,7 @@ test "Scheduler descriptor-backed state blocks are bound and validated" {
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
         .default_eos_token_ids = &[_]u32{100},
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
     });
     defer scheduler.deinit();
 
@@ -3782,7 +3780,7 @@ test "Scheduler zero-inits shortconv descriptor state on alloc" {
     });
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
     });
     defer scheduler.deinit();
 
@@ -3802,7 +3800,7 @@ test "Scheduler reuses slot-persistent state blocks across sequential requests o
     });
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
     });
     defer scheduler.deinit();
 
@@ -3836,7 +3834,7 @@ test "Scheduler frees request-scoped state blocks at request teardown" {
     });
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
     });
     defer scheduler.deinit();
 
@@ -3863,7 +3861,7 @@ test "Scheduler rejects descriptor alignment above 64" {
     });
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
     });
     defer scheduler.deinit();
 
@@ -3888,7 +3886,7 @@ test "Scheduler rejects descriptor size that cannot fit host usize" {
     });
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
     });
     defer scheduler.deinit();
 
@@ -4066,7 +4064,7 @@ test "Scheduler mixed lifecycle: slot-persistent stable, request-scoped freed be
     });
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
     });
     defer scheduler.deinit();
 
@@ -4108,7 +4106,7 @@ test "Scheduler step-scoped state blocks are zeroed at each step boundary" {
     });
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.stateDescriptors(),
+        .state_descriptors = backend.state_descriptors,
         .default_eos_token_ids = &[_]u32{},
     });
     defer scheduler.deinit();

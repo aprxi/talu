@@ -101,17 +101,20 @@ pub const db = @import("db/root.zig");
 // responses (conversation / item / reasoning types)
 pub const responses = @import("responses/root.zig");
 
-// policy (IAM-style tool call firewall)
-pub const policy = @import("policy/root.zig");
+// agent policy (IAM-style tool call firewall)
+pub const policy = @import("agent/policy/root.zig");
 
 // agent (tool registry + agent loop orchestration)
 pub const agent = @import("agent/root.zig");
 
 // agent filesystem (workspace sandbox + fs operations)
-pub const fs = @import("fs/root.zig");
+pub const fs = @import("agent/fs/root.zig");
 
 // agent shell (command execution + PTY sessions)
-pub const shell = @import("shell/root.zig");
+pub const shell = @import("agent/shell/root.zig");
+
+// agent process (non-PTY long-lived process sessions)
+pub const process = @import("agent/process/root.zig");
 
 // image (decode/convert/model_input/encode/capi)
 pub const image = @import("image/root.zig");

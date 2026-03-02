@@ -79,6 +79,7 @@ fn build_app_with_storage(temp_dir: &TempDir) -> Router {
         tenant_registry: None,
         bucket_path: Some(temp_dir.path().to_path_buf()),
         workspace_dir: std::env::current_dir().expect("cwd"),
+        agent_policy_json: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
@@ -87,6 +88,8 @@ fn build_app_with_storage(temp_dir: &TempDir) -> Router {
         code_session_ttl: std::time::Duration::from_secs(15 * 60),
         shell_sessions: Mutex::new(HashMap::new()),
         shell_session_ttl: std::time::Duration::from_secs(15 * 60),
+        process_sessions: Mutex::new(HashMap::new()),
+        process_session_ttl: std::time::Duration::from_secs(15 * 60),
     };
 
     Router::new(Arc::new(state))
@@ -105,6 +108,7 @@ fn build_app_no_storage() -> Router {
         tenant_registry: None,
         bucket_path: None,
         workspace_dir: std::env::current_dir().expect("cwd"),
+        agent_policy_json: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
@@ -113,6 +117,8 @@ fn build_app_no_storage() -> Router {
         code_session_ttl: std::time::Duration::from_secs(15 * 60),
         shell_sessions: Mutex::new(HashMap::new()),
         shell_session_ttl: std::time::Duration::from_secs(15 * 60),
+        process_sessions: Mutex::new(HashMap::new()),
+        process_session_ttl: std::time::Duration::from_secs(15 * 60),
     };
 
     Router::new(Arc::new(state))

@@ -51,6 +51,11 @@ pub struct Policy {
     ptr: *mut c_void,
 }
 
+// SAFETY: Policy points to immutable core-owned policy data after creation.
+// It can be shared across threads as read-only state.
+unsafe impl Send for Policy {}
+unsafe impl Sync for Policy {}
+
 impl Policy {
     /// Parse a policy from a JSON string.
     ///

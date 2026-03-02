@@ -732,6 +732,14 @@ pub const talu_agent_bus_pending = agent.talu_agent_bus_pending;
 pub const talu_agent_bus_set_notify = agent.talu_agent_bus_set_notify;
 pub const TaluAgentBus = agent.TaluAgentBus;
 
+// Re-export agent runtime policy C API functions.
+pub const talu_agent_policy_create = agent.talu_agent_policy_create;
+pub const talu_agent_policy_free = agent.talu_agent_policy_free;
+pub const talu_agent_policy_check_action = agent.talu_agent_policy_check_action;
+pub const talu_agent_policy_check_file = agent.talu_agent_policy_check_file;
+pub const talu_agent_policy_check_process = agent.talu_agent_policy_check_process;
+pub const TaluAgentPolicy = agent.TaluAgentPolicy;
+
 // Re-export Agent filesystem C API functions.
 pub const talu_fs_create = agent.talu_fs_create;
 pub const talu_fs_free = agent.talu_fs_free;
@@ -761,6 +769,16 @@ pub const talu_shell_signal = agent.talu_shell_signal;
 pub const talu_shell_alive = agent.talu_shell_alive;
 pub const talu_shell_scrollback = agent.talu_shell_scrollback;
 pub const TaluShell = agent.TaluShell;
+
+// Process sessions (non-PTY)
+pub const talu_process_open = agent.talu_process_open;
+pub const talu_process_close = agent.talu_process_close;
+pub const talu_process_write = agent.talu_process_write;
+pub const talu_process_read = agent.talu_process_read;
+pub const talu_process_signal = agent.talu_process_signal;
+pub const talu_process_alive = agent.talu_process_alive;
+pub const talu_process_exit_code = agent.talu_process_exit_code;
+pub const TaluProcess = agent.TaluProcess;
 
 // Re-export Tree-sitter C API functions (code parsing, highlighting, querying).
 pub const talu_treesitter_parser_create = treesitter.talu_treesitter_parser_create;

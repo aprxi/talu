@@ -51,7 +51,7 @@ pub(crate) struct ExecEvent {
         (status = 500, body = crate::server::http::ErrorResponse),
     ))]
 pub async fn handle_exec(
-    _state: Arc<AppState>,
+    state: Arc<AppState>,
     req: Request<Incoming>,
     _auth: Option<AuthContext>,
 ) -> Response<BoxBody> {
@@ -105,16 +105,21 @@ pub async fn handle_exec(
     let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let command = request.command;
     let cwd = request.cwd;
+    let policy = match super::load_runtime_policy(&state) {
+        Ok(policy) => policy,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "policy_invalid", &err),
+    };
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     tokio::task::spawn_blocking(move || {
         let tx_stdout = tx.clone();
         let tx_stderr = tx.clone();
 
-        let exec_result = talu::shell::exec_streaming(
+        let exec_result = talu::shell::exec_streaming_with_policy(
             &command,
             cwd.as_deref(),
             timeout_ms,
+            policy.as_ref(),
             move |chunk| {
                 let payload = ExecEvent {
                     kind: "stdout".to_string(),

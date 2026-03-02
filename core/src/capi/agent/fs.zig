@@ -6,6 +6,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const agent_fs = @import("../../agent/fs/root.zig");
+const policy_api = @import("policy.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
@@ -13,9 +14,13 @@ const allocator = std.heap.c_allocator;
 // Edit operations need a larger cap than the HTTP default read limit because
 // they load full file content for replacement semantics.
 const EDIT_MAX_READ_BYTES: usize = 256 * 1024 * 1024;
+const ACTION_FS_READ = "tool.fs.read";
+const ACTION_FS_WRITE = "tool.fs.write";
+const ACTION_FS_DELETE = "tool.fs.delete";
 
 const FsHandle = struct {
     workspace_dir: []u8,
+    policy: ?*policy_api.TaluAgentPolicy,
 };
 
 /// Opaque handle for workspace-scoped filesystem operations.
@@ -64,9 +69,39 @@ fn returnFsError(err: anyerror, comptime context: []const u8) i32 {
     return @intFromEnum(error_codes.errorToCode(err));
 }
 
+fn toWorkspaceRelativeForPolicy(state: *const FsHandle, resolved_path: []const u8) ![]u8 {
+    const relative = try agent_fs.path.toWorkspaceRelative(allocator, state.workspace_dir, resolved_path);
+    errdefer allocator.free(relative);
+    if (std.mem.eql(u8, relative, ".")) {
+        allocator.free(relative);
+        return allocator.dupe(u8, "");
+    }
+    return relative;
+}
+
+fn enforceFilePolicyOrDeny(
+    state: *const FsHandle,
+    action: []const u8,
+    relative_path: []const u8,
+    is_dir: bool,
+) i32 {
+    if (policy_api.enforceFilePolicy(state.policy, action, relative_path, is_dir)) {
+        return 0;
+    }
+    capi_error.setErrorWithCode(.io_permission_denied, "agent policy denied filesystem action", .{});
+    if (std.mem.eql(u8, action, ACTION_FS_READ)) {
+        return @intFromEnum(error_codes.ErrorCode.policy_denied_file_read);
+    }
+    if (std.mem.eql(u8, action, ACTION_FS_WRITE)) {
+        return @intFromEnum(error_codes.ErrorCode.policy_denied_file_write);
+    }
+    return @intFromEnum(error_codes.ErrorCode.policy_denied_file_delete);
+}
+
 /// Create a workspace-scoped filesystem handle.
 pub fn talu_fs_create(
     workspace_dir: ?[*:0]const u8,
+    policy: ?*policy_api.TaluAgentPolicy,
     out_handle: ?*?*TaluFs,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -89,6 +124,7 @@ pub fn talu_fs_create(
     state.workspace_dir = agent_fs.path.canonicalizeWorkspace(allocator, workspace) catch |err| {
         return returnFsError(err, "failed to canonicalize workspace");
     };
+    state.policy = policy;
 
     out.* = @ptrCast(state);
     return 0;
@@ -139,6 +175,13 @@ pub fn talu_fs_read(
     };
     defer allocator.free(resolved);
 
+    const relative = toWorkspaceRelativeForPolicy(state, resolved) catch |err| {
+        return returnFsError(err, "failed to derive policy path for read");
+    };
+    defer allocator.free(relative);
+    const policy_rc = enforceFilePolicyOrDeny(state, ACTION_FS_READ, relative, false);
+    if (policy_rc != 0) return policy_rc;
+
     const read_result = agent_fs.operations.readFile(allocator, resolved, max_bytes) catch |err| {
         return returnFsError(err, "failed to read file");
     };
@@ -180,6 +223,13 @@ pub fn talu_fs_write(
         return returnFsError(err, "failed to resolve write path");
     };
     defer allocator.free(resolved);
+
+    const relative = toWorkspaceRelativeForPolicy(state, resolved) catch |err| {
+        return returnFsError(err, "failed to derive policy path for write");
+    };
+    defer allocator.free(relative);
+    const policy_rc = enforceFilePolicyOrDeny(state, ACTION_FS_WRITE, relative, false);
+    if (policy_rc != 0) return policy_rc;
 
     if (mkdir) {
         const parent = std.fs.path.dirname(resolved) orelse {
@@ -233,6 +283,13 @@ pub fn talu_fs_edit(
     };
     defer allocator.free(resolved);
 
+    const relative = toWorkspaceRelativeForPolicy(state, resolved) catch |err| {
+        return returnFsError(err, "failed to derive policy path for edit");
+    };
+    defer allocator.free(relative);
+    const policy_rc = enforceFilePolicyOrDeny(state, ACTION_FS_WRITE, relative, false);
+    if (policy_rc != 0) return policy_rc;
+
     const result = agent_fs.operations.editFile(
         allocator,
         resolved,
@@ -275,6 +332,13 @@ pub fn talu_fs_stat(
     const result = agent_fs.operations.stat(resolved) catch |err| {
         return returnFsError(err, "failed to stat path");
     };
+
+    const relative = toWorkspaceRelativeForPolicy(state, resolved) catch |err| {
+        return returnFsError(err, "failed to derive policy path for stat");
+    };
+    defer allocator.free(relative);
+    const policy_rc = enforceFilePolicyOrDeny(state, ACTION_FS_READ, relative, result.is_dir);
+    if (policy_rc != 0) return policy_rc;
 
     out.* = .{
         .exists = result.exists,
@@ -324,10 +388,59 @@ pub fn talu_fs_list(
     };
     defer allocator.free(resolved);
 
+    const relative_root = toWorkspaceRelativeForPolicy(state, resolved) catch |err| {
+        return returnFsError(err, "failed to derive policy path for list root");
+    };
+    defer allocator.free(relative_root);
+    const root_policy_rc = enforceFilePolicyOrDeny(state, ACTION_FS_READ, relative_root, true);
+    if (root_policy_rc != 0) return root_policy_rc;
+
     var result = agent_fs.operations.listDir(allocator, resolved, glob_pattern, recursive, limit) catch |err| {
         return returnFsError(err, "failed to list path");
     };
     defer result.deinit(allocator);
+
+    if (state.policy != null) {
+        var filtered = std.ArrayList(agent_fs.operations.ListEntry).empty;
+        errdefer {
+            for (filtered.items) |entry| {
+                allocator.free(entry.path);
+                allocator.free(entry.name);
+            }
+            filtered.deinit(allocator);
+        }
+
+        for (result.entries) |entry| {
+            const abs_entry_path = if (entry.path.len == 0)
+                allocator.dupe(u8, resolved) catch |err| {
+                    return returnFsError(err, "failed to allocate list entry path");
+                }
+            else
+                std.fs.path.join(allocator, &.{ resolved, entry.path }) catch |err| {
+                    return returnFsError(err, "failed to build list entry path");
+                };
+            defer allocator.free(abs_entry_path);
+
+            const relative_entry = toWorkspaceRelativeForPolicy(state, abs_entry_path) catch |err| {
+                return returnFsError(err, "failed to derive policy path for list entry");
+            };
+            defer allocator.free(relative_entry);
+
+            if (policy_api.enforceFilePolicy(state.policy, ACTION_FS_READ, relative_entry, entry.is_dir)) {
+                filtered.append(allocator, entry) catch |err| {
+                    return returnFsError(err, "failed to append filtered list entry");
+                };
+            } else {
+                allocator.free(entry.path);
+                allocator.free(entry.name);
+            }
+        }
+
+        allocator.free(result.entries);
+        result.entries = filtered.toOwnedSlice(allocator) catch |err| {
+            return returnFsError(err, "failed to materialize filtered list");
+        };
+    }
 
     const json = std.fmt.allocPrint(allocator, "{f}", .{std.json.fmt(.{
         .entries = result.entries,
@@ -359,6 +472,16 @@ pub fn talu_fs_remove(
     };
     defer allocator.free(resolved);
 
+    const metadata = std.fs.cwd().statFile(resolved) catch |err| {
+        return returnFsError(err, "failed to stat remove path");
+    };
+    const relative = toWorkspaceRelativeForPolicy(state, resolved) catch |err| {
+        return returnFsError(err, "failed to derive policy path for remove");
+    };
+    defer allocator.free(relative);
+    const policy_rc = enforceFilePolicyOrDeny(state, ACTION_FS_DELETE, relative, metadata.kind == .directory);
+    if (policy_rc != 0) return policy_rc;
+
     agent_fs.operations.remove(resolved, recursive) catch |err| {
         return returnFsError(err, "failed to remove path");
     };
@@ -383,6 +506,13 @@ pub fn talu_fs_mkdir(
         return returnFsError(err, "failed to resolve mkdir path");
     };
     defer allocator.free(resolved);
+
+    const relative = toWorkspaceRelativeForPolicy(state, resolved) catch |err| {
+        return returnFsError(err, "failed to derive policy path for mkdir");
+    };
+    defer allocator.free(relative);
+    const policy_rc = enforceFilePolicyOrDeny(state, ACTION_FS_WRITE, relative, true);
+    if (policy_rc != 0) return policy_rc;
 
     agent_fs.operations.makeDir(resolved, recursive) catch |err| {
         return returnFsError(err, "failed to create directory");
@@ -417,6 +547,23 @@ pub fn talu_fs_rename(
     };
     defer allocator.free(resolved_to);
 
+    const from_stat = std.fs.cwd().statFile(resolved_from) catch |err| {
+        return returnFsError(err, "failed to stat source path");
+    };
+    const from_relative = toWorkspaceRelativeForPolicy(state, resolved_from) catch |err| {
+        return returnFsError(err, "failed to derive policy source path for rename");
+    };
+    defer allocator.free(from_relative);
+    const delete_rc = enforceFilePolicyOrDeny(state, ACTION_FS_DELETE, from_relative, from_stat.kind == .directory);
+    if (delete_rc != 0) return delete_rc;
+
+    const to_relative = toWorkspaceRelativeForPolicy(state, resolved_to) catch |err| {
+        return returnFsError(err, "failed to derive policy destination path for rename");
+    };
+    defer allocator.free(to_relative);
+    const write_rc = enforceFilePolicyOrDeny(state, ACTION_FS_WRITE, to_relative, from_stat.kind == .directory);
+    if (write_rc != 0) return write_rc;
+
     agent_fs.operations.rename(resolved_from, resolved_to) catch |err| {
         return returnFsError(err, "failed to rename path");
     };
@@ -444,7 +591,7 @@ test "talu_fs_create and read/write roundtrip" {
     @memcpy(workspace_z, workspace);
 
     var fs_handle: ?*TaluFs = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_fs_create(workspace_z.ptr, &fs_handle));
+    try std.testing.expectEqual(@as(i32, 0), talu_fs_create(workspace_z.ptr, null, &fs_handle));
     defer talu_fs_free(fs_handle);
 
     const path_text = "hello.txt";
@@ -500,13 +647,55 @@ test "talu_fs_read rejects outside-workspace paths" {
     @memcpy(outside_z, outside_file);
 
     var fs_handle: ?*TaluFs = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_fs_create(workspace_z.ptr, &fs_handle));
+    try std.testing.expectEqual(@as(i32, 0), talu_fs_create(workspace_z.ptr, null, &fs_handle));
     defer talu_fs_free(fs_handle);
 
     var out_ptr: ?[*]const u8 = null;
     var out_len: usize = 0;
     const rc = talu_fs_read(fs_handle, outside_z.ptr, 1024, &out_ptr, &out_len, null, null);
     try std.testing.expect(rc != 0);
+}
+
+test "talu_fs_write enforces agent policy when provided" {
+    const test_allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(test_allocator, ".");
+    defer test_allocator.free(workspace);
+
+    const workspace_z = try test_allocator.allocSentinel(u8, workspace.len, 0);
+    defer test_allocator.free(workspace_z);
+    @memcpy(workspace_z, workspace);
+
+    var policy_handle: ?*policy_api.TaluAgentPolicy = null;
+    const policy_json =
+        \\{"default":"deny","statements":[{"effect":"allow","action":"tool.fs.read","resource":"**"}]}
+    ;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        policy_api.talu_agent_policy_create(policy_json.ptr, policy_json.len, &policy_handle),
+    );
+    defer policy_api.talu_agent_policy_free(policy_handle);
+
+    var fs_handle: ?*TaluFs = null;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_fs_create(workspace_z.ptr, policy_handle, &fs_handle),
+    );
+    defer talu_fs_free(fs_handle);
+
+    const path_text = "blocked.txt";
+    const path_z = try test_allocator.allocSentinel(u8, path_text.len, 0);
+    defer test_allocator.free(path_z);
+    @memcpy(path_z, path_text);
+
+    const content = "x";
+    var bytes_written: usize = 0;
+    const rc = talu_fs_write(fs_handle, path_z.ptr, content.ptr, content.len, false, &bytes_written);
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(error_codes.ErrorCode.policy_denied_file_write)),
+        rc,
+    );
 }
 
 test "fuzz talu_fs_stat path handling" {
@@ -522,7 +711,7 @@ test "fuzz talu_fs_stat path handling" {
     @memcpy(workspace_z, workspace);
 
     var fs_handle: ?*TaluFs = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_fs_create(workspace_z.ptr, &fs_handle));
+    try std.testing.expectEqual(@as(i32, 0), talu_fs_create(workspace_z.ptr, null, &fs_handle));
     defer talu_fs_free(fs_handle);
 
     const FuzzCtx = struct {

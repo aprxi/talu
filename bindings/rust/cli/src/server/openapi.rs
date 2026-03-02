@@ -6,9 +6,12 @@
 use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 
+use crate::server::agent::{
+    exec as agent_exec, fs as agent_fs, process as agent_process, shell as agent_shell,
+};
 use crate::server::{
-    agent_exec, agent_fs, agent_shell, code, db, events, file, files, handlers, http, plugins,
-    projects, proxy, repo, responses, responses_types, search, sessions, settings, tags,
+    code, db, events, file, files, handlers, http, plugins, projects, proxy, repo, responses,
+    responses_types, search, sessions, settings, tags,
 };
 
 #[derive(OpenApi)]
@@ -42,6 +45,7 @@ use crate::server::{
         (name = "Agent::FS", description = "Workspace filesystem capabilities"),
         (name = "Agent::Exec", description = "One-shot shell command execution (SSE)"),
         (name = "Agent::Shell", description = "Interactive shell lifecycle and WebSocket attach"),
+        (name = "Agent::Process", description = "Long-lived process sessions (spawn/send/stream/delete/list)"),
     ),
     security(
         ("gateway_secret" = []),
@@ -65,6 +69,11 @@ use crate::server::{
         agent_shell::handle_get,
         agent_shell::handle_delete,
         agent_shell::handle_ws,
+        agent_process::handle_spawn,
+        agent_process::handle_list,
+        agent_process::handle_send,
+        agent_process::handle_stream,
+        agent_process::handle_delete,
         events::handle_replay,
         events::handle_stream,
         events::handle_topics,
@@ -211,6 +220,13 @@ use crate::server::{
         agent_shell::ShellSessionResponse,
         agent_shell::ShellListResponse,
         agent_shell::ShellDeleteResponse,
+        agent_process::ProcessSpawnRequest,
+        agent_process::ProcessSessionResponse,
+        agent_process::ProcessListResponse,
+        agent_process::ProcessSendRequest,
+        agent_process::ProcessSendResponse,
+        agent_process::ProcessDeleteResponse,
+        agent_process::ProcessEvent,
         // Events
         events::EventCorrelation,
         events::EventEnvelope,
