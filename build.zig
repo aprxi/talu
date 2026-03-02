@@ -777,7 +777,16 @@ pub fn build(b: *std.Build) void {
     ut.add("xray", "core/src/xray/root.zig");
     ut.add("image", "core/src/image/root.zig");
     ut.add("compute", "core/src/compute/root.zig");
-    ut.add("inference", "core/src/inference/root.zig");
+    // The inference subtree imports shared modules via `../../..` paths.
+    // Building tests from `core/src/inference/root.zig` as module root trips
+    // Zig's module-path guard ("import of file outside module path").
+    // Run inference tests from `core/src/lib.zig` with focused filters instead.
+    ut.addLazy("inference", b.path("core/src/lib.zig"), &.{
+        "inference",
+        "Scheduler",
+        "Vision",
+        "layer program",
+    });
     ut.addLazy("agent", b.path("core/src/lib.zig"), &.{
         "ToolRegistry",
         "MessageBus",

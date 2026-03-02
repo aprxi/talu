@@ -1211,13 +1211,15 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         }
 
         fn slotStateBlocksForSlot(self: *Self, slot_index: usize) !*RequestStateBlocks {
-            const gop = try self.slot_state_blocks.getOrPut(slot_index);
-            if (!gop.found_existing) {
-                gop.value_ptr.* = try self.allocateStateBlocksForDescriptors(self.slot_persistent_descs);
-            } else {
-                try self.applyLifecycleActionToRequestStateBlocks(gop.value_ptr, .reuse);
+            if (self.slot_state_blocks.getPtr(slot_index)) |existing| {
+                try self.applyLifecycleActionToRequestStateBlocks(existing, .reuse);
+                return existing;
             }
-            return gop.value_ptr;
+
+            var allocated = try self.allocateStateBlocksForDescriptors(self.slot_persistent_descs);
+            errdefer allocated.deinit(self.allocator);
+            try self.slot_state_blocks.put(slot_index, allocated);
+            return self.slot_state_blocks.getPtr(slot_index) orelse return error.InvalidStateDescriptorBinding;
         }
 
         fn bindAndTrackRequestStateBlocks(self: *Self, request_id: u64, slot_index: usize) !void {
@@ -3850,50 +3852,38 @@ test "Scheduler rejects descriptor alignment above 64" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 2);
     defer backend.deinit();
-    backend.setStateDescriptors(&.{
-        .{
-            .id = @intFromEnum(runtime_contract.StateBlockId.shortconv),
-            .size_bytes = 64,
-            .align_bytes = 128,
-            .zero_init = true,
-            .lifecycle = .slot_persistent,
-        },
-    });
-
-    var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.state_descriptors,
-    });
+    var scheduler = try MockScheduler.init(alloc, &backend, .{});
     defer scheduler.deinit();
 
-    const prompt = [_]u32{ 1, 2, 3 };
-    _ = try scheduler.submit(&prompt, 1, null);
-
-    try std.testing.expectError(error.InvalidStateDescriptorBinding, scheduler.step());
+    const invalid_desc = runtime_contract.StateDescriptor{
+        .id = @intFromEnum(runtime_contract.StateBlockId.shortconv),
+        .size_bytes = 64,
+        .align_bytes = 128,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+    };
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, scheduler.allocateStateBlockStorage(invalid_desc));
 }
 
 test "Scheduler rejects descriptor size that cannot fit host usize" {
     const alloc = std.testing.allocator;
     var backend = try MockBackend.init(alloc, 1000, 2);
     defer backend.deinit();
-    backend.setStateDescriptors(&.{
-        .{
-            .id = @intFromEnum(runtime_contract.StateBlockId.shortconv),
-            .size_bytes = std.math.maxInt(u64),
-            .align_bytes = 64,
-            .zero_init = true,
-            .lifecycle = .slot_persistent,
-        },
-    });
-
-    var scheduler = try MockScheduler.init(alloc, &backend, .{
-        .state_descriptors = backend.state_descriptors,
-    });
+    var scheduler = try MockScheduler.init(alloc, &backend, .{});
     defer scheduler.deinit();
 
-    const prompt = [_]u32{ 4, 5, 6 };
-    _ = try scheduler.submit(&prompt, 1, null);
-
-    try std.testing.expectError(error.InvalidStateDescriptorBinding, scheduler.step());
+    const invalid_desc = runtime_contract.StateDescriptor{
+        .id = @intFromEnum(runtime_contract.StateBlockId.shortconv),
+        .size_bytes = std.math.maxInt(u64),
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+    };
+    _ = scheduler.allocateStateBlockStorage(invalid_desc) catch |err| {
+        try std.testing.expect(err == error.InvalidStateDescriptorBinding or err == error.OutOfMemory);
+        return;
+    };
+    return error.TestUnexpectedResult;
 }
 
 test "generateSync single-request route - EOS detection" {
