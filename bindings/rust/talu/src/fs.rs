@@ -13,6 +13,10 @@ const ERROR_CODE_IO_IS_DIRECTORY: i32 = 508;
 const ERROR_CODE_IO_NOT_DIRECTORY: i32 = 509;
 const ERROR_CODE_IO_NOT_EMPTY: i32 = 510;
 const ERROR_CODE_IO_FILE_TOO_BIG: i32 = 511;
+const ERROR_CODE_POLICY_DENIED_FILE_READ: i32 = 805;
+const ERROR_CODE_POLICY_DENIED_FILE_WRITE: i32 = 806;
+const ERROR_CODE_POLICY_DENIED_FILE_DELETE: i32 = 807;
+const ERROR_CODE_POLICY_INVALID: i32 = 810;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 
 #[repr(C)]
@@ -47,7 +51,11 @@ impl Default for CTaluFsStat {
 
 unsafe extern "C" {
     #[link_name = "talu_fs_create"]
-    fn talu_fs_create_raw(workspace_dir: *const c_char, out_handle: *mut *mut c_void) -> c_int;
+    fn talu_fs_create_raw(
+        workspace_dir: *const c_char,
+        policy: *mut c_void,
+        out_handle: *mut *mut c_void,
+    ) -> c_int;
     #[link_name = "talu_fs_free"]
     fn talu_fs_free_raw(handle: *mut c_void);
     #[link_name = "talu_fs_read"]
@@ -117,6 +125,10 @@ pub enum FsError {
     NotDirectory(String),
     NotEmpty(String),
     TooLarge(String),
+    PolicyDeniedFileRead(String),
+    PolicyDeniedFileWrite(String),
+    PolicyDeniedFileDelete(String),
+    PolicyInvalid(String),
     Io(String),
 }
 
@@ -135,6 +147,10 @@ impl FsError {
             ERROR_CODE_IO_NOT_DIRECTORY => Self::NotDirectory(detail),
             ERROR_CODE_IO_NOT_EMPTY => Self::NotEmpty(detail),
             ERROR_CODE_IO_FILE_TOO_BIG => Self::TooLarge(detail),
+            ERROR_CODE_POLICY_DENIED_FILE_READ => Self::PolicyDeniedFileRead(detail),
+            ERROR_CODE_POLICY_DENIED_FILE_WRITE => Self::PolicyDeniedFileWrite(detail),
+            ERROR_CODE_POLICY_DENIED_FILE_DELETE => Self::PolicyDeniedFileDelete(detail),
+            ERROR_CODE_POLICY_INVALID => Self::PolicyInvalid(detail),
             _ => Self::Io(detail),
         }
     }
@@ -152,6 +168,10 @@ impl std::fmt::Display for FsError {
             Self::NotDirectory(msg) => write!(f, "Path is not a directory: {msg}"),
             Self::NotEmpty(msg) => write!(f, "Directory is not empty: {msg}"),
             Self::TooLarge(msg) => write!(f, "File too large: {msg}"),
+            Self::PolicyDeniedFileRead(msg) => write!(f, "Policy denied file read: {msg}"),
+            Self::PolicyDeniedFileWrite(msg) => write!(f, "Policy denied file write: {msg}"),
+            Self::PolicyDeniedFileDelete(msg) => write!(f, "Policy denied file delete: {msg}"),
+            Self::PolicyInvalid(msg) => write!(f, "Policy invalid: {msg}"),
             Self::Io(msg) => write!(f, "Filesystem error: {msg}"),
         }
     }
@@ -197,13 +217,22 @@ pub struct FsHandle {
 impl FsHandle {
     /// Open a filesystem handle rooted at `workspace_dir`.
     pub fn open(workspace_dir: &str) -> Result<Self, FsError> {
+        Self::open_with_policy(workspace_dir, None)
+    }
+
+    /// Open a filesystem handle with an optional agent runtime policy.
+    pub fn open_with_policy(
+        workspace_dir: &str,
+        policy: Option<&crate::policy::Policy>,
+    ) -> Result<Self, FsError> {
         let c_workspace = CString::new(workspace_dir).map_err(|_| {
             FsError::InvalidArgument("workspace_dir contains null byte".to_string())
         })?;
 
         let mut handle: *mut c_void = std::ptr::null_mut();
+        let policy_ptr = policy.map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
         // SAFETY: c_workspace and out pointer are valid for the duration of this call.
-        let rc = unsafe { talu_fs_create_raw(c_workspace.as_ptr(), &mut handle) };
+        let rc = unsafe { talu_fs_create_raw(c_workspace.as_ptr(), policy_ptr, &mut handle) };
         if rc != ERROR_CODE_OK {
             return Err(FsError::from_code(rc, "failed to create filesystem handle"));
         }

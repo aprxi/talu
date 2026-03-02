@@ -281,6 +281,12 @@ pub enum ErrorCode {
     ShellSessionClosed = 802,
     ShellTimeout = 803,
     ShellProcessExited = 804,
+    PolicyDeniedFileRead = 805,
+    PolicyDeniedFileWrite = 806,
+    PolicyDeniedFileDelete = 807,
+    PolicyDeniedExec = 808,
+    PolicyDeniedCwd = 809,
+    PolicyInvalid = 810,
     OutOfMemory = 900,
     InvalidArgument = 901,
     InvalidHandle = 902,
@@ -342,6 +348,12 @@ impl From<i32> for ErrorCode {
             802 => ErrorCode::ShellSessionClosed,
             803 => ErrorCode::ShellTimeout,
             804 => ErrorCode::ShellProcessExited,
+            805 => ErrorCode::PolicyDeniedFileRead,
+            806 => ErrorCode::PolicyDeniedFileWrite,
+            807 => ErrorCode::PolicyDeniedFileDelete,
+            808 => ErrorCode::PolicyDeniedExec,
+            809 => ErrorCode::PolicyDeniedCwd,
+            810 => ErrorCode::PolicyInvalid,
             900 => ErrorCode::OutOfMemory,
             901 => ErrorCode::InvalidArgument,
             902 => ErrorCode::InvalidHandle,
@@ -3626,6 +3638,38 @@ extern "C" {
     // core/src/capi/agent/root.zig
     pub fn talu_agent_heartbeat(handle: *mut c_void, out_result: CAgentLoopResult) -> c_int;
     // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_action(
+        policy: *mut c_void,
+        action: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
+        resource: *const c_char,
+        timeout_ms: u64,
+        out_allowed: *mut c_void,
+        out_reason: *mut c_void,
+        out_reason_len: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_file(
+        policy: *mut c_void,
+        action: *const c_char,
+        resource: *const c_char,
+        is_dir: bool,
+        out_allowed: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_check_process(
+        policy: *mut c_void,
+        action: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
+        out_allowed: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_create(json: *const u8, len: usize, out_policy: *mut c_void) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_agent_policy_free(policy: *mut c_void);
+    // core/src/capi/agent/root.zig
     pub fn talu_agent_prompt(
         handle: *mut c_void,
         message: *const c_char,
@@ -4781,7 +4825,11 @@ extern "C" {
     // core/src/capi/memory.zig
     pub fn talu_free_string(ptr: *mut u8, len: usize);
     // core/src/capi/agent/root.zig
-    pub fn talu_fs_create(workspace_dir: *const c_char, out_handle: *mut c_void) -> c_int;
+    pub fn talu_fs_create(
+        workspace_dir: *const c_char,
+        policy: *mut c_void,
+        out_handle: *mut c_void,
+    ) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_fs_edit(
         handle: *mut c_void,
@@ -4952,6 +5000,34 @@ extern "C" {
     pub fn talu_policy_free(handle: *mut c_void);
     // core/src/capi/policy.zig
     pub fn talu_policy_get_mode(handle: *mut c_void) -> u8;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_alive(process_handle: *mut c_void) -> bool;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_close(process_handle: *mut c_void);
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_exit_code(
+        process_handle: *mut c_void,
+        out_code: *mut c_void,
+        out_has_code: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_open(
+        command: *const c_char,
+        cwd: *const c_char,
+        policy: *mut c_void,
+        out_process: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_read(
+        process_handle: *mut c_void,
+        buf: *mut u8,
+        buf_len: usize,
+        out_read: *mut c_void,
+    ) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_signal(process_handle: *mut c_void, sig: u8) -> c_int;
+    // core/src/capi/agent/root.zig
+    pub fn talu_process_write(process_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
     // core/src/capi/provider_config.zig
     pub fn talu_provider_config_health(
         db_root: *const c_char,
@@ -5492,6 +5568,8 @@ extern "C" {
     // core/src/capi/agent/root.zig
     pub fn talu_shell_exec(
         command: *const c_char,
+        cwd: *const c_char,
+        policy: *mut c_void,
         out_stdout: *mut c_void,
         out_stdout_len: *mut c_void,
         out_stderr: *mut c_void,
@@ -5502,6 +5580,7 @@ extern "C" {
     pub fn talu_shell_exec_streaming(
         command: *const c_char,
         cwd: *const c_char,
+        policy: *mut c_void,
         timeout_ms: u64,
         on_stdout: *mut c_void,
         on_stdout_ctx: *mut c_void,
@@ -5522,6 +5601,7 @@ extern "C" {
         cols: u16,
         rows: u16,
         cwd: *const c_char,
+        policy: *mut c_void,
         out_shell: *mut c_void,
     ) -> c_int;
     // core/src/capi/agent/root.zig
@@ -5543,33 +5623,6 @@ extern "C" {
     pub fn talu_shell_signal(shell_handle: *mut c_void, sig: u8) -> c_int;
     // core/src/capi/agent/root.zig
     pub fn talu_shell_write(shell_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
-    // core/src/capi/agent/root.zig
-    pub fn talu_process_alive(process_handle: *mut c_void) -> bool;
-    // core/src/capi/agent/root.zig
-    pub fn talu_process_close(process_handle: *mut c_void);
-    // core/src/capi/agent/root.zig
-    pub fn talu_process_exit_code(
-        process_handle: *mut c_void,
-        out_code: *mut c_void,
-        out_has_code: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/agent/root.zig
-    pub fn talu_process_open(
-        command: *const c_char,
-        cwd: *const c_char,
-        out_process: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/agent/root.zig
-    pub fn talu_process_read(
-        process_handle: *mut c_void,
-        buf: *mut u8,
-        buf_len: usize,
-        out_read: *mut c_void,
-    ) -> c_int;
-    // core/src/capi/agent/root.zig
-    pub fn talu_process_signal(process_handle: *mut c_void, sig: u8) -> c_int;
-    // core/src/capi/agent/root.zig
-    pub fn talu_process_write(process_handle: *mut c_void, data: *const u8, len: usize) -> c_int;
     // core/src/capi/sql.zig
     pub fn talu_sql_query(
         db_path: *const c_char,

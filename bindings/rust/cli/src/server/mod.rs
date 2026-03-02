@@ -157,6 +157,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             workspace_dir.display()
         )
     })?;
+    let agent_policy_json = std::env::var("TALU_AGENT_POLICY_JSON").ok();
 
     let state = state::AppState {
         backend: Arc::new(tokio::sync::Mutex::new(backend_state)),
@@ -166,6 +167,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         tenant_registry,
         bucket_path,
         workspace_dir,
+        agent_policy_json,
         html_dir: args.html_dir,
         plugin_tokens: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         max_file_upload_bytes: args.max_file_upload_bytes,

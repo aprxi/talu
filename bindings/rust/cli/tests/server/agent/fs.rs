@@ -2,11 +2,22 @@ use crate::server::common::{delete_json, get, post_json, ServerConfig, ServerTes
 use tempfile::TempDir;
 
 fn config_with_workspace(workspace: &TempDir) -> ServerConfig {
+    config_with_workspace_and_policy(workspace, None)
+}
+
+fn config_with_workspace_and_policy(
+    workspace: &TempDir,
+    policy_json: Option<&str>,
+) -> ServerConfig {
     let mut cfg = ServerConfig::new();
     cfg.env_vars.push((
         "TALU_WORKSPACE_DIR".to_string(),
         workspace.path().to_string_lossy().to_string(),
     ));
+    if let Some(policy) = policy_json {
+        cfg.env_vars
+            .push(("TALU_AGENT_POLICY_JSON".to_string(), policy.to_string()));
+    }
     cfg
 }
 
@@ -198,6 +209,757 @@ fn agent_fs_blocks_outside_workspace_access() {
     );
     assert_eq!(read.status, 403, "body: {}", read.body);
     assert_eq!(read.json()["error"]["code"], "permission_denied");
+}
+
+#[test]
+fn agent_fs_policy_denies_write_with_specific_error_code() {
+    let workspace = TempDir::new().expect("workspace");
+    let policy = r#"{
+        "default": "deny",
+        "statements": [
+            {"effect":"allow","action":"tool.fs.read","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let write = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/write",
+        &serde_json::json!({
+            "path": "blocked.txt",
+            "content": "x"
+        }),
+    );
+    assert_eq!(write.status, 403, "body: {}", write.body);
+    assert_eq!(write.json()["error"]["code"], "policy_denied_file_write");
+}
+
+#[test]
+fn agent_fs_policy_rename_requires_delete_and_write() {
+    let workspace = TempDir::new().expect("workspace");
+    let policy = r#"{
+        "default": "deny",
+        "statements": [
+            {"effect":"allow","action":"tool.fs.write","resource":"dst/**"},
+            {"effect":"allow","action":"tool.fs.read","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    std::fs::create_dir_all(workspace.path().join("src")).expect("mkdir src");
+    std::fs::write(workspace.path().join("src/file.txt"), "x").expect("write src file");
+
+    let rename = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/rename",
+        &serde_json::json!({
+            "from": "src/file.txt",
+            "to": "dst/file.txt"
+        }),
+    );
+    assert_eq!(rename.status, 403, "body: {}", rename.body);
+    assert_eq!(rename.json()["error"]["code"], "policy_denied_file_delete");
+}
+
+#[test]
+fn agent_fs_policy_default_deny_blocks_read_write_delete() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::write(workspace.path().join("data.txt"), "locked").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "data.txt" }),
+    );
+    assert_eq!(read.status, 403, "body: {}", read.body);
+    assert_eq!(read.json()["error"]["code"], "policy_denied_file_read");
+
+    let write = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/write",
+        &serde_json::json!({
+            "path": "new.txt",
+            "content": "x"
+        }),
+    );
+    assert_eq!(write.status, 403, "body: {}", write.body);
+    assert_eq!(write.json()["error"]["code"], "policy_denied_file_write");
+
+    let rm = delete_json(
+        ctx.addr(),
+        "/v1/agent/fs/rm",
+        &serde_json::json!({ "path": "data.txt" }),
+    );
+    assert_eq!(rm.status, 403, "body: {}", rm.body);
+    assert_eq!(rm.json()["error"]["code"], "policy_denied_file_delete");
+}
+
+#[test]
+fn agent_fs_policy_default_allow_allows_read_write_delete() {
+    let workspace = TempDir::new().expect("workspace");
+    let policy = r#"{
+        "default":"allow",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let write = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/write",
+        &serde_json::json!({
+            "path": "ok.txt",
+            "content": "hello"
+        }),
+    );
+    assert_eq!(write.status, 200, "body: {}", write.body);
+
+    let read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "ok.txt" }),
+    );
+    assert_eq!(read.status, 200, "body: {}", read.body);
+    assert_eq!(read.json()["content"], "hello");
+
+    let rm = delete_json(
+        ctx.addr(),
+        "/v1/agent/fs/rm",
+        &serde_json::json!({ "path": "ok.txt" }),
+    );
+    assert_eq!(rm.status, 200, "body: {}", rm.body);
+    assert_eq!(rm.json()["removed"], true);
+}
+
+#[test]
+fn agent_fs_policy_deny_wins_for_file_read_regardless_of_statement_order() {
+    let policies = [
+        r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"allow","action":"tool.fs.read","resource":"src/**"},
+                {"effect":"deny","action":"tool.fs.read","resource":"src/secrets/**"}
+            ]
+        }"#,
+        r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"deny","action":"tool.fs.read","resource":"src/secrets/**"},
+                {"effect":"allow","action":"tool.fs.read","resource":"src/**"}
+            ]
+        }"#,
+    ];
+
+    for policy in policies {
+        let workspace = TempDir::new().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("src/secrets")).expect("mkdir");
+        std::fs::create_dir_all(workspace.path().join("src/public")).expect("mkdir");
+        std::fs::write(workspace.path().join("src/secrets/token.txt"), "secret").expect("write");
+        std::fs::write(workspace.path().join("src/public/readme.txt"), "public").expect("write");
+        let ctx =
+            ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+        let public_read = post_json(
+            ctx.addr(),
+            "/v1/agent/fs/read",
+            &serde_json::json!({ "path": "src/public/readme.txt" }),
+        );
+        assert_eq!(public_read.status, 200, "body: {}", public_read.body);
+
+        let secret_read = post_json(
+            ctx.addr(),
+            "/v1/agent/fs/read",
+            &serde_json::json!({ "path": "src/secrets/token.txt" }),
+        );
+        assert_eq!(secret_read.status, 403, "body: {}", secret_read.body);
+        assert_eq!(
+            secret_read.json()["error"]["code"],
+            "policy_denied_file_read"
+        );
+    }
+}
+
+#[test]
+fn agent_fs_policy_deny_wins_for_file_write_regardless_of_statement_order() {
+    let policies = [
+        r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"allow","action":"tool.fs.write","resource":"src/**"},
+                {"effect":"deny","action":"tool.fs.write","resource":"src/secrets/**"}
+            ]
+        }"#,
+        r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"deny","action":"tool.fs.write","resource":"src/secrets/**"},
+                {"effect":"allow","action":"tool.fs.write","resource":"src/**"}
+            ]
+        }"#,
+    ];
+
+    for policy in policies {
+        let workspace = TempDir::new().expect("workspace");
+        let ctx =
+            ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+        let public_write = post_json(
+            ctx.addr(),
+            "/v1/agent/fs/write",
+            &serde_json::json!({
+                "path": "src/public/readme.txt",
+                "content": "public",
+                "mkdir": true
+            }),
+        );
+        assert_eq!(public_write.status, 200, "body: {}", public_write.body);
+
+        let secret_write = post_json(
+            ctx.addr(),
+            "/v1/agent/fs/write",
+            &serde_json::json!({
+                "path": "src/secrets/token.txt",
+                "content": "secret",
+                "mkdir": true
+            }),
+        );
+        assert_eq!(secret_write.status, 403, "body: {}", secret_write.body);
+        assert_eq!(
+            secret_write.json()["error"]["code"],
+            "policy_denied_file_write"
+        );
+    }
+}
+
+#[test]
+fn agent_fs_policy_deny_wins_for_file_delete_regardless_of_statement_order() {
+    let policies = [
+        r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"allow","action":"tool.fs.delete","resource":"src/**"},
+                {"effect":"deny","action":"tool.fs.delete","resource":"src/secrets/**"}
+            ]
+        }"#,
+        r#"{
+            "default":"deny",
+            "statements":[
+                {"effect":"deny","action":"tool.fs.delete","resource":"src/secrets/**"},
+                {"effect":"allow","action":"tool.fs.delete","resource":"src/**"}
+            ]
+        }"#,
+    ];
+
+    for policy in policies {
+        let workspace = TempDir::new().expect("workspace");
+        std::fs::create_dir_all(workspace.path().join("src/secrets")).expect("mkdir");
+        std::fs::create_dir_all(workspace.path().join("src/public")).expect("mkdir");
+        std::fs::write(workspace.path().join("src/secrets/token.txt"), "secret").expect("write");
+        std::fs::write(workspace.path().join("src/public/readme.txt"), "public").expect("write");
+        let ctx =
+            ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+        let public_rm = delete_json(
+            ctx.addr(),
+            "/v1/agent/fs/rm",
+            &serde_json::json!({ "path": "src/public/readme.txt" }),
+        );
+        assert_eq!(public_rm.status, 200, "body: {}", public_rm.body);
+
+        let secret_rm = delete_json(
+            ctx.addr(),
+            "/v1/agent/fs/rm",
+            &serde_json::json!({ "path": "src/secrets/token.txt" }),
+        );
+        assert_eq!(secret_rm.status, 403, "body: {}", secret_rm.body);
+        assert_eq!(
+            secret_rm.json()["error"]["code"],
+            "policy_denied_file_delete"
+        );
+    }
+}
+
+#[test]
+fn agent_fs_policy_directory_resource_matches_only_directory_entry() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("vault")).expect("mkdir");
+    std::fs::write(workspace.path().join("vault/secret.txt"), "secret").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"vault/"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let stat_dir = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/stat",
+        &serde_json::json!({ "path": "vault" }),
+    );
+    assert_eq!(stat_dir.status, 200, "body: {}", stat_dir.body);
+    assert_eq!(stat_dir.json()["is_dir"], true);
+
+    let read_file = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "vault/secret.txt" }),
+    );
+    assert_eq!(read_file.status, 403, "body: {}", read_file.body);
+    assert_eq!(read_file.json()["error"]["code"], "policy_denied_file_read");
+}
+
+#[test]
+fn agent_fs_policy_directory_recursive_pattern_allows_directory_and_contents() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("vault")).expect("mkdir");
+    std::fs::write(workspace.path().join("vault/secret.txt"), "secret").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"vault/**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let stat_dir = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/stat",
+        &serde_json::json!({ "path": "vault" }),
+    );
+    assert_eq!(stat_dir.status, 200, "body: {}", stat_dir.body);
+    assert_eq!(stat_dir.json()["is_dir"], true);
+
+    let read_file = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "vault/secret.txt" }),
+    );
+    assert_eq!(read_file.status, 200, "body: {}", read_file.body);
+    assert_eq!(read_file.json()["content"], "secret");
+}
+
+#[test]
+fn agent_fs_policy_anchored_resource_matches_workspace_root_only() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("src")).expect("mkdir");
+    std::fs::create_dir_all(workspace.path().join("nested/src")).expect("mkdir");
+    std::fs::write(workspace.path().join("src/root.txt"), "root").expect("write");
+    std::fs::write(workspace.path().join("nested/src/nested.txt"), "nested").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"/src/**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let read_root = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "src/root.txt" }),
+    );
+    assert_eq!(read_root.status, 200, "body: {}", read_root.body);
+    assert_eq!(read_root.json()["content"], "root");
+
+    let read_nested = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "nested/src/nested.txt" }),
+    );
+    assert_eq!(read_nested.status, 403, "body: {}", read_nested.body);
+    assert_eq!(
+        read_nested.json()["error"]["code"],
+        "policy_denied_file_read"
+    );
+}
+
+#[test]
+fn agent_fs_policy_single_star_resource_does_not_cross_directories() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("src/nested")).expect("mkdir");
+    std::fs::write(workspace.path().join("src/top.txt"), "top").expect("write");
+    std::fs::write(workspace.path().join("src/nested/deep.txt"), "deep").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"src/*.txt"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let read_top = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "src/top.txt" }),
+    );
+    assert_eq!(read_top.status, 200, "body: {}", read_top.body);
+    assert_eq!(read_top.json()["content"], "top");
+
+    let read_nested = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "src/nested/deep.txt" }),
+    );
+    assert_eq!(read_nested.status, 403, "body: {}", read_nested.body);
+    assert_eq!(
+        read_nested.json()["error"]["code"],
+        "policy_denied_file_read"
+    );
+}
+
+#[test]
+fn agent_fs_policy_question_mark_resource_matches_single_character() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("logs")).expect("mkdir");
+    std::fs::write(workspace.path().join("logs/log1.txt"), "one").expect("write");
+    std::fs::write(workspace.path().join("logs/log10.txt"), "ten").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"logs/log?.txt"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let read_one = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "logs/log1.txt" }),
+    );
+    assert_eq!(read_one.status, 200, "body: {}", read_one.body);
+    assert_eq!(read_one.json()["content"], "one");
+
+    let read_ten = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "logs/log10.txt" }),
+    );
+    assert_eq!(read_ten.status, 403, "body: {}", read_ten.body);
+    assert_eq!(read_ten.json()["error"]["code"], "policy_denied_file_read");
+}
+
+#[test]
+fn agent_fs_policy_list_filters_entries_without_read_access() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("public")).expect("mkdir");
+    std::fs::create_dir_all(workspace.path().join("private")).expect("mkdir");
+    std::fs::write(workspace.path().join("public/ok.txt"), "ok").expect("write");
+    std::fs::write(workspace.path().join("private/no.txt"), "no").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"**"},
+            {"effect":"deny","action":"tool.fs.read","resource":"private/**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let ls = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/ls",
+        &serde_json::json!({
+            "path": ".",
+            "recursive": true
+        }),
+    );
+    assert_eq!(ls.status, 200, "body: {}", ls.body);
+    let list_json = ls.json();
+    let entries = list_json["entries"].as_array().expect("entries");
+    let paths: Vec<&str> = entries.iter().filter_map(|e| e["path"].as_str()).collect();
+    assert!(
+        paths.iter().any(|p| *p == "public/ok.txt"),
+        "expected public file in list: {paths:?}"
+    );
+    assert!(
+        !paths.iter().any(|p| *p == "private/no.txt"),
+        "private file must be filtered out: {paths:?}"
+    );
+}
+
+#[test]
+fn agent_fs_policy_rename_requires_write_on_destination() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("src")).expect("mkdir src");
+    std::fs::create_dir_all(workspace.path().join("dst")).expect("mkdir dst");
+    std::fs::write(workspace.path().join("src/file.txt"), "x").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"**"},
+            {"effect":"allow","action":"tool.fs.delete","resource":"src/**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let rename = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/rename",
+        &serde_json::json!({
+            "from": "src/file.txt",
+            "to": "dst/file.txt"
+        }),
+    );
+    assert_eq!(rename.status, 403, "body: {}", rename.body);
+    assert_eq!(rename.json()["error"]["code"], "policy_denied_file_write");
+}
+
+#[test]
+fn agent_fs_policy_denies_mkdir_as_write_action() {
+    let workspace = TempDir::new().expect("workspace");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let mkdir = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/mkdir",
+        &serde_json::json!({
+            "path": "blocked/dir",
+            "recursive": true
+        }),
+    );
+    assert_eq!(mkdir.status, 403, "body: {}", mkdir.body);
+    assert_eq!(mkdir.json()["error"]["code"], "policy_denied_file_write");
+}
+
+#[test]
+fn agent_fs_policy_default_deny_blocks_stat_and_list() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::write(workspace.path().join("data.txt"), "x").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let stat = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/stat",
+        &serde_json::json!({ "path": "data.txt" }),
+    );
+    assert_eq!(stat.status, 403, "body: {}", stat.body);
+    assert_eq!(stat.json()["error"]["code"], "policy_denied_file_read");
+
+    let list = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/ls",
+        &serde_json::json!({ "path": "." }),
+    );
+    assert_eq!(list.status, 403, "body: {}", list.body);
+    assert_eq!(list.json()["error"]["code"], "policy_denied_file_read");
+}
+
+#[test]
+fn agent_fs_policy_default_allow_with_explicit_deny_blocks_matching_read() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::create_dir_all(workspace.path().join("private")).expect("mkdir");
+    std::fs::create_dir_all(workspace.path().join("public")).expect("mkdir");
+    std::fs::write(workspace.path().join("private/secret.txt"), "secret").expect("write");
+    std::fs::write(workspace.path().join("public/open.txt"), "open").expect("write");
+    let policy = r#"{
+        "default":"allow",
+        "statements":[
+            {"effect":"deny","action":"tool.fs.read","resource":"private/**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let public_read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "public/open.txt" }),
+    );
+    assert_eq!(public_read.status, 200, "body: {}", public_read.body);
+    assert_eq!(public_read.json()["content"], "open");
+
+    let private_read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "private/secret.txt" }),
+    );
+    assert_eq!(private_read.status, 403, "body: {}", private_read.body);
+    assert_eq!(
+        private_read.json()["error"]["code"],
+        "policy_denied_file_read"
+    );
+}
+
+#[test]
+fn agent_fs_policy_denies_edit_as_write_action() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::write(workspace.path().join("notes.txt"), "foo").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.read","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let edit = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/edit",
+        &serde_json::json!({
+            "path": "notes.txt",
+            "old_text": "foo",
+            "new_text": "bar"
+        }),
+    );
+    assert_eq!(edit.status, 403, "body: {}", edit.body);
+    assert_eq!(edit.json()["error"]["code"], "policy_denied_file_write");
+}
+
+#[test]
+fn agent_fs_policy_delete_allow_only_grants_remove_not_read() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::write(workspace.path().join("deleteme.txt"), "x").expect("write");
+    let policy = r#"{
+        "default":"deny",
+        "statements":[
+            {"effect":"allow","action":"tool.fs.delete","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "deleteme.txt" }),
+    );
+    assert_eq!(read.status, 403, "body: {}", read.body);
+    assert_eq!(read.json()["error"]["code"], "policy_denied_file_read");
+
+    let rm = delete_json(
+        ctx.addr(),
+        "/v1/agent/fs/rm",
+        &serde_json::json!({ "path": "deleteme.txt" }),
+    );
+    assert_eq!(rm.status, 200, "body: {}", rm.body);
+}
+
+#[test]
+fn agent_fs_invalid_policy_json_returns_policy_invalid() {
+    let workspace = TempDir::new().expect("workspace");
+    let mut cfg = config_with_workspace(&workspace);
+    cfg.env_vars.push((
+        "TALU_AGENT_POLICY_JSON".to_string(),
+        "{not-valid-json".to_string(),
+    ));
+    let ctx = ServerTestContext::new(cfg);
+
+    let read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "anything.txt" }),
+    );
+    assert_eq!(read.status, 500, "body: {}", read.body);
+    assert_eq!(read.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_fs_invalid_policy_schema_returns_policy_invalid() {
+    let workspace = TempDir::new().expect("workspace");
+    let policy = r#"{
+        "default":"maybe",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "anything.txt" }),
+    );
+    assert_eq!(read.status, 500, "body: {}", read.body);
+    assert_eq!(read.json()["error"]["code"], "policy_invalid");
+}
+
+#[test]
+fn agent_fs_invalid_policy_schema_is_reported_on_all_fs_endpoints() {
+    let workspace = TempDir::new().expect("workspace");
+    std::fs::write(workspace.path().join("file.txt"), "content").expect("write");
+    let policy = r#"{
+        "default":"maybe",
+        "statements":[]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_workspace_and_policy(&workspace, Some(policy)));
+
+    let read = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/read",
+        &serde_json::json!({ "path": "file.txt" }),
+    );
+    assert_eq!(read.status, 500, "read body: {}", read.body);
+    assert_eq!(read.json()["error"]["code"], "policy_invalid");
+
+    let write = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/write",
+        &serde_json::json!({ "path": "new.txt", "content": "x" }),
+    );
+    assert_eq!(write.status, 500, "write body: {}", write.body);
+    assert_eq!(write.json()["error"]["code"], "policy_invalid");
+
+    let edit = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/edit",
+        &serde_json::json!({
+            "path": "file.txt",
+            "old_text": "content",
+            "new_text": "updated"
+        }),
+    );
+    assert_eq!(edit.status, 500, "edit body: {}", edit.body);
+    assert_eq!(edit.json()["error"]["code"], "policy_invalid");
+
+    let stat = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/stat",
+        &serde_json::json!({ "path": "file.txt" }),
+    );
+    assert_eq!(stat.status, 500, "stat body: {}", stat.body);
+    assert_eq!(stat.json()["error"]["code"], "policy_invalid");
+
+    let ls = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/ls",
+        &serde_json::json!({ "path": "." }),
+    );
+    assert_eq!(ls.status, 500, "ls body: {}", ls.body);
+    assert_eq!(ls.json()["error"]["code"], "policy_invalid");
+
+    let rm = delete_json(
+        ctx.addr(),
+        "/v1/agent/fs/rm",
+        &serde_json::json!({ "path": "file.txt" }),
+    );
+    assert_eq!(rm.status, 500, "rm body: {}", rm.body);
+    assert_eq!(rm.json()["error"]["code"], "policy_invalid");
+
+    let mkdir = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/mkdir",
+        &serde_json::json!({ "path": "new_dir", "recursive": true }),
+    );
+    assert_eq!(mkdir.status, 500, "mkdir body: {}", mkdir.body);
+    assert_eq!(mkdir.json()["error"]["code"], "policy_invalid");
+
+    let rename = post_json(
+        ctx.addr(),
+        "/v1/agent/fs/rename",
+        &serde_json::json!({ "from": "file.txt", "to": "renamed.txt" }),
+    );
+    assert_eq!(rename.status, 500, "rename body: {}", rename.body);
+    assert_eq!(rename.json()["error"]["code"], "policy_invalid");
 }
 
 #[test]

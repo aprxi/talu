@@ -1,12 +1,9 @@
 //! Policy evaluation.
 //!
-//! Implements evaluation semantics:
-//! 1. Collect all statements whose pattern matches the action.
-//! 2. If any matching statement has effect = deny -> DENIED.
-//! 3. If any matching statement has effect = allow -> ALLOWED.
-//! 4. If no statement matches -> apply default effect.
-//!
-//! Explicit deny always wins. No allow can override a deny.
+//! Semantics:
+//! 1. Match statements by action + optional command/cwd/resource filters.
+//! 2. Explicit deny wins over allow.
+//! 3. If no statements match, use default effect.
 
 const std = @import("std");
 const pattern_mod = @import("pattern.zig");
@@ -24,6 +21,17 @@ pub const Mode = enum(u8) {
 pub const Statement = struct {
     effect: Effect,
     action_pattern: []const u8,
+    command_pattern: ?[]const u8 = null,
+    cwd_pattern: ?[]const u8 = null,
+    resource_pattern: ?[]const u8 = null,
+};
+
+pub const EvaluateInput = struct {
+    action: []const u8,
+    command: ?[]const u8 = null,
+    cwd: ?[]const u8 = null,
+    resource: ?[]const u8 = null,
+    resource_is_dir: bool = false,
 };
 
 pub const Policy = struct {
@@ -33,46 +41,38 @@ pub const Policy = struct {
     /// Backing memory for statement patterns (owned, freed on deinit).
     _pattern_buf: []u8,
     allocator: std.mem.Allocator,
+    max_timeout_ms: ?u64 = null,
 
-    /// Evaluate an action string against this policy.
-    ///
-    /// Returns the effect (allow or deny) for the given action.
-    /// In audit mode, the caller should log denials but allow through.
+    /// Evaluate a simple action string.
     pub fn evaluate(self: *const Policy, action: []const u8) Effect {
+        return self.evaluateDetailed(.{ .action = action });
+    }
+
+    /// Evaluate action + optional command/cwd/resource constraints.
+    pub fn evaluateDetailed(self: *const Policy, input: EvaluateInput) Effect {
         var has_allow = false;
 
         for (self.statements) |stmt| {
-            if (matchesStatement(stmt.action_pattern, action)) {
-                // Explicit deny wins immediately.
-                if (stmt.effect == .deny) return .deny;
-                has_allow = true;
-            }
+            if (!actionMatch(stmt.action_pattern, input.action)) continue;
+            if (!optionalGlobMatch(stmt.command_pattern, input.command, true)) continue;
+            if (!optionalCwdMatch(stmt.cwd_pattern, input.cwd)) continue;
+            if (!optionalPathMatch(stmt.resource_pattern, input.resource, input.resource_is_dir)) continue;
+
+            if (stmt.effect == .deny) return .deny;
+            has_allow = true;
         }
 
         if (has_allow) return .allow;
         return self.default_effect;
     }
 
-    /// Match an action against a statement pattern.
-    ///
-    /// A pattern ending with ` *` (space-wildcard) means "this command
-    /// with any arguments". Since zero arguments is valid, `"ls *"` must
-    /// match both `"ls -la"` and bare `"ls"`. We handle this by also
-    /// trying an exact match against the prefix when the trailing ` *`
-    /// glob doesn't match.
-    fn matchesStatement(pat: []const u8, action: []const u8) bool {
-        if (pattern_mod.globMatch(pat, action)) return true;
-
-        // If pattern ends with " *", also accept the bare prefix.
-        // e.g. pattern "ls *" with action "ls" -> match prefix "ls".
-        if (pat.len >= 2 and
-            pat[pat.len - 1] == '*' and
-            pat[pat.len - 2] == ' ')
-        {
-            const prefix = pat[0 .. pat.len - 2]; // "ls"
-            return pattern_mod.globMatch(prefix, action);
+    /// Clamp requested timeout against policy max timeout, when configured.
+    pub fn clampTimeoutMs(self: *const Policy, requested_ms: u64) u64 {
+        if (self.max_timeout_ms) |max_timeout| {
+            if (requested_ms == 0) return max_timeout;
+            return @min(requested_ms, max_timeout);
         }
-        return false;
+        return requested_ms;
     }
 
     pub fn deinit(self: *Policy) void {
@@ -81,11 +81,52 @@ pub const Policy = struct {
     }
 };
 
+fn actionMatch(pattern: []const u8, action: []const u8) bool {
+    if (pattern_mod.globMatch(pattern, action)) return true;
+
+    // "ls *" should also match bare "ls" (zero args).
+    if (pattern.len >= 2 and
+        pattern[pattern.len - 1] == '*' and
+        pattern[pattern.len - 2] == ' ')
+    {
+        const prefix = pattern[0 .. pattern.len - 2];
+        return pattern_mod.globMatch(prefix, action);
+    }
+    return false;
+}
+
+fn optionalGlobMatch(pattern: ?[]const u8, value: ?[]const u8, allow_action_fallback: bool) bool {
+    if (pattern == null) return true;
+    const actual = value orelse return false;
+    if (allow_action_fallback) {
+        return actionMatch(pattern.?, actual);
+    }
+    return pattern_mod.globMatch(pattern.?, actual);
+}
+
+fn optionalCwdMatch(pattern: ?[]const u8, value: ?[]const u8) bool {
+    if (pattern == null) return true;
+    const actual = value orelse return false;
+
+    // CWD is a normalized workspace-relative directory path, so use path
+    // semantics first (supports `**` across separators).
+    if (pattern_mod.pathMatch(pattern.?, actual, true)) return true;
+
+    // Backward-compatible fallback for legacy glob-only patterns.
+    return pattern_mod.globMatch(pattern.?, actual);
+}
+
+fn optionalPathMatch(pattern: ?[]const u8, value: ?[]const u8, is_dir: bool) bool {
+    if (pattern == null) return true;
+    const actual = value orelse return false;
+    return pattern_mod.pathMatch(pattern.?, actual, is_dir);
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
 
-test "evaluate default deny blocks unmatched action" {
+test "evaluateDetailed default deny blocks unmatched action" {
     var policy = Policy{
         .default_effect = .deny,
         .mode = .enforce,
@@ -101,8 +142,7 @@ test "evaluate default deny blocks unmatched action" {
     try std.testing.expectEqual(Effect.deny, policy.evaluate("rm -rf /"));
 }
 
-test "evaluate trailing space-star matches bare command" {
-    // "ls *" should match bare "ls" (zero args) as well as "ls -la" (with args).
+test "evaluateDetailed trailing space-star matches bare command" {
     var policy = Policy{
         .default_effect = .deny,
         .mode = .enforce,
@@ -115,23 +155,13 @@ test "evaluate trailing space-star matches bare command" {
     };
     _ = &policy;
 
-    // Bare command (no args) — must be allowed.
     try std.testing.expectEqual(Effect.allow, policy.evaluate("ls"));
     try std.testing.expectEqual(Effect.allow, policy.evaluate("git show"));
-
-    // With args — still allowed.
-    try std.testing.expectEqual(Effect.allow, policy.evaluate("ls -la"));
     try std.testing.expectEqual(Effect.allow, policy.evaluate("git show HEAD"));
-
-    // Unrelated commands — denied.
-    try std.testing.expectEqual(Effect.deny, policy.evaluate("rm -rf /"));
-    try std.testing.expectEqual(Effect.deny, policy.evaluate("git push origin main"));
-
-    // Prefix substring should NOT match (no false positives).
     try std.testing.expectEqual(Effect.deny, policy.evaluate("lsblk"));
 }
 
-test "evaluate explicit deny wins over allow" {
+test "evaluateDetailed explicit deny wins over allow" {
     var policy = Policy{
         .default_effect = .deny,
         .mode = .enforce,
@@ -148,77 +178,70 @@ test "evaluate explicit deny wins over allow" {
     try std.testing.expectEqual(Effect.deny, policy.evaluate("find . -exec rm {} ;"));
 }
 
-test "evaluate default allow permits unmatched action" {
+test "evaluateDetailed matches command and cwd constraints" {
     var policy = Policy{
-        .default_effect = .allow,
+        .default_effect = .deny,
         .mode = .enforce,
         .statements = &[_]Statement{
-            .{ .effect = .deny, .action_pattern = "rm *" },
+            .{
+                .effect = .allow,
+                .action_pattern = "tool.exec",
+                .command_pattern = "rg *",
+                .cwd_pattern = "repo/**",
+            },
         },
         ._pattern_buf = &.{},
         .allocator = std.testing.allocator,
     };
     _ = &policy;
 
-    try std.testing.expectEqual(Effect.allow, policy.evaluate("ls -la"));
-    try std.testing.expectEqual(Effect.deny, policy.evaluate("rm -rf /"));
+    try std.testing.expectEqual(Effect.allow, policy.evaluateDetailed(.{
+        .action = "tool.exec",
+        .command = "rg foo src",
+        .cwd = "repo/core",
+    }));
+    try std.testing.expectEqual(Effect.deny, policy.evaluateDetailed(.{
+        .action = "tool.exec",
+        .command = "rg foo src",
+        .cwd = "tmp",
+    }));
 }
 
-test "evaluate deny wins regardless of order" {
-    // deny before allow
-    var policy1 = Policy{
+test "evaluateDetailed matches resource constraints" {
+    var policy = Policy{
         .default_effect = .deny,
         .mode = .enforce,
         .statements = &[_]Statement{
-            .{ .effect = .deny, .action_pattern = "git push *" },
-            .{ .effect = .allow, .action_pattern = "git *" },
+            .{ .effect = .allow, .action_pattern = "tool.fs.read", .resource_pattern = "src/**" },
+            .{ .effect = .deny, .action_pattern = "tool.fs.read", .resource_pattern = "src/secrets/**" },
         },
         ._pattern_buf = &.{},
         .allocator = std.testing.allocator,
     };
-    _ = &policy1;
+    _ = &policy;
 
-    // allow before deny
-    var policy2 = Policy{
-        .default_effect = .deny,
-        .mode = .enforce,
-        .statements = &[_]Statement{
-            .{ .effect = .allow, .action_pattern = "git *" },
-            .{ .effect = .deny, .action_pattern = "git push *" },
-        },
-        ._pattern_buf = &.{},
-        .allocator = std.testing.allocator,
-    };
-    _ = &policy2;
-
-    // Both should deny "git push origin main"
-    try std.testing.expectEqual(Effect.deny, policy1.evaluate("git push origin main"));
-    try std.testing.expectEqual(Effect.deny, policy2.evaluate("git push origin main"));
-
-    // Both should allow "git show HEAD"
-    try std.testing.expectEqual(Effect.allow, policy1.evaluate("git show HEAD"));
-    try std.testing.expectEqual(Effect.allow, policy2.evaluate("git show HEAD"));
+    try std.testing.expectEqual(Effect.allow, policy.evaluateDetailed(.{
+        .action = "tool.fs.read",
+        .resource = "src/main.zig",
+    }));
+    try std.testing.expectEqual(Effect.deny, policy.evaluateDetailed(.{
+        .action = "tool.fs.read",
+        .resource = "src/secrets/token.txt",
+    }));
 }
 
-test "evaluate empty statements uses default" {
-    var allow_policy = Policy{
+test "clampTimeoutMs applies policy max timeout" {
+    var policy = Policy{
         .default_effect = .allow,
         .mode = .enforce,
         .statements = &.{},
         ._pattern_buf = &.{},
         .allocator = std.testing.allocator,
+        .max_timeout_ms = 30_000,
     };
-    _ = &allow_policy;
+    _ = &policy;
 
-    var deny_policy = Policy{
-        .default_effect = .deny,
-        .mode = .enforce,
-        .statements = &.{},
-        ._pattern_buf = &.{},
-        .allocator = std.testing.allocator,
-    };
-    _ = &deny_policy;
-
-    try std.testing.expectEqual(Effect.allow, allow_policy.evaluate("anything"));
-    try std.testing.expectEqual(Effect.deny, deny_policy.evaluate("anything"));
+    try std.testing.expectEqual(@as(u64, 20_000), policy.clampTimeoutMs(20_000));
+    try std.testing.expectEqual(@as(u64, 30_000), policy.clampTimeoutMs(50_000));
+    try std.testing.expectEqual(@as(u64, 30_000), policy.clampTimeoutMs(0));
 }

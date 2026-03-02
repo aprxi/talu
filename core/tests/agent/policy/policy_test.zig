@@ -184,3 +184,32 @@ test "Policy parsePolicy rejects invalid mode" {
 test "Policy parsePolicy rejects invalid JSON" {
     try std.testing.expectError(error.InvalidJson, parsePolicy(std.testing.allocator, "not json"));
 }
+
+test "Policy checkProcessAction classifies cwd denial" {
+    var policy = try parsePolicy(std.testing.allocator,
+        \\{"default":"deny","statements":[
+        \\  {"effect":"allow","action":"tool.exec","command":"rg *","cwd":"repo/**"}
+        \\]}
+    );
+    defer policy.deinit();
+
+    const ok = policy_mod.checkProcessAction(&policy, "tool.exec", "rg foo", "repo/src");
+    try std.testing.expect(ok.allowed);
+
+    const denied = policy_mod.checkProcessAction(&policy, "tool.exec", "rg foo", "tmp");
+    try std.testing.expect(!denied.allowed);
+    try std.testing.expectEqual(policy_mod.ProcessDenyReason.cwd, denied.deny_reason.?);
+}
+
+test "Policy checkFileAction enforces resource globs" {
+    var policy = try parsePolicy(std.testing.allocator,
+        \\{"default":"deny","statements":[
+        \\  {"effect":"allow","action":"tool.fs.read","resource":"src/**"},
+        \\  {"effect":"deny","action":"tool.fs.read","resource":"src/secrets/**"}
+        \\]}
+    );
+    defer policy.deinit();
+
+    try std.testing.expect(policy_mod.checkFileAction(&policy, "tool.fs.read", "src/main.zig", false));
+    try std.testing.expect(!policy_mod.checkFileAction(&policy, "tool.fs.read", "src/secrets/key.txt", false));
+}

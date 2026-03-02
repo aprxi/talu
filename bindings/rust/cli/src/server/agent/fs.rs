@@ -169,9 +169,22 @@ fn parse_json<T: for<'de> Deserialize<'de>>(body: &[u8]) -> Result<T, Response<B
         .map_err(|e| json_error(StatusCode::BAD_REQUEST, "invalid_json", &e.to_string()))
 }
 
-fn open_fs(state: &AppState) -> Result<FsHandle, Response<BoxBody>> {
-    FsHandle::open(&state.workspace_dir.to_string_lossy())
+fn open_fs(
+    state: &AppState,
+    policy: Option<&talu::policy::Policy>,
+) -> Result<FsHandle, Response<BoxBody>> {
+    FsHandle::open_with_policy(&state.workspace_dir.to_string_lossy(), policy)
         .map_err(|e| fs_error_response(e, "failed to initialize workspace fs"))
+}
+
+fn load_policy(state: &AppState) -> Result<Option<talu::policy::Policy>, Response<BoxBody>> {
+    super::load_runtime_policy(state).map_err(|message| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy_invalid",
+            &message,
+        )
+    })
 }
 
 fn encoding_or_default(encoding: Option<String>) -> String {
@@ -229,6 +242,20 @@ fn fs_error_response(err: FsError, fallback: &str) -> Response<BoxBody> {
         FsError::NotDirectory(_) => json_error(StatusCode::BAD_REQUEST, "not_directory", &message),
         FsError::NotEmpty(_) => json_error(StatusCode::CONFLICT, "not_empty", &message),
         FsError::TooLarge(_) => json_error(StatusCode::PAYLOAD_TOO_LARGE, "too_large", &message),
+        FsError::PolicyDeniedFileRead(_) => {
+            json_error(StatusCode::FORBIDDEN, "policy_denied_file_read", &message)
+        }
+        FsError::PolicyDeniedFileWrite(_) => {
+            json_error(StatusCode::FORBIDDEN, "policy_denied_file_write", &message)
+        }
+        FsError::PolicyDeniedFileDelete(_) => {
+            json_error(StatusCode::FORBIDDEN, "policy_denied_file_delete", &message)
+        }
+        FsError::PolicyInvalid(_) => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy_invalid",
+            &message,
+        ),
         FsError::Io(_) => json_error(StatusCode::INTERNAL_SERVER_ERROR, "io_error", fallback),
     }
 }
@@ -258,7 +285,11 @@ pub async fn handle_read(
 
     let encoding = encoding_or_default(request.encoding);
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES);
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -306,7 +337,11 @@ pub async fn handle_write(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_encoding", &e),
     };
 
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -340,7 +375,11 @@ pub async fn handle_edit(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -380,7 +419,11 @@ pub async fn handle_stat(
         Err(resp) => return resp,
     };
 
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -422,7 +465,11 @@ pub async fn handle_list(
         Err(resp) => return resp,
     };
 
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -473,7 +520,11 @@ pub async fn handle_remove(
         Err(resp) => return resp,
     };
 
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -506,7 +557,11 @@ pub async fn handle_mkdir(
         Err(resp) => return resp,
     };
 
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -539,7 +594,11 @@ pub async fn handle_rename(
         Err(resp) => return resp,
     };
 
-    let fs = match open_fs(&state) {
+    let policy = match load_policy(&state) {
+        Ok(policy) => policy,
+        Err(resp) => return resp,
+    };
+    let fs = match open_fs(&state, policy.as_ref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };

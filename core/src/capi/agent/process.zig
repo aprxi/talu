@@ -2,11 +2,13 @@
 
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
+const policy_api = @import("policy.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
 const allocator = std.heap.c_allocator;
 const process = agent.process;
+const ACTION_PROCESS = "tool.process";
 
 pub const TaluProcess = opaque {};
 
@@ -15,10 +17,49 @@ fn toProcess(handle: ?*TaluProcess) !*process.session.ProcessSession {
     return @ptrCast(@alignCast(ptr));
 }
 
+fn setPolicyDeniedError(reason: ?policy_api.ProcessDenyReason) i32 {
+    if (reason != null and reason.? == .cwd) {
+        capi_error.setErrorWithCode(.io_permission_denied, "agent policy denied cwd", .{});
+        return @intFromEnum(error_codes.ErrorCode.policy_denied_cwd);
+    }
+    capi_error.setErrorWithCode(.shell_command_denied, "agent policy denied process action", .{});
+    return @intFromEnum(error_codes.ErrorCode.policy_denied_exec);
+}
+
+fn enforceProcessOpenPolicy(
+    policy: ?*policy_api.TaluAgentPolicy,
+    command: []const u8,
+    cwd: ?[]const u8,
+) i32 {
+    const safety_check = agent.shell.safety.checkCommand(command);
+    if (!safety_check.allowed) {
+        const reason = safety_check.reason orelse "command denied by baseline shell safety";
+        capi_error.setErrorWithCode(.shell_command_denied, "{s}", .{reason});
+        return @intFromEnum(error_codes.ErrorCode.shell_command_denied);
+    }
+
+    var iter = agent.shell.safety.ChainIterator.init(command);
+    while (iter.next()) |segment_raw| {
+        const segment = std.mem.trim(u8, segment_raw, &std.ascii.whitespace);
+        if (segment.len == 0) continue;
+
+        const normalized = agent.shell.safety.normalizeCommand(allocator, segment) catch |err| {
+            capi_error.setError(err, "failed to normalize command segment", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer allocator.free(normalized);
+
+        const policy_result = policy_api.enforceProcessPolicy(policy, ACTION_PROCESS, normalized, cwd);
+        if (!policy_result.allowed) return setPolicyDeniedError(policy_result.deny_reason);
+    }
+    return 0;
+}
+
 /// Open a non-PTY process session using `/bin/sh -c <command>`.
 pub fn talu_process_open(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
+    policy: ?*policy_api.TaluAgentPolicy,
     out_process: ?*?*TaluProcess,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -46,6 +87,9 @@ pub fn talu_process_open(
         }
         break :blk slice;
     } else null;
+
+    const policy_rc = enforceProcessOpenPolicy(policy, command_slice, cwd_slice);
+    if (policy_rc != 0) return policy_rc;
 
     const session_ptr = process.session.ProcessSession.open(allocator, command_slice, cwd_slice) catch |err| {
         capi_error.setError(err, "failed to open process session", .{});
@@ -195,7 +239,12 @@ test "talu_process_open write read close roundtrip" {
     var handle: ?*TaluProcess = null;
     try std.testing.expectEqual(
         @as(i32, 0),
-        talu_process_open("while IFS= read -r line; do echo \"$line\"; [ \"$line\" = \"quit\" ] && break; done", null, &handle),
+        talu_process_open(
+            "while IFS= read -r line; do echo \"$line\"; [ \"$line\" = \"quit\" ] && break; done",
+            null,
+            null,
+            &handle,
+        ),
     );
     defer talu_process_close(handle);
 
@@ -219,4 +268,24 @@ test "talu_process_open write read close roundtrip" {
     }
 
     try std.testing.expect(std.mem.indexOf(u8, output.items, "hello") != null);
+}
+
+test "talu_process_open enforces agent policy" {
+    var policy_handle: ?*policy_api.TaluAgentPolicy = null;
+    const policy_json =
+        \\{"default":"deny","statements":[{"effect":"allow","action":"tool.fs.read","resource":"**"}]}
+    ;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        policy_api.talu_agent_policy_create(policy_json.ptr, policy_json.len, &policy_handle),
+    );
+    defer policy_api.talu_agent_policy_free(policy_handle);
+
+    var handle: ?*TaluProcess = null;
+    const rc = talu_process_open("echo hi", null, policy_handle, &handle);
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(error_codes.ErrorCode.policy_denied_exec)),
+        rc,
+    );
+    try std.testing.expect(handle == null);
 }

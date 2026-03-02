@@ -97,6 +97,8 @@ pub struct AppState {
     pub bucket_path: Option<PathBuf>,
     /// Canonical workspace root for `/v1/agent/fs/*` endpoints.
     pub workspace_dir: PathBuf,
+    /// Optional JSON policy applied to `/v1/agent/*` runtime operations.
+    pub agent_policy_json: Option<String>,
     /// Serve console UI from this directory instead of bundled assets.
     pub html_dir: Option<PathBuf>,
     /// Plugin capability tokens — maps bearer token → plugin_id + permissions.

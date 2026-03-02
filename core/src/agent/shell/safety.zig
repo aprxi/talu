@@ -282,9 +282,54 @@ pub fn leadingExecutable(segment: []const u8) []const u8 {
         {
             continue;
         }
+        if (isShellControlKeyword(name)) {
+            continue;
+        }
+        if (isBuiltinConsumesSegment(name)) {
+            return "";
+        }
         return name;
     }
     return "";
+}
+
+fn isShellControlKeyword(name: []const u8) bool {
+    return std.mem.eql(u8, name, "if") or
+        std.mem.eql(u8, name, "then") or
+        std.mem.eql(u8, name, "elif") or
+        std.mem.eql(u8, name, "else") or
+        std.mem.eql(u8, name, "fi") or
+        std.mem.eql(u8, name, "for") or
+        std.mem.eql(u8, name, "while") or
+        std.mem.eql(u8, name, "until") or
+        std.mem.eql(u8, name, "do") or
+        std.mem.eql(u8, name, "done") or
+        std.mem.eql(u8, name, "case") or
+        std.mem.eql(u8, name, "esac") or
+        std.mem.eql(u8, name, "in") or
+        std.mem.eql(u8, name, "function");
+}
+
+fn isBuiltinConsumesSegment(name: []const u8) bool {
+    return std.mem.eql(u8, name, "read") or
+        std.mem.eql(u8, name, "break") or
+        std.mem.eql(u8, name, "continue") or
+        std.mem.eql(u8, name, "return") or
+        std.mem.eql(u8, name, "exit") or
+        std.mem.eql(u8, name, "cd") or
+        std.mem.eql(u8, name, "set") or
+        std.mem.eql(u8, name, "unset") or
+        std.mem.eql(u8, name, "export") or
+        std.mem.eql(u8, name, "local") or
+        std.mem.eql(u8, name, "declare") or
+        std.mem.eql(u8, name, "source") or
+        std.mem.eql(u8, name, ".") or
+        std.mem.eql(u8, name, "test") or
+        std.mem.eql(u8, name, "[") or
+        std.mem.eql(u8, name, "]") or
+        std.mem.eql(u8, name, "true") or
+        std.mem.eql(u8, name, "false") or
+        std.mem.eql(u8, name, ":");
 }
 
 /// Return the basename of a path: `/usr/bin/git` → `git`, `ls` → `ls`.
@@ -303,15 +348,15 @@ fn trim(s: []const u8) []const u8 {
 /// Iterator that splits a command string on shell chain operators:
 /// `|`, `&&`, `||`, `;`. Does NOT handle subshells / $() — intentionally
 /// conservative.
-const ChainIterator = struct {
+pub const ChainIterator = struct {
     buf: []const u8,
     pos: usize,
 
-    fn init(buf: []const u8) ChainIterator {
+    pub fn init(buf: []const u8) ChainIterator {
         return .{ .buf = buf, .pos = 0 };
     }
 
-    fn next(self: *ChainIterator) ?[]const u8 {
+    pub fn next(self: *ChainIterator) ?[]const u8 {
         if (self.pos >= self.buf.len) return null;
 
         const start = self.pos;
@@ -452,6 +497,16 @@ test "checkCommand blocks dangerous in or chain" {
 test "checkCommand allows empty command" {
     const result = checkCommand("");
     try std.testing.expect(result.allowed);
+}
+
+test "checkCommand allows control-flow script with whitelisted external command" {
+    const result = checkCommand("while IFS= read -r line; do echo \"$line\"; [ \"$line\" = \"quit\" ] && break; done");
+    try std.testing.expect(result.allowed);
+}
+
+test "checkCommand still blocks dangerous command behind control-flow keyword" {
+    const result = checkCommand("if true; then rm -rf /; fi");
+    try std.testing.expect(!result.allowed);
 }
 
 test "leadingExecutable simple" {

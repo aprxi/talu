@@ -4,9 +4,12 @@ use std::ffi::{c_void, CString};
 use std::os::raw::{c_char, c_int};
 
 const ERROR_CODE_OK: i32 = 0;
+const ERROR_CODE_SHELL_COMMAND_DENIED: i32 = 800;
 const ERROR_CODE_SHELL_EXEC_FAILED: i32 = 801;
 const ERROR_CODE_SHELL_SESSION_CLOSED: i32 = 802;
 const ERROR_CODE_SHELL_PROCESS_EXITED: i32 = 804;
+const ERROR_CODE_POLICY_DENIED_EXEC: i32 = 808;
+const ERROR_CODE_POLICY_DENIED_CWD: i32 = 809;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 const ERROR_CODE_INVALID_HANDLE: i32 = 902;
 
@@ -15,6 +18,7 @@ unsafe extern "C" {
     fn talu_process_open_raw(
         command: *const c_char,
         cwd: *const c_char,
+        policy: *mut c_void,
         out_process: *mut *mut c_void,
     ) -> c_int;
     #[link_name = "talu_process_close"]
@@ -43,6 +47,9 @@ unsafe extern "C" {
 /// Errors from process session operations.
 #[derive(Debug)]
 pub enum ProcessError {
+    CommandDenied(String),
+    PolicyDeniedExec(String),
+    PolicyDeniedCwd(String),
     ExecFailed(String),
     SessionClosed(String),
     ProcessExited(String),
@@ -55,6 +62,9 @@ impl ProcessError {
     fn from_code(code: i32, fallback: &str) -> Self {
         let detail = crate::error::last_error_message().unwrap_or_else(|| fallback.to_string());
         match code {
+            ERROR_CODE_SHELL_COMMAND_DENIED => Self::CommandDenied(detail),
+            ERROR_CODE_POLICY_DENIED_EXEC => Self::PolicyDeniedExec(detail),
+            ERROR_CODE_POLICY_DENIED_CWD => Self::PolicyDeniedCwd(detail),
             ERROR_CODE_SHELL_EXEC_FAILED => Self::ExecFailed(detail),
             ERROR_CODE_SHELL_SESSION_CLOSED => Self::SessionClosed(detail),
             ERROR_CODE_SHELL_PROCESS_EXITED => Self::ProcessExited(detail),
@@ -68,6 +78,9 @@ impl ProcessError {
 impl std::fmt::Display for ProcessError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            ProcessError::CommandDenied(s) => write!(f, "command denied: {}", s),
+            ProcessError::PolicyDeniedExec(s) => write!(f, "policy denied process exec: {}", s),
+            ProcessError::PolicyDeniedCwd(s) => write!(f, "policy denied cwd: {}", s),
             ProcessError::ExecFailed(s) => write!(f, "process spawn failed: {}", s),
             ProcessError::SessionClosed(s) => write!(f, "session closed: {}", s),
             ProcessError::ProcessExited(s) => write!(f, "process exited: {}", s),
@@ -93,6 +106,15 @@ unsafe impl Send for ProcessSession {}
 impl ProcessSession {
     /// Open a new process session with `/bin/sh -c <command>`.
     pub fn open(command: &str, cwd: Option<&str>) -> Result<Self, ProcessError> {
+        Self::open_with_policy(command, cwd, None)
+    }
+
+    /// Open a new process session with optional agent policy.
+    pub fn open_with_policy(
+        command: &str,
+        cwd: Option<&str>,
+        policy: Option<&crate::policy::Policy>,
+    ) -> Result<Self, ProcessError> {
         let c_command = CString::new(command)
             .map_err(|_| ProcessError::InvalidArgument("command contains null byte".into()))?;
         let c_cwd = if let Some(value) = cwd {
@@ -103,6 +125,7 @@ impl ProcessSession {
         } else {
             None
         };
+        let policy_ptr = policy.map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
 
         let mut handle: *mut c_void = std::ptr::null_mut();
         // SAFETY: pointers are valid for the duration of this call.
@@ -110,6 +133,7 @@ impl ProcessSession {
             talu_process_open_raw(
                 c_command.as_ptr(),
                 c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                policy_ptr,
                 &mut handle,
             )
         };

@@ -49,6 +49,7 @@ fn build_app() -> Router {
         tenant_registry: None,
         bucket_path: None,
         workspace_dir: std::env::current_dir().expect("cwd"),
+        agent_policy_json: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,

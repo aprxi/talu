@@ -412,6 +412,13 @@ comptime {
     _ = &capi.talu_agent_registry_count;
     _ = &capi.talu_agent_run;
 
+    // Agent runtime policy API
+    _ = &capi.talu_agent_policy_create;
+    _ = &capi.talu_agent_policy_free;
+    _ = &capi.talu_agent_policy_check_action;
+    _ = &capi.talu_agent_policy_check_file;
+    _ = &capi.talu_agent_policy_check_process;
+
     // Agent filesystem API
     _ = &capi.talu_fs_create;
     _ = &capi.talu_fs_free;

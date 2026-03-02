@@ -126,17 +126,37 @@ pub async fn handle_spawn(
         );
     }
 
-    let process =
-        match talu::process::ProcessSession::open(&request.command, request.cwd.as_deref()) {
-            Ok(value) => value,
-            Err(e) => {
-                return json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "process_error",
-                    &format!("failed to open process session: {e}"),
-                )
-            }
-        };
+    let policy = match super::load_runtime_policy(&state) {
+        Ok(policy) => policy,
+        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "policy_invalid", &err),
+    };
+
+    let process = match talu::process::ProcessSession::open_with_policy(
+        &request.command,
+        request.cwd.as_deref(),
+        policy.as_ref(),
+    ) {
+        Ok(value) => value,
+        Err(e) => {
+            let (status, code) = match &e {
+                talu::process::ProcessError::CommandDenied(_) => {
+                    (StatusCode::FORBIDDEN, "command_denied")
+                }
+                talu::process::ProcessError::PolicyDeniedCwd(_) => {
+                    (StatusCode::FORBIDDEN, "policy_denied_cwd")
+                }
+                talu::process::ProcessError::PolicyDeniedExec(_) => {
+                    (StatusCode::FORBIDDEN, "policy_denied_exec")
+                }
+                _ => (StatusCode::INTERNAL_SERVER_ERROR, "process_error"),
+            };
+            return json_error(
+                status,
+                code,
+                &format!("failed to open process session: {e}"),
+            );
+        }
+    };
 
     let process_id = uuid::Uuid::new_v4().to_string();
     let now = Instant::now();

@@ -70,6 +70,12 @@ pub const ErrorCode = enum(i32) {
     shell_session_closed = 802,
     shell_timeout = 803,
     shell_process_exited = 804,
+    policy_denied_file_read = 805,
+    policy_denied_file_write = 806,
+    policy_denied_file_delete = 807,
+    policy_denied_exec = 808,
+    policy_denied_cwd = 809,
+    policy_invalid = 810,
 
     // System errors (900-999)
     out_of_memory = 900,

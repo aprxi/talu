@@ -4,11 +4,14 @@
 
 const std = @import("std");
 const shell = @import("../../agent/shell/root.zig");
+const policy_api = @import("policy.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
 const allocator = std.heap.c_allocator;
 const DEFAULT_SCROLLBACK_BYTES: usize = 64 * 1024;
+const ACTION_EXEC = "tool.exec";
+const ACTION_SHELL = "tool.shell";
 
 pub const TaluShell = opaque {};
 
@@ -18,16 +21,58 @@ fn toShell(handle: ?*TaluShell) !*shell.session.ShellSession {
     return @ptrCast(@alignCast(handle orelse return error.InvalidHandle));
 }
 
+fn setPolicyDeniedError(reason: ?policy_api.ProcessDenyReason) i32 {
+    if (reason != null and reason.? == .cwd) {
+        capi_error.setErrorWithCode(.io_permission_denied, "agent policy denied cwd", .{});
+        return @intFromEnum(error_codes.ErrorCode.policy_denied_cwd);
+    }
+    capi_error.setErrorWithCode(.shell_command_denied, "agent policy denied exec action", .{});
+    return @intFromEnum(error_codes.ErrorCode.policy_denied_exec);
+}
+
+fn enforceShellExecPolicy(
+    policy: ?*policy_api.TaluAgentPolicy,
+    action: []const u8,
+    command: []const u8,
+    cwd: ?[]const u8,
+) i32 {
+    const safety_check = shell.safety.checkCommand(command);
+    if (!safety_check.allowed) {
+        const reason = safety_check.reason orelse "command denied by baseline shell safety";
+        capi_error.setErrorWithCode(.shell_command_denied, "{s}", .{reason});
+        return @intFromEnum(error_codes.ErrorCode.shell_command_denied);
+    }
+
+    var iter = shell.safety.ChainIterator.init(command);
+    while (iter.next()) |segment_raw| {
+        const segment = std.mem.trim(u8, segment_raw, &std.ascii.whitespace);
+        if (segment.len == 0) continue;
+
+        const normalized = shell.safety.normalizeCommand(allocator, segment) catch |err| {
+            capi_error.setError(err, "failed to normalize command segment", .{});
+            return @intFromEnum(error_codes.errorToCode(err));
+        };
+        defer allocator.free(normalized);
+
+        const policy_result = policy_api.enforceProcessPolicy(policy, action, normalized, cwd);
+        if (!policy_result.allowed) {
+            return setPolicyDeniedError(policy_result.deny_reason);
+        }
+    }
+    return 0;
+}
+
 /// Execute a shell command and capture output.
 ///
-/// The command is NOT safety-checked — callers should call
-/// `talu_shell_check_command` first if policy enforcement is needed.
+/// Enforces baseline shell safety checks and optional agent policy.
 ///
 /// On success (return 0), `out_stdout` / `out_stderr` point to allocated
 /// buffers that must be freed via `talu_shell_free_string`. `out_exit_code`
 /// receives the process exit code (or a negative signal number).
 pub fn talu_shell_exec(
     command: ?[*:0]const u8,
+    cwd: ?[*:0]const u8,
+    policy: ?*policy_api.TaluAgentPolicy,
     out_stdout: ?*?[*]const u8,
     out_stdout_len: ?*usize,
     out_stderr: ?*?[*]const u8,
@@ -51,7 +96,25 @@ pub fn talu_shell_exec(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }
 
-    var result = shell.exec.exec(allocator, cmd) catch |err| {
+    const cwd_slice: ?[]const u8 = if (cwd) |value| blk: {
+        const slice = std.mem.sliceTo(value, 0);
+        if (slice.len == 0) {
+            capi_error.setErrorWithCode(.invalid_argument, "cwd is empty", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        }
+        break :blk slice;
+    } else null;
+
+    const policy_rc = enforceShellExecPolicy(policy, ACTION_EXEC, cmd, cwd_slice);
+    if (policy_rc != 0) return policy_rc;
+
+    const default_timeout_ms: u64 = 120_000;
+    const effective_timeout_ms = policy_api.clampTimeoutMs(policy, default_timeout_ms);
+
+    var result = shell.exec.execWithOptions(allocator, cmd, .{
+        .cwd = cwd_slice,
+        .timeout_ms = effective_timeout_ms,
+    }) catch |err| {
         capi_error.setError(err, "shell exec failed", .{});
         return @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
     };
@@ -74,6 +137,7 @@ pub fn talu_shell_exec(
 pub fn talu_shell_exec_streaming(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
+    policy: ?*policy_api.TaluAgentPolicy,
     timeout_ms: u64,
     on_stdout: ?StreamCallback,
     on_stdout_ctx: ?*anyopaque,
@@ -102,6 +166,11 @@ pub fn talu_shell_exec_streaming(
         break :blk slice;
     } else null;
 
+    const policy_rc = enforceShellExecPolicy(policy, ACTION_EXEC, cmd, cwd_slice);
+    if (policy_rc != 0) return policy_rc;
+
+    const effective_timeout_ms = policy_api.clampTimeoutMs(policy, timeout_ms);
+
     var stdout_stream_ctx = CStreamCtx{ .callback = cNoopStreamCallback, .ctx = null };
     var stderr_stream_ctx = CStreamCtx{ .callback = cNoopStreamCallback, .ctx = null };
     if (on_stdout) |cb| {
@@ -116,7 +185,7 @@ pub fn talu_shell_exec_streaming(
         cmd,
         .{
             .cwd = cwd_slice,
-            .timeout_ms = timeout_ms,
+            .timeout_ms = effective_timeout_ms,
             .max_output_bytes = 1024 * 1024,
         },
         if (on_stdout != null) cStreamForward else null,
@@ -250,6 +319,7 @@ pub fn talu_shell_open(
     cols: u16,
     rows: u16,
     cwd: ?[*:0]const u8,
+    policy: ?*policy_api.TaluAgentPolicy,
     out_shell: ?*?*TaluShell,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -267,6 +337,11 @@ pub fn talu_shell_open(
         }
         break :blk slice;
     } else null;
+
+    const policy_result = policy_api.enforceProcessPolicy(policy, ACTION_SHELL, null, cwd_slice);
+    if (!policy_result.allowed) {
+        return setPolicyDeniedError(policy_result.deny_reason);
+    }
 
     const session_ptr = shell.session.ShellSession.open(
         allocator,
@@ -482,6 +557,8 @@ test "talu_shell_exec runs whitelisted command" {
 
     const rc = talu_shell_exec(
         "echo hello",
+        null,
+        null,
         &stdout_ptr,
         &stdout_len,
         &stderr_ptr,
@@ -498,8 +575,26 @@ test "talu_shell_exec runs whitelisted command" {
 }
 
 test "talu_shell_exec null command returns error" {
-    const rc = talu_shell_exec(null, null, null, null, null, null);
+    const rc = talu_shell_exec(null, null, null, null, null, null, null, null);
     try std.testing.expect(rc != 0);
+}
+
+test "talu_shell_exec enforces agent policy" {
+    var policy_handle: ?*policy_api.TaluAgentPolicy = null;
+    const policy_json =
+        \\{"default":"deny","statements":[{"effect":"allow","action":"tool.fs.read","resource":"**"}]}
+    ;
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        policy_api.talu_agent_policy_create(policy_json.ptr, policy_json.len, &policy_handle),
+    );
+    defer policy_api.talu_agent_policy_free(policy_handle);
+
+    const rc = talu_shell_exec("echo hello", null, policy_handle, null, null, null, null, null);
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(error_codes.ErrorCode.policy_denied_exec)),
+        rc,
+    );
 }
 
 test "talu_shell_default_policy_json returns valid JSON" {
@@ -551,6 +646,7 @@ test "talu_shell_exec_streaming invokes callbacks and returns exit" {
     const rc = talu_shell_exec_streaming(
         "echo out && echo err >&2",
         null,
+        null,
         30_000,
         callbacks.onStdout,
         &saw_stdout,
@@ -566,7 +662,7 @@ test "talu_shell_exec_streaming invokes callbacks and returns exit" {
 
 test "talu_shell_open write read and scrollback" {
     var handle: ?*TaluShell = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_shell_open(80, 24, null, &handle));
+    try std.testing.expectEqual(@as(i32, 0), talu_shell_open(80, 24, null, null, &handle));
     defer talu_shell_close(handle);
 
     const command = "echo hello\nexit\n";
