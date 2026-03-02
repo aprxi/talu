@@ -740,19 +740,6 @@ pub const Block = struct {
         const shared_state = dispatch_state.slot_ctx.sharedState();
         const bound_state_blocks = shared_state.state_blocks;
 
-        const resolveViewPtr = struct {
-            fn forState(
-                state_blocks: []const runtime_contract.StateBlockHandle,
-                state_id: u8,
-            ) !*const runtime_contract.CompatibilityStateView {
-                return runtime_contract.findStateValue(
-                    *const runtime_contract.CompatibilityStateView,
-                    state_blocks,
-                    state_id,
-                ) orelse error.InvalidStateDescriptorBinding;
-            }
-        }.forState;
-
         const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         for (dispatch_state.block.compiled_plan.plan.state_descs) |state_desc| {
             const maybe_state_block = runtime_contract.findStateBlock(bound_state_blocks, state_desc.id);
@@ -761,9 +748,6 @@ pub const Block = struct {
             }
             const state_block = maybe_state_block.?;
             const normalized_state_block = state_block.*;
-            if (normalized_state_block.size < @sizeOf(runtime_contract.OpaqueStateRef)) {
-                return error.InvalidStateDescriptorBinding;
-            }
             if (normalized_state_block.align_bytes < state_desc.align_bytes) {
                 return error.InvalidStateDescriptorBinding;
             }
@@ -774,8 +758,7 @@ pub const Block = struct {
         }
 
         if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, kv_state_id) != null) {
-            const state_view = try resolveViewPtr(bound_state_blocks, kv_state_id);
-            const raw_cache = runtime_contract.compatibilityStatePointerForId(state_view, kv_state_id) orelse {
+            const raw_cache = runtime_contract.statePointerForId(bound_state_blocks, kv_state_id) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
             const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_cache));
@@ -787,8 +770,7 @@ pub const Block = struct {
 
         const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
         if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, mamba_state_id) != null) {
-            const state_view = try resolveViewPtr(bound_state_blocks, mamba_state_id);
-            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, mamba_state_id) orelse {
+            const raw_scratch = runtime_contract.statePointerForId(bound_state_blocks, mamba_state_id) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
             shared_state.mamba_scratch = @ptrCast(@alignCast(raw_scratch));
@@ -798,8 +780,7 @@ pub const Block = struct {
 
         const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
         if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, shortconv_state_id) != null) {
-            const state_view = try resolveViewPtr(bound_state_blocks, shortconv_state_id);
-            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, shortconv_state_id) orelse {
+            const raw_scratch = runtime_contract.statePointerForId(bound_state_blocks, shortconv_state_id) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
             shared_state.shortconv_scratch = @ptrCast(@alignCast(raw_scratch));
@@ -2042,41 +2023,33 @@ pub const Block = struct {
     ) !void {
         const shared_state = state.slot_ctx.sharedState();
         const state_id = insn.state_block_id orelse return;
-        const state_view = runtime_contract.findStateValue(
-            *const runtime_contract.CompatibilityStateView,
-            state_blocks,
-            state_id,
-        ) orelse return error.InvalidStateDescriptorBinding;
+        const raw_state = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
         const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
         const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
 
         if (state_id == kv_state_id) {
-            const raw_cache = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_cache));
+            const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_state));
             if (state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
             shared_state.batched_cache = layered_cache.getLayer(state.block.block_idx);
             return;
         }
         if (state_id == shortconv_state_id) {
-            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            const shortconv_scratch: *runtime.ShortConvScratch = @ptrCast(@alignCast(raw_scratch));
+            const shortconv_scratch: *runtime.ShortConvScratch = @ptrCast(@alignCast(raw_state));
             shared_state.shortconv_scratch = shortconv_scratch;
             return;
         }
         if (state_id == mamba_state_id) {
-            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
-            const mamba_scratch: *runtime.MambaScratch = @ptrCast(@alignCast(raw_scratch));
+            const mamba_scratch: *runtime.MambaScratch = @ptrCast(@alignCast(raw_state));
             shared_state.mamba_scratch = mamba_scratch;
             return;
         }
-        return error.InvalidStateDescriptorBinding;
+        // Non-builtin descriptor IDs are valid in Phase-4 generic contracts.
+        // CPU shared-state extraction is only defined for builtins; unknown IDs
+        // are carried through descriptor validation and ignored here.
+        return;
     }
 
     fn residualScaleValue(self: *const Block, scale: ResidualScale) f32 {
@@ -3192,15 +3165,15 @@ test "Block.forwardWithBatchedCache executes with batched cache" {
     // Create layered KV cache state descriptor binding for block 0.
     var layered_cache = try LayeredBatchedKVCache.init(allocator, 1, 4, 2, 32, 2048);
     defer layered_cache.deinit();
-    var state_ref align(64) = runtime_contract.OpaqueStateRef{
+    var state_payload align(64) = runtime_contract.StatePointerPayload{
         .ptr = @ptrCast(&layered_cache),
     };
     const state_blocks = [_]runtime_contract.StateBlockHandle{
         .{
             .id = @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-            .ptr = @ptrCast(&state_ref),
-            .size = @sizeOf(runtime_contract.OpaqueStateRef),
-            .align_bytes = @alignOf(runtime_contract.OpaqueStateRef),
+            .ptr = @ptrCast(&state_payload),
+            .size = @sizeOf(runtime_contract.StatePointerPayload),
+            .align_bytes = @alignOf(runtime_contract.StatePointerPayload),
         },
     };
 

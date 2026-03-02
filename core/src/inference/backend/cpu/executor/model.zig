@@ -370,11 +370,11 @@ pub const Transformer = struct {
         use_cache: bool,
         deepstack: ?*const DeepstackAdditions,
     ) !void {
-        const layered_cache = runtime_contract.findStateValue(
-            *LayeredBatchedKVCache,
-            state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-        );
+        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
+        const layered_cache = if (runtime_contract.statePointerForId(state_blocks, kv_state_id)) |raw_cache|
+            @as(*LayeredBatchedKVCache, @ptrCast(@alignCast(raw_cache)))
+        else
+            null;
         if (!use_cache) {
             if (layered_cache) |cache| cache.resetSlot(slot_index);
         }
@@ -468,11 +468,11 @@ pub const Transformer = struct {
         std.debug.assert(input_tensor.shape[0] == 1 and output_tensor.shape[0] == 1);
         std.debug.assert(@as(usize, @intCast(input_tensor.shape[1])) == slot_indices.len);
         std.debug.assert(@as(usize, @intCast(output_tensor.shape[1])) == slot_indices.len);
-        const layered_cache = runtime_contract.findStateValue(
-            *LayeredBatchedKVCache,
-            state_blocks,
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-        );
+        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
+        const layered_cache = if (runtime_contract.statePointerForId(state_blocks, kv_state_id)) |raw_cache|
+            @as(*LayeredBatchedKVCache, @ptrCast(@alignCast(raw_cache)))
+        else
+            null;
         if (!use_cache) {
             if (layered_cache) |cache| {
                 for (slot_indices) |slot_index| cache.resetSlot(slot_index);

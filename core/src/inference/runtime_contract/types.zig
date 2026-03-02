@@ -241,75 +241,36 @@ pub const StateBlockHandle = struct {
     align_bytes: u16,
 };
 
-/// Backend-owned opaque state reference carried inside StateBlockHandle.ptr.
-/// Backends populate this with pointers to concrete runtime state objects.
-pub const OpaqueStateRef = extern struct {
+/// Descriptor-bound state payload used by scheduler -> backend bindings.
+/// Each descriptor block carries exactly one opaque pointer.
+pub const StatePointerPayload = extern struct {
     ptr: ?*anyopaque = null,
 };
 
-/// Backend-agnostic compatibility view stored in scheduler-owned state blocks.
-/// Backends populate pointer fields during bind, and adapters resolve typed
-/// runtime state from this view per instruction state descriptor.
-pub const CompatibilityStateView = extern struct {
-    kv_cache: ?*anyopaque = null,
-    shortconv_state: ?*anyopaque = null,
-    mamba_state: ?*anyopaque = null,
-    runtime_state: ?*anyopaque = null,
-};
+/// Compatibility descriptor allocation footprint for pointer payload blocks.
+pub const compatibility_state_block_bytes: u64 = @sizeOf(StatePointerPayload);
 
-/// Compatibility descriptor allocation footprint for legacy backend state views.
-/// Phase-4 scheduler semantics require non-trivial scheduler-owned storage.
-pub const compatibility_state_block_bytes: u64 = 256;
+pub fn writeStatePointerToBlock(
+    state_block: *const StateBlockHandle,
+    ptr: ?*anyopaque,
+) !void {
+    if (state_block.align_bytes < @alignOf(StatePointerPayload)) return error.InvalidStateDescriptorBinding;
+    if (state_block.size < @sizeOf(StatePointerPayload)) return error.InvalidStateDescriptorBinding;
+    const payload: *StatePointerPayload = @ptrCast(@alignCast(state_block.ptr));
+    payload.* = .{ .ptr = ptr };
+}
 
-pub fn compatibilityStatePointerForId(
-    view: *const CompatibilityStateView,
+pub fn statePointerFromBlock(state_block: *const StateBlockHandle) ?*anyopaque {
+    const payload = stateValueFromBlock(*const StatePointerPayload, state_block) orelse return null;
+    return payload.ptr;
+}
+
+pub fn statePointerForId(
+    state_blocks: []const StateBlockHandle,
     state_id: u8,
 ) ?*anyopaque {
-    return switch (state_id) {
-        kv_cache_state_id => view.kv_cache,
-        shortconv_state_id => view.shortconv_state,
-        mamba_state_id => view.mamba_state,
-        else => view.runtime_state,
-    };
-}
-
-pub fn validateCompatibilityStateViewForDescriptors(
-    descriptors: []const StateDescriptor,
-    view: *const CompatibilityStateView,
-) !void {
-    for (descriptors) |descriptor| {
-        switch (descriptor.id) {
-            kv_cache_state_id, shortconv_state_id, mamba_state_id => {
-                if (compatibilityStatePointerForId(view, descriptor.id) == null) {
-                    return error.InvalidStateDescriptorBinding;
-                }
-            },
-            else => {},
-        }
-    }
-}
-
-pub fn writeCompatibilityStateViewToBlock(
-    state_block: *const StateBlockHandle,
-    view: *const CompatibilityStateView,
-) !void {
-    if (state_block.align_bytes < @alignOf(OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
-    if (state_block.size < @sizeOf(OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
-    const block_start = @intFromPtr(state_block.ptr);
-    const payload_addr = std.mem.alignForward(
-        usize,
-        block_start + @sizeOf(OpaqueStateRef),
-        @alignOf(CompatibilityStateView),
-    );
-    const payload_end = std.math.add(usize, payload_addr, @sizeOf(CompatibilityStateView)) catch {
-        return error.InvalidStateDescriptorBinding;
-    };
-    if (payload_end - block_start > state_block.size) return error.InvalidStateDescriptorBinding;
-    const payload: *CompatibilityStateView = @ptrFromInt(payload_addr);
-    payload.* = view.*;
-
-    const state_ref: *OpaqueStateRef = @ptrCast(@alignCast(state_block.ptr));
-    state_ref.* = .{ .ptr = @ptrCast(payload) };
+    const state_block = findStateBlock(state_blocks, state_id) orelse return null;
+    return statePointerFromBlock(state_block);
 }
 
 pub const ParamBlock = struct {
@@ -835,7 +796,6 @@ fn opcodeMatchesLayerOp(opcode: Opcode, op: layer_ops.LayerOp) bool {
     if (actual == opcode) return true;
     return opcode == .mla_attention and actual == .multihead_attention;
 }
-
 
 const ParamEncoder = struct {
     bytes: std.ArrayListUnmanaged(u8) = .{},
@@ -1440,11 +1400,10 @@ pub fn stateValueFromBlock(comptime T: type, state_block: *const StateBlockHandl
     comptime {
         if (@typeInfo(T) != .pointer) @compileError("stateValueFromBlock requires a pointer type");
     }
-    if (state_block.size < @sizeOf(OpaqueStateRef)) return null;
-    if (state_block.align_bytes < @alignOf(OpaqueStateRef)) return null;
-    const state_ref: *const OpaqueStateRef = @ptrCast(@alignCast(state_block.ptr));
-    const raw = state_ref.ptr orelse return null;
-    return @ptrCast(@alignCast(raw));
+    const child = @typeInfo(T).pointer.child;
+    if (state_block.size < @sizeOf(child)) return null;
+    if (state_block.align_bytes < @alignOf(child)) return null;
+    return @ptrCast(@alignCast(state_block.ptr));
 }
 
 pub fn findStateValue(comptime T: type, state_blocks: []const StateBlockHandle, state_id: u8) ?T {

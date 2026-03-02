@@ -193,39 +193,14 @@ pub const MetalBackend = struct {
         var slot_cache = try self.slotCache(slot_index);
         var slot_shortconv_cache = try self.slotShortConvCache(slot_index);
         var slot_mamba_cache = try self.slotMambaCache(slot_index);
-        const descriptors = self.stateDescriptors();
 
-        if (runtime_contract.stateDescriptorIndex(descriptors, runtime_contract.kv_cache_state_id) != null) {
-            const state_view = runtime_contract.findStateValue(
-                *const runtime_contract.CompatibilityStateView,
-                slot_blocks,
-                runtime_contract.kv_cache_state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
-            const raw_cache = runtime_contract.compatibilityStatePointerForId(state_view, runtime_contract.kv_cache_state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
+        if (runtime_contract.statePointerForId(slot_blocks, runtime_contract.kv_cache_state_id)) |raw_cache| {
             slot_cache = @ptrCast(@alignCast(raw_cache));
         }
-        if (runtime_contract.stateDescriptorIndex(descriptors, runtime_contract.shortconv_state_id) != null) {
-            const state_view = runtime_contract.findStateValue(
-                *const runtime_contract.CompatibilityStateView,
-                slot_blocks,
-                runtime_contract.shortconv_state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
-            const raw_shortconv = runtime_contract.compatibilityStatePointerForId(state_view, runtime_contract.shortconv_state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
+        if (runtime_contract.statePointerForId(slot_blocks, runtime_contract.shortconv_state_id)) |raw_shortconv| {
             slot_shortconv_cache = @ptrCast(@alignCast(raw_shortconv));
         }
-        if (runtime_contract.stateDescriptorIndex(descriptors, runtime_contract.mamba_state_id) != null) {
-            const state_view = runtime_contract.findStateValue(
-                *const runtime_contract.CompatibilityStateView,
-                slot_blocks,
-                runtime_contract.mamba_state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
-            const raw_mamba = runtime_contract.compatibilityStatePointerForId(state_view, runtime_contract.mamba_state_id) orelse {
-                return error.InvalidStateDescriptorBinding;
-            };
+        if (runtime_contract.statePointerForId(slot_blocks, runtime_contract.mamba_state_id)) |raw_mamba| {
             slot_mamba_cache = @ptrCast(@alignCast(raw_mamba));
         }
 
@@ -599,22 +574,23 @@ pub const MetalBackend = struct {
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
         const slot_mamba_cache = try self.slotMambaCache(slot_index);
-        const state_view = runtime_contract.CompatibilityStateView{
-            .kv_cache = @ptrCast(slot_cache),
-            .shortconv_state = @ptrCast(slot_shortconv_cache),
-            .mamba_state = @ptrCast(slot_mamba_cache),
-            .runtime_state = null,
-        };
-        try runtime_contract.validateCompatibilityStateViewForDescriptors(self.stateDescriptors(), &state_view);
         for (self.stateDescriptors(), 0..) |descriptor, idx| {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
-            try runtime_contract.writeCompatibilityStateViewToBlock(incoming, &state_view);
+            const state_ptr: ?*anyopaque = switch (descriptor.id) {
+                runtime_contract.kv_cache_state_id => @ptrCast(slot_cache),
+                runtime_contract.shortconv_state_id => @ptrCast(slot_shortconv_cache),
+                runtime_contract.mamba_state_id => @ptrCast(slot_mamba_cache),
+                else => null,
+            };
+            if (state_ptr) |ptr| {
+                try runtime_contract.writeStatePointerToBlock(incoming, ptr);
+            }
             binding.handles[idx] = .{
                 .id = descriptor.id,
                 .ptr = incoming.ptr,
-                .size = descriptor.size_bytes,
+                .size = incoming.size,
                 .align_bytes = incoming.align_bytes,
             };
         }

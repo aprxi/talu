@@ -553,12 +553,23 @@ pub const FusedCpuBackend = struct {
 
     /// Reset a slot for reuse (new conversation in same slot).
     pub fn resetSlot(self: *FusedCpuBackend, slot_index: usize) void {
-        self.kv_cache.resetSlot(slot_index);
+        if (slot_index < self.slot_state_bindings.len and self.slot_state_bindings[slot_index].bound) {
+            if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+                layered_cache.resetSlot(slot_index);
+            } else |_| return;
+        } else {
+            self.kv_cache.resetSlot(slot_index);
+        }
         self.slot_rope_position_deltas[slot_index] = 0;
     }
 
     /// Get current position for a slot.
     pub fn getPosition(self: *const FusedCpuBackend, slot_index: usize) usize {
+        if (slot_index < self.slot_state_bindings.len and self.slot_state_bindings[slot_index].bound) {
+            if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+                return layered_cache.getPosition(slot_index);
+            } else |_| return 0;
+        }
         return self.kv_cache.getPosition(slot_index);
     }
 
@@ -579,23 +590,24 @@ pub const FusedCpuBackend = struct {
         if (state_blocks.len != descriptors.len) return error.InvalidStateDescriptorBinding;
         const shortconv_scratch = self.scratch.getShortConvScratch();
         const mamba_scratch = self.scratch.getMambaScratch();
-        const state_view = runtime_contract.CompatibilityStateView{
-            .kv_cache = @ptrCast(&self.kv_cache),
-            .shortconv_state = if (shortconv_scratch) |scratch| @ptrCast(scratch) else null,
-            .mamba_state = if (mamba_scratch) |scratch| @ptrCast(scratch) else null,
-            .runtime_state = null,
-        };
-        try runtime_contract.validateCompatibilityStateViewForDescriptors(descriptors, &state_view);
         for (state_blocks, 0..) |state_block, idx| {
             const descriptor_index = runtime_contract.stateDescriptorIndex(descriptors, state_block.id) orelse {
                 return error.UnknownStateDescriptorId;
             };
             const descriptor = descriptors[descriptor_index];
-            try runtime_contract.writeCompatibilityStateViewToBlock(&state_block, &state_view);
+            const state_ptr: ?*anyopaque = switch (descriptor.id) {
+                runtime_contract.kv_cache_state_id => @ptrCast(&self.kv_cache),
+                runtime_contract.shortconv_state_id => if (shortconv_scratch) |scratch| @ptrCast(scratch) else null,
+                runtime_contract.mamba_state_id => if (mamba_scratch) |scratch| @ptrCast(scratch) else null,
+                else => null,
+            };
+            if (state_ptr) |ptr| {
+                try runtime_contract.writeStatePointerToBlock(&state_block, ptr);
+            }
             binding.handles[idx] = .{
                 .id = state_block.id,
                 .ptr = state_block.ptr,
-                .size = descriptor.size_bytes,
+                .size = state_block.size,
                 .align_bytes = state_block.align_bytes,
             };
         }
@@ -611,6 +623,17 @@ pub const FusedCpuBackend = struct {
     fn slotStateBlocks(self: *const FusedCpuBackend, slot_index: usize) []const runtime_contract.StateBlockHandle {
         const binding = &self.slot_state_bindings[slot_index];
         return binding.handles[0..binding.count];
+    }
+
+    fn boundLayeredCacheForSlot(self: *const FusedCpuBackend, slot_index: usize) !*LayeredBatchedKVCache {
+        const kv_state_id = runtime_contract.kv_cache_state_id;
+        const state_block = runtime_contract.findStateBlock(self.slotStateBlocks(slot_index), kv_state_id) orelse {
+            return error.UnknownStateDescriptorId;
+        };
+        const raw_cache = runtime_contract.statePointerFromBlock(state_block) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        return @ptrCast(@alignCast(raw_cache));
     }
 
     fn ensureSlotStateBlocksBound(self: *const FusedCpuBackend, slot_index: usize) !void {
@@ -632,9 +655,14 @@ pub const FusedCpuBackend = struct {
     /// This resets the KV cache and processes the full prompt.
     /// Uses slot 0 for single-sequence compatibility.
     pub fn prefill(self: *FusedCpuBackend, tokens: []const u32, logits_out: []f32) !void {
-        // Always use slot 0 for single-sequence mode
-        self.kv_cache.resetSlot(0);
+        // Always use slot 0 for single-sequence mode.
         try self.ensureSlotStateBlocksBound(0);
+        if (self.boundLayeredCacheForSlot(0)) |layered_cache| {
+            layered_cache.resetSlot(0);
+        } else |err| switch (err) {
+            error.UnknownStateDescriptorId => {},
+            else => return err,
+        }
         try self.prefillSlot(0, tokens, logits_out);
     }
 
@@ -849,7 +877,14 @@ pub const FusedCpuBackend = struct {
         // Full single-token forward pass to warm up all layer weights.
         // This forces mmap pages to load, so the user doesn't wait during
         // the first real inference with no progress feedback.
-        self.kv_cache.resetSlot(0);
+        var maybe_layered_cache: ?*LayeredBatchedKVCache = null;
+        if (self.boundLayeredCacheForSlot(0)) |layered_cache| {
+            layered_cache.resetSlot(0);
+            maybe_layered_cache = layered_cache;
+        } else |err| switch (err) {
+            error.UnknownStateDescriptorId => {},
+            else => return err,
+        }
 
         const hidden_buffer = self.getHiddenBuffer(0);
         const token_ids = &[_]u32{0}; // BOS or padding token
@@ -865,7 +900,9 @@ pub const FusedCpuBackend = struct {
         try self.model.forwardWithBatchedCache(&hidden_view_3d, &hidden_view_3d, &self.scratch, self.slotStateBlocks(0), 0, false);
 
         // Reset after warmup
-        self.kv_cache.resetSlot(0);
+        if (maybe_layered_cache) |layered_cache| {
+            layered_cache.resetSlot(0);
+        }
     }
 
     // =========================================================================
@@ -901,7 +938,12 @@ pub const FusedCpuBackend = struct {
         const model_dim = self.d_model;
 
         // Reset the slot in batched cache
-        self.kv_cache.resetSlot(slot_index);
+        if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+            layered_cache.resetSlot(slot_index);
+        } else |err| switch (err) {
+            error.UnknownStateDescriptorId => {},
+            else => return err,
+        }
         self.slot_rope_position_deltas[slot_index] = 0;
 
         // Allocate prefill buffer
@@ -1486,7 +1528,12 @@ pub const FusedCpuBackend = struct {
         // Use slot 0 for embedding extraction
         const slot_index: usize = 0;
         try self.ensureSlotStateBlocksBound(slot_index);
-        self.kv_cache.resetSlot(slot_index);
+        if (self.boundLayeredCacheForSlot(slot_index)) |layered_cache| {
+            layered_cache.resetSlot(slot_index);
+        } else |err| switch (err) {
+            error.UnknownStateDescriptorId => {},
+            else => return err,
+        }
 
         // Allocate temporary buffer for full sequence hidden states
         const hidden_data = try self.allocator.alloc(f32, seq_len * model_dim);

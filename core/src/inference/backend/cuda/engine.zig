@@ -2202,13 +2202,6 @@ pub const CudaBackend = struct {
             return error.InvalidStateDescriptorBinding;
         }
         const runtime_ptr: *anyopaque = @ptrCast(&self.block_runtime);
-        const state_view = runtime_contract.CompatibilityStateView{
-            .kv_cache = runtime_ptr,
-            .shortconv_state = runtime_ptr,
-            .mamba_state = runtime_ptr,
-            .runtime_state = runtime_ptr,
-        };
-        try runtime_contract.validateCompatibilityStateViewForDescriptors(self.stateDescriptors(), &state_view);
         for (self.stateDescriptors(), 0..) |descriptor, idx| {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 log.warn("inference", "CUDA bindSlotStateBlocks missing descriptor state id", .{
@@ -2217,18 +2210,27 @@ pub const CudaBackend = struct {
                 });
                 return error.InvalidStateDescriptorBinding;
             };
-            runtime_contract.writeCompatibilityStateViewToBlock(incoming, &state_view) catch |err| {
-                log.warn("inference", "CUDA bindSlotStateBlocks state view write failed", .{
-                    .slot_index = slot_index,
-                    .state_id = descriptor.id,
-                    .reason = @errorName(err),
-                });
-                return err;
+            const should_bind_runtime_ptr = switch (descriptor.id) {
+                runtime_contract.kv_cache_state_id,
+                runtime_contract.shortconv_state_id,
+                runtime_contract.mamba_state_id,
+                => true,
+                else => false,
             };
+            if (should_bind_runtime_ptr) {
+                runtime_contract.writeStatePointerToBlock(incoming, runtime_ptr) catch |err| {
+                    log.warn("inference", "CUDA bindSlotStateBlocks state view write failed", .{
+                        .slot_index = slot_index,
+                        .state_id = descriptor.id,
+                        .reason = @errorName(err),
+                    });
+                    return err;
+                };
+            }
             self.slot_state_blocks[idx] = .{
                 .id = descriptor.id,
                 .ptr = incoming.ptr,
-                .size = descriptor.size_bytes,
+                .size = incoming.size,
                 .align_bytes = incoming.align_bytes,
             };
         }
@@ -3592,12 +3594,7 @@ pub const CudaBackend = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !*BlockRuntimeLayer {
         const state_id = insn.state_block_id orelse return ctx.layer;
-        const state_view = runtime_contract.findStateValue(
-            *const runtime_contract.CompatibilityStateView,
-            state_blocks,
-            state_id,
-        ) orelse return error.InvalidStateDescriptorBinding;
-        const raw_runtime = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
+        const raw_runtime = runtime_contract.statePointerForId(state_blocks, state_id) orelse {
             return error.InvalidStateDescriptorBinding;
         };
         const runtime_ptr: *BlockRuntime = @ptrCast(@alignCast(raw_runtime));
@@ -6759,13 +6756,13 @@ test "deepstackLayersCompatibleWithPrompt rejects malformed layers" {
     const bad_stride = [_]f32{0} ** 7;
     const valid = [_]f32{0} ** (2 * 4);
 
-    const layers_few = [_][]const f32{ too_few_rows[0..] };
+    const layers_few = [_][]const f32{too_few_rows[0..]};
     try std.testing.expect(!deepstackLayersCompatibleWithPrompt(layers_few[0..], image_positions, d_model));
 
-    const layers_stride = [_][]const f32{ bad_stride[0..] };
+    const layers_stride = [_][]const f32{bad_stride[0..]};
     try std.testing.expect(!deepstackLayersCompatibleWithPrompt(layers_stride[0..], image_positions, d_model));
 
-    const layers_zero_dim = [_][]const f32{ valid[0..] };
+    const layers_zero_dim = [_][]const f32{valid[0..]};
     try std.testing.expect(!deepstackLayersCompatibleWithPrompt(layers_zero_dim[0..], image_positions, 0));
 }
 
