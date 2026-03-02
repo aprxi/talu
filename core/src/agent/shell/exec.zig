@@ -57,16 +57,17 @@ pub fn execWithOptions(
     return execStreaming(allocator, command, options, null, null, null, null);
 }
 
-fn spawnShellChild(
+/// Initialize a Child that runs `/bin/sh -c <command>`.
+///
+/// IMPORTANT: `argv` is stored by pointer, not copied. The caller must keep
+/// `argv_buf` alive until after `child.spawn()` completes.
+fn initShellChild(
+    argv_buf: *const [3][]const u8,
     allocator: Allocator,
     options: ExecOptions,
-    command_z: []const u8,
     env_map: ?*std.process.EnvMap,
 ) Child {
-    var child = std.process.Child.init(
-        &.{ "/bin/sh", "-c", command_z },
-        allocator,
-    );
+    var child = std.process.Child.init(argv_buf, allocator);
     child.cwd = options.cwd;
     child.env_map = env_map;
     child.stdin_behavior = .Ignore;
@@ -138,7 +139,9 @@ pub fn execStreaming(
     }
 
     const env_map_ptr: ?*std.process.EnvMap = if (env_map) |*map| map else null;
-    var child = spawnShellChild(allocator, options, command_z, env_map_ptr);
+    // argv must outlive initShellChild — keep it on this stack frame.
+    const argv = [_][]const u8{ "/bin/sh", "-c", command_z };
+    var child = initShellChild(&argv, allocator, options, env_map_ptr);
     try child.spawn();
     errdefer {
         _ = child.kill() catch {};
