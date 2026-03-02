@@ -208,6 +208,9 @@ pub extern fn mlx_persistent_transpose(
     ndim: usize,
 ) ArrayHandle;
 
+/// Persistent cast to float16 - heap-allocated, survives pool resets
+pub extern fn mlx_persistent_cast_f16(input: ArrayHandle) ArrayHandle;
+
 /// Transpose - >>> Lazy
 pub extern fn mlx_lazy_transpose(
     input: ArrayHandle,

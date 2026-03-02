@@ -12,6 +12,93 @@ struct ProjectedQkv {
     array v;
 };
 
+static constexpr size_t kAttentionFusedQkvCacheMaxEntries = 2048;
+
+struct AttentionFusedQkvCacheKey {
+    const void* q_weight = nullptr;
+    const void* k_weight = nullptr;
+    const void* v_weight = nullptr;
+    int in_features = 0;
+    int q_out = 0;
+    int kv_out = 0;
+
+    bool operator==(const AttentionFusedQkvCacheKey& other) const {
+        return q_weight == other.q_weight &&
+               k_weight == other.k_weight &&
+               v_weight == other.v_weight &&
+               in_features == other.in_features &&
+               q_out == other.q_out &&
+               kv_out == other.kv_out;
+    }
+};
+
+struct AttentionFusedQkvCacheKeyHash {
+    size_t operator()(const AttentionFusedQkvCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.q_weight);
+        h ^= std::hash<const void*>{}(key.k_weight) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<const void*>{}(key.v_weight) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.in_features) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.q_out) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.kv_out) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<AttentionFusedQkvCacheKey, array, AttentionFusedQkvCacheKeyHash>& attention_fused_qkv_cache_store() {
+    static thread_local std::unordered_map<AttentionFusedQkvCacheKey, array, AttentionFusedQkvCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void attention_fused_qkv_cache_clear() {
+    attention_fused_qkv_cache_store().clear();
+}
+
+static inline array attention_fused_qkv_rhs_cached(
+    const void* q_w,
+    const void* k_w,
+    const void* v_w,
+    const array& q_weight,
+    const array& k_weight,
+    const array& v_weight,
+    int in_features,
+    int q_out,
+    int kv_out
+) {
+    if (q_w == nullptr || k_w == nullptr || v_w == nullptr) {
+        auto q_wt = orient_matmul_rhs_cached(q_w, q_weight, in_features, q_out, true);
+        auto k_wt = orient_matmul_rhs_cached(k_w, k_weight, in_features, kv_out, true);
+        auto v_wt = orient_matmul_rhs_cached(v_w, v_weight, in_features, kv_out, true);
+        return contiguous(concatenate({q_wt, k_wt, v_wt}, 1));
+    }
+
+    auto& cache = attention_fused_qkv_cache_store();
+    if (cache.size() >= kAttentionFusedQkvCacheMaxEntries) {
+        cache.clear();
+    }
+
+    AttentionFusedQkvCacheKey key{
+        q_w,
+        k_w,
+        v_w,
+        in_features,
+        q_out,
+        kv_out,
+    };
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    auto q_wt = orient_matmul_rhs_cached(q_w, q_weight, in_features, q_out, true);
+    auto k_wt = orient_matmul_rhs_cached(k_w, k_weight, in_features, kv_out, true);
+    auto v_wt = orient_matmul_rhs_cached(v_w, v_weight, in_features, kv_out, true);
+    auto fused = contiguous(concatenate({q_wt, k_wt, v_wt}, 1));
+    // Materialize once so cached fused projection weights remain concrete.
+    eval(fused);
+    auto [inserted, _] = cache.emplace(key, std::move(fused));
+    return inserted->second;
+}
+
 static float resolve_attention_scale(
     float query_pre_attn_scalar,
     float attention_multiplier,
@@ -453,7 +540,7 @@ void* mlx_lazy_fused_attention_qkv_quantized_o_dense(
         x.shape(2),
         true
     );
-    auto out = matmul(attn_out, o_wt);
+    auto out = matmul_lastdim(attn_out, o_wt);
 
     // Add output bias if present
     if (o_bias != nullptr) {
@@ -553,14 +640,26 @@ void* mlx_lazy_fused_attention_bf16(
     const int kv_out = n_kv_heads_int * head_dim_int;
     const float scale_value = resolve_attention_scale(query_pre_attn_scalar, attention_multiplier, head_dim_int);
 
-    auto q_wt = orient_matmul_rhs_cached(q_w, *static_cast<const array*>(q_w), hidden_dim, q_out, true);
-    auto k_wt = orient_matmul_rhs_cached(k_w, *static_cast<const array*>(k_w), hidden_dim, kv_out, true);
-    auto v_wt = orient_matmul_rhs_cached(v_w, *static_cast<const array*>(v_w), hidden_dim, kv_out, true);
+    const auto& q_weight = *static_cast<const array*>(q_w);
+    const auto& k_weight = *static_cast<const array*>(k_w);
+    const auto& v_weight = *static_cast<const array*>(v_w);
+    auto qkv_wt = attention_fused_qkv_rhs_cached(
+        q_w,
+        k_w,
+        v_w,
+        q_weight,
+        k_weight,
+        v_weight,
+        hidden_dim,
+        q_out,
+        kv_out
+    );
     auto o_wt = orient_matmul_rhs_cached(o_w, *static_cast<const array*>(o_w), q_out, hidden_dim, true);
 
-    array q = matmul(x, q_wt);
-    array k = matmul(x, k_wt);
-    array v = matmul(x, v_wt);
+    auto qkv = matmul_lastdim(x, qkv_wt);
+    array q = slice(qkv, {0, 0, 0}, {batch_size, seq_len, q_out});
+    array k = slice(qkv, {0, 0, q_out}, {batch_size, seq_len, q_out + kv_out});
+    array v = slice(qkv, {0, 0, q_out + kv_out}, {batch_size, seq_len, q_out + 2 * kv_out});
 
     maybe_add_linear_bias(&q, q_bias);
     maybe_add_linear_bias(&k, k_bias);
@@ -577,6 +676,12 @@ void* mlx_lazy_fused_attention_bf16(
         head_dim_int
     );
     maybe_apply_qk_norm(&q, &k, q_norm_w, k_norm_w, rms_eps);
+    // Keep dense attention compute on the model projection dtype after optional
+    // QK-norm to avoid unintended FP32 SDPA execution.
+    const Dtype proj_dtype = qkv.dtype();
+    if (q.dtype() != proj_dtype) q = astype(q, proj_dtype);
+    if (k.dtype() != proj_dtype) k = astype(k, proj_dtype);
+    if (v.dtype() != proj_dtype) v = astype(v, proj_dtype);
     apply_attention_rope(
         &q,
         &k,
@@ -606,7 +711,7 @@ void* mlx_lazy_fused_attention_bf16(
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, q_out);
 
     // Output projection
-    auto out = matmul(attn_out, o_wt);
+    auto out = matmul_lastdim(attn_out, o_wt);
 
     // Add output bias if present
     if (o_bias != nullptr) {

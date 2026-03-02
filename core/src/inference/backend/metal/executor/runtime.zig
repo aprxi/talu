@@ -10,6 +10,7 @@ const model_executor = @import("model.zig");
 const weights_executor = @import("weights.zig");
 
 const ArrayHandle = compute.metal.graph.ArrayHandle;
+const mlx_graph = compute.metal.graph;
 
 pub const Cache = runtime_graph.Cache;
 pub const ShortConvCache = runtime_graph.ShortConvCache;
@@ -24,7 +25,17 @@ pub const WeightHandles = weights_executor.WeightHandles;
 pub const loadWeightsToGPU = weights_executor.loadWeightsToGPU;
 pub const freeWeights = weights_executor.freeWeights;
 
-pub const gatherTokenEmbeddingsLazy = model_executor.gatherTokenEmbeddingsLazy;
+inline fn beginGraphBuild() void {
+    // Reset pooled transient arrays at the start of each logical forward.
+    // This keeps decode on one high-performance path by reusing array slots
+    // instead of continuously growing per-thread pool storage.
+    mlx_graph.mlx_pool_reset();
+}
+
+pub fn gatherTokenEmbeddingsLazy(weight_handles: anytype, input_ids: []const u32) !ArrayHandle {
+    beginGraphBuild();
+    return model_executor.gatherTokenEmbeddingsLazy(weight_handles, input_ids);
+}
 
 pub fn transformerForwardLazy(
     allocator: std.mem.Allocator,
@@ -34,6 +45,7 @@ pub fn transformerForwardLazy(
     config: anytype,
     pos_offset: usize,
 ) !ArrayHandle {
+    beginGraphBuild();
     return model_executor.Model.forward(
         allocator,
         weight_handles,
@@ -52,6 +64,7 @@ pub fn transformerForwardHiddenLazy(
     config: anytype,
     pos_offset: usize,
 ) !ArrayHandle {
+    beginGraphBuild();
     return model_executor.Model.forwardHidden(
         allocator,
         weight_handles,
@@ -73,6 +86,7 @@ pub fn transformerForwardLazyWithEmbeddingOverride(
     deepstack: ?DeepstackAdditions,
     runtime_rope: ?RuntimeRoPEOverride,
 ) !ArrayHandle {
+    beginGraphBuild();
     return model_executor.Model.forwardWithEmbeddingOverride(
         allocator,
         weight_handles,
@@ -94,6 +108,7 @@ pub fn transformerForwardFromGPUToken(
     config: anytype,
     pos_offset: usize,
 ) !ArrayHandle {
+    beginGraphBuild();
     return model_executor.Model.forwardFromGPUToken(
         allocator,
         weight_handles,

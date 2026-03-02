@@ -81,7 +81,9 @@ pub async fn serve(state: AppState, addr: SocketAddr, socket: PathBuf) -> Result
     let tcp_listener = TcpListener::bind(addr)
         .await
         .with_context(|| format!("Failed to bind TCP listener at {}", addr))?;
-    log::info!(target: "server::listen", "TCP listener bound at {}", addr);
+    let local_addr = tcp_listener.local_addr()
+        .with_context(|| "Failed to get local address from TCP listener")?;
+    log::info!(target: "server::listen", "TCP listener bound at {}", local_addr);
     let tcp_task = tokio::spawn(accept_tcp(tcp_listener, router.clone()));
 
     #[cfg(unix)]

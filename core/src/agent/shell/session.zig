@@ -121,11 +121,15 @@ pub const ShellSession = struct {
         try self.pty.resize(cols, rows);
     }
 
+    /// Send a POSIX signal to the shell session's process group.
+    /// After forkpty(3), the child is the process group leader, so
+    /// kill(-child_pid, sig) delivers the signal to the entire group
+    /// (the shell and any children sharing the group).
     pub fn sendSignal(self: *ShellSession, sig: u8) !void {
         if (self.closed) return error.SessionClosed;
         self.last_access = std.time.timestamp();
         if (!self.pollAlive()) return error.ProcessExited;
-        try signal.send(self.child_pid, sig);
+        try signal.sendGroup(self.child_pid, sig);
     }
 
     pub fn isAlive(self: *ShellSession) !bool {

@@ -21,20 +21,19 @@ void* mlx_lazy_causal_conv_mixer_bf16(
     const int conv_dim_i = static_cast<int>(conv_dim);
     const int hidden_dim = input_arr.shape(2);
 
-    const auto ensure_f32 = [](const array& arr) -> array {
-        // FP32 allowlist: depthwise conv kernel/state math remains in FP32.
-        return arr.dtype() == float32 ? arr : astype(arr, float32);
-    };
-
     const array in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_arr, hidden_dim, 3 * conv_dim_i, true);
-    const array bcx = matmul(input_arr, in_proj_rhs);
+    array bcx = matmul_lastdim(input_arr, in_proj_rhs);
+    // FP32 allowlist: keep causal-conv recurrence input stream in FP32.
+    if (bcx.dtype() != float32) {
+        bcx = astype(bcx, float32);
+    }
 
     array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
     array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
     array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
     // FP32 allowlist: causal_conv recurrence is stateful; keep conv stream update
     // in FP32 while preserving bf16/f16 for output projection.
-    array bx = ensure_f32(b_gate) * ensure_f32(x_proj);
+    array bx = b_gate * x_proj;
 
     array conv_kernel_broadcast = resolve_causal_conv_kernel(conv_weight, conv_weight_arr, d_conv_i, conv_dim_i);
 
@@ -77,7 +76,7 @@ void* mlx_lazy_causal_conv_mixer_bf16(
     const array conv_seq_model = (conv_seq.dtype() == c_gate.dtype()) ? conv_seq : astype(conv_seq, c_gate.dtype());
     const array gated = conv_seq_model * c_gate;
     const array out_proj_rhs = orient_matmul_rhs_cached(out_proj, out_proj_arr, conv_dim_i, hidden_dim, true);
-    const array out = matmul(gated, out_proj_rhs);
+    const array out = matmul_lastdim(gated, out_proj_rhs);
 
     if (layer_state != nullptr) {
         *layer_state->conv_state = conv_state;

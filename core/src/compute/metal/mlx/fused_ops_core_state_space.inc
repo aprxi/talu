@@ -100,6 +100,10 @@ static inline void oriented_rhs_cache_clear() {
     oriented_rhs_cache_store().clear();
 }
 
+// Defined in fused_ops_attention.inc and fused_ops_ffn_expert_mix.inc.
+static inline void attention_fused_qkv_cache_clear();
+static inline void ffn_fused_gate_up_cache_clear();
+
 struct StateSpaceConvKernelCacheKey {
     const void* weight_handle = nullptr;
     int d_conv = 0;
@@ -259,6 +263,8 @@ static inline array orient_matmul_rhs_cached(
         throw std::invalid_argument("[dense] weight orientation incompatible with matmul shape");
     }
 
+    // Materialize once so cached transforms do not get re-lowered per decode token.
+    eval(rhs);
     auto [inserted_it, _] = cache.emplace(key, rhs);
     return inserted_it->second;
 }
@@ -269,6 +275,8 @@ void mlx_weight_transform_cache_clear() {
     causal_conv_kernel_cache_clear();
     causal_conv_bias_cache_clear();
     bias_cast_cache_clear();
+    attention_fused_qkv_cache_clear();
+    ffn_fused_gate_up_cache_clear();
 }
 
 static array gelu_approx(const array& x) {
@@ -298,6 +306,49 @@ static array layer_norm_last_dim(
     return normed * weight + bias;
 }
 
+static array matmul_lastdim(
+    const array& input,
+    const array& rhs
+) {
+    if (rhs.ndim() != 2) {
+        throw std::invalid_argument("[dense] matmul rhs must be rank-2");
+    }
+    const array input_for_matmul = (input.dtype() == rhs.dtype()) ? input : astype(input, rhs.dtype());
+
+    if (input_for_matmul.ndim() < 2) {
+        throw std::invalid_argument("[dense] matmul input rank must be >=2");
+    }
+
+    const int in_features = input_for_matmul.shape(input_for_matmul.ndim() - 1);
+    if (rhs.shape(0) != in_features) {
+        throw std::invalid_argument("[dense] matmul rhs/input feature mismatch");
+    }
+
+    if (input_for_matmul.ndim() == 2) {
+        return matmul(input_for_matmul, rhs);
+    }
+
+    Shape out_shape = input_for_matmul.shape();
+    out_shape.back() = rhs.shape(1);
+
+    int rows = 1;
+    for (int axis = 0; axis < input_for_matmul.ndim() - 1; ++axis) {
+        rows *= input_for_matmul.shape(axis);
+    }
+
+    // Decode hot path: [1, 1, D] @ [D, O]. Prefer matvec dispatch when the
+    // flattened row count is one to reduce per-token launch overhead.
+    if (rows == 1) {
+        auto input_vec = reshape(input_for_matmul, {in_features});
+        auto out_vec = matmul(input_vec, rhs);
+        return reshape(out_vec, out_shape);
+    }
+
+    auto input_2d = reshape(input_for_matmul, {rows, in_features});
+    auto out_2d = matmul(input_2d, rhs);
+    return reshape(out_2d, out_shape);
+}
+
 static array linear_bf16_with_bias(
     const array& input,
     const array& weight,
@@ -307,7 +358,7 @@ static array linear_bf16_with_bias(
 ) {
     const int in_features = input.shape(input.ndim() - 1);
     const auto rhs = orient_matmul_rhs_cached(weight_handle, weight, in_features, out_features, true);
-    return matmul(input, rhs) + bias;
+    return matmul_lastdim(input, rhs) + bias;
 }
 
 static bool can_use_runtime_rope(
@@ -351,7 +402,7 @@ static array dense_linear_no_bias(
 ) {
     const int in_features = input.shape(input.ndim() - 1);
     const auto rhs = orient_matmul_rhs_cached(weight_handle, weight, in_features, out_features, true);
-    return matmul(input, rhs);
+    return matmul_lastdim(input, rhs);
 }
 
 static array quantized_linear_no_bias(
@@ -430,6 +481,7 @@ static array resolve_state_space_conv_kernel(
     }
 
     array kernel = resolve_state_space_conv_kernel_uncached(conv_weight, d_conv, xbc_len);
+    eval(kernel);
     auto [inserted_it, _] = cache.emplace(key, kernel);
     return inserted_it->second;
 }
@@ -483,6 +535,7 @@ static array resolve_causal_conv_kernel(
     }
 
     array kernel = uncached();
+    eval(kernel);
     auto [inserted_it, _] = cache.emplace(key, kernel);
     return inserted_it->second;
 }
@@ -522,6 +575,7 @@ static std::optional<array> resolve_causal_conv_bias_row(
     }
 
     array bias_row = uncached();
+    eval(bias_row);
     auto [inserted_it, _] = cache.emplace(key, bias_row);
     return std::optional<array>(inserted_it->second);
 }
@@ -552,6 +606,7 @@ static array cast_bias_cached(
     }
 
     array casted = astype(bias, target_dtype);
+    eval(casted);
     auto [inserted_it, _] = cache.emplace(key, casted);
     return inserted_it->second;
 }

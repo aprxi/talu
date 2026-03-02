@@ -1,7 +1,7 @@
 //! Shared test fixtures for the server integration tests.
 
 use std::io::{BufRead, BufReader, Read, Write};
-use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
@@ -54,15 +54,13 @@ pub struct ServerTestContext {
 impl ServerTestContext {
     pub fn new(config: ServerConfig) -> Self {
         let temp_dir = TempDir::new().expect("temp dir");
-        let port = pick_free_port();
-        let addr = SocketAddr::from(([127, 0, 0, 1], port));
         let socket_path = temp_dir.path().join("talu.sock");
 
         let mut command = Command::new(talu_bin_path());
         command
             .arg("serve")
             .arg("--port")
-            .arg(port.to_string())
+            .arg("0") // OS-assigned port — no TOCTOU race
             .arg("--socket")
             .arg(&socket_path)
             .stdin(Stdio::null())
@@ -116,7 +114,7 @@ impl ServerTestContext {
             spawn_reader(stderr, tx.clone());
         }
 
-        wait_for_ready(&rx, &mut child, addr);
+        let addr = wait_for_ready(&rx, &mut child);
 
         Self {
             _temp_dir: temp_dir,
@@ -323,6 +321,14 @@ pub fn send_request(
             Ok(n) => {
                 eprintln!("[DEBUG] Read {n} bytes");
                 raw.extend_from_slice(&buf[..n]);
+                // WebSocket 101 has no body — stop after headers.
+                if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&raw[..pos]);
+                    if head.contains("101") {
+                        eprintln!("[DEBUG] WebSocket 101 upgrade — done");
+                        break;
+                    }
+                }
             }
             Err(e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -415,13 +421,6 @@ fn write_tenant_config(dir: &Path, tenants: &[TenantSpec]) -> PathBuf {
     path
 }
 
-fn pick_free_port() -> u16 {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
-    let port = listener.local_addr().expect("addr").port();
-    drop(listener);
-    port
-}
-
 fn spawn_reader<R>(reader: R, tx: mpsc::Sender<String>)
 where
     R: Read + Send + 'static,
@@ -435,8 +434,9 @@ where
     });
 }
 
-fn wait_for_ready(rx: &Receiver<String>, child: &mut Child, addr: SocketAddr) {
-    let marker = format!("TCP listener bound at {addr}");
+/// Wait for the server to log its bound address and return the parsed SocketAddr.
+fn wait_for_ready(rx: &Receiver<String>, child: &mut Child) -> SocketAddr {
+    let marker = "TCP listener bound at ";
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut logs = Vec::new();
 
@@ -452,11 +452,15 @@ fn wait_for_ready(rx: &Receiver<String>, child: &mut Child, addr: SocketAddr) {
 
         match rx.recv_timeout(timeout) {
             Ok(line) => {
-                if line.contains(&marker) {
+                if let Some(addr_str) = line.find(marker).map(|i| &line[i + marker.len()..]) {
+                    let addr: SocketAddr = addr_str
+                        .trim()
+                        .parse()
+                        .unwrap_or_else(|e| panic!("bad addr in log: {addr_str:?}: {e}"));
                     eprintln!("[DEBUG] Server ready at {addr}");
                     // Small delay to ensure server is fully ready to accept connections
                     std::thread::sleep(Duration::from_millis(50));
-                    return;
+                    return addr;
                 }
                 logs.push(line);
             }
