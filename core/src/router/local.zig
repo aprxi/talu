@@ -48,6 +48,8 @@ const tool_schema_mod = @import("tool_schema.zig");
 const reasoning_parser_mod = responses_mod.reasoning_parser;
 const commit_mod = @import("commit.zig");
 const progress_mod = @import("../capi/progress.zig");
+const runtime_contract = inference.runtime_contract;
+const opcode_map = models.plan.opcode_map;
 
 pub const ResolutionConfig = io.repository.ResolutionConfig;
 pub const BackendInitOptions = backend_root.InitOptions;
@@ -252,6 +254,47 @@ pub const LocalEngine = struct {
 
     /// Path to the model directory.
     model_path: []const u8,
+    /// Plan-derived descriptor contract for scheduler state allocation.
+    scheduler_state_descriptors: []runtime_contract.StateDescriptor,
+
+    fn appendProgramStateDescriptors(
+        storage: []runtime_contract.StateDescriptor,
+        count: *u8,
+        program: []const models.layer_ops.LayerOp,
+    ) !void {
+        for (program) |op| {
+            const opcode = opcode_map.opcodeForLayerOp(op);
+            const state_id = runtime_contract.stateBlockIdForOpcode(opcode) orelse continue;
+            try runtime_contract.appendUniqueStateDescriptor(
+                storage,
+                count,
+                runtime_contract.descriptorForStateId(state_id),
+            );
+        }
+    }
+
+    fn collectSchedulerStateDescriptors(
+        allocator: std.mem.Allocator,
+        loaded_model: *const models.LoadedModel,
+    ) ![]runtime_contract.StateDescriptor {
+        const arch_id = loaded_model.runtime.architecture_id orelse return error.UnsupportedModel;
+        const entry = models.registry.detectByArchitectureId(arch_id) orelse return error.UnsupportedModel;
+        var storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined;
+        var count: u8 = 0;
+
+        for (loaded_model.blocks) |layer| {
+            const program = models.registry.blockProgramFor(entry, layer.block_type) orelse continue;
+            try appendProgramStateDescriptors(storage[0..], &count, program);
+        }
+        if (models.registry.visionProgramByArchitectureId(entry.id)) |program| {
+            try appendProgramStateDescriptors(storage[0..], &count, program);
+        }
+        if (count == 0) return &.{};
+
+        const descriptors = try allocator.alloc(runtime_contract.StateDescriptor, count);
+        @memcpy(descriptors, storage[0..count]);
+        return descriptors;
+    }
 
     /// Initialize engine from a model path or model ID.
     ///
@@ -399,6 +442,8 @@ pub const LocalEngine = struct {
         // Create backend (progress bar emitted from buildBlocks inside)
         var compute_backend = try Backend.init(allocator, loaded_model, backend_init_options, progress);
         errdefer compute_backend.deinit();
+        const scheduler_state_descriptors = try collectSchedulerStateDescriptors(allocator, loaded_model);
+        errdefer if (scheduler_state_descriptors.len > 0) allocator.free(scheduler_state_descriptors);
 
         {
             const now = std.time.nanoTimestamp();
@@ -426,6 +471,7 @@ pub const LocalEngine = struct {
             .gen_config = generation_config,
             .preproc_config = preproc_config,
             .model_path = resolved_model_path,
+            .scheduler_state_descriptors = scheduler_state_descriptors,
         };
     }
 
@@ -438,6 +484,7 @@ pub const LocalEngine = struct {
         self.tok.deinit();
         self.gen_config.deinit(self.allocator);
         self.allocator.free(self.model_path);
+        if (self.scheduler_state_descriptors.len > 0) self.allocator.free(self.scheduler_state_descriptors);
         self.* = undefined;
     }
 
@@ -729,6 +776,7 @@ pub const LocalEngine = struct {
             .default_eos_token_ids = self.gen_config.eos_token_ids,
             .default_sampling = sampling_config,
             .tokenizer = &self.tok,
+            .state_descriptors = self.scheduler_state_descriptors,
         });
         defer scheduler.deinit();
 
@@ -1297,6 +1345,7 @@ pub const LocalEngine = struct {
         var scheduler = try BackendScheduler.init(self.allocator, &self.backend, .{
             .default_eos_token_ids = config.eos_token_ids,
             .default_sampling = config.sampling,
+            .state_descriptors = self.scheduler_state_descriptors,
         });
         defer scheduler.deinit();
 
@@ -1383,6 +1432,9 @@ pub const LocalEngine = struct {
         var merged_config = config;
         if (merged_config.default_eos_token_ids.len == 0) {
             merged_config.default_eos_token_ids = self.gen_config.eos_token_ids;
+        }
+        if (merged_config.state_descriptors.len == 0) {
+            merged_config.state_descriptors = self.scheduler_state_descriptors;
         }
 
         return BackendScheduler.init(self.allocator, &self.backend, merged_config);

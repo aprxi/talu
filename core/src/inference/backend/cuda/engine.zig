@@ -1043,14 +1043,6 @@ const BlockRuntime = struct {
                         allocator.free(blocks[layer_idx].slot_width_hints);
                         blocks[layer_idx].slot_width_hints = &.{};
                     };
-                    const state_flags = try runtime_contract.collectBuiltinStateFlags(&blocks[layer_idx].compiled_plan.?.plan);
-                    if (state_flags.has_mamba or state_flags.has_shortconv) return error.InvalidStateDescriptorBinding;
-                    if (!state_flags.has_kv) {
-                        log.warn("inference", "CUDA block runtime missing KV state descriptor", .{
-                            .layer = layer_idx,
-                        });
-                        return error.UnsupportedModel;
-                    }
                     if (attn.mla_config != null) {
                         log.warn("inference", "CUDA block runtime MLA not supported yet", .{ .layer = layer_idx });
                         return error.UnsupportedModel;
@@ -1408,14 +1400,6 @@ const BlockRuntime = struct {
                         allocator.free(blocks[layer_idx].slot_width_hints);
                         blocks[layer_idx].slot_width_hints = &.{};
                     };
-                    const state_flags = try runtime_contract.collectBuiltinStateFlags(&blocks[layer_idx].compiled_plan.?.plan);
-                    if (state_flags.has_kv or state_flags.has_mamba) return error.InvalidStateDescriptorBinding;
-                    if (!state_flags.has_shortconv) {
-                        log.warn("inference", "CUDA shortconv runtime missing state descriptor", .{
-                            .layer = layer_idx,
-                        });
-                        return error.UnsupportedModel;
-                    }
                     if (shortconv.fused_gate_up != null) {
                         log.warn("inference", "CUDA block runtime fused shortconv gate_up not supported yet", .{
                             .layer = layer_idx,
@@ -1797,16 +1781,11 @@ pub const CudaBackend = struct {
     slot_position: usize = 0,
     slot_rope_position_delta: isize = 0,
     slot_logits: []f32,
-    state_descriptors_storage: [3]runtime_contract.StateDescriptor = .{
-        runtime_contract.defaultStateDescriptor(.kv_cache),
-        runtime_contract.defaultStateDescriptor(.shortconv),
-        runtime_contract.defaultStateDescriptor(.mamba),
-    },
+    state_descriptors_storage: [runtime_contract.max_state_descriptors]runtime_contract.StateDescriptor = undefined,
     state_descriptor_count: u8 = 0,
-    slot_state_blocks: [3]runtime_contract.StateBlockHandle = undefined,
+    slot_state_blocks: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined,
     slot_state_block_count: u8 = 0,
     slot_state_bound: bool = false,
-    implicit_slot_state_storage: [3][64]u8 align(64) = [_][64]u8{[_]u8{0} ** 64} ** 3,
     runtime_dispatch_counters: runtime_contract.DispatchCounters = .{},
     layer_program_dispatch_total: [256]u64 = [_]u64{0} ** 256,
     prefill_dispatch_window_start: [256]u64 = [_]u64{0} ** 256,
@@ -1840,16 +1819,11 @@ pub const CudaBackend = struct {
             .attention_scale = 0.0,
             .norm_eps = prototype_eps,
             .slot_logits = undefined,
-            .state_descriptors_storage = .{
-                runtime_contract.defaultStateDescriptor(.kv_cache),
-                runtime_contract.defaultStateDescriptor(.shortconv),
-                runtime_contract.defaultStateDescriptor(.mamba),
-            },
+            .state_descriptors_storage = undefined,
             .state_descriptor_count = 0,
             .slot_state_blocks = undefined,
             .slot_state_block_count = 0,
             .slot_state_bound = false,
-            .implicit_slot_state_storage = [_][64]u8{[_]u8{0} ** 64} ** 3,
             .runtime_dispatch_counters = .{},
             .layer_program_dispatch_total = [_]u64{0} ** 256,
             .prefill_dispatch_window_start = [_]u64{0} ** 256,
@@ -1900,25 +1874,6 @@ pub const CudaBackend = struct {
                     &compiled_plan.plan,
                 );
             }
-        }
-        const descriptor_slice = backend.state_descriptors_storage[0..backend.state_descriptor_count];
-        const has_kv_descriptor = runtime_contract.stateDescriptorIndex(
-            descriptor_slice,
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-        ) != null;
-        const has_shortconv_descriptor = runtime_contract.stateDescriptorIndex(
-            descriptor_slice,
-            @intFromEnum(runtime_contract.StateBlockId.shortconv),
-        ) != null;
-        const has_mamba_descriptor = runtime_contract.stateDescriptorIndex(
-            descriptor_slice,
-            @intFromEnum(runtime_contract.StateBlockId.mamba),
-        ) != null;
-        if (has_kv_descriptor != (backend.block_runtime.attention_block_count > 0) or
-            has_shortconv_descriptor != (backend.block_runtime.shortconv_block_count > 0) or
-            has_mamba_descriptor)
-        {
-            return error.InvalidStateDescriptorBinding;
         }
         backend.vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (backend.vision_runtime) |*rt| rt.deinit();
@@ -2173,7 +2128,7 @@ pub const CudaBackend = struct {
     }
 
     pub fn prefill(self: *CudaBackend, tokens: []const u32, logits_out: []f32) !void {
-        try self.bindImplicitSlot0StateBlocks();
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
         return prefill_mod.prefill(self, tokens, logits_out);
     }
 
@@ -2246,6 +2201,14 @@ pub const CudaBackend = struct {
             });
             return error.InvalidStateDescriptorBinding;
         }
+        const runtime_ptr: *anyopaque = @ptrCast(&self.block_runtime);
+        const state_view = runtime_contract.CompatibilityStateView{
+            .kv_cache = runtime_ptr,
+            .shortconv_state = runtime_ptr,
+            .mamba_state = runtime_ptr,
+            .runtime_state = runtime_ptr,
+        };
+        try runtime_contract.validateCompatibilityStateViewForDescriptors(self.stateDescriptors(), &state_view);
         for (self.stateDescriptors(), 0..) |descriptor, idx| {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 log.warn("inference", "CUDA bindSlotStateBlocks missing descriptor state id", .{
@@ -2254,43 +2217,18 @@ pub const CudaBackend = struct {
                 });
                 return error.InvalidStateDescriptorBinding;
             };
-            if (incoming.align_bytes < @alignOf(runtime_contract.OpaqueStateRef)) {
-                log.warn("inference", "CUDA bindSlotStateBlocks alignment too small", .{
+            runtime_contract.writeCompatibilityStateViewToBlock(incoming, &state_view) catch |err| {
+                log.warn("inference", "CUDA bindSlotStateBlocks state view write failed", .{
                     .slot_index = slot_index,
                     .state_id = descriptor.id,
-                    .incoming_align = incoming.align_bytes,
-                    .required_align = @as(u16, @alignOf(runtime_contract.OpaqueStateRef)),
+                    .reason = @errorName(err),
                 });
-                return error.InvalidStateDescriptorBinding;
-            }
-            if (incoming.size < @sizeOf(runtime_contract.OpaqueStateRef)) {
-                log.warn("inference", "CUDA bindSlotStateBlocks size too small", .{
-                    .slot_index = slot_index,
-                    .state_id = descriptor.id,
-                    .incoming_size = incoming.size,
-                    .required_size = @as(u64, @sizeOf(runtime_contract.OpaqueStateRef)),
-                });
-                return error.InvalidStateDescriptorBinding;
-            }
-            const resolved_ptr: *anyopaque = switch (descriptor.id) {
-                @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-                @intFromEnum(runtime_contract.StateBlockId.shortconv),
-                @intFromEnum(runtime_contract.StateBlockId.mamba),
-                => @ptrCast(&self.block_runtime),
-                else => {
-                    log.warn("inference", "CUDA bindSlotStateBlocks unknown state id", .{
-                        .slot_index = slot_index,
-                        .state_id = descriptor.id,
-                    });
-                    return error.InvalidStateDescriptorBinding;
-                },
+                return err;
             };
-            const state_ref: *runtime_contract.OpaqueStateRef = @ptrCast(@alignCast(incoming.ptr));
-            state_ref.* = .{ .ptr = resolved_ptr };
             self.slot_state_blocks[idx] = .{
                 .id = descriptor.id,
                 .ptr = incoming.ptr,
-                .size = if (descriptor.size_bytes == 0) incoming.size else descriptor.size_bytes,
+                .size = descriptor.size_bytes,
                 .align_bytes = incoming.align_bytes,
             };
         }
@@ -2311,42 +2249,11 @@ pub const CudaBackend = struct {
     pub fn ensureSlotStateBlocksBoundForScheduler(self: *CudaBackend, slot_index: usize) !void {
         if (slot_index != 0) return error.InvalidArgument;
         if (self.state_descriptor_count == 0) return;
-        if (!self.slot_state_bound) {
-            // Recover eagerly to keep scheduler and direct-call paths on the same
-            // state-descriptor execution model. This avoids transient unbound-slot
-            // failures while preserving strict descriptor validation below.
-            log.warn("inference", "CUDA slot state blocks were unbound at scheduler boundary; rebinding implicit slot0 blocks", .{
-                .slot_index = slot_index,
-                .state_descriptors = self.state_descriptor_count,
-            });
-            try self.bindImplicitSlot0StateBlocks();
-        }
+        if (!self.slot_state_bound) return error.InvalidStateDescriptorBinding;
         try runtime_contract.validateStateBlocksForDescriptors(
             self.stateDescriptors(),
             self.slotStateBlocks(),
         );
-    }
-
-    fn bindImplicitSlot0StateBlocks(self: *CudaBackend) !void {
-        if (self.state_descriptor_count == 0 or self.slot_state_bound) return;
-        const descriptors = self.stateDescriptors();
-        var handles: [3]runtime_contract.StateBlockHandle = undefined;
-        for (descriptors, 0..) |descriptor, idx| {
-            const size_bytes = if (descriptor.size_bytes == 0)
-                @as(u64, @sizeOf(runtime_contract.OpaqueStateRef))
-            else
-                descriptor.size_bytes;
-            const implicit_capacity = @as(u64, @intCast(self.implicit_slot_state_storage[idx].len));
-            if (size_bytes > implicit_capacity) return error.InvalidStateDescriptorBinding;
-            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
-            handles[idx] = .{
-                .id = descriptor.id,
-                .ptr = @ptrCast(&self.implicit_slot_state_storage[idx][0]),
-                .size = size_bytes,
-                .align_bytes = 64,
-            };
-        }
-        try self.bindSlotStateBlocks(0, handles[0..descriptors.len]);
     }
 
     pub fn prefillSlot(
@@ -3685,11 +3592,15 @@ pub const CudaBackend = struct {
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !*BlockRuntimeLayer {
         const state_id = insn.state_block_id orelse return ctx.layer;
-        const runtime_ptr = runtime_contract.findStateValue(
-            *BlockRuntime,
+        const state_view = runtime_contract.findStateValue(
+            *const runtime_contract.CompatibilityStateView,
             state_blocks,
             state_id,
         ) orelse return error.InvalidStateDescriptorBinding;
+        const raw_runtime = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const runtime_ptr: *BlockRuntime = @ptrCast(@alignCast(raw_runtime));
         if (ctx.layer_index >= runtime_ptr.blocks.len) return error.InvalidStateDescriptorBinding;
         return &runtime_ptr.blocks[ctx.layer_index];
     }

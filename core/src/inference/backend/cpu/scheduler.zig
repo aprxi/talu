@@ -140,6 +140,8 @@ pub const SchedulerConfig = struct {
     priority_scheduling: bool = false,
     /// Optional tokenizer for grammar-constrained sampling.
     tokenizer: ?*tokenizer_mod.Tokenizer = null,
+    /// Plan-owned state descriptor contract for scheduler allocation.
+    state_descriptors: []const runtime_contract.StateDescriptor = &.{},
 };
 
 /// Continuous batching scheduler.
@@ -153,7 +155,6 @@ pub const SchedulerConfig = struct {
 /// - `vocabSize(*const T) usize` - vocabulary size for logits
 /// - `allocSlot(*T) ?usize` - allocate a slot, returns null if full
 /// - `freeSlot(*T, usize) void` - release a slot
-/// - `stateDescriptors(*const T) []const runtime_contract.StateDescriptor` - per-slot state requirements
 /// - `bindSlotStateBlocks(*T, usize, []const runtime_contract.StateBlockHandle) !void` - bind opaque slot state
 /// - `unbindSlotStateBlocks(*T, usize) void` - unbind opaque slot state
 /// - `prefillSlot(*T, usize, []const u32, []f32) !void` - prefill
@@ -195,6 +196,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
         sampler: sampling.Sampler,
         /// Scheduler-owned opaque state blocks per active request.
         request_state_blocks: std.AutoHashMap(u64, RequestStateBlocks),
+        /// Scheduler-owned slot-persistent state blocks keyed by slot index.
+        slot_state_blocks: std.AutoHashMap(usize, RequestStateBlocks),
+        /// Immutable descriptor set for this scheduler instance.
+        state_descriptors: []runtime_contract.StateDescriptor,
+        /// Slot-persistent descriptors (subset of state_descriptors).
+        slot_persistent_descs: []runtime_contract.StateDescriptor,
+        /// Non-persistent descriptors: request_scoped + step_scoped (subset of state_descriptors).
+        non_persistent_descs: []runtime_contract.StateDescriptor,
 
         const StateBlockStorage = struct {
             bytes: []align(64) u8,
@@ -241,6 +250,31 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Allocate logits buffer for prefill
             const logits_scratch = try allocator.alloc(f32, vocab);
             errdefer allocator.free(logits_scratch);
+            const scheduler_state_descriptors = try allocator.alloc(runtime_contract.StateDescriptor, config.state_descriptors.len);
+            errdefer allocator.free(scheduler_state_descriptors);
+            @memcpy(scheduler_state_descriptors, config.state_descriptors);
+
+            // Split descriptors by lifecycle: slot_persistent vs non-persistent
+            var sp_count: usize = 0;
+            var np_count: usize = 0;
+            for (scheduler_state_descriptors) |desc| {
+                if (desc.lifecycle == .slot_persistent) sp_count += 1 else np_count += 1;
+            }
+            const sp_descs = try allocator.alloc(runtime_contract.StateDescriptor, sp_count);
+            errdefer allocator.free(sp_descs);
+            const np_descs = try allocator.alloc(runtime_contract.StateDescriptor, np_count);
+            errdefer allocator.free(np_descs);
+            var sp_idx: usize = 0;
+            var np_idx: usize = 0;
+            for (scheduler_state_descriptors) |desc| {
+                if (desc.lifecycle == .slot_persistent) {
+                    sp_descs[sp_idx] = desc;
+                    sp_idx += 1;
+                } else {
+                    np_descs[np_idx] = desc;
+                    np_idx += 1;
+                }
+            }
 
             return Self{
                 .allocator = allocator,
@@ -256,6 +290,10 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 .logits_buffer = logits_scratch,
                 .sampler = sampler_instance,
                 .request_state_blocks = std.AutoHashMap(u64, RequestStateBlocks).init(allocator),
+                .slot_state_blocks = std.AutoHashMap(usize, RequestStateBlocks).init(allocator),
+                .state_descriptors = scheduler_state_descriptors,
+                .slot_persistent_descs = sp_descs,
+                .non_persistent_descs = np_descs,
             };
         }
 
@@ -272,6 +310,14 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             }
             self.request_state_blocks.deinit();
 
+            var slot_state_iter = self.slot_state_blocks.iterator();
+            while (slot_state_iter.next()) |entry| {
+                var state_blocks = entry.value_ptr.*;
+                self.applyLifecycleActionToRequestStateBlocks(&state_blocks, .evict) catch {};
+                state_blocks.deinit(self.allocator);
+            }
+            self.slot_state_blocks.deinit();
+
             // Free all requests
             var request_iter = self.requests.valueIterator();
             while (request_iter.next()) |req_ptr| {
@@ -283,6 +329,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             self.pending_queue.deinit(self.allocator);
             self.active_requests.deinit(self.allocator);
             self.completed_queue.deinit(self.allocator);
+            self.allocator.free(self.state_descriptors);
+            self.allocator.free(self.slot_persistent_descs);
+            self.allocator.free(self.non_persistent_descs);
             self.allocator.free(self.decode_results);
             self.allocator.free(self.decode_requests);
             self.allocator.free(self.logits_buffer);
@@ -493,6 +542,13 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                 // Slots may have been freed during prefill - try to activate pending
                 try self.activatePending();
                 return &.{};
+            }
+
+            // Reset step-scoped state for all generating requests before decode
+            for (self.active_requests.items) |active_id| {
+                const req = self.requests.get(active_id) orelse continue;
+                if (req.state != .generating) continue;
+                try self.resetStepScopedBlocks(active_id);
             }
 
             // Run batched decode
@@ -730,9 +786,32 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             // Allocate slot directly (bypass request tracking)
             const slot_index = self.backend.allocSlot() orelse return error.NoSlotsAvailable;
             defer self.backend.freeSlot(slot_index);
-            var request_state_blocks = try self.allocateRequestStateBlocks();
-            defer request_state_blocks.deinit(self.allocator);
-            try self.backend.bindSlotStateBlocks(slot_index, request_state_blocks.handles);
+            // Use slot-persistent storage (same as scheduler path)
+            const sp_blocks = if (self.slot_persistent_descs.len > 0)
+                try self.slotStateBlocksForSlot(slot_index)
+            else
+                null;
+            var np_blocks = try self.allocateRequestStateBlocks();
+            defer {
+                self.applyLifecycleActionToRequestStateBlocks(&np_blocks, .evict) catch {};
+                np_blocks.deinit(self.allocator);
+            }
+            // Merge handles for binding
+            var merged: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
+            var merge_count: usize = 0;
+            if (sp_blocks) |spb| {
+                for (spb.handles) |h| {
+                    merged[merge_count] = h;
+                    merge_count += 1;
+                }
+            }
+            for (np_blocks.handles) |h| {
+                merged[merge_count] = h;
+                merge_count += 1;
+            }
+            if (merge_count > 0) {
+                try self.backend.bindSlotStateBlocks(slot_index, merged[0..merge_count]);
+            }
             defer self.backend.unbindSlotStateBlocks(slot_index);
 
             var prefill_timer = std.time.Timer.start() catch unreachable;
@@ -906,6 +985,9 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     }
                 }
 
+                // Reset step-scoped state before each decode step
+                try applyStepScopedReset(&np_blocks);
+
                 // Decode step
                 self.decode_requests[0] = .{
                     .slot_index = slot_index,
@@ -1050,15 +1132,34 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             try self.applyLifecycleActionToRequestStateBlocks(request_state_blocks, .reset);
         }
 
+        /// Reset step-scoped state blocks to zero within a RequestStateBlocks.
+        fn applyStepScopedReset(blocks: *RequestStateBlocks) !void {
+            for (blocks.descriptors, 0..) |desc, idx| {
+                if (desc.lifecycle != .step_scoped) continue;
+                const should_zero = runtime_contract.shouldZeroStateForLifecycleAction(&desc, .reset) catch |err| switch (err) {
+                    error.InvalidStateLifecycleAction => continue,
+                    else => return err,
+                };
+                if (should_zero) {
+                    @memset(blocks.storage[idx].bytes, 0);
+                }
+            }
+        }
+
+        /// Reset step-scoped state blocks to zero for a given request.
+        /// Called at each scheduler step boundary before decode.
+        fn resetStepScopedBlocks(self: *Self, request_id: u64) !void {
+            const blocks = self.request_state_blocks.getPtr(request_id) orelse return;
+            try applyStepScopedReset(blocks);
+        }
+
         fn allocateStateBlockStorage(self: *Self, descriptor: runtime_contract.StateDescriptor) !StateBlockStorage {
             if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) {
                 return error.InvalidStateDescriptorBinding;
             }
             const descriptor_size = std.math.cast(usize, descriptor.size_bytes) orelse return error.InvalidStateDescriptorBinding;
-            // Runtime state descriptors currently carry backend-owned pointers via
-            // OpaqueStateRef when size_bytes is 0 (compat mode), so storage must
-            // always fit at least one OpaqueStateRef payload.
-            const size_bytes: usize = @max(@sizeOf(runtime_contract.OpaqueStateRef), descriptor_size);
+            if (descriptor_size == 0) return error.InvalidStateDescriptorBinding;
+            const size_bytes: usize = descriptor_size;
             const bytes = try self.allocator.alignedAlloc(u8, .@"64", size_bytes);
             const should_zero_on_alloc = try runtime_contract.shouldZeroStateForLifecycleAction(&descriptor, .alloc);
             if (should_zero_on_alloc) {
@@ -1069,8 +1170,7 @@ pub fn GenericScheduler(comptime BackendType: type) type {
             };
         }
 
-        fn allocateRequestStateBlocks(self: *Self) !RequestStateBlocks {
-            const descriptors = self.backend.stateDescriptors();
+        fn allocateStateBlocksForDescriptors(self: *Self, descriptors: []const runtime_contract.StateDescriptor) !RequestStateBlocks {
             if (descriptors.len == 0) return .{};
 
             var request_state_blocks = RequestStateBlocks{};
@@ -1096,34 +1196,69 @@ pub fn GenericScheduler(comptime BackendType: type) type {
                     .id = descriptor.id,
                     .ptr = @ptrCast(storage.bytes.ptr),
                     .size = @intCast(storage.bytes.len),
-                    .align_bytes = 64,
+                    .align_bytes = descriptor.align_bytes,
                 };
                 initialized += 1;
             }
 
-            try runtime_contract.validateStateBlocksForDescriptors(
-                descriptors,
-                request_state_blocks.handles,
-            );
             return request_state_blocks;
         }
 
-        fn bindAndTrackRequestStateBlocks(self: *Self, request_id: u64, slot_index: usize) !void {
-            if (self.request_state_blocks.contains(request_id)) {
-                return error.InvalidStateDescriptorBinding;
+        /// Allocate request-owned (non-persistent) state blocks.
+        /// This keeps request-scoped and step-scoped lifecycles explicit in the scheduler contract.
+        fn allocateRequestStateBlocks(self: *Self) !RequestStateBlocks {
+            return self.allocateStateBlocksForDescriptors(self.non_persistent_descs);
+        }
+
+        fn slotStateBlocksForSlot(self: *Self, slot_index: usize) !*RequestStateBlocks {
+            const gop = try self.slot_state_blocks.getOrPut(slot_index);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = try self.allocateStateBlocksForDescriptors(self.slot_persistent_descs);
+            } else {
+                try self.applyLifecycleActionToRequestStateBlocks(gop.value_ptr, .reuse);
             }
-            var request_state_blocks = try self.allocateRequestStateBlocks();
-            errdefer request_state_blocks.deinit(self.allocator);
-            try self.backend.bindSlotStateBlocks(slot_index, request_state_blocks.handles);
-            errdefer self.backend.unbindSlotStateBlocks(slot_index);
-            try self.request_state_blocks.put(request_id, request_state_blocks);
+            return gop.value_ptr;
+        }
+
+        fn bindAndTrackRequestStateBlocks(self: *Self, request_id: u64, slot_index: usize) !void {
+            var merged: [runtime_contract.max_state_descriptors]runtime_contract.StateBlockHandle = undefined;
+            var count: usize = 0;
+
+            // 1. Get slot-persistent blocks if any exist
+            if (self.slot_persistent_descs.len > 0) {
+                const slot_blocks = try self.slotStateBlocksForSlot(slot_index);
+                for (slot_blocks.handles) |h| {
+                    merged[count] = h;
+                    count += 1;
+                }
+            }
+
+            // 2. Allocate non-persistent blocks if any exist
+            if (self.non_persistent_descs.len > 0) {
+                if (self.request_state_blocks.contains(request_id)) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+                var np_blocks = try self.allocateRequestStateBlocks();
+                errdefer np_blocks.deinit(self.allocator);
+                try self.request_state_blocks.put(request_id, np_blocks);
+                for (np_blocks.handles) |h| {
+                    merged[count] = h;
+                    count += 1;
+                }
+            }
+
+            // 3. Bind merged handles
+            if (count > 0) {
+                try self.backend.bindSlotStateBlocks(slot_index, merged[0..count]);
+            }
         }
 
         fn releaseRequestStateBlocks(self: *Self, request_id: u64, slot_index: ?usize) void {
+            if (slot_index) |slot| {
+                self.backend.unbindSlotStateBlocks(slot);
+            }
+            // Free only non-persistent blocks; slot-persistent blocks remain in slot_state_blocks
             if (self.request_state_blocks.fetchRemove(request_id)) |entry| {
-                if (slot_index) |slot| {
-                    self.backend.unbindSlotStateBlocks(slot);
-                }
                 var state_blocks = entry.value;
                 self.applyLifecycleActionToRequestStateBlocks(&state_blocks, .evict) catch {};
                 state_blocks.deinit(self.allocator);
@@ -2159,6 +2294,8 @@ const MockBackend = struct {
     last_bound_state_block_count: usize = 0,
     saw_state_blocks_valid: bool = true,
     saw_zero_init_shortconv_state: bool = false,
+    first_bound_state_ptr: ?usize = null,
+    second_bound_state_ptr: ?usize = null,
 
     const PrefillCall = struct {
         slot_index: usize,
@@ -2245,11 +2382,19 @@ const MockBackend = struct {
         slot_index: usize,
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
-        _ = slot_index;
         self.bind_slot_state_blocks_calls += 1;
         self.last_bound_state_block_count = state_blocks.len;
         try runtime_contract.validateStateBlocksForDescriptors(self.stateDescriptors(), state_blocks);
+        if (slot_index == 0 and state_blocks.len > 0) {
+            const state_ptr_value: usize = @intFromPtr(state_blocks[0].ptr);
+            if (self.first_bound_state_ptr == null) {
+                self.first_bound_state_ptr = state_ptr_value;
+            } else if (self.second_bound_state_ptr == null) {
+                self.second_bound_state_ptr = state_ptr_value;
+            }
+        }
         const descriptors = self.stateDescriptors();
+        const shortconv_id = runtime_contract.shortconv_state_id;
         for (descriptors) |descriptor| {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 self.saw_state_blocks_valid = false;
@@ -2259,7 +2404,7 @@ const MockBackend = struct {
             if (descriptor.size_bytes > 0 and incoming.size < descriptor.size_bytes) self.saw_state_blocks_valid = false;
             if (incoming.size < @sizeOf(runtime_contract.OpaqueStateRef)) self.saw_state_blocks_valid = false;
 
-            if (descriptor.id == @intFromEnum(runtime_contract.StateBlockId.shortconv) and descriptor.zero_init and incoming.size > 0) {
+            if (descriptor.id == shortconv_id and descriptor.zero_init and incoming.size > 0) {
                 const first_byte = incoming.ptr[0];
                 if (first_byte == 0) self.saw_zero_init_shortconv_state = true;
             }
@@ -3612,6 +3757,7 @@ test "Scheduler descriptor-backed state blocks are bound and validated" {
 
     var scheduler = try MockScheduler.init(alloc, &backend, .{
         .default_eos_token_ids = &[_]u32{100},
+        .state_descriptors = backend.stateDescriptors(),
     });
     defer scheduler.deinit();
 
@@ -3635,7 +3781,9 @@ test "Scheduler zero-inits shortconv descriptor state on alloc" {
         runtime_contract.defaultStateDescriptor(.shortconv),
     });
 
-    var scheduler = try MockScheduler.init(alloc, &backend, .{});
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = backend.stateDescriptors(),
+    });
     defer scheduler.deinit();
 
     const prompt = [_]u32{ 7, 8, 9 };
@@ -3643,6 +3791,111 @@ test "Scheduler zero-inits shortconv descriptor state on alloc" {
     _ = try scheduler.step();
 
     try std.testing.expect(backend.saw_zero_init_shortconv_state);
+}
+
+test "Scheduler reuses slot-persistent state blocks across sequential requests on the same slot" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 1);
+    defer backend.deinit();
+    backend.setStateDescriptors(&.{
+        runtime_contract.defaultStateDescriptor(.shortconv),
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = backend.stateDescriptors(),
+    });
+    defer scheduler.deinit();
+
+    const prompt_a = [_]u32{ 1, 2, 3 };
+    _ = try scheduler.submit(&prompt_a, 1, null);
+    _ = try scheduler.step();
+
+    const prompt_b = [_]u32{ 4, 5, 6 };
+    _ = try scheduler.submit(&prompt_b, 1, null);
+    _ = try scheduler.step();
+
+    try std.testing.expectEqual(@as(usize, 1), scheduler.slot_state_blocks.count());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.request_state_blocks.count());
+    try std.testing.expect(backend.first_bound_state_ptr != null);
+    try std.testing.expect(backend.second_bound_state_ptr != null);
+    try std.testing.expectEqual(backend.first_bound_state_ptr.?, backend.second_bound_state_ptr.?);
+}
+
+test "Scheduler frees request-scoped state blocks at request teardown" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 1);
+    defer backend.deinit();
+    backend.setStateDescriptors(&.{
+        .{
+            .id = 99,
+            .size_bytes = 64,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .request_scoped,
+        },
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = backend.stateDescriptors(),
+    });
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 7, 8, 9 };
+    _ = try scheduler.submit(&prompt, 1, null);
+    _ = try scheduler.step();
+
+    try std.testing.expectEqual(@as(usize, 0), scheduler.slot_state_blocks.count());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.request_state_blocks.count());
+}
+
+test "Scheduler rejects descriptor alignment above 64" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 2);
+    defer backend.deinit();
+    backend.setStateDescriptors(&.{
+        .{
+            .id = @intFromEnum(runtime_contract.StateBlockId.shortconv),
+            .size_bytes = 64,
+            .align_bytes = 128,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+        },
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = backend.stateDescriptors(),
+    });
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    _ = try scheduler.submit(&prompt, 1, null);
+
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, scheduler.step());
+}
+
+test "Scheduler rejects descriptor size that cannot fit host usize" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 2);
+    defer backend.deinit();
+    backend.setStateDescriptors(&.{
+        .{
+            .id = @intFromEnum(runtime_contract.StateBlockId.shortconv),
+            .size_bytes = std.math.maxInt(u64),
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .slot_persistent,
+        },
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = backend.stateDescriptors(),
+    });
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 4, 5, 6 };
+    _ = try scheduler.submit(&prompt, 1, null);
+
+    try std.testing.expectError(error.InvalidStateDescriptorBinding, scheduler.step());
 }
 
 test "generateSync single-request route - EOS detection" {
@@ -3794,4 +4047,95 @@ test "generateSync single-request route - seed produces deterministic output" {
 
     // Same seed must produce same tokens (fundamental determinism invariant)
     try std.testing.expectEqualSlices(u32, result1.tokens, result2.tokens);
+}
+
+test "Scheduler mixed lifecycle: slot-persistent stable, request-scoped freed between requests" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 1);
+    defer backend.deinit();
+    // Mixed descriptor set: 1 slot_persistent + 1 request_scoped
+    backend.setStateDescriptors(&.{
+        runtime_contract.defaultStateDescriptor(.shortconv),
+        .{
+            .id = 99,
+            .size_bytes = 64,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .request_scoped,
+        },
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = backend.stateDescriptors(),
+    });
+    defer scheduler.deinit();
+
+    // First request
+    const prompt_a = [_]u32{ 1, 2, 3 };
+    _ = try scheduler.submit(&prompt_a, 1, null);
+    _ = try scheduler.step();
+
+    // After first request completes: slot-persistent blocks remain, request-scoped freed
+    try std.testing.expectEqual(@as(usize, 1), scheduler.slot_state_blocks.count());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.request_state_blocks.count());
+
+    // Second request on same slot
+    const prompt_b = [_]u32{ 4, 5, 6 };
+    _ = try scheduler.submit(&prompt_b, 1, null);
+    _ = try scheduler.step();
+
+    // Slot-persistent ptr must be stable across requests
+    try std.testing.expectEqual(@as(usize, 1), scheduler.slot_state_blocks.count());
+    try std.testing.expectEqual(@as(usize, 0), scheduler.request_state_blocks.count());
+    try std.testing.expect(backend.first_bound_state_ptr != null);
+    try std.testing.expect(backend.second_bound_state_ptr != null);
+    try std.testing.expectEqual(backend.first_bound_state_ptr.?, backend.second_bound_state_ptr.?);
+}
+
+test "Scheduler step-scoped state blocks are zeroed at each step boundary" {
+    const alloc = std.testing.allocator;
+    var backend = try MockBackend.init(alloc, 1000, 1);
+    defer backend.deinit();
+    // step_scoped descriptor only
+    backend.setStateDescriptors(&.{
+        .{
+            .id = 50,
+            .size_bytes = 64,
+            .align_bytes = 64,
+            .zero_init = true,
+            .lifecycle = .step_scoped,
+        },
+    });
+
+    var scheduler = try MockScheduler.init(alloc, &backend, .{
+        .state_descriptors = backend.stateDescriptors(),
+        .default_eos_token_ids = &[_]u32{},
+    });
+    defer scheduler.deinit();
+
+    const prompt = [_]u32{ 1, 2, 3 };
+    _ = try scheduler.submit(&prompt, 5, null);
+
+    // First step: prefills + generates first token
+    _ = try scheduler.step();
+
+    // Verify step_scoped block exists in request_state_blocks
+    try std.testing.expectEqual(@as(usize, 1), scheduler.request_state_blocks.count());
+
+    // Write non-zero bytes into the step_scoped block
+    var iter = scheduler.request_state_blocks.valueIterator();
+    const blocks = iter.next().?;
+    try std.testing.expectEqual(@as(usize, 1), blocks.storage.len);
+    @memset(blocks.storage[0].bytes, 0xAA);
+
+    // Second step: should zero the step_scoped block before decode
+    _ = try scheduler.step();
+
+    // Verify the block was zeroed by resetStepScopedBlocks
+    var iter2 = scheduler.request_state_blocks.valueIterator();
+    if (iter2.next()) |blocks2| {
+        for (blocks2.storage[0].bytes) |byte| {
+            try std.testing.expectEqual(@as(u8, 0), byte);
+        }
+    }
 }

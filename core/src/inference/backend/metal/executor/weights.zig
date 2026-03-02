@@ -1003,7 +1003,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     for (weight_handles.layers) |layer| {
         if (layer.compiled_plan == null) continue;
         const plan = &layer.compiled_plan.?.plan;
-        const state_flags = try runtime_contract.collectBuiltinStateFlags(plan);
+        const state_flags = runtime_contract.collectBuiltinStateFlags(plan);
         if (state_flags.has_kv) weight_handles.state_flags.has_kv = true;
         if (state_flags.has_shortconv) weight_handles.state_flags.has_shortconv = true;
         if (state_flags.has_mamba) weight_handles.state_flags.has_mamba = true;
