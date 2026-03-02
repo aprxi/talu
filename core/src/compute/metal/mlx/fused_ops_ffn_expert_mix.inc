@@ -2,6 +2,79 @@
 // Fused FFN Block (BFloat16 - non-quantized)
 // ============================================================================
 
+static constexpr size_t kFfnFusedGateUpCacheMaxEntries = 2048;
+
+struct FfnFusedGateUpCacheKey {
+    const void* gate_weight = nullptr;
+    const void* up_weight = nullptr;
+    int in_features = 0;
+    int d_ff = 0;
+
+    bool operator==(const FfnFusedGateUpCacheKey& other) const {
+        return gate_weight == other.gate_weight &&
+               up_weight == other.up_weight &&
+               in_features == other.in_features &&
+               d_ff == other.d_ff;
+    }
+};
+
+struct FfnFusedGateUpCacheKeyHash {
+    size_t operator()(const FfnFusedGateUpCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.gate_weight);
+        h ^= std::hash<const void*>{}(key.up_weight) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.in_features) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.d_ff) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<FfnFusedGateUpCacheKey, array, FfnFusedGateUpCacheKeyHash>& ffn_fused_gate_up_cache_store() {
+    static thread_local std::unordered_map<FfnFusedGateUpCacheKey, array, FfnFusedGateUpCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void ffn_fused_gate_up_cache_clear() {
+    ffn_fused_gate_up_cache_store().clear();
+}
+
+static inline array ffn_fused_gate_up_rhs_cached(
+    const void* gate_w,
+    const void* up_w,
+    const array& gate_weight,
+    const array& up_weight,
+    int in_features
+) {
+    auto gate_wt = orient_matmul_rhs_cached(gate_w, gate_weight, in_features, std::nullopt, true);
+    const int d_ff = gate_wt.shape(1);
+    auto up_wt = orient_matmul_rhs_cached(up_w, up_weight, in_features, d_ff, true);
+
+    if (gate_w == nullptr || up_w == nullptr) {
+        return contiguous(concatenate({gate_wt, up_wt}, 1));
+    }
+
+    auto& cache = ffn_fused_gate_up_cache_store();
+    if (cache.size() >= kFfnFusedGateUpCacheMaxEntries) {
+        cache.clear();
+    }
+
+    FfnFusedGateUpCacheKey key{
+        gate_w,
+        up_w,
+        in_features,
+        d_ff,
+    };
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    auto fused = contiguous(concatenate({gate_wt, up_wt}, 1));
+    // Materialize once so cached fused FFN projection weights remain concrete.
+    eval(fused);
+    auto [inserted, _] = cache.emplace(key, std::move(fused));
+    return inserted->second;
+}
+
 void* mlx_lazy_fused_ffn_bf16(
     const void* input,
     const void* gate_w, const void* up_w, const void* down_w
@@ -9,14 +82,20 @@ void* mlx_lazy_fused_ffn_bf16(
     const auto& x = *static_cast<const array*>(input);
     const int in_features = x.shape(2);
 
-    auto gate_wt = orient_matmul_rhs_cached(gate_w, *static_cast<const array*>(gate_w), in_features, std::nullopt, true);
-    auto up_wt = orient_matmul_rhs_cached(up_w, *static_cast<const array*>(up_w), in_features, gate_wt.shape(1), true);
+    const auto& gate_weight = *static_cast<const array*>(gate_w);
+    const auto& up_weight = *static_cast<const array*>(up_w);
+    auto gate_wt = orient_matmul_rhs_cached(gate_w, gate_weight, in_features, std::nullopt, true);
+    const int d_ff = gate_wt.shape(1);
+    auto gate_up_wt = ffn_fused_gate_up_rhs_cached(gate_w, up_w, gate_weight, up_weight, in_features);
     auto down_wt = orient_matmul_rhs_cached(down_w, *static_cast<const array*>(down_w), gate_wt.shape(1), in_features, true);
 
-    auto gate = matmul(x, gate_wt);
-    auto up = matmul(x, up_wt);
+    auto gate_up = matmul_lastdim(x, gate_up_wt);
+    const int batch_size = x.shape(0);
+    const int seq_len = x.shape(1);
+    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, d_ff});
+    auto up = slice(gate_up, {0, 0, d_ff}, {batch_size, seq_len, 2 * d_ff});
     auto mid = (gate * sigmoid(gate)) * up;
-    auto out = matmul(mid, down_wt);
+    auto out = matmul_lastdim(mid, down_wt);
 
     return pool_array(std::move(out));
 }

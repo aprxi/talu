@@ -66,10 +66,48 @@ void* mlx_lazy_multiply_scalar(const void* a, float scalar) {
 // Matrix Operations
 // ============================================================================
 
+static array matmul_lastdim_impl(const array& input, const array& rhs) {
+    if (rhs.ndim() != 2) {
+        throw std::invalid_argument("[matmul_lastdim] rhs must be rank-2");
+    }
+    const array input_for_matmul = (input.dtype() == rhs.dtype()) ? input : astype(input, rhs.dtype());
+
+    if (input_for_matmul.ndim() < 2) {
+        throw std::invalid_argument("[matmul_lastdim] input rank must be >=2");
+    }
+    const int in_features = input_for_matmul.shape(input_for_matmul.ndim() - 1);
+    if (rhs.shape(0) != in_features) {
+        throw std::invalid_argument("[matmul_lastdim] rhs/input feature mismatch");
+    }
+    if (input_for_matmul.ndim() == 2) {
+        return matmul(input_for_matmul, rhs);
+    }
+
+    Shape out_shape = input_for_matmul.shape();
+    out_shape.back() = rhs.shape(1);
+    int rows = 1;
+    for (int axis = 0; axis < input_for_matmul.ndim() - 1; ++axis) {
+        rows *= input_for_matmul.shape(axis);
+    }
+    // Decode hot path: [1, 1, D] @ [D, O]. Prefer matvec-style dispatch
+    // over generic GEMM flattening to reduce single-token launch overhead.
+    if (rows == 1) {
+        auto input_vec = reshape(input_for_matmul, {in_features});
+        auto out_vec = matmul(input_vec, rhs);
+        return reshape(out_vec, out_shape);
+    }
+    auto input_2d = reshape(input_for_matmul, {rows, in_features});
+    auto out_2d = matmul(input_2d, rhs);
+    return reshape(out_2d, out_shape);
+}
+
 void* mlx_lazy_matmul(const void* a, const void* b) {
     mlx_count_op();
     const auto& lhs = *static_cast<const array*>(a);
     const auto& rhs = *static_cast<const array*>(b);
+    if (rhs.ndim() == 2 && lhs.ndim() >= 2) {
+        return pool_array(matmul_lastdim_impl(lhs, rhs));
+    }
     return pool_array(matmul(lhs, rhs));
 }
 
@@ -164,13 +202,12 @@ void* mlx_persistent_transpose(const void* input, const size_t* axes, size_t ndi
     return make_owned_array(contiguous(transpose(input_arr, axes_vec)));
 }
 
-// Persistent cast to float16 - heap-allocated, survives pool resets
 void* mlx_persistent_cast_f16(const void* input) {
     const auto& input_arr = *static_cast<const array*>(input);
-    if (input_arr.dtype() == float16) {
-        return make_owned_array(contiguous(input_arr));
-    }
-    return make_owned_array(contiguous(astype(input_arr, float16)));
+    auto casted = astype(input_arr, float16);
+    // Materialize once so decode does not re-lower weight casts per token.
+    eval(casted);
+    return make_owned_array(std::move(casted));
 }
 
 void* mlx_lazy_transpose(const void* input, const size_t* axes, size_t ndim) {

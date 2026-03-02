@@ -35,6 +35,15 @@ pub const MLXError = error{
     OutOfMemory,
 };
 
+fn maybeCastDenseBf16ToF16(tensor: *const Tensor, handle: ArrayHandle) ArrayHandle {
+    // Dense BF16 matmuls are the decode hot path for non-quantized models.
+    // Cast matrix weights once at load time to hit fast f16 kernels.
+    if (tensor.dtype != .bf16 or tensor.n_dims < 2) return handle;
+    const casted = mlx_graph.mlx_persistent_cast_f16(handle);
+    mlx_graph.freeArray(handle);
+    return casted;
+}
+
 fn tensorToArray(tensor: *const Tensor) MLXError!ArrayHandle {
     const shape = tensor.shape[0..@as(usize, @intCast(tensor.n_dims))];
     switch (tensor.dtype) {
@@ -42,7 +51,8 @@ fn tensorToArray(tensor: *const Tensor) MLXError!ArrayHandle {
         .bf16 => {
             const element_count = tensor.data_size / 2;
             const data_ptr: [*]align(1) const u16 = @ptrCast(tensor.data_ptr);
-            return mlx_graph.createArrayBF16Unaligned(data_ptr, element_count, shape);
+            const bf16 = mlx_graph.createArrayBF16Unaligned(data_ptr, element_count, shape);
+            return maybeCastDenseBf16ToF16(tensor, bf16);
         },
         .f16 => {
             const element_count = tensor.data_size / 2;
@@ -74,7 +84,10 @@ fn loadNormWeight(weight: *const Tensor) MLXError!ArrayHandle {
             const element_count = weight.data_size / 2;
             const shape = [_]i64{@intCast(element_count)};
             const data_ptr: [*]align(1) const u16 = @ptrCast(weight.data_ptr);
-            return mlx_graph.createArrayBF16Unaligned(data_ptr, element_count, &shape);
+            const bf16 = mlx_graph.createArrayBF16Unaligned(data_ptr, element_count, &shape);
+            const casted = mlx_graph.mlx_persistent_cast_f16(bf16);
+            mlx_graph.freeArray(bf16);
+            return casted;
         },
         else => return error.UnsupportedDType,
     }
@@ -975,7 +988,8 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
                 .bf16 => {
                     const lm_len = lm_head_tensor.data_size / 2;
                     const lm_ptr: [*]align(1) const u16 = @ptrCast(lm_head_tensor.data_ptr);
-                    weight_handles.lm_head = mlx_graph.createArrayBF16Unaligned(lm_ptr, lm_len, lm_shape);
+                    const bf16 = mlx_graph.createArrayBF16Unaligned(lm_ptr, lm_len, lm_shape);
+                    weight_handles.lm_head = maybeCastDenseBf16ToF16(&lm_head_tensor, bf16);
                 },
                 .f16 => {
                     const lm_len = lm_head_tensor.data_size / 2;
