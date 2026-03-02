@@ -26,8 +26,8 @@ test "LocalEngine has expected fields" {
     const fields = @typeInfo(LocalEngine).@"struct".fields;
 
     // Should have allocator, loaded, tok, samp, backend, gen_config,
-    // preproc_config, model_path.
-    try std.testing.expectEqual(@as(usize, 8), fields.len);
+    // preproc_config, model_path, scheduler_state_descriptors.
+    try std.testing.expectEqual(@as(usize, 9), fields.len);
 
     var has_allocator = false;
     var has_loaded = false;
@@ -37,6 +37,7 @@ test "LocalEngine has expected fields" {
     var has_gen_config = false;
     var has_preproc_config = false;
     var has_model_path = false;
+    var has_scheduler_state_descriptors = false;
 
     inline for (fields) |field| {
         if (comptime std.mem.eql(u8, field.name, "allocator")) has_allocator = true;
@@ -47,6 +48,7 @@ test "LocalEngine has expected fields" {
         if (comptime std.mem.eql(u8, field.name, "gen_config")) has_gen_config = true;
         if (comptime std.mem.eql(u8, field.name, "preproc_config")) has_preproc_config = true;
         if (comptime std.mem.eql(u8, field.name, "model_path")) has_model_path = true;
+        if (comptime std.mem.eql(u8, field.name, "scheduler_state_descriptors")) has_scheduler_state_descriptors = true;
     }
 
     try std.testing.expect(has_allocator);
@@ -57,6 +59,7 @@ test "LocalEngine has expected fields" {
     try std.testing.expect(has_gen_config);
     try std.testing.expect(has_preproc_config);
     try std.testing.expect(has_model_path);
+    try std.testing.expect(has_scheduler_state_descriptors);
 }
 
 // =============================================================================

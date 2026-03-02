@@ -736,27 +736,36 @@ pub const Block = struct {
     fn bindDispatchStateDescriptors(dispatch_state: *RuntimeDispatchState) !void {
         dispatch_state.state_binding_count = 0;
         dispatch_state.state_bindings = [_]?RuntimeDispatchState.StateBinding{null} ** RuntimeDispatchState.MaxStateBindings;
-        _ = try runtime_contract.collectBuiltinStateFlags(&dispatch_state.block.compiled_plan.plan);
 
         const shared_state = dispatch_state.slot_ctx.sharedState();
         const bound_state_blocks = shared_state.state_blocks;
+
+        const resolveViewPtr = struct {
+            fn forState(
+                state_blocks: []const runtime_contract.StateBlockHandle,
+                state_id: u8,
+            ) !*const runtime_contract.CompatibilityStateView {
+                return runtime_contract.findStateValue(
+                    *const runtime_contract.CompatibilityStateView,
+                    state_blocks,
+                    state_id,
+                ) orelse error.InvalidStateDescriptorBinding;
+            }
+        }.forState;
+
         const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         for (dispatch_state.block.compiled_plan.plan.state_descs) |state_desc| {
-            if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
             const maybe_state_block = runtime_contract.findStateBlock(bound_state_blocks, state_desc.id);
             if (maybe_state_block == null) {
-                // Single-slot decode/prefill uses per-slot attn cache and does
-                // not require scheduler-supplied KV descriptor bindings.
-                if (dispatch_state.mode == .single_slot and state_desc.id == kv_state_id) continue;
                 return error.InvalidStateDescriptorBinding;
             }
             const state_block = maybe_state_block.?;
-            var normalized_state_block = state_block.*;
+            const normalized_state_block = state_block.*;
             if (normalized_state_block.size < @sizeOf(runtime_contract.OpaqueStateRef)) {
                 return error.InvalidStateDescriptorBinding;
             }
             if (normalized_state_block.align_bytes < state_desc.align_bytes) {
-                normalized_state_block.align_bytes = state_desc.align_bytes;
+                return error.InvalidStateDescriptorBinding;
             }
             if (state_desc.size_bytes > 0 and normalized_state_block.size < state_desc.size_bytes) {
                 return error.InvalidStateDescriptorBinding;
@@ -765,39 +774,35 @@ pub const Block = struct {
         }
 
         if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, kv_state_id) != null) {
-            if (dispatch_state.mode == .single_slot and runtime_contract.findStateBlock(bound_state_blocks, kv_state_id) == null) {
-                shared_state.batched_cache = null;
-            } else {
-                const layered_cache = runtime_contract.findStateValue(
-                    *LayeredBatchedKVCache,
-                    bound_state_blocks,
-                    kv_state_id,
-                ) orelse return error.InvalidStateDescriptorBinding;
-                if (dispatch_state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
-                shared_state.batched_cache = layered_cache.getLayer(dispatch_state.block.block_idx);
-            }
+            const state_view = try resolveViewPtr(bound_state_blocks, kv_state_id);
+            const raw_cache = runtime_contract.compatibilityStatePointerForId(state_view, kv_state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_cache));
+            if (dispatch_state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
+            shared_state.batched_cache = layered_cache.getLayer(dispatch_state.block.block_idx);
         } else {
             shared_state.batched_cache = null;
         }
 
         const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
         if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, mamba_state_id) != null) {
-            shared_state.mamba_scratch = runtime_contract.findStateValue(
-                *runtime.MambaScratch,
-                bound_state_blocks,
-                mamba_state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
+            const state_view = try resolveViewPtr(bound_state_blocks, mamba_state_id);
+            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, mamba_state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            shared_state.mamba_scratch = @ptrCast(@alignCast(raw_scratch));
         } else {
             shared_state.mamba_scratch = null;
         }
 
         const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
         if (runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, shortconv_state_id) != null) {
-            shared_state.shortconv_scratch = runtime_contract.findStateValue(
-                *runtime.ShortConvScratch,
-                bound_state_blocks,
-                shortconv_state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
+            const state_view = try resolveViewPtr(bound_state_blocks, shortconv_state_id);
+            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, shortconv_state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            shared_state.shortconv_scratch = @ptrCast(@alignCast(raw_scratch));
         } else {
             shared_state.shortconv_scratch = null;
         }
@@ -809,9 +814,7 @@ pub const Block = struct {
         plan: *const runtime_contract.ExecutionPlan,
         state_blocks: []const runtime_contract.StateBlockHandle,
     ) !void {
-        if (state_blocks.len == 0 and mode == .single_slot and singleSlotStateBindingOptional(insn.opcode)) {
-            return;
-        }
+        _ = mode;
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, plan, state_blocks);
     }
 
@@ -821,10 +824,7 @@ pub const Block = struct {
     ) !InstructionStateBlocks {
         var blocks = InstructionStateBlocks{};
         const state_id = insn.state_block_id orelse return blocks;
-        const binding = dispatch_state.stateBinding(state_id) orelse {
-            if (dispatch_state.mode == .single_slot and singleSlotStateBindingOptional(insn.opcode)) return blocks;
-            return error.InvalidStateDescriptorBinding;
-        };
+        const binding = dispatch_state.stateBinding(state_id) orelse return error.InvalidStateDescriptorBinding;
         const descriptor = runtime_contract.findStateDescriptor(&dispatch_state.block.compiled_plan.plan, state_id) orelse {
             return error.UnknownStateDescriptorId;
         };
@@ -834,13 +834,6 @@ pub const Block = struct {
         blocks.handles[0] = state_block;
         blocks.len = 1;
         return blocks;
-    }
-
-    fn singleSlotStateBindingOptional(opcode: runtime_contract.Opcode) bool {
-        const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
-        const state_id = runtime_contract.stateBlockIdForOpcode(opcode) orelse return false;
-        if (state_id != kv_state_id) return false;
-        return runtime_contract.requiredStateBlockIdForOpcode(opcode) == null;
     }
 
     const required_opcodes = [_]runtime_contract.Opcode{
@@ -2049,35 +2042,37 @@ pub const Block = struct {
     ) !void {
         const shared_state = state.slot_ctx.sharedState();
         const state_id = insn.state_block_id orelse return;
+        const state_view = runtime_contract.findStateValue(
+            *const runtime_contract.CompatibilityStateView,
+            state_blocks,
+            state_id,
+        ) orelse return error.InvalidStateDescriptorBinding;
         const kv_state_id = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
         const shortconv_state_id = @intFromEnum(runtime_contract.StateBlockId.shortconv);
         const mamba_state_id = @intFromEnum(runtime_contract.StateBlockId.mamba);
 
         if (state_id == kv_state_id) {
-            const layered_cache = runtime_contract.findStateValue(
-                *LayeredBatchedKVCache,
-                state_blocks,
-                state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
+            const raw_cache = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            const layered_cache: *LayeredBatchedKVCache = @ptrCast(@alignCast(raw_cache));
             if (state.block.block_idx >= layered_cache.layers.len) return error.InvalidStateDescriptorBinding;
             shared_state.batched_cache = layered_cache.getLayer(state.block.block_idx);
             return;
         }
         if (state_id == shortconv_state_id) {
-            const shortconv_scratch = runtime_contract.findStateValue(
-                *runtime.ShortConvScratch,
-                state_blocks,
-                state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
+            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            const shortconv_scratch: *runtime.ShortConvScratch = @ptrCast(@alignCast(raw_scratch));
             shared_state.shortconv_scratch = shortconv_scratch;
             return;
         }
         if (state_id == mamba_state_id) {
-            const mamba_scratch = runtime_contract.findStateValue(
-                *runtime.MambaScratch,
-                state_blocks,
-                state_id,
-            ) orelse return error.InvalidStateDescriptorBinding;
+            const raw_scratch = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            const mamba_scratch: *runtime.MambaScratch = @ptrCast(@alignCast(raw_scratch));
             shared_state.mamba_scratch = mamba_scratch;
             return;
         }
@@ -3259,6 +3254,43 @@ test "Block.forwardWithBatchedCache handles mul_scalar" {
     for (output_data, 0..) |val, i| {
         try testing.expectApproxEqAbs(input_data[i] * 0.5, val, 1e-6);
     }
+}
+
+test "Block.forwardWithBatchedCache rejects missing descriptor state blocks for attention" {
+    const allocator = testing.allocator;
+
+    var weights = try TestWeights.init(allocator, 128, 512, 2, 32);
+    defer weights.deinit(allocator);
+
+    var transformer_block = try createTestTransformerBlock(allocator, &weights);
+    defer transformer_block.deinit(allocator);
+
+    const program = [_]LayerOp{
+        .{ .kernel = .{ .id = 0, .in = .residual, .out = .norm_out, .debug_type = .norm } },
+        .{ .kernel = .{ .id = 1, .in = .norm_out, .out = .branch_out, .debug_type = .multihead_attention } },
+        .{ .add = .{ .branch = .branch_out, .scale = .one } },
+    };
+
+    var block = try createTestBlock(allocator, &transformer_block, 128, &program);
+    defer block.deinit(allocator);
+
+    const input_data = try allocator.alloc(f32, 1 * 2 * 128);
+    defer allocator.free(input_data);
+    @memset(input_data, 1.0);
+    const input = Tensor.view(@ptrCast(input_data.ptr), &.{ 1, 2, 128 }, .f32, null);
+
+    const output_data = try allocator.alloc(f32, 1 * 2 * 128);
+    defer allocator.free(output_data);
+    @memset(output_data, 0.0);
+    var output = Tensor.view(@ptrCast(output_data.ptr), &.{ 1, 2, 128 }, .f32, null);
+
+    var scratch = try ScratchBuffer.init(allocator, 128, 512, 1);
+    defer scratch.deinit();
+
+    try testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        block.forwardWithBatchedCache(&input, &output, &scratch, &.{}, 0, true),
+    );
 }
 
 test "buildTmpRegisterScratchMap reuses physical tmp slots from liveness" {

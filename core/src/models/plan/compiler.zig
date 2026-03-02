@@ -14,9 +14,9 @@ const qwen3_moe = @import("../qwen/qwen3_moe.zig");
 
 pub const CompileMode = runtime_contract.ExecutionMode;
 
-const kv_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.kv_cache);
-const shortconv_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.shortconv);
-const mamba_state_id: u8 = @intFromEnum(runtime_contract.StateBlockId.mamba);
+const kv_state_id: u8 = runtime_contract.kv_cache_state_id;
+const shortconv_state_id: u8 = runtime_contract.shortconv_state_id;
+const mamba_state_id: u8 = runtime_contract.mamba_state_id;
 
 /// Allocation-order register assignment.
 ///
@@ -496,37 +496,25 @@ fn buildStateDescriptors(
     allocator: std.mem.Allocator,
     instructions: []const runtime_contract.Instruction,
 ) ![]runtime_contract.StateDescriptor {
-    var has_kv = false;
-    var has_shortconv = false;
-    var has_mamba = false;
-
+    var seen: [256]bool = [_]bool{false} ** 256;
+    var count: usize = 0;
     for (instructions) |insn| {
         const state_id = insn.state_block_id orelse continue;
-        switch (state_id) {
-            kv_state_id => has_kv = true,
-            shortconv_state_id => has_shortconv = true,
-            mamba_state_id => has_mamba = true,
-            else => return error.UnknownStateDescriptorId,
+        if (!seen[state_id]) {
+            seen[state_id] = true;
+            count += 1;
         }
     }
+    if (count == 0) return &.{};
 
-    const state_count: usize = @as(usize, @intFromBool(has_kv)) +
-        @as(usize, @intFromBool(has_shortconv)) +
-        @as(usize, @intFromBool(has_mamba));
-    if (state_count == 0) return &.{};
-
-    const descriptors = try allocator.alloc(runtime_contract.StateDescriptor, state_count);
+    const descriptors = try allocator.alloc(runtime_contract.StateDescriptor, count);
     var idx: usize = 0;
-    if (has_kv) {
-        descriptors[idx] = runtime_contract.defaultStateDescriptor(.kv_cache);
+    for (instructions) |insn| {
+        const state_id = insn.state_block_id orelse continue;
+        if (!seen[state_id]) continue;
+        seen[state_id] = false;
+        descriptors[idx] = runtime_contract.descriptorForStateId(state_id);
         idx += 1;
-    }
-    if (has_shortconv) {
-        descriptors[idx] = runtime_contract.defaultStateDescriptor(.shortconv);
-        idx += 1;
-    }
-    if (has_mamba) {
-        descriptors[idx] = runtime_contract.defaultStateDescriptor(.mamba);
     }
     return descriptors;
 }
@@ -1172,6 +1160,25 @@ test "compileLayerProgram emits shortconv state descriptor when shortconv op is 
 
     try std.testing.expect(hasStateDescriptor(&compiled, shortconv_state_id));
     try std.testing.expectEqual(@as(?u8, shortconv_state_id), compiled.plan.instructions[0].state_block_id);
+}
+
+test "buildStateDescriptors accepts unknown state ids" {
+    const allocator = std.testing.allocator;
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .residual_add,
+            .inputs = &.{},
+            .outputs = &.{},
+            .weights = &.{},
+            .param_block_id = null,
+            .state_block_id = 77,
+        },
+    };
+    const descriptors = try buildStateDescriptors(allocator, instructions[0..]);
+    defer if (descriptors.len > 0) allocator.free(descriptors);
+    try std.testing.expectEqual(@as(usize, 1), descriptors.len);
+    try std.testing.expectEqual(@as(u8, 77), descriptors[0].id);
+    try std.testing.expectEqual(runtime_contract.StateLifecycle.slot_persistent, descriptors[0].lifecycle);
 }
 
 test "compileLayerProgram emits structured kernel weight refs for macro attention ops" {

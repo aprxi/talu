@@ -142,7 +142,6 @@ pub const TransformerBlock = struct {
         ctx.state_bindings = [_]?LayerProgramStateBinding{null} ** MaxLayerProgramStateBindings;
         ctx.state_binding_count = 0;
         for (plan.state_descs) |state_desc| {
-            if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
             const state_block = runtime_contract.findStateBlock(bound_state_blocks, state_desc.id) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
@@ -479,12 +478,20 @@ pub const TransformerBlock = struct {
         return param_storage[0..1];
     }
 
-    fn optionalStateValue(
+    fn requireStateValue(
         comptime T: type,
         state_blocks: []const runtime_contract.StateBlockHandle,
         state_id: u8,
-    ) ?T {
-        const ptr = runtime_contract.findStateValue(*T, state_blocks, state_id) orelse return null;
+    ) !T {
+        const state_view = runtime_contract.findStateValue(
+            *const runtime_contract.CompatibilityStateView,
+            state_blocks,
+            state_id,
+        ) orelse return error.InvalidStateDescriptorBinding;
+        const raw = runtime_contract.compatibilityStatePointerForId(state_view, state_id) orelse {
+            return error.InvalidStateDescriptorBinding;
+        };
+        const ptr: *const T = @ptrCast(@alignCast(raw));
         return ptr.*;
     }
 
@@ -1065,7 +1072,7 @@ pub const TransformerBlock = struct {
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
-        const cache = optionalStateValue(
+        const cache = try requireStateValue(
             Cache,
             state_blocks,
             @intFromEnum(runtime_contract.StateBlockId.kv_cache),
@@ -1093,7 +1100,7 @@ pub const TransformerBlock = struct {
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
-        const shortconv_cache = optionalStateValue(
+        const shortconv_cache = try requireStateValue(
             ShortConvCache,
             state_blocks,
             @intFromEnum(runtime_contract.StateBlockId.shortconv),
@@ -1134,7 +1141,7 @@ pub const TransformerBlock = struct {
     ) !void {
         const state = try layerProgramExecutionState(ctx);
         _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
-        const mamba_cache = optionalStateValue(
+        const mamba_cache = try requireStateValue(
             MambaCache,
             state_blocks,
             @intFromEnum(runtime_contract.StateBlockId.mamba),
@@ -1257,7 +1264,6 @@ pub const TransformerBlock = struct {
             .norm_index = &norm_index,
             .bindings = try buildLayerProgramRuntimeBindings(&compiled_plan.plan, lw, config, weight_handles),
         };
-        _ = try runtime_contract.collectBuiltinStateFlags(&compiled_plan.plan);
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
         for (compiled_plan.plan.instructions, 0..) |insn, op_index| {

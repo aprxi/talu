@@ -38,9 +38,7 @@ pub const Cache = runtime_graph_mod.Cache;
 pub const WeightHandles = weights_trait.WeightHandles;
 /// Metal backend for GPU-accelerated transformer inference
 pub const MetalBackend = struct {
-    const MaxStateDescriptors: usize = std.math.maxInt(u8);
-    const ImplicitStateBlockBytes: usize = 64;
-
+    const MaxStateDescriptors: usize = runtime_contract.max_state_descriptors;
     pub const capabilities: contract.Capabilities = .{
         .vision_prefill = true,
         .decode_batch = false,
@@ -60,7 +58,6 @@ pub const MetalBackend = struct {
     mamba_cache: runtime_graph_mod.MambaCache,
     vocab_size: usize,
     d_model: usize,
-    state_flags: runtime_contract.BuiltinStateFlags,
     max_batch_size: usize,
     slot_in_use: bool,
     /// Slots 1..N-1 for scheduler-managed multi-slot decode.
@@ -71,8 +68,6 @@ pub const MetalBackend = struct {
     state_descriptors_storage: [MaxStateDescriptors]runtime_contract.StateDescriptor,
     state_descriptor_count: u8,
     slot0_state_binding: SlotStateBinding = .{},
-    implicit_slot0_state_storage: [MaxStateDescriptors][ImplicitStateBlockBytes]u8 align(64) =
-        [_][ImplicitStateBlockBytes]u8{[_]u8{0} ** ImplicitStateBlockBytes} ** MaxStateDescriptors,
 
     // Track position for decode
     current_position: usize,
@@ -198,27 +193,40 @@ pub const MetalBackend = struct {
         var slot_cache = try self.slotCache(slot_index);
         var slot_shortconv_cache = try self.slotShortConvCache(slot_index);
         var slot_mamba_cache = try self.slotMambaCache(slot_index);
+        const descriptors = self.stateDescriptors();
 
-        if (self.state_flags.has_kv) {
-            slot_cache = runtime_contract.findStateValue(
-                *runtime_graph_mod.Cache,
+        if (runtime_contract.stateDescriptorIndex(descriptors, runtime_contract.kv_cache_state_id) != null) {
+            const state_view = runtime_contract.findStateValue(
+                *const runtime_contract.CompatibilityStateView,
                 slot_blocks,
-                @intFromEnum(runtime_contract.StateBlockId.kv_cache),
+                runtime_contract.kv_cache_state_id,
             ) orelse return error.InvalidStateDescriptorBinding;
+            const raw_cache = runtime_contract.compatibilityStatePointerForId(state_view, runtime_contract.kv_cache_state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            slot_cache = @ptrCast(@alignCast(raw_cache));
         }
-        if (self.state_flags.has_shortconv) {
-            slot_shortconv_cache = runtime_contract.findStateValue(
-                *runtime_graph_mod.ShortConvCache,
+        if (runtime_contract.stateDescriptorIndex(descriptors, runtime_contract.shortconv_state_id) != null) {
+            const state_view = runtime_contract.findStateValue(
+                *const runtime_contract.CompatibilityStateView,
                 slot_blocks,
-                @intFromEnum(runtime_contract.StateBlockId.shortconv),
+                runtime_contract.shortconv_state_id,
             ) orelse return error.InvalidStateDescriptorBinding;
+            const raw_shortconv = runtime_contract.compatibilityStatePointerForId(state_view, runtime_contract.shortconv_state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            slot_shortconv_cache = @ptrCast(@alignCast(raw_shortconv));
         }
-        if (self.state_flags.has_mamba) {
-            slot_mamba_cache = runtime_contract.findStateValue(
-                *runtime_graph_mod.MambaCache,
+        if (runtime_contract.stateDescriptorIndex(descriptors, runtime_contract.mamba_state_id) != null) {
+            const state_view = runtime_contract.findStateValue(
+                *const runtime_contract.CompatibilityStateView,
                 slot_blocks,
-                @intFromEnum(runtime_contract.StateBlockId.mamba),
+                runtime_contract.mamba_state_id,
             ) orelse return error.InvalidStateDescriptorBinding;
+            const raw_mamba = runtime_contract.compatibilityStatePointerForId(state_view, runtime_contract.mamba_state_id) orelse {
+                return error.InvalidStateDescriptorBinding;
+            };
+            slot_mamba_cache = @ptrCast(@alignCast(raw_mamba));
         }
 
         return .{
@@ -235,18 +243,14 @@ pub const MetalBackend = struct {
         const slot_position = try self.slotPositionPtr(slot_index);
         const slot_rope_delta = try self.slotRopeDeltaPtr(slot_index);
 
-        if (self.state_flags.has_kv) {
-            slot_cache.deinit();
-            slot_cache.* = runtime_graph_mod.Cache.init(
-                @intCast(self.config.n_layers),
-                true,
-                self.cacheMaxSeqLen(),
-            );
-        } else {
-            slot_cache.* = runtime_graph_mod.Cache.disabled(true);
-        }
-        if (self.state_flags.has_shortconv) slot_shortconv_cache.reset();
-        if (self.state_flags.has_mamba) slot_mamba_cache.reset();
+        slot_cache.deinit();
+        slot_cache.* = runtime_graph_mod.Cache.init(
+            @intCast(self.config.n_layers),
+            true,
+            self.cacheMaxSeqLen(),
+        );
+        slot_shortconv_cache.reset();
+        slot_mamba_cache.reset();
         slot_position.* = 0;
         slot_rope_delta.* = 0;
     }
@@ -264,18 +268,14 @@ pub const MetalBackend = struct {
         slot_rope_delta.* = 0;
 
         // Reset cache for new sequence in this scheduler slot.
-        if (self.state_flags.has_kv) {
-            slot_cache.deinit();
-            slot_cache.* = runtime_graph_mod.Cache.init(
-                @intCast(self.config.n_layers),
-                true,
-                self.cacheMaxSeqLen(),
-            );
-        } else {
-            slot_cache.* = runtime_graph_mod.Cache.disabled(true);
-        }
-        if (self.state_flags.has_shortconv) slot_shortconv_cache.reset();
-        if (self.state_flags.has_mamba) slot_mamba_cache.reset();
+        slot_cache.deinit();
+        slot_cache.* = runtime_graph_mod.Cache.init(
+            @intCast(self.config.n_layers),
+            true,
+            self.cacheMaxSeqLen(),
+        );
+        slot_shortconv_cache.reset();
+        slot_mamba_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazy(
             self.allocator,
@@ -363,22 +363,20 @@ pub const MetalBackend = struct {
             .cache_max_seq_len = cache_max_seq_len,
             .dynamic_growth = @as(u8, @intFromBool(cache_max_seq_len == 0)),
         }, @src());
-        const state_flags = weight_handles.state_flags;
-        const has_kv_state = state_flags.has_kv;
-        const has_shortconv_state = state_flags.has_shortconv;
-        const has_mamba_state = state_flags.has_mamba;
-        const kv_cache = if (has_kv_state)
-            runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len)
-        else
-            runtime_graph_mod.Cache.disabled(true);
-        const shortconv_cache = if (has_shortconv_state)
-            runtime_graph_mod.ShortConvCache.init(layer_count)
-        else
-            runtime_graph_mod.ShortConvCache.disabled();
-        const mamba_cache = if (has_mamba_state)
-            runtime_graph_mod.MambaCache.init(layer_count)
-        else
-            runtime_graph_mod.MambaCache.disabled();
+        var state_descriptors_storage: [MaxStateDescriptors]runtime_contract.StateDescriptor = undefined;
+        var state_descriptor_count: u8 = 0;
+        for (weight_handles.layers) |*layer| {
+            if (layer.compiled_plan) |*compiled_plan| {
+                try runtime_contract.appendUniquePlanStateDescriptors(
+                    state_descriptors_storage[0..],
+                    &state_descriptor_count,
+                    &compiled_plan.plan,
+                );
+            }
+        }
+        const kv_cache = runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len);
+        const shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count);
+        const mamba_cache = runtime_graph_mod.MambaCache.init(layer_count);
         errdefer mamba_cache.deinit();
         var vision_runtime = try vision_runtime_mod.VisionRuntime.init(allocator, loaded);
         errdefer if (vision_runtime) |*rt| rt.deinit();
@@ -390,18 +388,9 @@ pub const MetalBackend = struct {
         errdefer allocator.free(extra_slots);
         for (extra_slots) |*slot| {
             slot.* = .{
-                .cache = if (has_kv_state)
-                    runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len)
-                else
-                    runtime_graph_mod.Cache.disabled(true),
-                .shortconv_cache = if (has_shortconv_state)
-                    runtime_graph_mod.ShortConvCache.init(layer_count)
-                else
-                    runtime_graph_mod.ShortConvCache.disabled(),
-                .mamba_cache = if (has_mamba_state)
-                    runtime_graph_mod.MambaCache.init(layer_count)
-                else
-                    runtime_graph_mod.MambaCache.disabled(),
+                .cache = runtime_graph_mod.Cache.init(layer_count, true, cache_max_seq_len),
+                .shortconv_cache = runtime_graph_mod.ShortConvCache.init(layer_count),
+                .mamba_cache = runtime_graph_mod.MambaCache.init(layer_count),
                 .in_use = false,
                 .position = 0,
                 .rope_position_delta = 0,
@@ -416,37 +405,6 @@ pub const MetalBackend = struct {
         const slot_logits_buffer = try allocator.alloc(f32, max_batch_size * @as(usize, @intCast(loaded.config.vocab_size)));
         errdefer allocator.free(slot_logits_buffer);
 
-        var state_descriptors_storage: [MaxStateDescriptors]runtime_contract.StateDescriptor = undefined;
-        var state_descriptor_count: u8 = 0;
-        for (weight_handles.layers) |*layer| {
-            if (layer.compiled_plan) |*compiled_plan| {
-                try runtime_contract.appendUniquePlanStateDescriptors(
-                    state_descriptors_storage[0..],
-                    &state_descriptor_count,
-                    &compiled_plan.plan,
-                );
-            }
-        }
-        const descriptor_slice = state_descriptors_storage[0..state_descriptor_count];
-        const has_kv_descriptor = runtime_contract.stateDescriptorIndex(
-            descriptor_slice,
-            @intFromEnum(runtime_contract.StateBlockId.kv_cache),
-        ) != null;
-        const has_shortconv_descriptor = runtime_contract.stateDescriptorIndex(
-            descriptor_slice,
-            @intFromEnum(runtime_contract.StateBlockId.shortconv),
-        ) != null;
-        const has_mamba_descriptor = runtime_contract.stateDescriptorIndex(
-            descriptor_slice,
-            @intFromEnum(runtime_contract.StateBlockId.mamba),
-        ) != null;
-        if (has_kv_descriptor != state_flags.has_kv or
-            has_shortconv_descriptor != state_flags.has_shortconv or
-            has_mamba_descriptor != state_flags.has_mamba)
-        {
-            return error.InvalidStateDescriptorBinding;
-        }
-
         return MetalBackend{
             .allocator = allocator,
             .config = loaded.config,
@@ -456,7 +414,6 @@ pub const MetalBackend = struct {
             .mamba_cache = mamba_cache,
             .vocab_size = @intCast(loaded.config.vocab_size),
             .d_model = @intCast(loaded.config.d_model),
-            .state_flags = state_flags,
             .max_batch_size = max_batch_size,
             .slot_in_use = false,
             .extra_slots = extra_slots,
@@ -488,7 +445,7 @@ pub const MetalBackend = struct {
     /// Prefill: process all prompt tokens, return logits for last position
     pub fn prefill(self: *MetalBackend, tokens: []const u32, logits_out: []f32) !void {
         // Single-sequence compatibility path always uses slot 0.
-        try self.bindImplicitSlot0StateBlocks();
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
         self.slot_in_use = true;
         try self.prefillSlotImpl(0, tokens, logits_out);
     }
@@ -502,7 +459,7 @@ pub const MetalBackend = struct {
     ) !void {
         if (tokens.len == 0) return error.EmptyInput;
         if (embedding_out.len < self.d_model) return error.BufferTooSmall;
-        try self.bindImplicitSlot0StateBlocks();
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
 
         const hidden_handle = try runtime_trait.transformerForwardHiddenLazy(
             self.allocator,
@@ -628,28 +585,6 @@ pub const MetalBackend = struct {
         );
     }
 
-    fn bindImplicitSlot0StateBlocks(self: *MetalBackend) !void {
-        if (self.state_descriptor_count == 0 or self.slot0_state_binding.bound) return;
-        const descriptors = self.stateDescriptors();
-        var handles: [MaxStateDescriptors]runtime_contract.StateBlockHandle = undefined;
-        for (descriptors, 0..) |descriptor, idx| {
-            const size_bytes = if (descriptor.size_bytes == 0)
-                @as(u64, @sizeOf(runtime_contract.OpaqueStateRef))
-            else
-                descriptor.size_bytes;
-            const implicit_capacity = @as(u64, @intCast(self.implicit_slot0_state_storage[idx].len));
-            if (size_bytes > implicit_capacity) return error.InvalidStateDescriptorBinding;
-            if (descriptor.align_bytes == 0 or descriptor.align_bytes > 64) return error.InvalidStateDescriptorBinding;
-            handles[idx] = .{
-                .id = descriptor.id,
-                .ptr = @ptrCast(&self.implicit_slot0_state_storage[idx][0]),
-                .size = size_bytes,
-                .align_bytes = 64,
-            };
-        }
-        try self.bindSlotStateBlocks(0, handles[0..descriptors.len]);
-    }
-
     pub fn bindSlotStateBlocks(
         self: *MetalBackend,
         slot_index: usize,
@@ -664,24 +599,22 @@ pub const MetalBackend = struct {
         const slot_cache = try self.slotCache(slot_index);
         const slot_shortconv_cache = try self.slotShortConvCache(slot_index);
         const slot_mamba_cache = try self.slotMambaCache(slot_index);
+        const state_view = runtime_contract.CompatibilityStateView{
+            .kv_cache = @ptrCast(slot_cache),
+            .shortconv_state = @ptrCast(slot_shortconv_cache),
+            .mamba_state = @ptrCast(slot_mamba_cache),
+            .runtime_state = null,
+        };
+        try runtime_contract.validateCompatibilityStateViewForDescriptors(self.stateDescriptors(), &state_view);
         for (self.stateDescriptors(), 0..) |descriptor, idx| {
             const incoming = runtime_contract.findStateBlock(state_blocks, descriptor.id) orelse {
                 return error.InvalidStateDescriptorBinding;
             };
-            if (incoming.align_bytes < @alignOf(runtime_contract.OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
-            if (incoming.size < @sizeOf(runtime_contract.OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
-            const state_ptr: *anyopaque = switch (descriptor.id) {
-                @intFromEnum(runtime_contract.StateBlockId.kv_cache) => @ptrCast(slot_cache),
-                @intFromEnum(runtime_contract.StateBlockId.shortconv) => @ptrCast(slot_shortconv_cache),
-                @intFromEnum(runtime_contract.StateBlockId.mamba) => @ptrCast(slot_mamba_cache),
-                else => return error.InvalidStateDescriptorBinding,
-            };
-            const state_ref: *runtime_contract.OpaqueStateRef = @ptrCast(@alignCast(incoming.ptr));
-            state_ref.* = .{ .ptr = state_ptr };
+            try runtime_contract.writeCompatibilityStateViewToBlock(incoming, &state_view);
             binding.handles[idx] = .{
                 .id = descriptor.id,
                 .ptr = incoming.ptr,
-                .size = if (descriptor.size_bytes == 0) incoming.size else descriptor.size_bytes,
+                .size = descriptor.size_bytes,
                 .align_bytes = incoming.align_bytes,
             };
         }
@@ -817,18 +750,14 @@ pub const MetalBackend = struct {
         }
 
         // Reset selected slot cache for new sequence.
-        if (self.state_flags.has_kv) {
-            slot_cache.deinit();
-            slot_cache.* = runtime_graph_mod.Cache.init(
-                @intCast(self.config.n_layers),
-                true,
-                self.cacheMaxSeqLen(),
-            );
-        } else {
-            slot_cache.* = runtime_graph_mod.Cache.disabled(true);
-        }
-        if (self.state_flags.has_shortconv) slot_shortconv_cache.reset();
-        if (self.state_flags.has_mamba) slot_mamba_cache.reset();
+        slot_cache.deinit();
+        slot_cache.* = runtime_graph_mod.Cache.init(
+            @intCast(self.config.n_layers),
+            true,
+            self.cacheMaxSeqLen(),
+        );
+        slot_shortconv_cache.reset();
+        slot_mamba_cache.reset();
 
         const logits_handle = try runtime_trait.transformerForwardLazyWithEmbeddingOverride(
             self.allocator,
@@ -898,7 +827,7 @@ pub const MetalBackend = struct {
     /// Decode: generate logits for a single token using KV cache
     pub fn decode(self: *MetalBackend, token: u32, position: usize, logits_out: []f32) !void {
         // Single-sequence compatibility path uses slot 0.
-        try self.bindImplicitSlot0StateBlocks();
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
         self.slot_in_use = true;
         try self.decodeSlot(0, token, position, logits_out);
     }
@@ -915,7 +844,7 @@ pub const MetalBackend = struct {
         callback_data: ?*anyopaque,
     ) !usize {
         if (max_tokens == 0 or output_tokens.len == 0) return 0;
-        try self.bindImplicitSlot0StateBlocks();
+        try self.ensureSlotStateBlocksBoundForScheduler(0);
         self.slot_in_use = true;
 
         var decode_timer = std.time.Timer.start() catch unreachable;

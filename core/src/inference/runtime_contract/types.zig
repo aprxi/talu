@@ -16,6 +16,8 @@ pub const RegisterRef = enum(u16) { _ };
 /// Maximum register index a compiled plan may reference. Backends use this
 /// for stack-local execution arrays; stored lookup maps are dynamically sized.
 pub const max_register_count: u16 = 256;
+/// Maximum number of distinct state descriptors per plan/backend binding table.
+pub const max_state_descriptors: usize = std.math.maxInt(u8);
 
 pub fn registerFromIndex(index: u16) RegisterRef {
     return @enumFromInt(index);
@@ -133,6 +135,10 @@ pub const StateBlockId = enum(u8) {
     mamba = 2,
 };
 
+pub const kv_cache_state_id: u8 = @intFromEnum(StateBlockId.kv_cache);
+pub const shortconv_state_id: u8 = @intFromEnum(StateBlockId.shortconv);
+pub const mamba_state_id: u8 = @intFromEnum(StateBlockId.mamba);
+
 pub const Instruction = struct {
     opcode: Opcode,
     inputs: []const RegisterRef,
@@ -240,6 +246,71 @@ pub const StateBlockHandle = struct {
 pub const OpaqueStateRef = extern struct {
     ptr: ?*anyopaque = null,
 };
+
+/// Backend-agnostic compatibility view stored in scheduler-owned state blocks.
+/// Backends populate pointer fields during bind, and adapters resolve typed
+/// runtime state from this view per instruction state descriptor.
+pub const CompatibilityStateView = extern struct {
+    kv_cache: ?*anyopaque = null,
+    shortconv_state: ?*anyopaque = null,
+    mamba_state: ?*anyopaque = null,
+    runtime_state: ?*anyopaque = null,
+};
+
+/// Compatibility descriptor allocation footprint for legacy backend state views.
+/// Phase-4 scheduler semantics require non-trivial scheduler-owned storage.
+pub const compatibility_state_block_bytes: u64 = 256;
+
+pub fn compatibilityStatePointerForId(
+    view: *const CompatibilityStateView,
+    state_id: u8,
+) ?*anyopaque {
+    return switch (state_id) {
+        kv_cache_state_id => view.kv_cache,
+        shortconv_state_id => view.shortconv_state,
+        mamba_state_id => view.mamba_state,
+        else => view.runtime_state,
+    };
+}
+
+pub fn validateCompatibilityStateViewForDescriptors(
+    descriptors: []const StateDescriptor,
+    view: *const CompatibilityStateView,
+) !void {
+    for (descriptors) |descriptor| {
+        switch (descriptor.id) {
+            kv_cache_state_id, shortconv_state_id, mamba_state_id => {
+                if (compatibilityStatePointerForId(view, descriptor.id) == null) {
+                    return error.InvalidStateDescriptorBinding;
+                }
+            },
+            else => {},
+        }
+    }
+}
+
+pub fn writeCompatibilityStateViewToBlock(
+    state_block: *const StateBlockHandle,
+    view: *const CompatibilityStateView,
+) !void {
+    if (state_block.align_bytes < @alignOf(OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
+    if (state_block.size < @sizeOf(OpaqueStateRef)) return error.InvalidStateDescriptorBinding;
+    const block_start = @intFromPtr(state_block.ptr);
+    const payload_addr = std.mem.alignForward(
+        usize,
+        block_start + @sizeOf(OpaqueStateRef),
+        @alignOf(CompatibilityStateView),
+    );
+    const payload_end = std.math.add(usize, payload_addr, @sizeOf(CompatibilityStateView)) catch {
+        return error.InvalidStateDescriptorBinding;
+    };
+    if (payload_end - block_start > state_block.size) return error.InvalidStateDescriptorBinding;
+    const payload: *CompatibilityStateView = @ptrFromInt(payload_addr);
+    payload.* = view.*;
+
+    const state_ref: *OpaqueStateRef = @ptrCast(@alignCast(state_block.ptr));
+    state_ref.* = .{ .ptr = @ptrCast(payload) };
+}
 
 pub const ParamBlock = struct {
     version: u8,
@@ -532,25 +603,44 @@ pub fn defaultStateDescriptor(state_id: StateBlockId) StateDescriptor {
     return switch (state_id) {
         .kv_cache => .{
             .id = @intFromEnum(StateBlockId.kv_cache),
-            .size_bytes = 0,
+            .size_bytes = compatibility_state_block_bytes,
             .align_bytes = 64,
             .zero_init = false,
             .lifecycle = .slot_persistent,
         },
         .shortconv => .{
             .id = @intFromEnum(StateBlockId.shortconv),
-            .size_bytes = 0,
+            .size_bytes = compatibility_state_block_bytes,
             .align_bytes = 64,
             .zero_init = true,
             .lifecycle = .slot_persistent,
         },
         .mamba => .{
             .id = @intFromEnum(StateBlockId.mamba),
-            .size_bytes = 0,
+            .size_bytes = compatibility_state_block_bytes,
             .align_bytes = 64,
             .zero_init = true,
             .lifecycle = .slot_persistent,
         },
+    };
+}
+
+pub fn defaultOpaqueStateDescriptor(state_id: u8) StateDescriptor {
+    return .{
+        .id = state_id,
+        .size_bytes = compatibility_state_block_bytes,
+        .align_bytes = 64,
+        .zero_init = true,
+        .lifecycle = .slot_persistent,
+    };
+}
+
+pub fn descriptorForStateId(state_id: u8) StateDescriptor {
+    return switch (state_id) {
+        @intFromEnum(StateBlockId.kv_cache) => defaultStateDescriptor(.kv_cache),
+        @intFromEnum(StateBlockId.shortconv) => defaultStateDescriptor(.shortconv),
+        @intFromEnum(StateBlockId.mamba) => defaultStateDescriptor(.mamba),
+        else => defaultOpaqueStateDescriptor(state_id),
     };
 }
 
@@ -600,14 +690,6 @@ pub fn appendUniquePlanStateDescriptors(
     plan: *const ExecutionPlan,
 ) !void {
     for (plan.state_descs) |descriptor| {
-        switch (descriptor.id) {
-            @intFromEnum(StateBlockId.kv_cache),
-            @intFromEnum(StateBlockId.shortconv),
-            @intFromEnum(StateBlockId.mamba),
-            => {},
-            else => return error.UnknownStateDescriptorId,
-        }
-        if (descriptor.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
         try appendUniqueStateDescriptor(storage, count, descriptor);
     }
 }
@@ -618,23 +700,14 @@ pub const BuiltinStateFlags = struct {
     has_mamba: bool = false,
 };
 
-pub fn collectBuiltinStateFlags(plan: *const ExecutionPlan) !BuiltinStateFlags {
+pub fn collectBuiltinStateFlags(plan: *const ExecutionPlan) BuiltinStateFlags {
     var flags = BuiltinStateFlags{};
     for (plan.state_descs) |state_desc| {
         switch (state_desc.id) {
-            @intFromEnum(StateBlockId.kv_cache) => {
-                if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
-                flags.has_kv = true;
-            },
-            @intFromEnum(StateBlockId.shortconv) => {
-                if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
-                flags.has_shortconv = true;
-            },
-            @intFromEnum(StateBlockId.mamba) => {
-                if (state_desc.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
-                flags.has_mamba = true;
-            },
-            else => return error.UnknownStateDescriptorId,
+            @intFromEnum(StateBlockId.kv_cache) => flags.has_kv = true,
+            @intFromEnum(StateBlockId.shortconv) => flags.has_shortconv = true,
+            @intFromEnum(StateBlockId.mamba) => flags.has_mamba = true,
+            else => {},
         }
     }
     return flags;
@@ -1409,7 +1482,6 @@ pub fn requireInstructionStateBlockForPlan(
     const state_block = try requireInstructionStateBlock(insn, state_blocks);
     if (insn.state_block_id) |state_id| {
         const descriptor = findStateDescriptor(plan, state_id) orelse return error.UnknownStateDescriptorId;
-        if (descriptor.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
         if (descriptor.align_bytes == 0) return error.InvalidStateDescriptorBinding;
         if (state_block.?.align_bytes < descriptor.align_bytes) return error.InvalidStateDescriptorBinding;
         if (descriptor.size_bytes > 0 and state_block.?.size < descriptor.size_bytes) {
@@ -1429,7 +1501,6 @@ pub fn validateStateBlocksForDescriptors(
     for (descriptors) |descriptor| {
         if (desc_seen[descriptor.id]) return error.DuplicateStateDescriptorId;
         desc_seen[descriptor.id] = true;
-        if (descriptor.lifecycle != .slot_persistent) return error.InvalidStateDescriptorBinding;
         if (descriptor.align_bytes == 0) return error.InvalidStateAlignment;
     }
 
@@ -2311,7 +2382,7 @@ test "validateStateLifecycleAction enforces lifecycle action support matrix" {
 test "shouldZeroStateForLifecycleAction applies descriptor and lifecycle policy" {
     const slot_desc = StateDescriptor{
         .id = @intFromEnum(StateBlockId.kv_cache),
-        .size_bytes = 0,
+        .size_bytes = compatibility_state_block_bytes,
         .align_bytes = 64,
         .zero_init = false,
         .lifecycle = .slot_persistent,
@@ -2341,27 +2412,10 @@ test "collectBuiltinStateFlags aggregates known descriptor ids" {
             defaultStateDescriptor(.shortconv),
         },
     };
-    const flags = try collectBuiltinStateFlags(&plan);
+    const flags = collectBuiltinStateFlags(&plan);
     try std.testing.expect(flags.has_kv);
     try std.testing.expect(flags.has_shortconv);
     try std.testing.expect(!flags.has_mamba);
-}
-
-test "collectBuiltinStateFlags rejects non-slot persistent lifecycle for builtin states" {
-    const plan = ExecutionPlan{
-        .instructions = &.{},
-        .register_count = 1,
-        .state_descs = &.{
-            .{
-                .id = @intFromEnum(StateBlockId.kv_cache),
-                .size_bytes = 0,
-                .align_bytes = 64,
-                .zero_init = false,
-                .lifecycle = .request_scoped,
-            },
-        },
-    };
-    try std.testing.expectError(error.InvalidStateDescriptorBinding, collectBuiltinStateFlags(&plan));
 }
 
 test "stateDescriptorIndex finds descriptor by id" {
@@ -2417,6 +2471,39 @@ test "appendUniquePlanStateDescriptors merges unique builtin descriptors" {
     try std.testing.expectEqual(@as(?usize, 0), stateDescriptorIndex(used, @intFromEnum(StateBlockId.kv_cache)));
     try std.testing.expectEqual(@as(?usize, 1), stateDescriptorIndex(used, @intFromEnum(StateBlockId.shortconv)));
     try std.testing.expectEqual(@as(?usize, 2), stateDescriptorIndex(used, @intFromEnum(StateBlockId.mamba)));
+}
+
+test "appendUniquePlanStateDescriptors accepts unknown descriptor ids" {
+    var storage: [4]StateDescriptor = undefined;
+    var count: u8 = 0;
+    const plan = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 1,
+        .state_descs = &.{
+            defaultStateDescriptor(.kv_cache),
+            defaultOpaqueStateDescriptor(99),
+        },
+    };
+    try appendUniquePlanStateDescriptors(storage[0..], &count, &plan);
+    try std.testing.expectEqual(@as(u8, 2), count);
+    const used = storage[0..@as(usize, @intCast(count))];
+    try std.testing.expectEqual(@as(?usize, 0), stateDescriptorIndex(used, @intFromEnum(StateBlockId.kv_cache)));
+    try std.testing.expectEqual(@as(?usize, 1), stateDescriptorIndex(used, 99));
+}
+
+test "collectBuiltinStateFlags ignores unknown descriptor ids" {
+    const plan = ExecutionPlan{
+        .instructions = &.{},
+        .register_count = 1,
+        .state_descs = &.{
+            defaultOpaqueStateDescriptor(77),
+            defaultStateDescriptor(.shortconv),
+        },
+    };
+    const flags = collectBuiltinStateFlags(&plan);
+    try std.testing.expect(!flags.has_kv);
+    try std.testing.expect(flags.has_shortconv);
+    try std.testing.expect(!flags.has_mamba);
 }
 
 test "decodeInstructionLayerOp validates param block abi version" {
