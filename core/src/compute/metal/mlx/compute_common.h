@@ -69,3 +69,5 @@ inline void mlx_count_op(size_t n = 1) {
 // Clears bounded thread-local caches for static weight transforms (e.g.
 // oriented/transpose matmul RHS views) used by fused kernels.
 extern "C" void mlx_weight_transform_cache_clear();
+// Clears cached quantization parameter casts keyed by static handle addresses.
+extern "C" void mlx_quant_param_cast_cache_clear();

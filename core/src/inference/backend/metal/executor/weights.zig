@@ -1142,17 +1142,18 @@ fn loadQuantizedWeight(tensor: *const Tensor, bits: usize) !WeightHandles.Quanti
     const scales_ptr = @as([*]align(1) const u16, @ptrCast(gaffine_meta.scales.ptr));
     const scales_shape = [_]usize{ row_count, group_count };
 
-    // Use correct dtype (F16 or BF16) based on model
+    // Keep quantized affine params on compute-native f16 at load time.
+    // This removes first-use BF16->F16 cast work from prefill/decode hot paths.
     const scales = if (gaffine_meta.scales_dtype == .f16)
         mlx_graph.mlx_array_from_float16(scales_ptr, &scales_shape, 2)
     else
-        mlx_graph.mlx_array_from_bfloat16(scales_ptr, &scales_shape, 2);
+        mlx_graph.mlx_array_from_bfloat16_dense_weight(scales_ptr, &scales_shape, 2);
 
     const biases_ptr = @as([*]align(1) const u16, @ptrCast(gaffine_meta.biases.ptr));
     const biases = if (gaffine_meta.scales_dtype == .f16)
         mlx_graph.mlx_array_from_float16(biases_ptr, &scales_shape, 2)
     else
-        mlx_graph.mlx_array_from_bfloat16(biases_ptr, &scales_shape, 2);
+        mlx_graph.mlx_array_from_bfloat16_dense_weight(biases_ptr, &scales_shape, 2);
 
     return .{
         .weights = packed_weights,

@@ -119,15 +119,15 @@ void* mlx_lazy_causal_conv_mixer_quantized(
     const int group_size_i = static_cast<int>(group_size);
     const int bits_i = static_cast<int>(bits);
 
-    array bcx = quantized_matmul(
+    array bcx = quantized_linear_no_bias(
         input_arr,
         in_w_arr,
         in_s_arr,
         in_b_arr,
-        true,
         group_size_i,
         bits_i,
-        "affine"
+        in_s,
+        in_b
     );
     // FP32 allowlist: causal_conv recurrence is stateful; keep conv inputs in FP32
     // to avoid drift across long prefill/decode sequences.
@@ -177,15 +177,15 @@ void* mlx_lazy_causal_conv_mixer_quantized(
     }
 
     const array gated = conv_seq * c_gate;
-    const array out = quantized_matmul(
+    const array out = quantized_linear_no_bias(
         gated,
         out_w_arr,
         out_s_arr,
         out_b_arr,
-        true,
         group_size_i,
         bits_i,
-        "affine"
+        out_s,
+        out_b
     );
 
     if (layer_state != nullptr) {

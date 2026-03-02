@@ -179,6 +179,24 @@ pub extern fn mlx_lazy_dequantize(
     bits: usize,
 ) ArrayHandle;
 
+/// Fused quantized FFN block:
+/// gate_proj -> (SiLU or GELU) -> gated multiply -> down_proj
+pub extern fn mlx_lazy_fused_ffn(
+    input: ArrayHandle,
+    gate_w: ArrayHandle,
+    gate_s: ArrayHandle,
+    gate_b: ArrayHandle,
+    up_w: ArrayHandle,
+    up_s: ArrayHandle,
+    up_b: ArrayHandle,
+    down_w: ArrayHandle,
+    down_s: ArrayHandle,
+    down_b: ArrayHandle,
+    group_size: usize,
+    bits: usize,
+    use_gelu: bool,
+) ArrayHandle;
+
 /// Element-wise add - >>> Lazy
 pub extern fn mlx_lazy_add(a: ArrayHandle, b: ArrayHandle) ArrayHandle;
 
