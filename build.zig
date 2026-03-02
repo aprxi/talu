@@ -251,6 +251,44 @@ fn linkExternalArchives(
 }
 
 // =============================================================================
+// Per-module unit test helper
+// =============================================================================
+
+const UnitTestCfg = struct {
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    build_options: *std.Build.Step.Options,
+    cuda_assets_mod: *std.Build.Module,
+    pcre2: Pcre2,
+    miniz: Miniz,
+    libmagic: LibMagic,
+    jpeg_turbo: JpegTurbo,
+    spng: Spng,
+    webp: Webp,
+    sqlite3: Sqlite3,
+    tree_sitter: TreeSitter,
+
+    fn add(self: UnitTestCfg, comptime name: []const u8, comptime root_path: []const u8) void {
+        const mod = self.b.createModule(.{
+            .root_source_file = self.b.path(root_path),
+            .target = self.target,
+            .optimize = self.optimize,
+            .link_libc = true,
+        });
+        mod.addImport("cuda_assets", self.cuda_assets_mod);
+        mod.addOptions("build_options", self.build_options);
+        addCDependencies(self.b, mod, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter);
+
+        const test_artifact = self.b.addTest(.{ .root_module = mod });
+        linkCDependencies(self.b, test_artifact, self.pcre2, self.miniz, self.libmagic, self.jpeg_turbo, self.spng, self.webp, self.sqlite3, self.tree_sitter, false);
+        const run = self.b.addRunArtifact(test_artifact);
+        const step = self.b.step("test-" ++ name, "Run " ++ name ++ " unit tests");
+        step.dependOn(&run.step);
+    }
+};
+
+// =============================================================================
 // Metal GPU support (macOS only)
 // =============================================================================
 
@@ -660,24 +698,70 @@ pub fn build(b: *std.Build) void {
     unit_test_build_options.addOption(bool, "dump_tensors", dump_tensors);
     unit_test_build_options.addOption([]const u8, "version", version);
 
-    const test_mod = b.createModule(.{
-        .root_source_file = b.path("core/src/lib.zig"),
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&FailStep.create(b,
+        \\
+        \\`zig build test` is disabled — the monolithic binary exceeds LLVM
+        \\release-mode memory limits. Use per-module test steps instead:
+        \\
+        \\  zig build test-<module> -Drelease
+        \\
+        \\Available modules:
+        \\  tokenizer
+        \\  validate
+        \\  io
+        \\  db
+        \\  template
+        \\  policy
+        \\  models
+        \\  responses
+        \\  converter
+        \\  xray
+        \\  image
+        \\  compute
+        \\  inference
+        \\  agent
+        \\
+        \\Example: zig build test-db -Drelease
+        \\
+    ).step);
+
+    // Per-module test steps — each module compiled as a separate LLVM unit
+    // so release-mode optimization stays within memory limits.
+    // `zig build test-<name> -Drelease` to run a single module.
+    //
+    // Excluded from per-module (debug-only via `zig build test`):
+    //   capi   — aggregates all modules
+    //   router — imports inference → full backend chain
+    const ut = UnitTestCfg{
+        .b = b,
         .target = target,
         .optimize = optimize,
-        .link_libc = true,
-    });
-    test_mod.addImport("cuda_assets", cuda_assets_mod);
-    test_mod.addOptions("build_options", unit_test_build_options);
-    addCDependencies(b, test_mod, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter);
-
-    const tests = b.addTest(.{
-        .root_module = test_mod,
-    });
-    linkCDependencies(b, tests, pcre2, miniz, libmagic, jpeg_turbo, spng, webp, sqlite3, tree_sitter, false);
-
-    const run_tests = b.addRunArtifact(tests);
-    const test_step = b.step("test", "Run unit tests");
-    test_step.dependOn(&run_tests.step);
+        .build_options = unit_test_build_options,
+        .cuda_assets_mod = cuda_assets_mod,
+        .pcre2 = pcre2,
+        .miniz = miniz,
+        .libmagic = libmagic,
+        .jpeg_turbo = jpeg_turbo,
+        .spng = spng,
+        .webp = webp,
+        .sqlite3 = sqlite3,
+        .tree_sitter = tree_sitter,
+    };
+    ut.add("tokenizer", "core/src/tokenizer/root.zig");
+    ut.add("validate", "core/src/validate/root.zig");
+    ut.add("io", "core/src/io/root.zig");
+    ut.add("db", "core/src/db/root.zig");
+    ut.add("template", "core/src/template/root.zig");
+    ut.add("policy", "core/src/policy/root.zig");
+    ut.add("models", "core/src/models/root.zig");
+    ut.add("responses", "core/src/responses/root.zig");
+    ut.add("converter", "core/src/converter/root.zig");
+    ut.add("xray", "core/src/xray/root.zig");
+    ut.add("image", "core/src/image/root.zig");
+    ut.add("compute", "core/src/compute/root.zig");
+    ut.add("inference", "core/src/inference/root.zig");
+    ut.add("agent", "core/src/test_agent.zig");
 
     // Build integration tests against a separate copy of core/src/lib.zig.
     // Keep integration on CPU-only to avoid MLX/Metal runtime coupling and

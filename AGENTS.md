@@ -107,9 +107,31 @@ Build & test entrypoints for canonical commands. Do not guess.
 
 ## Core (Zig)
 
-    zig build release -Drelease           # build library + CLI + copy to Python
-    zig build test -Drelease              # run unit tests
-    zig build test-integration -Drelease  # run integration tests
+    zig build release -Drelease                # build library + CLI + copy to Python
+    zig build test-<module> -Drelease          # run unit tests for a module
+    zig build test-integration -Drelease       # run integration tests
+
+Per-module test steps (match test scope to your changes):
+
+    tokenizer
+    validate
+    io
+    db
+    template
+    policy
+    models
+    responses
+    converter
+    xray
+    image
+    compute
+    inference
+    agent
+
+Example: changed `core/src/db/`? Run `zig build test-db -Drelease`.
+
+Do NOT use `zig build test` — it is disabled (monolithic binary exceeds
+LLVM release-mode memory limits).
 
 See `core/POLICY.md` for test requirements and conventions.
 
