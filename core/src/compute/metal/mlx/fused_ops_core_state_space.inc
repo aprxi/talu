@@ -218,6 +218,35 @@ static inline void bias_cast_cache_clear() {
     bias_cast_cache_store().clear();
 }
 
+struct QuantParamCastCacheKey {
+    const void* param_handle = nullptr;
+    int target_dtype = 0;
+
+    bool operator==(const QuantParamCastCacheKey& other) const {
+        return param_handle == other.param_handle &&
+               target_dtype == other.target_dtype;
+    }
+};
+
+struct QuantParamCastCacheKeyHash {
+    size_t operator()(const QuantParamCastCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.param_handle);
+        h ^= std::hash<int>{}(key.target_dtype) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static constexpr size_t kQuantParamCastCacheMaxEntries = 4096;
+
+static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>& quant_param_cast_cache_store() {
+    static thread_local std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void quant_param_cast_cache_clear() {
+    quant_param_cast_cache_store().clear();
+}
+
 static inline array orient_matmul_rhs_cached(
     const void* weight_handle,
     const array& weight,
@@ -275,6 +304,7 @@ void mlx_weight_transform_cache_clear() {
     causal_conv_kernel_cache_clear();
     causal_conv_bias_cache_clear();
     bias_cast_cache_clear();
+    quant_param_cast_cache_clear();
     attention_fused_qkv_cache_clear();
     ffn_fused_gate_up_cache_clear();
 }
@@ -349,6 +379,53 @@ static array matmul_lastdim(
     return reshape(out_2d, out_shape);
 }
 
+static array quantized_matmul_lastdim(
+    const array& input,
+    const array& weights,
+    const array& scales,
+    const array& biases,
+    int group_size,
+    int bits
+) {
+    if (input.ndim() < 2) {
+        throw std::invalid_argument("[quantized] matmul input rank must be >=2");
+    }
+    if (input.ndim() == 2) {
+        return quantized_matmul(
+            input,
+            weights,
+            scales,
+            biases,
+            true,
+            group_size,
+            bits,
+            "affine"
+        );
+    }
+
+    const int in_features = input.shape(input.ndim() - 1);
+    int rows = 1;
+    for (int axis = 0; axis < input.ndim() - 1; ++axis) {
+        rows *= input.shape(axis);
+    }
+
+    Shape out_shape = input.shape();
+    out_shape.back() = weights.shape(0);
+
+    auto input_2d = reshape(input, {rows, in_features});
+    auto out_2d = quantized_matmul(
+        input_2d,
+        weights,
+        scales,
+        biases,
+        true,
+        group_size,
+        bits,
+        "affine"
+    );
+    return reshape(out_2d, out_shape);
+}
+
 static array linear_bf16_with_bias(
     const array& input,
     const array& weight,
@@ -411,17 +488,48 @@ static array quantized_linear_no_bias(
     const array& scales,
     const array& biases,
     int group_size,
-    int bits
+    int bits,
+    const void* scales_handle = nullptr,
+    const void* biases_handle = nullptr
 ) {
-    return quantized_matmul(
-        input,
+    const Dtype param_dtype = scales.dtype();
+    const array input_cast = (input.dtype() == param_dtype) ? input : astype(input, param_dtype);
+    const auto cast_quant_param = [](const void* handle, const array& param, Dtype target_dtype) -> array {
+        if (param.dtype() == target_dtype) {
+            return param;
+        }
+        if (handle == nullptr) {
+            return astype(param, target_dtype);
+        }
+
+        auto& cache = quant_param_cast_cache_store();
+        if (cache.size() >= kQuantParamCastCacheMaxEntries) {
+            cache.clear();
+        }
+
+        QuantParamCastCacheKey key;
+        key.param_handle = handle;
+        key.target_dtype = static_cast<int>(target_dtype.val());
+        auto it = cache.find(key);
+        if (it != cache.end()) {
+            return it->second;
+        }
+
+        array casted = astype(param, target_dtype);
+        // Materialize once so repeated decode/prefill steps reuse casted params.
+        eval(casted);
+        auto [inserted, _] = cache.emplace(key, std::move(casted));
+        return inserted->second;
+    };
+    const array scales_cast = cast_quant_param(scales_handle, scales, param_dtype);
+    const array biases_cast = cast_quant_param(biases_handle, biases, param_dtype);
+    return quantized_matmul_lastdim(
+        input_cast,
         weights,
-        scales,
-        biases,
-        true,
+        scales_cast,
+        biases_cast,
         group_size,
-        bits,
-        "affine"
+        bits
     );
 }
 

@@ -1041,6 +1041,40 @@ pub fn build(b: *std.Build) void {
     }
 
     // ==========================================================================
+    // Metal compute benchmark harness (core/bench/compute/metal/)
+    // ==========================================================================
+    const bench_metal_compute_path = "core/bench/compute/metal/root.zig";
+    if (std.fs.cwd().access(bench_metal_compute_path, .{})) |_| {
+        const host_target = b.resolveTargetQuery(.{});
+        const bench_metal_compute_mod = b.createModule(.{
+            .root_source_file = b.path(bench_metal_compute_path),
+            .target = host_target,
+            .optimize = .ReleaseFast,
+            .link_libc = true,
+            .imports = &.{
+                .{ .name = "main", .module = integration_main_mod },
+            },
+        });
+        const bench_metal_compute_exe = b.addExecutable(.{
+            .name = "bench-metal-compute",
+            .root_module = bench_metal_compute_mod,
+        });
+        addMetalSupport(b, bench_metal_compute_mod, bench_metal_compute_exe, enable_metal);
+        b.installArtifact(bench_metal_compute_exe);
+
+        const run_bench_metal_compute = b.addRunArtifact(bench_metal_compute_exe);
+        if (b.args) |args| {
+            for (args) |arg| {
+                run_bench_metal_compute.addArg(arg);
+            }
+        }
+        const bench_metal_compute_step = b.step("bench-metal-compute", "Run Metal compute benchmark harness");
+        bench_metal_compute_step.dependOn(&run_bench_metal_compute.step);
+    } else |_| {
+        // compute benchmark harness not present - skip
+    }
+
+    // ==========================================================================
     // Python Binding Generator (core/tests/helpers/gen_bindings.zig)
     // ==========================================================================
     // Python bindings generator

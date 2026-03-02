@@ -420,11 +420,16 @@ void* mlx_lazy_fused_attention(
     attn_out = reshape_attention_output(attn_out, batch_size, seq_len, n_heads_int * head_dim_int);
 
     // Output projection
-    auto out = quantized_matmul(attn_out,
+    auto out = quantized_linear_no_bias(
+        attn_out,
         *static_cast<const array*>(o_w),
         *static_cast<const array*>(o_s),
         *static_cast<const array*>(o_b),
-        true, group_size_int, bits_int, "affine");
+        group_size_int,
+        bits_int,
+        o_s,
+        o_b
+    );
 
     // Add output bias if present
     if (o_bias != nullptr) {
@@ -569,17 +574,27 @@ void* mlx_lazy_fused_ffn(
     int gs = static_cast<int>(group_size);
     int b = static_cast<int>(bits);
 
-    auto gate = quantized_matmul(x,
+    auto gate = quantized_linear_no_bias(
+        x,
         *static_cast<const array*>(gate_w),
         *static_cast<const array*>(gate_s),
         *static_cast<const array*>(gate_b),
-        true, gs, b, "affine");
+        gs,
+        b,
+        gate_s,
+        gate_b
+    );
 
-    auto up = quantized_matmul(x,
+    auto up = quantized_linear_no_bias(
+        x,
         *static_cast<const array*>(up_w),
         *static_cast<const array*>(up_s),
         *static_cast<const array*>(up_b),
-        true, gs, b, "affine");
+        gs,
+        b,
+        up_s,
+        up_b
+    );
 
     // Activation: GELU or SwiGLU based on model config
     auto mid = [&]() -> array {
@@ -595,11 +610,16 @@ void* mlx_lazy_fused_ffn(
         }
     }();
 
-    auto out = quantized_matmul(mid,
+    auto out = quantized_linear_no_bias(
+        mid,
         *static_cast<const array*>(down_w),
         *static_cast<const array*>(down_s),
         *static_cast<const array*>(down_b),
-        true, gs, b, "affine");
+        gs,
+        b,
+        down_s,
+        down_b
+    );
 
     return pool_array(std::move(out));
 }

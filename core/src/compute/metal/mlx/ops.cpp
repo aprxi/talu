@@ -10,6 +10,67 @@
 thread_local bool g_count_ops_enabled = false;
 thread_local size_t g_count_ops_value = 0;
 
+static constexpr size_t kQuantParamCastCacheMaxEntries = 4096;
+
+struct QuantParamCastCacheKey {
+    const void* handle = nullptr;
+    int target_dtype = 0;
+
+    bool operator==(const QuantParamCastCacheKey& other) const {
+        return handle == other.handle &&
+               target_dtype == other.target_dtype;
+    }
+};
+
+struct QuantParamCastCacheKeyHash {
+    size_t operator()(const QuantParamCastCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.handle);
+        h ^= std::hash<int>{}(key.target_dtype) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>& quant_param_cast_cache_store() {
+    static thread_local std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void quant_param_cast_cache_clear() {
+    quant_param_cast_cache_store().clear();
+}
+
+static array cast_quant_param_cached(
+    const void* handle,
+    const array& param,
+    Dtype target_dtype
+) {
+    if (param.dtype() == target_dtype) {
+        return param;
+    }
+    if (handle == nullptr) {
+        return astype(param, target_dtype);
+    }
+
+    auto& cache = quant_param_cast_cache_store();
+    if (cache.size() >= kQuantParamCastCacheMaxEntries) {
+        cache.clear();
+    }
+
+    QuantParamCastCacheKey key;
+    key.handle = handle;
+    key.target_dtype = static_cast<int>(target_dtype.val());
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    array casted = astype(param, target_dtype);
+    // Materialize once so repeated decode/prefill steps reuse concrete casts.
+    eval(casted);
+    auto [inserted, _] = cache.emplace(key, std::move(casted));
+    return inserted->second;
+}
+
 extern "C" {
 
 void mlx_start_counting() {
@@ -36,6 +97,10 @@ size_t mlx_gqa_index_cache_max_entries() {
 
 void mlx_gqa_index_cache_touch(size_t q_heads, size_t kv_heads) {
     (void)gqa_cached_gather_indices(static_cast<int>(q_heads), static_cast<int>(kv_heads));
+}
+
+void mlx_quant_param_cast_cache_clear() {
+    quant_param_cast_cache_clear();
 }
 
 // ============================================================================
@@ -101,6 +166,56 @@ static array matmul_lastdim_impl(const array& input, const array& rhs) {
     return reshape(out_2d, out_shape);
 }
 
+static array quantized_matmul_lastdim_impl(
+    const array& input,
+    const array& weights,
+    const array& scales,
+    const array& biases,
+    bool transpose_weights,
+    int group_size,
+    int bits
+) {
+    if (input.ndim() < 2) {
+        throw std::invalid_argument("[quantized_matmul_lastdim] input rank must be >=2");
+    }
+
+    if (input.ndim() == 2) {
+        return quantized_matmul(
+            input,
+            weights,
+            scales,
+            biases,
+            transpose_weights,
+            group_size,
+            bits,
+            "affine"
+        );
+    }
+
+    const int in_features = input.shape(input.ndim() - 1);
+    int rows = 1;
+    for (int axis = 0; axis < input.ndim() - 1; ++axis) {
+        rows *= input.shape(axis);
+    }
+
+    Shape out_shape = input.shape();
+    // For talu quantized weights, transpose_weights is always true and N is dim 0.
+    out_shape.back() = transpose_weights ? weights.shape(0) : weights.shape(1);
+
+    auto input_2d = reshape(input, {rows, in_features});
+    auto out_2d = quantized_matmul(
+        input_2d,
+        weights,
+        scales,
+        biases,
+        transpose_weights,
+        group_size,
+        bits,
+        "affine"
+    );
+    return reshape(out_2d, out_shape);
+}
+
 void* mlx_lazy_matmul(const void* a, const void* b) {
     mlx_count_op();
     const auto& lhs = *static_cast<const array*>(a);
@@ -120,15 +235,20 @@ void* mlx_lazy_quantized_matmul(
     const auto& weights_arr = *static_cast<const array*>(weights);
     const auto& scales_arr = *static_cast<const array*>(scales);
     const auto& biases_arr = *static_cast<const array*>(biases);
-    return pool_array(quantized_matmul(
-        input_arr,
+    // Keep quant params in their stored dtype and cast activations instead.
+    // This avoids large first-use scale/bias casts on prompt prefill.
+    const Dtype param_dtype = scales_arr.dtype();
+    const array input_cast = (input_arr.dtype() == param_dtype) ? input_arr : astype(input_arr, param_dtype);
+    const array scales_cast = cast_quant_param_cached(scales, scales_arr, param_dtype);
+    const array biases_cast = cast_quant_param_cached(biases, biases_arr, param_dtype);
+    return pool_array(quantized_matmul_lastdim_impl(
+        input_cast,
         weights_arr,
-        scales_arr,
-        biases_arr,
+        scales_cast,
+        biases_cast,
         transpose_weights,
         static_cast<int>(group_size),
-        static_cast<int>(bits),
-        "affine"
+        static_cast<int>(bits)
     ));
 }
 
@@ -302,11 +422,6 @@ void* mlx_lazy_softmax(const void* input, int axis) {
     return pool_array(softmax(input_arr, axis));
 }
 
-void* mlx_lazy_silu(const void* input) {
-    const auto& input_arr = *static_cast<const array*>(input);
-    return pool_array(input_arr * sigmoid(input_arr));
-}
-
 void* mlx_lazy_rms_norm(const void* input, const void* weight, float eps) {
     return pool_array(fast::rms_norm(
         *static_cast<const array*>(input),
@@ -336,12 +451,22 @@ void* mlx_lazy_rope(const void* input, size_t head_dim, size_t offset, float rop
 }
 
 void* mlx_lazy_attention(const void* q, const void* k, const void* v, float scale, bool causal) {
+    const auto& q_arr = *static_cast<const array*>(q);
+    // Decode hot path: when query length is 1 there are no future tokens to mask,
+    // so causal masking adds overhead without changing semantics.
+    bool use_causal = causal;
+    if (causal && q_arr.ndim() >= 2) {
+        const int q_seq_axis = q_arr.ndim() - 2;
+        if (q_arr.shape(q_seq_axis) <= 1) {
+            use_causal = false;
+        }
+    }
     return pool_array(fast::scaled_dot_product_attention(
-        *static_cast<const array*>(q),
+        q_arr,
         *static_cast<const array*>(k),
         *static_cast<const array*>(v),
         scale,
-        causal ? "causal" : ""
+        use_causal ? "causal" : ""
     ));
 }
 

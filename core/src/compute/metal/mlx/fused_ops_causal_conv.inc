@@ -22,15 +22,14 @@ void* mlx_lazy_causal_conv_mixer_bf16(
     const int hidden_dim = input_arr.shape(2);
 
     const array in_proj_rhs = orient_matmul_rhs_cached(in_proj, in_proj_arr, hidden_dim, 3 * conv_dim_i, true);
-    array bcx = matmul_lastdim(input_arr, in_proj_rhs);
-    // FP32 allowlist: keep causal-conv recurrence input stream in FP32.
-    if (bcx.dtype() != float32) {
-        bcx = astype(bcx, float32);
-    }
-
+    const array bcx = matmul_lastdim(input_arr, in_proj_rhs);
+    // Keep recurrence update in FP32, but preserve model dtype for gating/output
+    // to avoid unnecessary FP32 residency and per-token recasts in dense decode.
     array b_gate = slice(bcx, {0, 0, 0}, {1, seq_len, conv_dim_i});
-    array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
+    const array c_gate = slice(bcx, {0, 0, conv_dim_i}, {1, seq_len, 2 * conv_dim_i});
     array x_proj = slice(bcx, {0, 0, 2 * conv_dim_i}, {1, seq_len, 3 * conv_dim_i});
+    if (b_gate.dtype() != float32) b_gate = astype(b_gate, float32);
+    if (x_proj.dtype() != float32) x_proj = astype(x_proj, float32);
     // FP32 allowlist: causal_conv recurrence is stateful; keep conv stream update
     // in FP32 while preserving bf16/f16 for output projection.
     array bx = b_gate * x_proj;
@@ -119,15 +118,15 @@ void* mlx_lazy_causal_conv_mixer_quantized(
     const int group_size_i = static_cast<int>(group_size);
     const int bits_i = static_cast<int>(bits);
 
-    array bcx = quantized_matmul(
+    array bcx = quantized_linear_no_bias(
         input_arr,
         in_w_arr,
         in_s_arr,
         in_b_arr,
-        true,
         group_size_i,
         bits_i,
-        "affine"
+        in_s,
+        in_b
     );
     // FP32 allowlist: causal_conv recurrence is stateful; keep conv inputs in FP32
     // to avoid drift across long prefill/decode sequences.
@@ -177,15 +176,15 @@ void* mlx_lazy_causal_conv_mixer_quantized(
     }
 
     const array gated = conv_seq * c_gate;
-    const array out = quantized_matmul(
+    const array out = quantized_linear_no_bias(
         gated,
         out_w_arr,
         out_s_arr,
         out_b_arr,
-        true,
         group_size_i,
         bits_i,
-        "affine"
+        out_s,
+        out_b
     );
 
     if (layer_state != nullptr) {

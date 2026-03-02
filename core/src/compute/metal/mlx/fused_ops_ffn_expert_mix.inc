@@ -158,11 +158,16 @@ void* mlx_lazy_fused_expert_mix_ffn_mxfp4(
     // 1. MLX community: 8-bit affine quantized router (router_s/router_b present)
     // 2. Hub/OpenAI: BF16 unquantized router (router_s/router_b null)
     array router_logits = (router_s != nullptr && router_b != nullptr)
-        ? quantized_matmul(x,
+        ? quantized_linear_no_bias(
+            x,
             *static_cast<const array*>(router_w),
             *static_cast<const array*>(router_s),
             *static_cast<const array*>(router_b),
-            true, static_cast<int>(router_group_size), 8, "affine")
+            static_cast<int>(router_group_size),
+            8,
+            router_s,
+            router_b
+        )
         : matmul(
             x,
             orient_matmul_rhs_cached(
