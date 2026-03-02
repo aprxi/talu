@@ -178,30 +178,6 @@ fn mlx_scaled_dot_product_attention_impl(
     return true;
 }
 
-fn mlx_silu_impl(
-    x_data: [*]const f32,
-    size: usize,
-    out_data: [*]f32,
-) bool {
-    // Create array
-    const x_shape = [_]usize{size};
-    const x_array = mlx_graph.mlx_array_from_float32(x_data, &x_shape, 1);
-    defer mlx_graph.mlx_array_free(x_array);
-
-    // Call SiLU
-    const result_handle = mlx_graph.mlx_lazy_silu(x_array);
-    defer mlx_graph.mlx_array_free(result_handle);
-
-    // Evaluate
-    var handles = [_]mlx_graph.ArrayHandle{result_handle};
-    mlx_graph.mlx_eval(&handles, 1);
-
-    // Copy back
-    mlx_graph.mlx_array_to_float32(result_handle, out_data, size);
-
-    return true;
-}
-
 // ============================================================================
 // Export C ABI functions for external use.
 // ============================================================================
@@ -271,14 +247,6 @@ export fn mlx_scaled_dot_product_attention(
         scale,
         out_data,
     );
-}
-
-export fn mlx_silu(
-    x_data: [*]const f32,
-    size: usize,
-    out_data: [*]f32,
-) bool {
-    return mlx_silu_impl(x_data, size, out_data);
 }
 
 /// Grouped-affine u4 quantized matrix multiplication using Metal GPU (MLX backend).
@@ -413,22 +381,6 @@ fn scaledDotProductAttention(
     );
 
     if (!success) return error.MLXAttentionFailed;
-}
-
-/// SiLU activation using MLX.
-pub fn silu(
-    x: []const f32,
-    out: []f32,
-) !void {
-    std.debug.assert(x.len == out.len);
-
-    const success = mlx_silu(
-        x.ptr,
-        x.len,
-        out.ptr,
-    );
-
-    if (!success) return error.MLXSiluFailed;
 }
 
 // =============================================================================
@@ -579,31 +531,6 @@ test "rope rotates at non-zero position" {
     const theta: f32 = 1.0;
     try std.testing.expectApproxEqAbs(@cos(theta), out[0], 0.01);
     try std.testing.expectApproxEqAbs(@sin(theta), out[1], 0.01);
-}
-
-test "silu applies activation function" {
-    if (comptime builtin.os.tag != .macos) return;
-
-    var x = [_]f32{ -2.0, -1.0, 0.0, 1.0, 2.0 };
-    var out: [5]f32 = undefined;
-
-    silu(&x, &out) catch |err| {
-        try std.testing.expect(err == error.MLXSiluFailed);
-        return;
-    };
-
-    // SiLU(x) = x * sigmoid(x) = x / (1 + e^(-x))
-    // Expected values computed mathematically:
-    // SiLU(-2) = -2 / (1 + e^2) ≈ -0.2384
-    // SiLU(-1) = -1 / (1 + e^1) ≈ -0.2689
-    // SiLU(0) = 0
-    // SiLU(1) = 1 / (1 + e^(-1)) ≈ 0.7311
-    // SiLU(2) = 2 / (1 + e^(-2)) ≈ 1.7616
-    try std.testing.expectApproxEqAbs(@as(f32, -0.2384), out[0], 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, -0.2689), out[1], 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.0), out[2], 0.001);
-    try std.testing.expectApproxEqAbs(@as(f32, 0.7311), out[3], 0.01);
-    try std.testing.expectApproxEqAbs(@as(f32, 1.7616), out[4], 0.01);
 }
 
 test "scaledDotProductAttention repeats KV heads for GQA" {

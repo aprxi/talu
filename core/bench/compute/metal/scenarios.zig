@@ -9,7 +9,6 @@ pub const Scenario = enum {
     all,
     add_f16,
     mul_f16,
-    silu_f16,
     rms_f16,
     softmax_f16,
     fused_ffn_quantized_decode_u4,
@@ -17,9 +16,11 @@ pub const Scenario = enum {
     quantized_matmul_u4,
     quantized_matmul_u8,
     attention_decode_f16,
+    shortconv_decode_bf16,
     matmul_throughput_f16,
     micro_matmul_f16,
     decode_synth_f16,
+    decode_dense_f16,
 };
 
 pub const Profile = enum {
@@ -100,6 +101,16 @@ const OwnedU32 = struct {
 const OwnedBF16 = struct {
     data: []u16,
     handle: graph.ArrayHandle,
+
+    fn initShape(allocator: std.mem.Allocator, shape: []const i64, seed: u64) !OwnedBF16 {
+        var count: usize = 1;
+        for (shape) |dim| count *= @intCast(dim);
+        const data = try allocator.alloc(u16, count);
+        fillDeterministicBF16(data, seed);
+        const ptr: [*]align(1) const u16 = @ptrCast(data.ptr);
+        const handle = graph.createArrayBF16Unaligned(ptr, data.len, shape) orelse return error.OutOfMemory;
+        return .{ .data = data, .handle = handle };
+    }
 
     fn init2D(allocator: std.mem.Allocator, rows: usize, cols: usize, seed: u64) !OwnedBF16 {
         const count = rows * cols;
@@ -208,10 +219,69 @@ fn profileDecodeDims(profile: Profile) struct { layers: usize, hidden: usize, ff
     };
 }
 
+fn profileDecodeDenseDims(profile: Profile) struct {
+    layers: usize,
+    hidden: usize,
+    ff: usize,
+    heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+    vocab: usize,
+    d_conv: usize,
+    conv_dim: usize,
+} {
+    return switch (profile) {
+        .ci => .{
+            .layers = 8,
+            .hidden = 512,
+            .ff = 2048,
+            .heads = 8,
+            .head_dim = 64,
+            .kv_len = 1024,
+            .vocab = 32768,
+            .d_conv = 4,
+            .conv_dim = 512,
+        },
+        .bw => .{
+            .layers = 16,
+            .hidden = 1024,
+            .ff = 4608,
+            .heads = 16,
+            .head_dim = 64,
+            .kv_len = 4096,
+            .vocab = 65536,
+            .d_conv = 4,
+            .conv_dim = 1024,
+        },
+    };
+}
+
 fn profileAttentionDecodeDims(profile: Profile) struct { heads: usize, head_dim: usize, kv_len: usize } {
     return switch (profile) {
         .ci => .{ .heads = 16, .head_dim = 64, .kv_len = 2048 },
         .bw => .{ .heads = 16, .head_dim = 64, .kv_len = 8192 },
+    };
+}
+
+fn profileShortconvDecodeDims(profile: Profile) struct {
+    hidden: usize,
+    conv_dim: usize,
+    d_conv: usize,
+    steps: usize,
+} {
+    return switch (profile) {
+        .ci => .{
+            .hidden = 512,
+            .conv_dim = 512,
+            .d_conv = 4,
+            .steps = 16,
+        },
+        .bw => .{
+            .hidden = 1024,
+            .conv_dim = 1024,
+            .d_conv = 4,
+            .steps = 48,
+        },
     };
 }
 
@@ -254,6 +324,15 @@ fn profileMethodRepeats(profile: Profile) usize {
     return switch (profile) {
         .ci => 4,
         .bw => 4,
+    };
+}
+
+fn profileReductionMethodRepeats(profile: Profile) usize {
+    return switch (profile) {
+        .ci => 4,
+        // Reduction-heavy kernels need longer sustained loops to amortize
+        // dispatch overhead and expose method-limited throughput.
+        .bw => 8,
     };
 }
 
@@ -444,58 +523,11 @@ pub fn runMultiplyF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioRes
     };
 }
 
-pub fn runSiluF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
-    try expectMetalReady();
-
-    const elems = profileAddElems(cfg.profile);
-    const repeats = profileMethodRepeats(cfg.profile);
-    var x = try OwnedF16.init1D(allocator, elems, 0x5301);
-    defer x.deinit(allocator);
-
-    const samples = try allocator.alloc(harness.Sample, cfg.iters);
-    errdefer allocator.free(samples);
-
-    const total_iters = cfg.warmup + cfg.iters;
-    var sample_idx: usize = 0;
-    var iter: usize = 0;
-    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
-    graph.mlx_clear_memory_cache();
-    while (iter < total_iters) : (iter += 1) {
-        graph.beginForwardGraphBuild();
-        const t0 = std.time.nanoTimestamp();
-        var out = graph.mlx_lazy_silu(x.handle);
-        var rep: usize = 1;
-        while (rep < repeats) : (rep += 1) {
-            out = graph.mlx_lazy_silu(out);
-        }
-        const t1 = std.time.nanoTimestamp();
-        var handles = [_]graph.ArrayHandle{out};
-        const t2 = std.time.nanoTimestamp();
-        graph.eval(&handles);
-        const t3 = std.time.nanoTimestamp();
-
-        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
-    }
-
-    const bytes = toU64Saturating(@as(u128, elems) * 2 * 2 * repeats);
-    const flops = toU64Saturating(@as(u128, elems) * 4 * repeats);
-
-    return .{
-        .name = "p2_silu",
-        .profile = cfg.profile,
-        .samples = samples,
-        .cold_first = cold_first,
-        .flops_per_iter = flops,
-        .bytes_per_iter = bytes,
-        .note = "SiLU activation method stress",
-    };
-}
-
 pub fn runRmsNormF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
     try expectMetalReady();
 
     const dims = profileNormShape(cfg.profile);
-    const repeats = profileMethodRepeats(cfg.profile);
+    const repeats = profileReductionMethodRepeats(cfg.profile);
     const x_shape = [_]i64{ @intCast(dims.batch), @intCast(dims.seq), @intCast(dims.dim) };
     var x = try OwnedF16.initShape(allocator, &x_shape, 0x5401);
     defer x.deinit(allocator);
@@ -546,7 +578,7 @@ pub fn runSoftmaxF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResu
     try expectMetalReady();
 
     const dims = profileSoftmaxShape(cfg.profile);
-    const repeats = profileMethodRepeats(cfg.profile);
+    const repeats = profileReductionMethodRepeats(cfg.profile);
     const x_shape = [_]i64{ @intCast(dims.rows), @intCast(dims.cols) };
     var x = try OwnedF16.initShape(allocator, &x_shape, 0x5501);
     defer x.deinit(allocator);
@@ -660,11 +692,11 @@ fn runFusedFfnQuantizedDecode(
             up_b.handle,
             down_w.handle,
             down_s.handle,
-                down_b.handle,
-                dims.group_size,
-                bits,
-                false,
-            );
+            down_b.handle,
+            dims.group_size,
+            bits,
+            false,
+        );
         var rep: usize = 1;
         while (rep < repeats) : (rep += 1) {
             out = graph.mlx_lazy_fused_ffn(
@@ -816,6 +848,10 @@ pub fn runMatmulThroughputF16(allocator: std.mem.Allocator, cfg: RunConfig) !Sce
 
     const dims = profileMatmulThroughputDims(cfg.profile);
     const repeats = profileMethodRepeats(cfg.profile);
+    const startup_preheat_iters: usize = switch (cfg.profile) {
+        .ci => 0,
+        .bw => 32,
+    };
     var lhs = try OwnedF16.init2D(allocator, dims.m, dims.k, 0x6101);
     defer lhs.deinit(allocator);
     var rhs = try OwnedF16.init2D(allocator, dims.k, dims.n, 0x6102);
@@ -829,6 +865,19 @@ pub fn runMatmulThroughputF16(allocator: std.mem.Allocator, cfg: RunConfig) !Sce
     var iter: usize = 0;
     var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
     graph.mlx_clear_memory_cache();
+    // BW throughput mode should reflect sustained compute. Prime clocks/state
+    // outside measured samples to reduce first-invocation ramp noise.
+    var preheat_iter: usize = 0;
+    while (preheat_iter < startup_preheat_iters) : (preheat_iter += 1) {
+        graph.beginForwardGraphBuild();
+        var out = graph.mlx_lazy_matmul(lhs.handle, rhs.handle);
+        var rep: usize = 1;
+        while (rep < repeats) : (rep += 1) {
+            out = graph.mlx_lazy_matmul(out, rhs.handle);
+        }
+        var handles = [_]graph.ArrayHandle{out};
+        graph.eval(&handles);
+    }
     while (iter < total_iters) : (iter += 1) {
         graph.beginForwardGraphBuild();
         const t0 = std.time.nanoTimestamp();
@@ -864,7 +913,12 @@ pub fn runAttentionDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
     try expectMetalReady();
 
     const dims = profileAttentionDecodeDims(cfg.profile);
-    const repeats = profileMethodRepeats(cfg.profile);
+    // Keep attention samples long enough in bw profile so results are stable
+    // and representative under sustained load (less sub-ms timing noise).
+    const repeats: usize = switch (cfg.profile) {
+        .ci => profileMethodRepeats(cfg.profile),
+        .bw => 16,
+    };
     const q_shape = [_]i64{ 1, @intCast(dims.heads), 1, @intCast(dims.head_dim) };
     const kv_shape = [_]i64{ 1, @intCast(dims.heads), @intCast(dims.kv_len), @intCast(dims.head_dim) };
     var q = try OwnedF16.initShape(allocator, &q_shape, 0x7101);
@@ -910,7 +964,85 @@ pub fn runAttentionDecodeF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scen
         .cold_first = cold_first,
         .flops_per_iter = flops,
         .bytes_per_iter = bytes,
-        .note = "decode attention method with KV-cache style shapes",
+        .note = "decode attention method with KV-cache style shapes (sustained bw repeats)",
+    };
+}
+
+pub fn runShortconvDecodeBF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileShortconvDecodeDims(cfg.profile);
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var x = try OwnedBF16.initShape(allocator, &token_shape, 0x9101);
+    defer x.deinit(allocator);
+    var in_proj = try OwnedBF16.init2D(allocator, dims.hidden, 3 * dims.conv_dim, 0x9102);
+    defer in_proj.deinit(allocator);
+    var conv_w = try OwnedBF16.init2D(allocator, dims.d_conv, dims.conv_dim, 0x9103);
+    defer conv_w.deinit(allocator);
+    var conv_b = try OwnedBF16.init2D(allocator, 1, dims.conv_dim, 0x9104);
+    defer conv_b.deinit(allocator);
+    var out_proj = try OwnedBF16.init2D(allocator, dims.conv_dim, dims.hidden, 0x9105);
+    defer out_proj.deinit(allocator);
+
+    const cache = graph.mlx_causal_conv_cache_create(1);
+    defer graph.mlx_causal_conv_cache_free(cache);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    while (iter < total_iters) : (iter += 1) {
+        graph.mlx_causal_conv_cache_reset(cache);
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+        var out: graph.ArrayHandle = x.handle;
+        var step: usize = 0;
+        while (step < dims.steps) : (step += 1) {
+            out = graph.mlx_lazy_causal_conv_mixer_bf16(
+                out,
+                in_proj.handle,
+                conv_w.handle,
+                conv_b.handle,
+                out_proj.handle,
+                cache,
+                0,
+                dims.d_conv,
+                dims.conv_dim,
+            );
+        }
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{out};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const flops_per_step =
+        @as(u128, 2) * dims.hidden * (3 * dims.conv_dim) +
+        @as(u128, 2) * dims.d_conv * dims.conv_dim +
+        @as(u128, 3) * dims.conv_dim +
+        @as(u128, 2) * dims.conv_dim * dims.hidden;
+    const bytes_per_step =
+        (@as(u128, dims.hidden) * (3 * dims.conv_dim) +
+            @as(u128, dims.d_conv) * dims.conv_dim +
+            @as(u128, dims.conv_dim) +
+            @as(u128, dims.conv_dim) * dims.hidden) * 2 +
+        (@as(u128, 2) * dims.d_conv * dims.conv_dim * 4);
+
+    return .{
+        .name = "p1_scv",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = toU64Saturating(flops_per_step * dims.steps),
+        .bytes_per_iter = toU64Saturating(bytes_per_step * dims.steps),
+        .note = "dense shortconv decode method with recurrent cache updates",
     };
 }
 
@@ -918,7 +1050,8 @@ pub fn runDecodeSynthF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scenario
     try expectMetalReady();
 
     const dims = profileDecodeDims(cfg.profile);
-    var input_token = try OwnedF16.init2D(allocator, 1, dims.hidden, 0xBEEF);
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var input_token = try OwnedF16.initShape(allocator, &token_shape, 0xBEEF);
     defer input_token.deinit(allocator);
 
     var layers = try allocator.alloc(DecodeLayer, dims.layers);
@@ -957,12 +1090,13 @@ pub fn runDecodeSynthF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scenario
             const x_res = graph.mlx_lazy_add(residual, o);
 
             const norm = graph.mlx_lazy_rms_norm(x_res, layer.norm.handle, 1.0e-5);
-            const g = graph.mlx_lazy_matmul(norm, layer.w1.handle);
-            const u = graph.mlx_lazy_matmul(norm, layer.w3.handle);
-            const silu = graph.mlx_lazy_silu(g);
-            const gated = graph.mlx_lazy_multiply(silu, u);
-            const down = graph.mlx_lazy_matmul(gated, layer.w2.handle);
-            x = graph.mlx_lazy_add(x_res, down);
+            const ffn = graph.mlx_lazy_fused_ffn_bf16(
+                norm,
+                layer.w1.handle,
+                layer.w3.handle,
+                layer.w2.handle,
+            );
+            x = graph.mlx_lazy_add(x_res, ffn);
         }
 
         const t1 = std.time.nanoTimestamp();
@@ -985,5 +1119,204 @@ pub fn runDecodeSynthF16(allocator: std.mem.Allocator, cfg: RunConfig) !Scenario
         .flops_per_iter = toU64Saturating(per_layer_flops * dims.layers),
         .bytes_per_iter = toU64Saturating(per_layer_weight_bytes * dims.layers),
         .note = "synthetic decode token path; bytes estimate is weight-stream lower bound",
+    };
+}
+
+const DecodeDenseLayer = struct {
+    // Attention path
+    wq: OwnedF16,
+    wo: OwnedF16,
+    k_cache: OwnedF16,
+    v_cache: OwnedF16,
+    // ShortConv path
+    conv_in: OwnedF16,
+    conv_out: OwnedF16,
+    // Shared FFN + norm
+    w1: OwnedF16,
+    w2: OwnedF16,
+    w3: OwnedF16,
+    norm: OwnedF16,
+    // Layer type
+    is_shortconv: bool,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        hidden: usize,
+        ff: usize,
+        heads: usize,
+        head_dim: usize,
+        kv_len: usize,
+        _: usize,
+        conv_dim: usize,
+        is_shortconv: bool,
+        seed: u64,
+    ) !DecodeDenseLayer {
+        const kv_shape = [_]i64{ 1, @intCast(heads), @intCast(kv_len), @intCast(head_dim) };
+        return .{
+            .wq = try OwnedF16.init2D(allocator, hidden, hidden, seed +% 1),
+            .wo = try OwnedF16.init2D(allocator, hidden, hidden, seed +% 2),
+            .k_cache = try OwnedF16.initShape(allocator, &kv_shape, seed +% 3),
+            .v_cache = try OwnedF16.initShape(allocator, &kv_shape, seed +% 4),
+            .conv_in = try OwnedF16.init2D(allocator, hidden, 3 * conv_dim, seed +% 5),
+            .conv_out = try OwnedF16.init2D(allocator, conv_dim, hidden, seed +% 6),
+            .w1 = try OwnedF16.init2D(allocator, hidden, ff, seed +% 7),
+            .w2 = try OwnedF16.init2D(allocator, ff, hidden, seed +% 8),
+            .w3 = try OwnedF16.init2D(allocator, hidden, ff, seed +% 9),
+            .norm = try OwnedF16.init1D(allocator, hidden, seed +% 10),
+            .is_shortconv = is_shortconv,
+        };
+    }
+
+    fn deinit(self: *DecodeDenseLayer, allocator: std.mem.Allocator) void {
+        self.wq.deinit(allocator);
+        self.wo.deinit(allocator);
+        self.k_cache.deinit(allocator);
+        self.v_cache.deinit(allocator);
+        self.conv_in.deinit(allocator);
+        self.conv_out.deinit(allocator);
+        self.w1.deinit(allocator);
+        self.w2.deinit(allocator);
+        self.w3.deinit(allocator);
+        self.norm.deinit(allocator);
+    }
+};
+
+pub fn runDecodeDenseF16(allocator: std.mem.Allocator, cfg: RunConfig) !ScenarioResult {
+    try expectMetalReady();
+
+    const dims = profileDecodeDenseDims(cfg.profile);
+    if (dims.hidden != dims.heads * dims.head_dim) return error.InvalidInput;
+
+    const token_shape = [_]i64{ 1, 1, @intCast(dims.hidden) };
+    var input_token = try OwnedF16.initShape(allocator, &token_shape, 0xD001);
+    defer input_token.deinit(allocator);
+    var ln_final = try OwnedF16.init1D(allocator, dims.hidden, 0xD002);
+    defer ln_final.deinit(allocator);
+    var lm_head = try OwnedF16.init2D(allocator, dims.hidden, dims.vocab, 0xD003);
+    defer lm_head.deinit(allocator);
+
+    var layers = try allocator.alloc(DecodeDenseLayer, dims.layers);
+    defer allocator.free(layers);
+    var initialized: usize = 0;
+    errdefer for (layers[0..initialized]) |*layer| layer.deinit(allocator);
+    for (layers, 0..) |*layer, idx| {
+        layer.* = try DecodeDenseLayer.init(
+            allocator,
+            dims.hidden,
+            dims.ff,
+            dims.heads,
+            dims.head_dim,
+            dims.kv_len,
+            dims.d_conv,
+            dims.conv_dim,
+            (idx % 2) == 0,
+            0xD100 +% idx *% 17,
+        );
+        initialized += 1;
+    }
+    defer for (layers) |*layer| layer.deinit(allocator);
+
+    const samples = try allocator.alloc(harness.Sample, cfg.iters);
+    errdefer allocator.free(samples);
+
+    const total_iters = cfg.warmup + cfg.iters;
+    var sample_idx: usize = 0;
+    var iter: usize = 0;
+    var cold_first: harness.Sample = .{ .build_ns = 0, .eval_ns = 0, .total_ns = 0 };
+    graph.mlx_clear_memory_cache();
+    const attn_scale = 1.0 / @sqrt(@as(f32, @floatFromInt(dims.head_dim)));
+    while (iter < total_iters) : (iter += 1) {
+        graph.beginForwardGraphBuild();
+        const t0 = std.time.nanoTimestamp();
+
+        var x = input_token.handle;
+        for (layers) |*layer| {
+            const residual = x;
+            const mixed = if (layer.is_shortconv) blk: {
+                // Stable shortconv proxy for dense decode benchmark:
+                // in_proj -> split gates -> multiplicative mixer -> out_proj.
+                const bcx = graph.mlx_lazy_matmul(x, layer.conv_in.handle);
+                const s0 = [_]c_int{ 0, 0, 0 };
+                const e0 = [_]c_int{ 1, 1, @intCast(dims.conv_dim) };
+                const s1 = [_]c_int{ 0, 0, @intCast(dims.conv_dim) };
+                const e1 = [_]c_int{ 1, 1, @intCast(2 * dims.conv_dim) };
+                const s2 = [_]c_int{ 0, 0, @intCast(2 * dims.conv_dim) };
+                const e2 = [_]c_int{ 1, 1, @intCast(3 * dims.conv_dim) };
+                const b_gate = graph.mlx_lazy_slice(bcx, &s0, &e0, 3);
+                const c_gate = graph.mlx_lazy_slice(bcx, &s1, &e1, 3);
+                const x_proj = graph.mlx_lazy_slice(bcx, &s2, &e2, 3);
+                const bx = graph.mlx_lazy_multiply(b_gate, x_proj);
+                const gated = graph.mlx_lazy_multiply(bx, c_gate);
+                break :blk graph.mlx_lazy_matmul(gated, layer.conv_out.handle);
+            } else blk: {
+                const q_lin = graph.mlx_lazy_matmul(x, layer.wq.handle); // [1,1,H]
+                const q_shape = [_]usize{ 1, dims.heads, 1, dims.head_dim };
+                const q = graph.mlx_lazy_reshape(q_lin, &q_shape, 4);
+                const attn = graph.mlx_lazy_attention(
+                    q,
+                    layer.k_cache.handle,
+                    layer.v_cache.handle,
+                    attn_scale,
+                    true,
+                );
+                const flat_shape = [_]usize{ 1, 1, dims.hidden };
+                const attn_flat = graph.mlx_lazy_reshape(attn, &flat_shape, 3);
+                break :blk graph.mlx_lazy_matmul(attn_flat, layer.wo.handle);
+            };
+
+            const x_res = graph.mlx_lazy_add(residual, mixed);
+            const norm = graph.mlx_lazy_rms_norm(x_res, layer.norm.handle, 1.0e-5);
+            const ffn = graph.mlx_lazy_fused_ffn_bf16(
+                norm,
+                layer.w1.handle,
+                layer.w3.handle,
+                layer.w2.handle,
+            );
+            x = graph.mlx_lazy_add(x_res, ffn);
+        }
+
+        const final_normed = graph.mlx_lazy_rms_norm(x, ln_final.handle, 1.0e-5);
+        const logits = graph.mlx_lazy_matmul(final_normed, lm_head.handle);
+
+        const t1 = std.time.nanoTimestamp();
+        var handles = [_]graph.ArrayHandle{logits};
+        const t2 = std.time.nanoTimestamp();
+        graph.eval(&handles);
+        const t3 = std.time.nanoTimestamp();
+
+        recordSample(&cold_first, samples, &sample_idx, iter, cfg.warmup, t0, t1, t2, t3);
+    }
+
+    const conv_layer_count = (dims.layers + 1) / 2;
+    const attn_layer_count = dims.layers - conv_layer_count;
+    const ffn_flops_per_layer = @as(u128, 6) * dims.hidden * dims.ff;
+    const shortconv_flops_per_layer = @as(u128, 2) * dims.hidden * (3 * dims.conv_dim) +
+        @as(u128, 2) * dims.conv_dim * dims.hidden +
+        @as(u128, 2) * dims.conv_dim;
+    const attn_proj_flops_per_layer = @as(u128, 4) * dims.hidden * dims.hidden;
+    const attn_kernel_flops_per_layer = @as(u128, 4) * dims.heads * dims.kv_len * dims.head_dim;
+    const lm_head_flops = @as(u128, 2) * dims.hidden * dims.vocab;
+    const flops = toU64Saturating(@as(u128, conv_layer_count) * (shortconv_flops_per_layer + ffn_flops_per_layer) +
+        @as(u128, attn_layer_count) * (attn_proj_flops_per_layer + attn_kernel_flops_per_layer + ffn_flops_per_layer) +
+        lm_head_flops);
+
+    const shortconv_weight_bytes_per_layer = (@as(u128, dims.hidden) * (3 * dims.conv_dim) +
+        @as(u128, dims.conv_dim) * dims.hidden) * 2;
+    const attn_weight_bytes_per_layer = (@as(u128, 2) * dims.hidden * dims.hidden) * 2;
+    const ffn_weight_bytes_per_layer = (@as(u128, 3) * dims.hidden * dims.ff) * 2;
+    const kv_cache_bytes_per_attn_layer = (@as(u128, 2) * dims.heads * dims.kv_len * dims.head_dim) * 2;
+    const lm_head_bytes = @as(u128, dims.hidden) * dims.vocab * 2;
+    const bytes = toU64Saturating(@as(u128, conv_layer_count) * (shortconv_weight_bytes_per_layer + ffn_weight_bytes_per_layer) +
+        @as(u128, attn_layer_count) * (attn_weight_bytes_per_layer + ffn_weight_bytes_per_layer + kv_cache_bytes_per_attn_layer) +
+        lm_head_bytes);
+
+    return .{
+        .name = "p1_dec_dense",
+        .profile = cfg.profile,
+        .samples = samples,
+        .cold_first = cold_first,
+        .flops_per_iter = flops,
+        .bytes_per_iter = bytes,
+        .note = "dense decode token path with shortconv+attention mix and logits projection",
     };
 }

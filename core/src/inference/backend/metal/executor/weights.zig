@@ -179,35 +179,93 @@ fn buildMetalLayerProgramRegisterSlotMap(
     return register_to_slot;
 }
 
-fn instructionKernelIdFromWeightBindings(
-    compiled: *const runtime_contract.CompiledPlan,
-    op_index: usize,
+fn layerProgramWeightBindingKeyFor(
     opcode: runtime_contract.Opcode,
-) !u32 {
-    if (op_index >= compiled.plan.instructions.len) return error.InvalidInstructionIndex;
-    const insn = compiled.plan.instructions[op_index];
-    const expected_slots = runtime_contract.expectedKernelWeightSlots(opcode);
-    if (expected_slots.len == 0) return error.InvalidInstructionPayload;
-    if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
-    var kernel_id: ?u32 = null;
-    for (insn.weights, 0..) |_, slot_idx| {
-        const binding_name = try runtime_contract.instructionWeightBindingName(compiled, op_index, slot_idx);
-        const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
-        if (!std.mem.eql(u8, parsed.slot_name, expected_slots[slot_idx])) return error.InvalidWeightBindingName;
-        if (kernel_id == null) {
-            kernel_id = parsed.kernel_id;
-        } else if (kernel_id.? != parsed.kernel_id) {
-            return error.InvalidWeightBindingName;
-        }
-    }
-    return kernel_id orelse error.InvalidInstructionPayload;
+    slot_name: []const u8,
+) !WeightHandles.LayerProgramWeightBindingKey {
+    return switch (opcode) {
+        .rmsnorm => if (std.mem.eql(u8, slot_name, "norm_weight")) .norm_weight else error.InvalidWeightBindingName,
+        .multihead_attention => if (std.mem.eql(u8, slot_name, "q_proj"))
+            .attention_q_proj
+        else if (std.mem.eql(u8, slot_name, "k_proj"))
+            .attention_k_proj
+        else if (std.mem.eql(u8, slot_name, "v_proj"))
+            .attention_v_proj
+        else if (std.mem.eql(u8, slot_name, "o_proj"))
+            .attention_o_proj
+        else
+            error.InvalidWeightBindingName,
+        .mla_attention => if (std.mem.eql(u8, slot_name, "mla_weights")) .mla_weights else error.InvalidWeightBindingName,
+        .swiglu => if (std.mem.eql(u8, slot_name, "w1"))
+            .swiglu_w1
+        else if (std.mem.eql(u8, slot_name, "w3"))
+            .swiglu_w3
+        else if (std.mem.eql(u8, slot_name, "w2"))
+            .swiglu_w2
+        else
+            error.InvalidWeightBindingName,
+        .moe => if (std.mem.eql(u8, slot_name, "router")) .moe_router else error.InvalidWeightBindingName,
+        .mamba_mixer => if (std.mem.eql(u8, slot_name, "in_proj"))
+            .mamba_in_proj
+        else if (std.mem.eql(u8, slot_name, "out_proj"))
+            .mamba_out_proj
+        else
+            error.InvalidWeightBindingName,
+        .shortconv => if (std.mem.eql(u8, slot_name, "in_proj"))
+            .shortconv_in_proj
+        else if (std.mem.eql(u8, slot_name, "conv_weight"))
+            .shortconv_conv_weight
+        else if (std.mem.eql(u8, slot_name, "out_proj"))
+            .shortconv_out_proj
+        else
+            error.InvalidWeightBindingName,
+        else => error.InvalidInstructionPayload,
+    };
 }
 
-fn validateKernelWeightBindings(compiled: *const runtime_contract.CompiledPlan) !void {
+fn buildLayerProgramWeightBindingKeys(
+    allocator: std.mem.Allocator,
+    compiled: *const runtime_contract.CompiledPlan,
+) ![]WeightHandles.LayerProgramWeightBindingKey {
+    if (compiled.weight_bindings.len == 0) return &.{};
+    const keys = try allocator.alloc(WeightHandles.LayerProgramWeightBindingKey, compiled.weight_bindings.len);
+    @memset(keys, .invalid);
+    errdefer allocator.free(keys);
+
     for (compiled.plan.instructions, 0..) |insn, op_index| {
-        if (runtime_contract.expectedKernelWeightSlots(insn.opcode).len == 0) continue;
-        _ = try instructionKernelIdFromWeightBindings(compiled, op_index, insn.opcode);
+        const expected_slots = runtime_contract.expectedKernelWeightSlots(insn.opcode);
+        if (expected_slots.len == 0) continue;
+        if (insn.weights.len != expected_slots.len) return error.InvalidWeightRefCount;
+        var kernel_id: ?u32 = null;
+        for (insn.weights, 0..) |weight_ref, slot_idx| {
+            const binding_name = try runtime_contract.instructionWeightBindingName(compiled, op_index, slot_idx);
+            const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
+            if (!std.mem.eql(u8, parsed.slot_name, expected_slots[slot_idx])) return error.InvalidWeightBindingName;
+            if (kernel_id == null) {
+                kernel_id = parsed.kernel_id;
+            } else if (kernel_id.? != parsed.kernel_id) {
+                return error.InvalidWeightBindingName;
+            }
+            if (weight_ref.index >= keys.len) return error.InvalidWeightRefIndex;
+            const key = try layerProgramWeightBindingKeyFor(insn.opcode, parsed.slot_name);
+            if (keys[weight_ref.index] == .invalid) {
+                keys[weight_ref.index] = key;
+            } else if (keys[weight_ref.index] != key) {
+                return error.InvalidWeightBindingName;
+            }
+        }
     }
+    return keys;
+}
+
+fn tensorViewDescForMetalArray() runtime_contract.TensorViewDesc {
+    return .{
+        .dtype = .f32,
+        .rank = 0,
+        .shape = .{ 0, 0, 0, 0 },
+        .stride_elems = .{ 0, 0, 0, 0 },
+        .layout = .backend_native,
+    };
 }
 
 fn compileLayerProgramContract(
@@ -218,6 +276,7 @@ fn compileLayerProgramContract(
 ) !void {
     layer.compiled_plan = null;
     layer.register_to_slot_map = &.{};
+    layer.weight_binding_keys = &.{};
     layer.slot_scratch = &.{};
     layer.instruction_handle_scratch = &.{};
     layer.instruction_view_scratch = &.{};
@@ -229,7 +288,11 @@ fn compileLayerProgramContract(
         plan_compiler.deinitCompiledPlan(allocator, compiled_plan);
         layer.compiled_plan = null;
     };
-    try validateKernelWeightBindings(&layer.compiled_plan.?);
+    layer.weight_binding_keys = try buildLayerProgramWeightBindingKeys(allocator, &layer.compiled_plan.?);
+    errdefer if (layer.weight_binding_keys.len > 0) {
+        allocator.free(layer.weight_binding_keys);
+        layer.weight_binding_keys = &.{};
+    };
     const register_map = try buildMetalLayerProgramRegisterSlotMap(
         allocator,
         &layer.compiled_plan.?,
@@ -266,6 +329,9 @@ fn compileLayerProgramContract(
             allocator.free(handle_scratch);
             return err;
         };
+        for (view_scratch) |*view| {
+            view.* = tensorViewDescForMetalArray();
+        }
         layer.instruction_handle_scratch = handle_scratch;
         layer.instruction_view_scratch = view_scratch;
         errdefer {
@@ -385,6 +451,7 @@ pub fn loadWeightsToGPU(allocator: std.mem.Allocator, loaded: *LoadedModel) !*We
     for (weight_handles.layers) |*layer| {
         layer.* = std.mem.zeroes(WeightHandles.LayerWeights);
         layer.register_to_slot_map = &.{};
+        layer.weight_binding_keys = &.{};
     }
 
     for (loaded.blocks, 0..) |*layer, layer_idx| {
@@ -1028,6 +1095,7 @@ pub fn freeWeights(allocator: std.mem.Allocator, weight_handles: *WeightHandles)
             layer.compiled_plan = null;
         }
         if (layer.register_to_slot_map.len > 0) allocator.free(layer.register_to_slot_map);
+        if (layer.weight_binding_keys.len > 0) allocator.free(layer.weight_binding_keys);
         if (layer.slot_scratch.len > 0) allocator.free(layer.slot_scratch);
         if (layer.instruction_handle_scratch.len > 0) allocator.free(layer.instruction_handle_scratch);
         if (layer.instruction_view_scratch.len > 0) allocator.free(layer.instruction_view_scratch);
@@ -1250,6 +1318,25 @@ pub const WeightHandles = struct {
         rope_interleave: bool,
     };
 
+    pub const LayerProgramWeightBindingKey = enum(u8) {
+        invalid = 0,
+        norm_weight,
+        attention_q_proj,
+        attention_k_proj,
+        attention_v_proj,
+        attention_o_proj,
+        swiglu_w1,
+        swiglu_w3,
+        swiglu_w2,
+        moe_router,
+        mamba_in_proj,
+        mamba_out_proj,
+        shortconv_in_proj,
+        shortconv_conv_weight,
+        shortconv_out_proj,
+        mla_weights,
+    };
+
     pub const LayerWeights = struct {
         pub const invalid_slot: u8 = std.math.maxInt(u8);
 
@@ -1290,6 +1377,8 @@ pub const WeightHandles = struct {
         kind: LayerKind = .attention_mlp,
         compiled_plan: ?runtime_contract.CompiledPlan = null,
         register_to_slot_map: []const u8 = &.{},
+        /// Precomputed compiled-plan weight binding keys (indexed by WeightRef.index).
+        weight_binding_keys: []const LayerProgramWeightBindingKey = &.{},
         /// Pre-allocated scratch for slot buffer handles during execution.
         slot_scratch: []mlx_graph.ArrayHandle = &.{},
         /// Pre-allocated per-instruction tensor handle scratch.
@@ -2124,4 +2213,58 @@ test "buildMetalLayerProgramRegisterSlotMap reuses temp slots from liveness" {
     try testing.expect(map[3] < 2);
     try testing.expectEqual(map[1], map[3]);
     try testing.expect(map[2] != map[1]);
+}
+
+test "buildLayerProgramWeightBindingKeys resolves multihead slots to keys" {
+    const inputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(0)};
+    const outputs = [_]runtime_contract.RegisterRef{runtime_contract.registerFromIndex(1)};
+    const weight_refs = [_]runtime_contract.WeightRef{
+        .{ .index = 0 },
+        .{ .index = 1 },
+        .{ .index = 2 },
+        .{ .index = 3 },
+    };
+    const instructions = [_]runtime_contract.Instruction{
+        .{
+            .opcode = .multihead_attention,
+            .inputs = inputs[0..],
+            .outputs = outputs[0..],
+            .weights = weight_refs[0..],
+            .param_block_id = null,
+            .state_block_id = null,
+        },
+    };
+    const kill0 = [_]u64{0b0011};
+    const compiled = runtime_contract.CompiledPlan{
+        .plan = .{
+            .instructions = instructions[0..],
+            .register_count = 2,
+            .state_descs = &.{},
+        },
+        .param_blocks = &.{},
+        .weight_bindings = &.{
+            .{ .index = 0, .name = "__kernel_weight::1::q_proj::0" },
+            .{ .index = 1, .name = "__kernel_weight::1::k_proj::0" },
+            .{ .index = 2, .name = "__kernel_weight::1::v_proj::0" },
+            .{ .index = 3, .name = "__kernel_weight::1::o_proj::0" },
+        },
+        .register_buffer_specs = &.{
+            .{ .size = 1, .@"align" = 4 },
+            .{ .size = 1, .@"align" = 4 },
+        },
+        .liveness = .{
+            .register_last_read = &.{ 0, 0 },
+            .kill_after_instruction = &.{kill0[0..]},
+        },
+        .peak_registers = 1,
+        .diagnostics = &.{},
+    };
+
+    const keys = try buildLayerProgramWeightBindingKeys(testing.allocator, &compiled);
+    defer if (keys.len > 0) testing.allocator.free(keys);
+    try testing.expectEqual(@as(usize, 4), keys.len);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_q_proj, keys[0]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_k_proj, keys[1]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_v_proj, keys[2]);
+    try testing.expectEqual(WeightHandles.LayerProgramWeightBindingKey.attention_o_proj, keys[3]);
 }

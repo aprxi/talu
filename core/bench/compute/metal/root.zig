@@ -61,7 +61,6 @@ fn parseScenario(value: []const u8) !scenarios.Scenario {
     if (std.mem.eql(u8, value, "all")) return .all;
     if (std.mem.eql(u8, value, "add") or std.mem.eql(u8, value, "add_f16")) return .add_f16;
     if (std.mem.eql(u8, value, "mul") or std.mem.eql(u8, value, "mul_f16")) return .mul_f16;
-    if (std.mem.eql(u8, value, "silu") or std.mem.eql(u8, value, "silu_f16")) return .silu_f16;
     if (std.mem.eql(u8, value, "rms") or std.mem.eql(u8, value, "rms_f16")) return .rms_f16;
     if (std.mem.eql(u8, value, "smx") or std.mem.eql(u8, value, "softmax_f16")) return .softmax_f16;
     if (std.mem.eql(u8, value, "ffnq") or std.mem.eql(u8, value, "ffnq_u4") or std.mem.eql(u8, value, "fused_ffn_quantized_decode_u4")) return .fused_ffn_quantized_decode_u4;
@@ -69,9 +68,11 @@ fn parseScenario(value: []const u8) !scenarios.Scenario {
     if (std.mem.eql(u8, value, "qmm_u4") or std.mem.eql(u8, value, "quantized_matmul_u4")) return .quantized_matmul_u4;
     if (std.mem.eql(u8, value, "qmm_u8") or std.mem.eql(u8, value, "quantized_matmul_u8")) return .quantized_matmul_u8;
     if (std.mem.eql(u8, value, "attn") or std.mem.eql(u8, value, "attention_decode_f16")) return .attention_decode_f16;
+    if (std.mem.eql(u8, value, "scv") or std.mem.eql(u8, value, "shortconv_decode_bf16")) return .shortconv_decode_bf16;
     if (std.mem.eql(u8, value, "mmthr") or std.mem.eql(u8, value, "matmul_throughput_f16")) return .matmul_throughput_f16;
     if (std.mem.eql(u8, value, "micro") or std.mem.eql(u8, value, "micro_matmul_f16")) return .micro_matmul_f16;
     if (std.mem.eql(u8, value, "decode") or std.mem.eql(u8, value, "decode_synth_f16")) return .decode_synth_f16;
+    if (std.mem.eql(u8, value, "decd") or std.mem.eql(u8, value, "decode_dense_f16")) return .decode_dense_f16;
     return error.InvalidArgument;
 }
 
@@ -92,7 +93,7 @@ fn printUsage(writer: anytype) !void {
         \\  zig build bench-metal-compute -Drelease -- [options]
         \\
         \\Options:
-        \\  --scenario <all|add|mul|silu|rms|smx|ffnq_u4|ffnq_u8|qmm_u4|qmm_u8|attn|mmthr|micro|decode> default: all
+        \\  --scenario <all|add|mul|rms|smx|ffnq_u4|ffnq_u8|qmm_u4|qmm_u8|attn|scv|mmthr|micro|decode|decd> default: all
         \\  --profile <ci|bw>               default: bw
         \\  --format <table|csv|tsv>        default: table
         \\  --warmup <N>                    default: 8
@@ -244,7 +245,6 @@ fn runScenario(
     return switch (which) {
         .add_f16 => try scenarios.runAddF16(allocator, cfg),
         .mul_f16 => try scenarios.runMultiplyF16(allocator, cfg),
-        .silu_f16 => try scenarios.runSiluF16(allocator, cfg),
         .rms_f16 => try scenarios.runRmsNormF16(allocator, cfg),
         .softmax_f16 => try scenarios.runSoftmaxF16(allocator, cfg),
         .fused_ffn_quantized_decode_u4 => try scenarios.runFusedFfnQuantizedDecodeU4(allocator, cfg),
@@ -252,9 +252,11 @@ fn runScenario(
         .quantized_matmul_u4 => try scenarios.runQuantizedMatmulU4(allocator, cfg),
         .quantized_matmul_u8 => try scenarios.runQuantizedMatmulU8(allocator, cfg),
         .attention_decode_f16 => try scenarios.runAttentionDecodeF16(allocator, cfg),
+        .shortconv_decode_bf16 => try scenarios.runShortconvDecodeBF16(allocator, cfg),
         .matmul_throughput_f16 => try scenarios.runMatmulThroughputF16(allocator, cfg),
         .micro_matmul_f16 => try scenarios.runMicroMatmulF16(allocator, cfg),
         .decode_synth_f16 => try scenarios.runDecodeSynthF16(allocator, cfg),
+        .decode_dense_f16 => try scenarios.runDecodeDenseF16(allocator, cfg),
         .all => return error.InvalidArgument,
     };
 }
@@ -288,6 +290,13 @@ fn runOne(
     format: OutputFormat,
     which: scenarios.Scenario,
 ) !RowMetrics {
+    if (cfg.profile == .bw and which == .matmul_throughput_f16) {
+        // Prime one full unmeasured pass so single-scenario throughput runs
+        // report sustained steady-state rather than first-invocation ramp.
+        var prime = try runScenario(allocator, cfg, which);
+        prime.deinit(allocator);
+    }
+
     var result = try runScenario(allocator, cfg, which);
     defer result.deinit(allocator);
 
@@ -364,12 +373,13 @@ pub fn main() !void {
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .quantized_matmul_u4));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .quantized_matmul_u8));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .attention_decode_f16));
+            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_bf16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .matmul_throughput_f16));
+            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_dense_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_synth_f16));
             if (cfg.format == .table) try stdout.writeAll("P2 component methods\n");
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .add_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .mul_f16));
-            updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .silu_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .rms_f16));
             updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .softmax_f16));
             if (cfg.format == .table) try stdout.writeAll("P3 micro-shape sanity\n");
@@ -377,7 +387,6 @@ pub fn main() !void {
         },
         .add_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .add_f16)),
         .mul_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .mul_f16)),
-        .silu_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .silu_f16)),
         .rms_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .rms_f16)),
         .softmax_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .softmax_f16)),
         .fused_ffn_quantized_decode_u4 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .fused_ffn_quantized_decode_u4)),
@@ -385,9 +394,11 @@ pub fn main() !void {
         .quantized_matmul_u4 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .quantized_matmul_u4)),
         .quantized_matmul_u8 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .quantized_matmul_u8)),
         .attention_decode_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .attention_decode_f16)),
+        .shortconv_decode_bf16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .shortconv_decode_bf16)),
         .matmul_throughput_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .matmul_throughput_f16)),
         .micro_matmul_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .micro_matmul_f16)),
         .decode_synth_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_synth_f16)),
+        .decode_dense_f16 => updatePeaks(&peaks, try runOne(stdout, allocator, cfg.run, cfg.format, .decode_dense_f16)),
     }
 
     if (cfg.format == .table) {
@@ -412,4 +423,6 @@ pub fn main() !void {
 test "parseScenario accepts short and full names" {
     try std.testing.expectEqual(scenarios.Scenario.micro_matmul_f16, try parseScenario("micro"));
     try std.testing.expectEqual(scenarios.Scenario.decode_synth_f16, try parseScenario("decode_synth_f16"));
+    try std.testing.expectEqual(scenarios.Scenario.decode_dense_f16, try parseScenario("decd"));
+    try std.testing.expectEqual(scenarios.Scenario.shortconv_decode_bf16, try parseScenario("scv"));
 }

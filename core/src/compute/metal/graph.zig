@@ -167,9 +167,6 @@ pub extern fn mlx_lazy_quantized_attention(
     bits: usize,
 ) ArrayHandle;
 
-/// SiLU activation - >>> Lazy: silu
-pub extern fn mlx_lazy_silu(input: ArrayHandle) ArrayHandle;
-
 /// Dequantize - >>> Lazy: dequantize
 pub extern fn mlx_lazy_dequantize(
     weights: ArrayHandle,
@@ -195,6 +192,15 @@ pub extern fn mlx_lazy_fused_ffn(
     group_size: usize,
     bits: usize,
     use_gelu: bool,
+) ArrayHandle;
+
+/// Fused BF16/FP16 FFN block:
+/// gate_proj -> SiLU -> gated multiply -> down_proj
+pub extern fn mlx_lazy_fused_ffn_bf16(
+    input: ArrayHandle,
+    gate_w: ArrayHandle,
+    up_w: ArrayHandle,
+    down_w: ArrayHandle,
 ) ArrayHandle;
 
 /// Element-wise add - >>> Lazy

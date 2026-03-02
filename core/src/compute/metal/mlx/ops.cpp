@@ -422,11 +422,6 @@ void* mlx_lazy_softmax(const void* input, int axis) {
     return pool_array(softmax(input_arr, axis));
 }
 
-void* mlx_lazy_silu(const void* input) {
-    const auto& input_arr = *static_cast<const array*>(input);
-    return pool_array(input_arr * sigmoid(input_arr));
-}
-
 void* mlx_lazy_rms_norm(const void* input, const void* weight, float eps) {
     return pool_array(fast::rms_norm(
         *static_cast<const array*>(input),
@@ -456,12 +451,22 @@ void* mlx_lazy_rope(const void* input, size_t head_dim, size_t offset, float rop
 }
 
 void* mlx_lazy_attention(const void* q, const void* k, const void* v, float scale, bool causal) {
+    const auto& q_arr = *static_cast<const array*>(q);
+    // Decode hot path: when query length is 1 there are no future tokens to mask,
+    // so causal masking adds overhead without changing semantics.
+    bool use_causal = causal;
+    if (causal && q_arr.ndim() >= 2) {
+        const int q_seq_axis = q_arr.ndim() - 2;
+        if (q_arr.shape(q_seq_axis) <= 1) {
+            use_causal = false;
+        }
+    }
     return pool_array(fast::scaled_dot_product_attention(
-        *static_cast<const array*>(q),
+        q_arr,
         *static_cast<const array*>(k),
         *static_cast<const array*>(v),
         scale,
-        causal ? "causal" : ""
+        use_causal ? "causal" : ""
     ));
 }
 

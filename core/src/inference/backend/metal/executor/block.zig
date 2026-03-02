@@ -33,6 +33,7 @@ pub const MambaCache = runtime_graph.MambaCache;
 const ModelConfig = tensor.ModelConfig;
 const WeightHandles = weights_mod.WeightHandles;
 const LayerWeights = WeightHandles.LayerWeights;
+const LayerProgramWeightBindingKey = WeightHandles.LayerProgramWeightBindingKey;
 
 pub const TransformerBlock = struct {
     const MaxLayerProgramStateBindings = 256;
@@ -74,7 +75,6 @@ pub const TransformerBlock = struct {
 
     const LayerProgramExecutionContext = struct {
         compiled_plan: *const runtime_contract.CompiledPlan,
-        op_index: usize,
         layer_idx: usize,
         pos_offset: usize,
         runtime_rope_cos_handle: mlx_graph.ArrayHandle,
@@ -83,6 +83,7 @@ pub const TransformerBlock = struct {
         residual: *mlx_graph.ArrayHandle,
         slot_buffers: []mlx_graph.ArrayHandle,
         register_to_slot_map: []const u8,
+        weight_binding_keys: []const LayerProgramWeightBindingKey,
         instruction_handles: []runtime_contract.TensorHandle,
         instruction_views: []runtime_contract.TensorViewDesc,
         norm_index: *usize,
@@ -297,27 +298,7 @@ pub const TransformerBlock = struct {
         return @ptrCast(@alignCast(handle.ptr));
     }
 
-    const LayerProgramWeightResolverFn = *const fn (
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) anyerror!*anyopaque;
-
-    const layer_program_weight_resolver_table: [256]?LayerProgramWeightResolverFn = blk: {
-        var table = [_]?LayerProgramWeightResolverFn{null} ** 256;
-        table[@intFromEnum(opcode_map.Opcode.rmsnorm)] = resolveLayerProgramNormWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.multihead_attention)] = resolveLayerProgramAttentionWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.swiglu)] = resolveLayerProgramSwiGluWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.moe)] = resolveLayerProgramMoeWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.shortconv)] = resolveLayerProgramShortconvWeightPtr;
-        table[@intFromEnum(opcode_map.Opcode.mamba_mixer)] = resolveLayerProgramMambaWeightPtr;
-        break :blk table;
-    };
-
-    fn resolveLayerProgramNormWeightPtr(
-        ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
-    ) !*anyopaque {
-        if (!std.mem.eql(u8, slot_name, "norm_weight")) return error.InvalidWeightBindingName;
+    fn resolveLayerProgramNormWeightPtr(ctx: *LayerProgramExecutionContext) !*anyopaque {
         const idx = ctx.norm_index.*;
         if (idx >= ctx.bindings.norm_weight_count) return error.InvalidInstructionBinding;
         if (ctx.bindings.norm_weights[idx]) |*weight| return @ptrCast(weight);
@@ -326,7 +307,7 @@ pub const TransformerBlock = struct {
 
     fn resolveLayerProgramAttentionWeightPtr(
         ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
+        key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
         const attention_binding = if (ctx.bindings.attention) |*binding|
             binding
@@ -334,22 +315,22 @@ pub const TransformerBlock = struct {
             return error.MissingField;
         switch (attention_binding.*) {
             .multihead => |*multihead| {
-                if (std.mem.eql(u8, slot_name, "q_proj")) {
+                if (key == .attention_q_proj) {
                     if (multihead.q_proj) |*weight| return @ptrCast(weight);
                     if (multihead.q_proj_bf16) |*weight| return @ptrCast(weight);
                     return error.MissingWeight;
                 }
-                if (std.mem.eql(u8, slot_name, "k_proj")) {
+                if (key == .attention_k_proj) {
                     if (multihead.k_proj) |*weight| return @ptrCast(weight);
                     if (multihead.k_proj_bf16) |*weight| return @ptrCast(weight);
                     return error.MissingWeight;
                 }
-                if (std.mem.eql(u8, slot_name, "v_proj")) {
+                if (key == .attention_v_proj) {
                     if (multihead.v_proj) |*weight| return @ptrCast(weight);
                     if (multihead.v_proj_bf16) |*weight| return @ptrCast(weight);
                     return error.MissingWeight;
                 }
-                if (std.mem.eql(u8, slot_name, "o_proj")) {
+                if (key == .attention_o_proj) {
                     if (multihead.o_proj) |*weight| return @ptrCast(weight);
                     if (multihead.o_proj_bf16) |*weight| return @ptrCast(weight);
                     return error.MissingWeight;
@@ -357,7 +338,7 @@ pub const TransformerBlock = struct {
                 return error.InvalidWeightBindingName;
             },
             .mla => |*mla| {
-                if (!std.mem.eql(u8, slot_name, "mla_weights")) return error.InvalidWeightBindingName;
+                if (key != .mla_weights) return error.InvalidWeightBindingName;
                 if (mla.o_proj) |*weight| return @ptrCast(weight);
                 if (mla.o_proj_bf16) |*weight| return @ptrCast(weight);
                 return error.MissingWeight;
@@ -367,19 +348,19 @@ pub const TransformerBlock = struct {
 
     fn resolveLayerProgramShortconvWeightPtr(
         ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
+        key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
         const shortconv_binding = if (ctx.bindings.shortconv) |*binding|
             binding
         else
             return error.MissingField;
-        if (std.mem.eql(u8, slot_name, "in_proj")) {
+        if (key == .shortconv_in_proj) {
             if (shortconv_binding.in_proj) |*weight| return @ptrCast(weight);
             if (shortconv_binding.in_proj_bf16) |*weight| return @ptrCast(weight);
             return error.MissingWeight;
         }
-        if (std.mem.eql(u8, slot_name, "conv_weight")) return @ptrCast(&shortconv_binding.conv_weight);
-        if (std.mem.eql(u8, slot_name, "out_proj")) {
+        if (key == .shortconv_conv_weight) return @ptrCast(&shortconv_binding.conv_weight);
+        if (key == .shortconv_out_proj) {
             if (shortconv_binding.out_proj) |*weight| return @ptrCast(weight);
             if (shortconv_binding.out_proj_bf16) |*weight| return @ptrCast(weight);
             return error.MissingWeight;
@@ -389,7 +370,7 @@ pub const TransformerBlock = struct {
 
     fn resolveLayerProgramSwiGluWeightPtr(
         ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
+        key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
         const ffn_binding = if (ctx.bindings.ffn) |*binding|
             binding
@@ -397,17 +378,17 @@ pub const TransformerBlock = struct {
             return error.MissingField;
         return switch (ffn_binding.*) {
             .dense => |*dense| blk: {
-                if (std.mem.eql(u8, slot_name, "w1")) {
+                if (key == .swiglu_w1) {
                     if (dense.w1) |*weight| break :blk @ptrCast(weight);
                     if (dense.w1_bf16) |*weight| break :blk @ptrCast(weight);
                     return error.MissingWeight;
                 }
-                if (std.mem.eql(u8, slot_name, "w3")) {
+                if (key == .swiglu_w3) {
                     if (dense.w3) |*weight| break :blk @ptrCast(weight);
                     if (dense.w3_bf16) |*weight| break :blk @ptrCast(weight);
                     return error.MissingWeight;
                 }
-                if (std.mem.eql(u8, slot_name, "w2")) {
+                if (key == .swiglu_w2) {
                     if (dense.w2) |*weight| break :blk @ptrCast(weight);
                     if (dense.w2_bf16) |*weight| break :blk @ptrCast(weight);
                     return error.MissingWeight;
@@ -420,9 +401,9 @@ pub const TransformerBlock = struct {
 
     fn resolveLayerProgramMoeWeightPtr(
         ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
+        key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
-        if (!std.mem.eql(u8, slot_name, "router")) return error.InvalidWeightBindingName;
+        if (key != .moe_router) return error.InvalidWeightBindingName;
         const ffn_binding = if (ctx.bindings.ffn) |*binding|
             binding
         else
@@ -435,18 +416,18 @@ pub const TransformerBlock = struct {
 
     fn resolveLayerProgramMambaWeightPtr(
         ctx: *LayerProgramExecutionContext,
-        slot_name: []const u8,
+        key: LayerProgramWeightBindingKey,
     ) !*anyopaque {
         const mamba_binding = if (ctx.bindings.mamba) |*binding|
             binding
         else
             return error.MissingField;
-        if (std.mem.eql(u8, slot_name, "in_proj")) {
+        if (key == .mamba_in_proj) {
             if (mamba_binding.in_proj) |*weight| return @ptrCast(weight);
             if (mamba_binding.in_proj_bf16) |*weight| return @ptrCast(weight);
             return error.MissingWeight;
         }
-        if (std.mem.eql(u8, slot_name, "out_proj")) {
+        if (key == .mamba_out_proj) {
             if (mamba_binding.out_proj) |*weight| return @ptrCast(weight);
             if (mamba_binding.out_proj_bf16) |*weight| return @ptrCast(weight);
             return error.MissingWeight;
@@ -459,12 +440,21 @@ pub const TransformerBlock = struct {
         ctx: *LayerProgramExecutionContext,
         slot_idx: usize,
     ) !*anyopaque {
-        const binding_name = try runtime_contract.instructionWeightBindingName(ctx.compiled_plan, ctx.op_index, slot_idx);
-        const parsed = try runtime_contract.parseKernelWeightBindingName(binding_name);
-        const resolver = layer_program_weight_resolver_table[@intFromEnum(insn.opcode)] orelse {
-            return error.InvalidInstructionBinding;
+        if (slot_idx >= insn.weights.len) return error.InvalidWeightRefIndex;
+        const ref_index = insn.weights[slot_idx].index;
+        if (ref_index >= ctx.weight_binding_keys.len) return error.InvalidWeightRefIndex;
+        const key = ctx.weight_binding_keys[ref_index];
+        if (key == .invalid) return error.InvalidWeightBindingName;
+
+        return switch (key) {
+            .norm_weight => resolveLayerProgramNormWeightPtr(ctx),
+            .attention_q_proj, .attention_k_proj, .attention_v_proj, .attention_o_proj, .mla_weights => resolveLayerProgramAttentionWeightPtr(ctx, key),
+            .swiglu_w1, .swiglu_w3, .swiglu_w2 => resolveLayerProgramSwiGluWeightPtr(ctx, key),
+            .moe_router => resolveLayerProgramMoeWeightPtr(ctx, key),
+            .mamba_in_proj, .mamba_out_proj => resolveLayerProgramMambaWeightPtr(ctx, key),
+            .shortconv_in_proj, .shortconv_conv_weight, .shortconv_out_proj => resolveLayerProgramShortconvWeightPtr(ctx, key),
+            .invalid => error.InvalidWeightBindingName,
         };
-        return resolver(ctx, parsed.slot_name);
     }
 
     fn instructionParams(
@@ -490,16 +480,6 @@ pub const TransformerBlock = struct {
         return ptr.*;
     }
 
-    fn tensorViewDescForMetalArray() runtime_contract.TensorViewDesc {
-        return .{
-            .dtype = .f32,
-            .rank = 0,
-            .shape = .{ 0, 0, 0, 0 },
-            .stride_elems = .{ 0, 0, 0, 0 },
-            .layout = .backend_native,
-        };
-    }
-
     fn buildLayerProgramInstructionHandles(
         insn: *const runtime_contract.Instruction,
         ctx: *LayerProgramExecutionContext,
@@ -507,44 +487,37 @@ pub const TransformerBlock = struct {
         view_storage: []runtime_contract.TensorViewDesc,
     ) !BuiltLayerProgramHandles {
         var handle_count: usize = 0;
-        var view_count: usize = 0;
         for (insn.inputs) |reg| {
-            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
             const slot = try bufferSlotForRegister(reg, ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
             handle_storage[handle_count] = .{
                 .register = reg,
                 .ptr = @ptrCast(slot),
             };
-            view_storage[view_count] = tensorViewDescForMetalArray();
             handle_count += 1;
-            view_count += 1;
         }
         for (insn.outputs) |reg| {
-            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
             const slot = try bufferSlotForRegister(reg, ctx.residual, ctx.slot_buffers, ctx.register_to_slot_map);
             handle_storage[handle_count] = .{
                 .register = reg,
                 .ptr = @ptrCast(slot),
             };
-            view_storage[view_count] = tensorViewDescForMetalArray();
             handle_count += 1;
-            view_count += 1;
         }
         for (insn.weights, 0..) |_, slot_idx| {
-            if (handle_count >= handle_storage.len) return error.InvalidInstructionBinding;
+            if (handle_count >= handle_storage.len or handle_count >= view_storage.len) return error.InvalidInstructionBinding;
             const weight_ptr = try layerProgramWeightHandlePtr(insn, ctx, slot_idx);
             handle_storage[handle_count] = .{
                 .register = runtime_contract.registerFromIndex(@intCast(slot_idx)),
                 .ptr = weight_ptr,
             };
-            view_storage[view_count] = tensorViewDescForMetalArray();
             handle_count += 1;
-            view_count += 1;
         }
 
         return .{
             .registers = handle_storage[0..handle_count],
-            .views = view_storage[0..view_count],
+            .views = view_storage[0..handle_count],
         };
     }
 
@@ -1044,11 +1017,10 @@ pub const TransformerBlock = struct {
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
-        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []runtime_contract.StateBlockHandle,
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
         try layerProgramNormAdapter(
             insn,
             registers,
@@ -1066,7 +1038,6 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
         const cache = try requireStateValue(
             Cache,
             state_blocks,
@@ -1094,7 +1065,6 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
         const shortconv_cache = try requireStateValue(
             ShortConvCache,
             state_blocks,
@@ -1114,11 +1084,10 @@ pub const TransformerBlock = struct {
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
-        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []runtime_contract.StateBlockHandle,
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
         try layerProgramFfnAdapter(
             insn,
             registers,
@@ -1135,7 +1104,6 @@ pub const TransformerBlock = struct {
         _: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
         const mamba_cache = try requireStateValue(
             MambaCache,
             state_blocks,
@@ -1155,11 +1123,10 @@ pub const TransformerBlock = struct {
         insn: *const runtime_contract.Instruction,
         registers: []runtime_contract.TensorHandle,
         _: []const runtime_contract.TensorViewDesc,
-        state_blocks: []runtime_contract.StateBlockHandle,
+        _: []runtime_contract.StateBlockHandle,
         params: []const runtime_contract.ParamBlock,
     ) !void {
         const state = try layerProgramExecutionState(ctx);
-        _ = try runtime_contract.requireInstructionStateBlockForPlan(insn, &state.compiled_plan.plan, state_blocks);
         const p = try runtime_contract.paramAs(runtime_contract.ResidualAddParam, params, .residual_add);
         const scale_kind: layer_ops.ResidualScale = switch (p.scale_tag) {
             0 => .one,
@@ -1190,11 +1157,13 @@ pub const TransformerBlock = struct {
             .dispatch_counters = if (enable_dispatch_observability) &layer_program_dispatch_counters else null,
             .workspace = .{ .any = @ptrCast(ctx) },
         };
-        try runtime_contract.validateExecutionContext(&rt_ctx);
-        try runtime_contract.validateBatchCapability(
-            layer_program_adapter_capabilities[@intFromEnum(insn.opcode)],
-            rt_ctx.batch_size,
-        );
+        if (comptime std.debug.runtime_safety) {
+            try runtime_contract.validateExecutionContext(&rt_ctx);
+            try runtime_contract.validateBatchCapability(
+                layer_program_adapter_capabilities[@intFromEnum(insn.opcode)],
+                rt_ctx.batch_size,
+            );
+        }
         runtime_contract.recordExecutionDispatch(&rt_ctx, insn.opcode);
         const built_handles = try buildLayerProgramInstructionHandles(
             insn,
@@ -1245,7 +1214,6 @@ pub const TransformerBlock = struct {
         var norm_index: usize = 0;
         var exec_ctx = LayerProgramExecutionContext{
             .compiled_plan = &compiled_plan,
-            .op_index = 0,
             .layer_idx = layer_idx,
             .pos_offset = pos_offset,
             .runtime_rope_cos_handle = runtime_rope_cos_handle,
@@ -1254,6 +1222,7 @@ pub const TransformerBlock = struct {
             .residual = &residual,
             .slot_buffers = slot_buffers,
             .register_to_slot_map = lw.register_to_slot_map,
+            .weight_binding_keys = lw.weight_binding_keys,
             .instruction_handles = lw.instruction_handle_scratch,
             .instruction_views = lw.instruction_view_scratch,
             .norm_index = &norm_index,
@@ -1261,8 +1230,7 @@ pub const TransformerBlock = struct {
         };
         try bindLayerProgramStateDescriptors(&exec_ctx, &compiled_plan.plan, state_blocks);
 
-        for (compiled_plan.plan.instructions, 0..) |insn, op_index| {
-            exec_ctx.op_index = op_index;
+        for (compiled_plan.plan.instructions) |insn| {
             try dispatchLayerProgramInstruction(&insn, &exec_ctx);
         }
 
