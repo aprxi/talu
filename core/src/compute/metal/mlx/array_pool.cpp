@@ -11,6 +11,8 @@
 #include <cstring>
 #include <memory>
 
+extern "C" void* mlx_persistent_cast_f16(const void* input);
+
 // ============================================================================
 // Global state
 // ============================================================================
@@ -130,6 +132,8 @@ void* make_owned_array(array&& result) {
 
 extern "C" {
 
+void mlx_array_free(void* arr);
+
 void mlx_pool_reset() {
     // reset is the explicit eval-complete barrier for pooled temporaries
     g_pool_index = 0;
@@ -201,6 +205,26 @@ void* mlx_array_from_uint32(const void* data, const size_t* shape, size_t ndim) 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data
 void* mlx_array_from_bfloat16(const void* data, const size_t* shape, size_t ndim) {
     return create_ingested_array<uint16_t>(data, shape, ndim, bfloat16);
+}
+
+void* mlx_array_from_bfloat16_dense_weight(const void* data, const size_t* shape, size_t ndim) {
+    void* handle = create_ingested_array<uint16_t>(data, shape, ndim, bfloat16);
+    // Dense matrix weights are decode-hot; keep them persisted as float16.
+    if (ndim >= 2) {
+        void* casted = mlx_persistent_cast_f16(handle);
+        mlx_array_free(handle);
+        return casted;
+    }
+    return handle;
+}
+
+void* mlx_array_from_bfloat16_norm(const void* data, const size_t* shape, size_t ndim) {
+    (void)ndim;
+    void* handle = create_ingested_array<uint16_t>(data, shape, ndim, bfloat16);
+    // Norm vectors are used on every layer step; keep on the same f16 path.
+    void* casted = mlx_persistent_cast_f16(handle);
+    mlx_array_free(handle);
+    return casted;
 }
 
 // Note: data is const void* to handle potentially unaligned mmap'd safetensor data

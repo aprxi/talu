@@ -18,6 +18,9 @@ pub const CausalConvCacheHandle = ?*anyopaque;
 
 /// Reset array pool for next forward pass (eliminates heap allocations)
 pub extern fn mlx_pool_reset() void;
+pub inline fn beginForwardGraphBuild() void {
+    mlx_pool_reset();
+}
 
 /// Clear MLX memory cache - call periodically to prevent fragmentation
 pub extern fn mlx_clear_memory_cache() void;
@@ -63,6 +66,20 @@ pub extern fn mlx_array_from_uint32(
 /// Create MLX array from bfloat16 data (stored as u16)
 /// C++ signature: void* mlx_array_from_bfloat16(const void* data, ...)
 pub extern fn mlx_array_from_bfloat16(
+    data: *const anyopaque,
+    shape: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
+/// Create dense-weight MLX array from bfloat16 data using compute-owned policy.
+pub extern fn mlx_array_from_bfloat16_dense_weight(
+    data: *const anyopaque,
+    shape: [*]const usize,
+    ndim: usize,
+) ArrayHandle;
+
+/// Create norm MLX array from bfloat16 data using compute-owned policy.
+pub extern fn mlx_array_from_bfloat16_norm(
     data: *const anyopaque,
     shape: [*]const usize,
     ndim: usize,
@@ -427,6 +444,22 @@ pub fn createArrayBF16Unaligned(data: [*]align(1) const u16, len: usize, shape: 
     const shape_usize = shapeToUsize(shape);
     // Cast to *const anyopaque to avoid alignment checks - C++ uses memcpy internally
     return mlx_array_from_bfloat16(@ptrCast(data), &shape_usize.shape, shape_usize.len);
+}
+
+/// Create dense-weight array from unaligned bfloat16 data using compute-owned
+/// dense-weight policy.
+pub fn createArrayBF16DenseWeightUnaligned(data: [*]align(1) const u16, len: usize, shape: []const i64) ArrayHandle {
+    _ = len; // used for bounds checking in caller
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_bfloat16_dense_weight(@ptrCast(data), &shape_usize.shape, shape_usize.len);
+}
+
+/// Create norm array from unaligned bfloat16 data using compute-owned norm
+/// policy.
+pub fn createArrayBF16NormUnaligned(data: [*]align(1) const u16, len: usize, shape: []const i64) ArrayHandle {
+    _ = len; // used for bounds checking in caller
+    const shape_usize = shapeToUsize(shape);
+    return mlx_array_from_bfloat16_norm(@ptrCast(data), &shape_usize.shape, shape_usize.len);
 }
 
 /// Create MLX array from Zig slice (float16/IEEE as u16)

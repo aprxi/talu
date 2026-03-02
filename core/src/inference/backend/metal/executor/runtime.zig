@@ -29,7 +29,7 @@ inline fn beginGraphBuild() void {
     // Reset pooled transient arrays at the start of each logical forward.
     // This keeps decode on one high-performance path by reusing array slots
     // instead of continuously growing per-thread pool storage.
-    mlx_graph.mlx_pool_reset();
+    mlx_graph.beginForwardGraphBuild();
 }
 
 pub fn gatherTokenEmbeddingsLazy(weight_handles: anytype, input_ids: []const u32) !ArrayHandle {
