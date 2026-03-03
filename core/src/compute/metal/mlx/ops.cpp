@@ -238,6 +238,17 @@ void* mlx_lazy_quantized_matmul(
     // Keep quant params in their stored dtype and cast activations instead.
     // This avoids large first-use scale/bias casts on prompt prefill.
     const Dtype param_dtype = scales_arr.dtype();
+    if (input_arr.dtype() == param_dtype && biases_arr.dtype() == param_dtype) {
+        return pool_array(quantized_matmul_lastdim_impl(
+            input_arr,
+            weights_arr,
+            scales_arr,
+            biases_arr,
+            transpose_weights,
+            static_cast<int>(group_size),
+            static_cast<int>(bits)
+        ));
+    }
     const array input_cast = (input_arr.dtype() == param_dtype) ? input_arr : astype(input_arr, param_dtype);
     const array scales_cast = cast_quant_param_cached(scales, scales_arr, param_dtype);
     const array biases_cast = cast_quant_param_cached(biases, biases_arr, param_dtype);

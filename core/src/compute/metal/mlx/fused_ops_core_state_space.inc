@@ -102,6 +102,7 @@ static inline void oriented_rhs_cache_clear() {
 
 // Defined in fused_ops_attention.inc and fused_ops_ffn_expert_mix.inc.
 static inline void attention_fused_qkv_cache_clear();
+static inline void ffn_quantized_gate_up_cache_clear();
 static inline void ffn_fused_gate_up_cache_clear();
 
 struct StateSpaceConvKernelCacheKey {
@@ -237,6 +238,7 @@ struct QuantParamCastCacheKeyHash {
 };
 
 static constexpr size_t kQuantParamCastCacheMaxEntries = 4096;
+static constexpr size_t kStateSpaceStaticCacheMaxEntries = 1024;
 
 static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash>& quant_param_cast_cache_store() {
     static thread_local std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCacheKeyHash> cache;
@@ -245,6 +247,118 @@ static inline std::unordered_map<QuantParamCastCacheKey, array, QuantParamCastCa
 
 static inline void quant_param_cast_cache_clear() {
     quant_param_cast_cache_store().clear();
+}
+
+struct StateSpaceStaticCacheKey {
+    const void* a_log_handle = nullptr;
+    const void* d_skip_handle = nullptr;
+    int n_groups = 0;
+    int heads_per_group = 0;
+
+    bool operator==(const StateSpaceStaticCacheKey& other) const {
+        return a_log_handle == other.a_log_handle &&
+               d_skip_handle == other.d_skip_handle &&
+               n_groups == other.n_groups &&
+               heads_per_group == other.heads_per_group;
+    }
+};
+
+struct StateSpaceStaticCacheKeyHash {
+    size_t operator()(const StateSpaceStaticCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.a_log_handle);
+        h ^= std::hash<const void*>{}(key.d_skip_handle) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.n_groups) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<int>{}(key.heads_per_group) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+struct StateSpaceStaticTerms {
+    array a_log_exp_group;
+    array d_skip_group;
+};
+
+static inline std::unordered_map<StateSpaceStaticCacheKey, StateSpaceStaticTerms, StateSpaceStaticCacheKeyHash>& state_space_static_cache_store() {
+    static thread_local std::unordered_map<StateSpaceStaticCacheKey, StateSpaceStaticTerms, StateSpaceStaticCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void state_space_static_cache_clear() {
+    state_space_static_cache_store().clear();
+}
+
+static inline array cast_tensor_cached(
+    const void* handle,
+    const array& param,
+    Dtype target_dtype
+) {
+    if (param.dtype() == target_dtype) {
+        return param;
+    }
+    if (handle == nullptr) {
+        return astype(param, target_dtype);
+    }
+
+    auto& cache = quant_param_cast_cache_store();
+    if (cache.size() >= kQuantParamCastCacheMaxEntries) {
+        cache.clear();
+    }
+
+    QuantParamCastCacheKey key;
+    key.param_handle = handle;
+    key.target_dtype = static_cast<int>(target_dtype.val());
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    array casted = astype(param, target_dtype);
+    // Materialize once so repeated decode/prefill steps reuse casted params.
+    eval(casted);
+    auto [inserted, _] = cache.emplace(key, std::move(casted));
+    return inserted->second;
+}
+
+static inline StateSpaceStaticTerms resolve_state_space_static_terms(
+    const void* a_log_handle,
+    const void* d_skip_handle,
+    const array& a_log_arr,
+    const array& d_skip_arr,
+    int n_groups,
+    int heads_per_group
+) {
+    const auto uncached = [&]() -> StateSpaceStaticTerms {
+        return StateSpaceStaticTerms{
+            exp(reshape(a_log_arr, {1, n_groups, heads_per_group, 1, 1})),
+            reshape(d_skip_arr, {1, n_groups, heads_per_group, 1}),
+        };
+    };
+
+    if (a_log_handle == nullptr || d_skip_handle == nullptr) {
+        return uncached();
+    }
+
+    auto& cache = state_space_static_cache_store();
+    if (cache.size() >= kStateSpaceStaticCacheMaxEntries) {
+        cache.clear();
+    }
+
+    StateSpaceStaticCacheKey key;
+    key.a_log_handle = a_log_handle;
+    key.d_skip_handle = d_skip_handle;
+    key.n_groups = n_groups;
+    key.heads_per_group = heads_per_group;
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    StateSpaceStaticTerms terms = uncached();
+    // Materialize once so repeated decode steps reuse static terms.
+    eval(terms.a_log_exp_group);
+    eval(terms.d_skip_group);
+    auto [inserted, _] = cache.emplace(key, std::move(terms));
+    return inserted->second;
 }
 
 static inline array orient_matmul_rhs_cached(
@@ -305,7 +419,9 @@ void mlx_weight_transform_cache_clear() {
     causal_conv_bias_cache_clear();
     bias_cast_cache_clear();
     quant_param_cast_cache_clear();
+    state_space_static_cache_clear();
     attention_fused_qkv_cache_clear();
+    ffn_quantized_gate_up_cache_clear();
     ffn_fused_gate_up_cache_clear();
 }
 
@@ -364,14 +480,6 @@ static array matmul_lastdim(
     int rows = 1;
     for (int axis = 0; axis < input_for_matmul.ndim() - 1; ++axis) {
         rows *= input_for_matmul.shape(axis);
-    }
-
-    // Decode hot path: [1, 1, D] @ [D, O]. Prefer matvec dispatch when the
-    // flattened row count is one to reduce per-token launch overhead.
-    if (rows == 1) {
-        auto input_vec = reshape(input_for_matmul, {in_features});
-        auto out_vec = matmul(input_vec, rhs);
-        return reshape(out_vec, out_shape);
     }
 
     auto input_2d = reshape(input_for_matmul, {rows, in_features});
@@ -493,36 +601,19 @@ static array quantized_linear_no_bias(
     const void* biases_handle = nullptr
 ) {
     const Dtype param_dtype = scales.dtype();
+    if (input.dtype() == param_dtype && biases.dtype() == param_dtype) {
+        return quantized_matmul_lastdim(
+            input,
+            weights,
+            scales,
+            biases,
+            group_size,
+            bits
+        );
+    }
     const array input_cast = (input.dtype() == param_dtype) ? input : astype(input, param_dtype);
-    const auto cast_quant_param = [](const void* handle, const array& param, Dtype target_dtype) -> array {
-        if (param.dtype() == target_dtype) {
-            return param;
-        }
-        if (handle == nullptr) {
-            return astype(param, target_dtype);
-        }
-
-        auto& cache = quant_param_cast_cache_store();
-        if (cache.size() >= kQuantParamCastCacheMaxEntries) {
-            cache.clear();
-        }
-
-        QuantParamCastCacheKey key;
-        key.param_handle = handle;
-        key.target_dtype = static_cast<int>(target_dtype.val());
-        auto it = cache.find(key);
-        if (it != cache.end()) {
-            return it->second;
-        }
-
-        array casted = astype(param, target_dtype);
-        // Materialize once so repeated decode/prefill steps reuse casted params.
-        eval(casted);
-        auto [inserted, _] = cache.emplace(key, std::move(casted));
-        return inserted->second;
-    };
-    const array scales_cast = cast_quant_param(scales_handle, scales, param_dtype);
-    const array biases_cast = cast_quant_param(biases_handle, biases, param_dtype);
+    const array scales_cast = cast_tensor_cached(scales_handle, scales, param_dtype);
+    const array biases_cast = cast_tensor_cached(biases_handle, biases, param_dtype);
     return quantized_matmul_lastdim(
         input_cast,
         weights,
@@ -559,8 +650,8 @@ static array resolve_state_space_conv_kernel_uncached(
     } else if (!(kernel.shape(0) == d_conv and kernel.shape(1) == xbc_len)) {
         throw std::invalid_argument("[state_space] conv1d_weight shape incompatible with xbc_len/d_conv");
     }
-
-    kernel = ensure_float32(kernel);
+    // Keep conv kernel in model dtype; FP32 is reintroduced only at recurrent
+    // accumulation boundaries.
     return reshape(kernel, {1, d_conv, xbc_len});
 }
 
@@ -725,8 +816,8 @@ static array state_space_forward_core(
     const std::function<array(const array&)>& in_proj_fn,
     const array& conv_kernel_broadcast, // [1, d_conv, xbc_len]
     const std::optional<array>& conv_bias_row, // [1, xbc_len]
-    const array& a_log, // [n_heads]
-    const array& d_skip, // [n_heads]
+    const array& a_log_exp_group, // [1, n_groups, heads_per_group, 1, 1]
+    const array& d_skip_group, // [1, n_groups, heads_per_group, 1]
     const std::optional<array>& dt_bias_row, // [1, n_heads]
     const std::optional<array>& norm_weight, // [d_inner]
     const std::function<array(const array&)>& out_proj_fn,
@@ -757,8 +848,6 @@ static array state_space_forward_core(
         throw std::invalid_argument("[state_space] n_heads must be divisible by n_groups");
     }
 
-    const array a_log_row = reshape(a_log, {1, n_heads, 1, 1});
-    const array d_skip_row = reshape(d_skip, {1, n_heads, 1});
     const int heads_per_group = n_heads / n_groups;
     const int min_proj_dim = (2 * d_inner + 2 * bc_len + n_heads);
 
@@ -771,7 +860,7 @@ static array state_space_forward_core(
     }
 
     const array z_all = slice(proj_all, {0, 0, 0}, {1, seq_len, d_inner});
-    const array xbc_all = ensure_float32(slice(proj_all, {0, 0, d_inner}, {1, seq_len, d_inner + xbc_len}));
+    const array xbc_all = slice(proj_all, {0, 0, d_inner}, {1, seq_len, d_inner + xbc_len});
     array dt_all = ensure_float32(slice(
         proj_all,
         {0, 0, d_inner + xbc_len},
@@ -793,39 +882,58 @@ static array state_space_forward_core(
     const array xbc_conv_all = conv_seq * sigmoid(conv_seq);
     conv_state = slice(conv_history, {0, seq_len, 0}, {1, seq_len + d_conv, xbc_len});
 
-    const array x_conv_all = slice(xbc_conv_all, {0, 0, 0}, {1, seq_len, d_inner});
-    array b_heads_all = reshape(
-        slice(xbc_conv_all, {0, 0, d_inner}, {1, seq_len, d_inner + bc_len}),
+    // FP32 allowlist starts here for recurrent-state-sensitive math.
+    const array xbc_conv_f32_all = ensure_float32(xbc_conv_all);
+    const array x_conv_all = slice(xbc_conv_f32_all, {0, 0, 0}, {1, seq_len, d_inner});
+    const array b_groups_all = reshape(
+        slice(xbc_conv_f32_all, {0, 0, d_inner}, {1, seq_len, d_inner + bc_len}),
         {seq_len, n_groups, d_state}
     );
-    array c_heads_all = reshape(
-        slice(xbc_conv_all, {0, 0, d_inner + bc_len}, {1, seq_len, d_inner + 2 * bc_len}),
+    const array c_groups_all = reshape(
+        slice(xbc_conv_f32_all, {0, 0, d_inner + bc_len}, {1, seq_len, d_inner + 2 * bc_len}),
         {seq_len, n_groups, d_state}
     );
-    if (heads_per_group > 1) {
-        b_heads_all = repeat(b_heads_all, heads_per_group, 1);
-        c_heads_all = repeat(c_heads_all, heads_per_group, 1);
+
+    const array x_heads_group_all = reshape(x_conv_all, {seq_len, n_groups, heads_per_group, d_head});
+    const array dt5_all = reshape(dt_all, {seq_len, n_groups, heads_per_group, 1, 1});
+    array ssm_state_group = reshape(ssm_state, {1, n_groups, heads_per_group, d_head, d_state});
+
+    const array dA_all = exp((-a_log_exp_group) * dt5_all);
+    const array x_term_all = dt5_all *
+        reshape(x_heads_group_all, {seq_len, n_groups, heads_per_group, d_head, 1}) *
+        reshape(b_groups_all, {seq_len, n_groups, 1, 1, d_state});
+
+    array ssm_all_group(0.0f, float32);
+    if (seq_len == 1) {
+        // Decode fast path: exact single-step recurrence.
+        // s_next = dA * s_prev + x_term (algebraically equivalent to scan at L=1).
+        const array ssm_next = dA_all * ssm_state_group + x_term_all;
+        ssm_state_group = ssm_next;
+        ssm_all_group = ssm_next;
+    } else {
+        // Solve s_t = dA_t * s_{t-1} + x_t with parallel prefix products/sums.
+        // dA_t is strictly non-negative (exp of real), so clipping protects only
+        // against denorm/underflow during long prefills.
+        const array prefix = cumprod(dA_all, 0);
+        const array prefix_safe = clip(prefix, array(1.0e-20f), std::nullopt);
+        const array ssm_terms = x_term_all / prefix_safe;
+        const array ssm_accum = cumsum(ssm_terms, 0);
+        ssm_all_group = prefix * (ssm_state_group + ssm_accum);
+        ssm_state_group = slice(
+            ssm_all_group,
+            {seq_len - 1, 0, 0, 0, 0},
+            {seq_len, n_groups, heads_per_group, d_head, d_state}
+        );
     }
 
-    const array x_heads_all = reshape(x_conv_all, {seq_len, n_heads, d_head});
-    const array dt4_all = reshape(dt_all, {seq_len, n_heads, 1, 1});
-    const array dA_all = exp((-exp(a_log_row)) * dt4_all);
-    const array x_term_all = dt4_all *
-        reshape(x_heads_all, {seq_len, n_heads, d_head, 1}) *
-        reshape(b_heads_all, {seq_len, n_heads, 1, d_state});
+    ssm_state = reshape(ssm_state_group, {1, n_heads, d_head, d_state});
 
-    // Solve s_t = dA_t * s_{t-1} + x_t with parallel prefix products/sums.
-    // dA_t is strictly non-negative (exp of real), so clipping protects only
-    // against denorm/underflow during long prefills.
-    const array prefix = cumprod(dA_all, 0);
-    const array prefix_safe = clip(prefix, array(1.0e-20f), std::nullopt);
-    const array ssm_terms = x_term_all / prefix_safe;
-    const array ssm_accum = cumsum(ssm_terms, 0);
-    const array ssm_all = prefix * (ssm_state + ssm_accum);
-    ssm_state = slice(ssm_all, {seq_len - 1, 0, 0, 0}, {seq_len, n_heads, d_head, d_state});
-
-    array y_all = sum(ssm_all * reshape(c_heads_all, {seq_len, n_heads, 1, d_state}), 3);
-    y_all = y_all + d_skip_row * x_heads_all;
+    array y_group_all = sum(
+        ssm_all_group * reshape(c_groups_all, {seq_len, n_groups, 1, 1, d_state}),
+        4
+    );
+    y_group_all = y_group_all + d_skip_group * x_heads_group_all;
+    array y_all = reshape(y_group_all, {seq_len, n_heads, d_head});
     array ssm_out = reshape(y_all, {1, seq_len, d_inner});
     ssm_out = ssm_out * (z_all * sigmoid(z_all));
     if (norm_weight) {
@@ -913,8 +1021,8 @@ void* mlx_lazy_state_space_block_bf16(
     const auto& in_proj_w = *static_cast<const array*>(in_proj);
     const auto& conv_w = *static_cast<const array*>(conv_weight);
     const auto* conv_b = static_cast<const array*>(conv_bias);
-    const auto a_log_arr = ensure_float32(*static_cast<const array*>(a_log));
-    const auto d_skip_arr = ensure_float32(*static_cast<const array*>(d_skip));
+    const auto a_log_arr = cast_tensor_cached(a_log, *static_cast<const array*>(a_log), float32);
+    const auto d_skip_arr = cast_tensor_cached(d_skip, *static_cast<const array*>(d_skip), float32);
     const auto* dt_b = static_cast<const array*>(dt_bias);
     const auto* norm_w = static_cast<const array*>(norm_weight);
     const auto& out_proj_w = *static_cast<const array*>(out_proj);
@@ -927,18 +1035,27 @@ void* mlx_lazy_state_space_block_bf16(
     const int n_heads_i = static_cast<int>(n_heads);
     const int d_head_i = static_cast<int>(d_head);
     const int n_groups_i = static_cast<int>(n_groups);
+    const int heads_per_group = n_heads_i / n_groups_i;
     const int d_inner = n_heads_i * d_head_i;
     const int xbc_len = d_inner + 2 * n_groups_i * d_state_i;
+    const auto static_terms = resolve_state_space_static_terms(
+        a_log,
+        d_skip,
+        a_log_arr,
+        d_skip_arr,
+        n_groups_i,
+        heads_per_group
+    );
 
     const array conv_kernel_broadcast = resolve_state_space_conv_kernel(conv_weight, conv_w, d_conv_i, xbc_len);
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
         ? std::optional<array>(
             (conv_b->ndim() == 2 && conv_b->shape(0) == 1 && conv_b->shape(1) == xbc_len)
-                ? ensure_float32(*conv_b)
-                : reshape(ensure_float32(*conv_b), {1, xbc_len}))
+                ? *conv_b
+                : reshape(*conv_b, {1, xbc_len}))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
-        ? std::optional<array>(reshape(ensure_float32(*dt_b), {1, n_heads_i}))
+        ? std::optional<array>(reshape(cast_tensor_cached(dt_b, *dt_b, float32), {1, n_heads_i}))
         : std::nullopt;
     const std::optional<array> norm_weight_arr = (norm_w != nullptr)
         ? std::optional<array>(*norm_w)
@@ -958,14 +1075,15 @@ void* mlx_lazy_state_space_block_bf16(
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
-            layer_state->conv_state->shape(2) != xbc_len;
+            layer_state->conv_state->shape(2) != xbc_len ||
+            layer_state->conv_state->dtype() != input_arr.dtype();
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, xbc_len}, float32));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, xbc_len}, input_arr.dtype()));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, xbc_len}, float32);
+        conv_state = zeros({1, d_conv_i, xbc_len}, input_arr.dtype());
     }
 
     array ssm_state(0.0f, float32);
@@ -1004,8 +1122,8 @@ void* mlx_lazy_state_space_block_bf16(
         in_proj_fn,
         conv_kernel_broadcast,
         conv_bias_row,
-        a_log_arr,
-        d_skip_arr,
+        static_terms.a_log_exp_group,
+        static_terms.d_skip_group,
         dt_bias_row,
         norm_weight_arr,
         out_proj_fn,
@@ -1078,8 +1196,8 @@ void* mlx_lazy_state_space_block_quantized(
     const auto& in_proj_b = *static_cast<const array*>(in_b);
     const auto& conv_w = *static_cast<const array*>(conv_weight);
     const auto* conv_b = static_cast<const array*>(conv_bias);
-    const auto a_log_arr = ensure_float32(*static_cast<const array*>(a_log));
-    const auto d_skip_arr = ensure_float32(*static_cast<const array*>(d_skip));
+    const auto a_log_arr = cast_tensor_cached(a_log, *static_cast<const array*>(a_log), float32);
+    const auto d_skip_arr = cast_tensor_cached(d_skip, *static_cast<const array*>(d_skip), float32);
     const auto* dt_b = static_cast<const array*>(dt_bias);
     const auto* norm_w = static_cast<const array*>(norm_weight);
     const auto& out_proj_w = *static_cast<const array*>(out_w);
@@ -1098,8 +1216,17 @@ void* mlx_lazy_state_space_block_quantized(
     const int n_heads_i = static_cast<int>(n_heads);
     const int d_head_i = static_cast<int>(d_head);
     const int n_groups_i = static_cast<int>(n_groups);
+    const int heads_per_group = n_heads_i / n_groups_i;
     const int d_inner = n_heads_i * d_head_i;
     const int xbc_len = d_inner + 2 * n_groups_i * d_state_i;
+    const auto static_terms = resolve_state_space_static_terms(
+        a_log,
+        d_skip,
+        a_log_arr,
+        d_skip_arr,
+        n_groups_i,
+        heads_per_group
+    );
     const int group_size_i = static_cast<int>(group_size);
     const int bits_i = static_cast<int>(bits);
 
@@ -1107,11 +1234,11 @@ void* mlx_lazy_state_space_block_quantized(
     const std::optional<array> conv_bias_row = (conv_b != nullptr)
         ? std::optional<array>(
             (conv_b->ndim() == 2 && conv_b->shape(0) == 1 && conv_b->shape(1) == xbc_len)
-                ? ensure_float32(*conv_b)
-                : reshape(ensure_float32(*conv_b), {1, xbc_len}))
+                ? *conv_b
+                : reshape(*conv_b, {1, xbc_len}))
         : std::nullopt;
     const std::optional<array> dt_bias_row = (dt_b != nullptr)
-        ? std::optional<array>(reshape(ensure_float32(*dt_b), {1, n_heads_i}))
+        ? std::optional<array>(reshape(cast_tensor_cached(dt_b, *dt_b, float32), {1, n_heads_i}))
         : std::nullopt;
     const std::optional<array> norm_weight_arr = (norm_w != nullptr)
         ? std::optional<array>(*norm_w)
@@ -1131,14 +1258,15 @@ void* mlx_lazy_state_space_block_quantized(
         const bool need_init =
             layer_state->conv_state == nullptr ||
             layer_state->conv_state->shape(1) != d_conv_i ||
-            layer_state->conv_state->shape(2) != xbc_len;
+            layer_state->conv_state->shape(2) != xbc_len ||
+            layer_state->conv_state->dtype() != input_arr.dtype();
         if (need_init) {
             delete layer_state->conv_state;
-            layer_state->conv_state = new array(zeros({1, d_conv_i, xbc_len}, float32));
+            layer_state->conv_state = new array(zeros({1, d_conv_i, xbc_len}, input_arr.dtype()));
         }
         conv_state = *layer_state->conv_state;
     } else {
-        conv_state = zeros({1, d_conv_i, xbc_len}, float32);
+        conv_state = zeros({1, d_conv_i, xbc_len}, input_arr.dtype());
     }
 
     array ssm_state(0.0f, float32);
@@ -1157,21 +1285,21 @@ void* mlx_lazy_state_space_block_quantized(
         ssm_state = zeros({1, n_heads_i, d_head_i, d_state_i}, float32);
     }
 
-    const auto in_proj_fn = [&in_proj_w, &in_proj_s, &in_proj_b, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, in_proj_w, in_proj_s, in_proj_b, group_size_i, bits_i);
+    const auto in_proj_fn = [&in_proj_w, &in_proj_s, &in_proj_b, in_s, in_b, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, in_proj_w, in_proj_s, in_proj_b, group_size_i, bits_i, in_s, in_b);
     };
-    const auto out_proj_fn = [&out_proj_w, &out_proj_s, &out_proj_b, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, out_proj_w, out_proj_s, out_proj_b, group_size_i, bits_i);
+    const auto out_proj_fn = [&out_proj_w, &out_proj_s, &out_proj_b, out_s, out_b, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, out_proj_w, out_proj_s, out_proj_b, group_size_i, bits_i, out_s, out_b);
     };
     const bool has_ffn =
         gate_up_w_arr != nullptr && gate_up_s_arr != nullptr && gate_up_b_arr != nullptr &&
         down_w_arr != nullptr && down_s_arr != nullptr && down_b_arr != nullptr &&
         ln2_w != nullptr;
-    const auto gate_up_fn = [&gate_up_w_arr, &gate_up_s_arr, &gate_up_b_arr, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, *gate_up_w_arr, *gate_up_s_arr, *gate_up_b_arr, group_size_i, bits_i);
+    const auto gate_up_fn = [&gate_up_w_arr, &gate_up_s_arr, &gate_up_b_arr, gate_up_s, gate_up_b, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, *gate_up_w_arr, *gate_up_s_arr, *gate_up_b_arr, group_size_i, bits_i, gate_up_s, gate_up_b);
     };
-    const auto down_proj_fn = [&down_w_arr, &down_s_arr, &down_b_arr, group_size_i, bits_i](const array& x) -> array {
-        return quantized_linear_no_bias(x, *down_w_arr, *down_s_arr, *down_b_arr, group_size_i, bits_i);
+    const auto down_proj_fn = [&down_w_arr, &down_s_arr, &down_b_arr, down_s, down_b, group_size_i, bits_i](const array& x) -> array {
+        return quantized_linear_no_bias(x, *down_w_arr, *down_s_arr, *down_b_arr, group_size_i, bits_i, down_s, down_b);
     };
 
     array out = state_space_forward_core(
@@ -1180,8 +1308,8 @@ void* mlx_lazy_state_space_block_quantized(
         in_proj_fn,
         conv_kernel_broadcast,
         conv_bias_row,
-        a_log_arr,
-        d_skip_arr,
+        static_terms.a_log_exp_group,
+        static_terms.d_skip_group,
         dt_bias_row,
         norm_weight_arr,
         out_proj_fn,

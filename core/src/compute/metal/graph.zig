@@ -9,6 +9,7 @@ const std = @import("std");
 
 /// Opaque handle to MLX array (GPU memory)
 pub const ArrayHandle = ?*anyopaque;
+pub const CacheHandle = ?*anyopaque;
 pub const StateSpaceCacheHandle = ?*anyopaque;
 pub const CausalConvCacheHandle = ?*anyopaque;
 
@@ -165,6 +166,46 @@ pub extern fn mlx_lazy_quantized_attention(
     scale: f32,
     group_size: usize,
     bits: usize,
+) ArrayHandle;
+
+/// Fused quantized attention block:
+/// QKV projections + optional norm/rope + KV cache update + SDPA + output proj.
+pub extern fn mlx_lazy_fused_attention(
+    input: ArrayHandle,
+    q_w: ArrayHandle,
+    q_s: ArrayHandle,
+    q_b: ArrayHandle,
+    k_w: ArrayHandle,
+    k_s: ArrayHandle,
+    k_b: ArrayHandle,
+    v_w: ArrayHandle,
+    v_s: ArrayHandle,
+    v_b: ArrayHandle,
+    o_w: ArrayHandle,
+    o_s: ArrayHandle,
+    o_b: ArrayHandle,
+    q_norm_w: ArrayHandle,
+    k_norm_w: ArrayHandle,
+    q_bias: ArrayHandle,
+    k_bias: ArrayHandle,
+    v_bias: ArrayHandle,
+    o_bias: ArrayHandle,
+    attn_sinks: ArrayHandle,
+    cache_ptr: CacheHandle,
+    layer_idx: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pos_offset: usize,
+    rope_theta: f32,
+    runtime_rope_cos: ArrayHandle,
+    runtime_rope_sin: ArrayHandle,
+    runtime_rope_dim: usize,
+    rms_eps: f32,
+    group_size: usize,
+    bits: usize,
+    query_pre_attn_scalar: f32,
+    attention_multiplier: f32,
 ) ArrayHandle;
 
 /// Dequantize - >>> Lazy: dequantize
@@ -343,10 +384,34 @@ pub extern fn mlx_lazy_causal_conv_mixer_bf16(
     conv_dim: usize,
 ) ArrayHandle;
 
+/// Fused causal-conv mixer (quantized grouped-affine path)
+pub extern fn mlx_lazy_causal_conv_mixer_quantized(
+    input: ArrayHandle,
+    in_w: ArrayHandle,
+    in_s: ArrayHandle,
+    in_b: ArrayHandle,
+    conv_weight: ArrayHandle,
+    conv_bias: ArrayHandle,
+    out_w: ArrayHandle,
+    out_s: ArrayHandle,
+    out_b: ArrayHandle,
+    group_size: usize,
+    bits: usize,
+    causal_conv_cache: CausalConvCacheHandle,
+    layer_idx: usize,
+    d_conv: usize,
+    conv_dim: usize,
+) ArrayHandle;
+
 /// Causal-conv recurrent state cache lifecycle
 pub extern fn mlx_causal_conv_cache_create(n_layers: usize) CausalConvCacheHandle;
 pub extern fn mlx_causal_conv_cache_reset(cache: CausalConvCacheHandle) void;
 pub extern fn mlx_causal_conv_cache_free(cache: CausalConvCacheHandle) void;
+
+/// KV cache lifecycle for fused attention.
+pub extern fn mlx_cache_create(n_layers: usize, max_seq_len: usize) CacheHandle;
+pub extern fn mlx_cache_reset(cache: CacheHandle) void;
+pub extern fn mlx_cache_free(cache: CacheHandle) void;
 
 /// Fused state-space block (dense/bfloat16 path)
 pub extern fn mlx_lazy_state_space_block_bf16(

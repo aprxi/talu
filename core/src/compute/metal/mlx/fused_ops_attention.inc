@@ -53,6 +53,128 @@ static inline void attention_fused_qkv_cache_clear() {
     attention_fused_qkv_cache_store().clear();
 }
 
+struct FfnQuantizedGateUpCacheValue {
+    array weights;
+    array scales;
+    array biases;
+    int d_ff = 0;
+};
+
+static constexpr size_t kFfnQuantizedGateUpCacheMaxEntries = 2048;
+
+struct FfnQuantizedGateUpCacheKey {
+    const void* gate_w = nullptr;
+    const void* gate_s = nullptr;
+    const void* gate_b = nullptr;
+    const void* up_w = nullptr;
+    const void* up_s = nullptr;
+    const void* up_b = nullptr;
+
+    bool operator==(const FfnQuantizedGateUpCacheKey& other) const {
+        return gate_w == other.gate_w &&
+               gate_s == other.gate_s &&
+               gate_b == other.gate_b &&
+               up_w == other.up_w &&
+               up_s == other.up_s &&
+               up_b == other.up_b;
+    }
+};
+
+struct FfnQuantizedGateUpCacheKeyHash {
+    size_t operator()(const FfnQuantizedGateUpCacheKey& key) const {
+        size_t h = std::hash<const void*>{}(key.gate_w);
+        h ^= std::hash<const void*>{}(key.gate_s) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<const void*>{}(key.gate_b) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<const void*>{}(key.up_w) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<const void*>{}(key.up_s) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        h ^= std::hash<const void*>{}(key.up_b) + 0x9e3779b9 + (h << 6) + (h >> 2);
+        return h;
+    }
+};
+
+static inline std::unordered_map<FfnQuantizedGateUpCacheKey, FfnQuantizedGateUpCacheValue, FfnQuantizedGateUpCacheKeyHash>& ffn_quantized_gate_up_cache_store() {
+    static thread_local std::unordered_map<FfnQuantizedGateUpCacheKey, FfnQuantizedGateUpCacheValue, FfnQuantizedGateUpCacheKeyHash> cache;
+    return cache;
+}
+
+static inline void ffn_quantized_gate_up_cache_clear() {
+    ffn_quantized_gate_up_cache_store().clear();
+}
+
+static inline const FfnQuantizedGateUpCacheValue& ffn_quantized_gate_up_cached(
+    const void* gate_w,
+    const void* gate_s,
+    const void* gate_b,
+    const void* up_w,
+    const void* up_s,
+    const void* up_b,
+    const array& gate_w_arr,
+    const array& gate_s_arr,
+    const array& gate_b_arr,
+    const array& up_w_arr,
+    const array& up_s_arr,
+    const array& up_b_arr
+) {
+    if (gate_w_arr.ndim() != 2 || up_w_arr.ndim() != 2) {
+        throw std::invalid_argument("[ffn_quantized] gate/up weights must be rank-2");
+    }
+    if (gate_s_arr.ndim() != 2 || up_s_arr.ndim() != 2 || gate_b_arr.ndim() != 2 || up_b_arr.ndim() != 2) {
+        throw std::invalid_argument("[ffn_quantized] gate/up scales and biases must be rank-2");
+    }
+    if (gate_w_arr.shape(1) != up_w_arr.shape(1)) {
+        throw std::invalid_argument("[ffn_quantized] gate/up packed-k mismatch");
+    }
+    if (gate_s_arr.shape(1) != up_s_arr.shape(1) || gate_b_arr.shape(1) != up_b_arr.shape(1)) {
+        throw std::invalid_argument("[ffn_quantized] gate/up group mismatch");
+    }
+    const int d_ff = gate_w_arr.shape(0);
+    if (up_w_arr.shape(0) != d_ff || up_s_arr.shape(0) != d_ff || up_b_arr.shape(0) != d_ff) {
+        throw std::invalid_argument("[ffn_quantized] gate/up out features mismatch");
+    }
+
+    if (gate_w == nullptr || gate_s == nullptr || gate_b == nullptr || up_w == nullptr || up_s == nullptr || up_b == nullptr) {
+        static thread_local std::optional<FfnQuantizedGateUpCacheValue> scratch;
+        scratch = FfnQuantizedGateUpCacheValue{
+            contiguous(concatenate({gate_w_arr, up_w_arr}, 0)),
+            contiguous(concatenate({gate_s_arr, up_s_arr}, 0)),
+            contiguous(concatenate({gate_b_arr, up_b_arr}, 0)),
+            d_ff,
+        };
+        return *scratch;
+    }
+
+    auto& cache = ffn_quantized_gate_up_cache_store();
+    if (cache.size() >= kFfnQuantizedGateUpCacheMaxEntries) {
+        cache.clear();
+    }
+
+    FfnQuantizedGateUpCacheKey key{
+        gate_w,
+        gate_s,
+        gate_b,
+        up_w,
+        up_s,
+        up_b,
+    };
+    auto it = cache.find(key);
+    if (it != cache.end()) {
+        return it->second;
+    }
+
+    FfnQuantizedGateUpCacheValue fused{
+        contiguous(concatenate({gate_w_arr, up_w_arr}, 0)),
+        contiguous(concatenate({gate_s_arr, up_s_arr}, 0)),
+        contiguous(concatenate({gate_b_arr, up_b_arr}, 0)),
+        d_ff,
+    };
+    // Materialize once so repeated decode steps reuse concrete fused tensors.
+    eval(fused.weights);
+    eval(fused.scales);
+    eval(fused.biases);
+    auto [inserted, _] = cache.emplace(key, std::move(fused));
+    return inserted->second;
+}
+
 static inline array attention_fused_qkv_rhs_cached(
     const void* q_w,
     const void* k_w,
@@ -147,7 +269,9 @@ static ProjectedQkv project_quantized_qkv(
             *static_cast<const array*>(q_s),
             *static_cast<const array*>(q_b),
             group_size,
-            bits
+            bits,
+            q_s,
+            q_b
         ),
         quantized_linear_no_bias(
             input,
@@ -155,7 +279,9 @@ static ProjectedQkv project_quantized_qkv(
             *static_cast<const array*>(k_s),
             *static_cast<const array*>(k_b),
             group_size,
-            bits
+            bits,
+            k_s,
+            k_b
         ),
         quantized_linear_no_bias(
             input,
@@ -163,7 +289,9 @@ static ProjectedQkv project_quantized_qkv(
             *static_cast<const array*>(v_s),
             *static_cast<const array*>(v_b),
             group_size,
-            bits
+            bits,
+            v_s,
+            v_b
         ),
     };
     maybe_add_linear_bias(&projected.q, q_bias);
@@ -573,28 +701,39 @@ void* mlx_lazy_fused_ffn(
     const auto& x = *static_cast<const array*>(input);
     int gs = static_cast<int>(group_size);
     int b = static_cast<int>(bits);
+    const auto& gate_w_arr = *static_cast<const array*>(gate_w);
+    const auto& gate_s_arr = *static_cast<const array*>(gate_s);
+    const auto& gate_b_arr = *static_cast<const array*>(gate_b);
+    const auto& up_w_arr = *static_cast<const array*>(up_w);
+    const auto& up_s_arr = *static_cast<const array*>(up_s);
+    const auto& up_b_arr = *static_cast<const array*>(up_b);
 
-    auto gate = quantized_linear_no_bias(
-        x,
-        *static_cast<const array*>(gate_w),
-        *static_cast<const array*>(gate_s),
-        *static_cast<const array*>(gate_b),
-        gs,
-        b,
+    const auto& fused = ffn_quantized_gate_up_cached(
+        gate_w,
         gate_s,
-        gate_b
-    );
-
-    auto up = quantized_linear_no_bias(
-        x,
-        *static_cast<const array*>(up_w),
-        *static_cast<const array*>(up_s),
-        *static_cast<const array*>(up_b),
-        gs,
-        b,
+        gate_b,
+        up_w,
         up_s,
-        up_b
+        up_b,
+        gate_w_arr,
+        gate_s_arr,
+        gate_b_arr,
+        up_w_arr,
+        up_s_arr,
+        up_b_arr
     );
+    const auto gate_up = quantized_linear_no_bias(
+        x,
+        fused.weights,
+        fused.scales,
+        fused.biases,
+        gs,
+        b
+    );
+    const int batch_size = x.shape(0);
+    const int seq_len = x.shape(1);
+    auto gate = slice(gate_up, {0, 0, 0}, {batch_size, seq_len, fused.d_ff});
+    auto up = slice(gate_up, {0, 0, fused.d_ff}, {batch_size, seq_len, 2 * fused.d_ff});
 
     // Activation: GELU or SwiGLU based on model config
     auto mid = [&]() -> array {

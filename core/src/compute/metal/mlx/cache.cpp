@@ -37,6 +37,14 @@ void mlx_cache_free(void* cache_ptr) {
     delete cache_state;
 }
 
+void mlx_cache_reset(void* cache_ptr) {
+    auto cache_state = static_cast<MLXCache*>(cache_ptr);
+    if (cache_state == nullptr) return;
+    for (auto& layer : cache_state->layers) {
+        layer.offset = 0;
+    }
+}
+
 // ============================================================================
 // BFloat16 Cache Operations
 // ============================================================================
@@ -223,7 +231,7 @@ void mlx_causal_conv_cache_reset(void* cache_ptr) {
     for (auto& layer : cache_state->layers) {
         if (layer.conv_state != nullptr) {
             const auto shape = layer.conv_state->shape();
-            *layer.conv_state = zeros(shape, float32);
+            *layer.conv_state = zeros(shape, layer.conv_state->dtype());
         }
     }
 }
@@ -257,7 +265,7 @@ void mlx_state_space_cache_reset(void* cache_ptr) {
     for (auto& layer : cache_state->layers) {
         if (layer.conv_state != nullptr) {
             const auto shape = layer.conv_state->shape();
-            *layer.conv_state = zeros(shape, float32);
+            *layer.conv_state = zeros(shape, layer.conv_state->dtype());
         }
         if (layer.ssm_state != nullptr) {
             const auto shape = layer.ssm_state->shape();

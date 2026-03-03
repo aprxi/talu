@@ -40,12 +40,11 @@ static inline void ffn_fused_gate_up_cache_clear() {
 static inline array ffn_fused_gate_up_rhs_cached(
     const void* gate_w,
     const void* up_w,
-    const array& gate_weight,
+    const array& gate_wt,
     const array& up_weight,
-    int in_features
+    int in_features,
+    int d_ff
 ) {
-    auto gate_wt = orient_matmul_rhs_cached(gate_w, gate_weight, in_features, std::nullopt, true);
-    const int d_ff = gate_wt.shape(1);
     auto up_wt = orient_matmul_rhs_cached(up_w, up_weight, in_features, d_ff, true);
 
     if (gate_w == nullptr || up_w == nullptr) {
@@ -86,7 +85,7 @@ void* mlx_lazy_fused_ffn_bf16(
     const auto& up_weight = *static_cast<const array*>(up_w);
     auto gate_wt = orient_matmul_rhs_cached(gate_w, gate_weight, in_features, std::nullopt, true);
     const int d_ff = gate_wt.shape(1);
-    auto gate_up_wt = ffn_fused_gate_up_rhs_cached(gate_w, up_w, gate_weight, up_weight, in_features);
+    auto gate_up_wt = ffn_fused_gate_up_rhs_cached(gate_w, up_w, gate_wt, up_weight, in_features, d_ff);
     auto down_wt = orient_matmul_rhs_cached(down_w, *static_cast<const array*>(down_w), gate_wt.shape(1), in_features, true);
 
     auto gate_up = matmul_lastdim(x, gate_up_wt);
