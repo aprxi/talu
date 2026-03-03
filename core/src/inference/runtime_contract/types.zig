@@ -250,6 +250,14 @@ pub const StatePointerPayload = extern struct {
 /// Compatibility descriptor allocation footprint for pointer payload blocks.
 pub const compatibility_state_block_bytes: u64 = @sizeOf(StatePointerPayload);
 
+pub fn writeStatePointerToBlock(state_block: *StateBlockHandle, ptr: ?*anyopaque) !void {
+    if (state_block.align_bytes == 0 or state_block.size == 0) return error.InvalidStateDescriptorBinding;
+    const payload = stateValueFromBlock(*StatePointerPayload, state_block) orelse {
+        return error.InvalidStateDescriptorBinding;
+    };
+    payload.* = .{ .ptr = ptr };
+}
+
 pub fn statePointerFromBlock(state_block: *const StateBlockHandle) ?*anyopaque {
     const payload = stateValueFromBlock(*const StatePointerPayload, state_block) orelse return @ptrCast(state_block.ptr);
     return payload.ptr orelse @ptrCast(state_block.ptr);
@@ -631,7 +639,7 @@ pub fn defaultOpaqueStateDescriptor(state_id: u8) StateDescriptor {
         .size_bytes = compatibility_state_block_bytes,
         .align_bytes = 64,
         .zero_init = true,
-        .lifecycle = .slot_persistent,
+        .lifecycle = .request_scoped,
     };
 }
 
@@ -1993,6 +2001,36 @@ test "validateStateBlocksForDescriptors enforces descriptor coverage and constra
     try std.testing.expectError(
         error.InvalidStateDescriptorBinding,
         validateStateBlocksForDescriptors(descriptors[0..], bad_align_blocks[0..]),
+    );
+}
+
+test "writeStatePointerToBlock updates pointer payload" {
+    var backing: [64]u8 align(64) = [_]u8{0} ** 64;
+    var target_value: u32 = 42;
+    var block = StateBlockHandle{
+        .id = 1,
+        .ptr = &backing,
+        .size = compatibility_state_block_bytes,
+        .align_bytes = 64,
+    };
+
+    try writeStatePointerToBlock(&block, @ptrCast(&target_value));
+    const resolved = statePointerFromBlock(&block) orelse return error.InvalidStateDescriptorBinding;
+    const typed: *u32 = @ptrCast(@alignCast(resolved));
+    try std.testing.expectEqual(@as(u32, 42), typed.*);
+}
+
+test "writeStatePointerToBlock rejects undersized block" {
+    var backing: [64]u8 align(64) = [_]u8{0} ** 64;
+    var block = StateBlockHandle{
+        .id = 1,
+        .ptr = &backing,
+        .size = 4,
+        .align_bytes = 64,
+    };
+    try std.testing.expectError(
+        error.InvalidStateDescriptorBinding,
+        writeStatePointerToBlock(&block, null),
     );
 }
 

@@ -15,6 +15,7 @@ pub const MambaCacheHandle = ?*anyopaque;
 extern fn mlx_cache_create(n_layers: usize, max_seq_len: usize) CacheHandle;
 extern fn mlx_cache_create_bfloat16(n_layers: usize, max_seq_len: usize) CacheHandle;
 extern fn mlx_cache_free(cache: CacheHandle) void;
+extern fn mlx_cache_reset(cache: CacheHandle) void;
 extern fn mlx_cache_update_and_fetch_bfloat16(
     cache: CacheHandle,
     layer_idx: usize,
@@ -83,6 +84,11 @@ pub const Cache = struct {
     pub fn deinit(self: Cache) void {
         if (self.handle == null) return;
         mlx_cache_free(self.handle);
+    }
+
+    pub fn reset(self: Cache) void {
+        if (self.handle == null) return;
+        mlx_cache_reset(self.handle);
     }
 
     pub fn updateAndFetch(self: Cache, layer_idx: usize, k_new: ArrayHandle, v_new: ArrayHandle) struct { k: ArrayHandle, v: ArrayHandle, is_prefill: bool } {

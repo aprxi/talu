@@ -92,6 +92,7 @@ pub const findStateDescriptor = types.findStateDescriptor;
 pub const requireInstructionStateBlock = types.requireInstructionStateBlock;
 pub const requireInstructionStateBlockForPlan = types.requireInstructionStateBlockForPlan;
 pub const validateStateBlocksForDescriptors = types.validateStateBlocksForDescriptors;
+pub const writeStatePointerToBlock = types.writeStatePointerToBlock;
 pub const statePointerFromBlock = types.statePointerFromBlock;
 pub const statePointerForId = types.statePointerForId;
 pub const blockKindSupportsState = types.blockKindSupportsState;

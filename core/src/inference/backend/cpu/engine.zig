@@ -374,16 +374,34 @@ pub const FusedCpuBackend = struct {
             );
 
             var attention_kernel_present = false;
+            for (layer.instruction_attention_bindings) |maybe_binding| {
+                if (maybe_binding != null) {
+                    attention_kernel_present = true;
+                    break;
+                }
+            }
+
             var mla_kernel_present = false;
+            for (layer.instruction_mla_attention_refs) |maybe_binding| {
+                if (maybe_binding != null) {
+                    mla_kernel_present = true;
+                    break;
+                }
+            }
+
             var mamba_kernel_present = false;
+            for (layer.instruction_mamba_bindings) |maybe_binding| {
+                if (maybe_binding != null) {
+                    mamba_kernel_present = true;
+                    break;
+                }
+            }
+
             var shortconv_kernel_present = false;
-            for (plan.instructions) |insn| {
-                switch (insn.opcode) {
-                    .multihead_attention => attention_kernel_present = true,
-                    .mla_attention => mla_kernel_present = true,
-                    .mamba_mixer => mamba_kernel_present = true,
-                    .shortconv => shortconv_kernel_present = true,
-                    else => {},
+            for (layer.instruction_shortconv_bindings) |maybe_binding| {
+                if (maybe_binding != null) {
+                    shortconv_kernel_present = true;
+                    break;
                 }
             }
 
@@ -621,7 +639,7 @@ pub const FusedCpuBackend = struct {
             };
             var bound = state_block;
             if (state_ptr) |ptr| {
-                bound.ptr = @ptrFromInt(@intFromPtr(ptr));
+                try runtime_contract.writeStatePointerToBlock(&bound, ptr);
             }
             binding.handles[idx] = .{
                 .id = bound.id,

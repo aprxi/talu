@@ -1335,7 +1335,10 @@ const BlockRuntime = struct {
                         allocator,
                         program,
                         .decode,
-                        .{ .size_floor = d_model },
+                        .{
+                            .size_floor = d_model,
+                            .state_descriptor_entry = entry,
+                        },
                     );
                     try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .attention_mlp);
                     if (runtime_contract.stateDescriptorIndex(
@@ -1695,7 +1698,10 @@ const BlockRuntime = struct {
                         allocator,
                         program,
                         .decode,
-                        .{ .size_floor = d_model },
+                        .{
+                            .size_floor = d_model,
+                            .state_descriptor_entry = entry,
+                        },
                     );
                     try validateCompiledLayerPlanForCuda(&blocks[layer_idx].compiled_plan.?, layer_idx, .shortconv);
                     if (runtime_contract.stateDescriptorIndex(
@@ -2555,7 +2561,7 @@ pub const CudaBackend = struct {
             };
             var bound = incoming.*;
             if (state_ptr) |ptr| {
-                bound.ptr = @ptrFromInt(@intFromPtr(ptr));
+                try runtime_contract.writeStatePointerToBlock(&bound, ptr);
             }
             self.slot_state_blocks[idx] = .{
                 .id = descriptor.id,
@@ -4274,9 +4280,10 @@ pub const CudaBackend = struct {
         ctx: *LayerProgramExecutionContext,
     ) !void {
         const io = try instructionIoSlices(insn, registers);
-        if (io.inputs.len < 2) return error.InvalidInstructionBinding;
+        if (io.inputs.len < 2 or io.outputs.len == 0) return error.InvalidInstructionBinding;
+        const residual = bufferFromTensorHandle(io.outputs[0]);
         const branch = bufferFromTensorHandle(io.inputs[1]);
-        try self.addResidualWithScale(&self.prototype.input_dev, branch, ctx.d_model_u32, scale);
+        try self.addResidualWithScale(residual, branch, ctx.d_model_u32, scale);
     }
 
     fn layerProgramNormRuntimeAdapter(

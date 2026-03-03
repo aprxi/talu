@@ -574,6 +574,7 @@ pub const VisionRuntime = struct {
         embeddings: []const f32,
     ) !void {
         try vision_adapters.runScatterProgram(
+            self.allocator,
             self.vision_stage_plans.scatter(),
             null,
             vision_adapters.adapter_table,
