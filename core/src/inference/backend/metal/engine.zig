@@ -702,8 +702,9 @@ pub const MetalBackend = struct {
                 runtime_contract.mamba_state_id => @ptrCast(slot_mamba_cache),
                 else => null,
             };
+            var rebound = incoming.*;
             if (state_ptr) |ptr| {
-                try runtime_contract.writeStatePointerToBlock(incoming, ptr);
+                rebound.ptr = @ptrFromInt(@intFromPtr(ptr));
             }
             const use_owned_storage =
                 descriptor.size_bytes <= SlotStateBinding.OwnedStateBlockBytes and descriptor.align_bytes <= 64;
@@ -712,7 +713,7 @@ pub const MetalBackend = struct {
                 if (target_size == 0 or target_size > SlotStateBinding.OwnedStateBlockBytes) {
                     return error.InvalidStateDescriptorBinding;
                 }
-                const src: [*]const u8 = @ptrCast(incoming.ptr);
+                const src: [*]const u8 = @ptrCast(rebound.ptr);
                 const dst = binding.owned_storage[idx].bytes[0..target_size];
                 @memcpy(dst, src[0..target_size]);
                 binding.handles[idx] = .{
@@ -724,9 +725,9 @@ pub const MetalBackend = struct {
             } else {
                 binding.handles[idx] = .{
                     .id = descriptor.id,
-                    .ptr = incoming.ptr,
-                    .size = incoming.size,
-                    .align_bytes = incoming.align_bytes,
+                    .ptr = rebound.ptr,
+                    .size = rebound.size,
+                    .align_bytes = rebound.align_bytes,
                 };
             }
         }

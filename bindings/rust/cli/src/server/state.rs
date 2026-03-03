@@ -5,8 +5,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use talu::InferenceBackend;
+use talu::policy::Policy;
 
 use crate::server::tenant::TenantRegistry;
+use crate::server::{AgentRuntimeMode, SandboxBackend};
 
 pub struct BackendState {
     pub backend: Option<InferenceBackend>,
@@ -99,6 +101,8 @@ pub struct AppState {
     pub workspace_dir: PathBuf,
     /// Optional JSON policy applied to `/v1/agent/*` runtime operations.
     pub agent_policy_json: Option<String>,
+    /// Parsed policy handle for `/v1/agent/*` endpoints (loaded at startup).
+    pub agent_policy: Option<Arc<Policy>>,
     /// Serve console UI from this directory instead of bundled assets.
     pub html_dir: Option<PathBuf>,
     /// Plugin capability tokens — maps bearer token → plugin_id + permissions.
@@ -119,4 +123,8 @@ pub struct AppState {
     pub process_sessions: Mutex<HashMap<String, ProcessSession>>,
     /// Max idle time before a detached process session is evicted by the reaper.
     pub process_session_ttl: std::time::Duration,
+    /// Agent terminal runtime mode (`host` vs `strict`).
+    pub agent_runtime_mode: AgentRuntimeMode,
+    /// Selected sandbox backend.
+    pub sandbox_backend: SandboxBackend,
 }

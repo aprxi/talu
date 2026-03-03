@@ -760,23 +760,67 @@ pub fn build(b: *std.Build) void {
         .sqlite3 = sqlite3,
         .tree_sitter = tree_sitter,
     };
-    ut.add("tokenizer", "core/src/tokenizer/root.zig");
-    ut.add("validate", "core/src/validate/root.zig");
-    ut.add("io", "core/src/io/root.zig");
-    ut.add("db", "core/src/db/root.zig");
-    ut.add("template", "core/src/template/root.zig");
+    ut.addLazy("tokenizer", b.path("core/src/lib.zig"), &.{
+        "wordpiece",
+        "tokenizer",
+        "SentencePiece",
+    });
+    ut.addLazy("validate", b.path("core/src/lib.zig"), &.{
+        "sampler",
+        "mask ",
+        "grammar",
+    });
+    ut.addLazy("io", b.path("core/src/lib.zig"), &.{
+        "Http",
+        "fetch ",
+        "download",
+    });
+    ut.addLazy("db", b.path("core/src/lib.zig"), &.{
+        "index build",
+        "vector",
+        "bench",
+    });
+    ut.addLazy("template", b.path("core/src/lib.zig"), &.{
+        "TemplateInput",
+        "TemplateTokenizer",
+        "template",
+    });
     ut.addLazy("policy", b.path("core/src/lib.zig"), &.{
         "parsePolicy",
         "globMatch",
         "Policy.evaluate",
         "evaluate ",
     });
-    ut.add("models", "core/src/models/root.zig");
-    ut.add("responses", "core/src/responses/root.zig");
-    ut.add("converter", "core/src/converter/root.zig");
-    ut.add("xray", "core/src/xray/root.zig");
-    ut.add("image", "core/src/image/root.zig");
-    ut.add("compute", "core/src/compute/root.zig");
+    ut.addLazy("models", b.path("core/src/lib.zig"), &.{
+        "registry",
+        "compileLayerProgram",
+        "plan",
+    });
+    ut.addLazy("responses", b.path("core/src/lib.zig"), &.{
+        "TableAdapter",
+        "responses",
+        "storage",
+    });
+    ut.addLazy("converter", b.path("core/src/lib.zig"), &.{
+        "QuantConfig",
+        "ConvertOptions",
+        "converter",
+    });
+    ut.addLazy("xray", b.path("core/src/lib.zig"), &.{
+        "estimatePerf",
+        "LayerGeometry",
+        "xray",
+    });
+    ut.addLazy("image", b.path("core/src/lib.zig"), &.{
+        "stripAlpha",
+        "compositeRgbaToRgb",
+        "image",
+    });
+    ut.addLazy("compute", b.path("core/src/lib.zig"), &.{
+        "validateArgs",
+        "mmap",
+        "compute",
+    });
     // The inference subtree imports shared modules via `../../..` paths.
     // Building tests from `core/src/inference/root.zig` as module root trips
     // Zig's module-path guard ("import of file outside module path").

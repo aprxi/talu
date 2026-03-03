@@ -19,6 +19,7 @@ use tokio::sync::Mutex;
 
 use talu_cli::server::http::Router;
 use talu_cli::server::state::{AppState, BackendState};
+use talu_cli::server::{AgentRuntimeMode, SandboxBackend};
 
 // Test images compiled into the test binary.
 const RED_PNG: &[u8] = include_bytes!(concat!(
@@ -55,6 +56,7 @@ fn build_app() -> Router {
         bucket_path: None,
         workspace_dir: std::env::current_dir().expect("cwd"),
         agent_policy_json: None,
+        agent_policy: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
@@ -65,6 +67,8 @@ fn build_app() -> Router {
         shell_session_ttl: std::time::Duration::from_secs(15 * 60),
         process_sessions: Mutex::new(HashMap::new()),
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
+        agent_runtime_mode: AgentRuntimeMode::Host,
+        sandbox_backend: SandboxBackend::LinuxLocal,
     };
     Router::new(Arc::new(state))
 }
@@ -82,6 +86,7 @@ fn build_app_with_inspect_limit(limit: u64) -> Router {
         bucket_path: None,
         workspace_dir: std::env::current_dir().expect("cwd"),
         agent_policy_json: None,
+        agent_policy: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
@@ -92,6 +97,8 @@ fn build_app_with_inspect_limit(limit: u64) -> Router {
         shell_session_ttl: std::time::Duration::from_secs(15 * 60),
         process_sessions: Mutex::new(HashMap::new()),
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
+        agent_runtime_mode: AgentRuntimeMode::Host,
+        sandbox_backend: SandboxBackend::LinuxLocal,
     };
     Router::new(Arc::new(state))
 }

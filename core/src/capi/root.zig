@@ -735,9 +735,11 @@ pub const TaluAgentBus = agent.TaluAgentBus;
 // Re-export agent runtime policy C API functions.
 pub const talu_agent_policy_create = agent.talu_agent_policy_create;
 pub const talu_agent_policy_free = agent.talu_agent_policy_free;
+pub const talu_agent_policy_prepare_runtime = agent.talu_agent_policy_prepare_runtime;
 pub const talu_agent_policy_check_action = agent.talu_agent_policy_check_action;
 pub const talu_agent_policy_check_file = agent.talu_agent_policy_check_file;
 pub const talu_agent_policy_check_process = agent.talu_agent_policy_check_process;
+pub const talu_agent_runtime_validate_strict = agent.talu_agent_runtime_validate_strict;
 pub const TaluAgentPolicy = agent.TaluAgentPolicy;
 
 // Re-export Agent filesystem C API functions.

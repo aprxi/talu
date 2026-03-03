@@ -2,11 +2,15 @@
 
 const std = @import("std");
 const policy_mod = @import("../../agent/policy/root.zig");
+const sandbox = @import("../../agent/sandbox/root.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
 const allocator = std.heap.c_allocator;
 const Policy = policy_mod.Policy;
+const ACTION_EXEC = "tool.exec";
+const ACTION_SHELL = "tool.shell";
+const ACTION_PROCESS = "tool.process";
 
 pub const TaluAgentPolicy = opaque {};
 pub const ProcessDenyReason = policy_mod.ProcessDenyReason;
@@ -22,11 +26,102 @@ pub const FileSubtreeDecision = enum {
     deny,
 };
 
-pub fn toPolicyConst(handle: ?*TaluAgentPolicy) ?*const Policy {
-    if (handle) |h| {
-        return @ptrCast(@alignCast(h));
+const PreparedProfiles = struct {
+    cwd: ?[]u8 = null,
+    exec: ?sandbox.profile.ExecProfile = null,
+    shell: ?sandbox.profile.ExecProfile = null,
+    process: ?sandbox.profile.ExecProfile = null,
+
+    fn deinit(self: *PreparedProfiles) void {
+        if (self.exec) |*profile| profile.deinit();
+        if (self.shell) |*profile| profile.deinit();
+        if (self.process) |*profile| profile.deinit();
+        if (self.cwd) |value| allocator.free(value);
+        self.* = .{};
     }
+};
+
+const PolicyHandle = struct {
+    policy: Policy,
+    prepared: PreparedProfiles = .{},
+
+    fn deinit(self: *PolicyHandle) void {
+        self.prepared.deinit();
+        self.policy.deinit();
+    }
+};
+
+fn toHandle(handle: ?*TaluAgentPolicy) ?*PolicyHandle {
+    if (handle) |h| return @ptrCast(@alignCast(h));
     return null;
+}
+
+pub fn toPolicyConst(handle: ?*TaluAgentPolicy) ?*const Policy {
+    const h = toHandle(handle) orelse return null;
+    return &h.policy;
+}
+
+pub fn preparedExecProfile(
+    policy: ?*TaluAgentPolicy,
+    action: []const u8,
+    cwd: ?[]const u8,
+) ?*const sandbox.profile.ExecProfile {
+    const handle = toHandle(policy) orelse return null;
+    if (!cwdMatches(handle.prepared.cwd, cwd)) return null;
+    if (std.mem.eql(u8, action, ACTION_EXEC)) return if (handle.prepared.exec) |*p| p else null;
+    if (std.mem.eql(u8, action, ACTION_SHELL)) return if (handle.prepared.shell) |*p| p else null;
+    if (std.mem.eql(u8, action, ACTION_PROCESS)) return if (handle.prepared.process) |*p| p else null;
+    return null;
+}
+
+pub fn prepareRuntimeProfiles(policy: ?*TaluAgentPolicy, cwd: ?[]const u8) !void {
+    const handle = toHandle(policy) orelse return;
+    var canonical_cwd: ?[]u8 = null;
+    if (cwd) |value| {
+        if (value.len == 0) return error.StrictSetupFailed;
+        canonical_cwd = std.fs.cwd().realpathAlloc(allocator, value) catch return error.StrictSetupFailed;
+    }
+    errdefer if (canonical_cwd) |value| allocator.free(value);
+
+    var exec_profile = sandbox.profile.buildExecProfile(allocator, &handle.policy, .{
+        .action = ACTION_EXEC,
+        .cwd = canonical_cwd,
+        .include_shell_paths = true,
+    }) catch |err| return mapStrictProfileBuildError(err);
+    errdefer exec_profile.deinit();
+
+    var shell_profile = sandbox.profile.buildExecProfile(allocator, &handle.policy, .{
+        .action = ACTION_SHELL,
+        .cwd = canonical_cwd,
+        .include_shell_paths = true,
+    }) catch |err| return mapStrictProfileBuildError(err);
+    errdefer shell_profile.deinit();
+
+    var process_profile = sandbox.profile.buildExecProfile(allocator, &handle.policy, .{
+        .action = ACTION_PROCESS,
+        .cwd = canonical_cwd,
+        .include_shell_paths = true,
+    }) catch |err| return mapStrictProfileBuildError(err);
+    errdefer process_profile.deinit();
+
+    handle.prepared.deinit();
+    handle.prepared.cwd = canonical_cwd;
+    handle.prepared.exec = exec_profile;
+    handle.prepared.shell = shell_profile;
+    handle.prepared.process = process_profile;
+}
+
+fn mapStrictProfileBuildError(err: anyerror) anyerror {
+    return switch (err) {
+        error.StrictDeferred => error.StrictDeferred,
+        else => error.StrictSetupFailed,
+    };
+}
+
+fn cwdMatches(prepared_cwd: ?[]const u8, requested_cwd: ?[]const u8) bool {
+    if (prepared_cwd == null and requested_cwd == null) return true;
+    if (prepared_cwd == null or requested_cwd == null) return false;
+    return std.mem.eql(u8, prepared_cwd.?, requested_cwd.?);
 }
 
 pub fn clampTimeoutMs(policy: ?*TaluAgentPolicy, requested_ms: u64) u64 {
@@ -97,25 +192,47 @@ pub fn talu_agent_policy_create(
         return @intFromEnum(error_codes.ErrorCode.invalid_argument);
     }
 
-    const policy_ptr = allocator.create(Policy) catch |err| {
+    const policy_ptr = allocator.create(PolicyHandle) catch |err| {
         capi_error.setError(err, "failed to allocate policy", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
 
-    policy_ptr.* = policy_mod.parsePolicy(allocator, json_slice) catch |err| {
+    const parsed = policy_mod.parsePolicy(allocator, json_slice) catch |err| {
         allocator.destroy(policy_ptr);
         capi_error.setError(err, "failed to parse agent policy", .{});
         return @intFromEnum(error_codes.ErrorCode.policy_invalid);
     };
+    policy_ptr.* = .{ .policy = parsed };
 
     out.* = @ptrCast(policy_ptr);
     return 0;
 }
 
 pub fn talu_agent_policy_free(policy: ?*TaluAgentPolicy) callconv(.c) void {
-    const p: *Policy = @ptrCast(@alignCast(policy orelse return));
+    const p = toHandle(policy) orelse return;
     p.deinit();
     allocator.destroy(p);
+}
+
+pub fn talu_agent_policy_prepare_runtime(
+    policy: ?*TaluAgentPolicy,
+    cwd: ?[*:0]const u8,
+) callconv(.c) i32 {
+    capi_error.clearError();
+    const cwd_slice: ?[]const u8 = if (cwd) |value| blk: {
+        const slice = std.mem.sliceTo(value, 0);
+        if (slice.len == 0) {
+            capi_error.setErrorWithCode(.invalid_argument, "cwd is empty", .{});
+            return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+        }
+        break :blk slice;
+    } else null;
+
+    prepareRuntimeProfiles(policy, cwd_slice) catch |err| {
+        capi_error.setError(err, "failed to precompile strict runtime profiles", .{});
+        return @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+    };
+    return 0;
 }
 
 pub fn talu_agent_policy_check_action(
@@ -251,4 +368,52 @@ test "talu_agent_policy_create check and free" {
     );
     try std.testing.expectEqual(@as(i32, 0), check_rc);
     try std.testing.expect(allowed);
+}
+
+test "talu_agent_policy_prepare_runtime precompiles strict profiles" {
+    var handle: ?*TaluAgentPolicy = null;
+    const policy_json =
+        \\{
+        \\  "default":"deny",
+        \\  "statements":[
+        \\    {"effect":"allow","action":"tool.exec","command":"echo *"},
+        \\    {"effect":"allow","action":"tool.shell","command":"echo *"},
+        \\    {"effect":"allow","action":"tool.process","command":"echo *"}
+        \\  ]
+        \\}
+    ;
+    const rc = talu_agent_policy_create(policy_json.ptr, policy_json.len, &handle);
+    defer talu_agent_policy_free(handle);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+
+    const prep_rc = talu_agent_policy_prepare_runtime(handle, null);
+    try std.testing.expectEqual(@as(i32, 0), prep_rc);
+    try std.testing.expect(preparedExecProfile(handle, ACTION_EXEC, null) != null);
+    try std.testing.expect(preparedExecProfile(handle, ACTION_SHELL, null) != null);
+    try std.testing.expect(preparedExecProfile(handle, ACTION_PROCESS, null) != null);
+}
+
+test "prepareRuntimeProfiles defers cwd-dependent missing allow paths" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const cwd = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(cwd);
+
+    var handle: ?*TaluAgentPolicy = null;
+    const policy_json =
+        \\{
+        \\  "default":"deny",
+        \\  "statements":[
+        \\    {"effect":"allow","action":"tool.exec","command":"echo *"},
+        \\    {"effect":"allow","action":"tool.shell","command":"echo *"},
+        \\    {"effect":"allow","action":"tool.process","command":"echo *"},
+        \\    {"effect":"allow","action":"tool.fs.write","resource":"allowed/**"}
+        \\  ]
+        \\}
+    ;
+    const rc = talu_agent_policy_create(policy_json.ptr, policy_json.len, &handle);
+    defer talu_agent_policy_free(handle);
+    try std.testing.expectEqual(@as(i32, 0), rc);
+
+    try std.testing.expectError(error.StrictDeferred, prepareRuntimeProfiles(handle, cwd));
 }

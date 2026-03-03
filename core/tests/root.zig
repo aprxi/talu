@@ -116,6 +116,9 @@ pub const shell = @import("agent/shell/root.zig");
 // agent process (non-PTY long-lived process sessions)
 pub const process = @import("agent/process/root.zig");
 
+// agent sandbox (runtime mode/profile enforcement)
+pub const sandbox = @import("agent/sandbox/root.zig");
+
 // image (decode/convert/model_input/encode/capi)
 pub const image = @import("image/root.zig");
 

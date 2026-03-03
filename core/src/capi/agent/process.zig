@@ -2,7 +2,9 @@
 
 const std = @import("std");
 const agent = @import("../../agent/root.zig");
+const sandbox = @import("../../agent/sandbox/root.zig");
 const policy_api = @import("policy.zig");
+const runtime_api = @import("runtime.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
@@ -24,6 +26,19 @@ fn setPolicyDeniedError(reason: ?policy_api.ProcessDenyReason) i32 {
     }
     capi_error.setErrorWithCode(.shell_command_denied, "agent policy denied process action", .{});
     return @intFromEnum(error_codes.ErrorCode.policy_denied_exec);
+}
+
+fn setStrictError(err: anyerror) i32 {
+    return switch (err) {
+        error.StrictUnavailable => blk: {
+            capi_error.setErrorWithCode(.shell_command_denied, "strict runtime unavailable", .{});
+            break :blk @intFromEnum(error_codes.ErrorCode.policy_strict_unavailable);
+        },
+        else => blk: {
+            capi_error.setErrorWithCode(.shell_exec_failed, "strict runtime setup failed", .{});
+            break :blk @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+        },
+    };
 }
 
 fn enforceProcessOpenPolicy(
@@ -60,6 +75,8 @@ pub fn talu_process_open(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
     policy: ?*policy_api.TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     out_process: ?*?*TaluProcess,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -91,7 +108,51 @@ pub fn talu_process_open(
     const policy_rc = enforceProcessOpenPolicy(policy, command_slice, cwd_slice);
     if (policy_rc != 0) return policy_rc;
 
-    const session_ptr = process.session.ProcessSession.open(allocator, command_slice, cwd_slice) catch |err| {
+    const mode = runtime_api.parseRuntimeMode(runtime_mode) catch |err| {
+        capi_error.setError(err, "invalid runtime mode", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    const backend = runtime_api.parseBackend(sandbox_backend) catch |err| {
+        capi_error.setError(err, "invalid sandbox backend", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    runtime_api.validate(mode, backend) catch |err| {
+        return setStrictError(err);
+    };
+
+    var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
+    defer if (owned_exec_profile) |*p| p.deinit();
+    var exec_profile_ptr: ?*const sandbox.profile.ExecProfile = null;
+    if (mode == .strict) {
+        if (policy_api.preparedExecProfile(policy, ACTION_PROCESS, cwd_slice)) |prepared| {
+            exec_profile_ptr = prepared;
+        } else {
+            owned_exec_profile = sandbox.profile.buildExecProfile(
+                allocator,
+                policy_api.toPolicyConst(policy),
+                .{
+                    .action = ACTION_PROCESS,
+                    .cwd = cwd_slice,
+                    .include_shell_paths = true,
+                },
+            ) catch |err| {
+                capi_error.setError(err, "failed to build strict process profile", .{});
+                return @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+            };
+            exec_profile_ptr = &owned_exec_profile.?;
+        }
+    }
+
+    const session_ptr = process.session.ProcessSession.open(
+        allocator,
+        command_slice,
+        cwd_slice,
+        .{
+            .mode = mode,
+            .backend = backend,
+            .exec_profile = exec_profile_ptr,
+        },
+    ) catch |err| {
         capi_error.setError(err, "failed to open process session", .{});
         return @intFromEnum(error_codes.errorToCode(err));
     };
@@ -243,6 +304,8 @@ test "talu_process_open write read close roundtrip" {
             "while IFS= read -r line; do echo \"$line\"; [ \"$line\" = \"quit\" ] && break; done",
             null,
             null,
+            @intFromEnum(runtime_api.TaluAgentRuntimeMode.host),
+            @intFromEnum(runtime_api.TaluSandboxBackend.linux_local),
             &handle,
         ),
     );
@@ -282,7 +345,14 @@ test "talu_process_open enforces agent policy" {
     defer policy_api.talu_agent_policy_free(policy_handle);
 
     var handle: ?*TaluProcess = null;
-    const rc = talu_process_open("echo hi", null, policy_handle, &handle);
+    const rc = talu_process_open(
+        "echo hi",
+        null,
+        policy_handle,
+        @intFromEnum(runtime_api.TaluAgentRuntimeMode.host),
+        @intFromEnum(runtime_api.TaluSandboxBackend.linux_local),
+        &handle,
+    );
     try std.testing.expectEqual(
         @as(i32, @intFromEnum(error_codes.ErrorCode.policy_denied_exec)),
         rc,

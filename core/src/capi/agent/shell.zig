@@ -4,7 +4,9 @@
 
 const std = @import("std");
 const shell = @import("../../agent/shell/root.zig");
+const sandbox = @import("../../agent/sandbox/root.zig");
 const policy_api = @import("policy.zig");
+const runtime_api = @import("runtime.zig");
 const capi_error = @import("../error.zig");
 const error_codes = @import("../error_codes.zig");
 
@@ -28,6 +30,28 @@ fn setPolicyDeniedError(reason: ?policy_api.ProcessDenyReason) i32 {
     }
     capi_error.setErrorWithCode(.shell_command_denied, "agent policy denied exec action", .{});
     return @intFromEnum(error_codes.ErrorCode.policy_denied_exec);
+}
+
+fn setStrictError(err: anyerror) i32 {
+    return switch (err) {
+        error.StrictUnavailable => blk: {
+            capi_error.setErrorWithCode(.shell_command_denied, "strict runtime unavailable", .{});
+            break :blk @intFromEnum(error_codes.ErrorCode.policy_strict_unavailable);
+        },
+        else => blk: {
+            capi_error.setErrorWithCode(.shell_exec_failed, "strict runtime setup failed", .{});
+            break :blk @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+        },
+    };
+}
+
+fn parseRuntime(
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
+) !struct { mode: sandbox.RuntimeMode, backend: sandbox.Backend } {
+    const mode = try runtime_api.parseRuntimeMode(runtime_mode);
+    const backend = try runtime_api.parseBackend(sandbox_backend);
+    return .{ .mode = mode, .backend = backend };
 }
 
 fn enforceShellExecPolicy(
@@ -73,6 +97,8 @@ pub fn talu_shell_exec(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
     policy: ?*policy_api.TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     out_stdout: ?*?[*]const u8,
     out_stdout_len: ?*usize,
     out_stderr: ?*?[*]const u8,
@@ -108,15 +134,61 @@ pub fn talu_shell_exec(
     const policy_rc = enforceShellExecPolicy(policy, ACTION_EXEC, cmd, cwd_slice);
     if (policy_rc != 0) return policy_rc;
 
+    const runtime = parseRuntime(runtime_mode, sandbox_backend) catch |err| {
+        capi_error.setError(err, "invalid runtime config", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    runtime_api.validate(runtime.mode, runtime.backend) catch |err| {
+        return setStrictError(err);
+    };
+
+    var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
+    defer if (owned_exec_profile) |*p| p.deinit();
+    var exec_profile_ptr: ?*const sandbox.profile.ExecProfile = null;
+    if (runtime.mode == .strict) {
+        if (policy_api.preparedExecProfile(policy, ACTION_EXEC, cwd_slice)) |prepared| {
+            exec_profile_ptr = prepared;
+        } else {
+            owned_exec_profile = sandbox.profile.buildExecProfile(
+                allocator,
+                policy_api.toPolicyConst(policy),
+                .{
+                    .action = ACTION_EXEC,
+                    .cwd = cwd_slice,
+                    .include_shell_paths = true,
+                },
+            ) catch |err| {
+                capi_error.setError(err, "failed to build strict exec profile", .{});
+                return @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+            };
+            exec_profile_ptr = &owned_exec_profile.?;
+        }
+    }
+
     const default_timeout_ms: u64 = 120_000;
     const effective_timeout_ms = policy_api.clampTimeoutMs(policy, default_timeout_ms);
 
-    var result = shell.exec.execWithOptions(allocator, cmd, .{
-        .cwd = cwd_slice,
-        .timeout_ms = effective_timeout_ms,
-    }) catch |err| {
-        capi_error.setError(err, "shell exec failed", .{});
-        return @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
+    const sandbox_options: shell.exec.SandboxOptions = .{
+        .mode = runtime.mode,
+        .backend = runtime.backend,
+        .exec_profile = exec_profile_ptr,
+    };
+    var result = shell.exec.execWithOptionsSandbox(
+        allocator,
+        cmd,
+        .{
+            .cwd = cwd_slice,
+            .timeout_ms = effective_timeout_ms,
+        },
+        sandbox_options,
+    ) catch |err| {
+        return switch (err) {
+            error.StrictUnavailable, error.StrictSetupFailed => setStrictError(err),
+            else => blk: {
+                capi_error.setError(err, "shell exec failed", .{});
+                break :blk @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
+            },
+        };
     };
     // We transfer ownership to the caller; do NOT deinit here.
 
@@ -138,6 +210,8 @@ pub fn talu_shell_exec_streaming(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
     policy: ?*policy_api.TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     timeout_ms: u64,
     on_stdout: ?StreamCallback,
     on_stdout_ctx: ?*anyopaque,
@@ -169,6 +243,37 @@ pub fn talu_shell_exec_streaming(
     const policy_rc = enforceShellExecPolicy(policy, ACTION_EXEC, cmd, cwd_slice);
     if (policy_rc != 0) return policy_rc;
 
+    const runtime = parseRuntime(runtime_mode, sandbox_backend) catch |err| {
+        capi_error.setError(err, "invalid runtime config", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    runtime_api.validate(runtime.mode, runtime.backend) catch |err| {
+        return setStrictError(err);
+    };
+
+    var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
+    defer if (owned_exec_profile) |*p| p.deinit();
+    var exec_profile_ptr: ?*const sandbox.profile.ExecProfile = null;
+    if (runtime.mode == .strict) {
+        if (policy_api.preparedExecProfile(policy, ACTION_EXEC, cwd_slice)) |prepared| {
+            exec_profile_ptr = prepared;
+        } else {
+            owned_exec_profile = sandbox.profile.buildExecProfile(
+                allocator,
+                policy_api.toPolicyConst(policy),
+                .{
+                    .action = ACTION_EXEC,
+                    .cwd = cwd_slice,
+                    .include_shell_paths = true,
+                },
+            ) catch |err| {
+                capi_error.setError(err, "failed to build strict exec profile", .{});
+                return @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+            };
+            exec_profile_ptr = &owned_exec_profile.?;
+        }
+    }
+
     const effective_timeout_ms = policy_api.clampTimeoutMs(policy, timeout_ms);
 
     var stdout_stream_ctx = CStreamCtx{ .callback = cNoopStreamCallback, .ctx = null };
@@ -180,7 +285,7 @@ pub fn talu_shell_exec_streaming(
         stderr_stream_ctx = .{ .callback = cb, .ctx = on_stderr_ctx };
     }
 
-    var result = shell.exec.execStreaming(
+    var result = shell.exec.execStreamingSandbox(
         allocator,
         cmd,
         .{
@@ -188,13 +293,23 @@ pub fn talu_shell_exec_streaming(
             .timeout_ms = effective_timeout_ms,
             .max_output_bytes = 1024 * 1024,
         },
+        .{
+            .mode = runtime.mode,
+            .backend = runtime.backend,
+            .exec_profile = exec_profile_ptr,
+        },
         if (on_stdout != null) cStreamForward else null,
         if (on_stdout != null) &stdout_stream_ctx else null,
         if (on_stderr != null) cStreamForward else null,
         if (on_stderr != null) &stderr_stream_ctx else null,
     ) catch |err| {
-        capi_error.setError(err, "shell streaming exec failed", .{});
-        return @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
+        return switch (err) {
+            error.StrictUnavailable, error.StrictSetupFailed => setStrictError(err),
+            else => blk: {
+                capi_error.setError(err, "shell streaming exec failed", .{});
+                break :blk @intFromEnum(error_codes.ErrorCode.shell_exec_failed);
+            },
+        };
     };
     defer result.deinit(allocator);
 
@@ -320,6 +435,8 @@ pub fn talu_shell_open(
     rows: u16,
     cwd: ?[*:0]const u8,
     policy: ?*policy_api.TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     out_shell: ?*?*TaluShell,
 ) callconv(.c) i32 {
     capi_error.clearError();
@@ -343,6 +460,37 @@ pub fn talu_shell_open(
         return setPolicyDeniedError(policy_result.deny_reason);
     }
 
+    const runtime = parseRuntime(runtime_mode, sandbox_backend) catch |err| {
+        capi_error.setError(err, "invalid runtime config", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+    runtime_api.validate(runtime.mode, runtime.backend) catch |err| {
+        return setStrictError(err);
+    };
+
+    var owned_exec_profile: ?sandbox.profile.ExecProfile = null;
+    defer if (owned_exec_profile) |*p| p.deinit();
+    var exec_profile_ptr: ?*const sandbox.profile.ExecProfile = null;
+    if (runtime.mode == .strict) {
+        if (policy_api.preparedExecProfile(policy, ACTION_EXEC, cwd_slice)) |prepared| {
+            exec_profile_ptr = prepared;
+        } else {
+            owned_exec_profile = sandbox.profile.buildExecProfile(
+                allocator,
+                policy_api.toPolicyConst(policy),
+                .{
+                    .action = ACTION_EXEC,
+                    .cwd = cwd_slice,
+                    .include_shell_paths = true,
+                },
+            ) catch |err| {
+                capi_error.setError(err, "failed to build strict exec profile", .{});
+                return @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed);
+            };
+            exec_profile_ptr = &owned_exec_profile.?;
+        }
+    }
+
     const spawn_mode: shell.pty.ShellSpawnMode = switch (policy_api.terminalShellMode(policy)) {
         .host => .host,
         .builtin => .builtin,
@@ -355,6 +503,11 @@ pub fn talu_shell_open(
         cwd_slice,
         DEFAULT_SCROLLBACK_BYTES,
         spawn_mode,
+        .{
+            .mode = runtime.mode,
+            .backend = runtime.backend,
+            .exec_profile = exec_profile_ptr,
+        },
     ) catch |err| {
         capi_error.setError(err, "failed to open shell session", .{});
         return @intFromEnum(error_codes.errorToCode(err));
@@ -565,6 +718,8 @@ test "talu_shell_exec runs whitelisted command" {
         "echo hello",
         null,
         null,
+        @intFromEnum(runtime_api.TaluAgentRuntimeMode.host),
+        @intFromEnum(runtime_api.TaluSandboxBackend.linux_local),
         &stdout_ptr,
         &stdout_len,
         &stderr_ptr,
@@ -581,7 +736,18 @@ test "talu_shell_exec runs whitelisted command" {
 }
 
 test "talu_shell_exec null command returns error" {
-    const rc = talu_shell_exec(null, null, null, null, null, null, null, null);
+    const rc = talu_shell_exec(
+        null,
+        null,
+        null,
+        @intFromEnum(runtime_api.TaluAgentRuntimeMode.host),
+        @intFromEnum(runtime_api.TaluSandboxBackend.linux_local),
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
     try std.testing.expect(rc != 0);
 }
 
@@ -596,7 +762,18 @@ test "talu_shell_exec enforces agent policy" {
     );
     defer policy_api.talu_agent_policy_free(policy_handle);
 
-    const rc = talu_shell_exec("echo hello", null, policy_handle, null, null, null, null, null);
+    const rc = talu_shell_exec(
+        "echo hello",
+        null,
+        policy_handle,
+        @intFromEnum(runtime_api.TaluAgentRuntimeMode.host),
+        @intFromEnum(runtime_api.TaluSandboxBackend.linux_local),
+        null,
+        null,
+        null,
+        null,
+        null,
+    );
     try std.testing.expectEqual(
         @as(i32, @intFromEnum(error_codes.ErrorCode.policy_denied_exec)),
         rc,
@@ -653,6 +830,8 @@ test "talu_shell_exec_streaming invokes callbacks and returns exit" {
         "echo out && echo err >&2",
         null,
         null,
+        @intFromEnum(runtime_api.TaluAgentRuntimeMode.host),
+        @intFromEnum(runtime_api.TaluSandboxBackend.linux_local),
         30_000,
         callbacks.onStdout,
         &saw_stdout,
@@ -668,7 +847,18 @@ test "talu_shell_exec_streaming invokes callbacks and returns exit" {
 
 test "talu_shell_open write read and scrollback" {
     var handle: ?*TaluShell = null;
-    try std.testing.expectEqual(@as(i32, 0), talu_shell_open(80, 24, null, null, &handle));
+    try std.testing.expectEqual(
+        @as(i32, 0),
+        talu_shell_open(
+            80,
+            24,
+            null,
+            null,
+            @intFromEnum(runtime_api.TaluAgentRuntimeMode.host),
+            @intFromEnum(runtime_api.TaluSandboxBackend.linux_local),
+            &handle,
+        ),
+    );
     defer talu_shell_close(handle);
 
     const command = "echo hello\nexit\n";

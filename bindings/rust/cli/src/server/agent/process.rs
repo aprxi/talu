@@ -79,7 +79,7 @@ pub(crate) struct ProcessEvent {
 #[utoipa::path(post, path = "/v1/agent/processes/spawn", tag = "Agent::Process",
     request_body = ProcessSpawnRequest,
     responses(
-        (status = 200, body = ProcessSessionResponse),
+        (status = 200, description = "Create process session. In strict mode, descendant exec/file access is sandbox-enforced; in host mode, passthrough has no firewall guarantee.", body = ProcessSessionResponse),
         (status = 400, body = crate::server::http::ErrorResponse),
         (status = 429, body = crate::server::http::ErrorResponse),
         (status = 500, body = crate::server::http::ErrorResponse),
@@ -126,15 +126,24 @@ pub async fn handle_spawn(
         );
     }
 
-    let policy = match super::load_runtime_policy(&state) {
-        Ok(policy) => policy,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "policy_invalid", &err),
+    let policy = super::load_runtime_policy(&state);
+    let runtime_mode = super::runtime_mode_for_talu(state.agent_runtime_mode);
+    let sandbox_backend = super::sandbox_backend_for_talu(state.sandbox_backend);
+    let effective_cwd = if state.agent_runtime_mode == crate::server::AgentRuntimeMode::Strict {
+        request
+            .cwd
+            .clone()
+            .or_else(|| Some(state.workspace_dir.to_string_lossy().into_owned()))
+    } else {
+        request.cwd.clone()
     };
 
-    let process = match talu::process::ProcessSession::open_with_policy(
+    let process = match talu::process::ProcessSession::open_with_policy_runtime(
         &request.command,
-        request.cwd.as_deref(),
-        policy.as_ref(),
+        effective_cwd.as_deref(),
+        policy.as_deref(),
+        runtime_mode,
+        sandbox_backend,
     ) {
         Ok(value) => value,
         Err(e) => {
@@ -147,6 +156,12 @@ pub async fn handle_spawn(
                 }
                 talu::process::ProcessError::PolicyDeniedExec(_) => {
                     (StatusCode::FORBIDDEN, "policy_denied_exec")
+                }
+                talu::process::ProcessError::StrictUnavailable(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_unavailable")
+                }
+                talu::process::ProcessError::StrictSetupFailed(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_setup_failed")
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "process_error"),
             };
@@ -163,7 +178,7 @@ pub async fn handle_spawn(
     let response = ProcessSessionResponse {
         process_id: process_id.clone(),
         command: request.command.clone(),
-        cwd: request.cwd.clone(),
+        cwd: effective_cwd.clone(),
         attached_streams: 0,
     };
     sessions.insert(
@@ -172,7 +187,7 @@ pub async fn handle_spawn(
             process: Arc::new(tokio::sync::Mutex::new(process)),
             owner_key: owner,
             command: request.command,
-            cwd: request.cwd,
+            cwd: effective_cwd,
             created_at: now,
             last_access: now,
             attached_streams: 0,

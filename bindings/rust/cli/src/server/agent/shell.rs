@@ -81,7 +81,7 @@ struct ShellControlMessage {
 #[utoipa::path(post, path = "/v1/agent/shells", tag = "Agent::Shell",
     request_body = ShellCreateRequest,
     responses(
-        (status = 200, body = ShellSessionResponse),
+        (status = 200, description = "Create shell session. In strict mode, descendant exec/file access is sandbox-enforced; in host mode, passthrough has no firewall guarantee.", body = ShellSessionResponse),
         (status = 400, body = crate::server::http::ErrorResponse),
         (status = 403, body = crate::server::http::ErrorResponse),
         (status = 429, body = crate::server::http::ErrorResponse),
@@ -145,16 +145,25 @@ pub async fn handle_create(
         );
     }
 
-    let policy = match super::load_runtime_policy(&state) {
-        Ok(policy) => policy,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "policy_invalid", &err),
+    let policy = super::load_runtime_policy(&state);
+    let runtime_mode = super::runtime_mode_for_talu(state.agent_runtime_mode);
+    let sandbox_backend = super::sandbox_backend_for_talu(state.sandbox_backend);
+    let effective_cwd = if state.agent_runtime_mode == crate::server::AgentRuntimeMode::Strict {
+        request
+            .cwd
+            .clone()
+            .or_else(|| Some(state.workspace_dir.to_string_lossy().into_owned()))
+    } else {
+        request.cwd.clone()
     };
 
-    let shell = match talu::shell::ShellSession::open_with_policy(
+    let shell = match talu::shell::ShellSession::open_with_policy_runtime(
         cols,
         rows,
-        request.cwd.as_deref(),
-        policy.as_ref(),
+        effective_cwd.as_deref(),
+        policy.as_deref(),
+        runtime_mode,
+        sandbox_backend,
     ) {
         Ok(value) => value,
         Err(e) => {
@@ -165,6 +174,12 @@ pub async fn handle_create(
                 talu::shell::ShellError::PolicyDeniedExec(_)
                 | talu::shell::ShellError::CommandDenied(_) => {
                     (StatusCode::FORBIDDEN, "policy_denied_exec")
+                }
+                talu::shell::ShellError::StrictUnavailable(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_unavailable")
+                }
+                talu::shell::ShellError::StrictSetupFailed(_) => {
+                    (StatusCode::INTERNAL_SERVER_ERROR, "strict_runtime_setup_failed")
                 }
                 _ => (StatusCode::INTERNAL_SERVER_ERROR, "shell_error"),
             };
@@ -178,7 +193,7 @@ pub async fn handle_create(
         shell_id: shell_id.clone(),
         cols,
         rows,
-        cwd: request.cwd.clone(),
+        cwd: effective_cwd.clone(),
         attached_clients: 0,
     };
 
@@ -187,7 +202,7 @@ pub async fn handle_create(
         ShellSession {
             shell: Arc::new(Mutex::new(shell)),
             owner_key: owner,
-            cwd: request.cwd,
+            cwd: effective_cwd,
             cols,
             rows,
             created_at: now,

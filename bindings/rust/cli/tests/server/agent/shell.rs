@@ -17,6 +17,13 @@ fn config_with_policy(policy_json: &str) -> ServerConfig {
     cfg
 }
 
+fn config_with_strict_policy(policy_json: &str) -> ServerConfig {
+    let mut cfg = config_with_policy(policy_json);
+    cfg.agent_runtime_mode = Some("strict".to_string());
+    cfg.sandbox_backend = Some("linux-local".to_string());
+    cfg
+}
+
 fn config_with_policy_and_shell_env(policy_json: &str, shell: &str) -> ServerConfig {
     let mut cfg = config_with_policy(policy_json);
     cfg.env_vars.push(("SHELL".to_string(), shell.to_string()));
@@ -109,6 +116,20 @@ async fn ws_drain_output(ws: &mut WsStream) -> (Vec<u8>, Option<serde_json::Valu
             Ok(Some(Ok(Message::Text(text)))) => {
                 let json: serde_json::Value = serde_json::from_str(&text).unwrap_or_default();
                 if json["type"] == "exit" || json["type"] == "error" {
+                    // Terminal event can race ahead of trailing PTY bytes; drain
+                    // a short window of immediately available frames before return.
+                    for _ in 0..64 {
+                        match tokio::time::timeout(std::time::Duration::from_millis(20), ws.next())
+                            .await
+                        {
+                            Ok(Some(Ok(Message::Binary(data)))) => {
+                                output.extend_from_slice(&data);
+                            }
+                            Ok(Some(Ok(_))) => continue,
+                            Ok(Some(Err(_))) => break,
+                            Ok(None) | Err(_) => break,
+                        }
+                    }
                     return (output, Some(json));
                 }
             }
@@ -930,6 +951,239 @@ async fn agent_shell_ws_exit_event_on_shell_exit() {
         .expect("ws send");
 
     let (_, exit_event) = ws_drain_output(&mut ws).await;
+    let exit = exit_event.expect("should receive exit event");
+    assert_eq!(exit["type"], "exit");
+}
+
+#[tokio::test]
+async fn agent_shell_ws_strict_mode_blocks_nested_subprocess_exec() {
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"builtin",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"},
+            {"effect":"allow","action":"tool.exec","command":"python3 *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
+    let shell_id = create_shell(&ctx);
+    let mut ws = ws_connect(&ctx, &shell_id).await;
+
+    ws.send(
+        Message::Binary(
+            b"python3 -c 'raise SystemExit(__import__(\"os\").system(\"ls\")//256)'\necho RET:$?\nexit\n"
+                .to_vec()
+                .into(),
+        ),
+    )
+    .await
+    .expect("ws send");
+
+    let (output, exit_event) = ws_drain_output(&mut ws).await;
+    let text = String::from_utf8_lossy(&output);
+    if text.contains("RET:") {
+        assert!(
+            !text.contains("RET:0"),
+            "strict mode should not allow nested ls exec, got: {text}"
+        );
+    }
+
+    let terminal = exit_event.expect("should receive terminal event");
+    assert!(
+        terminal["type"] == "exit" || terminal["type"] == "error",
+        "unexpected terminal event: {terminal}"
+    );
+}
+
+#[tokio::test]
+async fn agent_shell_ws_strict_mode_blocks_descendant_file_write_without_fs_write_allow() {
+    std::fs::create_dir_all("/tmp/allowed").expect("create /tmp/allowed");
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"builtin",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"},
+            {"effect":"allow","action":"tool.exec","command":"python3 *"},
+            {"effect":"allow","action":"tool.fs.write","resource":"allowed/**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
+    let create = post_json(
+        ctx.addr(),
+        "/v1/agent/shells",
+        &serde_json::json!({"cwd": "/tmp"}),
+    );
+    assert_eq!(create.status, 200, "create failed: {}", create.body);
+    let shell_id = create.json()["shell_id"]
+        .as_str()
+        .expect("shell_id")
+        .to_string();
+    let mut ws = ws_connect(&ctx, &shell_id).await;
+
+    ws.send(
+        Message::Binary(
+            b"python3 -c '__import__(\"pathlib\").Path(\"/tmp/deny-shell-write.txt\").write_text(\"x\")'\necho RET:$?\nexit\n"
+                .to_vec()
+                .into(),
+        ),
+    )
+    .await
+    .expect("ws send");
+
+    let (output, exit_event) = ws_drain_output(&mut ws).await;
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        !text.contains("RET:0"),
+        "strict mode should deny descendant file write without fs.write allow, got: {text}"
+    );
+
+    let terminal = exit_event.expect("should receive terminal event");
+    assert!(
+        terminal["type"] == "exit" || terminal["type"] == "error",
+        "unexpected terminal event: {terminal}"
+    );
+}
+
+#[tokio::test]
+async fn agent_shell_ws_strict_mode_allows_descendant_file_write_with_fs_write_allow() {
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"builtin",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"},
+            {"effect":"allow","action":"tool.exec","command":"python3 *"},
+            {"effect":"allow","action":"tool.fs.write","resource":"**"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
+    let create = post_json(
+        ctx.addr(),
+        "/v1/agent/shells",
+        &serde_json::json!({"cwd": "/tmp"}),
+    );
+    assert_eq!(create.status, 200, "create failed: {}", create.body);
+    let shell_id = create.json()["shell_id"]
+        .as_str()
+        .expect("shell_id")
+        .to_string();
+    let mut ws = ws_connect(&ctx, &shell_id).await;
+
+    ws.send(
+        Message::Binary(
+            b"python3 -c '__import__(\"pathlib\").Path(\"allow-shell-write.txt\").write_text(\"ok\")'\necho RET:$?\nexit\n"
+                .to_vec()
+                .into(),
+        ),
+    )
+    .await
+    .expect("ws send");
+
+    let (output, exit_event) = ws_drain_output(&mut ws).await;
+    let text = String::from_utf8_lossy(&output);
+    assert!(
+        text.contains("RET:0"),
+        "strict mode should allow descendant file write when fs.write is allowed, got: {text}"
+    );
+
+    let terminal = exit_event.expect("should receive terminal event");
+    assert!(
+        terminal["type"] == "exit" || terminal["type"] == "error",
+        "unexpected terminal event: {terminal}"
+    );
+}
+
+#[tokio::test]
+async fn agent_shell_ws_strict_mode_tui_less_smoke() {
+    let has_less = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v less >/dev/null 2>&1")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !has_less {
+        eprintln!("Skipped: less not available in test environment");
+        return;
+    }
+
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"builtin",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"},
+            {"effect":"allow","action":"tool.exec","command":"less"},
+            {"effect":"allow","action":"tool.exec","command":"less *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
+    let shell_id = create_shell(&ctx);
+    let mut ws = ws_connect(&ctx, &shell_id).await;
+
+    ws.send(Message::Binary(b"less /etc/hosts\nq\nexit\n".to_vec().into()))
+        .await
+        .expect("ws send");
+
+    let (output, exit_event) = ws_drain_output(&mut ws).await;
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(
+        !text.contains("command denied"),
+        "strict mode TUI smoke should not be denied by command gate: {text}"
+    );
+    assert!(
+        !text.contains("not found"),
+        "strict mode TUI smoke should find less executable: {text}"
+    );
+
+    let exit = exit_event.expect("should receive exit event");
+    assert_eq!(exit["type"], "exit");
+}
+
+#[tokio::test]
+async fn agent_shell_ws_strict_mode_tui_vim_smoke() {
+    let has_vim = std::process::Command::new("sh")
+        .arg("-c")
+        .arg("command -v vim >/dev/null 2>&1")
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    if !has_vim {
+        eprintln!("Skipped: vim not available in test environment");
+        return;
+    }
+
+    let policy = r#"{
+        "default":"deny",
+        "terminal_shell_mode":"builtin",
+        "statements":[
+            {"effect":"allow","action":"tool.shell"},
+            {"effect":"allow","action":"tool.exec","command":"vim"},
+            {"effect":"allow","action":"tool.exec","command":"vim *"}
+        ]
+    }"#;
+    let ctx = ServerTestContext::new(config_with_strict_policy(policy));
+    let shell_id = create_shell(&ctx);
+    let mut ws = ws_connect(&ctx, &shell_id).await;
+
+    ws.send(
+        Message::Binary(
+            b"vim -Nu NONE -n -c 'q' /etc/hosts\nexit\n".to_vec().into(),
+        ),
+    )
+    .await
+    .expect("ws send");
+
+    let (output, exit_event) = ws_drain_output(&mut ws).await;
+    let text = String::from_utf8_lossy(&output);
+
+    assert!(
+        !text.contains("command denied"),
+        "strict mode vim smoke should not be denied by command gate: {text}"
+    );
+    assert!(
+        !text.contains("not found"),
+        "strict mode vim smoke should find vim executable: {text}"
+    );
+
     let exit = exit_event.expect("should receive exit event");
     assert_eq!(exit["type"], "exit");
 }

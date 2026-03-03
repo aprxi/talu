@@ -9,8 +9,25 @@ const ERROR_CODE_SHELL_EXEC_FAILED: i32 = 801;
 const ERROR_CODE_SHELL_SESSION_CLOSED: i32 = 802;
 const ERROR_CODE_POLICY_DENIED_EXEC: i32 = 808;
 const ERROR_CODE_POLICY_DENIED_CWD: i32 = 809;
+const ERROR_CODE_POLICY_STRICT_UNAVAILABLE: i32 = 811;
+const ERROR_CODE_POLICY_STRICT_SETUP_FAILED: i32 = 812;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 const ERROR_CODE_INVALID_HANDLE: i32 = 902;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum AgentRuntimeMode {
+    Host = 0,
+    Strict = 1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i32)]
+pub enum SandboxBackend {
+    LinuxLocal = 0,
+    Oci = 1,
+    AppleContainer = 2,
+}
 
 type StreamCallback = unsafe extern "C" fn(*mut c_void, *const u8, usize) -> bool;
 
@@ -20,6 +37,8 @@ unsafe extern "C" {
         command: *const c_char,
         cwd: *const c_char,
         policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
         out_stdout: *mut *const u8,
         out_stdout_len: *mut usize,
         out_stderr: *mut *const u8,
@@ -32,6 +51,8 @@ unsafe extern "C" {
         command: *const c_char,
         cwd: *const c_char,
         policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
         timeout_ms: u64,
         on_stdout: Option<StreamCallback>,
         on_stdout_ctx: *mut c_void,
@@ -67,6 +88,8 @@ unsafe extern "C" {
         rows: u16,
         cwd: *const c_char,
         policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
         out_shell: *mut *mut c_void,
     ) -> c_int;
 
@@ -102,6 +125,13 @@ unsafe extern "C" {
 
     #[link_name = "talu_shell_free_string"]
     fn talu_shell_free_string_raw(ptr: *const u8, len: usize);
+
+    #[link_name = "talu_agent_runtime_validate_strict"]
+    fn talu_agent_runtime_validate_strict_raw(
+        policy: *mut c_void,
+        cwd: *const c_char,
+        sandbox_backend: c_int,
+    ) -> c_int;
 }
 
 /// Output from executing a shell command.
@@ -125,6 +155,8 @@ pub enum ShellError {
     CommandDenied(String),
     PolicyDeniedExec(String),
     PolicyDeniedCwd(String),
+    StrictUnavailable(String),
+    StrictSetupFailed(String),
     ExecFailed(String),
     SessionClosed(String),
     InvalidArgument(String),
@@ -139,6 +171,8 @@ impl ShellError {
             ERROR_CODE_SHELL_COMMAND_DENIED => Self::CommandDenied(detail),
             ERROR_CODE_POLICY_DENIED_EXEC => Self::PolicyDeniedExec(detail),
             ERROR_CODE_POLICY_DENIED_CWD => Self::PolicyDeniedCwd(detail),
+            ERROR_CODE_POLICY_STRICT_UNAVAILABLE => Self::StrictUnavailable(detail),
+            ERROR_CODE_POLICY_STRICT_SETUP_FAILED => Self::StrictSetupFailed(detail),
             ERROR_CODE_SHELL_EXEC_FAILED => Self::ExecFailed(detail),
             ERROR_CODE_SHELL_SESSION_CLOSED => Self::SessionClosed(detail),
             ERROR_CODE_INVALID_ARGUMENT => Self::InvalidArgument(detail),
@@ -154,6 +188,8 @@ impl std::fmt::Display for ShellError {
             ShellError::CommandDenied(s) => write!(f, "command denied: {}", s),
             ShellError::PolicyDeniedExec(s) => write!(f, "policy denied exec: {}", s),
             ShellError::PolicyDeniedCwd(s) => write!(f, "policy denied cwd: {}", s),
+            ShellError::StrictUnavailable(s) => write!(f, "strict runtime unavailable: {}", s),
+            ShellError::StrictSetupFailed(s) => write!(f, "strict runtime setup failed: {}", s),
             ShellError::ExecFailed(s) => write!(f, "execution failed: {}", s),
             ShellError::SessionClosed(s) => write!(f, "session closed: {}", s),
             ShellError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
@@ -190,6 +226,25 @@ impl ShellSession {
         cwd: Option<&str>,
         policy: Option<&crate::policy::Policy>,
     ) -> Result<Self, ShellError> {
+        Self::open_with_policy_runtime(
+            cols,
+            rows,
+            cwd,
+            policy,
+            AgentRuntimeMode::Host,
+            SandboxBackend::LinuxLocal,
+        )
+    }
+
+    /// Open a new interactive shell session with policy and explicit runtime configuration.
+    pub fn open_with_policy_runtime(
+        cols: u16,
+        rows: u16,
+        cwd: Option<&str>,
+        policy: Option<&crate::policy::Policy>,
+        runtime_mode: AgentRuntimeMode,
+        sandbox_backend: SandboxBackend,
+    ) -> Result<Self, ShellError> {
         let c_cwd = if let Some(value) = cwd {
             Some(
                 CString::new(value)
@@ -208,6 +263,8 @@ impl ShellSession {
                 rows,
                 c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 policy_ptr,
+                runtime_mode as c_int,
+                sandbox_backend as c_int,
                 &mut handle,
             )
         };
@@ -329,6 +386,31 @@ impl Drop for ShellSession {
     }
 }
 
+/// Validate strict runtime support and precompile runtime policy profiles.
+///
+/// This is intended to be called once at server startup when strict mode is enabled.
+pub fn validate_strict_runtime(
+    policy: Option<&crate::policy::Policy>,
+    cwd: Option<&str>,
+    sandbox_backend: SandboxBackend,
+) -> Result<(), ShellError> {
+    let c_cwd = cwd
+        .map(|value| CString::new(value).map_err(|_| ShellError::InvalidArgument("cwd contains null byte".into())))
+        .transpose()?;
+    let policy_ptr = policy.map(|p| p.as_ptr()).unwrap_or(std::ptr::null_mut());
+    let rc = unsafe {
+        talu_agent_runtime_validate_strict_raw(
+            policy_ptr,
+            c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            sandbox_backend as c_int,
+        )
+    };
+    if rc != ERROR_CODE_OK {
+        return Err(ShellError::from_code(rc, "strict runtime validation failed"));
+    }
+    Ok(())
+}
+
 /// Execute a shell command and capture its output.
 ///
 /// This does NOT perform safety checks — call `check_command` first
@@ -342,6 +424,23 @@ pub fn exec_with_policy(
     command: &str,
     cwd: Option<&str>,
     policy: Option<&crate::policy::Policy>,
+) -> Result<ExecOutput, ShellError> {
+    exec_with_policy_runtime(
+        command,
+        cwd,
+        policy,
+        AgentRuntimeMode::Host,
+        SandboxBackend::LinuxLocal,
+    )
+}
+
+/// Execute a shell command with optional policy and explicit runtime configuration.
+pub fn exec_with_policy_runtime(
+    command: &str,
+    cwd: Option<&str>,
+    policy: Option<&crate::policy::Policy>,
+    runtime_mode: AgentRuntimeMode,
+    sandbox_backend: SandboxBackend,
 ) -> Result<ExecOutput, ShellError> {
     let c_cmd = CString::new(command)
         .map_err(|_| ShellError::InvalidArgument("command contains null byte".to_string()))?;
@@ -367,6 +466,8 @@ pub fn exec_with_policy(
             c_cmd.as_ptr(),
             c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
             policy_ptr,
+            runtime_mode as c_int,
+            sandbox_backend as c_int,
             &mut stdout_ptr,
             &mut stdout_len,
             &mut stderr_ptr,
@@ -451,6 +552,33 @@ pub fn exec_streaming_with_policy<FStdout, FStderr>(
     cwd: Option<&str>,
     timeout_ms: u64,
     policy: Option<&crate::policy::Policy>,
+    on_stdout: FStdout,
+    on_stderr: FStderr,
+) -> Result<Option<i32>, ShellError>
+where
+    FStdout: FnMut(&[u8]) -> bool,
+    FStderr: FnMut(&[u8]) -> bool,
+{
+    exec_streaming_with_policy_runtime(
+        command,
+        cwd,
+        timeout_ms,
+        policy,
+        AgentRuntimeMode::Host,
+        SandboxBackend::LinuxLocal,
+        on_stdout,
+        on_stderr,
+    )
+}
+
+/// Execute a shell command with optional policy/runtime and stream output chunks.
+pub fn exec_streaming_with_policy_runtime<FStdout, FStderr>(
+    command: &str,
+    cwd: Option<&str>,
+    timeout_ms: u64,
+    policy: Option<&crate::policy::Policy>,
+    runtime_mode: AgentRuntimeMode,
+    sandbox_backend: SandboxBackend,
     mut on_stdout: FStdout,
     mut on_stderr: FStderr,
 ) -> Result<Option<i32>, ShellError>
@@ -482,6 +610,8 @@ where
                 .as_ref()
                 .map_or(std::ptr::null(), |value| value.as_ptr()),
             policy_ptr,
+            runtime_mode as c_int,
+            sandbox_backend as c_int,
             timeout_ms,
             Some(stream_callback_bridge::<FStdout>),
             (&mut on_stdout as *mut FStdout).cast::<c_void>(),
@@ -701,5 +831,27 @@ mod tests {
         let scrollback = shell.scrollback().unwrap();
         let scrollback_text = String::from_utf8_lossy(&scrollback);
         assert!(scrollback_text.contains("hello"));
+    }
+
+    #[test]
+    fn test_validate_strict_runtime_rejects_invalid_runtime_policy() {
+        if !cfg!(target_os = "linux") {
+            return;
+        }
+        let policy = crate::policy::Policy::from_json(
+            r#"{
+                "default":"deny",
+                "statements":[
+                    {"effect":"allow","action":"tool.exec","command":"echo *"},
+                    {"effect":"allow","action":"tool.fs.write","resource":"src/**"},
+                    {"effect":"deny","action":"tool.fs.write","resource":"src/private/**"}
+                ]
+            }"#,
+        )
+        .unwrap();
+
+        let err = validate_strict_runtime(Some(&policy), None, SandboxBackend::LinuxLocal)
+            .expect_err("expected strict setup failure");
+        assert!(matches!(err, ShellError::StrictSetupFailed(_)));
     }
 }

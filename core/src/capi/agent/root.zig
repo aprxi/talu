@@ -20,6 +20,7 @@ const error_codes = @import("../error_codes.zig");
 const fs_api = @import("fs.zig");
 const policy_api = @import("policy.zig");
 const process_api = @import("process.zig");
+const runtime_api = @import("runtime.zig");
 const shell_api = @import("shell.zig");
 
 const ToolRegistry = agent_mod.ToolRegistry;
@@ -65,6 +66,8 @@ pub const TaluFsStat = fs_api.TaluFsStat;
 pub const TaluProcess = process_api.TaluProcess;
 pub const TaluShell = shell_api.TaluShell;
 pub const TaluAgentPolicy = policy_api.TaluAgentPolicy;
+pub const TaluAgentRuntimeMode = runtime_api.TaluAgentRuntimeMode;
+pub const TaluSandboxBackend = runtime_api.TaluSandboxBackend;
 
 pub export fn talu_agent_policy_create(
     json: ?[*]const u8,
@@ -76,6 +79,13 @@ pub export fn talu_agent_policy_create(
 
 pub export fn talu_agent_policy_free(policy: ?*TaluAgentPolicy) callconv(.c) void {
     policy_api.talu_agent_policy_free(policy);
+}
+
+pub export fn talu_agent_policy_prepare_runtime(
+    policy: ?*TaluAgentPolicy,
+    cwd: ?[*:0]const u8,
+) callconv(.c) i32 {
+    return policy_api.talu_agent_policy_prepare_runtime(policy, cwd);
 }
 
 pub export fn talu_agent_policy_check_action(
@@ -120,6 +130,14 @@ pub export fn talu_agent_policy_check_process(
     out_allowed: ?*bool,
 ) callconv(.c) i32 {
     return policy_api.talu_agent_policy_check_process(policy, action, command, cwd, out_allowed);
+}
+
+pub export fn talu_agent_runtime_validate_strict(
+    policy: ?*TaluAgentPolicy,
+    cwd: ?[*:0]const u8,
+    sandbox_backend: c_int,
+) callconv(.c) i32 {
+    return runtime_api.talu_agent_runtime_validate_strict(policy, cwd, sandbox_backend);
 }
 
 pub export fn talu_fs_create(
@@ -226,19 +244,34 @@ pub export fn talu_shell_exec(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
     policy: ?*TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     out_stdout: ?*?[*]const u8,
     out_stdout_len: ?*usize,
     out_stderr: ?*?[*]const u8,
     out_stderr_len: ?*usize,
     out_exit_code: ?*i32,
 ) callconv(.c) i32 {
-    return shell_api.talu_shell_exec(command, cwd, policy, out_stdout, out_stdout_len, out_stderr, out_stderr_len, out_exit_code);
+    return shell_api.talu_shell_exec(
+        command,
+        cwd,
+        policy,
+        runtime_mode,
+        sandbox_backend,
+        out_stdout,
+        out_stdout_len,
+        out_stderr,
+        out_stderr_len,
+        out_exit_code,
+    );
 }
 
 pub export fn talu_shell_exec_streaming(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
     policy: ?*TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     timeout_ms: u64,
     on_stdout: ?shell_api.StreamCallback,
     on_stdout_ctx: ?*anyopaque,
@@ -250,6 +283,8 @@ pub export fn talu_shell_exec_streaming(
         command,
         cwd,
         policy,
+        runtime_mode,
+        sandbox_backend,
         timeout_ms,
         on_stdout,
         on_stdout_ctx,
@@ -292,9 +327,19 @@ pub export fn talu_shell_open(
     rows: u16,
     cwd: ?[*:0]const u8,
     policy: ?*TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     out_shell: ?*?*TaluShell,
 ) callconv(.c) i32 {
-    return shell_api.talu_shell_open(cols, rows, cwd, policy, out_shell);
+    return shell_api.talu_shell_open(
+        cols,
+        rows,
+        cwd,
+        policy,
+        runtime_mode,
+        sandbox_backend,
+        out_shell,
+    );
 }
 
 pub export fn talu_shell_close(shell_handle: ?*TaluShell) callconv(.c) void {
@@ -353,9 +398,18 @@ pub export fn talu_process_open(
     command: ?[*:0]const u8,
     cwd: ?[*:0]const u8,
     policy: ?*TaluAgentPolicy,
+    runtime_mode: c_int,
+    sandbox_backend: c_int,
     out_process: ?*?*TaluProcess,
 ) callconv(.c) i32 {
-    return process_api.talu_process_open(command, cwd, policy, out_process);
+    return process_api.talu_process_open(
+        command,
+        cwd,
+        policy,
+        runtime_mode,
+        sandbox_backend,
+        out_process,
+    );
 }
 
 pub export fn talu_process_close(process_handle: ?*TaluProcess) callconv(.c) void {

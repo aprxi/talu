@@ -1377,6 +1377,7 @@ pub const LocalEngine = struct {
             .callback_data = if (config.token_callback != null) @ptrCast(&callback_wrapper) else null,
             .sampling = config.sampling,
             .stop_flag = config.stop_flag,
+            .return_final_logits = true,
         });
         errdefer result.deinit(self.allocator);
 
@@ -1400,10 +1401,11 @@ pub const LocalEngine = struct {
         @memcpy(all_tokens[0..prompt_len], prompt_tokens);
         @memcpy(all_tokens[prompt_len..], result.tokens);
 
-        // Preserve run() behavior: return logits for the final sequence position.
-        const final_logits = try self.allocator.alloc(f32, self.backend.vocabSize());
-        errdefer self.allocator.free(final_logits);
-        try self.backend.prefill(all_tokens, final_logits);
+        if (result.final_logits.len != self.backend.vocabSize()) {
+            return error.InvalidStateDescriptorBinding;
+        }
+        const final_logits = result.final_logits;
+        result.final_logits = &.{};
 
         // Free scheduler result tokens (we've copied them)
         result.deinit(self.allocator);
