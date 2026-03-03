@@ -45,7 +45,7 @@ pub(crate) struct ExecEvent {
 #[utoipa::path(post, path = "/v1/agent/exec", tag = "Agent::Exec",
     request_body = ExecRequest,
     responses(
-        (status = 200, description = "SSE stream with stdout/stderr/exit events"),
+        (status = 200, description = "SSE stream with stdout/stderr/exit events. In strict mode, execution is sandbox-enforced; in host mode, passthrough has no firewall guarantee."),
         (status = 400, body = crate::server::http::ErrorResponse),
         (status = 403, body = crate::server::http::ErrorResponse),
         (status = 500, body = crate::server::http::ErrorResponse),
@@ -73,53 +73,31 @@ pub async fn handle_exec(
         );
     }
 
-    let normalized = match talu::shell::normalize_command(&request.command) {
-        Ok(value) => value,
-        Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "shell_error",
-                &format!("failed to normalize command: {e}"),
-            )
-        }
-    };
-
-    let check = match talu::shell::check_command(&normalized) {
-        Ok(value) => value,
-        Err(e) => {
-            return json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "shell_error",
-                &format!("failed to validate command: {e}"),
-            )
-        }
-    };
-
-    if !check.allowed {
-        let reason = check
-            .reason
-            .unwrap_or_else(|| "command rejected by policy".to_string());
-        return json_error(StatusCode::FORBIDDEN, "command_denied", &reason);
-    }
-
     let timeout_ms = request.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS);
     let command = request.command;
-    let cwd = request.cwd;
-    let policy = match super::load_runtime_policy(&state) {
-        Ok(policy) => policy,
-        Err(err) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "policy_invalid", &err),
+    let cwd = if state.agent_runtime_mode == crate::server::AgentRuntimeMode::Strict {
+        request
+            .cwd
+            .or_else(|| Some(state.workspace_dir.to_string_lossy().into_owned()))
+    } else {
+        request.cwd
     };
+    let policy = super::load_runtime_policy(&state);
+    let runtime_mode = super::runtime_mode_for_talu(state.agent_runtime_mode);
+    let sandbox_backend = super::sandbox_backend_for_talu(state.sandbox_backend);
 
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Bytes>();
     tokio::task::spawn_blocking(move || {
         let tx_stdout = tx.clone();
         let tx_stderr = tx.clone();
 
-        let exec_result = talu::shell::exec_streaming_with_policy(
+        let exec_result = talu::shell::exec_streaming_with_policy_runtime(
             &command,
             cwd.as_deref(),
             timeout_ms,
-            policy.as_ref(),
+            policy.as_deref(),
+            runtime_mode,
+            sandbox_backend,
             move |chunk| {
                 let payload = ExecEvent {
                     kind: "stdout".to_string(),

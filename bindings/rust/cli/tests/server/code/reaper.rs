@@ -16,6 +16,7 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         bucket_path: None,
         workspace_dir: std::env::current_dir().expect("cwd"),
         agent_policy_json: None,
+        agent_policy: None,
         html_dir: None,
         plugin_tokens: Mutex::new(HashMap::new()),
         max_file_upload_bytes: 100 * 1024 * 1024,
@@ -26,6 +27,8 @@ fn build_app_zero_ttl() -> (Router, Arc<AppState>) {
         shell_session_ttl: std::time::Duration::from_secs(15 * 60),
         process_sessions: Mutex::new(HashMap::new()),
         process_session_ttl: std::time::Duration::from_secs(15 * 60),
+        agent_runtime_mode: talu_cli::server::AgentRuntimeMode::Host,
+        sandbox_backend: talu_cli::server::SandboxBackend::LinuxLocal,
     });
     let router = Router::new(state.clone());
     (router, state)

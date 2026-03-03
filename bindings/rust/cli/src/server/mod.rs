@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use clap::Args;
+use clap::{Args, ValueEnum};
 use log::LevelFilter;
 use talu::blobs::BlobsHandle;
 
@@ -37,6 +37,27 @@ pub mod tenant;
 const DEFAULT_MAX_FILE_UPLOAD_BYTES: u64 = 100 * 1024 * 1024;
 const DEFAULT_MAX_FILE_INSPECT_BYTES: u64 = 50 * 1024 * 1024;
 const DEFAULT_STARTUP_BLOB_GC_MIN_AGE_SECONDS: u64 = 15 * 60;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum AgentRuntimeMode {
+    Host,
+    Strict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SandboxBackendArg {
+    Auto,
+    LinuxLocal,
+    Oci,
+    AppleContainer,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxBackend {
+    LinuxLocal,
+    Oci,
+    AppleContainer,
+}
 
 #[derive(Args, Debug)]
 pub struct ServerArgs {
@@ -100,6 +121,18 @@ pub struct ServerArgs {
     /// Relative request paths are resolved against this directory.
     #[arg(long, env = "TALU_WORKSPACE_DIR")]
     pub workspace_dir: Option<PathBuf>,
+
+    /// Runtime mode for `/v1/agent/exec`, `/v1/agent/shells/*`, and
+    /// `/v1/agent/processes/*`.
+    ///
+    /// `strict` enables kernel/runtime sandbox enforcement guarantees.
+    /// `host` keeps passthrough behavior without firewall guarantees.
+    #[arg(long, env = "TALU_AGENT_RUNTIME_MODE", value_enum, default_value_t = AgentRuntimeMode::Host)]
+    pub agent_runtime_mode: AgentRuntimeMode,
+
+    /// Sandbox backend selection for strict runtime mode.
+    #[arg(long, env = "TALU_SANDBOX_BACKEND", value_enum, default_value_t = SandboxBackendArg::Auto)]
+    pub sandbox_backend: SandboxBackendArg,
 }
 
 pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Result<()> {
@@ -123,6 +156,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     let model = args.model.clone();
     let profile = args.profile.clone();
     let socket_path = expand_socket_path(&args.socket);
+    let sandbox_backend = resolve_sandbox_backend(args.agent_runtime_mode, args.sandbox_backend)?;
 
     let (gateway_secret, tenant_registry) = match (args.gateway_secret, args.tenant_config) {
         (Some(secret), Some(path)) => {
@@ -183,9 +217,29 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     } else {
         env_agent_policy_json
     };
-    if let Some(policy_json) = agent_policy_json.as_deref() {
-        // Validate once at startup so policy mistakes fail fast before serving.
-        talu::policy::Policy::from_json(policy_json).context("parse agent runtime policy JSON")?;
+    let agent_policy = if let Some(policy_json) = agent_policy_json.as_deref() {
+        // Parse once at startup so policy mistakes fail fast and endpoints do
+        // not re-parse JSON on each request.
+        Some(Arc::new(
+            talu::policy::Policy::from_json(policy_json)
+                .context("parse agent runtime policy JSON")?,
+        ))
+    } else {
+        None
+    };
+    if args.agent_runtime_mode == AgentRuntimeMode::Strict && agent_policy.is_none() {
+        bail!("strict agent runtime mode requires a policy via --policy-file or TALU_AGENT_POLICY_JSON");
+    }
+    if args.agent_runtime_mode == AgentRuntimeMode::Strict {
+        let strict_policy = agent_policy
+            .as_deref()
+            .expect("strict runtime mode requires policy by prior check");
+        talu::shell::validate_strict_runtime(
+            Some(strict_policy),
+            Some(&workspace_dir.to_string_lossy()),
+            sandbox_backend_for_talu(sandbox_backend),
+        )
+        .context("validate strict runtime policy and sandbox support")?;
     }
 
     let state = state::AppState {
@@ -197,6 +251,7 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         bucket_path,
         workspace_dir,
         agent_policy_json,
+        agent_policy,
         html_dir: args.html_dir,
         plugin_tokens: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         max_file_upload_bytes: args.max_file_upload_bytes,
@@ -207,6 +262,8 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         shell_session_ttl: listen::SHELL_SESSION_TTL,
         process_sessions: tokio::sync::Mutex::new(std::collections::HashMap::new()),
         process_session_ttl: listen::PROCESS_SESSION_TTL,
+        agent_runtime_mode: args.agent_runtime_mode,
+        sandbox_backend,
     };
 
     let addr = SocketAddr::new(args.host, args.port);
@@ -251,6 +308,23 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
     } else {
         log::info!(target: "server::init", "agent runtime policy: none");
     }
+    log::info!(
+        target: "server::init",
+        "agent runtime mode: {:?}, sandbox backend: {:?}",
+        state.agent_runtime_mode,
+        state.sandbox_backend
+    );
+    if state.agent_runtime_mode == AgentRuntimeMode::Host {
+        log::warn!(
+            target: "server::init",
+            "agent runtime mode host: terminal/process firewall guarantees are disabled"
+        );
+    } else {
+        log::info!(
+            target: "server::init",
+            "agent runtime mode strict: kernel/runtime sandbox enforcement enabled"
+        );
+    }
     log::info!(target: "server::init", "console: http://{}/", addr);
     log::info!(target: "server::init", "listening on http://{}", addr);
     log::info!(target: "server::init", "listening on unix://{}", socket_path.display());
@@ -259,6 +333,49 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
         .build()?;
     runtime.block_on(listen::serve(state, addr, socket_path))?;
     Ok(())
+}
+
+fn resolve_sandbox_backend(
+    mode: AgentRuntimeMode,
+    backend: SandboxBackendArg,
+) -> Result<SandboxBackend> {
+    match backend {
+        SandboxBackendArg::Auto => {
+            if cfg!(target_os = "linux") {
+                Ok(SandboxBackend::LinuxLocal)
+            } else if cfg!(target_os = "macos") {
+                Ok(SandboxBackend::AppleContainer)
+            } else {
+                bail!("no default sandbox backend for this platform");
+            }
+        }
+        SandboxBackendArg::LinuxLocal => {
+            if !cfg!(target_os = "linux") && mode == AgentRuntimeMode::Strict {
+                bail!("strict runtime with linux-local backend is only supported on Linux");
+            }
+            Ok(SandboxBackend::LinuxLocal)
+        }
+        SandboxBackendArg::Oci => {
+            if mode == AgentRuntimeMode::Strict {
+                bail!("strict runtime with oci backend is not implemented yet");
+            }
+            Ok(SandboxBackend::Oci)
+        }
+        SandboxBackendArg::AppleContainer => {
+            if mode == AgentRuntimeMode::Strict {
+                bail!("strict runtime with apple-container backend is not implemented yet");
+            }
+            Ok(SandboxBackend::AppleContainer)
+        }
+    }
+}
+
+fn sandbox_backend_for_talu(backend: SandboxBackend) -> talu::shell::SandboxBackend {
+    match backend {
+        SandboxBackend::LinuxLocal => talu::shell::SandboxBackend::LinuxLocal,
+        SandboxBackend::Oci => talu::shell::SandboxBackend::Oci,
+        SandboxBackend::AppleContainer => talu::shell::SandboxBackend::AppleContainer,
+    }
 }
 
 pub fn expand_socket_path(path: &str) -> PathBuf {

@@ -76,6 +76,8 @@ pub const ErrorCode = enum(i32) {
     policy_denied_exec = 808,
     policy_denied_cwd = 809,
     policy_invalid = 810,
+    policy_strict_unavailable = 811,
+    policy_strict_setup_failed = 812,
 
     // System errors (900-999)
     out_of_memory = 900,
@@ -148,6 +150,8 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.SessionClosed => .shell_session_closed,
         error.Timeout => .shell_timeout,
         error.ProcessExited => .shell_process_exited,
+        error.StrictUnavailable => .policy_strict_unavailable,
+        error.StrictSetupFailed => .policy_strict_setup_failed,
         // Image pipeline errors
         error.UnsupportedImageFormat => .convert_unsupported_format,
         error.ImageInputTooLarge,

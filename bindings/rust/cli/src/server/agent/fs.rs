@@ -177,14 +177,8 @@ fn open_fs(
         .map_err(|e| fs_error_response(e, "failed to initialize workspace fs"))
 }
 
-fn load_policy(state: &AppState) -> Result<Option<talu::policy::Policy>, Response<BoxBody>> {
-    super::load_runtime_policy(state).map_err(|message| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "policy_invalid",
-            &message,
-        )
-    })
+fn load_policy(state: &AppState) -> Option<Arc<talu::policy::Policy>> {
+    super::load_runtime_policy(state)
 }
 
 fn encoding_or_default(encoding: Option<String>) -> String {
@@ -285,11 +279,8 @@ pub async fn handle_read(
 
     let encoding = encoding_or_default(request.encoding);
     let max_bytes = request.max_bytes.unwrap_or(DEFAULT_MAX_READ_BYTES);
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -337,11 +328,8 @@ pub async fn handle_write(
         Err(e) => return json_error(StatusCode::BAD_REQUEST, "invalid_encoding", &e),
     };
 
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -375,11 +363,8 @@ pub async fn handle_edit(
         Ok(v) => v,
         Err(resp) => return resp,
     };
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -419,11 +404,8 @@ pub async fn handle_stat(
         Err(resp) => return resp,
     };
 
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -465,11 +447,8 @@ pub async fn handle_list(
         Err(resp) => return resp,
     };
 
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -520,11 +499,8 @@ pub async fn handle_remove(
         Err(resp) => return resp,
     };
 
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -557,11 +533,8 @@ pub async fn handle_mkdir(
         Err(resp) => return resp,
     };
 
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };
@@ -594,11 +567,8 @@ pub async fn handle_rename(
         Err(resp) => return resp,
     };
 
-    let policy = match load_policy(&state) {
-        Ok(policy) => policy,
-        Err(resp) => return resp,
-    };
-    let fs = match open_fs(&state, policy.as_ref()) {
+    let policy = load_policy(&state);
+    let fs = match open_fs(&state, policy.as_deref()) {
         Ok(fs) => fs,
         Err(resp) => return resp,
     };

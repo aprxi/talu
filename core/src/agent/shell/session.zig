@@ -4,6 +4,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const pty_mod = @import("pty.zig");
 const signal = @import("signal.zig");
+const mounts = @import("../sandbox/mounts.zig");
 
 pub const ShellSession = struct {
     allocator: Allocator,
@@ -16,6 +17,7 @@ pub const ShellSession = struct {
     last_access: i64,
     exit_code: ?i32 = null,
     closed: bool = false,
+    cleanup_mount_root: bool = false,
 
     pub fn open(
         allocator: Allocator,
@@ -24,11 +26,12 @@ pub const ShellSession = struct {
         cwd: ?[]const u8,
         max_scrollback_bytes: usize,
         spawn_mode: pty_mod.ShellSpawnMode,
+        sandbox_config: pty_mod.SandboxConfig,
     ) !*ShellSession {
         const resolved_cwd = try resolveCwd(allocator, cwd);
         errdefer allocator.free(resolved_cwd);
 
-        var spawned = try pty_mod.spawnShell(cols, rows, resolved_cwd, spawn_mode);
+        var spawned = try pty_mod.spawnShell(cols, rows, resolved_cwd, spawn_mode, sandbox_config);
         errdefer spawned.pty.close();
 
         const now = std.time.timestamp();
@@ -43,6 +46,8 @@ pub const ShellSession = struct {
             .created_at = now,
             .last_access = now,
             .exit_code = null,
+            .cleanup_mount_root = sandbox_config.mode == .strict and
+                sandbox_config.backend == .linux_local,
         };
         return self;
     }
@@ -54,7 +59,7 @@ pub const ShellSession = struct {
         self.closed = true;
 
         if (self.exit_code == null) {
-            signal.send(self.child_pid, std.posix.SIG.TERM) catch {};
+            signal.sendGroup(self.child_pid, std.posix.SIG.TERM) catch {};
 
             // Poll with WNOHANG up to 100ms (10 × 10ms).
             var waited = false;
@@ -70,10 +75,14 @@ pub const ShellSession = struct {
 
             // Escalate to SIGKILL if still alive.
             if (!waited) {
-                signal.send(self.child_pid, std.posix.SIG.KILL) catch {};
+                signal.sendGroup(self.child_pid, std.posix.SIG.KILL) catch {};
                 const result = std.posix.waitpid(self.child_pid, 0);
                 self.recordExit(result.status);
             }
+        }
+
+        if (self.cleanup_mount_root) {
+            mounts.cleanupSessionRootForPid(self.child_pid);
         }
 
         self.pty.close();
@@ -212,7 +221,15 @@ test "ShellSession open write read close roundtrip" {
     const cwd = try tmp.dir.realpathAlloc(allocator, ".");
     defer allocator.free(cwd);
 
-    var session = try ShellSession.open(allocator, 80, 24, cwd, 64 * 1024, .host);
+    var session = try ShellSession.open(
+        allocator,
+        80,
+        24,
+        cwd,
+        64 * 1024,
+        .host,
+        .{},
+    );
     defer session.close();
 
     _ = try session.write("echo hello\n");

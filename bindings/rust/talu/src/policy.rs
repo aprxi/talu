@@ -20,7 +20,22 @@
 
 use crate::error::error_from_last_or;
 use crate::Result;
-use std::os::raw::c_void;
+use std::ffi::CString;
+use std::os::raw::{c_char, c_int, c_void};
+
+unsafe extern "C" {
+    #[link_name = "talu_agent_policy_check_process"]
+    fn talu_agent_policy_check_process_raw(
+        policy: *mut c_void,
+        action: *const c_char,
+        command: *const c_char,
+        cwd: *const c_char,
+        out_allowed: *mut c_void,
+    ) -> c_int;
+
+    #[link_name = "talu_agent_policy_prepare_runtime"]
+    fn talu_agent_policy_prepare_runtime_raw(policy: *mut c_void, cwd: *const c_char) -> c_int;
+}
 
 /// IAM-style evaluation result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,7 +95,7 @@ impl Policy {
     pub fn from_json(json: &str) -> Result<Self> {
         let mut out: *mut c_void = std::ptr::null_mut();
         let rc = unsafe {
-            talu_sys::talu_policy_create(
+            talu_sys::talu_agent_policy_create(
                 json.as_ptr(),
                 json.len(),
                 &mut out as *mut _ as *mut c_void,
@@ -118,13 +133,59 @@ impl Policy {
     pub(crate) fn as_ptr(&self) -> *mut c_void {
         self.ptr
     }
+
+    /// Evaluate a process-style action (`tool.exec` / `tool.shell` /
+    /// `tool.process`) with optional command and cwd filters.
+    pub fn check_process(
+        &self,
+        action: &str,
+        command: Option<&str>,
+        cwd: Option<&str>,
+    ) -> Result<bool> {
+        let c_action = CString::new(action)?;
+        let c_command = command.map(CString::new).transpose()?;
+        let c_cwd = cwd.map(CString::new).transpose()?;
+
+        let mut allowed = false;
+        let rc = unsafe {
+            talu_agent_policy_check_process_raw(
+                self.ptr,
+                c_action.as_ptr(),
+                c_command.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                (&mut allowed as *mut bool).cast(),
+            )
+        };
+        if rc != 0 {
+            return Err(error_from_last_or("Failed to evaluate process policy"));
+        }
+        Ok(allowed)
+    }
+
+    /// Pre-compile strict runtime profiles for this policy and optional cwd.
+    ///
+    /// This is intended for server startup preparation so strict mode can fail
+    /// fast before handling requests.
+    pub fn prepare_runtime(&self, cwd: Option<&str>) -> Result<()> {
+        let c_cwd = cwd.map(CString::new).transpose()?;
+        let rc = unsafe {
+            talu_agent_policy_prepare_runtime_raw(
+                self.ptr,
+                c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            )
+        };
+        if rc != 0 {
+            return Err(error_from_last_or("Failed to precompile strict runtime policy"));
+        }
+        Ok(())
+    }
 }
 
 impl Drop for Policy {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            // SAFETY: ptr was obtained from talu_policy_create and not yet freed.
-            unsafe { talu_sys::talu_policy_free(self.ptr) };
+            // SAFETY: ptr was obtained from talu_agent_policy_create and not yet freed.
+            unsafe { talu_sys::talu_agent_policy_free(self.ptr) };
         }
     }
 }
@@ -180,5 +241,20 @@ mod tests {
         let json = r#"{"default":"deny","statements":[]}"#;
         let _policy = Policy::from_json(json).unwrap();
         // policy dropped here — no double-free, no leak
+    }
+
+    #[test]
+    fn test_check_process_applies_command_pattern() {
+        let json = r#"{
+            "default":"allow",
+            "statements":[
+                {"effect":"deny","action":"tool.exec","command":"git *"}
+            ]
+        }"#;
+        let policy = Policy::from_json(json).unwrap();
+        assert!(!policy
+            .check_process("tool.exec", Some("git status"), None)
+            .unwrap());
+        assert!(policy.check_process("tool.exec", Some("ls"), None).unwrap());
     }
 }

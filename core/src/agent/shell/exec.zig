@@ -7,6 +7,9 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Child = std.process.Child;
+const sandbox = @import("../sandbox/root.zig");
+const helpers = @import("../sandbox/helpers.zig");
+const signal = @import("signal.zig");
 
 /// Result of a one-shot command execution. Caller owns stdout and stderr.
 pub const ExecResult = struct {
@@ -35,6 +38,12 @@ pub const ExecOptions = struct {
     max_output_bytes: usize = 1024 * 1024,
 };
 
+pub const SandboxOptions = struct {
+    mode: sandbox.RuntimeMode = .host,
+    backend: sandbox.Backend = .linux_local,
+    exec_profile: ?*const sandbox.profile.ExecProfile = null,
+};
+
 /// Streaming callback for incremental stdout/stderr forwarding.
 /// Return false to abort processing.
 pub const StreamCallback = *const fn (ctx: ?*anyopaque, data: []const u8) bool;
@@ -55,6 +64,24 @@ pub fn execWithOptions(
     options: ExecOptions,
 ) !ExecResult {
     return execStreaming(allocator, command, options, null, null, null, null);
+}
+
+pub fn execWithOptionsSandbox(
+    allocator: Allocator,
+    command: []const u8,
+    options: ExecOptions,
+    sandbox_options: SandboxOptions,
+) !ExecResult {
+    return execStreamingSandbox(
+        allocator,
+        command,
+        options,
+        sandbox_options,
+        null,
+        null,
+        null,
+        null,
+    );
 }
 
 /// Initialize a Child that runs `/bin/sh -c <command>`.
@@ -222,6 +249,233 @@ pub fn execStreaming(
         .stdout = stdout,
         .stderr = stderr,
         .exit_code = exit_code,
+    };
+}
+
+pub fn execStreamingSandbox(
+    allocator: Allocator,
+    command: []const u8,
+    options: ExecOptions,
+    sandbox_options: SandboxOptions,
+    on_stdout: ?StreamCallback,
+    on_stdout_ctx: ?*anyopaque,
+    on_stderr: ?StreamCallback,
+    on_stderr_ctx: ?*anyopaque,
+) !ExecResult {
+    if (sandbox_options.mode == .host) {
+        return execStreaming(
+            allocator,
+            command,
+            options,
+            on_stdout,
+            on_stdout_ctx,
+            on_stderr,
+            on_stderr_ctx,
+        );
+    }
+    try sandbox.validate(sandbox_options.mode, sandbox_options.backend);
+    const prof = sandbox_options.exec_profile orelse return error.StrictSetupFailed;
+    var strict_config = sandbox.StrictRuntimeConfig.defaultStrict(
+        sandbox_options.backend,
+        options.cwd,
+    );
+    strict_config.exec_profile = prof;
+    return execStreamingStrict(
+        allocator,
+        command,
+        options,
+        strict_config,
+        on_stdout,
+        on_stdout_ctx,
+        on_stderr,
+        on_stderr_ctx,
+    );
+}
+
+fn execStreamingStrict(
+    allocator: Allocator,
+    command: []const u8,
+    options: ExecOptions,
+    strict_config: sandbox.StrictRuntimeConfig,
+    on_stdout: ?StreamCallback,
+    on_stdout_ctx: ?*anyopaque,
+    on_stderr: ?StreamCallback,
+    on_stderr_ctx: ?*anyopaque,
+) !ExecResult {
+    if (command.len == 0) return error.InvalidArgument;
+
+    const command_z = try allocator.dupeZ(u8, command);
+    defer allocator.free(command_z);
+
+    const spawned = try spawnStrict(command_z, options.cwd, strict_config);
+    defer if (strict_config.backend == .linux_local) {
+        sandbox.mounts.cleanupSessionRootForPid(spawned.child_pid);
+    };
+    var stdout_file = std.fs.File{ .handle = spawned.stdout_fd };
+    defer stdout_file.close();
+    var stderr_file = std.fs.File{ .handle = spawned.stderr_fd };
+    defer stderr_file.close();
+
+    var stdout_buf = std.ArrayList(u8).empty;
+    defer stdout_buf.deinit(allocator);
+    var stderr_buf = std.ArrayList(u8).empty;
+    defer stderr_buf.deinit(allocator);
+
+    var poller = std.Io.poll(allocator, enum { stdout, stderr }, .{
+        .stdout = stdout_file,
+        .stderr = stderr_file,
+    });
+    defer poller.deinit();
+
+    const deadline_ns: ?i128 = if (options.timeout_ms == 0)
+        null
+    else
+        std.time.nanoTimestamp() + @as(i128, @intCast(options.timeout_ms)) * std.time.ns_per_ms;
+
+    while (true) {
+        const keep_polling = if (deadline_ns) |deadline| blk: {
+            const now = std.time.nanoTimestamp();
+            if (now >= deadline) {
+                signal.sendGroup(spawned.child_pid, std.posix.SIG.KILL) catch {};
+                _ = std.posix.waitpid(spawned.child_pid, 0);
+                return error.Timeout;
+            }
+            const remaining: u64 = @intCast(deadline - now);
+            break :blk try poller.pollTimeout(remaining);
+        } else try poller.poll();
+
+        flushStreamChunk(
+            allocator,
+            &stdout_buf,
+            poller.reader(.stdout),
+            on_stdout,
+            on_stdout_ctx,
+            options.max_output_bytes,
+            true,
+        ) catch |err| {
+            if (err == error.Aborted) {
+                signal.sendGroup(spawned.child_pid, std.posix.SIG.KILL) catch {};
+                _ = std.posix.waitpid(spawned.child_pid, 0);
+            }
+            return err;
+        };
+
+        flushStreamChunk(
+            allocator,
+            &stderr_buf,
+            poller.reader(.stderr),
+            on_stderr,
+            on_stderr_ctx,
+            options.max_output_bytes,
+            false,
+        ) catch |err| {
+            if (err == error.Aborted) {
+                signal.sendGroup(spawned.child_pid, std.posix.SIG.KILL) catch {};
+                _ = std.posix.waitpid(spawned.child_pid, 0);
+            }
+            return err;
+        };
+
+        if (!keep_polling) break;
+    }
+
+    const waited = std.posix.waitpid(spawned.child_pid, 0);
+    const exit_code: ?i32 = if (std.c.W.IFEXITED(waited.status))
+        @as(i32, @intCast(std.c.W.EXITSTATUS(waited.status)))
+    else if (std.c.W.IFSIGNALED(waited.status))
+        -@as(i32, @intCast(std.c.W.TERMSIG(waited.status)))
+    else
+        null;
+
+    const stdout = try stdout_buf.toOwnedSlice(allocator);
+    errdefer allocator.free(stdout);
+    const stderr = try stderr_buf.toOwnedSlice(allocator);
+    return .{
+        .stdout = stdout,
+        .stderr = stderr,
+        .exit_code = exit_code,
+    };
+}
+
+const StrictSpawn = struct {
+    child_pid: std.posix.pid_t,
+    stdout_fd: std.posix.fd_t,
+    stderr_fd: std.posix.fd_t,
+};
+
+fn spawnStrict(
+    command_z: [:0]const u8,
+    cwd: ?[]const u8,
+    strict_config: sandbox.StrictRuntimeConfig,
+) !StrictSpawn {
+    var bootstrap = try sandbox.launcher.openBootstrapPipe();
+    errdefer {
+        bootstrap.closeRead();
+        bootstrap.closeWrite();
+    }
+
+    const stdout_pipe = try helpers.pipeCloexec();
+    errdefer {
+        std.posix.close(stdout_pipe[0]);
+        std.posix.close(stdout_pipe[1]);
+    }
+    const stderr_pipe = try helpers.pipeCloexec();
+    errdefer {
+        std.posix.close(stderr_pipe[0]);
+        std.posix.close(stderr_pipe[1]);
+    }
+
+    const pid_raw = std.posix.fork() catch return error.ExecFailed;
+    if (pid_raw == 0) {
+        bootstrap.closeChildRead();
+        std.posix.setpgid(0, 0) catch |err| sandbox.launcher.childReportFailure(bootstrap.write_fd, err);
+
+        std.posix.close(stdout_pipe[0]);
+        std.posix.close(stderr_pipe[0]);
+        std.posix.dup2(stdout_pipe[1], std.posix.STDOUT_FILENO) catch |err| {
+            sandbox.launcher.childReportFailure(bootstrap.write_fd, err);
+        };
+        std.posix.dup2(stderr_pipe[1], std.posix.STDERR_FILENO) catch |err| {
+            sandbox.launcher.childReportFailure(bootstrap.write_fd, err);
+        };
+        std.posix.close(stdout_pipe[1]);
+        std.posix.close(stderr_pipe[1]);
+
+        if (cwd) |dir| {
+            std.posix.chdir(dir) catch |err| sandbox.launcher.childReportFailure(bootstrap.write_fd, err);
+        }
+        sandbox.applyInChild(strict_config) catch |err| sandbox.launcher.childReportFailure(bootstrap.write_fd, err);
+
+        const shell_path = helpers.preferredStrictShellPath(strict_config.exec_profile) orelse "/bin/sh";
+        var shell_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const shell_z = helpers.toPathZ(shell_path, &shell_buf) catch {
+            sandbox.launcher.childReportFailure(bootstrap.write_fd, error.StrictSetupFailed);
+        };
+        const argv = [_:null]?[*:0]const u8{ shell_z.ptr, "-c", command_z.ptr };
+        const exec_err = std.posix.execvpeZ(shell_z.ptr, &argv, std.c.environ);
+        sandbox.launcher.childReportFailure(bootstrap.write_fd, exec_err);
+    }
+
+    bootstrap.closeParentWrite();
+    sandbox.launcher.waitForExecBoundary(bootstrap.read_fd) catch |err| {
+        bootstrap.closeRead();
+        std.posix.close(stdout_pipe[0]);
+        std.posix.close(stdout_pipe[1]);
+        std.posix.close(stderr_pipe[0]);
+        std.posix.close(stderr_pipe[1]);
+        _ = std.posix.waitpid(pid_raw, 0);
+        return err;
+    };
+    bootstrap.closeRead();
+
+    std.posix.close(stdout_pipe[1]);
+    std.posix.close(stderr_pipe[1]);
+    try helpers.setNonBlocking(stdout_pipe[0]);
+    try helpers.setNonBlocking(stderr_pipe[0]);
+    return .{
+        .child_pid = pid_raw,
+        .stdout_fd = stdout_pipe[0],
+        .stderr_fd = stderr_pipe[0],
     };
 }
 

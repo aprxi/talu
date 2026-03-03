@@ -10,6 +10,8 @@ const ERROR_CODE_SHELL_SESSION_CLOSED: i32 = 802;
 const ERROR_CODE_SHELL_PROCESS_EXITED: i32 = 804;
 const ERROR_CODE_POLICY_DENIED_EXEC: i32 = 808;
 const ERROR_CODE_POLICY_DENIED_CWD: i32 = 809;
+const ERROR_CODE_POLICY_STRICT_UNAVAILABLE: i32 = 811;
+const ERROR_CODE_POLICY_STRICT_SETUP_FAILED: i32 = 812;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 const ERROR_CODE_INVALID_HANDLE: i32 = 902;
 
@@ -19,6 +21,8 @@ unsafe extern "C" {
         command: *const c_char,
         cwd: *const c_char,
         policy: *mut c_void,
+        runtime_mode: c_int,
+        sandbox_backend: c_int,
         out_process: *mut *mut c_void,
     ) -> c_int;
     #[link_name = "talu_process_close"]
@@ -50,6 +54,8 @@ pub enum ProcessError {
     CommandDenied(String),
     PolicyDeniedExec(String),
     PolicyDeniedCwd(String),
+    StrictUnavailable(String),
+    StrictSetupFailed(String),
     ExecFailed(String),
     SessionClosed(String),
     ProcessExited(String),
@@ -65,6 +71,8 @@ impl ProcessError {
             ERROR_CODE_SHELL_COMMAND_DENIED => Self::CommandDenied(detail),
             ERROR_CODE_POLICY_DENIED_EXEC => Self::PolicyDeniedExec(detail),
             ERROR_CODE_POLICY_DENIED_CWD => Self::PolicyDeniedCwd(detail),
+            ERROR_CODE_POLICY_STRICT_UNAVAILABLE => Self::StrictUnavailable(detail),
+            ERROR_CODE_POLICY_STRICT_SETUP_FAILED => Self::StrictSetupFailed(detail),
             ERROR_CODE_SHELL_EXEC_FAILED => Self::ExecFailed(detail),
             ERROR_CODE_SHELL_SESSION_CLOSED => Self::SessionClosed(detail),
             ERROR_CODE_SHELL_PROCESS_EXITED => Self::ProcessExited(detail),
@@ -81,6 +89,8 @@ impl std::fmt::Display for ProcessError {
             ProcessError::CommandDenied(s) => write!(f, "command denied: {}", s),
             ProcessError::PolicyDeniedExec(s) => write!(f, "policy denied process exec: {}", s),
             ProcessError::PolicyDeniedCwd(s) => write!(f, "policy denied cwd: {}", s),
+            ProcessError::StrictUnavailable(s) => write!(f, "strict runtime unavailable: {}", s),
+            ProcessError::StrictSetupFailed(s) => write!(f, "strict runtime setup failed: {}", s),
             ProcessError::ExecFailed(s) => write!(f, "process spawn failed: {}", s),
             ProcessError::SessionClosed(s) => write!(f, "session closed: {}", s),
             ProcessError::ProcessExited(s) => write!(f, "process exited: {}", s),
@@ -115,6 +125,23 @@ impl ProcessSession {
         cwd: Option<&str>,
         policy: Option<&crate::policy::Policy>,
     ) -> Result<Self, ProcessError> {
+        Self::open_with_policy_runtime(
+            command,
+            cwd,
+            policy,
+            crate::shell::AgentRuntimeMode::Host,
+            crate::shell::SandboxBackend::LinuxLocal,
+        )
+    }
+
+    /// Open a new process session with optional policy and explicit runtime configuration.
+    pub fn open_with_policy_runtime(
+        command: &str,
+        cwd: Option<&str>,
+        policy: Option<&crate::policy::Policy>,
+        runtime_mode: crate::shell::AgentRuntimeMode,
+        sandbox_backend: crate::shell::SandboxBackend,
+    ) -> Result<Self, ProcessError> {
         let c_command = CString::new(command)
             .map_err(|_| ProcessError::InvalidArgument("command contains null byte".into()))?;
         let c_cwd = if let Some(value) = cwd {
@@ -134,6 +161,8 @@ impl ProcessSession {
                 c_command.as_ptr(),
                 c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
                 policy_ptr,
+                runtime_mode as c_int,
+                sandbox_backend as c_int,
                 &mut handle,
             )
         };

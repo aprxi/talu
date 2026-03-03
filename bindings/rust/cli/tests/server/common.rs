@@ -31,6 +31,10 @@ pub struct ServerConfig {
     pub workspace_dir: Option<PathBuf>,
     /// Policy file passed via `talu serve --policy-file`.
     pub policy_file: Option<PathBuf>,
+    /// Runtime mode passed via `talu serve --agent-runtime-mode`.
+    pub agent_runtime_mode: Option<String>,
+    /// Sandbox backend passed via `talu serve --sandbox-backend`.
+    pub sandbox_backend: Option<String>,
     /// Extra environment variables to set on the server process.
     pub env_vars: Vec<(String, String)>,
 }
@@ -46,6 +50,8 @@ impl ServerConfig {
             html_dir: None,
             workspace_dir: None,
             policy_file: None,
+            agent_runtime_mode: None,
+            sandbox_backend: None,
             env_vars: Vec::new(),
         }
     }
@@ -143,6 +149,12 @@ impl ServerTestContext {
         }
         if let Some(ref policy_file) = config.policy_file {
             command.arg("--policy-file").arg(policy_file);
+        }
+        if let Some(ref mode) = config.agent_runtime_mode {
+            command.arg("--agent-runtime-mode").arg(mode);
+        }
+        if let Some(ref backend) = config.sandbox_backend {
+            command.arg("--sandbox-backend").arg(backend);
         }
 
         for (key, value) in &config.env_vars {
@@ -393,6 +405,11 @@ pub fn send_request(
                 // Partial response received, server stopped sending — done.
                 eprintln!("[DEBUG] Read timeout after {} bytes", raw.len());
                 break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {
+                // Server-side child reaping can deliver signals while the test
+                // client is blocked in read(2). Retry on EINTR.
+                continue;
             }
             Err(e) => panic!("read error: {e}"),
         }
