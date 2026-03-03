@@ -140,6 +140,22 @@ pub export fn talu_agent_runtime_validate_strict(
     return runtime_api.talu_agent_runtime_validate_strict(policy, cwd, sandbox_backend);
 }
 
+pub export fn talu_agent_runtime_validate_strict_ext(
+    sandbox_backend: c_int,
+    strict_required: bool,
+    run_probes: bool,
+    cwd: ?[*:0]const u8,
+    out_report: ?*runtime_api.TaluCapabilityReport,
+) callconv(.c) i32 {
+    return runtime_api.talu_agent_runtime_validate_strict_ext(
+        sandbox_backend,
+        strict_required,
+        run_probes,
+        cwd,
+        out_report,
+    );
+}
+
 pub export fn talu_fs_create(
     workspace_dir: ?[*:0]const u8,
     policy: ?*TaluAgentPolicy,

@@ -11,6 +11,9 @@ const ERROR_CODE_POLICY_DENIED_EXEC: i32 = 808;
 const ERROR_CODE_POLICY_DENIED_CWD: i32 = 809;
 const ERROR_CODE_POLICY_STRICT_UNAVAILABLE: i32 = 811;
 const ERROR_CODE_POLICY_STRICT_SETUP_FAILED: i32 = 812;
+const ERROR_CODE_SANDBOX_DETECT_FAILED: i32 = 813;
+const ERROR_CODE_SANDBOX_PROBE_FAILED: i32 = 814;
+const ERROR_CODE_SANDBOX_CGROUP_UNAVAILABLE: i32 = 815;
 const ERROR_CODE_INVALID_ARGUMENT: i32 = 901;
 const ERROR_CODE_INVALID_HANDLE: i32 = 902;
 
@@ -132,6 +135,15 @@ unsafe extern "C" {
         cwd: *const c_char,
         sandbox_backend: c_int,
     ) -> c_int;
+
+    #[link_name = "talu_agent_runtime_validate_strict_ext"]
+    fn talu_agent_runtime_validate_strict_ext_raw(
+        sandbox_backend: c_int,
+        strict_required: bool,
+        run_probes: bool,
+        cwd: *const c_char,
+        out_report: *mut CapabilityReport,
+    ) -> c_int;
 }
 
 /// Output from executing a shell command.
@@ -157,6 +169,9 @@ pub enum ShellError {
     PolicyDeniedCwd(String),
     StrictUnavailable(String),
     StrictSetupFailed(String),
+    SandboxDetectFailed(String),
+    SandboxProbeFailed(String),
+    SandboxCgroupUnavailable(String),
     ExecFailed(String),
     SessionClosed(String),
     InvalidArgument(String),
@@ -173,6 +188,9 @@ impl ShellError {
             ERROR_CODE_POLICY_DENIED_CWD => Self::PolicyDeniedCwd(detail),
             ERROR_CODE_POLICY_STRICT_UNAVAILABLE => Self::StrictUnavailable(detail),
             ERROR_CODE_POLICY_STRICT_SETUP_FAILED => Self::StrictSetupFailed(detail),
+            ERROR_CODE_SANDBOX_DETECT_FAILED => Self::SandboxDetectFailed(detail),
+            ERROR_CODE_SANDBOX_PROBE_FAILED => Self::SandboxProbeFailed(detail),
+            ERROR_CODE_SANDBOX_CGROUP_UNAVAILABLE => Self::SandboxCgroupUnavailable(detail),
             ERROR_CODE_SHELL_EXEC_FAILED => Self::ExecFailed(detail),
             ERROR_CODE_SHELL_SESSION_CLOSED => Self::SessionClosed(detail),
             ERROR_CODE_INVALID_ARGUMENT => Self::InvalidArgument(detail),
@@ -190,6 +208,11 @@ impl std::fmt::Display for ShellError {
             ShellError::PolicyDeniedCwd(s) => write!(f, "policy denied cwd: {}", s),
             ShellError::StrictUnavailable(s) => write!(f, "strict runtime unavailable: {}", s),
             ShellError::StrictSetupFailed(s) => write!(f, "strict runtime setup failed: {}", s),
+            ShellError::SandboxDetectFailed(s) => write!(f, "sandbox detection failed: {}", s),
+            ShellError::SandboxProbeFailed(s) => write!(f, "sandbox probe failed: {}", s),
+            ShellError::SandboxCgroupUnavailable(s) => {
+                write!(f, "sandbox cgroup unavailable: {}", s)
+            }
             ShellError::ExecFailed(s) => write!(f, "execution failed: {}", s),
             ShellError::SessionClosed(s) => write!(f, "session closed: {}", s),
             ShellError::InvalidArgument(s) => write!(f, "invalid argument: {}", s),
@@ -409,6 +432,57 @@ pub fn validate_strict_runtime(
         return Err(ShellError::from_code(rc, "strict runtime validation failed"));
     }
     Ok(())
+}
+
+/// Capability detection report from strict runtime validation.
+#[derive(Debug, Clone, Default)]
+#[repr(C)]
+pub struct CapabilityReport {
+    pub kernel_version_ok: bool,
+    pub kernel_version_major: u32,
+    pub kernel_version_minor: u32,
+    pub landlock_available: bool,
+    pub landlock_abi_version: u8,
+    pub user_ns_available: bool,
+    pub seccomp_available: bool,
+    pub cgroupv2_available: bool,
+    pub cgroupv2_writable: bool,
+    pub probes_passed: bool,
+}
+
+/// Validate strict runtime with capability detection and optional conformance probes.
+///
+/// Returns a `CapabilityReport` describing host capabilities. When `strict_required`
+/// is true, returns an error if required capabilities are missing or probes fail.
+pub fn validate_strict_runtime_ext(
+    sandbox_backend: SandboxBackend,
+    strict_required: bool,
+    run_probes: bool,
+    cwd: Option<&str>,
+) -> Result<CapabilityReport, ShellError> {
+    let c_cwd = cwd
+        .map(|value| {
+            CString::new(value)
+                .map_err(|_| ShellError::InvalidArgument("cwd contains null byte".into()))
+        })
+        .transpose()?;
+    let mut report = CapabilityReport::default();
+    let rc = unsafe {
+        talu_agent_runtime_validate_strict_ext_raw(
+            sandbox_backend as c_int,
+            strict_required,
+            run_probes,
+            c_cwd.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+            &mut report,
+        )
+    };
+    if rc != ERROR_CODE_OK {
+        return Err(ShellError::from_code(
+            rc,
+            "strict runtime ext validation failed",
+        ));
+    }
+    Ok(report)
 }
 
 /// Execute a shell command and capture its output.

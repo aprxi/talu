@@ -5,6 +5,7 @@ const Allocator = std.mem.Allocator;
 const pty_mod = @import("pty.zig");
 const signal = @import("signal.zig");
 const mounts = @import("../sandbox/mounts.zig");
+const cgroups = @import("../sandbox/cgroups.zig");
 
 pub const ShellSession = struct {
     allocator: Allocator,
@@ -18,6 +19,7 @@ pub const ShellSession = struct {
     exit_code: ?i32 = null,
     closed: bool = false,
     cleanup_mount_root: bool = false,
+    cleanup_cgroups: bool = false,
 
     pub fn open(
         allocator: Allocator,
@@ -48,6 +50,9 @@ pub const ShellSession = struct {
             .exit_code = null,
             .cleanup_mount_root = sandbox_config.mode == .strict and
                 sandbox_config.backend == .linux_local,
+            .cleanup_cgroups = sandbox_config.mode == .strict and
+                sandbox_config.backend == .linux_local and
+                sandbox_config.cgroup_config != null,
         };
         return self;
     }
@@ -81,6 +86,9 @@ pub const ShellSession = struct {
             }
         }
 
+        if (self.cleanup_cgroups) {
+            cgroups.cleanupForPid(self.child_pid);
+        }
         if (self.cleanup_mount_root) {
             mounts.cleanupSessionRootForPid(self.child_pid);
         }

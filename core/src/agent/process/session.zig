@@ -6,6 +6,7 @@ const signal = @import("../shell/signal.zig");
 const sandbox = @import("../sandbox/root.zig");
 const helpers = @import("../sandbox/helpers.zig");
 const mounts = @import("../sandbox/mounts.zig");
+const cgroups = @import("../sandbox/cgroups.zig");
 
 pub const ProcessSession = struct {
     allocator: Allocator,
@@ -19,6 +20,7 @@ pub const ProcessSession = struct {
     exit_code: ?i32 = null,
     closed: bool = false,
     cleanup_mount_root: bool = false,
+    cleanup_cgroups: bool = false,
     signal_process_group: bool = false,
 
     pub fn open(
@@ -81,6 +83,9 @@ pub const ProcessSession = struct {
             .closed = false,
             .cleanup_mount_root = sandbox_config.mode == .strict and
                 sandbox_config.backend == .linux_local,
+            .cleanup_cgroups = sandbox_config.mode == .strict and
+                sandbox_config.backend == .linux_local and
+                sandbox_config.cgroup_config != null,
             .signal_process_group = sandbox_config.mode == .strict and
                 sandbox_config.backend == .linux_local,
         };
@@ -127,6 +132,9 @@ pub const ProcessSession = struct {
             }
         }
 
+        if (self.cleanup_cgroups) {
+            cgroups.cleanupForPid(self.child_pid);
+        }
         if (self.cleanup_mount_root) {
             mounts.cleanupSessionRootForPid(self.child_pid);
         }
@@ -227,6 +235,7 @@ pub const SandboxConfig = struct {
     mode: sandbox.RuntimeMode = .host,
     backend: sandbox.Backend = .linux_local,
     exec_profile: ?*const sandbox.profile.ExecProfile = null,
+    cgroup_config: ?sandbox.cgroups.CgroupConfig = null,
 
     /// Build the StrictRuntimeConfig with full isolation defaults for
     /// strict mode. `cwd` is the workspace directory to bind-mount.
@@ -234,6 +243,7 @@ pub const SandboxConfig = struct {
         if (self.mode == .strict) {
             var config = sandbox.StrictRuntimeConfig.defaultStrict(self.backend, cwd);
             config.exec_profile = self.exec_profile;
+            if (self.cgroup_config) |cg| config.cgroup_config = cg;
             return config;
         }
         return .{
@@ -319,6 +329,15 @@ fn spawnStrictProcess(
     }
 
     bootstrap.closeParentWrite();
+
+    // Parent-side cgroup setup: move child into cgroup before it execs.
+    // Best-effort in 02e-1: silently ignored when host lacks cgroup
+    // delegation. The server capability report surfaces cgroupv2_writable
+    // at startup so operators can diagnose missing limits.
+    if (sandbox_config.cgroup_config) |cg_config| {
+        cgroups.createForPid(pid_raw, cg_config) catch {};
+    }
+
     sandbox.launcher.waitForExecBoundary(bootstrap.read_fd) catch |err| {
         bootstrap.closeRead();
         std.posix.close(stdin_pipe[0]);

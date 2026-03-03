@@ -839,6 +839,12 @@ pub fn build(b: *std.Build) void {
         "ShellSession",
         "checkCommand",
         "compactTurns",
+        "CapabilityReport",
+        "parseKernelVersion",
+        "CgroupConfig",
+        "ProbeReport",
+        "TaluCapabilityReport",
+        "validate_strict_ext",
     });
 
     // Build integration tests against a separate copy of core/src/lib.zig.
