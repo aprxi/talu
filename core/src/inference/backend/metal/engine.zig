@@ -713,15 +713,21 @@ pub const MetalBackend = struct {
                 if (target_size == 0 or target_size > SlotStateBinding.OwnedStateBlockBytes) {
                     return error.InvalidStateDescriptorBinding;
                 }
-                const src: [*]const u8 = @ptrCast(rebound.ptr);
-                const dst = binding.owned_storage[idx].bytes[0..target_size];
-                @memcpy(dst, src[0..target_size]);
                 binding.handles[idx] = .{
                     .id = descriptor.id,
                     .ptr = @ptrCast(&binding.owned_storage[idx].bytes),
                     .size = @intCast(target_size),
                     .align_bytes = 64,
                 };
+                if (state_ptr) |ptr| {
+                    // Keep descriptor payload semantics consistent with CPU/CUDA:
+                    // block memory stores StatePointerPayload{ptr}, not pointed object bytes.
+                    try runtime_contract.writeStatePointerToBlock(&binding.handles[idx], ptr);
+                } else {
+                    const src: [*]const u8 = @ptrCast(rebound.ptr);
+                    const dst = binding.owned_storage[idx].bytes[0..target_size];
+                    @memcpy(dst, src[0..target_size]);
+                }
             } else {
                 binding.handles[idx] = .{
                     .id = descriptor.id,

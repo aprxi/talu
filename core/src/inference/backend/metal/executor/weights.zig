@@ -193,9 +193,40 @@ fn layerProgramWeightBindingKeyFor(
             .attention_v_proj
         else if (std.mem.eql(u8, slot_name, "o_proj"))
             .attention_o_proj
+        else if (std.mem.eql(u8, slot_name, "q_norm"))
+            .attention_o_proj
+        else if (std.mem.eql(u8, slot_name, "k_norm"))
+            .attention_o_proj
+        else if (std.mem.eql(u8, slot_name, "q_bias"))
+            .attention_o_proj
+        else if (std.mem.eql(u8, slot_name, "k_bias"))
+            .attention_o_proj
+        else if (std.mem.eql(u8, slot_name, "v_bias"))
+            .attention_o_proj
+        else if (std.mem.eql(u8, slot_name, "o_bias"))
+            .attention_o_proj
+        else if (std.mem.eql(u8, slot_name, "attn_sinks"))
+            .attention_o_proj
         else
             error.InvalidWeightBindingName,
-        .mla_attention => if (std.mem.eql(u8, slot_name, "mla_weights")) .mla_weights else error.InvalidWeightBindingName,
+        .mla_attention => if (std.mem.eql(u8, slot_name, "mla_weights"))
+            .mla_weights
+        else if (std.mem.eql(u8, slot_name, "q_a_proj"))
+            .mla_weights
+        else if (std.mem.eql(u8, slot_name, "q_a_norm"))
+            .mla_weights
+        else if (std.mem.eql(u8, slot_name, "q_b_proj"))
+            .mla_weights
+        else if (std.mem.eql(u8, slot_name, "kv_a_proj"))
+            .mla_weights
+        else if (std.mem.eql(u8, slot_name, "kv_a_norm"))
+            .mla_weights
+        else if (std.mem.eql(u8, slot_name, "kv_b_proj"))
+            .mla_weights
+        else if (std.mem.eql(u8, slot_name, "o_proj"))
+            .mla_weights
+        else
+            error.InvalidWeightBindingName,
         .swiglu => if (std.mem.eql(u8, slot_name, "w1"))
             .swiglu_w1
         else if (std.mem.eql(u8, slot_name, "w3"))
@@ -204,10 +235,57 @@ fn layerProgramWeightBindingKeyFor(
             .swiglu_w2
         else
             error.InvalidWeightBindingName,
-        .moe => if (std.mem.eql(u8, slot_name, "router")) .moe_router else error.InvalidWeightBindingName,
+        .moe => if (std.mem.eql(u8, slot_name, "router"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "gate_proj"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "up_proj"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "down_proj"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "router_bias"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "gate_scales"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "up_scales"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "down_scales"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "gate_bias"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "up_bias"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "down_bias"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "router_scales"))
+            .moe_router
+        else if (std.mem.eql(u8, slot_name, "router_quant_bias"))
+            .moe_router
+        else
+            error.InvalidWeightBindingName,
         .mamba_mixer => if (std.mem.eql(u8, slot_name, "in_proj"))
             .mamba_in_proj
         else if (std.mem.eql(u8, slot_name, "out_proj"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "conv_weight"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "a_log"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "d_skip"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "conv_bias"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "dt_bias"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "norm_weight"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "ln1_weight"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "ln2_weight"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "gate_up"))
+            .mamba_out_proj
+        else if (std.mem.eql(u8, slot_name, "down_proj"))
             .mamba_out_proj
         else
             error.InvalidWeightBindingName,
@@ -217,6 +295,8 @@ fn layerProgramWeightBindingKeyFor(
             .shortconv_conv_weight
         else if (std.mem.eql(u8, slot_name, "out_proj"))
             .shortconv_out_proj
+        else if (std.mem.eql(u8, slot_name, "conv_bias"))
+            .shortconv_conv_weight
         else
             error.InvalidWeightBindingName,
         else => error.InvalidInstructionPayload,
