@@ -4,6 +4,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const sandbox = @import("../sandbox/root.zig");
 const helpers = @import("../sandbox/helpers.zig");
+const cgroups = @import("../sandbox/cgroups.zig");
 
 const c = @cImport({
     if (builtin.os.tag == .macos) {
@@ -29,6 +30,7 @@ pub const SandboxConfig = struct {
     mode: sandbox.RuntimeMode = .host,
     backend: sandbox.Backend = .linux_local,
     exec_profile: ?*const sandbox.profile.ExecProfile = null,
+    cgroup_config: ?sandbox.cgroups.CgroupConfig = null,
 
     /// Build the StrictRuntimeConfig with full isolation defaults for
     /// strict mode. `cwd` is the workspace directory to bind-mount.
@@ -36,6 +38,7 @@ pub const SandboxConfig = struct {
         if (self.mode == .strict) {
             var config = sandbox.StrictRuntimeConfig.defaultStrict(self.backend, cwd);
             config.exec_profile = self.exec_profile;
+            if (self.cgroup_config) |cg| config.cgroup_config = cg;
             return config;
         }
         return .{
@@ -137,6 +140,14 @@ pub fn spawnShell(
         if (bootstrap) |pipe| sandbox.launcher.childReportExecFailure(pipe.write_fd);
         std.posix.exit(127);
         unreachable;
+    }
+
+    // Parent-side cgroup setup: move child into cgroup before it execs.
+    // Best-effort in 02e-1: silently ignored when host lacks cgroup
+    // delegation. The server capability report surfaces cgroupv2_writable
+    // at startup so operators can diagnose missing limits.
+    if (sandbox_config.cgroup_config) |cg_config| {
+        cgroups.createForPid(@intCast(pid_raw), cg_config) catch {};
     }
 
     if (bootstrap) |*pipe| {

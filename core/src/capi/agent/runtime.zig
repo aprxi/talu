@@ -86,6 +86,81 @@ pub fn talu_agent_runtime_validate_strict(
     return 0;
 }
 
+pub const TaluCapabilityReport = extern struct {
+    kernel_version_ok: bool = false,
+    kernel_version_major: u32 = 0,
+    kernel_version_minor: u32 = 0,
+    landlock_available: bool = false,
+    landlock_abi_version: u8 = 0,
+    user_ns_available: bool = false,
+    seccomp_available: bool = false,
+    cgroupv2_available: bool = false,
+    cgroupv2_writable: bool = false,
+    probes_passed: bool = false,
+};
+
+pub fn talu_agent_runtime_validate_strict_ext(
+    sandbox_backend: c_int,
+    strict_required: bool,
+    run_probes: bool,
+    cwd: ?[*:0]const u8,
+    out_report: ?*TaluCapabilityReport,
+) callconv(.c) i32 {
+    capi_error.clearError();
+
+    const backend = parseBackend(sandbox_backend) catch |err| {
+        capi_error.setError(err, "invalid sandbox backend", .{});
+        return @intFromEnum(error_codes.ErrorCode.invalid_argument);
+    };
+
+    // Non-linux-local backends are not implemented for strict mode yet.
+    if (backend != .linux_local) {
+        if (strict_required) {
+            capi_error.setErrorWithCode(.sandbox_detect_failed, "strict mode not implemented for this backend", .{});
+            return @intFromEnum(error_codes.ErrorCode.sandbox_detect_failed);
+        }
+        if (out_report) |r| r.* = std.mem.zeroes(TaluCapabilityReport);
+        return 0;
+    }
+
+    const cap = sandbox.detect.detect();
+    if (out_report) |r| {
+        r.* = std.mem.zeroes(TaluCapabilityReport);
+        r.kernel_version_ok = cap.kernel_version_ok;
+        r.kernel_version_major = cap.kernel_version[0];
+        r.kernel_version_minor = cap.kernel_version[1];
+        r.landlock_available = cap.landlock_available;
+        r.landlock_abi_version = cap.landlock_abi_version;
+        r.user_ns_available = cap.user_ns_available;
+        r.seccomp_available = cap.seccomp_available;
+        r.cgroupv2_available = cap.cgroupv2_available;
+        r.cgroupv2_writable = cap.cgroupv2_writable;
+    }
+
+    if (strict_required and !cap.allRequired()) {
+        capi_error.setErrorWithCode(.sandbox_detect_failed, "missing required capabilities", .{});
+        return @intFromEnum(error_codes.ErrorCode.sandbox_detect_failed);
+    }
+
+    if (run_probes) {
+        const ws = if (cwd) |c| std.mem.sliceTo(c, 0) else "/tmp";
+        const report = sandbox.probe.runAll(std.heap.c_allocator, ws) catch {
+            if (strict_required) {
+                capi_error.setErrorWithCode(.sandbox_probe_failed, "probe execution failed", .{});
+                return @intFromEnum(error_codes.ErrorCode.sandbox_probe_failed);
+            }
+            return 0;
+        };
+        if (out_report) |r| r.probes_passed = report.allPassed();
+        if (strict_required and !report.allPassed()) {
+            capi_error.setErrorWithCode(.sandbox_probe_failed, "conformance probes failed", .{});
+            return @intFromEnum(error_codes.ErrorCode.sandbox_probe_failed);
+        }
+    }
+
+    return 0;
+}
+
 test "parseRuntimeMode accepts host and strict" {
     try std.testing.expectEqual(sandbox.RuntimeMode.host, try parseRuntimeMode(0));
     try std.testing.expectEqual(sandbox.RuntimeMode.strict, try parseRuntimeMode(1));
@@ -172,4 +247,94 @@ test "strict validate allows deferred cwd-dependent fs rules" {
     );
     // Deferred compile must not be reported as strict setup failure.
     try std.testing.expect(validate_rc != @intFromEnum(error_codes.ErrorCode.policy_strict_setup_failed));
+}
+
+test "validate_strict_ext populates capability report" {
+    var report = std.mem.zeroes(TaluCapabilityReport);
+    const rc = talu_agent_runtime_validate_strict_ext(
+        @intFromEnum(TaluSandboxBackend.linux_local),
+        false, // strict_required
+        false, // run_probes
+        null,
+        &report,
+    );
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    // On Linux, kernel version should be detected.
+    if (builtin.os.tag == .linux) {
+        try std.testing.expect(report.kernel_version_major > 0);
+    }
+}
+
+test "validate_strict_ext rejects invalid backend" {
+    const rc = talu_agent_runtime_validate_strict_ext(
+        99, // invalid
+        false,
+        false,
+        null,
+        null,
+    );
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(error_codes.ErrorCode.invalid_argument)),
+        rc,
+    );
+}
+
+test "validate_strict_ext oci backend fails when strict_required" {
+    var report = std.mem.zeroes(TaluCapabilityReport);
+    const rc = talu_agent_runtime_validate_strict_ext(
+        @intFromEnum(TaluSandboxBackend.oci),
+        true, // strict_required
+        false,
+        null,
+        &report,
+    );
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(error_codes.ErrorCode.sandbox_detect_failed)),
+        rc,
+    );
+}
+
+test "validate_strict_ext oci backend succeeds when not strict_required" {
+    var report = std.mem.zeroes(TaluCapabilityReport);
+    const rc = talu_agent_runtime_validate_strict_ext(
+        @intFromEnum(TaluSandboxBackend.oci),
+        false, // strict_required
+        false,
+        null,
+        &report,
+    );
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    // Non-linux-local backend returns zeroed report.
+    try std.testing.expect(!report.kernel_version_ok);
+    try std.testing.expectEqual(@as(u32, 0), report.kernel_version_major);
+}
+
+test "validate_strict_ext apple_container backend fails when strict_required" {
+    var report = std.mem.zeroes(TaluCapabilityReport);
+    const rc = talu_agent_runtime_validate_strict_ext(
+        @intFromEnum(TaluSandboxBackend.apple_container),
+        true,
+        false,
+        null,
+        &report,
+    );
+    try std.testing.expectEqual(
+        @as(i32, @intFromEnum(error_codes.ErrorCode.sandbox_detect_failed)),
+        rc,
+    );
+}
+
+test "validate_strict_ext apple_container backend succeeds when not strict_required" {
+    var report = std.mem.zeroes(TaluCapabilityReport);
+    const rc = talu_agent_runtime_validate_strict_ext(
+        @intFromEnum(TaluSandboxBackend.apple_container),
+        false,
+        false,
+        null,
+        &report,
+    );
+    try std.testing.expectEqual(@as(i32, 0), rc);
+    // Non-linux-local backend returns zeroed report.
+    try std.testing.expect(!report.kernel_version_ok);
+    try std.testing.expectEqual(@as(u32, 0), report.kernel_version_major);
 }

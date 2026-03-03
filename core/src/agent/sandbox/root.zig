@@ -13,6 +13,9 @@ pub const seccomp = @import("seccomp.zig");
 pub const limits = @import("limits.zig");
 pub const helpers = @import("helpers.zig");
 pub const env = @import("env.zig");
+pub const detect = @import("detect.zig");
+pub const cgroups = @import("cgroups.zig");
+pub const probe = @import("probe.zig");
 
 pub const RuntimeMode = enum(u8) {
     host = 0,
@@ -34,6 +37,7 @@ pub const StrictRuntimeConfig = struct {
     runtime_limits: limits.RuntimeLimits = .{},
     env_config: env.EnvConfig = .{},
     enable_seccomp: bool = true,
+    cgroup_config: ?cgroups.CgroupConfig = null,
 
     /// Construct a StrictRuntimeConfig with strict-mode defaults enabled.
     ///
@@ -60,6 +64,10 @@ pub const StrictRuntimeConfig = struct {
             .runtime_limits = limits.RuntimeLimits.defaultStrict(),
             .env_config = .{},
             .enable_seccomp = true,
+            .cgroup_config = .{
+                .pids_max = 256,
+                .memory_max = 2 * 1024 * 1024 * 1024, // 2 GiB
+            },
         };
     }
 };
@@ -118,6 +126,8 @@ test "defaultStrict enables all isolation layers" {
     try std.testing.expect(config.mount_options.enable_mount_tree);
     try std.testing.expect(config.runtime_limits.max_memory_bytes != null);
     try std.testing.expect(config.enable_seccomp);
+    try std.testing.expect(config.cgroup_config != null);
+    try std.testing.expectEqual(@as(u64, 256), config.cgroup_config.?.pids_max.?);
 }
 
 const std = @import("std");

@@ -133,6 +133,12 @@ pub struct ServerArgs {
     /// Sandbox backend selection for strict runtime mode.
     #[arg(long, env = "TALU_SANDBOX_BACKEND", value_enum, default_value_t = SandboxBackendArg::Auto)]
     pub sandbox_backend: SandboxBackendArg,
+
+    /// Run conformance probes at startup to verify sandbox enforcement end-to-end.
+    ///
+    /// Only meaningful when `--agent-runtime-mode strict` is set.
+    #[arg(long, env = "TALU_STRICT_PROBES", default_value_t = false)]
+    pub strict_probes: bool,
 }
 
 pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Result<()> {
@@ -240,6 +246,33 @@ pub fn run_server(args: ServerArgs, verbose: u8, log_filter: Option<&str>) -> Re
             sandbox_backend_for_talu(sandbox_backend),
         )
         .context("validate strict runtime policy and sandbox support")?;
+
+        // Capability detection + optional conformance probes.
+        let report = talu::shell::validate_strict_runtime_ext(
+            sandbox_backend_for_talu(sandbox_backend),
+            true, // strict_required
+            args.strict_probes,
+            Some(&workspace_dir.to_string_lossy()),
+        )
+        .context("validate strict runtime capabilities")?;
+        log::info!(
+            target: "server::init",
+            "sandbox capabilities: kernel={}.{} landlock_abi={} user_ns={} seccomp={} cgroupv2={}/{}",
+            report.kernel_version_major,
+            report.kernel_version_minor,
+            report.landlock_abi_version,
+            report.user_ns_available,
+            report.seccomp_available,
+            report.cgroupv2_available,
+            report.cgroupv2_writable,
+        );
+        if args.strict_probes {
+            log::info!(
+                target: "server::init",
+                "conformance probes: {}",
+                if report.probes_passed { "passed" } else { "FAILED" }
+            );
+        }
     }
 
     let state = state::AppState {

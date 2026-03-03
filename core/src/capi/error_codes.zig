@@ -78,6 +78,9 @@ pub const ErrorCode = enum(i32) {
     policy_invalid = 810,
     policy_strict_unavailable = 811,
     policy_strict_setup_failed = 812,
+    sandbox_detect_failed = 813,
+    sandbox_probe_failed = 814,
+    sandbox_cgroup_unavailable = 815,
 
     // System errors (900-999)
     out_of_memory = 900,
@@ -152,6 +155,9 @@ pub fn errorToCode(err: anyerror) ErrorCode {
         error.ProcessExited => .shell_process_exited,
         error.StrictUnavailable => .policy_strict_unavailable,
         error.StrictSetupFailed => .policy_strict_setup_failed,
+        error.SandboxDetectFailed => .sandbox_detect_failed,
+        error.SandboxProbeFailed => .sandbox_probe_failed,
+        error.SandboxCgroupUnavailable => .sandbox_cgroup_unavailable,
         // Image pipeline errors
         error.UnsupportedImageFormat => .convert_unsupported_format,
         error.ImageInputTooLarge,
@@ -186,4 +192,7 @@ test "ErrorCode: error codes are stable" {
     try std.testing.expectEqual(@as(i32, 900), @intFromEnum(ErrorCode.out_of_memory));
     try std.testing.expectEqual(@as(i32, 903), @intFromEnum(ErrorCode.ambiguous_backend));
     try std.testing.expectEqual(@as(i32, 904), @intFromEnum(ErrorCode.unsupported_abi_version));
+    try std.testing.expectEqual(@as(i32, 813), @intFromEnum(ErrorCode.sandbox_detect_failed));
+    try std.testing.expectEqual(@as(i32, 814), @intFromEnum(ErrorCode.sandbox_probe_failed));
+    try std.testing.expectEqual(@as(i32, 815), @intFromEnum(ErrorCode.sandbox_cgroup_unavailable));
 }
